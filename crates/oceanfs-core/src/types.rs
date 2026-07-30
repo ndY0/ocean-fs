@@ -612,6 +612,34 @@ impl Default for GossipConfig {
 }
 
 // ---------------------------------------------------------------------------
+// WriteResult / WriteAck
+// ---------------------------------------------------------------------------
+
+/// Result of a successful write operation.
+#[derive(Debug, Clone)]
+pub struct WriteResult {
+    /// The object key that was written.
+    pub object_key: ObjectKey,
+    /// The chunks referencing the object's data in segments.
+    pub chunks: smallvec::SmallVec<[ChunkRef; 4]>,
+    /// Total size of the object in bytes.
+    pub size: u64,
+    /// BLAKE3 hash of the object content.
+    pub blake3_hash: Option<HashOutput>,
+}
+
+/// Acknowledgment from a replica node for a write.
+#[derive(Debug, Clone)]
+pub struct WriteAck {
+    /// The node that acknowledged.
+    pub node_id: NodeId,
+    /// WAL position on that node.
+    pub wal_position: u64,
+    /// HLC timestamp of the write.
+    pub hlc: Hlc,
+}
+
+// ---------------------------------------------------------------------------
 // CodecType / CodecConfig
 // ---------------------------------------------------------------------------
 

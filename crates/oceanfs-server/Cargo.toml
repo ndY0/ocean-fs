@@ -14,9 +14,13 @@ oceanfs-storage.workspace = true
 oceanfs-cache.workspace = true
 bytes.workspace = true
 parking_lot.workspace = true
+smallvec.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tokio-test = "0.4"
 
 [lints]
 workspace = true

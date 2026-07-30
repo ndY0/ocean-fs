@@ -36,5 +36,5 @@ pub use hlc::Hlc;
 pub use types::{
     BucketId, ChunkRef, CodecConfig, CodecType, EncodingPlan, GossipConfig, HashOutput, NodeId,
     NodeState, ObjectKey, ObjectMetadata, SegmentId, SegmentIndexEntry, SegmentMetadata,
-    SegmentSizeConfig, SizeTier, Tombstone, VnodeRange,
+    SegmentSizeConfig, SizeTier, Tombstone, VnodeRange, WriteAck, WriteResult,
 };

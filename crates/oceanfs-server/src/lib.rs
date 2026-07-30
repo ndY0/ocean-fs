@@ -1,16 +1,4 @@
 //! S3-compatible HTTP server and request coordinators.
-//!
-//! This crate defines **what the system does**: S3 API handlers, write
-//! and read coordinators, admin endpoints, and authentication middleware.
-//! It depends only on traits and core types — never on concrete storage
-//! or networking implementations.
-//!
-//! # Dependency Inversion
-//!
-//! Concrete implementations (RocksDB metadata, gRPC connection pool,
-//! SWIM membership) are wired together in `oceanfs_node::Node`.
-//! This crate only imports `oceanfs-core` for types and defines the
-//! traits that storage, networking, and membership must implement.
 
 #![forbid(unsafe_code)]
 #![deny(
@@ -24,6 +12,13 @@
 )]
 
 mod error;
+mod hinted_handoff;
+mod read_coordinator;
 mod router;
+mod write_coordinator;
 
+pub use error::{Error, Result};
+pub use hinted_handoff::HintedHandoff;
+pub use read_coordinator::{ReadCoordinator, ReadRequest, ReadResult};
 pub use router::Router;
+pub use write_coordinator::{WriteCoordinator, WriteRequest};
