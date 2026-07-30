@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package oceanfs.common;
+
+// ---------------------------------------------------------------------------
+// Shared message types used across all OceanFS gRPC services.
+// Individual crate service definitions import these messages.
+// ---------------------------------------------------------------------------
+
+// A bucket identifier.
+message BucketId {
+  string name = 1;
+}
+
+// An object key within a bucket.
+message ObjectKey {
+  string key = 1;
+}
+
+// A node identifier in the cluster.
+message NodeId {
+  string id = 1;
+}
+
+// A time-sortable segment identifier (UUIDv7, stored as 16 bytes).
+message SegmentId {
+  bytes id = 1;  // 16 bytes, UUIDv7
+}
+
+// A 256-bit BLAKE3 hash (32 bytes).
+message HashOutput {
+  bytes hash = 1;  // 32 bytes
+}
+
+// Hybrid Logical Clock timestamp.
+message HlcTimestamp {
+  uint64 wall_time = 1;  // milliseconds since epoch
+  uint32 logical = 2;    // logical counter
+}
+
+// Reference to a chunk of an object within a segment.
+message ChunkRef {
+  SegmentId segment_id = 1;
+  uint64 offset = 2;
+  uint32 length = 3;
+}

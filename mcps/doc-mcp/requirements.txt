@@ -1,0 +1,5 @@
+# mcp v2 is in alpha; pin to the stable v1 line.
+mcp>=1.27,<2
+qdrant-client>=1.12
+fastembed>=0.5
+python-frontmatter>=1.1

@@ -1,0 +1,20 @@
+//! Multi-layer caching subsystem.
+//!
+//! Three cache layers between the HTTP frontend and the storage engine:
+//!
+//! - **L1 Object Cache:** in-memory LRU of hot blob payloads (zero disk I/O)
+//! - **L2 Metadata Cache:** LRU of `ObjectMetadata` entries (avoids RocksDB)
+//! - **L3 Negative Cache:** Bloom filter for non-existent keys (constant-time 404)
+//!
+//! All caches are node-local and eventually consistent.
+
+#![forbid(unsafe_code)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::wildcard_imports,
+    clippy::undocumented_unsafe_blocks,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    missing_docs
+)]

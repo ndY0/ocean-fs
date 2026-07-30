@@ -1,0 +1,8 @@
+# OceanFS — Clippy configuration
+#
+# See guidelines/coding.md §9.2 for the full lint policy.
+
+disallowed-types = [
+    "std::sync::Mutex",
+    "std::sync::RwLock",
+]

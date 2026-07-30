@@ -1,0 +1,96 @@
+[workspace]
+members = [
+    "crates/oceanfs-core",
+    "crates/oceanfs-hash",
+    "crates/oceanfs-ec",
+    "crates/oceanfs-accel",
+    "crates/oceanfs-storage",
+    "crates/oceanfs-routing",
+    "crates/oceanfs-membership",
+    "crates/oceanfs-network",
+    "crates/oceanfs-cache",
+    "crates/oceanfs-server",
+    "crates/oceanfs-node",
+    "crates/oceanfs",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ocean-fs/ocean-fs"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# --- Internal ---
+oceanfs-core     = { path = "crates/oceanfs-core" }
+oceanfs-hash     = { path = "crates/oceanfs-hash" }
+oceanfs-ec       = { path = "crates/oceanfs-ec" }
+oceanfs-accel    = { path = "crates/oceanfs-accel" }
+oceanfs-storage  = { path = "crates/oceanfs-storage" }
+oceanfs-routing  = { path = "crates/oceanfs-routing" }
+oceanfs-membership = { path = "crates/oceanfs-membership" }
+oceanfs-network  = { path = "crates/oceanfs-network" }
+oceanfs-cache    = { path = "crates/oceanfs-cache" }
+oceanfs-server   = { path = "crates/oceanfs-server" }
+oceanfs-node     = { path = "crates/oceanfs-node" }
+
+# --- Async Runtime ---
+tokio            = { version = "1", default-features = false, features = ["rt-multi-thread", "sync", "macros", "time", "fs", "io-util", "signal"] }
+
+# --- Data ---
+bytes            = "1"
+smallvec         = "1"
+uuid             = { version = "1", features = ["v7"] }
+
+# --- Serialization ---
+serde            = { version = "1", features = ["derive"] }
+toml             = "0.8"
+prost            = "0.13"
+
+# --- Concurrency ---
+parking_lot      = "0.12"
+dashmap          = "6"
+arc-swap         = "1"
+rayon            = "1"
+
+# --- Hashing ---
+blake3           = "1"
+
+# --- Error Handling ---
+thiserror        = "2"
+
+# --- Observability ---
+tracing          = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+prometheus       = "0.13"
+
+# --- Testing ---
+static_assertions = "1"
+proptest          = "1"
+
+# --- Build ---
+tonic            = "0.12"
+tonic-build      = "0.12"
+
+[workspace.lints.clippy]
+unwrap_used      = "deny"
+expect_used      = "deny"
+wildcard_imports = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+lto             = "fat"
+codegen-units   = 1
+panic           = "abort"
+strip           = "symbols"
+opt-level       = 3
+
+[profile.dev]
+opt-level       = 0
+
+[profile.bench]
+lto             = "fat"
+codegen-units   = 1
+debug           = false

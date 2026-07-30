@@ -1,0 +1,16 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "mcp": {
+    "code-graph": {
+      "type": "remote",
+      "url": "http://localhost:8765/mcp",
+      "enabled": true
+    },
+    "doc-graph": {
+      "type": "remote",
+      "url": "http://localhost:8000/mcp",
+      "enabled": true
+    }
+  }
+}

@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package oceanfs.segment;
+
+import "oceanfs/common.proto";
+
+// ---------------------------------------------------------------------------
+// Segment-related message types.
+// These are shared across storage, network, and server crates.
+// ---------------------------------------------------------------------------
+
+// A request to append data to a segment.
+message SegmentAppendRequest {
+  oceanfs.common.SegmentId segment_id = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  oceanfs.common.HlcTimestamp timestamp = 4;
+}
+
+// Response to an append request.
+message SegmentAppendResponse {
+  uint64 wal_position = 1;
+  oceanfs.common.HlcTimestamp timestamp = 2;
+}
+
+// A request to fetch a shard from a sealed segment.
+message FetchShardRequest {
+  oceanfs.common.SegmentId segment_id = 1;
+  uint32 shard_index = 2;
+  uint32 offset = 3;
+  uint32 length = 4;
+}
+
+// A chunk of shard data streamed back to the requester.
+message ShardResponse {
+  bytes data = 1;
+  uint32 offset = 2;
+  bool is_last = 3;
+}

@@ -1,0 +1,20 @@
+[package]
+name = "oceanfs-accel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+cuda = []
+isa-l = []
+
+[dependencies]
+oceanfs-core.workspace = true
+oceanfs-ec.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

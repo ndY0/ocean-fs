@@ -1,0 +1,25 @@
+[package]
+name = "oceanfs-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Workspace
+bytes.workspace = true
+smallvec.workspace = true
+uuid.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# External
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+
+[dev-dependencies]
+static_assertions.workspace = true
+
+[lints]
+workspace = true

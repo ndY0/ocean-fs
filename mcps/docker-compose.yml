@@ -1,0 +1,116 @@
+services:
+  dgraph-zero:
+    image: dgraph/dgraph:v24.0.4
+    container_name: cgraph-zero
+    restart: unless-stopped
+    command: dgraph zero --my=dgraph-zero:5080
+    ports:
+      - "5080:5080"
+      - "6080:6080"
+    volumes:
+      - dgraph-zero-data:/dgraph
+    networks:
+      - cgraph-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:6080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  dgraph-alpha:
+    image: dgraph/dgraph:v24.0.4
+    container_name: cgraph-alpha
+    restart: unless-stopped
+    command: dgraph alpha --my=dgraph-alpha:7080 --zero=dgraph-zero:5080 --security whitelist=0.0.0.0/0
+    ports:
+      - "8080:8080"
+      - "9080:9080"
+    volumes:
+      - dgraph-alpha-data:/dgraph
+    networks:
+      - cgraph-net
+    depends_on:
+      dgraph-zero:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+  qdrant:
+    # Pin to a specific version for reproducibility; bump deliberately.
+    # Check https://hub.docker.com/r/qdrant/qdrant/tags for the current stable tag.
+    image: qdrant/qdrant:latest
+    container_name: doc-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"   # REST + web dashboard (http://localhost:6333/dashboard)
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    # No healthcheck: the qdrant image is distroless (no shell/wget/curl to run a
+    # probe with). Readiness is handled app-side — the MCP server waits for
+    # Qdrant on startup (see app/server.py).
+
+  doc-mcp:
+    build: ./doc-mcp
+    container_name: doc-mcp
+    restart: unless-stopped
+    depends_on:
+      - qdrant   # waits for the container to start; the server then polls until
+                 # Qdrant actually accepts connections before creating anything.
+    ports:
+      - "8000:8000"   # MCP streamable-http endpoint: http://localhost:8000/mcp
+    environment:
+      QDRANT_URL: "http://qdrant:6333"
+      COLLECTION: "pipeline_docs"
+      EMBED_MODEL: "BAAI/bge-small-en-v1.5"
+      VECTOR_SIZE: "384"
+      REPO_PATH: "/repo"          # the project git repo, mounted below
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8000"
+    volumes:
+      # Mount YOUR project's git repo read-only. The server reads files and
+      # resolves historical blobs via `git cat-file`; it never writes here.
+      # Set REPO_HOST_PATH in your shell or a .env file (see .env.example).
+      - "${REPO_HOST_PATH:?set REPO_HOST_PATH to your project repo path}:/repo:ro"
+  code-graph-mcp:
+    build:
+      context: ./code-graph-mcp
+      dockerfile: Dockerfile
+      args:
+        # Set LANGUAGE in .env to control which LSP server is installed
+        LANGUAGE: ${CG_LANG:-rust}
+    container_name: code-graph-mcp
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      DGRAPH_URL: "http://dgraph-alpha:8080"
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8765"
+      LOG_LEVEL: "INFO"
+      CODE_LANGUAGE: "${CG_LANG:-rust}"
+      LSP_INIT_TIMEOUT: "${LSP_INIT_TIMEOUT:-90}"
+      # Java-specific (ignored for other languages)
+      JDTLS_HOME: "/opt/jdtls"
+      JDTLS_DATA: "/tmp/jdtls-workspace-data"
+      # Python-specific
+      PYTHON_LSP: "${PYTHON_LSP:-pylsp}"
+    volumes:
+      - "${REPO_HOST_PATH}:/workspace:rw"
+    networks:
+      - cgraph-net
+    depends_on:
+      dgraph-alpha:
+        condition: service_healthy
+volumes:
+  qdrant_storage:
+  dgraph-zero-data:
+  dgraph-alpha-data:
+
+networks:
+  cgraph-net:
+    driver: bridge

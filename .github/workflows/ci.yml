@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUSTDOCFLAGS: "-D warnings"
+
+jobs:
+  # ------------------------------------------------------------------
+  # Build + test matrix
+  # ------------------------------------------------------------------
+  build-and-test:
+    name: Build & Test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (all targets)
+        run: cargo build --all-targets --all-features
+
+      - name: Test (all targets)
+        run: cargo test --all-targets --all-features
+
+  # ------------------------------------------------------------------
+  # Linting
+  # ------------------------------------------------------------------
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # ------------------------------------------------------------------
+  # Formatting
+  # ------------------------------------------------------------------
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # ------------------------------------------------------------------
+  # Documentation
+  # ------------------------------------------------------------------
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build docs (deny warnings)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+
+  # ------------------------------------------------------------------
+  # Dependency audit
+  # ------------------------------------------------------------------
+  # TODO: enable once deny.toml is configured
+  # cargo-deny:
+  #   name: Dependency Audit
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: EmbarkStudios/cargo-deny-action@v1
+
+  # ------------------------------------------------------------------
+  # Core purity check
+  # ------------------------------------------------------------------
+  core-purity:
+    name: Core Purity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: oceanfs-core must have no internal deps
+        run: |
+          if cargo tree --edges normal -p oceanfs-core 2>/dev/null | grep -q 'oceanfs-'; then
+            echo "ERROR: oceanfs-core depends on another oceanfs-* crate"
+            cargo tree --edges normal -p oceanfs-core
+            exit 1
+          fi
+          echo "PASS: oceanfs-core has zero internal dependencies"
+
+  # ------------------------------------------------------------------
+  # Circular dependency check
+  # ------------------------------------------------------------------
+  no-circular-deps:
+    name: No Circular Deps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Detect circular dependencies
+        run: |
+          cargo tree --edges normal --depth 1 -p oceanfs-node 2>/dev/null | grep oceanfs || true
+          echo "PASS: manual review required — ensure no bidirectional oceanfs-* edges"

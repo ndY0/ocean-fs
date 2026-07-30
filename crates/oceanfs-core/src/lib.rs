@@ -1,0 +1,36 @@
+//! OceanFS core types and traits.
+//!
+//! `oceanfs-core` is the foundation crate — it has zero internal dependencies.
+//! It provides shared types (`SegmentId`, `NodeId`, `BucketId`), the HLC
+//! clock, error types, and configuration structs used by every other crate.
+//!
+//! # Crate Purity
+//!
+//! This crate must never depend on any other `oceanfs-*` crate. CI enforces
+//! this via `cargo tree --edges normal -p oceanfs-core | grep oceanfs-`
+//! which must produce no output.
+
+// ---------------------------------------------------------------------------
+// Lint attributes
+// ---------------------------------------------------------------------------
+#![forbid(unsafe_code)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::wildcard_imports,
+    clippy::undocumented_unsafe_blocks,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    missing_docs
+)]
+// ---------------------------------------------------------------------------
+
+mod config;
+mod error;
+mod hlc;
+mod types;
+
+pub use config::NodeConfig;
+pub use error::{Error, Result};
+pub use hlc::Hlc;
+pub use types::{BucketId, HashOutput, NodeId, ObjectKey, SegmentId};

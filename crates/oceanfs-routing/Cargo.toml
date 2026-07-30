@@ -1,0 +1,15 @@
+[package]
+name = "oceanfs-routing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+oceanfs-core.workspace = true
+arc-swap.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
