@@ -34,7 +34,7 @@ pub use config::{MetadataConfig, NodeConfig, RingConfig, WalConfig};
 pub use error::{Error, Result};
 pub use hlc::Hlc;
 pub use types::{
-    BucketId, ChunkRef, GossipConfig, HashOutput, NodeId, NodeState, ObjectKey, ObjectMetadata,
-    SegmentId, SegmentIndexEntry, SegmentMetadata, SegmentSizeConfig, SizeTier, Tombstone,
-    VnodeRange,
+    BucketId, ChunkRef, CodecConfig, CodecType, EncodingPlan, GossipConfig, HashOutput, NodeId,
+    NodeState, ObjectKey, ObjectMetadata, SegmentId, SegmentIndexEntry, SegmentMetadata,
+    SegmentSizeConfig, SizeTier, Tombstone, VnodeRange,
 };

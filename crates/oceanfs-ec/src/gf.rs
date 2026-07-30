@@ -1,0 +1,146 @@
+//! Galois Field GF(2^8) arithmetic.
+//!
+//! Uses log/exp tables for fast multiplication and division.
+//! Addition is XOR. The primitive polynomial is 0x11D
+//! (x^8 + x^4 + x^3 + x^2 + 1).
+
+/// GF(2^8) element (0..255).
+pub(crate) type Gf8 = u8;
+
+/// Primitive polynomial: x^8 + x^4 + x^3 + x^2 + 1
+const PRIMITIVE_POLY: u16 = 0x11D;
+
+/// Log table: log[alpha^i] = i for i in 0..255.
+/// alpha = 2 is the primitive element.
+static LOG_TABLE: [u8; 256] = build_log_table();
+/// Exp table: exp[i] = alpha^i.
+static EXP_TABLE: [u8; 512] = build_exp_table();
+
+const fn build_log_table() -> [u8; 256] {
+    let mut log = [0u8; 256];
+    let mut x: u16 = 1;
+    let mut i: u16 = 0;
+    while i < 255 {
+        log[x as usize] = i as u8;
+        x <<= 1;
+        if x >= 256 {
+            x ^= PRIMITIVE_POLY;
+        }
+        i += 1;
+    }
+    log
+}
+
+const fn build_exp_table() -> [u8; 512] {
+    let mut exp = [0u8; 512];
+    let mut x: u16 = 1;
+    let mut i: u16 = 0;
+    while i < 511 {
+        exp[i as usize] = x as u8;
+        x <<= 1;
+        if x >= 256 {
+            x ^= PRIMITIVE_POLY;
+        }
+        i += 1;
+    }
+    exp[255] = exp[0]; // alpha^255 = 1
+    exp
+}
+
+/// Adds two GF(2^8) elements (XOR).
+#[inline]
+pub(crate) fn gf_add(a: Gf8, b: Gf8) -> Gf8 {
+    a ^ b
+}
+
+/// Multiplies two GF(2^8) elements.
+#[inline]
+pub(crate) fn gf_mul(a: Gf8, b: Gf8) -> Gf8 {
+    if a == 0 || b == 0 {
+        0
+    } else {
+        let sum = LOG_TABLE[a as usize] as u16 + LOG_TABLE[b as usize] as u16;
+        EXP_TABLE[sum as usize]
+    }
+}
+
+/// Divides a / b in GF(2^8).
+#[inline]
+pub(crate) fn gf_div(a: Gf8, b: Gf8) -> Gf8 {
+    if a == 0 {
+        0
+    } else if b == 0 {
+        panic!("division by zero in GF(2^8)")
+    } else {
+        let diff = LOG_TABLE[a as usize] as i16 - LOG_TABLE[b as usize] as i16;
+        let idx = if diff < 0 { diff + 255 } else { diff } as usize;
+        EXP_TABLE[idx]
+    }
+}
+
+/// Computes the multiplicative inverse a^(-1) in GF(2^8).
+#[inline]
+pub(crate) fn gf_inv(a: Gf8) -> Gf8 {
+    if a == 0 {
+        panic!("inverse of zero in GF(2^8)")
+    }
+    gf_div(1, a)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_is_xor() {
+        assert_eq!(gf_add(0x53, 0xCA), 0x53 ^ 0xCA);
+    }
+
+    #[test]
+    fn mul_commutative() {
+        for a in 1..=255u8 {
+            for b in 1..=255u8 {
+                assert_eq!(gf_mul(a, b), gf_mul(b, a), "a={a}, b={b}");
+            }
+        }
+    }
+
+    #[test]
+    fn mul_distributive() {
+        let a = 0x12;
+        let b = 0x34;
+        let c = 0x56;
+        assert_eq!(gf_mul(a, gf_add(b, c)), gf_add(gf_mul(a, b), gf_mul(a, c)));
+    }
+
+    #[test]
+    fn mul_identity() {
+        for a in 1..=255u8 {
+            assert_eq!(gf_mul(a, 1), a);
+        }
+    }
+
+    #[test]
+    fn mul_zero() {
+        for a in 0..=255u8 {
+            assert_eq!(gf_mul(a, 0), 0);
+        }
+    }
+
+    #[test]
+    fn inv_times_self_is_one() {
+        for a in 1..=255u8 {
+            assert_eq!(gf_mul(a, gf_inv(a)), 1, "a={a}");
+        }
+    }
+
+    #[test]
+    fn div_undoes_mul() {
+        for a in 1..=255u8 {
+            for b in 1..=255u8 {
+                assert_eq!(gf_div(gf_mul(a, b), b), a, "a={a}, b={b}");
+            }
+        }
+    }
+}

@@ -11,6 +11,11 @@ bytes.workspace = true
 rayon.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+static_assertions.workspace = true
 
 [lints]
 workspace = true

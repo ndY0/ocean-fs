@@ -1,8 +1,8 @@
 //! Erasure coding engine.
 //!
 //! Defines the `Encoder` and `Decoder` traits and a Cauchy Reed-Solomon
-//! implementation over GF(2⁸). Supports CPU SIMD via ISA-L (feature-gated)
-//! and GPU acceleration via CUDA (Phase 8).
+//! implementation over GF(2^8). Supports rayon-based stripe parallelism
+//! via `ParallelEncoder` and `ParallelDecoder`.
 //!
 //! # Unsafe Code
 //!
@@ -18,3 +18,14 @@
     clippy::missing_panics_doc,
     missing_docs
 )]
+
+mod cauchy;
+mod error;
+mod gf;
+mod stripe;
+mod traits;
+
+pub use cauchy::CauchyEncoder;
+pub use oceanfs_core::EncodingPlan;
+pub use stripe::{ParallelDecoder, ParallelEncoder, StripeBatch, StripeLayout};
+pub use traits::{Decoder, Encoder};

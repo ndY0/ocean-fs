@@ -612,6 +612,57 @@ impl Default for GossipConfig {
 }
 
 // ---------------------------------------------------------------------------
+// CodecType / CodecConfig
+// ---------------------------------------------------------------------------
+
+/// Supported erasure coding codecs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CodecType {
+    /// Cauchy Reed-Solomon over GF(2^8).
+    CauchyRs,
+}
+
+/// Configuration for an erasure coding codec.
+#[derive(Debug, Clone)]
+pub struct CodecConfig {
+    /// The codec to use.
+    pub codec_type: CodecType,
+    /// Number of data shards (k).
+    pub data_shards: u8,
+    /// Number of parity shards (m).
+    pub parity_shards: u8,
+    /// Size of each shard in bytes.
+    pub strip_size_bytes: usize,
+}
+
+impl Default for CodecConfig {
+    fn default() -> Self {
+        Self {
+            codec_type: CodecType::CauchyRs,
+            data_shards: 4,
+            parity_shards: 2,
+            strip_size_bytes: 65536,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EncodingPlan
+// ---------------------------------------------------------------------------
+
+/// A pre-computed plan for encoding a segment.
+#[derive(Debug, Clone)]
+pub struct EncodingPlan {
+    /// Number of stripes in the segment.
+    pub stripe_count: usize,
+    /// Total size after padding.
+    pub padded_size: u64,
+    /// Size of each individual shard.
+    pub shard_size: usize,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
