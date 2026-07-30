@@ -117,8 +117,33 @@ impl Default for WalConfig {
 }
 
 // ---------------------------------------------------------------------------
-// MetadataConfig
+// RingConfig
 // ---------------------------------------------------------------------------
+
+/// Configuration for the consistent hashing ring.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::RingConfig;
+///
+/// let config = RingConfig::default();
+/// assert_eq!(config.vnodes_per_node, 256);
+/// assert_eq!(config.replication_factor, 3);
+/// ```
+#[derive(Debug, Clone)]
+pub struct RingConfig {
+    /// Number of virtual nodes per physical node (default 256).
+    pub vnodes_per_node: u32,
+    /// Number of successors for each key (default 3).
+    pub replication_factor: u8,
+}
+
+impl Default for RingConfig {
+    fn default() -> Self {
+        Self { vnodes_per_node: 256, replication_factor: 3 }
+    }
+}
 
 /// Configuration for the RocksDB metadata store.
 ///

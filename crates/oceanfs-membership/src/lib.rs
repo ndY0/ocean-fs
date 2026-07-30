@@ -14,3 +14,9 @@
     clippy::missing_panics_doc,
     missing_docs
 )]
+
+mod error;
+mod membership;
+
+pub use error::{Error, Result};
+pub use membership::{Membership, MembershipEvent};

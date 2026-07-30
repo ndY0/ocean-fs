@@ -14,3 +14,7 @@
     clippy::missing_panics_doc,
     missing_docs
 )]
+
+mod pool;
+
+pub use pool::ConnectionPool;

@@ -549,6 +549,69 @@ pub struct SegmentIndexEntry {
 }
 
 // ---------------------------------------------------------------------------
+// VnodeRange
+// ---------------------------------------------------------------------------
+
+/// A key range affected by a ring topology change.
+///
+/// When a node is added or removed from the ring, the affected key range
+/// identifies which keys need data migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VnodeRange {
+    /// Start of the affected key range (inclusive).
+    pub start: [u8; 32],
+    /// End of the affected key range (exclusive).
+    pub end: [u8; 32],
+}
+
+// ---------------------------------------------------------------------------
+// NodeState
+// ---------------------------------------------------------------------------
+
+/// The state of a node in the cluster membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeState {
+    /// Node is healthy and participating.
+    Alive,
+    /// Node is suspected down (unreachable via direct or indirect ping).
+    Suspect,
+    /// Node is confirmed dead.
+    Dead,
+    /// Node is gracefully leaving the cluster.
+    Leaving,
+    /// Node has left the cluster.
+    Left,
+}
+
+// ---------------------------------------------------------------------------
+// GossipConfig
+// ---------------------------------------------------------------------------
+
+/// Configuration for the SWIM gossip membership protocol.
+#[derive(Debug, Clone)]
+pub struct GossipConfig {
+    /// Interval between gossip rounds in milliseconds.
+    pub interval_ms: u64,
+    /// Time in SUSPECT state before declaring DEAD.
+    pub suspicion_timeout_ms: u64,
+    /// Total time before declaring DEAD.
+    pub failure_timeout_ms: u64,
+    /// Number of peers to route indirect pings through.
+    pub indirect_ping_count: u8,
+}
+
+impl Default for GossipConfig {
+    fn default() -> Self {
+        Self {
+            interval_ms: 1000,
+            suspicion_timeout_ms: 5000,
+            failure_timeout_ms: 15000,
+            indirect_ping_count: 3,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

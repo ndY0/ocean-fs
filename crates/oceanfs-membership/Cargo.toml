@@ -7,9 +7,13 @@ rust-version.workspace = true
 
 [dependencies]
 oceanfs-core.workspace = true
-arc-swap.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+static_assertions.workspace = true
 
 [lints]
 workspace = true

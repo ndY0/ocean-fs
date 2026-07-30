@@ -7,10 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 oceanfs-core.workspace = true
-oceanfs-storage.workspace = true
 oceanfs-routing.workspace = true
 oceanfs-membership.workspace = true
 oceanfs-network.workspace = true
+oceanfs-storage.workspace = true
 oceanfs-cache.workspace = true
 bytes.workspace = true
 parking_lot.workspace = true

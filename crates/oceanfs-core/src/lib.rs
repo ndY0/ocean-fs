@@ -30,10 +30,11 @@ mod error;
 mod hlc;
 mod types;
 
-pub use config::{MetadataConfig, NodeConfig, WalConfig};
+pub use config::{MetadataConfig, NodeConfig, RingConfig, WalConfig};
 pub use error::{Error, Result};
 pub use hlc::Hlc;
 pub use types::{
-    BucketId, ChunkRef, HashOutput, NodeId, ObjectKey, ObjectMetadata, SegmentId,
-    SegmentIndexEntry, SegmentMetadata, SegmentSizeConfig, SizeTier, Tombstone,
+    BucketId, ChunkRef, GossipConfig, HashOutput, NodeId, NodeState, ObjectKey, ObjectMetadata,
+    SegmentId, SegmentIndexEntry, SegmentMetadata, SegmentSizeConfig, SizeTier, Tombstone,
+    VnodeRange,
 };

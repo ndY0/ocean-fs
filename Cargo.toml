@@ -62,6 +62,7 @@ num_cpus = "1"
 
 # --- Hashing ---
 blake3           = "1"
+sha2             = "0.10"
 
 # --- Error Handling ---
 thiserror        = "2"
