@@ -952,6 +952,8 @@ dependencies = [
  "dashmap",
  "oceanfs-core",
  "parking_lot",
+ "smallvec",
+ "static_assertions",
  "tokio",
  "tracing",
 ]

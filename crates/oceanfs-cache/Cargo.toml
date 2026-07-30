@@ -10,8 +10,12 @@ oceanfs-core.workspace = true
 bytes.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
+smallvec.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+static_assertions.workspace = true
 
 [lints]
 workspace = true
