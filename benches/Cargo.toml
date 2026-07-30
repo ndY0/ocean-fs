@@ -1,0 +1,17 @@
+[package]
+name = "oceanfs-benches"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "dummy.rs"
+
+[[bench]]
+name = "ec_benchmark"
+harness = false
+
+[dependencies]
+blake3.workspace = true
+criterion.workspace = true
+oceanfs-ec.workspace = true

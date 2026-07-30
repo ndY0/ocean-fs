@@ -6,7 +6,7 @@
 //! - **Tier 1:** ISA-L (x86, feature-gated)
 //! - **Tier 2:** GPU / CUDA (feature-gated)
 //!
-//! The `AccelDispatcher` selects the best available backend at runtime.
+//! The [`AccelDispatcher`] selects the best available backend at runtime.
 //!
 //! # Unsafe Code
 //!
@@ -21,3 +21,10 @@
     clippy::missing_panics_doc,
     missing_docs
 )]
+
+mod dispatcher;
+
+#[cfg(feature = "cuda")]
+mod cuda;
+
+pub use dispatcher::{AccelDispatcher, AccelTier};
