@@ -1058,6 +1058,8 @@ dependencies = [
  "oceanfs-routing",
  "oceanfs-storage",
  "parking_lot",
+ "serde",
+ "serde_json",
  "smallvec",
  "thiserror",
  "tokio",
