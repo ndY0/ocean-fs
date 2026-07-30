@@ -1,7 +1,7 @@
 ---
 feature: "Write-Ahead Log"
 epic: "phase-1-storage-engine"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:

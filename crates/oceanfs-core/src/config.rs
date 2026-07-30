@@ -69,4 +69,83 @@ mod tests {
         let config = NodeConfig::default();
         assert!(config.seed_nodes.is_empty());
     }
+
+    #[test]
+    fn wal_config_defaults_are_sensible() {
+        let config = WalConfig::default();
+        assert_eq!(config.max_file_size_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.fsync_batch_timeout_ms, 5);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WalConfig
+// ---------------------------------------------------------------------------
+
+/// Configuration for the Write-Ahead Log.
+///
+/// Controls WAL directory, file rotation, and fsync batching.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::WalConfig;
+///
+/// let config = WalConfig::default();
+/// assert_eq!(config.max_file_size_bytes, 64 * 1024 * 1024);
+/// ```
+#[derive(Debug, Clone)]
+pub struct WalConfig {
+    /// Directory where WAL files are stored.
+    pub data_dir: PathBuf,
+    /// Maximum size of a single WAL file before rotation (default 64 MB).
+    pub max_file_size_bytes: u64,
+    /// Maximum time to wait before fsyncing a batch of WAL entries (default 5 ms).
+    ///
+    /// Shorter values reduce latency at the cost of more frequent fsyncs.
+    pub fsync_batch_timeout_ms: u64,
+}
+
+impl Default for WalConfig {
+    fn default() -> Self {
+        Self {
+            data_dir: PathBuf::from("/var/lib/oceanfs/wal"),
+            max_file_size_bytes: 64 * 1024 * 1024,
+            fsync_batch_timeout_ms: 5,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MetadataConfig
+// ---------------------------------------------------------------------------
+
+/// Configuration for the RocksDB metadata store.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::MetadataConfig;
+///
+/// let config = MetadataConfig::default();
+/// assert_eq!(config.block_cache_size, 128 * 1024 * 1024);
+/// ```
+#[derive(Debug, Clone)]
+pub struct MetadataConfig {
+    /// Directory for RocksDB data files.
+    pub data_dir: std::path::PathBuf,
+    /// Size of the RocksDB block cache in bytes (default 128 MB).
+    pub block_cache_size: usize,
+    /// Size of the RocksDB memtable in bytes (default 64 MB).
+    pub memtable_size: usize,
+}
+
+impl Default for MetadataConfig {
+    fn default() -> Self {
+        Self {
+            data_dir: std::path::PathBuf::from("/var/lib/oceanfs/metadata"),
+            block_cache_size: 128 * 1024 * 1024,
+            memtable_size: 64 * 1024 * 1024,
+        }
+    }
 }

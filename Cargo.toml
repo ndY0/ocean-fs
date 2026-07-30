@@ -40,12 +40,13 @@ oceanfs-node     = { path = "crates/oceanfs-node" }
 tokio            = { version = "1", default-features = false, features = ["rt-multi-thread", "sync", "macros", "time", "fs", "io-util", "signal"] }
 
 # --- Data ---
-bytes            = "1"
-smallvec         = "1"
-uuid             = { version = "1", features = ["v7"] }
+bytes            = { version = "1", features = ["serde"] }
+smallvec         = { version = "1", features = ["serde"] }
+uuid             = { version = "1", features = ["v7", "serde"] }
 
 # --- Serialization ---
 serde            = { version = "1", features = ["derive"] }
+serde_json       = "1"
 toml             = "0.8"
 prost            = "0.13"
 
@@ -54,6 +55,10 @@ parking_lot      = "0.12"
 dashmap          = "6"
 arc-swap         = "1"
 rayon            = "1"
+
+# --- Storage ---
+rocksdb = "0.22"
+num_cpus = "1"
 
 # --- Hashing ---
 blake3           = "1"

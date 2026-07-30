@@ -22,7 +22,7 @@
 /// let t2 = Hlc::new(1000, 1);
 /// assert!(t1 < t2);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Hlc {
     /// Physical wall-clock component (milliseconds since epoch).
     pub wall_time: u64,

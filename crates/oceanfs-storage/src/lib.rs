@@ -23,3 +23,15 @@
     clippy::missing_panics_doc,
     missing_docs
 )]
+
+mod buffer_pool;
+mod error;
+pub mod metadata;
+pub mod segment;
+pub mod wal;
+
+pub use buffer_pool::BufferPool;
+pub use error::{Error, Result};
+pub use metadata::MetadataStore;
+pub use segment::{SegmentHandle, SegmentIndex};
+pub use wal::{WalEntry, WalReader, WalWriter};

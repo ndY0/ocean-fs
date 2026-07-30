@@ -10,13 +10,22 @@ oceanfs-core.workspace = true
 oceanfs-hash.workspace = true
 oceanfs-ec.workspace = true
 oceanfs-accel.workspace = true
+blake3.workspace = true
 bytes.workspace = true
+crc32fast = "1"
 parking_lot.workspace = true
+num_cpus.workspace = true
+rocksdb.workspace = true
+serde_json.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+static_assertions.workspace = true
+tempfile = "3"
 
 [lints]
 workspace = true
