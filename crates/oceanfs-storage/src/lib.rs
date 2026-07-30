@@ -24,14 +24,20 @@
     missing_docs
 )]
 
+mod anti_entropy;
 mod buffer_pool;
 mod error;
+mod gc;
 pub mod metadata;
+mod scrub;
 pub mod segment;
 pub mod wal;
 
+pub use anti_entropy::MerkleTree;
 pub use buffer_pool::BufferPool;
 pub use error::{Error, Result};
+pub use gc::{GarbageCollector, GcConfig};
 pub use metadata::MetadataStore;
+pub use scrub::ScrubCoordinator;
 pub use segment::{SegmentHandle, SegmentIndex};
 pub use wal::{WalEntry, WalReader, WalWriter};
