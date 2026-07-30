@@ -7,6 +7,7 @@ pub(crate) mod buffer;
 pub mod handle;
 pub(crate) mod header;
 pub mod index;
+pub(crate) mod route_write;
 pub(crate) mod sealer;
 pub(crate) mod shard;
 pub(crate) mod splitter;

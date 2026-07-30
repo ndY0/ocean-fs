@@ -639,6 +639,15 @@ pub struct WriteAck {
     pub hlc: Hlc,
 }
 
+/// A storage location — a node holding a segment shard.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StorageLocation {
+    /// The node holding this shard.
+    pub node_id: NodeId,
+    /// Index of the shard (0..k for data, k..k+m-1 for parity).
+    pub shard_index: u8,
+}
+
 // ---------------------------------------------------------------------------
 // CodecType / CodecConfig
 // ---------------------------------------------------------------------------

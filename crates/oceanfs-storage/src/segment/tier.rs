@@ -1,40 +1,26 @@
 //! Tiered segment routing — dispatches blob writes to the correct tier.
-//!
-//! Routes blobs to inline storage (metadata), small segments, standard
-//! segments, or multi-segment splitting based on blob size.
 
 use oceanfs_core::{ChunkRef, SegmentSizeConfig, SizeTier};
 
 /// Routes blob writes to the appropriate storage tier.
-///
-/// Wraps [`SegmentSizeConfig::classify`] to provide the routing decision
-/// used by the write path.
 pub(crate) struct TierRouter {
     config: SegmentSizeConfig,
 }
 
 #[allow(dead_code)]
 impl TierRouter {
-    /// Creates a new tier router.
     pub(crate) fn new(config: SegmentSizeConfig) -> Self {
         Self { config }
     }
 
-    /// Classifies a blob size into its appropriate storage tier.
-    ///
-    /// # Panics
-    ///
-    /// In debug builds: panics if `blob_size` is zero.
     pub(crate) fn classify(&self, blob_size: u64) -> SizeTier {
         self.config.classify(blob_size)
     }
 
-    /// Returns `true` if the blob should be stored inline.
     pub(crate) fn is_inline(&self, blob_size: u64) -> bool {
         matches!(self.classify(blob_size), SizeTier::Inline)
     }
 
-    /// Returns the target segment size for a given tier.
     pub(crate) fn target_size(&self, tier: SizeTier) -> u64 {
         match tier {
             SizeTier::Small => self.config.small_target_size,
@@ -51,7 +37,6 @@ pub(crate) struct ChunkListBuilder;
 
 #[allow(dead_code)]
 impl ChunkListBuilder {
-    /// Creates chunk refs from a single-segment write.
     pub(crate) fn single(
         segment_id: oceanfs_core::SegmentId,
         offset: u64,
@@ -62,7 +47,6 @@ impl ChunkListBuilder {
         chunks
     }
 
-    /// Creates chunk refs from a multi-segment write.
     pub(crate) fn multi(
         refs: Vec<(oceanfs_core::SegmentId, u64, u32)>,
     ) -> smallvec::SmallVec<[ChunkRef; 4]> {

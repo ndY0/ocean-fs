@@ -298,6 +298,154 @@ impl MetadataStore {
             Err(e) => Err(Error::Io(io_err(e))),
         }
     }
+
+    // ------------------------------------------------------------------
+    // Async wrappers
+    // ------------------------------------------------------------------
+
+    /// Async version of [`put_object`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the RocksDB write fails or the blocking
+    /// task panics.
+    pub async fn put_object_async(&self, meta: ObjectMetadata) -> Result<()> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let cf = db
+                .cf_handle(cf::CF_OBJECTS)
+                .ok_or_else(|| Error::InvalidConfig("objects CF not found".into()))?;
+            let key = cf::encode_object_key("default", meta.object_key.as_str());
+            let value = serde_json::to_vec(&meta).map_err(|e| Error::Io(io_err(e)))?;
+            db.put_cf(&cf, key, value).map_err(|e| Error::Io(io_err(e)))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?
+    }
+
+    /// Async version of [`get_object`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the RocksDB read fails or the blocking
+    /// task panics.
+    pub async fn get_object_async(
+        &self,
+        bucket: BucketId,
+        key: ObjectKey,
+    ) -> Result<Option<ObjectMetadata>> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let cf = db
+                .cf_handle(cf::CF_OBJECTS)
+                .ok_or_else(|| Error::InvalidConfig("objects CF not found".into()))?;
+            let db_key = cf::encode_object_key(bucket.as_str(), key.as_str());
+            match db.get_cf(&cf, db_key) {
+                Ok(Some(value)) => {
+                    let meta: ObjectMetadata =
+                        serde_json::from_slice(&value).map_err(|e| Error::Io(io_err(e)))?;
+                    Ok(Some(meta))
+                }
+                Ok(None) => Ok(None),
+                Err(e) => Err(Error::Io(io_err(e))),
+            }
+        })
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?
+    }
+
+    /// Async version of [`delete_object`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the RocksDB delete fails or the blocking
+    /// task panics.
+    pub async fn delete_object_async(&self, bucket: BucketId, key: ObjectKey) -> Result<()> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let cf = db
+                .cf_handle(cf::CF_OBJECTS)
+                .ok_or_else(|| Error::InvalidConfig("objects CF not found".into()))?;
+            let db_key = cf::encode_object_key(bucket.as_str(), key.as_str());
+            db.delete_cf(&cf, db_key).map_err(|e| Error::Io(io_err(e)))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?
+    }
+
+    // ------------------------------------------------------------------
+    // Batch operations
+    // ------------------------------------------------------------------
+
+    /// Atomically writes a batch of metadata operations.
+    ///
+    /// All put/delete operations in the batch succeed or fail together.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the RocksDB write batch fails.
+    pub fn batch_write(&self, ops: Vec<BatchOp>) -> Result<()> {
+        let mut batch = rocksdb::WriteBatch::default();
+
+        for op in &ops {
+            match op {
+                BatchOp::PutObject(key, value) => {
+                    let cf = self
+                        .db
+                        .cf_handle(cf::CF_OBJECTS)
+                        .ok_or_else(|| Error::InvalidConfig("objects CF not found".into()))?;
+                    let k = cf::encode_object_key("default", key.as_str());
+                    let v = serde_json::to_vec(value).map_err(|e| Error::Io(io_err(e)))?;
+                    batch.put_cf(&cf, k, v);
+                }
+                BatchOp::DeleteObject(bucket, key) => {
+                    let cf = self
+                        .db
+                        .cf_handle(cf::CF_OBJECTS)
+                        .ok_or_else(|| Error::InvalidConfig("objects CF not found".into()))?;
+                    let k = cf::encode_object_key(bucket.as_str(), key.as_str());
+                    batch.delete_cf(&cf, k);
+                }
+                BatchOp::PutTombstone(bucket, key, tombstone) => {
+                    let cf = self
+                        .db
+                        .cf_handle(cf::CF_DELETIONS)
+                        .ok_or_else(|| Error::InvalidConfig("deletions CF not found".into()))?;
+                    let k = cf::encode_object_key(bucket.as_str(), key.as_str());
+                    let v = serde_json::to_vec(tombstone).map_err(|e| Error::Io(io_err(e)))?;
+                    batch.put_cf(&cf, k, v);
+                }
+                BatchOp::PutSegment(meta) => {
+                    let cf = self
+                        .db
+                        .cf_handle(cf::CF_SEGMENTS)
+                        .ok_or_else(|| Error::InvalidConfig("segments CF not found".into()))?;
+                    let k = cf::encode_segment_key(&meta.segment_id);
+                    let v = serde_json::to_vec(meta).map_err(|e| Error::Io(io_err(e)))?;
+                    batch.put_cf(&cf, k, v);
+                }
+            }
+        }
+
+        self.db.write(batch).map_err(|e| Error::Io(io_err(e)))?;
+
+        Ok(())
+    }
+}
+
+/// An operation in a batch write.
+#[derive(Debug, Clone)]
+pub enum BatchOp {
+    /// Put an object metadata entry.
+    PutObject(ObjectKey, ObjectMetadata),
+    /// Delete an object.
+    DeleteObject(BucketId, ObjectKey),
+    /// Put a tombstone.
+    PutTombstone(BucketId, ObjectKey, Tombstone),
+    /// Put a segment metadata entry.
+    PutSegment(SegmentMetadata),
 }
 
 #[cfg(test)]

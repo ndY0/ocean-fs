@@ -7,4 +7,4 @@
 mod cf;
 mod store;
 
-pub use store::MetadataStore;
+pub use store::{BatchOp, MetadataStore};
