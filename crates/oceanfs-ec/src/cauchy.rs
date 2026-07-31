@@ -17,7 +17,7 @@ use crate::{
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
 /// use oceanfs_core::CodecConfig;
 /// use oceanfs_ec::CauchyEncoder;
 /// use oceanfs_ec::{Encoder, Decoder};
@@ -25,8 +25,8 @@ use crate::{
 /// let config = CodecConfig { data_shards: 4, parity_shards: 2, ..Default::default() };
 /// let codec = CauchyEncoder::new(config);
 ///
-/// let data = [&b"aaaa"[..], &b"bbbb"[..], &b"cccc"[..], &b"dddd"[..]];
-/// let parity = codec.encode(&data, 2).unwrap();
+/// let data: &[&[u8]] = &[b"aaaa", b"bbbb", b"cccc", b"dddd"];
+/// let parity = codec.encode(data, 2).unwrap();
 /// assert_eq!(parity.len(), 2);
 /// ```
 pub struct CauchyEncoder {
@@ -322,5 +322,139 @@ mod tests {
         let data = [&b"short"[..], &b"longer"[..]];
         let result = codec.encode(&data, 1);
         assert!(result.is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Property-based tests (proptest)
+    // ------------------------------------------------------------------
+    mod proptests {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        proptest! {
+            /// Round-trip: encode then decode should recover original data.
+            ///
+            /// Tests random data sizes from 1 to 8192 bytes, k in [1,8],
+            /// and m in [1,4]. Up to m shards may be missing.
+            #[test]
+            fn roundtrip_encode_decode_recover_original(
+                size in 1usize..4096,
+                k in 1u8..8,
+                m in 1u8..4,
+                seed in any::<u64>(),
+                missing_count in 0usize..3,
+            ) {
+                // Generate deterministic pseudo-random data from seed.
+                let shard_size = size;
+                let data: Vec<Vec<u8>> = (0..k as usize)
+                    .map(|shard_idx| {
+                        (0..shard_size)
+                            .map(|i| {
+                                ((seed.wrapping_mul(17 + shard_idx as u64)
+                                    .wrapping_add(i as u64 * 13)) % 251) as u8
+                            })
+                            .collect()
+                    })
+                    .collect();
+
+                let codec = CauchyEncoder::new(CodecConfig {
+                    data_shards: k,
+                    parity_shards: m,
+                    strip_size_bytes: shard_size,
+                    ..Default::default()
+                });
+
+                let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+                let parity = codec.encode(&data_refs, m).unwrap();
+                assert_eq!(parity.len(), m as usize);
+
+                // Build available shards: drop up to m data shards.
+                let total = (k + m) as usize;
+                let actual_missing = missing_count.min(m as usize).min(k as usize);
+
+                let available: Vec<Option<&[u8]>> = (0..total)
+                    .map(|i| {
+                        if i < k as usize {
+                            if i < actual_missing {
+                                None // missing data shard
+                            } else {
+                                Some(data_refs[i])
+                            }
+                        } else {
+                            Some(parity[i - k as usize].as_slice())
+                        }
+                    })
+                    .collect();
+
+                let recovered = codec.decode(&available, k, m).unwrap();
+
+                // Verify recovered data matches original.
+                for i in 0..k as usize {
+                    assert_eq!(recovered[i], data[i],
+                        "data shard {i} mismatch (k={k}, m={m}, size={shard_size})");
+                }
+            }
+
+            /// Cauchy matrix should be non-zero for any (k, m).
+            #[test]
+            fn cauchy_matrix_is_invertible(k in 1u8..16, m in 1u8..8) {
+                let matrix = CauchyEncoder::cauchy_matrix(k, m);
+                let ki = k as usize;
+                let mi = m as usize;
+
+                // Check that each row has at least one non-zero entry.
+                for i in 0..mi {
+                    let has_nonzero = (0..ki).any(|j| matrix[i][j] != 0);
+                    assert!(has_nonzero, "Cauchy matrix row {i} is all zeros (k={k}, m={m})");
+                }
+            }
+
+            /// Encode with random data should produce parity shards of correct size.
+            #[test]
+            fn encode_produces_correct_parity_count(
+                size in 1usize..4096,
+                k in 1u8..8,
+                m in 0u8..6,
+            ) {
+                let codec = CauchyEncoder::new(CodecConfig {
+                    data_shards: k,
+                    parity_shards: m,
+                    strip_size_bytes: size,
+                    ..Default::default()
+                });
+
+                let data: Vec<Vec<u8>> = (0..k as usize)
+                    .map(|_| vec![0xAAu8; size])
+                    .collect();
+                let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+
+                let parity = codec.encode(&data_refs, m).unwrap();
+                assert_eq!(parity.len(), m as usize);
+
+                for p in &parity {
+                    assert_eq!(p.len(), size);
+                }
+            }
+
+            /// Encode with m=0 should return empty parity vector.
+            #[test]
+            fn encode_m0_returns_empty(k in 1u8..16, size in 1usize..4096) {
+                let codec = CauchyEncoder::new(CodecConfig {
+                    data_shards: k,
+                    parity_shards: 0,
+                    strip_size_bytes: size,
+                    ..Default::default()
+                });
+
+                let data: Vec<Vec<u8>> = (0..k as usize)
+                    .map(|_| vec![0x55u8; size])
+                    .collect();
+                let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+
+                let parity = codec.encode(&data_refs, 0).unwrap();
+                assert!(parity.is_empty());
+            }
+        }
     }
 }

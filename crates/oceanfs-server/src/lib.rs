@@ -14,17 +14,24 @@
 mod admin;
 mod bucket_config;
 mod error;
+mod handoff;
 mod hinted_handoff;
+mod mocks;
+mod read;
 mod read_coordinator;
 mod router;
 mod s3_handler;
+mod write;
 mod write_coordinator;
 
 pub use admin::AdminHandler;
 pub use bucket_config::{BucketConfigStore, BucketPolicy};
 pub use error::{Error, Result};
-pub use hinted_handoff::HintedHandoff;
-pub use read_coordinator::{ReadCoordinator, ReadRequest, ReadResult};
-pub use router::Router;
+pub use hinted_handoff::{HintRecord, HintedHandoff};
+pub use read_coordinator::{ReadCoordinator, ReadOutcome, ReadRequest, ReadResult};
+pub use router::{RouteRequest, RouteResponse, Router};
 pub use s3_handler::S3Handler;
 pub use write_coordinator::{WriteCoordinator, WriteRequest};
+
+// Re-export core types used in the server's public API.
+pub use oceanfs_core::HashKey;

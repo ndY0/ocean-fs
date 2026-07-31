@@ -3,15 +3,22 @@
 //! The segment module manages the lifecycle of segments from active
 //! (in-memory append-only buffers) to sealed (on-disk immutable).
 
-pub(crate) mod buffer;
+pub mod buffer;
 pub mod handle;
-pub(crate) mod header;
+pub mod header;
 pub mod index;
+pub(crate) mod pool;
 pub(crate) mod route_write;
-pub(crate) mod sealer;
-pub(crate) mod shard;
-pub(crate) mod splitter;
-pub(crate) mod tier;
+pub mod sealer;
+pub mod shard;
+pub mod splitter;
+pub mod tier;
 
+pub use buffer::ActiveSegment;
 pub use handle::SegmentHandle;
+pub use header::SegmentHeader;
 pub use index::SegmentIndex;
+pub use sealer::{SealConfig, SegmentSealer};
+pub use shard::SegmentShard;
+pub use splitter::SegmentSplitter;
+pub use tier::TierRouter;

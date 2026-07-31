@@ -6,13 +6,13 @@ use crate::error::Result;
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
 /// use oceanfs_ec::{Encoder, CauchyEncoder};
 /// use oceanfs_core::CodecConfig;
 ///
 /// let config = CodecConfig { data_shards: 4, parity_shards: 2, ..Default::default() };
 /// let encoder = CauchyEncoder::new(config);
-/// let data = [b"hello", b"world", b"foo__", b"bar__"];
+/// let data = [&b"hell"[..], &b"owor"[..], &b"ldfo"[..], &b"obar"[..]];
 /// let parity = encoder.encode(&data, 2).unwrap();
 /// assert_eq!(parity.len(), 2);
 /// ```
@@ -31,14 +31,17 @@ pub trait Encoder: Send + Sync {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
 /// use oceanfs_ec::{Decoder, CauchyEncoder};
 /// use oceanfs_core::CodecConfig;
 ///
 /// let config = CodecConfig { data_shards: 4, parity_shards: 2, ..Default::default() };
 /// let encoder = CauchyEncoder::new(config);
 /// // Recover data shards 0 and 2 using other available shards.
-/// let available: Vec<Option<&[u8]>> = vec![None, Some(b"B"), Some(b"C"), Some(b"D"), Some(b"P0"), Some(b"P1")];
+/// let available: Vec<Option<&[u8]>> = vec![
+///     None, Some(b"B"), Some(b"C"), Some(b"D"),
+///     Some(b"P0"), Some(b"P1"),
+/// ];
 /// let recovered = encoder.decode(&available, 4, 2).unwrap();
 /// ```
 pub trait Decoder: Send + Sync {

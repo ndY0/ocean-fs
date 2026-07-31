@@ -9,12 +9,14 @@ dependencies:
     reason: CUDA backend implements the same Encoder/Decoder traits
   - feature: stripe-layout-parallelism
     reason: CUDA processes entire StripeBatch in one kernel call
-adr: []
+adr:
+  - 0006-hardware-acceleration-tier-model
 perf:
   - "2.7: Tokio semaphore for concurrency limits (GPU is a finite resource)"
   - "7.1: Minimize lock hold duration (GPU device lock)"
+  - "12.1: SAFETY comments on every unsafe block (CUDA kernel launch)"
 created: 2026-07-30
-updated: 2026-07-30
+updated: 2026-07-31
 ---
 
 # CUDA EC Backend
@@ -97,7 +99,7 @@ Batch efficiency:
 - [ ] **Coverage:** `cargo tarpaulin --fail-under 80` on `oceanfs-accel` (with cuda feature)
 - [ ] **Lint:** `cargo clippy -- -D warnings` passes; unsafe blocks have `// SAFETY:` comments
 - [ ] **Docs:** `#![deny(missing_docs)]` passes; `CudaBackend` documented with GPU requirements
-- [ ] **ADR:** N/A (spec §9 covers GPU acceleration model)
+- [ ] **ADR:** ADR-0006 constraints satisfied — trait-based pluggability via Encoder/Decoder traits (§3), GPU concurrency model with Semaphore (§4), startup probing (§1), GPU cooldown on failure (§2 runtime fallback), feature-gated compilation (§6)
 - [ ] **Perf:** Rule 2.7 (GPU semaphore), 7.1 (minimal GPU device lock hold time)
 - [ ] **Integration:** `tests/gpu_ec_roundtrip.rs` (requires GPU): encode 100 MB segment on GPU, decode on CPU (or vice versa), verify bit-exact match; encode 10 KB segment → verify CPU fallback used
 - [ ] **Manual:** Example in `CudaBackend` docs compiles and runs (with GPU)

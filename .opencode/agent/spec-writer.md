@@ -1,6 +1,6 @@
 ---
 description: Writes epics and features from the spec and ADRs. Use when creating a project roadmap, subdividing implementation phases into features, or defining definitions of done. Use when the user asks to "write features", "create epics", or "subdivide the spec".
-mode: primary
+mode: all
 permission:
   read: allow
   edit: allow

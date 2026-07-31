@@ -14,9 +14,14 @@
     clippy::missing_panics_doc,
     missing_docs
 )]
+// Internal infrastructure types are constructed by future integration code.
+#![allow(dead_code)]
 
 mod error;
+mod failure_detector;
+mod gossip;
 mod membership;
+mod state;
 
 pub use error::{Error, Result};
 pub use membership::{Membership, MembershipEvent};

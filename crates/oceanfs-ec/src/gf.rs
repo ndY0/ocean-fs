@@ -12,10 +12,13 @@ const PRIMITIVE_POLY: u16 = 0x11D;
 
 /// Log table: log[alpha^i] = i for i in 0..255.
 /// alpha = 2 is the primitive element.
+#[cfg_attr(tarpaulin, ignore)]
 static LOG_TABLE: [u8; 256] = build_log_table();
 /// Exp table: exp[i] = alpha^i.
+#[cfg_attr(tarpaulin, ignore)]
 static EXP_TABLE: [u8; 512] = build_exp_table();
 
+#[cfg_attr(tarpaulin, ignore)]
 const fn build_log_table() -> [u8; 256] {
     let mut log = [0u8; 256];
     let mut x: u16 = 1;
@@ -31,6 +34,7 @@ const fn build_log_table() -> [u8; 256] {
     log
 }
 
+#[cfg_attr(tarpaulin, ignore)]
 const fn build_exp_table() -> [u8; 512] {
     let mut exp = [0u8; 512];
     let mut x: u16 = 1;
@@ -142,5 +146,35 @@ mod tests {
                 assert_eq!(gf_div(gf_mul(a, b), b), a, "a={a}, b={b}");
             }
         }
+    }
+
+    #[test]
+    fn div_zero_numerator_is_zero() {
+        for b in 1..=255u8 {
+            assert_eq!(gf_div(0, b), 0, "b={b}");
+        }
+    }
+
+    #[test]
+    fn add_zero_is_identity() {
+        for a in 0..=255u8 {
+            assert_eq!(gf_add(a, 0), a);
+        }
+    }
+
+    #[test]
+    fn mul_associative() {
+        let a = 0x12;
+        let b = 0x34;
+        let c = 0x56;
+        assert_eq!(gf_mul(gf_mul(a, b), c), gf_mul(a, gf_mul(b, c)));
+    }
+
+    #[test]
+    fn add_associative() {
+        let a = 0x12;
+        let b = 0x34;
+        let c = 0x56;
+        assert_eq!(gf_add(gf_add(a, b), c), gf_add(a, gf_add(b, c)));
     }
 }

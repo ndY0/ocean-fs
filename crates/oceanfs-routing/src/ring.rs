@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use oceanfs_core::{NodeId, RingConfig, VnodeRange};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     error::{Error, Result},
@@ -35,6 +36,7 @@ type RingPosition = [u8; 32];
 /// let successors = ring.lookup(&[0u8; 32]);
 /// assert_eq!(successors.len(), 3);
 /// ```
+#[derive(Debug, Clone)]
 pub struct Ring {
     /// Sorted map from ring position → node ID.
     positions: BTreeMap<RingPosition, NodeId>,
@@ -42,6 +44,37 @@ pub struct Ring {
     config: RingConfig,
     /// Set of known node IDs.
     node_ids: Vec<NodeId>,
+}
+
+impl Serialize for Ring {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("Ring", 3)?;
+        // Serialize positions as Vec of (pos, node_id) tuples.
+        let entries: Vec<(&RingPosition, &NodeId)> = self.positions.iter().collect();
+        s.serialize_field("positions", &entries)?;
+        s.serialize_field("config", &self.config)?;
+        s.serialize_field("node_ids", &self.node_ids)?;
+        s.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Ring {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct RingData {
+            positions: Vec<(RingPosition, NodeId)>,
+            config: RingConfig,
+            node_ids: Vec<NodeId>,
+        }
+
+        let data = RingData::deserialize(deserializer)?;
+        Ok(Ring {
+            positions: data.positions.into_iter().collect(),
+            config: data.config,
+            node_ids: data.node_ids,
+        })
+    }
 }
 
 impl Ring {
@@ -230,5 +263,52 @@ mod tests {
         ring.remove_node(node).unwrap();
         // All positions should be gone.
         assert!(ring.positions.is_empty());
+    }
+
+    #[test]
+    fn serialization_round_trip() {
+        let mut ring = Ring::new(RingConfig { vnodes_per_node: 8, replication_factor: 3 });
+        ring.add_node(NodeId::new("a"));
+        ring.add_node(NodeId::new("b"));
+
+        let encoded = serde_json::to_string(&ring).unwrap();
+        let decoded: Ring = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded.node_count(), 2);
+        // Verify that lookups produce the same result after round-trip.
+        let original = ring.lookup(&[42u8; 32]);
+        let after = decoded.lookup(&[42u8; 32]);
+        assert_eq!(original, after);
+    }
+
+    #[test]
+    fn vnode_distribution_is_uniform() {
+        // With a sufficient number of vnodes per node, the ring positions
+        // should be well-distributed across the 256-bit space.
+        let config = RingConfig { vnodes_per_node: 64, replication_factor: 3 };
+        let mut ring = Ring::new(config);
+        let node_count = 10;
+        for i in 0..node_count {
+            ring.add_node(NodeId::new(format!("node-{}", i)));
+        }
+
+        // Partition the 256-bit space into 8 buckets and count vnodes per bucket.
+        let mut buckets = [0usize; 8];
+        for &pos in ring.positions.keys() {
+            let bucket_idx = (pos[0] as usize) / 32; // top byte / 32 → 0..7
+            buckets[bucket_idx] += 1;
+        }
+
+        let expected_per_bucket = (node_count * ring.config().vnodes_per_node as usize) / 8;
+        // Allow ±20% deviation.
+        for &count in &buckets {
+            let lower = expected_per_bucket.saturating_sub(expected_per_bucket / 5);
+            let upper = expected_per_bucket + expected_per_bucket / 5;
+            assert!(
+                count >= lower && count <= upper,
+                "bucket count {} not in range [{}, {}]",
+                count, lower, upper
+            );
+        }
     }
 }

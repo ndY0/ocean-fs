@@ -549,6 +549,108 @@ pub struct SegmentIndexEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Incarnation
+// ---------------------------------------------------------------------------
+
+/// An incarnation number for SWIM membership tracking.
+///
+/// Each time a node rejoins the cluster after being declared dead, its
+/// incarnation number is incremented. Higher incarnation numbers take
+/// precedence in gossip state merges, resolving split-brain scenarios.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::Incarnation;
+///
+/// let inc = Incarnation::new(1);
+/// assert_eq!(inc.value(), 1);
+/// ```
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
+    serde::Serialize, serde::Deserialize,
+)]
+pub struct Incarnation(u64);
+
+impl Incarnation {
+    /// Creates a new incarnation number.
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the incarnation value.
+    pub fn value(&self) -> u64 {
+        self.0
+    }
+
+    /// Returns the next incarnation number.
+    pub fn next(&self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+impl Default for Incarnation {
+    fn default() -> Self {
+        Self(1)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HashKey
+// ---------------------------------------------------------------------------
+
+/// A pre-computed key hash that flows through all routing layers.
+///
+/// Computed once at the HTTP entry point and passed through routing,
+/// metadata lookup, and segment operations — never re-hashed.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::HashKey;
+///
+/// let hash_key = HashKey::from_bytes([0u8; 32]);
+/// assert_eq!(hash_key.as_bytes().len(), 32);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HashKey([u8; 32]);
+
+impl HashKey {
+    /// Creates a `HashKey` from pre-computed SHA-256 hash bytes.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the raw hash bytes.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OperationType
+// ---------------------------------------------------------------------------
+
+/// The type of operation being routed.
+///
+/// Used by the request router to make forwarding decisions based
+/// on the operation type (read, write, delete, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum OperationType {
+    /// Read an object.
+    Read,
+    /// Write an object.
+    Write,
+    /// Delete an object.
+    Delete,
+    /// Retrieve object metadata.
+    Head,
+    /// List objects in a bucket.
+    List,
+}
+
+// ---------------------------------------------------------------------------
 // VnodeRange
 // ---------------------------------------------------------------------------
 
@@ -569,7 +671,7 @@ pub struct VnodeRange {
 // ---------------------------------------------------------------------------
 
 /// The state of a node in the cluster membership.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NodeState {
     /// Node is healthy and participating.
     Alive,
@@ -598,6 +700,8 @@ pub struct GossipConfig {
     pub failure_timeout_ms: u64,
     /// Number of peers to route indirect pings through.
     pub indirect_ping_count: u8,
+    /// Bootstrap nodes for cluster discovery (host:port pairs).
+    pub seed_nodes: Vec<String>,
 }
 
 impl Default for GossipConfig {
@@ -607,6 +711,7 @@ impl Default for GossipConfig {
             suspicion_timeout_ms: 5000,
             failure_timeout_ms: 15000,
             indirect_ping_count: 3,
+            seed_nodes: Vec::new(),
         }
     }
 }
@@ -639,6 +744,168 @@ pub struct WriteAck {
     pub hlc: Hlc,
 }
 
+// ---------------------------------------------------------------------------
+// WriteQuorum
+// ---------------------------------------------------------------------------
+
+/// Write quorum configuration for a write operation.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::WriteQuorum;
+///
+/// let quorum = WriteQuorum {
+///     required: 2,
+///     ack_after_wal: true,
+///     ec_async: true,
+/// };
+/// assert_eq!(quorum.required, 2);
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct WriteQuorum {
+    /// Required number of replica acknowledgments.
+    pub required: u8,
+    /// Acknowledge to client after WAL quorum (before EC seal).
+    pub ack_after_wal: bool,
+    /// Trigger EC encoding asynchronously after acknowledgment.
+    pub ec_async: bool,
+}
+
+impl Default for WriteQuorum {
+    fn default() -> Self {
+        Self {
+            required: 1,
+            ack_after_wal: true,
+            ec_async: true,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IntendedFor
+// ---------------------------------------------------------------------------
+
+/// Identifies the intended recipient node for a hinted handoff.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::{IntendedFor, NodeId};
+///
+/// let target = IntendedFor(NodeId::new("node-1"));
+/// assert_eq!(target.as_str(), "node-1");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IntendedFor(pub NodeId);
+
+impl IntendedFor {
+    /// Returns the node ID as a string slice.
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl std::fmt::Display for IntendedFor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RpcConfig
+// ---------------------------------------------------------------------------
+
+/// Configuration for the gRPC connection pool.
+///
+/// Controls per-peer channel pooling, keepalive, idle eviction, and timeouts.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::RpcConfig;
+///
+/// let config = RpcConfig::default();
+/// assert_eq!(config.pool_size_per_peer, 4);
+/// ```
+#[derive(Debug, Clone)]
+pub struct RpcConfig {
+    /// Number of gRPC channels to maintain per peer node.
+    pub pool_size_per_peer: usize,
+    /// Keepalive interval in seconds for idle channels.
+    pub keepalive_sec: u64,
+    /// Maximum number of idle channels across all peers.
+    pub max_idle_connections: usize,
+    /// Connection establishment timeout in milliseconds.
+    pub connect_timeout_ms: u64,
+    /// Default per-request timeout in milliseconds.
+    pub request_timeout_ms: u64,
+    /// Optional path to TLS certificate for mTLS.
+    pub tls_cert_path: Option<std::path::PathBuf>,
+}
+
+impl Default for RpcConfig {
+    fn default() -> Self {
+        Self {
+            pool_size_per_peer: 4,
+            keepalive_sec: 30,
+            max_idle_connections: 256,
+            connect_timeout_ms: 5000,
+            request_timeout_ms: 30000,
+            tls_cert_path: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PeerAddress
+// ---------------------------------------------------------------------------
+
+/// The network address of a peer node.
+///
+/// Wraps a `std::net::SocketAddr` for type safety and future extensibility.
+///
+/// # Examples
+///
+/// ```
+/// use std::net::SocketAddr;
+/// use oceanfs_core::PeerAddress;
+///
+/// let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+/// let peer = PeerAddress::new(addr);
+/// assert_eq!(peer.to_string(), "127.0.0.1:9001");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerAddress(std::net::SocketAddr);
+
+impl PeerAddress {
+    /// Creates a new peer address from a socket address.
+    pub fn new(addr: std::net::SocketAddr) -> Self {
+        Self(addr)
+    }
+
+    /// Returns the inner socket address.
+    pub fn socket_addr(&self) -> std::net::SocketAddr {
+        self.0
+    }
+}
+
+impl std::fmt::Display for PeerAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<std::net::SocketAddr> for PeerAddress {
+    fn from(addr: std::net::SocketAddr) -> Self {
+        Self(addr)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StorageLocation
+// ---------------------------------------------------------------------------
+
 /// A storage location — a node holding a segment shard.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StorageLocation {
@@ -653,11 +920,26 @@ pub struct StorageLocation {
 // ---------------------------------------------------------------------------
 
 /// Supported erasure coding codecs.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::CodecType;
+///
+/// let codec = CodecType::CauchyRs;
+/// assert!(matches!(codec, CodecType::CauchyRs));
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CodecType {
     /// Cauchy Reed-Solomon over GF(2^8).
     CauchyRs,
+    /// Standard Reed-Solomon (reserved for future use).
+    StandardRs,
+    /// Locally Recoverable Codes (reserved for future use).
+    Lrc,
+    /// Clay codes (reserved for future use).
+    Clay,
 }
 
 /// Configuration for an erasure coding codec.
@@ -689,14 +971,85 @@ impl Default for CodecConfig {
 // ---------------------------------------------------------------------------
 
 /// A pre-computed plan for encoding a segment.
+///
+/// Contains the stripe count, padding, shard size, and codec parameters
+/// (k = data shards, m = parity shards) needed for parallel encode/decode.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::EncodingPlan;
+///
+/// let plan = EncodingPlan {
+///     stripe_count: 16,
+///     padded_size: 4_194_304,
+///     shard_size: 65536,
+///     data_shards: 4,
+///     parity_shards: 2,
+/// };
+/// assert_eq!(plan.total_shards(), 6);
+/// ```
 #[derive(Debug, Clone)]
 pub struct EncodingPlan {
     /// Number of stripes in the segment.
     pub stripe_count: usize,
-    /// Total size after padding.
+    /// Total size of the segment data after zero-padding.
     pub padded_size: u64,
-    /// Size of each individual shard.
+    /// Size of each individual shard in bytes.
     pub shard_size: usize,
+    /// Number of data shards (k).
+    pub data_shards: u8,
+    /// Number of parity shards (m).
+    pub parity_shards: u8,
+}
+
+impl EncodingPlan {
+    /// Returns the total number of shards (k + m).
+    pub fn total_shards(&self) -> u8 {
+        self.data_shards + self.parity_shards
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PoolConfig
+// ---------------------------------------------------------------------------
+
+/// Configuration for the active segment pool.
+///
+/// Controls the number of concurrent active segments and per-core sharding
+/// to decouple append latency from EC encode time.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::PoolConfig;
+///
+/// let config = PoolConfig::default();
+/// assert_eq!(config.active_pool_size, 4);
+/// assert_eq!(config.shard_count, 4);
+/// ```
+#[derive(Debug, Clone)]
+pub struct PoolConfig {
+    /// Number of active segments per shard (default 4).
+    /// More pool slots allow concurrent appends while segments are being sealed.
+    pub active_pool_size: usize,
+    /// Number of per-core shards for contention reduction (default 4).
+    pub shard_count: usize,
+    /// Maximum number of in-flight EC encodes (bounded by semaphore).
+    pub max_inflight_encodes: usize,
+    /// Capacity of the EC encoding work queue (backpressure channel).
+    pub encode_queue_capacity: usize,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            active_pool_size: 4,
+            shard_count: 4,
+            max_inflight_encodes: 8,
+            encode_queue_capacity: 64,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -822,5 +1175,124 @@ mod tests {
     fn classify_zero_panics_in_debug() {
         let config = SegmentSizeConfig::default();
         config.classify(0);
+    }
+
+    // -- WriteQuorum --
+
+    #[test]
+    fn write_quorum_default_values() {
+        let q = WriteQuorum::default();
+        assert_eq!(q.required, 1);
+        assert!(q.ack_after_wal);
+        assert!(q.ec_async);
+    }
+
+    #[test]
+    fn write_quorum_custom_config() {
+        let q = WriteQuorum { required: 3, ack_after_wal: false, ec_async: false };
+        assert_eq!(q.required, 3);
+        assert!(!q.ack_after_wal);
+        assert!(!q.ec_async);
+    }
+
+    // -- WriteResult / WriteAck --
+
+    #[test]
+    fn write_result_construction() {
+        let key = ObjectKey::new("test");
+        let mut chunks = smallvec::SmallVec::new();
+        chunks.push(ChunkRef { segment_id: SegmentId::new(), offset: 0, length: 100 });
+        let result = WriteResult {
+            object_key: key.clone(),
+            chunks,
+            size: 100,
+            blake3_hash: None,
+        };
+        assert_eq!(result.size, 100);
+        assert_eq!(result.object_key, key);
+        assert_eq!(result.chunks.len(), 1);
+    }
+
+    #[test]
+    fn write_ack_construction() {
+        let ack = WriteAck {
+            node_id: NodeId::new("n1"),
+            wal_position: 42,
+            hlc: Hlc::zero(),
+        };
+        assert_eq!(ack.node_id.as_str(), "n1");
+        assert_eq!(ack.wal_position, 42);
+        assert_eq!(ack.hlc, Hlc::zero());
+    }
+
+    // -- IntendedFor --
+
+    #[test]
+    fn intended_for_from_node_id() {
+        let target = IntendedFor(NodeId::new("node-x"));
+        assert_eq!(target.as_str(), "node-x");
+        assert_eq!(target.to_string(), "node-x");
+    }
+
+    #[test]
+    fn intended_for_equality() {
+        let a = IntendedFor(NodeId::new("a"));
+        let b = IntendedFor(NodeId::new("a"));
+        let c = IntendedFor(NodeId::new("c"));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    // -- PoolConfig --
+
+    #[test]
+    fn pool_config_default_values() {
+        let cfg = PoolConfig::default();
+        assert_eq!(cfg.active_pool_size, 4);
+        assert_eq!(cfg.shard_count, 4);
+        assert_eq!(cfg.max_inflight_encodes, 8);
+        assert_eq!(cfg.encode_queue_capacity, 64);
+    }
+
+    #[test]
+    fn pool_config_custom_sizes() {
+        let cfg = PoolConfig {
+            active_pool_size: 16,
+            shard_count: 8,
+            max_inflight_encodes: 32,
+            encode_queue_capacity: 256,
+        };
+        assert_eq!(cfg.active_pool_size, 16);
+        assert_eq!(cfg.shard_count, 8);
+    }
+
+    // -- Hlc in ObjectMetadata --
+
+    #[test]
+    fn object_metadata_hlc_integration() {
+        let hlc = Hlc::new(1000, 5);
+        let meta = ObjectMetadata {
+            object_key: ObjectKey::new("hlc-obj"),
+            size: 42,
+            blake3_hash: None,
+            chunks: smallvec::SmallVec::new(),
+            inline_data: None,
+            created_at: 1000,
+            hlc,
+        };
+        assert_eq!(meta.hlc.wall_time(), 1000);
+        assert_eq!(meta.hlc.logical(), 5);
+    }
+
+    // -- Tombstone with HLC --
+
+    #[test]
+    fn tombstone_hlc_integration() {
+        let ts = Tombstone {
+            deletion_time: 1700000000000,
+            hlc: Hlc::new(1700000000000, 0),
+        };
+        assert_eq!(ts.deletion_time, 1700000000000);
+        assert_eq!(ts.hlc.wall_time(), 1700000000000);
     }
 }

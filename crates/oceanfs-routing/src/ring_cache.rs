@@ -13,8 +13,8 @@ use crate::ring::Ring;
 
 /// A wait-free cache for the consistent hashing ring.
 ///
-/// Readers call [`lookup`] without any lock acquisition. Writers call
-/// [`update`] to swap in a new ring topology atomically.
+/// Readers call [`Self::lookup`] without any lock acquisition. Writers call
+/// [`Self::update`] to swap in a new ring topology atomically.
 ///
 /// # Examples
 ///
@@ -46,7 +46,7 @@ impl RingCache {
 
     /// Atomically replaces the ring with a new topology.
     ///
-    /// All subsequent [`lookup`] calls will see the new ring.
+    /// All subsequent [`Self::lookup`] calls will see the new ring.
     pub fn update(&self, ring: Ring) {
         self.inner.store(Arc::new(ring));
     }

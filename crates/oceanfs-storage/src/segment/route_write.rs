@@ -84,6 +84,160 @@ pub(crate) fn route_write(
             }
             Ok(ChunkListBuilder::multi(refs))
         }
-        _ => Ok(smallvec::SmallVec::new()),
+                  _ => Ok(smallvec::SmallVec::new()),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::buffer_pool::BufferPool;
+    use oceanfs_core::SegmentSizeConfig;
+
+    fn test_config() -> MetadataStore {
+        let dir = tempfile::tempdir().unwrap();
+        MetadataStore::open(&oceanfs_core::MetadataConfig {
+            data_dir: dir.path().join("meta"),
+            block_cache_size: 1024,
+            memtable_size: 1024,
+        }).unwrap()
+    }
+
+    fn test_pool(chunk_size: usize, max: usize) -> BufferPool {
+        BufferPool::new(chunk_size, max)
+    }
+
+    // ------------------------------------------------------------------
+    // Inline path
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn route_write_inline_stores_in_metadata() {
+        let metadata = test_config();
+        let router = TierRouter::new(SegmentSizeConfig::default());
+        let pool = test_pool(65536, 8);
+        let mut active = crate::segment::buffer::ActiveSegment::new(
+            SizeTier::Small,
+            &SegmentSizeConfig::default(),
+            &pool,
+        ).unwrap();
+        let key = ObjectKey::new("inline-test");
+
+        let data = Bytes::from_static(b"tiny"); // 4 bytes ≤ 4096 → Inline
+        let refs = route_write(&router, &metadata, &mut active, key.clone(), data.clone()).unwrap();
+
+        assert!(refs.is_empty(), "inline blobs have no chunk refs");
+        let fetched = metadata
+            .get_object(&oceanfs_core::BucketId::new("default"), &key)
+            .unwrap()
+            .expect("object not found");
+        assert!(fetched.is_inline());
+        assert_eq!(fetched.inline_data.as_deref(), Some(&data[..]));
+    }
+
+    // ------------------------------------------------------------------
+    // Small / Standard path
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn route_write_small_tier_returns_chunk_ref() {
+        let metadata = test_config();
+        // Custom config: inline threshold = 0 so 5KB goes to Small tier
+        let config = SegmentSizeConfig {
+            inline_threshold_bytes: 0,
+            ..SegmentSizeConfig::default()
+        };
+        let router = TierRouter::new(config);
+        let pool = test_pool(65536, 8);
+        let mut active = crate::segment::buffer::ActiveSegment::new(
+            SizeTier::Small,
+            &SegmentSizeConfig::default(),
+            &pool,
+        ).unwrap();
+        let key = ObjectKey::new("small-test");
+        let data = Bytes::from(vec![0xCC; 5000]); // 5 KB → Small (≤256KB)
+
+        let refs = route_write(&router, &metadata, &mut active, key, data).unwrap();
+
+        assert_eq!(refs.len(), 1, "small blob should produce one chunk ref");
+        assert_eq!(refs[0].offset, 0);
+        assert_eq!(refs[0].length, 5000);
+    }
+
+    #[test]
+    fn route_write_standard_tier_returns_chunk_ref() {
+        let metadata = test_config();
+        // 1 MB blob → Standard tier
+        let router = TierRouter::new(SegmentSizeConfig::default());
+        let pool = test_pool(65536, 8);
+        let mut active = crate::segment::buffer::ActiveSegment::new(
+            SizeTier::Standard,
+            &SegmentSizeConfig::default(),
+            &pool,
+        ).unwrap();
+        let key = ObjectKey::new("std-test");
+        let data = Bytes::from(vec![0xDD; 1_048_576]); // 1 MB → Standard
+
+        let refs = route_write(&router, &metadata, &mut active, key, data).unwrap();
+
+        assert_eq!(refs.len(), 1, "standard blob should produce one chunk ref");
+        assert_eq!(refs[0].offset, 0);
+        assert_eq!(refs[0].length, 1_048_576);
+    }
+
+    // ------------------------------------------------------------------
+    // Multi segment path
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn route_write_multi_tier_splits_into_chunks() {
+        let metadata = test_config();
+        // Custom config: default_target_size = 1 MB so 3 MB blob is Multi
+        let config = SegmentSizeConfig {
+            default_target_size: 1_048_576, // 1 MB
+            ..SegmentSizeConfig::default()
+        };
+        let router = TierRouter::new(config);
+        let pool = BufferPool::new(65536 * 16, 8); // larger pool for multi
+        let mut active = crate::segment::buffer::ActiveSegment::new(
+            SizeTier::Multi,
+            &SegmentSizeConfig { default_target_size: 10_485_760, ..SegmentSizeConfig::default() },
+            &pool,
+        ).unwrap();
+        let key = ObjectKey::new("multi-test");
+        // 3 MB, each chunk is 1 MB (default_target_size)
+        let data = Bytes::from(vec![0xEE; 3_145_728]);
+
+        let refs = route_write(&router, &metadata, &mut active, key, data).unwrap();
+
+        // 3 MB / 1 MB = 3 chunks
+        assert_eq!(refs.len(), 3, "3 MB blob should split into 3 chunks");
+        assert_eq!(refs[0].offset, 0);
+        assert_eq!(refs[0].length, 1_048_576);
+        assert_eq!(refs[1].offset, 1_048_576);
+        assert_eq!(refs[1].length, 1_048_576);
+        assert_eq!(refs[2].offset, 2_097_152);
+        assert_eq!(refs[2].length, 1_048_576);
+    }
+
+    // ------------------------------------------------------------------
+    // Edge cases
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn route_write_empty_blob_returns_empty_refs() {
+        let metadata = test_config();
+        let router = TierRouter::new(SegmentSizeConfig::default());
+        let pool = test_pool(65536, 8);
+        let mut active = crate::segment::buffer::ActiveSegment::new(
+            SizeTier::Standard,
+            &SegmentSizeConfig::default(),
+            &pool,
+        ).unwrap();
+        let key = ObjectKey::new("empty");
+
+        let refs = route_write(&router, &metadata, &mut active, key, Bytes::new()).unwrap();
+        assert!(refs.is_empty());
     }
 }

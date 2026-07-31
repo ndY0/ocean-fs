@@ -51,8 +51,7 @@ impl SegmentShard {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::BufferPoolExhausted`] if the buffer pool cannot
-    /// provide enough buffers.
+    /// Returns an error if the buffer pool cannot provide enough buffers.
     pub fn new(
         count: usize,
         tier: SizeTier,

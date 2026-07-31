@@ -1,18 +1,18 @@
 //! Segment splitter — splits large blobs into fixed-size chunks.
 //!
-//! Used when a blob exceeds [`SegmentSizeConfig::default_target_size`].
+//! Used when a blob exceeds the default target segment size.
 //! Each chunk becomes a separate segment.
 
 /// Splits blob data into chunk-sized pieces for multi-segment storage.
 #[allow(dead_code)]
-pub(crate) struct SegmentSplitter {
+pub struct SegmentSplitter {
     chunk_size: u64,
 }
 
 #[allow(dead_code)]
 impl SegmentSplitter {
     /// Creates a new splitter with the given chunk size.
-    pub(crate) fn new(chunk_size: u64) -> Self {
+    pub fn new(chunk_size: u64) -> Self {
         Self { chunk_size }
     }
 
@@ -20,7 +20,7 @@ impl SegmentSplitter {
     ///
     /// Returns `(segment_offset, chunk_data)` pairs. The offset is the
     /// byte position within the original blob.
-    pub(crate) fn split<'a>(&self, data: &'a [u8]) -> Vec<(u64, &'a [u8])> {
+    pub fn split<'a>(&self, data: &'a [u8]) -> Vec<(u64, &'a [u8])> {
         let chunk_count = (data.len() as u64).div_ceil(self.chunk_size) as usize;
         let mut chunks = Vec::with_capacity(chunk_count);
 

@@ -35,8 +35,9 @@ pub struct SealConfig {
 }
 
 /// Orchestrates the sealing of active segments.
+/// Orchestrates the sealing of active segments.
 #[allow(dead_code)]
-pub(crate) struct SegmentSealer {
+pub struct SegmentSealer {
     config: SealConfig,
     metadata: Arc<MetadataStore>,
     wal: Arc<WalWriter>,
@@ -45,7 +46,7 @@ pub(crate) struct SegmentSealer {
 #[allow(dead_code)]
 impl SegmentSealer {
     /// Creates a new segment sealer.
-    pub(crate) fn new(
+    pub fn new(
         config: SealConfig,
         metadata: Arc<MetadataStore>,
         wal: Arc<WalWriter>,
@@ -55,16 +56,21 @@ impl SegmentSealer {
 
     /// Attempts to seal an active segment.
     ///
+    /// `entries` are the blob index entries mapping (offset, length, hash) for
+    /// each blob stored in this segment. The caller (write path) computes the
+    /// blob key hashes.
+    ///
     /// Returns `None` if the segment is not ready to seal (not full, not timed out,
     /// or empty). Returns a `SegmentHandle` on successful seal.
     ///
     /// # Errors
     ///
     /// Returns an error if the seal process fails (disk I/O, metadata write, etc.).
-    pub(crate) async fn try_seal(
+    pub async fn try_seal(
         &self,
         active: &mut ActiveSegment,
         elapsed_ms: u64,
+        entries: &[SegmentIndexEntry],
     ) -> Result<Option<SegmentHandle>> {
         // Don't seal empty segments.
         if active.size() == 0 {
@@ -77,24 +83,23 @@ impl SegmentSealer {
             return Ok(None);
         }
 
-        self.seal(active).await.map(Some)
+        self.seal(active, entries).await.map(Some)
     }
 
     /// Seals an active segment unconditionally.
-    async fn seal(&self, active: &mut ActiveSegment) -> Result<SegmentHandle> {
+    async fn seal(
+        &self,
+        active: &mut ActiveSegment,
+        entries: &[SegmentIndexEntry],
+    ) -> Result<SegmentHandle> {
         let segment_id = active.id();
         let tier = active.tier();
         let data = active.data().to_vec();
         let size = active.size();
-        let blob_count = 1; // simplified: assume one blob per seal for now
+        let blob_count = entries.len() as u32;
 
-        // Build the blob index.
-        let index_entry = SegmentIndexEntry {
-            offset: 0,
-            length: size as u32,
-            blob_key_hash: [0u8; 32], // placeholder — the write path fills this in
-        };
-        let index = SegmentIndex::new(vec![index_entry])?;
+        // Build the blob index from the provided entries.
+        let index = SegmentIndex::new(entries.to_vec())?;
 
         // Compute checksum (BLAKE3 of segment data).
         let checksum = blake3::hash(&data);
@@ -152,7 +157,7 @@ mod tests {
     use super::*;
     use crate::buffer_pool::BufferPool;
 
-    async fn setup() -> (SegmentSealer, ActiveSegment, tempfile::TempDir) {
+    async fn setup() -> (SegmentSealer, ActiveSegment, Vec<SegmentIndexEntry>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
 
         let metadata = Arc::new(
@@ -188,33 +193,40 @@ mod tests {
         // Write some data so it's not empty.
         active.append(&[0u8; 50]).unwrap();
 
+        // Build an index entry covering the appended data.
+        let entries = vec![SegmentIndexEntry {
+            offset: 0,
+            length: 50,
+            blob_key_hash: [0xAB; 32],
+        }];
+
         let sealer = SegmentSealer::new(config, metadata, wal);
-        (sealer, active, dir)
+        (sealer, active, entries, dir)
     }
 
     #[tokio::test]
     async fn try_seal_returns_none_when_not_full_and_not_timed_out() {
-        let (sealer, mut active, _dir) = setup().await;
-        let result = sealer.try_seal(&mut active, 0).await.unwrap();
+        let (sealer, mut active, entries, _dir) = setup().await;
+        let result = sealer.try_seal(&mut active, 0, &entries).await.unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn try_seal_returns_handle_when_full() {
-        let (sealer, mut active, _dir) = setup().await;
+        let (sealer, mut active, entries, _dir) = setup().await;
         // Fill it up.
         active.append(&[0u8; 60]).unwrap();
         assert!(active.is_full());
 
-        let result = sealer.try_seal(&mut active, 0).await.unwrap();
+        let result = sealer.try_seal(&mut active, 0, &entries).await.unwrap();
         assert!(result.is_some());
     }
 
     #[tokio::test]
     async fn try_seal_returns_handle_when_timed_out() {
-        let (sealer, mut active, _dir) = setup().await;
+        let (sealer, mut active, entries, _dir) = setup().await;
         // Not full, but timed out.
-        let result = sealer.try_seal(&mut active, 2000).await.unwrap();
+        let result = sealer.try_seal(&mut active, 2000, &entries).await.unwrap();
         assert!(result.is_some());
     }
 
@@ -250,7 +262,7 @@ mod tests {
         let sealer = SegmentSealer::new(config, metadata, wal);
 
         // Empty segment should not seal.
-        let result = sealer.try_seal(&mut active, 2000).await.unwrap();
+        let result = sealer.try_seal(&mut active, 2000, &[]).await.unwrap();
         assert!(result.is_none());
     }
 }

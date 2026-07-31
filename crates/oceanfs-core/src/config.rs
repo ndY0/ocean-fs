@@ -131,7 +131,7 @@ impl Default for WalConfig {
 /// assert_eq!(config.vnodes_per_node, 256);
 /// assert_eq!(config.replication_factor, 3);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RingConfig {
     /// Number of virtual nodes per physical node (default 256).
     pub vnodes_per_node: u32,

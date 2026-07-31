@@ -89,12 +89,14 @@ Conflict resolution on read (R > 1):
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds in `oceanfs-core`
-- [ ] **Tests:** Unit tests: HLC monotonic (now() > previous now()), HLC ordering (newer wall > older, same wall → higher logical > lower), update merges correctly, clock does not go backward, concurrent updates (stress test), LwwResolver picks newer, tie-break by node_id
+- [x] **Code:** `cargo build --all-targets` succeeds in `oceanfs-core`
+- [x] **Tests:** Unit tests: HLC monotonic (now() > previous now()), HLC ordering (newer wall > older, same wall → higher logical > lower), update merges correctly, clock does not go backward, concurrent updates (stress test), LwwResolver picks newer, tie-break by node_id
 - [ ] **Coverage:** `cargo tarpaulin --fail-under 80` on `oceanfs-core`
-- [ ] **Lint:** `cargo clippy -- -D warnings` passes
-- [ ] **Docs:** `#![deny(missing_docs)]` passes; `Hlc` and `ConflictResolver` documented
-- [ ] **ADR:** N/A (spec §7.6 covers versioning)
-- [ ] **Perf:** Rule 6.1 (cache-line aligned HlcClock to prevent false sharing)
-- [ ] **Integration:** `tests/hlc_ordering.rs`: multi-node scenario: node A writes, node B writes concurrently, verify HLC ordering yields deterministic LWW outcome
-- [ ] **Manual:** Example in `HlcClock` docs compiles and runs
+<!-- REVIEW: R2 — oceanfs-core tarpaulin reports 32.85% (137/417 lines, +5.99% from R1). hlc.rs 37/46 (80.4%), conflict.rs 9/9 (100%), types.rs 42/98 (42.9%), config.rs 11/16 (68.8%), error.rs 2/4 (50%). The 80% threshold is not met. Need additional unit tests for types.rs (WriteQuorum, WriteResult, WriteAck, IntendedFor, PoolConfig, etc.) and config.rs uncovered paths. hlc.rs logical overflow path (lines 140-148) not covered. -->
+- [x] **Lint:** `cargo clippy -- -D warnings` passes
+- [x] **Docs:** `#![deny(missing_docs)]` passes; `Hlc` and `ConflictResolver` documented
+- [x] **ADR:** N/A (spec §7.6 covers versioning)
+- [x] **Perf:** Rule 6.1 (cache-line aligned HlcClock to prevent false sharing)
+- [x] **Integration:** `tests/hlc_ordering.rs`: multi-node scenario: node A writes, node B writes concurrently, verify HLC ordering yields deterministic LWW outcome
+<!-- REVIEW: R2 — Integration test exists at crates/oceanfs-core/tests/hlc_ordering.rs with 5 tests (monotonic, merge, deterministic, equal-hlc, cache-line-alignment). All 5 pass. ✅ -->
+- [x] **Manual:** Example in `HlcClock` docs compiles and runs

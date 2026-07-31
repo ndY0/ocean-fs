@@ -14,7 +14,12 @@
     clippy::missing_panics_doc,
     missing_docs
 )]
+// Internal infrastructure fields and functions are wired by integration code.
+#![allow(dead_code)]
 
+mod client;
 mod pool;
+mod tls;
 
-pub use pool::ConnectionPool;
+pub use client::RpcClient;
+pub use pool::{ConnectionPool, PooledChannel};

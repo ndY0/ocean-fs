@@ -1,5 +1,5 @@
 ---
-description: Implements a feature from its definition of done. Use when a feature doc exists under docs/features/ and the user says "implement feature X", "build phase Y", or "implement the spec". Follows all code guidelines. Spawns subagents for complex research, dispatches them sequentially.
+description: Implements a feature from its definition of done. Use when a feature doc exists under docs/features/ and the user says "implement feature X", "build phase Y", or "implement the spec". Follows all code guidelines. After implementation, spawns the reviewer agent for independent verification — fixes gaps and re-submits up to 3 iterations.
 mode: primary
 permission:
   read: allow
@@ -123,9 +123,20 @@ After all sub-tasks are implemented, walk the DoD checklist:
    unchecked and you believe it's satisfied, report it. If any item is
    unchecked and you cannot satisfy it, explain why.
 
-### Phase 4: Report
+### Phase 4: Self-Verify & Report
 
-Output:
+Before calling the reviewer, do a thorough self-verification:
+
+1. **Run every DoD command** in each affected crate. Fix failures.
+2. **Walk the DoD checklist.** Every item must be verified by you first.
+3. **Check in-scope items** from `## Scope > In Scope` — does each exist?
+4. **Check out-of-scope items** — did you accidentally implement any?
+5. **Check interfaces** from `## Interface` — do signatures match?
+6. **Check ADR constraints** — re-read each cited ADR, confirm compliance.
+7. **Check perf rules** — search for violations of each cited rule.
+8. **Check crate impact** — do your changes match the `## Crate Impact` table?
+
+Output your self-report:
 
 ```
 ## Implementation Report: {feature}
@@ -138,18 +149,81 @@ Output:
 | ... | ... |
 
 ### DoD Status
-- [x] Code builds
-- [x] Tests pass
-- [x] Coverage ≥ 80%
+- [x] Code builds (`cargo build --all-targets` on oceanfs-core, oceanfs-storage)
+- [x] Tests pass (47 passed, 0 failed)
+- [x] Coverage ≥ 80% (oceanfs-storage: 84%)
 - [x] Clippy clean
 - [x] Docs pass
-- [x] ADR constraints satisfied
-- [x] Perf rules followed
-- [x] Integration test passes
+- [x] ADR constraints satisfied (ADR-0001)
+- [x] Perf rules followed (1.1, 1.2, 1.3)
+- [x] Integration test passes (segment_roundtrip.rs)
 
 ### Perf Deviations (if any)
 - Rule X.Y: [justification]
 ```
+
+### Phase 5: Independent Review
+
+After your self-report, **spawn the reviewer agent** to independently verify
+your work. Use the `task` tool with `subagent_type: "reviewer"`.
+
+**Prompt the reviewer with:** the feature path and your self-report, so it
+can cross-reference your claims.
+
+```
+Review feature: docs/features/{epic}/{feature}.md
+
+My Implementation Report:
+{paste your Phase 4 report}
+```
+
+Wait for the reviewer to return. It will produce a review with:
+- A verdict: PASS or FAIL
+- A gaps list (prioritized, precise, with file:line references)
+- An updated DoD checklist in the feature doc
+
+#### If the review is PASS:
+Done. Output a final summary and stop.
+
+#### If the review is FAIL:
+The reviewer's gaps list is your fix list. Address every gap in priority
+order (critical → high → medium → low), then re-submit:
+
+1. Fix each gap. For each fix, verify it compiles and tests pass.
+2. Update your self-report to reflect changes.
+3. Re-spawn the reviewer with your updated report.
+
+```
+Review iteration 2 for: docs/features/{epic}/{feature}.md
+
+Previous review gaps and my fixes:
+1. [CRITICAL] Integration test fails on 1 MB blob → FIXED: tests/segment_roundtrip.rs:45
+2. [HIGH] Missing ActiveSegment append overflow test → ADDED: crates/oceanfs-storage/tests/segment_overflow.rs
+...
+
+My updated Implementation Report:
+{paste updated report}
+```
+
+#### Iteration Cap:
+
+- **After the 3rd FAIL**, do not re-submit. Output:
+
+```
+## Review iterations exhausted (3 of 3)
+
+The reviewer has returned FAIL for the 3rd time. Gap summary:
+
+| Gap | Attempt 1 status | Attempt 2 status | Attempt 3 status |
+|---|---|---|---|
+| ... | ... | ... | ... |
+
+@user: The reviewer has failed 3 iterations. Please review the remaining
+gaps above and decide: continue fixing, adjust the feature requirements,
+or accept with known deviations.
+```
+
+Wait for the user's response. Do not proceed without explicit user input.
 
 ## Constraints
 
@@ -157,6 +231,9 @@ Output:
 - **Never skip the MCP search.** `get_edit_surface` before any edit.
 - **Never spawn concurrent subagents.** Sequential dispatch only. Each
   subagent's output informs the next task.
+- **Never skip the reviewer.** Every feature must pass independent review.
+  Do not mark a feature as done without a PASS verdict from the reviewer.
+- **Never exceed 3 review iterations** without asking the user.
 - **Never merge without DoD.** The DoD checklist is your contract.
 - **Never commit** unless the user explicitly asks you to.
 - **Report perf deviations.** If a performance rule cannot be followed,
@@ -168,9 +245,10 @@ Output:
 |---|---|
 | `explore` | Researching existing code, finding patterns, exploring crate APIs |
 | `general` | Complex multi-step research (understanding dependency chains, protocol behavior) |
+| `reviewer` | Independent feature review: verifies your implementation against the feature doc's DoD, in-scope items, ADR constraints, and perf rules. Spawn after Phase 4 self-verification. |
 
 Do **not** use subagents for writing code. You write the code. Subagents
-only research.
+research or review — they never write implementation code.
 
 ## Building & Testing (Rust)
 

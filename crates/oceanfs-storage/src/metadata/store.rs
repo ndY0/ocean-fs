@@ -56,11 +56,18 @@ impl MetadataStore {
         opts.increase_parallelism(num_cpus::get() as i32);
         opts.optimize_level_style_compaction(config.memtable_size);
 
+        // Configure block cache.
+        let block_cache =
+            rocksdb::Cache::new_lru_cache(config.block_cache_size);
+        let mut block_opts = rocksdb::BlockBasedOptions::default();
+        block_opts.set_block_cache(&block_cache);
+
         let cf_descriptors: Vec<ColumnFamilyDescriptor> = cf::ALL_COLUMN_FAMILIES
             .iter()
             .map(|&name| {
                 let mut cf_opts = Options::default();
                 cf_opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
+                cf_opts.set_block_based_table_factory(&block_opts);
                 ColumnFamilyDescriptor::new(name, cf_opts)
             })
             .collect();
@@ -123,7 +130,7 @@ impl MetadataStore {
     /// Deletes object metadata.
     ///
     /// This is a soft delete — the data remains in segments until GC.
-    /// Use [`put_tombstone`] to record the deletion for GC.
+    /// Use [`Self::put_tombstone`] to record the deletion for GC.
     ///
     /// # Errors
     ///
@@ -303,7 +310,7 @@ impl MetadataStore {
     // Async wrappers
     // ------------------------------------------------------------------
 
-    /// Async version of [`put_object`].
+    /// Async version of [`Self::put_object`].
     ///
     /// # Errors
     ///
@@ -324,7 +331,7 @@ impl MetadataStore {
         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?
     }
 
-    /// Async version of [`get_object`].
+    /// Async version of [`Self::get_object`].
     ///
     /// # Errors
     ///
@@ -355,7 +362,7 @@ impl MetadataStore {
         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?
     }
 
-    /// Async version of [`delete_object`].
+    /// Async version of [`Self::delete_object`].
     ///
     /// # Errors
     ///

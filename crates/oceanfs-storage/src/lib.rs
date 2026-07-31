@@ -39,5 +39,8 @@ pub use error::{Error, Result};
 pub use gc::{GarbageCollector, GcConfig};
 pub use metadata::{BatchOp, MetadataStore};
 pub use scrub::ScrubCoordinator;
-pub use segment::{SegmentHandle, SegmentIndex};
+pub use segment::{
+    ActiveSegment, SealConfig, SegmentHandle, SegmentHeader, SegmentIndex, SegmentSealer,
+    SegmentShard, SegmentSplitter, TierRouter,
+};
 pub use wal::{WalEntry, WalReader, WalWriter};

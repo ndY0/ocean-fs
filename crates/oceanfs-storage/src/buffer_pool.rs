@@ -58,11 +58,11 @@ impl BufferPool {
 
     /// Acquires a buffer from the pool.
     ///
-    /// Returns `BufferPoolExhausted` if no free buffers are available.
+    /// Returns an error if no free buffers are available.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::BufferPoolExhausted`] when the pool has no free buffers.
+    /// Returns an error when the pool has no free buffers.
     pub fn acquire(&self) -> Result<BytesMut> {
         let mut free = self.free.lock();
         free.pop().ok_or(Error::BufferPoolExhausted)

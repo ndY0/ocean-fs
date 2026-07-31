@@ -11,6 +11,18 @@ pub enum Error {
     #[error("membership shut down")]
     Shutdown,
 
+    /// Background tasks have already been started.
+    #[error("membership already started")]
+    AlreadyStarted,
+
+    /// Background tasks have not been started.
+    #[error("membership not started")]
+    NotStarted,
+
+    /// Failed to join the cluster.
+    #[error("join failed: {0}")]
+    JoinFailed(String),
+
     /// An I/O error occurred.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

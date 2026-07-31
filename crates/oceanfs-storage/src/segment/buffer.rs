@@ -57,7 +57,7 @@ impl ActiveSegment {
     /// # Errors
     ///
     /// Returns [`Error::InvalidConfig`] if the tier is `Inline`.
-    /// Returns [`Error::BufferPoolExhausted`] if the buffer pool has no free buffers.
+    /// Returns an error if the buffer pool has no free buffers.
     pub fn new(tier: SizeTier, config: &SegmentSizeConfig, pool: &BufferPool) -> Result<Self> {
         let target_size = match tier {
             SizeTier::Small => config.small_target_size,

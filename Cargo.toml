@@ -44,6 +44,9 @@ bytes            = { version = "1", features = ["serde"] }
 smallvec         = { version = "1", features = ["serde"] }
 uuid             = { version = "1", features = ["v7", "serde"] }
 
+# --- Zero-Copy ---
+bytemuck         = "1"
+
 # --- Serialization ---
 serde            = { version = "1", features = ["derive"] }
 serde_json       = "1"
@@ -86,6 +89,9 @@ unwrap_used      = "deny"
 expect_used      = "deny"
 wildcard_imports = "deny"
 undocumented_unsafe_blocks = "deny"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }
 
 [profile.release]
 lto             = "fat"

@@ -3,25 +3,29 @@
 use oceanfs_core::{ChunkRef, SegmentSizeConfig, SizeTier};
 
 /// Routes blob writes to the appropriate storage tier.
-pub(crate) struct TierRouter {
+pub struct TierRouter {
     config: SegmentSizeConfig,
 }
 
 #[allow(dead_code)]
 impl TierRouter {
-    pub(crate) fn new(config: SegmentSizeConfig) -> Self {
+    /// Creates a new tier router from the given configuration.
+    pub fn new(config: SegmentSizeConfig) -> Self {
         Self { config }
     }
 
-    pub(crate) fn classify(&self, blob_size: u64) -> SizeTier {
+    /// Classifies a blob of the given size into a storage tier.
+    pub fn classify(&self, blob_size: u64) -> SizeTier {
         self.config.classify(blob_size)
     }
 
-    pub(crate) fn is_inline(&self, blob_size: u64) -> bool {
+    /// Returns `true` if the blob should be stored inline.
+    pub fn is_inline(&self, blob_size: u64) -> bool {
         matches!(self.classify(blob_size), SizeTier::Inline)
     }
 
-    pub(crate) fn target_size(&self, tier: SizeTier) -> u64 {
+    /// Returns the target segment size for the given tier.
+    pub fn target_size(&self, tier: SizeTier) -> u64 {
         match tier {
             SizeTier::Small => self.config.small_target_size,
             SizeTier::Standard | SizeTier::Multi => self.config.default_target_size,
