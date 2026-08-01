@@ -1,14 +1,45 @@
 //! Build script for oceanfs-accel.
 //!
 //! - `isa-l` feature: links against system `libisal` via pkg-config.
-//! - `cuda` feature: compiles CUDA kernels to PTX with `nvcc`.
+//! - `cuda` feature: probes for CUDA toolkit + nvCOMP; sets cfg flags
+//!   when absent so Rust code can degrade gracefully. The checked-in
+//!   PTX (`kernels/gf256_encode.ptx`) is always used; nvcc recompilation
+//!   is a local-only optimization for the host GPU's compute capability.
 
 #![allow(clippy::expect_used)]
 
-#[cfg(any(feature = "isa-l", feature = "cuda"))]
+#[cfg(feature = "cuda")]
+use std::path::Path;
+#[cfg(any(feature = "cuda", feature = "isa-l"))]
 use std::process::Command;
 
-/// Runs `pkg-config` and returns the flags for the given library.
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the given command is found in PATH.
+#[cfg(feature = "cuda")]
+fn command_exists(cmd: &str) -> bool {
+    Command::new("which")
+        .arg(cmd)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Returns `true` if the given shared library exists at one of the
+/// standard system paths.
+#[cfg(feature = "cuda")]
+fn lib_exists(lib: &str) -> bool {
+    let name = format!("lib{lib}.so");
+    for dir in ["/usr/lib", "/usr/local/lib", "/usr/lib/x86_64-linux-gnu"] {
+        if Path::new(dir).join(&name).exists() {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(feature = "isa-l")]
 fn pkg_config(lib: &str, flag: &str) -> Result<String, String> {
     let output = Command::new("pkg-config")
@@ -25,14 +56,16 @@ fn pkg_config(lib: &str, flag: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
 fn main() {
     // --- ISA-L linking (gated on feature isa-l) ---
     #[cfg(feature = "isa-l")]
     {
         match pkg_config("libisal", "--libs") {
             Ok(libs) => {
-                // pkg-config returns something like "-lisal"
-                // Pass through to the linker
                 for flag in libs.split_whitespace() {
                     if let Some(lib) = flag.strip_prefix("-l") {
                         println!("cargo:rustc-link-lib={lib}");
@@ -58,52 +91,72 @@ fn main() {
         println!("cargo:isa-l=disabled");
     }
 
-    // --- CUDA kernel compilation + nvCOMP linking (gated on feature cuda) ---
+    // --- CUDA toolkit + nvCOMP probing (gated on feature cuda) ---
     #[cfg(feature = "cuda")]
     {
-        // Link nvCOMP (GPU-accelerated LZ4/zstd compression)
-        // Installed at /usr/local/lib by nvCOMP 4.0 SDK
-        println!("cargo:rustc-link-search=native=/usr/local/lib");
-        println!("cargo:rustc-link-lib=nvcomp");
-        println!("cargo:rustc-link-lib=nvcomp_cpu");
-        // Also link CUDA runtime for raw stream operations
-        println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
-        println!("cargo:rustc-link-lib=cudart");
+        // Declare custom cfgs used in Rust code
+        println!("cargo:rustc-check-cfg=cfg(no_cuda_toolkit)");
+        println!("cargo:rustc-check-cfg=cfg(no_nvcomp)");
 
-        // --- CUDA kernel compilation ---
-        let kernel_dir = "kernels";
-        let kernel_src = format!("{kernel_dir}/gf256_encode.cu");
-        let ptx_out = format!("{kernel_dir}/gf256_encode.ptx");
+        // ---- CUDA toolkit (nvcc + cudart) ----
+        let has_cuda = command_exists("nvcc") && lib_exists("cudart");
 
-        // Detect GPU compute capability from nvidia-smi or use default
-        let cc = detect_compute_capability();
+        if has_cuda {
+            // Recompile PTX for host GPU's compute capability (optimization).
+            // The checked-in PTX targets sm_50 which is always available.
+            let kernel_dir = "kernels";
+            let kernel_src = format!("{kernel_dir}/gf256_encode.cu");
+            let ptx_out = format!("{kernel_dir}/gf256_encode.ptx");
 
-        println!("cargo:rerun-if-changed={kernel_src}");
-        println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
+            let cc = detect_compute_capability();
 
-        let status = Command::new("nvcc")
-            .args([
-                "-ptx",
-                &format!("--gpu-architecture=compute_{cc}"),
-                "-o",
-                &ptx_out,
-                &kernel_src,
-            ])
-            .status()
-            .expect("nvcc not found — install nvidia-cuda-toolkit: sudo apt install nvidia-cuda-toolkit");
+            println!("cargo:rerun-if-changed={kernel_src}");
+            println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
 
-        if !status.success() {
-            panic!("CUDA kernel compilation failed (nvcc exited with {status})");
+            if let Ok(status) = Command::new("nvcc")
+                .args([
+                    "-ptx",
+                    &format!("--gpu-architecture=compute_{cc}"),
+                    "-o",
+                    &ptx_out,
+                    &kernel_src,
+                ])
+                .status()
+            {
+                if !status.success() {
+                    eprintln!("cargo:warning=CUDA kernel recompilation failed; using checked-in PTX");
+                }
+            }
+
+            println!("cargo:rerun-if-changed={ptx_out}");
+
+            // Link CUDA runtime for raw stream operations (cudaStreamCreate etc).
+            // cudarc links its own cudart; this covers our direct extern "C" usage.
+            println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
+            println!("cargo:rustc-link-lib=cudart");
+        } else {
+            eprintln!("cargo:warning=CUDA toolkit not found — cuda feature active but GPU kernels unavailable");
+            println!("cargo:rustc-cfg=no_cuda_toolkit");
         }
 
-        // Tell cargo where to find the PTX file for include_str!
-        println!("cargo:rerun-if-changed={ptx_out}");
+        // ---- nvCOMP (GPU compression library) ----
+        let has_nvcomp = lib_exists("nvcomp") && lib_exists("nvcomp_cpu");
+
+        if has_nvcomp {
+            println!("cargo:rustc-link-search=native=/usr/local/lib");
+            println!("cargo:rustc-link-lib=nvcomp");
+            println!("cargo:rustc-link-lib=nvcomp_cpu");
+        } else {
+            eprintln!("cargo:warning=nvCOMP not found — GPU compression unavailable");
+            println!("cargo:rustc-cfg=no_nvcomp");
+        }
+
+        println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
     }
 }
 
 #[cfg(feature = "cuda")]
 fn detect_compute_capability() -> String {
-    // Try nvidia-smi first
     if let Ok(output) = Command::new("nvidia-smi")
         .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
         .output()
@@ -116,12 +169,10 @@ fn detect_compute_capability() -> String {
         }
     }
 
-    // Environment override
     if let Ok(cap) = std::env::var("CUDA_COMPUTE_CAP") {
         eprintln!("cargo:warning=Using CUDA_COMPUTE_CAP={cap}");
         return cap;
     }
 
-    // Default: Maxwell (5.0) — widely compatible
     "50".into()
 }

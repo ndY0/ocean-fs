@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use oceanfs_core::{AccelConfig, CodecConfig, CompressConfig, CompressionTier};
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
 use oceanfs_core::GpuConfig;
 use oceanfs_ec::{Decoder, Encoder};
 
@@ -124,9 +124,9 @@ impl AccelDispatcher {
         #[cfg(not(any(feature = "isa-l", feature = "arm-sve")))]
         let tier1_available = false;
 
-        #[cfg(feature = "cuda")]
+        #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
         let cuda_available = Self::probe_cuda(config.gpu.as_ref());
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(any(not(feature = "cuda"), no_cuda_toolkit))]
         let cuda_available = false;
 
         tracing::debug!(
@@ -181,7 +181,7 @@ impl AccelDispatcher {
             tier_decoders.insert(AccelTier::IsaL, tier1_decoder);
         }
 
-        #[cfg(feature = "cuda")]
+        #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
         if cuda_available {
             if let Some(gpu_config) = &config.gpu {
                 if let Some(cuda) = crate::cuda::CudaBackend::new(gpu_config.clone()) {
@@ -213,7 +213,7 @@ impl AccelDispatcher {
         }
 
         // Tier 2: nvCOMP GPU compression (if available)
-        #[cfg(feature = "cuda")]
+        #[cfg(all(feature = "cuda", not(no_cuda_toolkit), not(no_nvcomp)))]
         if cuda_available {
             // Use a shared semaphore for GPU operations (EC + compression).
             let gpu_semaphore = Arc::new(tokio::sync::Semaphore::new(

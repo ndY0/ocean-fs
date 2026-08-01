@@ -23,6 +23,7 @@ jobs:
         features:
           - "default"
           - "isa-l"
+          - "cuda"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -48,6 +49,10 @@ jobs:
         if: matrix.features == 'isa-l'
         run: cargo build -p oceanfs-accel -p oceanfs-ec --all-targets --features isa-l
 
+      - name: Build with CUDA (compile-check, no GPU needed)
+        if: matrix.features == 'cuda'
+        run: cargo build -p oceanfs-accel --all-targets --features cuda
+
       - name: Test (all targets)
         if: matrix.features == 'default'
         run: cargo test --all-targets --workspace
@@ -56,21 +61,9 @@ jobs:
         if: matrix.features == 'isa-l'
         run: cargo test -p oceanfs-accel -p oceanfs-ec --all-targets --features isa-l
 
-  # ------------------------------------------------------------------
-  # GPU feature build check (compile-only, no hardware needed)
-  # ------------------------------------------------------------------
-  build-cuda:
-    name: Build CUDA (compile-check only)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      # cuda feature is a source-only feature gate (no external CUDA crates).
-      # This verifies the cuda module compiles on any runner.
-      - name: Build with cuda feature
-        run: cargo build -p oceanfs-accel --features cuda --all-targets
+      - name: Test with CUDA (compile-check, no GPU needed)
+        if: matrix.features == 'cuda'
+        run: cargo test -p oceanfs-accel --lib --features cuda
 
   # ------------------------------------------------------------------
   # Cross-compile for aarch64 (ARM NEON/SVE validation)
@@ -122,6 +115,9 @@ jobs:
 
       - name: Clippy (all features, deny warnings)
         run: cargo clippy --all-targets --features isa-l -- -D warnings
+
+      - name: Clippy (cuda feature)
+        run: cargo clippy -p oceanfs-accel --features cuda -- -D warnings
 
   # ------------------------------------------------------------------
   # Formatting

@@ -21,10 +21,11 @@
 //!
 //! ## Feature Flags
 //!
-//! - `cuda`: Enables the CUDA EC backend (requires CUDA toolkit at build time)
+//! - `cuda`: Enables CUDA EC backend + nvCOMP compression (auto-detects toolkit)
 //! - `isa-l`: Enables the ISA-L SIMD-accelerated encoder (x86 only)
 //!
-//! With no features enabled, only Tier 0 (CPU SIMD) is available.
+//! When CUDA tools are absent at build time, the `cuda` feature compiles
+//! but GPU backends are unavailable at runtime (degrade gracefully).
 //!
 //! # Unsafe Code
 //!
@@ -41,6 +42,8 @@
     clippy::missing_panics_doc,
     missing_docs
 )]
+// Custom cfgs set by build.rs when CUDA/nvCOMP tools are absent.
+#![allow(unexpected_cfgs)]
 
 mod arm_sve;
 mod compressor;
@@ -54,7 +57,7 @@ mod igzip;
 #[cfg(feature = "isa-l")]
 mod isal;
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
 mod cuda;
 
 // Public types (facade)
@@ -67,9 +70,9 @@ pub use error::{AccelError, Result};
 pub use oceanfs_core::{AccelConfig, CompressionTier, GpuConfig};
 
 // Feature-gated backends
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
 pub use cuda::CudaBackend;
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(no_cuda_toolkit), not(no_nvcomp)))]
 pub use cuda::nvcomp::NvcompCompressor;
 
 #[cfg(feature = "isa-l")]

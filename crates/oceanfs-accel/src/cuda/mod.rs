@@ -26,6 +26,7 @@
 //! is preceded by a `// SAFETY:` comment. `cudarc` provides safe device
 //! memory management; unsafe is limited to kernel argument construction.
 
+#[cfg(not(no_nvcomp))]
 pub(crate) mod nvcomp;
 
 use std::sync::Arc;
