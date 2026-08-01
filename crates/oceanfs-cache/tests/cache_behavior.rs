@@ -4,7 +4,6 @@
 //! Exercises L1 (object), L2 (metadata), L3 (negative) caches
 //! and the prefetch engine together.
 
-#![allow(clippy::unwrap_used)]
 
 use std::sync::Arc;
 

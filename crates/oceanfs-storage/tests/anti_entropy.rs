@@ -4,7 +4,6 @@
 //! Tests the Merkle tree construction, diff detection, proof generation,
 //! and anti-entropy cycle across two logical nodes sharing a metadata store.
 
-#![allow(clippy::unwrap_used)]
 
 use oceanfs_core::HashOutput;
 use oceanfs_storage::{AntiEntropy, AntiEntropyConfig, MerkleTree};

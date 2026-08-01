@@ -5,7 +5,6 @@
 //! verifies 16 stripes produced, then decodes with 1 missing shard
 //! per stripe and verifies all data recovered.
 
-#![allow(clippy::unwrap_used)]
 
 use std::sync::Arc;
 

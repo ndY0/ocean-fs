@@ -9,8 +9,6 @@
 //!
 //! Covers the `wal-write-ahead-log` feature's Definition of Done.
 
-#![allow(clippy::unwrap_used)]
-#![allow(clippy::expect_used)]
 
 use oceanfs_core::{HashOutput, SegmentId, WalConfig};
 use oceanfs_storage::wal::{WalEntry, WalReader, WalWriter};

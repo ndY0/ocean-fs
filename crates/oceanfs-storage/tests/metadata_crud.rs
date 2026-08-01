@@ -10,8 +10,6 @@
 //! - list_objects with prefix
 //! - batch atomic writes
 
-#![allow(clippy::unwrap_used)]
-#![allow(clippy::expect_used)]
 
 use oceanfs_core::{
     BucketId, ChunkRef, Hlc, MetadataConfig, ObjectKey, ObjectMetadata, SegmentId, SegmentMetadata,
