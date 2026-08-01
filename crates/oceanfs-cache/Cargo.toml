@@ -13,6 +13,7 @@ parking_lot.workspace = true
 smallvec.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 static_assertions.workspace = true

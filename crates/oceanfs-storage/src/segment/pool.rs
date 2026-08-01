@@ -379,7 +379,7 @@ mod tests {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool = StdArc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, &buf_pool).unwrap(),
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool.clone()).unwrap(),
         );
 
         let write_count = StdArc::new(AtomicUsize::new(0));
@@ -424,7 +424,7 @@ mod tests {
     fn encode_semaphore_has_correct_permits() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
-        let pool = SegmentPool::new(pool_cfg.clone(), SizeTier::Standard, &size_cfg, &buf_pool).unwrap();
+        let pool = SegmentPool::new(pool_cfg.clone(), SizeTier::Standard, &size_cfg, buf_pool.clone()).unwrap();
 
         let sem = pool.encode_semaphore();
         // Verify that the semaphore has been created with the expected count.
@@ -447,8 +447,8 @@ mod tests {
             ..PoolConfig::default()
         };
         let size_cfg = SegmentSizeConfig::default();
-        let buf_pool = BufferPool::new(65536, 32);
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Small, &size_cfg, &buf_pool).unwrap();
+        let buf_pool = Arc::new(BufferPool::new(65536, 32));
+        let pool = SegmentPool::new(pool_cfg, SizeTier::Small, &size_cfg, buf_pool).unwrap();
         assert_eq!(pool.slot_count(), 8);
     }
 

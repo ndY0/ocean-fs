@@ -7,11 +7,13 @@
 //!
 //! # Architecture
 //!
-//! The storage engine has four main components:
+//! The storage engine has six main components:
 //! - **Segment buffer:** in-memory append-only `BytesMut` buffers
 //! - **WAL:** sequential write-ahead log for crash recovery
 //! - **Metadata:** RocksDB-backed object and segment metadata
 //! - **Segment store:** manages sealed segments on disk
+//! - **GC & Compaction:** tombstone processing and segment space reclamation
+//! - **Durability:** anti-entropy, distributed scrubbing, and orphan reaping
 
 #![forbid(unsafe_code)]
 #![deny(
@@ -33,12 +35,15 @@ mod scrub;
 pub mod segment;
 pub mod wal;
 
-pub use anti_entropy::MerkleTree;
+pub use anti_entropy::{
+    AntiEntropy, AntiEntropyConfig, AntiEntropyStats, LeafRange, MerkleProof, MerkleRoot,
+    MerkleTree,
+};
 pub use buffer_pool::BufferPool;
 pub use error::{Error, Result};
-pub use gc::{GarbageCollector, GcConfig};
+pub use gc::{GarbageCollector, GcConfig, GcStats, OrphanReaper, OrphanStats};
 pub use metadata::{BatchOp, MetadataStore};
-pub use scrub::ScrubCoordinator;
+pub use scrub::{ScrubConfig, ScrubCoordinator, ScrubReport, SegmentPartition};
 pub use segment::{
     ActiveSegment, SealConfig, SegmentHandle, SegmentHeader, SegmentIndex, SegmentSealer,
     SegmentShard, SegmentSplitter, TierRouter,

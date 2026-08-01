@@ -75,6 +75,14 @@ tracing          = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 prometheus       = "0.13"
 
+# --- HTTP Server ---
+axum             = { version = "0.7", features = ["http2", "macros"] }
+tower            = "0.4"
+tower-http       = { version = "0.5", features = ["cors"] }
+http             = "1"
+mime_guess       = "2"
+hmac             = "0.12"
+
 # --- Testing ---
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest          = "1"

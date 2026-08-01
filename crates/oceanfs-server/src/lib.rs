@@ -1,4 +1,17 @@
 //! S3-compatible HTTP server and request coordinators.
+//!
+//! This crate provides the HTTP server layer (S3-compatible REST API),
+//! distributed read/write coordinators, and the integration glue
+//! between the storage, routing, membership, and networking crates.
+//!
+//! ## Architecture
+//!
+//! - [`S3Handler`]: axum-based HTTP handlers for S3 object/bucket operations
+//! - [`WriteCoordinator`]: orchestrates blob writes with quorum replication
+//! - [`ReadCoordinator`]: parallel shard fetch and blob reconstruction
+//! - [`AdminHandler`]: cluster health, metrics, and admin endpoints
+//! - [`BucketConfigStore`]: per-bucket policy management with `ArcSwap`
+//! - [`Router`]: request routing via consistent hashing
 
 #![forbid(unsafe_code)]
 #![deny(
@@ -12,13 +25,16 @@
 )]
 
 mod admin;
+pub mod auth;
 mod bucket_config;
 mod error;
 mod hinted_handoff;
+pub(crate) mod metadata_ops;
 mod read;
 mod read_coordinator;
 mod router;
 mod s3_handler;
+pub(crate) mod s3_xml;
 mod write;
 mod write_coordinator;
 

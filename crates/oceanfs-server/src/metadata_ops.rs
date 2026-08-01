@@ -1,0 +1,61 @@
+//! Metadata operations trait consumed by the S3 HTTP handler.
+//!
+//! Defines the interface that `S3Handler` uses for object lookup,
+//! deletion, and listing. Concrete implementations live in
+//! `oceanfs-storage` and are wired in `oceanfs-node`.
+
+use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata};
+
+/// Result type for metadata operations.
+pub type Result<T, E = MetadataError> = std::result::Result<T, E>;
+
+/// Errors returned by metadata operations.
+#[derive(Debug, thiserror::Error)]
+pub enum MetadataError {
+    /// The object was not found.
+    #[error("object not found: {0}")]
+    NotFound(String),
+
+    /// A storage I/O error occurred.
+    #[error("storage I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Internal metadata store error.
+    #[error("metadata store error: {0}")]
+    Internal(String),
+}
+
+/// Metadata operations required by the S3 handler.
+///
+/// This trait abstracts the metadata store so the S3 handler does
+/// not depend on `oceanfs-storage` directly. The concrete RocksDB
+/// implementation is wired at startup in `oceanfs-node`.
+///
+/// All implementations must be `Send + Sync + 'static`.
+pub trait MetadataOps: Send + Sync + 'static {
+    /// Retrieves object metadata by bucket and key.
+    ///
+    /// Returns `None` if the object does not exist.
+    fn get_object(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+    ) -> Result<Option<ObjectMetadata>>;
+
+    /// Soft-deletes an object by writing a tombstone entry.
+    fn delete_object(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+    ) -> Result<()>;
+
+    /// Lists objects in a bucket matching the given prefix.
+    ///
+    /// Results are sorted by key. Returns objects whose key starts
+    /// with `prefix`.
+    fn list_objects(
+        &self,
+        bucket: &BucketId,
+        prefix: &str,
+    ) -> Result<Vec<ObjectMetadata>>;
+}

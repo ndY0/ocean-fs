@@ -184,6 +184,11 @@ actual compilation speed. No more feature-gating, no more mock types.
    EC encoding work" will find §6 of the spec even though that section never
    uses those exact words.
 7. **Install system RocksDB for fast local builds.** See §4.5. Without it,
-   `librocksdb-sys` compiles ~500 KLoC of C++ from source on every clean
-   build. A one-time `sudo apt install librocksdb-dev` drops storage crate
-   builds from minutes to seconds.
+    `librocksdb-sys` compiles ~500 KLoC of C++ from source on every clean
+    build. A one-time `sudo apt install librocksdb-dev` drops storage crate
+    builds from minutes to seconds.
+8. **Re-spawn the reviewer in the same batch.** After addressing reviewer
+    gaps and producing an updated Implementation Report, always spawn the
+    reviewer subagent in the same tool-call batch. Never end a message with
+    just a report — that leaves you waiting for a user prompt that the
+    workflow already says should be automated.

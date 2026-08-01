@@ -12,15 +12,26 @@ oceanfs-membership.workspace = true
 oceanfs-network.workspace = true
 oceanfs-storage = { workspace = true, optional = true }
 oceanfs-cache = { workspace = true, optional = true }
+arc-swap.workspace = true
+axum.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 futures = "0.3"
+hex = "0.4"
+hmac.workspace = true
+http.workspace = true
+mime_guess.workspace = true
 parking_lot.workspace = true
+prometheus.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+toml.workspace = true
+tower.workspace = true
+tower-http.workspace = true
 tracing.workspace = true
 
 [features]

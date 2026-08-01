@@ -19,12 +19,14 @@
     missing_docs
 )]
 
+mod error;
 mod l1_object;
 mod l2_metadata;
 mod l3_negative;
 mod prefetch;
 
-pub use l1_object::ObjectCache;
-pub use l2_metadata::MetadataCache;
-pub use l3_negative::NegativeCache;
-pub use prefetch::PrefetchEngine;
+pub use error::{Error, Result};
+pub use l1_object::{CacheStats, ObjectCache, ObjectCacheConfig};
+pub use l2_metadata::{MetadataCache, MetadataCacheConfig, MetadataCacheStats};
+pub use l3_negative::{NegativeCache, NegativeCacheConfig, NegativeCacheStats};
+pub use prefetch::{PrefetchConfig, PrefetchEngine};

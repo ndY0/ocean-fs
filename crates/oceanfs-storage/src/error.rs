@@ -55,6 +55,33 @@ pub enum Error {
     /// Invalid configuration provided to the storage engine.
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+
+    /// A Merkle tree hash mismatch was detected.
+    #[error("merkle hash mismatch at leaf index {leaf_index}")]
+    MerkleMismatch {
+        /// The index of the leaf that diverged.
+        leaf_index: u64,
+        /// The expected hash.
+        expected: oceanfs_core::HashOutput,
+        /// The actual hash computed.
+        actual: oceanfs_core::HashOutput,
+    },
+
+    /// An error occurred during anti-entropy exchange.
+    #[error("anti-entropy error: {0}")]
+    AntiEntropy(String),
+
+    /// An error occurred during garbage collection.
+    #[error("GC error: {0}")]
+    Gc(String),
+
+    /// An error occurred during distributed scrubbing.
+    #[error("scrub error: {0}")]
+    Scrub(String),
+
+    /// An error occurred during orphan reaping.
+    #[error("orphan reaper error: {0}")]
+    OrphanReaper(String),
 }
 
 /// Convenience alias for `std::result::Result<T, Error>`.
