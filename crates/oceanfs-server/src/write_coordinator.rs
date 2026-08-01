@@ -19,19 +19,10 @@ use oceanfs_core::{
     BucketId, ChunkRef, HashKey, HashOutput, HlcClock, NodeId, ObjectKey, OperationTimeouts,
     SegmentId, WriteResult,
 };
+use oceanfs_membership::Membership;
+use oceanfs_network::ConnectionPool;
 use oceanfs_routing::RingCache;
 use tracing::{info, warn};
-
-// Only membership + network need mocks (they pull in tonic/native deps).
-#[cfg(feature = "membership")]
-use oceanfs_membership::Membership;
-#[cfg(not(feature = "membership"))]
-use crate::mocks::MockMembership as Membership;
-
-#[cfg(feature = "network")]
-use oceanfs_network::ConnectionPool;
-#[cfg(not(feature = "network"))]
-use crate::mocks::MockConnectionPool as ConnectionPool;
 
 use crate::error::{Error, Result};
 use crate::write::replication::replicate_write;
@@ -229,13 +220,9 @@ mod tests {
         }
         let ring_cache = Arc::new(RingCache::new(ring));
         let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-
-        #[cfg(feature = "membership")]
         let membership = Arc::new(Membership::new(
             NodeId::new(node_id), addr, GossipConfig::default(), ring_cache.clone(),
         ));
-        #[cfg(not(feature = "membership"))]
-        let membership = Arc::new(Membership::new(NodeId::new(node_id), addr));
 
         for node in ring_nodes {
             membership.upsert_node(NodeId::new(*node), NodeState::Alive, Incarnation::new(1), addr);

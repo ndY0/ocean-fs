@@ -2,7 +2,6 @@
 //!
 //! Tests quorum fan-out, ack collection, and error handling.
 
-#![cfg(all(feature = "membership", feature = "network"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;

@@ -4,19 +4,10 @@
 use std::sync::Arc;
 
 use oceanfs_core::{HashKey, NodeId, OperationType};
+use oceanfs_membership::Membership;
+use oceanfs_network::ConnectionPool;
 use oceanfs_routing::RingCache;
 use tracing::{debug, warn};
-
-// Only membership + network need mocks (they pull in tonic/native deps).
-#[cfg(feature = "membership")]
-use oceanfs_membership::Membership;
-#[cfg(not(feature = "membership"))]
-use crate::mocks::MockMembership as Membership;
-
-#[cfg(feature = "network")]
-use oceanfs_network::ConnectionPool;
-#[cfg(not(feature = "network"))]
-use crate::mocks::MockConnectionPool as ConnectionPool;
 
 use crate::error::{Error, Result};
 
@@ -250,13 +241,9 @@ mod tests {
 
         let ring_cache = Arc::new(RingCache::new(ring));
         let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-
-        #[cfg(feature = "membership")]
         let membership = Arc::new(Membership::new(
             NodeId::new(local_node_id), addr, GossipConfig::default(), ring_cache.clone(),
         ));
-        #[cfg(not(feature = "membership"))]
-        let membership = Arc::new(Membership::new(NodeId::new(local_node_id), addr));
 
         for node in ring_nodes {
             membership.upsert_node(NodeId::new(*node), NodeState::Alive, Incarnation::new(1), addr);
@@ -341,12 +328,9 @@ mod tests {
         let ring = Ring::new(RingConfig { vnodes_per_node: 8, replication_factor: 3 });
         let ring_cache = Arc::new(RingCache::new(ring));
         let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-        #[cfg(feature = "membership")]
         let membership = Arc::new(Membership::new(
             NodeId::new("n1"), addr, GossipConfig::default(), ring_cache.clone(),
         ));
-        #[cfg(not(feature = "membership"))]
-        let membership = Arc::new(Membership::new(NodeId::new("n1"), addr));
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let router = Router::new(ring_cache, membership, pool, NodeId::new("n1"));
 

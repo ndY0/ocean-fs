@@ -1,0 +1,6 @@
+# Use system RocksDB instead of compiling ~500 KLoC of C++ from source.
+# One-time setup: sudo apt install librocksdb-dev (or equivalent).
+# Verify: pkg-config rocksdb --libs should output -lrocksdb.
+[env]
+ROCKSDB_LIB_DIR = "/lib/x86_64-linux-gnu"
+ROCKSDB_STATIC = "0"

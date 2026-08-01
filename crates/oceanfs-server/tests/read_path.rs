@@ -2,7 +2,6 @@
 //!
 //! Tests inline reads, chunk assembly, hash verification, and not-found.
 
-#![cfg(all(feature = "membership", feature = "network"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;

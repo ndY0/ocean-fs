@@ -8,8 +8,8 @@ rust-version.workspace = true
 [dependencies]
 oceanfs-core.workspace = true
 oceanfs-routing.workspace = true
-oceanfs-membership = { workspace = true, optional = true }
-oceanfs-network = { workspace = true, optional = true }
+oceanfs-membership.workspace = true
+oceanfs-network.workspace = true
 oceanfs-storage = { workspace = true, optional = true }
 oceanfs-cache = { workspace = true, optional = true }
 blake3.workspace = true
@@ -24,12 +24,9 @@ tokio.workspace = true
 tracing.workspace = true
 
 [features]
-default = ["storage", "cache", "membership", "network"]
+default = ["storage", "cache"]
 storage = ["dep:oceanfs-storage"]
 cache = ["dep:oceanfs-cache"]
-membership = ["dep:oceanfs-membership"]
-network = ["dep:oceanfs-network"]
-testing = []  # enables mock membership + connection pool; skips rocksdb/tonic
 
 [dev-dependencies]
 tokio-test = "0.4"

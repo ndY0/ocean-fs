@@ -1,11 +1,5 @@
 //! Integration test: key routing and request forwarding.
-//!
-//! Tests routing decisions (local vs. remote), replica set formation,
-//! forward target assignment, and retry fallback behavior.
-//!
-//! Requires the full membership + network stack.
 
-#![cfg(all(feature = "membership", feature = "network"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::net::SocketAddr;

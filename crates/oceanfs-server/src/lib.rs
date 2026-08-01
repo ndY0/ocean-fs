@@ -14,9 +14,7 @@
 mod admin;
 mod bucket_config;
 mod error;
-mod handoff;
 mod hinted_handoff;
-mod mocks;
 mod read;
 mod read_coordinator;
 mod router;

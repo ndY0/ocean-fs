@@ -20,14 +20,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use oceanfs_core::{Hlc, NodeId, OperationTimeouts, SegmentId};
+use oceanfs_network::ConnectionPool;
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
-
-// Network is optional (pulls in tonic).
-#[cfg(feature = "network")]
-use oceanfs_network::ConnectionPool;
-#[cfg(not(feature = "network"))]
-use crate::mocks::MockConnectionPool as ConnectionPool;
 
 use crate::error::Result;
 

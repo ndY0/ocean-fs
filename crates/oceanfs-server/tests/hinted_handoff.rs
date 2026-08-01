@@ -2,7 +2,6 @@
 //!
 //! Tests hint creation, delivery on node return, and cleanup.
 
-#![cfg(all(feature = "membership", feature = "network"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use oceanfs_core::{Hlc, NodeId, SegmentId};

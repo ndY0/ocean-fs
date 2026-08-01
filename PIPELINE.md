@@ -142,43 +142,28 @@ deleted) and allows historical version resolution.
 3. grep / glob                               # only if 1+2 returned nothing
 ```
 
-### 4.5 "I'm working on oceanfs-server and the build is slow"
+### 4.5 "The build is slow (RocksDB, tonic)"
 
-**DO NOT compile with default features during local iteration.** The default
-features pull in `oceanfs-membership` and `oceanfs-network`, which depend on
-`tonic`/gRPC — adding minutes to every build. The crate provides a `testing`
-feature that swaps these heavy crates for lightweight in-process mocks:
+**Install system RocksDB to skip C++ compilation.** `librocksdb-sys` auto-detects
+it via `pkg-config` and dynamically links against the system `.so`, bypassing
+the ~500 KLoC C++ source build entirely.
 
-```
-# Fast dev loop (sub-second build):
-cargo build  -p oceanfs-server --no-default-features --features testing
-cargo test   -p oceanfs-server --no-default-features --features testing --lib
-cargo clippy -p oceanfs-server --no-default-features --features testing -- -D warnings
-cargo doc    -p oceanfs-server --no-default-features --features testing --no-deps
-```
+```bash
+# One-time setup:
+sudo apt install librocksdb-dev          # Ubuntu/Debian
+sudo pacman -S rocksdb                   # Arch
 
-**What gets mocked:**
-| Heavy crate | Replaced by | Why |
-|---|---|---|
-| `oceanfs-membership` (→ tonic) | `crate::mocks::MockMembership` | `RwLock<HashMap<NodeId, ...>>` |
-| `oceanfs-network` (→ tonic) | `crate::mocks::MockConnectionPool` | no-op struct |
+# Verify:
+pkg-config rocksdb --libs --cflags       # should output -lrocksdb
 
-**What stays real (no native deps, fast compile):**
-| Crate | Reason |
-|---|---|
-| `oceanfs-core` | Pure Rust, zero native deps |
-| `oceanfs-routing` | Pure Rust, only `sha2` + `arc-swap` |
-| `blake3` | Pure Rust (runtime SIMD detection, no build script) |
-| `futures` | Pure Rust |
-
-**Before pushing or reviewing, always verify with default features:**
-```
-cargo build -p oceanfs-server                         # full build, confirms real crate linkage
-cargo test -p oceanfs-server --tests routing_forward  # integration test needs real membership+network
+# Then build as normal — no C++ compilation:
+cargo build -p oceanfs-storage           # ~5s instead of ~5min
+cargo test -p oceanfs-server            # full test suite, sub-30s
 ```
 
-The same pattern applies to `oceanfs-storage` — its heavy dep is `rocksdb`.
-Work on storage internals that don't touch RocksDB can use `--no-default-features`.
+**What changed from previous `--features testing` approach:** the mock system
+was removed in commit `<sha>`. System RocksDB gives us real storage builds at
+actual compilation speed. No more feature-gating, no more mock types.
 
 ---
 
@@ -198,7 +183,7 @@ Work on storage internals that don't touch RocksDB can use `--no-default-feature
    (understands meaning), not lexical (pattern match). A query like "how does
    EC encoding work" will find §6 of the spec even though that section never
    uses those exact words.
-7. **Use `--no-default-features --features testing` for oceanfs-server
-   iteration.** Never sit through a tonic/RocksDB rebuild when you're only
-   changing coordinator logic, routing, or error types. See §4.5 for the
-   exact commands. Switch back to default features before final review.
+7. **Install system RocksDB for fast local builds.** See §4.5. Without it,
+   `librocksdb-sys` compiles ~500 KLoC of C++ from source on every clean
+   build. A one-time `sudo apt install librocksdb-dev` drops storage crate
+   builds from minutes to seconds.

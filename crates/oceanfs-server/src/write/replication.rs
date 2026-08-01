@@ -9,14 +9,9 @@ use std::sync::Arc;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use oceanfs_core::{Hlc, NodeId, WriteAck};
+use oceanfs_membership::Membership;
 use tokio::time::timeout;
 use tracing::debug;
-
-// Membership is optional (pulls in tonic).
-#[cfg(feature = "membership")]
-use oceanfs_membership::Membership;
-#[cfg(not(feature = "membership"))]
-use crate::mocks::MockMembership as Membership;
 
 use crate::error::{Error, Result};
 
@@ -104,13 +99,9 @@ mod tests {
         let ring = Ring::new(oceanfs_core::RingConfig::default());
         let ring_cache = Arc::new(RingCache::new(ring));
         let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-
-        #[cfg(feature = "membership")]
         let membership = Arc::new(Membership::new(
             NodeId::new(node_id), addr, oceanfs_core::GossipConfig::default(), ring_cache,
         ));
-        #[cfg(not(feature = "membership"))]
-        let membership = Arc::new(Membership::new(NodeId::new(node_id), addr));
 
         membership.upsert_node(NodeId::new("n2"), NodeState::Alive, Incarnation::new(1), "127.0.0.1:9002".parse().unwrap());
         membership.upsert_node(NodeId::new("n3"), NodeState::Alive, Incarnation::new(1), "127.0.0.1:9003".parse().unwrap());
