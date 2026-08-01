@@ -4,9 +4,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::thread;
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    thread,
+};
 
 use oceanfs_core::{PoolConfig, SegmentSizeConfig, SizeTier};
 use oceanfs_storage::BufferPool;

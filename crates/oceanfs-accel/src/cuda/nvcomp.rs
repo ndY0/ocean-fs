@@ -29,14 +29,11 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
 use oceanfs_core::CompressionTier;
 use tokio::sync::Semaphore;
 
-use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
-
-use crate::compressor::Compressor;
-use crate::error::AccelError;
-use crate::Result;
+use crate::{compressor::Compressor, error::AccelError, Result};
 
 // ---------------------------------------------------------------------------
 // FFI declarations — nvCOMP 4.x batched LZ4
@@ -131,16 +128,11 @@ fn slice_device_ptr<T>(slice: &CudaSlice<T>) -> *const u8 {
 /// batched API (which expects `const void* const*`).
 fn copy_usize_to_device(device: &Arc<CudaDevice>, val: usize) -> Result<CudaSlice<usize>> {
     // SAFETY: Device memory allocation on a valid, initialized CudaDevice.
-    let mut slice = unsafe { device.alloc::<usize>(1) }.map_err(|e| {
-        AccelError::CompressionError {
-            reason: format!("GPU alloc failed: {e}"),
-        }
-    })?;
+    let mut slice = unsafe { device.alloc::<usize>(1) }
+        .map_err(|e| AccelError::CompressionError { reason: format!("GPU alloc failed: {e}") })?;
     device
         .htod_sync_copy_into(&[val], &mut slice)
-        .map_err(|e| AccelError::CompressionError {
-            reason: format!("GPU copy failed: {e}"),
-        })?;
+        .map_err(|e| AccelError::CompressionError { reason: format!("GPU copy failed: {e}") })?;
     Ok(slice)
 }
 
@@ -218,10 +210,7 @@ impl NvcompCompressor {
                 return None;
             }
         };
-        Some(Self {
-            device,
-            semaphore,
-        })
+        Some(Self { device, semaphore })
     }
 
     /// Checks whether CUDA is available on this system.
@@ -233,9 +222,7 @@ impl NvcompCompressor {
 
     /// Returns the LZ4 format options (char type, default).
     fn lz4_opts() -> nvcompBatchedLZ4Opts_t {
-        nvcompBatchedLZ4Opts_t {
-            data_type: NVCOMP_TYPE_CHAR,
-        }
+        nvcompBatchedLZ4Opts_t { data_type: NVCOMP_TYPE_CHAR }
     }
 }
 
@@ -249,10 +236,8 @@ impl Compressor for NvcompCompressor {
         // SAFETY: Semaphore permit is acquired async; we use try_acquire
         // to fail fast if GPU is saturated. The caller (AccelDispatcher)
         // falls back to the next tier on failure.
-        let _permit = self.semaphore.try_acquire().map_err(|_| {
-            AccelError::CompressionError {
-                reason: "GPU saturated — no semaphore permits available".into(),
-            }
+        let _permit = self.semaphore.try_acquire().map_err(|_| AccelError::CompressionError {
+            reason: "GPU saturated — no semaphore permits available".into(),
         })?;
 
         let num_chunks: usize = 1;
@@ -285,17 +270,12 @@ impl Compressor for NvcompCompressor {
         // --- Step 2: Allocate device input ---
         // SAFETY: device is a valid, initialized CudaDevice.
         let d_input = unsafe {
-            let mut slice = self
-                .device
-                .alloc::<u8>(data.len())
-                .map_err(|e| AccelError::CompressionError {
-                    reason: format!("GPU input alloc failed: {e}"),
-                })?;
-            self.device
-                .htod_sync_copy_into(data, &mut slice)
-                .map_err(|e| AccelError::CompressionError {
-                    reason: format!("GPU input copy failed: {e}"),
-                })?;
+            let mut slice = self.device.alloc::<u8>(data.len()).map_err(|e| {
+                AccelError::CompressionError { reason: format!("GPU input alloc failed: {e}") }
+            })?;
+            self.device.htod_sync_copy_into(data, &mut slice).map_err(|e| {
+                AccelError::CompressionError { reason: format!("GPU input copy failed: {e}") }
+            })?;
             slice
         };
 
@@ -304,12 +284,7 @@ impl Compressor for NvcompCompressor {
         // SAFETY: temp_bytes is a valid mutable reference. nvcomp writes
         // the required workspace size on success.
         let status = unsafe {
-            nvcompBatchedLZ4CompressGetTempSize(
-                num_chunks,
-                max_uncompressed,
-                opts,
-                &mut temp_bytes,
-            )
+            nvcompBatchedLZ4CompressGetTempSize(num_chunks, max_uncompressed, opts, &mut temp_bytes)
         };
         if status != NVCOMP_SUCCESS {
             return Err(AccelError::CompressionError {
@@ -329,29 +304,23 @@ impl Compressor for NvcompCompressor {
         };
         if status != NVCOMP_SUCCESS {
             return Err(AccelError::CompressionError {
-                reason: format!(
-                    "nvcompBatchedLZ4CompressGetMaxOutputChunkSize failed: {status}"
-                ),
+                reason: format!("nvcompBatchedLZ4CompressGetMaxOutputChunkSize failed: {status}"),
             });
         }
 
         // --- Step 5: Allocate GPU temp + output ---
         // SAFETY: device is a valid, initialized CudaDevice.
         let d_temp: CudaSlice<u8> = unsafe {
-            self.device
-                .alloc::<u8>(temp_bytes)
-                .map_err(|e| AccelError::CompressionError {
-                    reason: format!("GPU temp alloc failed: {e}"),
-                })?
+            self.device.alloc::<u8>(temp_bytes).map_err(|e| AccelError::CompressionError {
+                reason: format!("GPU temp alloc failed: {e}"),
+            })?
         };
 
         // SAFETY: device is a valid, initialized CudaDevice.
         let d_output: CudaSlice<u8> = unsafe {
-            self.device
-                .alloc::<u8>(max_compressed)
-                .map_err(|e| AccelError::CompressionError {
-                    reason: format!("GPU output alloc failed: {e}"),
-                })?
+            self.device.alloc::<u8>(max_compressed).map_err(|e| AccelError::CompressionError {
+                reason: format!("GPU output alloc failed: {e}"),
+            })?
         };
 
         // --- Step 6: Build device-side pointer/size arrays ---
@@ -368,11 +337,9 @@ impl Compressor for NvcompCompressor {
 
         // SAFETY: device is a valid, initialized CudaDevice.
         let d_output_sizes = unsafe {
-            self.device
-                .alloc::<usize>(num_chunks)
-                .map_err(|e| AccelError::CompressionError {
-                    reason: format!("GPU output sizes array failed: {e}"),
-                })?
+            self.device.alloc::<usize>(num_chunks).map_err(|e| AccelError::CompressionError {
+                reason: format!("GPU output sizes array failed: {e}"),
+            })?
         };
 
         // --- Step 7: Launch nvcomp batched compress ---
@@ -414,11 +381,11 @@ impl Compressor for NvcompCompressor {
 
         // --- Step 9: Read compressed size from device ---
         let compressed_sizes: Vec<usize> =
-            self.device
-                .dtoh_sync_copy(&d_output_sizes)
-                .map_err(|e| AccelError::CompressionError {
+            self.device.dtoh_sync_copy(&d_output_sizes).map_err(|e| {
+                AccelError::CompressionError {
                     reason: format!("GPU read compressed sizes failed: {e}"),
-                })?;
+                }
+            })?;
 
         let compressed_len = compressed_sizes.first().copied().unwrap_or(0);
         if compressed_len == 0 || compressed_len > max_compressed {
@@ -428,12 +395,9 @@ impl Compressor for NvcompCompressor {
         }
 
         // --- Step 10: Copy compressed data device → host ---
-        let host_out: Vec<u8> = self
-            .device
-            .dtoh_sync_copy(&d_output)
-            .map_err(|e| AccelError::CompressionError {
-                reason: format!("GPU read output failed: {e}"),
-            })?;
+        let host_out: Vec<u8> = self.device.dtoh_sync_copy(&d_output).map_err(|e| {
+            AccelError::CompressionError { reason: format!("GPU read output failed: {e}") }
+        })?;
 
         // Truncate to actual compressed size
         let result = Bytes::from(host_out).slice(0..compressed_len);
@@ -450,10 +414,8 @@ impl Compressor for NvcompCompressor {
         }
 
         // --- Acquire GPU semaphore ---
-        let _permit = self.semaphore.try_acquire().map_err(|_| {
-            AccelError::CompressionError {
-                reason: "GPU saturated — no semaphore permits for decompress".into(),
-            }
+        let _permit = self.semaphore.try_acquire().map_err(|_| AccelError::CompressionError {
+            reason: "GPU saturated — no semaphore permits for decompress".into(),
         })?;
 
         let num_chunks: usize = 1;
@@ -481,17 +443,12 @@ impl Compressor for NvcompCompressor {
         // --- Step 2: Allocate device input ---
         // SAFETY: device is a valid, initialized CudaDevice.
         let d_compressed = unsafe {
-            let mut slice = self
-                .device
-                .alloc::<u8>(data.len())
-                .map_err(|e| AccelError::CompressionError {
-                    reason: format!("GPU compressed alloc failed: {e}"),
-                })?;
-            self.device
-                .htod_sync_copy_into(data, &mut slice)
-                .map_err(|e| AccelError::CompressionError {
-                    reason: format!("GPU compressed copy failed: {e}"),
-                })?;
+            let mut slice = self.device.alloc::<u8>(data.len()).map_err(|e| {
+                AccelError::CompressionError { reason: format!("GPU compressed alloc failed: {e}") }
+            })?;
+            self.device.htod_sync_copy_into(data, &mut slice).map_err(|e| {
+                AccelError::CompressionError { reason: format!("GPU compressed copy failed: {e}") }
+            })?;
             slice
         };
 
@@ -504,37 +461,27 @@ impl Compressor for NvcompCompressor {
         let mut temp_bytes: usize = 0;
         // SAFETY: temp_bytes is a valid mutable reference.
         let status = unsafe {
-            nvcompBatchedLZ4DecompressGetTempSize(
-                num_chunks,
-                max_uncompressed,
-                &mut temp_bytes,
-            )
+            nvcompBatchedLZ4DecompressGetTempSize(num_chunks, max_uncompressed, &mut temp_bytes)
         };
         if status != NVCOMP_SUCCESS {
             return Err(AccelError::CompressionError {
-                reason: format!(
-                    "nvcompBatchedLZ4DecompressGetTempSize failed: {status}"
-                ),
+                reason: format!("nvcompBatchedLZ4DecompressGetTempSize failed: {status}"),
             });
         }
 
         // --- Step 5: Allocate GPU temp + output ---
         // SAFETY: device is a valid, initialized CudaDevice.
         let d_temp: CudaSlice<u8> = unsafe {
-            self.device
-                .alloc::<u8>(temp_bytes)
-                .map_err(|e| AccelError::CompressionError {
-                    reason: format!("GPU decomp temp alloc failed: {e}"),
-                })?
+            self.device.alloc::<u8>(temp_bytes).map_err(|e| AccelError::CompressionError {
+                reason: format!("GPU decomp temp alloc failed: {e}"),
+            })?
         };
 
         // SAFETY: device is a valid, initialized CudaDevice.
         let d_output: CudaSlice<u8> = unsafe {
-            self.device
-                .alloc::<u8>(max_uncompressed)
-                .map_err(|e| AccelError::CompressionError {
-                    reason: format!("GPU decomp output alloc failed: {e}"),
-                })?
+            self.device.alloc::<u8>(max_uncompressed).map_err(|e| AccelError::CompressionError {
+                reason: format!("GPU decomp output alloc failed: {e}"),
+            })?
         };
 
         // --- Step 6: Build device-side arrays ---
@@ -551,20 +498,16 @@ impl Compressor for NvcompCompressor {
         // SAFETY: device is a valid, initialized CudaDevice.
         // SAFETY: device is a valid, initialized CudaDevice.
         let d_out_actual_sizes: CudaSlice<usize> = unsafe {
-            self.device
-                .alloc::<usize>(num_chunks)
-                .map_err(|e| AccelError::CompressionError {
-                    reason: format!("GPU out actual sizes array failed: {e}"),
-                })?
+            self.device.alloc::<usize>(num_chunks).map_err(|e| AccelError::CompressionError {
+                reason: format!("GPU out actual sizes array failed: {e}"),
+            })?
         };
 
         // SAFETY: device is a valid, initialized CudaDevice.
         let d_statuses: CudaSlice<i32> = unsafe {
-            self.device
-                .alloc::<i32>(num_chunks)
-                .map_err(|e| AccelError::CompressionError {
-                    reason: format!("GPU statuses array failed: {e}"),
-                })?
+            self.device.alloc::<i32>(num_chunks).map_err(|e| AccelError::CompressionError {
+                reason: format!("GPU statuses array failed: {e}"),
+            })?
         };
 
         // --- Step 7: Launch nvcomp batched decompress ---
@@ -603,12 +546,9 @@ impl Compressor for NvcompCompressor {
         }
 
         // --- Step 9: Check per-chunk decompression status ---
-        let host_statuses: Vec<i32> =
-            self.device
-                .dtoh_sync_copy(&d_statuses)
-                .map_err(|e| AccelError::CompressionError {
-                    reason: format!("GPU read statuses failed: {e}"),
-                })?;
+        let host_statuses: Vec<i32> = self.device.dtoh_sync_copy(&d_statuses).map_err(|e| {
+            AccelError::CompressionError { reason: format!("GPU read statuses failed: {e}") }
+        })?;
 
         let chunk_status = host_statuses.first().copied().unwrap_or(-1);
         if chunk_status != NVCOMP_SUCCESS {
@@ -618,19 +558,17 @@ impl Compressor for NvcompCompressor {
         }
 
         // --- Step 10: Read decompressed data ---
-        let host_out: Vec<u8> = self
-            .device
-            .dtoh_sync_copy(&d_output)
-            .map_err(|e| AccelError::CompressionError {
+        let host_out: Vec<u8> =
+            self.device.dtoh_sync_copy(&d_output).map_err(|e| AccelError::CompressionError {
                 reason: format!("GPU read decompressed output failed: {e}"),
             })?;
 
         let actual_sizes: Vec<usize> =
-            self.device
-                .dtoh_sync_copy(&d_out_actual_sizes)
-                .map_err(|e| AccelError::CompressionError {
+            self.device.dtoh_sync_copy(&d_out_actual_sizes).map_err(|e| {
+                AccelError::CompressionError {
                     reason: format!("GPU read actual sizes failed: {e}"),
-                })?;
+                }
+            })?;
 
         let actual_len = actual_sizes.first().copied().unwrap_or(host_out.len());
         let len = actual_len.min(host_out.len());

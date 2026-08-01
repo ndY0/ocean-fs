@@ -20,11 +20,7 @@ use std::process::Command;
 /// Returns `true` if the given command is found in PATH.
 #[cfg(feature = "cuda")]
 fn command_exists(cmd: &str) -> bool {
-    Command::new("which")
-        .arg(cmd)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    Command::new("which").arg(cmd).output().map(|o| o.status.success()).unwrap_or(false)
 }
 
 /// Returns `true` if the given shared library exists at one of the
@@ -61,6 +57,11 @@ fn pkg_config(lib: &str, flag: &str) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // Declare custom cfgs — always emitted so test files referencing
+    // no_cuda_toolkit / no_nvcomp don't fail other feature builds.
+    println!("cargo:rustc-check-cfg=cfg(no_cuda_toolkit)");
+    println!("cargo:rustc-check-cfg=cfg(no_nvcomp)");
+
     // --- ISA-L linking (gated on feature isa-l) ---
     #[cfg(feature = "isa-l")]
     {
@@ -94,10 +95,6 @@ fn main() {
     // --- CUDA toolkit + nvCOMP probing (gated on feature cuda) ---
     #[cfg(feature = "cuda")]
     {
-        // Declare custom cfgs used in Rust code
-        println!("cargo:rustc-check-cfg=cfg(no_cuda_toolkit)");
-        println!("cargo:rustc-check-cfg=cfg(no_nvcomp)");
-
         // ---- CUDA toolkit (nvcc + cudart) ----
         let has_cuda = command_exists("nvcc") && lib_exists("cudart");
 
@@ -124,7 +121,9 @@ fn main() {
                 .status()
             {
                 if !status.success() {
-                    eprintln!("cargo:warning=CUDA kernel recompilation failed; using checked-in PTX");
+                    eprintln!(
+                        "cargo:warning=CUDA kernel recompilation failed; using checked-in PTX"
+                    );
                 }
             }
 

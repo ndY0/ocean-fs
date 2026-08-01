@@ -133,10 +133,7 @@ impl PrefetchEngine {
 
         let end = (cursor + self.config.after_list).min(keys.len());
         for key in &keys[cursor..end] {
-            let task = PrefetchTask {
-                bucket: bucket.clone(),
-                key: key.clone(),
-            };
+            let task = PrefetchTask { bucket: bucket.clone(), key: key.clone() };
             // Best-effort: if queue is full, drop.
             let _ = self.sender.try_send(task);
         }
@@ -153,10 +150,7 @@ impl PrefetchEngine {
 
         let count = self.config.after_get.min(adjacent_keys.len());
         for k in adjacent_keys.iter().take(count) {
-            let task = PrefetchTask {
-                bucket: bucket.clone(),
-                key: k.clone(),
-            };
+            let task = PrefetchTask { bucket: bucket.clone(), key: k.clone() };
             let _ = self.sender.try_send(task);
         }
     }
@@ -196,14 +190,9 @@ impl PrefetchWorker {
                         meta_cache.put(task.bucket.clone(), task.key.clone(), meta.clone());
 
                         // Optionally warm the L1 object cache with inline data.
-                        if let (Some(ref obj), Some(inline_data)) =
-                            (&obj_cache, &meta.inline_data)
+                        if let (Some(ref obj), Some(inline_data)) = (&obj_cache, &meta.inline_data)
                         {
-                            obj.put(
-                                task.bucket.clone(),
-                                task.key.clone(),
-                                inline_data.clone(),
-                            );
+                            obj.put(task.bucket.clone(), task.key.clone(), inline_data.clone());
                         }
                     }
                     Ok(None) => {
@@ -236,10 +225,7 @@ mod tests {
 
     impl MockStore {
         fn new(entries: Vec<(BucketId, ObjectKey, ObjectMetadata)>) -> Self {
-            Self {
-                lookup_count: AtomicUsize::new(0),
-                entries,
-            }
+            Self { lookup_count: AtomicUsize::new(0), entries }
         }
     }
 
@@ -248,11 +234,7 @@ mod tests {
             &self,
             _bucket: &BucketId,
         ) -> std::io::Result<Vec<(BucketId, ObjectKey)>> {
-            Ok(self
-                .entries
-                .iter()
-                .map(|(b, k, _)| (b.clone(), k.clone()))
-                .collect())
+            Ok(self.entries.iter().map(|(b, k, _)| (b.clone(), k.clone())).collect())
         }
 
         fn get_object_metadata(
@@ -289,29 +271,17 @@ mod tests {
 
     #[test]
     fn can_be_enabled() {
-        let config = PrefetchConfig {
-            enabled: true,
-            ..Default::default()
-        };
+        let config = PrefetchConfig { enabled: true, ..Default::default() };
         assert!(config.enabled);
     }
 
     #[tokio::test]
     async fn after_list_enqueues_tasks() {
-        let metadata_cache = Arc::new(MetadataCache::new(
-            crate::l2_metadata::MetadataCacheConfig::default(),
-        ));
+        let metadata_cache =
+            Arc::new(MetadataCache::new(crate::l2_metadata::MetadataCacheConfig::default()));
         let entries = vec![
-            (
-                BucketId::new("b"),
-                ObjectKey::new("k1"),
-                make_meta("k1", None),
-            ),
-            (
-                BucketId::new("b"),
-                ObjectKey::new("k2"),
-                make_meta("k2", None),
-            ),
+            (BucketId::new("b"), ObjectKey::new("k1"), make_meta("k1", None)),
+            (BucketId::new("b"), ObjectKey::new("k2"), make_meta("k2", None)),
         ];
         let store = Arc::new(MockStore::new(entries));
         let engine = PrefetchEngine::new(
@@ -327,40 +297,24 @@ mod tests {
             store.clone() as Arc<dyn MetadataStore>,
         );
 
-        let keys = [
-            ObjectKey::new("k1"),
-            ObjectKey::new("k2"),
-        ];
+        let keys = [ObjectKey::new("k1"), ObjectKey::new("k2")];
         engine.after_list(BucketId::new("b"), &keys, 0);
 
         // Give the worker time to process.
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Metadata cache should now be warm.
-        assert!(metadata_cache
-            .get(&BucketId::new("b"), &ObjectKey::new("k1"))
-            .is_some());
-        assert!(metadata_cache
-            .get(&BucketId::new("b"), &ObjectKey::new("k2"))
-            .is_some());
+        assert!(metadata_cache.get(&BucketId::new("b"), &ObjectKey::new("k1")).is_some());
+        assert!(metadata_cache.get(&BucketId::new("b"), &ObjectKey::new("k2")).is_some());
     }
 
     #[tokio::test]
     async fn after_get_prefetches_adjacent_keys() {
-        let metadata_cache = Arc::new(MetadataCache::new(
-            crate::l2_metadata::MetadataCacheConfig::default(),
-        ));
+        let metadata_cache =
+            Arc::new(MetadataCache::new(crate::l2_metadata::MetadataCacheConfig::default()));
         let entries = vec![
-            (
-                BucketId::new("b"),
-                ObjectKey::new("k1"),
-                make_meta("k1", None),
-            ),
-            (
-                BucketId::new("b"),
-                ObjectKey::new("k2"),
-                make_meta("k2", None),
-            ),
+            (BucketId::new("b"), ObjectKey::new("k1"), make_meta("k1", None)),
+            (BucketId::new("b"), ObjectKey::new("k2"), make_meta("k2", None)),
         ];
         let store = Arc::new(MockStore::new(entries));
         let engine = PrefetchEngine::new(
@@ -382,47 +336,32 @@ mod tests {
         // Give the worker time.
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        assert!(metadata_cache
-            .get(&BucketId::new("b"), &ObjectKey::new("k1"))
-            .is_some());
+        assert!(metadata_cache.get(&BucketId::new("b"), &ObjectKey::new("k1")).is_some());
     }
 
     #[tokio::test]
     async fn disabled_engine_is_noop() {
-        let metadata_cache = Arc::new(MetadataCache::new(
-            crate::l2_metadata::MetadataCacheConfig::default(),
-        ));
+        let metadata_cache =
+            Arc::new(MetadataCache::new(crate::l2_metadata::MetadataCacheConfig::default()));
         let store = Arc::new(MockStore::new(vec![]));
         let engine = PrefetchEngine::new(
-            PrefetchConfig {
-                enabled: false,
-                ..Default::default()
-            },
+            PrefetchConfig { enabled: false, ..Default::default() },
             metadata_cache.clone(),
             None,
             store.clone() as Arc<dyn MetadataStore>,
         );
 
-        engine.after_list(
-            BucketId::new("b"),
-            &[ObjectKey::new("k")],
-            0,
-        );
+        engine.after_list(BucketId::new("b"), &[ObjectKey::new("k")], 0);
 
         // No prefetch should have happened.
-        assert!(metadata_cache
-            .get(&BucketId::new("b"), &ObjectKey::new("k"))
-            .is_none());
+        assert!(metadata_cache.get(&BucketId::new("b"), &ObjectKey::new("k")).is_none());
     }
 
     #[tokio::test]
     async fn inline_blob_warms_object_cache() {
-        let obj_cache = Arc::new(ObjectCache::new(
-            crate::l1_object::ObjectCacheConfig::default(),
-        ));
-        let metadata_cache = Arc::new(MetadataCache::new(
-            crate::l2_metadata::MetadataCacheConfig::default(),
-        ));
+        let obj_cache = Arc::new(ObjectCache::new(crate::l1_object::ObjectCacheConfig::default()));
+        let metadata_cache =
+            Arc::new(MetadataCache::new(crate::l2_metadata::MetadataCacheConfig::default()));
         let entries = vec![(
             BucketId::new("b"),
             ObjectKey::new("inline-key"),
@@ -442,11 +381,7 @@ mod tests {
             store.clone() as Arc<dyn MetadataStore>,
         );
 
-        engine.after_list(
-            BucketId::new("b"),
-            &[ObjectKey::new("inline-key")],
-            0,
-        );
+        engine.after_list(BucketId::new("b"), &[ObjectKey::new("inline-key")], 0);
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
@@ -459,9 +394,8 @@ mod tests {
 
     #[tokio::test]
     async fn queue_full_silently_drops() {
-        let metadata_cache = Arc::new(MetadataCache::new(
-            crate::l2_metadata::MetadataCacheConfig::default(),
-        ));
+        let metadata_cache =
+            Arc::new(MetadataCache::new(crate::l2_metadata::MetadataCacheConfig::default()));
         let store = Arc::new(MockStore::new(vec![]));
         let engine = PrefetchEngine::new(
             PrefetchConfig {

@@ -93,9 +93,7 @@ fn stripe_parallelism_with_padding() {
     assert_eq!(plan.stripe_count, 2);
     assert_eq!(plan.padded_size, 2 * 4 * 1024); // 8192
 
-    let segment_data: Vec<u8> = (0..data_size as usize)
-        .map(|i| (i % 256) as u8)
-        .collect();
+    let segment_data: Vec<u8> = (0..data_size as usize).map(|i| (i % 256) as u8).collect();
 
     let encoder = ParallelEncoder::new(codec.clone(), 0);
     let batch = encoder.encode(&segment_data, &plan).unwrap();
@@ -133,8 +131,7 @@ fn stripe_parallelism_single_stripe() {
     };
     let codec = Arc::new(CauchyEncoder::new(config));
 
-    let plan =
-        StripeLayout::compute(data_size as u64, k, m, strip_size).unwrap();
+    let plan = StripeLayout::compute(data_size as u64, k, m, strip_size).unwrap();
     assert_eq!(plan.stripe_count, 1);
 
     let segment_data = vec![0xCCu8; data_size];

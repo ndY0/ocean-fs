@@ -70,10 +70,7 @@ mod tests {
 
     #[test]
     fn gpu_out_of_memory_displays_sizes() {
-        let err = AccelError::GpuOutOfMemory {
-            requested: 1024,
-            available: 512,
-        };
+        let err = AccelError::GpuOutOfMemory { requested: 1024, available: 512 };
         let s = err.to_string();
         assert!(s.contains("1024"));
         assert!(s.contains("512"));
@@ -93,9 +90,7 @@ mod tests {
 
     #[test]
     fn backend_unavailable_displays_backend_name() {
-        let err = AccelError::BackendUnavailable {
-            backend: "cuda".into(),
-        };
+        let err = AccelError::BackendUnavailable { backend: "cuda".into() };
         assert!(err.to_string().contains("cuda"));
     }
 
@@ -113,17 +108,14 @@ mod tests {
 
     #[test]
     fn compression_error_displays_reason() {
-        let err = AccelError::CompressionError {
-            reason: "bad data".into(),
-        };
+        let err = AccelError::CompressionError { reason: "bad data".into() };
         assert!(err.to_string().contains("bad data"));
     }
 
     #[test]
     fn compression_backend_unavailable_displays_tier() {
-        let err = AccelError::CompressionBackendUnavailable {
-            requested: CompressionTier::CpuIgzip,
-        };
+        let err =
+            AccelError::CompressionBackendUnavailable { requested: CompressionTier::CpuIgzip };
         assert!(err.to_string().contains("CpuIgzip"));
     }
 }

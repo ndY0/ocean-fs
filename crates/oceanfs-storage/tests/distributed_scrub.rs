@@ -11,7 +11,11 @@ use oceanfs_storage::{MetadataStore, ScrubConfig, ScrubCoordinator};
 
 fn test_config() -> MetadataConfig {
     let dir = tempfile::tempdir().unwrap();
-    MetadataConfig { data_dir: dir.path().to_path_buf(), block_cache_size: 8 * 1024 * 1024, memtable_size: 8 * 1024 * 1024 }
+    MetadataConfig {
+        data_dir: dir.path().to_path_buf(),
+        block_cache_size: 8 * 1024 * 1024,
+        memtable_size: 8 * 1024 * 1024,
+    }
 }
 
 #[test]
@@ -60,7 +64,8 @@ async fn scrub_cycle_verifies_segments() {
     for _ in 0..3 {
         let seg = SegmentMetadata {
             segment_id: SegmentId::new(),
-            ec_k: 4, ec_m: 2,
+            ec_k: 4,
+            ec_m: 2,
             size_tier: SizeTier::Standard,
             merkle_root: Some(HashOutput::from_bytes([0u8; 32])),
             storage_locations: smallvec::SmallVec::new(),

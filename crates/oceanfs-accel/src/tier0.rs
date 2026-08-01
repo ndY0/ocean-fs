@@ -23,18 +23,12 @@ pub(crate) struct CpuEncoder {
 impl CpuEncoder {
     /// Creates a new CPU encoder with the given codec configuration.
     pub(crate) fn new(config: CodecConfig) -> Self {
-        Self {
-            inner: CauchyEncoder::new(config),
-        }
+        Self { inner: CauchyEncoder::new(config) }
     }
 }
 
 impl Encoder for CpuEncoder {
-    fn encode(
-        &self,
-        data_shards: &[&[u8]],
-        parity_count: u8,
-    ) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+    fn encode(&self, data_shards: &[&[u8]], parity_count: u8) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
         self.inner.encode(data_shards, parity_count)
     }
 }
@@ -111,9 +105,7 @@ mod tests {
         };
         let encoder = CpuEncoder::new(config);
 
-        let shard_data: Vec<Vec<u8>> = (0..4)
-            .map(|i| vec![b'a' + i; 64])
-            .collect();
+        let shard_data: Vec<Vec<u8>> = (0..4).map(|i| vec![b'a' + i; 64]).collect();
         let shard_refs: Vec<&[u8]> = shard_data.iter().map(|v| v.as_slice()).collect();
 
         let parity = encoder.encode(&shard_refs, 2).unwrap();
@@ -122,7 +114,7 @@ mod tests {
 
         // Simulate losing data shard 0 — should recover it
         let available: Vec<Option<&[u8]>> = vec![
-            None,                     // shard 0 missing
+            None, // shard 0 missing
             Some(&shard_data[1]),
             Some(&shard_data[2]),
             Some(&shard_data[3]),

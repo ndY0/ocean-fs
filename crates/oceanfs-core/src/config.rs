@@ -92,10 +92,7 @@ mod tests {
         let config = MetadataConfig::default();
         assert_eq!(config.block_cache_size, 128 * 1024 * 1024);
         assert_eq!(config.memtable_size, 64 * 1024 * 1024);
-        assert_eq!(
-            config.data_dir,
-            std::path::PathBuf::from("/var/lib/oceanfs/metadata")
-        );
+        assert_eq!(config.data_dir, std::path::PathBuf::from("/var/lib/oceanfs/metadata"));
     }
 }
 

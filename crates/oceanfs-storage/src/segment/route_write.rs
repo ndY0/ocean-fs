@@ -84,16 +84,17 @@ pub(crate) fn route_write(
             }
             Ok(ChunkListBuilder::multi(refs))
         }
-                  _ => Ok(smallvec::SmallVec::new()),
+        _ => Ok(smallvec::SmallVec::new()),
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use oceanfs_core::SegmentSizeConfig;
+
     use super::*;
     use crate::buffer_pool::BufferPool;
-    use oceanfs_core::SegmentSizeConfig;
 
     fn test_config() -> MetadataStore {
         let dir = tempfile::tempdir().unwrap();
@@ -101,7 +102,8 @@ mod tests {
             data_dir: dir.path().join("meta"),
             block_cache_size: 1024,
             memtable_size: 1024,
-        }).unwrap()
+        })
+        .unwrap()
     }
 
     fn test_pool(chunk_size: usize, max: usize) -> BufferPool {
@@ -121,7 +123,8 @@ mod tests {
             SizeTier::Small,
             &SegmentSizeConfig::default(),
             &pool,
-        ).unwrap();
+        )
+        .unwrap();
         let key = ObjectKey::new("inline-test");
 
         let data = Bytes::from_static(b"tiny"); // 4 bytes ≤ 4096 → Inline
@@ -144,17 +147,16 @@ mod tests {
     fn route_write_small_tier_returns_chunk_ref() {
         let metadata = test_config();
         // Custom config: inline threshold = 0 so 5KB goes to Small tier
-        let config = SegmentSizeConfig {
-            inline_threshold_bytes: 0,
-            ..SegmentSizeConfig::default()
-        };
+        let config =
+            SegmentSizeConfig { inline_threshold_bytes: 0, ..SegmentSizeConfig::default() };
         let router = TierRouter::new(config);
         let pool = test_pool(65536, 8);
         let mut active = crate::segment::buffer::ActiveSegment::new(
             SizeTier::Small,
             &SegmentSizeConfig::default(),
             &pool,
-        ).unwrap();
+        )
+        .unwrap();
         let key = ObjectKey::new("small-test");
         let data = Bytes::from(vec![0xCC; 5000]); // 5 KB → Small (≤256KB)
 
@@ -175,7 +177,8 @@ mod tests {
             SizeTier::Standard,
             &SegmentSizeConfig::default(),
             &pool,
-        ).unwrap();
+        )
+        .unwrap();
         let key = ObjectKey::new("std-test");
         let data = Bytes::from(vec![0xDD; 1_048_576]); // 1 MB → Standard
 
@@ -204,7 +207,8 @@ mod tests {
             SizeTier::Multi,
             &SegmentSizeConfig { default_target_size: 10_485_760, ..SegmentSizeConfig::default() },
             &pool,
-        ).unwrap();
+        )
+        .unwrap();
         let key = ObjectKey::new("multi-test");
         // 3 MB, each chunk is 1 MB (default_target_size)
         let data = Bytes::from(vec![0xEE; 3_145_728]);
@@ -234,7 +238,8 @@ mod tests {
             SizeTier::Standard,
             &SegmentSizeConfig::default(),
             &pool,
-        ).unwrap();
+        )
+        .unwrap();
         let key = ObjectKey::new("empty");
 
         let refs = route_write(&router, &metadata, &mut active, key, Bytes::new()).unwrap();

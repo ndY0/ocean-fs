@@ -35,10 +35,9 @@ mod traits;
 
 pub use cauchy::CauchyEncoder;
 pub use error::{Error, Result};
+#[cfg(feature = "isa-l")]
+pub use isal::isal::IsalEncoder;
 pub use oceanfs_core::EncodingPlan;
 pub use shard::{cast_shard_slice, cast_shard_slice_mut, ShardData, ShardPod};
 pub use stripe::{ParallelDecoder, ParallelEncoder, StripeBatch, StripeLayout};
 pub use traits::{Decoder, Encoder};
-
-#[cfg(feature = "isa-l")]
-pub use isal::isal::IsalEncoder;

@@ -6,17 +6,23 @@
 //! Per performance guideline §11.1, all counters use `AtomicU64` with
 //! relaxed ordering on the hot path.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use axum::routing::{get, post};
-use axum::{Json, Router};
-use parking_lot::RwLock;
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use oceanfs_core::SizeTier;
+use parking_lot::RwLock;
 use serde::Serialize;
 use tracing::instrument;
 
@@ -39,10 +45,7 @@ pub struct MetricsRegistry {
 impl MetricsRegistry {
     /// Creates a new empty metrics registry.
     pub fn new() -> Self {
-        Self {
-            counters: RwLock::new(HashMap::new()),
-            histograms: RwLock::new(HashMap::new()),
-        }
+        Self { counters: RwLock::new(HashMap::new()), histograms: RwLock::new(HashMap::new()) }
     }
 
     /// Registers or retrieves a counter by name.
@@ -61,12 +64,7 @@ impl MetricsRegistry {
     pub fn histogram(&self, name: &str, help: &str) -> Arc<Histogram> {
         let mut map = self.histograms.write();
         map.entry(name.to_string())
-            .or_insert_with(|| {
-                Arc::new(Histogram::new(
-                    name.to_string(),
-                    help.to_string(),
-                ))
-            })
+            .or_insert_with(|| Arc::new(Histogram::new(name.to_string(), help.to_string())))
             .clone()
     }
 
@@ -193,24 +191,16 @@ impl Histogram {
         let count = self.count.load(Ordering::Relaxed);
         let buckets = self.buckets.read();
 
-        let mut out = format!(
-            "# HELP {} {}\n# TYPE {} histogram\n",
-            self.name, self.help, self.name
-        );
+        let mut out =
+            format!("# HELP {} {}\n# TYPE {} histogram\n", self.name, self.help, self.name);
 
         let mut cumulative = 0u64;
         for (i, bound) in self.bucket_bounds.iter().enumerate() {
             cumulative = cumulative.wrapping_add(buckets[i]);
-            out.push_str(&format!(
-                "{}_bucket{{le=\"{}\"}} {}\n",
-                self.name, bound, cumulative
-            ));
+            out.push_str(&format!("{}_bucket{{le=\"{}\"}} {}\n", self.name, bound, cumulative));
         }
         // +Inf bucket
-        out.push_str(&format!(
-            "{}_bucket{{le=\"+Inf\"}} {}\n",
-            self.name, count
-        ));
+        out.push_str(&format!("{}_bucket{{le=\"+Inf\"}} {}\n", self.name, count));
         out.push_str(&format!("{}_sum {}\n", self.name, sum));
         out.push_str(&format!("{}_count {}\n", self.name, count));
 
@@ -266,10 +256,8 @@ fn serialize_tier_map<S>(map: &HashMap<SizeTier, u64>, s: S) -> Result<S::Ok, S:
 where
     S: serde::Serializer,
 {
-    let string_map: HashMap<String, u64> = map
-        .iter()
-        .map(|(k, v)| (format!("{:?}", k).to_lowercase(), *v))
-        .collect();
+    let string_map: HashMap<String, u64> =
+        map.iter().map(|(k, v)| (format!("{:?}", k).to_lowercase(), *v)).collect();
     string_map.serialize(s)
 }
 
@@ -311,10 +299,7 @@ pub struct AdminHandler {
 
 impl AdminHandler {
     /// Creates a new admin handler.
-    pub fn new(
-        buckets: Arc<BucketConfigStore>,
-        metrics: Arc<MetricsRegistry>,
-    ) -> Self {
+    pub fn new(buckets: Arc<BucketConfigStore>, metrics: Arc<MetricsRegistry>) -> Self {
         Self { state: AdminState { buckets, metrics } }
     }
 
@@ -339,11 +324,7 @@ async fn cluster_view(State(state): State<AdminState>) -> impl IntoResponse {
     // In a full implementation, this would query Membership and RingCache.
     // For now, return a placeholder with bucket count as a useful data point.
     let buckets = state.buckets.list();
-    let view = ClusterView {
-        nodes: Vec::new(),
-        vnodes: 0,
-        generation: 0,
-    };
+    let view = ClusterView { nodes: Vec::new(), vnodes: 0, generation: 0 };
     let _ = buckets; // used when Membership is wired
 
     Json(view).into_response()
@@ -352,13 +333,8 @@ async fn cluster_view(State(state): State<AdminState>) -> impl IntoResponse {
 /// GET /admin/segments — returns segment health report as JSON.
 #[instrument]
 async fn segment_report() -> impl IntoResponse {
-    let report = SegmentReport {
-        total: 0,
-        sealed: 0,
-        unsealed: 0,
-        encoding: 0,
-        by_tier: HashMap::new(),
-    };
+    let report =
+        SegmentReport { total: 0, sealed: 0, unsealed: 0, encoding: 0, by_tier: HashMap::new() };
     Json(report).into_response()
 }
 
@@ -504,13 +480,7 @@ mod tests {
         let mut by_tier = HashMap::new();
         by_tier.insert(SizeTier::Inline, 10);
         by_tier.insert(SizeTier::Standard, 5);
-        let report = SegmentReport {
-            total: 15,
-            sealed: 5,
-            unsealed: 10,
-            encoding: 2,
-            by_tier,
-        };
+        let report = SegmentReport { total: 15, sealed: 5, unsealed: 10, encoding: 2, by_tier };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("inline"));
         assert!(json.contains("standard"));

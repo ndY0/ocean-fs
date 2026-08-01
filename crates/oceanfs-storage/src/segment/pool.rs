@@ -57,18 +57,12 @@ impl PoolSlot {
         pool: &BufferPool,
     ) -> Result<Self> {
         let segment = ActiveSegment::new(tier, config, pool)?;
-        Ok(Self {
-            state: Mutex::new(PoolSlotState::Appending),
-            segment: Mutex::new(Some(segment)),
-        })
+        Ok(Self { state: Mutex::new(PoolSlotState::Appending), segment: Mutex::new(Some(segment)) })
     }
 
     /// Creates a new pool slot in Idle state (no segment).
     fn new_idle() -> Self {
-        Self {
-            state: Mutex::new(PoolSlotState::Idle),
-            segment: Mutex::new(None),
-        }
+        Self { state: Mutex::new(PoolSlotState::Idle), segment: Mutex::new(None) }
     }
 
     /// Returns the current state of this slot.
@@ -266,9 +260,7 @@ impl SegmentPool {
                 }
             }
         }
-        Err(Error::InvalidConfig(
-            "no appending segment available in pool".into(),
-        ))
+        Err(Error::InvalidConfig("no appending segment available in pool".into()))
     }
 
     /// Enqueues a segment ID for EC encoding on the bounded work channel.
@@ -301,9 +293,16 @@ impl SegmentPool {
             let mut seg = slot.segment.lock();
             if seg.is_none() {
                 let state = slot.state();
-                if state == PoolSlotState::Sealing || state == PoolSlotState::Encoding || state == PoolSlotState::Idle {
+                if state == PoolSlotState::Sealing
+                    || state == PoolSlotState::Encoding
+                    || state == PoolSlotState::Idle
+                {
                     // Try to create a new active segment from the buffer pool.
-                    match ActiveSegment::new(self.tier, &self.size_config, self.buffer_pool.as_ref()) {
+                    match ActiveSegment::new(
+                        self.tier,
+                        &self.size_config,
+                        self.buffer_pool.as_ref(),
+                    ) {
                         Ok(new_segment) => {
                             *seg = Some(new_segment);
                             slot.set_state(PoolSlotState::Appending);
@@ -340,11 +339,17 @@ impl SegmentPool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::*;
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc as StdArc,
+        },
+        thread,
+    };
+
     use oceanfs_core::SegmentSizeConfig;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc as StdArc;
-    use std::thread;
+
+    use super::*;
 
     fn test_config() -> (PoolConfig, SegmentSizeConfig) {
         (PoolConfig::default(), SegmentSizeConfig::default())
@@ -404,10 +409,7 @@ mod tests {
             handle.join().unwrap();
         }
 
-        assert_eq!(
-            write_count.load(Ordering::Relaxed),
-            num_threads * writes_per_thread
-        );
+        assert_eq!(write_count.load(Ordering::Relaxed), num_threads * writes_per_thread);
     }
 
     #[test]
@@ -424,7 +426,9 @@ mod tests {
     fn encode_semaphore_has_correct_permits() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
-        let pool = SegmentPool::new(pool_cfg.clone(), SizeTier::Standard, &size_cfg, buf_pool.clone()).unwrap();
+        let pool =
+            SegmentPool::new(pool_cfg.clone(), SizeTier::Standard, &size_cfg, buf_pool.clone())
+                .unwrap();
 
         let sem = pool.encode_semaphore();
         // Verify that the semaphore has been created with the expected count.
@@ -442,10 +446,7 @@ mod tests {
 
     #[test]
     fn custom_pool_size_config() {
-        let pool_cfg = PoolConfig {
-            active_pool_size: 8,
-            ..PoolConfig::default()
-        };
+        let pool_cfg = PoolConfig { active_pool_size: 8, ..PoolConfig::default() };
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = Arc::new(BufferPool::new(65536, 32));
         let pool = SegmentPool::new(pool_cfg, SizeTier::Small, &size_cfg, buf_pool).unwrap();
@@ -454,10 +455,7 @@ mod tests {
 
     #[test]
     fn pool_append_returns_different_segment_ids() {
-        let pool_cfg = PoolConfig {
-            active_pool_size: 2,
-            ..PoolConfig::default()
-        };
+        let pool_cfg = PoolConfig { active_pool_size: 2, ..PoolConfig::default() };
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = test_pool();
         let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool).unwrap();

@@ -8,12 +8,11 @@
 //! Per performance guideline §2.4, bucket policies are stored
 //! in `ArcSwap` for wait-free reads on the hot path.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use arc_swap::ArcSwap;
-use parking_lot::RwLock;
 use oceanfs_core::CodecType;
+use parking_lot::RwLock;
 
 // ---------------------------------------------------------------------------
 // BucketPolicy
@@ -363,10 +362,7 @@ impl BucketConfigStore {
     /// The returned `Arc` is a snapshot; any subsequent policy
     /// update will not be visible through this handle.
     pub fn get(&self, bucket: &str) -> Option<Arc<BucketPolicy>> {
-        self.policies
-            .read()
-            .get(bucket)
-            .map(|swap| swap.load_full())
+        self.policies.read().get(bucket).map(|swap| swap.load_full())
     }
 
     /// Returns `true` if a policy has been explicitly set for this bucket.

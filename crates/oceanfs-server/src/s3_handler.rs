@@ -15,8 +15,7 @@
 //! and §13.2 (`anyhow` only at application boundary — we use
 //! concrete [`Error`] types).
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     body::Body,
@@ -30,12 +29,14 @@ use oceanfs_core::{BucketId, HashKey, ObjectKey};
 use oceanfs_routing::hash_key;
 use tracing::{debug, error, info};
 
-use crate::bucket_config::BucketConfigStore;
-use crate::error::Error;
-use crate::metadata_ops::MetadataOps;
-use crate::read_coordinator::{ReadCoordinator, ReadRequest};
-use crate::s3_xml;
-use crate::write_coordinator::{WriteCoordinator, WriteRequest};
+use crate::{
+    bucket_config::BucketConfigStore,
+    error::Error,
+    metadata_ops::MetadataOps,
+    read_coordinator::{ReadCoordinator, ReadRequest},
+    s3_xml,
+    write_coordinator::{WriteCoordinator, WriteRequest},
+};
 
 // ---------------------------------------------------------------------------
 // Helper: safe HeaderValue construction
@@ -112,13 +113,8 @@ impl S3Handler {
         metadata: Arc<dyn MetadataOps>,
         buckets: Arc<BucketConfigStore>,
     ) -> Self {
-        let state = AppState {
-            write,
-            read,
-            metadata,
-            buckets,
-            mime_types: Arc::new(MimeMap::default()),
-        };
+        let state =
+            AppState { write, read, metadata, buckets, mime_types: Arc::new(MimeMap::default()) };
         Self { state }
     }
 
@@ -141,9 +137,7 @@ impl S3Handler {
             // Bucket operations: /{bucket}
             .route(
                 "/{bucket}",
-                axum::routing::put(create_bucket)
-                    .get(list_objects)
-                    .delete(delete_bucket),
+                axum::routing::put(create_bucket).get(list_objects).delete(delete_bucket),
             )
             .with_state(state)
     }
@@ -184,10 +178,7 @@ async fn put_object(
 
     match state.write.put(req).await {
         Ok(result) => {
-            let etag = result
-                .blake3_hash
-                .map(|h| h.to_hex())
-                .unwrap_or_default();
+            let etag = result.blake3_hash.map(|h| h.to_hex()).unwrap_or_default();
 
             info!(key = %key, size = result.size, etag = %etag, "PUT object success");
 
@@ -228,12 +219,8 @@ async fn get_object(
 
     match state.read.get(req).await {
         Ok(result) => {
-            let etag = result
-                .metadata
-                .blake3_hash
-                .as_ref()
-                .map(|h| h.to_hex())
-                .unwrap_or_else(|| {
+            let etag =
+                result.metadata.blake3_hash.as_ref().map(|h| h.to_hex()).unwrap_or_else(|| {
                     let hash = blake3::hash(&result.data);
                     oceanfs_core::HashOutput::from_bytes(*hash.as_bytes()).to_hex()
                 });
@@ -244,10 +231,7 @@ async fn get_object(
             let mut headers = HeaderMap::new();
             headers.insert(header::CONTENT_TYPE, header_val(&content_type));
             headers.insert(header::ETAG, header_val(&etag));
-            headers.insert(
-                header::CONTENT_LENGTH,
-                header_val(&result.data.len().to_string()),
-            );
+            headers.insert(header::CONTENT_LENGTH, header_val(&result.data.len().to_string()));
 
             (StatusCode::OK, headers, Body::from(result.data)).into_response()
         }
@@ -282,12 +266,7 @@ async fn head_object(
 
     match state.read.get(req).await {
         Ok(result) => {
-            let etag = result
-                .metadata
-                .blake3_hash
-                .as_ref()
-                .map(|h| h.to_hex())
-                .unwrap_or_default();
+            let etag = result.metadata.blake3_hash.as_ref().map(|h| h.to_hex()).unwrap_or_default();
             let size = result.metadata.size;
 
             debug!(key = %key, size = size, "HEAD object success");
@@ -343,10 +322,7 @@ async fn delete_object(
 /// # Errors
 ///
 /// Returns `409` if the bucket already exists.
-async fn create_bucket(
-    State(state): State<AppState>,
-    Path(bucket): Path<String>,
-) -> Response {
+async fn create_bucket(State(state): State<AppState>, Path(bucket): Path<String>) -> Response {
     if state.buckets.exists(&bucket) {
         let err = Error::BucketAlreadyExists(bucket.clone());
         return s3_error_response(&err, &bucket, "");
@@ -381,11 +357,7 @@ async fn list_objects(
             let entries: Vec<(String, u64, String)> = objects
                 .iter()
                 .map(|m| {
-                    let etag = m
-                        .blake3_hash
-                        .as_ref()
-                        .map(|h| h.to_hex())
-                        .unwrap_or_default();
+                    let etag = m.blake3_hash.as_ref().map(|h| h.to_hex()).unwrap_or_default();
                     (m.object_key.as_str().to_string(), m.size, etag)
                 })
                 .collect();
@@ -408,10 +380,7 @@ async fn list_objects(
 ///
 /// Returns `409` if the bucket is not empty.
 /// Returns `404` if the bucket does not exist.
-async fn delete_bucket(
-    State(state): State<AppState>,
-    Path(bucket): Path<String>,
-) -> Response {
+async fn delete_bucket(State(state): State<AppState>, Path(bucket): Path<String>) -> Response {
     if !state.buckets.exists(&bucket) {
         let err = Error::NotFound(format!("bucket {bucket}"));
         return s3_error_response(&err, &bucket, "");
@@ -442,11 +411,7 @@ async fn delete_bucket(
 
 /// Builds an S3-compatible XML error response from a server error.
 fn s3_error_response(err: &Error, bucket: &str, key: &str) -> Response {
-    let resource = if key.is_empty() {
-        bucket.to_string()
-    } else {
-        format!("{}/{}", bucket, key)
-    };
+    let resource = if key.is_empty() { bucket.to_string() } else { format!("{}/{}", bucket, key) };
 
     let status = err.s3_status();
     let code = err.s3_code();
@@ -469,10 +434,7 @@ fn s3_error_response(err: &Error, bucket: &str, key: &str) -> Response {
 /// Generates a short request ID for error XML bodies.
 fn uuid_for_error() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
     format!("{:016x}", ts % 0xFFFFFFFFFFFFFFFFu128)
 }
 
@@ -536,10 +498,7 @@ impl MimeMap {
     pub fn guess(&self, key: &str) -> String {
         if let Some(dot_pos) = key.rfind('.') {
             let ext = &key[(dot_pos + 1)..];
-            self.map
-                .get(ext)
-                .cloned()
-                .unwrap_or_else(|| "application/octet-stream".into())
+            self.map.get(ext).cloned().unwrap_or_else(|| "application/octet-stream".into())
         } else {
             "application/octet-stream".into()
         }
@@ -562,18 +521,20 @@ mod tests {
     use std::net::SocketAddr;
 
     use oceanfs_core::{
-        BucketId, GossipConfig, HlcClock, Incarnation, NodeId, NodeState,
-        ObjectMetadata, RingConfig, RpcConfig,
+        BucketId, GossipConfig, HlcClock, Incarnation, NodeId, NodeState, ObjectMetadata,
+        RingConfig, RpcConfig,
     };
     use oceanfs_membership::Membership;
     use oceanfs_network::ConnectionPool;
     use oceanfs_routing::{Ring, RingCache};
 
     use super::*;
-    use crate::bucket_config::BucketConfigStore;
-    use crate::metadata_ops::{MetadataOps, MetadataError};
-    use crate::read_coordinator::ReadCoordinator;
-    use crate::write_coordinator::WriteCoordinator;
+    use crate::{
+        bucket_config::BucketConfigStore,
+        metadata_ops::{MetadataError, MetadataOps},
+        read_coordinator::ReadCoordinator,
+        write_coordinator::WriteCoordinator,
+    };
 
     // --- Mock MetadataOps ---
 
@@ -600,11 +561,7 @@ mod tests {
             Ok(self.objects.read().get(&(bucket.as_str().into(), key.as_str().into())).cloned())
         }
 
-        fn delete_object(
-            &self,
-            bucket: &BucketId,
-            key: &ObjectKey,
-        ) -> Result<(), MetadataError> {
+        fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> Result<(), MetadataError> {
             // S3 DELETE is idempotent: always succeed, even if the
             // object doesn't exist (write a tombstone).
             let k = (bucket.as_str().into(), key.as_str().into());
@@ -632,10 +589,7 @@ mod tests {
     // --- Test helpers ---
 
     fn make_app_state() -> AppState {
-        let mut ring = Ring::new(RingConfig {
-            vnodes_per_node: 8,
-            replication_factor: 3,
-        });
+        let mut ring = Ring::new(RingConfig { vnodes_per_node: 8, replication_factor: 3 });
         ring.add_node(NodeId::new("n1"));
         let ring_cache = Arc::new(RingCache::new(ring));
         let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
@@ -645,12 +599,7 @@ mod tests {
             GossipConfig::default(),
             ring_cache.clone(),
         ));
-        membership.upsert_node(
-            NodeId::new("n1"),
-            NodeState::Alive,
-            Incarnation::new(1),
-            addr,
-        );
+        membership.upsert_node(NodeId::new("n1"), NodeState::Alive, Incarnation::new(1), addr);
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let hlc_clock = Arc::new(HlcClock::new());
 
@@ -665,13 +614,7 @@ mod tests {
         let metadata: Arc<dyn MetadataOps> = Arc::new(MockMetadata::new());
         let buckets = Arc::new(BucketConfigStore::new());
 
-        AppState {
-            write,
-            read,
-            metadata,
-            buckets,
-            mime_types: Arc::new(MimeMap::new()),
-        }
+        AppState { write, read, metadata, buckets, mime_types: Arc::new(MimeMap::new()) }
     }
 
     // --- MIME Map tests ---
@@ -734,11 +677,8 @@ mod tests {
         let state = make_app_state();
         state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
 
-        let response = get_object(
-            State(state),
-            Path(("test-bucket".into(), "any.txt".into())),
-        )
-        .await;
+        let response =
+            get_object(State(state), Path(("test-bucket".into(), "any.txt".into()))).await;
 
         assert_eq!(response.status(), StatusCode::OK);
     }
@@ -748,11 +688,8 @@ mod tests {
         let state = make_app_state();
         state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
 
-        let response = head_object(
-            State(state),
-            Path(("test-bucket".into(), "meta.txt".into())),
-        )
-        .await;
+        let response =
+            head_object(State(state), Path(("test-bucket".into(), "meta.txt".into()))).await;
 
         assert_eq!(response.status(), StatusCode::OK);
     }
@@ -762,11 +699,8 @@ mod tests {
         let state = make_app_state();
         state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
 
-        let response = head_object(
-            State(state),
-            Path(("test-bucket".into(), "small.txt".into())),
-        )
-        .await;
+        let response =
+            head_object(State(state), Path(("test-bucket".into(), "small.txt".into()))).await;
 
         let headers = response.headers();
         assert!(headers.contains_key(header::CONTENT_LENGTH));
@@ -777,11 +711,8 @@ mod tests {
     async fn delete_object_returns_204() {
         let state = make_app_state();
 
-        let response = delete_object(
-            State(state),
-            Path(("test-bucket".into(), "delete-me.txt".into())),
-        )
-        .await;
+        let response =
+            delete_object(State(state), Path(("test-bucket".into(), "delete-me.txt".into()))).await;
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
@@ -791,11 +722,9 @@ mod tests {
         // S3 DELETE is idempotent — always returns 204.
         let state = make_app_state();
 
-        let response = delete_object(
-            State(state),
-            Path(("test-bucket".into(), "never-existed.txt".into())),
-        )
-        .await;
+        let response =
+            delete_object(State(state), Path(("test-bucket".into(), "never-existed.txt".into())))
+                .await;
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }

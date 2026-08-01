@@ -32,18 +32,14 @@ fn bench_ec_encode_4_2_64k(c: &mut Criterion) {
     };
     let encoder = CauchyEncoder::new(config);
 
-    let data: Vec<Vec<u8>> = (0..4)
-        .map(|i| vec![(i as u8).wrapping_mul(64); 65536])
-        .collect();
+    let data: Vec<Vec<u8>> = (0..4).map(|i| vec![(i as u8).wrapping_mul(64); 65536]).collect();
     let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
 
     let mut group = c.benchmark_group("ec_encode");
     group.throughput(Throughput::Bytes(65536 * 4));
     group.measurement_time(Duration::from_secs(5));
     group.bench_function("k4_m2_64k", |b| {
-        b.iter(|| {
-            encoder.encode(black_box(&shard_refs), 2).unwrap()
-        });
+        b.iter(|| encoder.encode(black_box(&shard_refs), 2).unwrap());
     });
     group.finish();
 }
@@ -58,17 +54,13 @@ fn bench_ec_encode_8_4_64k(c: &mut Criterion) {
     };
     let encoder = CauchyEncoder::new(config);
 
-    let data: Vec<Vec<u8>> = (0..8)
-        .map(|i| vec![(i as u8).wrapping_mul(64); 65536])
-        .collect();
+    let data: Vec<Vec<u8>> = (0..8).map(|i| vec![(i as u8).wrapping_mul(64); 65536]).collect();
     let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
 
     let mut group = c.benchmark_group("ec_encode");
     group.throughput(Throughput::Bytes(65536 * 8));
     group.bench_function("k8_m4_64k", |b| {
-        b.iter(|| {
-            encoder.encode(black_box(&shard_refs), 4).unwrap()
-        });
+        b.iter(|| encoder.encode(black_box(&shard_refs), 4).unwrap());
     });
     group.finish();
 }
@@ -83,17 +75,13 @@ fn bench_ec_encode_16_8_64k(c: &mut Criterion) {
     };
     let encoder = CauchyEncoder::new(config);
 
-    let data: Vec<Vec<u8>> = (0..16)
-        .map(|i| vec![(i as u8).wrapping_mul(64); 65536])
-        .collect();
+    let data: Vec<Vec<u8>> = (0..16).map(|i| vec![(i as u8).wrapping_mul(64); 65536]).collect();
     let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
 
     let mut group = c.benchmark_group("ec_encode");
     group.throughput(Throughput::Bytes(65536 * 16));
     group.bench_function("k16_m8_64k", |b| {
-        b.iter(|| {
-            encoder.encode(black_box(&shard_refs), 8).unwrap()
-        });
+        b.iter(|| encoder.encode(black_box(&shard_refs), 8).unwrap());
     });
     group.finish();
 }
@@ -108,17 +96,13 @@ fn bench_ec_encode_4_2_4k(c: &mut Criterion) {
     };
     let encoder = CauchyEncoder::new(config);
 
-    let data: Vec<Vec<u8>> = (0..4)
-        .map(|i| vec![(i as u8).wrapping_mul(64); 4096])
-        .collect();
+    let data: Vec<Vec<u8>> = (0..4).map(|i| vec![(i as u8).wrapping_mul(64); 4096]).collect();
     let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
 
     let mut group = c.benchmark_group("ec_encode");
     group.throughput(Throughput::Bytes(4096 * 4));
     group.bench_function("k4_m2_4k", |b| {
-        b.iter(|| {
-            encoder.encode(black_box(&shard_refs), 2).unwrap()
-        });
+        b.iter(|| encoder.encode(black_box(&shard_refs), 2).unwrap());
     });
     group.finish();
 }
@@ -133,9 +117,7 @@ fn bench_ec_decode_4_2_64k(c: &mut Criterion) {
     };
     let encoder = CauchyEncoder::new(config);
 
-    let data: Vec<Vec<u8>> = (0..4)
-        .map(|i| vec![(i as u8).wrapping_mul(64); 65536])
-        .collect();
+    let data: Vec<Vec<u8>> = (0..4).map(|i| vec![(i as u8).wrapping_mul(64); 65536]).collect();
     let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
     let parity = encoder.encode(&shard_refs, 2).unwrap();
 
@@ -153,9 +135,7 @@ fn bench_ec_decode_4_2_64k(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(65536 * 4));
     group.measurement_time(Duration::from_secs(5));
     group.bench_function("k4_m2_64k_recover1", |b| {
-        b.iter(|| {
-            encoder.decode(black_box(&available), 4, 2).unwrap()
-        });
+        b.iter(|| encoder.decode(black_box(&available), 4, 2).unwrap());
     });
     group.finish();
 }
@@ -170,9 +150,7 @@ fn bench_ec_decode_8_4_64k(c: &mut Criterion) {
     };
     let encoder = CauchyEncoder::new(config);
 
-    let data: Vec<Vec<u8>> = (0..8)
-        .map(|i| vec![(i as u8).wrapping_mul(64); 65536])
-        .collect();
+    let data: Vec<Vec<u8>> = (0..8).map(|i| vec![(i as u8).wrapping_mul(64); 65536]).collect();
     let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
     let parity = encoder.encode(&shard_refs, 4).unwrap();
 
@@ -195,9 +173,7 @@ fn bench_ec_decode_8_4_64k(c: &mut Criterion) {
     let mut group = c.benchmark_group("ec_decode");
     group.throughput(Throughput::Bytes(65536 * 8));
     group.bench_function("k8_m4_64k_recover2", |b| {
-        b.iter(|| {
-            encoder.decode(black_box(&available), 8, 4).unwrap()
-        });
+        b.iter(|| encoder.decode(black_box(&available), 8, 4).unwrap());
     });
     group.finish();
 }

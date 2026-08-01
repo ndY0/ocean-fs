@@ -9,56 +9,38 @@ fn auto_tier_resolves_to_cpu_simd() {
     let dispatcher = AccelDispatcher::new(AccelConfig::default());
     let tier = dispatcher.active_tier();
     // Without cuda, auto → CpuSimd. With cuda + GPU, auto → GpuCuda.
-    assert!(
-        tier == AccelTier::CpuSimd || tier == AccelTier::GpuCuda,
-        "unexpected tier: {tier:?}"
-    );
+    assert!(tier == AccelTier::CpuSimd || tier == AccelTier::GpuCuda, "unexpected tier: {tier:?}");
 }
 
 #[test]
 fn cpu_simd_explicit_selects_simd() {
-    let config = AccelConfig {
-        ec_tier: "cpu_simd".into(),
-        ..Default::default()
-    };
+    let config = AccelConfig { ec_tier: "cpu_simd".into(), ..Default::default() };
     let dispatcher = AccelDispatcher::new(config);
     assert_eq!(dispatcher.active_tier(), AccelTier::CpuSimd);
 }
 
 #[test]
 fn isal_falls_back_to_cpu_simd_without_feature() {
-    let config = AccelConfig {
-        ec_tier: "isa_l".into(),
-        ..Default::default()
-    };
+    let config = AccelConfig { ec_tier: "isa_l".into(), ..Default::default() };
     let dispatcher = AccelDispatcher::new(config);
     assert_eq!(dispatcher.active_tier(), AccelTier::CpuSimd);
 }
 
 #[test]
 fn gpu_cuda_falls_back_to_cpu_simd_without_feature() {
-    let config = AccelConfig {
-        ec_tier: "gpu_cuda".into(),
-        ..Default::default()
-    };
+    let config = AccelConfig { ec_tier: "gpu_cuda".into(), ..Default::default() };
     let dispatcher = AccelDispatcher::new(config);
     // Without cuda feature: falls back to CpuSimd.
     // With cuda feature + GPU: stays at GpuCuda. Both are valid.
     let tier = dispatcher.active_tier();
-    assert!(
-        tier == AccelTier::CpuSimd || tier == AccelTier::GpuCuda,
-        "unexpected tier: {tier:?}"
-    );
+    assert!(tier == AccelTier::CpuSimd || tier == AccelTier::GpuCuda, "unexpected tier: {tier:?}");
 }
 
 #[test]
 fn all_tiers_can_be_constructed() {
     let tiers = ["auto", "cpu_simd", "isa_l", "gpu_cuda"];
     for &tier in &tiers {
-        let config = AccelConfig {
-            ec_tier: tier.into(),
-            ..Default::default()
-        };
+        let config = AccelConfig { ec_tier: tier.into(), ..Default::default() };
         let dispatcher = AccelDispatcher::new(config);
         let resolved = dispatcher.active_tier();
         // All tiers resolve to something valid
@@ -77,9 +59,7 @@ fn dispatcher_encode_decode_roundtrip() {
     use oceanfs_accel::{Decoder, Encoder};
 
     let dispatcher = AccelDispatcher::new(AccelConfig::default());
-    let data: Vec<Vec<u8>> = (0..4)
-        .map(|i| vec![b'0' + i; 128])
-        .collect();
+    let data: Vec<Vec<u8>> = (0..4).map(|i| vec![b'0' + i; 128]).collect();
     let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
     let parity = dispatcher.encode(&shard_refs, 2).unwrap();
     assert_eq!(parity.len(), 2);

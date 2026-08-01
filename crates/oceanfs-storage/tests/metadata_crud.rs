@@ -13,8 +13,8 @@
 #![allow(clippy::expect_used)]
 
 use oceanfs_core::{
-    BucketId, ChunkRef, Hlc, MetadataConfig, ObjectKey, ObjectMetadata, SegmentId,
-    SegmentMetadata, SizeTier, Tombstone,
+    BucketId, ChunkRef, Hlc, MetadataConfig, ObjectKey, ObjectMetadata, SegmentId, SegmentMetadata,
+    SizeTier, Tombstone,
 };
 use oceanfs_storage::{BatchOp, MetadataStore};
 
@@ -74,9 +74,8 @@ fn get_nonexistent_object_returns_none() {
     let dir = tempfile::tempdir().unwrap();
     let store = make_store(&dir);
 
-    let result = store
-        .get_object(&test_bucket(), &test_key("no-such-key"))
-        .expect("get_object failed");
+    let result =
+        store.get_object(&test_bucket(), &test_key("no-such-key")).expect("get_object failed");
     assert!(result.is_none());
 }
 
@@ -97,20 +96,12 @@ fn delete_object_removes_it() {
     store.put_object(meta).unwrap();
 
     // Confirm it exists.
-    assert!(store
-        .get_object(&test_bucket(), &test_key("tmp.dat"))
-        .unwrap()
-        .is_some());
+    assert!(store.get_object(&test_bucket(), &test_key("tmp.dat")).unwrap().is_some());
 
-    store
-        .delete_object(&test_bucket(), &test_key("tmp.dat"))
-        .unwrap();
+    store.delete_object(&test_bucket(), &test_key("tmp.dat")).unwrap();
 
     // Confirm it is gone.
-    assert!(store
-        .get_object(&test_bucket(), &test_key("tmp.dat"))
-        .unwrap()
-        .is_none());
+    assert!(store.get_object(&test_bucket(), &test_key("tmp.dat")).unwrap().is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -135,10 +126,8 @@ fn put_and_get_segment_roundtrip() {
 
     store.put_segment(meta).expect("put_segment failed");
 
-    let fetched = store
-        .get_segment(seg_id)
-        .expect("get_segment failed")
-        .expect("segment not found");
+    let fetched =
+        store.get_segment(seg_id).expect("get_segment failed").expect("segment not found");
 
     assert_eq!(fetched.segment_id.as_uuid(), seg_id.as_uuid());
     assert_eq!(fetched.ec_k, 4);
@@ -164,18 +153,11 @@ fn tombstone_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let store = make_store(&dir);
 
-    let tombstone = Tombstone {
-        deletion_time: 1_700_000_000_000,
-        hlc: Hlc::zero(),
-    };
+    let tombstone = Tombstone { deletion_time: 1_700_000_000_000, hlc: Hlc::zero() };
 
-    store
-        .put_tombstone(&test_bucket(), &test_key("deleted-key"), tombstone)
-        .unwrap();
+    store.put_tombstone(&test_bucket(), &test_key("deleted-key"), tombstone).unwrap();
 
-    assert!(store
-        .has_tombstone(&test_bucket(), &test_key("deleted-key"))
-        .unwrap());
+    assert!(store.has_tombstone(&test_bucket(), &test_key("deleted-key")).unwrap());
 }
 
 #[test]
@@ -183,9 +165,7 @@ fn no_tombstone_for_nonexistent_key() {
     let dir = tempfile::tempdir().unwrap();
     let store = make_store(&dir);
 
-    assert!(!store
-        .has_tombstone(&test_bucket(), &test_key("alive-key"))
-        .unwrap());
+    assert!(!store.has_tombstone(&test_bucket(), &test_key("alive-key")).unwrap());
 }
 
 // ---------------------------------------------------------------------------
@@ -266,11 +246,7 @@ fn chunk_stored_object_roundtrip() {
 
     let seg_id = SegmentId::new();
     let mut chunks = smallvec::SmallVec::new();
-    chunks.push(ChunkRef {
-        segment_id: seg_id,
-        offset: 0,
-        length: 500,
-    });
+    chunks.push(ChunkRef { segment_id: seg_id, offset: 0, length: 500 });
 
     let meta = ObjectMetadata {
         object_key: test_key("chunked-blob"),
@@ -318,10 +294,7 @@ fn batch_write_atomicity() {
         hlc: Hlc::zero(),
     };
 
-    let tombstone = Tombstone {
-        deletion_time: 1_700_000_001_000,
-        hlc: Hlc::zero(),
-    };
+    let tombstone = Tombstone { deletion_time: 1_700_000_001_000, hlc: Hlc::zero() };
 
     let ops = vec![
         BatchOp::PutObject(test_key("batch-obj"), meta),
@@ -331,15 +304,10 @@ fn batch_write_atomicity() {
     store.batch_write(ops).expect("batch_write failed");
 
     // Object should exist.
-    assert!(store
-        .get_object(&test_bucket(), &test_key("batch-obj"))
-        .unwrap()
-        .is_some());
+    assert!(store.get_object(&test_bucket(), &test_key("batch-obj")).unwrap().is_some());
 
     // Tombstone should exist.
-    assert!(store
-        .has_tombstone(&test_bucket(), &test_key("batch-obj"))
-        .unwrap());
+    assert!(store.has_tombstone(&test_bucket(), &test_key("batch-obj")).unwrap());
 }
 
 #[test]

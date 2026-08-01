@@ -182,7 +182,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - name: oceanfs-core must have no internal deps
         run: |
-          if cargo tree --edges normal -p oceanfs-core 2>/dev/null | grep -q 'oceanfs-'; then
+          if cargo tree --edges normal -p oceanfs-core 2>/dev/null | grep 'oceanfs-' | grep -qv 'oceanfs-core'; then
             echo "ERROR: oceanfs-core depends on another oceanfs-* crate"
             cargo tree --edges normal -p oceanfs-core
             exit 1

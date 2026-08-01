@@ -307,7 +307,9 @@ mod tests {
             assert!(
                 count >= lower && count <= upper,
                 "bucket count {} not in range [{}, {}]",
-                count, lower, upper
+                count,
+                lower,
+                upper
             );
         }
     }

@@ -5,10 +5,14 @@
 //! the [`PooledChannel`] guard. The pool enforces concurrency limits
 //! via a semaphore, ensuring bounded resource usage under load.
 
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use dashmap::DashMap;
 use oceanfs_core::RpcConfig;
@@ -124,12 +128,9 @@ impl ConnectionPool {
         let pool = self.get_or_create_pool(peer).await?;
 
         // Acquire a permit — this waits if all channels are in use.
-        let permit = pool
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::NoAvailableChannel(peer.to_string(), self.config.pool_size_per_peer))?;
+        let permit = pool.semaphore.clone().acquire_owned().await.map_err(|_| {
+            Error::NoAvailableChannel(peer.to_string(), self.config.pool_size_per_peer)
+        })?;
 
         // Select a channel via round-robin.
         let channel = {
@@ -230,11 +231,8 @@ mod tests {
 
     #[tokio::test]
     async fn get_channel_fails_for_invalid_address() {
-        let config = RpcConfig {
-            pool_size_per_peer: 1,
-            connect_timeout_ms: 100,
-            ..RpcConfig::default()
-        };
+        let config =
+            RpcConfig { pool_size_per_peer: 1, connect_timeout_ms: 100, ..RpcConfig::default() };
         let pool = ConnectionPool::new(config);
         // Use an unroutable address — should fail fast.
         let addr: SocketAddr = "192.0.2.1:1".parse().unwrap();
@@ -244,11 +242,8 @@ mod tests {
 
     #[tokio::test]
     async fn peer_count_increases_after_channel_attempt() {
-        let config = RpcConfig {
-            pool_size_per_peer: 1,
-            connect_timeout_ms: 100,
-            ..RpcConfig::default()
-        };
+        let config =
+            RpcConfig { pool_size_per_peer: 1, connect_timeout_ms: 100, ..RpcConfig::default() };
         let pool = ConnectionPool::new(config);
 
         assert_eq!(pool.peer_count(), 0);

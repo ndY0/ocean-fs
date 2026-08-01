@@ -7,13 +7,13 @@
 //! When auth is disabled (development mode), all requests pass through
 //! unauthenticated.
 
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use axum::response::Response;
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+    response::Response,
+};
 use tower::{Layer, Service};
 
 use crate::auth::sigv4::SigV4Verifier;
@@ -35,10 +35,7 @@ impl AuthMiddleware {
     /// If `enabled` is `true`, the verifier must be provided.
     /// If `enabled` is `false`, all requests pass through.
     pub fn new(enabled: bool, verifier: Option<SigV4Verifier>) -> Self {
-        Self {
-            enabled,
-            verifier: verifier.map(Arc::new),
-        }
+        Self { enabled, verifier: verifier.map(Arc::new) }
     }
 
     /// Creates a passthrough middleware (no auth).
@@ -56,11 +53,7 @@ impl<S> Layer<S> for AuthMiddleware {
     type Service = AuthService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        AuthService {
-            inner,
-            enabled: self.enabled,
-            verifier: self.verifier.clone(),
-        }
+        AuthService { inner, enabled: self.enabled, verifier: self.verifier.clone() }
     }
 }
 

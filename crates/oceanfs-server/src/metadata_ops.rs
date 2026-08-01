@@ -36,26 +36,14 @@ pub trait MetadataOps: Send + Sync + 'static {
     /// Retrieves object metadata by bucket and key.
     ///
     /// Returns `None` if the object does not exist.
-    fn get_object(
-        &self,
-        bucket: &BucketId,
-        key: &ObjectKey,
-    ) -> Result<Option<ObjectMetadata>>;
+    fn get_object(&self, bucket: &BucketId, key: &ObjectKey) -> Result<Option<ObjectMetadata>>;
 
     /// Soft-deletes an object by writing a tombstone entry.
-    fn delete_object(
-        &self,
-        bucket: &BucketId,
-        key: &ObjectKey,
-    ) -> Result<()>;
+    fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> Result<()>;
 
     /// Lists objects in a bucket matching the given prefix.
     ///
     /// Results are sorted by key. Returns objects whose key starts
     /// with `prefix`.
-    fn list_objects(
-        &self,
-        bucket: &BucketId,
-        prefix: &str,
-    ) -> Result<Vec<ObjectMetadata>>;
+    fn list_objects(&self, bucket: &BucketId, prefix: &str) -> Result<Vec<ObjectMetadata>>;
 }

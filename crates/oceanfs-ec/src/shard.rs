@@ -122,7 +122,11 @@ impl<'a> ShardData<'a> {
     ///
     /// In debug builds: panics if `index >= k`.
     pub fn data_shard(&self, index: u8) -> &'a [u8] {
-        debug_assert!(index < self.k, "data shard index {index} out of bounds (max {})", self.k - 1);
+        debug_assert!(
+            index < self.k,
+            "data shard index {index} out of bounds (max {})",
+            self.k - 1
+        );
         self.shard(index)
     }
 
@@ -132,7 +136,11 @@ impl<'a> ShardData<'a> {
     ///
     /// In debug builds: panics if `index >= m`.
     pub fn parity_shard(&self, index: u8) -> &'a [u8] {
-        debug_assert!(index < self.m, "parity shard index {index} out of bounds (max {})", self.m.wrapping_sub(1));
+        debug_assert!(
+            index < self.m,
+            "parity shard index {index} out of bounds (max {})",
+            self.m.wrapping_sub(1)
+        );
         self.shard(self.k + index)
     }
 
@@ -196,7 +204,13 @@ mod tests {
 
     #[test]
     fn shard_data_access_data_shards() {
-        let plan = EncodingPlan { stripe_count: 2, padded_size: 512, shard_size: 64, data_shards: 4, parity_shards: 0 };
+        let plan = EncodingPlan {
+            stripe_count: 2,
+            padded_size: 512,
+            shard_size: 64,
+            data_shards: 4,
+            parity_shards: 0,
+        };
         // 4 data shards × 2 stripes × 64 bytes = 512 bytes
         let mut raw = vec![0u8; 512];
         // Fill: shard 0 with 0xAA, shard 1 with 0xAB, shard 2 with 0xAC, shard 3 with 0xAD
@@ -226,7 +240,13 @@ mod tests {
 
     #[test]
     fn shard_data_with_parity() {
-        let plan = EncodingPlan { stripe_count: 1, padded_size: 256, shard_size: 64, data_shards: 4, parity_shards: 2 };
+        let plan = EncodingPlan {
+            stripe_count: 1,
+            padded_size: 256,
+            shard_size: 64,
+            data_shards: 4,
+            parity_shards: 2,
+        };
         // 4 data + 2 parity × 1 stripe × 64 bytes = 384 bytes
         let raw = vec![0u8; 384];
         let sd = ShardData::new(&raw, 4, 2, &plan);
@@ -262,7 +282,13 @@ mod tests {
 
     #[test]
     fn shard_data_as_bytes_returns_raw() {
-        let plan = EncodingPlan { stripe_count: 1, padded_size: 256, shard_size: 64, data_shards: 4, parity_shards: 0 };
+        let plan = EncodingPlan {
+            stripe_count: 1,
+            padded_size: 256,
+            shard_size: 64,
+            data_shards: 4,
+            parity_shards: 0,
+        };
         let raw = vec![0xAAu8; 256];
         let sd = ShardData::from_data_shards(&raw, 4, &plan);
         assert_eq!(sd.as_bytes(), &raw[..]);

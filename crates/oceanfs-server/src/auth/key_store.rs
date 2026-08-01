@@ -4,8 +4,7 @@
 //! TOML file. Used by [`SigV4Verifier`](super::sigv4::SigV4Verifier) to look up credentials
 //! during signature verification.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use serde::Deserialize;
 
@@ -44,16 +43,16 @@ impl KeyStore {
     /// Returns an error if the file cannot be read or is not
     /// valid TOML.
     pub fn load(path: &Path) -> Result<Self, KeyStoreError> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| KeyStoreError::Io(e.to_string()))?;
+        let content =
+            std::fs::read_to_string(path).map_err(|e| KeyStoreError::Io(e.to_string()))?;
 
         #[derive(Deserialize)]
         struct KeysFile {
             keys: Vec<Credentials>,
         }
 
-        let keys_file: KeysFile = toml::from_str(&content)
-            .map_err(|e| KeyStoreError::Parse(e.to_string()))?;
+        let keys_file: KeysFile =
+            toml::from_str(&content).map_err(|e| KeyStoreError::Parse(e.to_string()))?;
 
         let mut map = HashMap::new();
         for cred in keys_file.keys {
@@ -123,16 +122,22 @@ mod tests {
     #[test]
     fn key_store_len() {
         let mut map = HashMap::new();
-        map.insert("a".into(), Credentials {
-            access_key: "a".into(),
-            secret_key: "s".into(),
-            description: String::new(),
-        });
-        map.insert("b".into(), Credentials {
-            access_key: "b".into(),
-            secret_key: "t".into(),
-            description: String::new(),
-        });
+        map.insert(
+            "a".into(),
+            Credentials {
+                access_key: "a".into(),
+                secret_key: "s".into(),
+                description: String::new(),
+            },
+        );
+        map.insert(
+            "b".into(),
+            Credentials {
+                access_key: "b".into(),
+                secret_key: "t".into(),
+                description: String::new(),
+            },
+        );
         let store = KeyStore { keys: map };
         assert_eq!(store.len(), 2);
     }

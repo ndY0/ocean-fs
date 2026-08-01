@@ -11,8 +11,10 @@ use std::sync::Arc;
 use oceanfs_core::{SegmentId, SegmentMetadata};
 use tokio::sync::Semaphore;
 
-use crate::error::{Error, Result};
-use crate::metadata::MetadataStore;
+use crate::{
+    error::{Error, Result},
+    metadata::MetadataStore,
+};
 
 // ---------------------------------------------------------------------------
 // ScrubConfig
@@ -143,10 +145,7 @@ impl ScrubWorker {
     /// 4. On mismatch: flag the shard as corrupt
     ///
     /// Returns the scrub result for this segment.
-    pub(crate) fn scrub_segment(
-        &self,
-        segment_meta: &SegmentMetadata,
-    ) -> ScrubResult {
+    pub(crate) fn scrub_segment(&self, segment_meta: &SegmentMetadata) -> ScrubResult {
         // In a production implementation:
         // - Read shard data from disk
         // - Compute BLAKE3 per shard
@@ -160,11 +159,11 @@ impl ScrubWorker {
         if let Some(stored_root) = segment_meta.merkle_root {
             // In production: recompute Merkle tree from segment data
             // For now, the verification is a placeholder
-                tracing::debug!(
-                    segment_id = %segment_meta.segment_id,
-                    stored_root = %stored_root,
-                    "verifying segment merkle root"
-                );
+            tracing::debug!(
+                segment_id = %segment_meta.segment_id,
+                stored_root = %stored_root,
+                "verifying segment merkle root"
+            );
             // Placeholder: assume healthy
         }
 
@@ -182,10 +181,7 @@ impl ScrubWorker {
     }
 
     /// Scrubs a partition of segments and returns results.
-    pub(crate) fn scrub_partition(
-        &self,
-        partition: &SegmentPartition,
-    ) -> Vec<ScrubResult> {
+    pub(crate) fn scrub_partition(&self, partition: &SegmentPartition) -> Vec<ScrubResult> {
         let mut results = Vec::with_capacity(partition.segment_ids.len());
 
         for seg_id in &partition.segment_ids {
@@ -268,7 +264,8 @@ impl ScrubCoordinator {
             let end = (start + count).min(segment_count);
 
             let partition_ids = sorted_ids[start..end].to_vec();
-            partitions.push(SegmentPartition { node_id: node_id.clone(), segment_ids: partition_ids });
+            partitions
+                .push(SegmentPartition { node_id: node_id.clone(), segment_ids: partition_ids });
             start = end;
         }
 
@@ -290,10 +287,7 @@ impl ScrubCoordinator {
     ///
     /// Returns an error if metadata operations fail or the semaphore
     /// cannot be acquired.
-    pub async fn run_cycle(
-        &self,
-        metadata: Arc<MetadataStore>,
-    ) -> Result<ScrubReport> {
+    pub async fn run_cycle(&self, metadata: Arc<MetadataStore>) -> Result<ScrubReport> {
         use std::time::Instant;
 
         let start_time = Instant::now();
@@ -301,10 +295,8 @@ impl ScrubCoordinator {
 
         // Phase 1: Gather all segment IDs
         let segments = metadata.list_segments();
-        let segment_ids: Vec<SegmentId> = segments
-            .into_iter()
-            .filter_map(|r| r.ok().map(|s| s.segment_id))
-            .collect();
+        let segment_ids: Vec<SegmentId> =
+            segments.into_iter().filter_map(|r| r.ok().map(|s| s.segment_id)).collect();
 
         report.segments_total = segment_ids.len() as u64;
 
@@ -314,10 +306,7 @@ impl ScrubCoordinator {
 
         // Phase 2: For single-node/local scrub, verify each segment
         let semaphore = Arc::new(Semaphore::new(self.config.parallel_nodes.max(1)));
-        let worker = Arc::new(ScrubWorker::new(
-            metadata.clone(),
-            self.config.throttle_bytes_sec,
-        ));
+        let worker = Arc::new(ScrubWorker::new(metadata.clone(), self.config.throttle_bytes_sec));
 
         let partition = SegmentPartition {
             node_id: oceanfs_core::NodeId::new("local"),
@@ -325,9 +314,10 @@ impl ScrubCoordinator {
         };
 
         // Acquire semaphore permit for bounded concurrency
-        let _permit = semaphore.acquire().await.map_err(|e| {
-            Error::Scrub(format!("semaphore acquire failed: {e}"))
-        })?;
+        let _permit = semaphore
+            .acquire()
+            .await
+            .map_err(|e| Error::Scrub(format!("semaphore acquire failed: {e}")))?;
 
         let results = worker.scrub_partition(&partition);
         report.nodes_participated = 1;
@@ -360,10 +350,7 @@ impl ScrubCoordinator {
     /// # Errors
     ///
     /// Returns an error if the background task cannot be spawned.
-    pub async fn trigger_manual(
-        &self,
-        metadata: Arc<MetadataStore>,
-    ) -> Result<()> {
+    pub async fn trigger_manual(&self, metadata: Arc<MetadataStore>) -> Result<()> {
         tokio::spawn({
             let this = Arc::new(Self { config: self.config.clone() });
             async move {
@@ -394,8 +381,7 @@ impl ScrubCoordinator {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(self.config.interval_sec))
-                    .await;
+                tokio::time::sleep(std::time::Duration::from_secs(self.config.interval_sec)).await;
                 match self.run_cycle(metadata.clone()).await {
                     Ok(report) => {
                         if report.segments_corrupt > 0 {
@@ -421,8 +407,9 @@ impl ScrubCoordinator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::*;
     use oceanfs_core::{HashOutput, MetadataConfig, NodeId, SegmentId, SegmentMetadata, SizeTier};
+
+    use super::*;
 
     fn test_config() -> MetadataConfig {
         let dir = tempfile::tempdir().unwrap();
@@ -456,24 +443,21 @@ mod tests {
     #[test]
     fn partition_covers_all_segments_no_gaps() {
         let seg_ids: Vec<SegmentId> = (0..10).map(|_| SegmentId::new()).collect();
-        let node_ids: Vec<NodeId> =
-            (0..3).map(|i| NodeId::new(format!("node-{i}"))).collect();
+        let node_ids: Vec<NodeId> = (0..3).map(|i| NodeId::new(format!("node-{i}"))).collect();
 
         let coord = ScrubCoordinator::new(ScrubConfig::default());
         let partitions = coord.partition_segments(&seg_ids, &node_ids);
 
         assert_eq!(partitions.len(), 3);
 
-        let total_assigned: usize =
-            partitions.iter().map(|p| p.segment_ids.len()).sum();
+        let total_assigned: usize = partitions.iter().map(|p| p.segment_ids.len()).sum();
         assert_eq!(total_assigned, 10);
     }
 
     #[test]
     fn partition_no_overlap() {
         let seg_ids: Vec<SegmentId> = (0..5).map(|_| SegmentId::new()).collect();
-        let node_ids: Vec<NodeId> =
-            (0..2).map(|i| NodeId::new(format!("node-{i}"))).collect();
+        let node_ids: Vec<NodeId> = (0..2).map(|i| NodeId::new(format!("node-{i}"))).collect();
 
         let coord = ScrubCoordinator::new(ScrubConfig::default());
         let partitions = coord.partition_segments(&seg_ids, &node_ids);
@@ -543,10 +527,7 @@ mod tests {
         let metadata_store = Arc::new(MetadataStore::open(&test_config()).unwrap());
         let worker = ScrubWorker::new(metadata_store, 0);
 
-        let partition = SegmentPartition {
-            node_id: NodeId::new("test"),
-            segment_ids: Vec::new(),
-        };
+        let partition = SegmentPartition { node_id: NodeId::new("test"), segment_ids: Vec::new() };
 
         let results = worker.scrub_partition(&partition);
         assert!(results.is_empty());

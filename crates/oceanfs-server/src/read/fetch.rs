@@ -7,8 +7,7 @@
 //! Per performance guideline §8.1 (FuturesUnordered) and §8.2
 //! (tokio::select! for timeout branches).
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use oceanfs_core::{ChunkRef, ObjectMetadata};
@@ -58,10 +57,7 @@ pub(crate) async fn fetch_chunks(
 }
 
 /// Fetches all chunk data from available replicas.
-async fn fetch_all_chunks(
-    ring: &Arc<RingCache>,
-    chunks: &[ChunkRef],
-) -> Result<Vec<Bytes>> {
+async fn fetch_all_chunks(ring: &Arc<RingCache>, chunks: &[ChunkRef]) -> Result<Vec<Bytes>> {
     let mut data = Vec::with_capacity(chunks.len());
 
     for chunk in chunks {
@@ -70,10 +66,7 @@ async fn fetch_all_chunks(
         let replica_set = ring.lookup(segment_hash.as_bytes());
 
         if replica_set.is_empty() {
-            return Err(Error::Routing(format!(
-                "no replicas for segment {}",
-                chunk.segment_id
-            )));
+            return Err(Error::Routing(format!("no replicas for segment {}", chunk.segment_id)));
         }
 
         // In full implementation: fetch from first replica in parallel.
@@ -98,9 +91,10 @@ async fn fetch_all_chunks(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::*;
     use oceanfs_core::{NodeId, RingConfig, SegmentId};
     use oceanfs_routing::Ring;
+
+    use super::*;
 
     #[tokio::test]
     async fn fetch_inline_metadata_returns_inline_data() {
@@ -140,11 +134,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_with_timeout_returns_error() {
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef {
-            segment_id: SegmentId::new(),
-            offset: 0,
-            length: 100,
-        });
+        chunks.push(ChunkRef { segment_id: SegmentId::new(), offset: 0, length: 100 });
 
         let meta = ObjectMetadata {
             object_key: oceanfs_core::ObjectKey::new("timeout"),

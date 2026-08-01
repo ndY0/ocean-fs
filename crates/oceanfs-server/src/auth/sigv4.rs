@@ -18,8 +18,10 @@ use std::collections::HashMap;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
-use crate::auth::key_store::KeyStore;
-use crate::error::{Error, Result};
+use crate::{
+    auth::key_store::KeyStore,
+    error::{Error, Result},
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -94,20 +96,19 @@ impl SigV4Verifier {
 
         // Step 5: Build canonical request
         let canonical_request = build_canonical_request(
-            method, uri, query_string, headers, &auth_parts.signed_headers, &body_hash,
+            method,
+            uri,
+            query_string,
+            headers,
+            &auth_parts.signed_headers,
+            &body_hash,
         );
         let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
 
         // Step 6: Build string to sign
         let region = auth_parts.scope_region.as_deref().unwrap_or("us-east-1");
-        let service = auth_parts
-            .scope_service
-            .as_deref()
-            .unwrap_or("s3");
-        let scope = format!(
-            "{}/{}/{}/aws4_request",
-            auth_parts.scope_date, region, service
-        );
+        let service = auth_parts.scope_service.as_deref().unwrap_or("s3");
+        let scope = format!("{}/{}/{}/aws4_request", auth_parts.scope_date, region, service);
 
         let string_to_sign = format!(
             "AWS4-HMAC-SHA256\n{}\n{}\n{}",
@@ -115,7 +116,8 @@ impl SigV4Verifier {
         );
 
         // Step 7: Compute signing key
-        let signing_key = compute_signing_key(&credentials.secret_key, request_date, region, service);
+        let signing_key =
+            compute_signing_key(&credentials.secret_key, request_date, region, service);
 
         // Step 8: Compute signature
         let computed = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
@@ -215,12 +217,7 @@ fn build_canonical_request(
 
     format!(
         "{}\n{}\n{}\n{}\n\n{}\n{}",
-        method,
-        canonical_uri,
-        canonical_query,
-        canonical_headers,
-        signed_headers_str,
-        payload_hash,
+        method, canonical_uri, canonical_query, canonical_headers, signed_headers_str, payload_hash,
     )
 }
 
@@ -250,10 +247,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
 /// Returns the current UTC time as a formatted date string (YYYYMMDD).
 fn current_utc_time() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     // Convert epoch seconds to YYYYMMDD string
     let days_since_epoch = now / 86400;
     // Simple Gregorian date calculation (good enough for tests; production
@@ -330,9 +324,8 @@ mod tests {
 
     #[test]
     fn parse_auth_header_missing_credential() {
-        let result = parse_authorization_header(
-            "AWS4-HMAC-SHA256 SignedHeaders=host, Signature=abc",
-        );
+        let result =
+            parse_authorization_header("AWS4-HMAC-SHA256 SignedHeaders=host, Signature=abc");
         assert!(result.is_err());
     }
 

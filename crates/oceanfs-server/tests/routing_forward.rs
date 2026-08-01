@@ -2,8 +2,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use oceanfs_core::{GossipConfig, HashKey, Incarnation, NodeId, NodeState, RingConfig, RpcConfig};
 use oceanfs_membership::Membership;

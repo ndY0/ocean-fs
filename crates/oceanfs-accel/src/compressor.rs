@@ -16,8 +16,7 @@
 use bytes::Bytes;
 use oceanfs_core::CompressionTier;
 
-use crate::error::AccelError;
-use crate::Result;
+use crate::{error::AccelError, Result};
 
 /// A compression backend for segment data.
 ///
@@ -133,19 +132,15 @@ impl Default for ZstdCompressor {
 impl Compressor for ZstdCompressor {
     fn compress(&self, data: &[u8], level: u32) -> Result<Bytes> {
         let effective_level = if level == 0 { self.level } else { level };
-        zstd::encode_all(data, effective_level as i32)
-            .map(Bytes::from)
-            .map_err(|e| AccelError::CompressionError {
-                reason: format!("zstd compress failed: {e}"),
-            })
+        zstd::encode_all(data, effective_level as i32).map(Bytes::from).map_err(|e| {
+            AccelError::CompressionError { reason: format!("zstd compress failed: {e}") }
+        })
     }
 
     fn decompress(&self, data: &[u8]) -> Result<Bytes> {
-        zstd::decode_all(data)
-            .map(Bytes::from)
-            .map_err(|e| AccelError::CompressionError {
-                reason: format!("zstd decompress failed: {e}"),
-            })
+        zstd::decode_all(data).map(Bytes::from).map_err(|e| AccelError::CompressionError {
+            reason: format!("zstd decompress failed: {e}"),
+        })
     }
 
     fn compression_tier(&self) -> CompressionTier {

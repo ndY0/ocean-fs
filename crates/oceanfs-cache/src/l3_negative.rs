@@ -77,11 +77,7 @@ impl BloomFilter {
         let byte_count = bit_count / 8;
         // Optimal number of hash functions: k = -log2(fp_rate)
         let hash_count = Self::optimal_hash_count(fp_rate);
-        Self {
-            bits: vec![0u8; byte_count],
-            hash_count,
-            bit_count,
-        }
+        Self { bits: vec![0u8; byte_count], hash_count, bit_count }
     }
 
     /// Computes the optimal number of hash functions for a target FP rate.
@@ -124,9 +120,7 @@ struct BucketNegativeCache {
 
 impl BucketNegativeCache {
     fn new(config: &NegativeCacheConfig) -> Self {
-        Self {
-            filter: RwLock::new(BloomFilter::new(config.size_bytes, config.fp_rate)),
-        }
+        Self { filter: RwLock::new(BloomFilter::new(config.size_bytes, config.fp_rate)) }
     }
 }
 
@@ -152,11 +146,7 @@ pub struct NegativeCache {
 impl NegativeCache {
     /// Creates a new negative cache with the given configuration.
     pub fn new(config: NegativeCacheConfig) -> Self {
-        Self {
-            config,
-            buckets: DashMap::new(),
-            stats: NegativeCacheStats::default(),
-        }
+        Self { config, buckets: DashMap::new(), stats: NegativeCacheStats::default() }
     }
 
     /// Returns `true` if the key MAY exist (possible false positive).
@@ -207,18 +197,13 @@ impl NegativeCache {
     /// # Errors
     ///
     /// Returns an error if the metadata store is unavailable.
-    pub async fn rebuild(
-        &self,
-        metadata: Arc<dyn MetadataStore>,
-    ) -> crate::Result<()> {
+    pub async fn rebuild(&self, metadata: Arc<dyn MetadataStore>) -> crate::Result<()> {
         // Rebuild all known buckets.
         for bucket_entry in self.buckets.iter() {
             let bucket = bucket_entry.key().clone();
             let bucket_cache = bucket_entry.value().clone();
 
-            let keys = metadata
-                .list_object_keys(&bucket)
-                .map_err(crate::Error::RebuildIo)?;
+            let keys = metadata.list_object_keys(&bucket).map_err(crate::Error::RebuildIo)?;
 
             let mut new_filter = BloomFilter::new(self.config.size_bytes, self.config.fp_rate);
 
@@ -338,18 +323,13 @@ mod tests {
         let cache = NegativeCache::new(NegativeCacheConfig::default());
         cache.record_false_positive();
         cache.record_false_positive();
-        assert_eq!(
-            cache.stats().false_positives.load(Ordering::Relaxed),
-            2
-        );
+        assert_eq!(cache.stats().false_positives.load(Ordering::Relaxed), 2);
     }
 
     #[test]
     fn disabled_cache_always_returns_true() {
-        let cache = NegativeCache::new(NegativeCacheConfig {
-            enabled: false,
-            ..Default::default()
-        });
+        let cache =
+            NegativeCache::new(NegativeCacheConfig { enabled: false, ..Default::default() });
         // When disabled, always say "maybe" to force a real lookup.
         assert!(cache.contains(&BucketId::new("b"), &ObjectKey::new("nonexistent")));
     }
@@ -367,10 +347,7 @@ mod tests {
 
         // Insert 1000 keys.
         for i in 0..1000 {
-            cache.insert(
-                &BucketId::new("b"),
-                &ObjectKey::new(format!("key-{}", i)),
-            );
+            cache.insert(&BucketId::new("b"), &ObjectKey::new(format!("key-{}", i)));
         }
 
         // Test 1000 non-inserted keys — false-positive rate should be ≤ ~5%
@@ -386,10 +363,6 @@ mod tests {
 
         let fp_rate = fps as f64 / test_count as f64;
         // With 1MB filter and 1000 keys, FP rate should be very low.
-        assert!(
-            fp_rate < 0.10,
-            "false-positive rate {:.4} exceeds 10% threshold",
-            fp_rate
-        );
+        assert!(fp_rate < 0.10, "false-positive rate {:.4} exceeds 10% threshold", fp_rate);
     }
 }

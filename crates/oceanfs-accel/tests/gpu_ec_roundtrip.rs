@@ -6,6 +6,7 @@
 //! All tests gracefully skip when no GPU is available.
 
 #![allow(clippy::unwrap_used)]
+#![allow(unexpected_cfgs)]
 
 #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
 mod gpu_tests {
@@ -19,7 +20,10 @@ mod gpu_tests {
         let config = GpuConfig { min_segment_size: 0, ..Default::default() };
         let backend = match CudaBackend::new(config) {
             Some(b) => b,
-            None => { eprintln!("SKIP: no GPU"); return; }
+            None => {
+                eprintln!("SKIP: no GPU");
+                return;
+            }
         };
 
         let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 256]).collect();
@@ -27,8 +31,12 @@ mod gpu_tests {
         let parity = backend.encode(&refs, 2).unwrap();
 
         let available: Vec<Option<&[u8]>> = vec![
-            None, Some(&data[1]), Some(&data[2]), Some(&data[3]),
-            Some(&parity[0]), Some(&parity[1]),
+            None,
+            Some(&data[1]),
+            Some(&data[2]),
+            Some(&data[3]),
+            Some(&parity[0]),
+            Some(&parity[1]),
         ];
         let recovered = backend.decode(&available, 4, 2).unwrap();
         assert_eq!(recovered[0], data[0]);
@@ -40,7 +48,10 @@ mod gpu_tests {
         let config = GpuConfig { min_segment_size: 1_000_000, ..Default::default() };
         let backend = match CudaBackend::new(config) {
             Some(b) => b,
-            None => { eprintln!("SKIP: no GPU"); return; }
+            None => {
+                eprintln!("SKIP: no GPU");
+                return;
+            }
         };
         assert!(!backend.should_use_gpu(4096));
         assert!(backend.should_use_gpu(2_000_000));
@@ -52,7 +63,10 @@ mod gpu_tests {
         let config = GpuConfig::default();
         let backend = match CudaBackend::new(config) {
             Some(b) => b,
-            None => { eprintln!("SKIP: no GPU"); return; }
+            None => {
+                eprintln!("SKIP: no GPU");
+                return;
+            }
         };
         assert!(backend.is_available());
         backend.mark_unavailable();
@@ -65,7 +79,10 @@ mod gpu_tests {
         let config = GpuConfig { min_segment_size: 0, ..Default::default() };
         let backend = match CudaBackend::new(config) {
             Some(b) => b,
-            None => { eprintln!("SKIP: no GPU"); return; }
+            None => {
+                eprintln!("SKIP: no GPU");
+                return;
+            }
         };
         backend.mark_unavailable();
         let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 64]).collect();

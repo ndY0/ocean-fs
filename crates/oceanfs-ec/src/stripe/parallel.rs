@@ -130,17 +130,14 @@ impl<E: Encoder + ?Sized> ParallelEncoder<E> {
 
         // Encode each stripe in parallel.
         let m8 = m as u8;
-        let mut parity_shards: Vec<Vec<u8>> =
-            vec![vec![0u8; total_stripes * shard_size]; m];
+        let mut parity_shards: Vec<Vec<u8>> = vec![vec![0u8; total_stripes * shard_size]; m];
 
         let results: Vec<Result<Vec<Vec<u8>>>> = (0..total_stripes)
             .into_par_iter()
             .map(|stripe_idx| {
                 let stripe_data: Vec<&[u8]> = data_shards
                     .iter()
-                    .map(|shard| {
-                        &shard[stripe_idx * shard_size..(stripe_idx + 1) * shard_size]
-                    })
+                    .map(|shard| &shard[stripe_idx * shard_size..(stripe_idx + 1) * shard_size])
                     .collect();
                 self.encoder.encode(&stripe_data, m8)
             })

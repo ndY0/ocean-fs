@@ -368,7 +368,8 @@ mod tests {
             ..Default::default()
         });
         // Provide 5 available shards instead of 6 (k + m).
-        let available: Vec<Option<&[u8]>> = vec![Some(b"a"), Some(b"b"), Some(b"c"), Some(b"d"), Some(b"e")];
+        let available: Vec<Option<&[u8]>> =
+            vec![Some(b"a"), Some(b"b"), Some(b"c"), Some(b"d"), Some(b"e")];
         let result = codec.decode(&available, 4, 2);
         assert!(result.is_err());
     }

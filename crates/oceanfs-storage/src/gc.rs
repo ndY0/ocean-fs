@@ -5,16 +5,20 @@
 //! live-byte ratio falls below a configurable threshold. Repacked
 //! blobs follow tiered sizing rules defined by the tier router.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use oceanfs_core::{ChunkRef, ObjectMetadata, SegmentId, SegmentMetadata, SizeTier};
 use tokio::sync::Semaphore;
 
-use crate::error::{Error, Result};
-use crate::metadata::MetadataStore;
-use crate::segment::TierRouter;
+use crate::{
+    error::{Error, Result},
+    metadata::MetadataStore,
+    segment::TierRouter,
+};
 
 /// Returns the target segment size for a given storage tier.
 fn tier_target_size(tier: SizeTier) -> u64 {
@@ -156,11 +160,7 @@ impl LivenessTracker {
     pub(crate) fn compaction_candidates(&self, threshold: f64) -> Vec<SegmentId> {
         self.known_segments
             .iter()
-            .filter(|id| {
-                self.liveness_ratio(id)
-                    .map(|r| r < threshold)
-                    .unwrap_or(false)
-            })
+            .filter(|id| self.liveness_ratio(id).map(|r| r < threshold).unwrap_or(false))
             .copied()
             .collect()
     }
@@ -255,10 +255,7 @@ impl SegmentCompactor {
         let mut result = Vec::new();
 
         // Use list_objects with empty prefix to scan all; filter in-memory.
-        let all_objects = self.metadata.list_objects(
-            &oceanfs_core::BucketId::new("default"),
-            "",
-        );
+        let all_objects = self.metadata.list_objects(&oceanfs_core::BucketId::new("default"), "");
 
         for obj in all_objects.into_iter().flatten() {
             if obj.chunks.iter().any(|c| c.segment_id == segment_id) {
@@ -329,9 +326,8 @@ impl GarbageCollector {
         let tier_router = TierRouter::new(oceanfs_core::SegmentSizeConfig::default());
         let compactor = Arc::new(SegmentCompactor::new(metadata.clone(), tier_router));
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<(SegmentId, u64)>(
-            self.config.compaction_queue_capacity,
-        );
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<(SegmentId, u64)>(self.config.compaction_queue_capacity);
 
         // Collect stats from tracker before spawning tasks
         stats.segments_scanned = tracker.known_segments.len() as u64;
@@ -341,9 +337,11 @@ impl GarbageCollector {
         // Spawn compaction tasks for each candidate, bounded by semaphore
         let mut handles = Vec::with_capacity(candidates.len());
         for segment_id in candidates {
-            let permit = semaphore.clone().acquire_owned().await.map_err(|e| {
-                Error::Gc(format!("semaphore acquire failed: {e}"))
-            })?;
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| Error::Gc(format!("semaphore acquire failed: {e}")))?;
             let compactor = compactor.clone();
             let tx = tx.clone();
             let metadata = metadata.clone();
@@ -362,9 +360,7 @@ impl GarbageCollector {
                 let _permit = permit; // held until task completes
                 match compactor.compact_segment(segment_id, &segment_meta).await {
                     Ok(bytes_reclaimed) => {
-                        let _ = tx
-                            .send((segment_id, bytes_reclaimed + dead_bytes))
-                            .await;
+                        let _ = tx.send((segment_id, bytes_reclaimed + dead_bytes)).await;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -404,8 +400,7 @@ impl GarbageCollector {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(self.config.interval_sec))
-                    .await;
+                tokio::time::sleep(std::time::Duration::from_secs(self.config.interval_sec)).await;
                 match self.run_cycle(metadata.clone()).await {
                     Ok(stats) => {
                         tracing::info!(
@@ -430,10 +425,8 @@ impl GarbageCollector {
         tracker: &mut LivenessTracker,
         stats: &mut GcStats,
     ) -> Result<()> {
-        let _now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let _now_ms =
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
         let _ttl_ms = (self.config.tombstone_ttl_sec * 1000) as i64;
 
         // Register all known segments first
@@ -459,10 +452,7 @@ impl GarbageCollector {
         // For now, we use the metadata has_tombstone + the Tombstone's
         // deletion_time. In production, a dedicated tombstone iterator
         // would be more efficient.
-        let all_objects = metadata.list_objects(
-            &oceanfs_core::BucketId::new("default"),
-            "",
-        );
+        let all_objects = metadata.list_objects(&oceanfs_core::BucketId::new("default"), "");
 
         for obj in all_objects.into_iter().flatten() {
             let bucket = oceanfs_core::BucketId::new("default");
@@ -541,10 +531,8 @@ impl OrphanReaper {
         let referenced = self.build_referenced_set(&metadata)?;
 
         // Phase 2: Scan segments and find orphans
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let now_ms =
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
         let ttl_ms = (self.config.tombstone_ttl_sec * 1000) as i64;
 
         let segments = metadata.list_segments();
@@ -600,8 +588,7 @@ impl OrphanReaper {
         let this = self.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(this.config.interval_sec))
-                    .await;
+                tokio::time::sleep(std::time::Duration::from_secs(this.config.interval_sec)).await;
                 match this.run_cycle(metadata.clone()).await {
                     Ok(stats) => {
                         if stats.orphans_found > 0 {
@@ -621,16 +608,10 @@ impl OrphanReaper {
     }
 
     /// Builds the set of all segment IDs referenced by objects.
-    fn build_referenced_set(
-        &self,
-        metadata: &MetadataStore,
-    ) -> Result<HashSet<SegmentId>> {
+    fn build_referenced_set(&self, metadata: &MetadataStore) -> Result<HashSet<SegmentId>> {
         let mut referenced = HashSet::new();
 
-        let all_objects = metadata.list_objects(
-            &oceanfs_core::BucketId::new("default"),
-            "",
-        );
+        let all_objects = metadata.list_objects(&oceanfs_core::BucketId::new("default"), "");
 
         for obj in all_objects.into_iter().flatten() {
             for chunk in &obj.chunks {
@@ -660,11 +641,12 @@ impl OrphanReaper {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::*;
     use oceanfs_core::{
-        BucketId, ChunkRef, HashOutput, Hlc, MetadataConfig, ObjectKey, ObjectMetadata,
-        SegmentId, SegmentMetadata, SizeTier, Tombstone,
+        BucketId, ChunkRef, HashOutput, Hlc, MetadataConfig, ObjectKey, ObjectMetadata, SegmentId,
+        SegmentMetadata, SizeTier, Tombstone,
     };
+
+    use super::*;
 
     fn test_config() -> MetadataConfig {
         let dir = tempfile::tempdir().unwrap();
@@ -675,11 +657,7 @@ mod tests {
         }
     }
 
-    fn make_object_meta(
-        key: &str,
-        size: u64,
-        chunk: ChunkRef,
-    ) -> ObjectMetadata {
+    fn make_object_meta(key: &str, size: u64, chunk: ChunkRef) -> ObjectMetadata {
         let mut chunks = smallvec::SmallVec::new();
         chunks.push(chunk);
         ObjectMetadata {
@@ -693,11 +671,7 @@ mod tests {
         }
     }
 
-    fn make_segment_meta(
-        id: SegmentId,
-        tier: SizeTier,
-        sealed_at: i64,
-    ) -> SegmentMetadata {
+    fn make_segment_meta(id: SegmentId, tier: SizeTier, sealed_at: i64) -> SegmentMetadata {
         SegmentMetadata {
             segment_id: id,
             ec_k: 4,
@@ -911,10 +885,9 @@ mod tests {
 
         let seg_id = SegmentId::new();
         // Seal time is very recent (within TTL)
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let now_ms =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+                as i64;
         let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, now_ms);
         metadata.put_segment(seg_meta).unwrap();
         // No object references this segment
@@ -968,10 +941,9 @@ mod tests {
             TierRouter::new(oceanfs_core::SegmentSizeConfig::default()),
         );
 
-        let result = compactor.compact_segment(
-            seg_id,
-            &make_segment_meta(seg_id, SizeTier::Standard, 1700000000000),
-        ).await;
+        let result = compactor
+            .compact_segment(seg_id, &make_segment_meta(seg_id, SizeTier::Standard, 1700000000000))
+            .await;
         assert!(result.is_ok());
     }
 
@@ -1059,10 +1031,7 @@ mod tests {
         assert!(metadata.has_tombstone(&bucket, &ObjectKey::new("obj0.txt")).unwrap());
         assert!(metadata.has_tombstone(&bucket, &ObjectKey::new("obj1.txt")).unwrap());
 
-        let gc = GarbageCollector::new(GcConfig {
-            compact_threshold: 0.5,
-            ..GcConfig::default()
-        });
+        let gc = GarbageCollector::new(GcConfig { compact_threshold: 0.5, ..GcConfig::default() });
         let stats = gc.run_cycle(metadata).await.unwrap();
         assert!(stats.segments_scanned >= 1);
     }
@@ -1100,10 +1069,7 @@ mod tests {
         );
         metadata.put_object(dead_obj).unwrap();
 
-        let gc = GarbageCollector::new(GcConfig {
-            compact_threshold: 0.5,
-            ..GcConfig::default()
-        });
+        let gc = GarbageCollector::new(GcConfig { compact_threshold: 0.5, ..GcConfig::default() });
         let stats = gc.run_cycle(metadata).await.unwrap();
         // Liveness is 90% (900/1000), above 0.5 threshold → no compaction
         assert_eq!(stats.segments_compacted, 0);
@@ -1126,7 +1092,9 @@ mod tests {
             TierRouter::new(oceanfs_core::SegmentSizeConfig::default()),
         );
 
-        let result = compactor.compact_segment(seg_id, &make_segment_meta(seg_id, SizeTier::Standard, 1700000000000)).await;
+        let result = compactor
+            .compact_segment(seg_id, &make_segment_meta(seg_id, SizeTier::Standard, 1700000000000))
+            .await;
         assert!(result.is_ok());
         // Fully dead segment should return some reclaimed bytes
         assert!(result.unwrap() > 0);

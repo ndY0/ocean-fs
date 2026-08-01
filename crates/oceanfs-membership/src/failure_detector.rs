@@ -8,8 +8,10 @@
 //!
 //! The detector runs as a background task on each gossip interval.
 
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use oceanfs_core::{Incarnation, NodeId, NodeState};
 use rand::seq::IteratorRandom;
@@ -37,16 +39,9 @@ pub(crate) struct DetectorConfig {
 #[derive(Debug)]
 pub(crate) enum DetectorCommand {
     /// A direct ping result.
-    PingResponse {
-        target: NodeId,
-        success: bool,
-    },
+    PingResponse { target: NodeId, success: bool },
     /// An indirect ping result.
-    IndirectPingResult {
-        origin: NodeId,
-        target: NodeId,
-        success: bool,
-    },
+    IndirectPingResult { origin: NodeId, target: NodeId, success: bool },
     /// Shut down the detector.
     Shutdown,
 }
@@ -195,10 +190,13 @@ impl FailureDetector {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::*;
     use tokio::sync::{broadcast, mpsc};
 
-    fn make_detector() -> (FailureDetector, mpsc::Sender<DetectorCommand>, broadcast::Receiver<MembershipEvent>) {
+    use super::*;
+
+    fn make_detector(
+    ) -> (FailureDetector, mpsc::Sender<DetectorCommand>, broadcast::Receiver<MembershipEvent>)
+    {
         let (event_tx, event_rx) = broadcast::channel(16);
         let config = DetectorConfig {
             interval_ms: 100,
@@ -226,20 +224,15 @@ mod tests {
 
     #[test]
     fn select_random_peer_excludes_specified_node() {
-        let nodes = vec![
-            (NodeId::new("a"), NodeState::Alive),
-            (NodeId::new("b"), NodeState::Alive),
-        ];
+        let nodes =
+            vec![(NodeId::new("a"), NodeState::Alive), (NodeId::new("b"), NodeState::Alive)];
         let result = FailureDetector::select_random_peer(&nodes, Some(&NodeId::new("a")));
         assert_eq!(result.unwrap().as_str(), "b");
     }
 
     #[test]
     fn select_random_peer_returns_none_when_all_dead() {
-        let nodes = vec![
-            (NodeId::new("a"), NodeState::Dead),
-            (NodeId::new("b"), NodeState::Dead),
-        ];
+        let nodes = vec![(NodeId::new("a"), NodeState::Dead), (NodeId::new("b"), NodeState::Dead)];
         assert!(FailureDetector::select_random_peer(&nodes, None).is_none());
     }
 
@@ -333,13 +326,8 @@ mod tests {
         // Run one iteration to process the SUSPECT.
         // Then manually insert an expired suspicion timer.
         {
-            let past = std::time::Instant::now()
-                .checked_sub(Duration::from_millis(200))
-                .unwrap();
-            detector.suspicion_timers.insert(
-                target.clone(),
-                (Incarnation::new(1), past),
-            );
+            let past = std::time::Instant::now().checked_sub(Duration::from_millis(200)).unwrap();
+            detector.suspicion_timers.insert(target.clone(), (Incarnation::new(1), past));
         }
 
         // Run the timeout check.

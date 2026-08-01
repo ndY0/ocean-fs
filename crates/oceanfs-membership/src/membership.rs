@@ -5,10 +5,7 @@
 //! spawns background tasks for failure detection and gossip, and
 //! emits state-change events via a broadcast channel.
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use oceanfs_core::{GossipConfig, Incarnation, NodeId, NodeState};
 use oceanfs_routing::RingCache;
@@ -16,9 +13,11 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
-use crate::error::{Error, Result};
-use crate::failure_detector::{DetectorCommand, DetectorConfig, FailureDetector};
-use crate::gossip::GossipCommand;
+use crate::{
+    error::{Error, Result},
+    failure_detector::{DetectorCommand, DetectorConfig, FailureDetector},
+    gossip::GossipCommand,
+};
 
 /// An event emitted when a node's state changes.
 #[derive(Debug, Clone)]
@@ -152,8 +151,8 @@ impl Membership {
         let (mut detector, _detector_cmd_tx) =
             FailureDetector::new(detector_config, self.event_tx.clone(), 64);
         self.detector_tx.clone().try_send(DetectorCommand::Shutdown).ok(); // replace old
-        // Store the command sender.
-        // (We can't replace self.detector_tx directly, so we'll use a different approach.)
+                                                                           // Store the command sender.
+                                                                           // (We can't replace self.detector_tx directly, so we'll use a different approach.)
 
         // For simplicity, we'll spawn the detector with its own receiver.
         tokio::spawn(async move {
@@ -208,9 +207,7 @@ impl Membership {
 
         // Add self to ring.
         let mut ring_snapshot = (*self.ring.snapshot()).clone();
-        if ring_snapshot.node_count() == 0
-            || !ring_snapshot.nodes().contains(&self.node_id)
-        {
+        if ring_snapshot.node_count() == 0 || !ring_snapshot.nodes().contains(&self.node_id) {
             ring_snapshot.add_node(self.node_id.clone());
             self.ring.update(ring_snapshot);
         }
@@ -268,12 +265,7 @@ impl Membership {
 
     /// Returns all known nodes and their states.
     pub fn nodes(&self) -> Vec<(NodeId, NodeState)> {
-        self.state
-            .read()
-            .nodes
-            .iter()
-            .map(|(id, (state, _, _))| (id.clone(), *state))
-            .collect()
+        self.state.read().nodes.iter().map(|(id, (state, _, _))| (id.clone(), *state)).collect()
     }
 
     /// Returns the state of a specific node.
@@ -290,7 +282,13 @@ impl Membership {
     }
 
     /// Adds or updates a node's state from external input (e.g., gossip merge).
-    pub fn upsert_node(&self, node_id: NodeId, state: NodeState, incarnation: Incarnation, address: SocketAddr) {
+    pub fn upsert_node(
+        &self,
+        node_id: NodeId,
+        state: NodeState,
+        incarnation: Incarnation,
+        address: SocketAddr,
+    ) {
         let mut inner = self.state.write();
         let old = inner.nodes.insert(node_id.clone(), (state, incarnation, address));
         let old_state = old.map(|(s, _, _)| s).unwrap_or(NodeState::Alive);
@@ -455,10 +453,7 @@ mod tests {
         let m = Membership::new(
             NodeId::new("joiner"),
             "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
-            GossipConfig {
-                seed_nodes: vec![],
-                ..GossipConfig::default()
-            },
+            GossipConfig { seed_nodes: vec![], ..GossipConfig::default() },
             ring_cache.clone(),
         );
 

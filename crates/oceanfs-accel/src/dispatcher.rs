@@ -17,16 +17,17 @@
 //! GpuCuda -> IsaL -> CpuSimd   (always terminates at CpuSimd)
 //! ```
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use oceanfs_core::{AccelConfig, CodecConfig, CompressConfig, CompressionTier};
 #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
 use oceanfs_core::GpuConfig;
+use oceanfs_core::{AccelConfig, CodecConfig, CompressConfig, CompressionTier};
 use oceanfs_ec::{Decoder, Encoder};
 
-use crate::compressor::{Compressor, ZstdCompressor};
-use crate::tier0::{self, CpuEncoder};
+use crate::{
+    compressor::{Compressor, ZstdCompressor},
+    tier0::{self, CpuEncoder},
+};
 
 /// Acceleration tier levels for EC operations.
 ///
@@ -138,8 +139,7 @@ impl AccelDispatcher {
 
         // --- Resolve EC tier ---
         let requested_tier = Self::parse_ec_tier(&config.ec_tier);
-        let active_ec_tier =
-            Self::resolve_ec_tier(requested_tier, cuda_available, tier1_available);
+        let active_ec_tier = Self::resolve_ec_tier(requested_tier, cuda_available, tier1_available);
 
         if active_ec_tier != requested_tier && requested_tier != AccelTier::Auto {
             tracing::warn!(
@@ -283,10 +283,7 @@ impl AccelDispatcher {
 
         // Fall back through tiers
         let effective = self.resolve_tier_with_fallback(tier);
-        self.tier_encoders
-            .get(&effective)
-            .cloned()
-            .unwrap_or_else(|| self.encoder.clone())
+        self.tier_encoders.get(&effective).cloned().unwrap_or_else(|| self.encoder.clone())
     }
 
     /// Resolves an EC decoder for a specific tier override.
@@ -296,10 +293,7 @@ impl AccelDispatcher {
         }
 
         let effective = self.resolve_tier_with_fallback(tier);
-        self.tier_decoders
-            .get(&effective)
-            .cloned()
-            .unwrap_or_else(|| self.decoder.clone())
+        self.tier_decoders.get(&effective).cloned().unwrap_or_else(|| self.decoder.clone())
     }
 
     /// Resolves a compressor for a specific compression tier.
@@ -319,23 +313,17 @@ impl AccelDispatcher {
     /// ```
     pub fn resolve_compressor(&self, tier: CompressionTier) -> Arc<dyn Compressor> {
         let effective = Self::resolve_compression_tier_with_fallback(tier, &self.tier_compressors);
-        self.tier_compressors
-            .get(&effective)
-            .cloned()
-            .unwrap_or_else(|| {
-                // Ultimate fallback: zstd, always available
-                Arc::new(ZstdCompressor::default())
-            })
+        self.tier_compressors.get(&effective).cloned().unwrap_or_else(|| {
+            // Ultimate fallback: zstd, always available
+            Arc::new(ZstdCompressor::default())
+        })
     }
 
     /// Resolves a compressor for a specific compress configuration.
     ///
     /// Convenience method that extracts the tier from a [`CompressConfig`]
     /// and delegates to [`Self::resolve_compressor`].
-    pub fn resolve_compressor_for_config(
-        &self,
-        config: &CompressConfig,
-    ) -> Arc<dyn Compressor> {
+    pub fn resolve_compressor_for_config(&self, config: &CompressConfig) -> Arc<dyn Compressor> {
         self.resolve_compressor(config.tier)
     }
 
@@ -374,9 +362,7 @@ impl AccelDispatcher {
                 }
             }
             CompressionTier::CpuIgzip => {
-                tracing::warn!(
-                    "ISA-L igzip requested but unavailable; falling back to CpuZstd"
-                );
+                tracing::warn!("ISA-L igzip requested but unavailable; falling back to CpuZstd");
                 CompressionTier::CpuZstd
             }
             CompressionTier::CpuZstd => CompressionTier::CpuZstd,
@@ -402,10 +388,7 @@ impl AccelDispatcher {
             "isa_l" => AccelTier::IsaL,
             "gpu_cuda" => AccelTier::GpuCuda,
             other => {
-                tracing::warn!(
-                    tier = other,
-                    "unknown ec_tier value; falling back to auto"
-                );
+                tracing::warn!(tier = other, "unknown ec_tier value; falling back to auto");
                 AccelTier::Auto
             }
         }
@@ -446,9 +429,7 @@ impl AccelDispatcher {
                 if isal_available {
                     AccelTier::IsaL
                 } else {
-                    tracing::warn!(
-                        "ISA-L requested but not available; falling back to CPU SIMD"
-                    );
+                    tracing::warn!("ISA-L requested but not available; falling back to CPU SIMD");
                     AccelTier::CpuSimd
                 }
             }
@@ -585,10 +566,10 @@ impl AccelDispatcher {
     #[cfg(feature = "cuda")]
     fn probe_cuda(gpu_config: Option<&oceanfs_core::GpuConfig>) -> bool {
         let _ = gpu_config; // Used when actual CUDA probing is implemented
-        // In production, this would call cudarc::init() and check device_count.
-        // For now, with the cuda feature enabled but no actual GPU runtime,
-        // we treat CUDA as available if the feature is on. The CudaBackend
-        // itself will handle runtime errors gracefully.
+                            // In production, this would call cudarc::init() and check device_count.
+                            // For now, with the cuda feature enabled but no actual GPU runtime,
+                            // we treat CUDA as available if the feature is on. The CudaBackend
+                            // itself will handle runtime errors gracefully.
         tracing::debug!("CUDA feature enabled; backend will probe at first use");
         true
     }
@@ -602,9 +583,7 @@ impl AccelDispatcher {
         cpu_decoder: Arc<dyn Decoder>,
     ) -> (Arc<dyn Encoder>, Arc<dyn Decoder>) {
         match active_tier {
-            AccelTier::CpuSimd | AccelTier::Auto => {
-                (cpu_encoder, cpu_decoder)
-            }
+            AccelTier::CpuSimd | AccelTier::Auto => (cpu_encoder, cpu_decoder),
             AccelTier::IsaL => {
                 #[cfg(any(feature = "isa-l", feature = "arm-sve"))]
                 {
@@ -620,7 +599,7 @@ impl AccelDispatcher {
                     (cpu_encoder, cpu_decoder)
                 }
             }
-            #[cfg(feature = "cuda")]
+            #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
             AccelTier::GpuCuda => {
                 // Use actual CudaBackend with GPU kernel
                 let gpu_cfg = GpuConfig::default();
@@ -632,10 +611,12 @@ impl AccelDispatcher {
                         return (encoder, decoder);
                     }
                 }
-                tracing::warn!("CUDA tier requested but CudaBackend unavailable; falling back to CPU SIMD");
+                tracing::warn!(
+                    "CUDA tier requested but CudaBackend unavailable; falling back to CPU SIMD"
+                );
                 (cpu_encoder, cpu_decoder)
             }
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(any(not(feature = "cuda"), no_cuda_toolkit))]
             AccelTier::GpuCuda => (cpu_encoder, cpu_decoder),
         }
     }
@@ -646,11 +627,7 @@ impl AccelDispatcher {
 // ---------------------------------------------------------------------------
 
 impl Encoder for AccelDispatcher {
-    fn encode(
-        &self,
-        data_shards: &[&[u8]],
-        parity_count: u8,
-    ) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+    fn encode(&self, data_shards: &[&[u8]], parity_count: u8) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
         self.encoder.encode(data_shards, parity_count)
     }
 }
@@ -679,42 +656,27 @@ mod tests {
 
     #[test]
     fn parse_ec_tier_auto() {
-        assert_eq!(
-            AccelDispatcher::parse_ec_tier("auto"),
-            AccelTier::Auto
-        );
+        assert_eq!(AccelDispatcher::parse_ec_tier("auto"), AccelTier::Auto);
     }
 
     #[test]
     fn parse_ec_tier_cpu_simd() {
-        assert_eq!(
-            AccelDispatcher::parse_ec_tier("cpu_simd"),
-            AccelTier::CpuSimd
-        );
+        assert_eq!(AccelDispatcher::parse_ec_tier("cpu_simd"), AccelTier::CpuSimd);
     }
 
     #[test]
     fn parse_ec_tier_isa_l() {
-        assert_eq!(
-            AccelDispatcher::parse_ec_tier("isa_l"),
-            AccelTier::IsaL
-        );
+        assert_eq!(AccelDispatcher::parse_ec_tier("isa_l"), AccelTier::IsaL);
     }
 
     #[test]
     fn parse_ec_tier_gpu_cuda() {
-        assert_eq!(
-            AccelDispatcher::parse_ec_tier("gpu_cuda"),
-            AccelTier::GpuCuda
-        );
+        assert_eq!(AccelDispatcher::parse_ec_tier("gpu_cuda"), AccelTier::GpuCuda);
     }
 
     #[test]
     fn parse_ec_tier_unknown_falls_back_to_auto() {
-        assert_eq!(
-            AccelDispatcher::parse_ec_tier("supercomputer"),
-            AccelTier::Auto
-        );
+        assert_eq!(AccelDispatcher::parse_ec_tier("supercomputer"), AccelTier::Auto);
     }
 
     // -- Tier resolution (without hardware features) --
@@ -782,20 +744,14 @@ mod tests {
 
     #[test]
     fn cpu_simd_is_always_available() {
-        let config = AccelConfig {
-            ec_tier: "cpu_simd".into(),
-            ..Default::default()
-        };
+        let config = AccelConfig { ec_tier: "cpu_simd".into(), ..Default::default() };
         let dispatcher = AccelDispatcher::new(config);
         assert_eq!(dispatcher.active_tier(), AccelTier::CpuSimd);
     }
 
     #[test]
     fn gpu_cuda_falls_back_without_feature() {
-        let config = AccelConfig {
-            ec_tier: "gpu_cuda".into(),
-            ..Default::default()
-        };
+        let config = AccelConfig { ec_tier: "gpu_cuda".into(), ..Default::default() };
         let dispatcher = AccelDispatcher::new(config);
         // Without cuda feature, falls back to CpuSimd.
         // With cuda feature and NVIDIA drivers, may stay at GpuCuda.
@@ -813,20 +769,14 @@ mod tests {
 
     #[test]
     fn isal_falls_back_without_feature() {
-        let config = AccelConfig {
-            ec_tier: "isa_l".into(),
-            ..Default::default()
-        };
+        let config = AccelConfig { ec_tier: "isa_l".into(), ..Default::default() };
         let dispatcher = AccelDispatcher::new(config);
         assert_eq!(dispatcher.active_tier(), AccelTier::CpuSimd);
     }
 
     #[test]
     fn unknown_tier_falls_back_to_auto_then_cpu() {
-        let config = AccelConfig {
-            ec_tier: "quantum_computer".into(),
-            ..Default::default()
-        };
+        let config = AccelConfig { ec_tier: "quantum_computer".into(), ..Default::default() };
         let dispatcher = AccelDispatcher::new(config);
         // Unknown tier → parse returns Auto → resolve returns best available
         #[cfg(not(feature = "cuda"))]
@@ -848,9 +798,7 @@ mod tests {
         let config = AccelConfig::default();
         let dispatcher = AccelDispatcher::new(config);
 
-        let data: Vec<Vec<u8>> = (0..4)
-            .map(|i| vec![b'a' + i; 64])
-            .collect();
+        let data: Vec<Vec<u8>> = (0..4).map(|i| vec![b'a' + i; 64]).collect();
         let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
 
         let parity = dispatcher.encode(&shard_refs, 2).unwrap();
@@ -863,9 +811,7 @@ mod tests {
         let config = AccelConfig::default();
         let dispatcher = AccelDispatcher::new(config);
 
-        let data: Vec<Vec<u8>> = (0..4)
-            .map(|i| vec![b'a' + i; 64])
-            .collect();
+        let data: Vec<Vec<u8>> = (0..4).map(|i| vec![b'a' + i; 64]).collect();
         let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
         let parity = dispatcher.encode(&shard_refs, 2).unwrap();
 
@@ -885,9 +831,7 @@ mod tests {
     fn encode_decode_roundtrip_through_dispatcher() {
         let dispatcher = AccelDispatcher::new(AccelConfig::default());
 
-        let original: Vec<Vec<u8>> = (0..4)
-            .map(|i| vec![b'0' + i; 128])
-            .collect();
+        let original: Vec<Vec<u8>> = (0..4).map(|i| vec![b'0' + i; 128]).collect();
         let shard_refs: Vec<&[u8]> = original.iter().map(|v| v.as_slice()).collect();
         let parity = dispatcher.encode(&shard_refs, 2).unwrap();
 

@@ -567,8 +567,7 @@ pub struct SegmentIndexEntry {
 /// assert_eq!(inc.value(), 1);
 /// ```
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
-    serde::Serialize, serde::Deserialize,
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 pub struct Incarnation(u64);
 
@@ -774,11 +773,7 @@ pub struct WriteQuorum {
 
 impl Default for WriteQuorum {
     fn default() -> Self {
-        Self {
-            required: 1,
-            ack_after_wal: true,
-            ec_async: true,
-        }
+        Self { required: 1, ack_after_wal: true, ec_async: true }
     }
 }
 
@@ -1091,10 +1086,7 @@ pub trait MetadataStore: Send + Sync {
     /// # Errors
     ///
     /// Returns an I/O error if the underlying storage is unavailable.
-    fn list_object_keys(
-        &self,
-        bucket: &BucketId,
-    ) -> std::io::Result<Vec<(BucketId, ObjectKey)>>;
+    fn list_object_keys(&self, bucket: &BucketId) -> std::io::Result<Vec<(BucketId, ObjectKey)>>;
 
     /// Retrieves object metadata for a given key.
     ///
@@ -1174,11 +1166,7 @@ pub struct CompressConfig {
 
 impl Default for CompressConfig {
     fn default() -> Self {
-        Self {
-            tier: CompressionTier::Auto,
-            level: 3,
-            nvcomp: None,
-        }
+        Self { tier: CompressionTier::Auto, level: 3, nvcomp: None }
     }
 }
 
@@ -1225,11 +1213,7 @@ pub struct NvcompConfig {
 
 impl Default for NvcompConfig {
     fn default() -> Self {
-        Self {
-            codec: NvcompCodec::Lz4,
-            batch_size: 16,
-            device_id: 0,
-        }
+        Self { codec: NvcompCodec::Lz4, batch_size: 16, device_id: 0 }
     }
 }
 
@@ -1453,12 +1437,7 @@ mod tests {
         let key = ObjectKey::new("test");
         let mut chunks = smallvec::SmallVec::new();
         chunks.push(ChunkRef { segment_id: SegmentId::new(), offset: 0, length: 100 });
-        let result = WriteResult {
-            object_key: key.clone(),
-            chunks,
-            size: 100,
-            blake3_hash: None,
-        };
+        let result = WriteResult { object_key: key.clone(), chunks, size: 100, blake3_hash: None };
         assert_eq!(result.size, 100);
         assert_eq!(result.object_key, key);
         assert_eq!(result.chunks.len(), 1);
@@ -1466,11 +1445,7 @@ mod tests {
 
     #[test]
     fn write_ack_construction() {
-        let ack = WriteAck {
-            node_id: NodeId::new("n1"),
-            wal_position: 42,
-            hlc: Hlc::zero(),
-        };
+        let ack = WriteAck { node_id: NodeId::new("n1"), wal_position: 42, hlc: Hlc::zero() };
         assert_eq!(ack.node_id.as_str(), "n1");
         assert_eq!(ack.wal_position, 42);
         assert_eq!(ack.hlc, Hlc::zero());
@@ -1539,10 +1514,7 @@ mod tests {
 
     #[test]
     fn tombstone_hlc_integration() {
-        let ts = Tombstone {
-            deletion_time: 1700000000000,
-            hlc: Hlc::new(1700000000000, 0),
-        };
+        let ts = Tombstone { deletion_time: 1700000000000, hlc: Hlc::new(1700000000000, 0) };
         assert_eq!(ts.deletion_time, 1700000000000);
         assert_eq!(ts.hlc.wall_time(), 1700000000000);
     }
@@ -1829,11 +1801,7 @@ mod tests {
 
     #[test]
     fn segment_index_entry_construction() {
-        let entry = SegmentIndexEntry {
-            offset: 1024,
-            length: 512,
-            blob_key_hash: [0xABu8; 32],
-        };
+        let entry = SegmentIndexEntry { offset: 1024, length: 512, blob_key_hash: [0xABu8; 32] };
         assert_eq!(entry.offset, 1024);
         assert_eq!(entry.length, 512);
         assert_eq!(entry.blob_key_hash, [0xABu8; 32]);
@@ -1844,14 +1812,26 @@ mod tests {
     #[test]
     fn node_state_variants_exist() {
         // Verify all expected variants compile and can be used.
-        let _states = [NodeState::Alive, NodeState::Suspect, NodeState::Dead, NodeState::Leaving, NodeState::Left];
+        let _states = [
+            NodeState::Alive,
+            NodeState::Suspect,
+            NodeState::Dead,
+            NodeState::Leaving,
+            NodeState::Left,
+        ];
     }
 
     // -- OperationType --
 
     #[test]
     fn operation_type_variants_exist() {
-        let _ops = [OperationType::Read, OperationType::Write, OperationType::Delete, OperationType::Head, OperationType::List];
+        let _ops = [
+            OperationType::Read,
+            OperationType::Write,
+            OperationType::Delete,
+            OperationType::Head,
+            OperationType::List,
+        ];
     }
 
     // -- VnodeRange --
@@ -1876,10 +1856,7 @@ mod tests {
 
     #[test]
     fn cache_invalidate_request_construction() {
-        let req = CacheInvalidateRequest {
-            bucket: BucketId::new("b"),
-            key: ObjectKey::new("k"),
-        };
+        let req = CacheInvalidateRequest { bucket: BucketId::new("b"), key: ObjectKey::new("k") };
         assert_eq!(req.bucket.as_str(), "b");
         assert_eq!(req.key.as_str(), "k");
     }
@@ -1889,15 +1866,18 @@ mod tests {
     struct TestStore;
 
     impl MetadataStore for TestStore {
-        fn list_object_keys(&self, _bucket: &BucketId)
-            -> std::io::Result<Vec<(BucketId, ObjectKey)>>
-        {
+        fn list_object_keys(
+            &self,
+            _bucket: &BucketId,
+        ) -> std::io::Result<Vec<(BucketId, ObjectKey)>> {
             Ok(vec![])
         }
 
-        fn get_object_metadata(&self, _bucket: &BucketId, _key: &ObjectKey)
-            -> std::io::Result<Option<ObjectMetadata>>
-        {
+        fn get_object_metadata(
+            &self,
+            _bucket: &BucketId,
+            _key: &ObjectKey,
+        ) -> std::io::Result<Option<ObjectMetadata>> {
             Ok(None)
         }
     }

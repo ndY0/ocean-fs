@@ -17,18 +17,13 @@ use oceanfs_storage::wal::{WalEntry, WalReader, WalWriter};
 fn make_config(dir: &tempfile::TempDir) -> WalConfig {
     WalConfig {
         data_dir: dir.path().join("wal"),
-        max_file_size_bytes: 1024 * 1024,    // 1 MB
+        max_file_size_bytes: 1024 * 1024, // 1 MB
         fsync_batch_timeout_ms: 5,
     }
 }
 
 fn make_entry(segment_id: SegmentId, offset: u64, length: u32) -> WalEntry {
-    WalEntry::new(
-        segment_id,
-        offset,
-        length,
-        HashOutput::from_bytes([0u8; 32]),
-    )
+    WalEntry::new(segment_id, offset, length, HashOutput::from_bytes([0u8; 32]))
 }
 
 // ---------------------------------------------------------------------------

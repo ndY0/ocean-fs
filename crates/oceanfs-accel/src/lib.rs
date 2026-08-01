@@ -63,23 +63,18 @@ mod cuda;
 // Public types (facade)
 pub use arm_sve::ArmEncoder;
 pub use compressor::{Compressor, ZstdCompressor};
-pub use dispatcher::{AccelDispatcher, AccelTier};
-pub use error::{AccelError, Result};
-
-// Re-exports from oceanfs-core for dependents
-pub use oceanfs_core::{AccelConfig, CompressionTier, GpuConfig};
-
+#[cfg(all(feature = "cuda", not(no_cuda_toolkit), not(no_nvcomp)))]
+pub use cuda::nvcomp::NvcompCompressor;
 // Feature-gated backends
 #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
 pub use cuda::CudaBackend;
-#[cfg(all(feature = "cuda", not(no_cuda_toolkit), not(no_nvcomp)))]
-pub use cuda::nvcomp::NvcompCompressor;
-
-#[cfg(feature = "isa-l")]
-pub use isal::IsalEncoder;
-
+pub use dispatcher::{AccelDispatcher, AccelTier};
+pub use error::{AccelError, Result};
 #[cfg(all(target_arch = "x86_64", feature = "isa-l"))]
 pub use igzip::IgzipCompressor;
-
+#[cfg(feature = "isa-l")]
+pub use isal::IsalEncoder;
+// Re-exports from oceanfs-core for dependents
+pub use oceanfs_core::{AccelConfig, CompressionTier, GpuConfig};
 // Re-export Encoder/Decoder traits for convenience
 pub use oceanfs_ec::{Decoder, Encoder};

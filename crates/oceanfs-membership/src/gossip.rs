@@ -14,22 +14,18 @@ use oceanfs_core::{Incarnation, NodeId, NodeState};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, trace};
 
-use crate::failure_detector::DetectorCommand;
-use crate::state::{GossipDelta, GossipState, NodeEntry};
+use crate::{
+    failure_detector::DetectorCommand,
+    state::{GossipDelta, GossipState, NodeEntry},
+};
 
 /// Internal command to the gossip task.
 #[derive(Debug, Clone)]
 pub(crate) enum GossipCommand {
     /// Push a state delta to a specific peer.
-    Push {
-        peer: NodeId,
-        delta: GossipDelta,
-    },
+    Push { peer: NodeId, delta: GossipDelta },
     /// Receive a delta from a peer and merge it.
-    ReceiveDelta {
-        from: NodeId,
-        delta: GossipDelta,
-    },
+    ReceiveDelta { from: NodeId, delta: GossipDelta },
     /// Shut down the gossip task.
     Shutdown,
 }
@@ -106,11 +102,8 @@ impl GossipProtocol {
     /// the more "active" state wins (Alive > Suspect > Dead).
     fn merge_delta(&mut self, delta: &GossipDelta) {
         for entry in &delta.changed {
-            let current_incarnation = self
-                .incarnations
-                .get(&entry.node_id)
-                .copied()
-                .unwrap_or(Incarnation::new(0));
+            let current_incarnation =
+                self.incarnations.get(&entry.node_id).copied().unwrap_or(Incarnation::new(0));
 
             // Higher incarnation always wins.
             if entry.incarnation < current_incarnation {
@@ -123,29 +116,20 @@ impl GossipProtocol {
                 continue;
             }
 
-            let old_state = self
-                .state
-                .nodes
-                .get(&entry.node_id)
-                .map(|e| e.state)
-                .unwrap_or(NodeState::Alive);
+            let old_state =
+                self.state.nodes.get(&entry.node_id).map(|e| e.state).unwrap_or(NodeState::Alive);
 
             // Update local state.
-            self.state.nodes.insert(
-                entry.node_id.clone(),
-                entry.clone(),
-            );
+            self.state.nodes.insert(entry.node_id.clone(), entry.clone());
             self.incarnations.insert(entry.node_id.clone(), entry.incarnation);
 
             // Emit membership event if state changed.
             if old_state != entry.state {
-                let _ = self.membership_event_tx.send(
-                    crate::membership::MembershipEvent {
-                        node_id: entry.node_id.clone(),
-                        old_state,
-                        new_state: entry.state,
-                    },
-                );
+                let _ = self.membership_event_tx.send(crate::membership::MembershipEvent {
+                    node_id: entry.node_id.clone(),
+                    old_state,
+                    new_state: entry.state,
+                });
 
                 // If a node is declared DEAD, notify the failure detector.
                 if entry.state == NodeState::Dead {
@@ -157,9 +141,7 @@ impl GossipProtocol {
 
     /// Builds a delta containing all changes since the given watermark.
     pub(crate) fn build_delta(&self) -> GossipDelta {
-        GossipDelta {
-            changed: self.state.nodes.values().cloned().collect(),
-        }
+        GossipDelta { changed: self.state.nodes.values().cloned().collect() }
     }
 
     /// Returns a snapshot of the current gossip state.
@@ -217,9 +199,7 @@ mod tests {
         protocol.add_node(make_node_entry("n1", 1, NodeState::Alive));
 
         // Try to merge a stale delta (incarnation 0 → should be ignored).
-        let delta = GossipDelta {
-            changed: vec![make_node_entry("n1", 0, NodeState::Dead)],
-        };
+        let delta = GossipDelta { changed: vec![make_node_entry("n1", 0, NodeState::Dead)] };
         protocol.merge_delta(&delta);
 
         // The node should still be ALIVE (stale delta was ignored).
@@ -238,9 +218,7 @@ mod tests {
         protocol.add_node(make_node_entry("n1", 1, NodeState::Alive));
 
         // Merge a delta with incarnation 2 declaring it DEAD.
-        let delta = GossipDelta {
-            changed: vec![make_node_entry("n1", 2, NodeState::Dead)],
-        };
+        let delta = GossipDelta { changed: vec![make_node_entry("n1", 2, NodeState::Dead)] };
         protocol.merge_delta(&delta);
 
         // The node should now be dead.
@@ -258,9 +236,7 @@ mod tests {
         protocol.add_node(make_node_entry("n1", 1, NodeState::Alive));
 
         // Same incarnation, same state — no change.
-        let delta = GossipDelta {
-            changed: vec![make_node_entry("n1", 1, NodeState::Alive)],
-        };
+        let delta = GossipDelta { changed: vec![make_node_entry("n1", 1, NodeState::Alive)] };
         protocol.merge_delta(&delta);
 
         assert_eq!(protocol.alive_nodes().len(), 1);
@@ -321,14 +297,9 @@ mod tests {
         let mut protocol = make_protocol();
         protocol.add_node(make_node_entry("a", 1, NodeState::Alive));
 
-        let delta = GossipDelta {
-            changed: vec![make_node_entry("a", 2, NodeState::Dead)],
-        };
+        let delta = GossipDelta { changed: vec![make_node_entry("a", 2, NodeState::Dead)] };
         let result = protocol
-            .handle_command(GossipCommand::ReceiveDelta {
-                from: NodeId::new("peer"),
-                delta,
-            })
+            .handle_command(GossipCommand::ReceiveDelta { from: NodeId::new("peer"), delta })
             .await;
         assert!(result);
         // The node should now be dead.
@@ -340,15 +311,9 @@ mod tests {
     async fn handle_command_push_merges() {
         let mut protocol = make_protocol();
 
-        let delta = GossipDelta {
-            changed: vec![make_node_entry("new-node", 1, NodeState::Alive)],
-        };
-        let result = protocol
-            .handle_command(GossipCommand::Push {
-                peer: NodeId::new("peer"),
-                delta,
-            })
-            .await;
+        let delta = GossipDelta { changed: vec![make_node_entry("new-node", 1, NodeState::Alive)] };
+        let result =
+            protocol.handle_command(GossipCommand::Push { peer: NodeId::new("peer"), delta }).await;
         assert!(result);
         assert!(protocol.snapshot().nodes.contains_key(&NodeId::new("new-node")));
     }

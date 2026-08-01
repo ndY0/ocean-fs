@@ -44,7 +44,9 @@ fn ring_lifecycle_three_nodes_uniform_distribution() {
         assert!(
             *count >= lower && *count <= upper,
             "node distribution uneven: {} not in [{}, {}]",
-            count, lower, upper
+            count,
+            lower,
+            upper
         );
     }
 }
@@ -57,9 +59,7 @@ fn add_node_rebalances_and_all_keys_resolve() {
     ring.add_node(NodeId::new("b"));
 
     // Record pre-add lookups for 50 keys.
-    let keys: Vec<[u8; 32]> = (0..50)
-        .map(|i| hash_key(format!("key-{}", i).as_bytes()))
-        .collect();
+    let keys: Vec<[u8; 32]> = (0..50).map(|i| hash_key(format!("key-{}", i).as_bytes())).collect();
 
     // Add a new node.
     let ranges = ring.add_node(NodeId::new("c"));

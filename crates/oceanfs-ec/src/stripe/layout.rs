@@ -4,8 +4,9 @@
 //! EC parameters (k, m, strip_size). Validates inputs and returns
 //! a plan with explicit padding information.
 
-use crate::error::{Error, Result};
 use oceanfs_core::EncodingPlan;
+
+use crate::error::{Error, Result};
 
 /// Computes stripe layout for a segment.
 ///

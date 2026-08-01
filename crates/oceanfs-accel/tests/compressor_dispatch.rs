@@ -22,12 +22,7 @@ fn each_tier_produces_correct_roundtrip() {
         let compressor = dispatcher.resolve_compressor(tier);
         let compressed = compressor.compress(data, 3).unwrap();
         let decompressed = compressor.decompress(&compressed).unwrap();
-        assert_eq!(
-            &decompressed[..],
-            data,
-            "roundtrip failed for tier {:?}",
-            tier
-        );
+        assert_eq!(&decompressed[..], data, "roundtrip failed for tier {:?}", tier);
     }
 }
 
@@ -40,10 +35,7 @@ fn per_bucket_tier_override_via_config() {
     let data = b"per-bucket override test data";
 
     // Explicitly request CPU zstd
-    let config = CompressConfig {
-        tier: CompressionTier::CpuZstd,
-        ..Default::default()
-    };
+    let config = CompressConfig { tier: CompressionTier::CpuZstd, ..Default::default() };
     let compressor = dispatcher.resolve_compressor_for_config(&config);
     let compressed = compressor.compress(data, 3).unwrap();
     let decompressed = compressor.decompress(&compressed).unwrap();

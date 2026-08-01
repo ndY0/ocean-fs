@@ -39,9 +39,9 @@ pub use hlc::{Hlc, HlcClock};
 pub use timeouts::OperationTimeouts;
 pub use types::{
     BucketId, CacheInvalidateRequest, ChunkRef, CodecConfig, CodecType, CompressConfig,
-    CompressionTier, EncodingPlan, GpuConfig, GossipConfig, HashKey, HashOutput, Incarnation,
+    CompressionTier, EncodingPlan, GossipConfig, GpuConfig, HashKey, HashOutput, Incarnation,
     IntendedFor, MetadataStore, NodeId, NodeState, NvcompCodec, NvcompConfig, ObjectKey,
     ObjectMetadata, OperationType, PeerAddress, PoolConfig, RpcConfig, SegmentId,
-    SegmentIndexEntry, SegmentMetadata, SegmentSizeConfig, SizeTier, StorageLocation,
-    Tombstone, VnodeRange, WriteAck, WriteQuorum, WriteResult,
+    SegmentIndexEntry, SegmentMetadata, SegmentSizeConfig, SizeTier, StorageLocation, Tombstone,
+    VnodeRange, WriteAck, WriteQuorum, WriteResult,
 };

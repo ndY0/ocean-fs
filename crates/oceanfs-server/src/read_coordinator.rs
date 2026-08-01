@@ -134,11 +134,7 @@ impl ReadCoordinator {
                 created_at: 0,
                 hlc: Hlc::zero(),
             };
-            return Ok(ReadResult {
-                data: Bytes::new(),
-                metadata: meta,
-                hash_verified: false,
-            });
+            return Ok(ReadResult { data: Bytes::new(), metadata: meta, hash_verified: false });
         }
 
         // Step 2-4: Simulated segment read.
@@ -198,11 +194,7 @@ impl ReadCoordinator {
             }
         }
 
-        Ok(ReadResult {
-            data: placeholder_data,
-            metadata: meta,
-            hash_verified: hash_matched,
-        })
+        Ok(ReadResult { data: placeholder_data, metadata: meta, hash_verified: hash_matched })
     }
 
     /// Determines the read outcome for a given metadata entry.
@@ -214,9 +206,7 @@ impl ReadCoordinator {
         } else if meta.chunks.len() == 1 {
             ReadOutcome::SingleChunk
         } else {
-            ReadOutcome::MultiChunk {
-                chunk_count: meta.chunks.len(),
-            }
+            ReadOutcome::MultiChunk { chunk_count: meta.chunks.len() }
         }
     }
 
@@ -241,9 +231,10 @@ impl Default for ReadCoordinator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::*;
     use oceanfs_core::{NodeId, RingConfig, SegmentId};
     use oceanfs_routing::{hash_key, Ring};
+
+    use super::*;
 
     fn make_coordinator() -> ReadCoordinator {
         let mut ring = Ring::new(RingConfig::default());
@@ -362,10 +353,7 @@ mod tests {
             hlc: Hlc::zero(),
         };
         let outcome = coord.classify(&meta);
-        assert_eq!(
-            outcome,
-            ReadOutcome::MultiChunk { chunk_count: 3 }
-        );
+        assert_eq!(outcome, ReadOutcome::MultiChunk { chunk_count: 3 });
     }
 
     #[test]

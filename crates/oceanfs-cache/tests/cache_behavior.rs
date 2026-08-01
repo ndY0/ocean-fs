@@ -26,10 +26,7 @@ impl MockStore {
 }
 
 impl MetadataStore for MockStore {
-    fn list_object_keys(
-        &self,
-        bucket: &BucketId,
-    ) -> std::io::Result<Vec<(BucketId, ObjectKey)>> {
+    fn list_object_keys(&self, bucket: &BucketId) -> std::io::Result<Vec<(BucketId, ObjectKey)>> {
         Ok(self
             .entries
             .iter()
@@ -43,11 +40,7 @@ impl MetadataStore for MockStore {
         bucket: &BucketId,
         key: &ObjectKey,
     ) -> std::io::Result<Option<ObjectMetadata>> {
-        Ok(self
-            .entries
-            .iter()
-            .find(|(b, k, _)| b == bucket && k == key)
-            .map(|(_, _, m)| m.clone()))
+        Ok(self.entries.iter().find(|(b, k, _)| b == bucket && k == key).map(|(_, _, m)| m.clone()))
     }
 }
 
@@ -106,10 +99,7 @@ fn l2_cache_inline_serving() {
     let hit = cache.get(&bucket, &key).unwrap();
     assert!(hit.is_inline());
     assert_eq!(hit.inline_data, Some(Bytes::from_static(b"inline content")));
-    assert_eq!(
-        cache.stats().inline_hits.load(std::sync::atomic::Ordering::Relaxed),
-        1
-    );
+    assert_eq!(cache.stats().inline_hits.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -146,11 +136,7 @@ fn l1_l2_cascade_scenario() {
     let key = ObjectKey::new("obj");
 
     // L2 has inline metadata.
-    l2.put(
-        bucket.clone(),
-        key.clone(),
-        make_meta("obj", Some(b"cached-data")),
-    );
+    l2.put(bucket.clone(), key.clone(), make_meta("obj", Some(b"cached-data")));
 
     // L1 miss: check L1 first.
     assert!(l1.get(&bucket, &key).is_none());
@@ -158,26 +144,15 @@ fn l1_l2_cascade_scenario() {
     // L2 hit with inline data.
     let meta = l2.get(&bucket, &key).unwrap();
     assert!(meta.is_inline());
-    assert_eq!(
-        meta.inline_data,
-        Some(Bytes::from_static(b"cached-data"))
-    );
+    assert_eq!(meta.inline_data, Some(Bytes::from_static(b"cached-data")));
 }
 
 #[test]
 fn negative_cache_rebuild_from_store() {
     let bucket = BucketId::new("test-bucket");
     let entries = vec![
-        (
-            bucket.clone(),
-            ObjectKey::new("a"),
-            make_meta("a", None),
-        ),
-        (
-            bucket.clone(),
-            ObjectKey::new("b"),
-            make_meta("b", None),
-        ),
+        (bucket.clone(), ObjectKey::new("a"), make_meta("a", None)),
+        (bucket.clone(), ObjectKey::new("b"), make_meta("b", None)),
     ];
     let store = Arc::new(MockStore::new(entries));
 
@@ -209,16 +184,8 @@ fn negative_cache_rebuild_from_store() {
 async fn prefetch_warms_metadata_cache() {
     let bucket = BucketId::new("photos");
     let entries = vec![
-        (
-            bucket.clone(),
-            ObjectKey::new("img-001.jpg"),
-            make_meta("img-001.jpg", Some(b"data1")),
-        ),
-        (
-            bucket.clone(),
-            ObjectKey::new("img-002.jpg"),
-            make_meta("img-002.jpg", Some(b"data2")),
-        ),
+        (bucket.clone(), ObjectKey::new("img-001.jpg"), make_meta("img-001.jpg", Some(b"data1"))),
+        (bucket.clone(), ObjectKey::new("img-002.jpg"), make_meta("img-002.jpg", Some(b"data2"))),
     ];
     let store: Arc<dyn MetadataStore> = Arc::new(MockStore::new(entries));
     let metadata_cache = Arc::new(MetadataCache::new(MetadataCacheConfig::default()));
@@ -238,22 +205,15 @@ async fn prefetch_warms_metadata_cache() {
     );
 
     // Simulate LIST response prefetch.
-    let keys = [
-        ObjectKey::new("img-001.jpg"),
-        ObjectKey::new("img-002.jpg"),
-    ];
+    let keys = [ObjectKey::new("img-001.jpg"), ObjectKey::new("img-002.jpg")];
     engine.after_list(bucket.clone(), &keys, 0);
 
     // Allow worker to process.
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Metadata cache should be warm.
-    assert!(metadata_cache
-        .get(&bucket, &ObjectKey::new("img-001.jpg"))
-        .is_some());
-    assert!(metadata_cache
-        .get(&bucket, &ObjectKey::new("img-002.jpg"))
-        .is_some());
+    assert!(metadata_cache.get(&bucket, &ObjectKey::new("img-001.jpg")).is_some());
+    assert!(metadata_cache.get(&bucket, &ObjectKey::new("img-002.jpg")).is_some());
 
     // Object cache should have inline blobs.
     assert_eq!(
@@ -270,18 +230,12 @@ fn stats_accumulate_over_operations() {
 
     // Miss.
     cache.get(&bucket, &key);
-    assert_eq!(
-        cache.stats().misses.load(std::sync::atomic::Ordering::Relaxed),
-        1
-    );
+    assert_eq!(cache.stats().misses.load(std::sync::atomic::Ordering::Relaxed), 1);
 
     // Put + get = hit.
     cache.put(bucket.clone(), key.clone(), Bytes::from_static(b"data"));
     cache.get(&bucket, &key);
-    assert_eq!(
-        cache.stats().hits.load(std::sync::atomic::Ordering::Relaxed),
-        1
-    );
+    assert_eq!(cache.stats().hits.load(std::sync::atomic::Ordering::Relaxed), 1);
 
     // Hit rate.
     let rate = cache.stats().hit_rate();

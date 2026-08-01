@@ -69,9 +69,7 @@ impl PartialOrd for Hlc {
 
 impl Ord for Hlc {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.wall_time
-            .cmp(&other.wall_time)
-            .then_with(|| self.logical.cmp(&other.logical))
+        self.wall_time.cmp(&other.wall_time).then_with(|| self.logical.cmp(&other.logical))
     }
 }
 
@@ -109,10 +107,7 @@ impl HlcClock {
     /// The logical counter starts at 0.
     pub fn new() -> Self {
         let now_ms = current_time_millis();
-        Self {
-            wall: AtomicU64::new(now_ms),
-            logical: AtomicU64::new(0),
-        }
+        Self { wall: AtomicU64::new(now_ms), logical: AtomicU64::new(0) }
     }
 
     /// Returns the current HLC timestamp, advancing the logical counter.
@@ -132,19 +127,13 @@ impl HlcClock {
         // value as the logical component gives us sequential
         // assignment: 0, 1, 2, ... for the same wall time.
         if logical < u32::MAX as u64 {
-            Hlc {
-                wall_time: wall,
-                logical: logical as u32,
-            }
+            Hlc { wall_time: wall, logical: logical as u32 }
         } else {
             // Logical counter exhausted; bump wall time.
             let new_wall = current_time_millis().max(wall + 1);
             self.wall.store(new_wall, Ordering::Release);
             self.logical.store(1, Ordering::Release);
-            Hlc {
-                wall_time: new_wall,
-                logical: 0,
-            }
+            Hlc { wall_time: new_wall, logical: 0 }
         }
     }
 
@@ -193,27 +182,20 @@ impl HlcClock {
                 let wall_bump = new_wall + 1;
                 self.wall.store(wall_bump, Ordering::Release);
                 self.logical.store(0, Ordering::Release);
-                return Hlc {
-                    wall_time: wall_bump,
-                    logical: 0,
-                };
+                return Hlc { wall_time: wall_bump, logical: 0 };
             } else {
                 new_logical
             };
 
             // Attempt to atomically update both fields.
             // Use a compare-exchange loop on wall to ensure consistency.
-            if self.wall.compare_exchange_weak(
-                local_wall,
-                new_wall,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ).is_ok() {
+            if self
+                .wall
+                .compare_exchange_weak(local_wall, new_wall, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
                 self.logical.store(new_logical, Ordering::Release);
-                return Hlc {
-                    wall_time: new_wall,
-                    logical: new_logical as u32,
-                };
+                return Hlc { wall_time: new_wall, logical: new_logical as u32 };
             }
             // CAS failed — retry.
         }
@@ -357,8 +339,7 @@ mod tests {
 
     #[test]
     fn clock_concurrent_now_is_monotonic_per_thread() {
-        use std::sync::Arc;
-        use std::thread;
+        use std::{sync::Arc, thread};
         let clock = Arc::new(HlcClock::new());
         let mut handles = vec![];
         for _ in 0..4 {

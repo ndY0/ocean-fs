@@ -96,11 +96,7 @@ impl Router {
 
         let is_local = replica_set.contains(&self.node_id);
 
-        let forward_target = if is_local {
-            None
-        } else {
-            replica_set.first().cloned()
-        };
+        let forward_target = if is_local { None } else { replica_set.first().cloned() };
 
         debug!(
             is_local = is_local,
@@ -134,11 +130,7 @@ impl Router {
 
         // If this node is in the replica set, handle locally.
         if replica_set.contains(&self.node_id) {
-            return Ok(RouteResponse {
-                is_local: true,
-                replica_set,
-                forward_target: None,
-            });
+            return Ok(RouteResponse { is_local: true, replica_set, forward_target: None });
         }
 
         // Try each successor in order.
@@ -187,13 +179,10 @@ impl Router {
         //
         // For now, we simply verify that the target exists in membership
         // and that we can acquire a channel.
-        let _state = self
-            .membership
-            .state_of(target)
-            .ok_or_else(|| Error::ForwardFailed {
-                target: target.to_string(),
-                reason: "node not found in membership".into(),
-            })?;
+        let _state = self.membership.state_of(target).ok_or_else(|| Error::ForwardFailed {
+            target: target.to_string(),
+            reason: "node not found in membership".into(),
+        })?;
 
         // Channel acquisition is deferred to the actual RPC call site.
         // The pool.get_channel(addr) call will be made by the gRPC
@@ -242,7 +231,10 @@ mod tests {
         let ring_cache = Arc::new(RingCache::new(ring));
         let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
         let membership = Arc::new(Membership::new(
-            NodeId::new(local_node_id), addr, GossipConfig::default(), ring_cache.clone(),
+            NodeId::new(local_node_id),
+            addr,
+            GossipConfig::default(),
+            ring_cache.clone(),
         ));
 
         for node in ring_nodes {
@@ -329,7 +321,10 @@ mod tests {
         let ring_cache = Arc::new(RingCache::new(ring));
         let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
         let membership = Arc::new(Membership::new(
-            NodeId::new("n1"), addr, GossipConfig::default(), ring_cache.clone(),
+            NodeId::new("n1"),
+            addr,
+            GossipConfig::default(),
+            ring_cache.clone(),
         ));
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let router = Router::new(ring_cache, membership, pool, NodeId::new("n1"));

@@ -6,8 +6,7 @@
 
 use std::sync::Arc;
 
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
+use futures::{stream::FuturesUnordered, StreamExt};
 use oceanfs_core::{Hlc, NodeId, WriteAck};
 use oceanfs_membership::Membership;
 use tokio::time::timeout;
@@ -38,10 +37,8 @@ pub(crate) async fn replicate_write(
 
     let write_timeout = std::time::Duration::from_millis(write_timeout_ms);
 
-    let futures: FuturesUnordered<_> = targets
-        .iter()
-        .map(|target| replicate_to_single(membership, target, hlc))
-        .collect();
+    let futures: FuturesUnordered<_> =
+        targets.iter().map(|target| replicate_to_single(membership, target, hlc)).collect();
 
     let result = timeout(write_timeout, async {
         let mut stream = futures;
@@ -80,31 +77,42 @@ async fn replicate_to_single(
         "replica write (simulated)"
     );
 
-    Ok(WriteAck {
-        node_id: target.clone(),
-        wal_position: 0,
-        hlc,
-    })
+    Ok(WriteAck { node_id: target.clone(), wal_position: 0, hlc })
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::*;
+    use std::net::SocketAddr;
+
     use oceanfs_core::{Incarnation, NodeState};
     use oceanfs_routing::{Ring, RingCache};
-    use std::net::SocketAddr;
+
+    use super::*;
 
     fn make_membership(node_id: &str) -> Arc<Membership> {
         let ring = Ring::new(oceanfs_core::RingConfig::default());
         let ring_cache = Arc::new(RingCache::new(ring));
         let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
         let membership = Arc::new(Membership::new(
-            NodeId::new(node_id), addr, oceanfs_core::GossipConfig::default(), ring_cache,
+            NodeId::new(node_id),
+            addr,
+            oceanfs_core::GossipConfig::default(),
+            ring_cache,
         ));
 
-        membership.upsert_node(NodeId::new("n2"), NodeState::Alive, Incarnation::new(1), "127.0.0.1:9002".parse().unwrap());
-        membership.upsert_node(NodeId::new("n3"), NodeState::Alive, Incarnation::new(1), "127.0.0.1:9003".parse().unwrap());
+        membership.upsert_node(
+            NodeId::new("n2"),
+            NodeState::Alive,
+            Incarnation::new(1),
+            "127.0.0.1:9002".parse().unwrap(),
+        );
+        membership.upsert_node(
+            NodeId::new("n3"),
+            NodeState::Alive,
+            Incarnation::new(1),
+            "127.0.0.1:9003".parse().unwrap(),
+        );
         membership
     }
 

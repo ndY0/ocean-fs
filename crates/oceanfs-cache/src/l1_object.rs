@@ -88,11 +88,7 @@ struct CacheEntry {
 
 impl CacheEntry {
     fn new(data: Bytes) -> Self {
-        Self {
-            data,
-            inserted_at: Instant::now(),
-            last_access: AtomicU64::new(0),
-        }
+        Self { data, inserted_at: Instant::now(), last_access: AtomicU64::new(0) }
     }
 
     fn touch(&self, generation: u64) {
@@ -108,10 +104,7 @@ struct BucketCache {
 
 impl BucketCache {
     fn new(config: ObjectCacheConfig) -> Self {
-        Self {
-            config,
-            entries: DashMap::new(),
-        }
+        Self { config, entries: DashMap::new() }
     }
 }
 
@@ -126,9 +119,7 @@ struct LruClock {
 
 impl LruClock {
     fn new() -> Self {
-        Self {
-            generation: AtomicU64::new(1),
-        }
+        Self { generation: AtomicU64::new(1) }
     }
 
     /// Returns the next generation number (monotonically increasing).
@@ -194,9 +185,7 @@ impl ObjectCache {
                     bucket_cache.entries.remove(key);
                     self.stats.evictions.fetch_add(1, Ordering::Relaxed);
                     self.stats.entry_count.fetch_sub(1, Ordering::Relaxed);
-                    self.stats
-                        .size_bytes
-                        .fetch_sub(data_len as u64, Ordering::Relaxed);
+                    self.stats.size_bytes.fetch_sub(data_len as u64, Ordering::Relaxed);
                     self.stats.misses.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
@@ -257,9 +246,7 @@ impl ObjectCache {
 
         let data_len = entry.data.len();
         bucket_cache.entries.insert(key, entry);
-        self.stats
-            .size_bytes
-            .fetch_add(data_len as u64, Ordering::Relaxed);
+        self.stats.size_bytes.fetch_add(data_len as u64, Ordering::Relaxed);
         self.stats.entry_count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -270,9 +257,7 @@ impl ObjectCache {
         if let Some(bucket_cache) = self.buckets.get(bucket) {
             if let Some((_k, entry)) = bucket_cache.entries.remove(key) {
                 let data_len = entry.data.len();
-                self.stats
-                    .size_bytes
-                    .fetch_sub(data_len as u64, Ordering::Relaxed);
+                self.stats.size_bytes.fetch_sub(data_len as u64, Ordering::Relaxed);
                 self.stats.entry_count.fetch_sub(1, Ordering::Relaxed);
             }
         }
@@ -310,8 +295,7 @@ impl ObjectCache {
             }
             *entry = new_cache;
         } else {
-            self.buckets
-                .insert(bucket, Arc::new(BucketCache::new(config)));
+            self.buckets.insert(bucket, Arc::new(BucketCache::new(config)));
         }
     }
 
@@ -319,17 +303,10 @@ impl ObjectCache {
     pub fn clear_bucket(&self, bucket: &BucketId) {
         if let Some((_k, bucket_cache)) = self.buckets.remove(bucket) {
             let removed_count = bucket_cache.entries.len();
-            let removed_size: usize = bucket_cache
-                .entries
-                .iter()
-                .map(|entry| entry.data.len())
-                .sum();
-            self.stats
-                .entry_count
-                .fetch_sub(removed_count, Ordering::Relaxed);
-            self.stats
-                .size_bytes
-                .fetch_sub(removed_size as u64, Ordering::Relaxed);
+            let removed_size: usize =
+                bucket_cache.entries.iter().map(|entry| entry.data.len()).sum();
+            self.stats.entry_count.fetch_sub(removed_count, Ordering::Relaxed);
+            self.stats.size_bytes.fetch_sub(removed_size as u64, Ordering::Relaxed);
         }
     }
 
@@ -368,9 +345,7 @@ impl ObjectCache {
             if let Some(key) = to_remove.take() {
                 if let Some((_, entry)) = bucket_cache.entries.remove(&key) {
                     let data_len = entry.data.len();
-                    self.stats
-                        .size_bytes
-                        .fetch_sub(data_len as u64, Ordering::Relaxed);
+                    self.stats.size_bytes.fetch_sub(data_len as u64, Ordering::Relaxed);
                     self.stats.entry_count.fetch_sub(1, Ordering::Relaxed);
                     self.stats.evictions.fetch_add(1, Ordering::Relaxed);
                     evicted += 1;
@@ -393,9 +368,7 @@ mod tests {
     #[test]
     fn get_miss_returns_none() {
         let cache = ObjectCache::new(ObjectCacheConfig::default());
-        assert!(cache
-            .get(&BucketId::new("b"), &ObjectKey::new("k"))
-            .is_none());
+        assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k")).is_none());
     }
 
     #[test]
@@ -404,51 +377,30 @@ mod tests {
         let data = Bytes::from_static(b"hello");
         cache.put(BucketId::new("b"), ObjectKey::new("k"), data.clone());
 
-        let got = cache
-            .get(&BucketId::new("b"), &ObjectKey::new("k"))
-            .unwrap();
+        let got = cache.get(&BucketId::new("b"), &ObjectKey::new("k")).unwrap();
         assert_eq!(got, data);
     }
 
     #[test]
     fn invalidate_removes_entry() {
         let cache = ObjectCache::new(ObjectCacheConfig::default());
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k"),
-            Bytes::from_static(b"data"),
-        );
+        cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"data"));
         cache.invalidate(&BucketId::new("b"), &ObjectKey::new("k"));
-        assert!(cache
-            .get(&BucketId::new("b"), &ObjectKey::new("k"))
-            .is_none());
+        assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k")).is_none());
     }
 
     #[test]
     fn max_blob_size_gate() {
-        let config = ObjectCacheConfig {
-            max_blob_size: 10,
-            ..Default::default()
-        };
+        let config = ObjectCacheConfig { max_blob_size: 10, ..Default::default() };
         let cache = ObjectCache::new(config);
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k"),
-            Bytes::from(vec![0u8; 20]),
-        );
-        assert!(cache
-            .get(&BucketId::new("b"), &ObjectKey::new("k"))
-            .is_none());
+        cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from(vec![0u8; 20]));
+        assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k")).is_none());
     }
 
     #[test]
     fn hit_rate_computes_correctly() {
         let cache = ObjectCache::new(ObjectCacheConfig::default());
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k"),
-            Bytes::from_static(b"x"),
-        );
+        cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"x"));
         cache.get(&BucketId::new("b"), &ObjectKey::new("k"));
         cache.get(&BucketId::new("b"), &ObjectKey::new("nope"));
         let rate = cache.hit_rate();
@@ -484,39 +436,21 @@ mod tests {
 
     #[test]
     fn ttl_expiry_returns_none() {
-        let config = ObjectCacheConfig {
-            ttl_ms: 10,
-            max_blob_size: 1024,
-            ..Default::default()
-        };
+        let config = ObjectCacheConfig { ttl_ms: 10, max_blob_size: 1024, ..Default::default() };
         let cache = ObjectCache::new(config);
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k"),
-            Bytes::from_static(b"data"),
-        );
+        cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"data"));
 
         // Wait for TTL to expire.
         std::thread::sleep(Duration::from_millis(20));
 
-        assert!(cache
-            .get(&BucketId::new("b"), &ObjectKey::new("k"))
-            .is_none());
+        assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k")).is_none());
     }
 
     #[test]
     fn per_bucket_isolation() {
         let cache = ObjectCache::new(ObjectCacheConfig::default());
-        cache.put(
-            BucketId::new("b1"),
-            ObjectKey::new("k"),
-            Bytes::from_static(b"b1-data"),
-        );
-        cache.put(
-            BucketId::new("b2"),
-            ObjectKey::new("k"),
-            Bytes::from_static(b"b2-data"),
-        );
+        cache.put(BucketId::new("b1"), ObjectKey::new("k"), Bytes::from_static(b"b1-data"));
+        cache.put(BucketId::new("b2"), ObjectKey::new("k"), Bytes::from_static(b"b2-data"));
 
         assert_eq!(
             cache.get(&BucketId::new("b1"), &ObjectKey::new("k")),
@@ -531,20 +465,10 @@ mod tests {
     #[test]
     fn update_existing_key_replaces_value() {
         let cache = ObjectCache::new(ObjectCacheConfig::default());
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k"),
-            Bytes::from_static(b"old"),
-        );
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k"),
-            Bytes::from_static(b"new"),
-        );
+        cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"old"));
+        cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"new"));
 
-        let got = cache
-            .get(&BucketId::new("b"), &ObjectKey::new("k"))
-            .unwrap();
+        let got = cache.get(&BucketId::new("b"), &ObjectKey::new("k")).unwrap();
         assert_eq!(got, Bytes::from_static(b"new"));
     }
 
@@ -553,16 +477,8 @@ mod tests {
         let cache = ObjectCache::new(ObjectCacheConfig::default());
         assert_eq!(cache.stats().entry_count.load(Ordering::Relaxed), 0);
 
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k1"),
-            Bytes::from_static(b"a"),
-        );
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k2"),
-            Bytes::from_static(b"b"),
-        );
+        cache.put(BucketId::new("b"), ObjectKey::new("k1"), Bytes::from_static(b"a"));
+        cache.put(BucketId::new("b"), ObjectKey::new("k2"), Bytes::from_static(b"b"));
         assert_eq!(cache.stats().entry_count.load(Ordering::Relaxed), 2);
 
         cache.invalidate(&BucketId::new("b"), &ObjectKey::new("k1"));
@@ -571,19 +487,10 @@ mod tests {
 
     #[test]
     fn disabled_cache_always_misses() {
-        let config = ObjectCacheConfig {
-            enabled: false,
-            ..Default::default()
-        };
+        let config = ObjectCacheConfig { enabled: false, ..Default::default() };
         let cache = ObjectCache::new(config);
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k"),
-            Bytes::from_static(b"data"),
-        );
-        assert!(cache
-            .get(&BucketId::new("b"), &ObjectKey::new("k"))
-            .is_none());
+        cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"data"));
+        assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k")).is_none());
     }
 
     #[test]
@@ -599,49 +506,28 @@ mod tests {
     #[test]
     fn set_bucket_config_changes_existing_bucket() {
         let cache = ObjectCache::new(ObjectCacheConfig::default());
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k"),
-            Bytes::from_static(b"data"),
-        );
+        cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"data"));
 
         // Disable the bucket.
         cache.set_bucket_config(
             BucketId::new("b"),
-            ObjectCacheConfig {
-                enabled: false,
-                ..Default::default()
-            },
+            ObjectCacheConfig { enabled: false, ..Default::default() },
         );
 
         // Now the bucket should miss.
-        assert!(cache
-            .get(&BucketId::new("b"), &ObjectKey::new("k"))
-            .is_none());
+        assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k")).is_none());
     }
 
     #[test]
     fn clear_bucket_removes_all_entries() {
         let cache = ObjectCache::new(ObjectCacheConfig::default());
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k1"),
-            Bytes::from_static(b"a"),
-        );
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k2"),
-            Bytes::from_static(b"bb"),
-        );
+        cache.put(BucketId::new("b"), ObjectKey::new("k1"), Bytes::from_static(b"a"));
+        cache.put(BucketId::new("b"), ObjectKey::new("k2"), Bytes::from_static(b"bb"));
 
         cache.clear_bucket(&BucketId::new("b"));
 
-        assert!(cache
-            .get(&BucketId::new("b"), &ObjectKey::new("k1"))
-            .is_none());
-        assert!(cache
-            .get(&BucketId::new("b"), &ObjectKey::new("k2"))
-            .is_none());
+        assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k1")).is_none());
+        assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k2")).is_none());
         assert_eq!(cache.stats().entry_count.load(Ordering::Relaxed), 0);
     }
 
@@ -652,11 +538,7 @@ mod tests {
             max_blob_size: 1024,
             ..Default::default()
         });
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k"),
-            Bytes::from_static(b"small"),
-        );
+        cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"small"));
         let size_before = cache.stats().size_bytes.load(Ordering::Relaxed);
 
         cache.put(
@@ -680,18 +562,10 @@ mod tests {
             max_blob_size: 1024,
             ..Default::default()
         });
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k"),
-            Bytes::from_static(b"large value here"),
-        );
+        cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"large value here"));
         let size_before = cache.stats().size_bytes.load(Ordering::Relaxed);
 
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k"),
-            Bytes::from_static(b"tiny"),
-        );
+        cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"tiny"));
         let size_after = cache.stats().size_bytes.load(Ordering::Relaxed);
 
         assert!(size_after < size_before);

@@ -46,11 +46,7 @@ pub struct SegmentSealer {
 #[allow(dead_code)]
 impl SegmentSealer {
     /// Creates a new segment sealer.
-    pub fn new(
-        config: SealConfig,
-        metadata: Arc<MetadataStore>,
-        wal: Arc<WalWriter>,
-    ) -> Self {
+    pub fn new(config: SealConfig, metadata: Arc<MetadataStore>, wal: Arc<WalWriter>) -> Self {
         Self { config, metadata, wal }
     }
 
@@ -194,11 +190,7 @@ mod tests {
         active.append(&[0u8; 50]).unwrap();
 
         // Build an index entry covering the appended data.
-        let entries = vec![SegmentIndexEntry {
-            offset: 0,
-            length: 50,
-            blob_key_hash: [0xAB; 32],
-        }];
+        let entries = vec![SegmentIndexEntry { offset: 0, length: 50, blob_key_hash: [0xAB; 32] }];
 
         let sealer = SegmentSealer::new(config, metadata, wal);
         (sealer, active, entries, dir)

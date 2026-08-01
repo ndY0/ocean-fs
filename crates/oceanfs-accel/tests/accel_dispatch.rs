@@ -12,10 +12,7 @@ use oceanfs_core::CompressionTier;
 /// Encode with one tier, decode with another — must produce identical data.
 #[test]
 fn cross_backend_roundtrip_cpu_isa_l() {
-    let config = AccelConfig {
-        ec_tier: "cpu_simd".into(),
-        ..Default::default()
-    };
+    let config = AccelConfig { ec_tier: "cpu_simd".into(), ..Default::default() };
     let dispatcher = AccelDispatcher::new(config);
 
     let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 256]).collect();
@@ -42,18 +39,13 @@ fn cross_backend_roundtrip_cpu_isa_l() {
 /// GpuCuda tier falls back to CPU when no GPU.
 #[test]
 fn gpu_cuda_tier_falls_back() {
-    let config = AccelConfig {
-        ec_tier: "gpu_cuda".into(),
-        ..Default::default()
-    };
+    let config = AccelConfig { ec_tier: "gpu_cuda".into(), ..Default::default() };
     let dispatcher = AccelDispatcher::new(config);
     let tier = dispatcher.active_tier();
 
     // With or without GPU, must not panic and must produce a valid tier
     assert!(
-        tier == AccelTier::CpuSimd
-            || tier == AccelTier::IsaL
-            || tier == AccelTier::GpuCuda,
+        tier == AccelTier::CpuSimd || tier == AccelTier::IsaL || tier == AccelTier::GpuCuda,
         "unexpected tier: {tier:?}"
     );
 }

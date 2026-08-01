@@ -24,8 +24,10 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use oceanfs_ec::gf::{self, Gf8};
-use oceanfs_ec::{Decoder, Encoder, Error as EcError, Result as EcResult};
+use oceanfs_ec::{
+    gf::{self, Gf8},
+    Decoder, Encoder, Error as EcError, Result as EcResult,
+};
 
 // ---------------------------------------------------------------------------
 // FFI declarations
@@ -129,11 +131,7 @@ impl IsalEncoder {
             ec_init_tables(k_i32, m_i32, encode_matrix.as_ptr(), encode_tables.as_mut_ptr());
         }
 
-        Ok(Self {
-            k,
-            m,
-            encode_tables,
-        })
+        Ok(Self { k, m, encode_tables })
     }
 }
 
@@ -241,13 +239,9 @@ impl Decoder for IsalEncoder {
         }
 
         // Find which shards are present
-        let present: Vec<usize> =
-            (0..total).filter(|&i| available_shards[i].is_some()).collect();
+        let present: Vec<usize> = (0..total).filter(|&i| available_shards[i].is_some()).collect();
         if present.len() < k {
-            return Err(EcError::NotEnoughShards {
-                needed: k,
-                available: present.len(),
-            });
+            return Err(EcError::NotEnoughShards { needed: k, available: present.len() });
         }
 
         // Determine shard size from first available shard
@@ -562,14 +556,8 @@ mod tests {
         let parity = encoder.encode(&shard_refs, 2).unwrap();
 
         // Lose data shards 0 and 2
-        let available: Vec<Option<&[u8]>> = vec![
-            None,
-            Some(&data[1]),
-            None,
-            Some(&data[3]),
-            Some(&parity[0]),
-            Some(&parity[1]),
-        ];
+        let available: Vec<Option<&[u8]>> =
+            vec![None, Some(&data[1]), None, Some(&data[3]), Some(&parity[0]), Some(&parity[1])];
         let recovered = encoder.decode(&available, 4, 2).unwrap();
         assert_eq!(recovered[0], data[0]);
         assert_eq!(recovered[1], data[1]);
@@ -671,13 +659,15 @@ mod tests {
         let available: Vec<Option<&[u8]>> = data
             .iter()
             .enumerate()
-            .map(|(i, v)| {
-                if i == 0 || i == 3 || i == 7 || i == 12 {
-                    None
-                } else {
-                    Some(v.as_slice())
-                }
-            })
+            .map(
+                |(i, v)| {
+                    if i == 0 || i == 3 || i == 7 || i == 12 {
+                        None
+                    } else {
+                        Some(v.as_slice())
+                    }
+                },
+            )
             .chain(parity.iter().map(|v| v.as_slice()).map(Some))
             .collect();
         // Fix: use data[1], data[2], data[4], data[5], data[6], data[8], data[9],
@@ -695,11 +685,7 @@ mod tests {
     #[test]
     fn invert_identity_matrix() {
         // 3×3 identity should invert to itself
-        let matrix = vec![
-            vec![1, 0, 0],
-            vec![0, 1, 0],
-            vec![0, 0, 1],
-        ];
+        let matrix = vec![vec![1, 0, 0], vec![0, 1, 0], vec![0, 0, 1]];
         let inv = invert_matrix(&matrix).unwrap();
         assert_eq!(inv, matrix);
     }
@@ -713,11 +699,7 @@ mod tests {
     #[test]
     fn singular_matrix_returns_none() {
         // A zero matrix is singular
-        let matrix = vec![
-            vec![0u8; 3],
-            vec![0u8; 3],
-            vec![0u8; 3],
-        ];
+        let matrix = vec![vec![0u8; 3], vec![0u8; 3], vec![0u8; 3]];
         assert!(invert_matrix(&matrix).is_none());
     }
 
@@ -727,9 +709,21 @@ mod tests {
         // over GF(2^8) when generator sets are distinct.
         // For k=3: X = [1,2,3], Y = [7,8,9] (k+4, k+5, k+6)
         let matrix = vec![
-            vec![gf::gf_inv(gf::gf_add(1, 7)), gf::gf_inv(gf::gf_add(2, 7)), gf::gf_inv(gf::gf_add(3, 7))],
-            vec![gf::gf_inv(gf::gf_add(1, 8)), gf::gf_inv(gf::gf_add(2, 8)), gf::gf_inv(gf::gf_add(3, 8))],
-            vec![gf::gf_inv(gf::gf_add(1, 9)), gf::gf_inv(gf::gf_add(2, 9)), gf::gf_inv(gf::gf_add(3, 9))],
+            vec![
+                gf::gf_inv(gf::gf_add(1, 7)),
+                gf::gf_inv(gf::gf_add(2, 7)),
+                gf::gf_inv(gf::gf_add(3, 7)),
+            ],
+            vec![
+                gf::gf_inv(gf::gf_add(1, 8)),
+                gf::gf_inv(gf::gf_add(2, 8)),
+                gf::gf_inv(gf::gf_add(3, 8)),
+            ],
+            vec![
+                gf::gf_inv(gf::gf_add(1, 9)),
+                gf::gf_inv(gf::gf_add(2, 9)),
+                gf::gf_inv(gf::gf_add(3, 9)),
+            ],
         ];
         let inv = invert_matrix(&matrix).unwrap();
 
@@ -848,12 +842,9 @@ mod tests {
                 build_cauchy_matrix(k, m, &mut matrix);
 
                 for row in 0..m as usize {
-                    let has_nonzero = (0..k as usize)
-                        .any(|col| matrix[row * (k as usize) + col] != 0);
-                    assert!(
-                        has_nonzero,
-                        "Cauchy matrix k={k}, m={m}, row={row} is all zeros"
-                    );
+                    let has_nonzero =
+                        (0..k as usize).any(|col| matrix[row * (k as usize) + col] != 0);
+                    assert!(has_nonzero, "Cauchy matrix k={k}, m={m}, row={row} is all zeros");
                 }
             }
         }

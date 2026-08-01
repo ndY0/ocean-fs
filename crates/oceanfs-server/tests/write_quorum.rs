@@ -43,10 +43,11 @@ async fn write_with_quorum_capped_to_replica_count() {
 }
 
 fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
+    use std::net::SocketAddr;
+
     use oceanfs_core::{GossipConfig, Incarnation, NodeState, RingConfig, RpcConfig};
     use oceanfs_membership::Membership;
     use oceanfs_network::ConnectionPool;
-    use std::net::SocketAddr;
 
     let mut ring = Ring::new(RingConfig { vnodes_per_node: 8, replication_factor: 3 });
     for n in nodes {
@@ -55,13 +56,22 @@ fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
     let ring_cache = Arc::new(RingCache::new(ring));
     let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
     let membership = Arc::new(Membership::new(
-        NodeId::new(node_id), addr, GossipConfig::default(), ring_cache.clone(),
+        NodeId::new(node_id),
+        addr,
+        GossipConfig::default(),
+        ring_cache.clone(),
     ));
     for n in nodes {
         membership.upsert_node(NodeId::new(*n), NodeState::Alive, Incarnation::new(1), addr);
     }
     let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
-    WriteCoordinator::new(ring_cache, membership, pool, NodeId::new(node_id), Arc::new(HlcClock::new()))
+    WriteCoordinator::new(
+        ring_cache,
+        membership,
+        pool,
+        NodeId::new(node_id),
+        Arc::new(HlcClock::new()),
+    )
 }
 
 fn write_request(key: &str, data: &[u8], quorum: u8) -> WriteRequest {

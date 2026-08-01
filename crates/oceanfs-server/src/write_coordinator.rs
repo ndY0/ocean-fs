@@ -24,8 +24,10 @@ use oceanfs_network::ConnectionPool;
 use oceanfs_routing::RingCache;
 use tracing::{info, warn};
 
-use crate::error::{Error, Result};
-use crate::write::replication::replicate_write;
+use crate::{
+    error::{Error, Result},
+    write::replication::replicate_write,
+};
 
 /// Maximum number of replica nodes to fan out to for a write.
 const MAX_REPLICA_FANOUT: usize = 6;
@@ -147,11 +149,8 @@ impl WriteCoordinator {
         let mut acks_received: usize = 1; // local ack counted
 
         // Build list of remote replicas.
-        let remote_targets: Vec<&NodeId> = replica_set
-            .iter()
-            .filter(|n| *n != &self.node_id)
-            .take(MAX_REPLICA_FANOUT)
-            .collect();
+        let remote_targets: Vec<&NodeId> =
+            replica_set.iter().filter(|n| *n != &self.node_id).take(MAX_REPLICA_FANOUT).collect();
 
         if !remote_targets.is_empty() {
             let results = replicate_write(
@@ -179,10 +178,7 @@ impl WriteCoordinator {
 
         // Step 5: Verify quorum.
         if acks_received < quorum as usize {
-            return Err(Error::QuorumNotMet {
-                required: quorum,
-                received: acks_received,
-            });
+            return Err(Error::QuorumNotMet { required: quorum, received: acks_received });
         }
 
         // Step 6: Build result.
@@ -221,7 +217,10 @@ mod tests {
         let ring_cache = Arc::new(RingCache::new(ring));
         let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
         let membership = Arc::new(Membership::new(
-            NodeId::new(node_id), addr, GossipConfig::default(), ring_cache.clone(),
+            NodeId::new(node_id),
+            addr,
+            GossipConfig::default(),
+            ring_cache.clone(),
         ));
 
         for node in ring_nodes {

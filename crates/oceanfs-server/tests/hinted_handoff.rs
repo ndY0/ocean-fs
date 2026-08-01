@@ -35,13 +35,18 @@ async fn handoff_multiple_hints_delivered_in_batch() {
     let target = NodeId::new("node-c");
 
     for i in 0..5 {
-        hh.handoff(target.clone(), HintRecord {
-            intended_for: target.clone(),
-            segment_id: SegmentId::new(),
-            offset: i * 64,
-            length: 64,
-            timestamp: Hlc::zero(),
-        }).await.unwrap();
+        hh.handoff(
+            target.clone(),
+            HintRecord {
+                intended_for: target.clone(),
+                segment_id: SegmentId::new(),
+                offset: i * 64,
+                length: 64,
+                timestamp: Hlc::zero(),
+            },
+        )
+        .await
+        .unwrap();
     }
     assert_eq!(hh.pending_count(&target), 5);
 

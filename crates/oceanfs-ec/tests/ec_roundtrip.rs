@@ -24,9 +24,8 @@ fn ec_roundtrip_4mb_segment_k4_m2_no_erasures() {
     let codec = CauchyEncoder::new(config);
 
     // Generate pseudo-random segment data (deterministic).
-    let segment_data: Vec<u8> = (0..segment_size as usize)
-        .map(|i| ((i * 7 + 13) % 251) as u8)
-        .collect();
+    let segment_data: Vec<u8> =
+        (0..segment_size as usize).map(|i| ((i * 7 + 13) % 251) as u8).collect();
 
     let plan = StripeLayout::compute(segment_size, k, m, strip_size).unwrap();
 
@@ -40,8 +39,7 @@ fn ec_roundtrip_4mb_segment_k4_m2_no_erasures() {
         .map(|shard_idx| {
             let mut shard = Vec::with_capacity(plan.stripe_count * strip_size);
             for stripe_idx in 0..plan.stripe_count {
-                let start =
-                    stripe_idx * k as usize * strip_size + shard_idx * strip_size;
+                let start = stripe_idx * k as usize * strip_size + shard_idx * strip_size;
                 let end = (start + strip_size).min(segment_data.len());
                 shard.extend_from_slice(&segment_data[start..end]);
             }
@@ -54,9 +52,7 @@ fn ec_roundtrip_4mb_segment_k4_m2_no_erasures() {
     for stripe_idx in 0..plan.stripe_count {
         let stripe_data: Vec<&[u8]> = data_shards
             .iter()
-            .map(|shard| {
-                &shard[stripe_idx * strip_size..(stripe_idx + 1) * strip_size]
-            })
+            .map(|shard| &shard[stripe_idx * strip_size..(stripe_idx + 1) * strip_size])
             .collect();
         let parity = codec.encode(&stripe_data, m).unwrap();
         for (p_idx, p_data) in parity.iter().enumerate() {
@@ -89,8 +85,7 @@ fn ec_roundtrip_4mb_segment_k4_m2_no_erasures() {
 
         let decoded = codec.decode(&available, k, m).unwrap();
         for (shard_idx, shard_data) in decoded.iter().enumerate() {
-            let dest_start =
-                stripe_idx * k as usize * strip_size + shard_idx * strip_size;
+            let dest_start = stripe_idx * k as usize * strip_size + shard_idx * strip_size;
             let copy_len = shard_data.len().min(strip_size);
             let dest_end = (dest_start + copy_len).min(recovered.len());
             recovered[dest_start..dest_end].copy_from_slice(&shard_data[..copy_len]);
@@ -115,9 +110,8 @@ fn ec_roundtrip_with_m_erasures() {
     };
     let codec = CauchyEncoder::new(config);
 
-    let segment_data: Vec<u8> = (0..data_size as usize)
-        .map(|i| ((i * 17 + 31) % 256) as u8)
-        .collect();
+    let segment_data: Vec<u8> =
+        (0..data_size as usize).map(|i| ((i * 17 + 31) % 256) as u8).collect();
 
     let plan = StripeLayout::compute(data_size, k, m, strip_size).unwrap();
     assert_eq!(plan.stripe_count, 1);
@@ -165,12 +159,8 @@ fn ec_roundtrip_k1_m0() {
 
 #[test]
 fn ec_roundtrip_single_byte_edge_case() {
-    let config = CodecConfig {
-        data_shards: 4,
-        parity_shards: 2,
-        strip_size_bytes: 1,
-        ..Default::default()
-    };
+    let config =
+        CodecConfig { data_shards: 4, parity_shards: 2, strip_size_bytes: 1, ..Default::default() };
     let codec = CauchyEncoder::new(config);
     let data = [&b"a"[..], &b"b"[..], &b"c"[..], &b"d"[..]];
     let parity = codec.encode(&data, 2).unwrap();

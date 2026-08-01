@@ -49,10 +49,7 @@ fn active_segment_append_returns_sequential_offsets() {
 
 #[test]
 fn active_segment_is_full_after_target_reached() {
-    let config = SegmentSizeConfig {
-        default_target_size: 1000,
-        ..SegmentSizeConfig::default()
-    };
+    let config = SegmentSizeConfig { default_target_size: 1000, ..SegmentSizeConfig::default() };
     let pool = BufferPool::new(2048, 2);
     let mut seg = ActiveSegment::new(SizeTier::Standard, &config, &pool).unwrap();
 
@@ -63,10 +60,7 @@ fn active_segment_is_full_after_target_reached() {
 
 #[test]
 fn active_segment_rejects_append_when_full() {
-    let config = SegmentSizeConfig {
-        default_target_size: 5,
-        ..SegmentSizeConfig::default()
-    };
+    let config = SegmentSizeConfig { default_target_size: 5, ..SegmentSizeConfig::default() };
     let pool = BufferPool::new(1024, 2);
     let mut seg = ActiveSegment::new(SizeTier::Standard, &config, &pool).unwrap();
 
@@ -142,16 +136,8 @@ fn buffer_pool_exhaustion() {
 #[test]
 fn segment_index_new_with_entries() {
     let entries = vec![
-        SegmentIndexEntry {
-            offset: 0,
-            length: 100,
-            blob_key_hash: [1u8; 32],
-        },
-        SegmentIndexEntry {
-            offset: 100,
-            length: 200,
-            blob_key_hash: [2u8; 32],
-        },
+        SegmentIndexEntry { offset: 0, length: 100, blob_key_hash: [1u8; 32] },
+        SegmentIndexEntry { offset: 100, length: 200, blob_key_hash: [2u8; 32] },
     ];
 
     let index = SegmentIndex::new(entries).unwrap();
@@ -161,21 +147,9 @@ fn segment_index_new_with_entries() {
 #[test]
 fn segment_index_lookup_correct_entry() {
     let entries = vec![
-        SegmentIndexEntry {
-            offset: 0,
-            length: 500,
-            blob_key_hash: [0xAA; 32],
-        },
-        SegmentIndexEntry {
-            offset: 500,
-            length: 300,
-            blob_key_hash: [0xBB; 32],
-        },
-        SegmentIndexEntry {
-            offset: 800,
-            length: 200,
-            blob_key_hash: [0xCC; 32],
-        },
+        SegmentIndexEntry { offset: 0, length: 500, blob_key_hash: [0xAA; 32] },
+        SegmentIndexEntry { offset: 500, length: 300, blob_key_hash: [0xBB; 32] },
+        SegmentIndexEntry { offset: 800, length: 200, blob_key_hash: [0xCC; 32] },
     ];
 
     let index = SegmentIndex::new(entries).unwrap();
@@ -196,16 +170,8 @@ fn segment_index_lookup_correct_entry() {
 #[test]
 fn segment_index_serialization_roundtrip() {
     let entries = vec![
-        SegmentIndexEntry {
-            offset: 0,
-            length: 256,
-            blob_key_hash: [0x11; 32],
-        },
-        SegmentIndexEntry {
-            offset: 256,
-            length: 512,
-            blob_key_hash: [0x22; 32],
-        },
+        SegmentIndexEntry { offset: 0, length: 256, blob_key_hash: [0x11; 32] },
+        SegmentIndexEntry { offset: 256, length: 512, blob_key_hash: [0x22; 32] },
     ];
 
     let index = SegmentIndex::new(entries).unwrap();
@@ -220,13 +186,9 @@ fn segment_index_serialization_roundtrip() {
 #[test]
 fn segment_index_duplicate_offset_rejected() {
     let entries = vec![
+        SegmentIndexEntry { offset: 100, length: 50, blob_key_hash: [0u8; 32] },
         SegmentIndexEntry {
-            offset: 100,
-            length: 50,
-            blob_key_hash: [0u8; 32],
-        },
-        SegmentIndexEntry {
-            offset: 100,  // duplicate
+            offset: 100, // duplicate
             length: 75,
             blob_key_hash: [1u8; 32],
         },

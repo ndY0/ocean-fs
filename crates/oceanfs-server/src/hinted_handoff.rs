@@ -16,8 +16,7 @@
 //! Per performance guideline §2.6 (bounded channels) and §4.5 (adaptive
 //! per-operation timeouts).
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use oceanfs_core::{Hlc, NodeId, OperationTimeouts, SegmentId};
 use oceanfs_network::ConnectionPool;
@@ -72,10 +71,7 @@ pub struct HintedHandoff {
 impl HintedHandoff {
     /// Creates a new empty hinted handoff buffer.
     pub fn new_with_pool(pool: Arc<ConnectionPool>) -> Self {
-        Self {
-            hints: RwLock::new(HashMap::new()),
-            pool,
-        }
+        Self { hints: RwLock::new(HashMap::new()), pool }
     }
 
     /// Creates a new empty hinted handoff buffer (without a connection pool).

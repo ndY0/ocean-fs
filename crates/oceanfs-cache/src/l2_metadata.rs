@@ -46,11 +46,7 @@ pub struct MetadataCacheConfig {
 
 impl Default for MetadataCacheConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            max_size_bytes: 1024 * 1024 * 1024,
-            ttl_ms: 300_000,
-        }
+        Self { enabled: true, max_size_bytes: 1024 * 1024 * 1024, ttl_ms: 300_000 }
     }
 }
 
@@ -64,11 +60,7 @@ struct MetadataEntry {
 
 impl MetadataEntry {
     fn new(metadata: Arc<ObjectMetadata>) -> Self {
-        Self {
-            metadata,
-            inserted_at: Instant::now(),
-            last_access: AtomicU64::new(0),
-        }
+        Self { metadata, inserted_at: Instant::now(), last_access: AtomicU64::new(0) }
     }
 
     fn touch(&self, generation: u64) {
@@ -78,12 +70,7 @@ impl MetadataEntry {
     fn approximate_size(&self) -> usize {
         // Approximate memory: metadata struct + inline data if present.
         std::mem::size_of::<ObjectMetadata>()
-            + self
-                .metadata
-                .inline_data
-                .as_ref()
-                .map(|d| d.len())
-                .unwrap_or(0)
+            + self.metadata.inline_data.as_ref().map(|d| d.len()).unwrap_or(0)
     }
 }
 
@@ -95,10 +82,7 @@ struct BucketMetadataCache {
 
 impl BucketMetadataCache {
     fn new(config: MetadataCacheConfig) -> Self {
-        Self {
-            config,
-            entries: DashMap::new(),
-        }
+        Self { config, entries: DashMap::new() }
     }
 }
 
@@ -109,9 +93,7 @@ struct LruClock {
 
 impl LruClock {
     fn new() -> Self {
-        Self {
-            generation: AtomicU64::new(1),
-        }
+        Self { generation: AtomicU64::new(1) }
     }
 
     fn next(&self) -> u64 {
@@ -183,9 +165,7 @@ impl MetadataCache {
                     bucket_cache.entries.remove(key);
                     self.stats.misses.fetch_add(1, Ordering::Relaxed);
                     self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-                    self.stats
-                        .entry_count
-                        .fetch_sub(1, Ordering::Relaxed);
+                    self.stats.entry_count.fetch_sub(1, Ordering::Relaxed);
                     // Note: we don't track size_bytes for simplicity.
                     return None;
                 }
@@ -210,9 +190,7 @@ impl MetadataCache {
         let bucket_cache = self
             .buckets
             .entry(bucket.clone())
-            .or_insert_with(|| {
-                Arc::new(BucketMetadataCache::new(self.default_config.clone()))
-            })
+            .or_insert_with(|| Arc::new(BucketMetadataCache::new(self.default_config.clone())))
             .clone();
 
         if !bucket_cache.config.enabled {
@@ -278,8 +256,7 @@ impl MetadataCache {
             }
             *entry = new_cache;
         } else {
-            self.buckets
-                .insert(bucket, Arc::new(BucketMetadataCache::new(config)));
+            self.buckets.insert(bucket, Arc::new(BucketMetadataCache::new(config)));
         }
     }
 
@@ -327,11 +304,7 @@ mod tests {
             size: 100,
             blake3_hash: None,
             chunks: smallvec::SmallVec::new(),
-            inline_data: if inline {
-                Some(bytes::Bytes::from_static(b"data"))
-            } else {
-                None
-            },
+            inline_data: if inline { Some(bytes::Bytes::from_static(b"data")) } else { None },
             created_at: 0,
             hlc: Hlc::zero(),
         }
@@ -343,20 +316,14 @@ mod tests {
         let meta = make_meta("k", false);
         cache.put(BucketId::new("b"), ObjectKey::new("k"), meta);
 
-        let got = cache
-            .get(&BucketId::new("b"), &ObjectKey::new("k"))
-            .unwrap();
+        let got = cache.get(&BucketId::new("b"), &ObjectKey::new("k")).unwrap();
         assert_eq!(got.size, 100);
     }
 
     #[test]
     fn inline_hit_increments_counter() {
         let cache = MetadataCache::new(MetadataCacheConfig::default());
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k"),
-            make_meta("k", true),
-        );
+        cache.put(BucketId::new("b"), ObjectKey::new("k"), make_meta("k", true));
         cache.get(&BucketId::new("b"), &ObjectKey::new("k"));
         assert_eq!(cache.stats().inline_hits.load(Ordering::Relaxed), 1);
     }
@@ -364,25 +331,15 @@ mod tests {
     #[test]
     fn invalidate_removes_entry() {
         let cache = MetadataCache::new(MetadataCacheConfig::default());
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k"),
-            make_meta("k", false),
-        );
+        cache.put(BucketId::new("b"), ObjectKey::new("k"), make_meta("k", false));
         cache.invalidate(&BucketId::new("b"), &ObjectKey::new("k"));
-        assert!(cache
-            .get(&BucketId::new("b"), &ObjectKey::new("k"))
-            .is_none());
+        assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k")).is_none());
     }
 
     #[test]
     fn invalidate_increments_evictions() {
         let cache = MetadataCache::new(MetadataCacheConfig::default());
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k"),
-            make_meta("k", false),
-        );
+        cache.put(BucketId::new("b"), ObjectKey::new("k"), make_meta("k", false));
         cache.invalidate(&BucketId::new("b"), &ObjectKey::new("k"));
         assert_eq!(cache.stats().evictions.load(Ordering::Relaxed), 1);
     }
@@ -390,21 +347,12 @@ mod tests {
     #[test]
     fn handle_invalidation_removes_entry() {
         let cache = MetadataCache::new(MetadataCacheConfig::default());
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k"),
-            make_meta("k", false),
-        );
+        cache.put(BucketId::new("b"), ObjectKey::new("k"), make_meta("k", false));
 
-        let req = CacheInvalidateRequest {
-            bucket: BucketId::new("b"),
-            key: ObjectKey::new("k"),
-        };
+        let req = CacheInvalidateRequest { bucket: BucketId::new("b"), key: ObjectKey::new("k") };
         cache.handle_invalidation(req);
 
-        assert!(cache
-            .get(&BucketId::new("b"), &ObjectKey::new("k"))
-            .is_none());
+        assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k")).is_none());
         assert_eq!(cache.stats().evictions.load(Ordering::Relaxed), 1);
     }
 
@@ -421,62 +369,32 @@ mod tests {
 
     #[test]
     fn disabled_cache_always_returns_none() {
-        let config = MetadataCacheConfig {
-            enabled: false,
-            ..Default::default()
-        };
+        let config = MetadataCacheConfig { enabled: false, ..Default::default() };
         let cache = MetadataCache::new(config);
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k"),
-            make_meta("k", false),
-        );
-        assert!(cache
-            .get(&BucketId::new("b"), &ObjectKey::new("k"))
-            .is_none());
+        cache.put(BucketId::new("b"), ObjectKey::new("k"), make_meta("k", false));
+        assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k")).is_none());
     }
 
     #[test]
     fn ttl_expiry_returns_none_and_increments_evictions() {
-        let config = MetadataCacheConfig {
-            ttl_ms: 10,
-            ..Default::default()
-        };
+        let config = MetadataCacheConfig { ttl_ms: 10, ..Default::default() };
         let cache = MetadataCache::new(config);
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k"),
-            make_meta("k", false),
-        );
+        cache.put(BucketId::new("b"), ObjectKey::new("k"), make_meta("k", false));
 
         std::thread::sleep(Duration::from_millis(20));
 
-        assert!(cache
-            .get(&BucketId::new("b"), &ObjectKey::new("k"))
-            .is_none());
+        assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k")).is_none());
         assert_eq!(cache.stats().evictions.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn per_bucket_isolation() {
         let cache = MetadataCache::new(MetadataCacheConfig::default());
-        cache.put(
-            BucketId::new("b1"),
-            ObjectKey::new("k"),
-            make_meta("k-b1", false),
-        );
-        cache.put(
-            BucketId::new("b2"),
-            ObjectKey::new("k"),
-            make_meta("k-b2", false),
-        );
+        cache.put(BucketId::new("b1"), ObjectKey::new("k"), make_meta("k-b1", false));
+        cache.put(BucketId::new("b2"), ObjectKey::new("k"), make_meta("k-b2", false));
 
-        let got1 = cache
-            .get(&BucketId::new("b1"), &ObjectKey::new("k"))
-            .unwrap();
-        let got2 = cache
-            .get(&BucketId::new("b2"), &ObjectKey::new("k"))
-            .unwrap();
+        let got1 = cache.get(&BucketId::new("b1"), &ObjectKey::new("k")).unwrap();
+        let got2 = cache.get(&BucketId::new("b2"), &ObjectKey::new("k")).unwrap();
         assert_eq!(got1.object_key.as_str(), "k-b1");
         assert_eq!(got2.object_key.as_str(), "k-b2");
     }
@@ -490,16 +408,8 @@ mod tests {
         };
         let cache = MetadataCache::new(config);
 
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k1"),
-            make_meta("k1", false),
-        );
-        cache.put(
-            BucketId::new("b"),
-            ObjectKey::new("k2"),
-            make_meta("k2", false),
-        );
+        cache.put(BucketId::new("b"), ObjectKey::new("k1"), make_meta("k1", false));
+        cache.put(BucketId::new("b"), ObjectKey::new("k2"), make_meta("k2", false));
 
         // At least one entry should have been evicted (max_size_bytes=1).
         let stats = cache.stats();

@@ -5,8 +5,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use oceanfs_core::RpcConfig;
 use oceanfs_network::ConnectionPool;
@@ -20,11 +19,8 @@ async fn pool_create_and_acquire_channel() {
 
 #[tokio::test]
 async fn acquire_channel_for_unreachable_peer_errors() {
-    let config = RpcConfig {
-        pool_size_per_peer: 1,
-        connect_timeout_ms: 50,
-        ..RpcConfig::default()
-    };
+    let config =
+        RpcConfig { pool_size_per_peer: 1, connect_timeout_ms: 50, ..RpcConfig::default() };
     let pool = ConnectionPool::new(config);
 
     // TEST-NET-1 address (RFC 5737) — guaranteed unreachable.
@@ -35,11 +31,8 @@ async fn acquire_channel_for_unreachable_peer_errors() {
 
 #[tokio::test]
 async fn concurrent_acquire_from_same_peer() {
-    let config = RpcConfig {
-        pool_size_per_peer: 2,
-        connect_timeout_ms: 100,
-        ..RpcConfig::default()
-    };
+    let config =
+        RpcConfig { pool_size_per_peer: 2, connect_timeout_ms: 100, ..RpcConfig::default() };
     let pool = Arc::new(ConnectionPool::new(config));
     let addr: SocketAddr = "192.0.2.50:9998".parse().unwrap();
 

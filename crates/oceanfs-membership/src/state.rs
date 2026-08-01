@@ -3,8 +3,7 @@
 //! Defines the serializable representations of membership state used
 //! in gossip push/pull exchanges between peers.
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::{collections::HashMap, net::SocketAddr};
 
 use oceanfs_core::{Incarnation, NodeId, NodeState};
 use serde::{Deserialize, Serialize};

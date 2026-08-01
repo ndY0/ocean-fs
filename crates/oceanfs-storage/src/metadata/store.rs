@@ -57,8 +57,7 @@ impl MetadataStore {
         opts.optimize_level_style_compaction(config.memtable_size);
 
         // Configure block cache.
-        let block_cache =
-            rocksdb::Cache::new_lru_cache(config.block_cache_size);
+        let block_cache = rocksdb::Cache::new_lru_cache(config.block_cache_size);
         let mut block_opts = rocksdb::BlockBasedOptions::default();
         block_opts.set_block_cache(&block_cache);
 

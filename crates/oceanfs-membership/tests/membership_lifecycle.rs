@@ -4,8 +4,7 @@
 //! state transitions, event broadcasting, join/leave flow, and
 //! incarnation tracking across state changes.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use oceanfs_core::{GossipConfig, Incarnation, NodeId, NodeState, RingConfig};
 use oceanfs_membership::Membership;
@@ -25,24 +24,16 @@ fn test_addr() -> SocketAddr {
 #[test]
 fn membership_creation_has_correct_node_id() {
     let ring = make_ring();
-    let membership = Membership::new(
-        NodeId::new("test-node"),
-        test_addr(),
-        GossipConfig::default(),
-        ring,
-    );
+    let membership =
+        Membership::new(NodeId::new("test-node"), test_addr(), GossipConfig::default(), ring);
     assert_eq!(membership.node_id().as_str(), "test-node");
 }
 
 #[test]
 fn subscribe_receives_state_change_events() {
     let ring = make_ring();
-    let membership = Membership::new(
-        NodeId::new("observer"),
-        test_addr(),
-        GossipConfig::default(),
-        ring,
-    );
+    let membership =
+        Membership::new(NodeId::new("observer"), test_addr(), GossipConfig::default(), ring);
 
     let mut rx = membership.subscribe();
 
@@ -63,12 +54,8 @@ fn subscribe_receives_state_change_events() {
 #[test]
 fn state_transition_emits_event_with_correct_old_and_new_state() {
     let ring = make_ring();
-    let membership = Membership::new(
-        NodeId::new("observer"),
-        test_addr(),
-        GossipConfig::default(),
-        ring,
-    );
+    let membership =
+        Membership::new(NodeId::new("observer"), test_addr(), GossipConfig::default(), ring);
 
     let mut rx = membership.subscribe();
 
@@ -97,12 +84,8 @@ fn state_transition_emits_event_with_correct_old_and_new_state() {
 #[test]
 fn nodes_returns_all_known_nodes() {
     let ring = make_ring();
-    let membership = Membership::new(
-        NodeId::new("local"),
-        test_addr(),
-        GossipConfig::default(),
-        ring,
-    );
+    let membership =
+        Membership::new(NodeId::new("local"), test_addr(), GossipConfig::default(), ring);
 
     membership.upsert_node(
         NodeId::new("a"),
@@ -126,12 +109,8 @@ fn nodes_returns_all_known_nodes() {
 #[test]
 fn state_of_returns_correct_state_for_known_node() {
     let ring = make_ring();
-    let membership = Membership::new(
-        NodeId::new("local"),
-        test_addr(),
-        GossipConfig::default(),
-        ring,
-    );
+    let membership =
+        Membership::new(NodeId::new("local"), test_addr(), GossipConfig::default(), ring);
 
     membership.upsert_node(
         NodeId::new("known"),
@@ -140,10 +119,7 @@ fn state_of_returns_correct_state_for_known_node() {
         "127.0.0.1:9020".parse().unwrap(),
     );
 
-    assert_eq!(
-        membership.state_of(&NodeId::new("known")),
-        Some(NodeState::Dead)
-    );
+    assert_eq!(membership.state_of(&NodeId::new("known")), Some(NodeState::Dead));
     assert_eq!(membership.state_of(&NodeId::new("unknown")), None);
 }
 
@@ -158,10 +134,7 @@ fn join_without_seed_nodes_adds_self_to_ring() {
         let membership = Membership::new(
             NodeId::new("joiner"),
             test_addr(),
-            GossipConfig {
-                seed_nodes: vec![],
-                ..GossipConfig::default()
-            },
+            GossipConfig { seed_nodes: vec![], ..GossipConfig::default() },
             ring_cache.clone(),
         );
 

@@ -246,8 +246,7 @@ impl MerkleTree {
                 && node_idx < other_levels[0].len()
                 && self_levels[0][node_idx] != other_levels[0][node_idx]
             {
-                divergences
-                    .push(LeafRange { start: node_idx as u64, end: node_idx as u64 + 1 });
+                divergences.push(LeafRange { start: node_idx as u64, end: node_idx as u64 + 1 });
             }
             return;
         }
@@ -305,11 +304,7 @@ impl MerkleTree {
 
         // Walk up from leaf level (0) to just below root
         for level in 0..self.tree_levels.len().saturating_sub(1) {
-            let sibling_idx = if current_idx % 2 == 0 {
-                current_idx + 1
-            } else {
-                current_idx - 1
-            };
+            let sibling_idx = if current_idx % 2 == 0 { current_idx + 1 } else { current_idx - 1 };
 
             if sibling_idx < self.tree_levels[level].len() {
                 siblings.push(self.tree_levels[level][sibling_idx]);
@@ -544,8 +539,7 @@ impl AntiEntropy {
         let this = self.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(this.config.interval_sec))
-                    .await;
+                tokio::time::sleep(std::time::Duration::from_secs(this.config.interval_sec)).await;
                 if let Err(e) = this.run_cycle().await {
                     tracing::warn!(error = %e, "anti-entropy cycle failed");
                 }

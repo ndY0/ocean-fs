@@ -17,10 +17,10 @@
 //! When `s3_auth_enabled` is `false`, all requests pass through
 //! unauthenticated (development mode).
 
-pub mod sigv4;
-pub mod middleware;
 pub mod key_store;
+pub mod middleware;
+pub mod sigv4;
 
-pub use sigv4::SigV4Verifier;
-pub use middleware::AuthMiddleware;
 pub use key_store::{Credentials, KeyStore};
+pub use middleware::AuthMiddleware;
+pub use sigv4::SigV4Verifier;

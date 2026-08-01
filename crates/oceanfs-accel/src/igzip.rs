@@ -36,9 +36,7 @@ use std::alloc::{self, Layout};
 use bytes::Bytes;
 use oceanfs_core::CompressionTier;
 
-use crate::compressor::Compressor;
-use crate::error::AccelError;
-use crate::Result;
+use crate::{compressor::Compressor, error::AccelError, Result};
 
 // ---------------------------------------------------------------------------
 // FFI declarations — Intel ISA-L igzip library
@@ -281,17 +279,14 @@ impl Compressor for IgzipCompressor {
         // We allocate oversized memory to hold the entire isal_zstream
         // (including the large internal state buffer). The first fields
         // are accessed via the IsalZstream repr(C) struct.
-        let layout = Layout::from_size_align(ISAL_ZSTREAM_ESTIMATED_SIZE, 64)
-            .map_err(|e| AccelError::CompressionError {
-                reason: format!("stream layout error: {e}"),
-            })?;
+        let layout = Layout::from_size_align(ISAL_ZSTREAM_ESTIMATED_SIZE, 64).map_err(|e| {
+            AccelError::CompressionError { reason: format!("stream layout error: {e}") }
+        })?;
 
         // SAFETY: layout has non-zero size and alignment.
         let stream_ptr = unsafe { alloc::alloc_zeroed(layout) };
         if stream_ptr.is_null() {
-            return Err(AccelError::CompressionError {
-                reason: "stream allocation failed".into(),
-            });
+            return Err(AccelError::CompressionError { reason: "stream allocation failed".into() });
         }
 
         // SAFETY: stream_ptr is valid, non-null, and large enough to hold
@@ -383,10 +378,9 @@ impl Compressor for IgzipCompressor {
         }
 
         // --- Allocate inflate state ---
-        let layout = Layout::from_size_align(INFLATE_STATE_ESTIMATED_SIZE, 64)
-            .map_err(|e| AccelError::CompressionError {
-                reason: format!("inflate layout error: {e}"),
-            })?;
+        let layout = Layout::from_size_align(INFLATE_STATE_ESTIMATED_SIZE, 64).map_err(|e| {
+            AccelError::CompressionError { reason: format!("inflate layout error: {e}") }
+        })?;
 
         // SAFETY: layout has non-zero size and alignment.
         let state_ptr = unsafe { alloc::alloc_zeroed(layout) };
@@ -445,9 +439,11 @@ impl Compressor for IgzipCompressor {
                 let retry_capacity = data.len() * 64;
                 let mut retry_buf: Vec<u8> = vec![0u8; retry_capacity];
 
-                let layout2 = Layout::from_size_align(INFLATE_STATE_ESTIMATED_SIZE, 64)
-                    .map_err(|e| AccelError::CompressionError {
-                        reason: format!("inflate retry layout error: {e}"),
+                let layout2 =
+                    Layout::from_size_align(INFLATE_STATE_ESTIMATED_SIZE, 64).map_err(|e| {
+                        AccelError::CompressionError {
+                            reason: format!("inflate retry layout error: {e}"),
+                        }
                     })?;
                 // SAFETY: layout2 has non-zero size and alignment.
                 let state_ptr2 = unsafe { alloc::alloc_zeroed(layout2) };
@@ -470,8 +466,7 @@ impl Compressor for IgzipCompressor {
 
                 // SAFETY: state_ptr2 points to properly initialized inflate_state
                 // with valid input/output buffer pointers and sizes.
-                let rc2 =
-                    unsafe { isal_inflate_stateless(state_ptr2 as *mut InflateState) };
+                let rc2 = unsafe { isal_inflate_stateless(state_ptr2 as *mut InflateState) };
 
                 // SAFETY: state_ptr2 is still valid after decompression retry.
                 let len2 = unsafe {
@@ -516,8 +511,7 @@ impl IgzipCompressor {
     pub fn is_available() -> bool {
         #[cfg(target_arch = "x86_64")]
         {
-            std::is_x86_feature_detected!("avx512f")
-                && std::is_x86_feature_detected!("avx512bw")
+            std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw")
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -651,18 +645,12 @@ mod tests {
     #[test]
     fn level_buf_size_level_1_is_default() {
         let size = level_buf_size(1);
-        assert!(
-            size >= 64 * 1024,
-            "level 1 buffer should be >= 64KB, got {size}"
-        );
+        assert!(size >= 64 * 1024, "level 1 buffer should be >= 64KB, got {size}");
     }
 
     #[test]
     fn level_buf_size_level_3_is_default() {
         let size = level_buf_size(3);
-        assert!(
-            size >= 256 * 1024,
-            "level 3 buffer should be >= 256KB, got {size}"
-        );
+        assert!(size >= 256 * 1024, "level 3 buffer should be >= 256KB, got {size}");
     }
 }

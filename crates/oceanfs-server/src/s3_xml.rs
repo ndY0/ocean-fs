@@ -16,12 +16,7 @@
 ///                         "key", "abc123");
 /// assert!(xml.contains("<Code>NoSuchKey</Code>"));
 /// ```
-pub fn s3_error_xml(
-    code: &str,
-    message: &str,
-    resource: &str,
-    request_id: &str,
-) -> String {
+pub fn s3_error_xml(code: &str, message: &str, resource: &str, request_id: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <Error>
