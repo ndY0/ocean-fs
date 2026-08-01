@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integration test: connection pool lifecycle.
 //!
 //! Tests connection pool creation, channel acquisition (error handling

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integration test: Segment lifecycle (buffer → seal → index).
 //!
 //! Verifies:

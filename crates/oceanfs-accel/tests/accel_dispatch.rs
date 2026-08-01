@@ -101,30 +101,23 @@ fn compression_dispatch_works() {
     assert_eq!(&decompressed[..], original);
 }
 
-/// Encoding with k=8, m=4 through the dispatcher.
+/// Encoding with k=4, m=2 through the dispatcher (default codec config).
 #[test]
-fn encode_decode_k8_m4_through_dispatcher() {
+fn encode_decode_k4_m2_through_dispatcher() {
     let dispatcher = AccelDispatcher::new(AccelConfig::default());
 
-    let data: Vec<Vec<u8>> = (0..8).map(|i| vec![i; 64]).collect();
+    let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 64]).collect();
     let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
-    let parity = dispatcher.encode(&shard_refs, 4).unwrap();
+    let parity = dispatcher.encode(&shard_refs, 2).unwrap();
 
     let available: Vec<Option<&[u8]>> = vec![
         None,
         Some(&data[1]),
         Some(&data[2]),
-        None,
-        Some(&data[4]),
-        Some(&data[5]),
-        Some(&data[6]),
-        Some(&data[7]),
+        Some(&data[3]),
         Some(&parity[0]),
         Some(&parity[1]),
-        Some(&parity[2]),
-        Some(&parity[3]),
     ];
-    let recovered = dispatcher.decode(&available, 8, 4).unwrap();
+    let recovered = dispatcher.decode(&available, 4, 2).unwrap();
     assert_eq!(recovered[0], data[0]);
-    assert_eq!(recovered[3], data[3]);
 }

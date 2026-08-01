@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! EC round-trip integration test.
 //!
 //! Encodes a full segment (4 MB) with k=4, m=2, introduces up to m

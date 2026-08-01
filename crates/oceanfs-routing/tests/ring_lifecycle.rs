@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integration test: DHT ring lifecycle.
 //!
 //! Creates a ring with 3 nodes, looks up 100 keys for uniform distribution,

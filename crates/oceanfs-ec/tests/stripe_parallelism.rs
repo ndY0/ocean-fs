@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Stripe parallelism integration test.
 //!
 //! Encodes a 4 MB segment with k=4, m=2 using ParallelEncoder,

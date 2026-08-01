@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integration test: WAL recovery.
 //!
 //! Verifies the write-ahead log's durability guarantees:

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integration test: MetadataStore CRUD operations.
 //!
 //! Verifies object, segment, and tombstone CRUD against RocksDB.

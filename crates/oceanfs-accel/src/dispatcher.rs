@@ -563,7 +563,7 @@ impl AccelDispatcher {
     }
 
     /// Probes for CUDA availability.
-    #[cfg(feature = "cuda")]
+    #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
     fn probe_cuda(gpu_config: Option<&oceanfs_core::GpuConfig>) -> bool {
         let _ = gpu_config; // Used when actual CUDA probing is implemented
                             // In production, this would call cudarc::init() and check device_count.

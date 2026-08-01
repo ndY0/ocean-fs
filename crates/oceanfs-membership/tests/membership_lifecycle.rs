@@ -4,6 +4,8 @@
 //! state transitions, event broadcasting, join/leave flow, and
 //! incarnation tracking across state changes.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::{net::SocketAddr, sync::Arc};
 
 use oceanfs_core::{GossipConfig, Incarnation, NodeId, NodeState, RingConfig};

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integration tests for the caching layer.
 //!
 //! Exercises L1 (object), L2 (metadata), L3 (negative) caches

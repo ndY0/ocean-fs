@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integration test: Anti-Entropy Merkle Exchange
 //!
 //! Tests the Merkle tree construction, diff detection, proof generation,
