@@ -32,15 +32,16 @@ mod hlc;
 mod timeouts;
 mod types;
 
-pub use config::{AuthConfig, MetadataConfig, NodeConfig, RingConfig, WalConfig};
+pub use config::{AccelConfig, AuthConfig, MetadataConfig, NodeConfig, RingConfig, WalConfig};
 pub use conflict::{ConflictResolver, LwwResolver, Resolution};
 pub use error::{Error, Result};
 pub use hlc::{Hlc, HlcClock};
 pub use timeouts::OperationTimeouts;
 pub use types::{
-    BucketId, CacheInvalidateRequest, ChunkRef, CodecConfig, CodecType, EncodingPlan, GossipConfig,
-    HashKey, HashOutput, Incarnation, IntendedFor, MetadataStore, NodeId, NodeState, ObjectKey,
+    BucketId, CacheInvalidateRequest, ChunkRef, CodecConfig, CodecType, CompressConfig,
+    CompressionTier, EncodingPlan, GpuConfig, GossipConfig, HashKey, HashOutput, Incarnation,
+    IntendedFor, MetadataStore, NodeId, NodeState, NvcompCodec, NvcompConfig, ObjectKey,
     ObjectMetadata, OperationType, PeerAddress, PoolConfig, RpcConfig, SegmentId,
-    SegmentIndexEntry, SegmentMetadata, SegmentSizeConfig, SizeTier, StorageLocation, Tombstone,
-    VnodeRange, WriteAck, WriteQuorum, WriteResult,
+    SegmentIndexEntry, SegmentMetadata, SegmentSizeConfig, SizeTier, StorageLocation,
+    Tombstone, VnodeRange, WriteAck, WriteQuorum, WriteResult,
 };

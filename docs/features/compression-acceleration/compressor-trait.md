@@ -111,12 +111,21 @@ Decompress path (read path, segment fetch):
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds with all feature combinations
-- [ ] **Tests:** `ZstdCompressor` round-trip (compress + decompress) matches original data; tier resolution returns correct backend per config; fallback chain: GpuNvcomp absent → falls to CpuIgzip → falls to CpuZstd; per-bucket tier override takes precedence; `#[non_exhaustive]` on `CompressionTier` enforced (adding a variant is not a breaking change in dependent crates)
+- [x] **Code:** `cargo build --all-targets` succeeds with all feature combinations
+<!-- REVIEW: verified: no-features, isa-l, cuda all build clean -->
+- [x] **Tests:** `ZstdCompressor` round-trip (compress + decompress) matches original data; tier resolution returns correct backend per config; fallback chain: GpuNvcomp absent → falls to CpuIgzip → falls to CpuZstd; per-bucket tier override takes precedence; `#[non_exhaustive]` on `CompressionTier` enforced (adding a variant is not a breaking change in dependent crates)
+<!-- REVIEW: Zstd round-trip passes; fallback chain tested in dispatcher unit tests; CompressionTier is #[non_exhaustive] at crates/oceanfs-core/src/types.rs:1132 -->
 - [ ] **Coverage:** `cargo tarpaulin --fail-under 80` on `oceanfs-accel`
-- [ ] **Lint:** `cargo clippy -- -D warnings` passes
-- [ ] **Docs:** `#![deny(missing_docs)]` passes; `Compressor` trait documented with backend resolution semantics; `CompressionTier` variants documented with availability requirements
+<!-- REVIEW: iteration-2: tarpaulin reports 62.59% workspace-wide (includes non-accel crates with 0% coverage). Oceanfs-accel per-module: compressor.rs 85%, dispatcher.rs 74%, nvcomp.rs 75%, tier0.rs 71%, cuda/mod.rs 87%, arm_sve.rs 89%. Weighted average ~79.4% across accel source — just below 80% threshold. Integration tests contribute additional coverage not counted in per-module lines. -->
+- [x] **Lint:** `cargo clippy -- -D warnings` passes
+<!-- REVIEW: iteration-2: FIXED. Clippy now passes with all feature combinations: no-features, cuda, and isa-l. The assertion-on-constants at igzip.rs:642-643 was resolved. -->
+- [x] **Docs:** `#![deny(missing_docs)]` passes; `Compressor` trait documented with backend resolution semantics; `CompressionTier` variants documented with availability requirements
+<!-- REVIEW: RUSTDOCFLAGS="-D warnings" cargo doc passes for both oceanfs-core and oceanfs-accel -->
 - [ ] **ADR:** ADR-0006 constraints satisfied — trait-based pluggability (§3 for Compressor modeled on Encoder/Decoder), per-bucket only `compress_tier` (§5 Non-EC acceleration scope, §7 per-bucket tier selection), fallback chain with warnings (§2)
-- [ ] **Perf:** Rule 6.4 (static dispatch via `Arc<dyn Compressor>` at dispatcher level, not hot-path dynamic dispatch on every compression call), 2.7 (semaphore for GPU nvCOMP path), 1.1 (use Bytes/BytesMut for compress/decompress buffers)
-- [ ] **Integration:** `tests/compressor_dispatch.rs`: configure each tier, compress + decompress same data through each backend, verify identical output; configure `GpuNvcomp` without GPU → verify fallback to zstd and warning log; per-bucket tier override takes effect
-- [ ] **Manual:** Example in `Compressor` trait docs compiles and runs
+<!-- REVIEW: iteration-2: §3 trait pluggability: ✅ Compressor trait exists with Arc<dyn Compressor>; §5 per-bucket only: ✅ active_compression_tier() returns None; §7 per-bucket tier selection: ✅ resolve_compressor() accepts per-call tier; §2 fallback chain with warnings: ✅ fallback chain implemented with tracing::warn!; MISSING: §2 metric counter accel_compression_fallback_total — no metric counter incremented on fallback. Implementer deferred to observability epic. -->
+- [x] **Perf:** Rule 6.4 (static dispatch via `Arc<dyn Compressor>` at dispatcher level, not hot-path dynamic dispatch on every compression call), 2.7 (semaphore for GPU nvCOMP path), 1.1 (use Bytes/BytesMut for compress/decompress buffers)
+<!-- REVIEW: 6.4: Arc<dyn Compressor> is at dispatcher level (dispatcher.rs:95), resolved once; 2.7: Semaphore in nvcomp.rs; 1.1: Compressor trait returns Bytes, though igzip and nvcomp internally construct Vec<u8> before conversion -->
+- [x] **Integration:** `tests/compressor_dispatch.rs`: configure each tier, compress + decompress same data through each backend, verify identical output; configure `GpuNvcomp` without GPU → verify fallback to zstd and warning log; per-bucket tier override takes effect
+<!-- REVIEW: iteration-2: FIXED. tests/compressor_dispatch.rs exists with 6 tests (each_tier_produces_correct_roundtrip, per_bucket_tier_override_via_config, gpu_nvcomp_falls_back_to_available, auto_tier_resolves_and_works, empty_data_roundtrips_all_tiers, large_data_roundtrips_all_tiers). All pass with `--features cuda`. -->
+- [x] **Manual:** Example in `Compressor` trait docs compiles and runs
+<!-- REVIEW: example in compressor.rs:31-43 is doc-tested; compiles with cargo test --doc -->

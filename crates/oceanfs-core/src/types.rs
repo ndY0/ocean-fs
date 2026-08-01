@@ -1111,7 +1111,171 @@ pub trait MetadataStore: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// CacheInvalidateRequest
+// CompressionTier
+// ---------------------------------------------------------------------------
+
+/// Compression acceleration tier.
+///
+/// Controls which compression backend is used for segment data. Unlike
+/// `AccelTier`, compression tier is per-bucket only — there is no
+/// node-level compression tier configuration (per ADR-0006 §5).
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::CompressionTier;
+///
+/// let tier = CompressionTier::Auto;
+/// assert!(matches!(tier, CompressionTier::Auto));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum CompressionTier {
+    /// Automatically select the best available compression backend.
+    /// Probe order: nvCOMP > ISA-L igzip > CPU zstd.
+    Auto,
+    /// CPU zstd (always available).
+    CpuZstd,
+    /// ISA-L igzip (requires isa-l feature + AVX-512).
+    CpuIgzip,
+    /// nvCOMP GPU batch compression (requires cuda feature + nvCOMP library).
+    GpuNvcomp,
+}
+
+// ---------------------------------------------------------------------------
+// GpuConfig
+// ---------------------------------------------------------------------------
+
+/// Configuration for segment compression.
+///
+/// Controls the compression tier and level applied to segment data before
+/// erasure coding. Compression is per-bucket only — there is no node-level
+/// compression tier default (per ADR-0006 §5).
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::{CompressConfig, CompressionTier};
+///
+/// let config = CompressConfig::default();
+/// assert_eq!(config.tier, CompressionTier::Auto);
+/// assert_eq!(config.level, 3);
+/// ```
+#[derive(Debug, Clone)]
+pub struct CompressConfig {
+    /// Compression tier to use: Auto, CpuZstd, CpuIgzip, or GpuNvcomp.
+    pub tier: CompressionTier,
+    /// Compression level (0-22 for zstd, 0-3 for igzip).
+    /// Higher levels produce smaller output at the cost of more CPU/GPU time.
+    pub level: u32,
+    /// nvCOMP-specific configuration (only used when `tier` is GpuNvcomp).
+    pub nvcomp: Option<NvcompConfig>,
+}
+
+impl Default for CompressConfig {
+    fn default() -> Self {
+        Self {
+            tier: CompressionTier::Auto,
+            level: 3,
+            nvcomp: None,
+        }
+    }
+}
+
+/// nvCOMP GPU compression codec selection.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::NvcompCodec;
+///
+/// let codec = NvcompCodec::Lz4;
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum NvcompCodec {
+    /// LZ4 compression (fast, moderate ratio).
+    Lz4,
+    /// Snappy compression (fast, moderate ratio).
+    Snappy,
+    /// Zstandard compression (slower, high ratio).
+    Zstd,
+}
+
+/// Configuration for nvCOMP GPU-accelerated compression.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::{NvcompConfig, NvcompCodec};
+///
+/// let config = NvcompConfig::default();
+/// assert_eq!(config.codec, NvcompCodec::Lz4);
+/// assert_eq!(config.batch_size, 16);
+/// ```
+#[derive(Debug, Clone)]
+pub struct NvcompConfig {
+    /// Compression codec to use (default: LZ4).
+    pub codec: NvcompCodec,
+    /// Number of segments to batch for a single GPU kernel launch (default 16).
+    pub batch_size: usize,
+    /// CUDA device index (default 0).
+    pub device_id: usize,
+}
+
+impl Default for NvcompConfig {
+    fn default() -> Self {
+        Self {
+            codec: NvcompCodec::Lz4,
+            batch_size: 16,
+            device_id: 0,
+        }
+    }
+}
+
+/// Configuration for GPU-accelerated operations.
+///
+/// Controls CUDA device selection, batch sizes, concurrency limits,
+/// and error recovery behavior.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::GpuConfig;
+///
+/// let config = GpuConfig::default();
+/// assert_eq!(config.device_id, 0);
+/// assert_eq!(config.batch_size, 64);
+/// ```
+#[derive(Debug, Clone)]
+pub struct GpuConfig {
+    /// CUDA device index (default 0).
+    pub device_id: usize,
+    /// Number of stripes per GPU kernel launch (default 64).
+    pub batch_size: usize,
+    /// Minimum segment size in bytes for GPU offload (default 100 MB).
+    /// Segments smaller than this use the CPU path regardless of tier.
+    pub min_segment_size: u64,
+    /// Maximum concurrent GPU operations (semaphore permits, default 1).
+    pub max_concurrent_ops: usize,
+    /// Seconds to wait before retrying after a GPU failure (default 60).
+    pub cooldown_sec: u64,
+}
+
+impl Default for GpuConfig {
+    fn default() -> Self {
+        Self {
+            device_id: 0,
+            batch_size: 64,
+            min_segment_size: 104_857_600, // 100 MB
+            max_concurrent_ops: 1,
+            cooldown_sec: 60,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GpuConfig
 // ---------------------------------------------------------------------------
 
 /// A request to invalidate a cache entry, propagated via gossip or direct RPC.
@@ -1143,6 +1307,7 @@ pub struct CacheInvalidateRequest {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -1380,5 +1545,411 @@ mod tests {
         };
         assert_eq!(ts.deletion_time, 1700000000000);
         assert_eq!(ts.hlc.wall_time(), 1700000000000);
+    }
+
+    // -- SegmentId: from_uuid_bytes, as_uuid, Default --
+
+    #[test]
+    fn segment_id_from_uuid_bytes_roundtrip() {
+        let bytes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let id = SegmentId::from_uuid_bytes(bytes);
+        assert_eq!(id.as_uuid().as_bytes(), &bytes);
+    }
+
+    #[test]
+    fn segment_id_default_is_new() {
+        let id = SegmentId::default();
+        let s = id.to_string();
+        assert_eq!(s.len(), 36);
+    }
+
+    // -- NodeId: From<String>, Display --
+
+    #[test]
+    fn node_id_from_string_and_display() {
+        let id = NodeId::from(String::from("boxed-node"));
+        assert_eq!(id.as_str(), "boxed-node");
+        assert_eq!(id.to_string(), "boxed-node");
+    }
+
+    // -- BucketId: From<&str>, Display, From<String> --
+
+    #[test]
+    fn bucket_id_from_str_and_display() {
+        let bucket: BucketId = "my-bucket".into();
+        assert_eq!(bucket.as_str(), "my-bucket");
+    }
+
+    #[test]
+    fn bucket_id_display() {
+        let bucket = BucketId::new("photos");
+        assert_eq!(bucket.to_string(), "photos");
+    }
+
+    #[test]
+    fn bucket_id_from_string() {
+        let bucket = BucketId::from(String::from("videos"));
+        assert_eq!(bucket.as_str(), "videos");
+    }
+
+    // -- ObjectKey: Display, From<&str>, From<String> --
+
+    #[test]
+    fn object_key_display() {
+        let key = ObjectKey::new("hello/world.txt");
+        assert_eq!(key.to_string(), "hello/world.txt");
+    }
+
+    #[test]
+    fn object_key_from_str() {
+        let key: ObjectKey = "prefix/obj".into();
+        assert_eq!(key.as_str(), "prefix/obj");
+    }
+
+    #[test]
+    fn object_key_from_string() {
+        let key = ObjectKey::from(String::from("owned/key"));
+        assert_eq!(key.as_str(), "owned/key");
+    }
+
+    // -- HashOutput: as_bytes, Display --
+
+    #[test]
+    fn hash_output_as_bytes_returns_32_bytes() {
+        let bytes = [42u8; 32];
+        let hash = HashOutput::from_bytes(bytes);
+        assert_eq!(hash.as_bytes(), &bytes);
+    }
+
+    #[test]
+    fn hash_output_display_is_hex() {
+        let hash = HashOutput::from_bytes([0x12u8; 32]);
+        let displayed = hash.to_string();
+        assert_eq!(displayed.len(), 64);
+        assert_eq!(displayed, "12".repeat(32));
+    }
+
+    // -- ChunkRef --
+
+    #[test]
+    fn chunk_ref_construction_and_access() {
+        let seg = SegmentId::new();
+        let chunk = ChunkRef { segment_id: seg, offset: 4096, length: 1024 };
+        assert_eq!(chunk.offset, 4096);
+        assert_eq!(chunk.length, 1024);
+        assert_eq!(chunk.segment_id, seg);
+    }
+
+    #[test]
+    fn chunk_ref_copy_and_eq() {
+        let seg = SegmentId::new();
+        let a = ChunkRef { segment_id: seg, offset: 0, length: 100 };
+        let b = a; // Copy
+        assert_eq!(a, b);
+    }
+
+    // -- ObjectMetadata: is_inline, is_segment_stored --
+
+    #[test]
+    fn object_metadata_is_inline_when_inline_data_present() {
+        let meta = ObjectMetadata {
+            object_key: ObjectKey::new("x"),
+            size: 4,
+            blake3_hash: None,
+            chunks: smallvec::SmallVec::new(),
+            inline_data: Some(bytes::Bytes::from_static(b"data")),
+            created_at: 0,
+            hlc: Hlc::zero(),
+        };
+        assert!(meta.is_inline());
+        assert!(!meta.is_segment_stored());
+    }
+
+    #[test]
+    fn object_metadata_is_segment_stored_when_chunks_present() {
+        let mut chunks = smallvec::SmallVec::new();
+        chunks.push(ChunkRef { segment_id: SegmentId::new(), offset: 0, length: 200 });
+        let meta = ObjectMetadata {
+            object_key: ObjectKey::new("y"),
+            size: 200,
+            blake3_hash: None,
+            chunks,
+            inline_data: None,
+            created_at: 0,
+            hlc: Hlc::zero(),
+        };
+        assert!(meta.is_segment_stored());
+        assert!(!meta.is_inline());
+    }
+
+    // -- SegmentMetadata: is_sealed --
+
+    #[test]
+    fn segment_metadata_is_sealed_when_sealed_at_present() {
+        let meta = SegmentMetadata {
+            segment_id: SegmentId::new(),
+            ec_k: 4,
+            ec_m: 2,
+            size_tier: SizeTier::Standard,
+            merkle_root: None,
+            storage_locations: smallvec::SmallVec::new(),
+            sealed_at: Some(1700000000000),
+        };
+        assert!(meta.is_sealed());
+    }
+
+    #[test]
+    fn segment_metadata_is_not_sealed_when_none() {
+        let meta = SegmentMetadata {
+            segment_id: SegmentId::new(),
+            ec_k: 4,
+            ec_m: 2,
+            size_tier: SizeTier::Standard,
+            merkle_root: None,
+            storage_locations: smallvec::SmallVec::new(),
+            sealed_at: None,
+        };
+        assert!(!meta.is_sealed());
+    }
+
+    // -- Incarnation: new, value, next, Default --
+
+    #[test]
+    fn incarnation_new_and_value() {
+        let inc = Incarnation::new(42);
+        assert_eq!(inc.value(), 42);
+    }
+
+    #[test]
+    fn incarnation_next_increments() {
+        let inc = Incarnation::new(1);
+        assert_eq!(inc.next().value(), 2);
+    }
+
+    #[test]
+    fn incarnation_default_is_one() {
+        assert_eq!(Incarnation::default().value(), 1);
+    }
+
+    // -- HashKey: from_bytes, as_bytes --
+
+    #[test]
+    fn hash_key_from_bytes_and_as_bytes() {
+        let bytes = [0xAAu8; 32];
+        let key = HashKey::from_bytes(bytes);
+        assert_eq!(key.as_bytes(), &bytes);
+    }
+
+    // -- GossipConfig: Default --
+
+    #[test]
+    fn gossip_config_default_values() {
+        let cfg = GossipConfig::default();
+        assert_eq!(cfg.interval_ms, 1000);
+        assert_eq!(cfg.suspicion_timeout_ms, 5000);
+        assert_eq!(cfg.failure_timeout_ms, 15000);
+        assert_eq!(cfg.indirect_ping_count, 3);
+        assert!(cfg.seed_nodes.is_empty());
+    }
+
+    // -- RpcConfig: Default --
+
+    #[test]
+    fn rpc_config_default_values() {
+        let cfg = RpcConfig::default();
+        assert_eq!(cfg.pool_size_per_peer, 4);
+        assert_eq!(cfg.keepalive_sec, 30);
+        assert_eq!(cfg.max_idle_connections, 256);
+        assert_eq!(cfg.connect_timeout_ms, 5000);
+        assert_eq!(cfg.request_timeout_ms, 30000);
+        assert!(cfg.tls_cert_path.is_none());
+    }
+
+    // -- PeerAddress: new, socket_addr, Display, From --
+
+    #[test]
+    fn peer_address_new_and_socket_addr() {
+        let addr: std::net::SocketAddr = "10.0.0.1:9001".parse().unwrap();
+        let peer = PeerAddress::new(addr);
+        assert_eq!(peer.socket_addr(), addr);
+    }
+
+    #[test]
+    fn peer_address_display() {
+        let addr: std::net::SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let peer = PeerAddress::new(addr);
+        assert_eq!(peer.to_string(), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn peer_address_from_socket_addr() {
+        let addr: std::net::SocketAddr = "192.168.1.1:9000".parse().unwrap();
+        let peer: PeerAddress = addr.into();
+        assert_eq!(peer.socket_addr(), addr);
+    }
+
+    // -- CodecConfig: Default --
+
+    #[test]
+    fn codec_config_default_values() {
+        let cfg = CodecConfig::default();
+        assert!(matches!(cfg.codec_type, CodecType::CauchyRs));
+        assert_eq!(cfg.data_shards, 4);
+        assert_eq!(cfg.parity_shards, 2);
+        assert_eq!(cfg.strip_size_bytes, 65536);
+    }
+
+    // -- EncodingPlan: total_shards --
+
+    #[test]
+    fn encoding_plan_total_shards() {
+        let plan = EncodingPlan {
+            stripe_count: 8,
+            padded_size: 4096,
+            shard_size: 128,
+            data_shards: 4,
+            parity_shards: 2,
+        };
+        assert_eq!(plan.total_shards(), 6);
+    }
+
+    #[test]
+    fn encoding_plan_total_shards_only_data() {
+        let plan = EncodingPlan {
+            stripe_count: 1,
+            padded_size: 256,
+            shard_size: 64,
+            data_shards: 3,
+            parity_shards: 0,
+        };
+        assert_eq!(plan.total_shards(), 3);
+    }
+
+    // -- SegmentIndexEntry --
+
+    #[test]
+    fn segment_index_entry_construction() {
+        let entry = SegmentIndexEntry {
+            offset: 1024,
+            length: 512,
+            blob_key_hash: [0xABu8; 32],
+        };
+        assert_eq!(entry.offset, 1024);
+        assert_eq!(entry.length, 512);
+        assert_eq!(entry.blob_key_hash, [0xABu8; 32]);
+    }
+
+    // -- NodeState --
+
+    #[test]
+    fn node_state_variants_exist() {
+        // Verify all expected variants compile and can be used.
+        let _states = [NodeState::Alive, NodeState::Suspect, NodeState::Dead, NodeState::Leaving, NodeState::Left];
+    }
+
+    // -- OperationType --
+
+    #[test]
+    fn operation_type_variants_exist() {
+        let _ops = [OperationType::Read, OperationType::Write, OperationType::Delete, OperationType::Head, OperationType::List];
+    }
+
+    // -- VnodeRange --
+
+    #[test]
+    fn vnode_range_construction() {
+        let range = VnodeRange { start: [0u8; 32], end: [0xFFu8; 32] };
+        assert_eq!(range.start, [0u8; 32]);
+        assert_eq!(range.end, [0xFFu8; 32]);
+    }
+
+    // -- StorageLocation --
+
+    #[test]
+    fn storage_location_construction() {
+        let loc = StorageLocation { node_id: NodeId::new("n1"), shard_index: 3 };
+        assert_eq!(loc.node_id.as_str(), "n1");
+        assert_eq!(loc.shard_index, 3);
+    }
+
+    // -- CacheInvalidateRequest --
+
+    #[test]
+    fn cache_invalidate_request_construction() {
+        let req = CacheInvalidateRequest {
+            bucket: BucketId::new("b"),
+            key: ObjectKey::new("k"),
+        };
+        assert_eq!(req.bucket.as_str(), "b");
+        assert_eq!(req.key.as_str(), "k");
+    }
+
+    // -- MetadataStore trait: verify it can be implemented --
+
+    struct TestStore;
+
+    impl MetadataStore for TestStore {
+        fn list_object_keys(&self, _bucket: &BucketId)
+            -> std::io::Result<Vec<(BucketId, ObjectKey)>>
+        {
+            Ok(vec![])
+        }
+
+        fn get_object_metadata(&self, _bucket: &BucketId, _key: &ObjectKey)
+            -> std::io::Result<Option<ObjectMetadata>>
+        {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn metadata_store_trait_basic_impl() {
+        let store = TestStore;
+        let bucket = BucketId::new("test");
+        assert!(store.list_object_keys(&bucket).unwrap().is_empty());
+        assert!(store.get_object_metadata(&bucket, &ObjectKey::new("k")).unwrap().is_none());
+    }
+
+    // -- CompressionTier --
+
+    #[test]
+    fn compression_tier_variants_exist() {
+        let _tiers = [
+            CompressionTier::Auto,
+            CompressionTier::CpuZstd,
+            CompressionTier::CpuIgzip,
+            CompressionTier::GpuNvcomp,
+        ];
+    }
+
+    #[test]
+    fn compression_tier_auto_is_not_cpu_zstd() {
+        assert_ne!(CompressionTier::Auto, CompressionTier::CpuZstd);
+    }
+
+    // -- GpuConfig --
+
+    #[test]
+    fn gpu_config_default_values() {
+        let cfg = GpuConfig::default();
+        assert_eq!(cfg.device_id, 0);
+        assert_eq!(cfg.batch_size, 64);
+        assert_eq!(cfg.min_segment_size, 104_857_600);
+        assert_eq!(cfg.max_concurrent_ops, 1);
+        assert_eq!(cfg.cooldown_sec, 60);
+    }
+
+    #[test]
+    fn gpu_config_custom() {
+        let cfg = GpuConfig {
+            device_id: 1,
+            batch_size: 128,
+            min_segment_size: 50_000_000,
+            max_concurrent_ops: 4,
+            cooldown_sec: 120,
+        };
+        assert_eq!(cfg.device_id, 1);
+        assert_eq!(cfg.batch_size, 128);
+        assert_eq!(cfg.max_concurrent_ops, 4);
     }
 }

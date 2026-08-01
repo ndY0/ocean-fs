@@ -7,14 +7,23 @@ rust-version.workspace = true
 
 [features]
 default = []
-cuda = []
+cuda = ["dep:cudarc"]
 isa-l = []
+arm-sve = []
 
 [dependencies]
 oceanfs-core.workspace = true
 oceanfs-ec.workspace = true
+bytes.workspace = true
+cudarc = { workspace = true, optional = true, features = ["cuda-12000"] }
 parking_lot.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+zstd = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+static_assertions.workspace = true
 
 [lints]
 workspace = true
