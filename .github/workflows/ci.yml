@@ -13,86 +13,108 @@ env:
 
 jobs:
   # ------------------------------------------------------------------
-  # Build + test matrix
+  # Full workspace build + test (default features)
   # ------------------------------------------------------------------
-  build-and-test:
-    name: Build & Test (${{ matrix.features }})
+  build:
+    name: Build (default)
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        features:
-          - "default"
-          - "isa-l"
-          - "cuda"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-
-      # System libraries for fast native builds (avoids compiling C++ from source)
       - name: Install system libraries
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq librocksdb-dev
-
-      # ISA-L is optional; install only when testing with that feature
-      - name: Install ISA-L (isa-l feature)
-        if: contains(matrix.features, 'isa-l')
-        run: sudo apt-get install -y -qq libisal-dev
-
       - uses: Swatinem/rust-cache@v2
-
-      - name: Build (all targets)
-        if: matrix.features == 'default'
+      - name: Build workspace
         run: cargo build --all-targets --workspace
 
-      - name: Build with ISA-L
-        if: matrix.features == 'isa-l'
-        run: cargo build -p oceanfs-accel -p oceanfs-ec --all-targets --features isa-l
-
-      - name: Build with CUDA (compile-check, no GPU needed)
-        if: matrix.features == 'cuda'
-        run: cargo build -p oceanfs-accel --all-targets --features cuda
-
-      - name: Test (all targets)
-        if: matrix.features == 'default'
-        run: cargo test --all-targets --workspace
-
-      - name: Test with ISA-L
-        if: matrix.features == 'isa-l'
-        run: cargo test -p oceanfs-accel -p oceanfs-ec --all-targets --features isa-l
-
-      - name: Test with CUDA (compile-check, no GPU needed)
-        if: matrix.features == 'cuda'
-        run: cargo test -p oceanfs-accel --lib --features cuda
-
-  # ------------------------------------------------------------------
-  # Cross-compile for aarch64 (ARM NEON/SVE validation)
-  # ------------------------------------------------------------------
-  cross-aarch64:
-    name: Cross-compile aarch64 (arm-sve)
+  test:
+    name: Test (default)
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install aarch64 cross-linker
+      - name: Install system libraries
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
-
-      - name: Install aarch64 target
-        run: rustup target add aarch64-unknown-linux-gnu
-
+          sudo apt-get install -y -qq librocksdb-dev
       - uses: Swatinem/rust-cache@v2
+      - name: Test workspace
+        run: cargo test --all-targets --workspace
 
-      # Cross-compile the accel crate with ARM NEON/SVE intrinsics.
-      # This verifies the `std::arch::aarch64` intrinsics compile
-      # without needing actual ARM hardware.
-      - name: Build oceanfs-accel for aarch64
+  # ------------------------------------------------------------------
+  # Feature-gated builds (isa-l, cuda)
+  # ------------------------------------------------------------------
+  build-isa-l:
+    name: Build (isa-l)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq librocksdb-dev libisal-dev
+      - uses: Swatinem/rust-cache@v2
+      - name: Build with ISA-L
+        run: cargo build -p oceanfs-accel -p oceanfs-ec --all-targets --features isa-l
+
+  test-isa-l:
+    name: Test (isa-l)
+    needs: build-isa-l
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq librocksdb-dev libisal-dev
+      - uses: Swatinem/rust-cache@v2
+      - name: Test with ISA-L
+        run: cargo test -p oceanfs-accel -p oceanfs-ec --all-targets --features isa-l
+
+  build-cuda:
+    name: Build (cuda)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build with CUDA (no GPU needed)
+        run: cargo build -p oceanfs-accel --all-targets --features cuda
+
+  test-cuda:
+    name: Test (cuda)
+    needs: build-cuda
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test with CUDA (no GPU needed)
+        run: cargo test -p oceanfs-accel --lib --features cuda
+
+  # ------------------------------------------------------------------
+  # Cross-compile aarch64 (ARM NEON/SVE validation)
+  # ------------------------------------------------------------------
+  cross-aarch64:
+    name: Cross-compile (aarch64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install aarch64 target + cross-linker
+        run: |
+          rustup target add aarch64-unknown-linux-gnu
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Build with arm-sve feature
         run: cargo build -p oceanfs-accel --features arm-sve --target aarch64-unknown-linux-gnu
-
-      # Also verify the portable path compiles for aarch64 (no feature)
-      - name: Build oceanfs-accel for aarch64 (portable)
+      - name: Build portable aarch64
         run: cargo build -p oceanfs-accel --target aarch64-unknown-linux-gnu
 
   # ------------------------------------------------------------------
@@ -106,18 +128,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-
       - name: Install system libraries
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq librocksdb-dev libisal-dev
-
       - uses: Swatinem/rust-cache@v2
-
-      - name: Clippy (all features, deny warnings)
-        run: cargo clippy --all-targets --features isa-l -- -D warnings
-
-      - name: Clippy (cuda feature)
+      - name: Clippy (default)
+        run: cargo clippy --all-targets --workspace -- -D warnings
+      - name: Clippy (isa-l)
+        run: cargo clippy -p oceanfs-accel --features isa-l -- -D warnings
+      - name: Clippy (cuda)
         run: cargo clippy -p oceanfs-accel --features cuda -- -D warnings
 
   # ------------------------------------------------------------------
@@ -131,7 +151,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -144,15 +163,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system libraries (for doc builds of storage crate)
+      - name: Install system libraries
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq librocksdb-dev libisal-dev
-
       - uses: Swatinem/rust-cache@v2
-
-      - name: Build docs (deny warnings, all features)
+      - name: Build docs (all features, deny warnings)
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features isa-l
 
   # ------------------------------------------------------------------
@@ -164,7 +180,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-
       - name: oceanfs-core must have no internal deps
         run: |
           if cargo tree --edges normal -p oceanfs-core 2>/dev/null | grep -q 'oceanfs-'; then
@@ -183,32 +198,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-
       - name: Detect circular dependencies
         run: |
           cargo tree --edges normal --depth 1 -p oceanfs-node 2>/dev/null | grep oceanfs || true
           echo "PASS: manual review required — ensure no bidirectional oceanfs-* edges"
 
   # ------------------------------------------------------------------
-  # Benchmark regression detection
+  # Benchmark compile check
   # ------------------------------------------------------------------
   benchmarks:
-    name: Benchmarks (compile + quick test)
+    name: Benchmarks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-
       - name: Install system libraries
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq librocksdb-dev
-
       - uses: Swatinem/rust-cache@v2
-
       - name: Build benchmarks
         run: cargo bench --no-run --manifest-path benches/Cargo.toml
-
-      - name: Quick benchmark sanity (1 sample)
-        run: |
-          cargo bench --bench ec_benchmark -- --sample-size 2 --warm-up-time 0 --measurement-time 1 2>&1 | head -30
