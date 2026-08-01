@@ -5,7 +5,6 @@
 //! verifies 16 stripes produced, then decodes with 1 missing shard
 //! per stripe and verifies all data recovered.
 
-
 use std::sync::Arc;
 
 use oceanfs_core::CodecConfig;

@@ -9,7 +9,6 @@
 //!
 //! Covers the `wal-write-ahead-log` feature's Definition of Done.
 
-
 use oceanfs_core::{HashOutput, SegmentId, WalConfig};
 use oceanfs_storage::wal::{WalEntry, WalReader, WalWriter};
 

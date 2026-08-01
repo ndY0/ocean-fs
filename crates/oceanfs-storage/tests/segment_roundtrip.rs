@@ -10,7 +10,6 @@
 //!
 //! Covers `segment-buffer-inline` and `segment-sealing-index` features.
 
-
 use oceanfs_core::{SegmentId, SegmentIndexEntry, SegmentSizeConfig, SizeTier};
 use oceanfs_storage::{ActiveSegment, BufferPool, SegmentHeader, SegmentIndex};
 

@@ -4,7 +4,6 @@
 //! Exercises L1 (object), L2 (metadata), L3 (negative) caches
 //! and the prefetch engine together.
 
-
 use std::sync::Arc;
 
 use bytes::Bytes;

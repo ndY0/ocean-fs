@@ -4,7 +4,6 @@
 //! Encodes a full segment (4 MB) with k=4, m=2, introduces up to m
 //! erasures, decodes, and verifies bit-exact recovery.
 
-
 use oceanfs_core::CodecConfig;
 use oceanfs_ec::{CauchyEncoder, Decoder, Encoder, StripeLayout};
 

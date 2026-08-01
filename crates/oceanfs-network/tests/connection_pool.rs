@@ -4,7 +4,6 @@
 //! Tests connection pool creation, channel acquisition (error handling
 //! for unreachable peers), concurrent access, and configuration.
 
-
 use std::{net::SocketAddr, sync::Arc};
 
 use oceanfs_core::RpcConfig;
