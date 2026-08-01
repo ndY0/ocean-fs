@@ -4,6 +4,7 @@
 //! tier fallback behavior, per-bucket override, and compression dispatch.
 
 #![allow(clippy::unwrap_used)]
+#![allow(unused_imports)]
 
 use oceanfs_accel::{AccelConfig, AccelDispatcher, AccelTier, Decoder, Encoder};
 use oceanfs_core::CompressionTier;

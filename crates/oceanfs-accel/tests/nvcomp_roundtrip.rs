@@ -1,6 +1,8 @@
 //! Integration tests for nvCOMP GPU batch compression — verify GPU roundtrip,
 //! fallback to zstd when GPU unavailable, batch size boundaries, bit-exact match.
 
+#![allow(unused_imports)]
+
 #[cfg(feature = "cuda")]
 mod nvcomp_tests {
     use oceanfs_accel::{AccelConfig, AccelDispatcher, Compressor};

@@ -1,6 +1,8 @@
 //! Integration tests for compression dispatch — exercises the Compressor trait
 //! through AccelDispatcher, validates tier resolution, fallback, and roundtrips.
 
+#![allow(unused_imports)]
+
 use oceanfs_accel::{AccelConfig, AccelDispatcher, Compressor};
 use oceanfs_core::CompressionTier;
 

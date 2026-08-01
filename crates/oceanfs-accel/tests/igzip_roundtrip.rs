@@ -1,6 +1,8 @@
 //! Integration tests for ISA-L igzip compression — cross-backend roundtrip,
 //! fallback behavior when igzip is unavailable, DEFLATE compatibility.
 
+#![allow(unused_imports)]
+
 #[cfg(all(target_arch = "x86_64", feature = "isa-l"))]
 mod igzip_tests {
     use oceanfs_accel::{AccelConfig, AccelDispatcher, Compressor};
