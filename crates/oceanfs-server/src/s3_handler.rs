@@ -68,6 +68,13 @@ pub(crate) struct AppState {
     pub buckets: Arc<BucketConfigStore>,
     /// MIME type map by file extension.
     pub mime_types: Arc<MimeMap>,
+    /// Optional L1 object cache for fast reads.
+    pub object_cache: Option<Arc<oceanfs_cache::ObjectCache>>,
+    /// Optional L2 metadata cache.
+    pub metadata_cache: Option<Arc<oceanfs_cache::MetadataCache>>,
+    /// Optional L3 negative cache.
+    #[allow(dead_code)]
+    pub negative_cache: Option<Arc<oceanfs_cache::NegativeCache>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -113,8 +120,29 @@ impl S3Handler {
         metadata: Arc<dyn MetadataOps>,
         buckets: Arc<BucketConfigStore>,
     ) -> Self {
-        let state =
-            AppState { write, read, metadata, buckets, mime_types: Arc::new(MimeMap::default()) };
+        Self::new_with_caches(write, read, metadata, buckets, None, None, None)
+    }
+
+    /// Creates a new S3 handler with cache layers wired.
+    pub fn new_with_caches(
+        write: Arc<WriteCoordinator>,
+        read: Arc<ReadCoordinator>,
+        metadata: Arc<dyn MetadataOps>,
+        buckets: Arc<BucketConfigStore>,
+        object_cache: Option<Arc<oceanfs_cache::ObjectCache>>,
+        metadata_cache: Option<Arc<oceanfs_cache::MetadataCache>>,
+        negative_cache: Option<Arc<oceanfs_cache::NegativeCache>>,
+    ) -> Self {
+        let state = AppState {
+            write,
+            read,
+            metadata,
+            buckets,
+            mime_types: Arc::new(MimeMap::default()),
+            object_cache,
+            metadata_cache,
+            negative_cache,
+        };
         Self { state }
     }
 
@@ -126,9 +154,9 @@ impl S3Handler {
         let state = self.state;
 
         Router::new()
-            // Object operations: /{bucket}/{*key}
+            // Object operations: /:bucket/*key (catch-all for S3-style keys)
             .route(
-                "/{bucket}/{*key}",
+                "/:bucket/*key",
                 axum::routing::put(put_object)
                     .get(get_object)
                     .head(head_object)
@@ -208,6 +236,25 @@ async fn get_object(
     let object_key = ObjectKey::new(&key);
 
     let hk = HashKey::from_bytes(hash_key(object_key.as_str().as_bytes()));
+
+    // Check L1 object cache first.
+    if let Some(ref l1) = state.object_cache {
+        if let Some(cached_data) = l1.get(&bucket_id, &object_key) {
+            tracing::debug!(key = %key, "L1 cache hit");
+            let content_type = infer_content_type(&state.mime_types, &key);
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, header_val(&content_type));
+            headers.insert(header::CONTENT_LENGTH, header_val(&cached_data.len().to_string()));
+            return (StatusCode::OK, headers, cached_data.to_vec()).into_response();
+        }
+    }
+
+    // Check L2 metadata cache.
+    if let Some(ref l2) = state.metadata_cache {
+        if l2.get(&bucket_id, &object_key).is_some() {
+            tracing::debug!(key = %key, "L2 metadata cache hit");
+        }
+    }
 
     let req = ReadRequest {
         bucket: bucket_id,
@@ -614,7 +661,16 @@ mod tests {
         let metadata: Arc<dyn MetadataOps> = Arc::new(MockMetadata::new());
         let buckets = Arc::new(BucketConfigStore::new());
 
-        AppState { write, read, metadata, buckets, mime_types: Arc::new(MimeMap::new()) }
+        AppState {
+            write,
+            read,
+            metadata,
+            buckets,
+            mime_types: Arc::new(MimeMap::new()),
+            object_cache: None,
+            metadata_cache: None,
+            negative_cache: None,
+        }
     }
 
     // --- MIME Map tests ---

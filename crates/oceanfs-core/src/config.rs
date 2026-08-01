@@ -21,25 +21,41 @@ use crate::types::GpuConfig;
 /// let config = NodeConfig::default();
 /// assert_eq!(config.data_dir.to_str().unwrap(), "/var/lib/oceanfs");
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct NodeConfig {
     /// Unique identifier for this node.
+    #[serde(default = "default_node_id")]
     pub node_id: String,
     /// Directory for all persistent data (RocksDB, WAL, segments).
+    #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
     /// Address the S3 HTTP API listens on.
+    #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
     /// Address for internal gRPC node-to-node communication.
+    #[serde(default = "default_grpc_listen_addr")]
     pub grpc_listen_addr: String,
     /// Bootstrap nodes for cluster discovery.
+    #[serde(default)]
     pub seed_nodes: Vec<String>,
     /// Log level: trace, debug, info, warn, error.
+    #[serde(default = "default_log_level")]
     pub log_level: String,
     /// Whether to enable the Prometheus metrics endpoint.
+    #[serde(default = "default_metrics_enabled")]
     pub metrics_enabled: bool,
     /// Address for the Prometheus metrics HTTP endpoint.
+    #[serde(default = "default_metrics_listen_addr")]
     pub metrics_listen_addr: String,
 }
+
+fn default_node_id() -> String { "node-1".into() }
+fn default_data_dir() -> PathBuf { PathBuf::from("/var/lib/oceanfs") }
+fn default_listen_addr() -> String { "0.0.0.0:9000".into() }
+fn default_grpc_listen_addr() -> String { "0.0.0.0:9001".into() }
+fn default_log_level() -> String { "info".into() }
+fn default_metrics_enabled() -> bool { true }
+fn default_metrics_listen_addr() -> String { "0.0.0.0:9090".into() }
 
 impl Default for NodeConfig {
     fn default() -> Self {

@@ -13,10 +13,25 @@ oceanfs-routing.workspace = true
 oceanfs-membership.workspace = true
 oceanfs-network.workspace = true
 oceanfs-cache.workspace = true
+oceanfs-accel.workspace = true
+oceanfs-ec.workspace = true
+axum.workspace = true
 parking_lot.workspace = true
+serde.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
+tokio-util = "0.7"
+tonic.workspace = true
+tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+static_assertions.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1"
+toml.workspace = true
 
 [lints]
 workspace = true
