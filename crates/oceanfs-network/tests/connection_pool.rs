@@ -3,6 +3,8 @@
 //! Tests connection pool creation, channel acquisition (error handling
 //! for unreachable peers), concurrent access, and configuration.
 
+#![allow(clippy::unwrap_used)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 

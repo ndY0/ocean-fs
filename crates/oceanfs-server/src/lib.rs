@@ -34,7 +34,7 @@ mod read;
 mod read_coordinator;
 mod router;
 mod s3_handler;
-pub(crate) mod s3_xml;
+pub mod s3_xml;
 mod write;
 mod write_coordinator;
 

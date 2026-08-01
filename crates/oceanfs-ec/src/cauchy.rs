@@ -324,6 +324,55 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn data_shards_getter_returns_k() {
+        let codec = CauchyEncoder::new(CodecConfig {
+            data_shards: 7,
+            parity_shards: 3,
+            ..Default::default()
+        });
+        assert_eq!(codec.data_shards(), 7);
+        assert_eq!(codec.parity_shards(), 3);
+    }
+
+    #[test]
+    fn encode_with_wrong_shard_count_errors() {
+        let codec = CauchyEncoder::new(CodecConfig {
+            data_shards: 3,
+            parity_shards: 1,
+            ..Default::default()
+        });
+        // Provide 2 data shards instead of 3.
+        let data = [&b"a"[..], &b"b"[..]];
+        let result = codec.encode(&data, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn encode_with_empty_data_shards_returns_empty() {
+        let codec = CauchyEncoder::new(CodecConfig {
+            data_shards: 0, // k=0 allows empty shards
+            parity_shards: 2,
+            ..Default::default()
+        });
+        let empty: &[&[u8]] = &[];
+        let parity = codec.encode(empty, 2).unwrap();
+        assert!(parity.is_empty());
+    }
+
+    #[test]
+    fn decode_with_wrong_available_count_errors() {
+        let codec = CauchyEncoder::new(CodecConfig {
+            data_shards: 4,
+            parity_shards: 2,
+            ..Default::default()
+        });
+        // Provide 5 available shards instead of 6 (k + m).
+        let available: Vec<Option<&[u8]>> = vec![Some(b"a"), Some(b"b"), Some(b"c"), Some(b"d"), Some(b"e")];
+        let result = codec.decode(&available, 4, 2);
+        assert!(result.is_err());
+    }
+
     // ------------------------------------------------------------------
     // Property-based tests (proptest)
     // ------------------------------------------------------------------

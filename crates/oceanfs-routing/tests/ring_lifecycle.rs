@@ -5,8 +5,6 @@
 
 use oceanfs_core::{NodeId, RingConfig};
 use oceanfs_routing::{hash_key, Ring, RingCache};
-use std::collections::HashSet;
-use std::sync::Arc;
 
 #[test]
 fn ring_lifecycle_three_nodes_uniform_distribution() {

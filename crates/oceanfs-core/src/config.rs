@@ -6,6 +6,8 @@
 
 use std::path::PathBuf;
 
+use crate::types::GpuConfig;
+
 /// Root configuration for an OceanFS node.
 ///
 /// Loaded from `oceanfs.toml` on startup. All fields have sensible
@@ -55,6 +57,7 @@ impl Default for NodeConfig {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -75,6 +78,24 @@ mod tests {
         let config = WalConfig::default();
         assert_eq!(config.max_file_size_bytes, 64 * 1024 * 1024);
         assert_eq!(config.fsync_batch_timeout_ms, 5);
+    }
+
+    #[test]
+    fn ring_config_default_values() {
+        let config = RingConfig::default();
+        assert_eq!(config.vnodes_per_node, 256);
+        assert_eq!(config.replication_factor, 3);
+    }
+
+    #[test]
+    fn metadata_config_default_values() {
+        let config = MetadataConfig::default();
+        assert_eq!(config.block_cache_size, 128 * 1024 * 1024);
+        assert_eq!(config.memtable_size, 64 * 1024 * 1024);
+        assert_eq!(
+            config.data_dir,
+            std::path::PathBuf::from("/var/lib/oceanfs/metadata")
+        );
     }
 }
 
@@ -215,6 +236,58 @@ impl AuthConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AccelConfig
+// ---------------------------------------------------------------------------
+
+/// Configuration for the acceleration subsystem.
+///
+/// Controls EC encoding tier, hash tier, and GPU-specific options.
+/// Loaded from the `[acceleration]` section of `oceanfs.toml`.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::{AccelConfig, GpuConfig};
+///
+/// let config = AccelConfig::default();
+/// assert!(config.ec_tier_is_auto());
+/// ```
+#[derive(Debug, Clone)]
+pub struct AccelConfig {
+    /// EC acceleration tier: "auto", "cpu_simd", "isa_l", or "gpu_cuda".
+    pub ec_tier: String,
+    /// Hash acceleration tier: "auto" or "avx512" (delegates to blake3 crate).
+    pub hash_tier: String,
+    /// GPU-specific configuration (None if no GPU config is provided).
+    pub gpu: Option<GpuConfig>,
+    /// Prefer AVX-512 code path in ISA-L if available (default true).
+    pub isal_prefer_avx512: bool,
+}
+
+impl Default for AccelConfig {
+    fn default() -> Self {
+        Self {
+            ec_tier: "auto".into(),
+            hash_tier: "auto".into(),
+            gpu: None,
+            isal_prefer_avx512: true,
+        }
+    }
+}
+
+impl AccelConfig {
+    /// Returns `true` if the EC tier is set to `"auto"`.
+    pub fn ec_tier_is_auto(&self) -> bool {
+        self.ec_tier == "auto"
+    }
+
+    /// Returns `true` if GPU configuration is provided.
+    pub fn has_gpu_config(&self) -> bool {
+        self.gpu.is_some()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod auth_tests {
@@ -233,5 +306,43 @@ mod auth_tests {
         assert!(!cfg.auth_enabled());
         cfg.s3_auth_enabled = true;
         assert!(cfg.auth_enabled());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod accel_config_tests {
+    use super::*;
+
+    #[test]
+    fn accel_config_default_is_auto() {
+        let cfg = AccelConfig::default();
+        assert!(cfg.ec_tier_is_auto());
+        assert_eq!(cfg.hash_tier, "auto");
+        assert!(cfg.gpu.is_none());
+        assert!(cfg.isal_prefer_avx512);
+    }
+
+    #[test]
+    fn accel_config_has_gpu_config() {
+        let cfg = AccelConfig {
+            ec_tier: "gpu_cuda".into(),
+            hash_tier: "auto".into(),
+            gpu: Some(GpuConfig::default()),
+            isal_prefer_avx512: true,
+        };
+        assert!(cfg.has_gpu_config());
+    }
+
+    #[test]
+    fn accel_config_not_auto() {
+        let cfg = AccelConfig {
+            ec_tier: "cpu_simd".into(),
+            hash_tier: "auto".into(),
+            gpu: None,
+            isal_prefer_avx512: false,
+        };
+        assert!(!cfg.ec_tier_is_auto());
+        assert!(!cfg.has_gpu_config());
     }
 }

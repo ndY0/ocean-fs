@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use oceanfs_core::{GossipConfig, Incarnation, NodeId, NodeState, RingConfig};
-use oceanfs_membership::{Membership, MembershipEvent};
+use oceanfs_membership::Membership;
 use oceanfs_routing::{Ring, RingCache};
 
 fn make_ring() -> Arc<RingCache> {

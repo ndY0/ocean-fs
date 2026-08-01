@@ -249,4 +249,23 @@ mod tests {
         let values: &[u32] = cast_shard_slice(&bytes);
         assert_eq!(values, &[1u32, 2u32]);
     }
+
+    #[test]
+    fn cast_shard_slice_mut_writes_through() {
+        let mut bytes = vec![0u8; 8];
+        let values: &mut [u32] = cast_shard_slice_mut(&mut bytes);
+        values[0] = 42;
+        values[1] = 99;
+        let read_back: &[u32] = cast_shard_slice(&bytes);
+        assert_eq!(read_back, &[42u32, 99u32]);
+    }
+
+    #[test]
+    fn shard_data_as_bytes_returns_raw() {
+        let plan = EncodingPlan { stripe_count: 1, padded_size: 256, shard_size: 64, data_shards: 4, parity_shards: 0 };
+        let raw = vec![0xAAu8; 256];
+        let sd = ShardData::from_data_shards(&raw, 4, &plan);
+        assert_eq!(sd.as_bytes(), &raw[..]);
+        assert_eq!(sd.as_bytes().len(), 256);
+    }
 }

@@ -10,8 +10,20 @@ path = "dummy.rs"
 [[bench]]
 name = "ec_benchmark"
 harness = false
+path = "ec_benchmark.rs"
+
+[[bench]]
+name = "hash_benchmark"
+harness = false
+path = "hash_benchmark.rs"
+
+[[bench]]
+name = "storage_benchmark"
+harness = false
+path = "storage_benchmark.rs"
 
 [dependencies]
 blake3.workspace = true
 criterion.workspace = true
+oceanfs-core.workspace = true
 oceanfs-ec.workspace = true

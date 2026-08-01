@@ -26,7 +26,7 @@
 
 mod cauchy;
 mod error;
-mod gf;
+pub mod gf;
 #[cfg(feature = "isa-l")]
 mod isal;
 mod shard;
@@ -34,6 +34,7 @@ mod stripe;
 mod traits;
 
 pub use cauchy::CauchyEncoder;
+pub use error::{Error, Result};
 pub use oceanfs_core::EncodingPlan;
 pub use shard::{cast_shard_slice, cast_shard_slice_mut, ShardData, ShardPod};
 pub use stripe::{ParallelDecoder, ParallelEncoder, StripeBatch, StripeLayout};

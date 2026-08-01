@@ -12,6 +12,7 @@ members = [
     "crates/oceanfs-server",
     "crates/oceanfs-node",
     "crates/oceanfs",
+    "benches",
 ]
 resolver = "2"
 
@@ -82,6 +83,9 @@ tower-http       = { version = "0.5", features = ["cors"] }
 http             = "1"
 mime_guess       = "2"
 hmac             = "0.12"
+
+# --- GPU ---
+cudarc = "0.12"
 
 # --- Testing ---
 criterion = { version = "0.5", features = ["html_reports"] }

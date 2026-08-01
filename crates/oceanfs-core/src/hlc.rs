@@ -413,4 +413,11 @@ mod tests {
         assert_eq!(zero.wall_time(), 0);
         assert_eq!(zero.logical(), 0);
     }
+
+    #[test]
+    fn hlc_clock_default_is_new() {
+        let clock = HlcClock::default();
+        let ts = clock.now();
+        assert!(ts.wall_time() > 0);
+    }
 }

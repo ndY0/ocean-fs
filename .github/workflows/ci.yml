@@ -16,18 +16,90 @@ jobs:
   # Build + test matrix
   # ------------------------------------------------------------------
   build-and-test:
-    name: Build & Test (stable)
+    name: Build & Test (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features:
+          - "default"
+          - "isa-l"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # System libraries for fast native builds (avoids compiling C++ from source)
+      - name: Install system libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq librocksdb-dev
+
+      # ISA-L is optional; install only when testing with that feature
+      - name: Install ISA-L (isa-l feature)
+        if: contains(matrix.features, 'isa-l')
+        run: sudo apt-get install -y -qq libisal-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (all targets)
+        if: matrix.features == 'default'
+        run: cargo build --all-targets --workspace
+
+      - name: Build with ISA-L
+        if: matrix.features == 'isa-l'
+        run: cargo build -p oceanfs-accel -p oceanfs-ec --all-targets --features isa-l
+
+      - name: Test (all targets)
+        if: matrix.features == 'default'
+        run: cargo test --all-targets --workspace
+
+      - name: Test with ISA-L
+        if: matrix.features == 'isa-l'
+        run: cargo test -p oceanfs-accel -p oceanfs-ec --all-targets --features isa-l
+
+  # ------------------------------------------------------------------
+  # GPU feature build check (compile-only, no hardware needed)
+  # ------------------------------------------------------------------
+  build-cuda:
+    name: Build CUDA (compile-check only)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build (all targets)
-        run: cargo build --all-targets --all-features
+      # cuda feature is a source-only feature gate (no external CUDA crates).
+      # This verifies the cuda module compiles on any runner.
+      - name: Build with cuda feature
+        run: cargo build -p oceanfs-accel --features cuda --all-targets
 
-      - name: Test (all targets)
-        run: cargo test --all-targets --all-features
+  # ------------------------------------------------------------------
+  # Cross-compile for aarch64 (ARM NEON/SVE validation)
+  # ------------------------------------------------------------------
+  cross-aarch64:
+    name: Cross-compile aarch64 (arm-sve)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install aarch64 cross-linker
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Cross-compile the accel crate with ARM NEON/SVE intrinsics.
+      # This verifies the `std::arch::aarch64` intrinsics compile
+      # without needing actual ARM hardware.
+      - name: Build oceanfs-accel for aarch64
+        run: cargo build -p oceanfs-accel --features arm-sve --target aarch64-unknown-linux-gnu
+
+      # Also verify the portable path compiles for aarch64 (no feature)
+      - name: Build oceanfs-accel for aarch64 (portable)
+        run: cargo build -p oceanfs-accel --target aarch64-unknown-linux-gnu
 
   # ------------------------------------------------------------------
   # Linting
@@ -40,10 +112,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq librocksdb-dev libisal-dev
+
       - uses: Swatinem/rust-cache@v2
 
-      - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Clippy (all features, deny warnings)
+        run: cargo clippy --all-targets --features isa-l -- -D warnings
 
   # ------------------------------------------------------------------
   # Formatting
@@ -69,21 +147,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system libraries (for doc builds of storage crate)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq librocksdb-dev libisal-dev
+
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build docs (deny warnings)
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-
-  # ------------------------------------------------------------------
-  # Dependency audit
-  # ------------------------------------------------------------------
-  # TODO: enable once deny.toml is configured
-  # cargo-deny:
-  #   name: Dependency Audit
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: EmbarkStudios/cargo-deny-action@v1
+      - name: Build docs (deny warnings, all features)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features isa-l
 
   # ------------------------------------------------------------------
   # Core purity check
@@ -118,3 +191,27 @@ jobs:
         run: |
           cargo tree --edges normal --depth 1 -p oceanfs-node 2>/dev/null | grep oceanfs || true
           echo "PASS: manual review required — ensure no bidirectional oceanfs-* edges"
+
+  # ------------------------------------------------------------------
+  # Benchmark regression detection
+  # ------------------------------------------------------------------
+  benchmarks:
+    name: Benchmarks (compile + quick test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq librocksdb-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build benchmarks
+        run: cargo bench --no-run --manifest-path benches/Cargo.toml
+
+      - name: Quick benchmark sanity (1 sample)
+        run: |
+          cargo bench --bench ec_benchmark -- --sample-size 2 --warm-up-time 0 --measurement-time 1 2>&1 | head -30

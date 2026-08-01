@@ -59,6 +59,7 @@ mod assertions {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -76,6 +77,31 @@ mod tests {
     #[test]
     fn is_invalid_config_returns_false_for_bucket_not_found() {
         assert!(!Error::BucketNotFound("b".into()).is_invalid_config());
+    }
+
+    #[test]
+    fn is_bucket_not_found_returns_true_for_bucket_not_found() {
+        assert!(Error::BucketNotFound("missing".into()).is_bucket_not_found());
+    }
+
+    #[test]
+    fn is_bucket_not_found_returns_false_for_other_variants() {
+        assert!(!Error::InvalidConfig("x".into()).is_bucket_not_found());
+        assert!(!Error::Internal("x".into()).is_bucket_not_found());
+    }
+
+    #[test]
+    fn result_type_alias_works() {
+        // Verify the Result type alias compiles and can be used.
+        fn returns_result() -> Result<i32> {
+            Ok::<i32, Error>(42)
+        }
+        assert_eq!(returns_result().unwrap(), 42);
+
+        fn returns_error() -> Result<i32> {
+            Err(Error::Internal("fail".into()))
+        }
+        assert!(returns_error().is_err());
     }
 
     #[test]

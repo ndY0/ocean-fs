@@ -59,3 +59,23 @@ pub(crate) enum GossipDirection {
     /// Sender is requesting state from receiver (pull).
     Pull,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gossip_state_new_is_empty() {
+        let state = GossipState::new();
+        assert!(state.nodes.is_empty());
+        assert!(state.ring_json.is_none());
+    }
+
+    #[test]
+    fn gossip_state_default_equals_new() {
+        let a = GossipState::new();
+        let b = GossipState::default();
+        assert_eq!(a.nodes.len(), b.nodes.len());
+        assert_eq!(a.ring_json, b.ring_json);
+    }
+}

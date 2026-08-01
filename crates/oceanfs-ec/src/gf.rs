@@ -5,7 +5,7 @@
 //! (x^8 + x^4 + x^3 + x^2 + 1).
 
 /// GF(2^8) element (0..255).
-pub(crate) type Gf8 = u8;
+pub type Gf8 = u8;
 
 /// Primitive polynomial: x^8 + x^4 + x^3 + x^2 + 1
 const PRIMITIVE_POLY: u16 = 0x11D;
@@ -53,13 +53,13 @@ const fn build_exp_table() -> [u8; 512] {
 
 /// Adds two GF(2^8) elements (XOR).
 #[inline]
-pub(crate) fn gf_add(a: Gf8, b: Gf8) -> Gf8 {
+pub fn gf_add(a: Gf8, b: Gf8) -> Gf8 {
     a ^ b
 }
 
 /// Multiplies two GF(2^8) elements.
 #[inline]
-pub(crate) fn gf_mul(a: Gf8, b: Gf8) -> Gf8 {
+pub fn gf_mul(a: Gf8, b: Gf8) -> Gf8 {
     if a == 0 || b == 0 {
         0
     } else {
@@ -69,8 +69,12 @@ pub(crate) fn gf_mul(a: Gf8, b: Gf8) -> Gf8 {
 }
 
 /// Divides a / b in GF(2^8).
+///
+/// # Panics
+///
+/// Panics if `b` is zero (division by zero in GF(2^8)).
 #[inline]
-pub(crate) fn gf_div(a: Gf8, b: Gf8) -> Gf8 {
+pub fn gf_div(a: Gf8, b: Gf8) -> Gf8 {
     if a == 0 {
         0
     } else if b == 0 {
@@ -83,8 +87,12 @@ pub(crate) fn gf_div(a: Gf8, b: Gf8) -> Gf8 {
 }
 
 /// Computes the multiplicative inverse a^(-1) in GF(2^8).
+///
+/// # Panics
+///
+/// Panics if `a` is zero (zero has no multiplicative inverse).
 #[inline]
-pub(crate) fn gf_inv(a: Gf8) -> Gf8 {
+pub fn gf_inv(a: Gf8) -> Gf8 {
     if a == 0 {
         panic!("inverse of zero in GF(2^8)")
     }
@@ -176,5 +184,17 @@ mod tests {
         let b = 0x34;
         let c = 0x56;
         assert_eq!(gf_add(gf_add(a, b), c), gf_add(a, gf_add(b, c)));
+    }
+
+    #[test]
+    #[should_panic(expected = "division by zero")]
+    fn div_by_zero_panics() {
+        gf_div(1, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "inverse of zero")]
+    fn inv_of_zero_panics() {
+        gf_inv(0);
     }
 }

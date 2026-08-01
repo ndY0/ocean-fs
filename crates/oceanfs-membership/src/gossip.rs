@@ -290,4 +290,66 @@ mod tests {
         assert_eq!(alive.len(), 1);
         assert_eq!(alive[0].0.as_str(), "a");
     }
+
+    #[test]
+    fn snapshot_returns_current_state() {
+        let mut protocol = make_protocol();
+        protocol.add_node(make_node_entry("a", 1, NodeState::Alive));
+        let snap = protocol.snapshot();
+        assert!(snap.nodes.contains_key(&NodeId::new("a")));
+    }
+
+    #[tokio::test]
+    async fn run_shuts_down_gracefully() {
+        let mut protocol = make_protocol();
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let _ = std::mem::replace(&mut protocol.rx, cmd_rx);
+
+        // Send shutdown.
+        drop(cmd_tx); // closing the sender causes recv() to return None
+        protocol.run().await;
+    }
+
+    #[tokio::test]
+    async fn handle_command_shutdown_returns_false() {
+        let mut protocol = make_protocol();
+        assert!(!protocol.handle_command(GossipCommand::Shutdown).await);
+    }
+
+    #[tokio::test]
+    async fn handle_command_receive_delta_merges() {
+        let mut protocol = make_protocol();
+        protocol.add_node(make_node_entry("a", 1, NodeState::Alive));
+
+        let delta = GossipDelta {
+            changed: vec![make_node_entry("a", 2, NodeState::Dead)],
+        };
+        let result = protocol
+            .handle_command(GossipCommand::ReceiveDelta {
+                from: NodeId::new("peer"),
+                delta,
+            })
+            .await;
+        assert!(result);
+        // The node should now be dead.
+        let alive = protocol.alive_nodes();
+        assert!(alive.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_command_push_merges() {
+        let mut protocol = make_protocol();
+
+        let delta = GossipDelta {
+            changed: vec![make_node_entry("new-node", 1, NodeState::Alive)],
+        };
+        let result = protocol
+            .handle_command(GossipCommand::Push {
+                peer: NodeId::new("peer"),
+                delta,
+            })
+            .await;
+        assert!(result);
+        assert!(protocol.snapshot().nodes.contains_key(&NodeId::new("new-node")));
+    }
 }
