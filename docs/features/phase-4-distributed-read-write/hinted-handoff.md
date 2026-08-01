@@ -81,14 +81,14 @@ Node return and hint delivery:
 
 - [x] **Code:** `cargo build --all-targets` succeeds in affected crates
 - [ ] **Tests:** Unit tests: handoff creates hint on fallback node, delivery pushes hints on node return, hint cleared after successful delivery, duplicate hint ignored, pending_count accurate, delivery to still-unreachable node retries
-<!-- REVIEW: R2 — 6 unit tests pass (handoff_create, handoff_multiple, deliver_clears, deliver_no_hints=0, new_is_empty, pending_count). Missing: (1) duplicate hint prevention, (2) delivery to still-unreachable node retry. handoff/hinter.rs and handoff/delivery.rs sub-modules exist as scaffolding. In-memory storage used (not RocksDB CF) — acknowledged deferred to Phase 7. -->
+<!-- REVIEW: R3 — 6 unit tests pass (handoff_create, handoff_multiple, deliver_clears, deliver_no_hints=0, new_is_empty, pending_count). No new tests added in R3. Still missing: (1) duplicate hint prevention, (2) delivery to still-unreachable node retry. In-memory storage used (not RocksDB CF) — deferred to Phase 7. -->
 - [ ] **Coverage:** `cargo tarpaulin --fail-under 80` on `oceanfs-server`
-<!-- REVIEW: R2 — tarpaulin on oceanfs-server could not be verified (timed out, same as R1). -->
+<!-- REVIEW: R3 — tarpaulin on oceanfs-server still cannot be verified (RocksDB/tonic compilation timeout). -->
 - [x] **Lint:** `cargo clippy -- -D warnings` passes
 - [x] **Docs:** `#![deny(missing_docs)]` passes
 - [x] **ADR:** N/A (spec §7.2 covers hinted handoff)
 - [ ] **Perf:** Rule 2.6 (bounded hint queues), 4.5 (delivery timeout)
-<!-- REVIEW: Rule 2.6: No bounded channel — hints stored in an unbounded RwLock<HashMap<NodeId, Vec<HintRecord>>>. No backpressure on hint accumulation. Rule 4.5: No configurable delivery timeout — deliver_single always succeeds immediately. -->
+<!-- REVIEW: R3 — Rule 2.6: ❌ Still uses unbounded in-memory storage (RwLock<HashMap<NodeId, Vec<HintRecord>>>) with no backpressure on hint accumulation. No bounded channel or capacity limit. Rule 4.5: ❌ OperationTimeouts has `hint_delivery_ms: 10000` but HintedHandoff does not use it — deliver_single always succeeds immediately with no timeout. -->
 - [x] **Integration:** `tests/hinted_handoff.rs`: 3-node cluster, kill node_b, PUT succeeds via fallback node, restart node_b, verify hints delivered, verify data consistent
 <!-- REVIEW: R2 — Integration test exists at crates/oceanfs-server/tests/hinted_handoff.rs with 4 tests (handoff_create_deliver_cleanup, handoff_multiple_hints, deliver_no_hints=0, unknown_node_zero_pending). All pass with default features. Missing: kill-node scenario (requires real membership). -->
 - [ ] **Manual:** Example in `HintedHandoff` docs compiles and runs

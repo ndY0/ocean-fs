@@ -98,9 +98,9 @@ With 4 shards × 4 pool slots = 16 concurrent write buffers:
 
 - [x] **Code:** `cargo build --all-targets` succeeds in affected crates
 - [ ] **Tests:** Unit tests: pool rotation (fill → seal → new segment), concurrent writes across 4 shards (no data corruption), encoding queue backpressure (writes blocked when queue full), semaphore bounds in-flight encodes, pool slot state transitions, shard routing determinism
-<!-- REVIEW: R2 — 8 segment/pool unit tests pass (slot count, append offsets, concurrent writes, encode queue, semaphore bounds, custom sizes, segment IDs). SegmentShard has 5 tests (routing, same-mod, distribution, count, zero-panics). Missing: (1) pool rotation/fill-then-seal flow (tests use tiny data on 4MB-target segments; is_full() never triggers), (2) encoding queue backpressure (try_send makes it non-blocking), (3) full state transition cycle test, (4) shard→pool integration (shard routes to ActiveSegment directly, not through SegmentPool — separate code paths). -->
+<!-- REVIEW: R3 — 8 segment/pool unit tests pass (slot count, append offsets, concurrent writes, encode queue, semaphore bounds, custom sizes, segment IDs). SegmentShard has 5 tests (routing, same-mod, distribution, count, zero-panics). No new tests added in R3. Still missing from R2: (1) pool rotation/fill-then-seal flow (tests use tiny data on 4MB-target segments; is_full() never triggers), (2) encoding queue backpressure (try_send makes it non-blocking), (3) full state transition cycle test, (4) shard→pool integration (shard routes to ActiveSegment directly, not through SegmentPool). -->
 - [ ] **Coverage:** `cargo tarpaulin --fail-under 80` on `oceanfs-storage`
-<!-- REVIEW: R2 — tarpaulin on oceanfs-storage could not be verified (RocksDB compilation timeout, same as R1). -->
+<!-- REVIEW: R3 — tarpaulin on oceanfs-storage still cannot be verified (RocksDB compilation timeout). -->
 - [x] **Lint:** `cargo clippy -- -D warnings` passes
 - [x] **Docs:** `#![deny(missing_docs)]` passes
 - [x] **ADR:** ADR-0001 segment packing (pool enables sealing small segments without blocking writes)

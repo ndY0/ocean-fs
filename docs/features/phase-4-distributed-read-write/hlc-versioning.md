@@ -91,8 +91,9 @@ Conflict resolution on read (R > 1):
 
 - [x] **Code:** `cargo build --all-targets` succeeds in `oceanfs-core`
 - [x] **Tests:** Unit tests: HLC monotonic (now() > previous now()), HLC ordering (newer wall > older, same wall → higher logical > lower), update merges correctly, clock does not go backward, concurrent updates (stress test), LwwResolver picks newer, tie-break by node_id
+<!-- REVIEW: R3 — 17 HLC unit tests pass (hlc.rs: 17 tests), 4 conflict resolution tests pass (conflict.rs: 6 tests). All spec-required scenarios covered: monotonicity, ordering, merge, clock backward prevention, concurrent stress, LwwResolver newer/older/equal HLCs, cache-line alignment. Integration test hlc_ordering.rs: 5 tests pass (monotonic, merge, deterministic, equal-hlc, cache-line-alignment). ✅ All independent tests pass. -->
 - [ ] **Coverage:** `cargo tarpaulin --fail-under 80` on `oceanfs-core`
-<!-- REVIEW: R2 — oceanfs-core tarpaulin reports 32.85% (137/417 lines, +5.99% from R1). hlc.rs 37/46 (80.4%), conflict.rs 9/9 (100%), types.rs 42/98 (42.9%), config.rs 11/16 (68.8%), error.rs 2/4 (50%). The 80% threshold is not met. Need additional unit tests for types.rs (WriteQuorum, WriteResult, WriteAck, IntendedFor, PoolConfig, etc.) and config.rs uncovered paths. hlc.rs logical overflow path (lines 140-148) not covered. -->
+<!-- REVIEW: R3 — oceanfs-core tarpaulin reports 34.21% (143/418 lines, +1.36% from R2). hlc.rs 37/46 (80.4% ✅), conflict.rs 9/9 (100% ✅), timeouts.rs 1/1 (100% ✅), types.rs 47/98 (48.0%), config.rs 11/16 (68.8%), error.rs 2/4 (50%). Still below 80% threshold. The +17 unit tests added only +1.36% coverage; types.rs (98 lines) is the main bottleneck. hlc.rs logical overflow path (lines 139-148) still not covered. -->
 - [x] **Lint:** `cargo clippy -- -D warnings` passes
 - [x] **Docs:** `#![deny(missing_docs)]` passes; `Hlc` and `ConflictResolver` documented
 - [x] **ADR:** N/A (spec §7.6 covers versioning)

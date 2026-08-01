@@ -110,14 +110,14 @@ ReadCoordinator::get(req):
 
 - [x] **Code:** `cargo build --all-targets` succeeds in affected crates
 - [ ] **Tests:** Unit tests: inline read path (no segment I/O), single-chunk read (1 fetch → 1 decode), multi-chunk read (3 chunks in parallel), fastest-k (kill slow nodes), hash mismatch triggers repair, not-found path, concurrent reads on same key
-<!-- REVIEW: R2 — 7 unit tests pass (get returns result, metadata_only, classify × 4, default constructor). read/fetch.rs has 3 tests (inline, empty, timeout) using tokio::select! and ring lookup. read/repair.rs exists as scaffolding. Missing: (1) single-chunk with actual segment fetch, (2) multi-chunk assembled read, (3) fastest-k via FuturesUnordered, (4) hash mismatch error, (5) concurrent reads. Placeholder data used throughout — acknowledged deferred to Phase 5/6. -->
+<!-- REVIEW: R3 — 9 unit tests pass: get returns result, metadata_only, classify × 4, default constructor, plus read/fetch.rs inline/empty/timeout (using tokio::select! and ring lookup). read/repair.rs exists as scaffolding. No new read coordinator tests added in R3. Still missing: (1) single-chunk with actual segment fetch, (2) multi-chunk assembled read, (3) fastest-k via FuturesUnordered, (4) hash mismatch error, (5) concurrent reads. Placeholder data used throughout — deferred to Phase 5/6. -->
 - [ ] **Coverage:** `cargo tarpaulin --fail-under 80` on `oceanfs-server`
-<!-- REVIEW: tarpaulin timed out. Could not verify. -->
+<!-- REVIEW: R3 — tarpaulin on oceanfs-server still cannot be verified (RocksDB/tonic compilation timeout). -->
 - [x] **Lint:** `cargo clippy -- -D warnings` passes
 - [x] **Docs:** `#![deny(missing_docs)]` passes; `ReadCoordinator::get` fully documented
 - [x] **ADR:** N/A
 - [ ] **Perf:** Rule 8.1 (FuturesUnordered), 8.2 (tokio::select! with timeout), 5.4 (batch verify with single hasher across chunks)
-<!-- REVIEW: R2 — Rule 8.1: FuturesUnordered used in write/replication.rs ✅ but not in read coordinator (read/fetch.rs uses sequential for-loop, not parallel fan-out). Rule 8.2: tokio::select! used in read/fetch.rs for timeout ✅. Rule 5.4: blake3::hash is one-shot (not streaming .update() across chunks), and operates on placeholder data. -->
+<!-- REVIEW: R3 — Rule 8.1: ❌ FuturesUnordered still not used in read coordinator (read/fetch.rs uses sequential for-loop, not parallel fan-out). Used in write/replication.rs for write path though. Rule 8.2: ✅ tokio::select! used in read/fetch.rs for timeout. Rule 8.2: ✅ ReadCoordinator::get() verifies BLAKE3 hash against stored metadata. Rule 4.5: ❌ ReadCoordinator uses hardcoded DEFAULT_READ_TIMEOUT_MS=10000 instead of OperationTimeouts. -->
 - [x] **Integration:** `tests/read_path.rs`: PUT object, GET object, verify data matches; PUT 10 MB blob (multi-chunk), GET, verify assembly; kill 1 of 3 nodes mid-read, verify read succeeds with k surviving shards
 <!-- REVIEW: R2 — Integration test exists at crates/oceanfs-server/tests/read_path.rs with 4 tests (metadata_only, inline classify, multi-chunk classify, not-found classify). All pass. Missing: PUT+GET roundtrip and kill-node scenario (requires real segment store integration). -->
 - [ ] **Manual:** Example `ReadCoordinator::get` call compiles and runs

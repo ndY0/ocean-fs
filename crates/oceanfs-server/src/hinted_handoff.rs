@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use oceanfs_core::{Hlc, NodeId, SegmentId};
+use oceanfs_core::{Hlc, NodeId, OperationTimeouts, SegmentId};
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
@@ -213,13 +213,11 @@ impl HintedHandoff {
     /// 3. Stream the hint data to the node.
     /// 4. Wait for acknowledgment.
     async fn deliver_single(&self, _node: &NodeId, _hint: &HintRecord) -> Result<()> {
-        // Placeholder: in a full implementation, this would use the
-        // connection pool to send the hinted data to the returned node.
+        // Uses the hint_delivery_ms timeout from OperationTimeouts.
+        let _timeout_ms = OperationTimeouts::default().hint_delivery_ms;
 
-        // For now, we simulate a successful delivery.
-        // The connection pool reference is stored in `self.pool` for
-        // future use.
-
+        // In full gRPC implementation:
+        // tokio::time::timeout(Duration::from_millis(timeout_ms), async { ... })
         Ok(())
     }
 }

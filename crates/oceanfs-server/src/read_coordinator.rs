@@ -21,16 +21,17 @@ use std::sync::Arc;
 use bytes::Bytes;
 use oceanfs_core::{
     BucketId, ConflictResolver, HashKey, HashOutput, Hlc, LwwResolver, NodeId, ObjectKey,
-    ObjectMetadata,
+    ObjectMetadata, OperationTimeouts,
 };
 use oceanfs_routing::RingCache;
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
 
-/// Default read timeout.
+/// Default read timeout used when no policy is provided.
 #[allow(dead_code)]
-const DEFAULT_READ_TIMEOUT_MS: u64 = 10000;
+static DEFAULT_READ_TIMEOUT_MS: std::sync::LazyLock<u64> =
+    std::sync::LazyLock::new(|| OperationTimeouts::default().read_default_ms);
 
 /// A request to read an object.
 #[derive(Debug, Clone)]
