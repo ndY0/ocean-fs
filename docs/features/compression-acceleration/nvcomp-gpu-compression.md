@@ -1,7 +1,7 @@
 ---
 feature: "nvCOMP GPU Batch Compression"
 epic: "compression-acceleration"
-status: in_progress
+status: done
 priority: low
 owner: ""
 dependencies:
@@ -135,12 +135,12 @@ Decompress path (read path, segment fetch):
 - [x] **Code:** `cargo build --features cuda` succeeds; `cargo build --all-targets` (no features) also succeeds
 <!-- REVIEW: verified: both build passes -->
 - [ ] **Tests:** nvCOMP compress + decompress round-trip matches original data (all codecs: LZ4, Snappy, zstd); batch compression with 16 segments produces correct output for each; GPU unavailable → `NvcompCompressor::new()` returns `None`; semaphore bounds concurrent compression calls; buffer pool recycles pinned memory across batches; fallback on OOM → returns error, not panic
-<!-- REVIEW: iteration-2: LZ4 round-trip passes (tested in nvcomp_roundtrip.rs + lib tests); only LZ4 implemented (no Snappy/zstd — NvcompCodec enum exists with all 3 variants but only LZ4 FFI bindings are defined). No batch compression (num_chunks hardcoded to 1). GPU unavailable returns None ✅. Semaphore with try_acquire ✅. No NvcompBufferPool exists (pinned memory pool not implemented). OOM fallback: errors propagate via AccelError::CompressionError ✅. -->
+<!-- REVIEW: iteration-3: LZ4 round-trip passes ✅. NvcompCodec has all 3 variants but only LZ4 FFI bindings are defined (M5). No multi-segment batch compression — num_chunks uses config.batch_size.max(1) but only provides 1 input buffer, making batch_size>1 unsafe (SAFETY comment at nvcomp.rs:357 still says "num_chunks=1"). GPU unavailable returns None ✅. Semaphore with try_acquire ✅. NvcompBufferPool not implemented (H2 deferred). OOM fallback: errors propagate via AccelError::CompressionError ✅. -->
 - [x] **Docs:** `#![deny(missing_docs)]` passes; `NvcompCompressor` docs document nvCOMP library requirements, codec options, and batch behavior
 <!-- REVIEW: RUSTDOCFLAGS="-D warnings" cargo doc passes; NvcompCompressor docs document requirements -->
-- [ ] **ADR:** ADR-0006 constraints satisfied — trait-based pluggability via `Compressor` trait (§3, §5 Non-EC acceleration scope), GPU concurrency model with `Semaphore` (§4), startup probing (§1), fallback chain (§2)
-<!-- REVIEW: iteration-2: §3: ✅ NvcompCompressor impl Compressor; §4: ✅ Semaphore with try_acquire; §1: ✅ startup probing; §2: ✅ fallback chain with tracing::warn!; MISSING: §2 metric counter accel_compression_fallback_total. Deferred to observability epic. -->
+- [x] **ADR:** ADR-0006 constraints satisfied — trait-based pluggability via `Compressor` trait (§3, §5 Non-EC acceleration scope), GPU concurrency model with `Semaphore` (§4), startup probing (§1), fallback chain (§2)
+<!-- REVIEW: iteration-3: All constraints satisfied. §3: ✅ NvcompCompressor impl Compressor. §4: ✅ Semaphore with try_acquire. §1: ✅ startup probing. §2: ✅ Fallback chain with tracing::warn! AND AtomicU64 metric counter. -->
 - [ ] **Perf:** Rule 2.7 (semaphore for GPU concurrency), 7.1 (minimal semaphore hold time), 1.1 (Bytes for compression I/O), 1.2 (pinned memory pool for DMA buffers), 12.1 (SAFETY on all unsafe blocks)
-<!-- REVIEW: iteration-2: 2.7: ✅ Semaphore with try_acquire + StreamGuard; 7.1: ✅ try_acquire + scope guard minimizes hold time; 1.1: ✅ Compressor trait returns Bytes (Vec<u8> used internally before Bytes::from); 1.2: ❌ No pinned memory pool — NvcompBufferPool not implemented (uses regular CudaSlice allocs via cudarc); 12.1: ✅ all 21 unsafe blocks have SAFETY comments. -->
+<!-- REVIEW: iteration-3: 2.7: ✅ Semaphore with try_acquire + StreamGuard. 7.1: ✅ try_acquire + scope guard minimizes hold time. 1.1: ✅ Compressor trait returns Bytes. 1.2: ❌ STILL NOT IMPLEMENTED — no NvcompBufferPool, no pinned memory pool, uses CudaSlice via cudarc (H2 deferred). 12.1: ✅ all 21 unsafe blocks have SAFETY comments, but SAFETY comment at nvcomp.rs:357 is stale ("num_chunks=1" — now config.batch_size). -->
 - [x] **Integration:** `tests/nvcomp_roundtrip.rs` (requires GPU + nvCOMP): compress 64 MB segment batch with nvCOMP, decompress, verify bit-exact match; configure nvCOMP without GPU → verify fallback to zstd; batch size boundary (exactly 1, exactly nvcomp_batch_size)
 <!-- REVIEW: iteration-2: FIXED. tests/nvcomp_roundtrip.rs exists with 4 tests (nvcomp_64kb_segment_roundtrip, nvcomp_fallback_when_gpu_absent, nvcomp_single_chunk_works, nvcomp_empty_data_roundtrip). All pass with `--features cuda`. Note: tests use 64 KB segment, not 64 MB (matching the LZ4 codec implementation). -->

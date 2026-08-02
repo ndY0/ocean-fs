@@ -175,14 +175,10 @@ pub struct NvcompCompressor {
     config: NvcompConfig,
 }
 
-// SAFETY: NvcompCompressor is Send + Sync because:
-// - CudaDevice is Send + Sync (cudarc guarantees thread-safe device access)
-// - Semaphore is Send + Sync
-// - nvCOMP stateless batch functions are thread-safe per NVIDIA documentation
-// SAFETY: CudaDevice is Send + Sync (wraps Arc internally).
-// Semaphore is Send + Sync. nvCOMP functions are thread-safe.
+// SAFETY: CudaDevice is Send + Sync (cudarc guarantees thread-safe device access
+// via internal Arc). Semaphore is Send + Sync. nvCOMP stateless batch functions
+// are thread-safe per NVIDIA documentation.
 unsafe impl Send for NvcompCompressor {}
-// SAFETY: Same invariants as Send impl above.
 unsafe impl Sync for NvcompCompressor {}
 
 impl NvcompCompressor {
@@ -249,7 +245,10 @@ impl Compressor for NvcompCompressor {
             reason: "GPU saturated — no semaphore permits available".into(),
         })?;
 
-        let num_chunks: usize = self.config.batch_size.max(1);
+        // nvCOMP batched API accepts num_chunks input buffers; the Compressor
+        // trait operates on a single &[u8], so num_chunks is always 1.
+        let num_chunks: usize = 1;
+        let _batch_capacity = self.config.batch_size; // for future multi-chunk batching
         let max_uncompressed: usize = data.len();
         let opts = Self::lz4_opts();
 
@@ -427,7 +426,8 @@ impl Compressor for NvcompCompressor {
             reason: "GPU saturated — no semaphore permits for decompress".into(),
         })?;
 
-        let num_chunks: usize = self.config.batch_size.max(1);
+        // nvCOMP batched API: single input => num_chunks always 1
+        let num_chunks: usize = 1;
 
         // --- Step 1: Create CUDA stream ---
         let mut stream: cudaStream_t = std::ptr::null_mut();

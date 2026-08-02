@@ -1,7 +1,7 @@
 ---
 feature: "ISA-L igzip CPU Compression"
 epic: "compression-acceleration"
-status: in_progress
+status: done
 priority: medium
 owner: ""
 dependencies:
@@ -120,8 +120,8 @@ Fallback chain (compression):
 <!-- REVIEW: roundtrip tests pass; DEFLATE validation via zstd::decode_all works (igzip.rs:596); AVX-512 absent returns None (igzip.rs:546); level clamping tested (igzip.rs:633); buffer bounds tested (igzip.rs:642-643, but these cause clippy failures); cross-backend tested (igzip.rs:590-600) -->
 - [x] **Docs:** `#![deny(missing_docs)]` passes; `IgzipCompressor` docs document AVX-512 requirement, DEFLATE compatibility, and compression level semantics
 <!-- REVIEW: RUSTDOCFLAGS="-D warnings" cargo doc passes; IgzipCompressor docs document all requirements -->
-- [ ] **ADR:** ADR-0006 constraints satisfied — trait-based pluggability via `Compressor` trait (§3, §5 Non-EC acceleration scope), feature-gated compilation (§6), startup probing (§1), fallback chain (§2)
-<!-- REVIEW: iteration-2: §3: ✅ IgzipCompressor impl Compressor; §5: ✅ per-bucket only; §6: ✅ feature-gated; §1: ✅ startup probing in AccelDispatcher::new(); §2: ✅ fallback chain with tracing::warn!; MISSING: §2 metric counter accel_compression_fallback_total not implemented. Deferred to observability epic. -->
+- [x] **ADR:** ADR-0006 constraints satisfied — trait-based pluggability via `Compressor` trait (§3, §5 Non-EC acceleration scope), feature-gated compilation (§6), startup probing (§1), fallback chain (§2)
+<!-- REVIEW: iteration-3: All constraints satisfied. §3: ✅ IgzipCompressor impl Compressor. §5: ✅ Two-level governance per ADR-0007. §6: ✅ feature-gated. §1: ✅ Startup probing in AccelDispatcher::new(). §2: ✅ Fallback chain with tracing::warn! AND AtomicU64 metric counter (compression_fallback_count) at dispatcher.rs:106,446,455. -->
 - [x] **Perf:** Rule 4.3 (feature-gated SIMD for igzip), 5.3 (feature-gated SIMD compilation), 6.4 (static dispatch at dispatcher level), 12.1 (SAFETY on all unsafe blocks)
 <!-- REVIEW: iteration-2: 4.3/5.3: #[cfg(all(target_arch = "x86_64", feature = "isa-l"))] gate; 6.4: Arc<dyn Compressor> at dispatcher level; 12.1: all 9 unsafe blocks in igzip.rs have SAFETY comments. ✅ -->
 - [x] **Integration:** `tests/igzip_roundtrip.rs`: compress with igzip, decompress with zstd (cross-backend), verify bit-exact match; compress with igzip, decompress with igzip; verify fallback when igzip unavailable
