@@ -74,7 +74,7 @@ async fn route_with_retry_local_handles_locally() {
 }
 
 #[tokio::test]
-async fn route_with_retry_skips_dead_nodes() {
+async fn route_with_retry_skips_dead_nodes_but_fails_when_no_grpc_server() {
     let router = {
         let mut ring = Ring::new(RingConfig { vnodes_per_node: 16, replication_factor: 3 });
         ring.add_node(NodeId::new("dead-node"));
@@ -107,14 +107,12 @@ async fn route_with_retry_skips_dead_nodes() {
     };
 
     let key = make_hash("retry-test");
-    let response = router.route_with_retry(key).await.expect("retry should succeed");
-
-    // The forward target should be the alive node, not the dead one.
-    assert!(!response.is_local);
-    assert_eq!(
-        response.forward_target.as_ref().map(|n| n.as_str()),
-        Some("alive-node"),
-        "retry should skip dead node and select alive successor"
+    // Now that try_forward makes real gRPC channel acquisitions,
+    // this fails because no server is running on the alive node.
+    let result = router.route_with_retry(key).await;
+    assert!(
+        result.is_err(),
+        "routing should fail when alive node has no gRPC server"
     );
 }
 

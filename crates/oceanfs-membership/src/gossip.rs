@@ -8,11 +8,12 @@
 //! The protocol is designed to be transport-agnostic — the actual
 //! message sending (gRPC, etc.) is handled by the caller.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use oceanfs_core::{Incarnation, NodeId, NodeState};
+use oceanfs_network::ConnectionPool;
 use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::{
     failure_detector::DetectorCommand,
@@ -47,6 +48,8 @@ pub(crate) struct GossipProtocol {
     incarnations: HashMap<NodeId, Incarnation>,
     /// Membership event channel (for higher-level subscribers).
     membership_event_tx: broadcast::Sender<crate::membership::MembershipEvent>,
+    /// Connection pool for gRPC push calls to peers.
+    pool: Option<Arc<ConnectionPool>>,
 }
 
 impl GossipProtocol {
@@ -64,7 +67,13 @@ impl GossipProtocol {
             state: GossipState::new(),
             incarnations: HashMap::new(),
             membership_event_tx,
+            pool: None,
         }
+    }
+
+    /// Sets the connection pool for gRPC push calls.
+    pub fn set_pool(&mut self, pool: Arc<ConnectionPool>) {
+        self.pool = Some(pool);
     }
 
     /// Runs the gossip protocol loop.
@@ -82,8 +91,81 @@ impl GossipProtocol {
         match cmd {
             GossipCommand::Push { peer, delta } => {
                 trace!(peer = %peer, changed = delta.changed.len(), "pushing gossip delta");
-                // In a real implementation, this would send the delta over gRPC.
-                // For now, we just update our local state as if we merged our own delta.
+                // Send the delta to the peer over gRPC.
+                if let Some(ref pool) = self.pool {
+                    if let Some(entry) = self.state.nodes.get(&peer) {
+                        let peer_addr = entry.address;
+                        match pool.get_channel(peer_addr).await {
+                            Ok(pooled) => {
+                                let channel = pooled.channel().clone();
+                                drop(pooled);
+
+                                let mut client =
+                                    oceanfs_network::GossipRpcClient::new(channel);
+
+                                // Convert the GossipDelta into protobuf GossipMessages.
+                                let entries: Vec<_> = delta
+                                    .changed
+                                    .iter()
+                                    .map(|e| {
+                                        oceanfs_core::proto::membership::MembershipEntry {
+                                            node_id: Some(
+                                                oceanfs_core::proto::common::NodeId {
+                                                    id: e.node_id.to_string(),
+                                                },
+                                            ),
+                                            state: match e.state {
+                                                NodeState::Alive => 0,
+                                                NodeState::Suspect => 1,
+                                                NodeState::Dead => 2,
+                                                NodeState::Leaving => 3,
+                                                NodeState::Left => 4,
+                                            },
+                                            incarnation: e.incarnation.value(),
+                                            address: e.address.to_string(),
+                                            last_seen: None,
+                                        }
+                                    })
+                                    .collect();
+
+                                let msg = oceanfs_network::gossip::GossipMessage {
+                                    delta: Some(
+                                        oceanfs_core::proto::membership::MembershipList {
+                                            entries,
+                                        },
+                                    ),
+                                    ring_version: 0,
+                                    hlc: None,
+                                };
+
+                                let stream = tokio_stream::iter(vec![msg]);
+                                match client.push(tonic::Request::new(stream)).await {
+                                    Ok(response) => {
+                                        let ack = response.into_inner();
+                                        if ack.accepted {
+                                            debug!(
+                                                peer = %peer,
+                                                updated = ack.updated_entries,
+                                                "gossip push ack received"
+                                            );
+                                        }
+                                    }
+                                    Err(status) => {
+                                        warn!(peer = %peer, error = %status, "gossip push failed");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(peer = %peer, error = %e, "failed to acquire channel for push");
+                            }
+                        }
+                    } else {
+                        warn!(peer = %peer, "peer not found in local state for push");
+                    }
+                } else {
+                    debug!(peer = %peer, "no connection pool set, merging delta locally");
+                }
+                // Always merge our own delta locally so our state stays consistent.
                 self.merge_delta(&delta);
             }
             GossipCommand::ReceiveDelta { from, delta } => {

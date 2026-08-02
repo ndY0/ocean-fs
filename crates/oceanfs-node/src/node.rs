@@ -171,6 +171,7 @@ impl Node {
         // ---- 5. Construct connection pool ----
         let rpc_config = RpcConfig::default();
         let pool = Arc::new(oceanfs_network::ConnectionPool::new(rpc_config));
+        membership.set_pool(pool.clone());
 
         // ---- 6. Construct storage components ----
         let segment_size = SegmentSizeConfig::default();
@@ -349,8 +350,12 @@ impl Node {
             .map_err(|e| format!("invalid grpc_listen_addr: {e}"))?;
 
         // Build gRPC service implementations.
-        let segment_service = oceanfs_server::grpc::segment_service::SegmentGrpcService::new();
-        let gossip_service = oceanfs_membership::grpc::gossip_service::GossipGrpcService::new();
+        let segment_service = oceanfs_server::grpc::segment_service::SegmentGrpcService::new(
+            heal_data_store.clone(),
+        );
+        let gossip_service = oceanfs_membership::grpc::gossip_service::GossipGrpcService::new(
+            membership.clone(),
+        );
 
         let healing_service =
             oceanfs_server::grpc::healing_service::HealingGrpcService::new(

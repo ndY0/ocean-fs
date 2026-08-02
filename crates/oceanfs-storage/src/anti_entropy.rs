@@ -856,6 +856,58 @@ impl AntiEntropy {
                     };
                     if peer_root_hash != stored_root {
                         peer_stats.mismatches_found += 1;
+
+                        // Binary descent: if the peer returned leaf hashes, build
+                        // a Merkle tree from them and use descend_diff to identify
+                        // the exact diverged leaves.
+                        if !resp.leaf_hashes.is_empty() {
+                            let peer_leaves: Vec<HashOutput> = resp
+                                .leaf_hashes
+                                .iter()
+                                .filter(|h| h.len() >= 32)
+                                .map(|h| {
+                                    let mut arr = [0u8; 32];
+                                    arr.copy_from_slice(&h[..32]);
+                                    HashOutput::from_bytes(arr)
+                                })
+                                .collect();
+
+                            if let Some(peer_tree) =
+                                MerkleTree::build_from_hashes(&peer_leaves)
+                            {
+                                // Build local tree from segment data to diff.
+                                if let Ok(segment_data) = self
+                                    .segment_store
+                                    .read_segment_data(&seg.segment_id)
+                                {
+                                    if let Some(local_tree) =
+                                        MerkleTree::build(&segment_data, DEFAULT_LEAF_SIZE)
+                                    {
+                                        let diverged =
+                                            local_tree.descend_diff(&peer_tree);
+                                        if !diverged.is_empty() {
+                                            tracing::info!(
+                                                segment_id = %seg.segment_id,
+                                                diverged_leaves = diverged.len(),
+                                                "binary descent found diverged leaves"
+                                            );
+                                            // Enqueue diverged leaves for healing.
+                                            for range in &diverged {
+                                                let _ = crate::heal::enqueue_heal(
+                                                    seg.segment_id,
+                                                    vec![range.start as usize],
+                                                );
+                                            }
+                                            peer_stats.leaves_repaired +=
+                                                diverged.len() as u64;
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // No leaf hashes — enqueue entire segment for healing.
+                            let _ = crate::heal::enqueue_heal(seg.segment_id, Vec::new());
+                        }
                     }
                 }
                 true

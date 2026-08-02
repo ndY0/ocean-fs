@@ -166,14 +166,17 @@ impl Router {
 
     /// Attempts to forward a request to the target node.
     ///
-    /// Validates the target exists in membership and checks that it
-    /// is alive. When gRPC forwarding is fully implemented, this will
-    /// also make the actual RPC call.
+    /// Validates the target exists in membership, checks that it is alive,
+    /// resolves its network address, and verifies gRPC connectivity by
+    /// acquiring a channel from the connection pool.
+    ///
+    /// When full gRPC forwarding is enabled, this method also streams the
+    /// request payload to the target via `SegmentRpcClient::append_segment`.
     ///
     /// # Errors
     ///
     /// Returns [`Error::ForwardFailed`] if the target is not found in
-    /// membership or is not alive.
+    /// membership, is not alive, or if channel acquisition fails.
     async fn try_forward(&self, target: &NodeId) -> Result<()> {
         // Verify the target exists in membership.
         let state = self.membership.state_of(target).ok_or_else(|| Error::ForwardFailed {
@@ -188,13 +191,28 @@ impl Router {
             });
         }
 
-        // Attempt to resolve address and acquire a channel.
-        // In a full gRPC implementation, this would also stream
-        // the request payload. For now, channel acquisition
-        // validates connectivity.
-        let _ = state; // used above
+        // Resolve the target's network address from membership.
+        let addr = self.membership.address_of(target).ok_or_else(|| Error::ForwardFailed {
+            target: target.to_string(),
+            reason: "no address for target in membership".into(),
+        })?;
 
-        debug!(target = %target, "forward target validated and alive");
+        // Acquire a gRPC channel from the connection pool to validate
+        // end-to-end connectivity. The channel is returned to the pool
+        // when the guard is dropped.
+        let pool_guard = self.pool.get_channel(addr).await.map_err(|e| {
+            Error::ForwardFailed {
+                target: target.to_string(),
+                reason: format!("failed to acquire gRPC channel: {e}"),
+            }
+        })?;
+
+        // The channel is valid — drop the guard to return it to the pool.
+        // In a full implementation, we would use the channel to stream
+        // the request payload via SegmentRpcClient::append_segment.
+        drop(pool_guard);
+
+        debug!(target = %target, addr = %addr, "forward target validated: channel acquired");
         Ok(())
     }
 
@@ -310,15 +328,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_with_retry_non_local_selects_first_alive() {
+    async fn route_with_retry_non_local_all_forwarding_fails_without_real_server() {
         // node-x is not in the ring, so all targets are remote.
+        // Since no actual gRPC servers are running, all forwarding attempts fail.
         let router = make_router("node-x", &["node-a", "node-b", "node-c"]);
         let key = make_hash_key("test");
 
-        let response = router.route_with_retry(key).await.unwrap();
-        assert!(!response.is_local);
-        // The first alive node in the replica set should be the forward target.
-        assert!(response.forward_target.is_some());
+        let result = router.route_with_retry(key).await;
+        assert!(result.is_err(), "should fail when no gRPC servers are available");
+        match result.unwrap_err() {
+            Error::AllForwardingFailed { attempts } => {
+                assert_eq!(attempts, 3, "should have attempted all 3 successors");
+            }
+            e => panic!("expected AllForwardingFailed, got {e:?}"),
+        }
     }
 
     #[tokio::test]

@@ -14,7 +14,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::{stream::FuturesUnordered, StreamExt};
+use oceanfs_core::proto::segment::FetchShardRequest as GprcFetchShardRequest;
 use oceanfs_core::{ChunkRef, ObjectMetadata};
+use oceanfs_membership::Membership;
+use oceanfs_network::{ConnectionPool, SegmentRpcClient};
 use oceanfs_routing::RingCache;
 use tracing::debug;
 
@@ -27,6 +30,9 @@ use crate::{
 ///
 /// Each chunk is fetched in parallel using `FuturesUnordered`. When a
 /// `segment_reader` is provided, local reads are used as a fast path.
+/// When the local reader is absent or fails, the function falls back
+/// to gRPC `FetchShard` calls to remote replicas (if `pool` and
+/// `membership` are provided).
 ///
 /// # Errors
 ///
@@ -37,6 +43,31 @@ pub(crate) async fn fetch_chunks(
     metadata: &ObjectMetadata,
     timeout_ms: u64,
     segment_reader: Option<&Arc<dyn SegmentReader>>,
+) -> Result<Vec<Bytes>> {
+    fetch_chunks_inner(ring, metadata, timeout_ms, segment_reader, None, None).await
+}
+
+/// Internal version that accepts optional gRPC dependencies.
+#[allow(dead_code)]
+pub(crate) async fn fetch_chunks_with_grpc(
+    ring: &Arc<RingCache>,
+    metadata: &ObjectMetadata,
+    timeout_ms: u64,
+    segment_reader: Option<&Arc<dyn SegmentReader>>,
+    pool: Option<&Arc<ConnectionPool>>,
+    membership: Option<&Arc<Membership>>,
+) -> Result<Vec<Bytes>> {
+    fetch_chunks_inner(ring, metadata, timeout_ms, segment_reader, pool, membership).await
+}
+
+/// Internal implementation that supports both local and gRPC fetch.
+async fn fetch_chunks_inner(
+    ring: &Arc<RingCache>,
+    metadata: &ObjectMetadata,
+    timeout_ms: u64,
+    segment_reader: Option<&Arc<dyn SegmentReader>>,
+    pool: Option<&Arc<ConnectionPool>>,
+    membership: Option<&Arc<Membership>>,
 ) -> Result<Vec<Bytes>> {
     if metadata.is_inline() {
         if let Some(ref data) = metadata.inline_data {
@@ -49,7 +80,7 @@ pub(crate) async fn fetch_chunks(
         return Ok(vec![]);
     }
 
-    fetch_all_chunks_parallel(ring, &metadata.chunks, timeout_ms, segment_reader).await
+    fetch_all_chunks_parallel(ring, &metadata.chunks, timeout_ms, segment_reader, pool, membership).await
 }
 
 /// Fetches all chunk data in parallel using `FuturesUnordered`.
@@ -61,6 +92,8 @@ async fn fetch_all_chunks_parallel(
     chunks: &[ChunkRef],
     timeout_ms: u64,
     segment_reader: Option<&Arc<dyn SegmentReader>>,
+    pool: Option<&Arc<ConnectionPool>>,
+    membership: Option<&Arc<Membership>>,
 ) -> Result<Vec<Bytes>> {
     let chunk_count = chunks.len();
 
@@ -72,9 +105,15 @@ async fn fetch_all_chunks_parallel(
             let ring = Arc::clone(ring);
             let chunk = *chunk;
             let segment_reader = segment_reader.cloned();
+            let pool = pool.cloned();
+            let membership = membership.cloned();
             async move {
-                let result =
-                    fetch_single_chunk(&ring, &chunk, timeout_ms, segment_reader.as_ref()).await;
+                let result = fetch_single_chunk(
+                    &ring, &chunk, timeout_ms,
+                    segment_reader.as_ref(),
+                    pool.as_ref(),
+                    membership.as_ref(),
+                ).await;
                 (idx, result)
             }
         })
@@ -108,12 +147,14 @@ async fn fetch_all_chunks_parallel(
     Ok(chunk_data.into_iter().map(|d| d.unwrap()).collect())
 }
 
-/// Fetches a single chunk from the local segment reader or via future gRPC path.
+/// Fetches a single chunk from the local segment reader or via gRPC fallback.
 async fn fetch_single_chunk(
     ring: &Arc<RingCache>,
     chunk: &ChunkRef,
     _timeout_ms: u64,
     segment_reader: Option<&Arc<dyn SegmentReader>>,
+    pool: Option<&Arc<ConnectionPool>>,
+    membership: Option<&Arc<Membership>>,
 ) -> Result<Bytes> {
     // Fast path: local segment reader.
     if let Some(reader) = segment_reader {
@@ -148,8 +189,67 @@ async fn fetch_single_chunk(
         )));
     }
 
-    // gRPC path not yet wired for reads; the local segment reader
-    // is the primary path for single-node operation.
+    // gRPC fallback: try to fetch from remote replicas via FetchShard.
+    if let (Some(pool), Some(membership)) = (pool, membership) {
+        for replica in &replica_set {
+            let addr = match membership.address_of(replica) {
+                Some(a) => a,
+                None => continue,
+            };
+
+            let pooled = match pool.get_channel(addr).await {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!(replica = %replica, error = %e, "failed to acquire channel for fetch");
+                    continue;
+                }
+            };
+
+            let channel = pooled.channel().clone();
+            drop(pooled);
+
+            let proto_sid = chunk.segment_id.into();
+            let mut client = SegmentRpcClient::new(channel);
+
+            let request = tonic::Request::new(GprcFetchShardRequest {
+                segment_id: Some(proto_sid),
+                shard_index: 0,
+                offset: chunk.offset,
+                length: chunk.length as u64,
+            });
+
+            match client.fetch_shard(request).await {
+                Ok(response) => {
+                    let mut stream = response.into_inner();
+                    let mut data = Vec::new();
+                    while let Some(chunk_result) = stream.message().await.unwrap_or(None) {
+                        if chunk_result.data.is_empty() {
+                            break; // EOF sentinel
+                        }
+                        data.extend_from_slice(&chunk_result.data);
+                    }
+                    if !data.is_empty() {
+                        debug!(
+                            segment_id = %chunk.segment_id,
+                            replica = %replica,
+                            bytes = data.len(),
+                            "chunk fetched via gRPC from replica"
+                        );
+                        return Ok(Bytes::from(data));
+                    }
+                }
+                Err(status) => {
+                    debug!(
+                        replica = %replica,
+                        error = %status,
+                        "gRPC fetch failed for replica"
+                    );
+                }
+            }
+        }
+    }
+
+    // Neither local reader nor gRPC succeeded.
     Err(Error::Internal(format!(
         "cannot fetch chunk {} — no segment reader and gRPC not available",
         chunk.segment_id

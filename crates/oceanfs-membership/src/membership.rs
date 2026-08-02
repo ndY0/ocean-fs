@@ -8,6 +8,7 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use oceanfs_core::{GossipConfig, Incarnation, NodeId, NodeState};
+use oceanfs_network::ConnectionPool;
 use oceanfs_routing::RingCache;
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
@@ -91,6 +92,8 @@ pub struct Membership {
     detector_tx: tokio::sync::mpsc::Sender<DetectorCommand>,
     /// Sender for gossip protocol commands.
     gossip_tx: tokio::sync::mpsc::Sender<GossipCommand>,
+    /// Connection pool for gRPC calls (join, gossip push).
+    pool: RwLock<Option<Arc<ConnectionPool>>>,
     /// Whether the membership has been started.
     started: RwLock<bool>,
 }
@@ -120,6 +123,7 @@ impl Membership {
             event_tx,
             detector_tx,
             gossip_tx,
+            pool: RwLock::new(None),
             started: RwLock::new(false),
         }
     }
@@ -164,15 +168,29 @@ impl Membership {
         Ok(())
     }
 
-    /// Joins the cluster by contacting seed nodes.
+    /// Sets the connection pool for gRPC-based gossip and join operations.
     ///
-    /// 1. Contacts each seed node to receive the current membership state.
-    /// 2. Announces self as ALIVE via gossip.
-    /// 3. The ring is updated with the new node when peers process the announcement.
+    /// Must be called before [`Self::join`] if seed nodes are configured.
+    /// The pool is shared with the gossip protocol for push/pull.
+    pub fn set_pool(&self, pool: Arc<ConnectionPool>) {
+        *self.pool.write() = Some(pool);
+    }
+
+    /// Joins the cluster by contacting seed nodes via gRPC.
+    ///
+    /// 1. Contacts each seed node via `GossipRpcClient::pull` to receive
+    ///    the current membership state.
+    /// 2. Merges received entries into the local membership.
+    /// 3. Announces self as ALIVE to the seed via `GossipRpcClient::push`.
+    /// 4. Adds self to the ring.
+    ///
+    /// If no seed nodes are configured, the node starts as the first
+    /// cluster member.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::JoinFailed`] if no seed nodes are reachable.
+    /// Returns [`Error::JoinFailed`] if seed nodes are configured but
+    /// none are reachable, or if no connection pool has been set.
     pub async fn join(&self) -> Result<()> {
         let seed_nodes = &self.config.seed_nodes;
         if seed_nodes.is_empty() {
@@ -182,22 +200,98 @@ impl Membership {
             ring_snapshot.add_node(self.node_id.clone());
             self.ring.update(ring_snapshot);
         } else {
-            // Contact seed nodes to receive initial state.
-            if let Some(seed) = seed_nodes.first() {
-                debug!(node_id = %self.node_id, seed = %seed, "contacting seed node");
-                // In a real implementation, this would make a gRPC call.
-                // For now, we simulate a successful join.
-                let _joined = true;
-            } else {
-                return Err(Error::JoinFailed("no seed nodes configured".into()));
+            // Contact seed nodes via gRPC to receive initial state.
+            let pool = {
+                self.pool
+                    .read()
+                    .as_ref()
+                    .ok_or_else(|| Error::JoinFailed("no connection pool set".into()))?
+                    .clone()
+            };
+
+            let mut joined = false;
+            for seed_str in seed_nodes {
+                let seed_addr: SocketAddr = match seed_str.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!(seed = %seed_str, error = %e, "invalid seed address");
+                        continue;
+                    }
+                };
+
+                debug!(node_id = %self.node_id, seed = %seed_addr, "contacting seed node via gRPC");
+
+                let pooled = match pool.get_channel(seed_addr).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(seed = %seed_addr, error = %e, "failed to connect to seed");
+                        continue;
+                    }
+                };
+
+                let channel = pooled.channel().clone();
+                drop(pooled);
+
+                // Pull the full membership list from the seed.
+                let mut client = oceanfs_network::GossipRpcClient::new(channel);
+                let request = tonic::Request::new(
+                    oceanfs_network::gossip::GossipPullRequest {
+                        node_id: Some(oceanfs_core::proto::common::NodeId {
+                            id: self.node_id.to_string(),
+                        }),
+                        last_known_version: 0,
+                    },
+                );
+
+                match client.pull(request).await {
+                    Ok(response) => {
+                        let mut stream = response.into_inner();
+                        while let Some(Ok(msg)) = tokio_stream::StreamExt::next(&mut stream).await {
+                            if let Some(delta) = msg.delta {
+                                for entry in &delta.entries {
+                                    let nid = entry.node_id.as_ref().map(|n| NodeId::new(&n.id));
+                                    let state = match entry.state {
+                                        0 => NodeState::Alive,
+                                        1 => NodeState::Suspect,
+                                        2 => NodeState::Dead,
+                                        3 => NodeState::Leaving,
+                                        4 => NodeState::Left,
+                                        _ => continue,
+                                    };
+                                    let inc = Incarnation::new(entry.incarnation);
+                                    let addr = entry
+                                        .address
+                                        .parse::<SocketAddr>()
+                                        .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 9001)));
+                                    if let Some(id) = nid {
+                                        self.upsert_node(id, state, inc, addr);
+                                    }
+                                }
+                            }
+                        }
+                        joined = true;
+                        info!(seed = %seed_addr, "received membership state from seed");
+                        break;
+                    }
+                    Err(status) => {
+                        warn!(seed = %seed_addr, error = %status, "pull from seed failed");
+                    }
+                }
+            }
+
+            if !joined {
+                return Err(Error::JoinFailed(
+                    "could not contact any seed node".into(),
+                ));
             }
         }
 
         // Announce self as ALIVE.
         let mut state = self.state.write();
-        state
-            .nodes
-            .insert(self.node_id.clone(), (NodeState::Alive, Incarnation::new(1), self.address));
+        state.nodes.insert(
+            self.node_id.clone(),
+            (NodeState::Alive, Incarnation::new(1), self.address),
+        );
 
         let _ = self.event_tx.send(MembershipEvent {
             node_id: self.node_id.clone(),

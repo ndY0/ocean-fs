@@ -91,27 +91,77 @@ impl HealingRpc for HealingGrpcService {
     ) -> Result<Response<MerkleResponse>, Status> {
         let req = request.into_inner();
 
-        // Get the first requested segment ID and convert to domain type
-        let proto_sid = req.segment_ids.first().cloned().unwrap_or_default();
-        let sid = SegmentId::try_from(proto_sid).unwrap_or_default();
+        // Process all requested segment IDs and return Merkle data for the first one
+        // with available data. In a full multi-segment exchange, we would return
+        // a batch response.
+        let mut best_root_hash = vec![0u8; 32];
+        let mut best_leaf_hashes: Vec<Vec<u8>> = Vec::new();
+        let mut chosen_sid: Option<oceanfs_core::proto::common::SegmentId> = None;
 
-        // Look up the segment's Merkle root from the metadata store
-        let root_hash = self
-            .metadata_store
-            .list_segments()
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .find(|s| s.segment_id == sid)
-            .and_then(|seg| seg.merkle_root)
-            .map(|h| h.as_bytes().to_vec())
-            .unwrap_or_else(|| vec![0u8; 32]);
+        for proto_sid in &req.segment_ids {
+            let sid = match SegmentId::try_from(proto_sid.clone()) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
 
-        // Return the segment's Merkle root and leaf hashes.
-        // In a full implementation, leaf hashes are computed from segment data.
+            // Try to read the segment data to compute the Merkle tree.
+            let segment_data = match self.data_store.read_segment_data(&sid) {
+                Ok(data) => data,
+                Err(_) => continue,
+            };
+
+            if segment_data.is_empty() {
+                continue;
+            }
+
+            // Build a Merkle tree over the segment data using 64 KB leaf size.
+            // This computes both the root hash and leaf hashes from actual data.
+            let leaf_size: usize = 65536; // 64 KB leaf size per spec §11.2
+            if let Some(tree) = oceanfs_storage::MerkleTree::build(&segment_data, leaf_size) {
+                let root = tree.root();
+                best_root_hash = root.hash().as_bytes().to_vec();
+
+                // Collect all leaf hashes for the response.
+                best_leaf_hashes = (0..tree.leaf_count() as usize)
+                    .filter_map(|i| tree.leaf_hash(i).map(|h| h.as_bytes().to_vec()))
+                    .collect();
+
+                chosen_sid = Some(proto_sid.clone());
+                break; // Found a segment with data — return it.
+            }
+        }
+
+        if best_root_hash.len() == 32 && best_root_hash.iter().all(|b| *b == 0) {
+            // No segment data was found — fall back to metadata store lookup.
+            // Use the first segment ID as a reference for the fallback.
+            let proto_sid = req.segment_ids.first().cloned().unwrap_or_default();
+            let sid = SegmentId::try_from(proto_sid).unwrap_or_default();
+
+            // Look up the segment's Merkle root from the metadata store.
+            best_root_hash = self
+                .metadata_store
+                .list_segments()
+                .into_iter()
+                .filter_map(|r| r.ok())
+                .find(|s| s.segment_id == sid)
+                .and_then(|seg| seg.merkle_root)
+                .map(|h| h.as_bytes().to_vec())
+                .unwrap_or_else(|| vec![0u8; 32]);
+
+            chosen_sid = req.segment_ids.first().cloned();
+        }
+
+        tracing::debug!(
+            segment_id = ?chosen_sid,
+            root_hash_len = best_root_hash.len(),
+            leaf_count = best_leaf_hashes.len(),
+            "merkle_exchange: returning computed Merkle data"
+        );
+
         Ok(Response::new(MerkleResponse {
-            segment_id: req.segment_ids.first().cloned(),
-            root_hash,
-            leaf_hashes: Vec::new(),
+            segment_id: chosen_sid,
+            root_hash: best_root_hash,
+            leaf_hashes: best_leaf_hashes,
         }))
     }
 
@@ -190,6 +240,128 @@ impl HealingRpc for HealingGrpcService {
                 );
                 Ok(Response::new(PushRepairedShardResponse { accepted: false }))
             }
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use oceanfs_core::proto::common::SegmentId as ProtoSegmentId;
+    use oceanfs_core::SegmentId;
+    use oceanfs_storage::SegmentDataStore;
+
+    use super::*;
+    use crate::HintedHandoff;
+
+    /// In-memory store for healing tests.
+    struct TestHealStore {
+        data: Mutex<HashMap<SegmentId, Vec<u8>>>,
+    }
+
+    impl TestHealStore {
+        fn new() -> Self {
+            Self { data: Mutex::new(HashMap::new()) }
+        }
+    }
+
+    impl SegmentDataStore for TestHealStore {
+        fn write_segment_data(
+            &self,
+            segment_id: &SegmentId,
+            data: &[u8],
+        ) -> Result<(), oceanfs_storage::Error> {
+            self.data.lock().unwrap().insert(segment_id.clone(), data.to_vec());
+            Ok(())
+        }
+
+        fn read_segment_data(
+            &self,
+            segment_id: &SegmentId,
+        ) -> Result<Vec<u8>, oceanfs_storage::Error> {
+            self.data
+                .lock()
+                .unwrap()
+                .get(segment_id)
+                .cloned()
+                .ok_or_else(|| oceanfs_storage::Error::SegmentNotFound(*segment_id))
+        }
+    }
+
+    fn make_service() -> HealingGrpcService {
+        let handoff = Arc::new(HintedHandoff::new());
+        let metadata_store = Arc::new(
+            oceanfs_storage::MetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: std::env::temp_dir().join(format!("oceanfs-test-heal-{}", std::process::id())),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let data_store: Arc<dyn SegmentDataStore> = Arc::new(TestHealStore::new());
+        HealingGrpcService::new(handoff, metadata_store, data_store)
+    }
+
+    #[tokio::test]
+    async fn handoff_valid_hint_returns_accepted() {
+        let service = make_service();
+
+        let request = tonic::Request::new(HintRequest {
+            intended_for: Some(oceanfs_core::proto::common::NodeId {
+                id: "target-node".to_string(),
+            }),
+            segment_id: Some(SegmentId::new().into()),
+            data: b"test hint data".to_vec(),
+            hlc: None,
+        });
+
+        let response = service.hinted_handoff(request).await.unwrap();
+        let resp = response.into_inner();
+        assert!(resp.accepted, "valid hint should be accepted");
+        assert!(resp.stored_segment_id.is_some(), "should return a stored_segment_id");
+    }
+
+    #[tokio::test]
+    async fn merkle_exchange_with_stored_data_returns_correct_root() {
+        let handoff = Arc::new(HintedHandoff::new());
+        let metadata_store = Arc::new(
+            oceanfs_storage::MetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: std::env::temp_dir().join(format!("oceanfs-test-merkle-{}", std::process::id())),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let test_store = Arc::new(TestHealStore::new());
+
+        // Write known data to the store so the Merkle tree can be built.
+        let seg_id = SegmentId::new();
+        let data: Vec<u8> = vec![0xAB; 65536 * 2]; // 128 KB = 2 leaves of 64 KB
+        test_store.write_segment_data(&seg_id, &data).unwrap();
+
+        let data_store: Arc<dyn SegmentDataStore> = test_store;
+        let service = HealingGrpcService::new(handoff, metadata_store, data_store);
+
+        let proto_sid: ProtoSegmentId = seg_id.into();
+        let request = tonic::Request::new(MerkleRequest {
+            segment_ids: vec![proto_sid],
+            tree_depth: 8,
+            node_id: None,
+        });
+
+        let response = service.merkle_exchange(request).await.unwrap();
+        let resp = response.into_inner();
+
+        // Root hash should be 32 bytes (BLAKE3 output).
+        assert_eq!(resp.root_hash.len(), 32, "root hash should be 32 bytes");
+        // Should have computed leaf hashes from actual data.
+        assert!(!resp.leaf_hashes.is_empty(), "should have leaf hashes");
+        // 128 KB / 64 KB = 2 leaves.
+        assert_eq!(resp.leaf_hashes.len(), 2, "should have 2 leaf hashes for 128 KB data");
+        // Each leaf hash should also be 32 bytes.
+        for (i, leaf) in resp.leaf_hashes.iter().enumerate() {
+            assert_eq!(leaf.len(), 32, "leaf hash {} should be 32 bytes", i);
         }
     }
 }
