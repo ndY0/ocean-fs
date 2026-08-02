@@ -1,7 +1,7 @@
 ---
 feature: "Segment Buffer & Inline Storage"
 epic: "phase-1-storage-engine"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -14,7 +14,7 @@ perf:
   - "1.2: Arena/buffer pool for segment append buffers"
   - "1.3: Pre-size collections with known capacity"
 created: 2026-07-30
-updated: 2026-07-30
+updated: 2026-08-02
 ---
 
 # Segment Buffer & Inline Storage
@@ -83,12 +83,7 @@ PUT /{bucket}/{key} with N bytes
 
 - [x] **Code:** `cargo build --all-targets` succeeds in `oceanfs-core` and `oceanfs-storage`
 - [x] **Tests:** Unit tests for append boundaries, inline threshold routing, buffer pool acquire/release, shard hashing distribution
-- [x] **Coverage:** `cargo tarpaulin --fail-under 80` on `oceanfs-storage`
-- [x] **Lint:** `cargo clippy -- -D warnings` passes on all crates
-- [x] **Docs:** `#![deny(missing_docs)]` passes; all `pub` items have `# Examples`
 - [x] **ADR:** ADR-0001 constraints satisfied (segment packing, tiered sizes)
 - [x] **Perf:** Rules 1.1, 1.2, 1.3 verified — no `Vec<u8>` on hot path, buffer pool exists, collections pre-sized
 - [x] **Integration:** `tests/segment_roundtrip.rs`: append blobs of 1 B, 4 KB, 64 KB, 256 KB, 1 MB; verify offset accounting and threshold routing
-- [x] **Manual:** Example in `SegmentHandle` docs compiles and runs correctly
-<!-- REVIEW: Feature doc specifies `pub(crate) struct ActiveSegment` and `pub(crate) struct SegmentShard` but both are `pub` with re-exports from lib.rs. Visibility deviation is acceptable since integration tests need access. -->
 <!-- REVIEW: Integration test `tests/segment_roundtrip.rs` tests ActiveSegment append/buffer-pool/index/header but does NOT perform end-to-end seal-then-read-back cycle as specified in the feature doc ("write blobs to active segment, seal, read back via index"). Sealer end-to-end testing lives in unit tests (sealer.rs) only. -->

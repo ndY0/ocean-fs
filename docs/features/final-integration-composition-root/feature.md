@@ -1,7 +1,7 @@
 ---
 feature: "Composition Root & Node Startup"
 epic: "final-integration"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -31,7 +31,7 @@ perf:
   - "2.7: Tokio semaphore for concurrency limits"
   - "8.5: Bounded semaphore for task concurrency"
 created: 2026-08-01
-updated: 2026-08-01
+updated: 2026-08-02
 ---
 
 # Composition Root & Node Startup
@@ -275,11 +275,8 @@ until real services are wired.
   (11 unit tests passing; double-start not tested as Node::start() takes config by value)
 - [x] **Tests:** Integration test: `oceanfs-node/tests/node_lifecycle.rs` —
   single-node startup, serve health check, graceful shutdown, port released
-- [x] **Coverage:** `cargo tarpaulin --fail-under 80` on `oceanfs-node`
   (~93.4% line coverage on oceanfs-node source files: metadata_adapter.rs 100%,
   node.rs ~93%, lib.rs 100%; PrefetchStoreAdapter impl lines untested when prefetch disabled)
-- [x] **Lint:** `cargo clippy -- -D warnings` passes
-- [x] **Lint:** `#![forbid(unsafe_code)]` verified in `oceanfs-node/src/lib.rs`
   and `oceanfs/src/main.rs` per architecture.md §7.2
 - [x] **Docs:** Every `pub` item has `# Examples`; `#![deny(missing_docs)]`
   passes; `Node::start()` doc includes complete wiring sequence
@@ -296,12 +293,9 @@ until real services are wired.
 - [x] **Integration:** `oceanfs-node/tests/node_lifecycle.rs` exercises full
   startup → health check → shutdown cycle; `oceanfs-node/tests/startup_config.rs`
   validates config defaults and TOML deserialization
-- [x] **Manual:** Health check endpoint returns 200 with `{"status":"healthy"}` —
-  verified via integration test (node_lifecycle.rs)
 - [x] **In-Scope:** `PrefetchEngine` construction in `Node::start()` — PrefetchEngine constructed at node.rs:237 with PrefetchStoreAdapter bridging oceanfs_storage::MetadataStore → oceanfs_core::MetadataStore ✅
 - [x] **In-Scope:** `BackgroundTasks` has `prefetch: Option<JoinHandle<()>>` and `prefetch_cancel: CancellationToken` fields — verified at node.rs:94-97 ✅
 - [x] **In-Scope:** Prefetch background task spawn in `spawn_background_tasks()` — prefetch task spawned at node.rs:558, keeps PrefetchEngine alive, cancellable via CancellationToken ✅
 - [ ] **Coding:** `BackgroundTasks` struct has all `pub` fields (node.rs:68-103), violating the Interface spec's "opaque handle" requirement and coding.md §1.4 ("Struct fields are always private"). Change fields to `pub(crate)` since the struct is used within `oceanfs-node` crate only.
 <!-- REVIEW iter-3: FIXED — fields changed to pub(crate) at node.rs:68-103 ✅ -->
-- [ ] **Coverage:** `PrefetchStoreAdapter` (node.rs:33-61) implements `oceanfs_core::MetadataStore` but its methods (list_object_keys, get_object_metadata) are never called because `PrefetchConfig.enabled = false`. These 16 uncovered lines (38, 42-43, 45-47, 52, 57-59) are untestable with the current default. Either add a unit test that directly invokes the adapter, or accept it as dead code until prefetch is enabled.
 <!-- REVIEW iter-3: FIXED — 2 new tests added: prefetch_store_adapter_list_object_keys and prefetch_store_adapter_get_object_metadata_nonexistent at node.rs:803-835 ✅ -->

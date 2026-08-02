@@ -38,6 +38,12 @@ message HlcTimestamp {
   uint32 logical = 2;    // logical counter
 }
 
+// Index into a k+m shard set.
+// 0..k-1 are data shards; k..k+m-1 are parity shards.
+message ShardIndex {
+  uint32 index = 1;
+}
+
 // Reference to a chunk of an object within a segment.
 message ChunkRef {
   SegmentId segment_id = 1;

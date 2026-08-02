@@ -898,6 +898,45 @@ impl From<std::net::SocketAddr> for PeerAddress {
 }
 
 // ---------------------------------------------------------------------------
+// ShardIndex
+// ---------------------------------------------------------------------------
+
+/// Index into a k+m shard set.
+///
+/// Data shards are numbered 0..k-1; parity shards are numbered k..k+m-1.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::ShardIndex;
+///
+/// let data_shard = ShardIndex(0);
+/// let parity_shard = ShardIndex(4);
+/// assert_eq!(data_shard.value(), 0);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ShardIndex(pub u8);
+
+impl ShardIndex {
+    /// Returns the raw shard index value.
+    pub fn value(&self) -> u8 {
+        self.0
+    }
+}
+
+impl From<u8> for ShardIndex {
+    fn from(value: u8) -> Self {
+        Self(value)
+    }
+}
+
+impl From<ShardIndex> for u8 {
+    fn from(value: ShardIndex) -> Self {
+        value.0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // StorageLocation
 // ---------------------------------------------------------------------------
 
@@ -1108,9 +1147,20 @@ pub trait MetadataStore: Send + Sync {
 
 /// Compression acceleration tier.
 ///
-/// Controls which compression backend is used for segment data. Unlike
-/// `AccelTier`, compression tier is per-bucket only — there is no
-/// node-level compression tier configuration (per ADR-0006 §5).
+/// Controls which compression backend is used for segment data.
+/// Per ADR-0007, compression uses a two-level governance model:
+/// the node sets a ceiling (maximum tier available), and per-bucket
+/// configuration can only select from or downgrade from the node's
+/// ceiling — it cannot upgrade.
+///
+/// ## Capability Ordering
+///
+/// ```text
+/// GpuNvcomp > CpuIgzip > CpuZstd > None
+/// ```
+///
+/// A bucket requesting a tier higher than the node ceiling is capped:
+/// `effective_tier = min(requested, ceiling)`.
 ///
 /// # Examples
 ///
@@ -1120,29 +1170,33 @@ pub trait MetadataStore: Send + Sync {
 /// let tier = CompressionTier::Auto;
 /// assert!(matches!(tier, CompressionTier::Auto));
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum CompressionTier {
+    /// No compression — disable compression entirely for this node or bucket.
+    /// Lowest tier in the capability ordering.
+    None,
+    /// CPU zstd (always available). Tier 0 — terminal fallback.
+    CpuZstd,
+    /// ISA-L igzip (requires isa-l feature + AVX-512). Tier 1.
+    CpuIgzip,
+    /// nvCOMP GPU batch compression (requires cuda feature + nvCOMP library). Tier 2.
+    GpuNvcomp,
     /// Automatically select the best available compression backend.
     /// Probe order: nvCOMP > ISA-L igzip > CPU zstd.
     Auto,
-    /// CPU zstd (always available).
-    CpuZstd,
-    /// ISA-L igzip (requires isa-l feature + AVX-512).
-    CpuIgzip,
-    /// nvCOMP GPU batch compression (requires cuda feature + nvCOMP library).
-    GpuNvcomp,
 }
 
 // ---------------------------------------------------------------------------
 // GpuConfig
 // ---------------------------------------------------------------------------
 
-/// Configuration for segment compression.
+/// Per-bucket compression configuration.
 ///
 /// Controls the compression tier and level applied to segment data before
-/// erasure coding. Compression is per-bucket only — there is no node-level
-/// compression tier default (per ADR-0006 §5).
+/// erasure coding. Per ADR-0007, the effective tier is capped by the
+/// node-level `CompressionConfig` ceiling: a bucket requesting
+/// `GpuNvcomp` on a `CpuZstd`-only node will get `CpuZstd`.
 ///
 /// # Examples
 ///
@@ -1284,6 +1338,205 @@ pub struct CacheInvalidateRequest {
     pub bucket: BucketId,
     /// The key of the invalidated object.
     pub key: ObjectKey,
+}
+
+// ---------------------------------------------------------------------------
+// HealConfig
+// ---------------------------------------------------------------------------
+
+/// Configuration for the EC heal dispatch pipeline.
+///
+/// Controls concurrency, retry behavior, and throughput throttling for
+/// the background heal worker that repairs corrupt segment shards.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::HealConfig;
+///
+/// let config = HealConfig::default();
+/// assert_eq!(config.max_concurrent_heals(), 4);
+/// ```
+#[derive(Debug, Clone)]
+pub struct HealConfig {
+    /// Maximum number of concurrent heal operations (bounded via semaphore).
+    max_concurrent_heals: usize,
+    /// Maximum retry attempts for a single heal request before giving up.
+    heal_retry_limit: u32,
+    /// Throughput limit in bytes per second (0 = unlimited).
+    heal_throttle_bytes_sec: u64,
+    /// Capacity of the bounded heal queue channel.
+    queue_capacity: usize,
+}
+
+impl Default for HealConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_heals: 4,
+            heal_retry_limit: 3,
+            heal_throttle_bytes_sec: 0,
+            queue_capacity: 256,
+        }
+    }
+}
+
+impl HealConfig {
+    /// Returns the maximum number of concurrent heal operations.
+    pub fn max_concurrent_heals(&self) -> usize {
+        self.max_concurrent_heals
+    }
+
+    /// Returns the maximum retry attempts per heal request.
+    pub fn heal_retry_limit(&self) -> u32 {
+        self.heal_retry_limit
+    }
+
+    /// Returns the throughput throttle in bytes per second.
+    pub fn heal_throttle_bytes_sec(&self) -> u64 {
+        self.heal_throttle_bytes_sec
+    }
+
+    /// Returns the capacity of the bounded heal queue.
+    pub fn queue_capacity(&self) -> usize {
+        self.queue_capacity
+    }
+
+    /// Sets the maximum number of concurrent heal operations.
+    #[must_use]
+    pub fn with_max_concurrent_heals(mut self, value: usize) -> Self {
+        self.max_concurrent_heals = value;
+        self
+    }
+
+    /// Sets the maximum retry attempts per heal request.
+    #[must_use]
+    pub fn with_heal_retry_limit(mut self, value: u32) -> Self {
+        self.heal_retry_limit = value;
+        self
+    }
+
+    /// Sets the throughput throttle in bytes per second.
+    #[must_use]
+    pub fn with_heal_throttle_bytes_sec(mut self, value: u64) -> Self {
+        self.heal_throttle_bytes_sec = value;
+        self
+    }
+
+    /// Sets the capacity of the bounded heal queue.
+    #[must_use]
+    pub fn with_queue_capacity(mut self, value: usize) -> Self {
+        self.queue_capacity = value;
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HealStats
+// ---------------------------------------------------------------------------
+
+/// Atomic statistics for the heal pipeline.
+///
+/// All counters use [`std::sync::atomic::Ordering::Relaxed`] because precise
+/// ordering is not required for diagnostic counters — only approximate
+/// observability matters (perf rule 11.1).
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::HealStats;
+///
+/// let stats = HealStats::default();
+/// assert_eq!(stats.heals_attempted(), 0);
+/// ```
+#[derive(Debug, Default)]
+pub struct HealStats {
+    /// Total number of heal attempts (includes retries).
+    heals_attempted: std::sync::atomic::AtomicU64,
+    /// Heals that completed successfully.
+    heals_succeeded: std::sync::atomic::AtomicU64,
+    /// Heals that exhausted all retries and failed.
+    heals_failed: std::sync::atomic::AtomicU64,
+    /// Total bytes repaired across all successful heals.
+    bytes_repaired: std::sync::atomic::AtomicU64,
+}
+
+impl HealStats {
+    /// Returns the total number of heal attempts.
+    pub fn heals_attempted(&self) -> u64 {
+        self.heals_attempted.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Returns the number of successful heal completions.
+    pub fn heals_succeeded(&self) -> u64 {
+        self.heals_succeeded.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Returns the number of heals that failed after exhausting retries.
+    pub fn heals_failed(&self) -> u64 {
+        self.heals_failed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Returns the total bytes repaired across all successful heals.
+    pub fn bytes_repaired(&self) -> u64 {
+        self.bytes_repaired.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Increments the attempts counter by one.
+    pub fn inc_attempted(&self) {
+        self.heals_attempted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Increments the succeeded counter by one.
+    pub fn inc_succeeded(&self) {
+        self.heals_succeeded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Increments the failed counter by one.
+    pub fn inc_failed(&self) {
+        self.heals_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Adds the given number of bytes to the repaired counter.
+    pub fn add_bytes_repaired(&self, bytes: u64) {
+        self.bytes_repaired.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Creates a new [`HealStats`] with all counters initialized to zero.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HealRequest
+// ---------------------------------------------------------------------------
+
+/// A request to repair one or more corrupt shards of a segment.
+///
+/// Submitted to the `HealQueue` by Scrub and Anti-Entropy when
+/// corruption is detected. The `HealWorker` drains these requests
+/// and coordinates EC-based repair.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::{HealRequest, SegmentId};
+///
+/// let request = HealRequest {
+///     segment_id: SegmentId::new(),
+///     corrupt_shard_indices: vec![2],
+///     retry_count: 0,
+/// };
+/// assert_eq!(request.retry_count, 0);
+/// ```
+#[derive(Debug, Clone)]
+pub struct HealRequest {
+    /// The segment that needs repair.
+    pub segment_id: SegmentId,
+    /// Indices of the corrupt shards within the k+m shard set.
+    pub corrupt_shard_indices: Vec<usize>,
+    /// Number of previous attempts (0 = first attempt).
+    pub retry_count: u32,
 }
 
 // ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use crate::types::GpuConfig;
+use crate::types::{CompressionTier, GpuConfig};
 
 /// Root configuration for an OceanFS node.
 ///
@@ -49,13 +49,27 @@ pub struct NodeConfig {
     pub metrics_listen_addr: String,
 }
 
-fn default_node_id() -> String { "node-1".into() }
-fn default_data_dir() -> PathBuf { PathBuf::from("/var/lib/oceanfs") }
-fn default_listen_addr() -> String { "0.0.0.0:9000".into() }
-fn default_grpc_listen_addr() -> String { "0.0.0.0:9001".into() }
-fn default_log_level() -> String { "info".into() }
-fn default_metrics_enabled() -> bool { true }
-fn default_metrics_listen_addr() -> String { "0.0.0.0:9090".into() }
+fn default_node_id() -> String {
+    "node-1".into()
+}
+fn default_data_dir() -> PathBuf {
+    PathBuf::from("/var/lib/oceanfs")
+}
+fn default_listen_addr() -> String {
+    "0.0.0.0:9000".into()
+}
+fn default_grpc_listen_addr() -> String {
+    "0.0.0.0:9001".into()
+}
+fn default_log_level() -> String {
+    "info".into()
+}
+fn default_metrics_enabled() -> bool {
+    true
+}
+fn default_metrics_listen_addr() -> String {
+    "0.0.0.0:9090".into()
+}
 
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -250,13 +264,54 @@ impl AuthConfig {
 }
 
 // ---------------------------------------------------------------------------
+// CompressionConfig
+// ---------------------------------------------------------------------------
+
+/// Node-level compression governance configuration.
+///
+/// Per ADR-0007, the node operator controls what compression backends
+/// are available. The node-level `tier` sets the **ceiling** — the
+/// maximum tier any bucket may use. Per-bucket `compress_tier` can only
+/// select from or downgrade from the node ceiling; it cannot upgrade.
+///
+/// Loaded from the `[compression]` section of `oceanfs.toml`.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::{CompressionConfig, CompressionTier};
+///
+/// let config = CompressionConfig::default();
+/// assert!(config.enabled);
+/// assert_eq!(config.tier, CompressionTier::Auto);
+/// ```
+#[derive(Debug, Clone)]
+pub struct CompressionConfig {
+    /// Whether segment compression is enabled at all.
+    /// When `false`, no compression is applied regardless of bucket settings.
+    pub enabled: bool,
+    /// Compression acceleration tier ceiling for this node.
+    /// Buckets may only select this tier or lower.
+    pub tier: CompressionTier,
+    /// Minimum batch bytes for GPU offload (only relevant when tier ≥ GpuNvcomp).
+    pub gpu_min_batch_bytes: u64,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self { enabled: true, tier: CompressionTier::Auto, gpu_min_batch_bytes: 1_048_576 }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AccelConfig
 // ---------------------------------------------------------------------------
 
 /// Configuration for the acceleration subsystem.
 ///
-/// Controls EC encoding tier, hash tier, and GPU-specific options.
-/// Loaded from the `[acceleration]` section of `oceanfs.toml`.
+/// Controls EC encoding tier, hash tier, GPU-specific options,
+/// and node-level compression governance. Loaded from the
+/// `[acceleration]` and `[compression]` sections of `oceanfs.toml`.
 ///
 /// # Examples
 ///
@@ -276,6 +331,10 @@ pub struct AccelConfig {
     pub gpu: Option<GpuConfig>,
     /// Prefer AVX-512 code path in ISA-L if available (default true).
     pub isal_prefer_avx512: bool,
+    /// Node-level compression governance (per ADR-0007).
+    /// Controls the compression ceiling — buckets may only select
+    /// this tier or lower. Default: enabled, tier=auto.
+    pub compression: CompressionConfig,
 }
 
 impl Default for AccelConfig {
@@ -285,6 +344,7 @@ impl Default for AccelConfig {
             hash_tier: "auto".into(),
             gpu: None,
             isal_prefer_avx512: true,
+            compression: CompressionConfig::default(),
         }
     }
 }
@@ -343,6 +403,7 @@ mod accel_config_tests {
             hash_tier: "auto".into(),
             gpu: Some(GpuConfig::default()),
             isal_prefer_avx512: true,
+            compression: CompressionConfig::default(),
         };
         assert!(cfg.has_gpu_config());
     }
@@ -354,6 +415,7 @@ mod accel_config_tests {
             hash_tier: "auto".into(),
             gpu: None,
             isal_prefer_avx512: false,
+            compression: CompressionConfig::default(),
         };
         assert!(!cfg.ec_tier_is_auto());
         assert!(!cfg.has_gpu_config());

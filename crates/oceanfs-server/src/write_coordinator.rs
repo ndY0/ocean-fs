@@ -20,7 +20,7 @@ use oceanfs_core::{
     SegmentId, WriteResult,
 };
 use oceanfs_membership::Membership;
-use oceanfs_network::ConnectionPool;
+use oceanfs_network::{ConnectionPool, SegmentRpcClient};
 use oceanfs_routing::RingCache;
 use tracing::{info, warn};
 
@@ -63,8 +63,7 @@ pub struct WriteCoordinator {
     ring: Arc<RingCache>,
     /// Cluster membership for node state queries.
     membership: Arc<Membership>,
-    /// gRPC connection pool for replica communication.
-    #[allow(dead_code)]
+    /// gRPC connection pool for replica communication and forwarding.
     pool: Arc<ConnectionPool>,
     /// This node's identifier.
     node_id: NodeId,
@@ -113,15 +112,15 @@ impl WriteCoordinator {
 
         let is_local = replica_set.contains(&self.node_id);
 
-        // Step 2: If not local, we would forward to the first successor.
-        // In local-only mode, we proceed with the write if local.
+        // Step 2: If not local, forward to the first available successor.
         if !is_local {
-            // For now, return an error indicating forwarding is needed.
-            // A full implementation would forward via gRPC to the first successor.
-            return Err(Error::Routing(format!(
-                "key not hosted locally; forward to {}",
-                replica_set.first().map(|n| n.as_str()).unwrap_or("unknown")
-            )));
+            let forward_target = replica_set
+                .iter()
+                .find(|n| self.membership.state_of(n) == Some(oceanfs_core::NodeState::Alive))
+                .cloned()
+                .ok_or_else(|| Error::Routing("no alive replica to forward write".into()))?;
+
+            return self.forward_write(&forward_target, &req).await;
         }
 
         // Step 3: Local write + timestamp.
@@ -153,11 +152,15 @@ impl WriteCoordinator {
             replica_set.iter().filter(|n| *n != &self.node_id).take(MAX_REPLICA_FANOUT).collect();
 
         if !remote_targets.is_empty() {
+            let write_timeout_ms = OperationTimeouts::default().wal_write_ms;
             let results = replicate_write(
                 &self.membership,
+                &self.pool,
                 &remote_targets,
+                segment_id,
+                &req.data,
                 hlc,
-                OperationTimeouts::default().wal_write_ms,
+                write_timeout_ms,
             )
             .await;
 
@@ -196,6 +199,70 @@ impl WriteCoordinator {
     /// Returns a reference to the HLC clock.
     pub fn hlc_clock(&self) -> &Arc<HlcClock> {
         &self.hlc_clock
+    }
+
+    /// Forwards a write request to another node via gRPC.
+    ///
+    /// Resolves the target's address and streams the write request
+    /// using the same `AppendSegment` gRPC call that replication uses.
+    async fn forward_write(&self, target: &NodeId, req: &WriteRequest) -> Result<WriteResult> {
+        let addr = self.membership.address_of(target).ok_or_else(|| Error::ForwardFailed {
+            target: target.to_string(),
+            reason: "node address not found in membership".into(),
+        })?;
+
+        let pooled = self.pool.get_channel(addr).await.map_err(|e| Error::ForwardFailed {
+            target: target.to_string(),
+            reason: format!("connection pool error: {e}"),
+        })?;
+
+        let channel = pooled.channel().clone();
+        drop(pooled);
+
+        let mut client = SegmentRpcClient::new(channel);
+
+        let segment_id = SegmentId::new();
+        let proto_segment_id: oceanfs_core::proto::common::SegmentId = segment_id.into();
+        let hlc = self.hlc_clock.now();
+        let proto_hlc: oceanfs_core::proto::common::HlcTimestamp = hlc.into();
+
+        let request = oceanfs_core::proto::segment::SegmentAppendRequest {
+            segment_id: Some(proto_segment_id),
+            shard_index: None,
+            offset: 0,
+            data: req.data.to_vec(),
+            hlc: Some(proto_hlc),
+        };
+
+        info!(
+            target = %target,
+            bucket = %req.bucket,
+            key = %req.key,
+            "forwarding write to remote replica"
+        );
+
+        let response =
+            client.append_segment(tokio_stream::once(request)).await.map_err(|status| {
+                Error::ForwardFailed {
+                    target: target.to_string(),
+                    reason: format!("gRPC forward failed: {status}"),
+                }
+            })?;
+
+        let _ack = response.into_inner();
+
+        let hash = blake3::hash(&req.data);
+        let blake3_hash = HashOutput::from_bytes(*hash.as_bytes());
+
+        let mut chunks = smallvec::SmallVec::new();
+        chunks.push(ChunkRef { segment_id, offset: 0, length: req.data.len() as u32 });
+
+        Ok(WriteResult {
+            object_key: req.key.clone(),
+            chunks,
+            size: req.data.len() as u64,
+            blake3_hash: Some(blake3_hash),
+        })
     }
 }
 
@@ -279,6 +346,9 @@ mod tests {
     #[tokio::test]
     async fn coordinator_put_forwards_non_local() {
         // n4 is not in the ring, so it's not a replica.
+        // It should attempt to forward to an alive node from the
+        // replica set, returning a ForwardFailed error with the
+        // target node information.
         let coord = make_write_coordinator("n4", &["n1", "n2"]);
 
         let req = WriteRequest {
@@ -293,7 +363,15 @@ mod tests {
         };
 
         let result = coord.put(req).await;
-        assert!(result.is_err(), "non-local write should return routing error");
+        assert!(result.is_err(), "non-local write should attempt forwarding");
+        match result.unwrap_err() {
+            Error::ForwardFailed { target, .. } => {
+                assert!(!target.is_empty(), "forward target should be specified");
+            }
+            other => {
+                panic!("expected ForwardFailed, got {other:?}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -358,5 +436,143 @@ mod tests {
 
         let after = coord.hlc_clock().now();
         assert!(after > before, "HLC clock must advance after write");
+    }
+
+    // ── Quorum tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn coordinator_put_quorum_not_met_when_insufficient_acks() {
+        // 3-node ring, n1 is local, quorum=2.
+        // Remote replicas n2 and n3 will fail (no gRPC server running).
+        // Local ack counts as 1, so acks=1 < quorum=2 → QuorumNotMet.
+        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"]);
+
+        let req = WriteRequest {
+            bucket: BucketId::new("test"),
+            key: ObjectKey::new("quorum-fail"),
+            hash_key: HashKey::from_bytes(hash_key(b"quorum-fail")),
+            data: Bytes::from_static(b"data"),
+            write_quorum: 2,
+            ack_after_wal: true,
+            ec_async: false,
+            policy: None,
+        };
+
+        let result = coord.put(req).await;
+        assert!(result.is_err(), "write should fail with insufficient acks");
+        match result.unwrap_err() {
+            Error::QuorumNotMet { required, received } => {
+                assert_eq!(required, 2, "quorum required should be 2");
+                assert_eq!(received, 1, "only local ack received");
+            }
+            other => panic!("expected QuorumNotMet, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_put_succeeds_with_quorum_1_even_if_remotes_fail() {
+        // 3-node ring, n1 is local, quorum=1.
+        // Remote replicas fail but local ack counts as 1, so quorum is met.
+        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"]);
+
+        let req = WriteRequest {
+            bucket: BucketId::new("test"),
+            key: ObjectKey::new("partial-fail-ok"),
+            hash_key: HashKey::from_bytes(hash_key(b"partial-fail-ok")),
+            data: Bytes::from_static(b"partial failure test data"),
+            write_quorum: 1,
+            ack_after_wal: true,
+            ec_async: false,
+            policy: None,
+        };
+
+        let result = coord.put(req).await;
+        assert!(result.is_ok(), "write with quorum=1 should succeed despite remote failures");
+        let wr = result.unwrap();
+        assert_eq!(wr.size, 25);
+        assert_eq!(wr.object_key, ObjectKey::new("partial-fail-ok"));
+    }
+
+    #[tokio::test]
+    async fn coordinator_put_empty_replica_set_returns_routing_error() {
+        // Ring with no nodes → routing error.
+        let coord = make_write_coordinator("n1", &[]);
+
+        let req = WriteRequest {
+            bucket: BucketId::new("test"),
+            key: ObjectKey::new("empty-ring"),
+            hash_key: HashKey::from_bytes(hash_key(b"empty-ring")),
+            data: Bytes::from_static(b"data"),
+            write_quorum: 1,
+            ack_after_wal: true,
+            ec_async: false,
+            policy: None,
+        };
+
+        let result = coord.put(req).await;
+        assert!(result.is_err(), "empty ring should return routing error");
+        match result.unwrap_err() {
+            Error::Routing(msg) => {
+                assert!(msg.contains("empty"), "error should mention empty replica set");
+            }
+            other => panic!("expected Routing, got {other:?}"),
+        }
+    }
+
+    // ── Replication fan-out test ──────────────────────────────────
+
+    #[tokio::test]
+    async fn replicate_write_fan_out_contacts_all_targets() {
+        // Test at the replicate_write level: with 3 known targets
+        // (all failing because no gRPC server), verify we get one
+        // result per target, confirming all were contacted.
+        let membership = make_membership_for_replication("n1");
+        let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
+        let target_n2 = NodeId::new("n2");
+        let target_n3 = NodeId::new("n3");
+        let targets: Vec<&NodeId> = vec![&target_n2, &target_n3];
+
+        let results = crate::write::replication::replicate_write(
+            &membership,
+            &pool,
+            &targets,
+            SegmentId::new(),
+            b"fan-out test data",
+            oceanfs_core::Hlc::zero(),
+            5000,
+        )
+        .await;
+
+        assert_eq!(results.len(), 2, "should return one result per target");
+        for result in &results {
+            assert!(result.is_err(), "all should fail without gRPC server");
+        }
+    }
+
+    fn make_membership_for_replication(node_id: &str) -> Arc<Membership> {
+        use std::net::SocketAddr;
+        let ring = Ring::new(RingConfig::default());
+        let ring_cache = Arc::new(RingCache::new(ring));
+        let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let membership = Arc::new(Membership::new(
+            NodeId::new(node_id),
+            addr,
+            GossipConfig::default(),
+            ring_cache,
+        ));
+
+        membership.upsert_node(
+            NodeId::new("n2"),
+            NodeState::Alive,
+            Incarnation::new(1),
+            "127.0.0.1:9002".parse().unwrap(),
+        );
+        membership.upsert_node(
+            NodeId::new("n3"),
+            NodeState::Alive,
+            Incarnation::new(1),
+            "127.0.0.1:9003".parse().unwrap(),
+        );
+        membership
     }
 }

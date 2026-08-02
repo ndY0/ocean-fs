@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package oceanfs.cache;
+
+import "oceanfs/common.proto";
+
+// ---------------------------------------------------------------------------
+// Cache invalidation messages and service.
+// ---------------------------------------------------------------------------
+
+// Types of cache entries to invalidate.
+enum InvalidationType {
+  OBJECT_DATA = 0;
+  METADATA = 1;
+  ALL = 2;
+}
+
+// Request to invalidate cache entries for an object.
+message CacheInvalidateRequest {
+  oceanfs.common.BucketId bucket_id = 1;
+  oceanfs.common.ObjectKey object_key = 2;
+  InvalidationType invalidation_type = 3;
+}
+
+// Response acknowledging cache invalidation.
+message CacheInvalidateResponse {
+  bool acknowledged = 1;
+}
+
+// Cache invalidation RPC service.
+service CacheRpc {
+  // Invalidate cache entries for the given object.
+  rpc Invalidate(CacheInvalidateRequest) returns (CacheInvalidateResponse);
+}

@@ -74,7 +74,7 @@ Plan:
   4. [code] Implement ActiveSegment in oceanfs-storage (depends on 2, 3)
   5. [code] Implement SegmentShard in oceanfs-storage (depends on 4)
   6. [code] Implement inline storage in metadata (depends on 2)
-  7. [verify] Run tests, lint, coverage (depends on 2-6)
+  7. [verify] Run tests, lint (depends on 2-6)
 ```
 
 ### Phase 2: Implement
@@ -104,14 +104,21 @@ For each sub-task in dependency order:
 5. **Verify incrementally:** `cargo build`, `cargo test`, `cargo clippy`
    after each sub-task.
 
+6. **Format after each batch of edits:** Run `cargo fmt` after every batch
+   of file modifications. This ensures consistent formatting before any
+   subsequent build or test step. Never skip this — unformatted code
+   causes spurious diff noise in reviews.
+
 ### Phase 3: Verify Against DoD
 
 After all sub-tasks are implemented, walk the DoD checklist:
 
 1. **Code:** `cargo build --all-targets` in each affected crate
-2. **Tests:** `cargo test --all-targets` in each affected crate
-3. **Coverage:** `cargo tarpaulin --fail-under 80` on affected crates
-4. **Lint:** `cargo clippy -- -D warnings`
+2. **Format:** `cargo fmt -- --check` — must pass (no uncommitted format changes)
+3. **Tests:** `cargo test --all-targets` in each affected crate
+4. **Lint (production code):** `cargo clippy --lib -- -D warnings` — production
+   code must be clean. Test-code `unwrap_used`/`expect_used` warnings are
+   non-blocking (see `guidelines/coding.md` §9.2.1).
 5. **Docs:** `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
 6. **ADR:** Re-read each ADR cited in the feature. Confirm every constraint
    is satisfied.
@@ -150,9 +157,8 @@ Output your self-report:
 
 ### DoD Status
 - [x] Code builds (`cargo build --all-targets` on oceanfs-core, oceanfs-storage)
+- [x] Format clean (`cargo fmt -- --check`)
 - [x] Tests pass (47 passed, 0 failed)
-- [x] Coverage ≥ 80% (oceanfs-storage: 84%)
-- [x] Clippy clean
 - [x] Docs pass
 - [x] ADR constraints satisfied (ADR-0001)
 - [x] Perf rules followed (1.1, 1.2, 1.3)
@@ -225,6 +231,39 @@ or accept with known deviations.
 
 Wait for the user's response. Do not proceed without explicit user input.
 
+### Phase 6: Dispatch Spec-Writer
+
+After the review cycle concludes — whether the reviewer returns PASS or the
+3-iteration cap is exhausted — **you must dispatch the spec-writer agent** to
+update the feature document to reflect the final state of the implementation.
+
+The spec-writer updates the feature's frontmatter `status` and `updated` date
+and records any accepted deviations, compromises, or deferrals that were
+agreed upon during review. This ensures the specification stays in sync with
+the actual code.
+
+Use the `task` tool with `subagent_type: "spec-writer"`:
+
+```
+Update feature: docs/features/{epic}/{feature}.md
+
+Implementation is complete. The reviewer returned {PASS/FAIL after 3 iterations}.
+Please update the feature status and record the following accepted deviations:
+
+1. [deviation]: [justification agreed by implementer and reviewer]
+2. ...
+```
+
+The spec-writer will:
+1. Update `status` in the feature frontmatter (to `done`, `in_progress`, etc.)
+2. Update the `updated` date
+3. Add a "Deviations" section or update the DoD notes with accepted compromises
+4. Re-index the document via `doc-graph_index_document`
+
+Wait for the spec-writer to complete before considering the feature done.
+This is a **mandatory** step — the spec must always reflect what was actually
+built, not what was originally planned.
+
 ## Constraints
 
 - **Never skip the guidelines.** Read them at the start of every session.
@@ -233,6 +272,9 @@ Wait for the user's response. Do not proceed without explicit user input.
   subagent's output informs the next task.
 - **Never skip the reviewer.** Every feature must pass independent review.
   Do not mark a feature as done without a PASS verdict from the reviewer.
+- **Never skip the spec-writer.** After all review iterations, dispatch the
+  spec-writer to update the feature document status and record accepted
+  deviations. This is mandatory — the spec must reflect what was built.
 - **Never exceed 3 review iterations** without asking the user.
 - **Never merge without DoD.** The DoD checklist is your contract.
 - **Never commit** unless the user explicitly asks you to.
@@ -246,6 +288,7 @@ Wait for the user's response. Do not proceed without explicit user input.
 | `explore` | Researching existing code, finding patterns, exploring crate APIs |
 | `general` | Complex multi-step research (understanding dependency chains, protocol behavior) |
 | `reviewer` | Independent feature review: verifies your implementation against the feature doc's DoD, in-scope items, ADR constraints, and perf rules. Spawn after Phase 4 self-verification. |
+| `spec-writer` | Post-review spec synchronization: updates the feature document's status, records accepted deviations and compromises, and re-indexes the document. Spawn after Phase 5 (all review iterations complete). **Mandatory.** |
 
 Do **not** use subagents for writing code. You write the code. Subagents
 research or review — they never write implementation code.
@@ -253,12 +296,13 @@ research or review — they never write implementation code.
 ## Building & Testing (Rust)
 
 ```
-cargo build --all-targets                     # compile everything
+cargo fmt                                      # format all code
+cargo build --all-targets                      # compile everything
 cargo test --all-targets                       # run all tests
 cargo test -p oceanfs-storage                  # run tests for one crate
-cargo clippy --all-targets -- -D warnings       # lint
-cargo tarpaulin -p oceanfs-storage --fail-under 80  # coverage
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps  # doc check
+cargo clippy --lib -- -D warnings              # lint production code only
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps # doc check
 ```
 
-If `cargo tarpaulin` is not installed: `cargo install cargo-tarpaulin`.
+After every batch of file edits, run `cargo fmt` before building or testing.
+Unformatted code causes spurious diffs in review.

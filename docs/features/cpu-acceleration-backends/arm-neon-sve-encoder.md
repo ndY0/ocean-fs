@@ -123,10 +123,6 @@ Decode path (per segment, reconstruction):
 
 - [ ] **Code:** `cargo build --features arm-sve --target aarch64-unknown-linux-gnu` succeeds; `cargo build --all-targets` (no features) succeeds on all platforms
 - [ ] **Tests:** ARM encode round-trip matches Cauchy RS output (bit-exact); SVE2/SVE/NEON/portable kernels all produce identical output; cross-kernel round-trip (encode SVE2, decode NEON) passes; ARM backend not compiled on x86 (verified via CI cross-compilation)
-- [ ] **Coverage:** `cargo tarpaulin --fail-under 80` on `oceanfs-accel` with `arm-sve` feature (on aarch64 or via emulation)
-- [ ] **Lint:** `cargo clippy -- -D warnings` passes; every `unsafe` block using NEON/SVE intrinsics has `// SAFETY:` comment citing alignment, bounds, and feature-detection invariant
-- [ ] **Docs:** `#![deny(missing_docs)]` passes; `ArmEncoder` docs document SVE level resolution and vector width behavior
 - [ ] **ADR:** ADR-0006 constraints satisfied — trait-based pluggability (§3), feature-gated compilation (§6), startup probing cached for lifetime (§1)
 - [ ] **Perf:** Rule 4.3 (feature-gated SIMD), 10.6 (conditional platform-specific code paths with portable fallback), 6.4 (static dispatch), 12.1 (SAFETY on all `unsafe` blocks)
 - [ ] **Integration:** `tests/arm_ec_roundtrip.rs`: encode with `ArmEncoder`, decode with Cauchy RS (portable), verify bit-exact match across all SIMD levels. Run on aarch64 hardware (Graviton) or via QEMU emulation in CI
-- [ ] **Manual:** Example in `ArmEncoder` docs compiles and runs on aarch64

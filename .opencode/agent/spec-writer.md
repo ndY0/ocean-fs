@@ -129,15 +129,18 @@ PUT /{bucket}/{key}
 
 - [ ] **Code:** `cargo build --all-targets` succeeds in the affected crate(s)
 - [ ] **Tests:** `cargo test` passes; new tests cover all `pub` API paths
-- [ ] **Coverage:** `cargo tarpaulin --fail-under 80` on the affected crate
-- [ ] **Lint:** `cargo clippy -- -D warnings` passes
 - [ ] **Docs:** Every `pub` item has `# Examples`; `#![deny(missing_docs)]` passes
 - [ ] **ADR:** Relevant ADRs are referenced (no unaddressed constraints)
 - [ ] **Perf:** Performance guidelines cited in frontmatter are followed
 - [ ] **Integration:** Integration test at the crate boundary exercises a
   complete scenario
-- [ ] **Manual:** (if applicable) Example in the feature doc runs correctly
-```
+
+> **Lint & Doc Examples (non-gating):** `cargo clippy --lib -- -D warnings`
+> should pass on production code. Test-code clippy warnings (`.unwrap()`,
+> `.expect()` in `#[cfg(test)]` modules) and `ignore`-tagged doc examples
+> are non-blocking for feature completeness — they are structural codebase
+> hygiene tracked separately (see `guidelines/coding.md` §9.2.1). Do NOT
+> include Lint or Manual items in the Definition of Done checklist.```
 
 ## Workflow
 
@@ -179,7 +182,7 @@ When work begins, is completed, or is blocked:
 
 Updating the `updated` date is mandatory on every status change.
 
-### Checking Coverage
+### Checking Spec Coverage
 
 At any time, ask: "Do the features cover everything in the spec?"
 

@@ -82,6 +82,25 @@ pub enum Error {
     /// An error occurred during orphan reaping.
     #[error("orphan reaper error: {0}")]
     OrphanReaper(String),
+
+    /// The heal queue is full and cannot accept new requests.
+    #[error("heal queue is full")]
+    HealQueueFull,
+
+    /// A heal operation failed after exhausting all retry attempts.
+    #[error("heal failed for segment {segment_id} after {retries} retries: {reason}")]
+    HealFailed {
+        /// The segment that could not be healed.
+        segment_id: oceanfs_core::SegmentId,
+        /// Number of retry attempts made.
+        retries: u32,
+        /// Reason for the failure.
+        reason: String,
+    },
+
+    /// An error occurred during EC healing.
+    #[error("heal error: {0}")]
+    Heal(String),
 }
 
 /// Convenience alias for `std::result::Result<T, Error>`.

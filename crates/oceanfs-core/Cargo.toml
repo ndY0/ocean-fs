@@ -14,9 +14,14 @@ uuid.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+prost.workspace = true
+tonic.workspace = true
 
 # External
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+
+[build-dependencies]
+tonic-build.workspace = true
 
 [dev-dependencies]
 static_assertions.workspace = true

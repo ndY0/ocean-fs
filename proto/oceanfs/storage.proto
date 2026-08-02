@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package oceanfs.storage;
+
+import "oceanfs/common.proto";
+import "oceanfs/segment.proto";
+
+// ---------------------------------------------------------------------------
+// Storage RPC service for segment append / shard fetch.
+// ---------------------------------------------------------------------------
+
+// Re-exports the segment message types via import above.
+// The service definition lives here in the network crate.
+
+// Segment RPC service for node-to-node data transfer.
+service SegmentRpc {
+  // Append data to a segment (client-streaming: sender streams data,
+  // receiver returns one ack).
+  rpc AppendSegment(stream oceanfs.segment.SegmentAppendRequest)
+      returns (oceanfs.segment.SegmentAppendResponse);
+
+  // Fetch a shard from a sealed segment (server-streaming: sender sends
+  // one request, receiver streams shard data back).
+  rpc FetchShard(oceanfs.segment.FetchShardRequest)
+      returns (stream oceanfs.segment.ShardResponse);
+}

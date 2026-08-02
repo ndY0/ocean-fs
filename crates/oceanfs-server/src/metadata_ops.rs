@@ -36,14 +36,29 @@ pub trait MetadataOps: Send + Sync + 'static {
     /// Retrieves object metadata by bucket and key.
     ///
     /// Returns `None` if the object does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata store is unavailable or
+    /// the underlying storage operation fails.
     fn get_object(&self, bucket: &BucketId, key: &ObjectKey) -> Result<Option<ObjectMetadata>>;
 
     /// Soft-deletes an object by writing a tombstone entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata store is unavailable or
+    /// the tombstone write fails.
     fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> Result<()>;
 
     /// Lists objects in a bucket matching the given prefix.
     ///
     /// Results are sorted by key. Returns objects whose key starts
     /// with `prefix`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata store is unavailable or
+    /// the iteration over keys fails.
     fn list_objects(&self, bucket: &BucketId, prefix: &str) -> Result<Vec<ObjectMetadata>>;
 }

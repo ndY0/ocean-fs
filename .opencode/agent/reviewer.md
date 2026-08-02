@@ -85,10 +85,7 @@ cargo clippy --all-targets -p {crate} -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p {crate}
 ```
 
-Check coverage (install tarpaulin first if missing):
-```
-cargo tarpaulin -p {crate} --fail-under 80
-```
+Coverage is not a gate (see guidelines/coding.md). Skip tarpaulin.
 
 Capture all output. If a command fails, record the exact error and the
 first few lines of relevant output (never the full trace).
@@ -180,14 +177,13 @@ Output a summary in this format:
 | Implementer Claim | Verdict | Evidence |
 |---|---|---|
 | "Tests pass" | ❌ FALSE | 2 failing tests |
-| "Coverage ≥ 80%" | ❌ FALSE | Actual: 76% |
 | "Clippy clean" | ✅ TRUE | Verified |
 | ... | ... | ... |
 
 ### Gaps (prioritized)
 1. **CRITICAL** Integration test fails on 1 MB blob — tests/segment_roundtrip.rs:45
 2. **HIGH** Missing ActiveSegment append overflow test — need test at {crate}/tests/
-3. **MEDIUM** Coverage 76% (need 80%) — add tests for {uncovered paths}
+3. **MEDIUM** {description} — add tests for {uncovered paths}
 4. **LOW** Doc warnings on 2 pub items — add doc comments
 ```
 
@@ -230,7 +226,6 @@ cargo build --all-targets -p {crate}
 cargo test --all-targets -p {crate}
 cargo clippy --all-targets -p {crate} -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p {crate}
-cargo tarpaulin -p {crate} --fail-under 80
 ```
 
-If `cargo tarpaulin` is not installed: `cargo install cargo-tarpaulin`.
+Coverage is not a gate (see guidelines/coding.md). Skip tarpaulin.

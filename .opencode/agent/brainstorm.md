@@ -1,6 +1,6 @@
 ---
 description: Expert architect for brainstorming, structural analysis, and design. Use when discussing architecture, planning refactors, proposing new ADRs, evaluating coupling, or shaping future features. Use when the user asks "what should the architecture look like" or "how should we structure this".
-mode: primary
+mode: all
 permission:
   read: allow
   edit: allow

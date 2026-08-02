@@ -11,7 +11,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use arc_swap::ArcSwap;
-use oceanfs_core::CodecType;
+use oceanfs_core::{CodecType, CompressConfig};
 use parking_lot::RwLock;
 
 // ---------------------------------------------------------------------------
@@ -48,6 +48,9 @@ pub struct BucketPolicy {
     pub heal: HealConfig,
     /// Garbage collection configuration.
     pub gc: GcConfig,
+    /// Compression configuration (per-bucket tier + level).
+    /// Per ADR-0007, the effective tier is capped by the node-level ceiling.
+    pub compression: CompressConfig,
 }
 
 // ---------------------------------------------------------------------------

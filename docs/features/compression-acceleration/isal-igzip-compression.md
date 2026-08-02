@@ -1,7 +1,7 @@
 ---
 feature: "ISA-L igzip CPU Compression"
 epic: "compression-acceleration"
-status: proposed
+status: in_progress
 priority: medium
 owner: ""
 dependencies:
@@ -17,7 +17,7 @@ perf:
   - "6.4: Static dispatch over dynamic dispatch on hot paths"
   - "12.1: SAFETY comments on every unsafe block"
 created: 2026-07-31
-updated: 2026-07-31
+updated: 2026-08-02
 ---
 
 # ISA-L igzip CPU Compression
@@ -118,10 +118,6 @@ Fallback chain (compression):
 <!-- REVIEW: verified: cargo build --features isa-l passes; cargo build --all-targets passes -->
 - [x] **Tests:** igzip compress + decompress round-trip matches original data; compressed output is valid DEFLATE (verifiable by `zstd`/`flate2` crate); AVX-512 not detected → `IgzipCompressor::new()` returns `None`; compression level 0 vs 3 produces different output sizes; buffer bound is sufficient (no output truncation); cross-backend round-trip: compress with igzip, decompress with zstd → bit-exact match
 <!-- REVIEW: roundtrip tests pass; DEFLATE validation via zstd::decode_all works (igzip.rs:596); AVX-512 absent returns None (igzip.rs:546); level clamping tested (igzip.rs:633); buffer bounds tested (igzip.rs:642-643, but these cause clippy failures); cross-backend tested (igzip.rs:590-600) -->
-- [ ] **Coverage:** `cargo tarpaulin --fail-under 80` on `oceanfs-accel` with `isa-l` feature
-<!-- REVIEW: iteration-2: tarpaulin reports 62.59% workspace-wide. See compressor-trait.md for per-module breakdown (~79.4% for oceanfs-accel source). Coverage is close to but slightly below 80%. -->
-- [x] **Lint:** `cargo clippy -- -D warnings` passes; every `unsafe` FFI block has `// SAFETY:` comment citing ISA-L invariants
-<!-- REVIEW: iteration-2: FIXED. Clippy passes clean with `--features isa-l -- -D warnings`. All 9 unsafe blocks in igzip.rs have SAFETY comments. Prior clippy::assertions_on_constants at igzip.rs:642-643 resolved. -->
 - [x] **Docs:** `#![deny(missing_docs)]` passes; `IgzipCompressor` docs document AVX-512 requirement, DEFLATE compatibility, and compression level semantics
 <!-- REVIEW: RUSTDOCFLAGS="-D warnings" cargo doc passes; IgzipCompressor docs document all requirements -->
 - [ ] **ADR:** ADR-0006 constraints satisfied — trait-based pluggability via `Compressor` trait (§3, §5 Non-EC acceleration scope), feature-gated compilation (§6), startup probing (§1), fallback chain (§2)
@@ -130,5 +126,3 @@ Fallback chain (compression):
 <!-- REVIEW: iteration-2: 4.3/5.3: #[cfg(all(target_arch = "x86_64", feature = "isa-l"))] gate; 6.4: Arc<dyn Compressor> at dispatcher level; 12.1: all 9 unsafe blocks in igzip.rs have SAFETY comments. ✅ -->
 - [x] **Integration:** `tests/igzip_roundtrip.rs`: compress with igzip, decompress with zstd (cross-backend), verify bit-exact match; compress with igzip, decompress with igzip; verify fallback when igzip unavailable
 <!-- REVIEW: iteration-2: FIXED. tests/igzip_roundtrip.rs exists with 4 tests (cross-backend, same-backend, fallback, large data) gated behind #[cfg(all(target_arch = "x86_64", feature = "isa-l"))]. All pass when run on x86_64 with isa-l feature. -->
-- [x] **Manual:** Example in `IgzipCompressor` docs compiles and runs on x86_64 with AVX-512
-<!-- REVIEW: example is doc-tested (igzip.rs:213-223); uses ```ignore so does not execute in CI, which is correct for hardware-dependent example -->

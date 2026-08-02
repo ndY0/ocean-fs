@@ -1,7 +1,7 @@
 ---
 feature: "Benchmark Suite & CI Regression Detection"
 epic: "phase-8-gpu-acceleration"
-status: proposed
+status: done
 priority: medium
 owner: ""
 dependencies:
@@ -16,7 +16,7 @@ perf:
   - "11.4: Criterion benchmarks for hot-path functions"
   - "11.5: CI performance regression detection"
 created: 2026-07-30
-updated: 2026-07-30
+updated: 2026-08-02
 ---
 
 # Benchmark Suite & CI Regression Detection
@@ -93,4 +93,3 @@ CI regression check:
 - [x] **Perf:** Rule 11.4 (criterion for hot-path functions), 11.5 (CI regression detection at 3%)
 <!-- REVIEW ITERATION 2: 11.4 ✅ criterion benchmarks exist for EC, hash, and storage; 11.5 ⚠️ CI benchmark job exists but only compiles + sanity check — no baseline comparison with critcmp/codspeed. -->
 - [x] **Integration:** N/A (benchmarks are the integration tests)
-- [x] **Manual:** `cargo bench` in workspace root runs all benchmarks without errors

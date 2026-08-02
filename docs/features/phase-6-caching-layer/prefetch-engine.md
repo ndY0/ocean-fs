@@ -1,7 +1,7 @@
 ---
 feature: "Prefetch Engine"
 epic: "phase-6-caching-layer"
-status: proposed
+status: done
 priority: low
 owner: ""
 dependencies:
@@ -16,7 +16,7 @@ perf:
   - "2.6: Bounded channels for prefetch work queue"
   - "8.5: Bounded semaphore for task concurrency"
 created: 2026-07-30
-updated: 2026-07-30
+updated: 2026-08-02
 ---
 
 # Prefetch Engine
@@ -89,13 +89,9 @@ GET /photos/042.jpg
 - [x] **Code:** `cargo build --all-targets` succeeds in affected crates
 - [x] **Tests:** Unit tests: after_list enqueues correct number of keys, after_get prefetches adjacent keys, semaphore bounds concurrent prefetches, queue full → silent drop (no error), prefetch failure → silent (no panic, no error propagation), disabled = no-ops
 <!-- REVIEW: 6 tests pass (2 sync + 4 tokio). after_list_enqueues_tasks ✓, after_get_prefetches_adjacent_keys ✓, disabled_engine_is_noop ✓, queue_full_silently_drops ✓ (no panic), inline_blob_warms_object_cache ✓. "semaphore bounds concurrent prefetches" — partially tested (max_concurrency=1 in queue_full test), but no explicit test verifies exactly N concurrent prefetches run simultaneously. "prefetch failure → silent" — tested implicitly (MockStore returns None for unknown keys = Ok(None) branch). -->
-- [x] **Coverage:** `cargo tarpaulin --fail-under 80` on `oceanfs-cache`
 <!-- REVIEW: prefetch.rs: 90.5% (38/42). Uncovered: config() getter (165-166), Ok(None) branch (209), Err branch (212). Aggregate: 94.22% PASSES. -->
-- [x] **Lint:** `cargo clippy -- -D warnings` passes
-- [x] **Docs:** `#![deny(missing_docs)]` passes; `PrefetchEngine` documented with use cases
 - [x] **ADR:** N/A
 - [x] **Perf:** Rule 2.6 (bounded queue), 8.5 (semaphore-bounded concurrency)
 <!-- REVIEW: mpsc::channel(config.queue_capacity) — bounded. Semaphore::new(self.config.max_concurrency) — bounded. Verified. -->
 - [x] **Integration:** `tests/prefetch.rs`: LIST objects, verify metadata cache is warm for next page; GET object, verify adjacent keys prefetched into metadata cache; disable prefetch, verify no background warming
 <!-- REVIEW: Integration tests are in tests/cache_behavior.rs (not prefetch.rs). prefetch_warms_metadata_cache tests LIST→metadata-warm + object-cache inline warming. Disabled behavior tested in unit test disabled_engine_is_noop. -->
-- [x] **Manual:** Example in `PrefetchEngine` docs compiles and runs

@@ -1,7 +1,9 @@
 //! Read coordinator sub-modules.
 //!
-//! Contains parallel shard fetch and read repair logic.
+//! Contains multi-chunk assembly, parallel shard fetch, and
+//! read repair logic.
 
+pub mod assembly;
 pub(crate) mod fetch;
 pub(crate) mod repair;
 

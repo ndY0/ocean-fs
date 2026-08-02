@@ -26,6 +26,5 @@ mod node;
 
 pub use metadata_adapter::MetadataStoreAdapter;
 pub use node::{BackgroundTasks, Node};
-
 // Re-export common types used by node consumers.
 pub use oceanfs_core::NodeConfig;

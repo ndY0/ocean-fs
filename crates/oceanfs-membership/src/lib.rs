@@ -20,6 +20,7 @@
 mod error;
 mod failure_detector;
 mod gossip;
+pub mod grpc;
 mod membership;
 mod state;
 

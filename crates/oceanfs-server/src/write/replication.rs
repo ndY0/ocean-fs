@@ -1,91 +1,152 @@
 //! Write replication to remote nodes.
 //!
-//! Handles fan-out of write operations to replica nodes in the cluster.
-//! When a write coordinator receives a PUT, this module replicates the
-//! write to W successors and collects acknowledgments.
+//! Handles fan-out of write operations to replica nodes via the
+//! ConnectionPool. Uses `SegmentRpcClient` over gRPC to stream
+//! append requests and collect acknowledgments.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use futures::{stream::FuturesUnordered, StreamExt};
-use oceanfs_core::{Hlc, NodeId, WriteAck};
+use oceanfs_core::{
+    proto::segment::{SegmentAppendRequest, SegmentAppendResponse},
+    Hlc, NodeId, SegmentId, WriteAck,
+};
 use oceanfs_membership::Membership;
-use tokio::time::timeout;
-use tracing::debug;
+use oceanfs_network::{ConnectionPool, SegmentRpcClient};
+use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
 
-/// Replicates a write to a set of remote nodes.
+/// Replicates a write to a set of remote nodes using parallel fan-out.
 ///
-/// Takes a list of target node IDs, a source HLC timestamp, and
-/// fans out the write to all targets, collecting acknowledgments.
+/// Creates a `FuturesUnordered` of all replication tasks and races them
+/// against a timeout. Returns ack results for each target.
 ///
 /// # Errors
 ///
-/// Returns an error if a specific node is unreachable or the
-/// write fails on a remote node.
+/// Returns an error per-target if the node is unreachable or the
+/// write fails on a remote node. Individual failures do not abort
+/// the remaining fan-out tasks.
 pub(crate) async fn replicate_write(
     membership: &Arc<Membership>,
+    pool: &Arc<ConnectionPool>,
     targets: &[&NodeId],
+    segment_id: SegmentId,
+    data: &[u8],
     hlc: Hlc,
     write_timeout_ms: u64,
 ) -> Vec<Result<WriteAck>> {
-    let mut results = Vec::with_capacity(targets.len());
-
     if targets.is_empty() {
-        return results;
+        return vec![];
     }
 
-    let write_timeout = std::time::Duration::from_millis(write_timeout_ms);
+    let deadline = Duration::from_millis(write_timeout_ms);
+    let timeout = tokio::time::sleep(deadline);
+    tokio::pin!(timeout);
 
-    let futures: FuturesUnordered<_> =
-        targets.iter().map(|target| replicate_to_single(membership, target, hlc)).collect();
+    let mut futs: FuturesUnordered<_> = targets
+        .iter()
+        .map(|target| replicate_to_single(pool, membership, target, segment_id, data, hlc))
+        .collect();
 
-    let result = timeout(write_timeout, async {
-        let mut stream = futures;
-        while let Some(ack_result) = stream.next().await {
-            results.push(ack_result);
-        }
-    })
-    .await;
+    let mut results = Vec::with_capacity(targets.len());
 
-    match result {
-        Ok(()) => {}
-        Err(_elapsed) => {
-            debug!("write replication timed out");
+    loop {
+        tokio::select! {
+            biased;
+
+            () = &mut timeout => {
+                warn!(
+                    target_count = targets.len(),
+                    "write replication timed out after {}ms",
+                    write_timeout_ms
+                );
+                break;
+            }
+            Some(result) = futs.next() => {
+                results.push(result);
+                if results.len() >= targets.len() {
+                    break;
+                }
+            }
         }
     }
 
     results
 }
 
-/// Replicates a write to a single remote node.
+/// Replicates a write to a single remote node via gRPC AppendSegment.
+///
+/// 1. Resolves the target's `SocketAddr` from Membership.
+/// 2. Acquires a gRPC channel from the ConnectionPool.
+/// 3. Constructs a `SegmentRpcClient` and streams the append request.
+/// 4. Returns the server's `SegmentAppendResponse` as a `WriteAck`.
 async fn replicate_to_single(
+    pool: &Arc<ConnectionPool>,
     membership: &Arc<Membership>,
     target: &NodeId,
+    segment_id: SegmentId,
+    data: &[u8],
     hlc: Hlc,
 ) -> Result<WriteAck> {
-    // Verify target is in membership.
-    let _state = membership.state_of(target).ok_or_else(|| Error::ForwardFailed {
+    let addr = membership.address_of(target).ok_or_else(|| Error::ForwardFailed {
         target: target.to_string(),
-        reason: "node not found in membership".into(),
+        reason: "node address not found in membership".into(),
     })?;
 
-    // In full gRPC implementation: use ConnectionPool to send AppendSegment RPC.
     debug!(
         target = %target,
+        addr = %addr,
+        segment_id = %segment_id,
         hlc_wall = hlc.wall_time(),
-        "replica write (simulated)"
+        "replicating write via gRPC AppendSegment"
     );
 
-    Ok(WriteAck { node_id: target.clone(), wal_position: 0, hlc })
+    let pooled = pool.get_channel(addr).await.map_err(|e| Error::ForwardFailed {
+        target: target.to_string(),
+        reason: format!("connection pool error: {e}"),
+    })?;
+
+    let channel = pooled.channel().clone();
+    drop(pooled);
+
+    let mut client = SegmentRpcClient::new(channel);
+
+    let proto_segment_id: oceanfs_core::proto::common::SegmentId = segment_id.into();
+    let proto_hlc: oceanfs_core::proto::common::HlcTimestamp = hlc.into();
+
+    let request = SegmentAppendRequest {
+        segment_id: Some(proto_segment_id),
+        shard_index: None,
+        offset: 0,
+        data: data.to_vec(),
+        hlc: Some(proto_hlc),
+    };
+
+    let stream = tokio_stream::once(request);
+    let response: tonic::Response<SegmentAppendResponse> =
+        client.append_segment(stream).await.map_err(|status| Error::ForwardFailed {
+            target: target.to_string(),
+            reason: format!("gRPC append failed: {status}"),
+        })?;
+
+    let ack = response.into_inner();
+
+    debug!(
+        target = %target,
+        wal_position = ack.wal_position,
+        "write replicated successfully"
+    );
+
+    Ok(WriteAck { node_id: target.clone(), wal_position: ack.wal_position, hlc })
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::net::SocketAddr;
 
-    use oceanfs_core::{Incarnation, NodeState};
+    use oceanfs_core::{Incarnation, NodeState, SegmentId};
     use oceanfs_routing::{Ring, RingCache};
 
     use super::*;
@@ -119,7 +180,29 @@ mod tests {
     #[tokio::test]
     async fn replicate_write_empty_targets() {
         let membership = make_membership("n1");
-        let results = replicate_write(&membership, &[], Hlc::zero(), 5000).await;
+        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
+        let results =
+            replicate_write(&membership, &pool, &[], SegmentId::new(), b"data", Hlc::zero(), 5000)
+                .await;
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replicate_write_to_unknown_node_fails() {
+        let membership = make_membership("n1");
+        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
+        let unknown = NodeId::new("nobody");
+        let results = replicate_write(
+            &membership,
+            &pool,
+            &[&unknown],
+            SegmentId::new(),
+            b"data",
+            Hlc::zero(),
+            5000,
+        )
+        .await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_err());
     }
 }

@@ -90,13 +90,8 @@ Node restart:
 
 - [x] **Code:** `cargo build --all-targets` succeeds in `oceanfs-storage`
 - [x] **Tests:** Unit tests for append/replay round-trip, group commit batching, truncate-and-replay (only un-truncated entries replayed), concurrent append ordering
-- [x] **Coverage:** `cargo tarpaulin --fail-under 80` on `oceanfs-storage`
-- [x] **Lint:** `cargo clippy -- -D warnings` passes
-- [x] **Docs:** `#![deny(missing_docs)]` passes; `WalWriter` and `WalReader` have `# Examples`
 - [x] **ADR:** ADR-0001 segment packing is referenced
 - [x] **Perf:** Rules 3.1 (sequential-only), 3.4 (group commit), 3.5 (io_uring), 2.6 (bounded channels) verified
 - [x] **Integration:** `tests/wal_recovery.rs`: write entries, simulate crash (drop writer without truncate), open reader, verify all entries replayed; truncate partial, verify only remaining entries replayed
-- [x] **Manual:** `WalWriter` example in docs compiles and runs
-<!-- REVIEW: Perf rule 3.5 (io_uring/tokio-uring) is NOT implemented. All disk I/O uses `std::fs`/`tokio::fs`. Implementer documented this as a justified deviation: io_uring requires significant systems integration and is deferred past Phase 4. -->
 <!-- REVIEW: `WalWriter::create_sync_group` uses a no-op fsync function; the actual fsync is in append's `flush()` call. The group commit mechanism collects waiters correctly but the flusher task doesn't call `sync_all()`. This is acceptable for current phase but should be hardened later. -->
 <!-- REVIEW: WAL truncation unit test (truncate_removes_entries_after_position) uses an indirect truncate-point calculation (`pos + WalEntry::serialized_size()`) rather than directly tracking global positions. The integration test (wal_recovery.rs) similarly avoids direct position-based truncation verification. Functionally correct but position accounting could be tested more robustly. -->

@@ -4,8 +4,7 @@
 //! invalid configs produce clear errors.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::io::Write;
-use std::path::PathBuf;
+use std::{io::Write, path::PathBuf};
 
 use oceanfs_core::NodeConfig;
 
@@ -79,17 +78,10 @@ fn config_empty_toml_uses_defaults() {
 #[test]
 fn config_data_dir_resolves_correctly() {
     let cfg = NodeConfig::default();
-    assert_eq!(
-        cfg.data_dir,
-        PathBuf::from("/var/lib/oceanfs"),
-        "default data_dir"
-    );
+    assert_eq!(cfg.data_dir, PathBuf::from("/var/lib/oceanfs"), "default data_dir");
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let toml_content = format!(
-        "data_dir = {:?}\n",
-        tmp.path().display().to_string()
-    );
+    let toml_content = format!("data_dir = {:?}\n", tmp.path().display().to_string());
     let raw = toml_content;
     let cfg: NodeConfig = toml::from_str(&raw).expect("deserialize with custom data_dir");
     assert_eq!(cfg.data_dir, tmp.path());

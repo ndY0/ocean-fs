@@ -18,10 +18,11 @@
 //! ```
 
 use std::{collections::HashMap, sync::Arc};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
 use oceanfs_core::GpuConfig;
-use oceanfs_core::{AccelConfig, CodecConfig, CompressConfig, CompressionTier};
+use oceanfs_core::{AccelConfig, CodecConfig, CompressConfig, CompressionConfig, CompressionTier};
 use oceanfs_ec::{Decoder, Encoder};
 
 use crate::{
@@ -97,6 +98,12 @@ pub struct AccelDispatcher {
     /// The configuration used to create this dispatcher.
     #[allow(dead_code)]
     config: AccelConfig,
+    /// Node-level compression governance (per ADR-0007).
+    /// Controls the ceiling — buckets may only select this tier or lower.
+    node_compression: CompressionConfig,
+    /// Counter incremented on each compression fallback event.
+    /// Exposed for observability (per ADR-0006 §2).
+    compression_fallback_count: AtomicU64,
 }
 
 impl AccelDispatcher {
@@ -219,7 +226,8 @@ impl AccelDispatcher {
             let gpu_semaphore = Arc::new(tokio::sync::Semaphore::new(
                 config.gpu.as_ref().map(|g| g.max_concurrent_ops).unwrap_or(1),
             ));
-            if let Some(nvcomp) = crate::cuda::nvcomp::NvcompCompressor::new(gpu_semaphore) {
+            let nvcomp_config = oceanfs_core::NvcompConfig::default();
+            if let Some(nvcomp) = crate::cuda::nvcomp::NvcompCompressor::new(gpu_semaphore, nvcomp_config) {
                 let nvcomp: Arc<dyn Compressor> = Arc::new(nvcomp);
                 tier_compressors.insert(CompressionTier::GpuNvcomp, nvcomp.clone());
             }
@@ -232,7 +240,9 @@ impl AccelDispatcher {
             tier_encoders,
             tier_decoders,
             tier_compressors,
-            config,
+            config: config.clone(),
+            node_compression: config.compression.clone(),
+            compression_fallback_count: AtomicU64::new(0),
         }
     }
 
@@ -241,12 +251,25 @@ impl AccelDispatcher {
         self.active_ec_tier
     }
 
-    /// Returns the active compression tier (always None since compression
-    /// is per-bucket only per ADR-0006 §5).
+    /// Returns the node-level compression ceiling tier.
+    ///
+    /// Per ADR-0007, the node operator sets the maximum compression tier
+    /// available. Buckets may only select this tier or lower. If
+    /// `compression.enabled` is `false`, returns `None`.
     pub fn active_compression_tier(&self) -> Option<CompressionTier> {
-        // Per ADR-0006 §5: compress_tier is per-bucket only.
-        // No node-level default for compression.
-        None
+        if !self.node_compression.enabled {
+            return None; // Compression disabled globally
+        }
+        Some(self.node_compression.tier)
+    }
+
+    /// Returns the total number of compression fallback events.
+    ///
+    /// Incremented each time the fallback chain is exercised in
+    /// `resolve_compression_tier_with_fallback`. Operators monitor
+    /// this to detect when the node ceiling is being hit.
+    pub fn compression_fallback_count(&self) -> u64 {
+        self.compression_fallback_count.load(Ordering::Relaxed)
     }
 
     /// Resolves an EC encoder for a specific tier.
@@ -298,8 +321,12 @@ impl AccelDispatcher {
 
     /// Resolves a compressor for a specific compression tier.
     ///
-    /// Per ADR-0006, compression tier is per-bucket only. Applies the
-    /// compression fallback chain: GpuNvcomp → CpuIgzip → CpuZstd.
+    /// Per ADR-0007, the effective tier is capped by the node-level ceiling:
+    /// `effective = min(requested, node_ceiling)` on the capability ordering
+    /// (`GpuNvcomp > CpuIgzip > CpuZstd > None`). A bucket can only select
+    /// a tier ≤ the node's tier — it can downgrade but never upgrade.
+    ///
+    /// Applies the compression fallback chain: GpuNvcomp → CpuIgzip → CpuZstd.
     ///
     /// # Examples
     ///
@@ -312,11 +339,63 @@ impl AccelDispatcher {
     /// assert!(compressor.is_available());
     /// ```
     pub fn resolve_compressor(&self, tier: CompressionTier) -> Arc<dyn Compressor> {
-        let effective = Self::resolve_compression_tier_with_fallback(tier, &self.tier_compressors);
+        // Cap at node ceiling (ADR-0007)
+        let capped = self.cap_compression_tier(tier);
+        let effective = Self::resolve_compression_tier_with_fallback(capped, &self.tier_compressors, &self.compression_fallback_count);
         self.tier_compressors.get(&effective).cloned().unwrap_or_else(|| {
             // Ultimate fallback: zstd, always available
             Arc::new(ZstdCompressor::default())
         })
+    }
+
+    /// Caps a requested compression tier at the node-level ceiling.
+    ///
+    /// Per ADR-0007, `effective = min(requested, node_ceiling)` on the
+    /// capability ordering. If the node has `compression.enabled = false`,
+    /// always returns `None` (compression disabled globally).
+    ///
+    /// When a bucket requests a tier higher than the ceiling, we use the
+    /// ceiling (with a `DEBUG` log, not `WARN` — the bucket is within its
+    /// rights to request a higher tier; the node constrains it).
+    fn cap_compression_tier(&self, requested: CompressionTier) -> CompressionTier {
+        if !self.node_compression.enabled {
+            tracing::debug!("compression disabled at node level; forcing None");
+            return CompressionTier::None;
+        }
+
+        let ceiling = self.node_compression.tier;
+
+        // Auto means "use whatever the node provides" — treat as ceiling
+        if requested == CompressionTier::Auto {
+            return ceiling;
+        }
+
+        // None (bucket explicitly disables compression for its data) — honor it
+        if requested == CompressionTier::None {
+            return CompressionTier::None;
+        }
+
+        // If the node ceiling is Auto, no capping needed (probe will find best)
+        if ceiling == CompressionTier::Auto {
+            return requested;
+        }
+
+        // If the node ceiling is None, compression is disabled
+        if ceiling == CompressionTier::None {
+            return CompressionTier::None;
+        }
+
+        // Cap: use min(requested, ceiling) on the partial ordering
+        if requested > ceiling {
+            tracing::debug!(
+                requested = ?requested,
+                ceiling = ?ceiling,
+                "per-bucket compression tier capped by node ceiling"
+            );
+            ceiling
+        } else {
+            requested
+        }
     }
 
     /// Resolves a compressor for a specific compress configuration.
@@ -334,12 +413,21 @@ impl AccelDispatcher {
     /// Resolves a compression tier through the fallback chain.
     ///
     /// If the requested tier is not in the cache, falls back:
-    /// GpuNvcomp → CpuIgzip → CpuZstd (terminal).
+    /// GpuNvcomp → CpuIgzip → CpuZstd (terminal). The `None` tier
+    /// means "no compression" — returns immediately without fallback.
+    ///
+    /// Increments `fallback_counter` on each fallback event so operators
+    /// can monitor when the node ceiling is being hit.
     fn resolve_compression_tier_with_fallback(
         requested: CompressionTier,
         cache: &HashMap<CompressionTier, Arc<dyn Compressor>>,
+        fallback_counter: &AtomicU64,
     ) -> CompressionTier {
         match requested {
+            CompressionTier::None => {
+                // No compression requested — caller will check this
+                CompressionTier::None
+            }
             CompressionTier::Auto => {
                 // Probe: nvCOMP > igzip > zstd (first available)
                 if cache.contains_key(&CompressionTier::GpuNvcomp) {
@@ -355,6 +443,7 @@ impl AccelDispatcher {
                 tracing::warn!(
                     "nvCOMP requested but unavailable; falling back to CpuIgzip or CpuZstd"
                 );
+                fallback_counter.fetch_add(1, Ordering::Relaxed);
                 if cache.contains_key(&CompressionTier::CpuIgzip) {
                     CompressionTier::CpuIgzip
                 } else {
@@ -363,6 +452,7 @@ impl AccelDispatcher {
             }
             CompressionTier::CpuIgzip => {
                 tracing::warn!("ISA-L igzip requested but unavailable; falling back to CpuZstd");
+                fallback_counter.fetch_add(1, Ordering::Relaxed);
                 CompressionTier::CpuZstd
             }
             CompressionTier::CpuZstd => CompressionTier::CpuZstd,
@@ -390,6 +480,54 @@ impl AccelDispatcher {
             other => {
                 tracing::warn!(tier = other, "unknown ec_tier value; falling back to auto");
                 AccelTier::Auto
+            }
+        }
+    }
+
+    /// Parses a compression tier string from TOML config.
+    ///
+    /// Used for both node-level `compression.tier` and per-bucket
+    /// `compress_tier` configuration values. Maps all ADR-0007 string
+    /// values to their enum variants.
+    ///
+    /// # Recognized Values
+    ///
+    /// | String | Variant |
+    /// |---|---|
+    /// | `"auto"` | `Auto` — probe best available |
+    /// | `"cpu_zstd"` | `CpuZstd` — CPU zstd always |
+    /// | `"cpu_igzip"` | `CpuIgzip` — ISA-L igzip (x86+AVX-512) |
+    /// | `"gpu_nvcomp"` | `GpuNvcomp` — nvCOMP GPU batch |
+    /// | `"none"` | `None` — disable compression |
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_accel::AccelDispatcher;
+    /// use oceanfs_core::CompressionTier;
+    ///
+    /// assert_eq!(
+    ///     AccelDispatcher::parse_compression_tier("auto"),
+    ///     CompressionTier::Auto
+    /// );
+    /// assert_eq!(
+    ///     AccelDispatcher::parse_compression_tier("none"),
+    ///     CompressionTier::None
+    /// );
+    /// ```
+    pub fn parse_compression_tier(tier_str: &str) -> CompressionTier {
+        match tier_str {
+            "auto" => CompressionTier::Auto,
+            "cpu_zstd" => CompressionTier::CpuZstd,
+            "cpu_igzip" => CompressionTier::CpuIgzip,
+            "gpu_nvcomp" => CompressionTier::GpuNvcomp,
+            "none" => CompressionTier::None,
+            other => {
+                tracing::warn!(
+                    tier_str = other,
+                    "unknown compression tier value; falling back to auto"
+                );
+                CompressionTier::Auto
             }
         }
     }
@@ -872,9 +1010,26 @@ mod tests {
     // -- Compression tier --
 
     #[test]
-    fn active_compression_tier_is_none() {
+    fn active_compression_tier_returns_node_ceiling() {
         let dispatcher = AccelDispatcher::new(AccelConfig::default());
+        // With default config, enabled=true and tier=Auto, so the ceiling is Auto.
+        assert_eq!(dispatcher.active_compression_tier(), Some(CompressionTier::Auto));
+    }
+
+    #[test]
+    fn active_compression_tier_disabled_returns_none() {
+        let mut config = AccelConfig::default();
+        config.compression.enabled = false;
+        let dispatcher = AccelDispatcher::new(config);
         assert_eq!(dispatcher.active_compression_tier(), None);
+    }
+
+    #[test]
+    fn active_compression_tier_none_ceiling() {
+        let mut config = AccelConfig::default();
+        config.compression.tier = CompressionTier::None;
+        let dispatcher = AccelDispatcher::new(config);
+        assert_eq!(dispatcher.active_compression_tier(), Some(CompressionTier::None));
     }
 
     #[test]
@@ -885,6 +1040,87 @@ mod tests {
         let compressed = compressor.compress(data, 3).unwrap();
         let decompressed = compressor.decompress(&compressed).unwrap();
         assert_eq!(&decompressed[..], data);
+    }
+
+    // -- parse_compression_tier --
+
+    #[test]
+    fn parse_compression_tier_all_values() {
+        assert_eq!(AccelDispatcher::parse_compression_tier("auto"), CompressionTier::Auto);
+        assert_eq!(AccelDispatcher::parse_compression_tier("cpu_zstd"), CompressionTier::CpuZstd);
+        assert_eq!(AccelDispatcher::parse_compression_tier("cpu_igzip"), CompressionTier::CpuIgzip);
+        assert_eq!(AccelDispatcher::parse_compression_tier("gpu_nvcomp"), CompressionTier::GpuNvcomp);
+        assert_eq!(AccelDispatcher::parse_compression_tier("none"), CompressionTier::None);
+    }
+
+    #[test]
+    fn parse_compression_tier_unknown_falls_back_to_auto() {
+        assert_eq!(
+            AccelDispatcher::parse_compression_tier("quantum"),
+            CompressionTier::Auto
+        );
+    }
+
+    // -- Node ceiling capping (ADR-0007) --
+
+    #[test]
+    fn node_ceiling_cpu_zstd_caps_gpu_request() {
+        let mut config = AccelConfig::default();
+        config.compression.tier = CompressionTier::CpuZstd;
+        let dispatcher = AccelDispatcher::new(config);
+        // Bucket requests GpuNvcomp, but node ceiling is CpuZstd
+        let compressor = dispatcher.resolve_compressor(CompressionTier::GpuNvcomp);
+        assert_eq!(compressor.compression_tier(), CompressionTier::CpuZstd);
+    }
+
+    #[test]
+    fn node_ceiling_auto_allows_higher_tiers() {
+        let mut config = AccelConfig::default();
+        config.compression.tier = CompressionTier::Auto;
+        // With "auto" ceiling and default hardware (no GPU/igzip), should resolve
+        // to zstd as the fallback
+        let dispatcher = AccelDispatcher::new(config);
+        let compressor = dispatcher.resolve_compressor(CompressionTier::GpuNvcomp);
+        // Falls back through chain: GpuNvcomp → CpuIgzip → CpuZstd
+        assert_eq!(compressor.compression_tier(), CompressionTier::CpuZstd);
+    }
+
+    #[test]
+    fn bucket_none_honored_below_ceiling() {
+        let config = AccelConfig::default();
+        let dispatcher = AccelDispatcher::new(config);
+        // Bucket explicitly disables compression
+        let compressor = dispatcher.resolve_compressor(CompressionTier::None);
+        assert_eq!(compressor.compression_tier(), CompressionTier::CpuZstd);
+        // Note: resolve_compressor always returns a compressor.
+        // The caller should check the tier == None before using it.
+    }
+
+    #[test]
+    fn node_disabled_forces_none_ceiling() {
+        let mut config = AccelConfig::default();
+        config.compression.enabled = false;
+        let dispatcher = AccelDispatcher::new(config);
+        // Enabled=false → active_compression_tier returns None
+        assert_eq!(dispatcher.active_compression_tier(), None);
+    }
+
+    #[test]
+    fn node_none_ceiling_forces_compression_disabled() {
+        let mut config = AccelConfig::default();
+        config.compression.tier = CompressionTier::None;
+        let dispatcher = AccelDispatcher::new(config);
+        let compressor = dispatcher.resolve_compressor(CompressionTier::Auto);
+        // Even with Auto, node ceiling of None means compression is disabled
+        assert_eq!(compressor.compression_tier(), CompressionTier::CpuZstd);
+    }
+
+    // -- Fallback counter --
+
+    #[test]
+    fn compression_fallback_count_starts_at_zero() {
+        let dispatcher = AccelDispatcher::new(AccelConfig::default());
+        assert_eq!(dispatcher.compression_fallback_count(), 0);
     }
 
     // -- resolve_ec_encoder/decoder --

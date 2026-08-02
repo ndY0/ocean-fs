@@ -265,22 +265,28 @@ impl SegmentPool {
 
     /// Enqueues a segment ID for EC encoding on the bounded work channel.
     ///
-    /// This is a non-blocking try-send — if the queue is full, the segment
-    /// encoding is deferred but not lost (the segment is sealed and its data
-    /// is persisted in the WAL).
+    /// Uses `send().await` with a bounded timeout to enforce backpressure:
+    /// if the encoding queue is full, this method will block the caller for
+    /// up to 500ms. If the timeout elapses, the encoding is deferred and
+    /// will be retried later by the pool rotation logic.
     fn enqueue_encoding(&self, segment_id: SegmentId) {
-        match self.encode_tx.try_send(segment_id) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!(
-                    segment_id = %segment_id,
-                    "EC encoding queue full; encoding deferred"
-                );
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+        let timeout = std::time::Duration::from_millis(500);
+        let handle = tokio::runtime::Handle::current();
+        let result =
+            handle.block_on(tokio::time::timeout(timeout, self.encode_tx.send(segment_id)));
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(mpsc::error::SendError(_))) => {
                 tracing::error!(
                     segment_id = %segment_id,
                     "EC encoding queue closed; segment will not be encoded"
+                );
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    segment_id = %segment_id,
+                    timeout_ms = 500,
+                    "EC encoding queue full after timeout; encoding deferred"
                 );
             }
         }
@@ -466,5 +472,197 @@ mod tests {
         // Both IDs are valid UUIDs.
         assert_ne!(id1, SegmentId::default());
         assert_ne!(id2, SegmentId::default());
+    }
+
+    // ── Pool rotation tests (fill → seal → new segment) ───────────
+
+    #[test]
+    fn pool_rotation_fills_segment_and_activates_new_slot() {
+        // Use a tiny target size so a single append triggers is_full().
+        let pool_cfg = PoolConfig { active_pool_size: 4, ..PoolConfig::default() };
+        let size_cfg = SegmentSizeConfig {
+            default_target_size: 10,
+            small_target_size: 10,
+            ..SegmentSizeConfig::default()
+        };
+        let buf_pool = test_pool();
+
+        // We need a tokio runtime because enqueue_encoding calls
+        // Handle::current(). Create a minimal runtime for the test.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+
+        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool).unwrap();
+        assert_eq!(pool.active_count(), 4, "all 4 slots start appending");
+
+        // Append data larger than target_size (10 bytes).
+        // This fills the first slot's segment, triggering seal+rotation.
+        let data = b"hello world, this is longer than 10 bytes";
+        let (seg_id, offset, length) = pool.append(data).unwrap();
+        assert_eq!(offset, 0);
+        assert_eq!(length, data.len() as u32);
+        assert_ne!(seg_id, SegmentId::default());
+
+        // After fill+rotation, active_count should still be 4
+        // (the filled slot was replaced with a newly activated one).
+        assert_eq!(pool.active_count(), 4, "pool should re-activate after fill");
+
+        // The encoding queue should have received the sealed segment ID.
+        let rx = pool.take_encode_rx();
+        assert!(rx.is_some(), "encoding queue should have entries after fill");
+
+        // Verify subsequent appends succeed (pool is still functional).
+        let (seg_id2, offset2, _len2) = pool.append(b"more data").unwrap();
+        assert_eq!(offset2, 0);
+        assert_ne!(seg_id2, SegmentId::default());
+    }
+
+    #[test]
+    fn pool_rotation_multiple_fills_all_slots() {
+        // Fill all slots sequentially and verify pool remains functional.
+        let pool_cfg = PoolConfig { active_pool_size: 2, ..PoolConfig::default() };
+        let size_cfg = SegmentSizeConfig {
+            default_target_size: 15,
+            small_target_size: 15,
+            ..SegmentSizeConfig::default()
+        };
+        let buf_pool = test_pool();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+
+        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool).unwrap();
+        assert_eq!(pool.active_count(), 2);
+
+        // Fill both slots multiple times. Each 20-byte append overflows
+        // target_size=15, triggering rotation.
+        for i in 0..10 {
+            let data = format!("fill-iteration-{i:02}-padding");
+            let result = pool.append(data.as_bytes());
+            assert!(result.is_ok(), "append {} must succeed after rotation", i);
+        }
+
+        // Pool should still have active slots.
+        assert!(pool.active_count() > 0, "pool must have active slots after fill cycles");
+    }
+
+    // ── Backpressure test ─────────────────────────────────────────
+
+    #[test]
+    fn encode_queue_backpressure_config_is_respected() {
+        // Verify that a pool with small encode_queue_capacity can be
+        // created and used without panicking, even when the queue fills.
+        // Uses a large target size so enqueue_encoding is never called
+        // (segment never fills). This tests the configuration path.
+        let pool_cfg = PoolConfig {
+            active_pool_size: 4,
+            encode_queue_capacity: 2,
+            ..PoolConfig::default()
+        };
+        let size_cfg = SegmentSizeConfig::default();
+        let buf_pool = test_pool();
+        let pool =
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool).unwrap();
+
+        // The encode queue should exist with the configured capacity.
+        let rx = pool.take_encode_rx();
+        assert!(rx.is_some(), "encode queue must exist");
+
+        // Appends should succeed normally (segment won't fill with 4MB target).
+        for _ in 0..10 {
+            assert!(pool.append(b"data").is_ok());
+        }
+    }
+
+    #[test]
+    fn pool_handles_segment_full_with_encode_queue_not_draining() {
+        // Create a pool with tiny target and take the encode receiver.
+        // Verify that appends still succeed after the segment fills
+        // (the enqueue_encoding timeout path is exercised but doesn't panic).
+        use std::sync::Arc as StdArc;
+
+        let pool_cfg = PoolConfig {
+            active_pool_size: 4,
+            encode_queue_capacity: 2,
+            ..PoolConfig::default()
+        };
+        let size_cfg = SegmentSizeConfig {
+            default_target_size: 20,
+            small_target_size: 20,
+            ..SegmentSizeConfig::default()
+        };
+        let buf_pool = test_pool();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        let pool = StdArc::new(
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool).unwrap(),
+        );
+
+        // Take the receiver but don't drain — the channel will fill.
+        let _rx = pool.take_encode_rx();
+
+        // Execute on the runtime so block_on works for enqueue_encoding.
+        rt.block_on(async {
+            // Fill segments. With encode_queue_capacity=2, after 2 fills
+            // the channel is full. Subsequent fills trigger the 500ms
+            // timeout in enqueue_encoding but should not panic.
+            for i in 0..5 {
+                let pool = StdArc::clone(&pool);
+                let data = format!("fill-data-{i:02}-enough-bytes-to-overflow");
+                let result = tokio::task::spawn_blocking(move || pool.append(data.as_bytes()))
+                    .await
+                    .unwrap();
+                assert!(result.is_ok(), "append {i} must succeed");
+            }
+        });
+    }
+
+    // ── State transition test ─────────────────────────────────────
+
+    #[test]
+    fn pool_slot_state_transitions_after_fill() {
+        let pool_cfg = PoolConfig { active_pool_size: 4, ..PoolConfig::default() };
+        let size_cfg = SegmentSizeConfig {
+            default_target_size: 10,
+            small_target_size: 10,
+            ..SegmentSizeConfig::default()
+        };
+        let buf_pool = test_pool();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+
+        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool).unwrap();
+
+        // Before writes: all slots in Appending.
+        assert_eq!(pool.active_count(), 4);
+
+        // Fill one slot with a large append.
+        pool.append(b"this is more than 10 bytes, should fill").unwrap();
+
+        // After fill: the filled slot transitions to Sealing then gets
+        // a new segment via try_activate_slot(). Verify active count
+        // remains stable (re-activation happened).
+        assert!(pool.active_count() >= 3, "at least 3 slots should still be appending");
+
+        // Subsequent appends across remaining active slots succeed.
+        for _ in 0..10 {
+            let result = pool.append(b"small");
+            assert!(result.is_ok(), "append after rotation must succeed");
+        }
+        assert!(pool.active_count() > 0, "pool must still have active slots");
     }
 }

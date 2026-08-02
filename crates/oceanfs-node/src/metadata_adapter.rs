@@ -45,15 +45,11 @@ impl MetadataOps for MetadataStoreAdapter {
         bucket: &BucketId,
         key: &ObjectKey,
     ) -> Result<Option<ObjectMetadata>, MetadataError> {
-        self.store
-            .get_object(bucket, key)
-            .map_err(|e| MetadataError::Internal(format!("{e}")))
+        self.store.get_object(bucket, key).map_err(|e| MetadataError::Internal(format!("{e}")))
     }
 
     fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> Result<(), MetadataError> {
-        self.store
-            .delete_object(bucket, key)
-            .map_err(|e| MetadataError::Internal(format!("{e}")))
+        self.store.delete_object(bucket, key).map_err(|e| MetadataError::Internal(format!("{e}")))
     }
 
     fn list_objects(

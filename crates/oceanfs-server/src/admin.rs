@@ -280,9 +280,23 @@ pub struct CacheStats {
 #[derive(Clone)]
 pub(crate) struct AdminState {
     /// Bucket config store.
+    #[allow(dead_code)]
     pub buckets: Arc<BucketConfigStore>,
     /// Metrics registry.
     pub metrics: Arc<MetricsRegistry>,
+    /// Membership for cluster view (optional).
+    pub membership: Option<Arc<oceanfs_membership::Membership>>,
+    /// Ring cache for topology data (optional).
+    pub ring_cache: Option<Arc<oceanfs_routing::RingCache>>,
+    /// Scrub coordinator for manual scrub triggering (storage feature only).
+    #[cfg(feature = "storage")]
+    pub scrub_coordinator: Option<Arc<oceanfs_storage::ScrubCoordinator>>,
+    /// Metadata store for scrub verification (storage feature only).
+    #[cfg(feature = "storage")]
+    pub metadata_store: Option<Arc<oceanfs_storage::MetadataStore>>,
+    /// Segment data store for scrub (storage feature only).
+    #[cfg(feature = "storage")]
+    pub data_store: Option<Arc<dyn oceanfs_storage::SegmentDataStore>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -300,7 +314,61 @@ pub struct AdminHandler {
 impl AdminHandler {
     /// Creates a new admin handler.
     pub fn new(buckets: Arc<BucketConfigStore>, metrics: Arc<MetricsRegistry>) -> Self {
-        Self { state: AdminState { buckets, metrics } }
+        Self {
+            state: AdminState {
+                buckets,
+                metrics,
+                membership: None,
+                ring_cache: None,
+                #[cfg(feature = "storage")]
+                scrub_coordinator: None,
+                #[cfg(feature = "storage")]
+                metadata_store: None,
+                #[cfg(feature = "storage")]
+                data_store: None,
+            },
+        }
+    }
+
+    /// Creates a new admin handler with full cluster context.
+    pub fn new_with_cluster(
+        buckets: Arc<BucketConfigStore>,
+        metrics: Arc<MetricsRegistry>,
+        membership: Arc<oceanfs_membership::Membership>,
+        ring_cache: Arc<oceanfs_routing::RingCache>,
+    ) -> Self {
+        Self {
+            state: AdminState {
+                buckets,
+                metrics,
+                membership: Some(membership),
+                ring_cache: Some(ring_cache),
+                #[cfg(feature = "storage")]
+                scrub_coordinator: None,
+                #[cfg(feature = "storage")]
+                metadata_store: None,
+                #[cfg(feature = "storage")]
+                data_store: None,
+            },
+        }
+    }
+
+    /// Enables scrub triggering via the admin API.
+    ///
+    /// When configured, `POST /admin/scrub` will call
+    /// `ScrubCoordinator::trigger_manual()` with the provided
+    /// metadata and data stores.
+    #[cfg(feature = "storage")]
+    pub fn with_scrub(
+        mut self,
+        coordinator: Arc<oceanfs_storage::ScrubCoordinator>,
+        metadata: Arc<oceanfs_storage::MetadataStore>,
+        data_store: Arc<dyn oceanfs_storage::SegmentDataStore>,
+    ) -> Self {
+        self.state.scrub_coordinator = Some(coordinator);
+        self.state.metadata_store = Some(metadata);
+        self.state.data_store = Some(data_store);
+        self
     }
 
     /// Consumes the handler and returns an axum `Router` for the
@@ -309,6 +377,7 @@ impl AdminHandler {
         let state = self.state;
 
         Router::new()
+            .route("/admin/health", get(health_check))
             .route("/admin/cluster", get(cluster_view))
             .route("/admin/segments", get(segment_report))
             .route("/admin/caches", get(cache_stats))
@@ -318,15 +387,37 @@ impl AdminHandler {
     }
 }
 
+/// GET /admin/health — returns 200 OK when the node is running.
+#[instrument]
+async fn health_check() -> impl IntoResponse {
+    let body = serde_json::json!({
+        "status": "healthy",
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
 /// GET /admin/cluster — returns cluster membership view as JSON.
 #[instrument(skip(state))]
 async fn cluster_view(State(state): State<AdminState>) -> impl IntoResponse {
-    // In a full implementation, this would query Membership and RingCache.
-    // For now, return a placeholder with bucket count as a useful data point.
-    let buckets = state.buckets.list();
-    let view = ClusterView { nodes: Vec::new(), vnodes: 0, generation: 0 };
-    let _ = buckets; // used when Membership is wired
+    let nodes: Vec<NodeInfo> = if let Some(ref membership) = state.membership {
+        membership
+            .nodes_full()
+            .into_iter()
+            .map(|(node_id, node_state, incarnation, addr)| NodeInfo {
+                id: node_id.to_string(),
+                state: format!("{:?}", node_state),
+                address: addr.to_string(),
+                incarnation: incarnation.value(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
+    let vnodes = state.ring_cache.as_ref().map(|_rc| 256usize).unwrap_or(0);
+
+    let view = ClusterView { nodes, vnodes, generation: 0 };
     Json(view).into_response()
 }
 
@@ -350,11 +441,44 @@ async fn cache_stats() -> impl IntoResponse {
 }
 
 /// POST /admin/scrub — triggers a full distributed scrub.
-#[instrument]
-async fn trigger_scrub() -> impl IntoResponse {
-    // In a full implementation, this would send a scrub command
-    // to the ScrubCoordinator. For now, acknowledge the request.
-    (StatusCode::ACCEPTED, "Scrub triggered").into_response()
+#[instrument(skip(state))]
+async fn trigger_scrub(State(state): State<AdminState>) -> impl IntoResponse {
+    #[cfg(feature = "storage")]
+    {
+        if let (Some(coordinator), Some(metadata), Some(data_store)) =
+            (&state.scrub_coordinator, &state.metadata_store, &state.data_store)
+        {
+            let coordinator = coordinator.clone();
+            let metadata = metadata.clone();
+            let data_store = data_store.clone();
+            match coordinator.trigger_manual(metadata, data_store).await {
+                Ok(()) => {
+                    tracing::info!("scrub triggered via admin API");
+                    return (StatusCode::ACCEPTED, "Scrub triggered").into_response();
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to trigger scrub via admin API");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to trigger scrub: {e}"),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        tracing::warn!("scrub trigger requested but scrub coordinator not configured");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Scrub coordinator not configured on this node",
+        )
+            .into_response();
+    }
+    #[cfg(not(feature = "storage"))]
+    {
+        let _ = state;
+        (StatusCode::SERVICE_UNAVAILABLE, "Scrub not available (storage feature disabled)")
+            .into_response()
+    }
 }
 
 /// GET /admin/metrics — returns Prometheus text-format metrics.

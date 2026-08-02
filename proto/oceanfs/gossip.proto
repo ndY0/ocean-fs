@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package oceanfs.gossip;
+
+import "oceanfs/common.proto";
+import "oceanfs/membership.proto";
+
+// ---------------------------------------------------------------------------
+// Gossip protocol messages and service.
+// ---------------------------------------------------------------------------
+
+// A gossip message carrying a delta of the membership list.
+message GossipMessage {
+  oceanfs.membership.MembershipList delta = 1;
+  uint64 ring_version = 2;
+  oceanfs.common.HlcTimestamp hlc = 3;
+}
+
+// Request to pull membership updates from a peer.
+message GossipPullRequest {
+  oceanfs.common.NodeId node_id = 1;
+  uint64 last_known_version = 2;
+}
+
+// Acknowledgment of a gossip push.
+message GossipAck {
+  bool accepted = 1;
+  uint32 updated_entries = 2;
+}
+
+// Gossip RPC service for SWIM-based membership dissemination.
+service GossipRpc {
+  // Push a membership delta to a peer.
+  rpc Push(stream GossipMessage) returns (GossipAck);
+
+  // Pull membership updates from a peer.
+  rpc Pull(GossipPullRequest) returns (stream GossipMessage);
+}

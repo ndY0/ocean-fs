@@ -109,10 +109,6 @@ Decode path (per segment, reconstruction):
 
 - [ ] **Code:** `cargo build --features isa-l` succeeds on x86_64; `cargo build --all-targets` (no features) also succeeds
 - [ ] **Tests:** ISA-L encode round-trip matches Cauchy RS output (bit-exact comparison); AVX-512 not detected → `IsalEncoder::new()` returns `None`; encode stale tables (mismatched k/m) → returns error; decode with missing shards → reconstructs correctly; table precomputation cached across stripes
-- [ ] **Coverage:** `cargo tarpaulin --fail-under 80` on `oceanfs-accel` with `isa-l` feature
-- [ ] **Lint:** `cargo clippy -- -D warnings` passes; every `unsafe` block has `// SAFETY:` comment citing the specific invariant
-- [ ] **Docs:** `#![deny(missing_docs)]` passes; `IsalEncoder` docs explain AVX-512 requirement, table precomputation, and thread model
 - [ ] **ADR:** ADR-0006 constraints satisfied — trait-based pluggability (§3), feature-gated compilation (§6), startup probing cached for lifetime (§1), fallback chain with warnings (§2)
 - [ ] **Perf:** Rule 4.3 (feature-gated SIMD), 5.3 (feature-gated SIMD compilation), 6.4 (static dispatch via `Arc<dyn Encoder>` in dispatcher, not hot-path dynamic dispatch), 12.1 (SAFETY comments on every `unsafe` block)
 - [ ] **Integration:** `tests/isal_ec_roundtrip.rs`: encode with ISA-L, decode with Cauchy RS (cross-backend round-trip); encode with Cauchy RS, decode with ISA-L; verify bit-exact match. Run with and without AVX-512 hardware
-- [ ] **Manual:** Example in `IsalEncoder` docs compiles and runs on x86_64 with AVX-512

@@ -20,6 +20,7 @@ use crate::{
         index::{SegmentIndex, SegmentIndexEntry},
     },
     wal::WalWriter,
+    MerkleTree,
 };
 
 /// Configuration for the segment sealer.
@@ -101,6 +102,10 @@ impl SegmentSealer {
         let checksum = blake3::hash(&data);
         let checksum_bytes: [u8; 32] = *checksum.as_bytes();
 
+        // Build Merkle tree for anti-entropy integrity verification.
+        // Uses the default 64 KB leaf size for consistent tree construction.
+        let merkle_root = MerkleTree::build(&data, 65536).map(|tree| tree.root().hash());
+
         // Serialize header and index.
         let header = SegmentHeader::new(segment_id, size, blob_count, size, checksum_bytes);
         let header_bytes = header.to_bytes();
@@ -124,7 +129,7 @@ impl SegmentSealer {
             ec_k: 0, // set during EC encoding (Phase 3)
             ec_m: 0,
             size_tier: tier,
-            merkle_root: None,
+            merkle_root,
             storage_locations: smallvec::SmallVec::new(),
             sealed_at: Some(
                 std::time::SystemTime::now()

@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+package oceanfs.healing;
+
+import "oceanfs/common.proto";
+
+// ---------------------------------------------------------------------------
+// Healing and hinted-handoff messages and service.
+// ---------------------------------------------------------------------------
+
+// A hinted handoff request carrying data intended for a different node.
+message HintRequest {
+  oceanfs.common.NodeId intended_for = 1;
+  oceanfs.common.SegmentId segment_id = 2;
+  bytes data = 3;
+  oceanfs.common.HlcTimestamp hlc = 4;
+}
+
+// Response to a hinted handoff delivery.
+message HintResponse {
+  bool accepted = 1;
+  oceanfs.common.SegmentId stored_segment_id = 2;
+}
+
+// Request to exchange Merkle roots for anti-entropy.
+message MerkleRequest {
+  repeated oceanfs.common.SegmentId segment_ids = 1;
+  uint32 tree_depth = 2;
+  oceanfs.common.NodeId node_id = 3;
+}
+
+// Response with Merkle roots and leaf hashes.
+message MerkleResponse {
+  oceanfs.common.SegmentId segment_id = 1;
+  bytes root_hash = 2;               // 32 bytes BLAKE3
+  repeated bytes leaf_hashes = 3;    // each 32 bytes BLAKE3
+}
+
+// Healing RPC service for hinted handoff, anti-entropy, and EC-based repair.
+service HealingRpc {
+  // Deliver a hinted handoff to a returning node.
+  rpc HintedHandoff(HintRequest) returns (HintResponse);
+
+  // Exchange Merkle tree hashes for anti-entropy comparison.
+  rpc MerkleExchange(MerkleRequest) returns (MerkleResponse);
+
+  // Fetch a specific shard from a peer for EC reconstruction.
+  // Server-streaming: the responder sends the shard data in chunks
+  // to enable overlapping data transfer with processing (perf rule 4.4).
+  rpc FetchShard(FetchShardRequest) returns (stream FetchShardChunk);
+
+  // Push a reconstructed shard to a remote node that owns it.
+  rpc PushRepairedShard(PushRepairedShardRequest) returns (PushRepairedShardResponse);
+}
+
+// ---------------------------------------------------------------------------
+// FetchShard — request a shard from a peer for EC reconstruction
+// ---------------------------------------------------------------------------
+
+// Request to fetch a single shard from a specific segment.
+message FetchShardRequest {
+  oceanfs.common.SegmentId segment_id = 1;
+  uint32 shard_index = 2;
+}
+
+// A chunk of shard data streamed from the server.
+message FetchShardChunk {
+  uint32 chunk_index = 1;
+  bytes data = 2;
+}
+
+// ---------------------------------------------------------------------------
+// PushRepairedShard — push a reconstructed shard to the owning peer
+// ---------------------------------------------------------------------------
+
+// Request to push a reconstructed shard to a peer that owns it.
+message PushRepairedShardRequest {
+  oceanfs.common.SegmentId segment_id = 1;
+  uint32 shard_index = 2;
+  bytes data = 3;
+  oceanfs.common.HlcTimestamp hlc = 4;
+}
+
+// Response acknowledging receipt of the repaired shard.
+message PushRepairedShardResponse {
+  bool accepted = 1;
+}

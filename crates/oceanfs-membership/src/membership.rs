@@ -263,6 +263,16 @@ impl Membership {
         Ok(())
     }
 
+    /// Returns all known nodes with their states, incarnations, and addresses.
+    pub fn nodes_full(&self) -> Vec<(NodeId, NodeState, Incarnation, std::net::SocketAddr)> {
+        self.state
+            .read()
+            .nodes
+            .iter()
+            .map(|(id, (state, incarnation, addr))| (id.clone(), *state, *incarnation, *addr))
+            .collect()
+    }
+
     /// Returns all known nodes and their states.
     pub fn nodes(&self) -> Vec<(NodeId, NodeState)> {
         self.state.read().nodes.iter().map(|(id, (state, _, _))| (id.clone(), *state)).collect()
@@ -271,6 +281,11 @@ impl Membership {
     /// Returns the state of a specific node.
     pub fn state_of(&self, node_id: &NodeId) -> Option<NodeState> {
         self.state.read().nodes.get(node_id).map(|(state, _, _)| *state)
+    }
+
+    /// Returns the network address of a specific node.
+    pub fn address_of(&self, node_id: &NodeId) -> Option<SocketAddr> {
+        self.state.read().nodes.get(node_id).map(|(_, _, addr)| *addr)
     }
 
     /// Subscribes to membership change events.

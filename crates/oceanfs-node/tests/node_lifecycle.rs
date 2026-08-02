@@ -4,8 +4,7 @@
 //! `/admin/health` endpoint, and releases its port after shutdown.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::net::TcpStream;
-use std::time::Duration;
+use std::{net::TcpStream, time::Duration};
 
 use oceanfs_core::NodeConfig;
 use oceanfs_node::Node;
@@ -22,28 +21,20 @@ async fn node_lifecycle_startup_health_shutdown() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = NodeConfig {
         data_dir: tmp.path().to_path_buf(),
-        listen_addr: "127.0.0.1:0".into(), // ephemeral port
+        listen_addr: "127.0.0.1:0".into(),      // ephemeral port
         grpc_listen_addr: "127.0.0.1:0".into(), // ephemeral port
         ..NodeConfig::default()
     };
 
     // Start the node.
-    let node = Node::start(config)
-        .await
-        .expect("node should start with valid config");
+    let node = Node::start(config).await.expect("node should start with valid config");
     let server_addr = node.server_addr();
 
     // Verify the server is listening.
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .expect("client");
+    let client =
+        reqwest::Client::builder().timeout(Duration::from_secs(3)).build().expect("client");
     let url = format!("http://{server_addr}/admin/health");
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .expect("health check should succeed");
+    let resp = client.get(&url).send().await.expect("health check should succeed");
     assert_eq!(resp.status(), 200, "health check returns 200");
 
     let body: serde_json::Value = resp.json().await.expect("valid JSON body");
@@ -52,18 +43,12 @@ async fn node_lifecycle_startup_health_shutdown() {
     assert!(!body["version"].as_str().unwrap().is_empty(), "version is non-empty");
 
     // Shut down the node.
-    node.shutdown()
-        .await
-        .expect("graceful shutdown should succeed");
+    node.shutdown().await.expect("graceful shutdown should succeed");
 
     // Give the OS a moment to release the port.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Verify the port is released.
-    let reconnect =
-        TcpStream::connect_timeout(&server_addr, Duration::from_secs(1));
-    assert!(
-        reconnect.is_err(),
-        "port {server_addr} should be released after shutdown"
-    );
+    let reconnect = TcpStream::connect_timeout(&server_addr, Duration::from_secs(1));
+    assert!(reconnect.is_err(), "port {server_addr} should be released after shutdown");
 }

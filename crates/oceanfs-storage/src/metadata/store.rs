@@ -305,6 +305,74 @@ impl MetadataStore {
         }
     }
 
+    /// Lists all deletion tombstones for a bucket.
+    ///
+    /// Returns `(ObjectKey, Tombstone)` pairs for each tombstone in the
+    /// deletions column family whose key starts with the bucket prefix.
+    /// This enables garbage collection to check tombstone TTL before
+    /// reclaiming space.
+    ///
+    /// # Errors
+    ///
+    /// Individual entries that fail to deserialize are skipped.
+    pub fn list_tombstones(
+        &self,
+        bucket: &BucketId,
+    ) -> Vec<Result<(ObjectKey, Tombstone)>> {
+        let cf = self.db.cf_handle(cf::CF_DELETIONS);
+        let Some(cf_handle) = cf else {
+            return vec![];
+        };
+
+        let prefix = cf::encode_object_key(bucket.as_str(), "");
+
+        let iter = self.db.iterator_cf(
+            &cf_handle,
+            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+        );
+
+        iter.take_while(move |item| {
+            if let Ok((key, _)) = item {
+                key.starts_with(&prefix)
+            } else {
+                false
+            }
+        })
+        .filter_map(|item| match item {
+            Ok((key, value)) => {
+                let (bucket_str, key_str) = cf::decode_object_key(&key)?;
+                if bucket_str != bucket.as_str() {
+                    return None;
+                }
+                match serde_json::from_slice::<Tombstone>(&value) {
+                    Ok(tombstone) => {
+                        Some(Ok((ObjectKey::new(key_str), tombstone)))
+                    }
+                    Err(_) => None,
+                }
+            }
+            Err(e) => Some(Err(Error::Io(io_err(e)))),
+        })
+        .collect()
+    }
+
+    /// Deletes a segment metadata entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the RocksDB delete fails.
+    pub fn delete_segment(&self, id: SegmentId) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(cf::CF_SEGMENTS)
+            .ok_or_else(|| Error::InvalidConfig("segments CF not found".into()))?;
+
+        let key = cf::encode_segment_key(&id);
+        self.db.delete_cf(&cf, key).map_err(|e| Error::Io(io_err(e)))?;
+
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // Async wrappers
     // ------------------------------------------------------------------
@@ -432,6 +500,14 @@ impl MetadataStore {
                     let v = serde_json::to_vec(meta).map_err(|e| Error::Io(io_err(e)))?;
                     batch.put_cf(&cf, k, v);
                 }
+                BatchOp::DeleteSegment(segment_id) => {
+                    let cf = self
+                        .db
+                        .cf_handle(cf::CF_SEGMENTS)
+                        .ok_or_else(|| Error::InvalidConfig("segments CF not found".into()))?;
+                    let k = cf::encode_segment_key(segment_id);
+                    batch.delete_cf(&cf, k);
+                }
             }
         }
 
@@ -452,6 +528,8 @@ pub enum BatchOp {
     PutTombstone(BucketId, ObjectKey, Tombstone),
     /// Put a segment metadata entry.
     PutSegment(SegmentMetadata),
+    /// Delete a segment metadata entry.
+    DeleteSegment(SegmentId),
 }
 
 #[cfg(test)]

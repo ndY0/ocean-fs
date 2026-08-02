@@ -9,31 +9,48 @@ import "oceanfs/common.proto";
 // These are shared across storage, network, and server crates.
 // ---------------------------------------------------------------------------
 
-// A request to append data to a segment.
+// Status for segment append acknowledgement.
+enum AckStatus {
+  OK = 0;
+  FULL = 1;
+  ERROR = 2;
+}
+
+// A request to append data to a segment (streaming chunk).
 message SegmentAppendRequest {
   oceanfs.common.SegmentId segment_id = 1;
-  uint64 offset = 2;
-  bytes data = 3;
-  oceanfs.common.HlcTimestamp timestamp = 4;
+  oceanfs.common.ShardIndex shard_index = 2;
+  uint64 offset = 3;
+  bytes data = 4;
+  oceanfs.common.HlcTimestamp hlc = 5;
 }
 
 // Response to an append request.
 message SegmentAppendResponse {
   uint64 wal_position = 1;
-  oceanfs.common.HlcTimestamp timestamp = 2;
+  AckStatus ack = 2;
 }
 
 // A request to fetch a shard from a sealed segment.
 message FetchShardRequest {
   oceanfs.common.SegmentId segment_id = 1;
   uint32 shard_index = 2;
-  uint32 offset = 3;
-  uint32 length = 4;
+  uint64 offset = 3;
+  uint64 length = 4;
 }
 
 // A chunk of shard data streamed back to the requester.
 message ShardResponse {
   bytes data = 1;
-  uint32 offset = 2;
-  bool is_last = 3;
+  bytes checksum = 2;       // BLAKE3 checksum of this chunk
+  uint32 chunk_index = 3;
+}
+
+// Segment metadata describing EC parameters and storage locations.
+message SegmentMetadata {
+  oceanfs.common.SegmentId segment_id = 1;
+  uint32 ec_k = 2;                  // data shard count
+  uint32 ec_m = 3;                  // parity shard count
+  bytes merkle_root = 4;            // 32 bytes BLAKE3
+  repeated oceanfs.common.NodeId storage_locations = 5;
 }

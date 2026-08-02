@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package oceanfs.scrub;
+
+import "oceanfs/common.proto";
+
+// ---------------------------------------------------------------------------
+// ScrubRpc — distributed scrub partition assignment and result reporting
+// ---------------------------------------------------------------------------
+
+// The coordinator assigns a partition (range of segment IDs) to a worker node.
+message AssignPartitionRequest {
+  // The node that is sending this assignment (coordinator).
+  oceanfs.common.NodeId coordinator_id = 1;
+  // Segment IDs to scrub on the target node.
+  repeated oceanfs.common.SegmentId segment_ids = 2;
+}
+
+// Worker acknowledges receipt of the partition assignment.
+message AssignPartitionResponse {
+  // true if the worker accepted the assignment.
+  bool accepted = 1;
+}
+
+// Worker reports the results of scrubbing its assigned partition back to the coordinator.
+message ReportPartitionResultRequest {
+  // The node reporting results.
+  oceanfs.common.NodeId node_id = 1;
+  // Total segments assigned.
+  uint64 segments_total = 2;
+  // Segments that verified healthy.
+  uint64 segments_healthy = 3;
+  // Segments found to be corrupt.
+  uint64 segments_corrupt = 4;
+  // Segments enqueued for healing.
+  uint64 segments_healed = 5;
+  // Total bytes scanned.
+  uint64 bytes_scanned = 6;
+}
+
+// Coordinator acknowledges receipt of the partition result.
+message ReportPartitionResultResponse {
+  bool accepted = 1;
+}
+
+// ScrubRpc service for distributed scrubbing across cluster nodes.
+service ScrubRpc {
+  // Coordinator sends a partition of segment IDs to a worker for scrubbing.
+  rpc AssignPartition(AssignPartitionRequest) returns (AssignPartitionResponse);
+
+  // Worker reports scrub results back to the coordinator after completing its partition.
+  rpc ReportPartitionResult(ReportPartitionResultRequest) returns (ReportPartitionResultResponse);
+}

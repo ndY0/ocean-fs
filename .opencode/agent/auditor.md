@@ -1,6 +1,6 @@
 ---
 description: Audits code structure, identifies structural issues and code smells. Writes reports under docs/audits/. Use when the user asks to "audit the code", "find code smells", or "check structural health".
-mode: primary
+mode: all
 permission:
   read: allow
   edit: allow

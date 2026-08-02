@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
-use oceanfs_core::CompressionTier;
+use oceanfs_core::{CompressionTier, NvcompConfig};
 use tokio::sync::Semaphore;
 
 use crate::{compressor::Compressor, error::AccelError, Result};
@@ -171,6 +171,8 @@ pub struct NvcompCompressor {
     device: Arc<CudaDevice>,
     /// Semaphore bounding concurrent GPU operations.
     semaphore: Arc<Semaphore>,
+    /// Compression config: codec, batch_size, device_id.
+    config: NvcompConfig,
 }
 
 // SAFETY: NvcompCompressor is Send + Sync because:
@@ -189,18 +191,25 @@ impl NvcompCompressor {
     /// Probes for a CUDA device at construction time. Shares a GPU semaphore
     /// with other CUDA backends (EC) to prevent concurrent GPU contention.
     ///
+    /// The `config` parameter specifies the compression codec, batch size,
+    /// and GPU device index. When batch_size > 1, the compressor splits
+    /// input data into batches for parallel GPU kernel execution.
+    ///
     /// # Returns
     ///
     /// - `Some(NvcompCompressor)` if a CUDA device is available.
     /// - `None` if no GPU is detected.
-    pub fn new(semaphore: Arc<Semaphore>) -> Option<Self> {
+    pub fn new(semaphore: Arc<Semaphore>, config: NvcompConfig) -> Option<Self> {
         if !Self::is_available() {
             return None;
         }
-        let device = match CudaDevice::new(0) {
+        let device = match CudaDevice::new(config.device_id) {
             Ok(dev) => {
                 tracing::info!(
                     name = dev.name().unwrap_or_default(),
+                    device_id = config.device_id,
+                    batch_size = config.batch_size,
+                    codec = ?config.codec,
                     "nvCOMP GPU compression backend initialized"
                 );
                 dev
@@ -210,7 +219,7 @@ impl NvcompCompressor {
                 return None;
             }
         };
-        Some(Self { device, semaphore })
+        Some(Self { device, semaphore, config })
     }
 
     /// Checks whether CUDA is available on this system.
@@ -240,7 +249,7 @@ impl Compressor for NvcompCompressor {
             reason: "GPU saturated — no semaphore permits available".into(),
         })?;
 
-        let num_chunks: usize = 1;
+        let num_chunks: usize = self.config.batch_size.max(1);
         let max_uncompressed: usize = data.len();
         let opts = Self::lz4_opts();
 
@@ -418,7 +427,7 @@ impl Compressor for NvcompCompressor {
             reason: "GPU saturated — no semaphore permits for decompress".into(),
         })?;
 
-        let num_chunks: usize = 1;
+        let num_chunks: usize = self.config.batch_size.max(1);
 
         // --- Step 1: Create CUDA stream ---
         let mut stream: cudaStream_t = std::ptr::null_mut();
@@ -615,7 +624,8 @@ mod tests {
         }
 
         let semaphore = Arc::new(Semaphore::new(1));
-        let compressor = NvcompCompressor::new(semaphore).unwrap();
+        let config = NvcompConfig::default();
+        let compressor = NvcompCompressor::new(semaphore, config).unwrap();
         assert!(compressor.is_available());
         assert_eq!(compressor.compression_tier(), CompressionTier::GpuNvcomp);
 
@@ -635,7 +645,8 @@ mod tests {
         }
 
         let semaphore = Arc::new(Semaphore::new(1));
-        let compressor = NvcompCompressor::new(semaphore).unwrap();
+        let config = NvcompConfig::default();
+        let compressor = NvcompCompressor::new(semaphore, config).unwrap();
 
         let original = vec![0xABu8; 65536]; // 64 KB
         let compressed = compressor.compress(&original, 0).unwrap();
@@ -651,7 +662,8 @@ mod tests {
         }
 
         let semaphore = Arc::new(Semaphore::new(1));
-        let compressor = NvcompCompressor::new(semaphore).unwrap();
+        let config = NvcompConfig::default();
+        let compressor = NvcompCompressor::new(semaphore, config).unwrap();
 
         let compressed = compressor.compress(&[], 0).unwrap();
         assert!(compressed.is_empty());
@@ -668,7 +680,8 @@ mod tests {
         }
 
         let semaphore = Arc::new(Semaphore::new(1));
-        let compressor = NvcompCompressor::new(semaphore).unwrap();
+        let config = NvcompConfig::default();
+        let compressor = NvcompCompressor::new(semaphore, config).unwrap();
 
         let original = b"cross-backend LZ4 compatibility test data";
         let compressed = compressor.compress(original, 0).unwrap();

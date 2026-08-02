@@ -127,8 +127,7 @@ fn parse_args() -> config::CliArgs {
             "--seed-nodes" => {
                 i += 1;
                 if i < raw.len() {
-                    args.seed_nodes =
-                        raw[i].split(',').map(|s| s.trim().to_string()).collect();
+                    args.seed_nodes = raw[i].split(',').map(|s| s.trim().to_string()).collect();
                 }
             }
             "--log-format" => {
@@ -168,22 +167,15 @@ fn init_tracing(args: &config::CliArgs) {
         None => "oceanfs=info".to_string(),
     };
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&default_filter));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&default_filter));
 
     match args.log_format.as_str() {
         "json" => {
-            tracing_subscriber::fmt()
-                .json()
-                .with_env_filter(filter)
-                .with_target(false)
-                .init();
+            tracing_subscriber::fmt().json().with_env_filter(filter).with_target(false).init();
         }
         _ => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_target(false)
-                .init();
+            tracing_subscriber::fmt().with_env_filter(filter).with_target(false).init();
         }
     }
 }
@@ -226,9 +218,7 @@ async fn wait_for_shutdown() {
     #[cfg(not(unix))]
     {
         // On non-Unix, wait for Ctrl+C.
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to listen for Ctrl+C");
+        tokio::signal::ctrl_c().await.expect("failed to listen for Ctrl+C");
         info!("Received shutdown signal, initiating graceful shutdown");
     }
 }

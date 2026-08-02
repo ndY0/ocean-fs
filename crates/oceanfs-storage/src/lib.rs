@@ -30,20 +30,25 @@ mod anti_entropy;
 mod buffer_pool;
 mod error;
 mod gc;
+pub mod heal;
 pub mod metadata;
 mod scrub;
 pub mod segment;
 pub mod wal;
 
 pub use anti_entropy::{
-    AntiEntropy, AntiEntropyConfig, AntiEntropyStats, LeafRange, MerkleProof, MerkleRoot,
-    MerkleTree,
+    AntiEntropy, AntiEntropyConfig, AntiEntropyStats, InMemorySegmentStore, LeafRange,
+    MerkleProof, MerkleRoot, MerkleTree, SegmentDataStore,
 };
 pub use buffer_pool::BufferPool;
 pub use error::{Error, Result};
-pub use gc::{GarbageCollector, GcConfig, GcStats, OrphanReaper, OrphanStats};
+pub use gc::{
+    GarbageCollector, GcConfig, GcStats, InMemorySegmentShardStore, OrphanReaper, OrphanStats,
+    SegmentShardStore,
+};
+pub use heal::{enqueue_heal, HealConfig, HealQueue, HealQueueSender, HealRequest, HealStats, HealWorker};
 pub use metadata::{BatchOp, MetadataStore};
-pub use scrub::{ScrubConfig, ScrubCoordinator, ScrubReport, SegmentPartition};
+pub use scrub::{ScrubConfig, ScrubCoordinator, ScrubReport, ScrubReportBuilder};
 pub use segment::{
     ActiveSegment, SealConfig, SegmentHandle, SegmentHeader, SegmentIndex, SegmentSealer,
     SegmentShard, SegmentSplitter, TierRouter,

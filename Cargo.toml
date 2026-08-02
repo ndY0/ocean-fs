@@ -39,6 +39,8 @@ oceanfs-node     = { path = "crates/oceanfs-node" }
 
 # --- Async Runtime ---
 tokio            = { version = "1", default-features = false, features = ["rt-multi-thread", "sync", "macros", "time", "fs", "io-util", "signal"] }
+tokio-stream     = "0.1"
+tokio-util       = "0.7"
 
 # --- Data ---
 bytes            = { version = "1", features = ["serde"] }

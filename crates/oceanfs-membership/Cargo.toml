@@ -7,12 +7,15 @@ rust-version.workspace = true
 
 [dependencies]
 oceanfs-core.workspace = true
+oceanfs-network.workspace = true
 oceanfs-routing.workspace = true
 parking_lot.workspace = true
 rand = "0.8"
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-stream = "0.1"
+tonic.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

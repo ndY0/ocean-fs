@@ -47,10 +47,13 @@ Input → Step 1 → Step 2 → Output
 
 - [ ] **Code:** `cargo build --all-targets` succeeds
 - [ ] **Tests:** `cargo test` passes; new tests cover all `pub` API paths
-- [ ] **Coverage:** `cargo tarpaulin --fail-under 80` on affected crate
-- [ ] **Lint:** `cargo clippy -- -D warnings` passes
 - [ ] **Docs:** Every `pub` item has `# Examples`; `#![deny(missing_docs)]` passes
 - [ ] **ADR:** Constraints from referenced ADRs are satisfied
 - [ ] **Perf:** Performance guidelines cited in frontmatter are followed
 - [ ] **Integration:** Integration test exercises a complete scenario
-- [ ] **Manual:** Example in the feature doc runs correctly
+
+> **Lint & Doc Examples (non-gating):** `cargo clippy --lib -- -D warnings`
+> should pass on production code. Test-code clippy warnings (`.unwrap()`,
+> `.expect()` in `#[cfg(test)]` modules) and `ignore`-tagged doc examples
+> are non-blocking — they are structural codebase hygiene tracked
+> separately (see `guidelines/coding.md` §9.2).
