@@ -295,7 +295,7 @@ async fn put_object(
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as i64,
-                hlc: oceanfs_core::Hlc::zero(),
+                hlc: result.hlc,
             };
             if let Err(e) = state.metadata.put_object(&bucket_id, meta) {
                 error!(key = %key, error = %e, "failed to persist object metadata");
@@ -306,13 +306,14 @@ async fn put_object(
                 );
             }
 
-            // Invalidate caches for this key.
+            // Invalidate caches for this key — locally and on replicas.
             if let Some(ref l1) = state.object_cache {
                 l1.invalidate(&bucket_id, &object_key);
             }
             if let Some(ref l2) = state.metadata_cache {
                 l2.invalidate(&bucket_id, &object_key);
             }
+            state.write.invalidate_cache_on_replicas(&bucket_id, &object_key, &hk).await;
 
             // Register segment metadata for each unique segment so
             // /admin/segments reflects created segments.
@@ -603,13 +604,19 @@ async fn delete_object(
 
     match state.metadata.delete_object(&bucket_id, &object_key) {
         Ok(()) => {
-            // Invalidate caches for this key.
+            // Replicate deletion to other replicas in the ring.
+            let hk = HashKey::from_bytes(hash_key(object_key.as_str().as_bytes()));
+            let _ = state.write.delete(&bucket_id, &object_key, &hk).await;
+
+            // Invalidate caches for this key — locally and on replicas.
             if let Some(ref l1) = state.object_cache {
                 l1.invalidate(&bucket_id, &object_key);
             }
             if let Some(ref l2) = state.metadata_cache {
                 l2.invalidate(&bucket_id, &object_key);
             }
+            state.write.invalidate_cache_on_replicas(&bucket_id, &object_key, &hk).await;
+            state.write.invalidate_cache_on_replicas(&bucket_id, &object_key, &hk).await;
             // Add to negative cache so subsequent HEAD/GET skip RocksDB.
             if let Some(ref l3) = state.negative_cache {
                 l3.insert(&bucket_id, &object_key);

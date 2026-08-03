@@ -12,6 +12,23 @@ pub struct SegmentAppendRequest {
     pub data: ::prost::alloc::vec::Vec<u8>,
     #[prost(message, optional, tag = "5")]
     pub hlc: ::core::option::Option<super::common::HlcTimestamp>,
+    /// Object metadata for cross-node replication.
+    /// When set, the receiver persists this metadata in its local store
+    /// so that reads from any replica can locate the object.
+    #[prost(string, tag = "6")]
+    pub bucket_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub object_key: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "8")]
+    pub object_size: u64,
+    #[prost(bytes = "vec", tag = "9")]
+    pub blake3_hash: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", repeated, tag = "10")]
+    pub chunk_segment_ids: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    #[prost(uint64, repeated, tag = "11")]
+    pub chunk_offsets: ::prost::alloc::vec::Vec<u64>,
+    #[prost(uint32, repeated, tag = "12")]
+    pub chunk_lengths: ::prost::alloc::vec::Vec<u32>,
 }
 /// Response to an append request.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
@@ -60,6 +77,20 @@ pub struct SegmentMetadata {
     pub merkle_root: ::prost::alloc::vec::Vec<u8>,
     #[prost(message, repeated, tag = "5")]
     pub storage_locations: ::prost::alloc::vec::Vec<super::common::NodeId>,
+}
+/// Request to delete object metadata on a replica node.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteObjectRequest {
+    #[prost(string, tag = "1")]
+    pub bucket_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub object_key: ::prost::alloc::string::String,
+}
+/// Response to a delete request.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct DeleteObjectResponse {
+    #[prost(bool, tag = "1")]
+    pub deleted: bool,
 }
 /// Status for segment append acknowledgement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]

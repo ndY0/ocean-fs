@@ -160,12 +160,21 @@ impl Node {
         let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
 
         // ---- 4. Construct membership ----
-        let listen_addr: SocketAddr =
-            config.listen_addr.parse().map_err(|e| format!("invalid listen_addr: {e}"))?;
+        let grpc_addr: SocketAddr = config
+            .grpc_listen_addr
+            .parse()
+            .map_err(|e| format!("invalid grpc_listen_addr: {e}"))?;
+        let gossip_config = oceanfs_core::GossipConfig {
+            seed_nodes: config.seed_nodes.clone(),
+            interval_ms: config.gossip_interval_ms,
+            suspicion_timeout_ms: config.suspicion_timeout_ms,
+            failure_timeout_ms: config.failure_timeout_ms,
+            ..oceanfs_core::GossipConfig::default()
+        };
         let membership = Arc::new(oceanfs_membership::Membership::new(
             NodeId::new(&config.node_id),
-            listen_addr,
-            oceanfs_core::GossipConfig::default(),
+            grpc_addr,
+            gossip_config,
             ring_cache.clone(),
         ));
 
@@ -435,7 +444,10 @@ impl Node {
 
         // Build gRPC service implementations.
         let segment_service =
-            oceanfs_server::grpc::segment_service::SegmentGrpcService::new(heal_data_store.clone());
+            oceanfs_server::grpc::segment_service::SegmentGrpcService::new(
+                heal_data_store.clone(),
+                Some(metadata_store.clone()),
+            );
         let gossip_service =
             oceanfs_membership::grpc::gossip_service::GossipGrpcService::new(membership.clone());
 

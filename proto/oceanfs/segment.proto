@@ -23,6 +23,16 @@ message SegmentAppendRequest {
   uint64 offset = 3;
   bytes data = 4;
   oceanfs.common.HlcTimestamp hlc = 5;
+  // Object metadata for cross-node replication.
+  // When set, the receiver persists this metadata in its local store
+  // so that reads from any replica can locate the object.
+  string bucket_id = 6;
+  string object_key = 7;
+  uint64 object_size = 8;
+  bytes blake3_hash = 9;
+  repeated bytes chunk_segment_ids = 10;
+  repeated uint64 chunk_offsets = 11;
+  repeated uint32 chunk_lengths = 12;
 }
 
 // Response to an append request.
@@ -53,4 +63,15 @@ message SegmentMetadata {
   uint32 ec_m = 3;                  // parity shard count
   bytes merkle_root = 4;            // 32 bytes BLAKE3
   repeated oceanfs.common.NodeId storage_locations = 5;
+}
+
+// Request to delete object metadata on a replica node.
+message DeleteObjectRequest {
+  string bucket_id = 1;
+  string object_key = 2;
+}
+
+// Response to a delete request.
+message DeleteObjectResponse {
+  bool deleted = 1;
 }

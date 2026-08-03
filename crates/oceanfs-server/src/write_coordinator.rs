@@ -16,11 +16,11 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use oceanfs_core::{
-    BucketId, ChunkRef, HashKey, HashOutput, HlcClock, NodeId, ObjectKey, OperationTimeouts,
-    SegmentId, WriteResult,
+    BucketId, ChunkRef, HashKey, HashOutput, Hlc, HlcClock, NodeId, ObjectKey,
+    OperationTimeouts, SegmentId, WriteResult,
 };
 use oceanfs_membership::Membership;
-use oceanfs_network::{ConnectionPool, SegmentRpcClient};
+use oceanfs_network::{CacheRpcClient, ConnectionPool, SegmentRpcClient};
 use oceanfs_routing::RingCache;
 use tracing::{info, warn};
 
@@ -161,6 +161,7 @@ impl WriteCoordinator {
                 &req.data,
                 hlc,
                 write_timeout_ms,
+                &req,
             )
             .await;
 
@@ -193,12 +194,53 @@ impl WriteCoordinator {
             chunks,
             size: req.data.len() as u64,
             blake3_hash: Some(blake3_hash),
+            hlc,
         })
     }
 
     /// Returns a reference to the HLC clock.
     pub fn hlc_clock(&self) -> &Arc<HlcClock> {
         &self.hlc_clock
+    }
+
+    /// Invalidates cached object data on all remote replicas in the ring.
+    ///
+    /// Called after a write or delete to ensure remote nodes don't serve
+    /// stale data from their L1/L2 caches.
+    pub async fn invalidate_cache_on_replicas(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+        hash_key: &HashKey,
+    ) {
+        let replica_set = self.ring.lookup(hash_key.as_bytes());
+        for target in &replica_set {
+            if *target == self.node_id {
+                continue;
+            }
+            let addr = match self.membership.address_of(target) {
+                Some(a) => a,
+                None => continue,
+            };
+            let pooled = match self.pool.get_channel(addr).await {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let channel = pooled.channel().clone();
+            drop(pooled);
+
+            let proto_bucket: oceanfs_core::proto::common::BucketId = bucket.clone().into();
+            let proto_key: oceanfs_core::proto::common::ObjectKey = key.clone().into();
+            let mut client = CacheRpcClient::new(channel);
+            let request = tonic::Request::new(
+                oceanfs_network::cache::CacheInvalidateRequest {
+                    bucket_id: Some(proto_bucket),
+                    object_key: Some(proto_key),
+                    invalidation_type: 0, // ObjectData
+                },
+            );
+            let _ = client.invalidate(request).await;
+        }
     }
 
     /// Forwards a write request to another node via gRPC.
@@ -232,6 +274,13 @@ impl WriteCoordinator {
             offset: 0,
             data: req.data.to_vec(),
             hlc: Some(proto_hlc),
+            bucket_id: req.bucket.to_string(),
+            object_key: req.key.to_string(),
+            object_size: req.data.len() as u64,
+            blake3_hash: vec![],
+            chunk_segment_ids: vec![],
+            chunk_offsets: vec![],
+            chunk_lengths: vec![],
         };
 
         info!(
@@ -262,7 +311,67 @@ impl WriteCoordinator {
             chunks,
             size: req.data.len() as u64,
             blake3_hash: Some(blake3_hash),
+            hlc: Hlc::zero(),
         })
+    }
+
+    /// Deletes an object by replicating the deletion to all replicas.
+    ///
+    /// 1. Looks up the replica set from the ring.
+    /// 2. Sends a `DeleteObject` gRPC call to each remote replica.
+    /// 3. Deletes locally from the metadata store.
+    ///
+    /// Returns `true` if the object was deleted on at least one node.
+    pub async fn delete(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+        hash_key: &HashKey,
+    ) -> Result<bool> {
+        let replica_set = self.ring.lookup(hash_key.as_bytes());
+        if replica_set.is_empty() {
+            return Err(Error::Routing("ring returned empty replica set".into()));
+        }
+
+        let mut deleted = false;
+
+        // Delete on remote replicas.
+        for target in &replica_set {
+            if *target == self.node_id {
+                continue; // local delete handled by caller
+            }
+
+            let addr = match self.membership.address_of(target) {
+                Some(a) => a,
+                None => continue,
+            };
+
+            let pooled = match self.pool.get_channel(addr).await {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let channel = pooled.channel().clone();
+            drop(pooled);
+
+            let mut client = SegmentRpcClient::new(channel);
+            let request = tonic::Request::new(oceanfs_core::proto::segment::DeleteObjectRequest {
+                bucket_id: bucket.to_string(),
+                object_key: key.to_string(),
+            });
+
+            match client.delete_object(request).await {
+                Ok(resp) => {
+                    if resp.into_inner().deleted {
+                        deleted = true;
+                    }
+                }
+                Err(e) => {
+                    warn!(target = %target, error = %e, "delete replication failed");
+                }
+            }
+        }
+
+        Ok(deleted)
     }
 }
 

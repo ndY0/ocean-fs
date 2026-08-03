@@ -20,9 +20,10 @@ use std::sync::Arc;
 
 use oceanfs_core::{
     proto::segment::{
-        AckStatus, FetchShardRequest, SegmentAppendRequest, SegmentAppendResponse, ShardResponse,
+        AckStatus, DeleteObjectRequest, DeleteObjectResponse, FetchShardRequest,
+        SegmentAppendRequest, SegmentAppendResponse, ShardResponse,
     },
-    SegmentId,
+    BucketId, ChunkRef, ObjectKey, ObjectMetadata, SegmentId, Hlc,
 };
 use oceanfs_network::storage::segment_rpc_server::SegmentRpc;
 use oceanfs_storage::SegmentDataStore;
@@ -38,6 +39,9 @@ use tonic::{Request, Response, Status, Streaming};
 pub struct SegmentGrpcService {
     /// Segment data store for reading and writing segment data.
     data_store: Arc<dyn SegmentDataStore>,
+    /// Optional metadata store for persisting object metadata
+    /// replicated alongside segment data.
+    metadata_store: Option<Arc<oceanfs_storage::MetadataStore>>,
 }
 
 impl SegmentGrpcService {
@@ -46,8 +50,12 @@ impl SegmentGrpcService {
     /// # Arguments
     ///
     /// * `data_store` - The segment data store backing append and fetch operations.
-    pub fn new(data_store: Arc<dyn SegmentDataStore>) -> Self {
-        Self { data_store }
+    /// * `metadata_store` - Optional metadata store for cross-node metadata replication.
+    pub fn new(
+        data_store: Arc<dyn SegmentDataStore>,
+        metadata_store: Option<Arc<oceanfs_storage::MetadataStore>>,
+    ) -> Self {
+        Self { data_store, metadata_store }
     }
 
     /// Returns a reference to the underlying data store (for testing).
@@ -75,6 +83,14 @@ impl SegmentRpc for SegmentGrpcService {
         let mut total_bytes: u64 = 0;
         let mut segment_data: Vec<u8> = Vec::new();
         let mut segment_id = SegmentId::default();
+        // Collect metadata from the first chunk that carries it.
+        let mut bucket_id: Option<String> = None;
+        let mut object_key: Option<String> = None;
+        let mut object_size: u64 = 0;
+        let mut blake3_hash: Vec<u8> = vec![];
+        let mut chunk_segment_ids: Vec<Vec<u8>> = vec![];
+        let mut chunk_offsets: Vec<u64> = vec![];
+        let mut chunk_lengths: Vec<u32> = vec![];
 
         // Collect all chunks from the stream.
         while let Some(chunk) = stream
@@ -82,11 +98,21 @@ impl SegmentRpc for SegmentGrpcService {
             .await
             .map_err(|e| Status::internal(format!("append stream error: {e}")))?
         {
-            // Extract segment_id from the first chunk (if present in request metadata).
+            // Extract segment_id from the first chunk.
             if let Some(ref proto_sid) = chunk.segment_id {
                 if let Ok(sid) = SegmentId::try_from(proto_sid.clone()) {
                     segment_id = sid;
                 }
+            }
+            // Capture metadata from the first chunk that carries it.
+            if bucket_id.is_none() && !chunk.bucket_id.is_empty() {
+                bucket_id = Some(chunk.bucket_id.clone());
+                object_key = Some(chunk.object_key.clone());
+                object_size = chunk.object_size;
+                blake3_hash = chunk.blake3_hash.clone();
+                chunk_segment_ids = chunk.chunk_segment_ids.clone();
+                chunk_offsets = chunk.chunk_offsets.clone();
+                chunk_lengths = chunk.chunk_lengths.clone();
             }
             let chunk_len = chunk.data.len() as u64;
             segment_data.extend_from_slice(&chunk.data);
@@ -106,6 +132,53 @@ impl SegmentRpc for SegmentGrpcService {
             .write_segment_data(&segment_id, &segment_data)
             .map_err(|e| Status::internal(format!("segment write failed: {e}")))?;
 
+        // Persist object metadata if this append carried it (cross-node replication).
+        if let (Some(ref md_store), Some(bucket), Some(key)) =
+            (&self.metadata_store, bucket_id, object_key)
+        {
+            let mut chunks = smallvec::SmallVec::new();
+            for i in 0..chunk_segment_ids.len().min(chunk_offsets.len()).min(chunk_lengths.len()) {
+                let seg_bytes: [u8; 16] = chunk_segment_ids[i]
+                    .as_slice()
+                    .try_into()
+                    .unwrap_or([0u8; 16]);
+                chunks.push(ChunkRef {
+                    segment_id: SegmentId::from_uuid_bytes(seg_bytes),
+                    offset: chunk_offsets[i],
+                    length: chunk_lengths[i],
+                });
+            }
+            let meta = ObjectMetadata {
+                object_key: ObjectKey::new(&key),
+                size: object_size,
+                blake3_hash: if blake3_hash.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&blake3_hash);
+                    Some(oceanfs_core::HashOutput::from_bytes(arr))
+                } else {
+                    None
+                },
+                chunks,
+                inline_data: None,
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64,
+                hlc: Hlc::zero(),
+            };
+            if let Err(e) = md_store.put_object_in_bucket(
+                &oceanfs_core::BucketId::new(&bucket),
+                meta,
+            ) {
+                tracing::warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    error = %e,
+                    "append_segment: failed to persist replicated metadata"
+                );
+            }
+        }
+
         tracing::debug!(
             segment_id = %segment_id,
             total_bytes = total_bytes,
@@ -117,6 +190,27 @@ impl SegmentRpc for SegmentGrpcService {
             wal_position: total_bytes,
             ack: AckStatus::Ok as i32,
         }))
+    }
+
+    /// Handles a delete-object request from the write coordinator.
+    ///
+    /// Removes object metadata from the local metadata store so that
+    /// subsequent reads return 404.
+    async fn delete_object(
+        &self,
+        request: Request<DeleteObjectRequest>,
+    ) -> Result<Response<DeleteObjectResponse>, Status> {
+        let req = request.into_inner();
+        let bucket = BucketId::new(&req.bucket_id);
+        let key = ObjectKey::new(&req.object_key);
+
+        if let Some(ref md_store) = self.metadata_store {
+            md_store
+                .delete_object(&bucket, &key)
+                .map_err(|e| Status::internal(format!("metadata delete failed: {e}")))?;
+        }
+
+        Ok(Response::new(DeleteObjectResponse { deleted: true }))
     }
 
     type FetchShardStream = ReceiverStream<Result<ShardResponse, Status>>;
@@ -321,6 +415,13 @@ mod tests {
             offset: 0,
             data: test_data.clone(),
             hlc: None,
+            bucket_id: String::new(),
+            object_key: String::new(),
+            object_size: 0,
+            blake3_hash: vec![],
+            chunk_segment_ids: vec![],
+            chunk_offsets: vec![],
+            chunk_lengths: vec![],
         };
 
         let stream = tokio_stream::iter(vec![chunk]);

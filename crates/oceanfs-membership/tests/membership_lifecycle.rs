@@ -100,7 +100,7 @@ fn nodes_returns_all_known_nodes() {
     );
     membership.upsert_node(
         NodeId::new("b"),
-        NodeState::Dead,
+        NodeState::Suspect,
         Incarnation::new(1),
         "127.0.0.1:9011".parse().unwrap(),
     );
@@ -119,12 +119,12 @@ fn state_of_returns_correct_state_for_known_node() {
 
     membership.upsert_node(
         NodeId::new("known"),
-        NodeState::Dead,
+        NodeState::Suspect,
         Incarnation::new(1),
         "127.0.0.1:9020".parse().unwrap(),
     );
 
-    assert_eq!(membership.state_of(&NodeId::new("known")), Some(NodeState::Dead));
+    assert_eq!(membership.state_of(&NodeId::new("known")), Some(NodeState::Suspect));
     assert_eq!(membership.state_of(&NodeId::new("unknown")), None);
 }
 
@@ -160,12 +160,12 @@ fn leave_transitions_state_and_removes_self_from_ring() {
         ring.add_node(NodeId::new("other"));
         let ring_cache = Arc::new(RingCache::new(ring));
 
-        let membership = Membership::new(
+        let membership = Arc::new(Membership::new(
             NodeId::new("leaver"),
             test_addr(),
             GossipConfig::default(),
             ring_cache.clone(),
-        );
+        ));
 
         // Start background tasks.
         membership.start().expect("start should succeed");

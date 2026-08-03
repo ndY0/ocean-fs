@@ -52,6 +52,9 @@ pub enum Error {
     /// HTTP request to the node failed.
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
+    /// A cluster node returned an unexpected response.
+    #[error("cluster node error: {0}")]
+    ClusterError(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -98,6 +101,15 @@ pub struct NodeProcess {
     _config_path: PathBuf,
     /// HTTP client (connection pool reused across requests).
     client: reqwest::Client,
+}
+
+impl Drop for NodeProcess {
+    fn drop(&mut self) {
+        // Kill the child process if it's still running so that panics
+        // and early returns don't leave orphaned processes behind.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl NodeProcess {
@@ -501,6 +513,79 @@ ae_interval_sec = 10
 }
 
 // ---------------------------------------------------------------------------
+// Cluster config templates
+// ---------------------------------------------------------------------------
+
+/// Standard 3-node cluster configuration: W=2, R=2, N=3, replication_factor=3.
+///
+/// Each node gets a unique `node_id` and `{http_port}`/`{grpc_port}` placeholders
+/// are replaced at spawn time. The `{seed_node}` placeholder is replaced with
+/// node-0's gRPC address for nodes 1+.
+pub fn config_3node_w2_r2() -> String {
+    r#"
+node_id = "e2e-c3n-0"
+listen_addr = "127.0.0.1:{http_port}"
+grpc_listen_addr = "127.0.0.1:{grpc_port}"
+log_level = "error"
+prefetch_enabled = false
+write_quorum = 2
+read_quorum = 2
+replication_factor = 3
+"#
+    .to_string()
+}
+
+/// Configuration with shortened gossip interval (1s) for fast convergence tests.
+///
+/// Gossip push happens every second instead of the default 30s, allowing
+/// convergence assertions within reasonable test timeouts.
+pub fn config_fast_gossip() -> String {
+    r#"
+node_id = "e2e-gossip-0"
+listen_addr = "127.0.0.1:{http_port}"
+grpc_listen_addr = "127.0.0.1:{grpc_port}"
+log_level = "error"
+prefetch_enabled = false
+gossip_interval_ms = 100
+"#
+    .to_string()
+}
+
+/// Configuration with shortened failure detection intervals for SWIM tests.
+///
+/// Suspicion timeout is 2s, failure timeout is 5s, allowing failure
+/// detection assertions within reasonable test timeouts.
+pub fn config_fast_swim() -> String {
+    r#"
+node_id = "e2e-swim-0"
+listen_addr = "127.0.0.1:{http_port}"
+grpc_listen_addr = "127.0.0.1:{grpc_port}"
+log_level = "error"
+prefetch_enabled = false
+gossip_interval_ms = 50
+suspicion_timeout_ms = 2000
+failure_timeout_ms = 5000
+"#
+    .to_string()
+}
+
+/// Configuration with shortened anti-entropy interval (10s) for Merkle
+/// exchange tests.
+///
+/// Anti-entropy runs every 10 seconds instead of the default 300s.
+pub fn config_fast_ae() -> String {
+    r#"
+node_id = "e2e-ae-0"
+listen_addr = "127.0.0.1:{http_port}"
+grpc_listen_addr = "127.0.0.1:{grpc_port}"
+log_level = "error"
+prefetch_enabled = false
+ae_interval_sec = 10
+"#
+    .to_string()
+}
+
+// ---------------------------------------------------------------------------
 // Helper functions for tests
 // ---------------------------------------------------------------------------
 
@@ -551,6 +636,303 @@ pub async fn response_json<T: serde::de::DeserializeOwned>(
 ) -> Result<T, serde_json::Error> {
     let text = resp.text().await.unwrap_or_default();
     serde_json::from_str(&text)
+}
+
+// ---------------------------------------------------------------------------
+// Cluster harness
+// ---------------------------------------------------------------------------
+
+/// A managed cluster of N OceanFS nodes running as child processes.
+///
+/// All nodes share a common temporary directory root; each node gets
+/// its own subdirectory (`node-0/`, `node-1/`, etc.). The first node
+/// starts without seed nodes; subsequent nodes use `nodes[0]`'s gRPC
+/// address as their seed for cluster discovery.
+///
+/// # Examples
+///
+/// ```no_run
+/// use e2e::harness::{config_3node_w2_r2, Cluster};
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let cluster = Cluster::spawn(3, &config_3node_w2_r2()).await?;
+/// cluster.wait_for_convergence(3).await?;
+/// let resp = cluster.get(0, "/admin/cluster").await?;
+/// assert_eq!(resp.status(), 200);
+/// cluster.shutdown().await?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct Cluster {
+    /// All node processes in this cluster.
+    nodes: Vec<Option<NodeProcess>>,
+    /// Shared temporary directory root (cleaned on drop).
+    _temp_dir: TempDir,
+    /// Base config template string.
+    base_config: String,
+    /// HTTP client for admin polling.
+    #[allow(dead_code)]
+    client: reqwest::Client,
+}
+
+impl Drop for Cluster {
+    fn drop(&mut self) {
+        // Kill any remaining node processes so that panics don't leave
+        // orphaned oceanfs instances consuming CPU and ports.
+        for node in self.nodes.iter_mut().flatten() {
+            let _ = node.child.kill();
+            let _ = node.child.wait();
+        }
+    }
+}
+
+impl std::fmt::Debug for Cluster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cluster")
+            .field("node_count", &self.nodes.len())
+            .field("alive_count", &self.alive_count())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Cluster {
+    /// Spawns `count` nodes. The first node starts without seed nodes;
+    /// subsequent nodes use `nodes[0]`'s gRPC address as their seed.
+    ///
+    /// Each node gets a unique `node_id` (by replacing `-0` with `-{i}`
+    /// in the config template) and its own data subdirectory under a
+    /// shared temporary directory root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any node fails to spawn or become healthy.
+    pub async fn spawn(count: usize, base_config: &str) -> Result<Self, Error> {
+        assert!(count > 0, "Cluster must have at least 1 node");
+
+        let _temp_dir = TempDir::new().map_err(Error::ConfigWrite)?;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("reqwest client should build with default TLS");
+
+        let mut nodes: Vec<Option<NodeProcess>> = Vec::with_capacity(count);
+
+        // Spawn node 0 first (no seeds).
+        let node0_config = build_node_config(base_config, 0, "");
+        let node0_dir = _temp_dir.path().join("node-0");
+        let node0 = NodeProcess::spawn_with_data_dir(&node0_config, &node0_dir).await?;
+        let seed_addr = format!("127.0.0.1:{}", node0.grpc_addr().port());
+        nodes.push(Some(node0));
+
+        // Spawn remaining nodes with node 0 as seed.
+        for i in 1..count {
+            let node_config = build_node_config(base_config, i, &seed_addr);
+            let node_dir = _temp_dir.path().join(format!("node-{i}"));
+            let node = NodeProcess::spawn_with_data_dir(&node_config, &node_dir).await?;
+            nodes.push(Some(node));
+        }
+
+        Ok(Self { nodes, _temp_dir, base_config: base_config.to_string(), client })
+    }
+
+    /// Returns a reference to node `i`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` is out of bounds or if the node has been killed
+    /// without being restarted.
+    pub fn node(&self, i: usize) -> &NodeProcess {
+        self.nodes[i].as_ref().expect("node has been killed and not restarted")
+    }
+
+    /// Returns the number of nodes in the cluster (including killed ones).
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Returns `true` if the cluster has no nodes.
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// HTTP GET from node `i`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` is out of bounds or the node is killed.
+    pub async fn get(&self, i: usize, path: &str) -> Result<reqwest::Response, Error> {
+        self.node(i).get(path).await
+    }
+
+    /// HTTP PUT to node `i`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` is out of bounds or the node is killed.
+    pub async fn put(&self, i: usize, path: &str, body: &[u8]) -> Result<reqwest::Response, Error> {
+        self.node(i).put(path, body).await
+    }
+
+    /// HTTP DELETE from node `i`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` is out of bounds or the node is killed.
+    pub async fn delete(&self, i: usize, path: &str) -> Result<reqwest::Response, Error> {
+        self.node(i).delete(path).await
+    }
+
+    /// Kill node `i` with SIGKILL (hard crash for failure tests).
+    ///
+    /// After calling this, `node(i)` will panic until `restart(i)` is called.
+    /// The node's data directory is preserved for restart.
+    pub fn kill(&mut self, i: usize) -> std::io::Result<()> {
+        let mut node = self.nodes[i].take().expect("node already killed");
+        let result = node.kill();
+        // Drop the NodeProcess handle so the OS releases the process.
+        drop(node);
+        result
+    }
+
+    /// Restart a previously killed node `i` with its original data directory.
+    ///
+    /// The node is respawned with the same config (and thus same ports,
+    /// though the OS may assign different ports if the original ones were
+    /// released). For cluster rejoin tests, the seed is still configured.
+    pub async fn restart(&mut self, i: usize) -> Result<(), Error> {
+        let seed = if i == 0 {
+            String::new()
+        } else {
+            self.nodes[0]
+                .as_ref()
+                .map(|n| format!("127.0.0.1:{}", n.grpc_addr().port()))
+                .unwrap_or_default()
+        };
+
+        let node_dir = self._temp_dir.path().join(format!("node-{i}"));
+        let node_config = build_node_config(&self.base_config, i, &seed);
+        let node = NodeProcess::spawn_with_data_dir(&node_config, &node_dir).await?;
+        self.nodes[i] = Some(node);
+
+        Ok(())
+    }
+
+    /// Wait until all nodes agree on `expected_nodes` cluster size.
+    ///
+    /// Polls `GET /admin/cluster` on every alive node every 500ms.
+    /// Times out after 30s. Returns `Ok(())` when all nodes report
+    /// exactly `expected_nodes` members.
+    pub async fn wait_for_convergence(&self, expected_nodes: usize) -> Result<(), Error> {
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(30);
+        let poll_interval = Duration::from_millis(500);
+
+        loop {
+            if start.elapsed() > timeout {
+                return Err(Error::HealthTimeout(timeout));
+            }
+
+            let mut all_converged = true;
+            for (i, node_opt) in self.nodes.iter().enumerate() {
+                if let Some(node) = node_opt {
+                    match self.get_cluster_node_count(node).await {
+                        Ok(count) if count == expected_nodes => {}
+                        Ok(count) => {
+                            eprintln!(
+                                "  cluster: node {i} reports {count} nodes (expected {expected_nodes})"
+                            );
+                            all_converged = false;
+                        }
+                        Err(_) => {
+                            all_converged = false;
+                        }
+                    }
+                }
+            }
+
+            if all_converged && self.alive_count() > 0 {
+                return Ok(());
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    /// Returns the number of alive nodes (not killed).
+    fn alive_count(&self) -> usize {
+        self.nodes.iter().filter(|n| n.is_some()).count()
+    }
+
+    /// Queries `/admin/cluster` on a node and returns the number of nodes
+    /// in the cluster view.
+    async fn get_cluster_node_count(&self, node: &NodeProcess) -> Result<usize, Error> {
+        let resp = node.get("/admin/cluster").await?;
+        if !resp.status().is_success() {
+            return Err(Error::ClusterError(format!(
+                "cluster endpoint returned {}",
+                resp.status()
+            )));
+        }
+
+        let body: serde_json::Value = response_json(resp)
+            .await
+            .map_err(|e| Error::ClusterError(format!("failed to parse cluster JSON: {e}")))?;
+
+        Ok(body["nodes"].as_array().map(|a| a.len()).unwrap_or(0))
+    }
+
+    /// Shut down all nodes gracefully (SIGTERM), waiting for each to exit.
+    pub async fn shutdown(mut self) -> Result<(), Error> {
+        for i in 0..self.nodes.len() {
+            if let Some(node) = self.nodes[i].take() {
+                let _ = node.shutdown().await;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Extract the config name prefix from a config template.
+///
+/// Looks for patterns like `node_id = "e2e-{name}-0"` and returns `{name}`.
+fn extract_config_name(config: &str) -> String {
+    config
+        .lines()
+        .find(|l| l.contains("node_id"))
+        .and_then(|l| {
+            let start = l.find('"')? + 1;
+            let end = l.rfind('"')?;
+            Some(l[start..end].to_string())
+        })
+        .unwrap_or_else(|| "cluster".to_string())
+}
+
+/// Builds the TOML config for a specific cluster node.
+///
+/// Replaces the `node_id` in the template with a cluster-specific ID
+/// like `e2e-cluster-{i}-{original_suffix}`. If `seed` is non-empty,
+/// adds it as `seed_nodes`.
+fn build_node_config(base_config: &str, index: usize, seed: &str) -> String {
+    let old_node_id = extract_config_name(base_config);
+    let new_node_id = format!("e2e-cluster-{index}");
+
+    // Replace the node_id line.
+    let config = base_config.replacen(
+        &format!("node_id = \"{old_node_id}\""),
+        &format!("node_id = \"{new_node_id}\""),
+        1,
+    );
+
+    // Add seed_nodes if needed.
+    if seed.is_empty() {
+        config
+    } else if config.contains("seed_nodes") {
+        // Replace placeholder or add to existing seed_nodes value.
+        config.replace("{seed_node}", seed)
+    } else {
+        format!("{}seed_nodes = [\"{}\"]\n", config, seed)
+    }
 }
 
 // ---------------------------------------------------------------------------

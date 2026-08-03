@@ -19,6 +19,7 @@ use crate::{
     error::{Error, Result},
     failure_detector::{DetectorCommand, DetectorConfig, FailureDetector},
     gossip::{GossipCommand, GossipProtocol},
+    state::NodeEntry,
 };
 
 /// An event emitted when a node's state changes.
@@ -137,7 +138,7 @@ impl Membership {
     /// # Errors
     ///
     /// Returns [`Error::AlreadyStarted`] if called more than once.
-    pub fn start(&self) -> Result<()> {
+    pub fn start(self: &Arc<Self>) -> Result<()> {
         let mut started = self.started.write();
         if *started {
             return Err(Error::AlreadyStarted);
@@ -174,6 +175,38 @@ impl Membership {
             }
         });
 
+        // ---- Alive-nodes sync ----
+        // Periodically feed the failure detector with the current set of alive
+        // nodes from the membership state. Without this, the detector has no
+        // peers to ping and cannot detect failures.
+        let sync_membership = Arc::clone(self);
+        let sync_detector_tx = detector_tx_for_gossip.clone();
+        let sync_shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(
+                sync_membership.config.interval_ms,
+            ));
+            // Don't fire immediately — wait for the first interval.
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let alive: Vec<_> = sync_membership
+                            .state
+                            .read()
+                            .nodes
+                            .iter()
+                            .map(|(id, (state, _inc, addr))| (id.clone(), *state, *addr))
+                            .collect();
+                        let _ = sync_detector_tx.try_send(
+                            DetectorCommand::UpdateAliveNodes { nodes: alive },
+                        );
+                    }
+                    _ = sync_shutdown.cancelled() => break,
+                }
+            }
+        });
+
         // ---- Gossip protocol ----
 
         let (gossip_cmd_tx, gossip_cmd_rx) = tokio::sync::mpsc::channel(64);
@@ -203,6 +236,43 @@ impl Membership {
                 _ = gossip_protocol.run() => {},
                 _ = gossip_shutdown.cancelled() => {},
             }
+        });
+
+        // ---- Event handler: apply state changes to membership and ring ----
+        // The failure detector and gossip protocol emit MembershipEvent via
+        // event_tx. This task subscribes and calls upsert_node() to keep the
+        // membership state and ring consistent with detected state changes.
+        let mut event_rx = self.event_tx.subscribe();
+        let event_membership = Arc::clone(self);
+        let event_shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    event = event_rx.recv() => {
+                        match event {
+                            Ok(MembershipEvent { node_id, new_state, .. }) => {
+                                // Look up the node's current incarnation and address.
+                                let (incarnation, address) = {
+                                    let state = event_membership.state.read();
+                                    state.nodes.get(&node_id)
+                                        .map(|(_, inc, addr)| (*inc, *addr))
+                                        .unwrap_or((Incarnation::new(1),
+                                            std::net::SocketAddr::from(([127, 0, 0, 1], 9001))))
+                                };
+                                event_membership.upsert_node(
+                                    node_id, new_state, incarnation, address,
+                                );
+                            }
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!(skipped = n, "membership event handler lagged");
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                    _ = event_shutdown.cancelled() => break,
+                }
+            }
+            tracing::debug!("membership event handler shut down");
         });
 
         info!(node_id = %self.node_id, "membership background tasks started");
@@ -244,10 +314,7 @@ impl Membership {
         let seed_nodes = &self.config.seed_nodes;
         if seed_nodes.is_empty() {
             info!(node_id = %self.node_id, "no seed nodes configured, starting as first node");
-            // We're the first node — add self to the ring.
-            let mut ring_snapshot = (*self.ring.snapshot()).clone();
-            ring_snapshot.add_node(self.node_id.clone());
-            self.ring.update(ring_snapshot);
+            // Self is added via upsert_node() below.
         } else {
             // Contact seed nodes via gRPC to receive initial state.
             let pool = {
@@ -377,24 +444,13 @@ impl Membership {
             }
         }
 
-        // Announce self as ALIVE.
-        let mut state = self.state.write();
-        state
-            .nodes
-            .insert(self.node_id.clone(), (NodeState::Alive, Incarnation::new(1), self.address));
-
-        let _ = self.event_tx.send(MembershipEvent {
-            node_id: self.node_id.clone(),
-            old_state: NodeState::Alive,
-            new_state: NodeState::Alive,
-        });
-
-        // Add self to ring.
-        let mut ring_snapshot = (*self.ring.snapshot()).clone();
-        if ring_snapshot.node_count() == 0 || !ring_snapshot.nodes().contains(&self.node_id) {
-            ring_snapshot.add_node(self.node_id.clone());
-            self.ring.update(ring_snapshot);
-        }
+        // Announce self as ALIVE via upsert_node so the gossip protocol is notified.
+        self.upsert_node(
+            self.node_id.clone(),
+            NodeState::Alive,
+            Incarnation::new(1),
+            self.address,
+        );
 
         info!(node_id = %self.node_id, "joined cluster successfully");
         Ok(())
@@ -507,11 +563,20 @@ impl Membership {
         address: SocketAddr,
     ) {
         let mut inner = self.state.write();
-        let old = inner.nodes.insert(node_id.clone(), (state, incarnation, address));
-        let old_state = old.map(|(s, _, _)| s).unwrap_or(NodeState::Alive);
 
-        // Emit event if the node is new or its state changed.
+        // Capture old state before modifying.
+        let old = inner.nodes.get(&node_id).map(|(s, _, _)| *s);
+        let old_state = old.unwrap_or(NodeState::Alive);
         let is_new = old.is_none();
+
+        // Remove dead/left nodes from the state entirely so they don't
+        // appear in cluster views or get gossiped further.
+        if state == NodeState::Dead || state == NodeState::Left {
+            inner.nodes.remove(&node_id);
+        } else {
+            inner.nodes.insert(node_id.clone(), (state, incarnation, address));
+        }
+        drop(inner);
         if is_new || old_state != state {
             let _ = self.event_tx.send(MembershipEvent {
                 node_id: node_id.clone(),
@@ -534,6 +599,19 @@ impl Membership {
             }
 
             self.ring.update(ring_snapshot);
+
+            // Notify the gossip protocol so it can propagate membership changes
+            // to other peers during periodic gossip ticks.
+            if let Some(tx) = self.gossip_tx.read().as_ref() {
+                let entry = NodeEntry {
+                    node_id: node_id.clone(),
+                    incarnation,
+                    state,
+                    address,
+                };
+                let _ = tx.try_send(GossipCommand::AddNode { entry });
+                debug!(node_id = %node_id, state = ?state, "gossip: enqueued AddNode");
+            }
         }
     }
 
@@ -634,7 +712,7 @@ mod tests {
         );
         m.upsert_node(
             NodeId::new("b"),
-            NodeState::Dead,
+            NodeState::Suspect,
             Incarnation::new(1),
             "127.0.0.1:9011".parse().unwrap(),
         );
@@ -653,18 +731,19 @@ mod tests {
 
         m.upsert_node(
             NodeId::new("known"),
-            NodeState::Dead,
+            NodeState::Suspect,
             Incarnation::new(1),
             "127.0.0.1:9020".parse().unwrap(),
         );
 
-        assert_eq!(m.state_of(&NodeId::new("known")), Some(NodeState::Dead));
+        assert_eq!(m.state_of(&NodeId::new("known")), Some(NodeState::Suspect));
         assert_eq!(m.state_of(&NodeId::new("unknown")), None);
     }
 
     #[tokio::test]
     async fn start_cannot_be_called_twice() {
         let (_ring, m) = make_membership("node");
+        let m = Arc::new(m);
         assert!(m.start().is_ok());
         assert!(m.start().is_err()); // AlreadyStarted
     }
@@ -703,12 +782,12 @@ mod tests {
         ring.add_node(NodeId::new("other"));
         let ring_cache = Arc::new(RingCache::new(ring));
 
-        let m = Membership::new(
+        let m = Arc::new(Membership::new(
             NodeId::new("leaver"),
             "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
             GossipConfig::default(),
             ring_cache.clone(),
-        );
+        ));
 
         m.start().expect("start should succeed");
         m.leave().await.expect("leave should succeed");

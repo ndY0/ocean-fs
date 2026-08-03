@@ -156,9 +156,10 @@ impl Error {
             Self::InvalidBucketName(_) => StatusCode::BAD_REQUEST,
             Self::InvalidKey(_) | Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             Self::Timeout { .. } => StatusCode::REQUEST_TIMEOUT,
-            Self::HashMismatch { .. } | Self::QuorumNotMet { .. } | Self::WriteFailed(_) => {
+            Self::HashMismatch { .. } | Self::WriteFailed(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+            Self::QuorumNotMet { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::NoReachableNode
             | Self::Routing(_)
             | Self::ForwardFailed { .. }

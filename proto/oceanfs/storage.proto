@@ -23,4 +23,9 @@ service SegmentRpc {
   // one request, receiver streams shard data back).
   rpc FetchShard(oceanfs.segment.FetchShardRequest)
       returns (stream oceanfs.segment.ShardResponse);
+
+  // Delete object metadata on a replica node (used by the coordinator
+  // to propagate deletes across the replica set).
+  rpc DeleteObject(oceanfs.segment.DeleteObjectRequest)
+      returns (oceanfs.segment.DeleteObjectResponse);
 }

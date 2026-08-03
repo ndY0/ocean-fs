@@ -106,26 +106,26 @@ impl FailureDetector {
     /// responses, suspicion timeout expiry, and initiates periodic
     /// SWIM pings to random alive peers.
     pub async fn run(&mut self) {
-        loop {
-            let result = tokio::time::timeout(
-                Duration::from_millis(self.config.interval_ms),
-                self.rx.recv(),
-            )
-            .await;
+        let mut ticker = tokio::time::interval(Duration::from_millis(self.config.interval_ms));
+        // Don't fire immediately — wait for the first interval.
+        ticker.tick().await;
 
-            match result {
-                Ok(Some(cmd)) => {
-                    if !self.handle_command(cmd).await {
-                        break; // Shutdown.
+        loop {
+            tokio::select! {
+                cmd = self.rx.recv() => {
+                    match cmd {
+                        Some(cmd) => {
+                            if !self.handle_command(cmd).await {
+                                break; // Shutdown.
+                            }
+                        }
+                        None => break, // Channel closed.
                     }
                 }
-                Ok(None) => break, // Channel closed.
-                Err(_elapsed) => {
-                    // Interval tick: initiate ping cycle.
+                _ = ticker.tick() => {
+                    // Interval tick: initiate ping cycle, check timeouts.
                     self.on_ping_tick();
-                    // Check pending ping timeouts.
                     self.check_ping_timeouts();
-                    // Check suspicion timers.
                     self.check_suspicion_timers();
                 }
             }
@@ -203,35 +203,7 @@ impl FailureDetector {
         for target in timed_out {
             self.pending_pings.remove(&target);
             debug!(target = %target, "SWIM: direct ping timed out");
-
-            // Attempt indirect pings via k random peers.
-            let indirect_candidates: Vec<_> = self
-                .alive_nodes
-                .iter()
-                .filter(|(id, state, _)| {
-                    *state == NodeState::Alive && *id != self.node_id && *id != target
-                })
-                .map(|(id, _, _)| id.clone())
-                .collect();
-
-            let mut rng = rand::thread_rng();
-            let indirect_count = self.config.indirect_ping_count as usize;
-            let indirect_targets: Vec<_> = indirect_candidates
-                .iter()
-                .choose_multiple(&mut rng, indirect_count.min(indirect_candidates.len()))
-                .into_iter()
-                .cloned()
-                .collect();
-
-            if indirect_targets.is_empty() {
-                // No indirect peers available — mark suspect immediately.
-                self.mark_suspect(&target);
-            } else {
-                for relay in &indirect_targets {
-                    debug!(target = %target, relay = %relay, "SWIM: initiating indirect ping");
-                    self.pending_indirect.insert(target.clone(), (relay.clone(), Instant::now()));
-                }
-            }
+            self.initiate_indirect_pings(&target);
         }
 
         // Check indirect ping timeouts.
@@ -250,6 +222,40 @@ impl FailureDetector {
         }
     }
 
+    /// Initiates indirect pings for a target whose direct ping failed.
+    ///
+    /// Selects k random alive peers (excluding self and target) as relays.
+    /// If no relays are available, marks the target SUSPECT immediately.
+    fn initiate_indirect_pings(&mut self, target: &NodeId) {
+        let indirect_candidates: Vec<_> = self
+            .alive_nodes
+            .iter()
+            .filter(|(id, state, _)| {
+                *state == NodeState::Alive && *id != self.node_id && *id != *target
+            })
+            .map(|(id, _, _)| id.clone())
+            .collect();
+
+        let mut rng = rand::thread_rng();
+        let indirect_count = self.config.indirect_ping_count as usize;
+        let indirect_targets: Vec<_> = indirect_candidates
+            .iter()
+            .choose_multiple(&mut rng, indirect_count.min(indirect_candidates.len()))
+            .into_iter()
+            .cloned()
+            .collect();
+
+        if indirect_targets.is_empty() {
+            // No indirect peers available — mark suspect immediately.
+            self.mark_suspect(target);
+        } else {
+            for relay in &indirect_targets {
+                debug!(target = %target, relay = %relay, "SWIM: initiating indirect ping");
+                self.pending_indirect.insert(target.clone(), (relay.clone(), Instant::now()));
+            }
+        }
+    }
+
     /// Handles a ping result or other command.
     async fn handle_command(&mut self, cmd: DetectorCommand) -> bool {
         match cmd {
@@ -257,10 +263,15 @@ impl FailureDetector {
                 // Remove from pending pings.
                 self.pending_pings.remove(&target);
                 if !success {
-                    debug!(node_id = %target, "direct ping failed, awaiting indirect results");
+                    // Only initiate indirect pings if we're not already
+                    // waiting on one for this target (avoids resetting the
+                    // timeout on every repeated failure).
+                    if !self.pending_indirect.contains_key(&target) {
+                        debug!(node_id = %target, "direct ping failed, initiating indirect pings");
+                        self.initiate_indirect_pings(&target);
+                    }
                 } else {
                     debug!(node_id = %target, "direct ping succeeded — target is alive");
-                    // Clear any suspicion timers for this target.
                     self.suspicion_timers.remove(&target);
                 }
             }

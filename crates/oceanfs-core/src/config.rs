@@ -38,6 +38,15 @@ pub struct NodeConfig {
     /// Bootstrap nodes for cluster discovery.
     #[serde(default)]
     pub seed_nodes: Vec<String>,
+    /// Gossip interval in milliseconds (default 1000).
+    #[serde(default = "default_gossip_interval")]
+    pub gossip_interval_ms: u64,
+    /// Time in SUSPECT state before declaring DEAD in milliseconds (default 5000).
+    #[serde(default = "default_suspicion_timeout")]
+    pub suspicion_timeout_ms: u64,
+    /// Total failure detection timeout in milliseconds (default 15000).
+    #[serde(default = "default_failure_timeout")]
+    pub failure_timeout_ms: u64,
     /// Log level: trace, debug, info, warn, error.
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -122,6 +131,15 @@ fn default_scrub_interval() -> u64 {
 fn default_orphan_interval() -> u64 {
     3600
 }
+fn default_gossip_interval() -> u64 {
+    1000
+}
+fn default_suspicion_timeout() -> u64 {
+    5000
+}
+fn default_failure_timeout() -> u64 {
+    15000
+}
 
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -142,6 +160,9 @@ impl Default for NodeConfig {
             ae_interval_sec: 300,
             scrub_interval_sec: 604800,
             orphan_reaper_interval_sec: 3600,
+            gossip_interval_ms: 1000,
+            suspicion_timeout_ms: 5000,
+            failure_timeout_ms: 15000,
         }
     }
 }

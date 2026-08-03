@@ -149,6 +149,34 @@ pub mod segment_rpc_client {
                 .insert(GrpcMethod::new("oceanfs.storage.SegmentRpc", "FetchShard"));
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Delete object metadata on a replica node (used by the coordinator
+        /// to propagate deletes across the replica set).
+        pub async fn delete_object(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                ::oceanfs_core::proto::segment::DeleteObjectRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<::oceanfs_core::proto::segment::DeleteObjectResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/oceanfs.storage.SegmentRpc/DeleteObject",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("oceanfs.storage.SegmentRpc", "DeleteObject"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -190,6 +218,15 @@ pub mod segment_rpc_server {
             &self,
             request: tonic::Request<::oceanfs_core::proto::segment::FetchShardRequest>,
         ) -> std::result::Result<tonic::Response<Self::FetchShardStream>, tonic::Status>;
+        /// Delete object metadata on a replica node (used by the coordinator
+        /// to propagate deletes across the replica set).
+        async fn delete_object(
+            &self,
+            request: tonic::Request<::oceanfs_core::proto::segment::DeleteObjectRequest>,
+        ) -> std::result::Result<
+            tonic::Response<::oceanfs_core::proto::segment::DeleteObjectResponse>,
+            tonic::Status,
+        >;
     }
     /// Segment RPC service for node-to-node data transfer.
     #[derive(Debug)]
@@ -363,6 +400,54 @@ pub mod segment_rpc_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/oceanfs.storage.SegmentRpc/DeleteObject" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteObjectSvc<T: SegmentRpc>(pub Arc<T>);
+                    impl<
+                        T: SegmentRpc,
+                    > tonic::server::UnaryService<
+                        ::oceanfs_core::proto::segment::DeleteObjectRequest,
+                    > for DeleteObjectSvc<T> {
+                        type Response = ::oceanfs_core::proto::segment::DeleteObjectResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                ::oceanfs_core::proto::segment::DeleteObjectRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SegmentRpc>::delete_object(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeleteObjectSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

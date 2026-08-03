@@ -730,6 +730,8 @@ pub struct WriteResult {
     pub size: u64,
     /// BLAKE3 hash of the object content.
     pub blake3_hash: Option<HashOutput>,
+    /// HLC timestamp assigned to this write for conflict resolution.
+    pub hlc: Hlc,
 }
 
 /// Acknowledgment from a replica node for a write.
@@ -1692,7 +1694,13 @@ mod tests {
         let key = ObjectKey::new("test");
         let mut chunks = smallvec::SmallVec::new();
         chunks.push(ChunkRef { segment_id: SegmentId::new(), offset: 0, length: 100 });
-        let result = WriteResult { object_key: key.clone(), chunks, size: 100, blake3_hash: None };
+        let result = WriteResult {
+            object_key: key.clone(),
+            chunks,
+            size: 100,
+            blake3_hash: None,
+            hlc: Hlc::zero(),
+        };
         assert_eq!(result.size, 100);
         assert_eq!(result.object_key, key);
         assert_eq!(result.chunks.len(), 1);

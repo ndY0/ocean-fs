@@ -170,6 +170,13 @@ async fn append_to_node(
         offset: 0,
         data: data.to_vec(),
         hlc: None,
+        bucket_id: String::new(),
+        object_key: String::new(),
+        object_size: 0,
+        blake3_hash: vec![],
+        chunk_segment_ids: vec![],
+        chunk_offsets: vec![],
+        chunk_lengths: vec![],
     };
     let stream = tokio_stream::iter(vec![chunk]);
     let response = client.append_segment(tonic::Request::new(stream)).await.unwrap();

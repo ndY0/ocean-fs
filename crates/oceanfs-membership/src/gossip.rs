@@ -12,7 +12,6 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use oceanfs_core::{Incarnation, NodeId, NodeState};
 use oceanfs_network::ConnectionPool;
-use rand::seq::IteratorRandom;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, trace, warn};
 
@@ -143,38 +142,36 @@ impl GossipProtocol {
 
     /// Fires on each gossip interval tick.
     ///
-    /// Selects a random alive peer (excluding self) and pushes
-    /// the current membership delta to it.
+    /// Pushes the current membership delta to all alive peers so that
+    /// state changes propagate quickly and failure detection can
+    /// observe unreachable peers immediately.
     async fn on_gossip_tick(&mut self) {
-        let peer = {
-            let alive: Vec<_> = self
-                .state
-                .nodes
-                .iter()
-                .filter(|(id, e)| e.state == NodeState::Alive && *id != &self.node_id)
-                .map(|(id, _)| id.clone())
-                .collect();
+        let alive: Vec<_> = self
+            .state
+            .nodes
+            .iter()
+            .filter(|(id, e)| e.state == NodeState::Alive && *id != &self.node_id)
+            .map(|(id, _)| id.clone())
+            .collect();
 
-            if alive.is_empty() {
-                trace!("gossip tick: no alive peers to push to");
-                return;
-            }
-
-            let mut rng = rand::thread_rng();
-            match alive.iter().choose(&mut rng) {
-                Some(p) => p.clone(),
-                None => return,
-            }
-        };
-
-        let delta = self.build_delta();
-        if delta.changed.is_empty() {
-            trace!(peer = %peer, "gossip tick: delta is empty, skipping push");
+        if alive.is_empty() {
+            trace!("gossip tick: no alive peers to push to");
             return;
         }
 
-        debug!(peer = %peer, changed = delta.changed.len(), "periodic gossip push");
-        self.handle_command(GossipCommand::Push { peer, delta }).await;
+        let delta = self.build_delta();
+        if delta.changed.is_empty() {
+            trace!("gossip tick: delta is empty, skipping push");
+            return;
+        }
+
+        // Push to all alive peers so failure detection hits every
+        // unreachable peer on every tick, not just a random subset.
+        for peer in &alive {
+            debug!(peer = %peer, changed = delta.changed.len(), "periodic gossip push");
+            self.handle_command(GossipCommand::Push { peer: peer.clone(), delta: delta.clone() })
+                .await;
+        }
     }
 
     /// Handles a gossip command.
@@ -182,75 +179,104 @@ impl GossipProtocol {
         match cmd {
             GossipCommand::Push { peer, delta } => {
                 trace!(peer = %peer, changed = delta.changed.len(), "pushing gossip delta");
-                // Send the delta to the peer over gRPC.
+                // Merge our own delta locally first so our state stays consistent
+                // regardless of whether the push succeeds.
+                self.merge_delta(&delta);
+
+                // Spawn the gRPC push in a background task so it doesn't block
+                // the gossip ticker. If the peer is dead, the connection timeout
+                // (default 5s) would otherwise block the select! loop and prevent
+                // the ticker from firing, making failure detection stall.
                 if let Some(ref pool) = self.pool {
                     if let Some(entry) = self.state.nodes.get(&peer) {
                         let peer_addr = entry.address;
-                        match pool.get_channel(peer_addr).await {
-                            Ok(pooled) => {
-                                let channel = pooled.channel().clone();
-                                drop(pooled);
+                        let pool = pool.clone();
+                        let detector = self.detector_tx.clone();
+                        let peer_clone = peer.clone();
 
-                                let mut client = oceanfs_network::GossipRpcClient::new(channel);
+                        // Convert the GossipDelta into protobuf GossipMessages
+                        // outside the spawned task to avoid cloning the delta.
+                        let entries: Vec<_> = delta
+                            .changed
+                            .iter()
+                            .map(|e| oceanfs_core::proto::membership::MembershipEntry {
+                                node_id: Some(oceanfs_core::proto::common::NodeId {
+                                    id: e.node_id.to_string(),
+                                }),
+                                state: match e.state {
+                                    NodeState::Alive => 0,
+                                    NodeState::Suspect => 1,
+                                    NodeState::Dead => 2,
+                                    NodeState::Leaving => 3,
+                                    NodeState::Left => 4,
+                                },
+                                incarnation: e.incarnation.value(),
+                                address: e.address.to_string(),
+                                last_seen: None,
+                            })
+                            .collect();
 
-                                // Convert the GossipDelta into protobuf GossipMessages.
-                                let entries: Vec<_> = delta
-                                    .changed
-                                    .iter()
-                                    .map(|e| oceanfs_core::proto::membership::MembershipEntry {
-                                        node_id: Some(oceanfs_core::proto::common::NodeId {
-                                            id: e.node_id.to_string(),
-                                        }),
-                                        state: match e.state {
-                                            NodeState::Alive => 0,
-                                            NodeState::Suspect => 1,
-                                            NodeState::Dead => 2,
-                                            NodeState::Leaving => 3,
-                                            NodeState::Left => 4,
-                                        },
-                                        incarnation: e.incarnation.value(),
-                                        address: e.address.to_string(),
-                                        last_seen: None,
-                                    })
-                                    .collect();
+                        tokio::spawn(async move {
+                            match pool.get_channel(peer_addr).await {
+                                Ok(pooled) => {
+                                    let channel = pooled.channel().clone();
+                                    drop(pooled);
 
-                                let msg = oceanfs_network::gossip::GossipMessage {
-                                    delta: Some(oceanfs_core::proto::membership::MembershipList {
-                                        entries,
-                                    }),
-                                    ring_version: 0,
-                                    hlc: None,
-                                };
+                                    let mut client =
+                                        oceanfs_network::GossipRpcClient::new(channel);
 
-                                let stream = tokio_stream::iter(vec![msg]);
-                                match client.push(tonic::Request::new(stream)).await {
-                                    Ok(response) => {
-                                        let ack = response.into_inner();
-                                        if ack.accepted {
-                                            debug!(
-                                                peer = %peer,
-                                                updated = ack.updated_entries,
-                                                "gossip push ack received"
+                                    let msg = oceanfs_network::gossip::GossipMessage {
+                                        delta: Some(
+                                            oceanfs_core::proto::membership::MembershipList {
+                                                entries,
+                                            },
+                                        ),
+                                        ring_version: 0,
+                                        hlc: None,
+                                    };
+
+                                    let stream = tokio_stream::iter(vec![msg]);
+                                    match client.push(tonic::Request::new(stream)).await {
+                                        Ok(response) => {
+                                            let ack = response.into_inner();
+                                            if ack.accepted {
+                                                debug!(
+                                                    peer = %peer_clone,
+                                                    updated = ack.updated_entries,
+                                                    "gossip push ack received"
+                                                );
+                                            }
+                                            let _ = detector.try_send(
+                                                DetectorCommand::PingResponse {
+                                                    target: peer_clone,
+                                                    success: true,
+                                                },
+                                            );
+                                        }
+                                        Err(status) => {
+                                            warn!(peer = %peer_clone, error = %status, "gossip push failed");
+                                            let _ = detector.try_send(
+                                                DetectorCommand::PingResponse {
+                                                    target: peer_clone,
+                                                    success: false,
+                                                },
                                             );
                                         }
                                     }
-                                    Err(status) => {
-                                        warn!(peer = %peer, error = %status, "gossip push failed");
-                                    }
+                                }
+                                Err(e) => {
+                                    warn!(peer = %peer_clone, error = %e, "failed to acquire channel for push");
+                                    let _ = detector.try_send(
+                                        DetectorCommand::PingResponse {
+                                            target: peer_clone,
+                                            success: false,
+                                        },
+                                    );
                                 }
                             }
-                            Err(e) => {
-                                warn!(peer = %peer, error = %e, "failed to acquire channel for push");
-                            }
-                        }
-                    } else {
-                        warn!(peer = %peer, "peer not found in local state for push");
+                        });
                     }
-                } else {
-                    debug!(peer = %peer, "no connection pool set, merging delta locally");
                 }
-                // Always merge our own delta locally so our state stays consistent.
-                self.merge_delta(&delta);
             }
             GossipCommand::ReceiveDelta { from, delta } => {
                 debug!(from = %from, changed = delta.changed.len(), "received gossip delta");

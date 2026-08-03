@@ -35,6 +35,7 @@ pub(crate) async fn replicate_write(
     data: &[u8],
     hlc: Hlc,
     write_timeout_ms: u64,
+    req: &crate::write_coordinator::WriteRequest,
 ) -> Vec<Result<WriteAck>> {
     if targets.is_empty() {
         return vec![];
@@ -46,7 +47,7 @@ pub(crate) async fn replicate_write(
 
     let mut futs: FuturesUnordered<_> = targets
         .iter()
-        .map(|target| replicate_to_single(pool, membership, target, segment_id, data, hlc))
+        .map(|target| replicate_to_single(pool, membership, target, segment_id, data, hlc, req))
         .collect();
 
     let mut results = Vec::with_capacity(targets.len());
@@ -88,6 +89,7 @@ async fn replicate_to_single(
     segment_id: SegmentId,
     data: &[u8],
     hlc: Hlc,
+    req: &crate::write_coordinator::WriteRequest,
 ) -> Result<WriteAck> {
     let addr = membership.address_of(target).ok_or_else(|| Error::ForwardFailed {
         target: target.to_string(),
@@ -121,6 +123,13 @@ async fn replicate_to_single(
         offset: 0,
         data: data.to_vec(),
         hlc: Some(proto_hlc),
+        bucket_id: req.bucket.to_string(),
+        object_key: req.key.to_string(),
+        object_size: data.len() as u64,
+        blake3_hash: vec![],
+        chunk_segment_ids: vec![segment_id.as_uuid().as_bytes().to_vec()],
+        chunk_offsets: vec![0],
+        chunk_lengths: vec![data.len() as u32],
     };
 
     let stream = tokio_stream::once(request);
