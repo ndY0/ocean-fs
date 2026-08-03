@@ -200,9 +200,9 @@ impl S3Handler {
                 "/{bucket}",
                 axum::routing::put(create_bucket).get(list_objects).delete(delete_bucket),
             )
-            // Object operations: /:bucket/*key (catch-all for S3-style keys)
+            // Object operations: /{bucket}/{*key} (catch-all for S3-style keys)
             .route(
-                "/:bucket/*key",
+                "/{bucket}/{*key}",
                 axum::routing::put(put_object)
                     .get(get_object)
                     .head(head_object)

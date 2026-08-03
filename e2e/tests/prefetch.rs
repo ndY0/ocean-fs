@@ -38,31 +38,26 @@ async fn prefetch_after_list_warms_l2_cache() {
 
     // LIST the bucket (triggers prefetch if enabled).
     let list_resp = node.get(&format!("/{bucket}")).await.expect("LIST bucket");
-    let list_status = list_resp.status();
+    assert_eq!(list_resp.status(), 200, "LIST bucket should return 200 with axum 0.8 routing");
 
-    // LIST may return 200 (bucket found) or 404 (if route matching
-    // captures the bucket path as an object path with empty key).
-    // Both are acceptable; data integrity is verified below via GET.
-    if list_status == 200 {
-        // Wait for prefetch worker to drain its queue.
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // Wait for prefetch worker to drain its queue.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-        // Record post-LIST cache stats.
-        let after: Vec<CacheStats> = {
-            let resp = node.get("/admin/caches").await.expect("GET caches");
-            assert_eq!(resp.status(), 200);
-            response_json(resp).await.expect("parse caches")
-        };
+    // Record post-LIST cache stats.
+    let after: Vec<CacheStats> = {
+        let resp = node.get("/admin/caches").await.expect("GET caches");
+        assert_eq!(resp.status(), 200);
+        response_json(resp).await.expect("parse caches")
+    };
 
-        let baseline_l2 = baseline.iter().find(|s| s.tier == "l2");
-        let after_l2 = after.iter().find(|s| s.tier == "l2");
+    let baseline_l2 = baseline.iter().find(|s| s.tier == "l2");
+    let after_l2 = after.iter().find(|s| s.tier == "l2");
 
-        if let (Some(bl2), Some(al2)) = (baseline_l2, after_l2) {
-            assert!(
-                al2.hits + al2.misses >= bl2.hits + bl2.misses,
-                "L2 cache entry count should not decrease after prefetch"
-            );
-        }
+    if let (Some(bl2), Some(al2)) = (baseline_l2, after_l2) {
+        assert!(
+            al2.hits + al2.misses >= bl2.hits + bl2.misses,
+            "L2 cache entry count should not decrease after prefetch"
+        );
     }
 
     // GET one of the objects to verify data integrity.

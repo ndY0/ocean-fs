@@ -468,11 +468,9 @@ prefetch_enabled = true
 /// Configuration with shortened GC intervals for testing garbage
 /// collection.
 ///
-/// **Note:** The current binary hardcodes GC interval at 3600s and
-/// tombstone TTL at 259200s. Until `NodeConfig` supports `gc_interval_sec`
-/// and `tombstone_ttl_sec`, this config template is aspirational. Tests
-/// using this config will need to wait for the default intervals or be
-/// skipped.
+/// Uses the configurable `gc_interval_sec` and `tombstone_ttl_sec`
+/// fields introduced in commit ddc87ad. GC runs every 10 seconds,
+/// tombstones expire after 5 seconds.
 pub fn config_short_gc() -> String {
     r#"
 node_id = "e2e-gc"
@@ -480,15 +478,16 @@ listen_addr = "127.0.0.1:{http_port}"
 grpc_listen_addr = "127.0.0.1:{grpc_port}"
 log_level = "error"
 prefetch_enabled = false
+gc_interval_sec = 10
+tombstone_ttl_sec = 5
 "#
     .to_string()
 }
 
 /// Configuration with shortened anti-entropy intervals.
 ///
-/// **Note:** The current binary hardcodes AE interval at 300s. Until
-/// `NodeConfig` supports `ae_interval_sec`, this config template is
-/// aspirational.
+/// Uses the configurable `ae_interval_sec` field introduced in
+/// commit ddc87ad. AE runs every 10 seconds.
 pub fn config_short_ae() -> String {
     r#"
 node_id = "e2e-ae"
@@ -496,6 +495,7 @@ listen_addr = "127.0.0.1:{http_port}"
 grpc_listen_addr = "127.0.0.1:{grpc_port}"
 log_level = "error"
 prefetch_enabled = false
+ae_interval_sec = 10
 "#
     .to_string()
 }
