@@ -18,13 +18,12 @@ use oceanfs_ec::Decoder;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+use super::queue::HealQueue;
 use crate::{
     anti_entropy::SegmentDataStore,
     error::{Error, Result},
     metadata::MetadataStore,
 };
-
-use super::queue::HealQueue;
 
 // ---------------------------------------------------------------------------
 // HealWorker
@@ -161,11 +160,7 @@ impl HealWorker {
     }
 
     /// Process a single heal request with concurrency control.
-    async fn process_request(
-        &self,
-        request: HealRequest,
-        shutdown: &CancellationToken,
-    ) {
+    async fn process_request(&self, request: HealRequest, shutdown: &CancellationToken) {
         let stats = self.stats.clone();
         let metadata = self.metadata.clone();
         let data_store = self.data_store.clone();
@@ -264,9 +259,7 @@ impl HealWorker {
         let ec_m = segment_meta.ec_m;
 
         if ec_k == 0 {
-            return Err(Error::Heal(format!(
-                "segment {segment_id} has ec_k=0, cannot EC-heal"
-            )));
+            return Err(Error::Heal(format!("segment {segment_id} has ec_k=0, cannot EC-heal")));
         }
 
         let total_shards = (ec_k + ec_m) as usize;
@@ -276,11 +269,8 @@ impl HealWorker {
         let full_data = data_store.read_segment_data(segment_id)?;
 
         // Split into shard-sized chunks.
-        let shard_size = if full_data.is_empty() {
-            0
-        } else {
-            full_data.len() / total_shards.max(1)
-        };
+        let shard_size =
+            if full_data.is_empty() { 0 } else { full_data.len() / total_shards.max(1) };
 
         if shard_size == 0 && !full_data.is_empty() {
             return Err(Error::Heal(format!(
@@ -289,8 +279,7 @@ impl HealWorker {
             )));
         }
 
-        let mut available_shards: Vec<Option<&[u8]>> =
-            Vec::with_capacity(total_shards);
+        let mut available_shards: Vec<Option<&[u8]>> = Vec::with_capacity(total_shards);
 
         for i in 0..total_shards {
             let start = i * shard_size;
@@ -317,13 +306,9 @@ impl HealWorker {
             if corrupt_idx >= total_shards {
                 continue;
             }
-            let shard_data = reconstructed
-                .get(corrupt_idx)
-                .ok_or_else(|| {
-                    Error::Heal(format!(
-                        "decoder did not return shard for corrupt index {corrupt_idx}"
-                    ))
-                })?;
+            let shard_data = reconstructed.get(corrupt_idx).ok_or_else(|| {
+                Error::Heal(format!("decoder did not return shard for corrupt index {corrupt_idx}"))
+            })?;
 
             if !shard_data.is_empty() {
                 // Write the repaired shard into the data store.
@@ -351,10 +336,7 @@ impl HealWorker {
     }
 
     /// Drains remaining items in the queue after shutdown is signalled.
-    async fn drain_remaining(
-        &self,
-        rx: &mut tokio::sync::mpsc::Receiver<HealRequest>,
-    ) {
+    async fn drain_remaining(&self, rx: &mut tokio::sync::mpsc::Receiver<HealRequest>) {
         let drain_shutdown = CancellationToken::new();
         while let Ok(request) = rx.try_recv() {
             self.process_request(request, &drain_shutdown).await;
@@ -424,9 +406,7 @@ mod tests {
             _data_count: u8,
             _parity_count: u8,
         ) -> std::result::Result<Vec<Vec<u8>>, oceanfs_ec::Error> {
-            Err(oceanfs_ec::Error::DecodingFailed(
-                "simulated decode failure".into(),
-            ))
+            Err(oceanfs_ec::Error::DecodingFailed("simulated decode failure".into()))
         }
     }
 
@@ -517,11 +497,7 @@ mod tests {
         metadata.put_segment(segment_meta).unwrap();
 
         let decoder = StubDecoder;
-        let request = HealRequest {
-            segment_id,
-            corrupt_shard_indices: vec![2],
-            retry_count: 0,
-        };
+        let request = HealRequest { segment_id, corrupt_shard_indices: vec![2], retry_count: 0 };
 
         let result = HealWorker::execute_heal(&request, &decoder, &metadata, &*data_store).await;
         assert!(result.is_ok(), "execute_heal should succeed: {:?}", result.err());
@@ -554,11 +530,7 @@ mod tests {
         metadata.put_segment(segment_meta).unwrap();
 
         let decoder = StubDecoder;
-        let request = HealRequest {
-            segment_id,
-            corrupt_shard_indices: vec![0],
-            retry_count: 0,
-        };
+        let request = HealRequest { segment_id, corrupt_shard_indices: vec![0], retry_count: 0 };
 
         let result = HealWorker::execute_heal(&request, &decoder, &metadata, &*data_store).await;
         assert!(result.is_err(), "should fail for ec_k=0 segment");
@@ -599,11 +571,7 @@ mod tests {
         metadata.put_segment(segment_meta).unwrap();
 
         let decoder = StubDecoder;
-        let request = HealRequest {
-            segment_id,
-            corrupt_shard_indices: vec![0, 3],
-            retry_count: 0,
-        };
+        let request = HealRequest { segment_id, corrupt_shard_indices: vec![0, 3], retry_count: 0 };
 
         let result = HealWorker::execute_heal(&request, &decoder, &metadata, &*data_store).await;
         assert!(result.is_ok(), "multi-shard repair should succeed: {:?}", result.err());
@@ -651,11 +619,14 @@ mod tests {
         let queue = Arc::new(HealQueue::new(4));
         let decoder: Arc<dyn Decoder> = Arc::new(StubDecoder);
 
-        queue.sender().enqueue_blocking(HealRequest {
-            segment_id,
-            corrupt_shard_indices: vec![1],
-            retry_count: 0,
-        }).unwrap();
+        queue
+            .sender()
+            .enqueue_blocking(HealRequest {
+                segment_id,
+                corrupt_shard_indices: vec![1],
+                retry_count: 0,
+            })
+            .unwrap();
 
         let worker = HealWorker::new(config, queue.clone(), decoder, metadata.clone(), data_store);
         let shutdown = CancellationToken::new();
@@ -718,14 +689,18 @@ mod tests {
         // Enqueue a heal request (simulating Scrub/AntiEntropy detection).
         let config = HealConfig::default().with_max_concurrent_heals(2);
         let queue = Arc::new(HealQueue::new(4));
-        queue.sender().enqueue_blocking(HealRequest {
-            segment_id,
-            corrupt_shard_indices: vec![1],
-            retry_count: 0,
-        }).unwrap();
+        queue
+            .sender()
+            .enqueue_blocking(HealRequest {
+                segment_id,
+                corrupt_shard_indices: vec![1],
+                retry_count: 0,
+            })
+            .unwrap();
 
         let decoder: Arc<dyn Decoder> = Arc::new(StubDecoder);
-        let worker = HealWorker::new(config, queue.clone(), decoder, metadata.clone(), data_store.clone());
+        let worker =
+            HealWorker::new(config, queue.clone(), decoder, metadata.clone(), data_store.clone());
         let shutdown = CancellationToken::new();
 
         let cancel = shutdown.clone();
@@ -771,11 +746,7 @@ mod tests {
         metadata.put_segment(segment_meta).unwrap();
 
         let decoder = FailingDecoder;
-        let request = HealRequest {
-            segment_id,
-            corrupt_shard_indices: vec![0],
-            retry_count: 0,
-        };
+        let request = HealRequest { segment_id, corrupt_shard_indices: vec![0], retry_count: 0 };
 
         // execute_heal should fail because the decoder always fails.
         let result = HealWorker::execute_heal(&request, &decoder, &metadata, &*data_store).await;
@@ -802,34 +773,38 @@ mod tests {
         metadata.put_segment(segment_meta).unwrap();
 
         // Use HealConfig with retry limit 0 → no retries allowed.
-        let config = HealConfig::default()
-            .with_max_concurrent_heals(2)
-            .with_heal_retry_limit(0);
+        let config = HealConfig::default().with_max_concurrent_heals(2).with_heal_retry_limit(0);
         let queue = Arc::new(HealQueue::new(4));
 
         // Enqueue a request that will fail (ec_k=0 causes failure).
         // Actually, use a failing decoder for a clearer test.
         let segment_fail_id = SegmentId::new();
         data_store.write_segment_data(&segment_fail_id, &data).unwrap();
-        metadata.put_segment(SegmentMetadata {
-            segment_id: segment_fail_id,
-            ec_k: 3,
-            ec_m: 1,
-            size_tier: oceanfs_core::SizeTier::Standard,
-            merkle_root: None,
-            storage_locations: smallvec::smallvec![],
-            sealed_at: None,
-        }).unwrap();
+        metadata
+            .put_segment(SegmentMetadata {
+                segment_id: segment_fail_id,
+                ec_k: 3,
+                ec_m: 1,
+                size_tier: oceanfs_core::SizeTier::Standard,
+                merkle_root: None,
+                storage_locations: smallvec::smallvec![],
+                sealed_at: None,
+            })
+            .unwrap();
 
         let decoder: Arc<dyn Decoder> = Arc::new(FailingDecoder);
-        let worker = HealWorker::new(config, queue.clone(), decoder, metadata.clone(), data_store.clone());
+        let worker =
+            HealWorker::new(config, queue.clone(), decoder, metadata.clone(), data_store.clone());
 
         // Enqueue a request with retry_count already at limit.
-        queue.sender().enqueue_blocking(HealRequest {
-            segment_id: segment_fail_id,
-            corrupt_shard_indices: vec![0],
-            retry_count: 0,
-        }).unwrap();
+        queue
+            .sender()
+            .enqueue_blocking(HealRequest {
+                segment_id: segment_fail_id,
+                corrupt_shard_indices: vec![0],
+                retry_count: 0,
+            })
+            .unwrap();
 
         // Run the worker briefly to process the request.
         let shutdown = CancellationToken::new();

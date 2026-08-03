@@ -39,7 +39,6 @@
 // On x86_64, the NEON/SVE code is cfg-gated out but the supporting
 // structures (GfMulTable, EncodeTables, ArmEncoder fields) still exist
 // and are only read on aarch64.
-#![allow(dead_code)]
 #![allow(clippy::needless_range_loop)]
 
 #[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
@@ -54,6 +53,7 @@ use oceanfs_ec::{CauchyEncoder, Decoder, Encoder};
 
 /// Detected ARM SIMD capability level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum ArmSveLevel {
     /// No SIMD available — use portable GF-complete fallback.
     Portable = 0,
@@ -87,6 +87,8 @@ impl ArmSveLevel {
 ///
 /// Contains two 16-entry tables: low nibble and high nibble.
 /// Total size: 32 bytes per coefficient.
+// Read only on aarch64 with arm-sve feature; may appear unused.
+#[allow(dead_code)]
 #[derive(Clone)]
 struct GfMulTable {
     /// lo_table[i] = coefficient × i for i in 0..16 (low nibble)
@@ -114,6 +116,8 @@ impl GfMulTable {
 /// Size: 32 × k × m bytes.
 struct EncodeTables {
     /// tables[row][col] = split-table for matrix[row][col]
+    // Read only on aarch64 with arm-sve feature; may appear unused.
+    #[allow(dead_code)]
     tables: Vec<Vec<GfMulTable>>,
 }
 
@@ -328,24 +332,285 @@ fn portable_encode(k: usize, m: usize, data_shards: &[&[u8]], shard_size: usize)
 }
 
 // ---------------------------------------------------------------------------
+// SVE2 GF(2^8) multiply kernel (aarch64 only, requires SVE2)
+// ---------------------------------------------------------------------------
+
+/// SVE2-accelerated encode kernel using `svtbl_u8` for GF(2^8) split-table
+/// lookups. Processes data in VL-byte chunks (VL = svcntb(), typically 16,
+/// 32, or 64 bytes) using SVE predicated operations.
+///
+/// The split-table approach is identical to NEON but operates on wider
+/// vectors: `svtbl_u8` looks up each nibble in the precomputed table.
+///
+/// Tables are padded to VL bytes (the SVE vector length) so they can be
+/// loaded with `svld1_u8`.
+///
+/// # Safety
+///
+/// `data_shards` pointers must be valid for `shard_size` bytes.
+/// SVE2 intrinsics require the `sve2` target feature.
+#[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
+#[target_feature(enable = "sve2")]
+unsafe fn encode_sve2(
+    tables: &EncodeTables,
+    data_shards: &[&[u8]],
+    parity_count: u8,
+    shard_size: usize,
+) -> Vec<Vec<u8>> {
+    let k = data_shards.len();
+    let m = parity_count as usize;
+    // SAFETY: svcntb queries the hardware vector length; always safe to call.
+    let vl = svcntb() as usize;
+
+    // Build SVE2-padded tables: expand each 16-byte split-table to VL bytes
+    let lo_tables: Vec<Vec<u8>> = (0..m)
+        .map(|row| {
+            let mut all = Vec::with_capacity(k * vl);
+            for col in 0..k {
+                let mut padded = vec![0u8; vl];
+                padded[..16].copy_from_slice(&tables.tables[row][col].lo);
+                all.extend_from_slice(&padded);
+            }
+            all
+        })
+        .collect();
+    let hi_tables: Vec<Vec<u8>> = (0..m)
+        .map(|row| {
+            let mut all = Vec::with_capacity(k * vl);
+            for col in 0..k {
+                let mut padded = vec![0u8; vl];
+                padded[..16].copy_from_slice(&tables.tables[row][col].hi);
+                all.extend_from_slice(&padded);
+            }
+            all
+        })
+        .collect();
+
+    let mut parity: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
+
+    for row in 0..m {
+        let parity_ptr = parity[row].as_mut_ptr();
+        let lo_row = &lo_tables[row];
+        let hi_row = &hi_tables[row];
+
+        for col in 0..k {
+            let lo_table_ptr = lo_row.as_ptr().add(col * vl);
+            let hi_table_ptr = hi_row.as_ptr().add(col * vl);
+
+            let mut offset = 0usize;
+            while offset + vl <= shard_size {
+                let pred = svptrue_b8();
+                // SAFETY: data_shards[col].as_ptr().add(offset) points to at least vl bytes
+                let data = svld1_u8(pred, data_shards[col].as_ptr().add(offset));
+                let lo_nib = svand_u8_z(pred, data, svdup_n_u8(0x0F));
+                let hi_nib = svlsr_u8_z(pred, data, svdup_n_u8(4));
+                let lo_tbl = svld1_u8(pred, lo_table_ptr);
+                let hi_tbl = svld1_u8(pred, hi_table_ptr);
+                // SAFETY: lo_tbl contains the 16-byte table padded to VL;
+                // lo_nib indices are 0..15, well within VL.
+                let lo_res = svtbl_u8(lo_tbl, lo_nib);
+                let hi_res = svtbl_u8(hi_tbl, hi_nib);
+                let product = sveor_u8(lo_res, hi_res);
+
+                // Accumulate: load current parity, XOR with product, store back
+                let cur = svld1_u8(pred, parity_ptr.add(offset));
+                let acc = sveor_u8(cur, product);
+                svst1_u8(pred, parity_ptr.add(offset), acc);
+
+                offset += vl;
+            }
+        }
+
+        // Handle remainder bytes (< vl) with portable fallback
+        let remainder_start = (shard_size / vl) * vl;
+        for byte_idx in remainder_start..shard_size {
+            let mut sum: u8 = 0;
+            for col in 0..k {
+                let coeff = {
+                    let x = (col + 1) as u8;
+                    let y = (k + row + 1) as u8;
+                    gf_inv_portable(x ^ y)
+                };
+                sum ^= gf_mul_portable(coeff, data_shards[col][byte_idx]);
+            }
+            parity[row][byte_idx] = sum;
+        }
+    }
+
+    parity
+}
+
+/// SVE encode kernel: delegates to the NEON kernel.
+///
+/// On SVE-capable hardware (without SVE2), the `svtbl_u8` instruction is
+/// not available, so we use the NEON kernel which runs at full speed
+/// (NEON is mandatory on all aarch64 targets and coexists with SVE).
+///
+/// # Safety
+///
+/// See `neon_encode` for safety invariants.
+#[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
+#[allow(dead_code)]
+unsafe fn encode_sve(
+    tables: &EncodeTables,
+    data_shards: &[&[u8]],
+    parity_count: u8,
+    shard_size: usize,
+) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+    // SAFETY: SVE hardware always has NEON; the NEON kernel is safe to call.
+    neon_encode(tables, data_shards, parity_count, shard_size)
+}
+
+// ---------------------------------------------------------------------------
+// SVE2-accelerated decode (aarch64 only)
+// ---------------------------------------------------------------------------
+
+/// SVE2-accelerated decode: recovers missing data shards using SVE2 SIMD.
+///
+/// Same algorithm as `neon_decode` but uses SVE2 `svtbl_u8` for wider
+/// vector operations. The inverse matrix is computed with portable
+/// Gauss-Jordan; only the data recovery step uses SVE2 SIMD.
+///
+/// # Safety
+///
+/// `available_shards` data pointers must be valid. SVE2 intrinsics require
+/// the `sve2` target feature.
+#[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
+#[target_feature(enable = "sve2")]
+unsafe fn decode_sve2(
+    available_shards: &[Option<&[u8]>],
+    present_indices: &[usize],
+    data_count: u8,
+    parity_count: u8,
+    shard_size: usize,
+) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+    let k = data_count as usize;
+    let m = parity_count as usize;
+    let vl = svcntb() as usize;
+
+    // Build generator matrix and invert (portable)
+    let gen = build_generator_matrix(data_count, parity_count);
+    let mut sub_matrix: Vec<Vec<u8>> = Vec::with_capacity(k);
+    let mut sub_data: Vec<&[u8]> = Vec::with_capacity(k);
+    for &idx in present_indices.iter().take(k) {
+        sub_matrix.push(gen[idx].clone());
+        let shard = available_shards[idx]
+            .ok_or_else(|| oceanfs_ec::Error::InvalidConfig(format!("shard {idx} is None")))?;
+        sub_data.push(shard);
+    }
+    let inv = invert_gf_matrix(&sub_matrix)
+        .ok_or_else(|| oceanfs_ec::Error::DecodingFailed("decode submatrix is singular".into()))?;
+
+    // Precompute SVE2-padded split-tables for inverse matrix
+    let inv_tables: Vec<Vec<Vec<u8>>> = (0..k)
+        .map(|row| {
+            let mut cols = Vec::with_capacity(k);
+            for col in 0..k {
+                let tbl = GfMulTable::new(inv[row][col]);
+                let mut padded = vec![0u8; vl];
+                padded[..16].copy_from_slice(&tbl.lo);
+                cols.push(padded);
+            }
+            cols
+        })
+        .collect();
+    let inv_hi: Vec<Vec<Vec<u8>>> = (0..k)
+        .map(|row| {
+            let mut cols = Vec::with_capacity(k);
+            for col in 0..k {
+                let tbl = GfMulTable::new(inv[row][col]);
+                let mut padded = vec![0u8; vl];
+                padded[..16].copy_from_slice(&tbl.hi);
+                cols.push(padded);
+            }
+            cols
+        })
+        .collect();
+
+    // Recover data shards using SVE2
+    let mut recovered: Vec<Vec<u8>> = Vec::with_capacity(k);
+    for row in 0..k {
+        let mut buf = vec![0u8; shard_size];
+        let buf_ptr = buf.as_mut_ptr();
+
+        let mut offset = 0usize;
+        while offset + vl <= shard_size {
+            let pred = svptrue_b8();
+            let mut acc = svdup_n_u8(0);
+
+            for col in 0..k {
+                let lo_tbl_ptr = inv_tables[row][col].as_ptr();
+                let hi_tbl_ptr = inv_hi[row][col].as_ptr();
+
+                let data = svld1_u8(pred, sub_data[col].as_ptr().add(offset));
+                let lo_nib = svand_u8_z(pred, data, svdup_n_u8(0x0F));
+                let hi_nib = svlsr_u8_z(pred, data, svdup_n_u8(4));
+                let lo_tbl = svld1_u8(pred, lo_tbl_ptr);
+                let hi_tbl = svld1_u8(pred, hi_tbl_ptr);
+                let lo_res = svtbl_u8(lo_tbl, lo_nib);
+                let hi_res = svtbl_u8(hi_tbl, hi_nib);
+                acc = sveor_u8(acc, sveor_u8(lo_res, hi_res));
+            }
+
+            svst1_u8(pred, buf_ptr.add(offset), acc);
+            offset += vl;
+        }
+
+        // Remainder bytes: portable fallback
+        let remainder_start = (shard_size / vl) * vl;
+        for byte_idx in remainder_start..shard_size {
+            let mut sum: u8 = 0;
+            for col in 0..k {
+                sum ^= gf_mul_portable(inv[row][col], sub_data[col][byte_idx]);
+            }
+            buf[byte_idx] = sum;
+        }
+
+        recovered.push(buf);
+    }
+
+    Ok(recovered)
+}
+
+/// SVE decode kernel: delegates to the NEON decode kernel.
+///
+/// On SVE-capable hardware without SVE2, NEON is always available and
+/// provides equivalent throughput for 128-bit vectors.
+#[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
+#[allow(dead_code)]
+fn decode_sve(
+    available_shards: &[Option<&[u8]>],
+    present_indices: &[usize],
+    data_count: u8,
+    parity_count: u8,
+    shard_size: usize,
+) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+    neon_decode(available_shards, present_indices, data_count, parity_count, shard_size)
+}
+
+// ---------------------------------------------------------------------------
 // ArmEncoder
 // ---------------------------------------------------------------------------
 
-/// ARM NEON/SVE accelerated Reed-Solomon encoder/decoder.
+/// ARM NEON/SVE accelerated Reed-Solomon encoder.
 ///
 /// On aarch64 with the `arm-sve` feature: probes for SVE2, SVE, and NEON
 /// at construction, precomputes split-tables for the Cauchy encoding matrix,
 /// and uses SIMD intrinsics for the encode hot path.
+///
+/// Decoding is performed by the separate [`ArmDecoder`] struct, following
+/// the same SVE2 → SVE → NEON → Portable dispatch model.
 ///
 /// On non-ARM platforms: delegates to the portable Cauchy RS encoder.
 ///
 /// # Examples
 ///
 /// ```ignore
-/// use oceanfs_accel::ArmEncoder;
+/// use oceanfs_accel::{ArmEncoder, ArmDecoder};
 /// use oceanfs_ec::{Encoder, Decoder};
 ///
 /// let encoder = ArmEncoder::new(4, 2);
+/// let decoder = ArmDecoder::new(4, 2);
 /// let data: Vec<&[u8]> = vec![b"aaaa", b"bbbb", b"cccc", b"dddd"];
 /// let parity = encoder.encode(&data, 2).unwrap();
 /// ```
@@ -353,12 +618,13 @@ pub struct ArmEncoder {
     /// Detected SIMD level (Portable if not on aarch64).
     level: ArmSveLevel,
     /// Precomputed split-tables for the encode path (NEON/SVE only).
+    #[allow(dead_code)]
     encode_tables: Option<EncodeTables>,
-    /// Portable fallback encoder (always available).
-    fallback: CauchyEncoder,
     /// k and m parameters.
+    #[allow(dead_code)]
     k: u8,
-    /// m parameter.
+    /// m parameter (stored for API consistency; used in NEON paths).
+    #[allow(dead_code)]
     m: u8,
 }
 
@@ -377,9 +643,7 @@ impl ArmEncoder {
             None
         };
 
-        let config = CodecConfig { data_shards: k, parity_shards: m, ..Default::default() };
-
-        Self { level, encode_tables, fallback: CauchyEncoder::new(config), k, m }
+        Self { level, encode_tables, k, m }
     }
 
     /// Returns the detected ARM SIMD level.
@@ -428,7 +692,7 @@ impl ArmEncoder {
 }
 
 // ---------------------------------------------------------------------------
-// Encoder implementation
+// Encoder implementation (SVE2 → SVE → NEON → Portable dispatch)
 // ---------------------------------------------------------------------------
 
 impl Encoder for ArmEncoder {
@@ -444,22 +708,45 @@ impl Encoder for ArmEncoder {
         let m = parity_count as usize;
         let k = data_shards.len();
 
-        // --- NEON accelerated path (aarch64 + arm-sve feature) ---
+        // --- SIMD accelerated path (aarch64 + arm-sve feature) ---
         #[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
-        if self.level >= ArmSveLevel::Neon {
-            if let Some(ref tables) = self.encode_tables {
-                // SAFETY: The encode_tables were constructed for this (k, m).
-                // data_shards pointers are valid. The NEON intrinsics operate
-                // on 16-byte aligned chunks within the shards. Any remainder
-                // bytes are handled by portable fallback inside neon_encode.
-                let result = unsafe { neon_encode(tables, data_shards, parity_count, shard_size) };
-                match result {
-                    Ok(parity) => return Ok(parity),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "NEON encode failed; falling back to portable"
-                        );
+        {
+            if self.level == ArmSveLevel::Sve2 {
+                if let Some(ref tables) = self.encode_tables {
+                    // SAFETY: encode_tables constructed for this (k, m). SVE2
+                    // intrinsics use properly-bounded table lookups.
+                    let result =
+                        unsafe { encode_sve2(tables, data_shards, parity_count, shard_size) };
+                    return Ok(result);
+                }
+            }
+
+            if self.level >= ArmSveLevel::Sve {
+                if let Some(ref tables) = self.encode_tables {
+                    // SAFETY: SVE without SVE2 delegates to NEON kernel,
+                    // which is safe and always available.
+                    let result =
+                        unsafe { encode_sve(tables, data_shards, parity_count, shard_size) };
+                    match result {
+                        Ok(parity) => return Ok(parity),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "SVE encode failed; falling back to portable");
+                        }
+                    }
+                }
+            }
+
+            if self.level >= ArmSveLevel::Neon {
+                if let Some(ref tables) = self.encode_tables {
+                    // SAFETY: NEON intrinsics operate on 16-byte chunks.
+                    // Remainder bytes handled by portable fallback inside neon_encode.
+                    let result =
+                        unsafe { neon_encode(tables, data_shards, parity_count, shard_size) };
+                    match result {
+                        Ok(parity) => return Ok(parity),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "NEON encode failed; falling back to portable");
+                        }
                     }
                 }
             }
@@ -471,18 +758,312 @@ impl Encoder for ArmEncoder {
 }
 
 // ---------------------------------------------------------------------------
-// Decoder implementation (delegates to proven Cauchy RS)
+// ArmDecoder
 // ---------------------------------------------------------------------------
 
-impl Decoder for ArmEncoder {
+/// ARM NEON/SVE accelerated Reed-Solomon decoder.
+///
+/// On aarch64 with the `arm-sve` feature: probes for SVE2, SVE, and NEON
+/// at construction and uses SIMD intrinsics for the decode hot path.
+/// On non-ARM platforms: delegates to the portable Cauchy RS decoder.
+///
+/// # Examples
+///
+/// ```ignore
+/// use oceanfs_accel::{ArmEncoder, ArmDecoder};
+/// use oceanfs_ec::{Encoder, Decoder};
+///
+/// let encoder = ArmEncoder::new(4, 2);
+/// let decoder = ArmDecoder::new(4, 2);
+/// let data: Vec<&[u8]> = vec![b"aaaa", b"bbbb", b"cccc", b"dddd"];
+/// let parity = encoder.encode(&data, 2).unwrap();
+/// // ... decode with ArmDecoder
+/// ```
+pub struct ArmDecoder {
+    /// Detected SIMD level (Portable if not on aarch64).
+    level: ArmSveLevel,
+    /// Portable fallback encoder/decoder (always available).
+    fallback: CauchyEncoder,
+    /// k parameter (for codec config).
+    #[allow(dead_code)]
+    k: u8,
+    /// m parameter.
+    #[allow(dead_code)]
+    m: u8,
+}
+
+impl ArmDecoder {
+    /// Creates a new ARM decoder, probing for available SIMD capabilities.
+    ///
+    /// On aarch64 with `arm-sve` feature: probes SVE2 → SVE → NEON.
+    /// On other platforms: uses portable fallback.
+    pub fn new(k: u8, m: u8) -> Self {
+        let level = ArmEncoder::probe_simd_level();
+        let config = CodecConfig { data_shards: k, parity_shards: m, ..Default::default() };
+        Self { level, fallback: CauchyEncoder::new(config), k, m }
+    }
+
+    /// Returns the detected ARM SIMD level.
+    pub fn simd_level(&self) -> ArmSveLevel {
+        self.level
+    }
+
+    /// Returns `true` if any SIMD acceleration is active.
+    pub fn is_accelerated(&self) -> bool {
+        self.level > ArmSveLevel::Portable
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decoder implementation (SVE2 → SVE → NEON → Portable dispatch)
+// ---------------------------------------------------------------------------
+
+impl Decoder for ArmDecoder {
     fn decode(
         &self,
         available_shards: &[Option<&[u8]>],
         data_count: u8,
         parity_count: u8,
     ) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+        let k = data_count as usize;
+        let m = parity_count as usize;
+        let total = k + m;
+
+        if available_shards.len() != total {
+            return self.fallback.decode(available_shards, data_count, parity_count);
+        }
+
+        // Find which shards are present
+        let present: Vec<usize> = (0..total).filter(|&i| available_shards[i].is_some()).collect();
+        if present.len() < k {
+            return Err(oceanfs_ec::Error::NotEnoughShards { needed: k, available: present.len() });
+        }
+
+        // Determine shard size from first available shard
+        let shard_size = available_shards[present[0]]
+            .ok_or_else(|| {
+                oceanfs_ec::Error::InvalidConfig("first available shard is None".into())
+            })?
+            .len();
+
+        if shard_size == 0 {
+            return Ok(vec![Vec::new(); k]);
+        }
+
+        // --- SIMD accelerated decode (aarch64 + arm-sve feature) ---
+        #[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
+        if shard_size >= 16 {
+            let result = if self.level == ArmSveLevel::Sve2 {
+                // SAFETY: SVE2 intrinsics with properly-bounded data pointers
+                unsafe {
+                    decode_sve2(available_shards, &present, data_count, parity_count, shard_size)
+                }
+            } else if self.level >= ArmSveLevel::Sve {
+                decode_sve(available_shards, &present, data_count, parity_count, shard_size)
+            } else if self.level >= ArmSveLevel::Neon {
+                neon_decode(available_shards, &present, data_count, parity_count, shard_size)
+            } else {
+                Err(oceanfs_ec::Error::InvalidConfig("no SIMD available".into()))
+            };
+
+            match result {
+                Ok(recovered) => return Ok(recovered),
+                Err(e) => {
+                    tracing::warn!(error = %e, "SIMD decode failed; falling back to portable");
+                }
+            }
+        }
+
+        // --- Portable fallback ---
         self.fallback.decode(available_shards, data_count, parity_count)
     }
+}
+
+// ---------------------------------------------------------------------------
+// NEON-accelerated decode (aarch64 only)
+// ---------------------------------------------------------------------------
+
+/// NEON-accelerated EC decode: recovers missing data shards using
+/// SIMD-accelerated GF(2^8) matrix multiplication.
+///
+/// Algorithm:
+/// 1. Build generator matrix G (k+m)×k
+/// 2. Select k surviving rows
+/// 3. Invert k×k submatrix via Gauss-Jordan (portable)
+/// 4. Precompute NEON split-tables for the inverse matrix
+/// 5. Recover data shards using NEON SIMD
+///
+/// # Safety
+///
+/// The caller guarantees available_shards contains valid data pointers.
+/// NEON intrinsics are used within safely-constructed bounds.
+#[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
+fn neon_decode(
+    available_shards: &[Option<&[u8]>],
+    present_indices: &[usize],
+    data_count: u8,
+    parity_count: u8,
+    shard_size: usize,
+) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+    let k = data_count as usize;
+    let m = parity_count as usize;
+
+    // --- Build generator matrix G: (k+m) rows, k columns ---
+    // Top k rows: identity. Bottom m rows: Cauchy encoding matrix.
+    let gen = build_generator_matrix(data_count, parity_count);
+
+    // --- Select k surviving rows ---
+    let mut sub_matrix: Vec<Vec<u8>> = Vec::with_capacity(k);
+    let mut sub_data: Vec<&[u8]> = Vec::with_capacity(k);
+
+    for &idx in present_indices.iter().take(k) {
+        sub_matrix.push(gen[idx].clone());
+        let shard = available_shards[idx]
+            .ok_or_else(|| oceanfs_ec::Error::InvalidConfig(format!("shard {idx} is None")))?;
+        sub_data.push(shard);
+    }
+
+    // --- Invert k×k submatrix via Gauss-Jordan over GF(2^8) ---
+    let inv = invert_gf_matrix(&sub_matrix)
+        .ok_or_else(|| oceanfs_ec::Error::DecodingFailed("decode submatrix is singular".into()))?;
+
+    // --- Precompute NEON split-tables for the inverse matrix ---
+    // inv is k×k: each row i gives coefficients to recover data shard i.
+    // We precompute GfMulTable for each coefficient.
+    let inv_tables: Vec<Vec<GfMulTable>> =
+        inv.iter().map(|row| row.iter().map(|&c| GfMulTable::new(c)).collect()).collect();
+
+    // --- Recover data shards using NEON ---
+    let mut recovered: Vec<Vec<u8>> = Vec::with_capacity(k);
+    let num_chunks = shard_size / 16;
+
+    for row in 0..k {
+        let mut buf = vec![0u8; shard_size];
+        let buf_ptr = buf.as_mut_ptr();
+
+        for chunk in 0..num_chunks {
+            let offset = chunk * 16;
+
+            // SAFETY: Accumulator starts at zero
+            let mut acc: uint8x16_t = vdupq_n_u8(0);
+
+            for col in 0..k {
+                let table = &inv_tables[row][col];
+                let data_ptr = sub_data[col].as_ptr().add(offset);
+                // SAFETY: data_ptr points to valid 16-byte chunk within the shard.
+                // table was precomputed for the inverse matrix coefficient.
+                let product = neon_gf_mul_16(table, data_ptr);
+                // SAFETY: acc and product are valid NEON vectors
+                acc = veorq_u8(acc, product);
+            }
+
+            // SAFETY: buf_ptr + offset is within the allocated buffer
+            vst1q_u8(buf_ptr.add(offset), acc);
+        }
+
+        // Handle remainder bytes (< 16) with portable fallback
+        let remainder_start = num_chunks * 16;
+        for byte_idx in remainder_start..shard_size {
+            let mut sum: u8 = 0;
+            for col in 0..k {
+                let coeff = inv[row][col];
+                sum ^= gf_mul_portable(coeff, sub_data[col][byte_idx]);
+            }
+            buf[byte_idx] = sum;
+        }
+
+        recovered.push(buf);
+    }
+
+    Ok(recovered)
+}
+
+/// Builds the full generator matrix G: (k+m) rows, k columns over GF(2^8).
+///
+/// Top k rows: identity matrix I_k.
+/// Bottom m rows: Cauchy encoding matrix.
+#[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
+fn build_generator_matrix(k: u8, m: u8) -> Vec<Vec<u8>> {
+    let ki = k as usize;
+    let mi = m as usize;
+
+    let mut cauchy = vec![vec![0u8; ki]; mi];
+    for i in 0..mi {
+        for j in 0..ki {
+            let x = (j + 1) as u8;
+            let y = (ki + i + 1) as u8;
+            cauchy[i][j] = gf_inv_portable(x ^ y);
+        }
+    }
+
+    let mut g = vec![vec![0u8; ki]; ki + mi];
+    for i in 0..ki {
+        g[i][i] = 1;
+    }
+    for i in 0..mi {
+        for j in 0..ki {
+            g[ki + i][j] = cauchy[i][j];
+        }
+    }
+    g
+}
+
+/// Inverts a square matrix over GF(2^8) using Gauss-Jordan elimination.
+///
+/// Returns `None` if the matrix is singular (non-invertible).
+#[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
+fn invert_gf_matrix(matrix: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
+    let n = matrix.len();
+    if n == 0 {
+        return Some(Vec::new());
+    }
+
+    // Augmented matrix [A | I]
+    let mut aug: Vec<Vec<u8>> = vec![vec![0u8; 2 * n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            aug[i][j] = matrix[i][j];
+        }
+        aug[i][n + i] = 1;
+    }
+
+    // Forward elimination
+    for col in 0..n {
+        let mut pivot_row = col;
+        while pivot_row < n && aug[pivot_row][col] == 0 {
+            pivot_row += 1;
+        }
+        if pivot_row == n {
+            return None; // singular
+        }
+        aug.swap(col, pivot_row);
+
+        let inv_pivot = gf_inv_portable(aug[col][col]);
+        for j in 0..2 * n {
+            aug[col][j] = gf_mul_portable(aug[col][j], inv_pivot);
+        }
+
+        for row in 0..n {
+            if row == col {
+                continue;
+            }
+            let factor = aug[row][col];
+            if factor != 0 {
+                for j in 0..2 * n {
+                    aug[row][j] ^= gf_mul_portable(factor, aug[col][j]);
+                }
+            }
+        }
+    }
+
+    let mut inv = vec![vec![0u8; n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            inv[i][j] = aug[i][n + j];
+        }
+    }
+
+    Some(inv)
 }
 
 // ---------------------------------------------------------------------------
@@ -490,6 +1071,7 @@ impl Decoder for ArmEncoder {
 // ---------------------------------------------------------------------------
 
 /// Returns `true` if any ARM SIMD capability is available.
+// Called from dispatcher in cfg-gated code paths; may appear unused on some platforms.
 #[allow(dead_code)]
 pub(crate) fn is_arm_accelerated() -> bool {
     let level = ArmEncoder::probe_simd_level();
@@ -497,6 +1079,7 @@ pub(crate) fn is_arm_accelerated() -> bool {
 }
 
 /// Returns a human-readable description of ARM SIMD capabilities.
+// Called from dispatcher in cfg-gated code paths; may appear unused on some platforms.
 #[allow(dead_code)]
 pub(crate) fn arm_capabilities() -> &'static str {
     ArmEncoder::probe_simd_level().name()
@@ -624,6 +1207,7 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip_k4_m2() {
         let encoder = ArmEncoder::new(4, 2);
+        let decoder = ArmDecoder::new(4, 2);
         let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 128]).collect();
         let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
         let parity = encoder.encode(&shard_refs, 2).unwrap();
@@ -638,13 +1222,14 @@ mod tests {
             Some(&parity[0]),
             Some(&parity[1]),
         ];
-        let recovered = encoder.decode(&available, 4, 2).unwrap();
+        let recovered = decoder.decode(&available, 4, 2).unwrap();
         assert_eq!(recovered[0], data[0]);
     }
 
     #[test]
     fn encode_decode_k8_m4() {
         let encoder = ArmEncoder::new(8, 4);
+        let decoder = ArmDecoder::new(8, 4);
         let data: Vec<Vec<u8>> = (0..8).map(|i| vec![i; 64]).collect();
         let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
         let parity = encoder.encode(&shard_refs, 4).unwrap();
@@ -663,7 +1248,7 @@ mod tests {
             Some(&parity[2]),
             Some(&parity[3]),
         ];
-        let recovered = encoder.decode(&available, 8, 4).unwrap();
+        let recovered = decoder.decode(&available, 8, 4).unwrap();
         assert_eq!(recovered[0], data[0]);
         assert_eq!(recovered[3], data[3]);
     }

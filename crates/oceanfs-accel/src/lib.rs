@@ -27,6 +27,12 @@
 //! When CUDA tools are absent at build time, the `cuda` feature compiles
 //! but GPU backends are unavailable at runtime (degrade gracefully).
 //!
+//! ## Tier 1 CPU Acceleration (ARM NEON/SVE)
+//!
+//! - `arm-sve` feature: pure-Rust ARM NEON/SVE encoder (`ArmEncoder`).
+//!   Runtime SIMD detection selects the optimal path (SVE2 → SVE → NEON
+//!   → portable) at construction.
+//!
 //! # Unsafe Code
 //!
 //! This crate is permitted to use `unsafe` for GPU FFI and SIMD intrinsics
@@ -49,19 +55,20 @@ mod arm_sve;
 mod compressor;
 mod dispatcher;
 mod error;
+mod metrics;
 mod tier0;
 
 #[cfg(all(target_arch = "x86_64", feature = "isa-l"))]
 mod igzip;
 
-#[cfg(feature = "isa-l")]
+#[cfg(all(target_arch = "x86_64", feature = "isa-l"))]
 mod isal;
 
 #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
 mod cuda;
 
 // Public types (facade)
-pub use arm_sve::ArmEncoder;
+pub use arm_sve::{ArmDecoder, ArmEncoder, ArmSveLevel};
 pub use compressor::{Compressor, ZstdCompressor};
 #[cfg(all(feature = "cuda", not(no_cuda_toolkit), not(no_nvcomp)))]
 pub use cuda::nvcomp::NvcompCompressor;
@@ -72,8 +79,9 @@ pub use dispatcher::{AccelDispatcher, AccelTier};
 pub use error::{AccelError, Result};
 #[cfg(all(target_arch = "x86_64", feature = "isa-l"))]
 pub use igzip::IgzipCompressor;
-#[cfg(feature = "isa-l")]
-pub use isal::IsalEncoder;
+#[cfg(all(target_arch = "x86_64", feature = "isa-l"))]
+pub use isal::{IsalDecoder, IsalEncoder, IsalTables};
+pub use metrics::AccelMetrics;
 // Re-exports from oceanfs-core for dependents
 pub use oceanfs_core::{AccelConfig, CompressionTier, GpuConfig};
 // Re-export Encoder/Decoder traits for convenience

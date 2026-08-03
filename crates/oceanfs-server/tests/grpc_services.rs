@@ -5,25 +5,30 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use oceanfs_core::proto::common::SegmentId as ProtoSegmentId;
-use oceanfs_core::proto::membership::{MembershipEntry, MembershipList};
-use oceanfs_core::proto::segment::{AckStatus, SegmentAppendRequest};
 use oceanfs_core::{
+    proto::{
+        common::SegmentId as ProtoSegmentId,
+        membership::{MembershipEntry, MembershipList},
+        segment::{AckStatus, SegmentAppendRequest},
+    },
     GossipConfig, Incarnation, NodeId, NodeState, RingConfig, RpcConfig, SegmentId,
 };
-use oceanfs_membership::grpc::probe_service::ProbeHandler;
-use oceanfs_membership::Membership;
-use oceanfs_network::gossip::gossip_rpc_client::GossipRpcClient;
-use oceanfs_network::gossip::gossip_rpc_server::GossipRpcServer;
-use oceanfs_network::gossip::{GossipMessage, GossipPullRequest};
-use oceanfs_network::storage::segment_rpc_client::SegmentRpcClient;
-use oceanfs_network::storage::segment_rpc_server::SegmentRpcServer;
-use oceanfs_network::ConnectionPool;
+use oceanfs_membership::{grpc::probe_service::ProbeHandler, Membership};
+use oceanfs_network::{
+    gossip::{
+        gossip_rpc_client::GossipRpcClient, gossip_rpc_server::GossipRpcServer, GossipMessage,
+        GossipPullRequest,
+    },
+    storage::{segment_rpc_client::SegmentRpcClient, segment_rpc_server::SegmentRpcServer},
+    ConnectionPool,
+};
 use oceanfs_routing::{Ring, RingCache};
 use oceanfs_server::grpc::segment_service::SegmentGrpcService;
 use oceanfs_storage::{Error as StorageError, SegmentDataStore};
@@ -46,19 +51,12 @@ impl TestStore {
 }
 
 impl SegmentDataStore for TestStore {
-    fn write_segment_data(
-        &self,
-        segment_id: &SegmentId,
-        data: &[u8],
-    ) -> Result<(), StorageError> {
+    fn write_segment_data(&self, segment_id: &SegmentId, data: &[u8]) -> Result<(), StorageError> {
         self.data.lock().unwrap().insert(segment_id.clone(), data.to_vec());
         Ok(())
     }
 
-    fn read_segment_data(
-        &self,
-        segment_id: &SegmentId,
-    ) -> Result<Vec<u8>, StorageError> {
+    fn read_segment_data(&self, segment_id: &SegmentId) -> Result<Vec<u8>, StorageError> {
         self.data
             .lock()
             .unwrap()
@@ -73,12 +71,7 @@ fn make_membership(node_id: &str) -> Arc<Membership> {
     ring.add_node(NodeId::new(node_id));
     let ring_cache = Arc::new(RingCache::new(ring));
     let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-    Arc::new(Membership::new(
-        NodeId::new(node_id),
-        addr,
-        GossipConfig::default(),
-        ring_cache,
-    ))
+    Arc::new(Membership::new(NodeId::new(node_id), addr, GossipConfig::default(), ring_cache))
 }
 
 /// Structure holding a running segment server + its data store, supporting
@@ -201,7 +194,9 @@ async fn fetch_from_node(
     let mut stream = fetch_response.into_inner();
     let mut received = Vec::new();
     while let Some(chunk) = stream.message().await.unwrap() {
-        if chunk.data.is_empty() { break; }
+        if chunk.data.is_empty() {
+            break;
+        }
         received.extend_from_slice(&chunk.data);
     }
     received
@@ -386,24 +381,32 @@ async fn futures_unordered_fastest_2_of_3() {
         length: test_data.len() as u64,
     };
 
-    use futures::stream::FuturesUnordered;
-    use futures::FutureExt;
+    use futures::{stream::FuturesUnordered, FutureExt};
 
     let mut futs: FuturesUnordered<_> = vec![
         {
             let mut c = client1.clone();
             let req = fetch_req.clone();
-            async move { (1u32, c.fetch_shard(tonic::Request::new(req)).await.map(|r| r.into_inner())) }.boxed()
+            async move {
+                    (1u32, c.fetch_shard(tonic::Request::new(req)).await.map(|r| r.into_inner()))
+                }
+                .boxed()
         },
         {
             let mut c = client2.clone();
             let req = fetch_req.clone();
-            async move { (2u32, c.fetch_shard(tonic::Request::new(req)).await.map(|r| r.into_inner())) }.boxed()
+            async move {
+                    (2u32, c.fetch_shard(tonic::Request::new(req)).await.map(|r| r.into_inner()))
+                }
+                .boxed()
         },
         {
             let mut c = client3;
             let req = fetch_req;
-            async move { (3u32, c.fetch_shard(tonic::Request::new(req)).await.map(|r| r.into_inner())) }.boxed()
+            async move {
+                    (3u32, c.fetch_shard(tonic::Request::new(req)).await.map(|r| r.into_inner()))
+                }
+                .boxed()
         },
     ]
     .into_iter()
@@ -412,7 +415,9 @@ async fn futures_unordered_fastest_2_of_3() {
     let mut completions = Vec::new();
     while let Some((idx, result)) = futs.next().await {
         completions.push((idx, result));
-        if completions.len() >= 2 { break; }
+        if completions.len() >= 2 {
+            break;
+        }
     }
 
     assert_eq!(completions.len(), 2, "should have 2 completions (k=2)");
@@ -423,7 +428,9 @@ async fn futures_unordered_fastest_2_of_3() {
         if let Ok(stream) = result {
             let mut data = Vec::new();
             while let Some(chunk_result) = stream.message().await.unwrap_or(None) {
-                if chunk_result.data.is_empty() { break; }
+                if chunk_result.data.is_empty() {
+                    break;
+                }
                 data.extend_from_slice(&chunk_result.data);
             }
             assert_eq!(data, test_data);
@@ -466,11 +473,15 @@ async fn three_node_cluster_with_node_kill() {
     let (r1, r2) = tokio::join!(
         {
             let data = vec![chunk1.clone()];
-            async { node1.client.append_segment(tonic::Request::new(tokio_stream::iter(data))).await }
+            async {
+                node1.client.append_segment(tonic::Request::new(tokio_stream::iter(data))).await
+            }
         },
         {
             let data = vec![chunk1];
-            async { node2.client.append_segment(tonic::Request::new(tokio_stream::iter(data))).await }
+            async {
+                node2.client.append_segment(tonic::Request::new(tokio_stream::iter(data))).await
+            }
         }
     );
     assert_eq!(r1.unwrap().into_inner().ack, AckStatus::Ok as i32);
@@ -544,12 +555,8 @@ async fn swim_death_detection_within_timeout() {
     let ring_cache = Arc::new(RingCache::new(ring));
     let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
 
-    let membership = Arc::new(Membership::new(
-        NodeId::new("detector-node"),
-        addr,
-        config,
-        ring_cache,
-    ));
+    let membership =
+        Arc::new(Membership::new(NodeId::new("detector-node"), addr, config, ring_cache));
 
     let mut event_rx = membership.subscribe();
 
@@ -565,10 +572,7 @@ async fn swim_death_detection_within_timeout() {
     let _initial = event_rx.try_recv();
 
     // Verify node is ALIVE.
-    assert_eq!(
-        membership.state_of(&NodeId::new("target-node")),
-        Some(NodeState::Alive)
-    );
+    assert_eq!(membership.state_of(&NodeId::new("target-node")), Some(NodeState::Alive));
 
     // Simulate SWIM: after failed pings, a node is marked SUSPECT.
     // This is what the failure detector does when pings time out.
@@ -589,10 +593,7 @@ async fn swim_death_detection_within_timeout() {
     assert_eq!(suspect_event.new_state, NodeState::Suspect);
 
     // Verify node is now SUSPECT.
-    assert_eq!(
-        membership.state_of(&NodeId::new("target-node")),
-        Some(NodeState::Suspect)
-    );
+    assert_eq!(membership.state_of(&NodeId::new("target-node")), Some(NodeState::Suspect));
 
     // After more failed pings (or suspicion timeout expiry), the failure
     // detector transitions SUSPECT → DEAD.
@@ -612,8 +613,5 @@ async fn swim_death_detection_within_timeout() {
     assert_eq!(dead_event.new_state, NodeState::Dead);
 
     // Final verification: node is DEAD.
-    assert_eq!(
-        membership.state_of(&NodeId::new("target-node")),
-        Some(NodeState::Dead)
-    );
+    assert_eq!(membership.state_of(&NodeId::new("target-node")), Some(NodeState::Dead));
 }

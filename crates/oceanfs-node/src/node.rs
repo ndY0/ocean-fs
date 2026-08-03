@@ -173,6 +173,15 @@ impl Node {
         let pool = Arc::new(oceanfs_network::ConnectionPool::new(rpc_config));
         membership.set_pool(pool.clone());
 
+        // Bootstrap membership: start failure detection + gossip, then join the ring.
+        membership
+            .start()
+            .map_err(|e| format!("failed to start membership: {e}"))?;
+        membership
+            .join()
+            .await
+            .map_err(|e| format!("failed to join cluster: {e}"))?;
+
         // ---- 6. Construct storage components ----
         let segment_size = SegmentSizeConfig::default();
         let wal_config =
@@ -209,7 +218,15 @@ impl Node {
         ));
         let scrub_config = oceanfs_storage::ScrubConfig::default();
         let scrub_worker = Arc::new(oceanfs_storage::ScrubCoordinator::new(scrub_config));
-        let reaper = Arc::new(oceanfs_storage::OrphanReaper::new(gc_config));
+        // OrphanReaper needs a SegmentShardStore for deleting shard files.
+        // In production this is the on-disk segment store; tests/early builds use in-memory.
+        let reaper_shard_store: Arc<dyn oceanfs_storage::SegmentShardStore> =
+            Arc::new(oceanfs_storage::InMemorySegmentShardStore::new(4194304));
+        let reaper = Arc::new(oceanfs_storage::OrphanReaper::new(
+            metadata_store.clone(),
+            reaper_shard_store,
+            gc_config,
+        ));
 
         // ---- 7b. Construct segment data store (shared by heal and gRPC) ----
         let heal_data_store: Arc<dyn oceanfs_storage::SegmentDataStore> =
@@ -224,6 +241,8 @@ impl Node {
         let heal_codec_config = oceanfs_core::CodecConfig::default();
         let heal_decoder: Arc<dyn oceanfs_ec::Decoder> =
             Arc::new(oceanfs_ec::CauchyEncoder::new(heal_codec_config));
+        // Clone before move into HealWorker — used by ReadCoordinator as well.
+        let ec_decoder = heal_decoder.clone();
         let heal_worker = oceanfs_storage::HealWorker::new(
             heal_config,
             heal_queue.clone(),
@@ -244,7 +263,7 @@ impl Node {
 
         // ---- 9. Construct prefetch engine ----
         let prefetch_config = oceanfs_cache::PrefetchConfig {
-            enabled: false, // disabled by default; enabled per-bucket via config
+            enabled: config.prefetch_enabled,
             ..Default::default()
         };
         let prefetch_store: Arc<dyn oceanfs_core::MetadataStore> =
@@ -263,6 +282,10 @@ impl Node {
         // ---- 11. Construct coordinators ----
         let hlc_clock = Arc::new(HlcClock::new());
 
+        // Shared in-memory segment reader: used by ReadCoordinator for
+        // chunk assembly and by S3Handler to store segment data on PUT.
+        let segment_reader = Arc::new(oceanfs_server::InMemorySegmentReader::new());
+
         let write_coordinator = Arc::new(WriteCoordinator::new(
             ring_cache.clone(),
             membership.clone(),
@@ -271,20 +294,25 @@ impl Node {
             hlc_clock,
         ));
 
-        let read_coordinator = Arc::new(ReadCoordinator::new_with_metadata(
-            ring_cache.clone(),
-            NodeId::new(&config.node_id),
-            None,
-            metadata_ops.clone(),
-        ));
+        let read_coordinator = Arc::new(
+            ReadCoordinator::new_with_metadata(
+                ring_cache.clone(),
+                NodeId::new(&config.node_id),
+                None,
+                metadata_ops.clone(),
+            )
+            .with_segment_reader(segment_reader.clone())
+            .with_connection_pool(pool.clone())
+            .with_membership(membership.clone())
+            .with_decoder(ec_decoder.clone()),
+        );
 
         let hinted_handoff = Arc::new(
             HintedHandoff::new_with_pool(pool.clone()).with_membership(membership.clone()),
         );
 
-        // Router constructed here; will be wired to the request pipeline
-        // when final-integration-read-write-end-to-end lands.
-        let _router = Arc::new(Router::new(
+        // Router handles request forwarding to correct coordinator nodes.
+        let router = Arc::new(Router::new(
             ring_cache.clone(),
             membership.clone(),
             pool.clone(),
@@ -302,7 +330,9 @@ impl Node {
             Some(metadata_cache.clone()),
             Some(negative_cache.clone()),
         )
-        .with_prefetch_engine(prefetch_engine.clone());
+        .with_segment_store(segment_reader)
+        .with_prefetch_engine(prefetch_engine.clone())
+        .with_router(router);
 
         let metrics = Arc::new(oceanfs_server::admin::MetricsRegistry::new());
         let admin_handler = AdminHandler::new_with_cluster(
@@ -311,16 +341,46 @@ impl Node {
             membership.clone(),
             ring_cache.clone(),
         )
-        .with_scrub(
-            scrub_worker.clone(),
-            metadata_store.clone(),
-            heal_data_store.clone(),
-        );
+        .with_scrub(scrub_worker.clone(), metadata_store.clone(), heal_data_store.clone())
+        .with_caches(
+            Some(object_cache.clone()),
+            Some(metadata_cache.clone()),
+            Some(negative_cache.clone()),
+        )
+        .with_accel(accel.clone());
 
         // ---- 13. Build axum router ----
-        // Auth middleware is applied in passthrough mode by default.
-        // Set `s3_auth_enabled = true` in AuthConfig to enable verification.
-        let auth_middleware = AuthMiddleware::passthrough();
+        // Auth middleware is config-driven: when `s3_auth_enabled = true`,
+        // all S3 routes require valid SigV4 credentials. When disabled,
+        // requests pass through without authentication.
+        //
+        // Access keys are loaded from {data_dir}/access_keys.toml
+        // (TOML format: [[keys]]\naccess_key = "..."\nsecret_key = "...")
+        let auth_middleware = if config.s3_auth_enabled {
+            let keys_path = config.data_dir.join("access_keys.toml");
+            let verifier = if keys_path.exists() {
+                match oceanfs_server::auth::KeyStore::load(&keys_path) {
+                    Ok(store) => {
+                        info!(path = %keys_path.display(), "loaded access keys for S3 auth");
+                        Some(oceanfs_server::auth::SigV4Verifier::new(store))
+                    }
+                    Err(e) => {
+                        warn!(
+                            path = %keys_path.display(),
+                            error = %e,
+                            "failed to load access keys — auth will reject all requests"
+                        );
+                        None
+                    }
+                }
+            } else {
+                warn!("s3_auth_enabled but no access_keys.toml found at {}", keys_path.display());
+                None
+            };
+            AuthMiddleware::new(true, verifier)
+        } else {
+            AuthMiddleware::passthrough()
+        };
         let app = axum::Router::new()
             .merge(s3_handler.into_router_with_auth(auth_middleware))
             .merge(admin_handler.into_router());
@@ -350,19 +410,16 @@ impl Node {
             .map_err(|e| format!("invalid grpc_listen_addr: {e}"))?;
 
         // Build gRPC service implementations.
-        let segment_service = oceanfs_server::grpc::segment_service::SegmentGrpcService::new(
+        let segment_service =
+            oceanfs_server::grpc::segment_service::SegmentGrpcService::new(heal_data_store.clone());
+        let gossip_service =
+            oceanfs_membership::grpc::gossip_service::GossipGrpcService::new(membership.clone());
+
+        let healing_service = oceanfs_server::grpc::healing_service::HealingGrpcService::new(
+            hinted_handoff.clone(),
+            metadata_store.clone(),
             heal_data_store.clone(),
         );
-        let gossip_service = oceanfs_membership::grpc::gossip_service::GossipGrpcService::new(
-            membership.clone(),
-        );
-
-        let healing_service =
-            oceanfs_server::grpc::healing_service::HealingGrpcService::new(
-                hinted_handoff.clone(),
-                metadata_store.clone(),
-                heal_data_store.clone(),
-            );
         let cache_service = oceanfs_server::grpc::cache_service::CacheGrpcService::new(
             Some(object_cache.clone()),
             Some(metadata_cache.clone()),
@@ -393,9 +450,9 @@ impl Node {
             ae_worker,
             scrub_worker,
             reaper,
-            metadata_store.clone(),
             prefetch_engine,
             heal_worker,
+            heal_data_store.clone(),
         );
 
         info!(
@@ -496,9 +553,9 @@ impl Node {
         ae_worker: Arc<oceanfs_storage::AntiEntropy>,
         scrub_worker: Arc<oceanfs_storage::ScrubCoordinator>,
         reaper: Arc<oceanfs_storage::OrphanReaper>,
-        reaper_store: Arc<oceanfs_storage::MetadataStore>,
         prefetch_engine: Arc<oceanfs_cache::PrefetchEngine>,
         heal_worker: oceanfs_storage::HealWorker,
+        data_store: Arc<dyn oceanfs_storage::SegmentDataStore>,
     ) -> BackgroundTasks {
         // Gossip: placeholder (driven by Membership internally).
         let gossip_cancel = CancellationToken::new();
@@ -507,7 +564,7 @@ impl Node {
         // GC: runs every gc_interval_sec (default 3600s).
         let gc_cancel = CancellationToken::new();
         let gc_token = gc_cancel.clone();
-        let gc_store = metadata_store;
+        let gc_store = metadata_store.clone();
         let gc = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(3600));
             loop {
@@ -548,6 +605,8 @@ impl Node {
         // Scrub: runs every 604800s (7 days).
         let scrub_cancel = CancellationToken::new();
         let scrub_token = scrub_cancel.clone();
+        let scrub_store = metadata_store.clone();
+        let scrub_data = data_store;
         let scrub = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(604800));
             loop {
@@ -557,10 +616,20 @@ impl Node {
                         break;
                     }
                     _ = interval.tick() => {
-                        // The scrub worker takes metadata and data stores for verification.
-                        // We use the same metadata store and the in-memory heal data store.
-                        // In production, this would use the real on-disk segment store.
-                        let _ = scrub_worker;
+                        match scrub_worker.run_cycle(
+                            scrub_store.clone(),
+                            scrub_data.clone(),
+                        ).await {
+                            Ok(report) => {
+                                if report.segments_corrupt() > 0 {
+                                    warn!(
+                                        corrupt = report.segments_corrupt(),
+                                        "scrub detected corrupt segments"
+                                    );
+                                }
+                            }
+                            Err(e) => warn!("Scrub cycle error: {e}"),
+                        }
                     }
                 }
             }
@@ -578,7 +647,7 @@ impl Node {
                         break;
                     }
                     _ = interval.tick() => {
-                        if let Err(e) = reaper.run_cycle(reaper_store.clone()).await {
+                        if let Err(e) = reaper.run_cycle().await {
                             warn!("Orphan reaper cycle error: {e}");
                         }
                     }
@@ -787,9 +856,8 @@ mod tests {
             oceanfs_core::GossipConfig::default(),
             ring_cache,
         ));
-        let pool = Arc::new(oceanfs_network::ConnectionPool::new(
-            oceanfs_core::RpcConfig::default(),
-        ));
+        let pool =
+            Arc::new(oceanfs_network::ConnectionPool::new(oceanfs_core::RpcConfig::default()));
 
         let ae_worker = Arc::new(oceanfs_storage::AntiEntropy::new(
             oceanfs_storage::AntiEntropyConfig::default(),
@@ -800,7 +868,13 @@ mod tests {
         ));
         let scrub_config = oceanfs_storage::ScrubConfig::default();
         let scrub_worker = Arc::new(oceanfs_storage::ScrubCoordinator::new(scrub_config));
-        let reaper = Arc::new(oceanfs_storage::OrphanReaper::new(gc_config));
+        let reaper_shard_store: Arc<dyn oceanfs_storage::SegmentShardStore> =
+            Arc::new(oceanfs_storage::InMemorySegmentShardStore::new(4194304));
+        let reaper = Arc::new(oceanfs_storage::OrphanReaper::new(
+            metadata_store.clone(),
+            reaper_shard_store,
+            gc_config,
+        ));
 
         let prefetch_config = oceanfs_cache::PrefetchConfig::default();
         let prefetch_store: Arc<dyn oceanfs_core::MetadataStore> =
@@ -820,6 +894,8 @@ mod tests {
         let heal_queue = Arc::new(oceanfs_storage::HealQueue::new(heal_config.queue_capacity()));
         let heal_decoder: Arc<dyn oceanfs_ec::Decoder> =
             Arc::new(oceanfs_ec::CauchyEncoder::new(oceanfs_core::CodecConfig::default()));
+        let bg_data_store: Arc<dyn oceanfs_storage::SegmentDataStore> =
+            Arc::new(oceanfs_storage::InMemorySegmentStore::new());
         let heal_data_store: Arc<dyn oceanfs_storage::SegmentDataStore> =
             Arc::new(oceanfs_storage::InMemorySegmentStore::new());
         let heal_worker = oceanfs_storage::HealWorker::new(
@@ -836,9 +912,9 @@ mod tests {
             ae_worker,
             scrub_worker,
             reaper,
-            metadata_store,
             prefetch_engine,
             heal_worker,
+            bg_data_store,
         );
 
         // Verify handles are not finished immediately (they are pending).

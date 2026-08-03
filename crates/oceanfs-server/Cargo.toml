@@ -11,7 +11,9 @@ oceanfs-routing.workspace = true
 oceanfs-membership.workspace = true
 oceanfs-network.workspace = true
 oceanfs-storage = { workspace = true, optional = true }
+oceanfs-ec = { workspace = true, optional = true }
 oceanfs-cache = { workspace = true, optional = true }
+oceanfs-accel = { workspace = true, optional = true }
 arc-swap.workspace = true
 axum.workspace = true
 blake3.workspace = true
@@ -20,6 +22,7 @@ futures = "0.3"
 hex = "0.4"
 hmac.workspace = true
 http.workspace = true
+http-body-util = "0.1"
 mime_guess.workspace = true
 parking_lot.workspace = true
 prometheus.workspace = true
@@ -37,9 +40,11 @@ tower-http.workspace = true
 tracing.workspace = true
 
 [features]
-default = ["storage", "cache"]
+default = ["storage", "cache", "ec"]
 storage = ["dep:oceanfs-storage"]
+ec = ["dep:oceanfs-ec"]
 cache = ["dep:oceanfs-cache"]
+accel = ["dep:oceanfs-accel"]
 
 [dev-dependencies]
 tokio-test = "0.4"

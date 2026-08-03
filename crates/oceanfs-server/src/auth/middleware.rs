@@ -7,14 +7,16 @@
 //! When auth is disabled (development mode), all requests pass through
 //! unauthenticated.
 
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use axum::{
     body::Body,
     http::{Request, StatusCode},
     response::Response,
 };
+use http_body_util::BodyExt;
 use tower::{Layer, Service};
+use tracing::warn;
 
 use crate::auth::sigv4::SigV4Verifier;
 
@@ -67,7 +69,7 @@ pub struct AuthService<S> {
 
 impl<S> Service<Request<Body>> for AuthService<S>
 where
-    S: Service<Request<Body>, Response = Response> + Send + 'static,
+    S: Service<Request<Body>, Response = Response> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: std::fmt::Display,
 {
@@ -88,7 +90,7 @@ where
             return Box::pin(self.inner.call(request));
         }
 
-        let _verifier = match &self.verifier {
+        let verifier = match &self.verifier {
             Some(v) => v.clone(),
             None => {
                 // SAFETY: This Response::builder uses only valid status
@@ -102,14 +104,63 @@ where
             }
         };
 
-        // In a full implementation, we would:
-        // 1. Extract headers, method, URI, query string, body from the request
-        // 2. Call verifier.verify()
-        // 3. If valid, proceed; if invalid, return 403
-        //
-        // For now, pass through (auth is performed by the S3 handler
-        // via explicit verification or via an axum extractor).
-        Box::pin(self.inner.call(request))
+        // Extract request fields needed for SigV4 verification.
+        let method = request.method().to_string();
+        let uri_path = request.uri().path().to_string();
+        let query_string = request.uri().query().unwrap_or("").to_string();
+
+        // Collect headers into a HashMap (lowercase keys for case-insensitive matching).
+        let mut headers: HashMap<String, String> = HashMap::new();
+        for (name, value) in request.headers() {
+            if let Ok(v) = value.to_str() {
+                headers.insert(name.as_str().to_lowercase(), v.to_string());
+            }
+        }
+
+        // Buffer the body for hash computation. The body must be available
+        // for SHA-256 hashing (required by SigV4) and then forwarded to
+        // the inner service after verification.
+        let (parts, body) = request.into_parts();
+
+        // Clone inner service to move into the async block.
+        let mut inner = self.inner.clone();
+
+        Box::pin(async move {
+            // Collect body bytes.
+            let body_bytes = match body.collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(_e) => {
+                    warn!("failed to read request body for auth verification");
+                    #[allow(clippy::unwrap_used)]
+                    return Ok(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::from("Failed to read request body"))
+                        .unwrap_or_else(|_| {
+                            // SAFETY: INTERNAL_SERVER_ERROR + empty body is infallible.
+                            Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(Body::empty())
+                                .unwrap()
+                        }));
+                }
+            };
+
+            // Verify the SigV4 signature.
+            if let Err(e) =
+                verifier.verify(&headers, &method, &uri_path, &query_string, &body_bytes)
+            {
+                warn!(error = %e, "SigV4 verification failed");
+                #[allow(clippy::unwrap_used)]
+                return Ok(Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .body(Body::from(format!("AccessDenied: {e}")))
+                    .unwrap());
+            }
+
+            // Reconstruct the request with the original body bytes.
+            let request = Request::from_parts(parts, Body::from(body_bytes));
+            inner.call(request).await
+        })
     }
 }
 

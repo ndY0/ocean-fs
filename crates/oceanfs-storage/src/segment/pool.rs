@@ -489,10 +489,7 @@ mod tests {
 
         // We need a tokio runtime because enqueue_encoding calls
         // Handle::current(). Create a minimal runtime for the test.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         let _guard = rt.enter();
 
         let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool).unwrap();
@@ -531,10 +528,7 @@ mod tests {
         };
         let buf_pool = test_pool();
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         let _guard = rt.enter();
 
         let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool).unwrap();
@@ -560,15 +554,11 @@ mod tests {
         // created and used without panicking, even when the queue fills.
         // Uses a large target size so enqueue_encoding is never called
         // (segment never fills). This tests the configuration path.
-        let pool_cfg = PoolConfig {
-            active_pool_size: 4,
-            encode_queue_capacity: 2,
-            ..PoolConfig::default()
-        };
+        let pool_cfg =
+            PoolConfig { active_pool_size: 4, encode_queue_capacity: 2, ..PoolConfig::default() };
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = test_pool();
-        let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool).unwrap();
+        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool).unwrap();
 
         // The encode queue should exist with the configured capacity.
         let rx = pool.take_encode_rx();
@@ -587,11 +577,8 @@ mod tests {
         // (the enqueue_encoding timeout path is exercised but doesn't panic).
         use std::sync::Arc as StdArc;
 
-        let pool_cfg = PoolConfig {
-            active_pool_size: 4,
-            encode_queue_capacity: 2,
-            ..PoolConfig::default()
-        };
+        let pool_cfg =
+            PoolConfig { active_pool_size: 4, encode_queue_capacity: 2, ..PoolConfig::default() };
         let size_cfg = SegmentSizeConfig {
             default_target_size: 20,
             small_target_size: 20,
@@ -599,10 +586,7 @@ mod tests {
         };
         let buf_pool = test_pool();
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
 
         let pool = StdArc::new(
             SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool).unwrap(),
@@ -639,10 +623,7 @@ mod tests {
         };
         let buf_pool = test_pool();
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         let _guard = rt.enter();
 
         let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool).unwrap();

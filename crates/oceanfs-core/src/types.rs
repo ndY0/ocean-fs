@@ -1170,7 +1170,9 @@ pub trait MetadataStore: Send + Sync {
 /// let tier = CompressionTier::Auto;
 /// assert!(matches!(tier, CompressionTier::Auto));
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[non_exhaustive]
 pub enum CompressionTier {
     /// No compression — disable compression entirely for this node or bucket.

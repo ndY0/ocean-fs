@@ -37,10 +37,7 @@ fn make_membership(node_id_str: &str) -> (Arc<Membership>, Arc<RingCache>) {
 }
 
 /// Builds a test AntiEntropy instance with all dependencies wired.
-fn make_anti_entropy(
-    membership: Arc<Membership>,
-    metadata: Arc<MetadataStore>,
-) -> AntiEntropy {
+fn make_anti_entropy(membership: Arc<Membership>, metadata: Arc<MetadataStore>) -> AntiEntropy {
     let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
     let segment_store = Arc::new(InMemorySegmentStore::new());
     let config = AntiEntropyConfig::default();
@@ -157,11 +154,8 @@ async fn anti_entropy_cycle_with_valid_segments() {
     let metadata = Arc::new(MetadataStore::open(&config).unwrap());
 
     for _ in 0..3 {
-        let seg = make_segment_metadata(
-            SegmentId::new(),
-            true,
-            Some(HashOutput::from_bytes([0u8; 32])),
-        );
+        let seg =
+            make_segment_metadata(SegmentId::new(), true, Some(HashOutput::from_bytes([0u8; 32])));
         metadata.put_segment(seg).unwrap();
     }
 
@@ -349,18 +343,8 @@ async fn real_two_node_anti_entropy_cycle() {
     let segment_store_b = Arc::new(InMemorySegmentStore::new());
 
     // --- Cross-register each node in the other's membership ---
-    membership_a.upsert_node(
-        NodeId::new("node-b"),
-        NodeState::Alive,
-        Incarnation::new(1),
-        addr_b,
-    );
-    membership_b.upsert_node(
-        NodeId::new("node-a"),
-        NodeState::Alive,
-        Incarnation::new(1),
-        addr_a,
-    );
+    membership_a.upsert_node(NodeId::new("node-b"), NodeState::Alive, Incarnation::new(1), addr_b);
+    membership_b.upsert_node(NodeId::new("node-a"), NodeState::Alive, Incarnation::new(1), addr_a);
 
     // --- Both nodes write the same segment ---
     let seg_id = SegmentId::new();
@@ -487,13 +471,8 @@ async fn anti_entropy_handles_unreachable_peer() {
     };
     metadata.put_segment(seg).unwrap();
 
-    let ae = AntiEntropy::new(
-        AntiEntropyConfig::default(),
-        membership_a,
-        metadata,
-        pool,
-        segment_store,
-    );
+    let ae =
+        AntiEntropy::new(AntiEntropyConfig::default(), membership_a, metadata, pool, segment_store);
 
     // Should not panic even though the peer is unreachable
     let stats = ae.run_cycle().await.unwrap();
@@ -526,13 +505,8 @@ async fn anti_entropy_with_no_alive_peers() {
     };
     metadata.put_segment(seg).unwrap();
 
-    let ae = AntiEntropy::new(
-        AntiEntropyConfig::default(),
-        membership,
-        metadata,
-        pool,
-        segment_store,
-    );
+    let ae =
+        AntiEntropy::new(AntiEntropyConfig::default(), membership, metadata, pool, segment_store);
 
     // No alive peers — should still complete gracefully
     let stats = ae.run_cycle().await.unwrap();

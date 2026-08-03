@@ -200,11 +200,9 @@ impl Router {
         // Acquire a gRPC channel from the connection pool to validate
         // end-to-end connectivity. The channel is returned to the pool
         // when the guard is dropped.
-        let pool_guard = self.pool.get_channel(addr).await.map_err(|e| {
-            Error::ForwardFailed {
-                target: target.to_string(),
-                reason: format!("failed to acquire gRPC channel: {e}"),
-            }
+        let pool_guard = self.pool.get_channel(addr).await.map_err(|e| Error::ForwardFailed {
+            target: target.to_string(),
+            reason: format!("failed to acquire gRPC channel: {e}"),
         })?;
 
         // The channel is valid — drop the guard to return it to the pool.

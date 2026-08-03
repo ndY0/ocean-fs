@@ -7,11 +7,14 @@
 //! (common, segment, membership) so that tonic-build emits absolute
 //! `::oceanfs_core::proto::*` paths instead of generating duplicate types.
 
+#![allow(clippy::expect_used)]
+
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let crate_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
-    let workspace_root = crate_dir.parent().and_then(|p| p.parent()).expect("cannot find workspace root");
+    let workspace_root =
+        crate_dir.parent().and_then(|p| p.parent()).expect("cannot find workspace root");
     let proto_dir = workspace_root.join("proto");
 
     let out_dir = PathBuf::from("src/generated");

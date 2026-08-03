@@ -86,9 +86,7 @@ fn shard_concurrent_writes_across_multiple_connection_ids() {
 
     let config = SegmentSizeConfig::default();
     let pool = BufferPool::new(65536, 8);
-    let shard = Arc::new(
-        SegmentShard::new(8, SizeTier::Standard, &config, &pool).unwrap(),
-    );
+    let shard = Arc::new(SegmentShard::new(8, SizeTier::Standard, &config, &pool).unwrap());
 
     let counter = Arc::new(AtomicUsize::new(0));
     let num_threads = 8;

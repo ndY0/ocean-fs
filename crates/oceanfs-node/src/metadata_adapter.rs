@@ -48,6 +48,16 @@ impl MetadataOps for MetadataStoreAdapter {
         self.store.get_object(bucket, key).map_err(|e| MetadataError::Internal(format!("{e}")))
     }
 
+    fn put_object(
+        &self,
+        bucket: &BucketId,
+        meta: ObjectMetadata,
+    ) -> Result<(), MetadataError> {
+        self.store
+            .put_object_in_bucket(bucket, meta)
+            .map_err(|e| MetadataError::Internal(format!("{e}")))
+    }
+
     fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> Result<(), MetadataError> {
         self.store.delete_object(bucket, key).map_err(|e| MetadataError::Internal(format!("{e}")))
     }

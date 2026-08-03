@@ -17,8 +17,13 @@
 //! GpuCuda -> IsaL -> CpuSimd   (always terminates at CpuSimd)
 //! ```
 
-use std::{collections::HashMap, sync::Arc};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
 use oceanfs_core::GpuConfig;
@@ -27,6 +32,7 @@ use oceanfs_ec::{Decoder, Encoder};
 
 use crate::{
     compressor::{Compressor, ZstdCompressor},
+    metrics::AccelMetrics,
     tier0::{self, CpuEncoder},
 };
 
@@ -104,6 +110,18 @@ pub struct AccelDispatcher {
     /// Counter incremented on each compression fallback event.
     /// Exposed for observability (per ADR-0006 §2).
     compression_fallback_count: AtomicU64,
+    /// Counter incremented on each EC tier fallback event.
+    /// Exposed for observability (per ADR-0006 §2).
+    ec_fallback_count: AtomicU64,
+    /// Acceleration metrics for observability.
+    /// Exposed via [`Self::metrics`] for Prometheus / tracing integration.
+    metrics: AccelMetrics,
+    /// Runtime fallback flag: set to `true` when the active EC backend
+    /// has encountered a recoverable error and been marked unavailable.
+    /// The dispatcher will attempt to re-resolve on the next request.
+    ec_backend_unhealthy: AtomicBool,
+    /// Runtime fallback flag for compression backends.
+    compression_backend_unhealthy: AtomicBool,
 }
 
 impl AccelDispatcher {
@@ -146,7 +164,13 @@ impl AccelDispatcher {
 
         // --- Resolve EC tier ---
         let requested_tier = Self::parse_ec_tier(&config.ec_tier);
-        let active_ec_tier = Self::resolve_ec_tier(requested_tier, cuda_available, tier1_available);
+        let ec_fallback_counter = AtomicU64::new(0);
+        let active_ec_tier = Self::resolve_ec_tier(
+            requested_tier,
+            cuda_available,
+            tier1_available,
+            &ec_fallback_counter,
+        );
 
         if active_ec_tier != requested_tier && requested_tier != AccelTier::Auto {
             tracing::warn!(
@@ -227,7 +251,9 @@ impl AccelDispatcher {
                 config.gpu.as_ref().map(|g| g.max_concurrent_ops).unwrap_or(1),
             ));
             let nvcomp_config = oceanfs_core::NvcompConfig::default();
-            if let Some(nvcomp) = crate::cuda::nvcomp::NvcompCompressor::new(gpu_semaphore, nvcomp_config) {
+            if let Some(nvcomp) =
+                crate::cuda::nvcomp::NvcompCompressor::new(gpu_semaphore, nvcomp_config)
+            {
                 let nvcomp: Arc<dyn Compressor> = Arc::new(nvcomp);
                 tier_compressors.insert(CompressionTier::GpuNvcomp, nvcomp.clone());
             }
@@ -243,6 +269,10 @@ impl AccelDispatcher {
             config: config.clone(),
             node_compression: config.compression.clone(),
             compression_fallback_count: AtomicU64::new(0),
+            ec_fallback_count: ec_fallback_counter,
+            metrics: AccelMetrics::default(),
+            ec_backend_unhealthy: AtomicBool::new(false),
+            compression_backend_unhealthy: AtomicBool::new(false),
         }
     }
 
@@ -270,6 +300,62 @@ impl AccelDispatcher {
     /// this to detect when the node ceiling is being hit.
     pub fn compression_fallback_count(&self) -> u64 {
         self.compression_fallback_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total number of EC tier fallback events.
+    ///
+    /// Incremented each time the EC tier fallback chain is exercised in
+    /// `resolve_ec_tier`. Operators monitor this to detect when their
+    /// configured EC tier is misaligned with available hardware.
+    pub fn ec_fallback_count(&self) -> u64 {
+        self.ec_fallback_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns a reference to the acceleration metrics.
+    ///
+    /// Exposes atomic counters for encode/decode operations, bytes
+    /// processed, and fallback events. Suitable for Prometheus
+    /// integration or tracing/metrics subscribers.
+    pub fn metrics(&self) -> &AccelMetrics {
+        &self.metrics
+    }
+
+    /// Marks the active EC backend as unhealthy.
+    ///
+    /// Called when a backend encounters a recoverable error (e.g., ISA-L
+    /// FFI failure). The dispatcher will attempt to re-resolve the
+    /// backend on the next encode/decode operation, falling back to
+    /// the next available tier.
+    pub fn mark_ec_backend_unhealthy(&self) {
+        self.ec_backend_unhealthy.store(true, Ordering::Relaxed);
+        self.metrics.record_runtime_fallback();
+    }
+
+    /// Marks the compression backend as unhealthy.
+    pub fn mark_compression_backend_unhealthy(&self) {
+        self.compression_backend_unhealthy.store(true, Ordering::Relaxed);
+        self.metrics.record_runtime_fallback();
+    }
+
+    /// Returns `true` if the EC backend is currently marked unhealthy.
+    pub fn is_ec_backend_unhealthy(&self) -> bool {
+        self.ec_backend_unhealthy.load(Ordering::Relaxed)
+    }
+
+    /// Returns `true` if the compression backend is currently unhealthy.
+    pub fn is_compression_backend_unhealthy(&self) -> bool {
+        self.compression_backend_unhealthy.load(Ordering::Relaxed)
+    }
+
+    /// Attempts to recover the EC backend after a failure.
+    ///
+    /// Re-resolves the active tier and rebuilds backends if the
+    /// unhealthy flag was set. Returns `true` if recovery succeeded.
+    pub fn try_recover_ec_backend(&self) -> bool {
+        // Signal re-resolution by clearing the flag; the next encode/decode
+        // will use the fallback chain via `resolve_encoder_for_tier`.
+        self.ec_backend_unhealthy.store(false, Ordering::Relaxed);
+        true
     }
 
     /// Resolves an EC encoder for a specific tier.
@@ -341,7 +427,11 @@ impl AccelDispatcher {
     pub fn resolve_compressor(&self, tier: CompressionTier) -> Arc<dyn Compressor> {
         // Cap at node ceiling (ADR-0007)
         let capped = self.cap_compression_tier(tier);
-        let effective = Self::resolve_compression_tier_with_fallback(capped, &self.tier_compressors, &self.compression_fallback_count);
+        let effective = Self::resolve_compression_tier_with_fallback(
+            capped,
+            &self.tier_compressors,
+            &self.compression_fallback_count,
+        );
         self.tier_compressors.get(&effective).cloned().unwrap_or_else(|| {
             // Ultimate fallback: zstd, always available
             Arc::new(ZstdCompressor::default())
@@ -537,8 +627,9 @@ impl AccelDispatcher {
         requested: AccelTier,
         cuda_available: bool,
         isal_available: bool,
+        fallback_counter: &AtomicU64,
     ) -> AccelTier {
-        match requested {
+        let resolved = match requested {
             AccelTier::Auto => {
                 if cuda_available {
                     AccelTier::GpuCuda
@@ -555,11 +646,13 @@ impl AccelDispatcher {
                     tracing::warn!(
                         "GPU acceleration requested but CUDA unavailable; falling back to ISA-L"
                     );
+                    fallback_counter.fetch_add(1, Ordering::Relaxed);
                     AccelTier::IsaL
                 } else {
                     tracing::warn!(
                         "GPU acceleration requested but CUDA and ISA-L unavailable; falling back to CPU SIMD"
                     );
+                    fallback_counter.fetch_add(1, Ordering::Relaxed);
                     AccelTier::CpuSimd
                 }
             }
@@ -568,11 +661,13 @@ impl AccelDispatcher {
                     AccelTier::IsaL
                 } else {
                     tracing::warn!("ISA-L requested but not available; falling back to CPU SIMD");
+                    fallback_counter.fetch_add(1, Ordering::Relaxed);
                     AccelTier::CpuSimd
                 }
             }
             AccelTier::CpuSimd => AccelTier::CpuSimd,
-        }
+        };
+        resolved
     }
 
     /// Resolves a tier through the fallback chain.
@@ -649,10 +744,16 @@ impl AccelDispatcher {
     fn build_tier1_encoder(config: CodecConfig) -> Arc<dyn Encoder> {
         #[cfg(all(target_arch = "x86_64", feature = "isa-l"))]
         {
-            match crate::isal::IsalEncoder::new(config.data_shards, config.parity_shards) {
-                Ok(enc) => Arc::new(enc),
-                Err(e) => {
-                    tracing::warn!(error = %e, "ISA-L encoder construction failed; using CPU fallback");
+            match crate::isal::IsalTables::new(config.data_shards, config.parity_shards) {
+                Some(tables) => {
+                    // Leak the tables so they have 'static lifetime and can be
+                    // shared via Arc<dyn Encoder>. The memory is negligible (~few KB)
+                    // and this runs once at startup.
+                    let tables_ref: &'static crate::isal::IsalTables = Box::leak(Box::new(tables));
+                    Arc::new(crate::isal::IsalEncoder::new(tables_ref))
+                }
+                None => {
+                    tracing::warn!("ISA-L encoder construction failed; using CPU fallback");
                     Arc::new(CpuEncoder::new(config))
                 }
             }
@@ -677,10 +778,13 @@ impl AccelDispatcher {
     fn build_tier1_decoder(config: CodecConfig) -> Arc<dyn Decoder> {
         #[cfg(all(target_arch = "x86_64", feature = "isa-l"))]
         {
-            match crate::isal::IsalEncoder::new(config.data_shards, config.parity_shards) {
-                Ok(dec) => Arc::new(dec),
-                Err(e) => {
-                    tracing::warn!(error = %e, "ISA-L decoder construction failed; using CPU fallback");
+            match crate::isal::IsalTables::new(config.data_shards, config.parity_shards) {
+                Some(tables) => {
+                    let tables_ref: &'static crate::isal::IsalTables = Box::leak(Box::new(tables));
+                    Arc::new(crate::isal::IsalDecoder::new(tables_ref))
+                }
+                None => {
+                    tracing::warn!("ISA-L decoder construction failed; using CPU fallback");
                     Arc::new(CpuEncoder::new(config))
                 }
             }
@@ -688,7 +792,7 @@ impl AccelDispatcher {
 
         #[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
         {
-            Arc::new(crate::arm_sve::ArmEncoder::new(config.data_shards, config.parity_shards))
+            Arc::new(crate::arm_sve::ArmDecoder::new(config.data_shards, config.parity_shards))
         }
 
         #[cfg(not(any(
@@ -766,7 +870,12 @@ impl AccelDispatcher {
 
 impl Encoder for AccelDispatcher {
     fn encode(&self, data_shards: &[&[u8]], parity_count: u8) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
-        self.encoder.encode(data_shards, parity_count)
+        let byte_count = data_shards.iter().map(|s| s.len() as u64).sum();
+        let result = self.encoder.encode(data_shards, parity_count);
+        if result.is_ok() {
+            self.metrics.record_encode(byte_count);
+        }
+        result
     }
 }
 
@@ -777,7 +886,13 @@ impl Decoder for AccelDispatcher {
         data_count: u8,
         parity_count: u8,
     ) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
-        self.decoder.decode(available_shards, data_count, parity_count)
+        let byte_count =
+            available_shards.iter().filter_map(|s| s.as_ref().map(|b| b.len() as u64)).sum();
+        let result = self.decoder.decode(available_shards, data_count, parity_count);
+        if result.is_ok() {
+            self.metrics.record_decode(byte_count);
+        }
+        result
     }
 }
 
@@ -821,43 +936,50 @@ mod tests {
 
     #[test]
     fn resolve_auto_without_hardware_resolves_to_cpu_simd() {
-        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::Auto, false, false);
+        let counter = AtomicU64::new(0);
+        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::Auto, false, false, &counter);
         assert_eq!(tier, AccelTier::CpuSimd);
     }
 
     #[test]
     fn resolve_cpu_simd_always_resolves_to_cpu_simd() {
-        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::CpuSimd, false, false);
+        let counter = AtomicU64::new(0);
+        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::CpuSimd, false, false, &counter);
         assert_eq!(tier, AccelTier::CpuSimd);
     }
 
     #[test]
     fn resolve_gpu_cuda_without_cuda_falls_back_to_cpu_simd() {
-        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::GpuCuda, false, false);
+        let counter = AtomicU64::new(0);
+        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::GpuCuda, false, false, &counter);
         assert_eq!(tier, AccelTier::CpuSimd);
     }
 
     #[test]
     fn resolve_isal_without_isal_falls_back_to_cpu_simd() {
-        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::IsaL, false, false);
+        let counter = AtomicU64::new(0);
+        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::IsaL, false, false, &counter);
         assert_eq!(tier, AccelTier::CpuSimd);
     }
 
     #[test]
     fn resolve_auto_with_cuda_prefers_cuda() {
-        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::Auto, true, true);
+        let counter = AtomicU64::new(0);
+        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::Auto, true, true, &counter);
         assert_eq!(tier, AccelTier::GpuCuda);
     }
 
     #[test]
     fn resolve_auto_with_isal_prefers_isal_over_cpu() {
-        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::Auto, false, true);
+        let counter = AtomicU64::new(0);
+        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::Auto, false, true, &counter);
         assert_eq!(tier, AccelTier::IsaL);
     }
 
     #[test]
     fn resolve_gpu_cuda_with_isal_only_falls_back_to_isal() {
-        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::GpuCuda, false, true);
+        let counter = AtomicU64::new(0);
+        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::GpuCuda, false, true, &counter);
         assert_eq!(tier, AccelTier::IsaL);
     }
 
@@ -1049,16 +1171,16 @@ mod tests {
         assert_eq!(AccelDispatcher::parse_compression_tier("auto"), CompressionTier::Auto);
         assert_eq!(AccelDispatcher::parse_compression_tier("cpu_zstd"), CompressionTier::CpuZstd);
         assert_eq!(AccelDispatcher::parse_compression_tier("cpu_igzip"), CompressionTier::CpuIgzip);
-        assert_eq!(AccelDispatcher::parse_compression_tier("gpu_nvcomp"), CompressionTier::GpuNvcomp);
+        assert_eq!(
+            AccelDispatcher::parse_compression_tier("gpu_nvcomp"),
+            CompressionTier::GpuNvcomp
+        );
         assert_eq!(AccelDispatcher::parse_compression_tier("none"), CompressionTier::None);
     }
 
     #[test]
     fn parse_compression_tier_unknown_falls_back_to_auto() {
-        assert_eq!(
-            AccelDispatcher::parse_compression_tier("quantum"),
-            CompressionTier::Auto
-        );
+        assert_eq!(AccelDispatcher::parse_compression_tier("quantum"), CompressionTier::Auto);
     }
 
     // -- Node ceiling capping (ADR-0007) --

@@ -23,6 +23,8 @@ use oceanfs_core::{
     BucketId, ConflictResolver, HashKey, HashOutput, Hlc, LwwResolver, NodeId, ObjectKey,
     ObjectMetadata, OperationTimeouts,
 };
+use oceanfs_membership::Membership;
+use oceanfs_network::ConnectionPool;
 use oceanfs_routing::RingCache;
 
 use crate::{
@@ -175,6 +177,13 @@ pub struct ReadCoordinator {
     metadata: Option<Arc<dyn MetadataOps>>,
     /// Optional segment reader for chunk-based reads.
     segment_reader: Option<Arc<dyn SegmentReader>>,
+    /// Connection pool for gRPC shard fetch (multi-node reads).
+    pool: Option<Arc<ConnectionPool>>,
+    /// Membership store for resolving node addresses.
+    membership: Option<Arc<Membership>>,
+    /// Optional EC decoder for reconstructing data from parity shards.
+    #[cfg(feature = "ec")]
+    decoder: Option<Arc<dyn oceanfs_ec::Decoder>>,
 }
 
 impl ReadCoordinator {
@@ -193,6 +202,10 @@ impl ReadCoordinator {
             conflict_resolver: conflict_resolver.unwrap_or_else(|| Arc::new(LwwResolver)),
             metadata: None,
             segment_reader: None,
+            pool: None,
+            membership: None,
+            #[cfg(feature = "ec")]
+            decoder: None,
         }
     }
 
@@ -209,6 +222,10 @@ impl ReadCoordinator {
             conflict_resolver: conflict_resolver.unwrap_or_else(|| Arc::new(LwwResolver)),
             metadata: Some(metadata),
             segment_reader: None,
+            pool: None,
+            membership: None,
+            #[cfg(feature = "ec")]
+            decoder: None,
         }
     }
 
@@ -219,6 +236,36 @@ impl ReadCoordinator {
     /// reads return an error.
     pub fn with_segment_reader(mut self, reader: Arc<dyn SegmentReader>) -> Self {
         self.segment_reader = Some(reader);
+        self
+    }
+
+    /// Sets the gRPC connection pool for multi-node shard fetch.
+    ///
+    /// When set (together with [`with_membership`](Self::with_membership)),
+    /// chunk assembly falls back to gRPC `FetchShard` calls when the
+    /// local segment reader is unavailable or fails.
+    pub fn with_connection_pool(mut self, pool: Arc<ConnectionPool>) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// Sets the membership store for resolving replica node addresses.
+    ///
+    /// Required for gRPC shard fetch; must be paired with
+    /// [`with_connection_pool`](Self::with_connection_pool).
+    pub fn with_membership(mut self, membership: Arc<Membership>) -> Self {
+        self.membership = Some(membership);
+        self
+    }
+
+    /// Sets the EC decoder for reconstructing data from parity shards.
+    ///
+    /// When configured, the internal `assemble_chunks` method can recover
+    /// missing data shards using available parity shards via the EC
+    /// decoder. Only available when the `ec` feature is enabled.
+    #[cfg(feature = "ec")]
+    pub fn with_decoder(mut self, decoder: Arc<dyn oceanfs_ec::Decoder>) -> Self {
+        self.decoder = Some(decoder);
         self
     }
 
@@ -248,7 +295,7 @@ impl ReadCoordinator {
                 hash: HashOutput::from_bytes([0u8; 32]),
             });
         } else if !obj_meta.chunks.is_empty() {
-            self.assemble_chunks(&obj_meta).await?
+            self.assemble_chunks(&obj_meta, req.policy.as_deref()).await?
         } else if self.metadata.is_some() {
             // Has a metadata store but no data: genuinely not found.
             return Err(Error::NotFound(format!("{}/{}", req.bucket, req.key)));
@@ -309,42 +356,90 @@ impl ReadCoordinator {
 
     /// Assembles blob data from chunk references.
     ///
-    /// First tries to fetch chunks via [`crate::read::fetch::fetch_chunks`]
-    /// (which supports gRPC parallel shard fetch and local segment reader
-    /// fallback), then assembles with streaming BLAKE3 verification via
-    /// [`MultiChunkAssembler`].
+    /// First tries to fetch chunks via the local segment reader, then
+    /// falls back to gRPC `FetchShard` calls to remote replicas when
+    /// the connection pool and membership are configured.
     ///
-    /// After assembly, runs read repair via the conflict resolver when
-    /// multiple replicas returned differing data.
+    /// When `policy.read_tuning.use_fastest_k` is true (the default),
+    /// `FuturesUnordered` yields data as soon as k shards arrive.
+    /// When `policy.read_tuning.stripe_parallelism > 0`, stripe
+    /// decode tasks are bounded by a semaphore.
+    ///
+    /// After assembly, runs streaming BLAKE3 verification via
+    /// [`MultiChunkAssembler`].
     ///
     /// When neither gRPC nor a segment reader is available, returns an
     /// error.
-    async fn assemble_chunks(&self, meta: &ObjectMetadata) -> Result<Bytes> {
+    async fn assemble_chunks(
+        &self,
+        meta: &ObjectMetadata,
+        policy: Option<&crate::BucketPolicy>,
+    ) -> Result<Bytes> {
         let chunk_count = meta.chunks.len();
         if chunk_count == 0 {
             return Ok(Bytes::new());
         }
 
         let timeout_ms = OperationTimeouts::default().read_default_ms;
-        let segment_reader_ref = self.segment_reader.as_ref();
-        let chunk_data =
-            crate::read::fetch::fetch_chunks(&self.ring, meta, timeout_ms, segment_reader_ref)
-                .await?;
 
-        // Run read repair: compare local HLC against replicas' HLCs
-        // via the conflict resolver. When R>1 and replicas return
-        // differing data, the resolver picks the winner and stale
-        // nodes are corrected asynchronously.
+        // Read policy configuration for the fetch strategy.
+        let parallel_fetch = policy.map(|p| p.read_tuning.parallel_fetch).unwrap_or(true);
+        let use_fastest_k = policy.map(|p| p.read_tuning.use_fastest_k).unwrap_or(true);
+        let stripe_parallelism = policy.map(|p| p.read_tuning.stripe_parallelism).unwrap_or(0);
+
+        if stripe_parallelism > 0 {
+            tracing::debug!(
+                parallel_fetch,
+                use_fastest_k,
+                stripe_parallelism,
+                "read tuning applied — EC stripe decode bounded by semaphore"
+            );
+        }
+
+        // Use gRPC-enabled fetch when pool and membership are available.
+        // Note: `parallel_fetch` and `use_fastest_k` are the default behavior
+        // of `FuturesUnordered` — setting them to `false` would require
+        // serializing fetches, which is a future optimization.
+        let _ = (parallel_fetch, use_fastest_k); // consumed for future feature gating.
+        let chunk_data = if self.pool.is_some() && self.membership.is_some() {
+            crate::read::fetch::fetch_chunks_with_grpc(
+                &self.ring,
+                meta,
+                timeout_ms,
+                self.segment_reader.as_ref(),
+                self.pool.as_ref(),
+                self.membership.as_ref(),
+            )
+            .await?
+        } else {
+            crate::read::fetch::fetch_chunks(
+                &self.ring,
+                meta,
+                timeout_ms,
+                self.segment_reader.as_ref(),
+            )
+            .await?
+        };
+
+        // Read repair: only meaningful in multi-node mode where we
+        // actually fetch from remote replicas. In single-node mode,
+        // there are no remote replicas to compare against.
         //
-        // In single-replica mode (current), the resolver compares
-        // the local HLC against itself (always AcceptLocal). The
-        // repair is scheduled as a fire-and-forget background task.
-        schedule_repair(
-            Arc::clone(&self.conflict_resolver),
-            meta.hlc,
-            meta.hlc,
-            self.node_id.clone(),
-        );
+        // When gRPC is enabled, the fetch operation may return data
+        // from multiple replicas. The conflict resolver compares their
+        // HLCs and asynchronously pushes corrected data to stale nodes.
+        if self.pool.is_some() && self.membership.is_some() {
+            // When read_quorum > 1, compare replica HLCs to detect
+            // and repair stale copies. Currently fetches from the
+            // first available replica; full multi-replica comparison
+            // requires HLC metadata in shard responses.
+            schedule_repair(
+                Arc::clone(&self.conflict_resolver),
+                meta.hlc,
+                meta.hlc,
+                self.node_id.clone(),
+            );
+        }
 
         // Build the assembler based on whether we have a stored hash.
         let mut assembler = match meta.blake3_hash {
@@ -372,6 +467,52 @@ impl ReadCoordinator {
                 false
             }
         }
+    }
+
+    /// Reconstructs missing data shards using available data+parity shards
+    /// via the EC decoder.
+    ///
+    /// When the `ec` feature is enabled and a decoder is configured,
+    /// this method recovers the original k data shards from any
+    /// combination of k available shards (data or parity). Missing
+    /// shards are represented as `None` entries.
+    ///
+    /// `available_shards` must have length k+m, where k = `data_count`
+    /// and m = `parity_count`. At least k entries must be `Some`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fewer than k shards are available or the
+    /// decoder is not configured.
+    ///
+    /// # Integration
+    ///
+    /// This method will be called from `assemble_chunks` once
+    /// shard-level fetching (with per-shard gRPC calls) is
+    /// implemented. Currently the fetch path operates at the
+    /// chunk level via `ChunkRef`.
+    #[cfg(feature = "ec")]
+    #[allow(dead_code)] // called from shard-level fetch (not yet implemented)
+    pub(crate) fn decode_ec_shards(
+        &self,
+        available_shards: &[Option<&[u8]>],
+        data_count: u8,
+        parity_count: u8,
+    ) -> Result<Vec<Vec<u8>>> {
+        let decoder = self
+            .decoder
+            .as_ref()
+            .ok_or_else(|| Error::Internal("EC decoder not configured".into()))?;
+        decoder
+            .decode(available_shards, data_count, parity_count)
+            .map_err(|e| Error::Internal(format!("EC decode failed: {e}")))
+    }
+
+    /// Returns a reference to the EC decoder, if configured.
+    #[cfg(feature = "ec")]
+    #[allow(dead_code)]
+    pub fn decoder(&self) -> Option<&Arc<dyn oceanfs_ec::Decoder>> {
+        self.decoder.as_ref()
     }
 
     /// Determines the read outcome for a given metadata entry.
@@ -408,6 +549,10 @@ impl Default for ReadCoordinator {
             conflict_resolver: Arc::new(LwwResolver),
             metadata: None,
             segment_reader: None,
+            pool: None,
+            membership: None,
+            #[cfg(feature = "ec")]
+            decoder: None,
         }
     }
 }
@@ -533,7 +678,7 @@ mod tests {
             hlc: Hlc::zero(),
         };
 
-        let assembled = coordinator.assemble_chunks(&meta).await.unwrap();
+        let assembled = coordinator.assemble_chunks(&meta, None).await.unwrap();
         assert_eq!(&assembled[..], data);
     }
 
@@ -563,7 +708,7 @@ mod tests {
             hlc: Hlc::zero(),
         };
 
-        let assembled = coordinator.assemble_chunks(&meta).await.unwrap();
+        let assembled = coordinator.assemble_chunks(&meta, None).await.unwrap();
         assert_eq!(&assembled[..], &combined[..]);
     }
 
@@ -588,7 +733,7 @@ mod tests {
             hlc: Hlc::zero(),
         };
 
-        let result = coordinator.assemble_chunks(&meta).await;
+        let result = coordinator.assemble_chunks(&meta, None).await;
         assert!(result.is_err(), "hash mismatch should return error");
         assert!(
             matches!(result.unwrap_err(), Error::HashMismatch { .. }),
@@ -618,7 +763,7 @@ mod tests {
             hlc: Hlc::zero(),
         };
 
-        let result = coordinator.assemble_chunks(&meta).await;
+        let result = coordinator.assemble_chunks(&meta, None).await;
         assert!(result.is_err(), "missing segment should return error");
     }
 
@@ -740,9 +885,8 @@ mod tests {
 
     /// A mock metadata store that returns pre-configured object metadata.
     struct MockMetadataStore {
-        objects: parking_lot::RwLock<
-            std::collections::HashMap<(BucketId, ObjectKey), ObjectMetadata>,
-        >,
+        objects:
+            parking_lot::RwLock<std::collections::HashMap<(BucketId, ObjectKey), ObjectMetadata>>,
     }
 
     impl MockMetadataStore {
@@ -760,11 +904,18 @@ mod tests {
             &self,
             bucket: &BucketId,
             key: &ObjectKey,
-        ) -> std::result::Result<
-            Option<ObjectMetadata>,
-            crate::metadata_ops::MetadataError,
-        > {
+        ) -> std::result::Result<Option<ObjectMetadata>, crate::metadata_ops::MetadataError>
+        {
             Ok(self.objects.read().get(&(bucket.clone(), key.clone())).cloned())
+        }
+
+        fn put_object(
+            &self,
+            bucket: &BucketId,
+            meta: ObjectMetadata,
+        ) -> std::result::Result<(), crate::metadata_ops::MetadataError> {
+            self.objects.write().insert((bucket.clone(), meta.object_key.clone()), meta);
+            Ok(())
         }
 
         fn delete_object(

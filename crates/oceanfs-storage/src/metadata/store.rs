@@ -100,6 +100,29 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Stores object metadata with an explicit bucket.
+    ///
+    /// Unlike [`put_object`](Self::put_object) which defaults to
+    /// `"default"`, this method encodes the bucket name into the
+    /// RocksDB key so reads scoped to the correct bucket can find it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying RocksDB write fails.
+    pub fn put_object_in_bucket(&self, bucket: &BucketId, meta: ObjectMetadata) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(cf::CF_OBJECTS)
+            .ok_or_else(|| Error::InvalidConfig("objects CF not found".into()))?;
+
+        let key = cf::encode_object_key(bucket.as_str(), meta.object_key.as_str());
+        let value = serde_json::to_vec(&meta).map_err(|e| Error::Io(io_err(e)))?;
+
+        self.db.put_cf(&cf, key, value).map_err(|e| Error::Io(io_err(e)))?;
+
+        Ok(())
+    }
+
     /// Retrieves object metadata.
     ///
     /// Returns `None` if the object does not exist.
@@ -315,10 +338,7 @@ impl MetadataStore {
     /// # Errors
     ///
     /// Individual entries that fail to deserialize are skipped.
-    pub fn list_tombstones(
-        &self,
-        bucket: &BucketId,
-    ) -> Vec<Result<(ObjectKey, Tombstone)>> {
+    pub fn list_tombstones(&self, bucket: &BucketId) -> Vec<Result<(ObjectKey, Tombstone)>> {
         let cf = self.db.cf_handle(cf::CF_DELETIONS);
         let Some(cf_handle) = cf else {
             return vec![];
@@ -331,13 +351,15 @@ impl MetadataStore {
             rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
         );
 
-        iter.take_while(move |item| {
-            if let Ok((key, _)) = item {
-                key.starts_with(&prefix)
-            } else {
-                false
-            }
-        })
+        iter.take_while(
+            move |item| {
+                if let Ok((key, _)) = item {
+                    key.starts_with(&prefix)
+                } else {
+                    false
+                }
+            },
+        )
         .filter_map(|item| match item {
             Ok((key, value)) => {
                 let (bucket_str, key_str) = cf::decode_object_key(&key)?;
@@ -345,9 +367,7 @@ impl MetadataStore {
                     return None;
                 }
                 match serde_json::from_slice::<Tombstone>(&value) {
-                    Ok(tombstone) => {
-                        Some(Ok((ObjectKey::new(key_str), tombstone)))
-                    }
+                    Ok(tombstone) => Some(Ok((ObjectKey::new(key_str), tombstone))),
                     Err(_) => None,
                 }
             }

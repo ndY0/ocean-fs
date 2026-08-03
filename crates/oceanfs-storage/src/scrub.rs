@@ -189,19 +189,40 @@ pub struct ScrubReportBuilder {
 
 impl ScrubReportBuilder {
     /// Sets the total segments examined.
-    pub fn segments_total(mut self, v: u64) -> Self { self.segments_total = v; self }
+    pub fn segments_total(mut self, v: u64) -> Self {
+        self.segments_total = v;
+        self
+    }
     /// Sets the healthy segment count.
-    pub fn segments_healthy(mut self, v: u64) -> Self { self.segments_healthy = v; self }
+    pub fn segments_healthy(mut self, v: u64) -> Self {
+        self.segments_healthy = v;
+        self
+    }
     /// Sets the corrupt segment count.
-    pub fn segments_corrupt(mut self, v: u64) -> Self { self.segments_corrupt = v; self }
+    pub fn segments_corrupt(mut self, v: u64) -> Self {
+        self.segments_corrupt = v;
+        self
+    }
     /// Sets the healed segment count.
-    pub fn segments_healed(mut self, v: u64) -> Self { self.segments_healed = v; self }
+    pub fn segments_healed(mut self, v: u64) -> Self {
+        self.segments_healed = v;
+        self
+    }
     /// Sets the bytes scanned.
-    pub fn bytes_scanned(mut self, v: u64) -> Self { self.bytes_scanned = v; self }
+    pub fn bytes_scanned(mut self, v: u64) -> Self {
+        self.bytes_scanned = v;
+        self
+    }
     /// Sets the number of nodes participated.
-    pub fn nodes_participated(mut self, v: usize) -> Self { self.nodes_participated = v; self }
+    pub fn nodes_participated(mut self, v: usize) -> Self {
+        self.nodes_participated = v;
+        self
+    }
     /// Sets the duration in seconds.
-    pub fn duration_sec(mut self, v: f64) -> Self { self.duration_sec = v; self }
+    pub fn duration_sec(mut self, v: f64) -> Self {
+        self.duration_sec = v;
+        self
+    }
 
     /// Builds the [`ScrubReport`].
     pub fn build(self) -> ScrubReport {
@@ -225,15 +246,12 @@ impl ScrubReportBuilder {
 #[derive(Debug, Clone)]
 pub(crate) struct ScrubResult {
     /// The segment ID that was scrubbed.
-    #[allow(dead_code)]
     pub segment_id: SegmentId,
     /// Whether the segment verified as healthy.
     pub healthy: bool,
     /// Indices of corrupt shards (empty if healthy).
-    #[allow(dead_code)]
     pub corrupt_shard_indices: Vec<usize>,
     /// Whether the Merkle root mismatched.
-    #[allow(dead_code)]
     pub merkle_mismatch: bool,
     /// Number of bytes scanned for this segment.
     pub bytes_scanned: u64,
@@ -250,7 +268,6 @@ pub(crate) struct ScrubResult {
 #[doc(hidden)]
 pub(crate) struct SegmentPartition {
     /// The node ID responsible for this partition.
-    #[allow(dead_code)]
     pub node_id: NodeId,
     /// The segment IDs in this partition.
     pub segment_ids: Vec<SegmentId>,
@@ -403,10 +420,8 @@ impl ScrubWorker {
             );
 
             // Enqueue for EC-based healing via the global heal queue.
-            match crate::heal::enqueue_heal(
-                segment_meta.segment_id,
-                corrupt_shard_indices.clone(),
-            ) {
+            match crate::heal::enqueue_heal(segment_meta.segment_id, corrupt_shard_indices.clone())
+            {
                 Ok(()) => {
                     enqueued_heal = true;
                     tracing::info!(
@@ -439,6 +454,11 @@ impl ScrubWorker {
     /// Iterates through each segment in the partition, reads its metadata
     /// from the metadata store, and verifies it via [`scrub_segment`].
     pub(crate) fn scrub_partition(&self, partition: &SegmentPartition) -> Vec<ScrubResult> {
+        tracing::debug!(
+            node_id = %partition.node_id,
+            segment_count = partition.segment_ids.len(),
+            "scrubbing partition"
+        );
         let mut results = Vec::with_capacity(partition.segment_ids.len());
 
         for seg_id in &partition.segment_ids {
@@ -577,10 +597,8 @@ impl ScrubCoordinator {
         // Phase 2: Partition segments into batches for parallel verification.
         // Each batch is assigned to a spawned task bounded by the semaphore.
         let batch_size = (segment_ids.len() / max_concurrent).max(1);
-        let batches: Vec<Vec<SegmentId>> = segment_ids
-            .chunks(batch_size)
-            .map(|chunk| chunk.to_vec())
-            .collect();
+        let batches: Vec<Vec<SegmentId>> =
+            segment_ids.chunks(batch_size).map(|chunk| chunk.to_vec()).collect();
 
         let semaphore = Arc::new(Semaphore::new(max_concurrent));
         let worker = Arc::new(ScrubWorker::new(
@@ -605,11 +623,10 @@ impl ScrubCoordinator {
                 let partition = SegmentPartition { node_id, segment_ids: batch };
                 // Perform the actual verification on a blocking thread
                 // to avoid blocking the async runtime.
-                let results = tokio::task::spawn_blocking(move || {
-                    worker.scrub_partition(&partition)
-                })
-                .await
-                .map_err(|e| Error::Scrub(format!("spawn_blocking failed: {e}")))?;
+                let results =
+                    tokio::task::spawn_blocking(move || worker.scrub_partition(&partition))
+                        .await
+                        .map_err(|e| Error::Scrub(format!("spawn_blocking failed: {e}")))?;
 
                 Ok::<Vec<ScrubResult>, Error>(results)
             });
@@ -627,6 +644,13 @@ impl ScrubCoordinator {
                             report.segments_healthy += 1;
                         } else {
                             report.segments_corrupt += 1;
+                            if result.merkle_mismatch {
+                                tracing::warn!(
+                                    segment_id = %result.segment_id,
+                                    corrupt_shards = result.corrupt_shard_indices.len(),
+                                    "scrub detected segment with Merkle root mismatch"
+                                );
+                            }
                         }
                         if result.enqueued_heal {
                             report.segments_healed += 1;
@@ -766,29 +790,6 @@ mod tests {
         store
     }
 
-    /// Creates a segment metadata entry with an optionally-computed Merkle root.
-    #[allow(dead_code)]
-    fn segment_meta_with_data(
-        seg_id: SegmentId,
-        data: &[u8],
-    ) -> SegmentMetadata {
-        let merkle_root = if data.is_empty() {
-            None
-        } else {
-            Some(MerkleTree::build(data, 0).unwrap().root().hash())
-        };
-
-        SegmentMetadata {
-            segment_id: seg_id,
-            ec_k: 4,
-            ec_m: 2,
-            size_tier: SizeTier::Standard,
-            merkle_root,
-            storage_locations: smallvec::SmallVec::new(),
-            sealed_at: Some(1700000000000),
-        }
-    }
-
     // -----------------------------------------------------------------------
     // ScrubConfig
     // -----------------------------------------------------------------------
@@ -897,8 +898,7 @@ mod tests {
         let test_data = b"data present but no merkle root stored".to_vec();
 
         let metadata_store = Arc::new(MetadataStore::open(&test_config()).unwrap());
-        let data_store =
-            segment_store_with_data(vec![(seg_id, test_data.clone())]);
+        let data_store = segment_store_with_data(vec![(seg_id, test_data.clone())]);
         let worker = ScrubWorker::new(metadata_store, data_store, 0);
 
         let seg_meta = SegmentMetadata {
@@ -926,8 +926,7 @@ mod tests {
         let merkle_root = MerkleTree::build(&test_data, 0).unwrap().root().hash();
 
         let metadata_store = Arc::new(MetadataStore::open(&test_config()).unwrap());
-        let data_store =
-            segment_store_with_data(vec![(seg_id, test_data.clone())]);
+        let data_store = segment_store_with_data(vec![(seg_id, test_data.clone())]);
         let worker = ScrubWorker::new(metadata_store, data_store, 0);
 
         let seg_meta = SegmentMetadata {
@@ -952,8 +951,7 @@ mod tests {
         let data_store = segment_store_with_data(vec![]);
         let worker = ScrubWorker::new(metadata_store, data_store, 0);
 
-        let partition =
-            SegmentPartition { node_id: NodeId::new("test"), segment_ids: Vec::new() };
+        let partition = SegmentPartition { node_id: NodeId::new("test"), segment_ids: Vec::new() };
 
         let results = worker.scrub_partition(&partition);
         assert!(results.is_empty());
@@ -978,8 +976,7 @@ mod tests {
 
         let metadata_store = Arc::new(MetadataStore::open(&test_config()).unwrap());
         // Store the CORRUPTED data (simulating disk corruption)
-        let data_store =
-            segment_store_with_data(vec![(seg_id, corrupted_data)]);
+        let data_store = segment_store_with_data(vec![(seg_id, corrupted_data)]);
         let worker = ScrubWorker::new(metadata_store, data_store, 0);
 
         let seg_meta = SegmentMetadata {
@@ -1009,8 +1006,7 @@ mod tests {
 
         let metadata_store = Arc::new(MetadataStore::open(&test_config()).unwrap());
         // Store DIFFERENT data (simulating accidental overwrite)
-        let data_store =
-            segment_store_with_data(vec![(seg_id, different_data)]);
+        let data_store = segment_store_with_data(vec![(seg_id, different_data)]);
         let worker = ScrubWorker::new(metadata_store, data_store, 0);
 
         let seg_meta = SegmentMetadata {
@@ -1035,8 +1031,7 @@ mod tests {
         let merkle_root = MerkleTree::build(&test_data, 0).unwrap().root().hash();
 
         let metadata_store = Arc::new(MetadataStore::open(&test_config()).unwrap());
-        let data_store =
-            segment_store_with_data(vec![(seg_id, test_data.clone())]);
+        let data_store = segment_store_with_data(vec![(seg_id, test_data.clone())]);
         let worker = ScrubWorker::new(metadata_store, data_store, 0);
 
         let seg_meta = SegmentMetadata {
@@ -1114,8 +1109,7 @@ mod tests {
         let merkle_root = MerkleTree::build(&large_data, 0).unwrap().root().hash();
 
         let metadata_store = Arc::new(MetadataStore::open(&test_config()).unwrap());
-        let data_store =
-            segment_store_with_data(vec![(seg_id, large_data.clone())]);
+        let data_store = segment_store_with_data(vec![(seg_id, large_data.clone())]);
         let worker = ScrubWorker::new(metadata_store, data_store, 0);
 
         let seg_meta = SegmentMetadata {
@@ -1206,8 +1200,7 @@ mod tests {
         metadata.put_segment(seg_meta).unwrap();
 
         // Data store has the CORRUPTED data
-        let data_store =
-            segment_store_with_data(vec![(seg_id, corrupted_data)]);
+        let data_store = segment_store_with_data(vec![(seg_id, corrupted_data)]);
 
         let coord = ScrubCoordinator::new(ScrubConfig::default());
         let report = coord.run_cycle(metadata, data_store).await.unwrap();
@@ -1324,10 +1317,8 @@ mod tests {
 
         // Create a segment ID that was never stored in metadata
         let missing_id = SegmentId::new();
-        let partition = SegmentPartition {
-            node_id: NodeId::new("test"),
-            segment_ids: vec![missing_id],
-        };
+        let partition =
+            SegmentPartition { node_id: NodeId::new("test"), segment_ids: vec![missing_id] };
 
         let results = worker.scrub_partition(&partition);
         // No scrub results should be produced for a missing segment

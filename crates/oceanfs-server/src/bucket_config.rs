@@ -44,6 +44,8 @@ pub struct BucketPolicy {
     pub cache: CacheConfig,
     /// Performance-tuning knobs.
     pub tuning: TuningConfig,
+    /// Read-path performance tuning.
+    pub read_tuning: ReadTuningConfig,
     /// Healing/recovery configuration.
     pub heal: HealConfig,
     /// Garbage collection configuration.
@@ -266,6 +268,38 @@ impl Default for TuningConfig {
             max_concurrent_encodes: 8,
             wal_sync_interval_ms: 10,
             wal_max_file_bytes: 67108864, // 64 MiB
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReadTuningConfig
+// ---------------------------------------------------------------------------
+
+/// Read-path performance parameters.
+///
+/// Controls parallelism, shard fetch strategy, and stripe decode
+/// concurrency for distributed blob reads.
+#[derive(Debug, Clone)]
+pub struct ReadTuningConfig {
+    /// When `true`, fetch all k+m shards simultaneously.
+    /// When `false`, fetch only the k data shards first.
+    pub parallel_fetch: bool,
+    /// When `true`, return data as soon as k shards arrive
+    /// (using `FuturesUnordered` completion-order semantics).
+    /// When `false`, wait for all k data shards before proceeding.
+    pub use_fastest_k: bool,
+    /// Maximum concurrent stripe decode tasks.
+    /// Bounded by a `tokio::sync::Semaphore`. Set to 0 for unlimited.
+    pub stripe_parallelism: usize,
+}
+
+impl Default for ReadTuningConfig {
+    fn default() -> Self {
+        Self {
+            parallel_fetch: true,
+            use_fastest_k: true,
+            stripe_parallelism: 0, // unlimited
         }
     }
 }

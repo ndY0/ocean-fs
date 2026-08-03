@@ -43,16 +43,10 @@ impl ScrubRpc for ScrubGrpcService {
     ) -> Result<Response<AssignPartitionResponse>, Status> {
         let req = request.into_inner();
 
-        let segment_ids: Vec<SegmentId> = req
-            .segment_ids
-            .into_iter()
-            .filter_map(|sid| SegmentId::try_from(sid).ok())
-            .collect();
+        let segment_ids: Vec<SegmentId> =
+            req.segment_ids.into_iter().filter_map(|sid| SegmentId::try_from(sid).ok()).collect();
 
-        tracing::info!(
-            segment_count = segment_ids.len(),
-            "received scrub partition assignment"
-        );
+        tracing::info!(segment_count = segment_ids.len(), "received scrub partition assignment");
 
         // Accept the assignment. The actual scrubbing is handled
         // asynchronously by the background scrub task.
@@ -66,10 +60,7 @@ impl ScrubRpc for ScrubGrpcService {
     ) -> Result<Response<ReportPartitionResultResponse>, Status> {
         let req = request.into_inner();
 
-        let node_id = req
-            .node_id
-            .map(NodeId::from)
-            .unwrap_or_else(|| NodeId::new("unknown"));
+        let node_id = req.node_id.map(NodeId::from).unwrap_or_else(|| NodeId::new("unknown"));
 
         tracing::info!(
             node_id = %node_id,

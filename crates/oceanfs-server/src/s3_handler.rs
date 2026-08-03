@@ -22,10 +22,10 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    Router,
+    Router as AxumRouter,
 };
 use bytes::Bytes;
-use oceanfs_core::{BucketId, HashKey, HashOutput, ObjectKey};
+use oceanfs_core::{BucketId, HashKey, HashOutput, ObjectKey, ObjectMetadata};
 use oceanfs_routing::hash_key;
 use tracing::{debug, error, info};
 
@@ -77,8 +77,9 @@ pub(crate) struct AppState {
     /// Optional in-memory segment store for chunk-based reads.
     pub segment_store: Option<Arc<InMemorySegmentReader>>,
     /// Optional prefetch engine for warming caches after LIST/GET.
-    #[allow(dead_code)]
     pub prefetch_engine: Option<Arc<oceanfs_cache::PrefetchEngine>>,
+    /// Request router for non-local forwarding decisions.
+    pub router: Option<Arc<crate::router::Router>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +149,7 @@ impl S3Handler {
             negative_cache,
             segment_store: None,
             prefetch_engine: None,
+            router: None,
         };
         Self { state }
     }
@@ -165,14 +167,20 @@ impl S3Handler {
         self
     }
 
+    /// Sets the request router for non-local forwarding.
+    pub fn with_router(mut self, router: Arc<crate::router::Router>) -> Self {
+        self.state.router = Some(router);
+        self
+    }
+
     /// Consumes the handler and returns an axum `Router`.
     ///
     /// The returned router can be mounted in an axum `Server` via
     /// `axum::serve(listener, router)`.
-    pub fn into_router(self) -> Router {
+    pub fn into_router(self) -> AxumRouter {
         let state = self.state;
 
-        Router::new()
+        AxumRouter::new()
             // Object operations: /:bucket/*key (catch-all for S3-style keys)
             .route(
                 "/:bucket/*key",
@@ -189,15 +197,14 @@ impl S3Handler {
             .with_state(state)
     }
 
-    /// Consumes the handler and returns a `Router` with auth
+    /// Consumes the handler and returns an axum `Router` with auth
     /// middleware applied.
     ///
     /// When the auth layer is enabled, all S3 object and bucket
     /// operations require valid AWS SigV4 credentials (or a
     /// valid access key). When disabled, the layer passes
     /// requests through unchanged.
-    #[allow(dead_code)]
-    pub fn into_router_with_auth(self, auth_layer: crate::auth::AuthMiddleware) -> Router {
+    pub fn into_router_with_auth(self, auth_layer: crate::auth::AuthMiddleware) -> AxumRouter {
         self.into_router().layer(auth_layer)
     }
 }
@@ -227,15 +234,18 @@ async fn put_object(
 
     let hk = HashKey::from_bytes(hash_key(object_key.as_str().as_bytes()));
 
+    let policy = state.buckets.get(&bucket);
+    let write_quorum = policy.as_ref().map(|p| p.consistency.write_quorum).unwrap_or(1);
+
     let req = WriteRequest {
         bucket: bucket_id.clone(),
         key: object_key.clone(),
         hash_key: hk,
         data: body.clone(),
-        write_quorum: 1,
+        write_quorum,
         ack_after_wal: true,
         ec_async: false,
-        policy: None,
+        policy,
     };
 
     match state.write.put(req).await {
@@ -247,6 +257,28 @@ async fn put_object(
                 for chunk in &result.chunks {
                     store.put(chunk.segment_id, body.clone());
                 }
+            }
+
+            // Persist object metadata so reads can locate the data.
+            let meta = ObjectMetadata {
+                object_key: object_key.clone(),
+                size: result.size,
+                blake3_hash: result.blake3_hash.clone(),
+                chunks: result.chunks.clone(),
+                inline_data: None,
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64,
+                hlc: oceanfs_core::Hlc::zero(),
+            };
+            if let Err(e) = state.metadata.put_object(&bucket_id, meta) {
+                error!(key = %key, error = %e, "failed to persist object metadata");
+                return s3_error_response(
+                    &Error::Internal(format!("metadata write failed: {e}")),
+                    &bucket,
+                    &key,
+                );
             }
 
             // Invalidate caches for this key.
@@ -298,6 +330,42 @@ async fn get_object(
     if let Some(ref l1) = state.object_cache {
         if let Some(cached_data) = l1.get(&bucket_id, &object_key) {
             tracing::debug!(key = %key, "L1 cache hit");
+            // Verify BLAKE3 hash against L2 metadata if available.
+            if let Some(ref l2) = state.metadata_cache {
+                if let Some(ref meta) = l2.get(&bucket_id, &object_key) {
+                    if let Some(ref stored_hash) = meta.blake3_hash {
+                        let computed = blake3::hash(&cached_data);
+                        if *computed.as_bytes() != *stored_hash.as_bytes() {
+                            error!(
+                                key = %key,
+                                "L1 cache BLAKE3 mismatch — evicting and falling through"
+                            );
+                            l1.invalidate(&bucket_id, &object_key);
+                            // Fall through to ReadCoordinator below.
+                        } else {
+                            let content_type = infer_content_type(&state.mime_types, &key);
+                            let mut headers = HeaderMap::new();
+                            headers.insert(header::CONTENT_TYPE, header_val(&content_type));
+                            headers.insert(
+                                header::CONTENT_LENGTH,
+                                header_val(&cached_data.len().to_string()),
+                            );
+                            return (StatusCode::OK, headers, cached_data.to_vec()).into_response();
+                        }
+                    } else {
+                        // No stored hash to verify — serve from cache.
+                        let content_type = infer_content_type(&state.mime_types, &key);
+                        let mut headers = HeaderMap::new();
+                        headers.insert(header::CONTENT_TYPE, header_val(&content_type));
+                        headers.insert(
+                            header::CONTENT_LENGTH,
+                            header_val(&cached_data.len().to_string()),
+                        );
+                        return (StatusCode::OK, headers, cached_data.to_vec()).into_response();
+                    }
+                }
+            }
+            // No L2 cache available — serve from L1 without verification.
             let content_type = infer_content_type(&state.mime_types, &key);
             let mut headers = HeaderMap::new();
             headers.insert(header::CONTENT_TYPE, header_val(&content_type));
@@ -329,8 +397,12 @@ async fn get_object(
     }
 
     // ---- L3 Negative Cache ----
+    // The negative cache stores keys known to be absent (deleted or never written).
+    // A Bloom filter returns `false` for "definitely absent" keys. We check if the
+    // key is in the cache (i.e., `contains` returns true), meaning the Bloom filter
+    // says "definitely absent" → return 404 immediately.
     if let Some(ref l3) = state.negative_cache {
-        if !l3.contains(&bucket_id, &object_key) {
+        if l3.contains(&bucket_id, &object_key) {
             tracing::debug!(key = %key, "L3 negative cache hit — key definitely absent");
             return s3_error_response(
                 &Error::NotFound(format!("{}/{}", bucket, key)),
@@ -341,12 +413,13 @@ async fn get_object(
     }
 
     // ---- ReadCoordinator ----
+    let policy = state.buckets.get(&bucket);
     let req = ReadRequest {
         bucket: bucket_id.clone(),
         key: object_key.clone(),
         hash_key: hk,
         metadata_only: false,
-        policy: None,
+        policy,
     };
 
     match state.read.get(req).await {
@@ -412,8 +485,9 @@ async fn head_object(
     let hk = HashKey::from_bytes(hash_key(object_key.as_str().as_bytes()));
 
     // ---- L3 Negative Cache ----
+    // See get_object for explanation of the inverted Bloom filter check.
     if let Some(ref l3) = state.negative_cache {
-        if !l3.contains(&bucket_id, &object_key) {
+        if l3.contains(&bucket_id, &object_key) {
             debug!(key = %key, "L3 negative cache hit — key definitely absent");
             return s3_error_response(
                 &Error::NotFound(format!("{}/{}", bucket, key)),
@@ -423,12 +497,13 @@ async fn head_object(
         }
     }
 
+    let policy = state.buckets.get(&bucket);
     let req = ReadRequest {
         bucket: bucket_id,
         key: object_key,
         hash_key: hk,
         metadata_only: true,
-        policy: None,
+        policy,
     };
 
     match state.read.get(req).await {
@@ -754,6 +829,17 @@ mod tests {
             Ok(self.objects.read().get(&(bucket.as_str().into(), key.as_str().into())).cloned())
         }
 
+        fn put_object(
+            &self,
+            bucket: &BucketId,
+            meta: ObjectMetadata,
+        ) -> Result<(), MetadataError> {
+            self.objects
+                .write()
+                .insert((bucket.as_str().into(), meta.object_key.as_str().into()), meta);
+            Ok(())
+        }
+
         fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> Result<(), MetadataError> {
             let k = (bucket.as_str().into(), key.as_str().into());
             self.objects.write().remove(&k);
@@ -825,6 +911,7 @@ mod tests {
             negative_cache: None,
             segment_store: Some(segment_store),
             prefetch_engine: None,
+            router: None,
         }
     }
 

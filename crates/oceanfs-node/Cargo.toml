@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 oceanfs-core.workspace = true
-oceanfs-server.workspace = true
+oceanfs-server = { workspace = true, features = ["storage", "cache", "accel"] }
 oceanfs-storage.workspace = true
 oceanfs-routing.workspace = true
 oceanfs-membership.workspace = true

@@ -21,6 +21,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+#[cfg(feature = "accel")]
+use oceanfs_accel::AccelDispatcher;
+#[cfg(feature = "cache")]
+use oceanfs_cache::{MetadataCache, NegativeCache, ObjectCache};
 use oceanfs_core::SizeTier;
 use parking_lot::RwLock;
 use serde::Serialize;
@@ -297,6 +301,18 @@ pub(crate) struct AdminState {
     /// Segment data store for scrub (storage feature only).
     #[cfg(feature = "storage")]
     pub data_store: Option<Arc<dyn oceanfs_storage::SegmentDataStore>>,
+    /// L1 object cache for cache stats (cache feature only).
+    #[cfg(feature = "cache")]
+    pub object_cache: Option<Arc<ObjectCache>>,
+    /// L2 metadata cache for cache stats (cache feature only).
+    #[cfg(feature = "cache")]
+    pub metadata_cache: Option<Arc<MetadataCache>>,
+    /// L3 negative cache for cache stats (cache feature only).
+    #[cfg(feature = "cache")]
+    pub negative_cache: Option<Arc<NegativeCache>>,
+    /// Acceleration dispatcher for hardware status (accel feature only).
+    #[cfg(feature = "accel")]
+    pub accel: Option<Arc<AccelDispatcher>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +342,14 @@ impl AdminHandler {
                 metadata_store: None,
                 #[cfg(feature = "storage")]
                 data_store: None,
+                #[cfg(feature = "cache")]
+                object_cache: None,
+                #[cfg(feature = "cache")]
+                metadata_cache: None,
+                #[cfg(feature = "cache")]
+                negative_cache: None,
+                #[cfg(feature = "accel")]
+                accel: None,
             },
         }
     }
@@ -349,6 +373,14 @@ impl AdminHandler {
                 metadata_store: None,
                 #[cfg(feature = "storage")]
                 data_store: None,
+                #[cfg(feature = "cache")]
+                object_cache: None,
+                #[cfg(feature = "cache")]
+                metadata_cache: None,
+                #[cfg(feature = "cache")]
+                negative_cache: None,
+                #[cfg(feature = "accel")]
+                accel: None,
             },
         }
     }
@@ -371,6 +403,33 @@ impl AdminHandler {
         self
     }
 
+    /// Wires cache instances for real cache statistics.
+    ///
+    /// When configured, `GET /admin/caches` returns real hit/miss data
+    /// from the provided cache instances.
+    #[cfg(feature = "cache")]
+    pub fn with_caches(
+        mut self,
+        object_cache: Option<Arc<ObjectCache>>,
+        metadata_cache: Option<Arc<MetadataCache>>,
+        negative_cache: Option<Arc<NegativeCache>>,
+    ) -> Self {
+        self.state.object_cache = object_cache;
+        self.state.metadata_cache = metadata_cache;
+        self.state.negative_cache = negative_cache;
+        self
+    }
+
+    /// Wires the acceleration dispatcher for hardware status reporting.
+    ///
+    /// When configured, `GET /admin/acceleration` returns the active
+    /// acceleration tier and available backends.
+    #[cfg(feature = "accel")]
+    pub fn with_accel(mut self, accel: Arc<AccelDispatcher>) -> Self {
+        self.state.accel = Some(accel);
+        self
+    }
+
     /// Consumes the handler and returns an axum `Router` for the
     /// `/admin/` prefix.
     pub fn into_router(self) -> Router {
@@ -383,6 +442,7 @@ impl AdminHandler {
             .route("/admin/caches", get(cache_stats))
             .route("/admin/scrub", post(trigger_scrub))
             .route("/admin/metrics", get(metrics_endpoint))
+            .route("/admin/acceleration", get(acceleration_status))
             .with_state(state)
     }
 }
@@ -422,21 +482,83 @@ async fn cluster_view(State(state): State<AdminState>) -> impl IntoResponse {
 }
 
 /// GET /admin/segments — returns segment health report as JSON.
-#[instrument]
-async fn segment_report() -> impl IntoResponse {
+#[instrument(skip(state))]
+async fn segment_report(State(state): State<AdminState>) -> impl IntoResponse {
+    #[cfg(feature = "storage")]
+    {
+        if let Some(ref metadata) = state.metadata_store {
+            let mut total: u64 = 0;
+            let mut sealed: u64 = 0;
+            let mut unsealed: u64 = 0;
+            let mut by_tier: HashMap<SizeTier, u64> = HashMap::new();
+
+            let segments = metadata.list_segments();
+            for seg in segments.into_iter().flatten() {
+                total += 1;
+                if seg.is_sealed() {
+                    sealed += 1;
+                } else {
+                    unsealed += 1;
+                }
+                *by_tier.entry(seg.size_tier).or_insert(0) += 1;
+            }
+
+            let report = SegmentReport {
+                total,
+                sealed,
+                unsealed,
+                encoding: 0, // encoding state not tracked in segment metadata
+                by_tier,
+            };
+            return Json(report).into_response();
+        }
+    }
     let report =
         SegmentReport { total: 0, sealed: 0, unsealed: 0, encoding: 0, by_tier: HashMap::new() };
     Json(report).into_response()
 }
 
 /// GET /admin/caches — returns per-tier cache hit/miss stats as JSON.
-#[instrument]
-async fn cache_stats() -> impl IntoResponse {
-    let stats = vec![
-        CacheStats { tier: "l1".into(), hits: 0, misses: 0 },
-        CacheStats { tier: "l2".into(), hits: 0, misses: 0 },
-        CacheStats { tier: "l3".into(), hits: 0, misses: 0 },
-    ];
+#[instrument(skip(state))]
+async fn cache_stats(State(state): State<AdminState>) -> impl IntoResponse {
+    let mut stats = Vec::new();
+
+    #[cfg(feature = "cache")]
+    {
+        if let Some(ref object_cache) = state.object_cache {
+            let s = object_cache.stats();
+            stats.push(CacheStats {
+                tier: "l1".into(),
+                hits: s.hits.load(Ordering::Relaxed),
+                misses: s.misses.load(Ordering::Relaxed),
+            });
+        }
+        if let Some(ref meta_cache) = state.metadata_cache {
+            let s = meta_cache.stats();
+            stats.push(CacheStats {
+                tier: "l2".into(),
+                hits: s.hits.load(Ordering::Relaxed),
+                misses: s.misses.load(Ordering::Relaxed),
+            });
+        }
+        if let Some(ref neg_cache) = state.negative_cache {
+            let s = neg_cache.stats();
+            stats.push(CacheStats {
+                tier: "l3".into(),
+                hits: s.hits.load(Ordering::Relaxed),
+                misses: s.false_positives.load(Ordering::Relaxed),
+            });
+        }
+    }
+
+    if stats.is_empty() {
+        stats = vec![
+            CacheStats { tier: "l1".into(), hits: 0, misses: 0 },
+            CacheStats { tier: "l2".into(), hits: 0, misses: 0 },
+            CacheStats { tier: "l3".into(), hits: 0, misses: 0 },
+        ];
+    }
+
     Json(stats).into_response()
 }
 
@@ -467,10 +589,7 @@ async fn trigger_scrub(State(state): State<AdminState>) -> impl IntoResponse {
             }
         }
         tracing::warn!("scrub trigger requested but scrub coordinator not configured");
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Scrub coordinator not configured on this node",
-        )
+        return (StatusCode::SERVICE_UNAVAILABLE, "Scrub coordinator not configured on this node")
             .into_response();
     }
     #[cfg(not(feature = "storage"))]
@@ -486,6 +605,33 @@ async fn trigger_scrub(State(state): State<AdminState>) -> impl IntoResponse {
 async fn metrics_endpoint(State(state): State<AdminState>) -> impl IntoResponse {
     let body = state.metrics.gather();
     (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/plain")], body)
+}
+
+/// GET /admin/acceleration — returns hardware acceleration status.
+#[derive(Serialize)]
+struct AccelerationStatus {
+    active_tier: String,
+    fallback_count: u64,
+    healthy: bool,
+}
+
+#[instrument(skip(state))]
+async fn acceleration_status(State(state): State<AdminState>) -> impl IntoResponse {
+    #[cfg(feature = "accel")]
+    {
+        if let Some(ref accel) = state.accel {
+            let status = AccelerationStatus {
+                active_tier: format!("{:?}", accel.active_tier()),
+                fallback_count: accel.ec_fallback_count(),
+                healthy: !accel.is_ec_backend_unhealthy(),
+            };
+            return Json(status).into_response();
+        }
+    }
+    // Without accel feature or dispatcher, report CPU baseline
+    let status =
+        AccelerationStatus { active_tier: "CpuSimd".into(), fallback_count: 0, healthy: true };
+    Json(status).into_response()
 }
 
 // ---------------------------------------------------------------------------

@@ -97,10 +97,7 @@ async fn gc_cycle_detects_dead_space() {
         .put_tombstone(
             &bucket,
             &ObjectKey::new("live.txt"),
-            Tombstone {
-                deletion_time: 1700000000000,
-                hlc: Hlc::new(1700000000000, 1),
-            },
+            Tombstone { deletion_time: 1700000000000, hlc: Hlc::new(1700000000000, 1) },
         )
         .unwrap();
 
@@ -185,24 +182,17 @@ async fn full_gc_cycle_compacts_segment() {
 
     // Live objects should still exist and reference new segments
     for key_str in &live_keys {
-        let obj_opt = metadata
-            .get_object(&bucket, &ObjectKey::new(*key_str))
-            .unwrap();
+        let obj_opt = metadata.get_object(&bucket, &ObjectKey::new(*key_str)).unwrap();
         assert!(obj_opt.is_some(), "live object should exist");
 
         let obj = obj_opt.unwrap();
         assert!(!obj.chunks.is_empty());
-        assert_ne!(
-            obj.chunks[0].segment_id, seg_id,
-            "live object should reference new segment"
-        );
+        assert_ne!(obj.chunks[0].segment_id, seg_id, "live object should reference new segment");
     }
 
     // Dead objects still have metadata (their tombstone records deletion)
     for i in 0..3 {
-        let obj = metadata
-            .get_object(&bucket, &ObjectKey::new(format!("obj{i}.txt")))
-            .unwrap();
+        let obj = metadata.get_object(&bucket, &ObjectKey::new(format!("obj{i}.txt"))).unwrap();
         assert!(obj.is_some(), "dead object metadata still exists");
     }
 }
@@ -229,19 +219,15 @@ async fn gc_cycle_respects_tombstone_ttl() {
     }
 
     // Create a tombstone with a recent deletion_time (effectively "now")
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
+    let now_ms =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+            as i64;
 
     metadata
         .put_tombstone(
             &bucket,
             &ObjectKey::new("ttl_obj0.txt"),
-            Tombstone {
-                deletion_time: now_ms,
-                hlc: Hlc::new(now_ms as u64, 1),
-            },
+            Tombstone { deletion_time: now_ms, hlc: Hlc::new(now_ms as u64, 1) },
         )
         .unwrap();
 
@@ -257,4 +243,3 @@ async fn gc_cycle_respects_tombstone_ttl() {
     // Old segment should still exist
     assert!(metadata.get_segment(seg_id).unwrap().is_some());
 }
-

@@ -52,8 +52,7 @@
 mod queue;
 mod worker;
 
-pub use queue::{enqueue_heal, init_global_queue, HealQueue, HealQueueSender};
-pub use worker::HealWorker;
-
 /// Re-export core types for ergonomic use within heal module callers.
 pub use oceanfs_core::{HealConfig, HealRequest, HealStats};
+pub use queue::{enqueue_heal, init_global_queue, HealQueue, HealQueueSender};
+pub use worker::HealWorker;

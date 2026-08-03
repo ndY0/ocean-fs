@@ -100,40 +100,33 @@ impl GossipProtocol {
                                 let channel = pooled.channel().clone();
                                 drop(pooled);
 
-                                let mut client =
-                                    oceanfs_network::GossipRpcClient::new(channel);
+                                let mut client = oceanfs_network::GossipRpcClient::new(channel);
 
                                 // Convert the GossipDelta into protobuf GossipMessages.
                                 let entries: Vec<_> = delta
                                     .changed
                                     .iter()
-                                    .map(|e| {
-                                        oceanfs_core::proto::membership::MembershipEntry {
-                                            node_id: Some(
-                                                oceanfs_core::proto::common::NodeId {
-                                                    id: e.node_id.to_string(),
-                                                },
-                                            ),
-                                            state: match e.state {
-                                                NodeState::Alive => 0,
-                                                NodeState::Suspect => 1,
-                                                NodeState::Dead => 2,
-                                                NodeState::Leaving => 3,
-                                                NodeState::Left => 4,
-                                            },
-                                            incarnation: e.incarnation.value(),
-                                            address: e.address.to_string(),
-                                            last_seen: None,
-                                        }
+                                    .map(|e| oceanfs_core::proto::membership::MembershipEntry {
+                                        node_id: Some(oceanfs_core::proto::common::NodeId {
+                                            id: e.node_id.to_string(),
+                                        }),
+                                        state: match e.state {
+                                            NodeState::Alive => 0,
+                                            NodeState::Suspect => 1,
+                                            NodeState::Dead => 2,
+                                            NodeState::Leaving => 3,
+                                            NodeState::Left => 4,
+                                        },
+                                        incarnation: e.incarnation.value(),
+                                        address: e.address.to_string(),
+                                        last_seen: None,
                                     })
                                     .collect();
 
                                 let msg = oceanfs_network::gossip::GossipMessage {
-                                    delta: Some(
-                                        oceanfs_core::proto::membership::MembershipList {
-                                            entries,
-                                        },
-                                    ),
+                                    delta: Some(oceanfs_core::proto::membership::MembershipList {
+                                        entries,
+                                    }),
                                     ring_version: 0,
                                     hlc: None,
                                 };

@@ -167,7 +167,11 @@ async fn double_check_prevents_concurrent_write_race() {
     metadata.put_segment(make_segment(seg_id2, 1000000000000)).unwrap();
 
     // The in-memory store tracks deleted segments. Run cycle again.
-    let reaper2 = OrphanReaper::new(metadata.clone(), Arc::new(InMemorySegmentShardStore::new(4194304)), GcConfig::default());
+    let reaper2 = OrphanReaper::new(
+        metadata.clone(),
+        Arc::new(InMemorySegmentShardStore::new(4194304)),
+        GcConfig::default(),
+    );
     let stats2 = reaper2.run_cycle().await.unwrap();
     assert_eq!(stats2.orphans_found, 1);
     assert_eq!(stats2.orphans_deleted, 1);

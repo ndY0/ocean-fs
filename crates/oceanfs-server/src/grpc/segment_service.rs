@@ -18,10 +18,12 @@
 
 use std::sync::Arc;
 
-use oceanfs_core::proto::segment::{
-    AckStatus, FetchShardRequest, SegmentAppendRequest, SegmentAppendResponse, ShardResponse,
+use oceanfs_core::{
+    proto::segment::{
+        AckStatus, FetchShardRequest, SegmentAppendRequest, SegmentAppendResponse, ShardResponse,
+    },
+    SegmentId,
 };
-use oceanfs_core::SegmentId;
 use oceanfs_network::storage::segment_rpc_server::SegmentRpc;
 use oceanfs_storage::SegmentDataStore;
 use tokio::sync::mpsc;
@@ -151,34 +153,26 @@ impl SegmentRpc for SegmentGrpcService {
         );
 
         // Read the full segment data from the store.
-        let segment_data = self.data_store.read_segment_data(&segment_id).map_err(|e| {
-            Status::not_found(format!("segment {} not found: {}", segment_id, e))
-        })?;
+        let segment_data = self
+            .data_store
+            .read_segment_data(&segment_id)
+            .map_err(|e| Status::not_found(format!("segment {} not found: {}", segment_id, e)))?;
 
         if segment_data.is_empty() {
-            return Err(Status::not_found(format!(
-                "segment {} has no data",
-                segment_id
-            )));
+            return Err(Status::not_found(format!("segment {} has no data", segment_id)));
         }
 
         // Determine total shards from known configuration (k+m).
         // For a production system, ec_k and ec_m would be read from
         // segment metadata. Here we use a sensible default.
         let total_shards = 6; // default k=4, m=2
-        let shard_size = if segment_data.is_empty() {
-            0
-        } else {
-            segment_data.len() / total_shards
-        };
+        let shard_size =
+            if segment_data.is_empty() { 0 } else { segment_data.len() / total_shards };
 
         let shard_index = req.shard_index as usize;
         let start = req.offset as usize;
-        let length = if req.length == 0 {
-            shard_size.saturating_sub(start)
-        } else {
-            req.length as usize
-        };
+        let length =
+            if req.length == 0 { shard_size.saturating_sub(start) } else { req.length as usize };
 
         let shard_start = (shard_index * shard_size) + start;
         let shard_end = (shard_start + length).min(segment_data.len());
@@ -232,14 +226,12 @@ impl SegmentRpc for SegmentGrpcService {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use std::collections::HashMap;
-    use std::net::SocketAddr;
-    use std::sync::Mutex;
+    use std::{collections::HashMap, net::SocketAddr, sync::Mutex};
 
-    use oceanfs_core::proto::common::SegmentId as ProtoSegmentId;
-    use oceanfs_core::SegmentId;
-    use oceanfs_network::storage::segment_rpc_client::SegmentRpcClient;
-    use oceanfs_network::storage::segment_rpc_server::SegmentRpcServer;
+    use oceanfs_core::{proto::common::SegmentId as ProtoSegmentId, SegmentId};
+    use oceanfs_network::storage::{
+        segment_rpc_client::SegmentRpcClient, segment_rpc_server::SegmentRpcServer,
+    };
     use oceanfs_storage::SegmentDataStore;
     use tonic::transport::Server;
 
@@ -434,7 +426,9 @@ mod tests {
 
         let mut received_bytes: Vec<u8> = Vec::new();
         while let Some(chunk_result) = response_stream.message().await.unwrap() {
-            if chunk_result.data.is_empty() { break; }
+            if chunk_result.data.is_empty() {
+                break;
+            }
             received_bytes.extend_from_slice(&chunk_result.data);
         }
 

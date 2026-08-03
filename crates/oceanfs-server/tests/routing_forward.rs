@@ -110,10 +110,7 @@ async fn route_with_retry_skips_dead_nodes_but_fails_when_no_grpc_server() {
     // Now that try_forward makes real gRPC channel acquisitions,
     // this fails because no server is running on the alive node.
     let result = router.route_with_retry(key).await;
-    assert!(
-        result.is_err(),
-        "routing should fail when alive node has no gRPC server"
-    );
+    assert!(result.is_err(), "routing should fail when alive node has no gRPC server");
 }
 
 #[tokio::test]

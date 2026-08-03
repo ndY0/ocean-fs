@@ -73,9 +73,7 @@ impl GossipRpc for GossipGrpcService {
                         .node_id
                         .as_ref()
                         .map(|nid| NodeId::new(&nid.id))
-                        .unwrap_or_else(|| {
-                            NodeId::new("unknown")
-                        });
+                        .unwrap_or_else(|| NodeId::new("unknown"));
 
                     let state = match entry.state {
                         0 => NodeState::Alive,
@@ -89,9 +87,10 @@ impl GossipRpc for GossipGrpcService {
                     let incarnation = Incarnation::new(entry.incarnation);
 
                     // Parse address from the protobuf string.
-                    let address = entry.address.parse::<SocketAddr>().unwrap_or_else(|_| {
-                        SocketAddr::from(([127, 0, 0, 1], 9001))
-                    });
+                    let address = entry
+                        .address
+                        .parse::<SocketAddr>()
+                        .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 9001)));
 
                     self.membership.upsert_node(node_id, state, incarnation, address);
                     entry_count += 1;
@@ -141,18 +140,12 @@ impl GossipRpc for GossipGrpcService {
 
             if filtered.is_empty() {
                 // Send an empty delta to acknowledge the pull.
-                let _ = tx
-                    .send(Ok(GossipMessage {
-                        delta: None,
-                        ring_version: 0,
-                        hlc: None,
-                    }))
-                    .await;
+                let _ =
+                    tx.send(Ok(GossipMessage { delta: None, ring_version: 0, hlc: None })).await;
             } else {
                 for (node_id, state, incarnation, address) in filtered {
-                    let proto_node_id = oceanfs_core::proto::common::NodeId {
-                        id: node_id.to_string(),
-                    };
+                    let proto_node_id =
+                        oceanfs_core::proto::common::NodeId { id: node_id.to_string() };
 
                     let proto_state = match state {
                         NodeState::Alive => 0,
@@ -170,16 +163,11 @@ impl GossipRpc for GossipGrpcService {
                         last_seen: None,
                     };
 
-                    let delta = oceanfs_core::proto::membership::MembershipList {
-                        entries: vec![entry],
-                    };
+                    let delta =
+                        oceanfs_core::proto::membership::MembershipList { entries: vec![entry] };
 
                     if tx
-                        .send(Ok(GossipMessage {
-                            delta: Some(delta),
-                            ring_version: 0,
-                            hlc: None,
-                        }))
+                        .send(Ok(GossipMessage { delta: Some(delta), ring_version: 0, hlc: None }))
                         .await
                         .is_err()
                     {
@@ -199,8 +187,9 @@ mod tests {
     use std::net::SocketAddr;
 
     use oceanfs_core::{GossipConfig, Incarnation, NodeId, NodeState, RingConfig};
-    use oceanfs_network::gossip::gossip_rpc_client::GossipRpcClient;
-    use oceanfs_network::gossip::gossip_rpc_server::GossipRpcServer;
+    use oceanfs_network::gossip::{
+        gossip_rpc_client::GossipRpcClient, gossip_rpc_server::GossipRpcServer,
+    };
     use oceanfs_routing::{Ring, RingCache};
     use tonic::transport::Server;
 
@@ -212,12 +201,7 @@ mod tests {
         ring.add_node(NodeId::new(node_id));
         let ring_cache = Arc::new(RingCache::new(ring));
         let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-        Arc::new(Membership::new(
-            NodeId::new(node_id),
-            addr,
-            GossipConfig::default(),
-            ring_cache,
-        ))
+        Arc::new(Membership::new(NodeId::new(node_id), addr, GossipConfig::default(), ring_cache))
     }
 
     /// Helper to start a test gRPC server with the gossip service and return a client.
@@ -250,24 +234,16 @@ mod tests {
 
         // Construct a GossipMessage with a delta containing one entry.
         let entry = oceanfs_core::proto::membership::MembershipEntry {
-            node_id: Some(oceanfs_core::proto::common::NodeId {
-                id: "node-b".to_string(),
-            }),
+            node_id: Some(oceanfs_core::proto::common::NodeId { id: "node-b".to_string() }),
             state: 0, // ALIVE
             incarnation: 1,
             address: "127.0.0.1:9002".to_string(),
             last_seen: None,
         };
 
-        let delta = oceanfs_core::proto::membership::MembershipList {
-            entries: vec![entry],
-        };
+        let delta = oceanfs_core::proto::membership::MembershipList { entries: vec![entry] };
 
-        let msg = GossipMessage {
-            delta: Some(delta),
-            ring_version: 0,
-            hlc: None,
-        };
+        let msg = GossipMessage { delta: Some(delta), ring_version: 0, hlc: None };
 
         let stream = tokio_stream::iter(vec![msg]);
         let request = tonic::Request::new(stream);
@@ -299,9 +275,7 @@ mod tests {
 
         // Request delta for anything with version > 3.
         let request = tonic::Request::new(GossipPullRequest {
-            node_id: Some(oceanfs_core::proto::common::NodeId {
-                id: "node-x".to_string(),
-            }),
+            node_id: Some(oceanfs_core::proto::common::NodeId { id: "node-x".to_string() }),
             last_known_version: 3,
         });
 
@@ -339,9 +313,7 @@ mod tests {
 
         // Request delta for anything with version > 100 (nothing).
         let request = tonic::Request::new(GossipPullRequest {
-            node_id: Some(oceanfs_core::proto::common::NodeId {
-                id: "node-x".to_string(),
-            }),
+            node_id: Some(oceanfs_core::proto::common::NodeId { id: "node-x".to_string() }),
             last_known_version: 100,
         });
 

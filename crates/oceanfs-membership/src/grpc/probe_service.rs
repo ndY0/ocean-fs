@@ -21,8 +21,10 @@
 //! in the current protobuf definitions); instead it is invoked as a
 //! method on the handler struct by internal callers.
 
-use oceanfs_core::{Incarnation, NodeId};
-use oceanfs_core::proto::membership::{ProbeRequest, ProbeResponse};
+use oceanfs_core::{
+    proto::membership::{ProbeRequest, ProbeResponse},
+    Incarnation, NodeId,
+};
 
 /// SWIM probe handler for failure detection.
 ///
@@ -82,10 +84,7 @@ impl ProbeHandler {
     /// A `ProbeResponse` with `ack: true` if this is the target and it
     /// is alive, or `ack: false` otherwise.
     pub fn handle_probe(&self, request: &ProbeRequest) -> ProbeResponse {
-        let target_id = request
-            .target
-            .as_ref()
-            .map(|nid| NodeId::new(&nid.id));
+        let target_id = request.target.as_ref().map(|nid| NodeId::new(&nid.id));
 
         // If the target matches the local node, respond with ack.
         if target_id.as_ref() == Some(&self.node_id) {
@@ -94,10 +93,7 @@ impl ProbeHandler {
                 incarnation = self.incarnation.value(),
                 "direct probe received: responding with ack"
             );
-            return ProbeResponse {
-                ack: true,
-                incarnation: self.incarnation.value(),
-            };
+            return ProbeResponse { ack: true, incarnation: self.incarnation.value() };
         }
 
         // For indirect pings: the caller (failure detector) forwards the
@@ -142,12 +138,8 @@ mod tests {
         let handler = ProbeHandler::new(node_id.clone(), Incarnation::new(42));
 
         let request = ProbeRequest {
-            target: Some(oceanfs_core::proto::common::NodeId {
-                id: "test-node".to_string(),
-            }),
-            origin: Some(oceanfs_core::proto::common::NodeId {
-                id: "other-node".to_string(),
-            }),
+            target: Some(oceanfs_core::proto::common::NodeId { id: "test-node".to_string() }),
+            origin: Some(oceanfs_core::proto::common::NodeId { id: "other-node".to_string() }),
             is_indirect: false,
         };
 
@@ -162,12 +154,8 @@ mod tests {
         let handler = ProbeHandler::new(node_id, Incarnation::new(1));
 
         let request = ProbeRequest {
-            target: Some(oceanfs_core::proto::common::NodeId {
-                id: "other-node".to_string(),
-            }),
-            origin: Some(oceanfs_core::proto::common::NodeId {
-                id: "origin-node".to_string(),
-            }),
+            target: Some(oceanfs_core::proto::common::NodeId { id: "other-node".to_string() }),
+            origin: Some(oceanfs_core::proto::common::NodeId { id: "origin-node".to_string() }),
             is_indirect: false,
         };
 
@@ -182,12 +170,8 @@ mod tests {
         let handler = ProbeHandler::new(node_id, Incarnation::new(5));
 
         let request = ProbeRequest {
-            target: Some(oceanfs_core::proto::common::NodeId {
-                id: "actual-target".to_string(),
-            }),
-            origin: Some(oceanfs_core::proto::common::NodeId {
-                id: "origin-node".to_string(),
-            }),
+            target: Some(oceanfs_core::proto::common::NodeId { id: "actual-target".to_string() }),
+            origin: Some(oceanfs_core::proto::common::NodeId { id: "origin-node".to_string() }),
             is_indirect: true,
         };
 
@@ -205,9 +189,7 @@ mod tests {
         assert_eq!(handler.incarnation().value(), 10);
 
         let request = ProbeRequest {
-            target: Some(oceanfs_core::proto::common::NodeId {
-                id: "node".to_string(),
-            }),
+            target: Some(oceanfs_core::proto::common::NodeId { id: "node".to_string() }),
             origin: None,
             is_indirect: false,
         };
@@ -222,11 +204,7 @@ mod tests {
         let node_id = NodeId::new("test-node");
         let handler = ProbeHandler::new(node_id, Incarnation::new(1));
 
-        let request = ProbeRequest {
-            target: None,
-            origin: None,
-            is_indirect: false,
-        };
+        let request = ProbeRequest { target: None, origin: None, is_indirect: false };
 
         let response = handler.handle_probe(&request);
         assert!(!response.ack);

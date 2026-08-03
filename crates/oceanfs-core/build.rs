@@ -11,7 +11,11 @@ use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let crate_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
-    let workspace_root = crate_dir.parent().and_then(|p| p.parent()).expect("cannot find workspace root");
+    // Build script: expect is acceptable here since a missing workspace root
+    // is an unrecoverable build configuration error.
+    #[allow(clippy::expect_used)]
+    let workspace_root =
+        crate_dir.parent().and_then(|p| p.parent()).expect("cannot find workspace root");
     let proto_dir = workspace_root.join("proto");
 
     let out_dir = PathBuf::from("src/generated");

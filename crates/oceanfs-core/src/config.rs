@@ -47,6 +47,20 @@ pub struct NodeConfig {
     /// Address for the Prometheus metrics HTTP endpoint.
     #[serde(default = "default_metrics_listen_addr")]
     pub metrics_listen_addr: String,
+    /// Whether S3 Signature V4 authentication is enforced.
+    ///
+    /// When `true`, all S3 object and bucket operations require valid
+    /// AWS SigV4 credentials. When `false` (default), requests pass
+    /// through unauthenticated (development mode).
+    #[serde(default)]
+    pub s3_auth_enabled: bool,
+    /// Whether the prefetch engine warms caches after LIST/GET.
+    ///
+    /// Enables anticipatory cache population for improved read
+    /// latency. Prefetch runs as a background task and does not
+    /// block request handling.
+    #[serde(default)]
+    pub prefetch_enabled: bool,
 }
 
 fn default_node_id() -> String {
@@ -82,6 +96,8 @@ impl Default for NodeConfig {
             log_level: "info".into(),
             metrics_enabled: true,
             metrics_listen_addr: "0.0.0.0:9090".into(),
+            s3_auth_enabled: false,
+            prefetch_enabled: false,
         }
     }
 }

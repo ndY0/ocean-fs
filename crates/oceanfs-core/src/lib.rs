@@ -55,7 +55,9 @@ pub mod proto {
 
 pub mod proto_convert;
 
-pub use config::{AccelConfig, AuthConfig, CompressionConfig, MetadataConfig, NodeConfig, RingConfig, WalConfig};
+pub use config::{
+    AccelConfig, AuthConfig, CompressionConfig, MetadataConfig, NodeConfig, RingConfig, WalConfig,
+};
 pub use conflict::{ConflictResolver, LwwResolver, Resolution};
 pub use error::{Error, Result};
 pub use hlc::{Hlc, HlcClock};

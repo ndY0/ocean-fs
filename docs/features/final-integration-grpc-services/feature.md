@@ -1,7 +1,7 @@
 ---
 feature: "gRPC Service Implementations"
 epic: "final-integration"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies:
@@ -18,7 +18,7 @@ perf:
   - "4.5: Adaptive per-operation timeouts"
   - "2.6: Bounded channels for inter-task communication"
 created: 2026-08-01
-updated: 2026-08-01
+updated: 2026-08-03
 ---
 
 # gRPC Service Implementations

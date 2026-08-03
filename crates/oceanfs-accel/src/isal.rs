@@ -1,8 +1,8 @@
 //! ISA-L accelerated erasure coding backend (feature-gated).
 //!
-//! Provides `IsalEncoder` which wraps Intel's Intelligent Storage Acceleration
-//! Library (`libisal`) for SIMD-accelerated Reed-Solomon encode/decode using
-//! AVX-512, AVX2, or SSE4.1 instructions.
+//! Provides `IsalEncoder` and `IsalDecoder` which wrap Intel's Intelligent
+//! Storage Acceleration Library (`libisal`) for SIMD-accelerated Reed-Solomon
+//! encode/decode using AVX-512, AVX2, or SSE4.1 instructions.
 //!
 //! ## Architecture
 //!
@@ -66,52 +66,52 @@ extern "C" {
 }
 
 // ---------------------------------------------------------------------------
-// IsalEncoder
+// IsalTables
 // ---------------------------------------------------------------------------
 
-/// ISA-L accelerated Reed-Solomon encoder/decoder.
+/// Precomputed ISA-L encoding tables with validated k, m parameters.
 ///
-/// Uses Intel's hand-tuned SIMD assembly for line-rate EC encoding and
-/// decoding. Requires AVX-512, AVX2, or SSE4.1 at runtime (auto-detected
-/// by ISA-L's `ec_encode_data`).
+/// Wraps the raw 32\*k\*m byte buffer produced by `ec_init_tables`,
+/// along with the k and m values that were used to generate it.
+/// This struct is reused across stripes in a segment and shared between
+/// the encoder and decoder via `&IsalTables`.
 ///
 /// # Examples
 ///
 /// ```ignore
-/// use oceanfs_accel::IsalEncoder;
-/// use oceanfs_ec::{Encoder, Decoder};
+/// use oceanfs_accel::{IsalEncoder, IsalTables};
 ///
-/// let encoder = IsalEncoder::new(4, 2).unwrap();
-/// let data: Vec<&[u8]> = vec![b"aaaa", b"bbbb", b"cccc", b"dddd"];
-/// let parity = encoder.encode(&data, 2).unwrap();
-/// assert_eq!(parity.len(), 2);
+/// if let Some(tables) = IsalTables::new(4, 2) {
+///     let encoder = IsalEncoder::new(&tables);
+///     // ... use encoder
+/// }
 /// ```
-pub struct IsalEncoder {
+#[derive(Clone)]
+pub struct IsalTables {
     /// Number of data shards (k).
     k: u8,
     /// Number of parity shards (m).
     m: u8,
-    /// Pre-computed encoding tables (32*k*m bytes) for the encode path.
-    encode_tables: Vec<u8>,
+    /// Pre-computed encoding tables buffer (32\*k\*m bytes).
+    buf: Vec<u8>,
 }
 
-impl IsalEncoder {
-    /// Creates a new ISA-L encoder for the given k (data shards) and
-    /// m (parity shards).
+impl IsalTables {
+    /// Creates new ISA-L encoding tables for the given k, m.
     ///
     /// Pre-computes the encoding tables using a Cauchy matrix over GF(2^8).
     /// The same Cauchy construction as `oceanfs-ec::CauchyEncoder` is used
     /// to ensure encode/decode compatibility.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if k=0 or m=0, or if k+m > 255.
-    pub fn new(k: u8, m: u8) -> EcResult<Self> {
-        if k == 0 {
-            return Err(EcError::InvalidConfig("k must be >= 1".into()));
+    /// Returns `None` if k=0 or m=0, if k+m > 255, or if AVX-512 is not
+    /// available on this system.
+    pub fn new(k: u8, m: u8) -> Option<Self> {
+        if k == 0 || m == 0 {
+            return None;
         }
-        if m == 0 {
-            return Err(EcError::InvalidConfig("m must be >= 1".into()));
+        if !Self::is_available() {
+            tracing::debug!("ISA-L not available: AVX-512 not detected");
+            return None;
         }
         let k_i32 = i32::from(k);
         let m_i32 = i32::from(m);
@@ -122,16 +122,87 @@ impl IsalEncoder {
 
         // Initialize ISA-L encoding tables
         let table_size = (32 * k_i32 * m_i32) as usize;
-        let mut encode_tables = vec![0u8; table_size];
+        let mut buf = vec![0u8; table_size];
 
-        // SAFETY: encode_matrix is k*m bytes, encode_tables is 32*k*m bytes.
+        // SAFETY: encode_matrix is k*m bytes, buf is 32*k*m bytes.
         // Both are properly allocated and aligned. k and m are within valid
         // range (1..=255). ISA-L ec_init_tables is thread-safe.
         unsafe {
-            ec_init_tables(k_i32, m_i32, encode_matrix.as_ptr(), encode_tables.as_mut_ptr());
+            ec_init_tables(k_i32, m_i32, encode_matrix.as_ptr(), buf.as_mut_ptr());
         }
 
-        Ok(Self { k, m, encode_tables })
+        Some(Self { k, m, buf })
+    }
+
+    /// Checks whether the ISA-L backend is available on this system.
+    ///
+    /// Returns `true` if AVX-512F and AVX-512BW are detected at runtime.
+    /// ISA-L requires these instruction sets for its SIMD-accelerated
+    /// Reed-Solomon encode/decode.
+    pub fn is_available() -> bool {
+        std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw")
+    }
+
+    /// Returns the number of data shards (k).
+    pub fn k(&self) -> u8 {
+        self.k
+    }
+
+    /// Returns the number of parity shards (m).
+    pub fn m(&self) -> u8 {
+        self.m
+    }
+
+    /// Returns a reference to the raw encoding tables buffer.
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        self.buf.as_ptr()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IsalEncoder
+// ---------------------------------------------------------------------------
+
+/// ISA-L accelerated Reed-Solomon encoder.
+///
+/// Uses Intel's hand-tuned SIMD assembly for line-rate EC encoding.
+/// Requires AVX-512, AVX2, or SSE4.1 at runtime (auto-detected
+/// by ISA-L's `ec_encode_data`). Takes precomputed `IsalTables` at
+/// construction, which must have been initialized with matching k, m
+/// parameters.
+///
+/// # Examples
+///
+/// ```ignore
+/// use oceanfs_accel::{IsalEncoder, IsalTables};
+/// use oceanfs_ec::Encoder;
+///
+/// let tables = IsalTables::new(4, 2).unwrap();
+/// let encoder = IsalEncoder::new(&tables);
+/// let data: Vec<&[u8]> = vec![b"aaaa", b"bbbb", b"cccc", b"dddd"];
+/// let parity = encoder.encode(&data, 2).unwrap();
+/// assert_eq!(parity.len(), 2);
+/// ```
+pub struct IsalEncoder<'a> {
+    /// Reference to precomputed encoding tables (with validated k, m).
+    tables: &'a IsalTables,
+}
+
+impl<'a> IsalEncoder<'a> {
+    /// Creates a new ISA-L encoder backed by the given precomputed tables.
+    ///
+    /// The tables must have been created with `IsalTables::new(k, m)`.
+    /// The encoder borrows the tables — they may be shared across
+    /// multiple encoder/decoder instances.
+    pub fn new(tables: &'a IsalTables) -> Self {
+        Self { tables }
+    }
+
+    /// Checks whether the ISA-L backend is available on this system.
+    ///
+    /// Returns `true` if AVX-512F and AVX-512BW are detected at runtime.
+    pub fn is_available() -> bool {
+        IsalTables::is_available()
     }
 }
 
@@ -139,17 +210,18 @@ impl IsalEncoder {
 // Encoder implementation (ISA-L SIMD encode)
 // ---------------------------------------------------------------------------
 
-impl Encoder for IsalEncoder {
+impl Encoder for IsalEncoder<'_> {
     fn encode(&self, data_shards: &[&[u8]], parity_count: u8) -> EcResult<Vec<Vec<u8>>> {
         let m = parity_count;
+        let k = self.tables.k();
         if m == 0 {
             return Ok(Vec::new());
         }
 
-        if data_shards.len() != self.k as usize {
+        if data_shards.len() != k as usize {
             return Err(EcError::InvalidConfig(format!(
                 "expected {} data shards, got {}",
-                self.k,
+                k,
                 data_shards.len()
             )));
         }
@@ -169,21 +241,23 @@ impl Encoder for IsalEncoder {
             }
         }
 
-        // Re-initialize tables if m differs from stored m
-        let tables = if m != self.m {
-            let k_i32 = i32::from(self.k);
+        // Use precomputed tables if m matches, otherwise build temporary tables.
+        // Tables are borrowed, not cloned — the buffer content is read-only.
+        let temp_tables: Vec<u8>;
+        let tables_ptr: *const u8 = if m == self.tables.m() {
+            self.tables.as_ptr()
+        } else {
+            let k_i32 = i32::from(k);
             let m_i32 = i32::from(m);
-            let mut matrix = vec![0u8; (self.k as usize) * (m as usize)];
-            build_cauchy_matrix(self.k, m, &mut matrix);
+            let mut matrix = vec![0u8; (k as usize) * (m as usize)];
+            build_cauchy_matrix(k, m, &mut matrix);
             let table_size = (32 * k_i32 * m_i32) as usize;
-            let mut t = vec![0u8; table_size];
+            temp_tables = vec![0u8; table_size];
             // SAFETY: matrix and tables are correctly sized. k, m in valid range.
             unsafe {
-                ec_init_tables(k_i32, m_i32, matrix.as_ptr(), t.as_mut_ptr());
+                ec_init_tables(k_i32, m_i32, matrix.as_ptr(), temp_tables.as_mut_ptr());
             }
-            t
-        } else {
-            self.encode_tables.clone()
+            temp_tables.as_ptr()
         };
 
         // Assemble pointer arrays for ISA-L
@@ -197,15 +271,15 @@ impl Encoder for IsalEncoder {
         // SAFETY:
         // - data_ptrs has k valid, non-null pointers to buffers of `shard_size` bytes
         // - parity_ptrs has m valid, non-null pointers to buffers of `shard_size` bytes
-        // - tables was initialized by ec_init_tables with matching k, m
+        // - tables_ptr points to tables initialized by ec_init_tables with matching k, m
         // - ISA-L ec_encode_data is thread-safe and reentrant
         // - All buffers remain valid for the duration of the call
         unsafe {
             ec_encode_data(
                 shard_size as i32,
-                i32::from(self.k),
+                i32::from(k),
                 i32::from(m),
-                tables.as_ptr(),
+                tables_ptr,
                 data_ptrs.as_ptr(),
                 parity_ptrs.as_mut_ptr(),
             );
@@ -216,10 +290,55 @@ impl Encoder for IsalEncoder {
 }
 
 // ---------------------------------------------------------------------------
+// IsalDecoder
+// ---------------------------------------------------------------------------
+
+/// ISA-L accelerated Reed-Solomon decoder.
+///
+/// Uses Intel's hand-tuned SIMD assembly for line-rate EC decoding.
+/// Takes precomputed `IsalTables` at construction, which must have been
+/// initialized with matching k, m parameters. Decoding is performed via
+/// Gauss-Jordan matrix inversion + ISA-L SIMD recovery.
+///
+/// # Examples
+///
+/// ```ignore
+/// use oceanfs_accel::{IsalDecoder, IsalEncoder, IsalTables};
+/// use oceanfs_ec::{Encoder, Decoder};
+///
+/// let tables = IsalTables::new(4, 2).unwrap();
+/// let encoder = IsalEncoder::new(&tables);
+/// let decoder = IsalDecoder::new(&tables);
+/// // ... encode, decode with ISA-L
+/// ```
+pub struct IsalDecoder<'a> {
+    /// Reference to precomputed encoding tables (with validated k, m).
+    tables: &'a IsalTables,
+}
+
+impl<'a> IsalDecoder<'a> {
+    /// Creates a new ISA-L decoder backed by the given precomputed tables.
+    ///
+    /// The tables must have been created with `IsalTables::new(k, m)`.
+    /// The decoder borrows the tables — they may be shared across
+    /// multiple encoder/decoder instances.
+    pub fn new(tables: &'a IsalTables) -> Self {
+        Self { tables }
+    }
+
+    /// Checks whether the ISA-L backend is available on this system.
+    ///
+    /// Returns `true` if AVX-512F and AVX-512BW are detected at runtime.
+    pub fn is_available() -> bool {
+        IsalTables::is_available()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Decoder implementation (Gauss-Jordan + ISA-L SIMD decode)
 // ---------------------------------------------------------------------------
 
-impl Decoder for IsalEncoder {
+impl Decoder for IsalDecoder<'_> {
     fn decode(
         &self,
         available_shards: &[Option<&[u8]>],
@@ -467,27 +586,28 @@ mod tests {
     // -- Construction --
 
     #[test]
-    fn isal_encoder_construction() {
-        let encoder = IsalEncoder::new(4, 2).unwrap();
-        assert_eq!(encoder.k, 4);
-        assert_eq!(encoder.m, 2);
+    fn isal_tables_rejects_k_zero() {
+        assert!(IsalTables::new(0, 2).is_none());
     }
 
     #[test]
-    fn isal_encoder_rejects_k_zero() {
-        assert!(IsalEncoder::new(0, 2).is_err());
+    fn isal_tables_rejects_m_zero() {
+        assert!(IsalTables::new(4, 0).is_none());
     }
 
     #[test]
-    fn isal_encoder_rejects_m_zero() {
-        assert!(IsalEncoder::new(4, 0).is_err());
+    fn isal_tables_k_m_accessors() {
+        let tables = IsalTables::new(4, 2).unwrap();
+        assert_eq!(tables.k(), 4);
+        assert_eq!(tables.m(), 2);
     }
 
     // -- Encode --
 
     #[test]
     fn isal_encode_k4_m2_64b() {
-        let encoder = IsalEncoder::new(4, 2).unwrap();
+        let tables = IsalTables::new(4, 2).unwrap();
+        let encoder = IsalEncoder::new(&tables);
 
         let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 64]).collect();
         let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
@@ -500,21 +620,24 @@ mod tests {
 
     #[test]
     fn isal_encode_mismatched_shard_sizes_errors() {
-        let encoder = IsalEncoder::new(4, 2).unwrap();
+        let tables = IsalTables::new(4, 2).unwrap();
+        let encoder = IsalEncoder::new(&tables);
         let shards: Vec<&[u8]> = vec![b"aaa", b"bbbb", b"ccc", b"dddd"];
         assert!(encoder.encode(&shards, 2).is_err());
     }
 
     #[test]
     fn isal_encode_wrong_shard_count_errors() {
-        let encoder = IsalEncoder::new(4, 2).unwrap();
+        let tables = IsalTables::new(4, 2).unwrap();
+        let encoder = IsalEncoder::new(&tables);
         let shards: Vec<&[u8]> = vec![b"aa", b"bb"];
         assert!(encoder.encode(&shards, 2).is_err());
     }
 
     #[test]
     fn isal_encode_m0_returns_empty() {
-        let encoder = IsalEncoder::new(4, 2).unwrap();
+        let tables = IsalTables::new(4, 2).unwrap();
+        let encoder = IsalEncoder::new(&tables);
         let data: Vec<&[u8]> = vec![b"aaaa", b"bbbb", b"cccc", b"dddd"];
         let parity = encoder.encode(&data, 0).unwrap();
         assert!(parity.is_empty());
@@ -524,7 +647,9 @@ mod tests {
 
     #[test]
     fn encode_decode_roundtrip_k4_m2_lose_shard0() {
-        let encoder = IsalEncoder::new(4, 2).unwrap();
+        let tables = IsalTables::new(4, 2).unwrap();
+        let encoder = IsalEncoder::new(&tables);
+        let decoder = IsalDecoder::new(&tables);
 
         let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 128]).collect();
         let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
@@ -539,7 +664,7 @@ mod tests {
             Some(&parity[0]),
             Some(&parity[1]),
         ];
-        let recovered = encoder.decode(&available, 4, 2).unwrap();
+        let recovered = decoder.decode(&available, 4, 2).unwrap();
         assert_eq!(recovered.len(), 4);
         assert_eq!(recovered[0], data[0]);
         assert_eq!(recovered[1], data[1]);
@@ -549,7 +674,9 @@ mod tests {
 
     #[test]
     fn encode_decode_roundtrip_k4_m2_lose_two_shards() {
-        let encoder = IsalEncoder::new(4, 2).unwrap();
+        let tables = IsalTables::new(4, 2).unwrap();
+        let encoder = IsalEncoder::new(&tables);
+        let decoder = IsalDecoder::new(&tables);
 
         let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 128]).collect();
         let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
@@ -558,7 +685,7 @@ mod tests {
         // Lose data shards 0 and 2
         let available: Vec<Option<&[u8]>> =
             vec![None, Some(&data[1]), None, Some(&data[3]), Some(&parity[0]), Some(&parity[1])];
-        let recovered = encoder.decode(&available, 4, 2).unwrap();
+        let recovered = decoder.decode(&available, 4, 2).unwrap();
         assert_eq!(recovered[0], data[0]);
         assert_eq!(recovered[1], data[1]);
         assert_eq!(recovered[2], data[2]);
@@ -567,7 +694,9 @@ mod tests {
 
     #[test]
     fn encode_decode_no_missing_shards() {
-        let encoder = IsalEncoder::new(4, 2).unwrap();
+        let tables = IsalTables::new(4, 2).unwrap();
+        let encoder = IsalEncoder::new(&tables);
+        let decoder = IsalDecoder::new(&tables);
 
         let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 64]).collect();
         let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
@@ -579,13 +708,15 @@ mod tests {
             .map(Some)
             .chain(parity.iter().map(|v| v.as_slice()).map(Some))
             .collect();
-        let recovered = encoder.decode(&available, 4, 2).unwrap();
+        let recovered = decoder.decode(&available, 4, 2).unwrap();
         assert_eq!(recovered, data);
     }
 
     #[test]
     fn encode_decode_k8_m4_lose_two_shards() {
-        let encoder = IsalEncoder::new(8, 4).unwrap();
+        let tables = IsalTables::new(8, 4).unwrap();
+        let encoder = IsalEncoder::new(&tables);
+        let decoder = IsalDecoder::new(&tables);
 
         let data: Vec<Vec<u8>> = (0..8).map(|i| vec![i; 64]).collect();
         let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
@@ -606,7 +737,7 @@ mod tests {
             Some(&parity[2]),
             Some(&parity[3]),
         ];
-        let recovered = encoder.decode(&available, 8, 4).unwrap();
+        let recovered = decoder.decode(&available, 8, 4).unwrap();
         assert_eq!(recovered[0], data[0]);
         assert_eq!(recovered[1], data[1]);
         assert_eq!(recovered[2], data[2]);
@@ -619,7 +750,9 @@ mod tests {
 
     #[test]
     fn encode_decode_k8_m4_lose_four_shards() {
-        let encoder = IsalEncoder::new(8, 4).unwrap();
+        let tables = IsalTables::new(8, 4).unwrap();
+        let encoder = IsalEncoder::new(&tables);
+        let decoder = IsalDecoder::new(&tables);
 
         let data: Vec<Vec<u8>> = (0..8).map(|i| vec![i; 64]).collect();
         let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
@@ -640,7 +773,7 @@ mod tests {
             Some(&parity[2]),
             Some(&parity[3]),
         ];
-        let recovered = encoder.decode(&available, 8, 4).unwrap();
+        let recovered = decoder.decode(&available, 8, 4).unwrap();
         assert_eq!(recovered[0], data[0]);
         assert_eq!(recovered[2], data[2]);
         assert_eq!(recovered[5], data[5]);
@@ -649,7 +782,9 @@ mod tests {
 
     #[test]
     fn encode_decode_k16_m8() {
-        let encoder = IsalEncoder::new(16, 8).unwrap();
+        let tables = IsalTables::new(16, 8).unwrap();
+        let encoder = IsalEncoder::new(&tables);
+        let decoder = IsalDecoder::new(&tables);
 
         let data: Vec<Vec<u8>> = (0..16).map(|i| vec![i; 32]).collect();
         let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
@@ -670,10 +805,7 @@ mod tests {
             )
             .chain(parity.iter().map(|v| v.as_slice()).map(Some))
             .collect();
-        // Fix: use data[1], data[2], data[4], data[5], data[6], data[8], data[9],
-        // data[10], data[11], data[13], data[14], data[15] = 12 data + 8 parity = 20 total
-        // Need 16 for recovery — correct.
-        let recovered = encoder.decode(&available, 16, 8).unwrap();
+        let recovered = decoder.decode(&available, 16, 8).unwrap();
         assert_eq!(recovered[0], data[0]);
         assert_eq!(recovered[3], data[3]);
         assert_eq!(recovered[7], data[7]);
@@ -748,7 +880,8 @@ mod tests {
         use oceanfs_core::CodecConfig;
         use oceanfs_ec::CauchyEncoder;
 
-        let isal = IsalEncoder::new(4, 2).unwrap();
+        let tables = IsalTables::new(4, 2).unwrap();
+        let isal = IsalEncoder::new(&tables);
         let cauchy = CauchyEncoder::new(CodecConfig {
             data_shards: 4,
             parity_shards: 2,
@@ -779,7 +912,8 @@ mod tests {
         use oceanfs_core::CodecConfig;
         use oceanfs_ec::CauchyEncoder;
 
-        let isal = IsalEncoder::new(4, 2).unwrap();
+        let tables = IsalTables::new(4, 2).unwrap();
+        let isal_dec = IsalDecoder::new(&tables);
         let cauchy = CauchyEncoder::new(CodecConfig {
             data_shards: 4,
             parity_shards: 2,
@@ -801,11 +935,11 @@ mod tests {
             Some(&parity[0]),
             Some(&parity[1]),
         ];
-        let recovered = isal.decode(&available, 4, 2).unwrap();
+        let recovered = isal_dec.decode(&available, 4, 2).unwrap();
         assert_eq!(recovered[0], data[0]);
     }
 
-    // -- GF arithmetic properties ---
+    // -- GF arithmetic properties --
 
     #[test]
     fn gf_inv_involutive() {

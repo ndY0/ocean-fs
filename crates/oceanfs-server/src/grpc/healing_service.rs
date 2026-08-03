@@ -36,8 +36,7 @@ impl HealingGrpcService {
 
 #[tonic::async_trait]
 impl HealingRpc for HealingGrpcService {
-    type FetchShardStream =
-        tokio_stream::wrappers::ReceiverStream<Result<FetchShardChunk, Status>>;
+    type FetchShardStream = tokio_stream::wrappers::ReceiverStream<Result<FetchShardChunk, Status>>;
 
     async fn hinted_handoff(
         &self,
@@ -186,21 +185,15 @@ impl HealingRpc for HealingGrpcService {
 
         let start = shard_index * shard_size;
         let end = (start + shard_size).min(data.len());
-        let shard_data: Vec<u8> = if start < data.len() {
-            data[start..end].to_vec()
-        } else {
-            Vec::new()
-        };
+        let shard_data: Vec<u8> =
+            if start < data.len() { data[start..end].to_vec() } else { Vec::new() };
 
         // Stream the shard data in chunks.
         let chunk_size = 65536; // 64 KB chunks
         let chunks: Vec<FetchShardChunk> = shard_data
             .chunks(chunk_size)
             .enumerate()
-            .map(|(i, chunk)| FetchShardChunk {
-                chunk_index: i as u32,
-                data: chunk.to_vec(),
-            })
+            .map(|(i, chunk)| FetchShardChunk { chunk_index: i as u32, data: chunk.to_vec() })
             .collect();
 
         let (tx, rx) = tokio::sync::mpsc::channel(chunks.len().max(1));
@@ -247,11 +240,9 @@ impl HealingRpc for HealingGrpcService {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::{collections::HashMap, sync::Mutex};
 
-    use oceanfs_core::proto::common::SegmentId as ProtoSegmentId;
-    use oceanfs_core::SegmentId;
+    use oceanfs_core::{proto::common::SegmentId as ProtoSegmentId, SegmentId};
     use oceanfs_storage::SegmentDataStore;
 
     use super::*;
@@ -295,7 +286,8 @@ mod tests {
         let handoff = Arc::new(HintedHandoff::new());
         let metadata_store = Arc::new(
             oceanfs_storage::MetadataStore::open(&oceanfs_core::MetadataConfig {
-                data_dir: std::env::temp_dir().join(format!("oceanfs-test-heal-{}", std::process::id())),
+                data_dir: std::env::temp_dir()
+                    .join(format!("oceanfs-test-heal-{}", std::process::id())),
                 ..Default::default()
             })
             .unwrap(),
@@ -328,7 +320,8 @@ mod tests {
         let handoff = Arc::new(HintedHandoff::new());
         let metadata_store = Arc::new(
             oceanfs_storage::MetadataStore::open(&oceanfs_core::MetadataConfig {
-                data_dir: std::env::temp_dir().join(format!("oceanfs-test-merkle-{}", std::process::id())),
+                data_dir: std::env::temp_dir()
+                    .join(format!("oceanfs-test-merkle-{}", std::process::id())),
                 ..Default::default()
             })
             .unwrap(),

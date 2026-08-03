@@ -43,6 +43,17 @@ mod helpers {
                 .cloned())
         }
 
+        fn put_object(
+            &self,
+            bucket: &BucketId,
+            meta: ObjectMetadata,
+        ) -> Result<(), MetadataError> {
+            self.objects
+                .write()
+                .insert((bucket.as_str().to_string(), meta.object_key.as_str().to_string()), meta);
+            Ok(())
+        }
+
         fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> Result<(), MetadataError> {
             self.objects.write().remove(&(bucket.as_str().to_string(), key.as_str().to_string()));
             Ok(())

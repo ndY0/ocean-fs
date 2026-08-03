@@ -14,8 +14,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::{stream::FuturesUnordered, StreamExt};
-use oceanfs_core::proto::segment::FetchShardRequest as GprcFetchShardRequest;
-use oceanfs_core::{ChunkRef, ObjectMetadata};
+use oceanfs_core::{
+    proto::segment::FetchShardRequest as GprcFetchShardRequest, ChunkRef, ObjectMetadata,
+};
 use oceanfs_membership::Membership;
 use oceanfs_network::{ConnectionPool, SegmentRpcClient};
 use oceanfs_routing::RingCache;
@@ -48,7 +49,6 @@ pub(crate) async fn fetch_chunks(
 }
 
 /// Internal version that accepts optional gRPC dependencies.
-#[allow(dead_code)]
 pub(crate) async fn fetch_chunks_with_grpc(
     ring: &Arc<RingCache>,
     metadata: &ObjectMetadata,
@@ -80,7 +80,8 @@ async fn fetch_chunks_inner(
         return Ok(vec![]);
     }
 
-    fetch_all_chunks_parallel(ring, &metadata.chunks, timeout_ms, segment_reader, pool, membership).await
+    fetch_all_chunks_parallel(ring, &metadata.chunks, timeout_ms, segment_reader, pool, membership)
+        .await
 }
 
 /// Fetches all chunk data in parallel using `FuturesUnordered`.
@@ -109,11 +110,14 @@ async fn fetch_all_chunks_parallel(
             let membership = membership.cloned();
             async move {
                 let result = fetch_single_chunk(
-                    &ring, &chunk, timeout_ms,
+                    &ring,
+                    &chunk,
+                    timeout_ms,
                     segment_reader.as_ref(),
                     pool.as_ref(),
                     membership.as_ref(),
-                ).await;
+                )
+                .await;
                 (idx, result)
             }
         })

@@ -53,12 +53,10 @@ impl HealQueueSender {
     /// Returns an error if the queue is at capacity or the receiver
     /// has been dropped (i.e. the heal worker has shut down).
     pub fn enqueue(&self, request: HealRequest) -> Result<()> {
-        self.tx
-            .try_send(request)
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => Error::HealQueueFull,
-                mpsc::error::TrySendError::Closed(_) => Error::Heal("heal queue closed".into()),
-            })
+        self.tx.try_send(request).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => Error::HealQueueFull,
+            mpsc::error::TrySendError::Closed(_) => Error::Heal("heal queue closed".into()),
+        })
     }
 }
 
@@ -155,8 +153,9 @@ pub fn init_global_queue(sender: HealQueueSender) {
 /// ```
 pub fn enqueue_heal(segment_id: SegmentId, corrupt_shard_indices: Vec<usize>) -> Result<()> {
     let sender = GLOBAL_HEAL_SENDER.get().ok_or_else(|| {
-        Error::Heal("global heal queue not initialized — call init_global_queue during startup"
-            .into())
+        Error::Heal(
+            "global heal queue not initialized — call init_global_queue during startup".into(),
+        )
     })?;
 
     let request = HealRequest { segment_id, corrupt_shard_indices, retry_count: 0 };

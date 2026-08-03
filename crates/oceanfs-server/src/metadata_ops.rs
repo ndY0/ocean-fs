@@ -51,6 +51,21 @@ pub trait MetadataOps: Send + Sync + 'static {
     /// the tombstone write fails.
     fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> Result<()>;
 
+    /// Stores object metadata.
+    ///
+    /// This must be called after a successful write to persist the
+    /// object → segment mapping so subsequent reads can locate the data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata store is unavailable or
+    /// the underlying storage operation fails.
+    fn put_object(
+        &self,
+        bucket: &BucketId,
+        meta: ObjectMetadata,
+    ) -> Result<()>;
+
     /// Lists objects in a bucket matching the given prefix.
     ///
     /// Results are sorted by key. Returns objects whose key starts

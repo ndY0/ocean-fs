@@ -552,8 +552,7 @@ mod tests {
         );
 
         let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
-        let hh =
-            HintedHandoff::new_with_pool_and_membership(pool, Some(membership));
+        let hh = HintedHandoff::new_with_pool_and_membership(pool, Some(membership));
 
         // Store a hint for the returned node.
         let hint = HintRecord {

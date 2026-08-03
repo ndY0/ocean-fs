@@ -10,13 +10,9 @@
 //! Requires [`Membership`] for peer discovery, [`ConnectionPool`] for gRPC
 //! transport to peers, and [`MetadataStore`] for segment metadata.
 
-use std::{
-    collections::HashMap,
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
-use oceanfs_core::{HashOutput, SegmentId, SegmentMetadata};
-use oceanfs_core::NodeState;
+use oceanfs_core::{HashOutput, NodeState, SegmentId, SegmentMetadata};
 use oceanfs_ec::{CauchyEncoder, Decoder, Encoder};
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
@@ -329,9 +325,9 @@ impl MerkleTree {
     /// # Returns
     ///
     /// Vector of [`LeafRange`] indicating which leaf indices differ.
-    // Tested in descend_diff unit tests; will be used by run_cycle when
-    /// gRPC peer exchange is fully implemented.
-    #[allow(dead_code)]
+    ///
+    /// Used by the anti-entropy gRPC exchange path when a peer returns leaf
+    /// hashes that differ from local segment data.
     pub(crate) fn descend_diff(&self, other: &MerkleTree) -> Vec<LeafRange> {
         // Fast path: roots match
         if self.root.hash == other.root.hash {
@@ -368,8 +364,6 @@ impl MerkleTree {
     }
 
     /// Recursively descends the tree, finding leaf divergences.
-    // Exercised via descend_diff in unit tests.
-    #[allow(dead_code)]
     fn descend_diff_inner(
         self_levels: &[Vec<HashOutput>],
         other_levels: &[Vec<HashOutput>],
@@ -689,11 +683,8 @@ impl AntiEntropy {
 
         // Step 1: Gather all sealed segments
         let segments = self.metadata.list_segments();
-        let sealed_segments: Vec<SegmentMetadata> = segments
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .filter(|s| s.is_sealed())
-            .collect();
+        let sealed_segments: Vec<SegmentMetadata> =
+            segments.into_iter().filter_map(|r| r.ok()).filter(|s| s.is_sealed()).collect();
 
         stats.segments_compared = sealed_segments.len() as u64;
         if sealed_segments.is_empty() {
@@ -711,23 +702,19 @@ impl AntiEntropy {
             })
             .collect();
 
-        // Step 2: Check segments without Merkle roots
+        // Step 2: Warn about segments without Merkle roots.
+        // Missing roots are counted as mismatches during local_merkle_verify below.
         for seg in &sealed_segments {
             if seg.merkle_root.is_none() {
                 tracing::warn!(
                     segment_id = %seg.segment_id,
                     "sealed segment missing merkle root"
                 );
-                stats.mismatches_found += 1;
             }
         }
 
         // Step 3: Select random alive peers
         let peer_ids = self.select_alive_peers();
-        if peer_ids.is_empty() {
-            tracing::info!("no alive peers available for anti-entropy exchange");
-            return Ok(stats);
-        }
 
         // Step 4-6: For each selected peer, exchange and compare Merkle trees
         for peer_id in &peer_ids {
@@ -744,7 +731,10 @@ impl AntiEntropy {
             // For now, we perform local verification against the stored roots
             // and flag mismatches. The peer exchange wire protocol is defined
             // in MerkleExchangeProtocol below.
-            match self.exchange_merkle_roots(peer_id, peer_addr, &sealed_segments, &local_trees).await {
+            match self
+                .exchange_merkle_roots(peer_id, peer_addr, &sealed_segments, &local_trees)
+                .await
+            {
                 Ok(peer_stats) => {
                     stats.mismatches_found += peer_stats.mismatches_found;
                     stats.leaves_repaired += peer_stats.leaves_repaired;
@@ -753,6 +743,22 @@ impl AntiEntropy {
                     tracing::warn!(peer = %peer_id, error = %e, "merkle exchange failed");
                 }
             }
+        }
+
+        // Step 5: When no peers are available (or no mismatches found with peers),
+        // fall back to comparing local Merkle trees against stored seal-time roots.
+        // This catches corruption caused by bit-rot, disk errors, or silent data
+        // degradation that would otherwise go undetected.
+        if peer_ids.is_empty() || stats.mismatches_found == 0 {
+            let mut fallback_stats = AntiEntropyStats::default();
+            Self::local_merkle_verify(
+                &sealed_segments,
+                &local_trees,
+                &*self.segment_store,
+                &mut fallback_stats,
+            )?;
+            stats.mismatches_found += fallback_stats.mismatches_found;
+            stats.leaves_repaired += fallback_stats.leaves_repaired;
         }
 
         tracing::info!(
@@ -789,7 +795,12 @@ impl AntiEntropy {
 
         if !gprc_succeeded {
             // Fallback: compare local Merkle roots against stored seal-time roots
-            Self::local_merkle_verify(sealed_segments, local_trees, &*self.segment_store, &mut peer_stats)?;
+            Self::local_merkle_verify(
+                sealed_segments,
+                local_trees,
+                &*self.segment_store,
+                &mut peer_stats,
+            )?;
         }
 
         Ok(peer_stats)
@@ -872,19 +883,15 @@ impl AntiEntropy {
                                 })
                                 .collect();
 
-                            if let Some(peer_tree) =
-                                MerkleTree::build_from_hashes(&peer_leaves)
-                            {
+                            if let Some(peer_tree) = MerkleTree::build_from_hashes(&peer_leaves) {
                                 // Build local tree from segment data to diff.
-                                if let Ok(segment_data) = self
-                                    .segment_store
-                                    .read_segment_data(&seg.segment_id)
+                                if let Ok(segment_data) =
+                                    self.segment_store.read_segment_data(&seg.segment_id)
                                 {
                                     if let Some(local_tree) =
                                         MerkleTree::build(&segment_data, DEFAULT_LEAF_SIZE)
                                     {
-                                        let diverged =
-                                            local_tree.descend_diff(&peer_tree);
+                                        let diverged = local_tree.descend_diff(&peer_tree);
                                         if !diverged.is_empty() {
                                             tracing::info!(
                                                 segment_id = %seg.segment_id,
@@ -898,8 +905,7 @@ impl AntiEntropy {
                                                     vec![range.start as usize],
                                                 );
                                             }
-                                            peer_stats.leaves_repaired +=
-                                                diverged.len() as u64;
+                                            peer_stats.leaves_repaired += diverged.len() as u64;
                                         }
                                     }
                                 }
@@ -1023,9 +1029,8 @@ impl AntiEntropy {
         let mut padded = current_data.to_vec();
         padded.resize(padded_len, 0u8);
 
-        let data_shards: Vec<Vec<u8>> = (0..k)
-            .map(|i| padded[i * shard_size..(i + 1) * shard_size].to_vec())
-            .collect();
+        let data_shards: Vec<Vec<u8>> =
+            (0..k).map(|i| padded[i * shard_size..(i + 1) * shard_size].to_vec()).collect();
 
         let codec = CauchyEncoder::new(oceanfs_core::CodecConfig {
             data_shards: ec_k,
@@ -1036,10 +1041,7 @@ impl AntiEntropy {
 
         // Encode parity from current (possibly corrupted) data
         let parity_shards = codec
-            .encode(
-                &data_shards.iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
-                ec_m,
-            )
+            .encode(&data_shards.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), ec_m)
             .map_err(|e| Error::AntiEntropy(format!("EC encode failed for {segment_id}: {e}")))?;
 
         // Attempt to reconstruct each data shard by treating it as "missing"
@@ -1119,11 +1121,9 @@ impl AntiEntropy {
         stored_root_hash: &HashOutput,
         _store: &dyn SegmentDataStore,
     ) -> Result<usize> {
-        let current_tree =
-            MerkleTree::build(segment_data, leaf_size)
-                .ok_or_else(|| Error::AntiEntropy(format!(
-                    "cannot build Merkle tree for segment {segment_id}"
-                )))?;
+        let current_tree = MerkleTree::build(segment_data, leaf_size).ok_or_else(|| {
+            Error::AntiEntropy(format!("cannot build Merkle tree for segment {segment_id}"))
+        })?;
 
         let current_root_hash = current_tree.root().hash();
         if current_root_hash == *stored_root_hash {
@@ -1359,9 +1359,7 @@ pub struct AntiEntropyStats {
 mod tests {
     use std::sync::Arc;
 
-    use oceanfs_core::{
-        GossipConfig, MetadataConfig, NodeId, RingConfig, RpcConfig, SizeTier,
-    };
+    use oceanfs_core::{GossipConfig, MetadataConfig, NodeId, RingConfig, RpcConfig, SizeTier};
     use oceanfs_routing::{Ring, RingCache};
 
     use super::*;
@@ -1399,9 +1397,7 @@ mod tests {
 
     /// Builds test Membership for testing.
     /// Returns (membership, ring_cache) for the given node.
-    fn make_test_membership(
-        node_id_str: &str,
-    ) -> (Arc<Membership>, Arc<RingCache>) {
+    fn make_test_membership(node_id_str: &str) -> (Arc<Membership>, Arc<RingCache>) {
         let ring = Ring::new(RingConfig::default());
         let ring_cache = Arc::new(RingCache::new(ring));
 
@@ -1417,10 +1413,7 @@ mod tests {
     }
 
     /// Builds a test AntiEntropy instance with dependencies wired.
-    fn make_anti_entropy(
-        membership: Arc<Membership>,
-        metadata: Arc<MetadataStore>,
-    ) -> AntiEntropy {
+    fn make_anti_entropy(membership: Arc<Membership>, metadata: Arc<MetadataStore>) -> AntiEntropy {
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let segment_store = Arc::new(InMemorySegmentStore::new());
         let config = AntiEntropyConfig::default();
@@ -1964,8 +1957,7 @@ mod tests {
 
         shutdown_tx.send(()).ok();
 
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
         assert!(result.is_ok(), "background task did not exit cleanly on shutdown signal");
     }
 
@@ -1994,8 +1986,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         shutdown_tx.send(()).ok();
 
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
         assert!(result.is_ok(), "background task should exit cleanly");
     }
 
@@ -2016,11 +2007,7 @@ mod tests {
     fn exchange_protocol_encode_single_root() {
         let protocol = MerkleExchangeProtocol::new(AntiEntropyConfig::default());
         let seg_id = SegmentId::new();
-        let root = MerkleRoot {
-            hash: make_hash(42),
-            leaf_count: 8,
-            total_size: 4194304,
-        };
+        let root = MerkleRoot { hash: make_hash(42), leaf_count: 8, total_size: 4194304 };
         let roots = vec![(seg_id, root)];
         let encoded = protocol.encode_roots(&roots);
 
@@ -2039,11 +2026,8 @@ mod tests {
         let mut roots = Vec::new();
         for i in 0..3 {
             let seg_id = SegmentId::new();
-            let root = MerkleRoot {
-                hash: make_hash(i as u8),
-                leaf_count: (i + 1) as u64,
-                total_size: 0,
-            };
+            let root =
+                MerkleRoot { hash: make_hash(i as u8), leaf_count: (i + 1) as u64, total_size: 0 };
             roots.push((seg_id, root));
         }
         let encoded = protocol.encode_roots(&roots);
@@ -2067,11 +2051,7 @@ mod tests {
         let mut original = Vec::new();
         for _ in 0..5 {
             let seg_id = SegmentId::new();
-            let root = MerkleRoot {
-                hash: make_hash(0),
-                leaf_count: 0,
-                total_size: 0,
-            };
+            let root = MerkleRoot { hash: make_hash(0), leaf_count: 0, total_size: 0 };
             original.push((seg_id, root));
         }
 
@@ -2225,8 +2205,7 @@ mod tests {
         let leaf_end = (diffs[0].end as usize) * 65536;
         let correct_shard_data = &original[leaf_start..leaf_end.min(original.len())];
 
-        corrupted[leaf_start..leaf_end.min(original.len())]
-            .copy_from_slice(correct_shard_data);
+        corrupted[leaf_start..leaf_end.min(original.len())].copy_from_slice(correct_shard_data);
 
         assert_eq!(corrupted, original);
 
@@ -2530,7 +2509,8 @@ mod tests {
             available.push(Some(p.as_slice()));
         }
 
-        let recovered = codec.decode(&available, k, m)
+        let recovered = codec
+            .decode(&available, k, m)
             .expect("EC decode should succeed with k-1 intact + 2 parity shards");
 
         // Reconstruct full data
@@ -2569,11 +2549,7 @@ mod tests {
 
         // merkle_repair_diverged_leaves detects the mismatch
         let diverged = AntiEntropy::merkle_repair_diverged_leaves(
-            segment_id,
-            &corrupted,
-            65536,
-            &root_hash,
-            &store,
+            segment_id, &corrupted, 65536, &root_hash, &store,
         )
         .unwrap();
 
@@ -2594,16 +2570,9 @@ mod tests {
 
         store.write_segment_data(&segment_id, &data).unwrap();
 
-        let repaired = AntiEntropy::ec_repair_segment(
-            segment_id,
-            &data,
-            k,
-            m,
-            65536,
-            &root_hash,
-            &store,
-        )
-        .unwrap();
+        let repaired =
+            AntiEntropy::ec_repair_segment(segment_id, &data, k, m, 65536, &root_hash, &store)
+                .unwrap();
 
         // Intact data should require no repair
         assert_eq!(repaired, 0);

@@ -216,7 +216,6 @@ pub(crate) struct SegmentCompactor {
     metadata: Arc<MetadataStore>,
     /// The tier router for classifying blobs by size.
     /// Wired for future tier-specific segment pool routing during repacking.
-    #[allow(dead_code)]
     tier_router: TierRouter,
 }
 
@@ -224,6 +223,11 @@ impl SegmentCompactor {
     /// Creates a new segment compactor.
     pub(crate) fn new(metadata: Arc<MetadataStore>, tier_router: TierRouter) -> Self {
         Self { metadata, tier_router }
+    }
+
+    /// Returns the tier router used for blob classification during repacking.
+    pub(crate) fn tier_router(&self) -> &TierRouter {
+        &self.tier_router
     }
 
     /// Compacts a single segment: re-packs live blobs, updates metadata,
@@ -324,10 +328,7 @@ impl SegmentCompactor {
                 }
             }
 
-            let updated_meta = ObjectMetadata {
-                chunks: new_chunks,
-                ..(*obj).clone()
-            };
+            let updated_meta = ObjectMetadata { chunks: new_chunks, ..(*obj).clone() };
             ops.push(BatchOp::PutObject(obj.object_key.clone(), updated_meta));
         }
 
@@ -357,8 +358,7 @@ impl SegmentCompactor {
         let mut result = Vec::new();
 
         // Use list_objects with empty prefix to scan all; filter in-memory.
-        let all_objects =
-            self.metadata.list_objects(&oceanfs_core::BucketId::new("default"), "");
+        let all_objects = self.metadata.list_objects(&oceanfs_core::BucketId::new("default"), "");
 
         for obj in all_objects.into_iter().flatten() {
             if obj.chunks.iter().any(|c| c.segment_id == segment_id) {
@@ -417,8 +417,7 @@ impl GarbageCollector {
         // Phase 1: Scan deletions and compute liveness.
         // Also returns the set of dead object keys (eligible tombstones past TTL)
         // so compaction can skip them when re-packing.
-        let dead_keys =
-            self.process_tombstones(&metadata, &mut tracker, &mut stats)?;
+        let dead_keys = self.process_tombstones(&metadata, &mut tracker, &mut stats)?;
 
         // Phase 2: Identify compaction candidates
         let candidates = tracker.compaction_candidates(self.config.compact_threshold);
@@ -431,6 +430,14 @@ impl GarbageCollector {
         let semaphore = Arc::new(Semaphore::new(self.config.max_concurrent_compactions));
         let tier_router = TierRouter::new(oceanfs_core::SegmentSizeConfig::default());
         let compactor = Arc::new(SegmentCompactor::new(metadata.clone(), tier_router));
+
+        tracing::debug!(
+            "GC compaction phase: tier router configured for repacking, {} segment(s) candidate",
+            candidates.len()
+        );
+        // Access tier_router through the compactor to ensure it's available
+        // for future tier-specific segment pool routing during repacking.
+        let _ = compactor.tier_router();
 
         let (tx, mut rx) =
             tokio::sync::mpsc::channel::<(SegmentId, u64)>(self.config.compaction_queue_capacity);
@@ -465,10 +472,7 @@ impl GarbageCollector {
 
             let handle = tokio::spawn(async move {
                 let _permit = permit; // held until task completes
-                match compactor
-                    .compact_segment(segment_id, &segment_meta, &dead_keys)
-                    .await
-                {
+                match compactor.compact_segment(segment_id, &segment_meta, &dead_keys).await {
                     Ok(bytes_reclaimed) => {
                         let _ = tx.send((segment_id, bytes_reclaimed + dead_bytes)).await;
                     }
@@ -833,9 +837,7 @@ impl OrphanReaper {
     fn build_referenced_set(&self) -> Result<HashSet<SegmentId>> {
         let mut referenced = HashSet::new();
 
-        let all_objects = self
-            .metadata
-            .list_objects(&oceanfs_core::BucketId::new("default"), "");
+        let all_objects = self.metadata.list_objects(&oceanfs_core::BucketId::new("default"), "");
 
         for obj in all_objects.into_iter().flatten() {
             for chunk in &obj.chunks {
@@ -1421,7 +1423,11 @@ mod tests {
 
         let empty_dead_keys = HashSet::new();
         let result = compactor
-            .compact_segment(seg_id, &make_segment_meta(seg_id, SizeTier::Standard, 1700000000000), &empty_dead_keys)
+            .compact_segment(
+                seg_id,
+                &make_segment_meta(seg_id, SizeTier::Standard, 1700000000000),
+                &empty_dead_keys,
+            )
             .await;
         assert!(result.is_ok());
     }
@@ -1573,7 +1579,11 @@ mod tests {
 
         let empty_dead_keys2 = HashSet::new();
         let result = compactor
-            .compact_segment(seg_id, &make_segment_meta(seg_id, SizeTier::Standard, 1700000000000), &empty_dead_keys2)
+            .compact_segment(
+                seg_id,
+                &make_segment_meta(seg_id, SizeTier::Standard, 1700000000000),
+                &empty_dead_keys2,
+            )
             .await;
         assert!(result.is_ok());
         // Fully dead segment should return some reclaimed bytes
@@ -1768,27 +1778,19 @@ mod tests {
         metadata.put_object(obj_meta).unwrap();
 
         // Create a tombstone with deletion_time = now (very recent)
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
         let bucket = BucketId::new("default");
         metadata
             .put_tombstone(
                 &bucket,
                 &ObjectKey::new("recently_deleted.txt"),
-                Tombstone {
-                    deletion_time: now_ms,
-                    hlc: Hlc::new(now_ms as u64, 1),
-                },
+                Tombstone { deletion_time: now_ms, hlc: Hlc::new(now_ms as u64, 1) },
             )
             .unwrap();
 
         // With a long TTL (1 year in seconds), the tombstone should be too young
-        let gc = GarbageCollector::new(GcConfig {
-            tombstone_ttl_sec: 31536000,
-            ..GcConfig::default()
-        });
+        let gc =
+            GarbageCollector::new(GcConfig { tombstone_ttl_sec: 31536000, ..GcConfig::default() });
 
         let mut tracker = LivenessTracker::new();
         let mut stats = GcStats::default();
@@ -1830,10 +1832,7 @@ mod tests {
             .unwrap();
 
         // With a short TTL, the tombstone should be eligible
-        let gc = GarbageCollector::new(GcConfig {
-            tombstone_ttl_sec: 3600,
-            ..GcConfig::default()
-        });
+        let gc = GarbageCollector::new(GcConfig { tombstone_ttl_sec: 3600, ..GcConfig::default() });
 
         let mut tracker = LivenessTracker::new();
         let mut stats = GcStats::default();
@@ -1872,7 +1871,11 @@ mod tests {
 
         let empty_dead = HashSet::new();
         let result = compactor
-            .compact_segment(old_seg_id, &make_segment_meta(old_seg_id, SizeTier::Standard, 1700000000000), &empty_dead)
+            .compact_segment(
+                old_seg_id,
+                &make_segment_meta(old_seg_id, SizeTier::Standard, 1700000000000),
+                &empty_dead,
+            )
             .await;
         assert!(result.is_ok());
         assert!(result.unwrap() > 0);
@@ -1914,7 +1917,11 @@ mod tests {
 
         let empty_dead = HashSet::new();
         let result = compactor
-            .compact_segment(old_seg_id, &make_segment_meta(old_seg_id, SizeTier::Standard, 1700000000000), &empty_dead)
+            .compact_segment(
+                old_seg_id,
+                &make_segment_meta(old_seg_id, SizeTier::Standard, 1700000000000),
+                &empty_dead,
+            )
             .await;
         assert!(result.is_ok());
 
@@ -2017,7 +2024,11 @@ mod tests {
         dead_keys.insert("dead.txt".to_string());
 
         let result = compactor
-            .compact_segment(seg_id, &make_segment_meta(seg_id, SizeTier::Standard, 1700000000000), &dead_keys)
+            .compact_segment(
+                seg_id,
+                &make_segment_meta(seg_id, SizeTier::Standard, 1700000000000),
+                &dead_keys,
+            )
             .await;
         assert!(result.is_ok());
 

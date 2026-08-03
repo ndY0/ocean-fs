@@ -234,14 +234,12 @@ impl Membership {
 
                 // Pull the full membership list from the seed.
                 let mut client = oceanfs_network::GossipRpcClient::new(channel);
-                let request = tonic::Request::new(
-                    oceanfs_network::gossip::GossipPullRequest {
-                        node_id: Some(oceanfs_core::proto::common::NodeId {
-                            id: self.node_id.to_string(),
-                        }),
-                        last_known_version: 0,
-                    },
-                );
+                let request = tonic::Request::new(oceanfs_network::gossip::GossipPullRequest {
+                    node_id: Some(oceanfs_core::proto::common::NodeId {
+                        id: self.node_id.to_string(),
+                    }),
+                    last_known_version: 0,
+                });
 
                 match client.pull(request).await {
                     Ok(response) => {
@@ -259,10 +257,10 @@ impl Membership {
                                         _ => continue,
                                     };
                                     let inc = Incarnation::new(entry.incarnation);
-                                    let addr = entry
-                                        .address
-                                        .parse::<SocketAddr>()
-                                        .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 9001)));
+                                    let addr =
+                                        entry.address.parse::<SocketAddr>().unwrap_or_else(|_| {
+                                            SocketAddr::from(([127, 0, 0, 1], 9001))
+                                        });
                                     if let Some(id) = nid {
                                         self.upsert_node(id, state, inc, addr);
                                     }
@@ -280,18 +278,15 @@ impl Membership {
             }
 
             if !joined {
-                return Err(Error::JoinFailed(
-                    "could not contact any seed node".into(),
-                ));
+                return Err(Error::JoinFailed("could not contact any seed node".into()));
             }
         }
 
         // Announce self as ALIVE.
         let mut state = self.state.write();
-        state.nodes.insert(
-            self.node_id.clone(),
-            (NodeState::Alive, Incarnation::new(1), self.address),
-        );
+        state
+            .nodes
+            .insert(self.node_id.clone(), (NodeState::Alive, Incarnation::new(1), self.address));
 
         let _ = self.event_tx.send(MembershipEvent {
             node_id: self.node_id.clone(),

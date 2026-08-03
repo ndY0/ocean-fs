@@ -8,6 +8,10 @@ rust-version.workspace = true
 [features]
 default = []
 cuda = ["dep:cudarc"]
+# ISA-L feature uses raw extern "C" FFI bindings to the system-installed
+# libisal rather than the isal-rs crate. This avoids an extra dependency
+# and gives direct control over the FFI surface. The FFI declarations
+# are in isal.rs with full SAFETY documentation per coding.md §7.2.
 isa-l = []
 arm-sve = []
 
