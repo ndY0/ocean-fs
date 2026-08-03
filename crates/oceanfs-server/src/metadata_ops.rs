@@ -60,11 +60,7 @@ pub trait MetadataOps: Send + Sync + 'static {
     ///
     /// Returns an error if the metadata store is unavailable or
     /// the underlying storage operation fails.
-    fn put_object(
-        &self,
-        bucket: &BucketId,
-        meta: ObjectMetadata,
-    ) -> Result<()>;
+    fn put_object(&self, bucket: &BucketId, meta: ObjectMetadata) -> Result<()>;
 
     /// Lists objects in a bucket matching the given prefix.
     ///

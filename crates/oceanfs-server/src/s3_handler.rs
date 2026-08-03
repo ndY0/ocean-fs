@@ -829,11 +829,7 @@ mod tests {
             Ok(self.objects.read().get(&(bucket.as_str().into(), key.as_str().into())).cloned())
         }
 
-        fn put_object(
-            &self,
-            bucket: &BucketId,
-            meta: ObjectMetadata,
-        ) -> Result<(), MetadataError> {
+        fn put_object(&self, bucket: &BucketId, meta: ObjectMetadata) -> Result<(), MetadataError> {
             self.objects
                 .write()
                 .insert((bucket.as_str().into(), meta.object_key.as_str().into()), meta);

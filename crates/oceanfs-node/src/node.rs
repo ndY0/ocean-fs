@@ -174,13 +174,8 @@ impl Node {
         membership.set_pool(pool.clone());
 
         // Bootstrap membership: start failure detection + gossip, then join the ring.
-        membership
-            .start()
-            .map_err(|e| format!("failed to start membership: {e}"))?;
-        membership
-            .join()
-            .await
-            .map_err(|e| format!("failed to join cluster: {e}"))?;
+        membership.start().map_err(|e| format!("failed to start membership: {e}"))?;
+        membership.join().await.map_err(|e| format!("failed to join cluster: {e}"))?;
 
         // ---- 6. Construct storage components ----
         let segment_size = SegmentSizeConfig::default();

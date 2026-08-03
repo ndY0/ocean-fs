@@ -43,11 +43,7 @@ impl MetadataOps for TestMetadata {
             .cloned())
     }
 
-    fn put_object(
-        &self,
-        bucket: &BucketId,
-        meta: ObjectMetadata,
-    ) -> Result<(), MetadataError> {
+    fn put_object(&self, bucket: &BucketId, meta: ObjectMetadata) -> Result<(), MetadataError> {
         self.objects
             .write()
             .insert((bucket.as_str().to_string(), meta.object_key.as_str().to_string()), meta);
