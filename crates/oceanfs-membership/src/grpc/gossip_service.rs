@@ -257,6 +257,13 @@ mod tests {
         // Verify the node was added to membership.
         let state = membership.state_of(&NodeId::new("node-b"));
         assert_eq!(state, Some(NodeState::Alive));
+
+        // PR4: Verify the ring was updated via upsert_node.
+        let ring_snapshot = membership.ring().snapshot();
+        assert!(
+            ring_snapshot.nodes().contains(&NodeId::new("node-b")),
+            "push should add the new node to the ring via upsert_node"
+        );
     }
 
     #[tokio::test]

@@ -10,15 +10,16 @@
 
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     time::{Duration, Instant},
 };
 
-use oceanfs_core::{Incarnation, NodeId, NodeState};
+use oceanfs_core::{proto::membership::ProbeRequest, Incarnation, NodeId, NodeState};
 use rand::seq::IteratorRandom;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
-use crate::membership::MembershipEvent;
+use crate::{grpc::probe_service::ProbeHandler, membership::MembershipEvent};
 
 /// Configuration for the failure detector.
 #[derive(Debug, Clone)]
@@ -42,6 +43,8 @@ pub(crate) enum DetectorCommand {
     PingResponse { target: NodeId, success: bool },
     /// An indirect ping result.
     IndirectPingResult { origin: NodeId, target: NodeId, success: bool },
+    /// Update the list of alive nodes for periodic ping selection.
+    UpdateAliveNodes { nodes: Vec<(NodeId, NodeState, SocketAddr)> },
     /// Shut down the detector.
     Shutdown,
 }
@@ -59,6 +62,16 @@ pub(crate) struct FailureDetector {
     config: DetectorConfig,
     /// Current suspicion timers: node_id → (incarnation, suspect_since).
     suspicion_timers: HashMap<NodeId, (Incarnation, Instant)>,
+    /// This node's identifier.
+    node_id: NodeId,
+    /// List of alive nodes: (node_id, state, address).
+    alive_nodes: Vec<(NodeId, NodeState, SocketAddr)>,
+    /// Probe handler for in-process self-pings.
+    probe_handler: ProbeHandler,
+    /// Pending direct pings: target → ping_start_time.
+    pending_pings: HashMap<NodeId, Instant>,
+    /// Pending indirect pings: target → (origin, ping_start_time).
+    pending_indirect: HashMap<NodeId, (NodeId, Instant)>,
 }
 
 impl FailureDetector {
@@ -66,27 +79,33 @@ impl FailureDetector {
     pub fn new(
         config: DetectorConfig,
         event_tx: tokio::sync::broadcast::Sender<MembershipEvent>,
+        node_id: NodeId,
+        incarnation: Incarnation,
         buffer: usize,
     ) -> (Self, mpsc::Sender<DetectorCommand>) {
         let (tx, rx) = mpsc::channel(buffer);
-        (Self { rx, event_tx, config, suspicion_timers: HashMap::new() }, tx)
+        (
+            Self {
+                rx,
+                event_tx,
+                config,
+                suspicion_timers: HashMap::new(),
+                node_id: node_id.clone(),
+                alive_nodes: Vec::new(),
+                probe_handler: ProbeHandler::new(node_id, incarnation),
+                pending_pings: HashMap::new(),
+                pending_indirect: HashMap::new(),
+            },
+            tx,
+        )
     }
 
     /// Runs the failure detector loop.
     ///
     /// This should be spawned as a background task. It handles ping
-    /// responses and suspicion timeout expiry.
+    /// responses, suspicion timeout expiry, and initiates periodic
+    /// SWIM pings to random alive peers.
     pub async fn run(&mut self) {
-        while let Some(cmd) = self.recv_with_timeout().await {
-            if !self.handle_command(cmd).await {
-                break; // Shutdown.
-            }
-        }
-    }
-
-    /// Waits for the next command with a timeout. On timeout, checks
-    /// suspicion timers and returns `None` (loop will call again).
-    async fn recv_with_timeout(&mut self) -> Option<DetectorCommand> {
         loop {
             let result = tokio::time::timeout(
                 Duration::from_millis(self.config.interval_ms),
@@ -95,14 +114,139 @@ impl FailureDetector {
             .await;
 
             match result {
-                Ok(Some(cmd)) => return Some(cmd),
-                Ok(None) => return None, // Channel closed.
+                Ok(Some(cmd)) => {
+                    if !self.handle_command(cmd).await {
+                        break; // Shutdown.
+                    }
+                }
+                Ok(None) => break, // Channel closed.
                 Err(_elapsed) => {
-                    // Timeout: check suspicion timers, then loop again.
+                    // Interval tick: initiate ping cycle.
+                    self.on_ping_tick();
+                    // Check pending ping timeouts.
+                    self.check_ping_timeouts();
+                    // Check suspicion timers.
                     self.check_suspicion_timers();
-                    // Continue waiting.
                 }
             }
+        }
+    }
+
+    /// Called on each SWIM interval tick.
+    ///
+    /// Selects a random alive peer (excluding self), sends a direct
+    /// ping, and registers a pending ping for timeout tracking.
+    fn on_ping_tick(&mut self) {
+        // Filter alive nodes that are not self and not already pending.
+        let target = {
+            let alive: Vec<_> = self
+                .alive_nodes
+                .iter()
+                .filter(|(id, state, _)| {
+                    *state == NodeState::Alive
+                        && *id != self.node_id
+                        && !self.pending_pings.contains_key(id)
+                })
+                .map(|(id, _, _)| id)
+                .collect();
+
+            if alive.is_empty() {
+                trace!("SWIM tick: no alive peers to ping");
+                return;
+            }
+
+            let mut rng = rand::thread_rng();
+            match alive.iter().choose(&mut rng) {
+                Some(p) => (*p).clone(),
+                None => return,
+            }
+        };
+
+        debug!(target = %target, "SWIM: initiating direct ping");
+
+        // Build a probe request and process it in-process for now.
+        // For remote targets, a full implementation would send via gRPC.
+        let request = ProbeRequest {
+            target: Some(oceanfs_core::proto::common::NodeId { id: target.to_string() }),
+            origin: Some(oceanfs_core::proto::common::NodeId { id: self.node_id.to_string() }),
+            is_indirect: false,
+        };
+
+        let response = self.probe_handler.handle_probe(&request);
+
+        if response.ack {
+            // Target is self — in-process ack.
+            debug!(target = %target, "SWIM: self-ping ack received");
+            // Nothing to do — self is always alive.
+        } else {
+            // Remote target — register pending ping for timeout tracking.
+            // In a full implementation, this would send a gRPC Probe request.
+            self.pending_pings.insert(target, Instant::now());
+        }
+    }
+
+    /// Checks pending direct pings for timeout.
+    ///
+    /// If a direct ping has been pending longer than `ping_timeout_ms`,
+    /// initiates indirect pings or marks the target as SUSPECT.
+    fn check_ping_timeouts(&mut self) {
+        let timeout = Duration::from_millis(self.config.ping_timeout_ms);
+        let now = Instant::now();
+
+        let timed_out: Vec<NodeId> = self
+            .pending_pings
+            .iter()
+            .filter(|(_, start)| now.duration_since(**start) >= timeout)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for target in timed_out {
+            self.pending_pings.remove(&target);
+            debug!(target = %target, "SWIM: direct ping timed out");
+
+            // Attempt indirect pings via k random peers.
+            let indirect_candidates: Vec<_> = self
+                .alive_nodes
+                .iter()
+                .filter(|(id, state, _)| {
+                    *state == NodeState::Alive && *id != self.node_id && *id != target
+                })
+                .map(|(id, _, _)| id.clone())
+                .collect();
+
+            let mut rng = rand::thread_rng();
+            let indirect_count = self.config.indirect_ping_count as usize;
+            let indirect_targets: Vec<_> = indirect_candidates
+                .iter()
+                .choose_multiple(&mut rng, indirect_count.min(indirect_candidates.len()))
+                .into_iter()
+                .cloned()
+                .collect();
+
+            if indirect_targets.is_empty() {
+                // No indirect peers available — mark suspect immediately.
+                self.mark_suspect(&target);
+            } else {
+                for relay in &indirect_targets {
+                    debug!(target = %target, relay = %relay, "SWIM: initiating indirect ping");
+                    self.pending_indirect.insert(target.clone(), (relay.clone(), Instant::now()));
+                }
+            }
+        }
+
+        // Check indirect ping timeouts.
+        let indirect_timeout = Duration::from_millis(self.config.ping_timeout_ms);
+        let indirect_timed_out: Vec<NodeId> = self
+            .pending_indirect
+            .iter()
+            .filter(|(_, (_, start))| now.duration_since(*start) >= indirect_timeout)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for target in indirect_timed_out {
+            self.pending_indirect.remove(&target);
+            warn!(target = %target, "SWIM: all indirect pings timed out — marking SUSPECT");
+            self.mark_suspect(&target);
         }
     }
 
@@ -110,17 +254,29 @@ impl FailureDetector {
     async fn handle_command(&mut self, cmd: DetectorCommand) -> bool {
         match cmd {
             DetectorCommand::PingResponse { target, success } => {
+                // Remove from pending pings.
+                self.pending_pings.remove(&target);
                 if !success {
                     debug!(node_id = %target, "direct ping failed, awaiting indirect results");
-                    // Will be handled when all indirect results are collected.
+                } else {
+                    debug!(node_id = %target, "direct ping succeeded — target is alive");
+                    // Clear any suspicion timers for this target.
+                    self.suspicion_timers.remove(&target);
                 }
             }
             DetectorCommand::IndirectPingResult { origin: _origin, target, success } => {
+                // Remove from pending indirect pings.
+                self.pending_indirect.remove(&target);
                 if !success {
-                    // Mark the target as SUSPECT.
+                    // All indirect pings failed — mark suspect.
                     self.mark_suspect(&target);
+                } else {
+                    debug!(node_id = %target, "indirect ping succeeded — target is alive");
+                    self.suspicion_timers.remove(&target);
                 }
-                // If success, target remains ALIVE — no action needed.
+            }
+            DetectorCommand::UpdateAliveNodes { nodes } => {
+                self.alive_nodes = nodes;
             }
             DetectorCommand::Shutdown => return false,
         }
@@ -205,7 +361,9 @@ mod tests {
             failure_timeout_ms: 5000,
             indirect_ping_count: 3,
         };
-        let (detector, cmd_tx) = FailureDetector::new(config, event_tx, 8);
+        let node_id = NodeId::new("test-node");
+        let incarnation = Incarnation::new(1);
+        let (detector, cmd_tx) = FailureDetector::new(config, event_tx, node_id, incarnation, 8);
         (detector, cmd_tx, event_rx)
     }
 

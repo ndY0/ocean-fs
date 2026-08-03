@@ -8,10 +8,11 @@
 //! The protocol is designed to be transport-agnostic — the actual
 //! message sending (gRPC, etc.) is handled by the caller.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use oceanfs_core::{Incarnation, NodeId, NodeState};
 use oceanfs_network::ConnectionPool;
+use rand::seq::IteratorRandom;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, trace, warn};
 
@@ -21,14 +22,40 @@ use crate::{
 };
 
 /// Internal command to the gossip task.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) enum GossipCommand {
     /// Push a state delta to a specific peer.
     Push { peer: NodeId, delta: GossipDelta },
     /// Receive a delta from a peer and merge it.
     ReceiveDelta { from: NodeId, delta: GossipDelta },
+    /// Set or update the connection pool for gRPC push calls.
+    SetPool { pool: Arc<ConnectionPool> },
+    /// Add a node entry to the local gossip state.
+    AddNode { entry: NodeEntry },
     /// Shut down the gossip task.
     Shutdown,
+}
+
+impl std::fmt::Debug for GossipCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Push { peer, delta } => f
+                .debug_struct("Push")
+                .field("peer", peer)
+                .field("delta_len", &delta.changed.len())
+                .finish(),
+            Self::ReceiveDelta { from, delta } => f
+                .debug_struct("ReceiveDelta")
+                .field("from", from)
+                .field("delta_len", &delta.changed.len())
+                .finish(),
+            Self::SetPool { .. } => f.debug_struct("SetPool").finish(),
+            Self::AddNode { entry } => {
+                f.debug_struct("AddNode").field("node_id", &entry.node_id).finish()
+            }
+            Self::Shutdown => write!(f, "Shutdown"),
+        }
+    }
 }
 
 /// The gossip protocol task.
@@ -50,6 +77,10 @@ pub(crate) struct GossipProtocol {
     membership_event_tx: broadcast::Sender<crate::membership::MembershipEvent>,
     /// Connection pool for gRPC push calls to peers.
     pool: Option<Arc<ConnectionPool>>,
+    /// Interval between periodic gossip rounds in milliseconds.
+    gossip_interval_ms: u64,
+    /// This node's identifier (for excluding self from peer selection).
+    node_id: NodeId,
 }
 
 impl GossipProtocol {
@@ -59,6 +90,8 @@ impl GossipProtocol {
         event_tx: broadcast::Sender<GossipCommand>,
         detector_tx: mpsc::Sender<DetectorCommand>,
         membership_event_tx: broadcast::Sender<crate::membership::MembershipEvent>,
+        gossip_interval_ms: u64,
+        node_id: NodeId,
     ) -> Self {
         Self {
             rx,
@@ -68,6 +101,8 @@ impl GossipProtocol {
             incarnations: HashMap::new(),
             membership_event_tx,
             pool: None,
+            gossip_interval_ms,
+            node_id,
         }
     }
 
@@ -77,13 +112,69 @@ impl GossipProtocol {
     }
 
     /// Runs the gossip protocol loop.
+    ///
+    /// Processes incoming commands and fires a periodic gossip ticker
+    /// that selects a random alive peer and pushes a membership delta.
     pub async fn run(&mut self) {
-        while let Some(cmd) = self.rx.recv().await {
-            if !self.handle_command(cmd).await {
-                break;
+        let mut ticker = tokio::time::interval(Duration::from_millis(self.gossip_interval_ms));
+        // Don't fire immediately — wait for the first interval to elapse.
+        ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                cmd = self.rx.recv() => {
+                    match cmd {
+                        Some(cmd) => {
+                            if !self.handle_command(cmd).await {
+                                break;
+                            }
+                        }
+                        None => break, // Channel closed.
+                    }
+                }
+                _ = ticker.tick() => {
+                    // Periodic gossip: select a random alive peer and push a delta.
+                    self.on_gossip_tick().await;
+                }
             }
         }
         debug!("gossip protocol shut down");
+    }
+
+    /// Fires on each gossip interval tick.
+    ///
+    /// Selects a random alive peer (excluding self) and pushes
+    /// the current membership delta to it.
+    async fn on_gossip_tick(&mut self) {
+        let peer = {
+            let alive: Vec<_> = self
+                .state
+                .nodes
+                .iter()
+                .filter(|(id, e)| e.state == NodeState::Alive && *id != &self.node_id)
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            if alive.is_empty() {
+                trace!("gossip tick: no alive peers to push to");
+                return;
+            }
+
+            let mut rng = rand::thread_rng();
+            match alive.iter().choose(&mut rng) {
+                Some(p) => p.clone(),
+                None => return,
+            }
+        };
+
+        let delta = self.build_delta();
+        if delta.changed.is_empty() {
+            trace!(peer = %peer, "gossip tick: delta is empty, skipping push");
+            return;
+        }
+
+        debug!(peer = %peer, changed = delta.changed.len(), "periodic gossip push");
+        self.handle_command(GossipCommand::Push { peer, delta }).await;
     }
 
     /// Handles a gossip command.
@@ -164,6 +255,14 @@ impl GossipProtocol {
             GossipCommand::ReceiveDelta { from, delta } => {
                 debug!(from = %from, changed = delta.changed.len(), "received gossip delta");
                 self.merge_delta(&delta);
+            }
+            GossipCommand::SetPool { pool } => {
+                debug!("gossip protocol pool updated");
+                self.pool = Some(pool);
+            }
+            GossipCommand::AddNode { entry } => {
+                debug!(node_id = %entry.node_id, "adding node to gossip state");
+                self.add_node(entry);
             }
             GossipCommand::Shutdown => return false,
         }
@@ -254,7 +353,14 @@ mod tests {
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
         let (detector_tx, _detector_rx) = mpsc::channel(8);
         let (membership_tx, _membership_rx) = tokio::sync::broadcast::channel(16);
-        GossipProtocol::new(cmd_rx, event_tx, detector_tx, membership_tx)
+        GossipProtocol::new(
+            cmd_rx,
+            event_tx,
+            detector_tx,
+            membership_tx,
+            1000, // gossip_interval_ms
+            NodeId::new("test-node"),
+        )
     }
 
     fn make_node_entry(id: &str, incarnation: u64, state: NodeState) -> NodeEntry {

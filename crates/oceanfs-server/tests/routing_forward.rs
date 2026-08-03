@@ -1,4 +1,7 @@
 //! Integration test: key routing and request forwarding.
+//!
+//! Forwarding is handled by WriteCoordinator::forward_write(). The Router
+//! provides the routing decision (replica set, is_local, forward_target).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -64,57 +67,19 @@ async fn remote_node_in_replica_set_returns_forward_target() {
 }
 
 #[tokio::test]
-async fn route_with_retry_local_handles_locally() {
-    let router = make_router("node-a", &["node-a", "node-b"]);
-    let key = make_hash("local-test");
-
-    let response = router.route_with_retry(key).await.expect("retry route should succeed");
-    assert!(response.is_local);
-    assert!(response.forward_target.is_none());
-}
-
-#[tokio::test]
-async fn route_with_retry_skips_dead_nodes_but_fails_when_no_grpc_server() {
-    let router = {
-        let mut ring = Ring::new(RingConfig { vnodes_per_node: 16, replication_factor: 3 });
-        ring.add_node(NodeId::new("dead-node"));
-        ring.add_node(NodeId::new("alive-node"));
-        let ring_cache = Arc::new(RingCache::new(ring));
-
-        let membership = Arc::new(Membership::new(
-            NodeId::new("requester"),
-            "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
-            GossipConfig::default(),
-            ring_cache.clone(),
-        ));
-
-        // Add nodes — one dead, one alive.
-        membership.upsert_node(
-            NodeId::new("dead-node"),
-            NodeState::Dead,
-            Incarnation::new(1),
-            "127.0.0.1:9002".parse().unwrap(),
-        );
-        membership.upsert_node(
-            NodeId::new("alive-node"),
-            NodeState::Alive,
-            Incarnation::new(1),
-            "127.0.0.1:9003".parse().unwrap(),
-        );
-
-        let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
-        Router::new(ring_cache, membership, pool, NodeId::new("requester"))
-    };
-
+async fn route_with_ring_and_membership_returns_correct_replica_set() {
+    let router = make_router("requester", &["dead-node", "alive-node"]);
     let key = make_hash("retry-test");
-    // Now that try_forward makes real gRPC channel acquisitions,
-    // this fails because no server is running on the alive node.
-    let result = router.route_with_retry(key).await;
-    assert!(result.is_err(), "routing should fail when alive node has no gRPC server");
+
+    // route() returns the replica set, regardless of node liveness.
+    let response = router.route(key).await.expect("route should succeed");
+    assert!(!response.is_local, "requester should not be in the replica set");
+    assert!(response.forward_target.is_some(), "forward target should be the first successor");
+    assert!(!response.replica_set.is_empty());
 }
 
 #[tokio::test]
-async fn retry_fails_when_all_successors_are_dead() {
+async fn route_with_all_dead_nodes_still_returns_replica_set() {
     let router = {
         let mut ring = Ring::new(RingConfig { vnodes_per_node: 16, replication_factor: 2 });
         ring.add_node(NodeId::new("dead-1"));
@@ -146,8 +111,10 @@ async fn retry_fails_when_all_successors_are_dead() {
     };
 
     let key = make_hash("all-dead");
-    let result = router.route_with_retry(key).await;
-    assert!(result.is_err(), "routing should fail when all successors are dead");
+    // route() doesn't check liveness — it returns what the ring says.
+    let response = router.route(key).await.expect("route should succeed even with dead nodes");
+    assert!(!response.is_local);
+    assert!(response.forward_target.is_some());
 }
 
 #[tokio::test]

@@ -1,13 +1,17 @@
 //! Request router — integrates ring, membership, and connection pool
 //! to dispatch blob operations to the correct replica set.
+//!
+//! The `route()` method performs a simple lookup: given a key hash,
+//! it returns the replica set and whether this node is in it.
+//! Actual request forwarding is handled by `WriteCoordinator::forward_write()`.
 
 use std::sync::Arc;
 
-use oceanfs_core::{HashKey, NodeId, NodeState, OperationType};
+use oceanfs_core::{HashKey, NodeId, OperationType};
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::RingCache;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::error::{Error, Result};
 
@@ -106,112 +110,6 @@ impl Router {
         );
 
         Ok(RouteResponse { is_local, replica_set, forward_target })
-    }
-
-    /// Routes with forwarding retry on failure.
-    ///
-    /// Attempts to route to the first successor. If the forward fails,
-    /// tries the next successor in the replica set, up to N attempts.
-    ///
-    /// Returns the response from the first successful forward, or an
-    /// error if all attempts fail.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Routing`] if the ring is empty.
-    /// Returns [`Error::AllForwardingFailed`] if all successors are
-    /// unreachable.
-    pub async fn route_with_retry(&self, key: HashKey) -> Result<RouteResponse> {
-        let replica_set = self.ring.lookup(key.as_bytes());
-
-        if replica_set.is_empty() {
-            return Err(Error::Routing("ring returned empty replica set".into()));
-        }
-
-        // If this node is in the replica set, handle locally.
-        if replica_set.contains(&self.node_id) {
-            return Ok(RouteResponse { is_local: true, replica_set, forward_target: None });
-        }
-
-        // Try each successor in order.
-        let mut attempts = 0usize;
-        for target in replica_set.clone() {
-            attempts += 1;
-
-            // Check if target is alive.
-            if let Some(state) = self.membership.state_of(&target) {
-                if !matches!(state, NodeState::Alive) {
-                    debug!(target = %target, state = ?state, "skipping non-alive node");
-                    continue;
-                }
-            }
-
-            // Attempt to forward to the target.
-            match self.try_forward(&target).await {
-                Ok(()) => {
-                    return Ok(RouteResponse {
-                        is_local: false,
-                        replica_set,
-                        forward_target: Some(target),
-                    });
-                }
-                Err(e) => {
-                    warn!(target = %target, attempt = attempts, error = %e, "forward attempt failed");
-                }
-            }
-        }
-
-        Err(Error::AllForwardingFailed { attempts })
-    }
-
-    /// Attempts to forward a request to the target node.
-    ///
-    /// Validates the target exists in membership, checks that it is alive,
-    /// resolves its network address, and verifies gRPC connectivity by
-    /// acquiring a channel from the connection pool.
-    ///
-    /// When full gRPC forwarding is enabled, this method also streams the
-    /// request payload to the target via `SegmentRpcClient::append_segment`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::ForwardFailed`] if the target is not found in
-    /// membership, is not alive, or if channel acquisition fails.
-    async fn try_forward(&self, target: &NodeId) -> Result<()> {
-        // Verify the target exists in membership.
-        let state = self.membership.state_of(target).ok_or_else(|| Error::ForwardFailed {
-            target: target.to_string(),
-            reason: "node not found in membership".into(),
-        })?;
-
-        if !matches!(state, oceanfs_core::NodeState::Alive) {
-            return Err(Error::ForwardFailed {
-                target: target.to_string(),
-                reason: format!("node is not alive (state: {state:?})"),
-            });
-        }
-
-        // Resolve the target's network address from membership.
-        let addr = self.membership.address_of(target).ok_or_else(|| Error::ForwardFailed {
-            target: target.to_string(),
-            reason: "no address for target in membership".into(),
-        })?;
-
-        // Acquire a gRPC channel from the connection pool to validate
-        // end-to-end connectivity. The channel is returned to the pool
-        // when the guard is dropped.
-        let pool_guard = self.pool.get_channel(addr).await.map_err(|e| Error::ForwardFailed {
-            target: target.to_string(),
-            reason: format!("failed to acquire gRPC channel: {e}"),
-        })?;
-
-        // The channel is valid — drop the guard to return it to the pool.
-        // In a full implementation, we would use the channel to stream
-        // the request payload via SegmentRpcClient::append_segment.
-        drop(pool_guard);
-
-        debug!(target = %target, addr = %addr, "forward target validated: channel acquired");
-        Ok(())
     }
 
     /// Returns a reference to the ring cache.
@@ -313,33 +211,6 @@ mod tests {
         let response = router.route(key).await.unwrap();
         assert!(!response.is_local, "node-x should not be in the replica set");
         assert!(response.forward_target.is_some(), "forward_target should be set");
-    }
-
-    #[tokio::test]
-    async fn route_with_retry_local_node_is_local_true() {
-        let router = make_router("node-a", &["node-a", "node-b"]);
-        let key = make_hash_key("test");
-
-        let response = router.route_with_retry(key).await.unwrap();
-        assert!(response.is_local);
-        assert!(response.forward_target.is_none());
-    }
-
-    #[tokio::test]
-    async fn route_with_retry_non_local_all_forwarding_fails_without_real_server() {
-        // node-x is not in the ring, so all targets are remote.
-        // Since no actual gRPC servers are running, all forwarding attempts fail.
-        let router = make_router("node-x", &["node-a", "node-b", "node-c"]);
-        let key = make_hash_key("test");
-
-        let result = router.route_with_retry(key).await;
-        assert!(result.is_err(), "should fail when no gRPC servers are available");
-        match result.unwrap_err() {
-            Error::AllForwardingFailed { attempts } => {
-                assert_eq!(attempts, 3, "should have attempted all 3 successors");
-            }
-            e => panic!("expected AllForwardingFailed, got {e:?}"),
-        }
     }
 
     #[tokio::test]

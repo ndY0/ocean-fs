@@ -8,9 +8,12 @@
 
 use std::{net::SocketAddr, sync::Arc};
 
-use oceanfs_core::{GossipConfig, Incarnation, NodeId, NodeState, RingConfig};
-use oceanfs_membership::Membership;
+use oceanfs_core::{GossipConfig, Incarnation, NodeId, NodeState, RingConfig, RpcConfig};
+use oceanfs_membership::{grpc::gossip_service::GossipGrpcService, Membership};
+use oceanfs_network::{gossip::gossip_rpc_server::GossipRpcServer, ConnectionPool};
 use oceanfs_routing::{Ring, RingCache};
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::Server;
 
 fn make_ring() -> Arc<RingCache> {
     let mut ring = Ring::new(RingConfig::default());
@@ -174,5 +177,89 @@ fn leave_transitions_state_and_removes_self_from_ring() {
         let snap = ring_cache.snapshot();
         assert!(!snap.nodes().contains(&NodeId::new("leaver")));
         assert!(snap.nodes().contains(&NodeId::new("other")));
+    });
+}
+
+/// PR5: Verifies that after a joiner calls `join()` on a seed,
+/// the seed's ring contains the joiner (and vice versa).
+#[test]
+fn seed_learns_joiner_on_join_via_push_after_pull() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // ---- Seed setup ----
+        let mut seed_ring = Ring::new(RingConfig::default());
+        seed_ring.add_node(NodeId::new("seed-node"));
+        let seed_ring_cache = Arc::new(RingCache::new(seed_ring));
+        let seed_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        let seed_membership = Arc::new(Membership::new(
+            NodeId::new("seed-node"),
+            seed_addr,
+            GossipConfig::default(),
+            seed_ring_cache.clone(),
+        ));
+
+        // Start a gRPC server for the seed's gossip service.
+        let seed_grpc_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let seed_grpc = seed_membership.clone();
+        let listener = tokio::net::TcpListener::bind(seed_grpc_addr).await.expect("bind seed gRPC");
+        let seed_listen_addr = listener.local_addr().expect("seed listen addr");
+
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(GossipRpcServer::new(GossipGrpcService::new(seed_grpc)))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .expect("seed server failed");
+        });
+
+        // Give the server a moment to start.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // ---- Joiner setup ----
+        let mut joiner_ring = Ring::new(RingConfig::default());
+        joiner_ring.add_node(NodeId::new("joiner-node"));
+        let joiner_ring_cache = Arc::new(RingCache::new(joiner_ring));
+        let joiner_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+
+        let joiner_config = GossipConfig {
+            seed_nodes: vec![seed_listen_addr.to_string()],
+            ..GossipConfig::default()
+        };
+
+        let joiner_membership = Arc::new(Membership::new(
+            NodeId::new("joiner-node"),
+            joiner_addr,
+            joiner_config,
+            joiner_ring_cache.clone(),
+        ));
+
+        // Set up connection pool for the joiner so it can talk to the seed.
+        let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
+        joiner_membership.set_pool(pool);
+
+        // ---- Join ----
+        joiner_membership.join().await.expect("joiner should join successfully");
+
+        // ---- Assertions ----
+        // The joiner's ring should contain itself.
+        let joiner_snap = joiner_ring_cache.snapshot();
+        assert!(
+            joiner_snap.nodes().contains(&NodeId::new("joiner-node")),
+            "joiner's ring should contain the joiner"
+        );
+
+        // PR5: The seed's ring should contain the joiner (push after pull).
+        let seed_snap = seed_ring_cache.snapshot();
+        assert!(
+            seed_snap.nodes().contains(&NodeId::new("joiner-node")),
+            "seed's ring should contain the joiner after join push"
+        );
+
+        // The seed should still have itself in the ring.
+        assert!(
+            seed_snap.nodes().contains(&NodeId::new("seed-node")),
+            "seed's ring should contain the seed"
+        );
     });
 }
