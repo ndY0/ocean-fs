@@ -7,6 +7,7 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+use bytes::Bytes;
 use oceanfs_core::{
     AccelConfig, BucketId, HlcClock, MetadataConfig, NodeConfig, NodeId, ObjectKey, ObjectMetadata,
     RingConfig, RpcConfig, SegmentSizeConfig, WalConfig,
@@ -202,7 +203,13 @@ impl Node {
             wal_writer.clone(),
         ));
         // ---- 7. Construct durability workers ----
-        let gc_config = oceanfs_storage::GcConfig::default();
+        let gc_config = oceanfs_storage::GcConfig::new(
+            config.gc_interval_sec,
+            config.tombstone_ttl_sec,
+            0.5,
+            4,
+            64,
+        );
         let gc_worker = Arc::new(oceanfs_storage::GarbageCollector::new(gc_config.clone()));
         let ae_worker = Arc::new(oceanfs_storage::AntiEntropy::new(
             oceanfs_storage::AntiEntropyConfig::default(),
@@ -224,8 +231,12 @@ impl Node {
         ));
 
         // ---- 7b. Construct segment data store (shared by heal and gRPC) ----
-        let heal_data_store: Arc<dyn oceanfs_storage::SegmentDataStore> =
-            Arc::new(oceanfs_storage::InMemorySegmentStore::new());
+        // Use a disk-backed blob store so segment data survives restarts.
+        let blob_store = Arc::new(
+            oceanfs_storage::BlobStore::open(&config.data_dir.join("blobs"))
+                .map_err(|e| format!("failed to open blob store: {e}"))?,
+        );
+        let heal_data_store: Arc<dyn oceanfs_storage::SegmentDataStore> = blob_store.clone();
 
         // ---- 7c. Construct heal dispatch pipeline ----
         let heal_config = oceanfs_storage::HealConfig::default();
@@ -281,6 +292,22 @@ impl Node {
         // chunk assembly and by S3Handler to store segment data on PUT.
         let segment_reader = Arc::new(oceanfs_server::InMemorySegmentReader::new());
 
+        // On startup, repopulate the in-memory segment reader from any
+        // blob data persisted on disk (surviving a previous restart).
+        {
+            let blob_ids = blob_store
+                .list_blobs()
+                .map_err(|e| format!("failed to list blob data on startup: {e}"))?;
+            for id in &blob_ids {
+                if let Ok(Some(data)) = blob_store.read_blob(id) {
+                    segment_reader.put(*id, Bytes::from(data));
+                }
+            }
+            if !blob_ids.is_empty() {
+                info!(count = blob_ids.len(), "loaded persisted blob data into segment reader");
+            }
+        }
+
         let write_coordinator = Arc::new(WriteCoordinator::new(
             ring_cache.clone(),
             membership.clone(),
@@ -326,6 +353,7 @@ impl Node {
             Some(negative_cache.clone()),
         )
         .with_segment_store(segment_reader)
+        .with_blob_dir(config.data_dir.join("blobs"))
         .with_prefetch_engine(prefetch_engine.clone())
         .with_router(router);
 
@@ -378,7 +406,8 @@ impl Node {
         };
         let app = axum::Router::new()
             .merge(s3_handler.into_router_with_auth(auth_middleware))
-            .merge(admin_handler.into_router());
+            .merge(admin_handler.into_router())
+            .layer(axum::extract::DefaultBodyLimit::max(config.max_body_size));
 
         // ---- 14. Bind HTTP server ----
         let http_listener = tokio::net::TcpListener::bind(&config.listen_addr)
@@ -448,6 +477,7 @@ impl Node {
             prefetch_engine,
             heal_worker,
             heal_data_store.clone(),
+            &config,
         );
 
         info!(
@@ -551,17 +581,19 @@ impl Node {
         prefetch_engine: Arc<oceanfs_cache::PrefetchEngine>,
         heal_worker: oceanfs_storage::HealWorker,
         data_store: Arc<dyn oceanfs_storage::SegmentDataStore>,
+        config: &oceanfs_core::NodeConfig,
     ) -> BackgroundTasks {
         // Gossip: placeholder (driven by Membership internally).
         let gossip_cancel = CancellationToken::new();
         let gossip = tokio::spawn(async { std::future::pending::<()>().await });
 
-        // GC: runs every gc_interval_sec (default 3600s).
+        // GC: runs every gc_interval_sec from config.
         let gc_cancel = CancellationToken::new();
         let gc_token = gc_cancel.clone();
         let gc_store = metadata_store.clone();
+        let gc_interval = Duration::from_secs(config.gc_interval_sec);
         let gc = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(3600));
+            let mut interval = tokio::time::interval(gc_interval);
             loop {
                 tokio::select! {
                     _ = gc_token.cancelled() => {
@@ -577,11 +609,12 @@ impl Node {
             }
         });
 
-        // Anti-entropy: runs every 300s.
+        // Anti-entropy: runs every ae_interval_sec from config.
         let ae_cancel = CancellationToken::new();
         let ae_token = ae_cancel.clone();
+        let ae_interval_secs = config.ae_interval_sec;
         let ae = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            let mut interval = tokio::time::interval(Duration::from_secs(ae_interval_secs));
             loop {
                 tokio::select! {
                     _ = ae_token.cancelled() => {
@@ -597,13 +630,14 @@ impl Node {
             }
         });
 
-        // Scrub: runs every 604800s (7 days).
+        // Scrub: runs every scrub_interval_sec from config.
         let scrub_cancel = CancellationToken::new();
         let scrub_token = scrub_cancel.clone();
         let scrub_store = metadata_store.clone();
         let scrub_data = data_store;
+        let scrub_interval_secs = config.scrub_interval_sec;
         let scrub = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(604800));
+            let mut interval = tokio::time::interval(Duration::from_secs(scrub_interval_secs));
             loop {
                 tokio::select! {
                     _ = scrub_token.cancelled() => {
@@ -630,11 +664,12 @@ impl Node {
             }
         });
 
-        // Orphan reaper: runs every 3600s.
+        // Orphan reaper: runs every orphan_reaper_interval_sec from config.
         let reaper_cancel = CancellationToken::new();
         let reaper_token = reaper_cancel.clone();
+        let reaper_interval = Duration::from_secs(config.orphan_reaper_interval_sec);
         let orphan_reaper = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(3600));
+            let mut interval = tokio::time::interval(reaper_interval);
             loop {
                 tokio::select! {
                     _ = reaper_token.cancelled() => {
@@ -910,6 +945,7 @@ mod tests {
             prefetch_engine,
             heal_worker,
             bg_data_store,
+            &NodeConfig::default(),
         );
 
         // Verify handles are not finished immediately (they are pending).

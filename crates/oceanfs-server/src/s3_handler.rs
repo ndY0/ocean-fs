@@ -15,7 +15,7 @@
 //! and §13.2 (`anyhow` only at application boundary — we use
 //! concrete [`Error`] types).
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use axum::{
     body::Body,
@@ -80,6 +80,9 @@ pub(crate) struct AppState {
     pub prefetch_engine: Option<Arc<oceanfs_cache::PrefetchEngine>>,
     /// Request router for non-local forwarding decisions.
     pub router: Option<Arc<crate::router::Router>>,
+    /// Optional directory for persisting blob data to disk.
+    /// When set, blob data is written to `{blob_dir}/{segment_id}.blob` on PUT.
+    pub blob_dir: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +153,7 @@ impl S3Handler {
             segment_store: None,
             prefetch_engine: None,
             router: None,
+            blob_dir: None,
         };
         Self { state }
     }
@@ -173,6 +177,15 @@ impl S3Handler {
         self
     }
 
+    /// Sets the blob data persistence directory.
+    ///
+    /// When set, blob data is written to `{dir}/{segment_id}.blob` on
+    /// every successful PUT. This ensures data survives node restarts.
+    pub fn with_blob_dir(mut self, dir: PathBuf) -> Self {
+        self.state.blob_dir = Some(dir);
+        self
+    }
+
     /// Consumes the handler and returns an axum `Router`.
     ///
     /// The returned router can be mounted in an axum `Server` via
@@ -181,6 +194,12 @@ impl S3Handler {
         let state = self.state;
 
         AxumRouter::new()
+            // Bucket operations: /{bucket} (must come BEFORE the catch-all
+            // route so that bucket CRUD doesn't get captured as object paths)
+            .route(
+                "/{bucket}",
+                axum::routing::put(create_bucket).get(list_objects).delete(delete_bucket),
+            )
             // Object operations: /:bucket/*key (catch-all for S3-style keys)
             .route(
                 "/:bucket/*key",
@@ -188,11 +207,6 @@ impl S3Handler {
                     .get(get_object)
                     .head(head_object)
                     .delete(delete_object),
-            )
-            // Bucket operations: /{bucket}
-            .route(
-                "/{bucket}",
-                axum::routing::put(create_bucket).get(list_objects).delete(delete_bucket),
             )
             .with_state(state)
     }
@@ -259,11 +273,22 @@ async fn put_object(
                 }
             }
 
+            // Persist blob data to disk so it survives node restarts.
+            if let Some(ref blob_dir) = state.blob_dir {
+                for chunk in &result.chunks {
+                    let path = blob_dir.join(format!("{}.blob", chunk.segment_id.as_uuid()));
+                    if let Err(e) = std::fs::write(&path, &body) {
+                        error!(segment_id = %chunk.segment_id, path = %path.display(), error = %e,
+                            "failed to persist blob data to disk");
+                    }
+                }
+            }
+
             // Persist object metadata so reads can locate the data.
             let meta = ObjectMetadata {
                 object_key: object_key.clone(),
                 size: result.size,
-                blake3_hash: result.blake3_hash.clone(),
+                blake3_hash: result.blake3_hash,
                 chunks: result.chunks.clone(),
                 inline_data: None,
                 created_at: std::time::SystemTime::now()
@@ -287,6 +312,29 @@ async fn put_object(
             }
             if let Some(ref l2) = state.metadata_cache {
                 l2.invalidate(&bucket_id, &object_key);
+            }
+
+            // Register segment metadata for each unique segment so
+            // /admin/segments reflects created segments.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let size_config = oceanfs_core::SegmentSizeConfig::default();
+            for chunk in &result.chunks {
+                let tier = size_config.classify(result.size);
+                let seg_meta = oceanfs_core::SegmentMetadata {
+                    segment_id: chunk.segment_id,
+                    ec_k: 1,
+                    ec_m: 0,
+                    size_tier: tier,
+                    merkle_root: None,
+                    storage_locations: smallvec::SmallVec::new(),
+                    sealed_at: Some(now_ms),
+                };
+                if let Err(e) = state.metadata.put_segment(seg_meta) {
+                    error!(segment_id = %chunk.segment_id, error = %e, "failed to persist segment metadata");
+                }
             }
 
             info!(key = %key, size = result.size, etag = %etag, "PUT object success");
@@ -321,6 +369,13 @@ async fn get_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
 ) -> Response {
+    // When key is empty, this is a bucket listing request (GET /{bucket}).
+    // Route the request to list_objects handler.
+    if key.is_empty() {
+        return list_objects(State(state), Path(bucket), Query(std::collections::HashMap::new()))
+            .await;
+    }
+
     let bucket_id = BucketId::new(&bucket);
     let object_key = ObjectKey::new(&key);
 
@@ -857,6 +912,11 @@ mod tests {
                 .collect();
             Ok(objs)
         }
+
+        fn put_segment(&self, _meta: oceanfs_core::SegmentMetadata) -> Result<(), MetadataError> {
+            // No-op: mock metadata store doesn't track segments.
+            Ok(())
+        }
     }
 
     // --- Test helpers ---
@@ -908,6 +968,7 @@ mod tests {
             segment_store: Some(segment_store),
             prefetch_engine: None,
             router: None,
+            blob_dir: None,
         }
     }
 

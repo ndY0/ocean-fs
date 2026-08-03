@@ -18,7 +18,7 @@ use oceanfs_core::{
         membership::{MembershipEntry, MembershipList},
         segment::{AckStatus, SegmentAppendRequest},
     },
-    GossipConfig, Incarnation, NodeId, NodeState, RingConfig, RpcConfig, SegmentId,
+    GossipConfig, Incarnation, NodeId, NodeState, RingConfig, SegmentId,
 };
 use oceanfs_membership::{grpc::probe_service::ProbeHandler, Membership};
 use oceanfs_network::{
@@ -27,7 +27,6 @@ use oceanfs_network::{
         GossipPullRequest,
     },
     storage::{segment_rpc_client::SegmentRpcClient, segment_rpc_server::SegmentRpcServer},
-    ConnectionPool,
 };
 use oceanfs_routing::{Ring, RingCache};
 use oceanfs_server::grpc::segment_service::SegmentGrpcService;
@@ -80,6 +79,7 @@ struct RunningNode {
     client: SegmentRpcClient<tonic::transport::Channel>,
     #[allow(dead_code)]
     addr: SocketAddr,
+    #[allow(dead_code)]
     store: Arc<dyn SegmentDataStore>,
     _task: tokio::task::JoinHandle<()>,
 }

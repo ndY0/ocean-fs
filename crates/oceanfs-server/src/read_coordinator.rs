@@ -933,6 +933,13 @@ mod tests {
         ) -> std::result::Result<Vec<ObjectMetadata>, crate::metadata_ops::MetadataError> {
             Ok(vec![])
         }
+
+        fn put_segment(
+            &self,
+            _meta: oceanfs_core::SegmentMetadata,
+        ) -> std::result::Result<(), crate::metadata_ops::MetadataError> {
+            Ok(())
+        }
     }
 
     fn make_coordinator_with_metadata(store: Arc<MockMetadataStore>) -> ReadCoordinator {

@@ -27,6 +27,7 @@
 )]
 
 mod anti_entropy;
+mod blob_store;
 mod buffer_pool;
 mod error;
 mod gc;
@@ -40,6 +41,7 @@ pub use anti_entropy::{
     AntiEntropy, AntiEntropyConfig, AntiEntropyStats, InMemorySegmentStore, LeafRange, MerkleProof,
     MerkleRoot, MerkleTree, SegmentDataStore,
 };
+pub use blob_store::BlobStore;
 pub use buffer_pool::BufferPool;
 pub use error::{Error, Result};
 pub use gc::{

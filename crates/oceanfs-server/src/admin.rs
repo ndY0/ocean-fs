@@ -615,11 +615,11 @@ struct AccelerationStatus {
     healthy: bool,
 }
 
-#[instrument(skip(state))]
-async fn acceleration_status(State(state): State<AdminState>) -> impl IntoResponse {
+#[instrument(skip(_state))]
+async fn acceleration_status(State(_state): State<AdminState>) -> impl IntoResponse {
     #[cfg(feature = "accel")]
     {
-        if let Some(ref accel) = state.accel {
+        if let Some(ref accel) = _state.accel {
             let status = AccelerationStatus {
                 active_tier: format!("{:?}", accel.active_tier()),
                 fallback_count: accel.ec_fallback_count(),

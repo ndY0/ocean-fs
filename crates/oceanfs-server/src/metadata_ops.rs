@@ -4,7 +4,7 @@
 //! deletion, and listing. Concrete implementations live in
 //! `oceanfs-storage` and are wired in `oceanfs-node`.
 
-use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata};
+use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata, SegmentMetadata};
 
 /// Result type for metadata operations.
 pub type Result<T, E = MetadataError> = std::result::Result<T, E>;
@@ -61,6 +61,16 @@ pub trait MetadataOps: Send + Sync + 'static {
     /// Returns an error if the metadata store is unavailable or
     /// the underlying storage operation fails.
     fn put_object(&self, bucket: &BucketId, meta: ObjectMetadata) -> Result<()>;
+
+    /// Stores segment metadata.
+    ///
+    /// Called after a new segment is created to register it in the
+    /// metadata store so it appears in segment inventory reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata store is unavailable.
+    fn put_segment(&self, meta: SegmentMetadata) -> Result<()>;
 
     /// Lists objects in a bucket matching the given prefix.
     ///

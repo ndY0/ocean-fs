@@ -61,6 +61,26 @@ pub struct NodeConfig {
     /// block request handling.
     #[serde(default)]
     pub prefetch_enabled: bool,
+    /// Maximum HTTP body size in bytes (default 2 MB = 2097152).
+    #[serde(default = "default_max_body_size")]
+    pub max_body_size: usize,
+    /// Garbage collection interval in seconds (default 3600).
+    #[serde(default = "default_gc_interval")]
+    pub gc_interval_sec: u64,
+    /// Tombstone TTL in seconds before deleted objects are
+    /// permanently reclaimed (default 259200 = 3 days).
+    #[serde(default = "default_tombstone_ttl")]
+    pub tombstone_ttl_sec: u64,
+    /// Anti-entropy Merkle verification interval in seconds
+    /// (default 300).
+    #[serde(default = "default_ae_interval")]
+    pub ae_interval_sec: u64,
+    /// Scrub cycle interval in seconds (default 604800 = 7 days).
+    #[serde(default = "default_scrub_interval")]
+    pub scrub_interval_sec: u64,
+    /// Orphan reaper interval in seconds (default 3600).
+    #[serde(default = "default_orphan_interval")]
+    pub orphan_reaper_interval_sec: u64,
 }
 
 fn default_node_id() -> String {
@@ -84,6 +104,24 @@ fn default_metrics_enabled() -> bool {
 fn default_metrics_listen_addr() -> String {
     "0.0.0.0:9090".into()
 }
+fn default_max_body_size() -> usize {
+    2 * 1024 * 1024 // 2 MB
+}
+fn default_gc_interval() -> u64 {
+    3600
+}
+fn default_tombstone_ttl() -> u64 {
+    259200 // 3 days
+}
+fn default_ae_interval() -> u64 {
+    300
+}
+fn default_scrub_interval() -> u64 {
+    604800 // 7 days
+}
+fn default_orphan_interval() -> u64 {
+    3600
+}
 
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -98,6 +136,12 @@ impl Default for NodeConfig {
             metrics_listen_addr: "0.0.0.0:9090".into(),
             s3_auth_enabled: false,
             prefetch_enabled: false,
+            max_body_size: 2 * 1024 * 1024,
+            gc_interval_sec: 3600,
+            tombstone_ttl_sec: 259200,
+            ae_interval_sec: 300,
+            scrub_interval_sec: 604800,
+            orphan_reaper_interval_sec: 3600,
         }
     }
 }

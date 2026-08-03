@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata};
+use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata, SegmentMetadata};
 use oceanfs_server::metadata_ops::{MetadataError, MetadataOps};
 
 /// Bridges `oceanfs_storage::MetadataStore` to `oceanfs_server::MetadataOps`.
@@ -68,6 +68,10 @@ impl MetadataOps for MetadataStoreAdapter {
             .into_iter()
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| MetadataError::Internal(format!("{e}")))
+    }
+
+    fn put_segment(&self, meta: SegmentMetadata) -> Result<(), MetadataError> {
+        self.store.put_segment(meta).map_err(|e| MetadataError::Internal(format!("{e}")))
     }
 }
 

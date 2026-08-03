@@ -69,6 +69,11 @@ impl MetadataOps for TestMetadata {
             .map(|(_, v)| v.clone())
             .collect())
     }
+
+    fn put_segment(&self, _meta: oceanfs_core::SegmentMetadata) -> Result<(), MetadataError> {
+        // No-op: test store doesn't track segments.
+        Ok(())
+    }
 }
 
 /// Creates a minimal test setup with an in-memory segment store

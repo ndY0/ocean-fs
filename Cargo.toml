@@ -13,6 +13,7 @@ members = [
     "crates/oceanfs-node",
     "crates/oceanfs",
     "benches",
+    "e2e",
 ]
 resolver = "2"
 

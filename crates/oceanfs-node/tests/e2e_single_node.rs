@@ -69,6 +69,11 @@ mod helpers {
                 .map(|(_, v)| v.clone())
                 .collect())
         }
+
+        fn put_segment(&self, _meta: oceanfs_core::SegmentMetadata) -> Result<(), MetadataError> {
+            // No-op: in-memory store doesn't track segments.
+            Ok(())
+        }
     }
 
     pub struct TestNode {
