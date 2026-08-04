@@ -74,3 +74,124 @@ impl LivenessTracker {
         self.dead_bytes.get(segment_id).copied().unwrap_or(0)
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use oceanfs_core::{ChunkRef, SegmentId};
+
+    use super::super::liveness_tracker::LivenessTracker;
+    // LivenessTracker
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn liveness_ratio_no_deletions_is_one() {
+        let mut tracker = LivenessTracker::new();
+        let id = SegmentId::new();
+        tracker.register_segment(id, 1000);
+        let ratio = tracker.liveness_ratio(&id).unwrap();
+        assert!((ratio - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn liveness_ratio_all_deleted_is_zero() {
+        let mut tracker = LivenessTracker::new();
+        let id = SegmentId::new();
+        tracker.register_segment(id, 1000);
+        let chunk = ChunkRef { segment_id: id, offset: 0, length: 1000 };
+        tracker.mark_dead(&chunk);
+        let ratio = tracker.liveness_ratio(&id).unwrap();
+        assert!((ratio - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn liveness_ratio_half_deleted() {
+        let mut tracker = LivenessTracker::new();
+        let id = SegmentId::new();
+        tracker.register_segment(id, 1000);
+        let dead_chunk = ChunkRef { segment_id: id, offset: 0, length: 500 };
+        tracker.mark_dead(&dead_chunk);
+        let ratio = tracker.liveness_ratio(&id).unwrap();
+        assert!((ratio - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compaction_candidates_below_threshold() {
+        let mut tracker = LivenessTracker::new();
+        let id1 = SegmentId::new();
+        let id2 = SegmentId::new();
+        tracker.register_segment(id1, 1000);
+        tracker.register_segment(id2, 1000);
+
+        // Mark 800 bytes dead on id1 (20% liveness)
+        let chunk = ChunkRef { segment_id: id1, offset: 0, length: 800 };
+        tracker.mark_dead(&chunk);
+
+        let candidates = tracker.compaction_candidates(0.5);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0], id1);
+    }
+
+    // -----------------------------------------------------------------------
+
+    // LivenessTracker edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn liveness_ratio_unknown_segment_returns_none() {
+        let tracker = LivenessTracker::new();
+        let unknown_id = SegmentId::new();
+        assert_eq!(tracker.liveness_ratio(&unknown_id), None);
+    }
+
+    #[test]
+    fn dead_bytes_for_unknown_segment_returns_zero() {
+        let tracker = LivenessTracker::new();
+        assert_eq!(tracker.dead_bytes_for(&SegmentId::new()), 0);
+    }
+
+    #[test]
+    fn compaction_candidates_all_healthy_returns_empty() {
+        let mut tracker = LivenessTracker::new();
+        let id = SegmentId::new();
+        tracker.register_segment(id, 1000);
+        let candidates = tracker.compaction_candidates(0.5);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn mark_dead_saturating_subtraction() {
+        let mut tracker = LivenessTracker::new();
+        let id = SegmentId::new();
+        tracker.register_segment(id, 100);
+        let chunk = ChunkRef { segment_id: id, offset: 0, length: 200 };
+        tracker.mark_dead(&chunk);
+        // Live bytes should not go below 0
+        let ratio = tracker.liveness_ratio(&id).unwrap();
+        assert!((ratio - 0.0).abs() < f64::EPSILON);
+    }
+
+    // liveness_ratio for multiple segments
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn multiple_segment_liveness_tracking() {
+        let mut tracker = LivenessTracker::new();
+        let id1 = SegmentId::new();
+        let id2 = SegmentId::new();
+        tracker.register_segment(id1, 1000);
+        tracker.register_segment(id2, 2000);
+
+        assert!((tracker.liveness_ratio(&id1).unwrap() - 1.0).abs() < f64::EPSILON);
+        assert!((tracker.liveness_ratio(&id2).unwrap() - 1.0).abs() < f64::EPSILON);
+
+        // Mark some dead on id1
+        let chunk = ChunkRef { segment_id: id1, offset: 0, length: 500 };
+        tracker.mark_dead(&chunk);
+        // id1 should now be at 50% liveness, id2 still at 100%
+        assert!((tracker.liveness_ratio(&id1).unwrap() - 0.5).abs() < f64::EPSILON);
+        assert!((tracker.liveness_ratio(&id2).unwrap() - 1.0).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+}

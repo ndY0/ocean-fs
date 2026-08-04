@@ -18,3 +18,21 @@ pub struct GcStats {
     /// Bytes that are dead (reclaimable).
     pub dead_bytes: u64,
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    // GcStats defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gc_stats_defaults() {
+        let stats = GcStats::default();
+        assert_eq!(stats.segments_scanned, 0);
+        assert_eq!(stats.segments_compacted, 0);
+        assert_eq!(stats.bytes_reclaimed, 0);
+        assert_eq!(stats.live_bytes, 0);
+        assert_eq!(stats.dead_bytes, 0);
+    }
+}

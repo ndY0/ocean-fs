@@ -93,3 +93,38 @@ impl GcConfig {
         self.compact_threshold
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    // GcConfig
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_gc_config_values() {
+        let config = GcConfig::default();
+        assert_eq!(config.interval_sec(), 3600);
+        assert_eq!(config.tombstone_ttl_sec(), 259200);
+        assert!((config.compact_threshold() - 0.5).abs() < f64::EPSILON);
+    }
+
+    // GcConfig custom
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gc_config_custom_values() {
+        let config = GcConfig {
+            interval_sec: 7200,
+            tombstone_ttl_sec: 86400,
+            compact_threshold: 0.3,
+            max_concurrent_compactions: 8,
+            compaction_queue_capacity: 128,
+        };
+        assert_eq!(config.interval_sec(), 7200);
+        assert_eq!(config.tombstone_ttl_sec(), 86400);
+        assert!((config.compact_threshold() - 0.3).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+}
