@@ -1,118 +1,36 @@
-//! Cluster membership with SWIM failure detection and gossip.
+//! Membership lifecycle management.
 //!
-//! The [`Membership`] struct is the main entry point for membership
-//! operations. It manages the local node's view of the cluster,
-//! spawns background tasks for failure detection and gossip, and
-//! emits state-change events via a broadcast channel.
+//! Contains the constructor, start-up, join, leave, and state mutation
+//! logic for the [`Membership`] coordinator.
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use oceanfs_core::{GossipConfig, Incarnation, NodeId, NodeState};
+use oceanfs_core::{Incarnation, NodeId, NodeState};
 use oceanfs_network::ConnectionPool;
-use oceanfs_routing::RingCache;
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use super::{
+    state::{MembershipState, NodeEntry},
+    Membership, MembershipEvent,
+};
 use crate::{
     error::{Error, Result},
     failure_detector::{DetectorCommand, DetectorConfig, FailureDetector},
     gossip::{GossipCommand, GossipProtocol},
-    state::NodeEntry,
 };
-
-/// An event emitted when a node's state changes.
-#[derive(Debug, Clone)]
-pub struct MembershipEvent {
-    /// The node whose state changed.
-    pub node_id: NodeId,
-    /// Previous state.
-    pub old_state: NodeState,
-    /// New state.
-    pub new_state: NodeState,
-}
-
-/// Aggregate membership state for gossip exchange.
-#[derive(Debug, Clone)]
-pub(crate) struct MembershipState {
-    /// Per-node state.
-    nodes: HashMap<NodeId, (NodeState, Incarnation, SocketAddr)>,
-}
-
-impl MembershipState {
-    fn new() -> Self {
-        Self { nodes: HashMap::new() }
-    }
-}
-
-/// Cluster membership tracker with SWIM failure detection and gossip.
-///
-/// Manages the lifecycle of cluster membership: join, leave, failure
-/// detection, and state-change broadcasting. Background tasks run
-/// the SWIM ping loop and gossip protocol.
-///
-/// # Examples
-///
-/// ```ignore
-/// use std::sync::Arc;
-/// use oceanfs_core::{GossipConfig, NodeId};
-/// use oceanfs_membership::Membership;
-/// use oceanfs_routing::{Ring, RingCache};
-///
-/// # async fn example() {
-/// let config = GossipConfig::default();
-/// let ring_cache = Arc::new(RingCache::new(Ring::new(Default::default())));
-/// let membership = Membership::new(
-///     NodeId::new("node-1"),
-///     "127.0.0.1:9001".parse().unwrap(),
-///     config,
-///     ring_cache,
-/// );
-///
-/// // Subscribe to membership changes.
-/// let mut events = membership.subscribe();
-///
-/// // Trigger a join (async).
-/// // membership.join().await.unwrap();
-/// # }
-/// ```
-pub struct Membership {
-    /// This node's identifier.
-    node_id: NodeId,
-    /// This node's gRPC address.
-    address: SocketAddr,
-    /// Gossip configuration.
-    config: GossipConfig,
-    /// Current membership state.
-    state: RwLock<MembershipState>,
-    /// Ring cache for topology updates on membership changes.
-    ring: Arc<RingCache>,
-    /// Broadcast channel for state-change events.
-    event_tx: broadcast::Sender<MembershipEvent>,
-    /// Sender for failure detector commands (set during start()).
-    detector_tx: RwLock<Option<tokio::sync::mpsc::Sender<DetectorCommand>>>,
-    /// Sender for gossip protocol commands (set during start()).
-    gossip_tx: RwLock<Option<tokio::sync::mpsc::Sender<GossipCommand>>>,
-    /// Connection pool for gRPC calls (join, gossip push).
-    pool: RwLock<Option<Arc<ConnectionPool>>>,
-    /// Whether the membership has been started.
-    started: RwLock<bool>,
-    /// Cancellation token for graceful shutdown of background tasks.
-    shutdown: CancellationToken,
-}
 
 impl Membership {
     /// Creates a new membership instance.
     ///
-    /// This constructor sets up all internal channels and state but
-    /// does NOT start background tasks. Call [`Self::start`] to begin
-    /// failure detection and gossip, then [`Self::join`] to join the cluster.
+    /// Sets up internal channels and state but does NOT start background
+    /// tasks. Call [`Self::start`] then [`Self::join`] to join the cluster.
     pub fn new(
         node_id: NodeId,
         address: SocketAddr,
-        config: GossipConfig,
-        ring: Arc<RingCache>,
+        config: oceanfs_core::GossipConfig,
+        ring: Arc<oceanfs_routing::RingCache>,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(256);
 
@@ -127,16 +45,14 @@ impl Membership {
             gossip_tx: RwLock::new(None),
             pool: RwLock::new(None),
             started: RwLock::new(false),
-            shutdown: CancellationToken::new(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }
     }
 
     /// Starts the background failure detector and gossip tasks.
-    ///
     /// Must be called before [`Self::join`].
     ///
     /// # Errors
-    ///
     /// Returns [`Error::AlreadyStarted`] if called more than once.
     pub fn start(self: &Arc<Self>) -> Result<()> {
         let mut started = self.started.write();
@@ -145,9 +61,7 @@ impl Membership {
         }
         *started = true;
         drop(started);
-
         // ---- Failure detector ----
-
         let detector_config = DetectorConfig {
             interval_ms: self.config.interval_ms,
             ping_timeout_ms: self.config.failure_timeout_ms / 3,
@@ -205,12 +119,8 @@ impl Membership {
                 }
             }
         });
-
         // ---- Gossip protocol ----
-
         let (gossip_cmd_tx, gossip_cmd_rx) = tokio::sync::mpsc::channel(64);
-
-        // Create a broadcast channel for gossip-internal events.
         let (gossip_event_tx, _gossip_event_rx) = broadcast::channel(16);
 
         let mut gossip_protocol = GossipProtocol::new(
@@ -226,9 +136,7 @@ impl Membership {
         if let Some(pool) = self.pool.read().as_ref() {
             gossip_protocol.set_pool(pool.clone());
         }
-
         *self.gossip_tx.write() = Some(gossip_cmd_tx);
-
         let gossip_shutdown = self.shutdown.clone();
         tokio::spawn(async move {
             tokio::select! {
@@ -312,7 +220,10 @@ impl Membership {
     pub async fn join(&self) -> Result<()> {
         let seed_nodes = &self.config.seed_nodes;
         if seed_nodes.is_empty() {
-            info!(node_id = %self.node_id, "no seed nodes configured, starting as first node");
+            info!(
+                node_id = %self.node_id,
+                "no seed nodes configured, starting as first node"
+            );
             // Self is added via upsert_node() below.
         } else {
             // Contact seed nodes via gRPC to receive initial state.
@@ -336,7 +247,11 @@ impl Membership {
                     }
                 };
 
-                debug!(node_id = %self.node_id, seed = %seed_addr, "contacting seed node via gRPC");
+                debug!(
+                    node_id = %self.node_id,
+                    seed = %seed_addr,
+                    "contacting seed node via gRPC"
+                );
 
                 let pooled = match pool.get_channel(seed_addr).await {
                     Ok(p) => p,
@@ -390,7 +305,11 @@ impl Membership {
                         break;
                     }
                     Err(status) => {
-                        warn!(seed = %seed_addr, error = %status, "pull from seed failed");
+                        warn!(
+                            seed = %seed_addr,
+                            error = %status,
+                            "pull from seed failed"
+                        );
                     }
                 }
             }
@@ -399,8 +318,9 @@ impl Membership {
                 return Err(Error::JoinFailed("could not contact any seed node".into()));
             }
 
-            // PR5: After receiving membership list, announce self to the seed via push.
-            // This lets the seed learn about the joiner and add it to its ring.
+            // PR5: After receiving membership list, announce self to the seed
+            // via push. This lets the seed learn about the joiner and add it
+            // to its ring.
             if let Some(seed_addr) = joined_seed_addr {
                 debug!(seed = %seed_addr, "announcing self to seed via gossip push");
 
@@ -433,17 +353,25 @@ impl Membership {
                     Ok(response) => {
                         let ack = response.into_inner();
                         if ack.accepted {
-                            info!(seed = %seed_addr, "seed accepted self-announcement");
+                            info!(
+                                seed = %seed_addr,
+                                "seed accepted self-announcement"
+                            );
                         }
                     }
                     Err(status) => {
-                        warn!(seed = %seed_addr, error = %status, "failed to announce self to seed");
+                        warn!(
+                            seed = %seed_addr,
+                            error = %status,
+                            "failed to announce self to seed"
+                        );
                     }
                 }
             }
         }
 
-        // Announce self as ALIVE via upsert_node so the gossip protocol is notified.
+        // Announce self as ALIVE via upsert_node so the gossip protocol is
+        // notified.
         self.upsert_node(self.node_id.clone(), NodeState::Alive, Incarnation::new(1), self.address);
 
         info!(node_id = %self.node_id, "joined cluster successfully");
@@ -489,7 +417,11 @@ impl Membership {
         // Remove self from ring.
         let mut ring_snapshot = (*self.ring.snapshot()).clone();
         if let Err(e) = ring_snapshot.remove_node(node_id.clone()) {
-            warn!(node_id = %node_id, error = %e, "failed to remove self from ring");
+            warn!(
+                node_id = %node_id,
+                error = %e,
+                "failed to remove self from ring"
+            );
         }
         self.ring.update(ring_snapshot);
 
@@ -497,58 +429,8 @@ impl Membership {
         Ok(())
     }
 
-    /// Shuts down all background tasks gracefully.
-    ///
-    /// Cancels the detector and gossip tasks via the shared cancellation
-    /// token. After calling this, the membership is no longer usable.
-    pub fn shutdown(&self) {
-        self.shutdown.cancel();
-        info!(node_id = %self.node_id, "membership shut down");
-    }
-
-    /// Returns a clone of the cancellation token for use by callers.
-    pub fn shutdown_token(&self) -> CancellationToken {
-        self.shutdown.clone()
-    }
-
-    /// Returns all known nodes with their states, incarnations, and addresses.
-    pub fn nodes_full(&self) -> Vec<(NodeId, NodeState, Incarnation, std::net::SocketAddr)> {
-        self.state
-            .read()
-            .nodes
-            .iter()
-            .map(|(id, (state, incarnation, addr))| (id.clone(), *state, *incarnation, *addr))
-            .collect()
-    }
-
-    /// Returns all known nodes and their states.
-    pub fn nodes(&self) -> Vec<(NodeId, NodeState)> {
-        self.state.read().nodes.iter().map(|(id, (state, _, _))| (id.clone(), *state)).collect()
-    }
-
-    /// Returns the state of a specific node.
-    pub fn state_of(&self, node_id: &NodeId) -> Option<NodeState> {
-        self.state.read().nodes.get(node_id).map(|(state, _, _)| *state)
-    }
-
-    /// Returns the network address of a specific node.
-    pub fn address_of(&self, node_id: &NodeId) -> Option<SocketAddr> {
-        self.state.read().nodes.get(node_id).map(|(_, _, addr)| *addr)
-    }
-
-    /// Subscribes to membership change events.
-    ///
-    /// Returns a [`broadcast::Receiver`] that receives [`MembershipEvent`]
-    /// whenever a node's state changes (ALIVE → SUSPECT → DEAD, etc.).
-    pub fn subscribe(&self) -> broadcast::Receiver<MembershipEvent> {
-        self.event_tx.subscribe()
-    }
-
     /// Adds or updates a node's state from external input (e.g., gossip merge).
-    ///
-    /// When a new ALIVE node is added, it is inserted into the ring.
-    /// When a node transitions to Dead or Left, it is removed from the ring.
-    /// Ring updates are synchronous to keep routing consistent with membership.
+    /// New ALIVE nodes are added to the ring; Dead/Left nodes are removed.
     pub fn upsert_node(
         &self,
         node_id: NodeId,
@@ -563,8 +445,7 @@ impl Membership {
         let old_state = old.unwrap_or(NodeState::Alive);
         let is_new = old.is_none();
 
-        // Remove dead/left nodes from the state entirely so they don't
-        // appear in cluster views or get gossiped further.
+        // Remove dead/left nodes from state so they don't appear in cluster views.
         if state == NodeState::Dead || state == NodeState::Left {
             inner.nodes.remove(&node_id);
         } else {
@@ -578,7 +459,7 @@ impl Membership {
                 new_state: state,
             });
 
-            // PR4: Update the ring synchronously on membership changes.
+            // PR4: Update ring synchronously on membership changes.
             let mut ring_snapshot = (*self.ring.snapshot()).clone();
 
             if is_new {
@@ -588,30 +469,27 @@ impl Membership {
             } else if state == NodeState::Dead || state == NodeState::Left {
                 // Transitioned to dead/left — remove from ring.
                 if ring_snapshot.remove_node(node_id.clone()).is_ok() {
-                    debug!(node_id = %node_id, state = ?state, "ring: removed dead/left node");
+                    debug!(
+                        node_id = %node_id,
+                        state = ?state,
+                        "ring: removed dead/left node"
+                    );
                 }
             }
 
             self.ring.update(ring_snapshot);
 
-            // Notify the gossip protocol so it can propagate membership changes
-            // to other peers during periodic gossip ticks.
+            // Notify the gossip protocol of membership changes.
             if let Some(tx) = self.gossip_tx.read().as_ref() {
                 let entry = NodeEntry { node_id: node_id.clone(), incarnation, state, address };
                 let _ = tx.try_send(GossipCommand::AddNode { entry });
-                debug!(node_id = %node_id, state = ?state, "gossip: enqueued AddNode");
+                debug!(
+                    node_id = %node_id,
+                    state = ?state,
+                    "gossip: enqueued AddNode"
+                );
             }
         }
-    }
-
-    /// Returns this node's identifier.
-    pub fn node_id(&self) -> &NodeId {
-        &self.node_id
-    }
-
-    /// Returns the ring cache reference.
-    pub fn ring(&self) -> &Arc<RingCache> {
-        &self.ring
     }
 }
 
@@ -732,7 +610,7 @@ mod tests {
     #[tokio::test]
     async fn start_cannot_be_called_twice() {
         let (_ring, m) = make_membership("node");
-        let m = Arc::new(m);
+        let m = std::sync::Arc::new(m);
         assert!(m.start().is_ok());
         assert!(m.start().is_err()); // AlreadyStarted
     }
@@ -771,7 +649,7 @@ mod tests {
         ring.add_node(NodeId::new("other"));
         let ring_cache = Arc::new(RingCache::new(ring));
 
-        let m = Arc::new(Membership::new(
+        let m = std::sync::Arc::new(Membership::new(
             NodeId::new("leaver"),
             "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
             GossipConfig::default(),

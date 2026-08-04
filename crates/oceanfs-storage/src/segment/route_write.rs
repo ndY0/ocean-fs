@@ -8,11 +8,11 @@ use oceanfs_core::{ObjectKey, SizeTier};
 
 use crate::{
     error::Result,
-    metadata::MetadataStore,
     segment::{
         splitter::SegmentSplitter,
         tier::{ChunkListBuilder, TierRouter},
     },
+    RocksDbMetadataStore,
 };
 
 /// Writes blobs directly to the metadata store (inline path).
@@ -27,7 +27,7 @@ impl InlineWriter {
     /// Returns an error if the metadata write fails.
     #[allow(dead_code)]
     pub(crate) fn write_inline(
-        metadata: &MetadataStore,
+        metadata: &RocksDbMetadataStore,
         key: ObjectKey,
         data: Bytes,
     ) -> Result<()> {
@@ -51,7 +51,7 @@ impl InlineWriter {
 #[allow(dead_code)]
 pub(crate) fn route_write(
     router: &TierRouter,
-    metadata: &MetadataStore,
+    metadata: &RocksDbMetadataStore,
     active: &mut crate::segment::buffer::ActiveSegment,
     key: ObjectKey,
     data: Bytes,
@@ -96,9 +96,9 @@ mod tests {
     use super::*;
     use crate::buffer_pool::BufferPool;
 
-    fn test_config() -> MetadataStore {
+    fn test_config() -> RocksDbMetadataStore {
         let dir = tempfile::tempdir().unwrap();
-        MetadataStore::open(&oceanfs_core::MetadataConfig {
+        RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
             data_dir: dir.path().join("meta"),
             block_cache_size: 1024,
             memtable_size: 1024,

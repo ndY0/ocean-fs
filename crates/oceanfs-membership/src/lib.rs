@@ -22,7 +22,6 @@ mod failure_detector;
 mod gossip;
 pub mod grpc;
 mod membership;
-mod state;
 
 pub use error::{Error, Result};
 pub use membership::{Membership, MembershipEvent};

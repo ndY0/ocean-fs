@@ -1,7 +1,9 @@
-//! Gossip state and message types for SWIM membership protocol.
+//! Membership state and gossip exchange types.
 //!
-//! Defines the serializable representations of membership state used
-//! in gossip push/pull exchanges between peers.
+//! Defines the core state representation (`MembershipState`) used by
+//! the membership coordinator, plus the serializable types
+//! (`NodeEntry`, `GossipState`, `GossipDelta`) exchanged between
+//! peers during gossip push/pull.
 
 use std::{collections::HashMap, net::SocketAddr};
 
@@ -57,6 +59,24 @@ pub(crate) enum GossipDirection {
     Push,
     /// Sender is requesting state from receiver (pull).
     Pull,
+}
+
+/// Aggregate membership state for the [`Membership`] coordinator.
+///
+/// Tracks per-node state, incarnation, and address. This is the
+/// internal state used by the coordinator — distinct from the
+/// gossip-exchange types above.
+#[derive(Debug, Clone)]
+pub(crate) struct MembershipState {
+    /// Per-node state.
+    pub(crate) nodes: HashMap<NodeId, (NodeState, Incarnation, SocketAddr)>,
+}
+
+impl MembershipState {
+    /// Creates an empty membership state.
+    pub(crate) fn new() -> Self {
+        Self { nodes: HashMap::new() }
+    }
 }
 
 #[cfg(test)]

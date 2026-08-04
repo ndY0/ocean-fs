@@ -30,3 +30,19 @@ pub use l1_object::{CacheStats, ObjectCache, ObjectCacheConfig};
 pub use l2_metadata::{MetadataCache, MetadataCacheConfig, MetadataCacheStats};
 pub use l3_negative::{NegativeCache, NegativeCacheConfig, NegativeCacheStats};
 pub use prefetch::{PrefetchConfig, PrefetchEngine};
+
+// ---------------------------------------------------------------------------
+// Generated gRPC service stubs
+// ---------------------------------------------------------------------------
+
+/// Generated gRPC client and server stubs for cache invalidation services.
+#[allow(missing_docs, clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::all)]
+pub mod cache {
+    include!("generated/oceanfs.cache.rs");
+}
+
+// Re-export generated client and server types for ergonomic use.
+pub use cache::{
+    cache_rpc_client::CacheRpcClient,
+    cache_rpc_server::{CacheRpc, CacheRpcServer},
+};

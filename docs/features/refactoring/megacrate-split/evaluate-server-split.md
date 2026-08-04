@@ -1,7 +1,7 @@
 ---
 feature: "Evaluate Server Crate Split"
 epic: "refactoring/megacrate-split"
-status: proposed
+status: rejected
 priority: high
 owner: ""
 dependencies:
@@ -11,9 +11,10 @@ dependencies:
     reason: Server crate intra-crate splits (H4, H6, M2) must complete first for clean module boundaries
 adr:
   - 0005-trait-in-consuming-crate
+  - 0010-server-crate-split-rejected
 perf: []
 created: 2026-08-03
-updated: 2026-08-03
+updated: 2026-08-04
 ---
 
 # Evaluate Server Crate Split
@@ -102,22 +103,26 @@ Audit H3 finding + Epic 3 completion (clean server boundaries)
   → (if accepted) Create follow-up implementation feature brief
 ```
 
+## Decision (2026-08-04)
+
+**The server crate split is rejected.** The S3 API surface and coordination
+logic form a natural bounded context. The structural concerns identified by the
+audit are addressed through intra-crate organization (Epic 3: server-cleanup)
+rather than a crate-boundary change. See [ADR-0010](../../adr/0010-server-crate-split-rejected.md)
+for full rationale.
+
+No implementation feature is needed.
+
 ## Definition of Done
 
-- [ ] **Analysis:** A written analysis maps every source file in
-  `crates/oceanfs-server/src/` to either "S3 API surface" or "coordination"
-  (or "shared/cross-cutting"). The analysis identifies types that resist
-  clean categorization and evaluates whether a split creates more indirection
-  than it removes.
-- [ ] **ADR:** A new ADR (next available number) is written under `docs/adr/`
-  documenting the evaluated options, the decision, and the rationale. The ADR
-  follows the `docs/adr/0000-template.md` format.
-- [ ] **Cross-reference:** The ADR references ADR-0005 (trait-in-consuming-crate),
-  architecture §4.1 (construction in node), §1.2 (crate responsibilities), and
-  the `resolve-server-storage-dep` (H1) feature.
-- [ ] **Open questions resolved:** The structural roadmap question 4 ("Do
-  read/write coordinators belong in server or coordination? What about auth?")
-  is answered in the ADR.
-- [ ] **Follow-up:** If a split is approved, the ADR appendix includes a brief
-  feature outline for the implementation feature.
-- [ ] **Docs:** The ADR is indexed in the doc-graph.
+- [x] **Analysis:** File-by-file analysis maps every source file to "S3 API
+  surface" vs "coordination" and identifies shared-type risks. Documented in
+  ADR-0010.
+- [x] **ADR:** ADR-0010 written under `docs/adr/0010-server-crate-split-rejected.md`
+  documenting the evaluated options, the rejection decision, and the rationale.
+- [x] **Cross-reference:** ADR references ADR-0005, architecture §4.1, §1.2,
+  and the `resolve-server-storage-dep` feature.
+- [x] **Open questions resolved:** Structural roadmap Q4 answered: coordinators
+  stay in server crate; no coordination crate is created.
+- [x] **Follow-up:** N/A — split rejected. No implementation feature.
+- [x] **Docs:** ADR indexed in doc-graph

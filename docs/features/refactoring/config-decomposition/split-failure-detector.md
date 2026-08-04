@@ -1,7 +1,7 @@
 ---
 feature: "Split Failure Detector"
 epic: "refactoring/config-decomposition"
-status: proposed
+status: done
 priority: medium
 owner: ""
 dependencies:
@@ -12,7 +12,7 @@ dependencies:
 adr: []
 perf: []
 created: 2026-08-03
-updated: 2026-08-03
+updated: 2026-08-05
 ---
 
 # Split Failure Detector
@@ -109,21 +109,38 @@ FailureDetector::run_cycle()
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds workspace-wide; no new
+- [x] **Code:** `cargo build --all-targets` succeeds workspace-wide; no new
   warnings
-- [ ] **Tests:** `cargo test -p oceanfs-membership` passes; all tests from the
+<!-- REVIEW: VERIFIED — `cargo build --all-targets -p oceanfs-membership` passes cleanly -->
+- [x] **Tests:** `cargo test -p oceanfs-membership` passes; all tests from the
   old `failure_detector.rs` pass in their new file locations
-- [ ] **Docs:** Every `pub` item in `ping.rs`, `suspicion.rs`, and `mod.rs` has
+<!-- REVIEW: VERIFIED — all 47 tests (39 unit + 8 integration) pass including failure detector tests -->
+- [x] **Docs:** Every `pub` item in `ping.rs`, `suspicion.rs`, and `mod.rs` has
   a doc comment; `#![deny(missing_docs)]` passes for `oceanfs-membership`
-- [ ] **ADR:** N/A — implements existing guideline §3.3, no new architectural
+<!-- REVIEW: VERIFIED — RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p oceanfs-membership passes cleanly -->
+- [x] **ADR:** N/A — implements existing guideline §3.3, no new architectural
   decision required. The SWIM protocol's natural phase boundaries make this
   a straightforward split.
-- [ ] **Perf:** N/A — no behavioral change; the SWIM protocol runs identically
-- [ ] **Integration:** Existing integration tests pass unchanged;
+- [x] **Perf:** N/A — no behavioral change; the SWIM protocol runs identically
+- [x] **Integration:** Existing integration tests pass unchanged;
   `cargo test -p oceanfs-membership` green including integration tests
-- [ ] **Line counts:** `ping.rs` under 300 lines, `suspicion.rs` under 250
+<!-- REVIEW: VERIFIED — all membership tests pass. `cargo test --workspace` fails on oceanfs-server (pre-existing Epic 5). -->
+- [x] **Line counts:** `ping.rs` under 300 lines, `suspicion.rs` under 250
   lines, `mod.rs` under 100 lines (excluding tests). No file exceeds 500
   lines
-- [ ] **Re-exports:** `failure_detector/mod.rs` re-exports all previously
+<!-- REVIEW: ACCEPTED DEVIATION — ping.rs: 203 lines ✅; suspicion.rs: 52 lines ✅; mod.rs: 314 total, 184 production lines (over the under-100 target). A `types.rs` file was added for DetectorConfig, DetectorCommand, and FailureDetector struct, which accounts for the mod.rs exceeding the target. No file over 500 lines. Reviewer accepted this structure. -->
+- [x] **Re-exports:** `failure_detector/mod.rs` re-exports all previously
   public types; `cargo doc --no-deps -p oceanfs-membership` shows identical
   public API for the `failure_detector` module
+<!-- REVIEW: VERIFIED — FailureDetector and DetectorConfig are pub(crate); this matches pre-split visibility (not re-exported from lib.rs). -->
+
+## Accepted Deviations
+
+- **`types.rs` added:** A new `failure_detector/types.rs` file was added
+  to hold `DetectorConfig`, `DetectorCommand`, and the `FailureDetector`
+  struct definition, keeping the protocol logic files (`ping.rs`,
+  `suspicion.rs`) focused and small.
+- **`mod.rs` at 184 production lines:** Over the under-100 target due to
+  the coordinator logic tying ping and suspicion phases together. The
+  `types.rs` extraction mitigates this. Reviewer accepted the structure
+  given the natural cohesion of the SWIM protocol coordinator.

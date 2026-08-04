@@ -17,7 +17,7 @@ use tracing::{debug, trace, warn};
 
 use crate::{
     failure_detector::DetectorCommand,
-    state::{GossipDelta, GossipState, NodeEntry},
+    membership::state::{GossipDelta, GossipState, NodeEntry},
 };
 
 /// Internal command to the gossip task.

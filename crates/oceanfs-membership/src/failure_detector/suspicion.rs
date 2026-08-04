@@ -1,0 +1,52 @@
+//! SWIM suspicion mechanism.
+//!
+//! Manages the suspicion phase of the SWIM protocol: transitioning
+//! nodes from ALIVE → SUSPECT on ping failure, maintaining suspicion
+//! timers, and escalating expired SUSPECT nodes to DEAD.
+
+use std::time::{Duration, Instant};
+
+use oceanfs_core::{Incarnation, NodeId, NodeState};
+use tracing::{info, warn};
+
+use super::FailureDetector;
+use crate::membership::MembershipEvent;
+
+/// Marks a node as SUSPECT and starts the suspicion timer.
+pub(crate) fn mark_suspect(detector: &mut FailureDetector, node_id: &NodeId) {
+    let now = Instant::now();
+    let incarnation = Incarnation::new(1); // TODO: track actual incarnation.
+
+    detector.suspicion_timers.insert(node_id.clone(), (incarnation, now));
+
+    let _ = detector.event_tx.send(MembershipEvent {
+        node_id: node_id.clone(),
+        old_state: NodeState::Alive,
+        new_state: NodeState::Suspect,
+    });
+
+    info!(node_id = %node_id, "node marked SUSPECT");
+}
+
+/// Checks all suspicion timers and transitions expired ones to DEAD.
+pub(crate) fn check_suspicion_timers(detector: &mut FailureDetector) {
+    let now = Instant::now();
+    let suspicion_duration = Duration::from_millis(detector.config.suspicion_timeout_ms);
+
+    let mut expired = Vec::new();
+    for (node_id, (_incarnation, suspect_since)) in &detector.suspicion_timers {
+        if now.duration_since(*suspect_since) >= suspicion_duration {
+            expired.push(node_id.clone());
+        }
+    }
+
+    for node_id in expired {
+        detector.suspicion_timers.remove(&node_id);
+        let _ = detector.event_tx.send(MembershipEvent {
+            node_id: node_id.clone(),
+            old_state: NodeState::Suspect,
+            new_state: NodeState::Dead,
+        });
+        warn!(node_id = %node_id, "node declared DEAD (suspicion timeout)");
+    }
+}

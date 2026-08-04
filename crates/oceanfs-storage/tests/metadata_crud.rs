@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-//! Integration test: MetadataStore CRUD operations.
+//! Integration test: RocksDbMetadataStore CRUD operations.
 //!
 //! Verifies object, segment, and tombstone CRUD against RocksDB.
 //! Covers the `rocksdb-metadata-store` feature's Definition of Done:
@@ -14,10 +14,10 @@ use oceanfs_core::{
     BucketId, ChunkRef, Hlc, MetadataConfig, ObjectKey, ObjectMetadata, SegmentId, SegmentMetadata,
     SizeTier, Tombstone,
 };
-use oceanfs_storage::{BatchOp, MetadataStore};
+use oceanfs_storage::{BatchOp, RocksDbMetadataStore};
 
 fn test_bucket() -> BucketId {
-    // The current MetadataStore::put_object hardcodes "default" as the bucket
+    // The current RocksDbMetadataStore::put_object hardcodes "default" as the bucket
     // prefix. Use "default" here until multi-bucket support is added.
     BucketId::new("default")
 }
@@ -26,13 +26,13 @@ fn test_key(name: &str) -> ObjectKey {
     ObjectKey::new(name)
 }
 
-fn make_store(dir: &tempfile::TempDir) -> MetadataStore {
+fn make_store(dir: &tempfile::TempDir) -> RocksDbMetadataStore {
     let config = MetadataConfig {
         data_dir: dir.path().join("meta"),
         block_cache_size: 8 * 1024 * 1024,
         memtable_size: 64 * 1024 * 1024,
     };
-    MetadataStore::open(&config).expect("failed to open MetadataStore")
+    RocksDbMetadataStore::open(&config).expect("failed to open RocksDbMetadataStore")
 }
 
 // ---------------------------------------------------------------------------

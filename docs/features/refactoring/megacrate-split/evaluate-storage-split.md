@@ -1,7 +1,7 @@
 ---
 feature: "Evaluate Storage Crate Split"
 epic: "refactoring/megacrate-split"
-status: proposed
+status: accepted
 priority: high
 owner: ""
 dependencies:
@@ -9,9 +9,10 @@ dependencies:
     reason: Shared type re-exports must be stable before crate boundary evaluation
 adr:
   - 0005-trait-in-consuming-crate
+  - 0009-storage-crate-split
 perf: []
 created: 2026-08-03
-updated: 2026-08-03
+updated: 2026-08-04
 ---
 
 # Evaluate Storage Crate Split
@@ -77,13 +78,21 @@ Audit H2 finding
   → (if accepted) Create follow-up implementation feature brief
 ```
 
+## Decision (2026-08-04)
+
+Proposal A accepted with refinement: create both `oceanfs-durability` (for
+background maintenance tasks) and `oceanfs-storage-api` (for storage interface
+contracts). See [ADR-0009](../../adr/0009-storage-crate-split.md) for full
+rationale.
+
+Implementation feature: [Execute Storage Crate Split](./execute-storage-split.md).
+
 ## Definition of Done
 
-- [ ] **ADR:** New ADR written under `docs/adr/` (e.g., `docs/adr/0009-storage-crate-split.md`)
-  documenting the decision for Proposal A, module mapping, DAG edges, trait
-  placement, and migration plan
-- [ ] **Cross-reference:** ADR references ADR-0005 (trait-in-consuming-crate),
+- [x] **ADR:** ADR-0009 written under `docs/adr/0009-storage-crate-split.md`
+  documenting the decision, module mapping, DAG edges, trait placement, and
+  migration plan
+- [x] **Cross-reference:** ADR references ADR-0005 (trait-in-consuming-crate),
   architecture §4.1, and §1.2 (crate responsibilities)
-- [ ] **Follow-up:** ADR appendix includes implementation feature brief for
-  `execute-storage-split`
-- [ ] **Docs:** ADR indexed in doc-graph
+- [x] **Follow-up:** ADR appendix references `execute-storage-split` implementation feature
+- [x] **Docs:** ADR indexed in doc-graph

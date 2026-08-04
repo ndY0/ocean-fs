@@ -1,12 +1,10 @@
-//! Build script for oceanfs-network.
+//! Build script for oceanfs-cache.
 //!
-//! Generates gRPC client and server stubs for the gossip RPC service.
-//! Storage, healing, scrub, and cache service stubs are generated in
-//! their owning crates (oceanfs-storage, oceanfs-cache) per architecture §2.4.
+//! Generates gRPC client and server stubs for cache invalidation
+//! services owned by this crate.
 //!
 //! Uses `extern_path` to reference message types generated in oceanfs-core
-//! (common, membership) so that tonic-build emits absolute
-//! `::oceanfs_core::proto::*` paths instead of generating duplicate types.
+//! so that tonic-build emits absolute `::oceanfs_core::proto::*` paths.
 
 #![allow(clippy::expect_used)]
 
@@ -21,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = PathBuf::from("src/generated");
     std::fs::create_dir_all(&out_dir)?;
 
-    let protos = &[proto_dir.join("oceanfs/gossip.proto")];
+    let protos = &[proto_dir.join("oceanfs/cache.proto")];
 
     for proto in protos {
         println!("cargo:rerun-if-changed={}", proto.display());
@@ -29,7 +27,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tonic_build::configure()
         .extern_path(".oceanfs.common", "::oceanfs_core::proto::common")
-        .extern_path(".oceanfs.membership", "::oceanfs_core::proto::membership")
         .out_dir(&out_dir)
         .build_server(true)
         .build_client(true)

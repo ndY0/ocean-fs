@@ -22,11 +22,11 @@ use crate::{
 /// ```ignore
 /// // Requires a running RocksDB instance; examples are in unit tests.
 /// use oceanfs_core::{MetadataConfig, ObjectKey, BucketId, Hlc};
-/// use oceanfs_storage::MetadataStore;
+/// use oceanfs_storage::RocksDbMetadataStore;
 /// let config = MetadataConfig::default();
-/// let store = MetadataStore::open(&config).unwrap();
+/// let store = RocksDbMetadataStore::open(&config).unwrap();
 /// ```
-pub struct MetadataStore {
+pub struct RocksDbMetadataStore {
     db: Arc<DB>,
 }
 
@@ -34,7 +34,7 @@ fn io_err(e: impl std::error::Error) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
-impl MetadataStore {
+impl RocksDbMetadataStore {
     /// Opens or creates a metadata store at the given data directory.
     ///
     /// # Errors
@@ -582,7 +582,7 @@ mod tests {
 
     #[test]
     fn put_and_get_object_roundtrip() {
-        let store = MetadataStore::open(&test_config()).unwrap();
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
         let meta = make_object_meta("photo.jpg", 1024, Some(b"inline-data"));
         store.put_object(meta.clone()).unwrap();
 
@@ -597,14 +597,14 @@ mod tests {
 
     #[test]
     fn get_nonexistent_object_returns_none() {
-        let store = MetadataStore::open(&test_config()).unwrap();
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
         let result = store.get_object(&BucketId::new("default"), &ObjectKey::new("nope")).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn delete_object_removes_it() {
-        let store = MetadataStore::open(&test_config()).unwrap();
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
         let meta = make_object_meta("temp.txt", 100, None);
         store.put_object(meta).unwrap();
         store.delete_object(&BucketId::new("default"), &ObjectKey::new("temp.txt")).unwrap();
@@ -616,7 +616,7 @@ mod tests {
 
     #[test]
     fn list_objects_by_prefix() {
-        let store = MetadataStore::open(&test_config()).unwrap();
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
 
         for name in &["a/1.txt", "a/2.txt", "b/3.txt"] {
             store.put_object(make_object_meta(name, 10, None)).unwrap();
@@ -629,7 +629,7 @@ mod tests {
 
     #[test]
     fn put_and_get_segment_roundtrip() {
-        let store = MetadataStore::open(&test_config()).unwrap();
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
         let meta = SegmentMetadata {
             segment_id: SegmentId::new(),
             ec_k: 4,
@@ -649,7 +649,7 @@ mod tests {
 
     #[test]
     fn tombstone_roundtrip() {
-        let store = MetadataStore::open(&test_config()).unwrap();
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
         let bucket = BucketId::new("default");
         let key = ObjectKey::new("deleted.txt");
 
@@ -666,7 +666,7 @@ mod tests {
 
     #[test]
     fn no_tombstone_for_nonexistent_key() {
-        let store = MetadataStore::open(&test_config()).unwrap();
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
         assert!(!store.has_tombstone(&BucketId::new("default"), &ObjectKey::new("nope")).unwrap());
     }
 }

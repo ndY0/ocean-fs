@@ -6,11 +6,11 @@
 
 use std::sync::Arc;
 
-use oceanfs_cache::{MetadataCache, ObjectCache};
-use oceanfs_core::{BucketId, ObjectKey};
-use oceanfs_network::cache::{
-    cache_rpc_server::CacheRpc, CacheInvalidateRequest, CacheInvalidateResponse,
+use oceanfs_cache::{
+    cache::{cache_rpc_server::CacheRpc, CacheInvalidateRequest, CacheInvalidateResponse},
+    MetadataCache, ObjectCache,
 };
+use oceanfs_core::{BucketId, ObjectKey};
 use tonic::{Request, Response, Status};
 
 /// gRPC service for cache invalidation.

@@ -2,6 +2,7 @@
 
 - audit the for concision, code smells code reuse, class graph, complexity, ...
 - audit for performance on hot path
+- transaction mechanism ?
 - dont forget about encryption !
 - discuss implementing real production backend store for production and load tests
 - dicuss GC strategy : allow to choose a strategy prioritize either compaction / cleanup speed, or throughput

@@ -18,13 +18,14 @@ use oceanfs_core::{
     proto::segment::FetchShardRequest as GprcFetchShardRequest, ChunkRef, ObjectMetadata,
 };
 use oceanfs_membership::Membership;
-use oceanfs_network::{ConnectionPool, SegmentRpcClient};
+use oceanfs_network::ConnectionPool;
 use oceanfs_routing::RingCache;
+use oceanfs_storage::SegmentRpcClient;
 use tracing::debug;
 
 use crate::{
     error::{Error, Result},
-    read_coordinator::SegmentReader,
+    read::coordinator::SegmentReader,
 };
 
 /// Fetches blob data from segments identified by chunk references.
@@ -267,7 +268,7 @@ mod tests {
     use oceanfs_routing::Ring;
 
     use super::*;
-    use crate::read_coordinator::InMemorySegmentReader;
+    use crate::read::coordinator::InMemorySegmentReader;
 
     #[tokio::test]
     async fn fetch_inline_metadata_returns_inline_data() {
