@@ -443,11 +443,10 @@ impl Node {
             .map_err(|e| format!("invalid grpc_listen_addr: {e}"))?;
 
         // Build gRPC service implementations.
-        let segment_service =
-            oceanfs_server::grpc::segment_service::SegmentGrpcService::new(
-                heal_data_store.clone(),
-                Some(metadata_store.clone()),
-            );
+        let segment_service = oceanfs_server::grpc::segment_service::SegmentGrpcService::new(
+            heal_data_store.clone(),
+            Some(metadata_store.clone()),
+        );
         let gossip_service =
             oceanfs_membership::grpc::gossip_service::GossipGrpcService::new(membership.clone());
 

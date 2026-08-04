@@ -183,9 +183,8 @@ impl Membership {
         let sync_detector_tx = detector_tx_for_gossip.clone();
         let sync_shutdown = self.shutdown.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(
-                sync_membership.config.interval_ms,
-            ));
+            let mut interval =
+                tokio::time::interval(Duration::from_millis(sync_membership.config.interval_ms));
             // Don't fire immediately — wait for the first interval.
             interval.tick().await;
             loop {
@@ -445,12 +444,7 @@ impl Membership {
         }
 
         // Announce self as ALIVE via upsert_node so the gossip protocol is notified.
-        self.upsert_node(
-            self.node_id.clone(),
-            NodeState::Alive,
-            Incarnation::new(1),
-            self.address,
-        );
+        self.upsert_node(self.node_id.clone(), NodeState::Alive, Incarnation::new(1), self.address);
 
         info!(node_id = %self.node_id, "joined cluster successfully");
         Ok(())
@@ -603,12 +597,7 @@ impl Membership {
             // Notify the gossip protocol so it can propagate membership changes
             // to other peers during periodic gossip ticks.
             if let Some(tx) = self.gossip_tx.read().as_ref() {
-                let entry = NodeEntry {
-                    node_id: node_id.clone(),
-                    incarnation,
-                    state,
-                    address,
-                };
+                let entry = NodeEntry { node_id: node_id.clone(), incarnation, state, address };
                 let _ = tx.try_send(GossipCommand::AddNode { entry });
                 debug!(node_id = %node_id, state = ?state, "gossip: enqueued AddNode");
             }

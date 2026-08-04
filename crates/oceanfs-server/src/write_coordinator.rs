@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use oceanfs_core::{
-    BucketId, ChunkRef, HashKey, HashOutput, Hlc, HlcClock, NodeId, ObjectKey,
-    OperationTimeouts, SegmentId, WriteResult,
+    BucketId, ChunkRef, HashKey, HashOutput, Hlc, HlcClock, NodeId, ObjectKey, OperationTimeouts,
+    SegmentId, WriteResult,
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::{CacheRpcClient, ConnectionPool, SegmentRpcClient};
@@ -232,13 +232,11 @@ impl WriteCoordinator {
             let proto_bucket: oceanfs_core::proto::common::BucketId = bucket.clone().into();
             let proto_key: oceanfs_core::proto::common::ObjectKey = key.clone().into();
             let mut client = CacheRpcClient::new(channel);
-            let request = tonic::Request::new(
-                oceanfs_network::cache::CacheInvalidateRequest {
-                    bucket_id: Some(proto_bucket),
-                    object_key: Some(proto_key),
-                    invalidation_type: 0, // ObjectData
-                },
-            );
+            let request = tonic::Request::new(oceanfs_network::cache::CacheInvalidateRequest {
+                bucket_id: Some(proto_bucket),
+                object_key: Some(proto_key),
+                invalidation_type: 0, // ObjectData
+            });
             let _ = client.invalidate(request).await;
         }
     }

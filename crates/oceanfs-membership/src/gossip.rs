@@ -222,8 +222,7 @@ impl GossipProtocol {
                                     let channel = pooled.channel().clone();
                                     drop(pooled);
 
-                                    let mut client =
-                                        oceanfs_network::GossipRpcClient::new(channel);
+                                    let mut client = oceanfs_network::GossipRpcClient::new(channel);
 
                                     let msg = oceanfs_network::gossip::GossipMessage {
                                         delta: Some(
@@ -246,32 +245,28 @@ impl GossipProtocol {
                                                     "gossip push ack received"
                                                 );
                                             }
-                                            let _ = detector.try_send(
-                                                DetectorCommand::PingResponse {
+                                            let _ =
+                                                detector.try_send(DetectorCommand::PingResponse {
                                                     target: peer_clone,
                                                     success: true,
-                                                },
-                                            );
+                                                });
                                         }
                                         Err(status) => {
                                             warn!(peer = %peer_clone, error = %status, "gossip push failed");
-                                            let _ = detector.try_send(
-                                                DetectorCommand::PingResponse {
+                                            let _ =
+                                                detector.try_send(DetectorCommand::PingResponse {
                                                     target: peer_clone,
                                                     success: false,
-                                                },
-                                            );
+                                                });
                                         }
                                     }
                                 }
                                 Err(e) => {
                                     warn!(peer = %peer_clone, error = %e, "failed to acquire channel for push");
-                                    let _ = detector.try_send(
-                                        DetectorCommand::PingResponse {
-                                            target: peer_clone,
-                                            success: false,
-                                        },
-                                    );
+                                    let _ = detector.try_send(DetectorCommand::PingResponse {
+                                        target: peer_clone,
+                                        success: false,
+                                    });
                                 }
                             }
                         });

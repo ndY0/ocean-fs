@@ -23,7 +23,7 @@ use oceanfs_core::{
         AckStatus, DeleteObjectRequest, DeleteObjectResponse, FetchShardRequest,
         SegmentAppendRequest, SegmentAppendResponse, ShardResponse,
     },
-    BucketId, ChunkRef, ObjectKey, ObjectMetadata, SegmentId, Hlc,
+    BucketId, ChunkRef, Hlc, ObjectKey, ObjectMetadata, SegmentId,
 };
 use oceanfs_network::storage::segment_rpc_server::SegmentRpc;
 use oceanfs_storage::SegmentDataStore;
@@ -138,10 +138,8 @@ impl SegmentRpc for SegmentGrpcService {
         {
             let mut chunks = smallvec::SmallVec::new();
             for i in 0..chunk_segment_ids.len().min(chunk_offsets.len()).min(chunk_lengths.len()) {
-                let seg_bytes: [u8; 16] = chunk_segment_ids[i]
-                    .as_slice()
-                    .try_into()
-                    .unwrap_or([0u8; 16]);
+                let seg_bytes: [u8; 16] =
+                    chunk_segment_ids[i].as_slice().try_into().unwrap_or([0u8; 16]);
                 chunks.push(ChunkRef {
                     segment_id: SegmentId::from_uuid_bytes(seg_bytes),
                     offset: chunk_offsets[i],
@@ -166,10 +164,9 @@ impl SegmentRpc for SegmentGrpcService {
                     .as_millis() as i64,
                 hlc: Hlc::zero(),
             };
-            if let Err(e) = md_store.put_object_in_bucket(
-                &oceanfs_core::BucketId::new(&bucket),
-                meta,
-            ) {
+            if let Err(e) =
+                md_store.put_object_in_bucket(&oceanfs_core::BucketId::new(&bucket), meta)
+            {
                 tracing::warn!(
                     bucket = %bucket,
                     key = %key,
