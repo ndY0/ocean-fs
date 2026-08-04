@@ -14,6 +14,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use oceanfs_core::{HashOutput, NodeState, SegmentId, SegmentMetadata};
 use oceanfs_ec::{CauchyEncoder, Decoder, Encoder};
+use oceanfs_hash::{Blake3Hasher, Hasher as _};
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use rand::seq::SliceRandom;
@@ -143,15 +144,7 @@ impl MerkleTree {
         }
 
         let data_len = data.len() as u64;
-        let leaf_hashes: Vec<HashOutput> = data
-            .chunks(leaf_size)
-            .map(|chunk| {
-                let hash = blake3::hash(chunk);
-                let mut bytes = [0u8; 32];
-                bytes.copy_from_slice(hash.as_bytes());
-                HashOutput::from_bytes(bytes)
-            })
-            .collect();
+        let leaf_hashes: Vec<HashOutput> = data.chunks(leaf_size).map(Blake3Hasher::hash).collect();
 
         let leaf_count = leaf_hashes.len() as u64;
         let (tree_levels, root_hash) = Self::build_tree_from_leaves(&leaf_hashes);
@@ -195,7 +188,7 @@ impl MerkleTree {
         while current_level.len() > 1 {
             let mut next_level = Vec::with_capacity(current_level.len().div_ceil(2));
             for pair in current_level.chunks(2) {
-                let mut hasher = blake3::Hasher::new();
+                let mut hasher = Blake3Hasher::new();
                 hasher.update(pair[0].as_bytes());
                 if pair.len() > 1 {
                     hasher.update(pair[1].as_bytes());
@@ -203,10 +196,7 @@ impl MerkleTree {
                     // Duplicate last if odd
                     hasher.update(pair[0].as_bytes());
                 }
-                let hash = hasher.finalize();
-                let mut bytes = [0u8; 32];
-                bytes.copy_from_slice(hash.as_bytes());
-                next_level.push(HashOutput::from_bytes(bytes));
+                next_level.push(hasher.finalize());
             }
             tree_levels.push(next_level.clone());
             current_level = next_level;
@@ -460,7 +450,7 @@ impl MerkleTree {
         let mut idx = proof.leaf_index;
 
         for sibling in &proof.siblings {
-            let mut hasher = blake3::Hasher::new();
+            let mut hasher = Blake3Hasher::new();
             if idx % 2 == 0 {
                 hasher.update(current_hash.as_bytes());
                 hasher.update(sibling.as_bytes());
@@ -468,10 +458,7 @@ impl MerkleTree {
                 hasher.update(sibling.as_bytes());
                 hasher.update(current_hash.as_bytes());
             }
-            let hash = hasher.finalize();
-            let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(hash.as_bytes());
-            current_hash = HashOutput::from_bytes(bytes);
+            current_hash = hasher.finalize();
             idx /= 2;
         }
 

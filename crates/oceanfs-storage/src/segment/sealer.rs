@@ -9,6 +9,7 @@ use std::{path::PathBuf, sync::Arc};
 use oceanfs_core::SegmentMetadata;
 #[cfg(test)]
 use oceanfs_core::{SegmentSizeConfig, SizeTier};
+use oceanfs_hash::Blake3Hasher;
 
 use crate::{
     error::{Error, Result},
@@ -99,7 +100,7 @@ impl SegmentSealer {
         let index = SegmentIndex::new(entries.to_vec())?;
 
         // Compute checksum (BLAKE3 of segment data).
-        let checksum = blake3::hash(&data);
+        let checksum = Blake3Hasher::hash(&data);
         let checksum_bytes: [u8; 32] = *checksum.as_bytes();
 
         // Build Merkle tree for anti-entropy integrity verification.

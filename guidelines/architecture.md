@@ -14,33 +14,35 @@ prevents accidental coupling.
 ### 1.1 Crate Dependency Graph (DAG)
 
 ```
-                       oceanfs-core
-                            |
-         +-------+------+--+---+-------+---------+
-         |       |      |      |       |         |
-       hash     ec     |   storage  routing   membership
-         |       |     |      |       |         |
-         +---+---+      |      |       |         |
-             |          |      |       |         |
-           accel---------      |       |         |
-             |                 |       |         |
-           cache        network |       |         |
-             |             |    |       |         |
-             +------+------+----+-------+---------+
-                         |
-                  oceanfs-server
-                         |
-                    oceanfs-node
-                         |
-                    oceanfs (binary)
+                        oceanfs-hash
+                             |
+                        oceanfs-core
+                             |
+          +----------+------+--+---+----------+---------+
+          |          |         |   |          |         |
+         ec          |     storage routing membership  |
+          |          |         |   |          |         |
+          +----------+         |   |          |         |
+              |                |   |          |         |
+            accel---------------+   |          |         |
+              |                    |          |         |
+            cache           network |          |         |
+              |                |   |          |         |
+              +--------+-------+---+----------+---------+
+                          |
+                   oceanfs-server
+                          |
+                     oceanfs-node
+                          |
+                     oceanfs (binary)
 ```
 
 ### 1.2 Crate Responsibilities
 
 | Crate | Depends On (internal) | Public API |
 |---|---|---|
-| `oceanfs-core` | — | `Config`, `BucketPolicy`, `Hlc`, `Error`, `Result`, shared protobuf message types, version types |
-| `oceanfs-hash` | `core` | `Blake3Hasher` (streaming), `BatchHasher` (multi-chunk), `HashOutput` |
+| `oceanfs-core` | `hash` | `Config`, `BucketPolicy`, `Hlc`, `Error`, `Result`, shared protobuf message types, version types, `HashOutput` (re-export) |
+| `oceanfs-hash` | — | `Blake3Hasher` (streaming), `BatchHasher` (multi-chunk), `HashOutput` |
 | `oceanfs-ec` | `core` | `trait Encoder`, `trait Decoder`, `StripeLayout`, `CodecConfig`, `ShardData` |
 | `oceanfs-accel` | `core`, `ec` | `AccelTier`, `AccelDispatcher`, feature-gated `CudaBackend` |
 | `oceanfs-storage` | `core`, `hash`, `ec`, `accel` | `trait SegmentStore`, `trait MetadataStore`, `trait WalWriter`, `SegmentHandle`, `SegmentIndex`, `BufferPool` |
@@ -68,9 +70,9 @@ positions for the same pair is a CI failure.
 
 **`oceanfs-core` purity check:**
 ```bash
-# core must have no internal dependencies
+# core may only depend on oceanfs-hash
 cargo tree --edges normal -p oceanfs-core | grep oceanfs-
-# Expected output: (none)
+# Expected output: oceanfs-hash v0.2.0
 ```
 
 ---
@@ -259,9 +261,16 @@ file-count reduction.
 
 ### 4.1 Construction Happens in `oceanfs-node`
 
+`oceanfs-node` is the **composition root**: it constructs all concrete
+implementations and wires them together. The system's dependency graph
+at startup is visible in one place.
+
 `oceanfs-server` defines what the system does (S3 handlers,
-coordinators). `oceanfs-node` wires the concrete implementations
-together — it is the composition root.
+coordinators). It may import concrete crates (`oceanfs-storage`,
+`oceanfs-ec`, `oceanfs-cache`, `oceanfs-accel`) for type re-exports
+and concrete type construction. Dependency inversion via
+`Arc<dyn Trait>` is used where it improves testability; it is **not**
+mandated for all cross-crate boundaries.
 
 ```rust
 // oceanfs-node/src/node.rs
@@ -284,10 +293,6 @@ impl Node {
     }
 }
 ```
-
-`oceanfs-server` never imports `oceanfs-storage`, `oceanfs-membership`,
-or any concrete crate. It imports only `oceanfs-core` for types and
-traits.
 
 ### 4.2 Async Runtime Is Owned by `oceanfs-node`
 

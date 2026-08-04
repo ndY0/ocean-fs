@@ -1,14 +1,14 @@
 //! OceanFS core types and traits.
 //!
-//! `oceanfs-core` is the foundation crate — it has zero internal dependencies.
-//! It provides shared types (`SegmentId`, `NodeId`, `BucketId`), the HLC
-//! clock, error types, and configuration structs used by every other crate.
+//! `oceanfs-core` is the foundation crate — it depends only on `oceanfs-hash`
+//! (for `HashOutput`). It provides shared types (`SegmentId`, `NodeId`, `BucketId`),
+//! the HLC clock, error types, and configuration structs used by every other crate.
 //!
 //! # Crate Purity
 //!
-//! This crate must never depend on any other `oceanfs-*` crate. CI enforces
-//! this via `cargo tree --edges normal -p oceanfs-core | grep oceanfs-`
-//! which must produce no output.
+//! This crate may only depend on `oceanfs-hash` among all `oceanfs-*` crates.
+//! The purity check is: `cargo tree --edges normal -p oceanfs-core | grep oceanfs-`
+//! must produce only `oceanfs-hash`.
 
 // ---------------------------------------------------------------------------
 // Lint attributes

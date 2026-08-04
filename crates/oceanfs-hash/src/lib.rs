@@ -3,10 +3,6 @@
 //! Provides content-addressable hashing for blob data, segment checksums,
 //! and Merkle tree nodes. Uses the `blake3` crate with runtime SIMD
 //! detection (AVX-512, AVX2, SSE4.1, NEON).
-//!
-//! # Unsafe Code
-//!
-//! This crate is permitted to use `unsafe` for SIMD intrinsics.
 
 #![deny(
     clippy::unwrap_used,
@@ -17,3 +13,11 @@
     clippy::missing_panics_doc,
     missing_docs
 )]
+
+mod batch;
+mod hash_output;
+mod hasher;
+
+pub use batch::{BatchHasher, Blake3BatchHasher};
+pub use hash_output::HashOutput;
+pub use hasher::{Blake3Hasher, Hasher};
