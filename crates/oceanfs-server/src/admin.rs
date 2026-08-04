@@ -294,13 +294,13 @@ pub(crate) struct AdminState {
     pub ring_cache: Option<Arc<oceanfs_routing::RingCache>>,
     /// Scrub coordinator for manual scrub triggering (storage feature only).
     #[cfg(feature = "storage")]
-    pub scrub_coordinator: Option<Arc<oceanfs_storage::ScrubCoordinator>>,
+    pub scrub_coordinator: Option<Arc<oceanfs_durability::ScrubCoordinator>>,
     /// Metadata store for scrub verification (storage feature only).
     #[cfg(feature = "storage")]
-    pub metadata_store: Option<Arc<oceanfs_storage::MetadataStore>>,
+    pub metadata_store: Option<Arc<oceanfs_storage::RocksDbMetadataStore>>,
     /// Segment data store for scrub (storage feature only).
     #[cfg(feature = "storage")]
-    pub data_store: Option<Arc<dyn oceanfs_storage::SegmentDataStore>>,
+    pub data_store: Option<Arc<dyn oceanfs_durability::SegmentDataStore>>,
     /// L1 object cache for cache stats (cache feature only).
     #[cfg(feature = "cache")]
     pub object_cache: Option<Arc<ObjectCache>>,
@@ -393,9 +393,9 @@ impl AdminHandler {
     #[cfg(feature = "storage")]
     pub fn with_scrub(
         mut self,
-        coordinator: Arc<oceanfs_storage::ScrubCoordinator>,
-        metadata: Arc<oceanfs_storage::MetadataStore>,
-        data_store: Arc<dyn oceanfs_storage::SegmentDataStore>,
+        coordinator: Arc<oceanfs_durability::ScrubCoordinator>,
+        metadata: Arc<oceanfs_storage::RocksDbMetadataStore>,
+        data_store: Arc<dyn oceanfs_durability::SegmentDataStore>,
     ) -> Self {
         self.state.scrub_coordinator = Some(coordinator);
         self.state.metadata_store = Some(metadata);

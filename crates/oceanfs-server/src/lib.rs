@@ -29,28 +29,24 @@ pub mod auth;
 mod bucket_config;
 mod error;
 pub mod grpc;
-mod hinted_handoff;
 pub mod metadata_ops;
 pub mod read;
-mod read_coordinator;
 mod router;
 mod s3_handler;
 pub mod s3_xml;
 mod write;
-mod write_coordinator;
 
 pub use admin::AdminHandler;
 pub use bucket_config::{BucketConfigStore, BucketPolicy};
 pub use error::{Error, Result};
-pub use hinted_handoff::{HintRecord, HintedHandoff};
 // Re-export core types used in the server's public API.
 pub use oceanfs_core::HashKey;
 // MultiChunkAssembler is re-exported from the read module.
 pub use read::assembly::MultiChunkAssembler;
-pub use read_coordinator::{
+pub use read::coordinator::{
     CacheHitLevel, GetResult, InMemorySegmentReader, ReadCoordinator, ReadOutcome, ReadRequest,
     ReadResult, SegmentReader,
 };
 pub use router::{RouteRequest, RouteResponse, Router};
 pub use s3_handler::S3Handler;
-pub use write_coordinator::{WriteCoordinator, WriteRequest};
+pub use write::coordinator::{WriteCoordinator, WriteRequest};

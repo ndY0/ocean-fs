@@ -25,8 +25,8 @@ use oceanfs_core::{
     },
     BucketId, ChunkRef, Hlc, ObjectKey, ObjectMetadata, SegmentId,
 };
-use oceanfs_network::storage::segment_rpc_server::SegmentRpc;
-use oceanfs_storage::SegmentDataStore;
+use oceanfs_durability::SegmentDataStore;
+use oceanfs_storage::SegmentRpc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -41,7 +41,7 @@ pub struct SegmentGrpcService {
     data_store: Arc<dyn SegmentDataStore>,
     /// Optional metadata store for persisting object metadata
     /// replicated alongside segment data.
-    metadata_store: Option<Arc<oceanfs_storage::MetadataStore>>,
+    metadata_store: Option<Arc<oceanfs_storage::RocksDbMetadataStore>>,
 }
 
 impl SegmentGrpcService {
@@ -53,7 +53,7 @@ impl SegmentGrpcService {
     /// * `metadata_store` - Optional metadata store for cross-node metadata replication.
     pub fn new(
         data_store: Arc<dyn SegmentDataStore>,
-        metadata_store: Option<Arc<oceanfs_storage::MetadataStore>>,
+        metadata_store: Option<Arc<oceanfs_storage::RocksDbMetadataStore>>,
     ) -> Self {
         Self { data_store, metadata_store }
     }
@@ -320,10 +320,8 @@ mod tests {
     use std::{collections::HashMap, net::SocketAddr, sync::Mutex};
 
     use oceanfs_core::{proto::common::SegmentId as ProtoSegmentId, SegmentId};
-    use oceanfs_network::storage::{
-        segment_rpc_client::SegmentRpcClient, segment_rpc_server::SegmentRpcServer,
-    };
-    use oceanfs_storage::SegmentDataStore;
+    use oceanfs_durability::SegmentDataStore;
+    use oceanfs_storage::{SegmentRpcClient, SegmentRpcServer};
     use tonic::transport::Server;
 
     use super::*;
@@ -367,7 +365,7 @@ mod tests {
         store: Arc<dyn SegmentDataStore>,
     ) -> SegmentRpcClient<tonic::transport::Channel> {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let service = SegmentGrpcService::new(store);
+        let service = SegmentGrpcService::new(store, None);
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         let addr = listener.local_addr().unwrap();
 

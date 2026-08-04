@@ -12,9 +12,10 @@ use oceanfs_core::{
     AccelConfig, BucketId, HlcClock, MetadataConfig, NodeConfig, NodeId, ObjectKey, ObjectMetadata,
     RingConfig, RpcConfig, SegmentSizeConfig, WalConfig,
 };
+use oceanfs_durability::HintedHandoff;
 use oceanfs_server::{
     auth::AuthMiddleware, metadata_ops::MetadataOps, AdminHandler, BucketConfigStore,
-    HintedHandoff, ReadCoordinator, Router, S3Handler, WriteCoordinator,
+    ReadCoordinator, Router, S3Handler, WriteCoordinator,
 };
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -23,16 +24,16 @@ use tracing::{error, info, warn};
 use crate::metadata_adapter::MetadataStoreAdapter;
 
 // ---------------------------------------------------------------------------
-// PrefetchStoreAdapter — bridges concrete store to oceanfs_core::MetadataStore
+// PrefetchStoreAdapter — bridges concrete store to oceanfs_storage_api::MetadataStore
 // ---------------------------------------------------------------------------
 
-/// Minimal adapter wrapping `oceanfs_storage::MetadataStore` to implement
-/// the `oceanfs_core::MetadataStore` trait needed by `PrefetchEngine`.
+/// Minimal adapter wrapping `oceanfs_storage::RocksDbMetadataStore` to implement
+/// the `oceanfs_storage_api::MetadataStore` trait needed by `PrefetchEngine`.
 struct PrefetchStoreAdapter {
-    store: Arc<oceanfs_storage::MetadataStore>,
+    store: Arc<oceanfs_storage::RocksDbMetadataStore>,
 }
 
-impl oceanfs_core::MetadataStore for PrefetchStoreAdapter {
+impl oceanfs_storage_api::MetadataStore for PrefetchStoreAdapter {
     fn list_object_keys(&self, bucket: &BucketId) -> std::io::Result<Vec<(BucketId, ObjectKey)>> {
         let results = self.store.list_objects(bucket, "");
         results
@@ -146,7 +147,7 @@ impl Node {
         let metadata_config =
             MetadataConfig { data_dir: config.data_dir.join("metadata"), ..Default::default() };
         let metadata_store = Arc::new(
-            oceanfs_storage::MetadataStore::open(&metadata_config)
+            oceanfs_storage::RocksDbMetadataStore::open(&metadata_config)
                 .map_err(|e| format!("failed to open metadata store: {e}"))?,
         );
 
@@ -212,28 +213,28 @@ impl Node {
             wal_writer.clone(),
         ));
         // ---- 7. Construct durability workers ----
-        let gc_config = oceanfs_storage::GcConfig::new(
+        let gc_config = oceanfs_durability::GcConfig::new(
             config.gc_interval_sec,
             config.tombstone_ttl_sec,
             0.5,
             4,
             64,
         );
-        let gc_worker = Arc::new(oceanfs_storage::GarbageCollector::new(gc_config.clone()));
-        let ae_worker = Arc::new(oceanfs_storage::AntiEntropy::new(
-            oceanfs_storage::AntiEntropyConfig::default(),
+        let gc_worker = Arc::new(oceanfs_durability::GarbageCollector::new(gc_config.clone()));
+        let ae_worker = Arc::new(oceanfs_durability::AntiEntropy::new(
+            oceanfs_durability::AntiEntropyConfig::default(),
             membership.clone(),
             metadata_store.clone(),
             pool.clone(),
-            Arc::new(oceanfs_storage::InMemorySegmentStore::new()),
+            Arc::new(oceanfs_durability::InMemorySegmentStore::new()),
         ));
-        let scrub_config = oceanfs_storage::ScrubConfig::default();
-        let scrub_worker = Arc::new(oceanfs_storage::ScrubCoordinator::new(scrub_config));
+        let scrub_config = oceanfs_durability::ScrubConfig::default();
+        let scrub_worker = Arc::new(oceanfs_durability::ScrubCoordinator::new(scrub_config));
         // OrphanReaper needs a SegmentShardStore for deleting shard files.
         // In production this is the on-disk segment store; tests/early builds use in-memory.
-        let reaper_shard_store: Arc<dyn oceanfs_storage::SegmentShardStore> =
-            Arc::new(oceanfs_storage::InMemorySegmentShardStore::new(4194304));
-        let reaper = Arc::new(oceanfs_storage::OrphanReaper::new(
+        let reaper_shard_store: Arc<dyn oceanfs_durability::SegmentShardStore> =
+            Arc::new(oceanfs_durability::InMemorySegmentShardStore::new(4194304));
+        let reaper = Arc::new(oceanfs_durability::OrphanReaper::new(
             metadata_store.clone(),
             reaper_shard_store,
             gc_config,
@@ -245,20 +246,20 @@ impl Node {
             oceanfs_storage::BlobStore::open(&config.data_dir.join("blobs"))
                 .map_err(|e| format!("failed to open blob store: {e}"))?,
         );
-        let heal_data_store: Arc<dyn oceanfs_storage::SegmentDataStore> = blob_store.clone();
+        let heal_data_store: Arc<dyn oceanfs_durability::SegmentDataStore> = blob_store.clone();
 
         // ---- 7c. Construct heal dispatch pipeline ----
-        let heal_config = oceanfs_storage::HealConfig::default();
-        let heal_queue = Arc::new(oceanfs_storage::HealQueue::new(heal_config.queue_capacity()));
+        let heal_config = oceanfs_durability::HealConfig::default();
+        let heal_queue = Arc::new(oceanfs_durability::HealQueue::new(heal_config.queue_capacity()));
         // Initialize the global heal sender so scrub and anti-entropy can
         // call enqueue_heal() without direct queue access.
-        oceanfs_storage::heal::init_global_queue(heal_queue.sender());
+        oceanfs_durability::heal::init_global_queue(heal_queue.sender());
         let heal_codec_config = oceanfs_core::CodecConfig::default();
         let heal_decoder: Arc<dyn oceanfs_ec::Decoder> =
             Arc::new(oceanfs_ec::CauchyEncoder::new(heal_codec_config));
         // Clone before move into HealWorker — used by ReadCoordinator as well.
         let ec_decoder = heal_decoder.clone();
-        let heal_worker = oceanfs_storage::HealWorker::new(
+        let heal_worker = oceanfs_durability::HealWorker::new(
             heal_config,
             heal_queue.clone(),
             heal_decoder,
@@ -281,7 +282,7 @@ impl Node {
             enabled: config.prefetch_enabled,
             ..Default::default()
         };
-        let prefetch_store: Arc<dyn oceanfs_core::MetadataStore> =
+        let prefetch_store: Arc<dyn oceanfs_storage_api::MetadataStore> =
             Arc::new(PrefetchStoreAdapter { store: metadata_store.clone() });
         let prefetch_engine = Arc::new(oceanfs_cache::PrefetchEngine::new(
             prefetch_config,
@@ -450,7 +451,7 @@ impl Node {
         let gossip_service =
             oceanfs_membership::grpc::gossip_service::GossipGrpcService::new(membership.clone());
 
-        let healing_service = oceanfs_server::grpc::healing_service::HealingGrpcService::new(
+        let healing_service = oceanfs_durability::healing_service::HealingGrpcService::new(
             hinted_handoff.clone(),
             metadata_store.clone(),
             heal_data_store.clone(),
@@ -459,18 +460,18 @@ impl Node {
             Some(object_cache.clone()),
             Some(metadata_cache.clone()),
         );
-        let scrub_service = oceanfs_server::grpc::scrub_service::ScrubGrpcService::new(
+        let scrub_service = oceanfs_durability::scrub_service::ScrubGrpcService::new(
             metadata_store.clone(),
             heal_data_store.clone(),
         );
 
         // Build tonic Server with all services registered.
         let grpc_router = tonic::transport::Server::builder()
-            .add_service(oceanfs_network::SegmentRpcServer::new(segment_service))
+            .add_service(oceanfs_storage::SegmentRpcServer::new(segment_service))
             .add_service(oceanfs_network::GossipRpcServer::new(gossip_service))
-            .add_service(oceanfs_network::HealingRpcServer::new(healing_service))
-            .add_service(oceanfs_network::CacheRpcServer::new(cache_service))
-            .add_service(oceanfs_network::ScrubRpcServer::new(scrub_service));
+            .add_service(oceanfs_durability::HealingRpcServer::new(healing_service))
+            .add_service(oceanfs_cache::CacheRpcServer::new(cache_service))
+            .add_service(oceanfs_durability::ScrubRpcServer::new(scrub_service));
 
         tokio::spawn(async move {
             if let Err(e) = grpc_router.serve(grpc_addr).await {
@@ -584,14 +585,14 @@ impl Node {
     /// Spawns all background task loops.
     #[allow(clippy::too_many_arguments)]
     fn spawn_background_tasks(
-        gc_worker: Arc<oceanfs_storage::GarbageCollector>,
-        metadata_store: Arc<oceanfs_storage::MetadataStore>,
-        ae_worker: Arc<oceanfs_storage::AntiEntropy>,
-        scrub_worker: Arc<oceanfs_storage::ScrubCoordinator>,
-        reaper: Arc<oceanfs_storage::OrphanReaper>,
+        gc_worker: Arc<oceanfs_durability::GarbageCollector>,
+        metadata_store: Arc<oceanfs_storage::RocksDbMetadataStore>,
+        ae_worker: Arc<oceanfs_durability::AntiEntropy>,
+        scrub_worker: Arc<oceanfs_durability::ScrubCoordinator>,
+        reaper: Arc<oceanfs_durability::OrphanReaper>,
         prefetch_engine: Arc<oceanfs_cache::PrefetchEngine>,
-        heal_worker: oceanfs_storage::HealWorker,
-        data_store: Arc<dyn oceanfs_storage::SegmentDataStore>,
+        heal_worker: oceanfs_durability::HealWorker,
+        data_store: Arc<dyn oceanfs_durability::SegmentDataStore>,
         config: &oceanfs_core::NodeConfig,
     ) -> BackgroundTasks {
         // Gossip: placeholder (driven by Membership internally).
@@ -772,7 +773,7 @@ impl Node {
 mod tests {
     use std::{net::TcpStream, time::Duration};
 
-    use oceanfs_core::MetadataStore;
+    use oceanfs_storage_api::MetadataStore;
     use tempfile::TempDir;
 
     use super::*;
@@ -883,10 +884,11 @@ mod tests {
         let metadata_config =
             MetadataConfig { data_dir: tmp.path().join("metadata"), ..Default::default() };
         let metadata_store = Arc::new(
-            oceanfs_storage::MetadataStore::open(&metadata_config).expect("open metadata store"),
+            oceanfs_storage::RocksDbMetadataStore::open(&metadata_config)
+                .expect("open metadata store"),
         );
-        let gc_config = oceanfs_storage::GcConfig::default();
-        let gc_worker = Arc::new(oceanfs_storage::GarbageCollector::new(gc_config.clone()));
+        let gc_config = oceanfs_durability::GcConfig::default();
+        let gc_worker = Arc::new(oceanfs_durability::GarbageCollector::new(gc_config.clone()));
 
         // Wire minimal membership and connection pool for AntiEntropy construction
         let ring = oceanfs_routing::Ring::new(oceanfs_core::RingConfig::default());
@@ -900,25 +902,25 @@ mod tests {
         let pool =
             Arc::new(oceanfs_network::ConnectionPool::new(oceanfs_core::RpcConfig::default()));
 
-        let ae_worker = Arc::new(oceanfs_storage::AntiEntropy::new(
-            oceanfs_storage::AntiEntropyConfig::default(),
+        let ae_worker = Arc::new(oceanfs_durability::AntiEntropy::new(
+            oceanfs_durability::AntiEntropyConfig::default(),
             membership,
             metadata_store.clone(),
             pool,
-            Arc::new(oceanfs_storage::InMemorySegmentStore::new()),
+            Arc::new(oceanfs_durability::InMemorySegmentStore::new()),
         ));
-        let scrub_config = oceanfs_storage::ScrubConfig::default();
-        let scrub_worker = Arc::new(oceanfs_storage::ScrubCoordinator::new(scrub_config));
-        let reaper_shard_store: Arc<dyn oceanfs_storage::SegmentShardStore> =
-            Arc::new(oceanfs_storage::InMemorySegmentShardStore::new(4194304));
-        let reaper = Arc::new(oceanfs_storage::OrphanReaper::new(
+        let scrub_config = oceanfs_durability::ScrubConfig::default();
+        let scrub_worker = Arc::new(oceanfs_durability::ScrubCoordinator::new(scrub_config));
+        let reaper_shard_store: Arc<dyn oceanfs_durability::SegmentShardStore> =
+            Arc::new(oceanfs_durability::InMemorySegmentShardStore::new(4194304));
+        let reaper = Arc::new(oceanfs_durability::OrphanReaper::new(
             metadata_store.clone(),
             reaper_shard_store,
             gc_config,
         ));
 
         let prefetch_config = oceanfs_cache::PrefetchConfig::default();
-        let prefetch_store: Arc<dyn oceanfs_core::MetadataStore> =
+        let prefetch_store: Arc<dyn oceanfs_storage_api::MetadataStore> =
             Arc::new(PrefetchStoreAdapter { store: metadata_store.clone() });
         let _metadata_cache = Arc::new(oceanfs_cache::MetadataCache::new(
             oceanfs_cache::MetadataCacheConfig::default(),
@@ -931,15 +933,15 @@ mod tests {
         ));
 
         // Create minimal heal worker for testing
-        let heal_config = oceanfs_storage::HealConfig::default();
-        let heal_queue = Arc::new(oceanfs_storage::HealQueue::new(heal_config.queue_capacity()));
+        let heal_config = oceanfs_durability::HealConfig::default();
+        let heal_queue = Arc::new(oceanfs_durability::HealQueue::new(heal_config.queue_capacity()));
         let heal_decoder: Arc<dyn oceanfs_ec::Decoder> =
             Arc::new(oceanfs_ec::CauchyEncoder::new(oceanfs_core::CodecConfig::default()));
-        let bg_data_store: Arc<dyn oceanfs_storage::SegmentDataStore> =
-            Arc::new(oceanfs_storage::InMemorySegmentStore::new());
-        let heal_data_store: Arc<dyn oceanfs_storage::SegmentDataStore> =
-            Arc::new(oceanfs_storage::InMemorySegmentStore::new());
-        let heal_worker = oceanfs_storage::HealWorker::new(
+        let bg_data_store: Arc<dyn oceanfs_durability::SegmentDataStore> =
+            Arc::new(oceanfs_durability::InMemorySegmentStore::new());
+        let heal_data_store: Arc<dyn oceanfs_durability::SegmentDataStore> =
+            Arc::new(oceanfs_durability::InMemorySegmentStore::new());
+        let heal_worker = oceanfs_durability::HealWorker::new(
             heal_config,
             heal_queue,
             heal_decoder,
@@ -986,7 +988,8 @@ mod tests {
         let metadata_config =
             MetadataConfig { data_dir: tmp.path().join("metadata"), ..Default::default() };
         let store = Arc::new(
-            oceanfs_storage::MetadataStore::open(&metadata_config).expect("open metadata store"),
+            oceanfs_storage::RocksDbMetadataStore::open(&metadata_config)
+                .expect("open metadata store"),
         );
         let adapter = PrefetchStoreAdapter { store };
         let bucket = BucketId::new("test-bucket");
@@ -1000,7 +1003,8 @@ mod tests {
         let metadata_config =
             MetadataConfig { data_dir: tmp.path().join("metadata"), ..Default::default() };
         let store = Arc::new(
-            oceanfs_storage::MetadataStore::open(&metadata_config).expect("open metadata store"),
+            oceanfs_storage::RocksDbMetadataStore::open(&metadata_config)
+                .expect("open metadata store"),
         );
         let adapter = PrefetchStoreAdapter { store };
         let bucket = BucketId::new("test-bucket");

@@ -9,13 +9,13 @@
 use std::sync::Arc;
 
 use oceanfs_core::{MetadataConfig, SegmentId, SegmentMetadata, SizeTier};
-use oceanfs_storage::{
-    InMemorySegmentStore, MerkleTree, MetadataStore, ScrubConfig, ScrubCoordinator,
-    SegmentDataStore,
+use oceanfs_durability::{
+    InMemorySegmentStore, MerkleTree, ScrubConfig, ScrubCoordinator, SegmentDataStore,
 };
+use oceanfs_storage::RocksDbMetadataStore;
 
 /// Helper: create a temporary metadata store.
-fn open_temp_metadata() -> Arc<MetadataStore> {
+fn open_temp_metadata() -> Arc<RocksDbMetadataStore> {
     let dir = tempfile::tempdir().expect("temp dir");
     let config = MetadataConfig {
         data_dir: dir.path().to_path_buf(),
@@ -23,7 +23,7 @@ fn open_temp_metadata() -> Arc<MetadataStore> {
         memtable_size: 8 * 1024 * 1024,
     };
     let _dir_leaked = Box::leak(Box::new(dir));
-    Arc::new(MetadataStore::open(&config).expect("open metadata store"))
+    Arc::new(RocksDbMetadataStore::open(&config).expect("open metadata store"))
 }
 
 /// Helper: create test data with the given size.

@@ -19,8 +19,8 @@ use crate::error::Result;
 /// A disk-backed blob data store.
 ///
 /// Stores blob data in a flat directory as `{segment_id}.blob` files.
-/// Implements [`SegmentDataStore`](crate::SegmentDataStore) so it can
-/// be used wherever an in-memory or RocksDB-backed store is expected.
+/// The `SegmentDataStore` trait is implemented in `oceanfs-durability`
+/// for this type.
 ///
 /// # Examples
 ///
@@ -121,16 +121,6 @@ impl BlobStore {
     }
 }
 
-impl crate::anti_entropy::SegmentDataStore for BlobStore {
-    fn read_segment_data(&self, segment_id: &SegmentId) -> Result<Vec<u8>> {
-        self.read_blob(segment_id)?.ok_or(crate::error::Error::SegmentNotFound(*segment_id))
-    }
-
-    fn write_segment_data(&self, segment_id: &SegmentId, data: &[u8]) -> Result<()> {
-        self.write_blob(segment_id, data)
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -177,17 +167,5 @@ mod tests {
         }
         let found = store.list_blobs().unwrap();
         assert_eq!(found.len(), 5);
-    }
-
-    #[test]
-    fn segment_data_store_trait_roundtrip() {
-        use crate::SegmentDataStore;
-        let tmp = tempfile::tempdir().unwrap();
-        let store = BlobStore::open(tmp.path()).unwrap();
-        let id = SegmentId::new();
-        let data = vec![1, 2, 3, 4, 5];
-        store.write_segment_data(&id, &data).unwrap();
-        let read = store.read_segment_data(&id).unwrap();
-        assert_eq!(read, data);
     }
 }

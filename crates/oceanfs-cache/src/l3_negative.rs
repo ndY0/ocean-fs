@@ -14,7 +14,8 @@ use std::{
 };
 
 use dashmap::DashMap;
-use oceanfs_core::{BucketId, MetadataStore, ObjectKey};
+use oceanfs_core::{BucketId, ObjectKey};
+use oceanfs_storage_api::MetadataStore;
 use parking_lot::RwLock;
 
 /// Configuration for the negative cache.

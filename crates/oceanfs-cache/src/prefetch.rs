@@ -7,7 +7,8 @@
 
 use std::sync::Arc;
 
-use oceanfs_core::{BucketId, MetadataStore, ObjectKey};
+use oceanfs_core::{BucketId, ObjectKey};
+use oceanfs_storage_api::MetadataStore;
 use tokio::sync::{mpsc, Semaphore};
 
 use crate::{l1_object::ObjectCache, l2_metadata::MetadataCache};

@@ -7,13 +7,19 @@ rust-version.workspace = true
 
 [dependencies]
 oceanfs-core.workspace = true
+oceanfs-storage-api.workspace = true
 bytes.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
+prost.workspace = true
 smallvec.workspace = true
 tokio.workspace = true
+tonic.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
 
 [dev-dependencies]
 static_assertions.workspace = true

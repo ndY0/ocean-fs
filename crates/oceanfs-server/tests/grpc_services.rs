@@ -20,17 +20,15 @@ use oceanfs_core::{
     },
     GossipConfig, Incarnation, NodeId, NodeState, RingConfig, SegmentId,
 };
+use oceanfs_durability::SegmentDataStore;
 use oceanfs_membership::{grpc::probe_service::ProbeHandler, Membership};
-use oceanfs_network::{
-    gossip::{
-        gossip_rpc_client::GossipRpcClient, gossip_rpc_server::GossipRpcServer, GossipMessage,
-        GossipPullRequest,
-    },
-    storage::{segment_rpc_client::SegmentRpcClient, segment_rpc_server::SegmentRpcServer},
+use oceanfs_network::gossip::{
+    gossip_rpc_client::GossipRpcClient, gossip_rpc_server::GossipRpcServer, GossipMessage,
+    GossipPullRequest,
 };
 use oceanfs_routing::{Ring, RingCache};
 use oceanfs_server::grpc::segment_service::SegmentGrpcService;
-use oceanfs_storage::{Error as StorageError, SegmentDataStore};
+use oceanfs_storage::{Error as StorageError, SegmentRpcClient, SegmentRpcServer};
 use tokio_stream::StreamExt;
 use tonic::transport::Server;
 
@@ -93,7 +91,7 @@ impl RunningNode {
 /// Starts a segment gRPC server that can be killed later.
 async fn start_killable_node(store: Arc<dyn SegmentDataStore>) -> RunningNode {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let service = SegmentGrpcService::new(store.clone());
+    let service = SegmentGrpcService::new(store.clone(), None);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let server_addr = listener.local_addr().unwrap();
 
@@ -116,7 +114,7 @@ async fn start_segment_server(
     store: Arc<dyn SegmentDataStore>,
 ) -> (SegmentRpcClient<tonic::transport::Channel>, SocketAddr) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let service = SegmentGrpcService::new(store);
+    let service = SegmentGrpcService::new(store, None);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let server_addr = listener.local_addr().unwrap();
 
@@ -326,6 +324,13 @@ async fn three_node_write_with_w2_via_grpc() {
         offset: 0,
         data: test_data.clone(),
         hlc: None,
+        bucket_id: String::new(),
+        object_key: String::new(),
+        object_size: 0,
+        blake3_hash: vec![],
+        chunk_segment_ids: vec![],
+        chunk_offsets: vec![],
+        chunk_lengths: vec![],
     };
     let stream_data = vec![chunk];
 
@@ -474,6 +479,13 @@ async fn three_node_cluster_with_node_kill() {
         offset: 0,
         data: blob1.clone(),
         hlc: None,
+        bucket_id: String::new(),
+        object_key: String::new(),
+        object_size: 0,
+        blake3_hash: vec![],
+        chunk_segment_ids: vec![],
+        chunk_offsets: vec![],
+        chunk_lengths: vec![],
     };
 
     // Replicate blob1 to nodes 1 and 2.
@@ -518,6 +530,13 @@ async fn three_node_cluster_with_node_kill() {
         offset: 0,
         data: blob2.clone(),
         hlc: None,
+        bucket_id: String::new(),
+        object_key: String::new(),
+        object_size: 0,
+        blake3_hash: vec![],
+        chunk_segment_ids: vec![],
+        chunk_offsets: vec![],
+        chunk_lengths: vec![],
     };
 
     // Write to node-1 (the only available replica).

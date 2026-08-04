@@ -9,7 +9,7 @@ use oceanfs_hash::HashOutput;
 
 use super::{
     config::SizeTier,
-    id::{BucketId, NodeId, ObjectKey, SegmentId},
+    id::{NodeId, ObjectKey, SegmentId},
 };
 use crate::Hlc;
 
@@ -200,61 +200,6 @@ pub struct StorageLocation {
 }
 
 // ---------------------------------------------------------------------------
-// MetadataStore trait
-// ---------------------------------------------------------------------------
-
-/// Minimal trait for metadata access needed by caching and prefetch layers.
-///
-/// Each crate that provides metadata storage implements this trait so that
-/// caches can rebuild filters and warm entries without depending on the
-/// concrete storage implementation.
-///
-/// # Examples
-///
-/// ```
-/// use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata, MetadataStore};
-///
-/// struct MyStore;
-///
-/// impl MetadataStore for MyStore {
-///     fn list_object_keys(&self, _bucket: &BucketId)
-///         -> std::io::Result<Vec<(BucketId, ObjectKey)>>
-///     {
-///         Ok(vec![])
-///     }
-///
-///     fn get_object_metadata(&self, _bucket: &BucketId, _key: &ObjectKey)
-///         -> std::io::Result<Option<ObjectMetadata>>
-///     {
-///         Ok(None)
-///     }
-/// }
-/// ```
-pub trait MetadataStore: Send + Sync {
-    /// Lists all object keys in a bucket.
-    ///
-    /// Used to rebuild negative caches and for prefetch discovery.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error if the underlying storage is unavailable.
-    fn list_object_keys(&self, bucket: &BucketId) -> std::io::Result<Vec<(BucketId, ObjectKey)>>;
-
-    /// Retrieves object metadata for a given key.
-    ///
-    /// Returns `Ok(None)` if the key does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error if the underlying storage is unavailable.
-    fn get_object_metadata(
-        &self,
-        bucket: &BucketId,
-        key: &ObjectKey,
-    ) -> std::io::Result<Option<ObjectMetadata>>;
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -391,34 +336,5 @@ mod tests {
         let loc = StorageLocation { node_id: NodeId::new("n1"), shard_index: 3 };
         assert_eq!(loc.node_id.as_str(), "n1");
         assert_eq!(loc.shard_index, 3);
-    }
-
-    // -- MetadataStore trait: verify it can be implemented --
-
-    struct TestStore;
-
-    impl MetadataStore for TestStore {
-        fn list_object_keys(
-            &self,
-            _bucket: &BucketId,
-        ) -> std::io::Result<Vec<(BucketId, ObjectKey)>> {
-            Ok(vec![])
-        }
-
-        fn get_object_metadata(
-            &self,
-            _bucket: &BucketId,
-            _key: &ObjectKey,
-        ) -> std::io::Result<Option<ObjectMetadata>> {
-            Ok(None)
-        }
-    }
-
-    #[test]
-    fn metadata_store_trait_basic_impl() {
-        let store = TestStore;
-        let bucket = BucketId::new("test");
-        assert!(store.list_object_keys(&bucket).unwrap().is_empty());
-        assert!(store.get_object_metadata(&bucket, &ObjectKey::new("k")).unwrap().is_none());
     }
 }

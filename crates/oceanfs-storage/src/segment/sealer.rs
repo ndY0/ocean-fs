@@ -13,7 +13,7 @@ use oceanfs_hash::Blake3Hasher;
 
 use crate::{
     error::{Error, Result},
-    metadata::MetadataStore,
+    metadata::RocksDbMetadataStore,
     segment::{
         buffer::ActiveSegment,
         handle::SegmentHandle,
@@ -21,7 +21,6 @@ use crate::{
         index::{SegmentIndex, SegmentIndexEntry},
     },
     wal::WalWriter,
-    MerkleTree,
 };
 
 /// Configuration for the segment sealer.
@@ -41,14 +40,18 @@ pub struct SealConfig {
 #[allow(dead_code)]
 pub struct SegmentSealer {
     config: SealConfig,
-    metadata: Arc<MetadataStore>,
+    metadata: Arc<RocksDbMetadataStore>,
     wal: Arc<WalWriter>,
 }
 
 #[allow(dead_code)]
 impl SegmentSealer {
     /// Creates a new segment sealer.
-    pub fn new(config: SealConfig, metadata: Arc<MetadataStore>, wal: Arc<WalWriter>) -> Self {
+    pub fn new(
+        config: SealConfig,
+        metadata: Arc<RocksDbMetadataStore>,
+        wal: Arc<WalWriter>,
+    ) -> Self {
         Self { config, metadata, wal }
     }
 
@@ -104,8 +107,8 @@ impl SegmentSealer {
         let checksum_bytes: [u8; 32] = *checksum.as_bytes();
 
         // Build Merkle tree for anti-entropy integrity verification.
-        // Uses the default 64 KB leaf size for consistent tree construction.
-        let merkle_root = MerkleTree::build(&data, 65536).map(|tree| tree.root().hash());
+        // The Merkle tree is now computed by oceanfs-durability (ADR-0009).
+        let merkle_root: Option<oceanfs_core::HashOutput> = None;
 
         // Serialize header and index.
         let header = SegmentHeader::new(segment_id, size, blob_count, size, checksum_bytes);
@@ -163,7 +166,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let metadata = Arc::new(
-            MetadataStore::open(&oceanfs_core::MetadataConfig {
+            RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
                 data_dir: dir.path().join("meta"),
                 block_cache_size: 1024,
                 memtable_size: 1024,
@@ -232,7 +235,7 @@ mod tests {
     async fn try_seal_returns_none_for_empty_segment() {
         let dir = tempfile::tempdir().unwrap();
         let metadata = Arc::new(
-            MetadataStore::open(&oceanfs_core::MetadataConfig {
+            RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
                 data_dir: dir.path().join("meta"),
                 block_cache_size: 1024,
                 memtable_size: 1024,

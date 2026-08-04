@@ -7,12 +7,29 @@ rust-version.workspace = true
 
 [dependencies]
 oceanfs-core.workspace = true
+oceanfs-storage-api.workspace = true
 oceanfs-routing.workspace = true
 oceanfs-membership.workspace = true
 oceanfs-network.workspace = true
+# Optional: used for type re-exports and concrete type construction (e.g.,
+# RocksDbMetadataStore, SegmentStore). Architecture §4.1 permits the server
+# crate to import concrete storage types for wiring at the composition root.
+# See ADR-0005 §References.
 oceanfs-storage = { workspace = true, optional = true }
+# Optional: durability types for admin handler scrub wiring (ADR-0009).
+oceanfs-durability = { workspace = true, optional = true }
+# Optional: used for EC decoding during read repair.
+# When enabled, the ReadCoordinator can reconstruct missing data shards
+# from available parity shards.
 oceanfs-ec = { workspace = true, optional = true }
+# Optional: L1 object cache, L2 metadata cache, L3 negative cache (Bloom
+# filter), and prefetch engine. The S3 handler delegates to these caches
+# on every GET/HEAD request — see s3_handler/handlers.rs for the cache
+# cascade order.
 oceanfs-cache = { workspace = true, optional = true }
+# Optional: GPU-accelerated EC encoding via ISA-L, CUDA, etc.
+# When enabled, the AccelDispatcher offloads encode/decode to hardware
+# backends for improved throughput.
 oceanfs-accel = { workspace = true, optional = true }
 arc-swap.workspace = true
 axum.workspace = true
@@ -40,10 +57,16 @@ tower-http.workspace = true
 tracing.workspace = true
 
 [features]
+# Default features enable the full S3 server with storage, caching, and EC.
+# Disable individual features for testing or resource-constrained deployments.
 default = ["storage", "cache", "ec"]
-storage = ["dep:oceanfs-storage"]
+# Enables concrete storage type usage (RocksDbMetadataStore).
+storage = ["dep:oceanfs-storage", "dep:oceanfs-durability"]
+# Enables EC decoding in ReadCoordinator for read repair.
 ec = ["dep:oceanfs-ec"]
+# Enables L1/L2/L3 cache cascade and prefetch engine in S3 handler.
 cache = ["dep:oceanfs-cache"]
+# Enables GPU-accelerated EC encoding via hardware backends.
 accel = ["dep:oceanfs-accel"]
 
 [dev-dependencies]

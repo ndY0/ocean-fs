@@ -7,15 +7,18 @@ rust-version.workspace = true
 
 [dependencies]
 oceanfs-core.workspace = true
+oceanfs-storage-api.workspace = true
 oceanfs-hash.workspace = true
 oceanfs-ec.workspace = true
 oceanfs-accel.workspace = true
 oceanfs-membership.workspace = true
 oceanfs-network.workspace = true
 blake3.workspace = true
+async-trait = "0.1"
 bytes.workspace = true
 crc32fast = "1"
 parking_lot.workspace = true
+prost.workspace = true
 rayon.workspace = true
 num_cpus.workspace = true
 rocksdb.workspace = true
@@ -29,6 +32,9 @@ tracing.workspace = true
 uuid.workspace = true
 
 rand = "0.8"
+
+[build-dependencies]
+tonic-build.workspace = true
 
 [dev-dependencies]
 oceanfs-routing.workspace = true

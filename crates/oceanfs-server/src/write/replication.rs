@@ -12,7 +12,8 @@ use oceanfs_core::{
     Hlc, NodeId, SegmentId, WriteAck,
 };
 use oceanfs_membership::Membership;
-use oceanfs_network::{ConnectionPool, SegmentRpcClient};
+use oceanfs_network::ConnectionPool;
+use oceanfs_storage::SegmentRpcClient;
 use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
@@ -27,6 +28,7 @@ use crate::error::{Error, Result};
 /// Returns an error per-target if the node is unreachable or the
 /// write fails on a remote node. Individual failures do not abort
 /// the remaining fan-out tasks.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn replicate_write(
     membership: &Arc<Membership>,
     pool: &Arc<ConnectionPool>,
@@ -35,7 +37,7 @@ pub(crate) async fn replicate_write(
     data: &[u8],
     hlc: Hlc,
     write_timeout_ms: u64,
-    req: &crate::write_coordinator::WriteRequest,
+    req: &super::coordinator::WriteRequest,
 ) -> Vec<Result<WriteAck>> {
     if targets.is_empty() {
         return vec![];
@@ -89,7 +91,7 @@ async fn replicate_to_single(
     segment_id: SegmentId,
     data: &[u8],
     hlc: Hlc,
-    req: &crate::write_coordinator::WriteRequest,
+    req: &super::coordinator::WriteRequest,
 ) -> Result<WriteAck> {
     let addr = membership.address_of(target).ok_or_else(|| Error::ForwardFailed {
         target: target.to_string(),
@@ -155,7 +157,8 @@ async fn replicate_to_single(
 mod tests {
     use std::net::SocketAddr;
 
-    use oceanfs_core::{Incarnation, NodeState, SegmentId};
+    use bytes::Bytes;
+    use oceanfs_core::{BucketId, HashKey, Hlc, Incarnation, NodeState, ObjectKey, SegmentId};
     use oceanfs_routing::{Ring, RingCache};
 
     use super::*;
@@ -190,9 +193,27 @@ mod tests {
     async fn replicate_write_empty_targets() {
         let membership = make_membership("n1");
         let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
-        let results =
-            replicate_write(&membership, &pool, &[], SegmentId::new(), b"data", Hlc::zero(), 5000)
-                .await;
+        let req = crate::write::coordinator::WriteRequest {
+            bucket: BucketId::new("test"),
+            key: ObjectKey::new("test"),
+            hash_key: oceanfs_core::HashKey::from_bytes([0u8; 32]),
+            data: Bytes::from_static(b"data"),
+            write_quorum: 1,
+            ack_after_wal: true,
+            ec_async: false,
+            policy: None,
+        };
+        let results = replicate_write(
+            &membership,
+            &pool,
+            &[],
+            SegmentId::new(),
+            b"data",
+            Hlc::zero(),
+            5000,
+            &req,
+        )
+        .await;
         assert!(results.is_empty());
     }
 
@@ -201,6 +222,16 @@ mod tests {
         let membership = make_membership("n1");
         let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
         let unknown = NodeId::new("nobody");
+        let req = crate::write::coordinator::WriteRequest {
+            bucket: BucketId::new("test"),
+            key: ObjectKey::new("test"),
+            hash_key: oceanfs_core::HashKey::from_bytes([0u8; 32]),
+            data: Bytes::from_static(b"data"),
+            write_quorum: 1,
+            ack_after_wal: true,
+            ec_async: false,
+            policy: None,
+        };
         let results = replicate_write(
             &membership,
             &pool,
@@ -209,6 +240,7 @@ mod tests {
             b"data",
             Hlc::zero(),
             5000,
+            &req,
         )
         .await;
         assert_eq!(results.len(), 1);

@@ -1,4 +1,4 @@
-//! Adapter bridging `oceanfs_storage::MetadataStore` → `oceanfs_server::MetadataOps`.
+//! Adapter bridging `oceanfs_storage::RocksDbMetadataStore` → `oceanfs_server::MetadataOps`.
 //!
 //! Lives in `oceanfs-node` (the composition root) because it depends on both
 //! `oceanfs-storage` (concrete store) and `oceanfs-server` (trait).
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata, SegmentMetadata};
 use oceanfs_server::metadata_ops::{MetadataError, MetadataOps};
 
-/// Bridges `oceanfs_storage::MetadataStore` to `oceanfs_server::MetadataOps`.
+/// Bridges `oceanfs_storage::RocksDbMetadataStore` to `oceanfs_server::MetadataOps`.
 ///
 /// Wraps the concrete RocksDB-backed metadata store and translates
 /// storage errors to the server crate's error type via explicit
@@ -21,20 +21,20 @@ use oceanfs_server::metadata_ops::{MetadataError, MetadataOps};
 /// ```ignore
 /// use std::sync::Arc;
 /// use oceanfs_core::MetadataConfig;
-/// use oceanfs_storage::MetadataStore;
+/// use oceanfs_storage::RocksDbMetadataStore;
 /// use oceanfs_node::MetadataStoreAdapter;
 ///
 /// let config = MetadataConfig::default();
-/// let store = MetadataStore::open(&config).unwrap();
+/// let store = RocksDbMetadataStore::open(&config).unwrap();
 /// let adapter = MetadataStoreAdapter::new(Arc::new(store));
 /// ```
 pub struct MetadataStoreAdapter {
-    store: Arc<oceanfs_storage::MetadataStore>,
+    store: Arc<oceanfs_storage::RocksDbMetadataStore>,
 }
 
 impl MetadataStoreAdapter {
     /// Creates a new adapter wrapping the given concrete metadata store.
-    pub fn new(store: Arc<oceanfs_storage::MetadataStore>) -> Self {
+    pub fn new(store: Arc<oceanfs_storage::RocksDbMetadataStore>) -> Self {
         Self { store }
     }
 }
@@ -84,14 +84,14 @@ impl MetadataOps for MetadataStoreAdapter {
 mod tests {
     use super::*;
 
-    /// Test helper: creates a temporary MetadataStore.
-    fn create_test_store() -> Arc<oceanfs_storage::MetadataStore> {
+    /// Test helper: creates a temporary RocksDbMetadataStore.
+    fn create_test_store() -> Arc<oceanfs_storage::RocksDbMetadataStore> {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config = oceanfs_core::MetadataConfig {
             data_dir: tmp.path().to_path_buf(),
             ..Default::default()
         };
-        Arc::new(oceanfs_storage::MetadataStore::open(&config).expect("open"))
+        Arc::new(oceanfs_storage::RocksDbMetadataStore::open(&config).expect("open"))
     }
 
     #[test]

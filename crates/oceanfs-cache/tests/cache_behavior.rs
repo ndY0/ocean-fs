@@ -11,7 +11,8 @@ use oceanfs_cache::{
     MetadataCache, MetadataCacheConfig, NegativeCache, NegativeCacheConfig, ObjectCache,
     ObjectCacheConfig, PrefetchConfig, PrefetchEngine,
 };
-use oceanfs_core::{BucketId, Hlc, MetadataStore, ObjectKey, ObjectMetadata};
+use oceanfs_core::{BucketId, Hlc, ObjectKey, ObjectMetadata};
+use oceanfs_storage_api::MetadataStore;
 
 /// A mock metadata store for integration testing.
 struct MockStore {

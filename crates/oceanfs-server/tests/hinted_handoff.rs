@@ -5,7 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use oceanfs_core::{Hlc, NodeId, SegmentId};
-use oceanfs_server::{HintRecord, HintedHandoff};
+use oceanfs_durability::{HintRecord, HintedHandoff};
 
 #[tokio::test]
 async fn handoff_create_deliver_cleanup() {

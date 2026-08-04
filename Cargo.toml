@@ -4,7 +4,9 @@ members = [
     "crates/oceanfs-hash",
     "crates/oceanfs-ec",
     "crates/oceanfs-accel",
+    "crates/oceanfs-storage-api",
     "crates/oceanfs-storage",
+    "crates/oceanfs-durability",
     "crates/oceanfs-routing",
     "crates/oceanfs-membership",
     "crates/oceanfs-network",
@@ -30,7 +32,9 @@ oceanfs-core     = { path = "crates/oceanfs-core" }
 oceanfs-hash     = { path = "crates/oceanfs-hash" }
 oceanfs-ec       = { path = "crates/oceanfs-ec" }
 oceanfs-accel    = { path = "crates/oceanfs-accel" }
+oceanfs-storage-api = { path = "crates/oceanfs-storage-api" }
 oceanfs-storage  = { path = "crates/oceanfs-storage" }
+oceanfs-durability = { path = "crates/oceanfs-durability" }
 oceanfs-routing  = { path = "crates/oceanfs-routing" }
 oceanfs-membership = { path = "crates/oceanfs-membership" }
 oceanfs-network  = { path = "crates/oceanfs-network" }

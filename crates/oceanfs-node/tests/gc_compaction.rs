@@ -12,10 +12,11 @@ use oceanfs_core::{
     BucketId, ChunkRef, HashOutput, Hlc, MetadataConfig, ObjectKey, ObjectMetadata, SegmentId,
     SegmentMetadata, SizeTier, Tombstone,
 };
-use oceanfs_storage::{GarbageCollector, GcConfig, MetadataStore};
+use oceanfs_durability::{GarbageCollector, GcConfig};
+use oceanfs_storage::RocksDbMetadataStore;
 
 /// Helper: create a temporary metadata store backed by a temp directory.
-fn open_temp_metadata() -> Arc<MetadataStore> {
+fn open_temp_metadata() -> Arc<RocksDbMetadataStore> {
     let dir = tempfile::tempdir().expect("temp dir");
     let config = MetadataConfig {
         data_dir: dir.path().to_path_buf(),
@@ -25,7 +26,7 @@ fn open_temp_metadata() -> Arc<MetadataStore> {
     // Keep tempdir alive via leak (test scope ensures cleanup)
     // SAFETY: tempfile will clean up on process exit
     let _dir_leaked = Box::leak(Box::new(dir));
-    Arc::new(MetadataStore::open(&config).expect("open metadata store"))
+    Arc::new(RocksDbMetadataStore::open(&config).expect("open metadata store"))
 }
 
 /// Helper: create a simple object metadata entry.

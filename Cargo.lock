@@ -1491,11 +1491,15 @@ dependencies = [
  "bytes",
  "dashmap",
  "oceanfs-core",
+ "oceanfs-storage-api",
  "parking_lot",
+ "prost",
  "smallvec",
  "static_assertions",
  "thiserror 2.0.19",
  "tokio",
+ "tonic",
+ "tonic-build",
  "tracing",
 ]
 
@@ -1511,6 +1515,37 @@ dependencies = [
  "smallvec",
  "static_assertions",
  "thiserror 2.0.19",
+ "tonic",
+ "tonic-build",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "oceanfs-durability"
+version = "0.2.0"
+dependencies = [
+ "blake3",
+ "bytes",
+ "oceanfs-core",
+ "oceanfs-ec",
+ "oceanfs-hash",
+ "oceanfs-membership",
+ "oceanfs-network",
+ "oceanfs-routing",
+ "oceanfs-storage",
+ "oceanfs-storage-api",
+ "parking_lot",
+ "prost",
+ "rand 0.8.7",
+ "rayon",
+ "serde_json",
+ "smallvec",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
  "tonic",
  "tonic-build",
  "tracing",
@@ -1586,12 +1621,14 @@ dependencies = [
  "oceanfs-accel",
  "oceanfs-cache",
  "oceanfs-core",
+ "oceanfs-durability",
  "oceanfs-ec",
  "oceanfs-membership",
  "oceanfs-network",
  "oceanfs-routing",
  "oceanfs-server",
  "oceanfs-storage",
+ "oceanfs-storage-api",
  "parking_lot",
  "reqwest",
  "serde",
@@ -1640,11 +1677,13 @@ dependencies = [
  "oceanfs-accel",
  "oceanfs-cache",
  "oceanfs-core",
+ "oceanfs-durability",
  "oceanfs-ec",
  "oceanfs-membership",
  "oceanfs-network",
  "oceanfs-routing",
  "oceanfs-storage",
+ "oceanfs-storage-api",
  "parking_lot",
  "prometheus",
  "serde",
@@ -1666,6 +1705,7 @@ dependencies = [
 name = "oceanfs-storage"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "blake3",
  "bytes",
  "crc32fast",
@@ -1677,7 +1717,9 @@ dependencies = [
  "oceanfs-membership",
  "oceanfs-network",
  "oceanfs-routing",
+ "oceanfs-storage-api",
  "parking_lot",
+ "prost",
  "rand 0.8.7",
  "rayon",
  "rocksdb",
@@ -1689,8 +1731,19 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tonic",
+ "tonic-build",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "oceanfs-storage-api"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "oceanfs-core",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

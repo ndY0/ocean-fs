@@ -7,13 +7,11 @@
 //!
 //! # Architecture
 //!
-//! The storage engine has six main components:
+//! The storage engine has four main components:
 //! - **Segment buffer:** in-memory append-only `BytesMut` buffers
 //! - **WAL:** sequential write-ahead log for crash recovery
 //! - **Metadata:** RocksDB-backed object and segment metadata
 //! - **Segment store:** manages sealed segments on disk
-//! - **GC & Compaction:** tombstone processing and segment space reclamation
-//! - **Durability:** anti-entropy, distributed scrubbing, and orphan reaping
 
 #![forbid(unsafe_code)]
 #![deny(
@@ -26,35 +24,36 @@
     missing_docs
 )]
 
-mod anti_entropy;
 mod blob_store;
 mod buffer_pool;
 mod error;
-mod gc;
-pub mod heal;
 pub mod metadata;
-mod scrub;
 pub mod segment;
+mod traits;
 pub mod wal;
 
-pub use anti_entropy::{
-    AntiEntropy, AntiEntropyConfig, AntiEntropyStats, InMemorySegmentStore, LeafRange, MerkleProof,
-    MerkleRoot, MerkleTree, SegmentDataStore,
-};
 pub use blob_store::BlobStore;
 pub use buffer_pool::BufferPool;
 pub use error::{Error, Result};
-pub use gc::{
-    GarbageCollector, GcConfig, GcStats, InMemorySegmentShardStore, OrphanReaper, OrphanStats,
-    SegmentShardStore,
-};
-pub use heal::{
-    enqueue_heal, HealConfig, HealQueue, HealQueueSender, HealRequest, HealStats, HealWorker,
-};
-pub use metadata::{BatchOp, MetadataStore};
-pub use scrub::{ScrubConfig, ScrubCoordinator, ScrubReport, ScrubReportBuilder};
+pub use metadata::{BatchOp, RocksDbMetadataStore};
 pub use segment::{
     ActiveSegment, SealConfig, SegmentHandle, SegmentHeader, SegmentIndex, SegmentSealer,
     SegmentShard, SegmentSplitter, TierRouter,
 };
 pub use wal::{WalEntry, WalReader, WalWriter};
+
+// ---------------------------------------------------------------------------
+// Generated gRPC service stubs
+// ---------------------------------------------------------------------------
+
+/// Generated gRPC client and server stubs for storage services.
+#[allow(missing_docs, clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::all)]
+pub mod storage_rpc {
+    include!("generated/oceanfs.storage.rs");
+}
+
+// Re-export generated client and server types for ergonomic use.
+pub use storage_rpc::{
+    segment_rpc_client::SegmentRpcClient,
+    segment_rpc_server::{SegmentRpc, SegmentRpcServer},
+};
