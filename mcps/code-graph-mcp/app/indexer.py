@@ -133,22 +133,26 @@ async def index_workspace(
             language=plugin.name,
         )
 
-        # Phase 0: clear stale data for all files first
-        for f in source_files:
-            try:
-                await client.delete_file_symbols(str(f))
-            except Exception:
-                pass
+        # Phase 0: nuke all symbols so stale data from deleted/moved/renamed
+        # files doesn't persist. Single-file re-indexes use delete_file_symbols
+        # instead — this is only for full workspace rebuilds.
+        await client.delete_all_symbols()
 
-        # Phase 1: extract and upsert all symbols first
-        # (edges can only be resolved after all symbols exist)
+        # Cap concurrent LSP file-open operations.  247 files open
+        # simultaneously kills rust-analyzer (memory exhaustion /
+        # "invalid state" crashes during call-hierarchy queries).
+        _PHASE_SEMAPHORE = asyncio.Semaphore(4)
+
+        # Phase 1: extract all symbols — open / query / close per file.
+        # Symbols are gathered first because edge resolution (Phase 2)
+        # needs the full (uri, name) → id map.
         all_symbols: list[dict] = []
         name_to_sym_id: dict[str, str] = {}
 
         for i in range(0, len(source_files), _FILE_BATCH_SIZE):
             batch = source_files[i: i + _FILE_BATCH_SIZE]
             batch_results = await asyncio.gather(
-                *[_extract_symbols(lsp, plugin, path_to_uri(str(f)), str(f)) for f in batch],
+                *[_extract_symbols_one(lsp, plugin, str(f), _PHASE_SEMAPHORE) for f in batch],
                 return_exceptions=True,
             )
             for file_path, result in zip(batch, batch_results):
@@ -157,14 +161,12 @@ async def index_workspace(
                     continue
                 all_symbols.extend(result)
 
-        # Upsert all symbols before building any edges
         _, name_to_sym_id, uri_name_to_id = await _upsert_symbols(client, all_symbols)
         log.info("indexer.symbols_upserted", count=len(all_symbols))
 
-        # Phase 2: extract and upsert edges for all symbols
+        # Phase 2: extract edges — re-open / query / close per file.
         all_edges: list[tuple[str, str, str]] = []
 
-        # Group symbols by file for efficient LSP batching
         by_file: dict[str, list[dict]] = {}
         for sym in all_symbols:
             by_file.setdefault(sym["file_uri"], []).append(sym)
@@ -174,7 +176,7 @@ async def index_workspace(
             batch_uris = file_uris[i: i + _FILE_BATCH_SIZE]
             batch_results = await asyncio.gather(
                 *[
-                    _extract_edges(lsp, plugin, by_file[uri], name_to_sym_id, uri_name_to_id)
+                    _extract_edges_one(lsp, plugin, uri, by_file[uri], name_to_sym_id, uri_name_to_id, _PHASE_SEMAPHORE)
                     for uri in batch_uris
                 ],
                 return_exceptions=True,
@@ -185,14 +187,17 @@ async def index_workspace(
                     continue
                 all_edges.extend(result)
 
-        await _upsert_edges(client, all_edges)
+            # If the LSP subprocess died during this batch (e.g. a generated
+            # file's deep trait resolution crashed rust-analyzer), restart it
+            # so remaining files can still get call-hierarchy edges.
+            if not lsp._alive:
+                log.warning("indexer.lsp_died_restarting")
+                try:
+                    await lsp.restart(init_options=plugin.lsp_init_options)
+                except Exception as e:
+                    log.error("indexer.lsp_restart_failed", error=str(e))
 
-        # Close all files that were opened by _extract_symbols
-        for uri in file_uris:
-            try:
-                await lsp.did_close(uri)
-            except Exception:
-                pass
+        await _upsert_edges(client, all_edges)
 
         stats = await client.stats()
         log.info("indexer.full_index_done", edges=len(all_edges), **stats)
@@ -237,9 +242,68 @@ async def _extract_symbols(
     return symbols
 
 
+async def _extract_symbols_one(
+    lsp: LspClient,
+    plugin: "LanguagePlugin",
+    file_path: str,
+    sem: asyncio.Semaphore,
+) -> list[dict]:
+    """Open → extract symbols → close.  Called with limited concurrency."""
+    file_uri = path_to_uri(file_path)
+    async with sem:
+        try:
+            return await _extract_symbols(lsp, plugin, file_uri, file_path)
+        finally:
+            try:
+                await lsp.did_close(file_uri)
+            except Exception:
+                pass
+
+
+async def _extract_edges_one(
+    lsp: LspClient,
+    plugin: "LanguagePlugin",
+    file_uri: str,
+    symbols: list[dict],
+    name_to_sym_id: dict[str, str],
+    uri_name_to_id: dict,
+    sem: asyncio.Semaphore,
+) -> list[tuple[str, str, str]]:
+    """Re-open → extract edges → close.  Called with limited concurrency.
+    Returns [] if the LSP is already dead (crashed during a prior file)."""
+    file_path = symbols[0]["file_path"]
+    async with sem:
+        if not lsp._alive:
+            log.warning("indexer.lsp_dead_skipping", file=file_path)
+            return []
+        try:
+            text = Path(file_path).read_text(encoding="utf-8", errors="replace")
+            await lsp.did_open(file_uri, plugin.language_id, text)
+            await asyncio.sleep(0.1)
+            return await _extract_edges(lsp, plugin, symbols, name_to_sym_id, uri_name_to_id)
+        except ConnectionError:
+            log.warning("indexer.lsp_crashed_during", file=file_path)
+            return []
+        finally:
+            try:
+                await lsp.did_close(file_uri)
+            except Exception:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # Edge extraction
 # ---------------------------------------------------------------------------
+
+def _is_generated_file(file_path: str) -> bool:
+    """Return True if the file is auto-generated (prost, tonic, etc.)."""
+    try:
+        with open(file_path, encoding="utf-8", errors="replace") as f:
+            first_line = f.readline()
+        return "generated by" in first_line
+    except Exception:
+        return False
+
 
 async def _extract_edges(
     lsp: LspClient,
@@ -270,8 +334,16 @@ async def _extract_edges(
     file_uri = symbols[0]["file_uri"]
     file_path = symbols[0]["file_path"]
 
+    # rust-analyzer's call-hierarchy resolver crashes on deeply-nested
+    # generic types in generated code (tonic, prost).  Skip call hierarchy
+    # for those files — the references fallback below will still produce
+    # intra-file call edges without hitting the fragile trait solver.
+    generated = _is_generated_file(file_path)
+    if generated:
+        log.info("indexer.generated_skip_call_hierarchy", file=file_path)
+
     # Call hierarchy edges (functions/methods)
-    if lsp.has_call_hierarchy:
+    if lsp.has_call_hierarchy and not generated:
         call_syms = [s for s in symbols if s["kind"] in _CALL_HIERARCHY_KINDS]
         log.info("indexer.call_hierarchy_start", file=file_path, candidates=len(call_syms))
 
@@ -289,10 +361,15 @@ async def _extract_edges(
             if warm_start:
                 # Incremental: LSP is already hot. Try once with a tiny delay.
                 await asyncio.sleep(0.1)
-                items = await lsp.prepare_call_hierarchy(file_uri, probe_line, probe_col)
+                items = await lsp.prepare_call_hierarchy(file_uri, probe_line, probe_col, timeout=5)
                 if items:
-                    outgoing = await lsp.outgoing_calls(items[0])
-                    incoming = await lsp.incoming_calls(items[0])
+                    try:
+                        outgoing, incoming = await asyncio.gather(
+                            asyncio.wait_for(lsp.outgoing_calls(items[0]), timeout=5),
+                            asyncio.wait_for(lsp.incoming_calls(items[0]), timeout=5),
+                        )
+                    except asyncio.TimeoutError:
+                        outgoing, incoming = [], []
                     if outgoing or incoming:
                         ready = True
                     else:
@@ -305,12 +382,17 @@ async def _extract_edges(
                 # Full index: exponential backoff to let analysis stabilise.
                 for delay in (0.1, 0.2, 0.5, 1):
                     await asyncio.sleep(delay)
-                    items = await lsp.prepare_call_hierarchy(file_uri, probe_line, probe_col)
+                    items = await lsp.prepare_call_hierarchy(file_uri, probe_line, probe_col, timeout=5)
                     if items:
                         for extra in (0.2, 0.5, 1, 2):
                             await asyncio.sleep(extra)
-                            outgoing = await lsp.outgoing_calls(items[0])
-                            incoming = await lsp.incoming_calls(items[0])
+                            try:
+                                outgoing, incoming = await asyncio.gather(
+                                    asyncio.wait_for(lsp.outgoing_calls(items[0]), timeout=5),
+                                    asyncio.wait_for(lsp.incoming_calls(items[0]), timeout=5),
+                                )
+                            except asyncio.TimeoutError:
+                                outgoing, incoming = [], []
                             if outgoing or incoming:
                                 ready = True
                                 break

@@ -257,6 +257,22 @@ class DGraphClient:
             await asyncio.sleep(0.1)
         return None
 
+    async def delete_all_symbols(self) -> int:
+        """Remove ALL Symbol nodes — used before a full workspace rebuild."""
+        data = await self._query("{ q(func: type(Symbol)) { uid } }")
+        uids = [n["uid"] for n in data.get("q", [])]
+        if not uids:
+            return 0
+        del_nquads = "\n".join(f"<{uid}> * * ." for uid in uids)
+        await self._http.post(
+            f"{self._base}/mutate",
+            content=json.dumps({"delete": del_nquads}),
+            headers={"Content-Type": "application/json"},
+            params={"commitNow": "true"},
+        )
+        log.info("dgraph.deleted_all_symbols", count=len(uids))
+        return len(uids)
+
     async def delete_file_symbols(self, file_path: str) -> None:
         """Remove all Symbol nodes for a given file before re-indexing it."""
         data = await self._query(

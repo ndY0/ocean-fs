@@ -69,6 +69,8 @@ async def watch_workspace(
         if files:
             _schedule_batch(client, lsp, plugin, list(files))
 
+    workspace_root = Path(workspace)
+
     async for changes in awatch(workspace, recursive=True):
         for change_type, path in changes:
             # Filter by extension
@@ -80,14 +82,29 @@ async def watch_workspace(
             if any(part in exclude_dirs for part in path_parts):
                 continue
 
+            # watchfiles yields paths relative to the watched root.
+            # DGraph stores symbol_file as an absolute path, so we must
+            # resolve here for delete_file_symbols and re-index to work.
+            abs_path = str(workspace_root / path)
+
             if change_type == Change.deleted:
-                log.info("watcher.deleted", file=path)
-                await client.delete_file_symbols(path)
-                pending_files.discard(path)
+                log.info("watcher.deleted", file=abs_path)
+                await client.delete_file_symbols(abs_path)
+                pending_files.discard(abs_path)
+                continue
+
+            # File renaming / moving: the source path fires Modified, but
+            # the file no longer exists there.  Treat as deletion to clean
+            # up stale symbols (the destination path will fire separately
+            # and trigger a re-index).
+            if change_type == Change.modified and not Path(abs_path).exists():
+                log.info("watcher.moved_or_renamed", old_file=abs_path)
+                await client.delete_file_symbols(abs_path)
+                pending_files.discard(abs_path)
                 continue
 
             # Add to batch and restart the timer
-            pending_files.add(path)
+            pending_files.add(abs_path)
 
             if batch_timer is not None:
                 batch_timer.cancel()

@@ -36,6 +36,11 @@ log = structlog.get_logger()
 # LSP content-length framing
 _HEADER = "Content-Length: {}\r\n\r\n"
 
+# Maximum seconds to wait for any LSP response.  If the language server
+# hangs (e.g. a single call-hierarchy query never returns) this prevents
+# the entire index from freezing forever inside asyncio.gather.
+_DEFAULT_REQUEST_TIMEOUT = 60.0
+
 
 class LspError(Exception):
     """Raised when an LSP request returns an error response."""
@@ -65,6 +70,7 @@ class LspClient:
         self._reader_task: asyncio.Task | None = None
         self._write_lock = asyncio.Lock()
         self._server_capabilities: dict = {}
+        self._alive = False
 
     # -----------------------------------------------------------------------
     # Lifecycle
@@ -84,6 +90,10 @@ class LspClient:
 
         # Start background reader before sending initialize
         self._reader_task = asyncio.create_task(self._read_loop())
+
+        # Allow _request to proceed (set to True BEFORE the initialize
+        # handshake so calls to _request don't get blocked by the alive check)
+        self._alive = True
 
         # LSP initialize
         init_params = {
@@ -133,6 +143,13 @@ class LspClient:
             except asyncio.CancelledError:
                 pass
 
+    async def restart(self, init_options: dict | None = None, timeout: int = 60) -> None:
+        """Stop the current LSP subprocess and start a fresh one."""
+        log.info("lsp.restarting")
+        await self.stop()
+        await self.start(init_options=init_options, timeout=timeout)
+        log.info("lsp.restarted")
+
     # -----------------------------------------------------------------------
     # High-level LSP method wrappers
     # -----------------------------------------------------------------------
@@ -171,16 +188,23 @@ class LspClient:
         return result or []
 
     async def prepare_call_hierarchy(
-        self, file_uri: str, line: int, character: int
+        self, file_uri: str, line: int, character: int,
+        timeout: float = _DEFAULT_REQUEST_TIMEOUT,
     ) -> list[dict]:
         """textDocument/prepareCallHierarchy — prepare call hierarchy item."""
-        result = await self._request(
-            "textDocument/prepareCallHierarchy",
-            {
-                "textDocument": {"uri": file_uri},
-                "position": {"line": line, "character": character},
-            },
-        )
+        try:
+            result = await self._request(
+                "textDocument/prepareCallHierarchy",
+                {
+                    "textDocument": {"uri": file_uri},
+                    "position": {"line": line, "character": character},
+                },
+                timeout=timeout,
+            )
+        except (asyncio.TimeoutError, ConnectionError):
+            log.info("lsp.prepare_call_hierarchy_timeout",
+                     uri=file_uri, line=line, character=character)
+            return []
         if result is None:
             log.info("lsp.prepare_call_hierarchy_null",
                      uri=file_uri, line=line, character=character)
@@ -261,8 +285,15 @@ class LspClient:
     # JSON-RPC internals
     # -----------------------------------------------------------------------
 
-    async def _request(self, method: str, params: Any) -> Any:
-        """Send a JSON-RPC request and await its response."""
+    async def _request(self, method: str, params: Any, timeout: float = _DEFAULT_REQUEST_TIMEOUT) -> Any:
+        """Send a JSON-RPC request and await its response.
+        
+        Raises asyncio.TimeoutError if the server doesn't respond within
+        `timeout` seconds.
+        Raises ConnectionError immediately if the LSP subprocess has died.
+        """
+        if not self._alive:
+            raise ConnectionError("LSP subprocess is dead")
         req_id = self._next_id
         self._next_id += 1
 
@@ -270,7 +301,11 @@ class LspClient:
         self._pending[req_id] = future
 
         await self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
-        return await future
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._pending.pop(req_id, None)
+            raise
 
     async def _notify(self, method: str, params: Any) -> None:
         """Send a JSON-RPC notification (no response expected)."""
@@ -319,6 +354,7 @@ class LspClient:
         except Exception as e:
             log.error("lsp.reader_error", error=str(e))
         finally:
+            self._alive = False
             error = ConnectionError("LSP reader loop terminated")
             for future in self._pending.values():
                 if not future.done():
