@@ -6,11 +6,9 @@
 use oceanfs_core::SegmentId;
 
 /// Magic bytes identifying a sealed segment file.
-#[allow(dead_code)]
 pub(crate) const SEGMENT_MAGIC: [u8; 4] = *b"OFSG";
 
 /// Current segment format version.
-#[allow(dead_code)]
 pub(crate) const SEGMENT_VERSION: u16 = 1;
 
 /// On-disk header for a sealed segment.
@@ -33,7 +31,6 @@ pub(crate) const SEGMENT_VERSION: u16 = 1;
 ///
 /// Total: 76 bytes (padded to 8-byte alignment).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct SegmentHeader {
     /// Magic bytes: `[O, F, S, G]`.
     pub magic: [u8; 4],
@@ -51,7 +48,6 @@ pub struct SegmentHeader {
     pub checksum: [u8; 32],
 }
 
-#[allow(dead_code)]
 impl SegmentHeader {
     /// Creates a new segment header.
     pub fn new(

@@ -31,7 +31,6 @@ use crate::{buffer_pool::BufferPool, error::Result, segment::buffer::ActiveSegme
 /// let seg_a = shard.get(42);
 /// let seg_b = shard.get(99);
 /// ```
-#[allow(dead_code)]
 pub struct SegmentShard {
     /// The active segments, one per shard.
     segments: Vec<parking_lot::Mutex<ActiveSegment>>,
@@ -39,7 +38,6 @@ pub struct SegmentShard {
     shard_count: usize,
 }
 
-#[allow(dead_code)]
 impl SegmentShard {
     /// Creates a new `SegmentShard` with `count` independent segment groups.
     ///

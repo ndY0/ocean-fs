@@ -33,7 +33,6 @@ use crate::{
 /// assert_eq!(offset, 0);
 /// assert_eq!(length, 5);
 /// ```
-#[allow(dead_code)]
 pub struct ActiveSegment {
     /// Unique identifier for this segment.
     id: SegmentId,
@@ -47,7 +46,6 @@ pub struct ActiveSegment {
     target_size: u64,
 }
 
-#[allow(dead_code)]
 impl ActiveSegment {
     /// Creates a new active segment for the given tier.
     ///

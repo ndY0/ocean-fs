@@ -24,7 +24,6 @@ pub(crate) fn encode_object_key(bucket: &str, key: &str) -> Vec<u8> {
 }
 
 /// Decodes a RocksDB key back into bucket and object key components.
-#[allow(dead_code)]
 pub(crate) fn decode_object_key(data: &[u8]) -> Option<(&str, &str)> {
     let null_pos = data.iter().position(|&b| b == 0)?;
     let bucket = std::str::from_utf8(&data[..null_pos]).ok()?;

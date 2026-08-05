@@ -169,7 +169,6 @@ impl S3Handler {
     }
 
     /// Sets the in-memory segment store for chunk-based reads.
-    #[allow(dead_code)]
     pub fn with_segment_store(mut self, store: Arc<InMemorySegmentReader>) -> Self {
         self.state.segment_store = Some(store);
         self

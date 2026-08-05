@@ -7,7 +7,6 @@ pub struct TierRouter {
     config: SegmentSizeConfig,
 }
 
-#[allow(dead_code)]
 impl TierRouter {
     /// Creates a new tier router from the given configuration.
     pub fn new(config: SegmentSizeConfig) -> Self {

@@ -25,7 +25,6 @@ use crate::{
 
 /// Configuration for the segment sealer.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct SealConfig {
     /// Target size in bytes — seal when the segment exceeds this.
     pub target_size_bytes: u64,
@@ -37,14 +36,12 @@ pub struct SealConfig {
 
 /// Orchestrates the sealing of active segments.
 /// Orchestrates the sealing of active segments.
-#[allow(dead_code)]
 pub struct SegmentSealer {
     config: SealConfig,
     metadata: Arc<RocksDbMetadataStore>,
     wal: Arc<WalWriter>,
 }
 
-#[allow(dead_code)]
 impl SegmentSealer {
     /// Creates a new segment sealer.
     pub fn new(

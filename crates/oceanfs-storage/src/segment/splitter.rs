@@ -4,12 +4,10 @@
 //! Each chunk becomes a separate segment.
 
 /// Splits blob data into chunk-sized pieces for multi-segment storage.
-#[allow(dead_code)]
 pub struct SegmentSplitter {
     chunk_size: u64,
 }
 
-#[allow(dead_code)]
 impl SegmentSplitter {
     /// Creates a new splitter with the given chunk size.
     pub fn new(chunk_size: u64) -> Self {
