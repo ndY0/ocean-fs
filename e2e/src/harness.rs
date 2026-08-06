@@ -546,7 +546,9 @@ listen_addr = "127.0.0.1:{http_port}"
 grpc_listen_addr = "127.0.0.1:{grpc_port}"
 log_level = "error"
 prefetch_enabled = false
-gossip_interval_ms = 100
+
+[gossip]
+interval_ms = 100
 "#
     .to_string()
 }
@@ -562,7 +564,9 @@ listen_addr = "127.0.0.1:{http_port}"
 grpc_listen_addr = "127.0.0.1:{grpc_port}"
 log_level = "error"
 prefetch_enabled = false
-gossip_interval_ms = 50
+
+[gossip]
+interval_ms = 50
 suspicion_timeout_ms = 2000
 failure_timeout_ms = 5000
 "#

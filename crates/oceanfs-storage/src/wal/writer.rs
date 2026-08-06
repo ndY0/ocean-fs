@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use oceanfs_core::WalConfig;
+use oceanfs_core::{Counter, LabelSet, WalConfig};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -49,6 +49,10 @@ pub struct WalWriter {
     sync_group: WalSyncGroup,
     /// Global WAL position counter (monotonically increasing across files).
     global_position: Mutex<u64>,
+    /// Bytes written to WAL.
+    bytes_written_total: Counter,
+    /// WAL truncations.
+    truncations_total: Counter,
 }
 
 impl WalWriter {
@@ -74,6 +78,16 @@ impl WalWriter {
             position: Mutex::new(existing_size),
             global_position: Mutex::new(existing_size),
             sync_group: Self::create_sync_group(config),
+            bytes_written_total: Counter::new(
+                "wal_bytes_written_total".into(),
+                "Bytes written to WAL".into(),
+                LabelSet::empty(),
+            ),
+            truncations_total: Counter::new(
+                "wal_truncations_total".into(),
+                "WAL truncation operations".into(),
+                LabelSet::empty(),
+            ),
         };
 
         Ok(writer)
@@ -126,6 +140,7 @@ impl WalWriter {
             Error::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "WAL sync group dropped"))
         })?;
 
+        self.bytes_written_total.add(entry_size);
         Ok(global_pos)
     }
 
@@ -138,6 +153,7 @@ impl WalWriter {
     ///
     /// Returns an I/O error if the truncation fails.
     pub async fn truncate(&self, position: u64) -> Result<()> {
+        self.truncations_total.inc();
         let mut file = self.file.lock().await;
         file.set_len(position)?;
         file.seek(SeekFrom::Start(position))?;
@@ -163,6 +179,12 @@ impl WalWriter {
     /// Returns the current global WAL position.
     pub async fn global_position(&self) -> u64 {
         *self.global_position.lock().await
+    }
+
+    /// Registers WAL counters with a metrics registrar.
+    pub fn register_metrics(&self, registrar: &dyn oceanfs_core::MetricRegistrar) {
+        registrar.register_counter(self.bytes_written_total.clone());
+        registrar.register_counter(self.truncations_total.clone());
     }
 
     /// Rotates to a new WAL file.

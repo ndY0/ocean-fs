@@ -7,7 +7,7 @@
 
 use std::{net::SocketAddr, sync::Arc};
 
-use oceanfs_core::{GossipConfig, NodeId, NodeState};
+use oceanfs_core::{Counter, Gauge, GossipConfig, NodeId, NodeState};
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::RingCache;
 use parking_lot::RwLock;
@@ -86,4 +86,12 @@ pub struct Membership {
     pub(crate) started: RwLock<bool>,
     /// Cancellation token for graceful shutdown of background tasks.
     pub(crate) shutdown: CancellationToken,
+    /// Gossip messages sent (set during start).
+    pub(crate) gossip_sent: RwLock<Option<Counter>>,
+    /// Gossip messages received (set during start).
+    pub(crate) gossip_received: RwLock<Option<Counter>>,
+    /// Gossip messages dropped (set during start).
+    pub(crate) gossip_dropped: RwLock<Option<Counter>>,
+    /// Ring version gauge — increments on each ring topology change.
+    pub(crate) ring_version: Gauge,
 }

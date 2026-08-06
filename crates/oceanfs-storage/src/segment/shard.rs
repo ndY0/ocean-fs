@@ -6,7 +6,7 @@
 //!
 //! Per performance guideline §2.5: sharded segment buffer per worker thread.
 
-use oceanfs_core::{SegmentSizeConfig, SizeTier};
+use oceanfs_core::{Gauge, LabelSet, MetricRegistrar, SegmentSizeConfig, SizeTier};
 
 use crate::{buffer_pool::BufferPool, error::Result, segment::buffer::ActiveSegment};
 
@@ -87,6 +87,17 @@ impl SegmentShard {
     /// Returns the number of shard groups.
     pub fn shard_count(&self) -> usize {
         self.shard_count
+    }
+
+    /// Registers segment pool gauges with a metrics registrar.
+    pub fn register_metrics(&self, registrar: &dyn MetricRegistrar) {
+        let active = Gauge::new(
+            "segment_active_count".into(),
+            "Active segment groups in the sharded pool".into(),
+            LabelSet::empty(),
+        );
+        active.set(self.shard_count as u64);
+        registrar.register_gauge(active);
     }
 }
 

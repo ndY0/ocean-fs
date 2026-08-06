@@ -27,7 +27,10 @@ use std::{
 
 #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
 use oceanfs_core::GpuConfig;
-use oceanfs_core::{AccelConfig, CodecConfig, CompressConfig, CompressionConfig, CompressionTier};
+use oceanfs_core::{
+    sub_millisecond_histogram_config, AccelConfig, CodecConfig, CompressConfig, CompressionConfig,
+    CompressionTier, Histogram, LabelSet,
+};
 use oceanfs_ec::{Decoder, Encoder};
 
 use crate::{
@@ -122,6 +125,21 @@ pub struct AccelDispatcher {
     ec_backend_unhealthy: AtomicBool,
     /// Runtime fallback flag for compression backends.
     compression_backend_unhealthy: AtomicBool,
+
+    /// Concrete CUDA backend reference for GPU metric registration.
+    #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
+    cuda_backend: Option<Arc<crate::cuda::CudaBackend>>,
+
+    /// Encode duration histogram (microseconds).
+    encode_duration_us: Arc<Histogram>,
+    /// Decode duration histogram (microseconds).
+    decode_duration_us: Arc<Histogram>,
+    /// Compress duration histogram (microseconds).
+    compress_duration_us: Arc<Histogram>,
+    /// Decompress duration histogram (microseconds).
+    decompress_duration_us: Arc<Histogram>,
+    /// Hash duration histogram (microseconds).
+    hash_duration_us: Arc<Histogram>,
 }
 
 impl AccelDispatcher {
@@ -213,17 +231,21 @@ impl AccelDispatcher {
         }
 
         #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
+        let mut stored_cuda: Option<Arc<crate::cuda::CudaBackend>> = None;
+
+        #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
         if cuda_available {
             if let Some(gpu_config) = &config.gpu {
                 if let Some(cuda) = crate::cuda::CudaBackend::new(gpu_config.clone()) {
-                    let cuda_encoder: Arc<dyn Encoder> = Arc::new(cuda);
-                    // For CUDA decoder: CudaBackend impl Decoder delegates to CPU Cauchy RS
-                    // which is proven and always available. Use a separate instance.
-                    if let Some(cuda_dec) = crate::cuda::CudaBackend::new(gpu_config.clone()) {
-                        let cuda_decoder: Arc<dyn Decoder> = Arc::new(cuda_dec);
-                        tier_encoders.insert(AccelTier::GpuCuda, cuda_encoder);
-                        tier_decoders.insert(AccelTier::GpuCuda, cuda_decoder);
-                    }
+                    let cuda_arc = Arc::new(cuda);
+                    let cuda_encoder: Arc<dyn Encoder> = cuda_arc.clone();
+                    tier_encoders.insert(AccelTier::GpuCuda, cuda_encoder);
+                    stored_cuda = Some(cuda_arc);
+                }
+                // For CUDA decoder: CudaBackend impl Decoder delegates to CPU Cauchy RS
+                if let Some(cuda_dec) = crate::cuda::CudaBackend::new(gpu_config.clone()) {
+                    let cuda_decoder: Arc<dyn Decoder> = Arc::new(cuda_dec);
+                    tier_decoders.insert(AccelTier::GpuCuda, cuda_decoder);
                 }
             }
         }
@@ -259,6 +281,38 @@ impl AccelDispatcher {
             }
         }
 
+        let sub_ms = sub_millisecond_histogram_config();
+        let encode_hist = Arc::new(Histogram::new(
+            "accel_encode_duration_us".into(),
+            "Encode duration in microseconds".into(),
+            &sub_ms,
+            LabelSet::empty(),
+        ));
+        let decode_hist = Arc::new(Histogram::new(
+            "accel_decode_duration_us".into(),
+            "Decode duration in microseconds".into(),
+            &sub_ms,
+            LabelSet::empty(),
+        ));
+        let compress_hist = Arc::new(Histogram::new(
+            "accel_compress_duration_seconds".into(),
+            "Compress duration in microseconds".into(),
+            &sub_ms,
+            LabelSet::empty(),
+        ));
+        let decompress_hist = Arc::new(Histogram::new(
+            "accel_decompress_duration_seconds".into(),
+            "Decompress duration in microseconds".into(),
+            &sub_ms,
+            LabelSet::empty(),
+        ));
+        let hash_hist = Arc::new(Histogram::new(
+            "accel_hash_duration_seconds".into(),
+            "Hash duration in microseconds".into(),
+            &sub_ms,
+            LabelSet::empty(),
+        ));
+
         Self {
             active_ec_tier,
             encoder,
@@ -273,6 +327,13 @@ impl AccelDispatcher {
             metrics: AccelMetrics::default(),
             ec_backend_unhealthy: AtomicBool::new(false),
             compression_backend_unhealthy: AtomicBool::new(false),
+            #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
+            cuda_backend: stored_cuda,
+            encode_duration_us: encode_hist,
+            decode_duration_us: decode_hist,
+            compress_duration_us: compress_hist,
+            decompress_duration_us: decompress_hist,
+            hash_duration_us: hash_hist,
         }
     }
 
@@ -318,6 +379,38 @@ impl AccelDispatcher {
     /// integration or tracing/metrics subscribers.
     pub fn metrics(&self) -> &AccelMetrics {
         &self.metrics
+    }
+
+    /// Registers acceleration counters with a metrics registrar.
+    ///
+    /// Delegates to [`AccelMetrics::register_metrics`] which wires
+    /// all seven counter `Arc`s into the provided registrar.
+    pub fn register_metrics(&self, registrar: &dyn oceanfs_core::metrics::MetricRegistrar) {
+        self.metrics.register_metrics(registrar);
+
+        // Register histograms.
+        registrar.register_histogram(Arc::clone(&self.encode_duration_us));
+        registrar.register_histogram(Arc::clone(&self.decode_duration_us));
+        registrar.register_histogram(Arc::clone(&self.compress_duration_us));
+        registrar.register_histogram(Arc::clone(&self.decompress_duration_us));
+        registrar.register_histogram(Arc::clone(&self.hash_duration_us));
+
+        // Register accel_tier_active gauge for the current active tier.
+        use oceanfs_core::{Gauge, LabelSet};
+        let tier_name = format!("{:?}", self.active_tier()).to_lowercase();
+        let gauge = Gauge::new(
+            "accel_tier_active".into(),
+            "Active acceleration tier".into(),
+            LabelSet::new(&[("tier", &tier_name), ("operation", "encode")]),
+        );
+        gauge.set(1);
+        registrar.register_gauge(gauge);
+
+        // GPU metrics (CUDA feature only).
+        #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
+        if let Some(ref cuda) = self.cuda_backend {
+            cuda.register_metrics(registrar);
+        }
     }
 
     /// Marks the active EC backend as unhealthy.
@@ -870,8 +963,10 @@ impl AccelDispatcher {
 
 impl Encoder for AccelDispatcher {
     fn encode(&self, data_shards: &[&[u8]], parity_count: u8) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+        let start = std::time::Instant::now();
         let byte_count = data_shards.iter().map(|s| s.len() as u64).sum();
         let result = self.encoder.encode(data_shards, parity_count);
+        self.encode_duration_us.observe(start.elapsed().as_micros() as u64);
         if result.is_ok() {
             self.metrics.record_encode(byte_count);
         }
@@ -886,9 +981,11 @@ impl Decoder for AccelDispatcher {
         data_count: u8,
         parity_count: u8,
     ) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+        let start = std::time::Instant::now();
         let byte_count =
             available_shards.iter().filter_map(|s| s.as_ref().map(|b| b.len() as u64)).sum();
         let result = self.decoder.decode(available_shards, data_count, parity_count);
+        self.decode_duration_us.observe(start.elapsed().as_micros() as u64);
         if result.is_ok() {
             self.metrics.record_decode(byte_count);
         }
@@ -1268,5 +1365,77 @@ mod tests {
             .collect();
         let recovered = decoder.decode(&available, 4, 2).unwrap();
         assert_eq!(recovered.len(), 4);
+    }
+
+    // --- Histogram tests ---
+
+    #[test]
+    fn compress_duration_histogram_is_created() {
+        let dispatcher = AccelDispatcher::new(AccelConfig::default());
+        let hist = &dispatcher.compress_duration_us;
+        assert_eq!(hist.count(), 0);
+        hist.observe(100);
+        assert_eq!(hist.count(), 1);
+    }
+
+    #[test]
+    fn decompress_duration_histogram_is_created() {
+        let dispatcher = AccelDispatcher::new(AccelConfig::default());
+        let hist = &dispatcher.decompress_duration_us;
+        assert_eq!(hist.count(), 0);
+        hist.observe(200);
+        assert_eq!(hist.count(), 1);
+    }
+
+    #[test]
+    fn hash_duration_histogram_is_created() {
+        let dispatcher = AccelDispatcher::new(AccelConfig::default());
+        let hist = &dispatcher.hash_duration_us;
+        assert_eq!(hist.count(), 0);
+        hist.observe(50);
+        assert_eq!(hist.count(), 1);
+    }
+
+    #[test]
+    fn all_histograms_registered_via_register_metrics() {
+        use oceanfs_core::MetricRegistrar;
+
+        struct TestRegistrar {
+            names: std::sync::Mutex<Vec<String>>,
+        }
+        impl MetricRegistrar for TestRegistrar {
+            fn register_counter(&self, _: oceanfs_core::Counter) {}
+            fn register_gauge(&self, _: oceanfs_core::Gauge) {}
+            fn register_histogram(&self, h: std::sync::Arc<oceanfs_core::Histogram>) {
+                self.names.lock().unwrap().push(h.name().to_string());
+            }
+        }
+
+        let dispatcher = AccelDispatcher::new(AccelConfig::default());
+        let reg = TestRegistrar { names: std::sync::Mutex::new(Vec::new()) };
+
+        dispatcher.register_metrics(&reg);
+
+        let names = reg.names.lock().unwrap();
+        assert!(
+            names.contains(&"accel_encode_duration_us".to_string()),
+            "missing encode histogram, names: {names:?}"
+        );
+        assert!(
+            names.contains(&"accel_decode_duration_us".to_string()),
+            "missing decode histogram, names: {names:?}"
+        );
+        assert!(
+            names.contains(&"accel_compress_duration_seconds".to_string()),
+            "missing compress histogram, names: {names:?}"
+        );
+        assert!(
+            names.contains(&"accel_decompress_duration_seconds".to_string()),
+            "missing decompress histogram, names: {names:?}"
+        );
+        assert!(
+            names.contains(&"accel_hash_duration_seconds".to_string()),
+            "missing hash histogram, names: {names:?}"
+        );
     }
 }

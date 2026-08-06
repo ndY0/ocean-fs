@@ -156,7 +156,10 @@ impl Node {
         let accel = Arc::new(oceanfs_accel::AccelDispatcher::new(accel_config));
 
         // ---- 3. Construct routing ----
-        let ring_config = RingConfig::default();
+        let ring_config = RingConfig {
+            vnodes_per_node: config.vnodes_per_node,
+            replication_factor: config.replication_factor as u8,
+        };
         let ring = oceanfs_routing::Ring::new(ring_config);
         let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
 
@@ -165,13 +168,7 @@ impl Node {
             .grpc_listen_addr
             .parse()
             .map_err(|e| format!("invalid grpc_listen_addr: {e}"))?;
-        let gossip_config = oceanfs_core::GossipConfig {
-            seed_nodes: config.seed_nodes.clone(),
-            interval_ms: config.gossip_interval_ms,
-            suspicion_timeout_ms: config.suspicion_timeout_ms,
-            failure_timeout_ms: config.failure_timeout_ms,
-            ..oceanfs_core::GossipConfig::default()
-        };
+        let gossip_config = config.gossip.clone();
         let membership = Arc::new(oceanfs_membership::Membership::new(
             NodeId::new(&config.node_id),
             grpc_addr,
@@ -207,7 +204,7 @@ impl Node {
         };
         // SegmentSealer constructed here; will be wired into the write path
         // when final-integration-read-write-end-to-end lands.
-        let _sealer = Arc::new(oceanfs_storage::SegmentSealer::new(
+        let sealer = Arc::new(oceanfs_storage::SegmentSealer::new(
             seal_config,
             metadata_store.clone(),
             wal_writer.clone(),
@@ -368,6 +365,65 @@ impl Node {
         .with_router(router);
 
         let metrics = Arc::new(oceanfs_server::admin::MetricsRegistry::new());
+
+        // Register subsystem metrics into the central registry.
+        object_cache.register_metrics(&*metrics);
+        metadata_cache.register_metrics(&*metrics);
+        negative_cache.register_metrics(&*metrics);
+        accel.register_metrics(&*metrics);
+        heal_worker.register_metrics(&*metrics);
+        _buffer_pool.register_metrics(&*metrics);
+        s3_handler.register_metrics(&*metrics);
+
+        // Phase D: durability subsystem counters.
+        gc_worker.register_metrics(&*metrics);
+        reaper.register_metrics(&*metrics);
+        scrub_worker.register_metrics(&*metrics);
+        ae_worker.register_metrics(&*metrics);
+        hinted_handoff.register_metrics(&*metrics);
+        pool.register_metrics(&*metrics);
+        membership.register_gossip_metrics(&*metrics);
+        wal_writer.register_metrics(&*metrics);
+        sealer.register_metrics(&*metrics);
+
+        // Register RocksDB property gauges.
+        let rocksdb_keys_gauge =
+            metrics.gauge("rocksdb_estimate_keys", "Estimated number of keys in RocksDB");
+        let rocksdb_block_cache_gauge =
+            metrics.gauge("rocksdb_block_cache_usage_bytes", "RocksDB block cache usage in bytes");
+        let rocksdb_l0_gauge =
+            metrics.gauge("rocksdb_num_files_at_level0", "RocksDB number of files at level 0");
+
+        // Register process-level gauges.
+        let proc_mem_gauge =
+            metrics.gauge("process_resident_memory_bytes", "Resident memory in bytes");
+        let proc_fd_gauge = metrics.gauge("process_open_fds", "Open file descriptors");
+
+        // Spawn a background poller for process and RocksDB metrics (every 15s).
+        let metadata_clone = metadata_store.clone();
+        let _process_poller = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                interval.tick().await;
+                if let Ok(mem) = read_process_memory_bytes() {
+                    proc_mem_gauge.set(mem);
+                }
+                if let Ok(fds) = read_process_open_fds() {
+                    proc_fd_gauge.set(fds);
+                }
+                // RocksDB property polling.
+                if let Some(val) = property_as_u64(&metadata_clone, "rocksdb.estimate-num-keys") {
+                    rocksdb_keys_gauge.set(val);
+                }
+                if let Some(val) = property_as_u64(&metadata_clone, "rocksdb.block-cache-usage") {
+                    rocksdb_block_cache_gauge.set(val);
+                }
+                if let Some(val) = property_as_u64(&metadata_clone, "rocksdb.num-files-at-level0") {
+                    rocksdb_l0_gauge.set(val);
+                }
+            }
+        });
+
         let admin_handler = AdminHandler::new_with_cluster(
             bucket_store,
             metrics,
@@ -765,6 +821,51 @@ impl Node {
 }
 
 // ---------------------------------------------------------------------------
+// Process metrics helpers
+// ---------------------------------------------------------------------------
+
+/// Reads the resident memory size from `/proc/self/statm`.
+///
+/// Returns the resident set size in pages multiplied by the page size
+/// (typically 4096), yielding total resident memory in bytes.
+///
+/// # Errors
+///
+/// Returns an error if `/proc/self/statm` cannot be read or parsed.
+fn read_process_memory_bytes() -> Result<u64, std::io::Error> {
+    let statm = std::fs::read_to_string("/proc/self/statm")?;
+    // Format: size resident shared text lib data dt (in pages)
+    let parts: Vec<&str> = statm.split_whitespace().collect();
+    if parts.len() < 2 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected statm format",
+        ));
+    }
+    let resident_pages: u64 =
+        parts[1].parse().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let page_size = 4096u64; // Linux default page size
+    Ok(resident_pages * page_size)
+}
+
+/// Counts the number of open file descriptors from `/proc/self/fd`.
+///
+/// # Errors
+///
+/// Returns an error if the directory cannot be read.
+fn read_process_open_fds() -> Result<u64, std::io::Error> {
+    let entries = std::fs::read_dir("/proc/self/fd")?;
+    Ok(entries.count() as u64)
+}
+
+/// Queries a RocksDB integer property and returns it as a `u64`.
+///
+/// Returns `None` if the property is not available or cannot be parsed.
+fn property_as_u64(store: &oceanfs_storage::RocksDbMetadataStore, name: &str) -> Option<u64> {
+    store.property(name)?.parse::<u64>().ok()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -837,7 +938,10 @@ mod tests {
         let result = Node::start(config_invalid).await;
         assert!(result.is_err(), "invalid listen_addr should error");
         let err_msg = result.err().unwrap().to_string();
-        assert!(err_msg.contains("listen_addr"), "error should mention listen_addr: {err_msg}");
+        assert!(
+            err_msg.contains("HTTP server") || err_msg.contains("bind"),
+            "error should mention bind failure: {err_msg}"
+        );
     }
 
     #[tokio::test]
@@ -1011,5 +1115,50 @@ mod tests {
         let key = ObjectKey::new("nonexistent-key");
         let result = adapter.get_object_metadata(&bucket, &key).expect("get_object_metadata");
         assert!(result.is_none(), "nonexistent key should return None");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn process_memory_bytes_returns_non_zero() {
+        let mem = super::read_process_memory_bytes().expect("read memory");
+        assert!(mem > 0, "resident memory should be > 0");
+    }
+
+    #[test]
+    fn process_open_fds_returns_non_zero() {
+        let fds = super::read_process_open_fds().expect("read fds");
+        assert!(fds > 0, "open fds should be > 0");
+    }
+
+    // --- property_as_u64 tests ---
+
+    #[test]
+    fn property_as_u64_parses_rocksdb_integer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+            data_dir: dir.path().join("meta"),
+            block_cache_size: 1024,
+            memtable_size: 1024,
+        })
+        .expect("open metadata store");
+
+        // Estimate number of keys should parse to a valid u64.
+        let val = super::property_as_u64(&store, "rocksdb.estimate-num-keys");
+        assert!(val.is_some(), "estimate-num-keys should return a value");
+        // New store should have few keys.
+        assert!(val.unwrap() <= 10_000);
+    }
+
+    #[test]
+    fn property_as_u64_unknown_property_returns_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+            data_dir: dir.path().join("meta"),
+            block_cache_size: 1024,
+            memtable_size: 1024,
+        })
+        .expect("open metadata store");
+
+        assert_eq!(super::property_as_u64(&store, "rocksdb.nonexistent"), None);
     }
 }

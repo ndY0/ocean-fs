@@ -188,6 +188,6 @@ fn object_cache_stats_reflect_operations() {
 
     let stats = cache.stats();
     // After one put, we expect at least the entry_count to be 1.
-    let count = stats.entry_count.load(std::sync::atomic::Ordering::Relaxed);
+    let count = stats.entry_count.get();
     assert!(count >= 1);
 }

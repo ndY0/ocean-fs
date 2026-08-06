@@ -9,6 +9,7 @@
 //! re-exports their public API. Downstream consumers continue to write
 //! `use oceanfs_core::types::SegmentId` with zero changes.
 
+mod bucket;
 mod cache;
 mod codec;
 mod config;
@@ -20,6 +21,8 @@ mod node;
 
 // --- Identifier types ---
 // --- Cache types ---
+// --- Bucket policy types ---
+pub use bucket::BucketPolicy;
 pub use cache::CacheInvalidateRequest;
 // --- Codec types ---
 pub use codec::{CodecConfig, CodecType, EncodingPlan};

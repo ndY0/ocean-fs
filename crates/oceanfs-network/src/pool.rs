@@ -15,7 +15,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use oceanfs_core::RpcConfig;
+use oceanfs_core::{Counter, Gauge, LabelSet, MetricRegistrar, RpcConfig};
 use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::transport::{Channel, Endpoint};
@@ -104,12 +104,33 @@ struct PeerPool {
 pub struct ConnectionPool {
     config: RpcConfig,
     peers: DashMap<SocketAddr, Arc<PeerPool>>,
+    connection_errors_total: Counter,
+    connections_active: Gauge,
 }
 
 impl ConnectionPool {
     /// Creates a new connection pool with the given configuration.
     pub fn new(config: RpcConfig) -> Self {
-        Self { config, peers: DashMap::new() }
+        Self {
+            config,
+            peers: DashMap::new(),
+            connection_errors_total: Counter::new(
+                "grpc_connection_errors_total".into(),
+                "gRPC connection errors".into(),
+                LabelSet::empty(),
+            ),
+            connections_active: Gauge::new(
+                "grpc_connections_active".into(),
+                "Active gRPC peer connections".into(),
+                LabelSet::empty(),
+            ),
+        }
+    }
+
+    /// Registers connection pool metrics with a registrar.
+    pub fn register_metrics(&self, registrar: &dyn MetricRegistrar) {
+        registrar.register_counter(self.connection_errors_total.clone());
+        registrar.register_gauge(self.connections_active.clone());
     }
 
     /// Acquires a channel for the given peer.
@@ -125,10 +146,17 @@ impl ConnectionPool {
     /// semaphore is exhausted (should not normally happen with async
     /// semaphore — it waits).
     pub async fn get_channel(&self, peer: SocketAddr) -> Result<PooledChannel> {
-        let pool = self.get_or_create_pool(peer).await?;
+        let pool = match self.get_or_create_pool(peer).await {
+            Ok(p) => p,
+            Err(e) => {
+                self.connection_errors_total.inc();
+                return Err(e);
+            }
+        };
 
         // Acquire a permit — this waits if all channels are in use.
-        let permit = pool.semaphore.clone().acquire_owned().await.map_err(|_| {
+        let permit = pool.semaphore.clone().acquire_owned().await.map_err(|_e| {
+            self.connection_errors_total.inc();
             Error::NoAvailableChannel(peer.to_string(), self.config.pool_size_per_peer)
         })?;
 
@@ -273,5 +301,16 @@ mod tests {
         let pool = ConnectionPool::new(config);
         assert_eq!(pool.config().pool_size_per_peer, 8);
         assert_eq!(pool.config().keepalive_sec, 60);
+    }
+
+    #[test]
+    fn connection_pool_metrics_initialized() {
+        let config = RpcConfig::default();
+        let pool = ConnectionPool::new(config);
+        assert_eq!(pool.connection_errors_total.get(), 0);
+
+        pool.connection_errors_total.inc();
+        pool.connection_errors_total.inc();
+        assert_eq!(pool.connection_errors_total.get(), 2);
     }
 }

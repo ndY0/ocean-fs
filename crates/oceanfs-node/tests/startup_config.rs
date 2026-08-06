@@ -22,7 +22,7 @@ fn default_config_has_sensible_values() {
     assert_eq!(cfg.node_id, "node-1");
     assert_eq!(cfg.listen_addr, "0.0.0.0:9000");
     assert_eq!(cfg.grpc_listen_addr, "0.0.0.0:9001");
-    assert!(cfg.seed_nodes.is_empty());
+    assert!(cfg.gossip.seed_nodes.is_empty());
     assert_eq!(cfg.log_level, "info");
     assert!(cfg.metrics_enabled);
 }
@@ -34,10 +34,12 @@ fn config_deserializes_from_toml() {
         node_id = "test-node"
         listen_addr = "127.0.0.1:8080"
         grpc_listen_addr = "127.0.0.1:8081"
-        seed_nodes = ["peer1:9000", "peer2:9000"]
         log_level = "debug"
         metrics_enabled = false
         metrics_listen_addr = "0.0.0.0:9999"
+
+        [gossip]
+        seed_nodes = ["peer1:9000", "peer2:9000"]
     "#;
     let path = write_temp_toml(tmp.path(), toml_content);
 
@@ -46,7 +48,7 @@ fn config_deserializes_from_toml() {
     assert_eq!(cfg.node_id, "test-node");
     assert_eq!(cfg.listen_addr, "127.0.0.1:8080");
     assert_eq!(cfg.grpc_listen_addr, "127.0.0.1:8081");
-    assert_eq!(cfg.seed_nodes, vec!["peer1:9000", "peer2:9000"]);
+    assert_eq!(cfg.gossip.seed_nodes, vec!["peer1:9000", "peer2:9000"]);
     assert_eq!(cfg.log_level, "debug");
     assert!(!cfg.metrics_enabled);
 }

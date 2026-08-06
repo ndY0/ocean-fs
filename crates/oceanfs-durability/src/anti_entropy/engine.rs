@@ -6,7 +6,9 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use oceanfs_core::{HashOutput, NodeState, SegmentId, SegmentMetadata};
+use oceanfs_core::{
+    Counter, HashOutput, LabelSet, MetricRegistrar, NodeState, SegmentId, SegmentMetadata,
+};
 use oceanfs_ec::{CauchyEncoder, Decoder, Encoder};
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
@@ -62,6 +64,8 @@ pub struct AntiEntropy {
     /// Connection pool for peer-to-peer gRPC Merkle exchange.
     pool: Arc<ConnectionPool>,
     segment_store: Arc<dyn SegmentDataStore>,
+    segments_compared_total: Counter,
+    mismatches_found_total: Counter,
 }
 
 impl AntiEntropy {
@@ -81,7 +85,29 @@ impl AntiEntropy {
         pool: Arc<ConnectionPool>,
         segment_store: Arc<dyn SegmentDataStore>,
     ) -> Self {
-        Self { config, membership, metadata, pool, segment_store }
+        Self {
+            config,
+            membership,
+            metadata,
+            pool,
+            segment_store,
+            segments_compared_total: Counter::new(
+                "ae_segments_compared_total".into(),
+                "Segments compared by anti-entropy".into(),
+                LabelSet::empty(),
+            ),
+            mismatches_found_total: Counter::new(
+                "ae_mismatches_found_total".into(),
+                "Mismatches found by anti-entropy".into(),
+                LabelSet::empty(),
+            ),
+        }
+    }
+
+    /// Registers anti-entropy counters with a metrics registrar.
+    pub fn register_metrics(&self, registrar: &dyn MetricRegistrar) {
+        registrar.register_counter(self.segments_compared_total.clone());
+        registrar.register_counter(self.mismatches_found_total.clone());
     }
 
     /// Returns a reference to the configuration.
@@ -192,6 +218,9 @@ impl AntiEntropy {
             repaired = stats.leaves_repaired,
             "anti-entropy cycle complete"
         );
+
+        self.segments_compared_total.add(stats.segments_compared);
+        self.mismatches_found_total.add(stats.mismatches_found);
 
         Ok(stats)
     }
@@ -1477,5 +1506,17 @@ mod tests {
 
         // Intact data should require no repair
         assert_eq!(repaired, 0);
+    }
+
+    #[test]
+    fn ae_counter_type_works() {
+        use oceanfs_core::{Counter, LabelSet};
+
+        let c = Counter::new("ae_segments_compared_total".into(), "help".into(), LabelSet::empty());
+        assert_eq!(c.get(), 0);
+        c.add(10);
+        assert_eq!(c.get(), 10);
+        c.inc();
+        assert_eq!(c.get(), 11);
     }
 }

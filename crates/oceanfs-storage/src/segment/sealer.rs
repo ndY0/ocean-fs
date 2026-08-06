@@ -6,7 +6,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use oceanfs_core::SegmentMetadata;
+use oceanfs_core::{Counter, LabelSet, SegmentMetadata};
 #[cfg(test)]
 use oceanfs_core::{SegmentSizeConfig, SizeTier};
 use oceanfs_hash::Blake3Hasher;
@@ -40,6 +40,8 @@ pub struct SegmentSealer {
     config: SealConfig,
     metadata: Arc<RocksDbMetadataStore>,
     wal: Arc<WalWriter>,
+    /// Segment seal error counter.
+    seal_errors: Counter,
 }
 
 impl SegmentSealer {
@@ -49,7 +51,16 @@ impl SegmentSealer {
         metadata: Arc<RocksDbMetadataStore>,
         wal: Arc<WalWriter>,
     ) -> Self {
-        Self { config, metadata, wal }
+        Self {
+            config,
+            metadata,
+            wal,
+            seal_errors: Counter::new(
+                "segment_seal_errors_total".into(),
+                "Number of segment sealing failures".into(),
+                LabelSet::empty(),
+            ),
+        }
     }
 
     /// Attempts to seal an active segment.
@@ -81,7 +92,11 @@ impl SegmentSealer {
             return Ok(None);
         }
 
-        self.seal(active, entries).await.map(Some)
+        let result = self.seal(active, entries).await;
+        if result.is_err() {
+            self.seal_errors.inc();
+        }
+        result.map(Some)
     }
 
     /// Seals an active segment unconditionally.
@@ -148,6 +163,11 @@ impl SegmentSealer {
         self.wal.truncate(wal_pos).await?;
 
         Ok(SegmentHandle::new(segment_id, vec![]))
+    }
+
+    /// Registers the segment sealer counter with a metrics registrar.
+    pub fn register_metrics(&self, registrar: &dyn oceanfs_core::MetricRegistrar) {
+        registrar.register_counter(self.seal_errors.clone());
     }
 }
 
@@ -262,5 +282,34 @@ mod tests {
         // Empty segment should not seal.
         let result = sealer.try_seal(&mut active, 2000, &[]).await.unwrap();
         assert!(result.is_none());
+    }
+
+    // --- Metrics tests ---
+
+    #[tokio::test]
+    async fn register_metrics_registers_seal_errors() {
+        use oceanfs_core::MetricRegistrar;
+
+        struct TestRegistrar {
+            counter_names: std::sync::Mutex<Vec<String>>,
+        }
+        impl MetricRegistrar for TestRegistrar {
+            fn register_counter(&self, counter: oceanfs_core::Counter) {
+                self.counter_names.lock().unwrap().push(counter.name().to_string());
+            }
+            fn register_gauge(&self, _: oceanfs_core::Gauge) {}
+            fn register_histogram(&self, _: std::sync::Arc<oceanfs_core::Histogram>) {}
+        }
+
+        let (sealer, _active, _entries, _dir) = setup().await;
+        let reg = TestRegistrar { counter_names: std::sync::Mutex::new(Vec::new()) };
+
+        sealer.register_metrics(&reg);
+
+        let names = reg.counter_names.lock().unwrap();
+        assert!(
+            names.contains(&"segment_seal_errors_total".to_string()),
+            "seal_errors counter should be registered, got: {names:?}"
+        );
     }
 }

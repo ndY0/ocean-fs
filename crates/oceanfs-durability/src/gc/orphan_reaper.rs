@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use oceanfs_core::SegmentId;
+use oceanfs_core::{Counter, LabelSet, MetricRegistrar, SegmentId};
 use oceanfs_storage::{metadata::RocksDbMetadataStore, Result};
 
 use super::{config::GcConfig, garbage_collector::SegmentShardStore};
@@ -49,6 +49,8 @@ pub struct OrphanReaper {
     metadata: Arc<RocksDbMetadataStore>,
     store: Arc<dyn SegmentShardStore>,
     config: GcConfig,
+    orphans_deleted_total: Counter,
+    bytes_reclaimed_total: Counter,
 }
 
 impl OrphanReaper {
@@ -64,7 +66,27 @@ impl OrphanReaper {
         store: Arc<dyn SegmentShardStore>,
         config: GcConfig,
     ) -> Self {
-        Self { metadata, store, config }
+        Self {
+            metadata,
+            store,
+            config,
+            orphans_deleted_total: Counter::new(
+                "orphan_segments_reaped_total".into(),
+                "Orphan segments deleted".into(),
+                LabelSet::empty(),
+            ),
+            bytes_reclaimed_total: Counter::new(
+                "orphan_bytes_reclaimed_total".into(),
+                "Bytes reclaimed from orphan deletion".into(),
+                LabelSet::empty(),
+            ),
+        }
+    }
+
+    /// Registers all orphan reaper counters with a metrics registrar.
+    pub fn register_metrics(&self, registrar: &dyn MetricRegistrar) {
+        registrar.register_counter(self.orphans_deleted_total.clone());
+        registrar.register_counter(self.bytes_reclaimed_total.clone());
     }
 
     /// Runs a single orphan reaper cycle.
@@ -150,6 +172,9 @@ impl OrphanReaper {
                 tracing::info!(segment_id = %segment_id, "reclaimed orphan segment");
             }
         }
+
+        self.orphans_deleted_total.add(stats.orphans_deleted);
+        self.bytes_reclaimed_total.add(stats.bytes_reclaimed);
 
         Ok(stats)
     }
@@ -701,5 +726,22 @@ mod tests {
         assert!(!dead_keys.contains("recently_deleted.txt"));
         // And the chunk should NOT be marked dead
         assert_eq!(tracker.dead_bytes_for(&seg_id), 0);
+    }
+
+    // --- Metrics tests ---
+
+    #[test]
+    fn orphan_reaper_metrics_created_and_increment() {
+        let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let store = test_shard_store();
+        let reaper = OrphanReaper::new(metadata, store, GcConfig::default());
+        assert_eq!(reaper.orphans_deleted_total.get(), 0);
+        assert_eq!(reaper.bytes_reclaimed_total.get(), 0);
+
+        reaper.orphans_deleted_total.add(5);
+        reaper.bytes_reclaimed_total.add(4096);
+
+        assert_eq!(reaper.orphans_deleted_total.get(), 5);
+        assert_eq!(reaper.bytes_reclaimed_total.get(), 4096);
     }
 }

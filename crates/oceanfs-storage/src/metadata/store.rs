@@ -535,6 +535,24 @@ impl RocksDbMetadataStore {
 
         Ok(())
     }
+
+    /// Queries a RocksDB property by name.
+    ///
+    /// Returns `None` if RocksDB does not support the property.  See the
+    /// [RocksDB header][1] for the list of built-in properties such as
+    /// `"rocksdb.estimate-num-keys"`, `"rocksdb.block-cache-usage"`, and
+    /// `"rocksdb.num-files-at-level<N>"`.
+    ///
+    /// [1]: https://github.com/facebook/rocksdb/blob/main/include/rocksdb/db.h
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let val = store.property("rocksdb.estimate-num-keys");
+    /// ```
+    pub fn property(&self, name: &str) -> Option<String> {
+        self.db.property_value(name).ok().flatten()
+    }
 }
 
 /// An operation in a batch write.
@@ -668,5 +686,24 @@ mod tests {
     fn no_tombstone_for_nonexistent_key() {
         let store = RocksDbMetadataStore::open(&test_config()).unwrap();
         assert!(!store.has_tombstone(&BucketId::new("default"), &ObjectKey::new("nope")).unwrap());
+    }
+
+    // --- RocksDB property tests ---
+
+    #[test]
+    fn property_unknown_returns_none() {
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        assert_eq!(store.property("rocksdb.nonexistent-property"), None);
+    }
+
+    #[test]
+    fn property_estimate_num_keys_works() {
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        // A newly opened store should have zero or some keys from internal
+        // column families.
+        let val = store.property("rocksdb.estimate-num-keys");
+        assert!(val.is_some(), "estimate-num-keys should be available");
+        let num: u64 = val.unwrap().parse().unwrap();
+        assert!(num <= 1000, "new store should have few keys, got {num}");
     }
 }

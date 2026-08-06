@@ -1,10 +1,11 @@
 //! Heal pipeline types.
 //!
 //! Types for the EC heal dispatch pipeline: `HealRequest` (corrupt shard
-//! repair request), `HealStats` (atomic diagnostic counters), and
+//! repair request), `HealStats` (registrable metric counters), and
 //! `ShardIndex` (index into a k+m shard set).
 
 use super::id::SegmentId;
+use crate::metrics::{Counter, LabelSet, MetricRegistrar};
 
 // ---------------------------------------------------------------------------
 // ShardIndex
@@ -49,76 +50,113 @@ impl From<ShardIndex> for u8 {
 // HealStats
 // ---------------------------------------------------------------------------
 
-/// Atomic statistics for the heal pipeline.
+/// Registrable counters for the heal pipeline.
 ///
-/// All counters use [`std::sync::atomic::Ordering::Relaxed`] because precise
-/// ordering is not required for diagnostic counters — only approximate
-/// observability matters (perf rule 11.1).
+/// All fields are [`Counter`] — they can be wired into a central
+/// metrics registry via [`register_metrics`](HealStats::register_metrics).
 ///
 /// # Examples
 ///
 /// ```
 /// use oceanfs_core::HealStats;
 ///
-/// let stats = HealStats::default();
+/// let stats = HealStats::new();
 /// assert_eq!(stats.heals_attempted(), 0);
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct HealStats {
     /// Total number of heal attempts (includes retries).
-    heals_attempted: std::sync::atomic::AtomicU64,
+    pub heals_attempted: Counter,
     /// Heals that completed successfully.
-    heals_succeeded: std::sync::atomic::AtomicU64,
+    pub heals_succeeded: Counter,
     /// Heals that exhausted all retries and failed.
-    heals_failed: std::sync::atomic::AtomicU64,
+    pub heals_failed: Counter,
     /// Total bytes repaired across all successful heals.
-    bytes_repaired: std::sync::atomic::AtomicU64,
+    pub bytes_repaired: Counter,
 }
 
 impl HealStats {
+    /// Creates new heal statistics with unregistered counters.
+    ///
+    /// Use [`register_metrics`](Self::register_metrics) to wire them
+    /// into a registry.
+    pub fn new() -> Self {
+        Self {
+            heals_attempted: Counter::new(
+                "heal_requests_total".into(),
+                "Total heal requests attempted".into(),
+                LabelSet::empty(),
+            ),
+            heals_succeeded: Counter::new(
+                "heal_completed_total".into(),
+                "Heals completed successfully".into(),
+                LabelSet::empty(),
+            ),
+            heals_failed: Counter::new(
+                "heal_failed_total".into(),
+                "Heals that exhausted all retries".into(),
+                LabelSet::empty(),
+            ),
+            bytes_repaired: Counter::new(
+                "heal_bytes_repaired_total".into(),
+                "Total bytes repaired across successful heals".into(),
+                LabelSet::empty(),
+            ),
+        }
+    }
+
+    /// Registers all heal counters with a metrics registrar.
+    pub fn register_metrics(&self, registrar: &dyn MetricRegistrar) {
+        registrar.register_counter(self.heals_attempted.clone());
+        registrar.register_counter(self.heals_succeeded.clone());
+        registrar.register_counter(self.heals_failed.clone());
+        registrar.register_counter(self.bytes_repaired.clone());
+    }
+
     /// Returns the total number of heal attempts.
     pub fn heals_attempted(&self) -> u64 {
-        self.heals_attempted.load(std::sync::atomic::Ordering::Relaxed)
+        self.heals_attempted.get()
     }
 
     /// Returns the number of successful heal completions.
     pub fn heals_succeeded(&self) -> u64 {
-        self.heals_succeeded.load(std::sync::atomic::Ordering::Relaxed)
+        self.heals_succeeded.get()
     }
 
     /// Returns the number of heals that failed after exhausting retries.
     pub fn heals_failed(&self) -> u64 {
-        self.heals_failed.load(std::sync::atomic::Ordering::Relaxed)
+        self.heals_failed.get()
     }
 
     /// Returns the total bytes repaired across all successful heals.
     pub fn bytes_repaired(&self) -> u64 {
-        self.bytes_repaired.load(std::sync::atomic::Ordering::Relaxed)
+        self.bytes_repaired.get()
     }
 
     /// Increments the attempts counter by one.
     pub fn inc_attempted(&self) {
-        self.heals_attempted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.heals_attempted.inc();
     }
 
     /// Increments the succeeded counter by one.
     pub fn inc_succeeded(&self) {
-        self.heals_succeeded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.heals_succeeded.inc();
     }
 
     /// Increments the failed counter by one.
     pub fn inc_failed(&self) {
-        self.heals_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.heals_failed.inc();
     }
 
     /// Adds the given number of bytes to the repaired counter.
     pub fn add_bytes_repaired(&self, bytes: u64) {
-        self.bytes_repaired.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        self.bytes_repaired.add(bytes);
     }
+}
 
-    /// Creates a new [`HealStats`] with all counters initialized to zero.
-    pub fn new() -> Self {
-        Self::default()
+impl Default for HealStats {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -128,28 +166,71 @@ impl HealStats {
 
 /// A request to repair one or more corrupt shards of a segment.
 ///
-/// Submitted to the `HealQueue` by Scrub and Anti-Entropy when
-/// corruption is detected. The `HealWorker` drains these requests
-/// and coordinates EC-based repair.
-///
-/// # Examples
-///
-/// ```
-/// use oceanfs_core::{HealRequest, SegmentId};
-///
-/// let request = HealRequest {
-///     segment_id: SegmentId::new(),
-///     corrupt_shard_indices: vec![2],
-///     retry_count: 0,
-/// };
-/// assert_eq!(request.retry_count, 0);
-/// ```
+/// Generated by scrub or anti-entropy when a shard fails its
+/// integrity check (checksum mismatch, Merkle proof failure).
 #[derive(Debug, Clone)]
 pub struct HealRequest {
-    /// The segment that needs repair.
+    /// The segment containing the corrupt shard(s).
     pub segment_id: SegmentId,
-    /// Indices of the corrupt shards within the k+m shard set.
+    /// Indices of the shards that need repair.
     pub corrupt_shard_indices: Vec<usize>,
-    /// Number of previous attempts (0 = first attempt).
+    /// Number of times this request has already been retried.
     pub retry_count: u32,
+}
+
+impl HealRequest {
+    /// Returns true if this request has already been retried the maximum allowed times.
+    pub fn exhausted(&self, limit: u32) -> bool {
+        self.retry_count >= limit
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heal_stats_start_at_zero() {
+        let stats = HealStats::new();
+        assert_eq!(stats.heals_attempted(), 0);
+        assert_eq!(stats.heals_succeeded(), 0);
+        assert_eq!(stats.heals_failed(), 0);
+        assert_eq!(stats.bytes_repaired(), 0);
+    }
+
+    #[test]
+    fn heal_stats_increment_attempted() {
+        let stats = HealStats::new();
+        stats.inc_attempted();
+        stats.inc_attempted();
+        assert_eq!(stats.heals_attempted(), 2);
+    }
+
+    #[test]
+    fn heal_stats_increment_succeeded() {
+        let stats = HealStats::new();
+        stats.inc_succeeded();
+        assert_eq!(stats.heals_succeeded(), 1);
+    }
+
+    #[test]
+    fn heal_stats_add_bytes() {
+        let stats = HealStats::new();
+        stats.add_bytes_repaired(1024);
+        stats.add_bytes_repaired(2048);
+        assert_eq!(stats.bytes_repaired(), 3072);
+    }
+
+    #[test]
+    fn heal_request_exhausted_checks_limit() {
+        let mut req = HealRequest {
+            segment_id: SegmentId::new(),
+            corrupt_shard_indices: vec![0],
+            retry_count: 0,
+        };
+        assert!(!req.exhausted(3));
+        req.retry_count = 3;
+        assert!(req.exhausted(3));
+    }
 }

@@ -18,7 +18,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use oceanfs_core::{Hlc, NodeId, OperationTimeouts, SegmentId};
+use oceanfs_core::{Counter, Hlc, LabelSet, MetricRegistrar, NodeId, OperationTimeouts, SegmentId};
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use parking_lot::RwLock;
@@ -78,6 +78,9 @@ pub struct HintedHandoff {
     pool: Arc<ConnectionPool>,
     /// Membership for resolving node addresses.
     membership: Option<Arc<Membership>>,
+    hints_stored_total: Counter,
+    hints_delivered_total: Counter,
+    hints_expired_total: Counter,
 }
 
 impl HintedHandoff {
@@ -86,13 +89,50 @@ impl HintedHandoff {
         pool: Arc<ConnectionPool>,
         membership: Option<Arc<Membership>>,
     ) -> Self {
-        Self { hints: RwLock::new(HashMap::new()), pool, membership }
+        Self {
+            hints: RwLock::new(HashMap::new()),
+            pool,
+            membership,
+            hints_stored_total: Counter::new(
+                "hinted_handoff_hints_stored_total".into(),
+                "Hints stored for unreachable nodes".into(),
+                LabelSet::empty(),
+            ),
+            hints_delivered_total: Counter::new(
+                "hinted_handoff_hints_delivered_total".into(),
+                "Hints delivered to returning nodes".into(),
+                LabelSet::empty(),
+            ),
+            hints_expired_total: Counter::new(
+                "hinted_handoff_hints_expired_total".into(),
+                "Hints expired before delivery".into(),
+                LabelSet::empty(),
+            ),
+        }
     }
 
     /// Creates a new empty hinted handoff buffer (without a connection pool).
-    /// Used primarily for testing.
     pub fn new_with_pool(pool: Arc<ConnectionPool>) -> Self {
-        Self { hints: RwLock::new(HashMap::new()), pool, membership: None }
+        Self {
+            hints: RwLock::new(HashMap::new()),
+            pool,
+            membership: None,
+            hints_stored_total: Counter::new(
+                "hinted_handoff_hints_stored_total".into(),
+                "help".into(),
+                LabelSet::empty(),
+            ),
+            hints_delivered_total: Counter::new(
+                "hinted_handoff_hints_delivered_total".into(),
+                "help".into(),
+                LabelSet::empty(),
+            ),
+            hints_expired_total: Counter::new(
+                "hinted_handoff_hints_expired_total".into(),
+                "help".into(),
+                LabelSet::empty(),
+            ),
+        }
     }
 
     /// Creates a new empty hinted handoff buffer (without a connection pool).
@@ -102,7 +142,29 @@ impl HintedHandoff {
             hints: RwLock::new(HashMap::new()),
             pool: Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default())),
             membership: None,
+            hints_stored_total: Counter::new(
+                "hinted_handoff_hints_stored_total".into(),
+                "help".into(),
+                LabelSet::empty(),
+            ),
+            hints_delivered_total: Counter::new(
+                "hinted_handoff_hints_delivered_total".into(),
+                "help".into(),
+                LabelSet::empty(),
+            ),
+            hints_expired_total: Counter::new(
+                "hinted_handoff_hints_expired_total".into(),
+                "help".into(),
+                LabelSet::empty(),
+            ),
         }
+    }
+
+    /// Registers hinted handoff counters with a metrics registrar.
+    pub fn register_metrics(&self, registrar: &dyn MetricRegistrar) {
+        registrar.register_counter(self.hints_stored_total.clone());
+        registrar.register_counter(self.hints_delivered_total.clone());
+        registrar.register_counter(self.hints_expired_total.clone());
     }
 
     /// Stores a hinted write for a temporarily unreachable node.
@@ -142,6 +204,7 @@ impl HintedHandoff {
             let pending = hints.entry(intended_for.clone()).or_default();
             pending.push(entry);
         }
+        self.hints_stored_total.inc();
 
         info!(
             intended_for = %intended_for,
@@ -215,6 +278,8 @@ impl HintedHandoff {
                 }
             }
         }
+
+        self.hints_delivered_total.add(delivered as u64);
 
         Ok(delivered)
     }
@@ -577,5 +642,20 @@ mod tests {
         let delivered2 = hh.deliver_pending(node_id.clone()).await.unwrap();
         assert_eq!(delivered2, 0, "retry should also fail");
         assert_eq!(hh.pending_count(&node_id), 1, "hints still retained after retry failure");
+    }
+
+    #[test]
+    fn hinted_handoff_metrics_initialized() {
+        let hh = HintedHandoff::new();
+        assert_eq!(hh.hints_stored_total.get(), 0);
+        assert_eq!(hh.hints_delivered_total.get(), 0);
+        assert_eq!(hh.hints_expired_total.get(), 0);
+
+        hh.hints_stored_total.inc();
+        hh.hints_stored_total.inc();
+        hh.hints_delivered_total.add(5);
+
+        assert_eq!(hh.hints_stored_total.get(), 2);
+        assert_eq!(hh.hints_delivered_total.get(), 5);
     }
 }

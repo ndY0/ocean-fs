@@ -13,10 +13,9 @@
     missing_docs
 )]
 
-mod config;
-
 use std::process;
 
+use oceanfs::config;
 use oceanfs_node::Node;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;

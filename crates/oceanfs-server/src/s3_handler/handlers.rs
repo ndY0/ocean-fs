@@ -42,6 +42,7 @@ pub(crate) async fn put_object(
     Path((bucket, key)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
+    state.s3_put_counter.inc();
     let bucket_id = BucketId::new(&bucket);
     let object_key = ObjectKey::new(&key);
 
@@ -169,6 +170,7 @@ pub(crate) async fn get_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
 ) -> Response {
+    state.s3_get_counter.inc();
     // When key is empty, this is a bucket listing request (GET /{bucket}).
     // Route the request to list_objects handler.
     if key.is_empty() {
@@ -334,6 +336,7 @@ pub(crate) async fn head_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
 ) -> Response {
+    state.s3_head_counter.inc();
     let bucket_id = BucketId::new(&bucket);
     let object_key = ObjectKey::new(&key);
 
@@ -398,6 +401,7 @@ pub(crate) async fn delete_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
 ) -> Response {
+    state.s3_delete_counter.inc();
     let bucket_id = BucketId::new(&bucket);
     let object_key = ObjectKey::new(&key);
 
@@ -470,6 +474,7 @@ pub(crate) async fn list_objects(
     Path(bucket): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    state.s3_list_counter.inc();
     let bucket_id = BucketId::new(&bucket);
     let prefix = params.get("prefix").map(|s| s.as_str()).unwrap_or("");
 

@@ -57,7 +57,8 @@ pub enum SizeTier {
 /// assert_eq!(config.inline_threshold_bytes, 4096);
 /// assert_eq!(config.small_threshold_bytes, 262144);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SegmentSizeConfig {
     /// Maximum blob size for inline storage (default 4 KB).
     pub inline_threshold_bytes: u64,
@@ -105,7 +106,8 @@ impl SegmentSizeConfig {
 // ---------------------------------------------------------------------------
 
 /// Configuration for the SWIM gossip membership protocol.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct GossipConfig {
     /// Interval between gossip rounds in milliseconds.
     pub interval_ms: u64,
@@ -147,7 +149,8 @@ impl Default for GossipConfig {
 /// let config = RpcConfig::default();
 /// assert_eq!(config.pool_size_per_peer, 4);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct RpcConfig {
     /// Number of gRPC channels to maintain per peer node.
     pub pool_size_per_peer: usize,
@@ -194,7 +197,8 @@ impl Default for RpcConfig {
 /// assert_eq!(config.active_pool_size, 4);
 /// assert_eq!(config.shard_count, 4);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct PoolConfig {
     /// Number of active segments per shard (default 4).
     /// More pool slots allow concurrent appends while segments are being sealed.
@@ -284,7 +288,8 @@ pub enum CompressionTier {
 /// assert_eq!(config.device_id, 0);
 /// assert_eq!(config.batch_size, 64);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct GpuConfig {
     /// CUDA device index (default 0).
     pub device_id: usize,
@@ -331,7 +336,7 @@ impl Default for GpuConfig {
 /// assert_eq!(config.tier, CompressionTier::Auto);
 /// assert_eq!(config.level, 3);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompressConfig {
     /// Compression tier to use: Auto, CpuZstd, CpuIgzip, or GpuNvcomp.
     pub tier: CompressionTier,
@@ -357,7 +362,7 @@ impl Default for CompressConfig {
 ///
 /// let codec = NvcompCodec::Lz4;
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum NvcompCodec {
     /// LZ4 compression (fast, moderate ratio).
@@ -379,7 +384,8 @@ pub enum NvcompCodec {
 /// assert_eq!(config.codec, NvcompCodec::Lz4);
 /// assert_eq!(config.batch_size, 16);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct NvcompConfig {
     /// Compression codec to use (default: LZ4).
     pub codec: NvcompCodec,
@@ -412,7 +418,8 @@ impl Default for NvcompConfig {
 /// let config = HealConfig::default();
 /// assert_eq!(config.max_concurrent_heals(), 4);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct HealConfig {
     /// Maximum number of concurrent heal operations (bounded via semaphore).
     max_concurrent_heals: usize,

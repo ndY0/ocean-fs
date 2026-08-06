@@ -29,6 +29,7 @@ mod config;
 mod conflict;
 mod error;
 mod hlc;
+pub mod metrics;
 mod timeouts;
 mod types;
 
@@ -61,13 +62,17 @@ pub use config::{
 pub use conflict::{ConflictResolver, LwwResolver, Resolution};
 pub use error::{Error, Result};
 pub use hlc::{Hlc, HlcClock};
+pub use metrics::{
+    sub_millisecond_histogram_config, validate_counter_name, Counter, Gauge, Histogram,
+    HistogramConfig, LabelSet, MetricRegistrar,
+};
 pub use proto_convert::ConversionError;
 pub use timeouts::OperationTimeouts;
 pub use types::{
-    BucketId, CacheInvalidateRequest, ChunkRef, CodecConfig, CodecType, CompressConfig,
-    CompressionTier, EncodingPlan, GossipConfig, GpuConfig, HashKey, HashOutput, HealConfig,
-    HealRequest, HealStats, Incarnation, IntendedFor, NodeId, NodeState, NvcompCodec, NvcompConfig,
-    ObjectKey, ObjectMetadata, OperationType, PeerAddress, PoolConfig, RpcConfig, SegmentId,
-    SegmentIndexEntry, SegmentMetadata, SegmentSizeConfig, ShardIndex, SizeTier, StorageLocation,
-    Tombstone, VnodeRange, WriteAck, WriteQuorum, WriteResult,
+    BucketId, BucketPolicy, CacheInvalidateRequest, ChunkRef, CodecConfig, CodecType,
+    CompressConfig, CompressionTier, EncodingPlan, GossipConfig, GpuConfig, HashKey, HashOutput,
+    HealConfig, HealRequest, HealStats, Incarnation, IntendedFor, NodeId, NodeState, NvcompCodec,
+    NvcompConfig, ObjectKey, ObjectMetadata, OperationType, PeerAddress, PoolConfig, RpcConfig,
+    SegmentId, SegmentIndexEntry, SegmentMetadata, SegmentSizeConfig, ShardIndex, SizeTier,
+    StorageLocation, Tombstone, VnodeRange, WriteAck, WriteQuorum, WriteResult,
 };

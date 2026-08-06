@@ -7,14 +7,11 @@
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
-    sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::Arc,
 };
 
 use dashmap::DashMap;
-use oceanfs_core::{BucketId, ObjectKey};
+use oceanfs_core::{BucketId, Counter, Gauge, LabelSet, MetricRegistrar, ObjectKey};
 use oceanfs_storage_api::MetadataStore;
 use parking_lot::RwLock;
 
@@ -43,16 +40,16 @@ impl Default for NegativeCacheConfig {
 }
 
 /// Statistics for the negative cache.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct NegativeCacheStats {
     /// Correctly predicted missing keys (filter said "definitely absent").
-    pub hits: AtomicU64,
+    pub hits: Counter,
     /// False positives (filter said "maybe present" but key was absent).
-    pub false_positives: AtomicU64,
+    pub false_positives: Counter,
     /// Number of rebuilds performed.
-    pub rebuilds: AtomicU64,
+    pub rebuilds: Counter,
     /// Current number of entries across all bucket filters.
-    pub entry_count: AtomicUsize,
+    pub entry_count: Gauge,
 }
 
 /// A Bloom filter with configurable false-positive rate.
@@ -147,7 +144,32 @@ pub struct NegativeCache {
 impl NegativeCache {
     /// Creates a new negative cache with the given configuration.
     pub fn new(config: NegativeCacheConfig) -> Self {
-        Self { config, buckets: DashMap::new(), stats: NegativeCacheStats::default() }
+        Self {
+            config,
+            buckets: DashMap::new(),
+            stats: NegativeCacheStats {
+                hits: Counter::new(
+                    "cache_hits_total".into(),
+                    "L3 cache hits".into(),
+                    LabelSet::new(&[("tier", "l3")]),
+                ),
+                false_positives: Counter::new(
+                    "cache_false_positives_total".into(),
+                    "L3 cache false positives".into(),
+                    LabelSet::empty(),
+                ),
+                rebuilds: Counter::new(
+                    "cache_rebuilds_total".into(),
+                    "L3 cache rebuilds".into(),
+                    LabelSet::empty(),
+                ),
+                entry_count: Gauge::new(
+                    "cache_entry_count".into(),
+                    "L3 cache entry count".into(),
+                    LabelSet::empty(),
+                ),
+            },
+        }
     }
 
     /// Returns `true` if the key MAY exist (possible false positive).
@@ -168,7 +190,7 @@ impl NegativeCache {
         let result = bucket_cache.filter.read().contains(bucket, key);
         if !result {
             // Definitely absent — record as a hit for the negative cache.
-            self.stats.hits.fetch_add(1, Ordering::Relaxed);
+            self.stats.hits.inc();
         }
         result
     }
@@ -186,7 +208,7 @@ impl NegativeCache {
             .clone();
 
         bucket_cache.filter.write().insert(bucket, key);
-        self.stats.entry_count.fetch_add(1, Ordering::Relaxed);
+        self.stats.entry_count.inc();
     }
 
     /// Rebuilds the bucket's Bloom filter from the metadata store.
@@ -218,18 +240,26 @@ impl NegativeCache {
             }
         }
 
-        self.stats.rebuilds.fetch_add(1, Ordering::Relaxed);
+        self.stats.rebuilds.inc();
         Ok(())
     }
 
     /// Records a false positive: the filter said "maybe" but the key was absent.
     pub fn record_false_positive(&self) {
-        self.stats.false_positives.fetch_add(1, Ordering::Relaxed);
+        self.stats.false_positives.inc();
     }
 
     /// Returns cache statistics.
     pub fn stats(&self) -> &NegativeCacheStats {
         &self.stats
+    }
+
+    /// Registers the cache's counters and gauges with a metrics registry.
+    pub fn register_metrics(&self, reg: &dyn MetricRegistrar) {
+        reg.register_counter(self.stats.hits.clone());
+        reg.register_counter(self.stats.false_positives.clone());
+        reg.register_counter(self.stats.rebuilds.clone());
+        reg.register_gauge(self.stats.entry_count.clone());
     }
 }
 
@@ -316,7 +346,7 @@ mod tests {
             rebuild_interval_sec: 3600,
         });
         cache.contains(&BucketId::new("b"), &ObjectKey::new("nope"));
-        assert_eq!(cache.stats().hits.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.stats().hits.get(), 1);
     }
 
     #[test]
@@ -324,7 +354,7 @@ mod tests {
         let cache = NegativeCache::new(NegativeCacheConfig::default());
         cache.record_false_positive();
         cache.record_false_positive();
-        assert_eq!(cache.stats().false_positives.load(Ordering::Relaxed), 2);
+        assert_eq!(cache.stats().false_positives.get(), 2);
     }
 
     #[test]

@@ -6,7 +6,7 @@
 
 use std::{
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -14,23 +14,24 @@ use std::{
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use oceanfs_core::{BucketId, ObjectKey};
+use oceanfs_core::{BucketId, Counter, Gauge, LabelSet, MetricRegistrar, ObjectKey};
 
 /// Statistics for the L1 object cache.
 ///
-/// All counters use relaxed atomics for minimal overhead on the hot path.
-#[derive(Debug, Default)]
+/// All counters and gauges use atomic operations for minimal overhead
+/// on the hot path.
+#[derive(Debug)]
 pub struct CacheStats {
     /// Number of cache hits.
-    pub hits: AtomicU64,
+    pub hits: Counter,
     /// Number of cache misses.
-    pub misses: AtomicU64,
+    pub misses: Counter,
     /// Number of evicted entries.
-    pub evictions: AtomicU64,
+    pub evictions: Counter,
     /// Current cache size in bytes (approximate).
-    pub size_bytes: AtomicU64,
+    pub size_bytes: Gauge,
     /// Current number of entries (approximate).
-    pub entry_count: AtomicUsize,
+    pub entry_count: Gauge,
 }
 
 impl CacheStats {
@@ -38,8 +39,8 @@ impl CacheStats {
     ///
     /// Returns 0.0 if no requests have been made yet.
     pub fn hit_rate(&self) -> f64 {
-        let hits = self.hits.load(Ordering::Relaxed) as f64;
-        let misses = self.misses.load(Ordering::Relaxed) as f64;
+        let hits = self.hits.get() as f64;
+        let misses = self.misses.get() as f64;
         let total = hits + misses;
         if total > 0.0 {
             hits / total
@@ -158,7 +159,33 @@ impl ObjectCache {
             default_config: config,
             buckets: DashMap::new(),
             lru_clock: LruClock::new(),
-            stats: CacheStats::default(),
+            stats: CacheStats {
+                hits: Counter::new(
+                    "cache_hits_total".into(),
+                    "L1 cache hits".into(),
+                    LabelSet::new(&[("tier", "l1")]),
+                ),
+                misses: Counter::new(
+                    "cache_misses_total".into(),
+                    "L1 cache misses".into(),
+                    LabelSet::new(&[("tier", "l1")]),
+                ),
+                evictions: Counter::new(
+                    "cache_evictions_total".into(),
+                    "L1 cache evictions".into(),
+                    LabelSet::new(&[("tier", "l1")]),
+                ),
+                size_bytes: Gauge::new(
+                    "cache_size_bytes".into(),
+                    "L1 cache size in bytes".into(),
+                    LabelSet::new(&[("tier", "l1")]),
+                ),
+                entry_count: Gauge::new(
+                    "cache_entry_count".into(),
+                    "L1 cache entry count".into(),
+                    LabelSet::new(&[("tier", "l1")]),
+                ),
+            },
         }
     }
 
@@ -167,11 +194,11 @@ impl ObjectCache {
     /// Returns `None` on miss, TTL expiry, or if the cache is disabled.
     pub fn get(&self, bucket: &BucketId, key: &ObjectKey) -> Option<Bytes> {
         let Some(bucket_cache) = self.buckets.get(bucket) else {
-            self.stats.misses.fetch_add(1, Ordering::Relaxed);
+            self.stats.misses.inc();
             return None;
         };
         if !bucket_cache.config.enabled {
-            self.stats.misses.fetch_add(1, Ordering::Relaxed);
+            self.stats.misses.inc();
             return None;
         }
 
@@ -183,21 +210,21 @@ impl ObjectCache {
                     let data_len = entry.data.len();
                     drop(entry);
                     bucket_cache.entries.remove(key);
-                    self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-                    self.stats.entry_count.fetch_sub(1, Ordering::Relaxed);
-                    self.stats.size_bytes.fetch_sub(data_len as u64, Ordering::Relaxed);
-                    self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                    self.stats.evictions.inc();
+                    self.stats.entry_count.dec();
+                    self.stats.size_bytes.sub(data_len as u64);
+                    self.stats.misses.inc();
                     return None;
                 }
             }
             // Touch for LRU.
             let gen = self.lru_clock.next();
             entry.touch(gen);
-            self.stats.hits.fetch_add(1, Ordering::Relaxed);
+            self.stats.hits.inc();
             return Some(entry.data.clone());
         }
 
-        self.stats.misses.fetch_add(1, Ordering::Relaxed);
+        self.stats.misses.inc();
         None
     }
 
@@ -230,9 +257,9 @@ impl ObjectCache {
             let gen = self.lru_clock.next();
             existing.touch(gen);
             if delta > 0 {
-                self.stats.size_bytes.fetch_add(delta as u64, Ordering::Relaxed);
+                self.stats.size_bytes.add(delta as u64);
             } else if delta < 0 {
-                self.stats.size_bytes.fetch_sub((-delta) as u64, Ordering::Relaxed);
+                self.stats.size_bytes.sub((-delta) as u64);
             }
             return;
         }
@@ -246,8 +273,8 @@ impl ObjectCache {
 
         let data_len = entry.data.len();
         bucket_cache.entries.insert(key, entry);
-        self.stats.size_bytes.fetch_add(data_len as u64, Ordering::Relaxed);
-        self.stats.entry_count.fetch_add(1, Ordering::Relaxed);
+        self.stats.size_bytes.add(data_len as u64);
+        self.stats.entry_count.inc();
     }
 
     /// Invalidates a cache entry for the given bucket and key.
@@ -257,8 +284,8 @@ impl ObjectCache {
         if let Some(bucket_cache) = self.buckets.get(bucket) {
             if let Some((_k, entry)) = bucket_cache.entries.remove(key) {
                 let data_len = entry.data.len();
-                self.stats.size_bytes.fetch_sub(data_len as u64, Ordering::Relaxed);
-                self.stats.entry_count.fetch_sub(1, Ordering::Relaxed);
+                self.stats.size_bytes.sub(data_len as u64);
+                self.stats.entry_count.dec();
             }
         }
     }
@@ -271,6 +298,19 @@ impl ObjectCache {
     /// Returns the overall hit rate (0.0 to 1.0).
     pub fn hit_rate(&self) -> f64 {
         self.stats.hit_rate()
+    }
+
+    /// Registers the cache's counters and gauges with a metrics registry.
+    ///
+    /// After registration, the cached counters are included in
+    /// Prometheus text-format output when calling `gather()` on
+    /// the registry.
+    pub fn register_metrics(&self, reg: &dyn MetricRegistrar) {
+        reg.register_counter(self.stats.hits.clone());
+        reg.register_counter(self.stats.misses.clone());
+        reg.register_counter(self.stats.evictions.clone());
+        reg.register_gauge(self.stats.size_bytes.clone());
+        reg.register_gauge(self.stats.entry_count.clone());
     }
 
     /// Adds or updates a bucket-specific configuration.
@@ -305,8 +345,8 @@ impl ObjectCache {
             let removed_count = bucket_cache.entries.len();
             let removed_size: usize =
                 bucket_cache.entries.iter().map(|entry| entry.data.len()).sum();
-            self.stats.entry_count.fetch_sub(removed_count, Ordering::Relaxed);
-            self.stats.size_bytes.fetch_sub(removed_size as u64, Ordering::Relaxed);
+            self.stats.entry_count.sub(removed_count as u64);
+            self.stats.size_bytes.sub(removed_size as u64);
         }
     }
 
@@ -345,9 +385,9 @@ impl ObjectCache {
             if let Some(key) = to_remove.take() {
                 if let Some((_, entry)) = bucket_cache.entries.remove(&key) {
                     let data_len = entry.data.len();
-                    self.stats.size_bytes.fetch_sub(data_len as u64, Ordering::Relaxed);
-                    self.stats.entry_count.fetch_sub(1, Ordering::Relaxed);
-                    self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+                    self.stats.size_bytes.sub(data_len as u64);
+                    self.stats.entry_count.dec();
+                    self.stats.evictions.inc();
                     evicted += 1;
                 }
             }
@@ -431,7 +471,7 @@ mod tests {
         // At least one should have been evicted.
         assert!(k1.is_none() || k2.is_none());
         // Eviction counter should be non-zero.
-        assert!(cache.stats().evictions.load(Ordering::Relaxed) > 0);
+        assert!(cache.stats().evictions.get() > 0);
     }
 
     #[test]
@@ -475,14 +515,14 @@ mod tests {
     #[test]
     fn entry_count_tracks_insertions() {
         let cache = ObjectCache::new(ObjectCacheConfig::default());
-        assert_eq!(cache.stats().entry_count.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.stats().entry_count.get(), 0);
 
         cache.put(BucketId::new("b"), ObjectKey::new("k1"), Bytes::from_static(b"a"));
         cache.put(BucketId::new("b"), ObjectKey::new("k2"), Bytes::from_static(b"b"));
-        assert_eq!(cache.stats().entry_count.load(Ordering::Relaxed), 2);
+        assert_eq!(cache.stats().entry_count.get(), 2);
 
         cache.invalidate(&BucketId::new("b"), &ObjectKey::new("k1"));
-        assert_eq!(cache.stats().entry_count.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.stats().entry_count.get(), 1);
     }
 
     #[test]
@@ -495,11 +535,21 @@ mod tests {
 
     #[test]
     fn cache_stats_hit_rate_standalone() {
-        let stats = CacheStats::default();
+        let stats = CacheStats {
+            hits: Counter::new("test_hits_total".into(), "test".into(), LabelSet::empty()),
+            misses: Counter::new("test_misses_total".into(), "test".into(), LabelSet::empty()),
+            evictions: Counter::new(
+                "test_evictions_total".into(),
+                "test".into(),
+                LabelSet::empty(),
+            ),
+            size_bytes: Gauge::new("test_size_bytes".into(), "test".into(), LabelSet::empty()),
+            entry_count: Gauge::new("test_entry_count".into(), "test".into(), LabelSet::empty()),
+        };
         assert_eq!(stats.hit_rate(), 0.0);
 
-        stats.hits.store(3, Ordering::Relaxed);
-        stats.misses.store(1, Ordering::Relaxed);
+        stats.hits.add(3);
+        stats.misses.add(1);
         assert!((stats.hit_rate() - 0.75).abs() < 0.001);
     }
 
@@ -528,7 +578,7 @@ mod tests {
 
         assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k1")).is_none());
         assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k2")).is_none());
-        assert_eq!(cache.stats().entry_count.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.stats().entry_count.get(), 0);
     }
 
     #[test]
@@ -539,14 +589,14 @@ mod tests {
             ..Default::default()
         });
         cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"small"));
-        let size_before = cache.stats().size_bytes.load(Ordering::Relaxed);
+        let size_before = cache.stats().size_bytes.get();
 
         cache.put(
             BucketId::new("b"),
             ObjectKey::new("k"),
             Bytes::from_static(b"much larger value here"),
         );
-        let size_after = cache.stats().size_bytes.load(Ordering::Relaxed);
+        let size_after = cache.stats().size_bytes.get();
 
         assert!(size_after > size_before);
         assert_eq!(
@@ -563,10 +613,10 @@ mod tests {
             ..Default::default()
         });
         cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"large value here"));
-        let size_before = cache.stats().size_bytes.load(Ordering::Relaxed);
+        let size_before = cache.stats().size_bytes.get();
 
         cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"tiny"));
-        let size_after = cache.stats().size_bytes.load(Ordering::Relaxed);
+        let size_after = cache.stats().size_bytes.get();
 
         assert!(size_after < size_before);
         assert_eq!(

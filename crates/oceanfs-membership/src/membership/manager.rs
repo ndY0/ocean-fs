@@ -5,7 +5,7 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use oceanfs_core::{Incarnation, NodeId, NodeState};
+use oceanfs_core::{Gauge, Incarnation, LabelSet, NodeId, NodeState};
 use oceanfs_network::ConnectionPool;
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
@@ -46,6 +46,14 @@ impl Membership {
             pool: RwLock::new(None),
             started: RwLock::new(false),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            gossip_sent: RwLock::new(None),
+            gossip_received: RwLock::new(None),
+            gossip_dropped: RwLock::new(None),
+            ring_version: Gauge::new(
+                "ring_version".into(),
+                "Ring topology version, incremented on each change".into(),
+                LabelSet::empty(),
+            ),
         }
     }
 
@@ -136,6 +144,15 @@ impl Membership {
         if let Some(pool) = self.pool.read().as_ref() {
             gossip_protocol.set_pool(pool.clone());
         }
+        // Extract gossip counters for metrics registration.
+        {
+            let mut sent = self.gossip_sent.write();
+            let mut recv = self.gossip_received.write();
+            let mut dropped = self.gossip_dropped.write();
+            *sent = Some(gossip_protocol.messages_sent.clone());
+            *recv = Some(gossip_protocol.messages_received.clone());
+            *dropped = Some(gossip_protocol.messages_dropped.clone());
+        }
         *self.gossip_tx.write() = Some(gossip_cmd_tx);
         let gossip_shutdown = self.shutdown.clone();
         tokio::spawn(async move {
@@ -200,6 +217,20 @@ impl Membership {
             let _ = tx.try_send(GossipCommand::SetPool { pool: pool.clone() });
         }
         *self.pool.write() = Some(pool);
+    }
+
+    /// Registers gossip counters with a metrics registrar.
+    pub fn register_gossip_metrics(&self, registrar: &dyn oceanfs_core::MetricRegistrar) {
+        if let Some(ref c) = *self.gossip_sent.read() {
+            registrar.register_counter(c.clone());
+        }
+        if let Some(ref c) = *self.gossip_received.read() {
+            registrar.register_counter(c.clone());
+        }
+        if let Some(ref c) = *self.gossip_dropped.read() {
+            registrar.register_counter(c.clone());
+        }
+        registrar.register_gauge(self.ring_version.clone());
     }
 
     /// Joins the cluster by contacting seed nodes via gRPC.
@@ -424,6 +455,7 @@ impl Membership {
             );
         }
         self.ring.update(ring_snapshot);
+        self.ring_version.inc();
 
         info!(node_id = %node_id, "node left cluster");
         Ok(())
@@ -478,6 +510,7 @@ impl Membership {
             }
 
             self.ring.update(ring_snapshot);
+            self.ring_version.inc();
 
             // Notify the gossip protocol of membership changes.
             if let Some(tx) = self.gossip_tx.read().as_ref() {
@@ -685,5 +718,55 @@ mod tests {
         let (_ring, m) = make_membership("node");
         let ring_ref = m.ring();
         assert!(ring_ref.snapshot().node_count() >= 1);
+    }
+
+    // --- Ring version gauge tests ---
+
+    #[test]
+    fn ring_version_starts_at_zero() {
+        let (_ring, m) = make_membership("node");
+        assert_eq!(m.ring_version.get(), 0);
+    }
+
+    #[test]
+    fn ring_version_increments() {
+        let (_ring, m) = make_membership("node");
+        m.ring_version.inc();
+        assert_eq!(m.ring_version.get(), 1);
+        m.ring_version.inc();
+        assert_eq!(m.ring_version.get(), 2);
+    }
+
+    #[test]
+    fn ring_version_gauge_name_is_correct() {
+        let (_ring, m) = make_membership("node");
+        assert!(m.ring_version.name().contains("ring_version"));
+    }
+
+    #[test]
+    fn ring_version_is_registered_in_gossip_metrics() {
+        use oceanfs_core::MetricRegistrar;
+
+        struct TestRegistrar {
+            gauge_names: std::sync::Mutex<Vec<String>>,
+        }
+        impl MetricRegistrar for TestRegistrar {
+            fn register_counter(&self, _: oceanfs_core::Counter) {}
+            fn register_gauge(&self, gauge: oceanfs_core::Gauge) {
+                self.gauge_names.lock().unwrap().push(gauge.name().to_string());
+            }
+            fn register_histogram(&self, _: std::sync::Arc<oceanfs_core::Histogram>) {}
+        }
+
+        let (_ring, m) = make_membership("node");
+        let reg = TestRegistrar { gauge_names: std::sync::Mutex::new(Vec::new()) };
+
+        m.register_gossip_metrics(&reg);
+
+        let names = reg.gauge_names.lock().unwrap();
+        assert!(
+            names.contains(&"ring_version".to_string()),
+            "ring_version gauge should be registered, got: {names:?}"
+        );
     }
 }

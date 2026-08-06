@@ -99,7 +99,7 @@ fn l2_cache_inline_serving() {
     let hit = cache.get(&bucket, &key).unwrap();
     assert!(hit.is_inline());
     assert_eq!(hit.inline_data, Some(Bytes::from_static(b"inline content")));
-    assert_eq!(cache.stats().inline_hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(cache.stats().inline_hits.get(), 1);
 }
 
 #[test]
@@ -124,7 +124,7 @@ fn l3_negative_cache_filters_nonexistent() {
     assert!(!cache.contains(&bucket, &missing));
 
     // Hit counter should be incremented for definite-absent check.
-    assert!(cache.stats().hits.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    assert!(cache.stats().hits.get() > 0);
 }
 
 #[test]
@@ -230,12 +230,12 @@ fn stats_accumulate_over_operations() {
 
     // Miss.
     cache.get(&bucket, &key);
-    assert_eq!(cache.stats().misses.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(cache.stats().misses.get(), 1);
 
     // Put + get = hit.
     cache.put(bucket.clone(), key.clone(), Bytes::from_static(b"data"));
     cache.get(&bucket, &key);
-    assert_eq!(cache.stats().hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(cache.stats().hits.get(), 1);
 
     // Hit rate.
     let rate = cache.stats().hit_rate();

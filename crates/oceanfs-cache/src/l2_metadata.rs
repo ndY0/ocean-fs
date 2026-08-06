@@ -7,30 +7,33 @@
 
 use std::{
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
 
 use dashmap::DashMap;
-use oceanfs_core::{BucketId, CacheInvalidateRequest, ObjectKey, ObjectMetadata};
+use oceanfs_core::{
+    BucketId, CacheInvalidateRequest, Counter, Gauge, LabelSet, MetricRegistrar, ObjectKey,
+    ObjectMetadata,
+};
 
 /// Statistics for the L2 metadata cache.
 ///
 /// All counters use relaxed atomics for minimal overhead.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MetadataCacheStats {
     /// Metadata cache hits (any kind).
-    pub hits: AtomicU64,
+    pub hits: Counter,
     /// Hits that served an inline blob directly (zero I/O).
-    pub inline_hits: AtomicU64,
+    pub inline_hits: Counter,
     /// Cache misses.
-    pub misses: AtomicU64,
+    pub misses: Counter,
     /// Number of evicted entries (TTL, LRU, or gossip invalidation).
-    pub evictions: AtomicU64,
+    pub evictions: Counter,
     /// Current number of entries (approximate).
-    pub entry_count: AtomicUsize,
+    pub entry_count: Gauge,
 }
 
 /// Configuration for the L2 metadata cache.
@@ -138,7 +141,33 @@ impl MetadataCache {
             default_config: config,
             buckets: DashMap::new(),
             lru_clock: LruClock::new(),
-            stats: MetadataCacheStats::default(),
+            stats: MetadataCacheStats {
+                hits: Counter::new(
+                    "cache_hits_total".into(),
+                    "L2 cache hits".into(),
+                    LabelSet::new(&[("tier", "l2")]),
+                ),
+                inline_hits: Counter::new(
+                    "cache_inline_hits_total".into(),
+                    "L2 cache inline hits".into(),
+                    LabelSet::empty(),
+                ),
+                misses: Counter::new(
+                    "cache_misses_total".into(),
+                    "L2 cache misses".into(),
+                    LabelSet::new(&[("tier", "l2")]),
+                ),
+                evictions: Counter::new(
+                    "cache_evictions_total".into(),
+                    "L2 cache evictions".into(),
+                    LabelSet::new(&[("tier", "l2")]),
+                ),
+                entry_count: Gauge::new(
+                    "cache_entry_count".into(),
+                    "L2 cache entry count".into(),
+                    LabelSet::empty(),
+                ),
+            },
         }
     }
 
@@ -147,12 +176,12 @@ impl MetadataCache {
     /// Returns `None` on miss or TTL expiry.
     pub fn get(&self, bucket: &BucketId, key: &ObjectKey) -> Option<Arc<ObjectMetadata>> {
         let Some(bucket_cache) = self.buckets.get(bucket) else {
-            self.stats.misses.fetch_add(1, Ordering::Relaxed);
+            self.stats.misses.inc();
             return None;
         };
 
         if !bucket_cache.config.enabled {
-            self.stats.misses.fetch_add(1, Ordering::Relaxed);
+            self.stats.misses.inc();
             return None;
         }
 
@@ -163,23 +192,23 @@ impl MetadataCache {
                     let _entry_size = entry.approximate_size();
                     drop(entry);
                     bucket_cache.entries.remove(key);
-                    self.stats.misses.fetch_add(1, Ordering::Relaxed);
-                    self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-                    self.stats.entry_count.fetch_sub(1, Ordering::Relaxed);
+                    self.stats.misses.inc();
+                    self.stats.evictions.inc();
+                    self.stats.entry_count.dec();
                     // Note: we don't track size_bytes for simplicity.
                     return None;
                 }
             }
             if entry.metadata.is_inline() {
-                self.stats.inline_hits.fetch_add(1, Ordering::Relaxed);
+                self.stats.inline_hits.inc();
             }
             let gen = self.lru_clock.next();
             entry.touch(gen);
-            self.stats.hits.fetch_add(1, Ordering::Relaxed);
+            self.stats.hits.inc();
             return Some(entry.metadata.clone());
         }
 
-        self.stats.misses.fetch_add(1, Ordering::Relaxed);
+        self.stats.misses.inc();
         None
     }
 
@@ -213,7 +242,7 @@ impl MetadataCache {
         entry.touch(gen);
 
         bucket_cache.entries.insert(key, entry);
-        self.stats.entry_count.fetch_add(1, Ordering::Relaxed);
+        self.stats.entry_count.inc();
     }
 
     /// Invalidates a cache entry for the given bucket and key.
@@ -222,8 +251,8 @@ impl MetadataCache {
     pub fn invalidate(&self, bucket: &BucketId, key: &ObjectKey) {
         if let Some(bucket_cache) = self.buckets.get(bucket) {
             if bucket_cache.entries.remove(key).is_some() {
-                self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-                self.stats.entry_count.fetch_sub(1, Ordering::Relaxed);
+                self.stats.evictions.inc();
+                self.stats.entry_count.dec();
             }
         }
     }
@@ -265,6 +294,15 @@ impl MetadataCache {
         &self.stats
     }
 
+    /// Registers the cache's counters and gauges with a metrics registry.
+    pub fn register_metrics(&self, reg: &dyn MetricRegistrar) {
+        reg.register_counter(self.stats.hits.clone());
+        reg.register_counter(self.stats.inline_hits.clone());
+        reg.register_counter(self.stats.misses.clone());
+        reg.register_counter(self.stats.evictions.clone());
+        reg.register_gauge(self.stats.entry_count.clone());
+    }
+
     /// Evicts LRU entries until the bucket cache is below its size limit.
     fn evict_if_needed(&self, bucket_cache: &BucketMetadataCache) {
         let max_entries = bucket_cache.config.max_size_bytes as usize
@@ -284,8 +322,8 @@ impl MetadataCache {
 
             if let Some(key) = to_remove.take() {
                 bucket_cache.entries.remove(&key);
-                self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-                self.stats.entry_count.fetch_sub(1, Ordering::Relaxed);
+                self.stats.evictions.inc();
+                self.stats.entry_count.dec();
             }
         }
     }
@@ -325,7 +363,7 @@ mod tests {
         let cache = MetadataCache::new(MetadataCacheConfig::default());
         cache.put(BucketId::new("b"), ObjectKey::new("k"), make_meta("k", true));
         cache.get(&BucketId::new("b"), &ObjectKey::new("k"));
-        assert_eq!(cache.stats().inline_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.stats().inline_hits.get(), 1);
     }
 
     #[test]
@@ -341,7 +379,7 @@ mod tests {
         let cache = MetadataCache::new(MetadataCacheConfig::default());
         cache.put(BucketId::new("b"), ObjectKey::new("k"), make_meta("k", false));
         cache.invalidate(&BucketId::new("b"), &ObjectKey::new("k"));
-        assert_eq!(cache.stats().evictions.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.stats().evictions.get(), 1);
     }
 
     #[test]
@@ -353,7 +391,7 @@ mod tests {
         cache.handle_invalidation(req);
 
         assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k")).is_none());
-        assert_eq!(cache.stats().evictions.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.stats().evictions.get(), 1);
     }
 
     #[test]
@@ -364,7 +402,7 @@ mod tests {
             key: ObjectKey::new("nonexistent"),
         };
         cache.handle_invalidation(req);
-        assert_eq!(cache.stats().evictions.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.stats().evictions.get(), 0);
     }
 
     #[test]
@@ -384,7 +422,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
 
         assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k")).is_none());
-        assert_eq!(cache.stats().evictions.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.stats().evictions.get(), 1);
     }
 
     #[test]
@@ -413,9 +451,6 @@ mod tests {
 
         // At least one entry should have been evicted (max_size_bytes=1).
         let stats = cache.stats();
-        assert!(
-            stats.evictions.load(Ordering::Relaxed) > 0,
-            "expected some evictions when max_size_bytes=1"
-        );
+        assert!(stats.evictions.get() > 0, "expected some evictions when max_size_bytes=1");
     }
 }

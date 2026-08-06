@@ -8,6 +8,7 @@
 //! buffers.
 
 use bytes::BytesMut;
+use oceanfs_core::{Gauge, LabelSet, MetricRegistrar};
 use parking_lot::Mutex;
 
 use crate::error::{Error, Result};
@@ -99,6 +100,27 @@ impl BufferPool {
     /// Returns the total number of buffers ever created by this pool.
     pub fn total_created(&self) -> usize {
         self.total_created
+    }
+
+    /// Registers buffer pool gauges with a metrics registrar.
+    ///
+    /// Gauges reflect approximate live state (polled periodically).
+    pub fn register_metrics(&self, registrar: &dyn MetricRegistrar) {
+        let available = Gauge::new(
+            "buffer_pool_buffers_available".into(),
+            "Free buffers in the segment buffer pool".into(),
+            LabelSet::empty(),
+        );
+        let allocated = Gauge::new(
+            "buffer_pool_bytes_allocated".into(),
+            "Total bytes allocated in the buffer pool".into(),
+            LabelSet::empty(),
+        );
+        // Set initial values.
+        available.set(self.free_count() as u64);
+        allocated.set((self.total_created * self.chunk_size) as u64);
+        registrar.register_gauge(available);
+        registrar.register_gauge(allocated);
     }
 }
 

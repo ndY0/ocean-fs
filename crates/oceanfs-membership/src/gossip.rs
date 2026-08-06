@@ -10,7 +10,9 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use oceanfs_core::{Incarnation, NodeId, NodeState};
+use oceanfs_core::{
+    sub_millisecond_histogram_config, Counter, Histogram, Incarnation, LabelSet, NodeId, NodeState,
+};
 use oceanfs_network::ConnectionPool;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, trace, warn};
@@ -80,6 +82,14 @@ pub(crate) struct GossipProtocol {
     gossip_interval_ms: u64,
     /// This node's identifier (for excluding self from peer selection).
     node_id: NodeId,
+    /// Gossip messages sent counter.
+    pub(crate) messages_sent: Counter,
+    /// Gossip messages received counter.
+    pub(crate) messages_received: Counter,
+    /// Gossip messages dropped counter (push failures).
+    pub(crate) messages_dropped: Counter,
+    /// Gossip round duration histogram (microseconds).
+    pub(crate) round_duration_us: Arc<Histogram>,
 }
 
 impl GossipProtocol {
@@ -102,12 +112,41 @@ impl GossipProtocol {
             pool: None,
             gossip_interval_ms,
             node_id,
+            messages_sent: Counter::new(
+                "gossip_messages_sent_total".into(),
+                "Gossip messages pushed to peers".into(),
+                LabelSet::empty(),
+            ),
+            messages_received: Counter::new(
+                "gossip_messages_received_total".into(),
+                "Gossip deltas received from peers".into(),
+                LabelSet::empty(),
+            ),
+            messages_dropped: Counter::new(
+                "gossip_messages_dropped_total".into(),
+                "Gossip messages dropped due to push failures".into(),
+                LabelSet::empty(),
+            ),
+            round_duration_us: Arc::new(Histogram::new(
+                "gossip_round_duration_seconds".into(),
+                "Gossip round duration in microseconds".into(),
+                &sub_millisecond_histogram_config(),
+                LabelSet::empty(),
+            )),
         }
     }
 
     /// Sets the connection pool for gRPC push calls.
     pub fn set_pool(&mut self, pool: Arc<ConnectionPool>) {
         self.pool = Some(pool);
+    }
+
+    /// Registers gossip counters with a metrics registrar.
+    pub fn register_metrics(&self, registrar: &dyn oceanfs_core::MetricRegistrar) {
+        registrar.register_counter(self.messages_sent.clone());
+        registrar.register_counter(self.messages_received.clone());
+        registrar.register_counter(self.messages_dropped.clone());
+        registrar.register_histogram(Arc::clone(&self.round_duration_us));
     }
 
     /// Runs the gossip protocol loop.
@@ -146,6 +185,8 @@ impl GossipProtocol {
     /// state changes propagate quickly and failure detection can
     /// observe unreachable peers immediately.
     async fn on_gossip_tick(&mut self) {
+        let start = std::time::Instant::now();
+
         let alive: Vec<_> = self
             .state
             .nodes
@@ -169,9 +210,11 @@ impl GossipProtocol {
         // unreachable peer on every tick, not just a random subset.
         for peer in &alive {
             debug!(peer = %peer, changed = delta.changed.len(), "periodic gossip push");
+            self.messages_sent.inc();
             self.handle_command(GossipCommand::Push { peer: peer.clone(), delta: delta.clone() })
                 .await;
         }
+        self.round_duration_us.observe(start.elapsed().as_micros() as u64);
     }
 
     /// Handles a gossip command.
@@ -188,6 +231,7 @@ impl GossipProtocol {
                 // (default 5s) would otherwise block the select! loop and prevent
                 // the ticker from firing, making failure detection stall.
                 if let Some(ref pool) = self.pool {
+                    let messages_dropped = self.messages_dropped.clone();
                     if let Some(entry) = self.state.nodes.get(&peer) {
                         let peer_addr = entry.address;
                         let pool = pool.clone();
@@ -253,6 +297,7 @@ impl GossipProtocol {
                                         }
                                         Err(status) => {
                                             warn!(peer = %peer_clone, error = %status, "gossip push failed");
+                                            messages_dropped.inc();
                                             let _ =
                                                 detector.try_send(DetectorCommand::PingResponse {
                                                     target: peer_clone,
@@ -263,6 +308,7 @@ impl GossipProtocol {
                                 }
                                 Err(e) => {
                                     warn!(peer = %peer_clone, error = %e, "failed to acquire channel for push");
+                                    messages_dropped.inc();
                                     let _ = detector.try_send(DetectorCommand::PingResponse {
                                         target: peer_clone,
                                         success: false,
@@ -275,6 +321,7 @@ impl GossipProtocol {
             }
             GossipCommand::ReceiveDelta { from, delta } => {
                 debug!(from = %from, changed = delta.changed.len(), "received gossip delta");
+                self.messages_received.inc();
                 self.merge_delta(&delta);
             }
             GossipCommand::SetPool { pool } => {
@@ -518,5 +565,68 @@ mod tests {
             protocol.handle_command(GossipCommand::Push { peer: NodeId::new("peer"), delta }).await;
         assert!(result);
         assert!(protocol.snapshot().nodes.contains_key(&NodeId::new("new-node")));
+    }
+
+    // --- Metrics tests ---
+
+    #[test]
+    fn messages_dropped_starts_at_zero() {
+        let protocol = make_protocol();
+        assert_eq!(protocol.messages_dropped.get(), 0);
+    }
+
+    #[test]
+    fn messages_dropped_increments() {
+        let protocol = make_protocol();
+        protocol.messages_dropped.inc();
+        assert_eq!(protocol.messages_dropped.get(), 1);
+    }
+
+    #[test]
+    fn messages_sent_and_received_still_work() {
+        let protocol = make_protocol();
+        assert_eq!(protocol.messages_sent.get(), 0);
+        assert_eq!(protocol.messages_received.get(), 0);
+        protocol.messages_sent.inc();
+        protocol.messages_received.add(5);
+        assert_eq!(protocol.messages_sent.get(), 1);
+        assert_eq!(protocol.messages_received.get(), 5);
+    }
+
+    #[test]
+    fn round_duration_histogram_created() {
+        let protocol = make_protocol();
+        let hist = &protocol.round_duration_us;
+        assert_eq!(hist.count(), 0);
+        assert_eq!(hist.sum(), 0);
+        // Should not panic when observing.
+        hist.observe(42);
+        assert_eq!(hist.count(), 1);
+    }
+
+    #[test]
+    fn register_metrics_includes_dropped_counter() {
+        use oceanfs_core::MetricRegistrar;
+
+        struct TestRegistrar {
+            names: std::sync::Mutex<Vec<String>>,
+        }
+        impl MetricRegistrar for TestRegistrar {
+            fn register_counter(&self, counter: oceanfs_core::Counter) {
+                self.names.lock().unwrap().push(counter.name().to_string());
+            }
+            fn register_gauge(&self, _: oceanfs_core::Gauge) {}
+            fn register_histogram(&self, _: std::sync::Arc<oceanfs_core::Histogram>) {}
+        }
+
+        let protocol = make_protocol();
+        let reg = TestRegistrar { names: std::sync::Mutex::new(Vec::new()) };
+
+        protocol.register_metrics(&reg);
+
+        let names = reg.names.lock().unwrap();
+        assert!(names.contains(&"gossip_messages_dropped_total".to_string()));
+        assert!(names.contains(&"gossip_messages_sent_total".to_string()));
+        assert!(names.contains(&"gossip_messages_received_total".to_string()));
     }
 }

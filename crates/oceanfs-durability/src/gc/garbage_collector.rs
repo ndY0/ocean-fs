@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use oceanfs_core::SegmentId;
+use oceanfs_core::{Counter, LabelSet, MetricRegistrar, SegmentId};
 use oceanfs_storage::{metadata::RocksDbMetadataStore, segment::TierRouter, Error, Result};
 use tokio::sync::Semaphore;
 
@@ -30,12 +30,48 @@ use super::{
 /// ```
 pub struct GarbageCollector {
     config: GcConfig,
+    cycles_total: Counter,
+    segments_compacted_total: Counter,
+    bytes_reclaimed_total: Counter,
+    compaction_bytes_total: Counter,
 }
 
 impl GarbageCollector {
-    /// Creates a new garbage collector.
+    /// Creates a new garbage collector with unregistered counters.
+    ///
+    /// Use [`register_metrics`](Self::register_metrics) to wire them into a registry.
     pub fn new(config: GcConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            cycles_total: Counter::new(
+                "gc_cycles_total".into(),
+                "GC cycles completed".into(),
+                LabelSet::empty(),
+            ),
+            segments_compacted_total: Counter::new(
+                "gc_segments_compacted_total".into(),
+                "Segments compacted".into(),
+                LabelSet::empty(),
+            ),
+            bytes_reclaimed_total: Counter::new(
+                "gc_bytes_reclaimed_total".into(),
+                "Bytes reclaimed by GC".into(),
+                LabelSet::empty(),
+            ),
+            compaction_bytes_total: Counter::new(
+                "gc_compaction_bytes_total".into(),
+                "Bytes processed during segment compaction".into(),
+                LabelSet::empty(),
+            ),
+        }
+    }
+
+    /// Registers all GC counters with a metrics registrar.
+    pub fn register_metrics(&self, registrar: &dyn MetricRegistrar) {
+        registrar.register_counter(self.cycles_total.clone());
+        registrar.register_counter(self.segments_compacted_total.clone());
+        registrar.register_counter(self.bytes_reclaimed_total.clone());
+        registrar.register_counter(self.compaction_bytes_total.clone());
     }
 
     /// Returns a reference to the configuration.
@@ -146,6 +182,11 @@ impl GarbageCollector {
         for handle in handles {
             let _ = handle.await;
         }
+
+        self.cycles_total.inc();
+        self.segments_compacted_total.add(stats.segments_compacted);
+        self.bytes_reclaimed_total.add(stats.bytes_reclaimed);
+        self.compaction_bytes_total.add(stats.dead_bytes + stats.live_bytes);
 
         Ok(stats)
     }
@@ -581,6 +622,29 @@ mod tests {
         // No tombstones, so no dead bytes
         assert_eq!(stats.dead_bytes, 0);
         assert_eq!(stats.segments_compacted, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Metrics tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gc_metrics_registered_and_increment() {
+        let gc = GarbageCollector::new(GcConfig::default());
+        assert_eq!(gc.cycles_total.get(), 0);
+        assert_eq!(gc.segments_compacted_total.get(), 0);
+        assert_eq!(gc.bytes_reclaimed_total.get(), 0);
+        assert_eq!(gc.compaction_bytes_total.get(), 0);
+
+        gc.cycles_total.inc();
+        gc.segments_compacted_total.add(3);
+        gc.bytes_reclaimed_total.add(1024);
+        gc.compaction_bytes_total.add(2048);
+
+        assert_eq!(gc.cycles_total.get(), 1);
+        assert_eq!(gc.segments_compacted_total.get(), 3);
+        assert_eq!(gc.bytes_reclaimed_total.get(), 1024);
+        assert_eq!(gc.compaction_bytes_total.get(), 2048);
     }
 
     // -----------------------------------------------------------------------

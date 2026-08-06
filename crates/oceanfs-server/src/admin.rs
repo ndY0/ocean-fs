@@ -6,13 +6,7 @@
 //! Per performance guideline §11.1, all counters use `AtomicU64` with
 //! relaxed ordering on the hot path.
 
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-};
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     extract::State,
@@ -21,12 +15,16 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use dashmap::DashMap;
 #[cfg(feature = "accel")]
 use oceanfs_accel::AccelDispatcher;
 #[cfg(feature = "cache")]
 use oceanfs_cache::{MetadataCache, NegativeCache, ObjectCache};
-use oceanfs_core::SizeTier;
-use parking_lot::RwLock;
+pub use oceanfs_core::{
+    sub_millisecond_histogram_config, validate_counter_name, Counter, Gauge, LabelSet,
+    MetricRegistrar,
+};
+use oceanfs_core::{Histogram, HistogramConfig, SizeTier};
 use serde::Serialize;
 use tracing::instrument;
 
@@ -36,58 +34,152 @@ use crate::bucket_config::BucketConfigStore;
 // MetricsRegistry
 // ---------------------------------------------------------------------------
 
-/// A Prometheus-compatible metrics registry.
+/// A Prometheus-compatible metrics registry backed by `DashMap` for lock-free reads.
 ///
-/// All counters use `AtomicU64` with `Relaxed` ordering for minimal
-/// overhead on the hot path. Histograms use a simple lock-protected
-/// bucket accumulator.
+/// All counters and gauges use `AtomicU64` with `Relaxed` ordering for minimal
+/// overhead on the hot path. Histograms use per-bucket `AtomicU64` for lock-free
+/// observation (perf §11.1, §2.2).
 pub struct MetricsRegistry {
-    counters: RwLock<HashMap<String, Arc<Counter>>>,
-    histograms: RwLock<HashMap<String, Arc<Histogram>>>,
+    counters: DashMap<String, Counter>,
+    gauges: DashMap<String, Gauge>,
+    histograms: DashMap<String, Arc<Histogram>>,
 }
 
 impl MetricsRegistry {
     /// Creates a new empty metrics registry.
     pub fn new() -> Self {
-        Self { counters: RwLock::new(HashMap::new()), histograms: RwLock::new(HashMap::new()) }
+        Self { counters: DashMap::new(), gauges: DashMap::new(), histograms: DashMap::new() }
     }
 
     /// Registers or retrieves a counter by name.
     ///
     /// Returns an `Arc<Counter>` that can be shared across subsystems.
     /// If a counter with the given name already exists, it is returned
-    /// instead of creating a new one.
-    pub fn counter(&self, name: &str, help: &str) -> Arc<Counter> {
-        let mut map = self.counters.write();
-        map.entry(name.to_string())
-            .or_insert_with(|| Arc::new(Counter::new(name.to_string(), help.to_string())))
+    /// instead of creating a new one. Counter names are validated to
+    /// end with `_total`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_server::admin::MetricsRegistry;
+    ///
+    /// let reg = MetricsRegistry::new();
+    /// let c = reg.counter("requests_total", "Total requests");
+    /// c.inc();
+    /// ```
+    pub fn counter(&self, name: &str, help: &str) -> Counter {
+        let name = validate_counter_name(name);
+        self.counters
+            .entry(name.clone())
+            .or_insert_with(|| Counter::new(name, help.to_string(), LabelSet::empty()))
             .clone()
     }
 
-    /// Registers or retrieves a histogram by name.
+    /// Registers or retrieves a labeled counter.
+    ///
+    /// Labels are used to distinguish different series of the same metric.
+    /// For example: `cache_hits_total{tier="l1"}` and `cache_hits_total{tier="l2"}`
+    /// are registered as separate counters.
+    pub fn counter_with_labels(&self, name: &str, labels: &[(&str, &str)], help: &str) -> Counter {
+        let name = validate_counter_name(name);
+        let label_set = LabelSet::new(labels);
+        let key = Self::make_key(&name, &label_set);
+        self.counters
+            .entry(key)
+            .or_insert_with(|| Counter::new(name, help.to_string(), label_set))
+            .clone()
+    }
+
+    /// Registers or retrieves a gauge by name.
+    pub fn gauge(&self, name: &str, help: &str) -> Gauge {
+        self.gauges
+            .entry(name.to_string())
+            .or_insert_with(|| Gauge::new(name.to_string(), help.to_string(), LabelSet::empty()))
+            .clone()
+    }
+
+    /// Registers or retrieves a labeled gauge.
+    pub fn gauge_with_labels(&self, name: &str, labels: &[(&str, &str)], help: &str) -> Gauge {
+        let label_set = LabelSet::new(labels);
+        let key = Self::make_key(name, &label_set);
+        self.gauges
+            .entry(key)
+            .or_insert_with(|| Gauge::new(name.to_string(), help.to_string(), label_set))
+            .clone()
+    }
+
+    /// Registers or retrieves a histogram by name with default buckets.
     pub fn histogram(&self, name: &str, help: &str) -> Arc<Histogram> {
-        let mut map = self.histograms.write();
-        map.entry(name.to_string())
-            .or_insert_with(|| Arc::new(Histogram::new(name.to_string(), help.to_string())))
+        self.histogram_with_config(name, help, &HistogramConfig::default())
+    }
+
+    /// Registers or retrieves a histogram with custom bucket configuration.
+    pub fn histogram_with_config(
+        &self,
+        name: &str,
+        help: &str,
+        config: &HistogramConfig,
+    ) -> Arc<Histogram> {
+        self.histograms
+            .entry(name.to_string())
+            .or_insert_with(|| {
+                Arc::new(Histogram::new(
+                    name.to_string(),
+                    help.to_string(),
+                    config,
+                    LabelSet::empty(),
+                ))
+            })
+            .clone()
+    }
+
+    /// Registers or retrieves a labeled histogram.
+    pub fn histogram_with_labels(
+        &self,
+        name: &str,
+        labels: &[(&str, &str)],
+        help: &str,
+        config: &HistogramConfig,
+    ) -> Arc<Histogram> {
+        let label_set = LabelSet::new(labels);
+        let key = Self::make_key(name, &label_set);
+        self.histograms
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(Histogram::new(name.to_string(), help.to_string(), config, label_set))
+            })
             .clone()
     }
 
     /// Gathers all registered metrics in Prometheus text exposition format.
     ///
-    /// This is suitable for responding to `GET /admin/metrics`.
+    /// Lock-free iteration over `DashMap` entries.
     pub fn gather(&self) -> String {
-        let mut output = String::new();
+        let mut output = String::with_capacity(4096);
 
-        for counter in self.counters.read().values() {
-            output.push_str(&counter.render());
+        for entry in self.counters.iter() {
+            output.push_str(&entry.value().render());
             output.push('\n');
         }
-        for histogram in self.histograms.read().values() {
-            output.push_str(&histogram.render());
+        for entry in self.gauges.iter() {
+            output.push_str(&entry.value().render());
+            output.push('\n');
+        }
+        for entry in self.histograms.iter() {
+            output.push_str(&entry.value().render());
             output.push('\n');
         }
 
         output
+    }
+
+    /// Creates a composite key from metric name and label set.
+    fn make_key(name: &str, labels: &LabelSet) -> String {
+        if labels.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name}{}", labels.render())
+        }
     }
 }
 
@@ -97,45 +189,20 @@ impl Default for MetricsRegistry {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Counter
-// ---------------------------------------------------------------------------
-
-/// A monotonically-increasing counter with Prometheus text-format output.
-pub struct Counter {
-    name: String,
-    help: String,
-    value: AtomicU64,
-}
-
-impl Counter {
-    /// Creates a new counter with the given name and help text.
-    pub fn new(name: String, help: String) -> Self {
-        Self { name, help, value: AtomicU64::new(0) }
+impl MetricRegistrar for MetricsRegistry {
+    fn register_counter(&self, counter: Counter) {
+        let key = Self::make_key(counter.name(), counter.labels());
+        self.counters.entry(key).or_insert(counter);
     }
 
-    /// Increments the counter by 1.
-    pub fn inc(&self) {
-        self.value.fetch_add(1, Ordering::Relaxed);
+    fn register_gauge(&self, gauge: Gauge) {
+        let key = Self::make_key(gauge.name(), gauge.labels());
+        self.gauges.entry(key).or_insert(gauge);
     }
 
-    /// Adds `n` to the counter.
-    pub fn add(&self, n: u64) {
-        self.value.fetch_add(n, Ordering::Relaxed);
-    }
-
-    /// Returns the current counter value.
-    pub fn get(&self) -> u64 {
-        self.value.load(Ordering::Relaxed)
-    }
-
-    /// Renders the counter in Prometheus text exposition format.
-    fn render(&self) -> String {
-        let val = self.value.load(Ordering::Relaxed);
-        format!(
-            "# HELP {} {}\n# TYPE {} counter\n{} {}\n",
-            self.name, self.help, self.name, self.name, val
-        )
+    fn register_histogram(&self, histogram: Arc<oceanfs_core::Histogram>) {
+        let key = Self::make_key(histogram.name(), histogram.labels());
+        self.histograms.entry(key).or_insert(histogram);
     }
 }
 
@@ -143,74 +210,7 @@ impl Counter {
 // Histogram
 // ---------------------------------------------------------------------------
 
-/// A simple histogram with fixed buckets.
-///
-/// For hot-path timing, use a dedicated timer or a higher-resolution
-/// clock. This implementation is sufficient for coarse metrics like
-/// batch sizes and operation latencies in milliseconds.
-pub struct Histogram {
-    name: String,
-    help: String,
-    sum: AtomicU64,
-    count: AtomicU64,
-    buckets: RwLock<Vec<u64>>,
-    bucket_bounds: Vec<u64>,
-}
-
-impl Histogram {
-    /// Creates a new histogram with the given name and help text.
-    ///
-    /// Buckets are the standard Prometheus defaults: [1, 5, 10, 50, 100,
-    /// 250, 500, 1000, 2500, 5000, 10000].
-    pub fn new(name: String, help: String) -> Self {
-        let bucket_bounds = vec![1, 5, 10, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
-        let num_buckets = bucket_bounds.len();
-        Self {
-            name,
-            help,
-            sum: AtomicU64::new(0),
-            count: AtomicU64::new(0),
-            buckets: RwLock::new(vec![0; num_buckets]),
-            bucket_bounds,
-        }
-    }
-
-    /// Observes a value, incrementing the appropriate bucket.
-    pub fn observe(&self, value: u64) {
-        self.sum.fetch_add(value, Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
-
-        let mut buckets = self.buckets.write();
-        for (i, bound) in self.bucket_bounds.iter().enumerate() {
-            if value <= *bound {
-                buckets[i] = buckets[i].wrapping_add(1);
-                break;
-            }
-        }
-    }
-
-    /// Renders the histogram in Prometheus text exposition format.
-    fn render(&self) -> String {
-        let sum = self.sum.load(Ordering::Relaxed);
-        let count = self.count.load(Ordering::Relaxed);
-        let buckets = self.buckets.read();
-
-        let mut out =
-            format!("# HELP {} {}\n# TYPE {} histogram\n", self.name, self.help, self.name);
-
-        let mut cumulative = 0u64;
-        for (i, bound) in self.bucket_bounds.iter().enumerate() {
-            cumulative = cumulative.wrapping_add(buckets[i]);
-            out.push_str(&format!("{}_bucket{{le=\"{}\"}} {}\n", self.name, bound, cumulative));
-        }
-        // +Inf bucket
-        out.push_str(&format!("{}_bucket{{le=\"+Inf\"}} {}\n", self.name, count));
-        out.push_str(&format!("{}_sum {}\n", self.name, sum));
-        out.push_str(&format!("{}_count {}\n", self.name, count));
-
-        out
-    }
-}
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // ClusterView / NodeInfo / SegmentReport
@@ -529,24 +529,24 @@ async fn cache_stats(State(state): State<AdminState>) -> impl IntoResponse {
             let s = object_cache.stats();
             stats.push(CacheStats {
                 tier: "l1".into(),
-                hits: s.hits.load(Ordering::Relaxed),
-                misses: s.misses.load(Ordering::Relaxed),
+                hits: s.hits.get(),
+                misses: s.misses.get(),
             });
         }
         if let Some(ref meta_cache) = state.metadata_cache {
             let s = meta_cache.stats();
             stats.push(CacheStats {
                 tier: "l2".into(),
-                hits: s.hits.load(Ordering::Relaxed),
-                misses: s.misses.load(Ordering::Relaxed),
+                hits: s.hits.get(),
+                misses: s.misses.get(),
             });
         }
         if let Some(ref neg_cache) = state.negative_cache {
             let s = neg_cache.stats();
             stats.push(CacheStats {
                 tier: "l3".into(),
-                hits: s.hits.load(Ordering::Relaxed),
-                misses: s.false_positives.load(Ordering::Relaxed),
+                hits: s.hits.get(),
+                misses: s.false_positives.get(),
             });
         }
     }
@@ -769,6 +769,220 @@ mod tests {
         assert!(json.contains("l2"));
     }
 
+    // --- Labeled counter tests ---
+
+    #[test]
+    fn labeled_counter_distinct_by_labels() {
+        let reg = MetricsRegistry::new();
+        let c1 = reg.counter_with_labels("hits_total", &[("tier", "l1")], "L1 hits");
+        let c2 = reg.counter_with_labels("hits_total", &[("tier", "l2")], "L2 hits");
+        c1.inc();
+        c1.inc();
+        c2.inc();
+        assert_eq!(c1.get(), 2);
+        assert_eq!(c2.get(), 1);
+    }
+
+    #[test]
+    fn counter_name_gets_total_suffix() {
+        let reg = MetricsRegistry::new();
+        let c = reg.counter("requests", "help");
+        let rendered = c.render();
+        assert!(rendered.contains("requests_total 0"));
+    }
+
+    // --- Gauge tests ---
+
+    #[test]
+    fn gauge_set_and_get() {
+        let g = Gauge::new("mem".into(), "help".into(), LabelSet::empty());
+        g.set(1024);
+        assert_eq!(g.get(), 1024);
+        g.set(0);
+        assert_eq!(g.get(), 0);
+    }
+
+    #[test]
+    fn gauge_inc_and_dec() {
+        let g = Gauge::new("fd".into(), "help".into(), LabelSet::empty());
+        g.set(10);
+        g.inc();
+        g.inc();
+        assert_eq!(g.get(), 12);
+        g.dec();
+        assert_eq!(g.get(), 11);
+    }
+
+    #[test]
+    fn gauge_dec_does_not_underflow() {
+        let g = Gauge::new("x".into(), "help".into(), LabelSet::empty());
+        g.set(1);
+        g.dec();
+        assert_eq!(g.get(), 0);
+        g.dec();
+        assert_eq!(g.get(), 0);
+    }
+
+    #[test]
+    fn gauge_add_and_sub() {
+        let g = Gauge::new("x".into(), "help".into(), LabelSet::empty());
+        g.add(100);
+        assert_eq!(g.get(), 100);
+        g.sub(30);
+        assert_eq!(g.get(), 70);
+        g.sub(200);
+        assert_eq!(g.get(), 0);
+    }
+
+    #[test]
+    fn gauge_render_includes_value() {
+        let g = Gauge::new("process_open_fds".into(), "Open FDs".into(), LabelSet::empty());
+        g.set(42);
+        let rendered = g.render();
+        assert!(rendered.contains("# HELP process_open_fds Open FDs"));
+        assert!(rendered.contains("# TYPE process_open_fds gauge"));
+        assert!(rendered.contains("process_open_fds 42"));
+    }
+
+    #[test]
+    fn labeled_gauge_renders_labels() {
+        let g = Gauge::new(
+            "accel_tier_active".into(),
+            "help".into(),
+            LabelSet::new(&[("tier", "gpu_cuda"), ("operation", "encode")]),
+        );
+        g.set(1);
+        let rendered = g.render();
+        assert!(rendered.contains(r#"accel_tier_active{tier="gpu_cuda",operation="encode"} 1"#));
+    }
+
+    #[test]
+    fn registry_gauge_deduplicates() {
+        let reg = MetricsRegistry::new();
+        let g1 = reg.gauge("g1", "h1");
+        let g2 = reg.gauge("g1", "h2");
+        g1.set(5);
+        assert_eq!(g2.get(), 5);
+    }
+
+    // --- Label rendering tests ---
+
+    #[test]
+    fn label_set_empty_renders_empty() {
+        let labels = LabelSet::empty();
+        assert_eq!(labels.render(), "");
+    }
+
+    #[test]
+    fn label_set_single_pair() {
+        let labels = LabelSet::new(&[("tier", "l1")]);
+        assert_eq!(labels.render(), r#"{tier="l1"}"#);
+    }
+
+    #[test]
+    fn label_set_multiple_pairs() {
+        let labels = LabelSet::new(&[("from_tier", "gpu_cuda"), ("to_tier", "cpu_simd")]);
+        assert_eq!(labels.render(), r#"{from_tier="gpu_cuda",to_tier="cpu_simd"}"#);
+    }
+
+    #[test]
+    fn counter_with_labels_renders_correctly() {
+        let labels = LabelSet::new(&[("method", "GET")]);
+        let c = Counter::new("s3_requests_total".into(), "S3 requests".into(), labels);
+        c.inc();
+        let rendered = c.render();
+        assert!(rendered.contains(r#"s3_requests_total{method="GET"} 1"#));
+    }
+
+    // --- Histogram tests ---
+
+    #[test]
+    fn histogram_observe_is_lock_free() {
+        // Verifies observe() doesn't panic under concurrency (AtomicU64-based).
+        use std::thread;
+        let h = Arc::new(Histogram::new(
+            "latency".into(),
+            "help".into(),
+            &HistogramConfig::default(),
+            LabelSet::empty(),
+        ));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let h = h.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..1000 {
+                    h.observe(i % 100);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(h.count(), 8000);
+    }
+
+    #[test]
+    fn histogram_sub_millisecond_config_has_correct_buckets() {
+        let config = sub_millisecond_histogram_config();
+        assert!(config.buckets.contains(&1), "should have 0.001ms bucket");
+        assert!(config.buckets.contains(&5));
+        assert!(config.buckets.contains(&10));
+        assert!(config.buckets.contains(&1_000));
+        assert!(config.buckets.contains(&1_000_000));
+    }
+
+    #[test]
+    fn histogram_with_labels_renders_correctly() {
+        let h = Histogram::new(
+            "accel_encode_duration".into(),
+            "help".into(),
+            &HistogramConfig::default(),
+            LabelSet::new(&[("tier", "cpu_simd")]),
+        );
+        h.observe(50);
+        let rendered = h.render();
+        assert!(rendered.contains(r#"accel_encode_duration_bucket{le="50"}{tier="cpu_simd"} 1"#));
+    }
+
+    // --- DashMap registry tests ---
+
+    #[test]
+    fn registry_counter_reads_do_not_block_writes() {
+        use std::thread;
+        let reg = Arc::new(MetricsRegistry::new());
+        let c = reg.counter("concurrent_total", "test");
+
+        let reg_clone = reg.clone();
+        let writer = thread::spawn(move || {
+            for _ in 0..100 {
+                reg_clone.counter("new_counter", "help");
+            }
+        });
+
+        let reader = thread::spawn(move || {
+            for _ in 0..1000 {
+                let _ = reg.gather();
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+        // If we get here without deadlocking, DashMap works correctly.
+        assert_eq!(c.get(), 0);
+        c.inc();
+        assert_eq!(c.get(), 1);
+    }
+
+    #[test]
+    fn gather_includes_gauges_and_histograms() {
+        let reg = MetricsRegistry::new();
+        reg.gauge("mem_bytes", "memory");
+        reg.histogram("latency", "help");
+        let out = reg.gather();
+        assert!(out.contains("mem_bytes"));
+        assert!(out.contains("latency"));
+    }
+
     // --- Concurrency smoke test ---
 
     #[test]
@@ -793,5 +1007,44 @@ mod tests {
         }
 
         assert_eq!(c.get(), 8000);
+    }
+
+    #[test]
+    fn register_histogram_stores_in_registry() {
+        use oceanfs_core::{Histogram, HistogramConfig, LabelSet, MetricRegistrar};
+
+        let reg = MetricsRegistry::new();
+        let config = HistogramConfig::default();
+        let h = Arc::new(Histogram::new(
+            "test_latency".into(),
+            "Test histogram".into(),
+            &config,
+            LabelSet::empty(),
+        ));
+
+        reg.register_histogram(Arc::clone(&h));
+        let gathered = reg.gather();
+        assert!(
+            gathered.contains("test_latency"),
+            "gathered metrics should contain registered histogram: {gathered}"
+        );
+    }
+
+    #[test]
+    fn register_histogram_with_labels_renders_correctly() {
+        use oceanfs_core::{Histogram, HistogramConfig, LabelSet, MetricRegistrar};
+
+        let reg = MetricsRegistry::new();
+        let config = HistogramConfig::default();
+        let labels = LabelSet::new(&[("tier", "gpu"), ("op", "encode")]);
+        let h =
+            Arc::new(Histogram::new("latency".into(), "Test histogram".into(), &config, labels));
+
+        reg.register_histogram(Arc::clone(&h));
+        let gathered = reg.gather();
+        assert!(
+            gathered.contains("tier=\"gpu\"") && gathered.contains("op=\"encode\""),
+            "gathered output should contain label pairs, got: {gathered}"
+        );
     }
 }

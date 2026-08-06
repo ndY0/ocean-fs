@@ -28,6 +28,7 @@ use axum::{
     response::{IntoResponse, Response},
     Router as AxumRouter,
 };
+use oceanfs_core::Counter;
 use tracing::error;
 
 use crate::{
@@ -93,6 +94,18 @@ pub(crate) struct AppState {
     /// Optional directory for persisting blob data to disk.
     /// When set, blob data is written to `{blob_dir}/{segment_id}.blob` on PUT.
     pub blob_dir: Option<PathBuf>,
+    /// S3 request counter by method.
+    pub s3_put_counter: Counter,
+    /// S3 GET request counter.
+    pub s3_get_counter: Counter,
+    /// S3 HEAD request counter.
+    pub s3_head_counter: Counter,
+    /// S3 DELETE request counter.
+    pub s3_delete_counter: Counter,
+    /// S3 LIST request counter.
+    pub s3_list_counter: Counter,
+    /// S3 request error counter.
+    pub s3_error_counter: Counter,
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +177,36 @@ impl S3Handler {
             prefetch_engine: None,
             router: None,
             blob_dir: None,
+            s3_put_counter: Counter::new(
+                "s3_requests_total".into(),
+                "S3 PUT requests".into(),
+                oceanfs_core::LabelSet::new(&[("method", "PUT")]),
+            ),
+            s3_get_counter: Counter::new(
+                "s3_requests_total".into(),
+                "S3 GET requests".into(),
+                oceanfs_core::LabelSet::new(&[("method", "GET")]),
+            ),
+            s3_head_counter: Counter::new(
+                "s3_requests_total".into(),
+                "S3 HEAD requests".into(),
+                oceanfs_core::LabelSet::new(&[("method", "HEAD")]),
+            ),
+            s3_delete_counter: Counter::new(
+                "s3_requests_total".into(),
+                "S3 DELETE requests".into(),
+                oceanfs_core::LabelSet::new(&[("method", "DELETE")]),
+            ),
+            s3_list_counter: Counter::new(
+                "s3_requests_total".into(),
+                "S3 LIST requests".into(),
+                oceanfs_core::LabelSet::new(&[("method", "LIST")]),
+            ),
+            s3_error_counter: Counter::new(
+                "s3_request_errors_total".into(),
+                "S3 request errors".into(),
+                oceanfs_core::LabelSet::empty(),
+            ),
         };
         Self { state }
     }
@@ -193,6 +236,16 @@ impl S3Handler {
     pub fn with_blob_dir(mut self, dir: PathBuf) -> Self {
         self.state.blob_dir = Some(dir);
         self
+    }
+
+    /// Registers S3 request counters with a metrics registrar.
+    pub fn register_metrics(&self, registrar: &dyn oceanfs_core::MetricRegistrar) {
+        registrar.register_counter(self.state.s3_put_counter.clone());
+        registrar.register_counter(self.state.s3_get_counter.clone());
+        registrar.register_counter(self.state.s3_head_counter.clone());
+        registrar.register_counter(self.state.s3_delete_counter.clone());
+        registrar.register_counter(self.state.s3_list_counter.clone());
+        registrar.register_counter(self.state.s3_error_counter.clone());
     }
 
     /// Consumes the handler and returns an axum `Router`.
@@ -408,6 +461,36 @@ mod tests {
             prefetch_engine: None,
             router: None,
             blob_dir: None,
+            s3_put_counter: Counter::new(
+                "s3_requests_total".into(),
+                "help".into(),
+                oceanfs_core::LabelSet::new(&[("method", "PUT")]),
+            ),
+            s3_get_counter: Counter::new(
+                "s3_requests_total".into(),
+                "help".into(),
+                oceanfs_core::LabelSet::new(&[("method", "GET")]),
+            ),
+            s3_head_counter: Counter::new(
+                "s3_requests_total".into(),
+                "help".into(),
+                oceanfs_core::LabelSet::new(&[("method", "HEAD")]),
+            ),
+            s3_delete_counter: Counter::new(
+                "s3_requests_total".into(),
+                "help".into(),
+                oceanfs_core::LabelSet::new(&[("method", "DELETE")]),
+            ),
+            s3_list_counter: Counter::new(
+                "s3_requests_total".into(),
+                "help".into(),
+                oceanfs_core::LabelSet::new(&[("method", "LIST")]),
+            ),
+            s3_error_counter: Counter::new(
+                "s3_request_errors_total".into(),
+                "help".into(),
+                oceanfs_core::LabelSet::empty(),
+            ),
         }
     }
 

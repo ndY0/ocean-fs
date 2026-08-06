@@ -113,6 +113,11 @@ impl HealWorker {
         &self.stats
     }
 
+    /// Registers heal counters with a metrics registrar.
+    pub fn register_metrics(&self, registrar: &dyn oceanfs_core::MetricRegistrar) {
+        self.stats.register_metrics(registrar);
+    }
+
     /// Runs the heal worker loop until the shutdown token is cancelled.
     ///
     /// Continuously drains the bounded queue. Each request:

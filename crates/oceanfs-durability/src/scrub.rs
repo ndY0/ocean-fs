@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use oceanfs_core::{NodeId, SegmentId, SegmentMetadata};
+use oceanfs_core::{Counter, LabelSet, MetricRegistrar, NodeId, SegmentId, SegmentMetadata};
 use oceanfs_storage::{metadata::RocksDbMetadataStore, Error, Result};
 use tokio::sync::Semaphore;
 
@@ -495,12 +495,34 @@ impl ScrubWorker {
 /// ```
 pub struct ScrubCoordinator {
     config: ScrubConfig,
+    segments_checked_total: Counter,
+    segments_corrupt_total: Counter,
 }
 
 impl ScrubCoordinator {
-    /// Creates a new scrub coordinator.
+    /// Creates a new scrub coordinator with unregistered counters.
+    ///
+    /// Use [`register_metrics`](Self::register_metrics) to wire them.
     pub fn new(config: ScrubConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            segments_checked_total: Counter::new(
+                "scrub_segments_checked_total".into(),
+                "Segments checked by scrub".into(),
+                LabelSet::empty(),
+            ),
+            segments_corrupt_total: Counter::new(
+                "scrub_segments_corrupt_total".into(),
+                "Corrupt segments detected by scrub".into(),
+                LabelSet::empty(),
+            ),
+        }
+    }
+
+    /// Registers scrub counters with a metrics registrar.
+    pub fn register_metrics(&self, registrar: &dyn MetricRegistrar) {
+        registrar.register_counter(self.segments_checked_total.clone());
+        registrar.register_counter(self.segments_corrupt_total.clone());
     }
 
     /// Returns the configuration.
@@ -675,6 +697,11 @@ impl ScrubCoordinator {
             "scrub cycle complete"
         );
 
+        self.segments_checked_total.add(report.segments_total);
+        if report.segments_corrupt > 0 {
+            self.segments_corrupt_total.add(report.segments_corrupt);
+        }
+
         Ok(report)
     }
 
@@ -694,7 +721,7 @@ impl ScrubCoordinator {
     ) -> Result<()> {
         let config = self.config.clone();
         tokio::spawn(async move {
-            let coord = ScrubCoordinator { config };
+            let coord = ScrubCoordinator::new(config);
             match coord.run_cycle(metadata, data_store).await {
                 Ok(report) => {
                     tracing::info!(
@@ -1419,5 +1446,20 @@ mod tests {
         assert_eq!(report.segments_total(), 4);
         assert_eq!(report.segments_healthy(), 4);
         assert_eq!(report.segments_corrupt(), 0);
+    }
+
+    // --- Metrics tests ---
+
+    #[test]
+    fn scrub_metrics_created_and_increment() {
+        let coord = ScrubCoordinator::new(ScrubConfig::default());
+        assert_eq!(coord.segments_checked_total.get(), 0);
+        assert_eq!(coord.segments_corrupt_total.get(), 0);
+
+        coord.segments_checked_total.add(100);
+        coord.segments_corrupt_total.add(3);
+
+        assert_eq!(coord.segments_checked_total.get(), 100);
+        assert_eq!(coord.segments_corrupt_total.get(), 3);
     }
 }

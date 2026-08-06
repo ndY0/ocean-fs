@@ -33,18 +33,12 @@ pub struct NodeConfig {
     /// Address for internal gRPC node-to-node communication.
     #[serde(default = "default_grpc_listen_addr")]
     pub grpc_listen_addr: String,
-    /// Bootstrap nodes for cluster discovery.
+    /// Gossip membership protocol configuration.
+    ///
+    /// Controls SWIM gossip interval, suspicion/failure timeouts,
+    /// indirect ping count, and bootstrap seed nodes.
     #[serde(default)]
-    pub seed_nodes: Vec<String>,
-    /// Gossip interval in milliseconds (default 1000).
-    #[serde(default = "default_gossip_interval")]
-    pub gossip_interval_ms: u64,
-    /// Time in SUSPECT state before declaring DEAD in milliseconds (default 5000).
-    #[serde(default = "default_suspicion_timeout")]
-    pub suspicion_timeout_ms: u64,
-    /// Total failure detection timeout in milliseconds (default 15000).
-    #[serde(default = "default_failure_timeout")]
-    pub failure_timeout_ms: u64,
+    pub gossip: crate::GossipConfig,
     /// Log level: trace, debug, info, warn, error.
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -88,6 +82,24 @@ pub struct NodeConfig {
     /// Orphan reaper interval in seconds (default 3600).
     #[serde(default = "default_orphan_interval")]
     pub orphan_reaper_interval_sec: u64,
+    /// Number of virtual nodes per physical node in the DHT ring (default 256).
+    #[serde(default = "default_vnodes_per_node")]
+    pub vnodes_per_node: u32,
+    /// Number of replicas for each data item (default 3).
+    #[serde(default = "default_replication_factor")]
+    pub replication_factor: u32,
+    /// Number of gRPC channels per peer (default 4).
+    #[serde(default = "default_pool_size_per_peer")]
+    pub pool_size_per_peer: usize,
+    /// Keepalive interval in seconds for idle channels (default 30).
+    #[serde(default = "default_keepalive_sec")]
+    pub keepalive_sec: u64,
+    /// Connection establishment timeout in milliseconds (default 5000).
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    /// Default per-request timeout in milliseconds (default 30000).
+    #[serde(default = "default_request_timeout_ms")]
+    pub request_timeout_ms: u64,
 }
 
 fn default_node_id() -> String {
@@ -129,14 +141,23 @@ fn default_scrub_interval() -> u64 {
 fn default_orphan_interval() -> u64 {
     3600
 }
-fn default_gossip_interval() -> u64 {
-    1000
+fn default_vnodes_per_node() -> u32 {
+    256
 }
-fn default_suspicion_timeout() -> u64 {
+fn default_replication_factor() -> u32 {
+    3
+}
+fn default_pool_size_per_peer() -> usize {
+    4
+}
+fn default_keepalive_sec() -> u64 {
+    30
+}
+fn default_connect_timeout_ms() -> u64 {
     5000
 }
-fn default_failure_timeout() -> u64 {
-    15000
+fn default_request_timeout_ms() -> u64 {
+    30000
 }
 
 impl Default for NodeConfig {
@@ -146,7 +167,7 @@ impl Default for NodeConfig {
             data_dir: PathBuf::from("/var/lib/oceanfs"),
             listen_addr: "0.0.0.0:9000".into(),
             grpc_listen_addr: "0.0.0.0:9001".into(),
-            seed_nodes: vec![],
+            gossip: crate::GossipConfig::default(),
             log_level: "info".into(),
             metrics_enabled: true,
             metrics_listen_addr: "0.0.0.0:9090".into(),
@@ -158,9 +179,12 @@ impl Default for NodeConfig {
             ae_interval_sec: 300,
             scrub_interval_sec: 604800,
             orphan_reaper_interval_sec: 3600,
-            gossip_interval_ms: 1000,
-            suspicion_timeout_ms: 5000,
-            failure_timeout_ms: 15000,
+            vnodes_per_node: 256,
+            replication_factor: 3,
+            pool_size_per_peer: 4,
+            keepalive_sec: 30,
+            connect_timeout_ms: 5000,
+            request_timeout_ms: 30000,
         }
     }
 }
@@ -180,7 +204,7 @@ mod tests {
     #[test]
     fn default_config_seed_nodes_is_empty() {
         let config = NodeConfig::default();
-        assert!(config.seed_nodes.is_empty());
+        assert!(config.gossip.seed_nodes.is_empty());
     }
 
     #[test]
