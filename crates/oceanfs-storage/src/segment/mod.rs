@@ -18,6 +18,7 @@ pub use buffer::ActiveSegment;
 pub use handle::SegmentHandle;
 pub use header::SegmentHeader;
 pub use index::SegmentIndex;
+pub use pool::SegmentPool;
 pub use sealer::{SealConfig, SegmentSealer};
 pub use shard::SegmentShard;
 pub use splitter::SegmentSplitter;

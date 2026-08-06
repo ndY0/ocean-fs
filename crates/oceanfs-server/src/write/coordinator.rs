@@ -17,13 +17,16 @@ use std::sync::Arc;
 use bytes::Bytes;
 use oceanfs_cache::CacheRpcClient;
 use oceanfs_core::{
-    BucketId, ChunkRef, HashKey, HashOutput, Hlc, HlcClock, NodeId, ObjectKey, OperationTimeouts,
-    SegmentId, WriteResult,
+    BucketId, ChunkRef, HashKey, HashOutput, Hlc, HlcClock, NodeId, ObjectKey, ObjectMetadata,
+    OperationTimeouts, SegmentId, SegmentSizeConfig, SizeTier, WriteResult,
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::RingCache;
-use oceanfs_storage::SegmentRpcClient;
+use oceanfs_storage::{
+    RocksDbMetadataStore, SegmentPool, SegmentRpcClient, SegmentSealer, SegmentShard,
+    SegmentSplitter, TierRouter,
+};
 use tracing::{info, warn};
 
 use crate::{
@@ -58,8 +61,8 @@ pub struct WriteRequest {
 /// Coordinates distributed blob writes with quorum replication.
 ///
 /// Routes writes to the correct replica set, appends to the local
-/// segment, fans out replicas, and collects W acknowledgments before
-/// returning to the client.
+/// segment via the segment pipeline, fans out replicas, and collects W
+/// acknowledgments before returning to the client.
 pub struct WriteCoordinator {
     /// Ring cache for consistent-hashing lookups.
     ring: Arc<RingCache>,
@@ -71,32 +74,75 @@ pub struct WriteCoordinator {
     node_id: NodeId,
     /// HLC clock for write timestamping.
     hlc_clock: Arc<HlcClock>,
+    /// Metadata store for inline writes and segment metadata.
+    metadata_store: Arc<RocksDbMetadataStore>,
+    /// Tier router for classifying blob sizes.
+    tier_router: TierRouter,
+    /// Per-core sharded segment groups (Small tier).
+    #[allow(dead_code)]
+    shard_small: Arc<SegmentShard>,
+    /// Per-core sharded segment groups (Standard tier).
+    #[allow(dead_code)]
+    shard_standard: Arc<SegmentShard>,
+    /// Segment pool for pipeline parallelism (Small tier).
+    segment_pool_small: Arc<SegmentPool>,
+    /// Segment pool for pipeline parallelism (Standard tier).
+    segment_pool_standard: Arc<SegmentPool>,
+    /// Segment sealer for finalizing full segments.
+    #[allow(dead_code)]
+    sealer: Arc<SegmentSealer>,
+    /// Segment size configuration.
+    size_config: SegmentSizeConfig,
 }
 
 impl WriteCoordinator {
-    /// Creates a new write coordinator.
+    /// Creates a new write coordinator with the full segment pipeline.
     ///
     /// All dependencies are injected via `Arc` for testability and
     /// to support the composition-root pattern in `oceanfs-node`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ring: Arc<RingCache>,
         membership: Arc<Membership>,
         pool: Arc<ConnectionPool>,
         node_id: NodeId,
         hlc_clock: Arc<HlcClock>,
+        metadata_store: Arc<RocksDbMetadataStore>,
+        size_config: SegmentSizeConfig,
+        shard_small: Arc<SegmentShard>,
+        shard_standard: Arc<SegmentShard>,
+        segment_pool_small: Arc<SegmentPool>,
+        segment_pool_standard: Arc<SegmentPool>,
+        sealer: Arc<SegmentSealer>,
     ) -> Self {
-        Self { ring, membership, pool, node_id, hlc_clock }
+        let tier_router = TierRouter::new(size_config.clone());
+        Self {
+            ring,
+            membership,
+            pool,
+            node_id,
+            hlc_clock,
+            metadata_store,
+            tier_router,
+            shard_small,
+            shard_standard,
+            segment_pool_small,
+            segment_pool_standard,
+            sealer,
+            size_config,
+        }
     }
 
-    /// Executes a distributed write.
+    /// Executes a distributed write through the segment pipeline.
     ///
     /// # Algorithm
     ///
     /// 1. Look up the replica set from the ring.
     /// 2. If this node is not in the replica set, forward to the first
     ///    successor (in a full implementation, via gRPC).
-    /// 3. If local: append to the local active segment, replicate to
-    ///    W successors, collect W acks.
+    /// 3. If local: classify blob size via `TierRouter`, store via the
+    ///    segment pipeline (inline or `SegmentPool`), replicate to W
+    ///    successors, collect W acks.
     /// 4. On quorum success: return `WriteResult`.
     /// 5. On quorum failure (timeout or insufficient acks): return error.
     ///
@@ -125,15 +171,71 @@ impl WriteCoordinator {
             return self.forward_write(&forward_target, &req).await;
         }
 
-        // Step 3: Local write + timestamp.
+        // Step 3: Local write + timestamp. Handle empty blobs early.
         let hlc = self.hlc_clock.now();
-        let segment_id = SegmentId::new();
-        let offset = 0u64;
-        let length = req.data.len() as u32;
+        let blob_size = req.data.len() as u64;
+        if blob_size == 0 {
+            let hash = blake3::hash(&req.data);
+            let blake3_hash = HashOutput::from_bytes(*hash.as_bytes());
+            return Ok(WriteResult {
+                object_key: req.key,
+                chunks: smallvec::SmallVec::new(),
+                size: 0,
+                blake3_hash: Some(blake3_hash),
+                hlc,
+            });
+        }
+
+        let tier = self.tier_router.classify(blob_size);
+        let data_ref: &[u8] = req.data.as_ref();
 
         // Compute BLAKE3 hash of the data.
         let hash = blake3::hash(&req.data);
         let blake3_hash = HashOutput::from_bytes(*hash.as_bytes());
+
+        // Step 4: Store data through the segment pipeline.
+        let chunks = match tier {
+            SizeTier::Inline => {
+                let meta = ObjectMetadata {
+                    object_key: req.key.clone(),
+                    size: req.data.len() as u64,
+                    blake3_hash: Some(blake3_hash),
+                    chunks: smallvec::SmallVec::new(),
+                    inline_data: Some(req.data.clone()),
+                    created_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64,
+                    hlc,
+                };
+                self.metadata_store
+                    .put_object(meta)
+                    .map_err(|e| Error::Storage(format!("inline metadata write: {e}")))?;
+                smallvec::SmallVec::new()
+            }
+            SizeTier::Small => Self::append_to_pool(data_ref, &self.segment_pool_small)
+                .map_err(|e| Error::Storage(format!("small tier append: {e}")))?,
+            SizeTier::Standard => Self::append_to_pool(data_ref, &self.segment_pool_standard)
+                .map_err(|e| Error::Storage(format!("standard tier append: {e}")))?,
+            SizeTier::Multi => {
+                let splitter = SegmentSplitter::new(self.size_config.default_target_size);
+                let split_chunks = splitter.split(data_ref);
+                let mut chunks = smallvec::SmallVec::new();
+                for (chunk_offset, chunk_data) in &split_chunks {
+                    let (seg_id, _offset, length) =
+                        self.segment_pool_standard
+                            .append(chunk_data)
+                            .map_err(|e| Error::Storage(format!("multi tier append: {e}")))?;
+                    chunks.push(ChunkRef { segment_id: seg_id, offset: *chunk_offset, length });
+                }
+                chunks
+            }
+            _ => {
+                return Err(Error::InvalidRequest(format!("unsupported storage tier: {tier:?}")));
+            }
+        };
+
+        let segment_id = chunks.first().map(|c| c.segment_id).unwrap_or_else(SegmentId::new);
 
         info!(
             bucket = %req.bucket,
@@ -145,7 +247,7 @@ impl WriteCoordinator {
             "local write completed"
         );
 
-        // Step 4: Replicate to W successors using the replication module.
+        // Step 5: Replicate to W successors using the replication module.
         let quorum = req.write_quorum.min(replica_set.len() as u8);
         let mut acks_received: usize = 1; // local ack counted
 
@@ -182,15 +284,12 @@ impl WriteCoordinator {
             }
         }
 
-        // Step 5: Verify quorum.
+        // Step 6: Verify quorum.
         if acks_received < quorum as usize {
             return Err(Error::QuorumNotMet { required: quorum, received: acks_received });
         }
 
-        // Step 6: Build result.
-        let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id, offset, length });
-
+        // Step 7: Build result.
         Ok(WriteResult {
             object_key: req.key,
             chunks,
@@ -198,6 +297,17 @@ impl WriteCoordinator {
             blake3_hash: Some(blake3_hash),
             hlc,
         })
+    }
+
+    /// Appends data to a segment pool and returns the chunk reference.
+    fn append_to_pool(
+        data: &[u8],
+        pool: &SegmentPool,
+    ) -> std::result::Result<smallvec::SmallVec<[ChunkRef; 4]>, oceanfs_storage::Error> {
+        let (segment_id, offset, length) = pool.append(data)?;
+        let mut chunks = smallvec::SmallVec::new();
+        chunks.push(ChunkRef { segment_id, offset, length });
+        Ok(chunks)
     }
 
     /// Returns a reference to the HLC clock.
@@ -384,12 +494,17 @@ impl WriteCoordinator {
 mod tests {
     use std::net::SocketAddr;
 
-    use oceanfs_core::{GossipConfig, Incarnation, NodeId, NodeState, RingConfig, RpcConfig};
+    use oceanfs_core::{
+        GossipConfig, Incarnation, MetadataConfig, NodeId, NodeState, PoolConfig, RingConfig,
+        RpcConfig, SizeTier, WalConfig,
+    };
     use oceanfs_routing::{hash_key, Ring};
+    use oceanfs_storage::{BufferPool, SealConfig, WalWriter};
 
     use super::*;
 
-    fn make_write_coordinator(node_id: &str, ring_nodes: &[&str]) -> WriteCoordinator {
+    /// Creates a test coordinator with a fully wired segment pipeline.
+    async fn make_write_coordinator(node_id: &str, ring_nodes: &[&str]) -> WriteCoordinator {
         let mut ring = Ring::new(RingConfig { vnodes_per_node: 8, replication_factor: 3 });
         for node in ring_nodes {
             ring.add_node(NodeId::new(*node));
@@ -408,18 +523,78 @@ mod tests {
         }
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let hlc_clock = Arc::new(HlcClock::new());
-        WriteCoordinator::new(ring_cache, membership, pool, NodeId::new(node_id), hlc_clock)
+
+        // Segment pipeline components (in-memory / temp dir).
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = Arc::new(
+            RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: dir.path().join("meta"),
+                block_cache_size: 1024,
+                memtable_size: 1024,
+            })
+            .unwrap(),
+        );
+        let size_config = SegmentSizeConfig::default();
+        let buffer_pool = Arc::new(BufferPool::new(65536, 16));
+
+        let shard_small =
+            Arc::new(SegmentShard::new(4, SizeTier::Small, &size_config, &buffer_pool).unwrap());
+        let shard_standard =
+            Arc::new(SegmentShard::new(4, SizeTier::Standard, &size_config, &buffer_pool).unwrap());
+
+        let pool_cfg = PoolConfig::default();
+        let segment_pool_small = Arc::new(
+            SegmentPool::new(pool_cfg.clone(), SizeTier::Small, &size_config, buffer_pool.clone())
+                .unwrap(),
+        );
+        let segment_pool_standard = Arc::new(
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool).unwrap(),
+        );
+
+        let wal = Arc::new(
+            WalWriter::open(&WalConfig {
+                data_dir: dir.path().join("wal"),
+                max_file_size_bytes: 1024 * 1024,
+                fsync_batch_timeout_ms: 5,
+            })
+            .await
+            .unwrap(),
+        );
+
+        let seal_config = SealConfig {
+            target_size_bytes: size_config.default_target_size,
+            seal_timeout_ms: 5000,
+            data_dir: dir.path().join("segments"),
+        };
+        let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
+
+        WriteCoordinator::new(
+            ring_cache,
+            membership,
+            pool,
+            NodeId::new(node_id),
+            hlc_clock,
+            metadata,
+            size_config,
+            shard_small,
+            shard_standard,
+            segment_pool_small,
+            segment_pool_standard,
+            sealer,
+        )
     }
 
     #[tokio::test]
     async fn coordinator_put_returns_result_for_local_node() {
-        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"]);
+        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"]).await;
 
+        // Use data larger than the inline threshold (4096) to hit the Small tier.
+        let data = vec![0xABu8; 5000];
         let req = WriteRequest {
             bucket: BucketId::new("test"),
             key: ObjectKey::new("obj"),
             hash_key: HashKey::from_bytes(hash_key(b"obj")),
-            data: Bytes::from_static(b"hello world"),
+            data: Bytes::from(data),
             write_quorum: 1,
             ack_after_wal: true,
             ec_async: false,
@@ -427,15 +602,15 @@ mod tests {
         };
 
         let result = coord.put(req).await.unwrap();
-        assert_eq!(result.size, 11);
+        assert_eq!(result.size, 5000);
         assert_eq!(result.chunks.len(), 1);
-        assert_eq!(result.chunks[0].length, 11);
+        assert_eq!(result.chunks[0].length, 5000);
         assert!(result.blake3_hash.is_some(), "BLAKE3 hash must be computed");
     }
 
     #[tokio::test]
     async fn coordinator_put_generates_valid_hash() {
-        let coord = make_write_coordinator("n1", &["n1"]);
+        let coord = make_write_coordinator("n1", &["n1"]).await;
 
         let data = Bytes::from_static(b"test data");
         let expected_hash = blake3::hash(&data);
@@ -462,7 +637,7 @@ mod tests {
         // It should attempt to forward to an alive node from the
         // replica set, returning a ForwardFailed error with the
         // target node information.
-        let coord = make_write_coordinator("n4", &["n1", "n2"]);
+        let coord = make_write_coordinator("n4", &["n1", "n2"]).await;
 
         let req = WriteRequest {
             bucket: BucketId::new("test"),
@@ -490,7 +665,7 @@ mod tests {
     #[tokio::test]
     async fn coordinator_put_quorum_single_node_succeeds_with_quorum_1() {
         // Single node in ring — quorum is capped at replica count (1).
-        let coord = make_write_coordinator("n1", &["n1"]);
+        let coord = make_write_coordinator("n1", &["n1"]).await;
 
         let req = WriteRequest {
             bucket: BucketId::new("test"),
@@ -511,7 +686,7 @@ mod tests {
     #[tokio::test]
     async fn coordinator_put_quorum_exceeds_replicas_ok() {
         // 2 nodes in ring; quorum=1 uses at least 1. Write succeeds.
-        let coord = make_write_coordinator("n1", &["n1", "n2"]);
+        let coord = make_write_coordinator("n1", &["n1", "n2"]).await;
 
         let req = WriteRequest {
             bucket: BucketId::new("test"),
@@ -530,7 +705,7 @@ mod tests {
 
     #[tokio::test]
     async fn coordinator_put_hlc_clock_advances() {
-        let coord = make_write_coordinator("n1", &["n1", "n2"]);
+        let coord = make_write_coordinator("n1", &["n1", "n2"]).await;
 
         let before = coord.hlc_clock().now();
 
@@ -558,7 +733,7 @@ mod tests {
         // 3-node ring, n1 is local, quorum=2.
         // Remote replicas n2 and n3 will fail (no gRPC server running).
         // Local ack counts as 1, so acks=1 < quorum=2 → QuorumNotMet.
-        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"]);
+        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"]).await;
 
         let req = WriteRequest {
             bucket: BucketId::new("test"),
@@ -586,7 +761,7 @@ mod tests {
     async fn coordinator_put_succeeds_with_quorum_1_even_if_remotes_fail() {
         // 3-node ring, n1 is local, quorum=1.
         // Remote replicas fail but local ack counts as 1, so quorum is met.
-        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"]);
+        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"]).await;
 
         let req = WriteRequest {
             bucket: BucketId::new("test"),
@@ -609,7 +784,7 @@ mod tests {
     #[tokio::test]
     async fn coordinator_put_empty_replica_set_returns_routing_error() {
         // Ring with no nodes → routing error.
-        let coord = make_write_coordinator("n1", &[]);
+        let coord = make_write_coordinator("n1", &[]).await;
 
         let req = WriteRequest {
             bucket: BucketId::new("test"),

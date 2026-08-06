@@ -86,15 +86,20 @@ struct RoundTripEnv {
 }
 
 impl RoundTripEnv {
-    fn new() -> Self {
+    async fn new() -> Self {
         use std::net::SocketAddr;
 
         use oceanfs_core::{
-            GossipConfig, HlcClock, Incarnation, NodeId, NodeState, RingConfig, RpcConfig,
+            GossipConfig, HlcClock, Incarnation, MetadataConfig, NodeId, NodeState, PoolConfig,
+            RingConfig, RpcConfig, SegmentSizeConfig, SizeTier, WalConfig,
         };
         use oceanfs_membership::Membership;
         use oceanfs_network::ConnectionPool;
         use oceanfs_routing::{Ring, RingCache};
+        use oceanfs_storage::{
+            BufferPool, RocksDbMetadataStore, SealConfig, SegmentPool, SegmentSealer, SegmentShard,
+            WalWriter,
+        };
 
         let mut ring = Ring::new(RingConfig { vnodes_per_node: 8, replication_factor: 3 });
         ring.add_node(NodeId::new("n1"));
@@ -110,12 +115,59 @@ impl RoundTripEnv {
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let hlc_clock = Arc::new(HlcClock::new());
 
+        // Segment pipeline.
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_store = Arc::new(
+            RocksDbMetadataStore::open(&MetadataConfig {
+                data_dir: dir.path().join("meta"),
+                block_cache_size: 1024,
+                memtable_size: 1024,
+            })
+            .unwrap(),
+        );
+        let size_config = SegmentSizeConfig::default();
+        let buffer_pool = Arc::new(BufferPool::new(65536, 16));
+        let shard_small =
+            Arc::new(SegmentShard::new(4, SizeTier::Small, &size_config, &buffer_pool).unwrap());
+        let shard_standard =
+            Arc::new(SegmentShard::new(4, SizeTier::Standard, &size_config, &buffer_pool).unwrap());
+        let pool_cfg = PoolConfig::default();
+        let segment_pool_small = Arc::new(
+            SegmentPool::new(pool_cfg.clone(), SizeTier::Small, &size_config, buffer_pool.clone())
+                .unwrap(),
+        );
+        let segment_pool_standard = Arc::new(
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool).unwrap(),
+        );
+        let wal = Arc::new(
+            WalWriter::open(&WalConfig {
+                data_dir: dir.path().join("wal"),
+                max_file_size_bytes: 1024 * 1024,
+                fsync_batch_timeout_ms: 5,
+            })
+            .await
+            .unwrap(),
+        );
+        let seal_config = SealConfig {
+            target_size_bytes: size_config.default_target_size,
+            seal_timeout_ms: 5000,
+            data_dir: dir.path().join("segments"),
+        };
+        let sealer = Arc::new(SegmentSealer::new(seal_config, metadata_store.clone(), wal));
+
         let write = Arc::new(WriteCoordinator::new(
             ring_cache.clone(),
             membership,
             pool,
             NodeId::new("n1"),
             hlc_clock,
+            metadata_store,
+            size_config,
+            shard_small,
+            shard_standard,
+            segment_pool_small,
+            segment_pool_standard,
+            sealer,
         ));
 
         let segment_store = Arc::new(InMemorySegmentReader::new());
@@ -158,10 +210,15 @@ impl RoundTripEnv {
 
         let result = self.write.put(req).await.unwrap();
 
-        // Store segment data for subsequent reads.
-        for chunk in &result.chunks {
-            self.segment_store.put(chunk.segment_id, Self::to_bytes(data));
-        }
+        // Store segment data for subsequent reads (inline blobs have no chunks).
+        let inline_data = if result.chunks.is_empty() {
+            Some(Self::to_bytes(data))
+        } else {
+            for chunk in &result.chunks {
+                self.segment_store.put(chunk.segment_id, Self::to_bytes(data));
+            }
+            None
+        };
 
         // Store metadata so ReadCoordinator can find the object.
         let hash = blake3::hash(data);
@@ -171,7 +228,7 @@ impl RoundTripEnv {
             size: data.len() as u64,
             blake3_hash: Some(stored_hash),
             chunks: result.chunks.clone(),
-            inline_data: None,
+            inline_data,
             created_at: 0,
             hlc: oceanfs_core::Hlc::zero(),
         };
@@ -207,7 +264,7 @@ fn blake3_hash(data: &[u8]) -> String {
 
 #[tokio::test]
 async fn roundtrip_1kb_blob_hash_matches() {
-    let env = RoundTripEnv::new();
+    let env = RoundTripEnv::new().await;
     let data = vec![0xABu8; 1024];
     let expected_hash = env.put("test", "1kb.bin", &data).await;
 
@@ -221,7 +278,7 @@ async fn roundtrip_1kb_blob_hash_matches() {
 
 #[tokio::test]
 async fn roundtrip_100kb_blob_hash_matches() {
-    let env = RoundTripEnv::new();
+    let env = RoundTripEnv::new().await;
     let data = vec![0x42u8; 100_000];
     let expected_hash = env.put("test", "100kb.bin", &data).await;
 
@@ -235,7 +292,7 @@ async fn roundtrip_100kb_blob_hash_matches() {
 
 #[tokio::test]
 async fn roundtrip_small_blob_preserves_bytes() {
-    let env = RoundTripEnv::new();
+    let env = RoundTripEnv::new().await;
     let data = b"hello world small blob";
     let _ = env.put("test", "small.txt", data).await;
 
@@ -245,7 +302,7 @@ async fn roundtrip_small_blob_preserves_bytes() {
 
 #[tokio::test]
 async fn roundtrip_empty_blob() {
-    let env = RoundTripEnv::new();
+    let env = RoundTripEnv::new().await;
     let data: &[u8] = &[];
     let _ = env.put("test", "empty.bin", data).await;
 
@@ -255,7 +312,7 @@ async fn roundtrip_empty_blob() {
 
 #[tokio::test]
 async fn roundtrip_multiple_blobs_independent() {
-    let env = RoundTripEnv::new();
+    let env = RoundTripEnv::new().await;
 
     let data1 = b"first blob data";
     let data2 = b"second blob content";
@@ -276,7 +333,7 @@ async fn roundtrip_multiple_blobs_independent() {
 
 #[tokio::test]
 async fn roundtrip_1mb_blob_hash_matches() {
-    let env = RoundTripEnv::new();
+    let env = RoundTripEnv::new().await;
     let data = vec![0xABu8; 1_048_576]; // 1 MB
     let expected_hash = env.put("test", "1mb.bin", &data).await;
 
@@ -290,7 +347,7 @@ async fn roundtrip_1mb_blob_hash_matches() {
 
 #[tokio::test]
 async fn roundtrip_overwrite_preserves_latest() {
-    let env = RoundTripEnv::new();
+    let env = RoundTripEnv::new().await;
 
     let v1 = b"version one";
     let v2 = b"version two - updated content";

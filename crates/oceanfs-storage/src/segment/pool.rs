@@ -29,7 +29,6 @@ use crate::{
 
 /// The state of a pool slot throughout its lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum PoolSlotState {
     /// Slot is free and can accept a new segment.
     Idle,
@@ -42,13 +41,11 @@ pub(crate) enum PoolSlotState {
 }
 
 /// A single slot in the segment pool, holding one active segment and its state.
-#[allow(dead_code)]
 pub(crate) struct PoolSlot {
     state: Mutex<PoolSlotState>,
     segment: Mutex<Option<ActiveSegment>>,
 }
 
-#[allow(dead_code)]
 impl PoolSlot {
     /// Creates a new pool slot with a fresh active segment.
     fn new(
@@ -61,6 +58,7 @@ impl PoolSlot {
     }
 
     /// Creates a new pool slot in Idle state (no segment).
+    #[allow(dead_code)]
     fn new_idle() -> Self {
         Self { state: Mutex::new(PoolSlotState::Idle), segment: Mutex::new(None) }
     }
@@ -85,11 +83,10 @@ impl PoolSlot {
 ///
 /// # Examples
 ///
-/// ```ignore
-/// // SegmentPool is pub(crate); examples are in unit tests.
+/// ```text
+/// // SegmentPool examples are in unit tests.
 /// ```
-#[allow(dead_code)]
-pub(crate) struct SegmentPool {
+pub struct SegmentPool {
     /// Pool slots, one per active segment.
     slots: Vec<Arc<PoolSlot>>,
     /// The storage tier this pool serves.
@@ -105,12 +102,12 @@ pub(crate) struct SegmentPool {
     /// Semaphore limiting in-flight EC encodes.
     encode_semaphore: Arc<Semaphore>,
     /// Pool configuration.
+    #[allow(dead_code)]
     config: PoolConfig,
     /// Reference to the buffer pool for creating new active segments.
     buffer_pool: Arc<BufferPool>,
 }
 
-#[allow(dead_code)]
 impl SegmentPool {
     /// Creates a new segment pool.
     ///
@@ -118,7 +115,7 @@ impl SegmentPool {
     ///
     /// Returns an error if the buffer pool cannot provide enough buffers
     /// for the initial active segments.
-    pub(crate) fn new(
+    pub fn new(
         config: PoolConfig,
         tier: SizeTier,
         size_config: &oceanfs_core::SegmentSizeConfig,
@@ -176,7 +173,7 @@ impl SegmentPool {
     ///
     /// Returns an error if no segment is available for writing or if
     /// the underlying append operation fails.
-    pub(crate) fn append(&self, data: &[u8]) -> Result<(SegmentId, u64, u32)> {
+    pub fn append(&self, data: &[u8]) -> Result<(SegmentId, u64, u32)> {
         let idx = {
             let mut current = self.current_index.lock();
             let idx = *current;
@@ -213,8 +210,10 @@ impl SegmentPool {
             let sealed_segment = slot.segment.lock().take();
 
             if let Some(seg) = sealed_segment {
-                // Enqueue for EC encoding.
-                self.enqueue_encoding(seg.id());
+                let seg_id = seg.id();
+                // Return the buffer to the pool for reuse (perf §1.2).
+                self.buffer_pool.release(seg.into_buffer());
+                self.enqueue_encoding(seg_id);
             }
 
             // Try to activate a new segment in this slot (or another idle one).
@@ -225,11 +224,13 @@ impl SegmentPool {
     }
 
     /// Returns the number of slots in Appending state.
+    #[allow(dead_code)]
     pub(crate) fn active_count(&self) -> usize {
         self.slots.iter().filter(|s| s.state() == PoolSlotState::Appending).count()
     }
 
     /// Returns the number of pool slots.
+    #[allow(dead_code)]
     pub(crate) fn slot_count(&self) -> usize {
         self.slots.len()
     }
@@ -252,7 +253,10 @@ impl SegmentPool {
                         slot.set_state(PoolSlotState::Sealing);
                         let sealed = slot.segment.lock().take();
                         if let Some(seg) = sealed {
-                            self.enqueue_encoding(seg.id());
+                            let seg_id = seg.id();
+                            // Return the buffer to the pool for reuse (perf §1.2).
+                            self.buffer_pool.release(seg.into_buffer());
+                            self.enqueue_encoding(seg_id);
                         }
                         self.try_activate_slot();
                     }
@@ -265,28 +269,22 @@ impl SegmentPool {
 
     /// Enqueues a segment ID for EC encoding on the bounded work channel.
     ///
-    /// Uses `send().await` with a bounded timeout to enforce backpressure:
-    /// if the encoding queue is full, this method will block the caller for
-    /// up to 500ms. If the timeout elapses, the encoding is deferred and
-    /// will be retried later by the pool rotation logic.
+    /// Uses `try_send` for non-blocking enqueue. If the channel is full,
+    /// the encoding is deferred and will be retried later by the pool
+    /// rotation logic. This avoids blocking the caller in async contexts.
     fn enqueue_encoding(&self, segment_id: SegmentId) {
-        let timeout = std::time::Duration::from_millis(500);
-        let handle = tokio::runtime::Handle::current();
-        let result =
-            handle.block_on(tokio::time::timeout(timeout, self.encode_tx.send(segment_id)));
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(mpsc::error::SendError(_))) => {
+        match self.encode_tx.try_send(segment_id) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    segment_id = %segment_id,
+                    "EC encoding queue full; encoding deferred"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
                 tracing::error!(
                     segment_id = %segment_id,
                     "EC encoding queue closed; segment will not be encoded"
-                );
-            }
-            Err(_elapsed) => {
-                tracing::warn!(
-                    segment_id = %segment_id,
-                    timeout_ms = 500,
-                    "EC encoding queue full after timeout; encoding deferred"
                 );
             }
         }
@@ -332,12 +330,12 @@ impl SegmentPool {
     }
 
     /// Returns the EC encoding receiver channel, if available.
-    pub(crate) fn take_encode_rx(&self) -> Option<mpsc::Receiver<SegmentId>> {
+    pub fn take_encode_rx(&self) -> Option<mpsc::Receiver<SegmentId>> {
         self.encode_rx.lock().take()
     }
 
     /// Returns a clone of the encoding semaphore for worker tasks.
-    pub(crate) fn encode_semaphore(&self) -> Arc<Semaphore> {
+    pub fn encode_semaphore(&self) -> Arc<Semaphore> {
         Arc::clone(&self.encode_semaphore)
     }
 }

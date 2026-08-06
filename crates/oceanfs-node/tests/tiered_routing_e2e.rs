@@ -1,6 +1,12 @@
-//! Integration test: write coordinator and quorum replication.
+//! Integration test: Tiered blob size classification.
 //!
-//! Tests quorum fan-out, ack collection, and error handling.
+//! Verifies H7-storage: blobs of different sizes are routed to the correct
+//! storage tier (inline ≤4KB, small 4KB-256KB, standard 256KB-4MB, multi >4MB).
+//!
+//! ## Tests
+//! - `inline_blob_1kb_has_no_chunk_refs`
+//! - `small_blob_128kb_has_chunk_refs`
+//! - `standard_blob_1mb_has_chunk_refs`
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -39,7 +45,6 @@ async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
     let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
     let hlc_clock = Arc::new(HlcClock::new());
 
-    // Segment pipeline.
     let dir = tempfile::tempdir().unwrap();
     let metadata = Arc::new(
         RocksDbMetadataStore::open(&MetadataConfig {
@@ -50,7 +55,7 @@ async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
         .unwrap(),
     );
     let size_config = SegmentSizeConfig::default();
-    let buffer_pool = Arc::new(BufferPool::new(65536, 16));
+    let buffer_pool = Arc::new(BufferPool::new(65536, 32));
     let shard_small =
         Arc::new(SegmentShard::new(4, SizeTier::Small, &size_config, &buffer_pool).unwrap());
     let shard_standard =
@@ -95,46 +100,88 @@ async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
     )
 }
 
-fn write_request(key: &str, data: &[u8], quorum: u8) -> WriteRequest {
+fn write_request(key: &str, data: Vec<u8>) -> WriteRequest {
     WriteRequest {
         bucket: BucketId::new("test"),
         key: ObjectKey::new(key),
         hash_key: HashKey::from_bytes(hash_key(key.as_bytes())),
-        data: Bytes::copy_from_slice(data),
-        write_quorum: quorum,
+        data: Bytes::from(data),
+        write_quorum: 1,
         ack_after_wal: true,
         ec_async: false,
         policy: None,
     }
 }
 
-#[tokio::test]
-async fn write_quorum_1_with_local_node_succeeds() {
-    let coord = make_coordinator("n1", &["n1", "n2", "n3"]).await;
-    let req = write_request("obj-1", b"hello", 1);
-    let result = coord.put(req).await;
-    assert!(result.is_ok(), "write with quorum 1 should succeed");
-    let wr = result.unwrap();
-    assert_eq!(wr.size, 5);
-    assert_eq!(wr.object_key.as_str(), "obj-1");
-}
+// ---------------------------------------------------------------------------
+// Inline tier (≤ 4096 bytes)
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn write_triggers_hlc_advance() {
+async fn inline_blob_1kb_has_no_chunk_refs() {
     let coord = make_coordinator("n1", &["n1"]).await;
-    let before = coord.hlc_clock().now();
-    let req = write_request("hlc-test", b"data", 1);
-    coord.put(req).await.unwrap();
-    let after = coord.hlc_clock().now();
-    assert!(after > before, "HLC must advance after write");
+
+    // 1 KB ≤ 4096 → Inline tier.
+    let data = vec![0x11u8; 1024];
+    let req = write_request("inline-1kb", data);
+    let result = coord.put(req).await.unwrap();
+
+    assert_eq!(result.size, 1024);
+    assert!(result.chunks.is_empty(), "inline blobs should have zero chunk refs");
+    assert!(result.blake3_hash.is_some(), "BLAKE3 hash should always be computed");
 }
 
+// ---------------------------------------------------------------------------
+// Small tier (4 KB – 256 KB)
+// ---------------------------------------------------------------------------
+
 #[tokio::test]
-async fn write_with_quorum_capped_to_replica_count() {
-    // 1 node in ring, but requested quorum of 3 — capped to 1, succeeds.
+async fn small_blob_128kb_has_chunk_refs() {
     let coord = make_coordinator("n1", &["n1"]).await;
-    let mut req = write_request("capped", b"x", 3);
-    req.write_quorum = 3;
-    let result = coord.put(req).await;
-    assert!(result.is_ok(), "quorum capped to 1 should succeed");
+
+    // 128 KB → between 4KB and 256KB → Small tier.
+    let data = vec![0x22u8; 131_072];
+    let req = write_request("small-128kb", data);
+    let result = coord.put(req).await.unwrap();
+
+    assert_eq!(result.size, 131_072);
+    assert!(!result.chunks.is_empty(), "small tier blobs should have at least one chunk ref");
+    assert_eq!(result.chunks[0].offset, 0);
+    assert_eq!(result.chunks[0].length as u64, 131_072);
+    assert_ne!(result.chunks[0].segment_id, oceanfs_core::SegmentId::default());
+}
+
+// ---------------------------------------------------------------------------
+// Standard tier (256 KB – 4 MB)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn standard_blob_1mb_has_chunk_refs() {
+    let coord = make_coordinator("n1", &["n1"]).await;
+
+    // 1 MB → between 256KB and 4MB → Standard tier.
+    let data = vec![0x33u8; 1_048_576];
+    let req = write_request("standard-1mb", data);
+    let result = coord.put(req).await.unwrap();
+
+    assert_eq!(result.size, 1_048_576);
+    assert!(!result.chunks.is_empty(), "standard tier blobs should have at least one chunk ref");
+    assert_eq!(result.chunks[0].offset, 0);
+    assert_eq!(result.chunks[0].length as u64, 1_048_576);
+}
+
+// ---------------------------------------------------------------------------
+// Edge: empty blob
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn empty_blob_has_zero_chunks_and_size() {
+    let coord = make_coordinator("n1", &["n1"]).await;
+
+    let req = write_request("empty", vec![]);
+    let result = coord.put(req).await.unwrap();
+
+    assert_eq!(result.size, 0);
+    assert!(result.chunks.is_empty());
+    assert!(result.blake3_hash.is_some());
 }

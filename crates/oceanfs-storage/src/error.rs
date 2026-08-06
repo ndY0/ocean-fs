@@ -56,6 +56,10 @@ pub enum Error {
     #[error("invalid config: {0}")]
     InvalidConfig(String),
 
+    /// An unknown or unsupported storage tier was encountered.
+    #[error("invalid storage tier: {0}")]
+    InvalidTier(String),
+
     /// A Merkle tree hash mismatch was detected.
     #[error("merkle hash mismatch at leaf index {leaf_index}")]
     MerkleMismatch {

@@ -336,12 +336,17 @@ mod tests {
     use bytes::Bytes;
     use http::StatusCode;
     use oceanfs_core::{
-        BucketId, GossipConfig, HlcClock, Incarnation, NodeId, NodeState, ObjectKey,
-        ObjectMetadata, RingConfig, RpcConfig,
+        BucketId, GossipConfig, HlcClock, Incarnation, MetadataConfig, NodeId, NodeState,
+        ObjectKey, ObjectMetadata, PoolConfig, RingConfig, RpcConfig, SegmentSizeConfig, SizeTier,
+        WalConfig,
     };
     use oceanfs_membership::Membership;
     use oceanfs_network::ConnectionPool;
     use oceanfs_routing::{Ring, RingCache};
+    use oceanfs_storage::{
+        BufferPool, RocksDbMetadataStore, SealConfig, SegmentPool, SegmentSealer, SegmentShard,
+        WalWriter,
+    };
 
     use super::*;
     use crate::{
@@ -413,7 +418,7 @@ mod tests {
 
     // --- Test helpers ---
 
-    fn make_app_state() -> AppState {
+    async fn make_app_state() -> AppState {
         let mut ring = Ring::new(RingConfig { vnodes_per_node: 8, replication_factor: 3 });
         ring.add_node(NodeId::new("n1"));
         let ring_cache = Arc::new(RingCache::new(ring));
@@ -428,12 +433,60 @@ mod tests {
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let hlc_clock = Arc::new(HlcClock::new());
 
+        // Segment pipeline (in-memory / temp dir).
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = Arc::new(
+            RocksDbMetadataStore::open(&MetadataConfig {
+                data_dir: dir.path().join("meta"),
+                block_cache_size: 1024,
+                memtable_size: 1024,
+            })
+            .unwrap(),
+        );
+        let size_config = SegmentSizeConfig::default();
+        let buffer_pool = Arc::new(BufferPool::new(65536, 16));
+        let shard_small =
+            Arc::new(SegmentShard::new(4, SizeTier::Small, &size_config, &buffer_pool).unwrap());
+        let shard_standard =
+            Arc::new(SegmentShard::new(4, SizeTier::Standard, &size_config, &buffer_pool).unwrap());
+        let pool_cfg = PoolConfig::default();
+        let segment_pool_small = Arc::new(
+            SegmentPool::new(pool_cfg.clone(), SizeTier::Small, &size_config, buffer_pool.clone())
+                .unwrap(),
+        );
+        let segment_pool_standard = Arc::new(
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool).unwrap(),
+        );
+
+        let wal = Arc::new(
+            WalWriter::open(&WalConfig {
+                data_dir: dir.path().join("wal"),
+                max_file_size_bytes: 1024 * 1024,
+                fsync_batch_timeout_ms: 5,
+            })
+            .await
+            .unwrap(),
+        );
+        let seal_config = SealConfig {
+            target_size_bytes: size_config.default_target_size,
+            seal_timeout_ms: 5000,
+            data_dir: dir.path().join("segments"),
+        };
+        let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
+
         let write = Arc::new(WriteCoordinator::new(
             ring_cache.clone(),
             membership.clone(),
             pool,
             NodeId::new("n1"),
             hlc_clock,
+            metadata,
+            size_config,
+            shard_small,
+            shard_standard,
+            segment_pool_small,
+            segment_pool_standard,
+            sealer,
         ));
 
         // Create in-memory segment store shared by write and read paths.
@@ -498,7 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_object_returns_200() {
-        let state = make_app_state();
+        let state = make_app_state().await;
         state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
 
         let response = super::handlers::put_object(
@@ -513,7 +566,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_object_sets_etag_header() {
-        let state = make_app_state();
+        let state = make_app_state().await;
         state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
 
         let response = super::handlers::put_object(
@@ -529,7 +582,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_get_object_roundtrip() {
-        let state = make_app_state();
+        let state = make_app_state().await;
         state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
 
         let test_data = b"round-trip test data for verification";
@@ -555,7 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_and_get_object_data_matches() {
-        let state = make_app_state();
+        let state = make_app_state().await;
         state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
 
         let test_data = b"exact match test data bytes";
@@ -578,7 +631,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_object_returns_data() {
-        let state = make_app_state();
+        let state = make_app_state().await;
         state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
 
         let response = super::handlers::get_object(
@@ -592,7 +645,7 @@ mod tests {
 
     #[tokio::test]
     async fn head_object_returns_ok() {
-        let state = make_app_state();
+        let state = make_app_state().await;
         state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
 
         let response = super::handlers::head_object(
@@ -606,7 +659,7 @@ mod tests {
 
     #[tokio::test]
     async fn head_object_has_no_body() {
-        let state = make_app_state();
+        let state = make_app_state().await;
         state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
 
         let response = super::handlers::head_object(
@@ -622,7 +675,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_object_returns_204() {
-        let state = make_app_state();
+        let state = make_app_state().await;
 
         let response = super::handlers::delete_object(
             State(state),
@@ -636,7 +689,7 @@ mod tests {
     #[tokio::test]
     async fn delete_nonexistent_object_also_returns_204() {
         // S3 DELETE is idempotent — always returns 204.
-        let state = make_app_state();
+        let state = make_app_state().await;
 
         let response = super::handlers::delete_object(
             State(state),
@@ -651,14 +704,14 @@ mod tests {
 
     #[tokio::test]
     async fn create_bucket_returns_200() {
-        let state = make_app_state();
+        let state = make_app_state().await;
         let response = super::handlers::create_bucket(State(state), Path("photos".into())).await;
         assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn delete_bucket_returns_no_content() {
-        let state = make_app_state();
+        let state = make_app_state().await;
         let _ = super::handlers::create_bucket(State(state.clone()), Path("temp".into())).await;
         let response = super::handlers::delete_bucket(State(state), Path("temp".into())).await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -666,14 +719,14 @@ mod tests {
 
     #[tokio::test]
     async fn delete_nonexistent_bucket_returns_404() {
-        let state = make_app_state();
+        let state = make_app_state().await;
         let response = super::handlers::delete_bucket(State(state), Path("ghost".into())).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn list_objects_returns_xml() {
-        let state = make_app_state();
+        let state = make_app_state().await;
         state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
 
         let response = super::handlers::list_objects(
@@ -690,8 +743,8 @@ mod tests {
 
     // --- Cache cascade tests ---
 
-    fn make_app_state_with_caches() -> AppState {
-        let state = make_app_state();
+    async fn make_app_state_with_caches() -> AppState {
+        let state = make_app_state().await;
 
         // Wire L1, L2, L3 caches.
         let l1 = Arc::new(oceanfs_cache::ObjectCache::new(oceanfs_cache::ObjectCacheConfig {
@@ -722,7 +775,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_l1_hit_returns_200() {
-        let state = make_app_state_with_caches();
+        let state = make_app_state_with_caches().await;
         state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
 
         let bucket_id = BucketId::new("test-bucket");
@@ -744,7 +797,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_l3_negative_returns_404() {
-        let state = make_app_state_with_caches();
+        let state = make_app_state_with_caches().await;
         state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
 
         let _bucket_id = BucketId::new("test-bucket");

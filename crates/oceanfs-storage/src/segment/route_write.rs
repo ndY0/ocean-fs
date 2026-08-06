@@ -4,18 +4,16 @@
 //! function that dispatches writes to the correct tier.
 
 use bytes::Bytes;
-use oceanfs_core::{ObjectKey, SizeTier};
+use oceanfs_core::{ChunkRef, ObjectKey, SizeTier};
 
 use crate::{
     error::Result,
-    segment::{
-        splitter::SegmentSplitter,
-        tier::{ChunkListBuilder, TierRouter},
-    },
+    segment::{splitter::SegmentSplitter, tier::TierRouter},
     RocksDbMetadataStore,
 };
 
 /// Writes blobs directly to the metadata store (inline path).
+// TODO(write-path-unification): remove once cleanup task L5 is done.
 #[allow(dead_code)]
 pub(crate) struct InlineWriter;
 
@@ -48,6 +46,7 @@ impl InlineWriter {
 }
 
 /// Routes a blob write to the appropriate tier.
+// TODO(write-path-unification): remove once cleanup task L5 is done.
 #[allow(dead_code)]
 pub(crate) fn route_write(
     router: &TierRouter,
@@ -71,20 +70,28 @@ pub(crate) fn route_write(
         SizeTier::Small | SizeTier::Standard => {
             let segment_id = active.id();
             let (offset, length) = active.append(&data)?;
-            Ok(ChunkListBuilder::single(segment_id, offset, length as u32))
+            let mut chunks = smallvec::SmallVec::new();
+            chunks.push(ChunkRef { segment_id, offset, length: length as u32 });
+            Ok(chunks)
         }
         SizeTier::Multi => {
             let splitter = SegmentSplitter::new(router.target_size(SizeTier::Multi));
             let chunks = splitter.split(&data);
-            let mut refs = Vec::with_capacity(chunks.len());
+            let mut chunk_refs = smallvec::SmallVec::with_capacity(chunks.len());
             for (chunk_offset, chunk_data) in &chunks {
                 let segment_id = active.id();
                 let (_offset, _length) = active.append(chunk_data)?;
-                refs.push((segment_id, *chunk_offset, chunk_data.len() as u32));
+                chunk_refs.push(ChunkRef {
+                    segment_id,
+                    offset: *chunk_offset,
+                    length: chunk_data.len() as u32,
+                });
             }
-            Ok(ChunkListBuilder::multi(refs))
+            Ok(chunk_refs)
         }
-        _ => Ok(smallvec::SmallVec::new()),
+        _ => Err(crate::error::Error::InvalidTier(format!(
+            "unsupported storage tier for write routing: {tier:?}"
+        ))),
     }
 }
 

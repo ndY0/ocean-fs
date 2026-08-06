@@ -10,13 +10,14 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use bytes::Bytes;
 use oceanfs_core::{
     AccelConfig, BucketId, HlcClock, MetadataConfig, NodeConfig, NodeId, ObjectKey, ObjectMetadata,
-    RingConfig, RpcConfig, SegmentSizeConfig, WalConfig,
+    PoolConfig, RingConfig, RpcConfig, SegmentSizeConfig, SizeTier, WalConfig,
 };
 use oceanfs_durability::HintedHandoff;
 use oceanfs_server::{
     auth::AuthMiddleware, metadata_ops::MetadataOps, AdminHandler, BucketConfigStore,
     ReadCoordinator, Router, S3Handler, WriteCoordinator,
 };
+use oceanfs_storage::{SegmentPool, SegmentShard};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -193,22 +194,56 @@ impl Node {
             .await
             .map_err(|e| format!("failed to open WAL writer: {e}"))?;
         let wal_writer = Arc::new(wal_writer);
-        // BufferPool constructed here; will be wired to active segment writers
-        // when final-integration-read-write-end-to-end lands (perf rule 1.2).
-        let _buffer_pool = Arc::new(oceanfs_storage::BufferPool::new(65536, 256));
+        // BufferPool for recycling segment append buffers (perf rule §1.2).
+        let buffer_pool = Arc::new(oceanfs_storage::BufferPool::new(65536, 256));
         // ADR-0001: tiered segment sizing driven by SegmentSizeConfig.
         let seal_config = oceanfs_storage::SealConfig {
             target_size_bytes: segment_size.default_target_size,
             seal_timeout_ms: 5000,
             data_dir: config.data_dir.join("segments"),
         };
-        // SegmentSealer constructed here; will be wired into the write path
-        // when final-integration-read-write-end-to-end lands.
-        let sealer = Arc::new(oceanfs_storage::SegmentSealer::new(
-            seal_config,
-            metadata_store.clone(),
-            wal_writer.clone(),
-        ));
+        // SegmentSealer constructed here; wired into the write path below.
+        // Pass the blob store so sealed segments are available for heal/scrub/AE
+        // via SegmentDataStore (M5-storage).
+        let blob_store = Arc::new(
+            oceanfs_storage::BlobStore::open(&config.data_dir.join("blobs"))
+                .map_err(|e| format!("failed to open blob store: {e}"))?,
+        );
+        let sealer = Arc::new(
+            oceanfs_storage::SegmentSealer::new(
+                seal_config,
+                metadata_store.clone(),
+                wal_writer.clone(),
+            )
+            .with_blob_store(blob_store.clone()),
+        );
+
+        // Per-core segment shards for write concurrency (perf rule §2.5).
+        let shard_count = 4;
+        let shard_small = Arc::new(
+            SegmentShard::new(shard_count, SizeTier::Small, &segment_size, &buffer_pool)
+                .map_err(|e| format!("failed to create small segment shard: {e}"))?,
+        );
+        let shard_standard = Arc::new(
+            SegmentShard::new(shard_count, SizeTier::Standard, &segment_size, &buffer_pool)
+                .map_err(|e| format!("failed to create standard segment shard: {e}"))?,
+        );
+
+        // Segment pools for pipeline parallelism (perf rule §2.7).
+        let pool_config = PoolConfig::default();
+        let segment_pool_small = Arc::new(
+            SegmentPool::new(
+                pool_config.clone(),
+                SizeTier::Small,
+                &segment_size,
+                buffer_pool.clone(),
+            )
+            .map_err(|e| format!("failed to create small segment pool: {e}"))?,
+        );
+        let segment_pool_standard = Arc::new(
+            SegmentPool::new(pool_config, SizeTier::Standard, &segment_size, buffer_pool.clone())
+                .map_err(|e| format!("failed to create standard segment pool: {e}"))?,
+        );
         // ---- 7. Construct durability workers ----
         let gc_config = oceanfs_durability::GcConfig::new(
             config.gc_interval_sec,
@@ -238,11 +273,7 @@ impl Node {
         ));
 
         // ---- 7b. Construct segment data store (shared by heal and gRPC) ----
-        // Use a disk-backed blob store so segment data survives restarts.
-        let blob_store = Arc::new(
-            oceanfs_storage::BlobStore::open(&config.data_dir.join("blobs"))
-                .map_err(|e| format!("failed to open blob store: {e}"))?,
-        );
+        // BlobStore is already created in section 6 and passed to the sealer.
         let heal_data_store: Arc<dyn oceanfs_durability::SegmentDataStore> = blob_store.clone();
 
         // ---- 7c. Construct heal dispatch pipeline ----
@@ -321,6 +352,13 @@ impl Node {
             pool.clone(),
             NodeId::new(&config.node_id),
             hlc_clock,
+            metadata_store.clone(),
+            segment_size.clone(),
+            shard_small,
+            shard_standard,
+            segment_pool_small,
+            segment_pool_standard,
+            sealer.clone(),
         ));
 
         let read_coordinator = Arc::new(
@@ -372,7 +410,7 @@ impl Node {
         negative_cache.register_metrics(&*metrics);
         accel.register_metrics(&*metrics);
         heal_worker.register_metrics(&*metrics);
-        _buffer_pool.register_metrics(&*metrics);
+        buffer_pool.register_metrics(&*metrics);
         s3_handler.register_metrics(&*metrics);
 
         // Phase D: durability subsystem counters.

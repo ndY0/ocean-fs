@@ -72,6 +72,7 @@ accel = ["dep:oceanfs-accel"]
 
 [dev-dependencies]
 tokio-test = "0.4"
+tempfile = "3"
 
 [lints]
 workspace = true

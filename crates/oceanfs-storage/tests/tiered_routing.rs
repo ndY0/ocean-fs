@@ -4,7 +4,6 @@
 //! - TierRouter::classify() at boundary sizes
 //! - SizeTier threshold table implementation
 //! - SegmentSplitter chunk boundaries
-//! - ChunkListBuilder (indirectly through classify + splitter)
 //!
 //! Covers the `tiered-segment-routing` feature's Definition of Done.
 

@@ -1,6 +1,6 @@
 //! Tiered segment routing — dispatches blob writes to the correct tier.
 
-use oceanfs_core::{ChunkRef, SegmentSizeConfig, SizeTier};
+use oceanfs_core::{SegmentSizeConfig, SizeTier};
 
 /// Routes blob writes to the appropriate storage tier.
 pub struct TierRouter {
@@ -34,33 +34,6 @@ impl TierRouter {
     }
 }
 
-/// Builds a list of `ChunkRef`s from segment append operations.
-#[allow(dead_code)]
-pub(crate) struct ChunkListBuilder;
-
-#[allow(dead_code)]
-impl ChunkListBuilder {
-    pub(crate) fn single(
-        segment_id: oceanfs_core::SegmentId,
-        offset: u64,
-        length: u32,
-    ) -> smallvec::SmallVec<[ChunkRef; 4]> {
-        let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id, offset, length });
-        chunks
-    }
-
-    pub(crate) fn multi(
-        refs: Vec<(oceanfs_core::SegmentId, u64, u32)>,
-    ) -> smallvec::SmallVec<[ChunkRef; 4]> {
-        let mut chunks = smallvec::SmallVec::with_capacity(refs.len());
-        for (segment_id, offset, length) in refs {
-            chunks.push(ChunkRef { segment_id, offset, length });
-        }
-        chunks
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -81,23 +54,5 @@ mod tests {
         let router = TierRouter::new(SegmentSizeConfig::default());
         assert!(router.is_inline(100));
         assert!(!router.is_inline(5000));
-    }
-
-    #[test]
-    fn chunk_list_builder_single() {
-        let id = oceanfs_core::SegmentId::new();
-        let chunks = ChunkListBuilder::single(id, 0, 1024);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].segment_id, id);
-        assert_eq!(chunks[0].offset, 0);
-        assert_eq!(chunks[0].length, 1024);
-    }
-
-    #[test]
-    fn chunk_list_builder_multi() {
-        let id1 = oceanfs_core::SegmentId::new();
-        let id2 = oceanfs_core::SegmentId::new();
-        let chunks = ChunkListBuilder::multi(vec![(id1, 0, 100), (id2, 0, 50)]);
-        assert_eq!(chunks.len(), 2);
     }
 }

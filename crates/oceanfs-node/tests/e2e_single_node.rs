@@ -84,15 +84,20 @@ mod helpers {
     }
 
     impl TestNode {
-        pub fn new() -> Self {
+        pub async fn new() -> Self {
             use std::net::SocketAddr;
 
             use oceanfs_core::{
-                GossipConfig, HlcClock, Incarnation, NodeId, NodeState, RingConfig, RpcConfig,
+                GossipConfig, HlcClock, Incarnation, MetadataConfig, NodeId, NodeState, PoolConfig,
+                RingConfig, RpcConfig, SegmentSizeConfig, SizeTier, WalConfig,
             };
             use oceanfs_membership::Membership;
             use oceanfs_network::ConnectionPool;
             use oceanfs_routing::{Ring, RingCache};
+            use oceanfs_storage::{
+                BufferPool, RocksDbMetadataStore, SealConfig, SegmentPool, SegmentSealer,
+                SegmentShard, WalWriter,
+            };
 
             let mut ring = Ring::new(RingConfig { vnodes_per_node: 8, replication_factor: 3 });
             ring.add_node(NodeId::new("n1"));
@@ -108,12 +113,66 @@ mod helpers {
             let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
             let hlc_clock = Arc::new(HlcClock::new());
 
+            // Segment pipeline.
+            let dir = tempfile::tempdir().unwrap();
+            let metadata_store = Arc::new(
+                RocksDbMetadataStore::open(&MetadataConfig {
+                    data_dir: dir.path().join("meta"),
+                    block_cache_size: 1024,
+                    memtable_size: 1024,
+                })
+                .unwrap(),
+            );
+            let size_config = SegmentSizeConfig::default();
+            let buffer_pool = Arc::new(BufferPool::new(65536, 16));
+            let shard_small = Arc::new(
+                SegmentShard::new(4, SizeTier::Small, &size_config, &buffer_pool).unwrap(),
+            );
+            let shard_standard = Arc::new(
+                SegmentShard::new(4, SizeTier::Standard, &size_config, &buffer_pool).unwrap(),
+            );
+            let pool_cfg = PoolConfig::default();
+            let segment_pool_small = Arc::new(
+                SegmentPool::new(
+                    pool_cfg.clone(),
+                    SizeTier::Small,
+                    &size_config,
+                    buffer_pool.clone(),
+                )
+                .unwrap(),
+            );
+            let segment_pool_standard = Arc::new(
+                SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool).unwrap(),
+            );
+            let wal = Arc::new(
+                WalWriter::open(&WalConfig {
+                    data_dir: dir.path().join("wal"),
+                    max_file_size_bytes: 1024 * 1024,
+                    fsync_batch_timeout_ms: 5,
+                })
+                .await
+                .unwrap(),
+            );
+            let seal_config = SealConfig {
+                target_size_bytes: size_config.default_target_size,
+                seal_timeout_ms: 5000,
+                data_dir: dir.path().join("segments"),
+            };
+            let sealer = Arc::new(SegmentSealer::new(seal_config, metadata_store.clone(), wal));
+
             let write = Arc::new(WriteCoordinator::new(
                 ring_cache.clone(),
                 membership,
                 pool,
                 NodeId::new("n1"),
                 hlc_clock,
+                metadata_store,
+                size_config,
+                shard_small,
+                shard_standard,
+                segment_pool_small,
+                segment_pool_standard,
+                sealer,
             ));
 
             let segment_store = Arc::new(InMemorySegmentReader::new());
@@ -150,9 +209,15 @@ mod helpers {
 
             let result = self.write.put(req).await.unwrap();
 
-            for chunk in &result.chunks {
-                self.segment_store.put(chunk.segment_id, Bytes::copy_from_slice(data));
-            }
+            // If chunks is empty, this is an inline blob — store inline_data.
+            let inline_data = if result.chunks.is_empty() {
+                Some(Bytes::copy_from_slice(data))
+            } else {
+                for chunk in &result.chunks {
+                    self.segment_store.put(chunk.segment_id, Bytes::copy_from_slice(data));
+                }
+                None
+            };
 
             let hash = blake3::hash(data);
             let stored_hash = HashOutput::from_bytes(*hash.as_bytes());
@@ -161,7 +226,7 @@ mod helpers {
                 size: data.len() as u64,
                 blake3_hash: Some(stored_hash),
                 chunks: result.chunks.clone(),
-                inline_data: None,
+                inline_data,
                 created_at: 0,
                 hlc: oceanfs_core::Hlc::zero(),
             };
@@ -190,7 +255,7 @@ use helpers::TestNode;
 
 #[tokio::test]
 async fn e2e_put_get_1kb() {
-    let node = TestNode::new();
+    let node = TestNode::new().await;
     let data = vec![0xABu8; 1024];
     node.put("test", "1kb.bin", &data).await;
     let retrieved = node.get("test", "1kb.bin").await;
@@ -199,7 +264,7 @@ async fn e2e_put_get_1kb() {
 
 #[tokio::test]
 async fn e2e_put_get_100kb() {
-    let node = TestNode::new();
+    let node = TestNode::new().await;
     let data = vec![0x42u8; 100_000];
     node.put("test", "100kb.bin", &data).await;
     let retrieved = node.get("test", "100kb.bin").await;
@@ -209,7 +274,7 @@ async fn e2e_put_get_100kb() {
 
 #[tokio::test]
 async fn e2e_put_get_1mb() {
-    let node = TestNode::new();
+    let node = TestNode::new().await;
     let data = vec![0xABu8; 1_048_576];
     node.put("test", "1mb.bin", &data).await;
     let retrieved = node.get("test", "1mb.bin").await;
@@ -219,7 +284,7 @@ async fn e2e_put_get_1mb() {
 
 #[tokio::test]
 async fn e2e_hash_verification_passes() {
-    let node = TestNode::new();
+    let node = TestNode::new().await;
     let data = b"hash verification test payload";
     node.put("test", "hash.bin", data).await;
     let retrieved = node.get("test", "hash.bin").await;

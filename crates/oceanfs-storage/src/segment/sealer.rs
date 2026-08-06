@@ -12,6 +12,7 @@ use oceanfs_core::{SegmentSizeConfig, SizeTier};
 use oceanfs_hash::Blake3Hasher;
 
 use crate::{
+    blob_store::BlobStore,
     error::{Error, Result},
     metadata::RocksDbMetadataStore,
     segment::{
@@ -35,11 +36,15 @@ pub struct SealConfig {
 }
 
 /// Orchestrates the sealing of active segments.
-/// Orchestrates the sealing of active segments.
 pub struct SegmentSealer {
     config: SealConfig,
     metadata: Arc<RocksDbMetadataStore>,
     wal: Arc<WalWriter>,
+    /// Optional blob store for unified segment data access (M5-storage).
+    /// When set, sealed segment data is also written here so that the
+    /// durability subsystem (heal, scrub, anti-entropy) reads from the
+    /// same physical storage as the write path.
+    blob_store: Option<Arc<BlobStore>>,
     /// Segment seal error counter.
     seal_errors: Counter,
 }
@@ -55,12 +60,23 @@ impl SegmentSealer {
             config,
             metadata,
             wal,
+            blob_store: None,
             seal_errors: Counter::new(
                 "segment_seal_errors_total".into(),
                 "Number of segment sealing failures".into(),
                 LabelSet::empty(),
             ),
         }
+    }
+
+    /// Sets an optional blob store for unified segment data access.
+    ///
+    /// When set, sealed segment data is also written to the blob store,
+    /// making it available to the durability subsystem (heal, scrub,
+    /// anti-entropy) via `SegmentDataStore`.
+    pub fn with_blob_store(mut self, blob_store: Arc<BlobStore>) -> Self {
+        self.blob_store = Some(blob_store);
+        self
     }
 
     /// Attempts to seal an active segment.
@@ -138,6 +154,13 @@ impl SegmentSealer {
         file_data.extend_from_slice(&data);
         file_data.extend_from_slice(&index_bytes);
         tokio::fs::write(&path, &file_data).await?;
+
+        // Also write raw segment data to the blob store for unified storage
+        // access (M5-storage). The durability subsystem (heal, scrub,
+        // anti-entropy) reads segment data via BlobStore → SegmentDataStore.
+        if let Some(ref blob_store) = self.blob_store {
+            blob_store.write_blob(&segment_id, &data)?;
+        }
 
         // Persist segment metadata.
         let meta = SegmentMetadata {

@@ -584,17 +584,34 @@ impl Default for InMemorySegmentReader {
 }
 
 impl SegmentReader for InMemorySegmentReader {
+    /// Reads a chunk from the in-memory store, respecting the given offset.
+    ///
+    /// Uses the `(offset, length)` from the chunk ref to slice the stored
+    /// segment data. This mirrors the behavior of `SegmentIndex::lookup(offset)`
+    /// in on-disk segments, where the B-tree index maps blob offsets to
+    /// data ranges within the segment file.
     fn read_chunk(
         &self,
         segment_id: &oceanfs_core::SegmentId,
-        _offset: u64,
-        _length: u32,
+        offset: u64,
+        length: u32,
     ) -> Result<Bytes, String> {
-        self.segments
+        let full = self
+            .segments
             .read()
             .get(segment_id)
             .cloned()
-            .ok_or_else(|| format!("segment {segment_id} not found"))
+            .ok_or_else(|| format!("segment {segment_id} not found"))?;
+
+        let start = offset as usize;
+        let end = (offset as usize).saturating_add(length as usize).min(full.len());
+        if start >= full.len() {
+            return Err(format!(
+                "offset {offset} out of bounds for segment {segment_id} (len {})",
+                full.len()
+            ));
+        }
+        Ok(full.slice(start..end))
     }
 }
 
