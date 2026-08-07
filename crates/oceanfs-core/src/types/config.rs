@@ -164,6 +164,9 @@ pub struct RpcConfig {
     pub request_timeout_ms: u64,
     /// Optional path to TLS certificate for mTLS.
     pub tls_cert_path: Option<std::path::PathBuf>,
+    /// Interval in seconds for periodic health checks on all peer channels.
+    /// Set to 0 to disable periodic health checking.
+    pub health_check_interval_sec: u64,
 }
 
 impl Default for RpcConfig {
@@ -175,6 +178,7 @@ impl Default for RpcConfig {
             connect_timeout_ms: 5000,
             request_timeout_ms: 30000,
             tls_cert_path: None,
+            health_check_interval_sec: 30,
         }
     }
 }

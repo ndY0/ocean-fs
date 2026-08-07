@@ -117,7 +117,7 @@ impl Membership {
                             .read()
                             .nodes
                             .iter()
-                            .map(|(id, (state, _inc, addr))| (id.clone(), *state, *addr))
+                            .map(|(id, (state, inc, addr))| (id.clone(), *state, *addr, *inc))
                             .collect();
                         let _ = sync_detector_tx.try_send(
                             DetectorCommand::UpdateAliveNodes { nodes: alive },

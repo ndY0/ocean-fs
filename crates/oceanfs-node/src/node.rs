@@ -226,7 +226,8 @@ impl NodeLeaveHandler {
 
 /// Aggregated join handles and cancellation tokens for background loops.
 pub struct BackgroundTasks {
-    /// Gossip protocol task placeholder.
+    /// Gossip protocol task handle (Membership drives gossip internally;
+    /// this handle waits for cancellation).
     pub(crate) gossip: JoinHandle<()>,
     /// Gossip cancellation token.
     pub(crate) gossip_cancel: CancellationToken,
@@ -256,7 +257,8 @@ pub struct BackgroundTasks {
     /// Prefetch cancellation token.
     pub(crate) prefetch_cancel: CancellationToken,
 
-    /// Failure detector task.
+    /// Failure detector task handle (Membership drives FD internally;
+    /// this handle waits for cancellation).
     pub(crate) failure_detector: JoinHandle<()>,
     /// Failure detector cancellation token.
     pub(crate) fd_cancel: CancellationToken,
@@ -270,6 +272,14 @@ pub struct BackgroundTasks {
     pub(crate) hinted_handoff_delivery: Option<JoinHandle<()>>,
     /// Hinted handoff delivery cancellation token.
     pub(crate) delivery_cancel: CancellationToken,
+
+    /// gRPC server task handle for graceful shutdown.
+    pub(crate) grpc_server: Option<JoinHandle<()>>,
+    /// gRPC server cancellation token.
+    pub(crate) grpc_shutdown: CancellationToken,
+
+    /// Health check loop cancellation token.
+    pub(crate) health_check_cancel: CancellationToken,
 }
 
 // ---------------------------------------------------------------------------
@@ -293,12 +303,18 @@ pub struct Node {
     grpc_addr: SocketAddr,
     /// Cancellation token for the HTTP server graceful shutdown.
     http_shutdown: CancellationToken,
+    /// Cancellation token for the gRPC server graceful shutdown.
+    grpc_shutdown: CancellationToken,
     /// Background task handles and cancellation tokens.
     background: BackgroundTasks,
     /// Graceful leave handler for WAL and segment handoff.
     leave_handler: Arc<NodeLeaveHandler>,
     /// Cluster membership for leave signaling.
     membership: Arc<oceanfs_membership::Membership>,
+    /// Metadata store (held for graceful shutdown flush).
+    metadata_store: Arc<oceanfs_storage::RocksDbMetadataStore>,
+    /// WAL writer (held for graceful shutdown sync).
+    wal_writer: Arc<oceanfs_storage::WalWriter>,
 }
 
 impl Node {
@@ -773,8 +789,15 @@ impl Node {
             .add_service(oceanfs_cache::CacheRpcServer::new(cache_service))
             .add_service(oceanfs_durability::ScrubRpcServer::new(scrub_service));
 
-        tokio::spawn(async move {
-            if let Err(e) = grpc_router.serve(grpc_addr).await {
+        // Create gRPC shutdown token before spawning so it can be used
+        // by both the gRPC server and BackgroundTasks.
+        let grpc_shutdown = CancellationToken::new();
+        let grpc_shutdown_signal = grpc_shutdown.clone();
+        let grpc_server_handle = tokio::spawn(async move {
+            if let Err(e) = grpc_router
+                .serve_with_shutdown(grpc_addr, grpc_shutdown_signal.cancelled_owned())
+                .await
+            {
                 error!("gRPC server error: {e}");
             }
         });
@@ -791,6 +814,8 @@ impl Node {
             heal_data_store.clone(),
             &config,
         );
+        background.grpc_shutdown = grpc_shutdown;
+        background.grpc_server = Some(grpc_server_handle);
 
         // ---- 17. Spawn hinted handoff delivery watcher ----
         // Watches for membership state transitions to ALIVE and drains
@@ -832,6 +857,11 @@ impl Node {
         });
         background.hinted_handoff_delivery = Some(delivery_handle);
 
+        // Start periodic connection pool health checks (perf rule §4.1).
+        // The health check loop runs until cancelled during shutdown.
+        let health_cancel = background.health_check_cancel.clone();
+        pool.start_health_check_loop(health_cancel);
+
         info!(
             node_id = %config.node_id,
             http_addr = %server_addr,
@@ -853,9 +883,12 @@ impl Node {
             server_addr,
             grpc_addr,
             http_shutdown,
+            grpc_shutdown: background.grpc_shutdown.clone(),
             background,
             leave_handler,
             membership,
+            metadata_store,
+            wal_writer: wal_writer.clone(),
         })
     }
 
@@ -879,22 +912,28 @@ impl Node {
 
     /// Gracefully shuts down the node.
     ///
+    /// Sequence: graceful leave → cancel gRPC → cancel HTTP → cancel background
+    /// tasks → wait for tasks → flush WAL → close metadata → drop subsystems.
+    ///
     /// # Errors
     ///
     /// Returns an error if any background task panicked or timed out.
     pub async fn shutdown(self) -> Result<(), Box<dyn std::error::Error>> {
         info!(node_id = %self.config.node_id, "Shutting down OceanFS node");
 
-        // ---- Graceful leave: handoff WAL and segment shards to successor ----
+        // ---- 1. Graceful leave: handoff WAL and segment shards to successor ----
         let leave_result = self.membership.leave(Some(self.leave_handler.as_ref())).await;
         if let Err(e) = leave_result {
             warn!(error = %e, "graceful leave handoff failed; continuing shutdown");
         }
 
-        // Signal the HTTP server to stop accepting connections and drain.
+        // ---- 2. Cancel gRPC server (stop accepting new RPCs, drain in-flight) ----
+        self.grpc_shutdown.cancel();
+
+        // ---- 3. Signal the HTTP server to stop accepting connections and drain ----
         self.http_shutdown.cancel();
 
-        // Signal all background loops to stop.
+        // ---- 4. Signal all background tasks to stop ----
         self.background.gossip_cancel.cancel();
         self.background.gc_cancel.cancel();
         self.background.ae_cancel.cancel();
@@ -904,8 +943,9 @@ impl Node {
         self.background.fd_cancel.cancel();
         self.background.heal_cancel.cancel();
         self.background.delivery_cancel.cancel();
+        self.background.health_check_cancel.cancel();
 
-        // Wait for background tasks with a timeout.
+        // ---- 5. Wait for background tasks with a timeout ----
         let _ = tokio::time::timeout(Duration::from_secs(10), async {
             let _ = tokio::try_join!(
                 async { self.background.gossip.await.map_err(|e| format!("{e}")) },
@@ -929,6 +969,24 @@ impl Node {
             let _ = tokio::time::timeout(Duration::from_secs(5), dh).await;
         }
 
+        // Wait for gRPC server handle (may be None).
+        if let Some(grpc_handle) = self.background.grpc_server {
+            let _ = tokio::time::timeout(Duration::from_secs(5), grpc_handle).await;
+        }
+
+        // ---- 6. Flush WAL writer to disk ----
+        if let Err(e) = self.wal_writer.sync().await {
+            warn!(error = %e, "WAL sync failed during shutdown");
+        }
+
+        // ---- 7. Close metadata store (flush RocksDB) ----
+        if let Err(e) = self.metadata_store.close() {
+            warn!(error = %e, "metadata store close failed during shutdown");
+        }
+
+        // ---- 8. Membership shutdown (cancels internal gossip + FD) ----
+        self.membership.shutdown();
+
         info!(node_id = %self.config.node_id, "OceanFS node shut down");
         Ok(())
     }
@@ -948,6 +1006,36 @@ impl Node {
             cfg.node_id = "oceanfs-node".to_string();
         }
 
+        // Validate auth config at startup rather than at first request time.
+        // If S3 auth is enabled but the key file is missing or invalid,
+        // log a warning but don't block startup — the system will reject
+        // all authenticated requests until valid keys are provided.
+        if cfg.s3_auth_enabled {
+            let keys_path = cfg.data_dir.join("access_keys.toml");
+            if keys_path.exists() {
+                match std::fs::read_to_string(&keys_path) {
+                    Ok(content) => {
+                        if let Err(e) = toml::from_str::<toml::Value>(&content) {
+                            warn!(
+                                path = %keys_path.display(),
+                                error = %e,
+                                "access_keys.toml is invalid TOML — S3 auth will reject all requests"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            path = %keys_path.display(),
+                            error = %e,
+                            "cannot read access_keys.toml — S3 auth will reject all requests"
+                        );
+                    }
+                }
+            } else {
+                warn!("s3_auth_enabled but no access_keys.toml found at {}", keys_path.display());
+            }
+        }
+
         Ok(cfg)
     }
 
@@ -964,9 +1052,15 @@ impl Node {
         data_store: Arc<dyn oceanfs_durability::SegmentDataStore>,
         config: &oceanfs_core::NodeConfig,
     ) -> BackgroundTasks {
-        // Gossip: placeholder (driven by Membership internally).
+        // Gossip: Membership drives the gossip protocol internally via
+        // Membership::start(). This task holds a cancellation-aware standby
+        // so the shutdown sequence can await it cleanly.
         let gossip_cancel = CancellationToken::new();
-        let gossip = tokio::spawn(async { std::future::pending::<()>().await });
+        let gossip_token = gossip_cancel.clone();
+        let gossip = tokio::spawn(async move {
+            gossip_token.cancelled().await;
+            info!("Gossip task cancelled");
+        });
 
         // GC: runs every gc_interval_sec from config.
         let gc_cancel = CancellationToken::new();
@@ -1067,41 +1161,26 @@ impl Node {
         });
 
         // Prefetch background pre-warmer: PrefetchEngine runs its own internal
-        // worker; the background task keeps the join handle alive. When prefetch
-        // is disabled, the engine silently drops all queued tasks.
+        // worker (spawned in PrefetchEngine::new()). This task holds the engine
+        // Arc alive and waits for cancellation. When prefetch is disabled, the
+        // engine silently drops all queued tasks.
         let prefetch_cancel = CancellationToken::new();
         let prefetch_token = prefetch_cancel.clone();
         let prefetch = Some(tokio::spawn(async move {
-            // Move prefetch_engine into the closure to keep it alive.
+            // Hold the engine alive for the lifetime of this task.
             let _engine = prefetch_engine;
-            loop {
-                tokio::select! {
-                    _ = prefetch_token.cancelled() => {
-                        info!("Prefetch task cancelled");
-                        break;
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(60)) => {
-                        // Keep alive.
-                    }
-                }
-            }
+            prefetch_token.cancelled().await;
+            info!("Prefetch task cancelled");
         }));
 
-        // SWIM failure detector: Membership handles this internally.
+        // SWIM failure detector: Membership drives the failure detector
+        // internally via Membership::start(). This task holds a cancellation-
+        // aware standby so the shutdown sequence can await it cleanly.
         let fd_cancel = CancellationToken::new();
         let fd_token = fd_cancel.clone();
         let failure_detector = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = fd_token.cancelled() => {
-                        info!("Failure detector task cancelled");
-                        break;
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                        // Heartbeat placeholder.
-                    }
-                }
-            }
+            fd_token.cancelled().await;
+            info!("Failure detector task cancelled");
         });
 
         // EC Heal worker: drains the HealQueue and repairs corrupt shards.
@@ -1136,6 +1215,9 @@ impl Node {
             heal_cancel,
             hinted_handoff_delivery: None,
             delivery_cancel,
+            grpc_server: None,
+            grpc_shutdown: CancellationToken::new(),
+            health_check_cancel: CancellationToken::new(),
         }
     }
 }
@@ -1532,6 +1614,7 @@ mod tests {
             length: 42,
             timestamp: Hlc::zero(),
             data: vec![1, 2, 3],
+            stored_at_secs: 0,
         };
         handoff.handoff(target.clone(), hint).await.unwrap();
         assert_eq!(handoff.pending_count(&target), 1);
@@ -1673,8 +1756,7 @@ mod tests {
         use std::sync::Arc;
 
         use oceanfs_core::{NodeId, WalConfig};
-        use oceanfs_membership::GracefulLeaveHandler;
-        use oceanfs_membership::Membership;
+        use oceanfs_membership::{GracefulLeaveHandler, Membership};
         use oceanfs_network::ConnectionPool;
 
         // Setup: real WAL in temp dir.
@@ -1715,8 +1797,7 @@ mod tests {
         use std::sync::Arc;
 
         use oceanfs_core::NodeId;
-        use oceanfs_membership::GracefulLeaveHandler;
-        use oceanfs_membership::Membership;
+        use oceanfs_membership::{GracefulLeaveHandler, Membership};
         use oceanfs_network::ConnectionPool;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1759,8 +1840,7 @@ mod tests {
         use std::sync::Arc;
 
         use oceanfs_core::{NodeId, SegmentId};
-        use oceanfs_membership::GracefulLeaveHandler;
-        use oceanfs_membership::Membership;
+        use oceanfs_membership::{GracefulLeaveHandler, Membership};
         use oceanfs_network::ConnectionPool;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1888,12 +1968,11 @@ mod tests {
         use std::sync::Arc;
 
         use oceanfs_core::{Incarnation, NodeId, NodeState, SegmentId};
-        use oceanfs_membership::GracefulLeaveHandler;
         use oceanfs_durability::{
             anti_entropy::InMemorySegmentStore, healing_service::HealingGrpcService,
             HealingRpcServer, HintedHandoff, SegmentDataStore,
         };
-        use oceanfs_membership::Membership;
+        use oceanfs_membership::{GracefulLeaveHandler, Membership};
         use oceanfs_network::ConnectionPool;
         use tonic::transport::Server;
 

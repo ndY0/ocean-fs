@@ -190,9 +190,8 @@ async fn t14_write_to_dead_node_successor_succeeds() {
     let body = b"write after coordinator died";
     let put_resp = cluster.put(1, &format!("/{bucket}/{key}"), body).await;
     // The write must eventually succeed via the live successor.
-    // PR6 must be fixed for this to work — Router::try_forward currently
-    // drops the channel without forwarding. This assertion ensures we know
-    // when it starts working.
+    // WriteCoordinator::forward_write() handles routing to the live
+    // successor node. This assertion ensures the forwarding works.
     assert!(
         put_resp.is_ok(),
         "PUT after coordinator kill must succeed or fail gracefully, got: {:?}",

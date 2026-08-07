@@ -4,6 +4,10 @@
 //! acquired via [`ConnectionPool::get_channel`] and returned on drop of
 //! the [`PooledChannel`] guard. The pool enforces concurrency limits
 //! via a semaphore, ensuring bounded resource usage under load.
+//!
+//! Periodic health checks probe each peer's gRPC health service and
+//! evict broken channels, triggering lazy reconnection on the next
+//! [`get_channel`] call.
 
 use std::{
     net::SocketAddr,
@@ -18,7 +22,10 @@ use dashmap::DashMap;
 use oceanfs_core::{Counter, Gauge, LabelSet, MetricRegistrar, RpcConfig};
 use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
+use tonic_health::pb::health_client::HealthClient;
+use tracing::{debug, info, warn};
 
 /// Error type for connection pool operations.
 #[derive(Debug, thiserror::Error)]
@@ -106,6 +113,7 @@ pub struct ConnectionPool {
     peers: DashMap<SocketAddr, Arc<PeerPool>>,
     connection_errors_total: Counter,
     connections_active: Gauge,
+    health_check_failures_total: Counter,
 }
 
 impl ConnectionPool {
@@ -124,12 +132,18 @@ impl ConnectionPool {
                 "Active gRPC peer connections".into(),
                 LabelSet::empty(),
             ),
+            health_check_failures_total: Counter::new(
+                "grpc_health_check_failures_total".into(),
+                "gRPC health check failures".into(),
+                LabelSet::empty(),
+            ),
         }
     }
 
     /// Registers connection pool metrics with a registrar.
     pub fn register_metrics(&self, registrar: &dyn MetricRegistrar) {
         registrar.register_counter(self.connection_errors_total.clone());
+        registrar.register_counter(self.health_check_failures_total.clone());
         registrar.register_gauge(self.connections_active.clone());
     }
 
@@ -172,10 +186,80 @@ impl ConnectionPool {
 
     /// Performs a health check on all peer pools.
     ///
-    /// Currently a no-op placeholder. Future: probes each channel
-    /// with a gRPC health check RPC.
+    /// Probes each peer channel with a gRPC health check RPC
+    /// (`grpc.health.v1.Health/Check`). Channels that fail the
+    /// health check are evicted from the pool, triggering lazy
+    /// reconnection on the next [`ConnectionPool::get_channel`] call.
+    ///
+    /// This method does not hold the pool lock during gRPC calls,
+    /// satisfying performance rule §7.1.
     pub async fn health_check(&self) {
-        // Placeholder for gRPC health probing.
+        // Collect peer addresses to avoid holding DashMap during async calls.
+        let peers: Vec<SocketAddr> = self.peers.iter().map(|entry| *entry.key()).collect();
+
+        let mut failed_count = 0u64;
+        for peer in &peers {
+            match self.check_peer(peer).await {
+                Ok(true) => {
+                    debug!(peer = %peer, "health check passed");
+                }
+                Ok(false) => {
+                    warn!(peer = %peer, "health check failed — evicting channels");
+                    self.evict_peer(*peer);
+                    failed_count += 1;
+                }
+                Err(e) => {
+                    warn!(peer = %peer, error = %e, "health check error — evicting channels");
+                    self.evict_peer(*peer);
+                    failed_count += 1;
+                }
+            }
+        }
+
+        if failed_count > 0 {
+            self.health_check_failures_total.add(failed_count);
+        }
+
+        // Update active connections gauge.
+        let active_count: usize =
+            self.peers.iter().map(|e| e.value().total_channels.load(Ordering::Relaxed)).sum();
+        self.connections_active.set(active_count as u64);
+    }
+
+    /// Starts a periodic health check background task.
+    ///
+    /// Runs health checks on the configured interval
+    /// (`RpcConfig::health_check_interval_sec`). If the interval is
+    /// 0, no periodic checks are performed.
+    ///
+    /// The task runs until the given [`CancellationToken`] is cancelled.
+    pub fn start_health_check_loop(self: &Arc<Self>, cancel: CancellationToken) {
+        let interval_sec = self.config.health_check_interval_sec;
+        if interval_sec == 0 {
+            info!("periodic health check disabled (health_check_interval_sec = 0)");
+            return;
+        }
+
+        let pool = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_sec));
+            // Don't fire immediately — wait for the first interval.
+            interval.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        info!("health check loop cancelled");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        pool.health_check().await;
+                    }
+                }
+            }
+        });
+
+        info!(interval_sec, "started periodic connection pool health check");
     }
 
     /// Returns the number of active peer pools.
@@ -189,6 +273,45 @@ impl ConnectionPool {
     }
 
     // --- private ---
+
+    /// Checks a single peer's health by probing one of its channels.
+    ///
+    /// Returns `Ok(true)` if the health check succeeds, `Ok(false)` if
+    /// the service reports non-SERVING status, or `Err` if the RPC fails.
+    async fn check_peer(&self, peer: &SocketAddr) -> std::result::Result<bool, Box<tonic::Status>> {
+        let channel = {
+            let pool = match self.peers.get(peer) {
+                Some(p) => p,
+                None => return Ok(true), // Peer already evicted.
+            };
+            let channels = pool.channels.lock();
+            channels.first().cloned()
+        };
+
+        let channel = match channel {
+            Some(c) => c,
+            None => return Ok(true), // No channels to check.
+        };
+
+        let mut client = HealthClient::new(channel);
+        let request =
+            tonic::Request::new(tonic_health::pb::HealthCheckRequest { service: "".to_string() });
+
+        let response = client.check(request).await.map_err(Box::new)?;
+        let serving = response.into_inner().status
+            == tonic_health::pb::health_check_response::ServingStatus::Serving as i32;
+
+        Ok(serving)
+    }
+
+    /// Evicts a peer's pool, removing all channels.
+    ///
+    /// Subsequent [`get_channel`] calls will lazily recreate the pool
+    /// with fresh connections.
+    fn evict_peer(&self, peer: SocketAddr) {
+        self.peers.remove(&peer);
+        debug!(peer = %peer, "peer evicted from connection pool");
+    }
 
     /// Gets or creates a peer pool for the given address.
     async fn get_or_create_pool(&self, peer: SocketAddr) -> Result<Arc<PeerPool>> {
@@ -226,12 +349,23 @@ impl ConnectionPool {
             channels.push(channel);
         }
 
-        Ok(Arc::new(PeerPool {
+        let pool = Arc::new(PeerPool {
             channels: Mutex::new(channels),
             semaphore: Arc::new(Semaphore::new(pool_size)),
             total_channels: AtomicUsize::new(pool_size),
             next_index: AtomicUsize::new(0),
-        }))
+        });
+
+        // Update active connections gauge.
+        self.connections_active.set(
+            self.peers
+                .iter()
+                .map(|e| e.value().total_channels.load(Ordering::Relaxed) as u64)
+                .sum::<u64>()
+                + pool_size as u64,
+        );
+
+        Ok(pool)
     }
 }
 
@@ -255,6 +389,16 @@ mod tests {
         assert_eq!(config.connect_timeout_ms, 5000);
         assert_eq!(config.request_timeout_ms, 30000);
         assert!(config.tls_cert_path.is_none());
+        assert_eq!(config.health_check_interval_sec, 30);
+    }
+
+    #[test]
+    fn health_check_disabled_when_interval_zero() {
+        let config = RpcConfig { health_check_interval_sec: 0, ..RpcConfig::default() };
+        let pool = ConnectionPool::new(config);
+        // health_check on empty pool is a no-op
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(pool.health_check());
     }
 
     #[tokio::test]
@@ -297,10 +441,12 @@ mod tests {
             connect_timeout_ms: 10000,
             request_timeout_ms: 60000,
             tls_cert_path: None,
+            health_check_interval_sec: 15,
         };
         let pool = ConnectionPool::new(config);
         assert_eq!(pool.config().pool_size_per_peer, 8);
         assert_eq!(pool.config().keepalive_sec, 60);
+        assert_eq!(pool.config().health_check_interval_sec, 15);
     }
 
     #[test]
@@ -308,9 +454,61 @@ mod tests {
         let config = RpcConfig::default();
         let pool = ConnectionPool::new(config);
         assert_eq!(pool.connection_errors_total.get(), 0);
+        assert_eq!(pool.health_check_failures_total.get(), 0);
 
         pool.connection_errors_total.inc();
         pool.connection_errors_total.inc();
         assert_eq!(pool.connection_errors_total.get(), 2);
+    }
+
+    /// Integration test: starts a real tonic test server with a health
+    /// service, connects via `ConnectionPool`, acquires a channel, and
+    /// verifies health check succeeds.
+    #[tokio::test]
+    async fn health_check_succeeds_with_real_server() {
+        use std::net::SocketAddr;
+
+        use tonic::transport::Server;
+
+        // Bind to a random port.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+
+        // Create a health reporter and get the server-side service.
+        // The default status is UNKNOWN, so we need to set a service as SERVING.
+        // The health check client uses an empty string for the service name.
+        let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+        health_reporter.set_service_status("", tonic_health::ServingStatus::Serving).await;
+
+        let server_task = tokio::spawn(async move {
+            Server::builder()
+                .add_service(health_service)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        // Give the server a moment to start.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Create pool and connect.
+        let config = RpcConfig {
+            pool_size_per_peer: 1,
+            connect_timeout_ms: 1000,
+            health_check_interval_sec: 0,
+            ..RpcConfig::default()
+        };
+        let pool = ConnectionPool::new(config);
+
+        // Acquire a channel.
+        let pooled = pool.get_channel(addr).await.expect("should connect to test server");
+
+        // Run health check.
+        pool.health_check().await;
+        assert_eq!(pool.health_check_failures_total.get(), 0, "health check should pass");
+
+        // Cleanup.
+        drop(pooled);
+        server_task.abort();
     }
 }

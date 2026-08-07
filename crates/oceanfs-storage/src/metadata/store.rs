@@ -553,6 +553,18 @@ impl RocksDbMetadataStore {
     pub fn property(&self, name: &str) -> Option<String> {
         self.db.property_value(name).ok().flatten()
     }
+
+    /// Flushes all column families to disk.
+    ///
+    /// This ensures that all pending writes are persisted before the
+    /// database is closed. Called during graceful shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying RocksDB flush fails.
+    pub fn close(&self) -> Result<()> {
+        self.db.flush().map_err(|e| Error::Io(io_err(e)))
+    }
 }
 
 /// An operation in a batch write.

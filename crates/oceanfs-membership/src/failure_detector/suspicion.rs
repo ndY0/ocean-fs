@@ -15,7 +15,17 @@ use crate::membership::MembershipEvent;
 /// Marks a node as SUSPECT and starts the suspicion timer.
 pub(crate) fn mark_suspect(detector: &mut FailureDetector, node_id: &NodeId) {
     let now = Instant::now();
-    let incarnation = Incarnation::new(1); // TODO: track actual incarnation.
+
+    // Look up the current incarnation from alive_nodes via the new
+    // incarnation_for() accessor. If the node is not found in the
+    // alive list, fall back to Incarnation::new(1) with a WARN log.
+    let incarnation = detector.incarnation_for(node_id).unwrap_or_else(|| {
+        tracing::warn!(
+            node_id = %node_id,
+            "mark_suspect: node not found in alive_nodes, using default incarnation"
+        );
+        Incarnation::new(1)
+    });
 
     detector.suspicion_timers.insert(node_id.clone(), (incarnation, now));
 

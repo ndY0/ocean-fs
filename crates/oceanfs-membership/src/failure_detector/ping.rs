@@ -22,12 +22,12 @@ pub(crate) fn on_ping_tick(detector: &mut FailureDetector) {
         let alive: Vec<_> = detector
             .alive_nodes
             .iter()
-            .filter(|(id, state, _)| {
+            .filter(|(id, state, _, _)| {
                 *state == NodeState::Alive
                     && *id != detector.node_id
                     && !detector.pending_pings.contains_key(id)
             })
-            .map(|(id, _, _)| id)
+            .map(|(id, _, _, _)| id)
             .collect();
 
         if alive.is_empty() {
@@ -44,23 +44,34 @@ pub(crate) fn on_ping_tick(detector: &mut FailureDetector) {
 
     debug!(target = %target, "SWIM: initiating direct ping");
 
-    // Build a probe request and process it in-process for now.
-    // For remote targets, a full implementation would send via gRPC.
-    let request = ProbeRequest {
-        target: Some(oceanfs_core::proto::common::NodeId { id: target.to_string() }),
-        origin: Some(oceanfs_core::proto::common::NodeId { id: detector.node_id.to_string() }),
-        is_indirect: false,
-    };
+    // SWIM remote probes are handled via the gossip-push-as-ping-proxy approach
+    // (DK-007). The gossip protocol carries the failure detector's probe
+    // information through the gossip push/pull delta, allowing nodes to
+    // detect failures without a dedicated gRPC Probe RPC.
+    //
+    // For self-ping (localhost), we handle the probe in-process.
+    // For remote targets, the probe result arrives asynchronously through
+    // the gossip merge path — we register a pending ping to track the timeout.
+    if target == detector.node_id {
+        // Self-ping: handle in-process.
+        let request = ProbeRequest {
+            target: Some(oceanfs_core::proto::common::NodeId { id: target.to_string() }),
+            origin: Some(oceanfs_core::proto::common::NodeId { id: detector.node_id.to_string() }),
+            is_indirect: false,
+        };
+        let response = detector.probe_handler.handle_probe(&request);
 
-    let response = detector.probe_handler.handle_probe(&request);
-
-    if response.ack {
-        // Target is self — in-process ack.
-        debug!(target = %target, "SWIM: self-ping ack received");
-        // Nothing to do — self is always alive.
+        if response.ack {
+            debug!(target = %target, "SWIM: self-ping ack received");
+        }
     } else {
-        // Remote target — register pending ping for timeout tracking.
-        // In a full implementation, this would send a gRPC Probe request.
+        // Remote target: probe handled via gossip proxy (DK-007).
+        // Register pending ping for timeout tracking; the result
+        // arrives through the gossip merge → DetectorCommand::PingResponse.
+        debug!(
+            target = %target,
+            "SWIM: remote ping via gossip proxy (DK-007)"
+        );
         detector.pending_pings.insert(target, Instant::now());
     }
 }
@@ -113,10 +124,10 @@ pub(crate) fn initiate_indirect_pings(detector: &mut FailureDetector, target: &N
     let indirect_candidates: Vec<_> = detector
         .alive_nodes
         .iter()
-        .filter(|(id, state, _)| {
+        .filter(|(id, state, _, _)| {
             *state == NodeState::Alive && *id != detector.node_id && *id != *target
         })
-        .map(|(id, _, _)| id.clone())
+        .map(|(id, _, _, _)| id.clone())
         .collect();
 
     let mut rng = rand::thread_rng();

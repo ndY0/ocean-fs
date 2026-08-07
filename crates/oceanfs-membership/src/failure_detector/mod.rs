@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use oceanfs_core::Incarnation;
+use oceanfs_core::{Incarnation, NodeId};
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -50,6 +50,22 @@ impl FailureDetector {
             },
             tx,
         )
+    }
+
+    /// Looks up the current incarnation for a node from the alive list.
+    ///
+    /// Returns `None` if the node is not found in the alive nodes list.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let incarnation = detector.incarnation_for(&node_id);
+    /// ```
+    pub fn incarnation_for(&self, node_id: &NodeId) -> Option<Incarnation> {
+        self.alive_nodes
+            .iter()
+            .find(|(id, _, _, _)| *id == *node_id)
+            .map(|(_, _, _, incarnation)| *incarnation)
     }
 
     /// Runs the failure detector loop.
@@ -230,5 +246,88 @@ mod tests {
             }
         }
         assert!(found, "expected DEAD event for target-node after suspicion timeout");
+    }
+
+    #[test]
+    fn incarnation_for_returns_incarnation_when_node_in_alive_list() {
+        let (mut detector, _cmd_tx, _event_rx) = make_detector();
+        let target = NodeId::new("target-node");
+        let incarnation = Incarnation::new(5);
+
+        // Populate alive_nodes with the target and its incarnation.
+        detector.alive_nodes = vec![(
+            target.clone(),
+            NodeState::Alive,
+            "127.0.0.1:9000".parse().unwrap(),
+            incarnation,
+        )];
+
+        assert_eq!(detector.incarnation_for(&target), Some(incarnation));
+    }
+
+    #[test]
+    fn incarnation_for_returns_none_when_node_not_in_alive_list() {
+        let (detector, _cmd_tx, _event_rx) = make_detector();
+        let unknown = NodeId::new("unknown-node");
+        assert_eq!(detector.incarnation_for(&unknown), None);
+    }
+
+    #[test]
+    fn incarnation_for_returns_correct_value_with_multiple_nodes() {
+        let (mut detector, _cmd_tx, _event_rx) = make_detector();
+        let a = NodeId::new("node-a");
+        let b = NodeId::new("node-b");
+        let inc_a = Incarnation::new(3);
+        let inc_b = Incarnation::new(7);
+
+        detector.alive_nodes = vec![
+            (a.clone(), NodeState::Alive, "127.0.0.1:9001".parse().unwrap(), inc_a),
+            (b.clone(), NodeState::Alive, "127.0.0.1:9002".parse().unwrap(), inc_b),
+        ];
+
+        assert_eq!(detector.incarnation_for(&a), Some(inc_a));
+        assert_eq!(detector.incarnation_for(&b), Some(inc_b));
+    }
+
+    /// End-to-end test: node X in alive_nodes with incarnation 5,
+    /// then mark_suspect via indirect ping failure — assert the
+    /// suspicion timer carries incarnation 5, not fallback 1.
+    #[tokio::test]
+    async fn mark_suspect_uses_incarnation_from_alive_nodes() {
+        let (mut detector, cmd_tx, _event_rx) = make_detector();
+        let target = NodeId::new("target-node");
+        let incarnation = Incarnation::new(5);
+
+        // Populate alive_nodes with the target and incarnation 5.
+        detector.alive_nodes = vec![(
+            target.clone(),
+            NodeState::Alive,
+            "127.0.0.1:9000".parse().unwrap(),
+            incarnation,
+        )];
+
+        // Trigger an indirect ping failure, which calls mark_suspect.
+        cmd_tx
+            .send(DetectorCommand::IndirectPingResult {
+                origin: NodeId::new("origin"),
+                target: target.clone(),
+                success: false,
+            })
+            .await
+            .unwrap();
+        cmd_tx.send(DetectorCommand::Shutdown).await.unwrap();
+        detector.run().await;
+
+        // Assert the suspicion timer uses incarnation 5 from alive_nodes.
+        let timer = detector.suspicion_timers.get(&target);
+        assert!(
+            timer.is_some(),
+            "target should have a suspicion timer after indirect ping failure"
+        );
+        assert_eq!(
+            timer.unwrap().0,
+            Incarnation::new(5),
+            "suspicion timer incarnation should be 5 (from alive_nodes), not fallback 1"
+        );
     }
 }

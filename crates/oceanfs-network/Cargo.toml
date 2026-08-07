@@ -13,11 +13,16 @@ prost.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util = "0.7"
 tonic.workspace = true
+tonic-health = "0.12"
 tracing.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true
+
+[dev-dependencies]
+tokio-stream = "0.1"
 
 [lints]
 workspace = true

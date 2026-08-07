@@ -33,7 +33,7 @@ pub(crate) enum DetectorCommand {
     /// An indirect ping result.
     IndirectPingResult { origin: NodeId, target: NodeId, success: bool },
     /// Update the list of alive nodes for periodic ping selection.
-    UpdateAliveNodes { nodes: Vec<(NodeId, NodeState, SocketAddr)> },
+    UpdateAliveNodes { nodes: Vec<(NodeId, NodeState, SocketAddr, Incarnation)> },
     /// Shut down the detector.
     Shutdown,
 }
@@ -53,8 +53,8 @@ pub(crate) struct FailureDetector {
     pub(crate) suspicion_timers: HashMap<NodeId, (Incarnation, Instant)>,
     /// This node's identifier.
     pub(crate) node_id: NodeId,
-    /// List of alive nodes: (node_id, state, address).
-    pub(crate) alive_nodes: Vec<(NodeId, NodeState, SocketAddr)>,
+    /// List of alive nodes: (node_id, state, address, incarnation).
+    pub(crate) alive_nodes: Vec<(NodeId, NodeState, SocketAddr, Incarnation)>,
     /// Probe handler for in-process self-pings.
     pub(crate) probe_handler: ProbeHandler,
     /// Pending direct pings: target → ping_start_time.
