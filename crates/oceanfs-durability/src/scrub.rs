@@ -13,7 +13,8 @@ use oceanfs_core::{
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
-use oceanfs_storage::{metadata::RocksDbMetadataStore, Error, Result};
+use oceanfs_storage::metadata::RocksDbMetadataStore;
+use crate::{Error, Result};
 use tokio::sync::Semaphore;
 
 use crate::anti_entropy::{MerkleTree, SegmentDataStore};
@@ -697,7 +698,7 @@ impl ScrubCoordinator {
                 let _permit = semaphore
                     .acquire()
                     .await
-                    .map_err(|e| Error::Scrub(format!("semaphore acquire failed: {e}")))?;
+                    .map_err(|e| Error::Internal(format!("semaphore acquire failed: {e}")))?;
 
                 let partition = SegmentPartition { node_id, segment_ids: batch };
                 // Perform the actual verification on a blocking thread
@@ -705,7 +706,7 @@ impl ScrubCoordinator {
                 let results =
                     tokio::task::spawn_blocking(move || worker.scrub_partition(&partition))
                         .await
-                        .map_err(|e| Error::Scrub(format!("spawn_blocking failed: {e}")))?;
+                        .map_err(|e| Error::Internal(format!("spawn_blocking failed: {e}")))?;
 
                 Ok::<Vec<ScrubResult>, Error>(results)
             });

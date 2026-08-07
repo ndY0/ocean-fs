@@ -72,7 +72,7 @@ struct NodeLeaveHandler {
 }
 
 #[async_trait::async_trait]
-impl oceanfs_core::GracefulLeaveHandler for NodeLeaveHandler {
+impl oceanfs_membership::GracefulLeaveHandler for NodeLeaveHandler {
     async fn handoff_wal_to(&self, successor: &oceanfs_core::NodeId) -> oceanfs_core::Result<()> {
         // Seal: flush pending WAL entries to disk.
         self.wal_writer
@@ -1672,7 +1672,8 @@ mod tests {
     async fn leave_handler_handoff_wal_flushes_and_reports_success() {
         use std::sync::Arc;
 
-        use oceanfs_core::{GracefulLeaveHandler, NodeId, WalConfig};
+        use oceanfs_core::{NodeId, WalConfig};
+        use oceanfs_membership::GracefulLeaveHandler;
         use oceanfs_membership::Membership;
         use oceanfs_network::ConnectionPool;
 
@@ -1713,7 +1714,8 @@ mod tests {
     async fn leave_handler_transfer_empty_blob_store_returns_zero() {
         use std::sync::Arc;
 
-        use oceanfs_core::{GracefulLeaveHandler, NodeId};
+        use oceanfs_core::NodeId;
+        use oceanfs_membership::GracefulLeaveHandler;
         use oceanfs_membership::Membership;
         use oceanfs_network::ConnectionPool;
 
@@ -1756,7 +1758,8 @@ mod tests {
     async fn leave_handler_transfer_segments_handles_grpc_failure() {
         use std::sync::Arc;
 
-        use oceanfs_core::{GracefulLeaveHandler, NodeId, SegmentId};
+        use oceanfs_core::{NodeId, SegmentId};
+        use oceanfs_membership::GracefulLeaveHandler;
         use oceanfs_membership::Membership;
         use oceanfs_network::ConnectionPool;
 
@@ -1827,7 +1830,7 @@ mod tests {
         }
 
         #[async_trait::async_trait]
-        impl oceanfs_core::GracefulLeaveHandler for RecordingHandler {
+        impl oceanfs_membership::GracefulLeaveHandler for RecordingHandler {
             async fn handoff_wal_to(&self, _: &NodeId) -> oceanfs_core::Result<()> {
                 self.wal_called.store(true, Ordering::SeqCst);
                 Ok(())
@@ -1884,7 +1887,8 @@ mod tests {
     async fn leave_handler_transfer_via_grpc_received_by_successor() {
         use std::sync::Arc;
 
-        use oceanfs_core::{GracefulLeaveHandler, Incarnation, NodeId, NodeState, SegmentId};
+        use oceanfs_core::{Incarnation, NodeId, NodeState, SegmentId};
+        use oceanfs_membership::GracefulLeaveHandler;
         use oceanfs_durability::{
             anti_entropy::InMemorySegmentStore, healing_service::HealingGrpcService,
             HealingRpcServer, HintedHandoff, SegmentDataStore,

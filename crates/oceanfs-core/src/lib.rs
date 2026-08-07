@@ -28,7 +28,6 @@
 mod config;
 mod conflict;
 mod error;
-mod graceful_leave;
 mod hlc;
 pub mod metrics;
 mod timeouts;
@@ -62,7 +61,6 @@ pub use config::{
 };
 pub use conflict::{ConflictResolver, LwwResolver, Resolution};
 pub use error::{Error, Result};
-pub use graceful_leave::GracefulLeaveHandler;
 pub use hlc::{Hlc, HlcClock};
 pub use metrics::{
     sub_millisecond_histogram_config, validate_counter_name, Counter, Gauge, Histogram,

@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 
-use crate::{NodeId, Result};
+use oceanfs_core::{NodeId, Result};
 
 /// Handler for data transfer operations during graceful cluster leave.
 ///
@@ -19,7 +19,8 @@ use crate::{NodeId, Result};
 ///
 /// ```ignore
 /// use async_trait::async_trait;
-/// use oceanfs_core::{GracefulLeaveHandler, NodeId};
+/// use oceanfs_core::NodeId;
+/// use oceanfs_membership::GracefulLeaveHandler;
 /// use std::sync::Arc;
 ///
 /// struct MyLeaveHandler;

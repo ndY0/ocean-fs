@@ -423,7 +423,7 @@ impl Membership {
     /// Returns [`Error::Leave`] if the leave handler reports a failure.
     pub async fn leave(
         &self,
-        leave_handler: Option<&dyn oceanfs_core::GracefulLeaveHandler>,
+        leave_handler: Option<&dyn crate::GracefulLeaveHandler>,
     ) -> Result<()> {
         if !*self.started.read() {
             return Err(Error::NotStarted);

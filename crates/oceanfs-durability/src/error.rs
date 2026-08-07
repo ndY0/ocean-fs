@@ -42,5 +42,11 @@ pub enum Error {
     InvalidConfig(String),
 }
 
+impl From<oceanfs_storage::Error> for Error {
+    fn from(e: oceanfs_storage::Error) -> Self {
+        Error::Storage(e.to_string())
+    }
+}
+
 /// Convenience alias for `std::result::Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;

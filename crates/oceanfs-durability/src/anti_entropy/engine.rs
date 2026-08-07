@@ -12,7 +12,8 @@ use oceanfs_core::{
 use oceanfs_ec::{CauchyEncoder, Decoder, Encoder};
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
-use oceanfs_storage::{metadata::RocksDbMetadataStore, Error, Result};
+use oceanfs_storage::metadata::RocksDbMetadataStore;
+use crate::{Error, Result};
 use rand::seq::SliceRandom;
 
 use super::{
@@ -468,7 +469,7 @@ impl AntiEntropy {
 
         // Build current Merkle tree and check if repair is needed
         let current_tree = MerkleTree::build(current_data, leaf_size).ok_or_else(|| {
-            Error::AntiEntropy(format!("cannot build Merkle tree for segment {segment_id}"))
+            Error::Storage(format!("cannot build Merkle tree for segment {segment_id}"))
         })?;
 
         // Fast path: data is intact
@@ -496,7 +497,7 @@ impl AntiEntropy {
         // Encode parity from current (possibly corrupted) data
         let parity_shards = codec
             .encode(&data_shards.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), ec_m)
-            .map_err(|e| Error::AntiEntropy(format!("EC encode failed for {segment_id}: {e}")))?;
+            .map_err(|e| Error::Storage(format!("EC encode failed for {segment_id}: {e}")))?;
 
         // Attempt to reconstruct each data shard by treating it as "missing"
         // and using the remaining k-1 shards + parity to decode
@@ -541,7 +542,7 @@ impl AntiEntropy {
         reconstructed_data.truncate(current_data.len());
 
         let repaired_tree = MerkleTree::build(&reconstructed_data, leaf_size).ok_or_else(|| {
-            Error::AntiEntropy(format!("cannot build repaired Merkle tree for {segment_id}"))
+            Error::Storage(format!("cannot build repaired Merkle tree for {segment_id}"))
         })?;
 
         if repaired_tree.root().hash() == *stored_root_hash {
@@ -576,7 +577,7 @@ impl AntiEntropy {
         _store: &dyn SegmentDataStore,
     ) -> Result<usize> {
         let current_tree = MerkleTree::build(segment_data, leaf_size).ok_or_else(|| {
-            Error::AntiEntropy(format!("cannot build Merkle tree for segment {segment_id}"))
+            Error::Storage(format!("cannot build Merkle tree for segment {segment_id}"))
         })?;
 
         let current_root_hash = current_tree.root().hash();
@@ -741,18 +742,18 @@ impl MerkleExchangeProtocol {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::AntiEntropy`] if the buffer has an invalid length
+    /// Returns [`Error::Storage`] if the buffer has an invalid length
     /// or contains malformed data.
     pub(crate) fn decode_roots(&self, data: &[u8]) -> Result<Vec<(SegmentId, MerkleRoot)>> {
         if data.len() < 4 {
-            return Err(Error::AntiEntropy("buffer too short for entry count".into()));
+            return Err(Error::Storage("buffer too short for entry count".into()));
         }
 
         let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
         let expected_len = 4 + count * (16 + 32);
 
         if data.len() < expected_len {
-            return Err(Error::AntiEntropy(format!(
+            return Err(Error::Storage(format!(
                 "buffer too short: expected {expected_len} bytes, got {}",
                 data.len()
             )));
@@ -765,7 +766,7 @@ impl MerkleExchangeProtocol {
             // Read segment ID (16 bytes UUID)
             let uuid_bytes: [u8; 16] = data[offset..offset + 16]
                 .try_into()
-                .map_err(|_| Error::AntiEntropy("invalid segment ID bytes".into()))?;
+                .map_err(|_| Error::Storage("invalid segment ID bytes".into()))?;
             offset += 16;
 
             let seg_id = SegmentId::from_uuid_bytes(uuid_bytes);
@@ -773,7 +774,7 @@ impl MerkleExchangeProtocol {
             // Read merkle root (32 bytes BLAKE3)
             let hash_bytes: [u8; 32] = data[offset..offset + 32]
                 .try_into()
-                .map_err(|_| Error::AntiEntropy("invalid merkle root bytes".into()))?;
+                .map_err(|_| Error::Storage("invalid merkle root bytes".into()))?;
             offset += 32;
 
             let root = MerkleRoot {

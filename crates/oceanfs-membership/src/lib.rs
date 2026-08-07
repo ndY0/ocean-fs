@@ -20,8 +20,10 @@
 mod error;
 mod failure_detector;
 mod gossip;
+mod graceful_leave;
 pub mod grpc;
 mod membership;
 
 pub use error::{Error, Result};
+pub use graceful_leave::GracefulLeaveHandler;
 pub use membership::{Membership, MembershipEvent};

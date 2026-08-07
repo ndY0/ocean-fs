@@ -1583,6 +1583,7 @@ dependencies = [
 name = "oceanfs-membership"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "oceanfs-core",
  "oceanfs-network",
  "oceanfs-routing",

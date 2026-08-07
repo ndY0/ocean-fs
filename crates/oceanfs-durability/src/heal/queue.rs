@@ -4,7 +4,7 @@
 //! to enforce backpressure when the heal pipeline is saturated.
 
 use oceanfs_core::{HealRequest, SegmentId};
-use oceanfs_storage::{Error, Result};
+use crate::{Error, Result};
 use tokio::sync::mpsc;
 
 /// A global sender for submitting heal requests without direct queue access.
@@ -45,7 +45,7 @@ impl HealQueueSender {
     /// Sends a heal request into the bounded queue.
     ///
     /// Uses `try_send` for immediate backpressure feedback (perf rule 2.6).
-    /// If the queue is full, returns `Error::HealQueueFull` immediately.
+    /// If the queue is full, returns `Error::Storage("heal queue full".into())` immediately.
     ///
     /// # Errors
     ///
@@ -53,8 +53,8 @@ impl HealQueueSender {
     /// has been dropped (i.e. the heal worker has shut down).
     pub fn enqueue(&self, request: HealRequest) -> Result<()> {
         self.tx.try_send(request).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => Error::HealQueueFull,
-            mpsc::error::TrySendError::Closed(_) => Error::Heal("heal queue closed".into()),
+            mpsc::error::TrySendError::Full(_) => Error::Storage("heal queue full".into()),
+            mpsc::error::TrySendError::Closed(_) => Error::Storage("heal queue closed".into()),
         })
     }
 }
@@ -152,7 +152,7 @@ pub fn init_global_queue(sender: HealQueueSender) {
 /// ```
 pub fn enqueue_heal(segment_id: SegmentId, corrupt_shard_indices: Vec<usize>) -> Result<()> {
     let sender = GLOBAL_HEAL_SENDER.get().ok_or_else(|| {
-        Error::Heal(
+        Error::Storage(
             "global heal queue not initialized — call init_global_queue during startup".into(),
         )
     })?;
@@ -171,8 +171,8 @@ impl HealQueueSender {
     /// Uses `try_send` directly, returning immediately on backpressure.
     pub(crate) fn enqueue_blocking(&self, request: HealRequest) -> Result<()> {
         self.tx.try_send(request).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => Error::HealQueueFull,
-            mpsc::error::TrySendError::Closed(_) => Error::Heal("heal queue closed".into()),
+            mpsc::error::TrySendError::Full(_) => Error::Storage("heal queue full".into()),
+            mpsc::error::TrySendError::Closed(_) => Error::Storage("heal queue closed".into()),
         })
     }
 }
@@ -236,7 +236,7 @@ mod tests {
 
         // Second send should fail (queue full)
         let result = sender.enqueue_blocking(request);
-        assert!(matches!(result, Err(Error::HealQueueFull)));
+        assert!(matches!(result, Err(Error::Storage("heal queue full".into()))));
     }
 
     #[test]

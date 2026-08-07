@@ -19,7 +19,8 @@ use oceanfs_core::{
 use oceanfs_ec::Decoder;
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
-use oceanfs_storage::{metadata::RocksDbMetadataStore, Error, Result};
+use oceanfs_storage::metadata::RocksDbMetadataStore;
+use crate::{Error, Result};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -289,14 +290,14 @@ impl HealWorker {
         // Step 1: Look up segment metadata.
         let segment_meta = metadata
             .get_segment(*segment_id)
-            .map_err(|e| Error::Heal(format!("metadata lookup failed: {e}")))?
+            .map_err(|e| Error::Storage(format!("metadata lookup failed: {e}")))?
             .ok_or(Error::SegmentNotFound(*segment_id))?;
 
         let ec_k = segment_meta.ec_k;
         let ec_m = segment_meta.ec_m;
 
         if ec_k == 0 {
-            return Err(Error::Heal(format!("segment {segment_id} has ec_k=0, cannot EC-heal")));
+            return Err(Error::Storage(format!("segment {segment_id} has ec_k=0, cannot EC-heal")));
         }
 
         let total_shards = (ec_k + ec_m) as usize;
@@ -338,7 +339,7 @@ impl HealWorker {
             if full_data.is_empty() { 0 } else { full_data.len() / total_shards.max(1) };
 
         if shard_size == 0 && !full_data.is_empty() {
-            return Err(Error::Heal(format!(
+            return Err(Error::Storage(format!(
                 "segment {segment_id} data size {} not divisible by total shards {total_shards}",
                 full_data.len()
             )));
@@ -362,7 +363,7 @@ impl HealWorker {
         // Step 3: EC decode.
         let reconstructed = decoder
             .decode(&available_shards, ec_k, ec_m)
-            .map_err(|e| Error::Heal(format!("EC decode failed: {e}")))?;
+            .map_err(|e| Error::Storage(format!("EC decode failed: {e}")))?;
 
         // Step 4: Write repaired shards back.
         let mut total_repaired: u64 = 0;
@@ -372,7 +373,7 @@ impl HealWorker {
                 continue;
             }
             let shard_data = reconstructed.get(corrupt_idx).ok_or_else(|| {
-                Error::Heal(format!("decoder did not return shard for corrupt index {corrupt_idx}"))
+                Error::Storage(format!("decoder did not return shard for corrupt index {corrupt_idx}"))
             })?;
 
             if !shard_data.is_empty() {
@@ -395,7 +396,7 @@ impl HealWorker {
         updated_meta.merkle_root = None; // Invalidate old Merkle root until rebuilt.
         metadata
             .put_segment(updated_meta)
-            .map_err(|e| Error::Heal(format!("metadata update failed: {e}")))?;
+            .map_err(|e| Error::Storage(format!("metadata update failed: {e}")))?;
 
         Ok(total_repaired)
     }
@@ -467,7 +468,7 @@ impl HealWorker {
             }
         }
 
-        Err(Error::Heal(format!("no reachable replica has segment {segment_id}")))
+        Err(Error::Storage(format!("no reachable replica has segment {segment_id}")))
     }
 
     /// Drains remaining items in the queue after shutdown is signalled.

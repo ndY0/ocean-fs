@@ -7,7 +7,8 @@ use std::{
 };
 
 use oceanfs_core::{Counter, LabelSet, MetricRegistrar, SegmentId};
-use oceanfs_storage::{metadata::RocksDbMetadataStore, segment::TierRouter, Error, Result};
+use oceanfs_storage::{metadata::RocksDbMetadataStore, segment::TierRouter};
+use crate::{Error, Result};
 use tokio::sync::Semaphore;
 
 use super::{
@@ -135,7 +136,7 @@ impl GarbageCollector {
                 .clone()
                 .acquire_owned()
                 .await
-                .map_err(|e| Error::Gc(format!("semaphore acquire failed: {e}")))?;
+                .map_err(|e| Error::Internal(format!("semaphore acquire failed: {e}")))?;
             let compactor = compactor.clone();
             let tx = tx.clone();
             let metadata = metadata.clone();

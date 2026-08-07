@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait = "0.1"
 oceanfs-core.workspace = true
 oceanfs-network.workspace = true
 oceanfs-routing.workspace = true
