@@ -77,7 +77,7 @@ impl SegmentIndex {
     /// a compact binary format in production).
     pub fn to_bytes(&self) -> Vec<u8> {
         let entries: Vec<&SegmentIndexEntry> = self.entries.values().collect();
-        serde_json::to_vec(&entries).unwrap_or_default()
+        bincode::serialize(&entries).unwrap_or_default()
     }
 
     /// Deserializes an index from bytes.
@@ -87,7 +87,8 @@ impl SegmentIndex {
     /// Returns an error if the data is not valid JSON or contains
     /// entries with duplicate offsets.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        let entries: Vec<SegmentIndexEntry> = serde_json::from_slice(data)
+        let entries: Vec<SegmentIndexEntry> = bincode::deserialize(data)
+            .or_else(|_| serde_json::from_slice(data))
             .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
         Self::new(entries)
     }

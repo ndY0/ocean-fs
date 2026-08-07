@@ -153,7 +153,7 @@ pub async fn cleanup_old_wal_files(config: &WalConfig) {
 
     // Find the current WAL file sequence (the highest-numbered file).
     let mut current_seq: u64 = 0;
-    let mut file_paths = Vec::new();
+    let mut file_paths = Vec::with_capacity(16);
 
     match std::fs::read_dir(dir_path) {
         Ok(dir) => {

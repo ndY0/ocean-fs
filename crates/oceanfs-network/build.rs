@@ -8,7 +8,7 @@
 //! (common, membership) so that tonic-build emits absolute
 //! `::oceanfs_core::proto::*` paths instead of generating duplicate types.
 
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::needless_borrows_for_generic_args)]
 
 use std::path::PathBuf;
 
@@ -33,6 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .out_dir(&out_dir)
         .build_server(true)
         .build_client(true)
+        .bytes(&["."])
         .compile_protos(protos, &[proto_dir])?;
 
     Ok(())

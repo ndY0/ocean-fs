@@ -194,6 +194,7 @@ fn make_store(dir: &tempfile::TempDir) -> Arc<RocksDbMetadataStore> {
         data_dir: dir.path().join("meta"),
         block_cache_size: 8 * 1024 * 1024,
         memtable_size: 64 * 1024 * 1024,
+        ..Default::default()
     };
     Arc::new(RocksDbMetadataStore::open(&config).expect("failed to open store"))
 }

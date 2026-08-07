@@ -10,6 +10,7 @@ pub(crate) const CF_SEGMENTS: &str = "segments";
 pub(crate) const CF_DELETIONS: &str = "deletions";
 
 /// All column families used by the metadata store.
+#[allow(dead_code)]
 pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[CF_OBJECTS, CF_SEGMENTS, CF_DELETIONS];
 
 /// Encodes a bucket and object key into a RocksDB key.

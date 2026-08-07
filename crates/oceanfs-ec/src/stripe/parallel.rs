@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use oceanfs_core::EncodingPlan;
 use rayon::prelude::*;
 use tokio::sync::Semaphore;
@@ -132,7 +133,7 @@ impl<E: Encoder + ?Sized> ParallelEncoder<E> {
         let m8 = m as u8;
         let mut parity_shards: Vec<Vec<u8>> = vec![vec![0u8; total_stripes * shard_size]; m];
 
-        let results: Vec<Result<Vec<Vec<u8>>>> = (0..total_stripes)
+        let results: Vec<Result<Vec<Bytes>>> = (0..total_stripes)
             .into_par_iter()
             .map(|stripe_idx| {
                 let stripe_data: Vec<&[u8]> = data_shards
@@ -221,7 +222,7 @@ impl<D: Decoder + ?Sized> ParallelDecoder<D> {
         let mut recovered_data: Vec<Vec<u8>> =
             vec![vec![0u8; total_stripes * shard_size]; k as usize];
 
-        let results: Vec<Result<Vec<Vec<u8>>>> = (0..total_stripes)
+        let results: Vec<Result<Vec<Bytes>>> = (0..total_stripes)
             .into_par_iter()
             .map(|stripe_idx| {
                 let mut shards: Vec<Option<&[u8]>> = vec![None; (k + m) as usize];

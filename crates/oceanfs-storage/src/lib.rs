@@ -35,7 +35,7 @@ pub mod wal;
 pub use blob_store::BlobStore;
 pub use buffer_pool::BufferPool;
 pub use error::{Error, Result};
-pub use metadata::{BatchOp, RocksDbMetadataStore};
+pub use metadata::{BatchOp, RocksDbMetadataStore, RocksDbMetrics};
 pub use segment::{
     ActiveSegment, SealConfig, SegmentHandle, SegmentHeader, SegmentIndex, SegmentPool,
     SegmentSealer, SegmentShard, SegmentSplitter, TierRouter,

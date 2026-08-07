@@ -37,6 +37,7 @@ use std::{
     time::Instant,
 };
 
+use bytes::Bytes;
 use cudarc::driver::{CudaDevice, CudaFunction, LaunchAsync, LaunchConfig};
 use oceanfs_core::{Counter, Gauge, GpuConfig, LabelSet, MetricRegistrar};
 use oceanfs_ec::{Decoder, Encoder, Error as EcError, Result as EcResult};
@@ -310,7 +311,7 @@ impl CudaBackend {
 // ---------------------------------------------------------------------------
 
 impl Encoder for CudaBackend {
-    fn encode(&self, data_shards: &[&[u8]], parity_count: u8) -> EcResult<Vec<Vec<u8>>> {
+    fn encode(&self, data_shards: &[&[u8]], parity_count: u8) -> EcResult<Vec<Bytes>> {
         let start = Instant::now();
         let result = self.encode_impl(data_shards, parity_count);
         let elapsed_us = start.elapsed().as_micros() as u64;
@@ -320,7 +321,7 @@ impl Encoder for CudaBackend {
 }
 
 impl CudaBackend {
-    fn encode_impl(&self, data_shards: &[&[u8]], parity_count: u8) -> EcResult<Vec<Vec<u8>>> {
+    fn encode_impl(&self, data_shards: &[&[u8]], parity_count: u8) -> EcResult<Vec<Bytes>> {
         if !self.is_available() {
             return Err(EcError::DecodingFailed("GPU backend is unavailable (cooldown)".into()));
         }
@@ -361,7 +362,7 @@ impl CudaBackend {
         let m_usize = m as usize;
 
         // --- GPU operations ---
-        let result = (|| -> Result<Vec<Vec<u8>>, cudarc::driver::DriverError> {
+        let result = (|| -> Result<Vec<Bytes>, cudarc::driver::DriverError> {
             // SAFETY: Device memory allocation on a valid, initialized CudaDevice.
             // The returned CudaSlice wraps a valid GPU pointer or returns Err.
             let mut d_data = unsafe { self.device.alloc::<u8>(flat_data.len()) }?;
@@ -411,11 +412,11 @@ impl CudaBackend {
             let mut host_parity = vec![0u8; m_usize * shard_size];
             self.device.dtoh_sync_copy_into(&d_parity, &mut host_parity)?;
 
-            // Convert flat to Vec<Vec<u8>>
-            let parity: Vec<Vec<u8>> = (0..m_usize)
+            // Convert flat to Vec<Bytes> — zero-copy via Bytes::copy_from_slice
+            let parity: Vec<Bytes> = (0..m_usize)
                 .map(|row| {
                     let start = row * shard_size;
-                    host_parity[start..start + shard_size].to_vec()
+                    Bytes::copy_from_slice(&host_parity[start..start + shard_size])
                 })
                 .collect();
 
@@ -443,7 +444,7 @@ impl Decoder for CudaBackend {
         available_shards: &[Option<&[u8]>],
         data_count: u8,
         parity_count: u8,
-    ) -> EcResult<Vec<Vec<u8>>> {
+    ) -> oceanfs_ec::Result<Vec<bytes::Bytes>> {
         let _ = self.is_available();
         let encoder = oceanfs_ec::CauchyEncoder::new(oceanfs_core::CodecConfig {
             data_shards: data_count,

@@ -51,6 +51,7 @@ async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
             data_dir: dir.path().join("meta"),
             block_cache_size: 1024,
             memtable_size: 1024,
+            ..Default::default()
         })
         .unwrap(),
     );

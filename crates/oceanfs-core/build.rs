@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 
+#[allow(clippy::needless_borrows_for_generic_args)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let crate_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     // Build script: expect is acceptable here since a missing workspace root
@@ -35,6 +36,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .out_dir(&out_dir)
         .build_server(false)
         .build_client(false)
+        // Use bytes::Bytes for all proto `bytes` fields — eliminates every
+        // Vec<u8> allocation and copy on the data plane (append, fetch,
+        // inline metadata). The wire format is identical.
+        .bytes(&["."])
         .compile_protos(protos, &[proto_dir])?;
 
     Ok(())

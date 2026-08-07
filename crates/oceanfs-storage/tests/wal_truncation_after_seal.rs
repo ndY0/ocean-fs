@@ -62,6 +62,7 @@ async fn wal_truncation_called_during_seal() {
             data_dir: dir.path().join("meta"),
             block_cache_size: 1024,
             memtable_size: 1024,
+            ..Default::default()
         })
         .unwrap(),
     );

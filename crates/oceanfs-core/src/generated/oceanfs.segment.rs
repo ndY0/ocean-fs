@@ -8,8 +8,8 @@ pub struct SegmentAppendRequest {
     pub shard_index: ::core::option::Option<super::common::ShardIndex>,
     #[prost(uint64, tag = "3")]
     pub offset: u64,
-    #[prost(bytes = "vec", tag = "4")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub data: ::prost::bytes::Bytes,
     #[prost(message, optional, tag = "5")]
     pub hlc: ::core::option::Option<super::common::HlcTimestamp>,
     /// Object metadata for cross-node replication.
@@ -21,10 +21,10 @@ pub struct SegmentAppendRequest {
     pub object_key: ::prost::alloc::string::String,
     #[prost(uint64, tag = "8")]
     pub object_size: u64,
-    #[prost(bytes = "vec", tag = "9")]
-    pub blake3_hash: ::prost::alloc::vec::Vec<u8>,
-    #[prost(bytes = "vec", repeated, tag = "10")]
-    pub chunk_segment_ids: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bytes = "bytes", tag = "9")]
+    pub blake3_hash: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", repeated, tag = "10")]
+    pub chunk_segment_ids: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
     #[prost(uint64, repeated, tag = "11")]
     pub chunk_offsets: ::prost::alloc::vec::Vec<u64>,
     #[prost(uint32, repeated, tag = "12")]
@@ -53,11 +53,11 @@ pub struct FetchShardRequest {
 /// A chunk of shard data streamed back to the requester.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ShardResponse {
-    #[prost(bytes = "vec", tag = "1")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub data: ::prost::bytes::Bytes,
     /// BLAKE3 checksum of this chunk
-    #[prost(bytes = "vec", tag = "2")]
-    pub checksum: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub checksum: ::prost::bytes::Bytes,
     #[prost(uint32, tag = "3")]
     pub chunk_index: u32,
 }
@@ -73,8 +73,8 @@ pub struct SegmentMetadata {
     #[prost(uint32, tag = "3")]
     pub ec_m: u32,
     /// 32 bytes BLAKE3
-    #[prost(bytes = "vec", tag = "4")]
-    pub merkle_root: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub merkle_root: ::prost::bytes::Bytes,
     #[prost(message, repeated, tag = "5")]
     pub storage_locations: ::prost::alloc::vec::Vec<super::common::NodeId>,
 }
@@ -110,14 +110,14 @@ pub struct GetObjectMetadataResponse {
     #[prost(uint64, tag = "2")]
     pub size: u64,
     /// BLAKE3 hash of the object data (32 bytes, empty if not present).
-    #[prost(bytes = "vec", tag = "3")]
-    pub blake3_hash: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub blake3_hash: ::prost::bytes::Bytes,
     /// HLC timestamp of this object version.
     #[prost(message, optional, tag = "4")]
     pub hlc: ::core::option::Option<super::common::HlcTimestamp>,
     /// Inline data (present for small objects, empty otherwise).
-    #[prost(bytes = "vec", tag = "5")]
-    pub inline_data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub inline_data: ::prost::bytes::Bytes,
     /// Chunk references for segment-stored objects.
     #[prost(message, repeated, tag = "6")]
     pub chunk_segment_ids: ::prost::alloc::vec::Vec<super::common::SegmentId>,
@@ -135,12 +135,12 @@ pub struct PutObjectMetadataRequest {
     pub object_key: ::prost::alloc::string::String,
     #[prost(uint64, tag = "3")]
     pub size: u64,
-    #[prost(bytes = "vec", tag = "4")]
-    pub blake3_hash: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub blake3_hash: ::prost::bytes::Bytes,
     #[prost(message, optional, tag = "5")]
     pub hlc: ::core::option::Option<super::common::HlcTimestamp>,
-    #[prost(bytes = "vec", tag = "6")]
-    pub inline_data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub inline_data: ::prost::bytes::Bytes,
     #[prost(message, repeated, tag = "7")]
     pub chunk_segment_ids: ::prost::alloc::vec::Vec<super::common::SegmentId>,
     #[prost(uint64, repeated, tag = "8")]

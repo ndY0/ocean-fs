@@ -443,12 +443,12 @@ impl WriteCoordinator {
             segment_id: Some(proto_segment_id),
             shard_index: None,
             offset: 0,
-            data: req.data.to_vec(),
+            data: req.data.clone(),
             hlc: Some(proto_hlc),
             bucket_id: req.bucket.to_string(),
             object_key: req.key.to_string(),
             object_size: req.data.len() as u64,
-            blake3_hash: vec![],
+            blake3_hash: Bytes::new(),
             chunk_segment_ids: vec![],
             chunk_offsets: vec![],
             chunk_lengths: vec![],
@@ -592,7 +592,8 @@ mod tests {
                 data_dir: dir.path().join("meta"),
                 block_cache_size: 1024,
                 memtable_size: 1024,
-            })
+                        ..Default::default()
+        })
             .unwrap(),
         );
         let size_config = SegmentSizeConfig::default();

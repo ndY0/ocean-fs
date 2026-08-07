@@ -46,7 +46,7 @@ impl WalReader {
     ///
     /// Returns an I/O error if the WAL directory cannot be read.
     pub fn open(config: &WalConfig) -> Result<Self> {
-        let mut files = Vec::new();
+        let mut files = Vec::with_capacity(16);
 
         let dir = std::fs::read_dir(&config.data_dir)?;
         for entry in dir {

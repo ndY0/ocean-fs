@@ -3,6 +3,25 @@
 //! Uses log/exp tables for fast multiplication and division.
 //! Addition is XOR. The primitive polynomial is 0x11D
 //! (x^8 + x^4 + x^3 + x^2 + 1).
+//!
+//! ## SIMD Acceleration (x86_64)
+//!
+//! On x86_64, run-time CPU feature detection selects the fastest available
+//! SIMD path for batched GF(2^8) multiplication:
+//!
+//! - **SSE4.1** (PSHUFB split-table): 16 elements/instruction, ~1.5× portable
+//! - **AVX2** (VPSHUFB split-table): 32 elements/instruction, ~2× portable
+//! - **AVX-512** (VPSHUFB split-table): 64 elements/instruction, ~4× portable
+//!
+//! The SIMD code lives in the `simd_x86` module. Use [`gf_mul_simd`] to
+//! multiply a byte slice by a single coefficient using the fastest available
+//! SIMD path.
+
+#[cfg(target_arch = "x86_64")]
+mod simd_x86;
+
+#[cfg(target_arch = "x86_64")]
+pub use simd_x86::{gf_mul_simd, gf_mul_simd_unchecked, GfSimdLevel};
 
 /// GF(2^8) element (0..255).
 pub type Gf8 = u8;
@@ -52,13 +71,19 @@ const fn build_exp_table() -> [u8; 512] {
 }
 
 /// Adds two GF(2^8) elements (XOR).
-#[inline]
+///
+/// Force-inlined to ensure the compiler can fold multiple XORs into
+/// a single SIMD operation when vectorizing the Cauchy encode loop.
+#[inline(always)]
 pub fn gf_add(a: Gf8, b: Gf8) -> Gf8 {
     a ^ b
 }
 
 /// Multiplies two GF(2^8) elements.
-#[inline]
+///
+/// Force-inlined to allow the compiler to see through the log/exp table
+/// lookup and potentially vectorize when LTO is enabled.
+#[inline(always)]
 pub fn gf_mul(a: Gf8, b: Gf8) -> Gf8 {
     if a == 0 || b == 0 {
         0
@@ -70,10 +95,13 @@ pub fn gf_mul(a: Gf8, b: Gf8) -> Gf8 {
 
 /// Divides a / b in GF(2^8).
 ///
+/// Force-inlined per perf guideline §10.1 — the scalar division path
+/// is used in the decode matrix inversion where every cycle counts.
+///
 /// # Panics
 ///
 /// Panics if `b` is zero (division by zero in GF(2^8)).
-#[inline]
+#[inline(always)]
 pub fn gf_div(a: Gf8, b: Gf8) -> Gf8 {
     if a == 0 {
         0

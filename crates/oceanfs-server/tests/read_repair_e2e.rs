@@ -93,6 +93,7 @@ fn make_rocks_metadata() -> Arc<RocksDbMetadataStore> {
             data_dir: tmp.path().join("meta"),
             block_cache_size: 1024,
             memtable_size: 1024,
+            ..Default::default()
         })
         .unwrap(),
     )

@@ -528,7 +528,7 @@ async fn segment_report(State(state): State<AdminState>) -> impl IntoResponse {
 /// GET /admin/caches — returns per-tier cache hit/miss stats as JSON.
 #[instrument(skip(state))]
 async fn cache_stats(State(state): State<AdminState>) -> impl IntoResponse {
-    let mut stats = Vec::new();
+    let mut stats = Vec::with_capacity(3);
 
     #[cfg(feature = "cache")]
     {

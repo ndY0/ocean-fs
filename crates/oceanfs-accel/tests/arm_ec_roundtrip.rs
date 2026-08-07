@@ -114,7 +114,7 @@ fn arm_encode_decode_large_data_k16_m8() {
         .iter()
         .enumerate()
         .map(|(i, v)| if i == 0 || i == 3 || i == 7 { None } else { Some(v.as_slice()) })
-        .chain(parity.iter().map(|v| v.as_slice()).map(Some))
+        .chain(parity.iter().map(|v| v.as_ref()).map(Some))
         .collect();
 
     let recovered = decoder.decode(&available, 16, 8).unwrap();

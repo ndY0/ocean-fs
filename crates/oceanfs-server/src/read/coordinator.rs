@@ -524,7 +524,7 @@ impl ReadCoordinator {
             let inline_data = if winning.inline_data.is_empty() {
                 None
             } else {
-                Some(Bytes::from(winning.inline_data.clone()))
+                Some(winning.inline_data.clone())
             };
 
             Some(ObjectMetadata {
@@ -586,7 +586,7 @@ impl ReadCoordinator {
         tokio::spawn(async move {
             let mut winning_hlc = local_hlc;
             let mut winning_meta: Option<GetObjectMetadataResponse> = None;
-            let mut stale_remotes: Vec<NodeId> = Vec::new();
+            let mut stale_remotes: Vec<NodeId> = Vec::with_capacity(replica_set.len());
             let mut local_is_stale: bool = false;
 
             // Fetch metadata from each remote replica in parallel.
@@ -814,11 +814,8 @@ impl ReadCoordinator {
             None
         };
 
-        let inline_data = if winning.inline_data.is_empty() {
-            None
-        } else {
-            Some(Bytes::from(winning.inline_data.clone()))
-        };
+        let inline_data =
+            if winning.inline_data.is_empty() { None } else { Some(winning.inline_data.clone()) };
 
         let meta = ObjectMetadata {
             object_key: key.clone(),
@@ -969,6 +966,7 @@ impl ReadCoordinator {
                     self.membership.as_ref(),
                     ec,
                     parallel_fetch,
+                    use_fastest_k,
                     sem_ref,
                 )
                 .await?
@@ -981,6 +979,7 @@ impl ReadCoordinator {
                     self.pool.as_ref(),
                     self.membership.as_ref(),
                     parallel_fetch,
+                    use_fastest_k,
                     sem_ref,
                 )
                 .await?
@@ -994,6 +993,7 @@ impl ReadCoordinator {
                 self.pool.as_ref(),
                 self.membership.as_ref(),
                 parallel_fetch,
+                use_fastest_k,
                 sem_ref,
             )
             .await?
@@ -1010,6 +1010,7 @@ impl ReadCoordinator {
                     None,
                     ec,
                     parallel_fetch,
+                    use_fastest_k,
                     sem_ref,
                 )
                 .await?
@@ -1088,7 +1089,7 @@ impl ReadCoordinator {
         available_shards: &[Option<&[u8]>],
         data_count: u8,
         parity_count: u8,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<Bytes>> {
         let decoder = self
             .decoder
             .as_ref()
@@ -1347,9 +1348,12 @@ fn build_put_metadata_request(
         bucket_id: bucket.as_str().to_string(),
         object_key: key.as_str().to_string(),
         size: meta.size,
-        blake3_hash: meta.blake3_hash.map(|h| h.as_bytes().to_vec()).unwrap_or_default(),
+        blake3_hash: meta
+            .blake3_hash
+            .map(|h| Bytes::copy_from_slice(h.as_bytes()))
+            .unwrap_or_default(),
         hlc: Some(hlc_proto),
-        inline_data: meta.inline_data.clone().map(|b| b.to_vec()).unwrap_or_default(),
+        inline_data: meta.inline_data.clone().unwrap_or_default(),
         chunk_segment_ids,
         chunk_offsets,
         chunk_lengths,
@@ -2541,8 +2545,8 @@ mod tests {
         }
 
         // Verify parity data in segment matches.
-        assert_eq!(&segment[64..80], parity[0].as_slice(), "parity[0] mismatch");
-        assert_eq!(&segment[80..96], parity[1].as_slice(), "parity[1] mismatch");
+        assert_eq!(&segment[64..80], parity[0].as_ref(), "parity[0] mismatch");
+        assert_eq!(&segment[80..96], parity[1].as_ref(), "parity[1] mismatch");
 
         let seg_id = SegmentId::new();
         let inner = Arc::new(InMemorySegmentReader::new());

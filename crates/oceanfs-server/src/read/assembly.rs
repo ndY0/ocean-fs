@@ -8,7 +8,7 @@
 //! the full blob before hashing) and §5.4 (single hasher for
 //! multi-chunk reads).
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use oceanfs_core::HashOutput;
 
 use crate::error::{Error, Result};
@@ -47,7 +47,7 @@ pub struct MultiChunkAssembler {
     /// received.
     expected_hash: HashOutput,
     /// Accumulated data, built by appending each chunk.
-    buffer: Vec<u8>,
+    buffer: BytesMut,
     /// Number of chunks expected.
     chunk_count: usize,
     /// Number of chunks received so far.
@@ -66,7 +66,7 @@ impl MultiChunkAssembler {
         Self {
             hasher: blake3::Hasher::new(),
             expected_hash,
-            buffer: Vec::with_capacity(64 * 1024), // pre-allocate 64 KB
+            buffer: BytesMut::with_capacity(64 * 1024), // pre-allocate 64 KB
             chunk_count,
             received: 0,
             verify: true,
@@ -80,7 +80,7 @@ impl MultiChunkAssembler {
         Self {
             hasher: blake3::Hasher::new(),
             expected_hash: HashOutput::from_bytes([0u8; 32]),
-            buffer: Vec::with_capacity(64 * 1024),
+            buffer: BytesMut::with_capacity(64 * 1024),
             chunk_count,
             received: 0,
             verify: false,
@@ -139,7 +139,7 @@ impl MultiChunkAssembler {
             }
         }
 
-        Ok(Bytes::from(self.buffer))
+        Ok(self.buffer.freeze())
     }
 
     /// Returns the total number of bytes accumulated so far.

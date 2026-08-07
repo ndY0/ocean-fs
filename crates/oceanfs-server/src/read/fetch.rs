@@ -61,7 +61,7 @@ impl EcRecoveryParams {
     /// `available_shards` must have length `data_shards + parity_shards`.
     /// `None` entries indicate missing shards. At least `data_shards`
     /// entries must be `Some`.
-    pub(crate) fn decode_shards(&self, available_shards: &[Option<&[u8]>]) -> Result<Vec<Vec<u8>>> {
+    pub(crate) fn decode_shards(&self, available_shards: &[Option<&[u8]>]) -> Result<Vec<Bytes>> {
         self.decoder
             .decode(available_shards, self.data_shards, self.parity_shards)
             .map_err(|e| Error::Internal(format!("EC decode failed: {e}")))
@@ -89,11 +89,26 @@ pub(crate) async fn fetch_chunks(
     timeout_ms: u64,
     segment_reader: Option<&Arc<dyn SegmentReader>>,
 ) -> Result<Vec<Bytes>> {
-    fetch_chunks_inner(ring, metadata, timeout_ms, segment_reader, None, None, None, true, None)
-        .await
+    fetch_chunks_inner(
+        ring,
+        metadata,
+        timeout_ms,
+        segment_reader,
+        None,
+        None,
+        None,
+        true,
+        true,
+        None,
+    )
+    .await
 }
 
 /// Internal version that accepts optional gRPC dependencies.
+/// - `use_fastest_k`: when `true`, `FuturesUnordered` may return early
+///   once k data shards arrive (enabled when EC parity is available).
+///   Currently a passthrough — full k-of-m termination is implemented
+///   in the EC integration epic.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetch_chunks_with_grpc(
     ring: &Arc<RingCache>,
@@ -103,6 +118,7 @@ pub(crate) async fn fetch_chunks_with_grpc(
     pool: Option<&Arc<ConnectionPool>>,
     membership: Option<&Arc<Membership>>,
     parallel_fetch: bool,
+    use_fastest_k: bool,
     stripe_semaphore: Option<&Arc<Semaphore>>,
 ) -> Result<Vec<Bytes>> {
     fetch_chunks_inner(
@@ -114,6 +130,7 @@ pub(crate) async fn fetch_chunks_with_grpc(
         membership,
         None,
         parallel_fetch,
+        use_fastest_k,
         stripe_semaphore,
     )
     .await
@@ -135,6 +152,7 @@ pub(crate) async fn fetch_chunks_with_ec(
     membership: Option<&Arc<Membership>>,
     ec_params: &EcRecoveryParams,
     parallel_fetch: bool,
+    use_fastest_k: bool,
     stripe_semaphore: Option<&Arc<Semaphore>>,
 ) -> Result<Vec<Bytes>> {
     fetch_chunks_inner(
@@ -146,6 +164,7 @@ pub(crate) async fn fetch_chunks_with_ec(
         membership,
         Some(ec_params),
         parallel_fetch,
+        use_fastest_k,
         stripe_semaphore,
     )
     .await
@@ -156,6 +175,8 @@ pub(crate) async fn fetch_chunks_with_ec(
 ///
 /// - `parallel_fetch`: when `false`, chunks are fetched sequentially
 ///   (one at a time) instead of in parallel via `FuturesUnordered`.
+/// - `use_fastest_k`: when `true` and EC params are available,
+///   `FuturesUnordered` may exit early once k data shards arrive.
 /// - `stripe_semaphore`: when set, EC recovery tasks acquire a permit
 ///   before decoding, bounding concurrent EC work per perf §2.7/8.5.
 #[allow(clippy::too_many_arguments)]
@@ -168,6 +189,7 @@ async fn fetch_chunks_inner(
     membership: Option<&Arc<Membership>>,
     #[cfg_attr(not(feature = "ec"), allow(unused_variables))] ec_params: Option<&EcRecoveryParams>,
     parallel_fetch: bool,
+    #[cfg_attr(not(feature = "ec"), allow(unused_variables))] use_fastest_k: bool,
     stripe_semaphore: Option<&Arc<Semaphore>>,
 ) -> Result<Vec<Bytes>> {
     if metadata.is_inline() {
@@ -190,6 +212,7 @@ async fn fetch_chunks_inner(
             pool,
             membership,
             ec_params,
+            use_fastest_k,
             stripe_semaphore,
         )
         .await
@@ -202,6 +225,7 @@ async fn fetch_chunks_inner(
             pool,
             membership,
             ec_params,
+            use_fastest_k,
             stripe_semaphore,
         )
         .await
@@ -215,6 +239,9 @@ async fn fetch_chunks_inner(
 ///
 /// When `ec_params` is provided, each chunk fetch will attempt EC recovery
 /// as a fallback if the normal fetch path fails.
+///
+/// When `use_fastest_k` is `true` and EC params are available, the loop
+/// exits early once at least `k` data shards have been fetched successfully.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_all_chunks_parallel(
     ring: &Arc<RingCache>,
@@ -224,6 +251,7 @@ async fn fetch_all_chunks_parallel(
     pool: Option<&Arc<ConnectionPool>>,
     membership: Option<&Arc<Membership>>,
     ec_params: Option<&EcRecoveryParams>,
+    use_fastest_k: bool,
     stripe_semaphore: Option<&Arc<Semaphore>>,
 ) -> Result<Vec<Bytes>> {
     let chunk_count = chunks.len();
@@ -237,6 +265,15 @@ async fn fetch_all_chunks_parallel(
         })
     });
     let sem = stripe_semaphore.cloned();
+
+    // When use_fastest_k is enabled with EC, we only need k data shards
+    // (the remaining m parity shards can be used for reconstruction).
+    // Without EC, we need all chunks and fastest-k is a no-op.
+    let required = if use_fastest_k {
+        ec_params.map(|p| p.data_shards as usize).unwrap_or(chunk_count)
+    } else {
+        chunk_count
+    };
 
     let mut futs: FuturesUnordered<_> = chunks
         .iter()
@@ -268,12 +305,25 @@ async fn fetch_all_chunks_parallel(
 
     // Collect results, preserving chunk order.
     let mut chunk_data: Vec<Option<Bytes>> = vec![None; chunk_count];
-    let mut errors = Vec::new();
+    let mut errors = Vec::with_capacity(4);
+    let mut successes: usize = 0;
 
     while let Some((idx, result)) = futs.next().await {
         match result {
             Ok(data) => {
                 chunk_data[idx] = Some(data);
+                successes += 1;
+                // k-of-m early termination: stop once we have enough
+                // successful fetches. Remaining futures are dropped.
+                if successes >= required && required < chunk_count {
+                    tracing::debug!(
+                        successes,
+                        required,
+                        chunk_count,
+                        "use_fastest_k: early termination after k shards"
+                    );
+                    break;
+                }
             }
             Err(e) => {
                 errors.push((idx, e));
@@ -308,6 +358,7 @@ async fn fetch_all_chunks_serial(
     pool: Option<&Arc<ConnectionPool>>,
     membership: Option<&Arc<Membership>>,
     ec_params: Option<&EcRecoveryParams>,
+    #[allow(unused_variables)] use_fastest_k: bool,
     stripe_semaphore: Option<&Arc<Semaphore>>,
 ) -> Result<Vec<Bytes>> {
     let ec_params_arc = ec_params.map(|p| {
@@ -447,7 +498,7 @@ async fn fetch_single_chunk(
             match fetch_result {
                 Ok(Ok(response)) => {
                     let mut stream = response.into_inner();
-                    let mut data = BytesMut::new();
+                    let mut data = BytesMut::with_capacity(chunk.length as usize);
                     while let Some(chunk_result) = stream.message().await.unwrap_or(None) {
                         if chunk_result.data.is_empty() {
                             break; // EOF sentinel
@@ -914,7 +965,7 @@ mod tests {
 
         /// Convenience: build an EC(4,2)-encoded segment from 4 equal-size
         /// data shards, returning (data_shards, parity_shards, full_segment).
-        fn encode_ec_segment(data: &[Vec<u8>; 4]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<u8>) {
+        fn encode_ec_segment(data: &[Vec<u8>; 4]) -> (Vec<Vec<u8>>, Vec<Bytes>, Vec<u8>) {
             let data_refs: [&[u8]; 4] = [&data[0], &data[1], &data[2], &data[3]];
             let shard_size = data[0].len();
             let encoder = CauchyEncoder::new(CodecConfig {

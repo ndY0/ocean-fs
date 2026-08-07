@@ -23,6 +23,7 @@ rayon.workspace = true
 num_cpus.workspace = true
 rocksdb.workspace = true
 serde_json.workspace = true
+bincode.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

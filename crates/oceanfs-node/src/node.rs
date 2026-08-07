@@ -199,7 +199,7 @@ impl NodeLeaveHandler {
         let request = tonic::Request::new(HintRequest {
             intended_for: Some(proto_node),
             segment_id: Some(proto_seg),
-            data: data.to_vec(),
+            data: Bytes::copy_from_slice(data),
             hlc: Some(Hlc::zero().into()),
         });
 
@@ -327,6 +327,22 @@ impl Node {
     /// bound, or any subsystem fails to initialize.
     pub async fn start(config: NodeConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let config = Arc::new(Self::validate_config(config)?);
+
+        // Configure the rayon global thread pool for EC encode/decode.
+        // Leave 2 cores for tokio's async runtime to avoid CPU oversubscription
+        // when both compute (EC) and I/O (gRPC, RocksDB) run concurrently.
+        if let Err(e) = rayon::ThreadPoolBuilder::new()
+            .num_threads(
+                std::thread::available_parallelism()
+                    .map(|n| n.get().saturating_sub(2).max(1))
+                    .unwrap_or(2),
+            )
+            .thread_name(|i| format!("oceanfs-rayon-{i}"))
+            .build_global()
+        {
+            tracing::warn!(error = %e, "rayon global pool already initialized; using existing");
+        }
+
         info!(
             node_id = %config.node_id,
             listen_addr = %config.listen_addr,
@@ -646,21 +662,18 @@ impl Node {
         wal_writer.register_metrics(&*metrics);
         sealer.register_metrics(&*metrics);
 
-        // Register RocksDB property gauges.
-        let rocksdb_keys_gauge =
-            metrics.gauge("rocksdb_estimate_keys", "Estimated number of keys in RocksDB");
-        let rocksdb_block_cache_gauge =
-            metrics.gauge("rocksdb_block_cache_usage_bytes", "RocksDB block cache usage in bytes");
-        let rocksdb_l0_gauge =
-            metrics.gauge("rocksdb_num_files_at_level0", "RocksDB number of files at level 0");
+        // Register RocksDB property gauges into the central metrics registry.
+        metadata_store.metrics().register(&*metrics);
+        // Start the background RocksDB metrics polling task (every 30s).
+        metadata_store.start_metrics_task();
 
         // Register process-level gauges.
         let proc_mem_gauge =
             metrics.gauge("process_resident_memory_bytes", "Resident memory in bytes");
         let proc_fd_gauge = metrics.gauge("process_open_fds", "Open file descriptors");
 
-        // Spawn a background poller for process and RocksDB metrics (every 15s).
-        let metadata_clone = metadata_store.clone();
+        // Spawn a background poller for process-level metrics (every 15s).
+        // RocksDB metrics are polled separately by metadata_store.start_metrics_task().
         let _process_poller = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(15));
             loop {
@@ -670,16 +683,6 @@ impl Node {
                 }
                 if let Ok(fds) = read_process_open_fds() {
                     proc_fd_gauge.set(fds);
-                }
-                // RocksDB property polling.
-                if let Some(val) = property_as_u64(&metadata_clone, "rocksdb.estimate-num-keys") {
-                    rocksdb_keys_gauge.set(val);
-                }
-                if let Some(val) = property_as_u64(&metadata_clone, "rocksdb.block-cache-usage") {
-                    rocksdb_block_cache_gauge.set(val);
-                }
-                if let Some(val) = property_as_u64(&metadata_clone, "rocksdb.num-files-at-level0") {
-                    rocksdb_l0_gauge.set(val);
                 }
             }
         });
@@ -1260,13 +1263,6 @@ fn read_process_open_fds() -> Result<u64, std::io::Error> {
     Ok(entries.count() as u64)
 }
 
-/// Queries a RocksDB integer property and returns it as a `u64`.
-///
-/// Returns `None` if the property is not available or cannot be parsed.
-fn property_as_u64(store: &oceanfs_storage::RocksDbMetadataStore, name: &str) -> Option<u64> {
-    store.property(name)?.parse::<u64>().ok()
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1541,6 +1537,7 @@ mod tests {
             data_dir: dir.path().join("meta"),
             block_cache_size: 1024,
             memtable_size: 1024,
+                    ..Default::default()
         })
         .expect("open metadata store");
 
@@ -1558,6 +1555,7 @@ mod tests {
             data_dir: dir.path().join("meta"),
             block_cache_size: 1024,
             memtable_size: 1024,
+                    ..Default::default()
         })
         .expect("open metadata store");
 
@@ -1987,7 +1985,8 @@ mod tests {
                     // Keep tempdir alive
                     std::mem::forget(d);
                     p.join("meta")
-                },
+                            ..Default::default()
+        },
                 block_cache_size: 1024,
                 memtable_size: 1024,
             })

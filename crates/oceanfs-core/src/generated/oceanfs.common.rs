@@ -21,15 +21,15 @@ pub struct NodeId {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SegmentId {
     /// 16 bytes, UUIDv7
-    #[prost(bytes = "vec", tag = "1")]
-    pub id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub id: ::prost::bytes::Bytes,
 }
 /// A 256-bit BLAKE3 hash (32 bytes).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct HashOutput {
     /// 32 bytes
-    #[prost(bytes = "vec", tag = "1")]
-    pub hash: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub hash: ::prost::bytes::Bytes,
 }
 /// Hybrid Logical Clock timestamp.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]

@@ -9,6 +9,8 @@
 //! not need to do any feature detection.
 
 use oceanfs_core::CodecConfig;
+#[cfg(target_arch = "x86_64")]
+use oceanfs_ec::gf::GfSimdLevel;
 use oceanfs_ec::{CauchyEncoder, Decoder, Encoder};
 
 /// The Tier 0 CPU SIMD EC backend.
@@ -28,7 +30,11 @@ impl CpuEncoder {
 }
 
 impl Encoder for CpuEncoder {
-    fn encode(&self, data_shards: &[&[u8]], parity_count: u8) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+    fn encode(
+        &self,
+        data_shards: &[&[u8]],
+        parity_count: u8,
+    ) -> oceanfs_ec::Result<Vec<bytes::Bytes>> {
         self.inner.encode(data_shards, parity_count)
     }
 }
@@ -39,7 +45,7 @@ impl Decoder for CpuEncoder {
         available_shards: &[Option<&[u8]>],
         data_count: u8,
         parity_count: u8,
-    ) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+    ) -> oceanfs_ec::Result<Vec<bytes::Bytes>> {
         self.inner.decode(available_shards, data_count, parity_count)
     }
 }
@@ -53,25 +59,22 @@ pub(crate) fn is_cpu_available() -> bool {
 pub(crate) fn cpu_capabilities() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("avx512f") {
-            "AVX-512"
-        } else if std::is_x86_feature_detected!("avx2") {
-            "AVX2"
-        } else if std::is_x86_feature_detected!("sse4.1") {
-            "SSE4.1"
-        } else {
-            "portable"
+        match GfSimdLevel::detect() {
+            GfSimdLevel::Avx512 => "AVX-512+VPSHUFB",
+            GfSimdLevel::Avx2 => "AVX2+VPSHUFB",
+            GfSimdLevel::Sse41 => "SSE4.1+PSHUFB",
+            GfSimdLevel::Portable | _ => "portable (log/exp)",
         }
     }
     #[cfg(target_arch = "aarch64")]
     {
-        #[cfg(target_feature = "neon")]
-        {
-            "NEON"
-        }
         #[cfg(not(target_feature = "neon"))]
         {
             "portable"
+        }
+        #[cfg(target_feature = "neon")]
+        {
+            "NEON"
         }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

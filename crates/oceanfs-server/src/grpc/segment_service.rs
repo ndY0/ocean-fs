@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 
+use bytes::{Bytes, BytesMut};
 use oceanfs_core::{
     proto::segment::{
         AckStatus, DeleteObjectRequest, DeleteObjectResponse, FetchShardRequest,
@@ -82,14 +83,14 @@ impl SegmentRpc for SegmentGrpcService {
     ) -> Result<Response<SegmentAppendResponse>, Status> {
         let mut stream = request.into_inner();
         let mut total_bytes: u64 = 0;
-        let mut segment_data: Vec<u8> = Vec::new();
+        let mut segment_data = BytesMut::with_capacity(65536); // 64 KB initial capacity
         let mut segment_id = SegmentId::default();
         // Collect metadata from the first chunk that carries it.
         let mut bucket_id: Option<String> = None;
         let mut object_key: Option<String> = None;
         let mut object_size: u64 = 0;
-        let mut blake3_hash: Vec<u8> = vec![];
-        let mut chunk_segment_ids: Vec<Vec<u8>> = vec![];
+        let mut blake3_hash = Bytes::new();
+        let mut chunk_segment_ids: Vec<Bytes> = vec![];
         let mut chunk_offsets: Vec<u64> = vec![];
         let mut chunk_lengths: Vec<u32> = vec![];
 
@@ -140,7 +141,7 @@ impl SegmentRpc for SegmentGrpcService {
             let mut chunks = smallvec::SmallVec::new();
             for i in 0..chunk_segment_ids.len().min(chunk_offsets.len()).min(chunk_lengths.len()) {
                 let seg_bytes: [u8; 16] =
-                    chunk_segment_ids[i].as_slice().try_into().unwrap_or([0u8; 16]);
+                    chunk_segment_ids[i].as_ref().try_into().unwrap_or([0u8; 16]);
                 chunks.push(ChunkRef {
                     segment_id: SegmentId::from_uuid_bytes(seg_bytes),
                     offset: chunk_offsets[i],
@@ -277,21 +278,28 @@ impl SegmentRpc for SegmentGrpcService {
             )));
         }
 
-        let shard_data: Vec<u8> = segment_data[shard_start..shard_end].to_vec();
+        // Convert to Bytes once for zero-copy slicing — avoids double-copy
+        // (first copy: segment → Vec, then chunk.to_vec() per 64 KB).
+        let segment_bytes = Bytes::from(segment_data);
+        let shard_bytes = segment_bytes.slice(shard_start..shard_end);
 
         let (tx, rx) = mpsc::channel(16);
         let chunk_size = 65536; // 64 KB chunks per perf §4.4
 
         tokio::spawn(async move {
-            for (chunk_idx, chunk) in shard_data.chunks(chunk_size).enumerate() {
+            let mut chunk_idx = 0u32;
+            let mut offset = 0usize;
+            while offset < shard_bytes.len() {
+                let end = (offset + chunk_size).min(shard_bytes.len());
+                let chunk = shard_bytes.slice(offset..end);
                 // Compute BLAKE3 checksum for this chunk.
-                let checksum = blake3::hash(chunk);
+                let checksum = blake3::hash(&chunk[..]);
 
                 if tx
                     .send(Ok(ShardResponse {
-                        data: chunk.to_vec(),
-                        checksum: checksum.as_bytes().to_vec(),
-                        chunk_index: chunk_idx as u32,
+                        data: chunk,
+                        checksum: Bytes::copy_from_slice(checksum.as_bytes()),
+                        chunk_index: chunk_idx,
                     }))
                     .await
                     .is_err()
@@ -299,13 +307,15 @@ impl SegmentRpc for SegmentGrpcService {
                     // Receiver dropped — client disconnected.
                     break;
                 }
+                offset = end;
+                chunk_idx += 1;
             }
 
             // Send EOF sentinel: empty data chunk.
             let _ = tx
                 .send(Ok(ShardResponse {
-                    data: Vec::new(),
-                    checksum: vec![0u8; 32],
+                    data: Bytes::new(),
+                    checksum: Bytes::from_static(&[0u8; 32]),
                     chunk_index: u32::MAX,
                 }))
                 .await;
@@ -357,10 +367,10 @@ impl SegmentRpc for SegmentGrpcService {
                     size: meta.size,
                     blake3_hash: meta
                         .blake3_hash
-                        .map(|h| h.as_bytes().to_vec())
+                        .map(|h| Bytes::copy_from_slice(h.as_bytes()))
                         .unwrap_or_default(),
                     hlc: Some(hlc_proto),
-                    inline_data: meta.inline_data.map(|b| b.to_vec()).unwrap_or_default(),
+                    inline_data: meta.inline_data.unwrap_or_default(),
                     chunk_segment_ids,
                     chunk_offsets,
                     chunk_lengths,
@@ -369,9 +379,9 @@ impl SegmentRpc for SegmentGrpcService {
             None => Ok(Response::new(GetObjectMetadataResponse {
                 found: false,
                 size: 0,
-                blake3_hash: vec![],
+                blake3_hash: Bytes::new(),
                 hlc: None,
-                inline_data: vec![],
+                inline_data: Bytes::new(),
                 chunk_segment_ids: vec![],
                 chunk_offsets: vec![],
                 chunk_lengths: vec![],
@@ -423,11 +433,7 @@ impl SegmentRpc for SegmentGrpcService {
             None
         };
 
-        let inline_data = if req.inline_data.is_empty() {
-            None
-        } else {
-            Some(bytes::Bytes::from(req.inline_data))
-        };
+        let inline_data = if req.inline_data.is_empty() { None } else { Some(req.inline_data) };
 
         let meta = ObjectMetadata {
             object_key: key,

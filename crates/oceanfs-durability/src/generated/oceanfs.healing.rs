@@ -6,8 +6,8 @@ pub struct HintRequest {
     pub intended_for: ::core::option::Option<::oceanfs_core::proto::common::NodeId>,
     #[prost(message, optional, tag = "2")]
     pub segment_id: ::core::option::Option<::oceanfs_core::proto::common::SegmentId>,
-    #[prost(bytes = "vec", tag = "3")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub data: ::prost::bytes::Bytes,
     #[prost(message, optional, tag = "4")]
     pub hlc: ::core::option::Option<::oceanfs_core::proto::common::HlcTimestamp>,
 }
@@ -37,11 +37,11 @@ pub struct MerkleResponse {
     #[prost(message, optional, tag = "1")]
     pub segment_id: ::core::option::Option<::oceanfs_core::proto::common::SegmentId>,
     /// 32 bytes BLAKE3
-    #[prost(bytes = "vec", tag = "2")]
-    pub root_hash: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub root_hash: ::prost::bytes::Bytes,
     /// each 32 bytes BLAKE3
-    #[prost(bytes = "vec", repeated, tag = "3")]
-    pub leaf_hashes: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bytes = "bytes", repeated, tag = "3")]
+    pub leaf_hashes: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
 }
 /// Request to fetch a single shard from a specific segment.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -56,8 +56,8 @@ pub struct FetchShardRequest {
 pub struct FetchShardChunk {
     #[prost(uint32, tag = "1")]
     pub chunk_index: u32,
-    #[prost(bytes = "vec", tag = "2")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub data: ::prost::bytes::Bytes,
 }
 /// Request to push a reconstructed shard to a peer that owns it.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -66,8 +66,8 @@ pub struct PushRepairedShardRequest {
     pub segment_id: ::core::option::Option<::oceanfs_core::proto::common::SegmentId>,
     #[prost(uint32, tag = "2")]
     pub shard_index: u32,
-    #[prost(bytes = "vec", tag = "3")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub data: ::prost::bytes::Bytes,
     #[prost(message, optional, tag = "4")]
     pub hlc: ::core::option::Option<::oceanfs_core::proto::common::HlcTimestamp>,
 }

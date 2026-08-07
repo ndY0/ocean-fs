@@ -44,6 +44,7 @@
 #[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
 use std::arch::aarch64::*;
 
+use bytes::Bytes;
 use oceanfs_core::CodecConfig;
 use oceanfs_ec::{CauchyEncoder, Decoder, Encoder};
 
@@ -263,7 +264,7 @@ unsafe fn neon_encode(
     data_shards: &[&[u8]],
     parity_count: u8,
     shard_size: usize,
-) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+) -> oceanfs_ec::Result<Vec<bytes::Bytes>> {
     let k = data_shards.len();
     let m = parity_count as usize;
     let num_chunks = shard_size / 16;
@@ -456,7 +457,7 @@ unsafe fn encode_sve(
     data_shards: &[&[u8]],
     parity_count: u8,
     shard_size: usize,
-) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+) -> oceanfs_ec::Result<Vec<bytes::Bytes>> {
     // SAFETY: SVE hardware always has NEON; the NEON kernel is safe to call.
     neon_encode(tables, data_shards, parity_count, shard_size)
 }
@@ -483,7 +484,7 @@ unsafe fn decode_sve2(
     data_count: u8,
     parity_count: u8,
     shard_size: usize,
-) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+) -> oceanfs_ec::Result<Vec<bytes::Bytes>> {
     let k = data_count as usize;
     let m = parity_count as usize;
     let vl = svcntb() as usize;
@@ -584,7 +585,7 @@ fn decode_sve(
     data_count: u8,
     parity_count: u8,
     shard_size: usize,
-) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+) -> oceanfs_ec::Result<Vec<bytes::Bytes>> {
     neon_decode(available_shards, present_indices, data_count, parity_count, shard_size)
 }
 
@@ -696,13 +697,13 @@ impl ArmEncoder {
 // ---------------------------------------------------------------------------
 
 impl Encoder for ArmEncoder {
-    fn encode(&self, data_shards: &[&[u8]], parity_count: u8) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+    fn encode(&self, data_shards: &[&[u8]], parity_count: u8) -> oceanfs_ec::Result<Vec<Bytes>> {
         if parity_count == 0 {
             return Ok(Vec::new());
         }
         let shard_size = data_shards.first().map(|s| s.len()).unwrap_or(0);
         if shard_size == 0 {
-            return Ok(vec![Vec::new(); parity_count as usize]);
+            return Ok(vec![Bytes::new(); parity_count as usize]);
         }
 
         let m = parity_count as usize;
@@ -717,7 +718,7 @@ impl Encoder for ArmEncoder {
                     // intrinsics use properly-bounded table lookups.
                     let result =
                         unsafe { encode_sve2(tables, data_shards, parity_count, shard_size) };
-                    return Ok(result);
+                    return Ok(result.into_iter().map(Bytes::from).collect());
                 }
             }
 
@@ -728,7 +729,7 @@ impl Encoder for ArmEncoder {
                     let result =
                         unsafe { encode_sve(tables, data_shards, parity_count, shard_size) };
                     match result {
-                        Ok(parity) => return Ok(parity),
+                        Ok(parity) => return Ok(parity.into_iter().map(Bytes::from).collect()),
                         Err(e) => {
                             tracing::warn!(error = %e, "SVE encode failed; falling back to portable");
                         }
@@ -743,7 +744,7 @@ impl Encoder for ArmEncoder {
                     let result =
                         unsafe { neon_encode(tables, data_shards, parity_count, shard_size) };
                     match result {
-                        Ok(parity) => return Ok(parity),
+                        Ok(parity) => return Ok(parity.into_iter().map(Bytes::from).collect()),
                         Err(e) => {
                             tracing::warn!(error = %e, "NEON encode failed; falling back to portable");
                         }
@@ -753,7 +754,7 @@ impl Encoder for ArmEncoder {
         }
 
         // --- Portable fallback ---
-        Ok(portable_encode(k, m, data_shards, shard_size))
+        Ok(portable_encode(k, m, data_shards, shard_size).into_iter().map(Bytes::from).collect())
     }
 }
 
@@ -824,7 +825,7 @@ impl Decoder for ArmDecoder {
         available_shards: &[Option<&[u8]>],
         data_count: u8,
         parity_count: u8,
-    ) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+    ) -> oceanfs_ec::Result<Vec<bytes::Bytes>> {
         let k = data_count as usize;
         let m = parity_count as usize;
         let total = k + m;
@@ -847,7 +848,7 @@ impl Decoder for ArmDecoder {
             .len();
 
         if shard_size == 0 {
-            return Ok(vec![Vec::new(); k]);
+            return Ok(vec![Bytes::new(); k]);
         }
 
         // --- SIMD accelerated decode (aarch64 + arm-sve feature) ---
@@ -867,7 +868,7 @@ impl Decoder for ArmDecoder {
             };
 
             match result {
-                Ok(recovered) => return Ok(recovered),
+                Ok(recovered) => return Ok(recovered.into_iter().map(Bytes::from).collect()),
                 Err(e) => {
                     tracing::warn!(error = %e, "SIMD decode failed; falling back to portable");
                 }
@@ -904,7 +905,7 @@ fn neon_decode(
     data_count: u8,
     parity_count: u8,
     shard_size: usize,
-) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+) -> oceanfs_ec::Result<Vec<bytes::Bytes>> {
     let k = data_count as usize;
     let m = parity_count as usize;
 

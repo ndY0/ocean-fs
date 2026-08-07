@@ -69,6 +69,85 @@ pub enum AccelTier {
     GpuCuda,
 }
 
+// ---------------------------------------------------------------------------
+// Static-dispatch backend enums (replaces Arc<dyn Encoder>/Arc<dyn Decoder>)
+//
+// Eliminates vtable dispatch on every encode/decode call per perf rule §6.4.
+// Each variant wraps the concrete backend type so the compiler can
+// monomorphize and inline the call through the match arm.
+// ---------------------------------------------------------------------------
+
+/// Static-dispatch backend for EC encoding.
+#[allow(variant_size_differences)]
+#[derive(Clone)]
+pub(crate) enum EncoderBackend {
+    /// Tier 0: CPU SIMD (Cauchy RS) — always available.
+    Cpu(Arc<CpuEncoder>),
+    /// Tier 1: ISA-L AVX-512 (x86_64 only, feature-gated).
+    #[cfg(all(target_arch = "x86_64", feature = "isa-l"))]
+    Isal(Arc<crate::isal::IsalEncoder<'static>>),
+    /// Tier 1: ARM SVE/NEON (aarch64 only, feature-gated).
+    #[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
+    Arm(Arc<crate::arm_sve::ArmEncoder>),
+    /// Tier 2: CUDA GPU (feature-gated).
+    #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
+    Cuda(Arc<crate::cuda::CudaBackend>),
+}
+
+impl Encoder for EncoderBackend {
+    fn encode(
+        &self,
+        data_shards: &[&[u8]],
+        parity_count: u8,
+    ) -> oceanfs_ec::Result<Vec<bytes::Bytes>> {
+        match self {
+            Self::Cpu(e) => e.encode(data_shards, parity_count),
+            #[cfg(all(target_arch = "x86_64", feature = "isa-l"))]
+            Self::Isal(e) => e.encode(data_shards, parity_count),
+            #[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
+            Self::Arm(e) => e.encode(data_shards, parity_count),
+            #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
+            Self::Cuda(e) => e.encode(data_shards, parity_count),
+        }
+    }
+}
+
+/// Static-dispatch backend for EC decoding.
+#[allow(variant_size_differences)]
+#[derive(Clone)]
+pub(crate) enum DecoderBackend {
+    /// Tier 0: CPU SIMD (Cauchy RS) — always available.
+    Cpu(Arc<CpuEncoder>),
+    /// Tier 1: ISA-L (x86_64 only).
+    #[cfg(all(target_arch = "x86_64", feature = "isa-l"))]
+    Isal(Arc<crate::isal::IsalDecoder<'static>>),
+    /// Tier 1: ARM SVE/NEON (aarch64 only).
+    #[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
+    Arm(Arc<crate::arm_sve::ArmDecoder>),
+    /// Tier 2: CUDA GPU.
+    #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
+    Cuda(Arc<crate::cuda::CudaBackend>),
+}
+
+impl Decoder for DecoderBackend {
+    fn decode(
+        &self,
+        available_shards: &[Option<&[u8]>],
+        data_count: u8,
+        parity_count: u8,
+    ) -> oceanfs_ec::Result<Vec<bytes::Bytes>> {
+        match self {
+            Self::Cpu(e) => e.decode(available_shards, data_count, parity_count),
+            #[cfg(all(target_arch = "x86_64", feature = "isa-l"))]
+            Self::Isal(e) => e.decode(available_shards, data_count, parity_count),
+            #[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
+            Self::Arm(e) => e.decode(available_shards, data_count, parity_count),
+            #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
+            Self::Cuda(e) => e.decode(available_shards, data_count, parity_count),
+        }
+    }
+}
+
 /// Dispatches EC and compression operations to the best available backend.
 ///
 /// Performs hardware probing at construction and caches the resolved
@@ -94,14 +173,16 @@ pub enum AccelTier {
 pub struct AccelDispatcher {
     /// The resolved active EC tier.
     active_ec_tier: AccelTier,
-    /// Cached encoder backend for the active EC tier.
-    encoder: Arc<dyn Encoder>,
-    /// Cached decoder backend for the active EC tier.
-    decoder: Arc<dyn Decoder>,
+    /// Cached encoder backend for the active EC tier (static dispatch).
+    encoder: EncoderBackend,
+    /// Cached decoder backend for the active EC tier (static dispatch).
+    decoder: DecoderBackend,
     /// Per-tier encoder cache (for per-bucket overrides).
-    tier_encoders: HashMap<AccelTier, Arc<dyn Encoder>>,
+    #[allow(dead_code)]
+    tier_encoders: HashMap<AccelTier, EncoderBackend>,
     /// Per-tier decoder cache (for per-bucket overrides).
-    tier_decoders: HashMap<AccelTier, Arc<dyn Decoder>>,
+    #[allow(dead_code)]
+    tier_decoders: HashMap<AccelTier, DecoderBackend>,
     /// Per-tier compressor cache (for per-bucket compression tier overrides).
     tier_compressors: HashMap<CompressionTier, Arc<dyn Compressor>>,
     /// The configuration used to create this dispatcher.
@@ -201,31 +282,28 @@ impl AccelDispatcher {
         tracing::info!(active_tier = ?active_ec_tier, "acceleration subsystem initialized");
 
         // --- Build encoder/decoder backends ---
-        let codec_config = CodecConfig::default();
-        let cpu_encoder: Arc<dyn Encoder> = Arc::new(CpuEncoder::new(codec_config.clone()));
-        let cpu_decoder: Arc<dyn Decoder> = Arc::new(CpuEncoder::new(codec_config));
-
-        let (encoder, decoder) = Self::build_ec_backends(
-            active_ec_tier,
-            cuda_available,
-            tier1_available,
-            cpu_encoder.clone(),
-            cpu_decoder.clone(),
-        );
+        let (encoder, decoder) =
+            Self::build_ec_backends(active_ec_tier, cuda_available, tier1_available);
 
         // --- Per-tier caches ---
         let mut tier_encoders = HashMap::new();
-        tier_encoders.insert(AccelTier::CpuSimd, cpu_encoder.clone());
+        tier_encoders.insert(
+            AccelTier::CpuSimd,
+            EncoderBackend::Cpu(Arc::new(CpuEncoder::new(CodecConfig::default()))),
+        );
 
         let mut tier_decoders = HashMap::new();
-        tier_decoders.insert(AccelTier::CpuSimd, cpu_decoder.clone());
+        tier_decoders.insert(
+            AccelTier::CpuSimd,
+            DecoderBackend::Cpu(Arc::new(CpuEncoder::new(CodecConfig::default()))),
+        );
 
         // Add ISA-L (x86) or ARM SVE (aarch64) tier to cache if available
         #[cfg(any(feature = "isa-l", feature = "arm-sve"))]
         if tier1_available {
             let codec_cfg = CodecConfig::default();
-            let tier1_encoder: Arc<dyn Encoder> = Self::build_tier1_encoder(codec_cfg.clone());
-            let tier1_decoder: Arc<dyn Decoder> = Self::build_tier1_decoder(codec_cfg);
+            let tier1_encoder = Self::build_tier1_encoder(codec_cfg.clone());
+            let tier1_decoder = Self::build_tier1_decoder(codec_cfg);
             tier_encoders.insert(AccelTier::IsaL, tier1_encoder);
             tier_decoders.insert(AccelTier::IsaL, tier1_decoder);
         }
@@ -238,14 +316,14 @@ impl AccelDispatcher {
             if let Some(gpu_config) = &config.gpu {
                 if let Some(cuda) = crate::cuda::CudaBackend::new(gpu_config.clone()) {
                     let cuda_arc = Arc::new(cuda);
-                    let cuda_encoder: Arc<dyn Encoder> = cuda_arc.clone();
-                    tier_encoders.insert(AccelTier::GpuCuda, cuda_encoder);
+                    tier_encoders
+                        .insert(AccelTier::GpuCuda, EncoderBackend::Cuda(cuda_arc.clone()));
                     stored_cuda = Some(cuda_arc);
                 }
                 // For CUDA decoder: CudaBackend impl Decoder delegates to CPU Cauchy RS
                 if let Some(cuda_dec) = crate::cuda::CudaBackend::new(gpu_config.clone()) {
-                    let cuda_decoder: Arc<dyn Decoder> = Arc::new(cuda_dec);
-                    tier_decoders.insert(AccelTier::GpuCuda, cuda_decoder);
+                    tier_decoders
+                        .insert(AccelTier::GpuCuda, DecoderBackend::Cuda(Arc::new(cuda_dec)));
                 }
             }
         }
@@ -456,12 +534,14 @@ impl AccelDispatcher {
     /// Used for per-bucket tier overrides. Returns the cached encoder
     /// for the given tier, falling back if the requested tier is
     /// unavailable.
-    pub fn resolve_ec_encoder(&self) -> Arc<dyn Encoder> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resolve_ec_encoder(&self) -> EncoderBackend {
         self.encoder.clone()
     }
 
     /// Resolves an EC decoder for the active tier.
-    pub fn resolve_ec_decoder(&self) -> Arc<dyn Decoder> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resolve_ec_decoder(&self) -> DecoderBackend {
         self.decoder.clone()
     }
 
@@ -469,16 +549,8 @@ impl AccelDispatcher {
     ///
     /// If the requested tier differs from the active tier, this re-resolves
     /// against the per-tier cache and applies the fallback chain.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use oceanfs_accel::{AccelDispatcher, AccelConfig, AccelTier};
-    ///
-    /// let dispatcher = AccelDispatcher::new(AccelConfig::default());
-    /// let encoder = dispatcher.resolve_encoder_for_tier(AccelTier::CpuSimd);
-    /// ```
-    pub fn resolve_encoder_for_tier(&self, tier: AccelTier) -> Arc<dyn Encoder> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resolve_encoder_for_tier(&self, tier: AccelTier) -> EncoderBackend {
         if tier == self.active_ec_tier {
             return self.encoder.clone();
         }
@@ -489,7 +561,8 @@ impl AccelDispatcher {
     }
 
     /// Resolves an EC decoder for a specific tier override.
-    pub fn resolve_decoder_for_tier(&self, tier: AccelTier) -> Arc<dyn Decoder> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resolve_decoder_for_tier(&self, tier: AccelTier) -> DecoderBackend {
         if tier == self.active_ec_tier {
             return self.decoder.clone();
         }
@@ -764,6 +837,7 @@ impl AccelDispatcher {
     }
 
     /// Resolves a tier through the fallback chain.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn resolve_tier_with_fallback(&self, tier: AccelTier) -> AccelTier {
         if self.tier_encoders.contains_key(&tier) {
             return tier;
@@ -834,27 +908,30 @@ impl AccelDispatcher {
 
     /// Builds a Tier 1 encoder (ISA-L on x86_64, ARM SVE on aarch64).
     #[cfg(any(feature = "isa-l", feature = "arm-sve"))]
-    fn build_tier1_encoder(config: CodecConfig) -> Arc<dyn Encoder> {
+    fn build_tier1_encoder(config: CodecConfig) -> EncoderBackend {
         #[cfg(all(target_arch = "x86_64", feature = "isa-l"))]
         {
             match crate::isal::IsalTables::new(config.data_shards, config.parity_shards) {
                 Some(tables) => {
                     // Leak the tables so they have 'static lifetime and can be
-                    // shared via Arc<dyn Encoder>. The memory is negligible (~few KB)
+                    // shared via EncoderBackend. The memory is negligible (~few KB)
                     // and this runs once at startup.
                     let tables_ref: &'static crate::isal::IsalTables = Box::leak(Box::new(tables));
-                    Arc::new(crate::isal::IsalEncoder::new(tables_ref))
+                    EncoderBackend::Isal(Arc::new(crate::isal::IsalEncoder::new(tables_ref)))
                 }
                 None => {
                     tracing::warn!("ISA-L encoder construction failed; using CPU fallback");
-                    Arc::new(CpuEncoder::new(config))
+                    EncoderBackend::Cpu(Arc::new(CpuEncoder::new(config)))
                 }
             }
         }
 
         #[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
         {
-            Arc::new(crate::arm_sve::ArmEncoder::new(config.data_shards, config.parity_shards))
+            EncoderBackend::Arm(Arc::new(crate::arm_sve::ArmEncoder::new(
+                config.data_shards,
+                config.parity_shards,
+            )))
         }
 
         #[cfg(not(any(
@@ -862,30 +939,33 @@ impl AccelDispatcher {
             all(target_arch = "aarch64", feature = "arm-sve")
         )))]
         {
-            Arc::new(CpuEncoder::new(config))
+            EncoderBackend::Cpu(Arc::new(CpuEncoder::new(config)))
         }
     }
 
     /// Builds a Tier 1 decoder.
     #[cfg(any(feature = "isa-l", feature = "arm-sve"))]
-    fn build_tier1_decoder(config: CodecConfig) -> Arc<dyn Decoder> {
+    fn build_tier1_decoder(config: CodecConfig) -> DecoderBackend {
         #[cfg(all(target_arch = "x86_64", feature = "isa-l"))]
         {
             match crate::isal::IsalTables::new(config.data_shards, config.parity_shards) {
                 Some(tables) => {
                     let tables_ref: &'static crate::isal::IsalTables = Box::leak(Box::new(tables));
-                    Arc::new(crate::isal::IsalDecoder::new(tables_ref))
+                    DecoderBackend::Isal(Arc::new(crate::isal::IsalDecoder::new(tables_ref)))
                 }
                 None => {
                     tracing::warn!("ISA-L decoder construction failed; using CPU fallback");
-                    Arc::new(CpuEncoder::new(config))
+                    DecoderBackend::Cpu(Arc::new(CpuEncoder::new(config)))
                 }
             }
         }
 
         #[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
         {
-            Arc::new(crate::arm_sve::ArmDecoder::new(config.data_shards, config.parity_shards))
+            DecoderBackend::Arm(Arc::new(crate::arm_sve::ArmDecoder::new(
+                config.data_shards,
+                config.parity_shards,
+            )))
         }
 
         #[cfg(not(any(
@@ -893,7 +973,7 @@ impl AccelDispatcher {
             all(target_arch = "aarch64", feature = "arm-sve")
         )))]
         {
-            Arc::new(CpuEncoder::new(config))
+            DecoderBackend::Cpu(Arc::new(CpuEncoder::new(config)))
         }
     }
 
@@ -914,9 +994,10 @@ impl AccelDispatcher {
         active_tier: AccelTier,
         _cuda_available: bool,
         _tier1_available: bool,
-        cpu_encoder: Arc<dyn Encoder>,
-        cpu_decoder: Arc<dyn Decoder>,
-    ) -> (Arc<dyn Encoder>, Arc<dyn Decoder>) {
+    ) -> (EncoderBackend, DecoderBackend) {
+        let cpu_encoder = EncoderBackend::Cpu(Arc::new(CpuEncoder::new(CodecConfig::default())));
+        let cpu_decoder = DecoderBackend::Cpu(Arc::new(CpuEncoder::new(CodecConfig::default())));
+
         match active_tier {
             AccelTier::CpuSimd | AccelTier::Auto => (cpu_encoder, cpu_decoder),
             AccelTier::IsaL => {
@@ -939,9 +1020,9 @@ impl AccelDispatcher {
                 // Use actual CudaBackend with GPU kernel
                 let gpu_cfg = GpuConfig::default();
                 if let Some(cuda_enc) = crate::cuda::CudaBackend::new(gpu_cfg.clone()) {
-                    let encoder: Arc<dyn Encoder> = Arc::new(cuda_enc);
+                    let encoder = EncoderBackend::Cuda(Arc::new(cuda_enc));
                     if let Some(cuda_dec) = crate::cuda::CudaBackend::new(gpu_cfg) {
-                        let decoder: Arc<dyn Decoder> = Arc::new(cuda_dec);
+                        let decoder = DecoderBackend::Cuda(Arc::new(cuda_dec));
                         tracing::info!("using CUDA backend (GPU kernel)");
                         return (encoder, decoder);
                     }
@@ -962,7 +1043,11 @@ impl AccelDispatcher {
 // ---------------------------------------------------------------------------
 
 impl Encoder for AccelDispatcher {
-    fn encode(&self, data_shards: &[&[u8]], parity_count: u8) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+    fn encode(
+        &self,
+        data_shards: &[&[u8]],
+        parity_count: u8,
+    ) -> oceanfs_ec::Result<Vec<bytes::Bytes>> {
         let start = std::time::Instant::now();
         let byte_count = data_shards.iter().map(|s| s.len() as u64).sum();
         let result = self.encoder.encode(data_shards, parity_count);
@@ -980,7 +1065,7 @@ impl Decoder for AccelDispatcher {
         available_shards: &[Option<&[u8]>],
         data_count: u8,
         parity_count: u8,
-    ) -> oceanfs_ec::Result<Vec<Vec<u8>>> {
+    ) -> oceanfs_ec::Result<Vec<bytes::Bytes>> {
         let start = std::time::Instant::now();
         let byte_count =
             available_shards.iter().filter_map(|s| s.as_ref().map(|b| b.len() as u64)).sum();
@@ -1197,7 +1282,7 @@ mod tests {
             .iter()
             .map(|v| v.as_slice())
             .map(Some)
-            .chain(parity.iter().map(|v| v.as_slice()).map(Some))
+            .chain(parity.iter().map(|v| v.as_ref()).map(Some))
             .collect();
         let recovered = dispatcher.decode(&available, 4, 2).unwrap();
 
@@ -1358,11 +1443,8 @@ mod tests {
         let decoder = dispatcher.resolve_ec_decoder();
         let data: Vec<&[u8]> = vec![b"aaaa", b"bbbb", b"cccc", b"dddd"];
         let parity = dispatcher.encode(&data, 2).unwrap();
-        let available: Vec<Option<&[u8]>> = data
-            .into_iter()
-            .map(Some)
-            .chain(parity.iter().map(|v| v.as_slice()).map(Some))
-            .collect();
+        let available: Vec<Option<&[u8]>> =
+            data.into_iter().map(Some).chain(parity.iter().map(|v| v.as_ref()).map(Some)).collect();
         let recovered = decoder.decode(&available, 4, 2).unwrap();
         assert_eq!(recovered.len(), 4);
     }

@@ -6,6 +6,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use bytes::Bytes;
 use futures::{stream::FuturesUnordered, StreamExt};
 use oceanfs_core::{
     proto::segment::{SegmentAppendRequest, SegmentAppendResponse},
@@ -132,13 +133,13 @@ async fn replicate_to_single(
         segment_id: Some(proto_segment_id),
         shard_index: None,
         offset: 0,
-        data: data.to_vec(),
+        data: Bytes::copy_from_slice(data),
         hlc: Some(proto_hlc),
         bucket_id: req.bucket.to_string(),
         object_key: req.key.to_string(),
         object_size: data.len() as u64,
-        blake3_hash: vec![],
-        chunk_segment_ids: vec![segment_id.as_uuid().as_bytes().to_vec()],
+        blake3_hash: Bytes::new(),
+        chunk_segment_ids: vec![Bytes::copy_from_slice(segment_id.as_uuid().as_bytes())],
         chunk_offsets: vec![0],
         chunk_lengths: vec![data.len() as u32],
     };

@@ -7,4 +7,4 @@
 mod cf;
 mod store;
 
-pub use store::{BatchOp, RocksDbMetadataStore};
+pub use store::{BatchOp, RocksDbMetadataStore, RocksDbMetrics};

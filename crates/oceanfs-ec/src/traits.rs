@@ -1,5 +1,7 @@
 //! Encoder and Decoder traits for erasure coding.
 
+use bytes::Bytes;
+
 use crate::error::Result;
 
 /// Encodes k data shards into m parity shards.
@@ -24,7 +26,7 @@ pub trait Encoder: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if shard sizes differ or k/m are invalid.
-    fn encode(&self, data_shards: &[&[u8]], parity_count: u8) -> Result<Vec<Vec<u8>>>;
+    fn encode(&self, data_shards: &[&[u8]], parity_count: u8) -> Result<Vec<Bytes>>;
 }
 
 /// Decodes available shards to recover missing data shards.
@@ -58,5 +60,5 @@ pub trait Decoder: Send + Sync {
         available_shards: &[Option<&[u8]>],
         data_count: u8,
         parity_count: u8,
-    ) -> Result<Vec<Vec<u8>>>;
+    ) -> Result<Vec<Bytes>>;
 }

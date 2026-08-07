@@ -21,6 +21,7 @@ async-trait = "0.1"
 axum.workspace = true
 bytes.workspace = true
 parking_lot.workspace = true
+rayon.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

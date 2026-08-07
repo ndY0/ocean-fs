@@ -6,6 +6,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
+use bytes::Bytes;
 use oceanfs_core::{Counter, LabelSet, SegmentMetadata};
 #[cfg(test)]
 use oceanfs_core::{SegmentSizeConfig, SizeTier};
@@ -123,7 +124,7 @@ impl SegmentSealer {
     ) -> Result<SegmentHandle> {
         let segment_id = active.id();
         let tier = active.tier();
-        let data = active.data().to_vec();
+        let data = Bytes::copy_from_slice(active.data());
         let size = active.size();
         let blob_count = entries.len() as u32;
 
@@ -217,6 +218,7 @@ mod tests {
                 data_dir: dir.path().join("meta"),
                 block_cache_size: 1024,
                 memtable_size: 1024,
+                ..Default::default()
             })
             .unwrap(),
         );
@@ -286,6 +288,7 @@ mod tests {
                 data_dir: dir.path().join("meta"),
                 block_cache_size: 1024,
                 memtable_size: 1024,
+                ..Default::default()
             })
             .unwrap(),
         );

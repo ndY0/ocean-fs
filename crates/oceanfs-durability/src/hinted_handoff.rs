@@ -18,6 +18,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use bytes::Bytes;
 use oceanfs_core::{Counter, Hlc, LabelSet, MetricRegistrar, NodeId, OperationTimeouts, SegmentId};
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
@@ -412,7 +413,7 @@ impl HintedHandoff {
         let request = HintRequest {
             intended_for: Some(proto_intended),
             segment_id: Some(proto_segment_id),
-            data: hint.data.clone(),
+            data: Bytes::from(hint.data.clone()),
             hlc: Some(proto_hlc),
         };
 

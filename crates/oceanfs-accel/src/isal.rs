@@ -24,6 +24,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
+use bytes::Bytes;
 use oceanfs_ec::{
     gf::{self, Gf8},
     Decoder, Encoder, Error as EcError, Result as EcResult,
@@ -211,7 +212,7 @@ impl<'a> IsalEncoder<'a> {
 // ---------------------------------------------------------------------------
 
 impl Encoder for IsalEncoder<'_> {
-    fn encode(&self, data_shards: &[&[u8]], parity_count: u8) -> EcResult<Vec<Vec<u8>>> {
+    fn encode(&self, data_shards: &[&[u8]], parity_count: u8) -> EcResult<Vec<Bytes>> {
         let m = parity_count;
         let k = self.tables.k();
         if m == 0 {
@@ -285,7 +286,7 @@ impl Encoder for IsalEncoder<'_> {
             );
         }
 
-        Ok(parity_buffers)
+        Ok(parity_buffers.into_iter().map(Bytes::from).collect())
     }
 }
 
@@ -344,7 +345,7 @@ impl Decoder for IsalDecoder<'_> {
         available_shards: &[Option<&[u8]>],
         data_count: u8,
         parity_count: u8,
-    ) -> EcResult<Vec<Vec<u8>>> {
+    ) -> oceanfs_ec::Result<Vec<bytes::Bytes>> {
         let k = data_count as usize;
         let m = parity_count as usize;
         let total = k + m;
@@ -706,7 +707,7 @@ mod tests {
             .iter()
             .map(|v| v.as_slice())
             .map(Some)
-            .chain(parity.iter().map(|v| v.as_slice()).map(Some))
+            .chain(parity.iter().map(|v| v.as_ref()).map(Some))
             .collect();
         let recovered = decoder.decode(&available, 4, 2).unwrap();
         assert_eq!(recovered, data);
@@ -803,7 +804,7 @@ mod tests {
                     }
                 },
             )
-            .chain(parity.iter().map(|v| v.as_slice()).map(Some))
+            .chain(parity.iter().map(|v| v.as_ref()).map(Some))
             .collect();
         let recovered = decoder.decode(&available, 16, 8).unwrap();
         assert_eq!(recovered[0], data[0]);

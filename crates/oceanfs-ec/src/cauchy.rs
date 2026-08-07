@@ -5,6 +5,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
+use bytes::Bytes;
 use oceanfs_core::CodecConfig;
 
 use crate::{
@@ -12,6 +13,22 @@ use crate::{
     gf,
     traits::{Decoder, Encoder},
 };
+
+// ---------------------------------------------------------------------------
+// Reusable thread-local SIMD buffer
+// ---------------------------------------------------------------------------
+
+// Thread-local scratch buffer for SIMD-accelerated GF multiplication.
+// Avoids a heap allocation per `encode_cauchy` call by reusing the
+// buffer across encodes on the same thread. The buffer grows to the
+// largest shard size seen and is never deallocated until thread exit.
+//
+// Initial capacity: 64 KB (typical shard size for k=4, strip_size=64KB).
+#[cfg(target_arch = "x86_64")]
+thread_local! {
+    static SIMD_BUF: std::cell::RefCell<Vec<u8>> =
+        std::cell::RefCell::new(Vec::with_capacity(65536));
+}
 
 /// A Cauchy Reed-Solomon encoder/decoder.
 ///
@@ -92,7 +109,12 @@ impl CauchyEncoder {
     }
 
     /// Encodes data shards into parity shards using the Cauchy matrix.
-    fn encode_cauchy(k: u8, m: u8, data_shards: &[&[u8]]) -> Result<Vec<Vec<u8>>> {
+    ///
+    /// On x86_64, uses SIMD-accelerated batch GF multiplication
+    /// ([`gf_mul_simd`](crate::gf::gf_mul_simd)) for each column, which
+    /// processes the entire data shard in 16/32/64-byte chunks.
+    /// On other architectures, falls back to scalar `gf_mul`.
+    fn encode_cauchy(k: u8, m: u8, data_shards: &[&[u8]]) -> Result<Vec<Bytes>> {
         let ki = k as usize;
         let mi = m as usize;
         let cm = Self::cauchy_matrix(k, m);
@@ -100,17 +122,40 @@ impl CauchyEncoder {
 
         let mut parity: Vec<Vec<u8>> = (0..mi).map(|_| vec![0u8; shard_size]).collect();
 
-        for i in 0..mi {
-            for byte_idx in 0..shard_size {
-                let mut sum: gf::Gf8 = 0;
+        // Reusable SIMD temp buffer — thread-local to avoid per-call allocation.
+        #[cfg(target_arch = "x86_64")]
+        SIMD_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            if buf.len() < shard_size {
+                buf.resize(shard_size, 0);
+            }
+            let simd_buf = &mut buf[..shard_size];
+
+            for i in 0..mi {
                 for j in 0..ki {
-                    sum = gf::gf_add(sum, gf::gf_mul(cm[i][j], data_shards[j][byte_idx]));
+                    let coeff = cm[i][j];
+                    gf::gf_mul_simd(coeff, data_shards[j], simd_buf);
+                    for byte_idx in 0..shard_size {
+                        parity[i][byte_idx] ^= simd_buf[byte_idx];
+                    }
                 }
-                parity[i][byte_idx] = sum;
+            }
+        });
+
+        #[cfg(not(target_arch = "x86_64"))]
+        for i in 0..mi {
+            for j in 0..ki {
+                let coeff = cm[i][j];
+                for byte_idx in 0..shard_size {
+                    parity[i][byte_idx] = gf::gf_add(
+                        parity[i][byte_idx],
+                        gf::gf_mul(coeff, data_shards[j][byte_idx]),
+                    );
+                }
             }
         }
 
-        Ok(parity)
+        Ok(parity.into_iter().map(Bytes::from).collect())
     }
 
     /// Inverts a square matrix over GF(2^8) using Gauss-Jordan elimination.
@@ -169,7 +214,7 @@ impl CauchyEncoder {
 }
 
 impl Encoder for CauchyEncoder {
-    fn encode(&self, data_shards: &[&[u8]], parity_count: u8) -> Result<Vec<Vec<u8>>> {
+    fn encode(&self, data_shards: &[&[u8]], parity_count: u8) -> Result<Vec<Bytes>> {
         if data_shards.len() != self.k as usize {
             return Err(Error::InvalidConfig(format!(
                 "expected {} data shards, got {}",
@@ -198,7 +243,7 @@ impl Decoder for CauchyEncoder {
         available_shards: &[Option<&[u8]>],
         data_count: u8,
         parity_count: u8,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<Bytes>> {
         let k = data_count as usize;
         let m = parity_count as usize;
         let total = k + m;
@@ -256,7 +301,7 @@ impl Decoder for CauchyEncoder {
         }
 
         // Recovered data is the original k data shards in order.
-        Ok(recovered)
+        Ok(recovered.into_iter().map(Bytes::from).collect())
     }
 }
 
@@ -432,7 +477,7 @@ mod tests {
                                 Some(data_refs[i])
                             }
                         } else {
-                            Some(parity[i - k as usize].as_slice())
+                            Some(parity[i - k as usize].as_ref())
                         }
                     })
                     .collect();

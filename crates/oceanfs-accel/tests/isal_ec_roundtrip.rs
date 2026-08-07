@@ -155,7 +155,7 @@ mod isal_tests {
             .iter()
             .enumerate()
             .map(|(i, v)| if i == 0 || i == 3 || i == 7 { None } else { Some(v.as_slice()) })
-            .chain(parity.iter().map(|v| v.as_slice()).map(Some))
+            .chain(parity.iter().map(|v| v.as_ref()).map(Some))
             .collect();
 
         let recovered = dec.decode(&available, 16, 8).unwrap();

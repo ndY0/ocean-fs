@@ -73,7 +73,8 @@ impl BlobStore {
             return Ok(None);
         }
         let mut file = std::fs::File::open(&path)?;
-        let mut data = Vec::new();
+        let md = file.metadata()?;
+        let mut data = Vec::with_capacity(md.len() as usize);
         file.read_to_end(&mut data)?;
         Ok(Some(data))
     }
@@ -101,7 +102,7 @@ impl BlobStore {
     ///
     /// Returns an I/O error if the directory cannot be read.
     pub fn list_blobs(&self) -> Result<Vec<SegmentId>> {
-        let mut ids = Vec::new();
+        let mut ids = Vec::with_capacity(1024);
         let entries = std::fs::read_dir(&self.dir)?;
         for entry in entries {
             let entry = entry?;

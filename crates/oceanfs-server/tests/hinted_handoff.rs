@@ -172,6 +172,7 @@ async fn write_coordinator_handoff_on_replica_failure() {
             data_dir: dir.path().join("meta"),
             block_cache_size: 1024,
             memtable_size: 1024,
+            ..Default::default()
         })
         .unwrap(),
     );

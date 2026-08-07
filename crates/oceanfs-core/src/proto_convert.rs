@@ -6,6 +6,8 @@
 
 use std::convert::TryFrom;
 
+use bytes::Bytes;
+
 use crate::{BucketId, HashOutput, Hlc, NodeId, ObjectKey, SegmentId};
 
 /// Error returned when proto-to-domain conversion fails.
@@ -78,7 +80,7 @@ impl From<SegmentId> for crate::proto::common::SegmentId {
     fn from(value: SegmentId) -> Self {
         let uuid = value.as_uuid();
         let uuid_bytes = uuid.as_bytes();
-        crate::proto::common::SegmentId { id: uuid_bytes.to_vec() }
+        crate::proto::common::SegmentId { id: Bytes::copy_from_slice(uuid_bytes) }
     }
 }
 
@@ -102,7 +104,7 @@ impl TryFrom<crate::proto::common::SegmentId> for SegmentId {
 
 impl From<HashOutput> for crate::proto::common::HashOutput {
     fn from(value: HashOutput) -> Self {
-        crate::proto::common::HashOutput { hash: value.as_bytes().to_vec() }
+        crate::proto::common::HashOutput { hash: Bytes::copy_from_slice(value.as_bytes()) }
     }
 }
 
@@ -200,7 +202,7 @@ mod tests {
 
     #[test]
     fn segment_id_invalid_length() {
-        let proto = crate::proto::common::SegmentId { id: b"too-short".to_vec() };
+        let proto = crate::proto::common::SegmentId { id: Bytes::copy_from_slice(b"too-short") };
         let result = SegmentId::try_from(proto);
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -220,7 +222,7 @@ mod tests {
 
     #[test]
     fn hash_output_invalid_length() {
-        let proto = crate::proto::common::HashOutput { hash: b"too-short".to_vec() };
+        let proto = crate::proto::common::HashOutput { hash: Bytes::copy_from_slice(b"too-short") };
         let result = HashOutput::try_from(proto);
         assert!(result.is_err());
     }

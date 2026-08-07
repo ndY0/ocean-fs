@@ -5,7 +5,6 @@
 //! owns the storage components (`WalWriter`, `BlobStore`, connection pool).
 
 use async_trait::async_trait;
-
 use oceanfs_core::{NodeId, Result};
 
 /// Handler for data transfer operations during graceful cluster leave.
