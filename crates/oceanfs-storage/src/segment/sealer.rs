@@ -192,6 +192,13 @@ impl SegmentSealer {
     pub fn register_metrics(&self, registrar: &dyn oceanfs_core::MetricRegistrar) {
         registrar.register_counter(self.seal_errors.clone());
     }
+
+    /// Returns a reference to the WAL writer for crash-recovery
+    /// durability. Callers use this to append WAL entries alongside
+    /// active segment writes.
+    pub fn wal_writer(&self) -> &Arc<WalWriter> {
+        &self.wal
+    }
 }
 
 #[cfg(test)]

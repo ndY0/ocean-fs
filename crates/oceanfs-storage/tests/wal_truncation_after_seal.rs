@@ -13,8 +13,20 @@ use std::sync::Arc;
 
 use oceanfs_core::{HashOutput, SegmentId, SegmentSizeConfig, SizeTier, WalConfig};
 use oceanfs_storage::{
-    segment::buffer::ActiveSegment, BufferPool, SealConfig, SegmentSealer, WalWriter,
+    segment::buffer::ActiveSegment, BufferPool, SealConfig, SegmentSealer, WalEntry, WalWriter,
 };
+
+fn make_test_entry(segment_id: SegmentId, offset: u64, length: u32) -> WalEntry {
+    WalEntry::new(
+        segment_id,
+        offset,
+        length,
+        0,
+        0,
+        HashOutput::from_bytes([0u8; 32]),
+        vec![0u8; length as usize],
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Test: WAL truncation is exercised during seal
@@ -37,12 +49,7 @@ async fn wal_truncation_called_during_seal() {
 
     // Write some entries to the WAL (simulating prior segment activity).
     for i in 0u64..5 {
-        let entry = oceanfs_storage::WalEntry::new(
-            SegmentId::new(),
-            i * 100,
-            100,
-            HashOutput::from_bytes([0u8; 32]),
-        );
+        let entry = make_test_entry(SegmentId::new(), i * 100, 100);
         wal.append(entry).await.unwrap();
     }
 
@@ -92,8 +99,7 @@ async fn wal_truncation_called_during_seal() {
     );
 
     // Verify we can still write to the WAL after truncation (idempotency).
-    let new_entry =
-        oceanfs_storage::WalEntry::new(SegmentId::new(), 0, 50, HashOutput::from_bytes([0u8; 32]));
+    let new_entry = make_test_entry(SegmentId::new(), 0, 50);
     let post_trunc_pos = wal.append(new_entry).await.unwrap();
     assert!(post_trunc_pos > 0, "WAL should still accept writes after truncation");
 }
@@ -118,8 +124,7 @@ async fn wal_writer_truncation_is_idempotent() {
     assert_eq!(wal.global_position().await, 0);
 
     // Write an entry, then truncate back.
-    let entry =
-        oceanfs_storage::WalEntry::new(SegmentId::new(), 0, 100, HashOutput::from_bytes([0u8; 32]));
+    let entry = make_test_entry(SegmentId::new(), 0, 100);
     let pos = wal.append(entry).await.unwrap();
     assert!(pos < 1024, "first entry should be at a small position, got {pos}");
 
@@ -127,14 +132,6 @@ async fn wal_writer_truncation_is_idempotent() {
 
     // After truncation, the next append returns a small position
     // (truncation resets the file cursor).
-    let pos2 = wal
-        .append(oceanfs_storage::WalEntry::new(
-            SegmentId::new(),
-            0,
-            50,
-            HashOutput::from_bytes([0u8; 32]),
-        ))
-        .await
-        .unwrap();
+    let pos2 = wal.append(make_test_entry(SegmentId::new(), 0, 50)).await.unwrap();
     assert!(pos2 < 1024, "after truncation, next write should be at a small position, got {pos2}");
 }

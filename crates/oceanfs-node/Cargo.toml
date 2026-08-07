@@ -17,6 +17,7 @@ oceanfs-network.workspace = true
 oceanfs-cache.workspace = true
 oceanfs-accel.workspace = true
 oceanfs-ec.workspace = true
+async-trait = "0.1"
 axum.workspace = true
 bytes.workspace = true
 parking_lot.workspace = true

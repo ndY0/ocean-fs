@@ -475,7 +475,14 @@ async fn cluster_view(State(state): State<AdminState>) -> impl IntoResponse {
         Vec::new()
     };
 
-    let vnodes = state.ring_cache.as_ref().map(|_rc| 256usize).unwrap_or(0);
+    let vnodes = state
+        .ring_cache
+        .as_ref()
+        .map(|rc| {
+            let ring = rc.snapshot();
+            ring.node_count() * ring.config().vnodes_per_node as usize
+        })
+        .unwrap_or(0);
 
     let view = ClusterView { nodes, vnodes, generation: 0 };
     Json(view).into_response()

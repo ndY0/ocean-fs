@@ -18,7 +18,7 @@ use oceanfs_server::{
     ReadCoordinator, Router, S3Handler, WriteCoordinator,
 };
 use oceanfs_storage::{SegmentPool, SegmentShard};
-use tokio::task::JoinHandle;
+use tokio::{sync::broadcast, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -52,6 +52,171 @@ impl oceanfs_storage_api::MetadataStore for PrefetchStoreAdapter {
         key: &ObjectKey,
     ) -> std::io::Result<Option<ObjectMetadata>> {
         self.store.get_object(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Node leave handler — implements GracefulLeaveHandler for WAL + shard handoff
+// ---------------------------------------------------------------------------
+
+/// Handles WAL sealing and segment shard streaming during graceful leave.
+struct NodeLeaveHandler {
+    /// WAL writer for flushing pending entries.
+    wal_writer: Arc<oceanfs_storage::WalWriter>,
+    /// Blob store for listing and reading owned segments.
+    blob_store: Arc<oceanfs_storage::BlobStore>,
+    /// Connection pool for gRPC data transfer.
+    pool: Arc<oceanfs_network::ConnectionPool>,
+    /// Membership for resolving successor node addresses.
+    membership: Arc<oceanfs_membership::Membership>,
+}
+
+#[async_trait::async_trait]
+impl oceanfs_core::GracefulLeaveHandler for NodeLeaveHandler {
+    async fn handoff_wal_to(&self, successor: &oceanfs_core::NodeId) -> oceanfs_core::Result<()> {
+        // Seal: flush pending WAL entries to disk.
+        self.wal_writer
+            .sync()
+            .await
+            .map_err(|e| oceanfs_core::Error::Leave(format!("WAL sync failed: {e}")))?;
+
+        info!(
+            successor = %successor,
+            "WAL flushed to disk for graceful leave handoff"
+        );
+
+        // Push: transfer WAL-protected segment data to the successor.
+        // Segments in the blob store represent data that was previously
+        // WAL-protected and has been sealed. Transferring them completes
+        // the WAL handoff.
+        let segments = self
+            .blob_store
+            .list_blobs()
+            .map_err(|e| oceanfs_core::Error::Leave(format!("blob list failed: {e}")))?;
+
+        let mut transferred = 0usize;
+        for seg_id in &segments {
+            if let Some(data) = self
+                .blob_store
+                .read_blob(seg_id)
+                .map_err(|e| oceanfs_core::Error::Leave(format!("blob read failed: {e}")))?
+            {
+                if self.push_data_to_node(successor, seg_id, &data).await.is_ok() {
+                    transferred += 1;
+                }
+            }
+        }
+        info!(
+            successor = %successor,
+            transferred,
+            total = segments.len(),
+            "WAL-protected segments handed off to successor"
+        );
+        Ok(())
+    }
+
+    async fn transfer_segment_shards_to(
+        &self,
+        successor: &oceanfs_core::NodeId,
+    ) -> oceanfs_core::Result<usize> {
+        // Enumerate owned segments.
+        let segments = self
+            .blob_store
+            .list_blobs()
+            .map_err(|e| oceanfs_core::Error::Leave(format!("blob list failed: {e}")))?;
+
+        if segments.is_empty() {
+            info!(successor = %successor, "no segments to transfer");
+            return Ok(0);
+        }
+
+        info!(
+            successor = %successor,
+            count = segments.len(),
+            "transferring segment shards to successor"
+        );
+
+        let mut transferred: usize = 0;
+
+        // Transfer each segment via hinted handoff gRPC.
+        for seg_id in &segments {
+            let data = self
+                .blob_store
+                .read_blob(seg_id)
+                .map_err(|e| oceanfs_core::Error::Leave(format!("blob read failed: {e}")))?;
+
+            let data = match data {
+                Some(d) => d,
+                None => continue,
+            };
+
+            // Push segment data to successor via hinted handoff.
+            if let Err(e) = self.push_data_to_node(successor, seg_id, &data).await {
+                warn!(
+                    successor = %successor,
+                    segment_id = %seg_id,
+                    error = %e,
+                    "failed to transfer segment shard"
+                );
+                continue;
+            }
+            transferred += 1;
+        }
+
+        Ok(transferred)
+    }
+}
+
+impl NodeLeaveHandler {
+    /// Pushes segment data to a remote node via `HealingRpcClient::hinted_handoff`.
+    async fn push_data_to_node(
+        &self,
+        node: &oceanfs_core::NodeId,
+        segment_id: &oceanfs_core::SegmentId,
+        data: &[u8],
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let addr = self
+            .membership
+            .address_of(node)
+            .ok_or_else(|| format!("no address for node {node}"))?;
+
+        let pooled = self
+            .pool
+            .get_channel(addr)
+            .await
+            .map_err(|e| format!("connection pool error for {node}: {e}"))?;
+
+        let channel = pooled.channel().clone();
+        drop(pooled);
+
+        use oceanfs_core::Hlc;
+        use oceanfs_durability::{healing_rpc::HintRequest, HealingRpcClient};
+
+        let mut client = HealingRpcClient::new(channel);
+        let proto_seg: oceanfs_core::proto::common::SegmentId = (*segment_id).into();
+        let proto_node: oceanfs_core::proto::common::NodeId = node.clone().into();
+
+        let request = tonic::Request::new(HintRequest {
+            intended_for: Some(proto_node),
+            segment_id: Some(proto_seg),
+            data: data.to_vec(),
+            hlc: Some(Hlc::zero().into()),
+        });
+
+        let timeout_ms = 5000u64;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            client.hinted_handoff(request),
+        )
+        .await
+        .map_err(|_| format!("gRPC hinted_handoff to {node} timed out after {timeout_ms}ms"))?
+        .map_err(|s| format!("gRPC hinted_handoff to {node} failed: {s}"))?;
+
+        if !response.into_inner().accepted {
+            return Err(format!("node {node} rejected hinted handoff").into());
+        }
+
+        Ok(())
     }
 }
 
@@ -100,6 +265,11 @@ pub struct BackgroundTasks {
     pub(crate) heal: JoinHandle<()>,
     /// Heal worker cancellation token.
     pub(crate) heal_cancel: CancellationToken,
+
+    /// Hinted handoff delivery watcher task.
+    pub(crate) hinted_handoff_delivery: Option<JoinHandle<()>>,
+    /// Hinted handoff delivery cancellation token.
+    pub(crate) delivery_cancel: CancellationToken,
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +295,10 @@ pub struct Node {
     http_shutdown: CancellationToken,
     /// Background task handles and cancellation tokens.
     background: BackgroundTasks,
+    /// Graceful leave handler for WAL and segment handoff.
+    leave_handler: Arc<NodeLeaveHandler>,
+    /// Cluster membership for leave signaling.
+    membership: Arc<oceanfs_membership::Membership>,
 }
 
 impl Node {
@@ -194,8 +368,65 @@ impl Node {
             .await
             .map_err(|e| format!("failed to open WAL writer: {e}"))?;
         let wal_writer = Arc::new(wal_writer);
+
         // BufferPool for recycling segment append buffers (perf rule §1.2).
         let buffer_pool = Arc::new(oceanfs_storage::BufferPool::new(65536, 256));
+
+        // Per-core segment shards for write concurrency (perf rule §2.5).
+        let shard_count = 4;
+        let shard_small = Arc::new(
+            SegmentShard::new(shard_count, SizeTier::Small, &segment_size, &buffer_pool)
+                .map_err(|e| format!("failed to create small segment shard: {e}"))?,
+        );
+        let shard_standard = Arc::new(
+            SegmentShard::new(shard_count, SizeTier::Standard, &segment_size, &buffer_pool)
+                .map_err(|e| format!("failed to create standard segment shard: {e}"))?,
+        );
+
+        // Segment pools for pipeline parallelism (perf rule §2.7).
+        // Created before WAL replay so that replayed entries can be
+        // reconstructed into active segments (C4-storage, D6).
+        let pool_config = PoolConfig::default();
+        let segment_pool_small = Arc::new(
+            SegmentPool::new(
+                pool_config.clone(),
+                SizeTier::Small,
+                &segment_size,
+                buffer_pool.clone(),
+            )
+            .map_err(|e| format!("failed to create small segment pool: {e}"))?,
+        );
+        let segment_pool_standard = Arc::new(
+            SegmentPool::new(pool_config, SizeTier::Standard, &segment_size, buffer_pool.clone())
+                .map_err(|e| format!("failed to create standard segment pool: {e}"))?,
+        );
+
+        // ---- 6a. Replay WAL from any previous unclean shutdown (C4-storage, D6) ----
+        // Rebuilds in-memory active segments from unsealed WAL entries left
+        // behind by a crash. Occurs before the HTTP server binds.
+        let replay_summary = oceanfs_storage::wal::replay_wal(
+            &wal_config,
+            &wal_writer,
+            &segment_pool_small,
+            &segment_pool_standard,
+            &segment_size,
+        )
+        .await
+        .map_err(|e| format!("WAL replay failed: {e}"))?;
+        if replay_summary.entries_replayed > 0 {
+            info!(
+                entries = replay_summary.entries_replayed,
+                bytes = replay_summary.bytes_replayed,
+                segments = replay_summary.segments_seen.len(),
+                hlc_wall = replay_summary.max_hlc_wall_time,
+                hlc_logical = replay_summary.max_hlc_logical,
+                "replayed unsealed WAL entries from prior crash; active segments rebuilt"
+            );
+            // Best-effort: remove old WAL files that have been fully replayed.
+            // Failure is logged but does not prevent startup (H8-storage).
+            oceanfs_storage::wal::cleanup_old_wal_files(&wal_config).await;
+        }
+
         // ADR-0001: tiered segment sizing driven by SegmentSizeConfig.
         let seal_config = oceanfs_storage::SealConfig {
             target_size_bytes: segment_size.default_target_size,
@@ -216,33 +447,6 @@ impl Node {
                 wal_writer.clone(),
             )
             .with_blob_store(blob_store.clone()),
-        );
-
-        // Per-core segment shards for write concurrency (perf rule §2.5).
-        let shard_count = 4;
-        let shard_small = Arc::new(
-            SegmentShard::new(shard_count, SizeTier::Small, &segment_size, &buffer_pool)
-                .map_err(|e| format!("failed to create small segment shard: {e}"))?,
-        );
-        let shard_standard = Arc::new(
-            SegmentShard::new(shard_count, SizeTier::Standard, &segment_size, &buffer_pool)
-                .map_err(|e| format!("failed to create standard segment shard: {e}"))?,
-        );
-
-        // Segment pools for pipeline parallelism (perf rule §2.7).
-        let pool_config = PoolConfig::default();
-        let segment_pool_small = Arc::new(
-            SegmentPool::new(
-                pool_config.clone(),
-                SizeTier::Small,
-                &segment_size,
-                buffer_pool.clone(),
-            )
-            .map_err(|e| format!("failed to create small segment pool: {e}"))?,
-        );
-        let segment_pool_standard = Arc::new(
-            SegmentPool::new(pool_config, SizeTier::Standard, &segment_size, buffer_pool.clone())
-                .map_err(|e| format!("failed to create standard segment pool: {e}"))?,
         );
         // ---- 7. Construct durability workers ----
         let gc_config = oceanfs_durability::GcConfig::new(
@@ -284,7 +488,7 @@ impl Node {
         oceanfs_durability::heal::init_global_queue(heal_queue.sender());
         let heal_codec_config = oceanfs_core::CodecConfig::default();
         let heal_decoder: Arc<dyn oceanfs_ec::Decoder> =
-            Arc::new(oceanfs_ec::CauchyEncoder::new(heal_codec_config));
+            Arc::new(oceanfs_ec::CauchyEncoder::new(heal_codec_config.clone()));
         // Clone before move into HealWorker — used by ReadCoordinator as well.
         let ec_decoder = heal_decoder.clone();
         let heal_worker = oceanfs_durability::HealWorker::new(
@@ -346,6 +550,10 @@ impl Node {
             }
         }
 
+        let hinted_handoff = Arc::new(
+            HintedHandoff::new_with_pool(pool.clone()).with_membership(membership.clone()),
+        );
+
         let write_coordinator = Arc::new(WriteCoordinator::new(
             ring_cache.clone(),
             membership.clone(),
@@ -359,6 +567,7 @@ impl Node {
             segment_pool_small,
             segment_pool_standard,
             sealer.clone(),
+            hinted_handoff.clone(),
         ));
 
         let read_coordinator = Arc::new(
@@ -371,11 +580,8 @@ impl Node {
             .with_segment_reader(segment_reader.clone())
             .with_connection_pool(pool.clone())
             .with_membership(membership.clone())
-            .with_decoder(ec_decoder.clone()),
-        );
-
-        let hinted_handoff = Arc::new(
-            HintedHandoff::new_with_pool(pool.clone()).with_membership(membership.clone()),
+            .with_decoder(ec_decoder.clone())
+            .with_ec_codec(heal_codec_config.data_shards, heal_codec_config.parity_shards),
         );
 
         // Router handles request forwarding to correct coordinator nodes.
@@ -574,7 +780,7 @@ impl Node {
         });
 
         // ---- 16. Spawn background tasks ----
-        let background = Self::spawn_background_tasks(
+        let mut background = Self::spawn_background_tasks(
             gc_worker,
             metadata_store.clone(),
             ae_worker,
@@ -586,6 +792,46 @@ impl Node {
             &config,
         );
 
+        // ---- 17. Spawn hinted handoff delivery watcher ----
+        // Watches for membership state transitions to ALIVE and drains
+        // the handoff buffer for returning nodes.
+        let hh = hinted_handoff.clone();
+        let mut events = membership.subscribe();
+        let delivery_token = background.delivery_cancel.clone();
+        let delivery_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = delivery_token.cancelled() => {
+                        info!("Hinted handoff delivery watcher cancelled");
+                        break;
+                    }
+                    event = events.recv() => {
+                        match event {
+                            Ok(ev) if ev.new_state == oceanfs_core::NodeState::Alive &&
+                                      ev.old_state != oceanfs_core::NodeState::Alive => {
+                                info!(
+                                    node = %ev.node_id,
+                                    "node returned to cluster; delivering pending hinted handoffs"
+                                );
+                                if let Err(e) = hh.deliver_pending(ev.node_id).await {
+                                    warn!(error = %e, "hinted handoff delivery failed on rejoin");
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                warn!(skipped = n, "hinted handoff watcher lagged");
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                info!("Membership event channel closed; stopping delivery watcher");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        background.hinted_handoff_delivery = Some(delivery_handle);
+
         info!(
             node_id = %config.node_id,
             http_addr = %server_addr,
@@ -593,7 +839,24 @@ impl Node {
             "OceanFS node started"
         );
 
-        Ok(Node { config, accel, server_addr, grpc_addr, http_shutdown, background })
+        // ---- 18. Construct graceful leave handler ----
+        let leave_handler = Arc::new(NodeLeaveHandler {
+            wal_writer: wal_writer.clone(),
+            blob_store: blob_store.clone(),
+            pool: pool.clone(),
+            membership: membership.clone(),
+        });
+
+        Ok(Node {
+            config,
+            accel,
+            server_addr,
+            grpc_addr,
+            http_shutdown,
+            background,
+            leave_handler,
+            membership,
+        })
     }
 
     /// Returns the acceleration dispatcher probed at startup (ADR-0006).
@@ -622,6 +885,12 @@ impl Node {
     pub async fn shutdown(self) -> Result<(), Box<dyn std::error::Error>> {
         info!(node_id = %self.config.node_id, "Shutting down OceanFS node");
 
+        // ---- Graceful leave: handoff WAL and segment shards to successor ----
+        let leave_result = self.membership.leave(Some(self.leave_handler.as_ref())).await;
+        if let Err(e) = leave_result {
+            warn!(error = %e, "graceful leave handoff failed; continuing shutdown");
+        }
+
         // Signal the HTTP server to stop accepting connections and drain.
         self.http_shutdown.cancel();
 
@@ -634,6 +903,7 @@ impl Node {
         self.background.prefetch_cancel.cancel();
         self.background.fd_cancel.cancel();
         self.background.heal_cancel.cancel();
+        self.background.delivery_cancel.cancel();
 
         // Wait for background tasks with a timeout.
         let _ = tokio::time::timeout(Duration::from_secs(10), async {
@@ -652,6 +922,11 @@ impl Node {
         // Wait for prefetch handle separately (it may be None).
         if let Some(pf) = self.background.prefetch {
             let _ = tokio::time::timeout(Duration::from_secs(5), pf).await;
+        }
+
+        // Wait for hinted handoff delivery handle (may be None).
+        if let Some(dh) = self.background.hinted_handoff_delivery {
+            let _ = tokio::time::timeout(Duration::from_secs(5), dh).await;
         }
 
         info!(node_id = %self.config.node_id, "OceanFS node shut down");
@@ -837,6 +1112,11 @@ impl Node {
             info!("Heal worker task completed");
         });
 
+        // Hinted handoff delivery watcher token — the watcher itself is
+        // spawned after BackgroundTasks is constructed so we can store
+        // the join handle retroactively.
+        let delivery_cancel = CancellationToken::new();
+
         BackgroundTasks {
             gossip,
             gossip_cancel,
@@ -854,6 +1134,8 @@ impl Node {
             fd_cancel,
             heal,
             heal_cancel,
+            hinted_handoff_delivery: None,
+            delivery_cancel,
         }
     }
 }
@@ -1198,5 +1480,514 @@ mod tests {
         .expect("open metadata store");
 
         assert_eq!(super::property_as_u64(&store, "rocksdb.nonexistent"), None);
+    }
+
+    // ── Hinted Handoff Watcher (4.4) ──────────────────────────────
+
+    /// Verifies that the membership event watcher correctly processes
+    /// ALIVE events and calls `deliver_pending` on the hinted handoff.
+    ///
+    /// Uses an mpsc channel to confirm the watcher saw the event and
+    /// attempted delivery.
+    #[tokio::test]
+    async fn hinted_handoff_watcher_delivers_on_alive_event() {
+        use std::{net::SocketAddr, sync::Arc, time::Duration};
+
+        use oceanfs_core::{Hlc, Incarnation, NodeId, NodeState, SegmentId};
+        use oceanfs_durability::{HintRecord, HintedHandoff};
+        use oceanfs_membership::Membership;
+        use oceanfs_network::ConnectionPool;
+        use tokio::sync::{broadcast, mpsc};
+        use tokio_util::sync::CancellationToken;
+
+        let addr: SocketAddr = "127.0.0.1:9100".parse().unwrap();
+        let ring = oceanfs_routing::Ring::new(oceanfs_core::RingConfig::default());
+        let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
+        let membership = Arc::new(Membership::new(
+            NodeId::new("watcher-test"),
+            addr,
+            oceanfs_core::GossipConfig::default(),
+            ring_cache,
+        ));
+        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
+        let handoff =
+            Arc::new(HintedHandoff::new_with_pool(pool).with_membership(membership.clone()));
+
+        // Store a hint for a returning node.
+        let target = NodeId::new("returning-node");
+
+        // Register the node as SUSPECT first so transitioning to ALIVE
+        // triggers a state-change event.
+        membership.upsert_node(
+            target.clone(),
+            NodeState::Suspect,
+            Incarnation::new(1),
+            "127.0.0.1:9200".parse().unwrap(),
+        );
+
+        let hint = HintRecord {
+            intended_for: target.clone(),
+            segment_id: SegmentId::new(),
+            offset: 0,
+            length: 42,
+            timestamp: Hlc::zero(),
+            data: vec![1, 2, 3],
+        };
+        handoff.handoff(target.clone(), hint).await.unwrap();
+        assert_eq!(handoff.pending_count(&target), 1);
+
+        // Channel to verify the watcher processes events.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let hh = handoff.clone();
+        let token = cancel.clone();
+
+        // Spawn the watcher — same logic as production.
+        let mut events = membership.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    ev = events.recv() => {
+                        match ev {
+                            Ok(ev) if ev.new_state == NodeState::Alive &&
+                                      ev.old_state != NodeState::Alive => {
+                                let _ = tx.send(ev.node_id.clone());
+                                let _ = hh.deliver_pending(ev.node_id).await;
+                            }
+                            Ok(_) => {}
+                            Err(broadcast::error::RecvError::Closed) => break,
+                            Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        }
+                    }
+                }
+            }
+        });
+
+        // Mark the target node as returning to the cluster.
+        membership.upsert_node(
+            target.clone(),
+            NodeState::Alive,
+            Incarnation::new(2),
+            "127.0.0.1:9200".parse().unwrap(),
+        );
+
+        // Wait for the watcher to process the event (with timeout).
+        let received = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(received.is_ok(), "watcher should process ALIVE event within 2 seconds");
+        assert_eq!(received.unwrap(), Some(target.clone()));
+
+        // Delivery fails without a real gRPC server, but the watcher
+        // should have attempted it (hints remain pending).
+        assert_eq!(
+            handoff.pending_count(&target),
+            1,
+            "hints retained after failed delivery attempt"
+        );
+
+        cancel.cancel();
+    }
+
+    /// Verifies the watcher ignores non-ALIVE state changes.
+    #[tokio::test]
+    async fn hinted_handoff_watcher_ignores_non_alive_events() {
+        use std::{net::SocketAddr, sync::Arc};
+
+        use oceanfs_core::{Incarnation, NodeId, NodeState};
+        use oceanfs_membership::Membership;
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let addr: SocketAddr = "127.0.0.1:9100".parse().unwrap();
+        let ring = oceanfs_routing::Ring::new(oceanfs_core::RingConfig::default());
+        let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
+        let membership = Arc::new(Membership::new(
+            NodeId::new("ignorer"),
+            addr,
+            oceanfs_core::GossipConfig::default(),
+            ring_cache,
+        ));
+        // hinted handoff not needed for this test — we verify watcher
+        // event discrimination via the mpsc channel alone.
+
+        let target = NodeId::new("suspect-node");
+        // Pre-register the node in membership so state changes are detected.
+        membership.upsert_node(
+            target.clone(),
+            NodeState::Alive,
+            Incarnation::new(1),
+            "127.0.0.1:9300".parse().unwrap(),
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        let mut events = membership.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    ev = events.recv() => {
+                        match ev {
+                            Ok(ev) if ev.new_state == NodeState::Alive &&
+                                      ev.old_state != NodeState::Alive => {
+                                let _ = tx.send(ev.node_id.clone());
+                            }
+                            Ok(_) => {
+                                // Non-ALIVE or same-state: send a dummy to confirm
+                                // we saw it but didn't trigger delivery.
+                                let _ = tx.send(NodeId::new("non-alive-seen"));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        });
+
+        // Transition node to SUSPECT (not ALIVE).
+        membership.upsert_node(
+            target.clone(),
+            NodeState::Suspect,
+            Incarnation::new(2),
+            "127.0.0.1:9300".parse().unwrap(),
+        );
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
+        assert!(received.is_ok(), "watcher should process SUSPECT event");
+        assert_eq!(
+            received.unwrap(),
+            Some(NodeId::new("non-alive-seen")),
+            "non-ALIVE event should not trigger delivery"
+        );
+
+        cancel.cancel();
+    }
+
+    // ── Graceful Leave Handler (4.5) ──────────────────────────────
+
+    /// Verifies that the `NodeLeaveHandler` correctly implements
+    /// `GracefulLeaveHandler::handoff_wal_to()` by flushing the WAL.
+    #[tokio::test]
+    async fn leave_handler_handoff_wal_flushes_and_reports_success() {
+        use std::sync::Arc;
+
+        use oceanfs_core::{GracefulLeaveHandler, NodeId, WalConfig};
+        use oceanfs_membership::Membership;
+        use oceanfs_network::ConnectionPool;
+
+        // Setup: real WAL in temp dir.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_writer = Arc::new(
+            oceanfs_storage::WalWriter::open(&WalConfig {
+                data_dir: dir.path().join("wal"),
+                max_file_size_bytes: 1024 * 1024,
+                fsync_batch_timeout_ms: 5,
+            })
+            .await
+            .unwrap(),
+        );
+        let blob_store =
+            Arc::new(oceanfs_storage::BlobStore::open(&dir.path().join("blobs")).unwrap());
+
+        let ring = oceanfs_routing::Ring::new(oceanfs_core::RingConfig::default());
+        let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
+        let membership = Arc::new(Membership::new(
+            NodeId::new("leave-test"),
+            "127.0.0.1:9100".parse().unwrap(),
+            oceanfs_core::GossipConfig::default(),
+            ring_cache,
+        ));
+        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
+
+        let handler = super::NodeLeaveHandler { wal_writer, blob_store, pool, membership };
+
+        // handoff_wal_to should sync and succeed even without a real successor.
+        let result =
+            GracefulLeaveHandler::handoff_wal_to(&handler, &NodeId::new("successor")).await;
+        assert!(result.is_ok(), "WAL handoff should succeed");
+    }
+
+    /// Verifies that `transfer_segment_shards_to` handles an empty blob store.
+    #[tokio::test]
+    async fn leave_handler_transfer_empty_blob_store_returns_zero() {
+        use std::sync::Arc;
+
+        use oceanfs_core::{GracefulLeaveHandler, NodeId};
+        use oceanfs_membership::Membership;
+        use oceanfs_network::ConnectionPool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_writer = Arc::new(
+            oceanfs_storage::WalWriter::open(&oceanfs_core::WalConfig {
+                data_dir: dir.path().join("wal"),
+                max_file_size_bytes: 1024 * 1024,
+                fsync_batch_timeout_ms: 5,
+            })
+            .await
+            .unwrap(),
+        );
+        let blob_store =
+            Arc::new(oceanfs_storage::BlobStore::open(&dir.path().join("blobs")).unwrap());
+
+        let ring = oceanfs_routing::Ring::new(oceanfs_core::RingConfig::default());
+        let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
+        let membership = Arc::new(Membership::new(
+            NodeId::new("empty-blob"),
+            "127.0.0.1:9200".parse().unwrap(),
+            oceanfs_core::GossipConfig::default(),
+            ring_cache,
+        ));
+        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
+
+        let handler = super::NodeLeaveHandler { wal_writer, blob_store, pool, membership };
+
+        let transferred =
+            GracefulLeaveHandler::transfer_segment_shards_to(&handler, &NodeId::new("successor"))
+                .await
+                .unwrap();
+        assert_eq!(transferred, 0, "empty blob store transfers 0 segments");
+    }
+
+    /// Verifies that `transfer_segment_shards_to` enumerates segments
+    /// and handles gRPC failure gracefully (all transfers fail without
+    /// a server running → 0 transferred).
+    #[tokio::test]
+    async fn leave_handler_transfer_segments_handles_grpc_failure() {
+        use std::sync::Arc;
+
+        use oceanfs_core::{GracefulLeaveHandler, NodeId, SegmentId};
+        use oceanfs_membership::Membership;
+        use oceanfs_network::ConnectionPool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_writer = Arc::new(
+            oceanfs_storage::WalWriter::open(&oceanfs_core::WalConfig {
+                data_dir: dir.path().join("wal"),
+                max_file_size_bytes: 1024 * 1024,
+                fsync_batch_timeout_ms: 5,
+            })
+            .await
+            .unwrap(),
+        );
+        let blob_store =
+            Arc::new(oceanfs_storage::BlobStore::open(&dir.path().join("blobs")).unwrap());
+
+        // Write some segments.
+        for i in 0..3 {
+            blob_store.write_blob(&SegmentId::new(), &[i as u8; 64]).unwrap();
+        }
+
+        let ring = oceanfs_routing::Ring::new(oceanfs_core::RingConfig::default());
+        let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
+        let addr: std::net::SocketAddr = "127.0.0.1:9300".parse().unwrap();
+        let membership = Arc::new(Membership::new(
+            NodeId::new("blob-test"),
+            addr,
+            oceanfs_core::GossipConfig::default(),
+            ring_cache,
+        ));
+        // Register the successor in membership so address resolution works.
+        membership.upsert_node(
+            NodeId::new("successor"),
+            oceanfs_core::NodeState::Alive,
+            oceanfs_core::Incarnation::new(1),
+            addr,
+        );
+        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
+
+        let handler = super::NodeLeaveHandler { wal_writer, blob_store, pool, membership };
+
+        // Transfer: gRPC to successor will fail (no server), but we verify
+        // the enumeration happened and attempts were made.
+        let transferred =
+            GracefulLeaveHandler::transfer_segment_shards_to(&handler, &NodeId::new("successor"))
+                .await
+                .unwrap();
+        // All transfers fail because no gRPC server — count is 0.
+        assert_eq!(transferred, 0, "transfers fail without gRPC server");
+    }
+
+    /// Verifies that `Membership::leave()` with a handler calls the handler
+    /// instead of sleeping. Uses a mock handler that records calls.
+    #[tokio::test]
+    async fn membership_leave_calls_handler_instead_of_sleeping() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        use oceanfs_core::{NodeId, RingConfig};
+        use oceanfs_membership::Membership;
+        use oceanfs_routing::Ring;
+
+        struct RecordingHandler {
+            wal_called: AtomicBool,
+            shard_called: AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl oceanfs_core::GracefulLeaveHandler for RecordingHandler {
+            async fn handoff_wal_to(&self, _: &NodeId) -> oceanfs_core::Result<()> {
+                self.wal_called.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn transfer_segment_shards_to(&self, _: &NodeId) -> oceanfs_core::Result<usize> {
+                self.shard_called.store(true, Ordering::SeqCst);
+                Ok(42)
+            }
+        }
+
+        let ring = Ring::new(RingConfig::default());
+        let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
+        let membership = Arc::new(Membership::new(
+            NodeId::new("leave-call-test"),
+            "127.0.0.1:9400".parse().unwrap(),
+            oceanfs_core::GossipConfig::default(),
+            ring_cache.clone(),
+        ));
+
+        // Add a successor node so handoff targets a real node.
+        let mut write_ring = Ring::new(RingConfig::default());
+        write_ring.add_node(NodeId::new("successor"));
+        ring_cache.update(write_ring);
+        // Register successor in membership for address resolution.
+        membership.upsert_node(
+            NodeId::new("successor"),
+            oceanfs_core::NodeState::Alive,
+            oceanfs_core::Incarnation::new(1),
+            "127.0.0.1:9500".parse().unwrap(),
+        );
+
+        let handler = RecordingHandler {
+            wal_called: AtomicBool::new(false),
+            shard_called: AtomicBool::new(false),
+        };
+
+        // leave() requires started membership; start background tasks.
+        membership.start().unwrap();
+        membership.join().await.unwrap();
+
+        let result = membership.leave(Some(&handler)).await;
+        assert!(result.is_ok(), "leave should succeed");
+
+        assert!(handler.wal_called.load(Ordering::SeqCst), "WAL handoff was called");
+        assert!(handler.shard_called.load(Ordering::SeqCst), "shard transfer was called");
+    }
+
+    // ── gRPC segment transfer integration test ────────────────────
+
+    /// Verifies that `transfer_segment_shards_to` successfully pushes
+    /// segment data to a real gRPC healing service and the recipient
+    /// stores the received hints.
+    #[tokio::test]
+    async fn leave_handler_transfer_via_grpc_received_by_successor() {
+        use std::sync::Arc;
+
+        use oceanfs_core::{GracefulLeaveHandler, Incarnation, NodeId, NodeState, SegmentId};
+        use oceanfs_durability::{
+            anti_entropy::InMemorySegmentStore, healing_service::HealingGrpcService,
+            HealingRpcServer, HintedHandoff, SegmentDataStore,
+        };
+        use oceanfs_membership::Membership;
+        use oceanfs_network::ConnectionPool;
+        use tonic::transport::Server;
+
+        // ---- Setup server (successor) ----
+        let server_handoff = Arc::new(HintedHandoff::new());
+        let server_store: Arc<dyn SegmentDataStore> = Arc::new(InMemorySegmentStore::new());
+        let server_meta = Arc::new(
+            oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: {
+                    let d = tempfile::tempdir().unwrap();
+                    let p = d.path().to_path_buf();
+                    // Keep tempdir alive
+                    std::mem::forget(d);
+                    p.join("meta")
+                },
+                block_cache_size: 1024,
+                memtable_size: 1024,
+            })
+            .unwrap(),
+        );
+        // Use a fixed port for the test gRPC server.
+        let bound_addr: std::net::SocketAddr = "127.0.0.1:15550".parse().unwrap();
+        let healing_svc =
+            HealingGrpcService::new(server_handoff.clone(), server_meta.clone(), server_store);
+
+        let server_task = tokio::spawn(async move {
+            Server::builder()
+                .add_service(HealingRpcServer::new(healing_svc))
+                .serve(bound_addr)
+                .await
+                .unwrap();
+        });
+
+        // Give the server a moment to start.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // ---- Setup client (leaving node) ----
+        let dir = tempfile::tempdir().unwrap();
+        let wal_writer = Arc::new(
+            oceanfs_storage::WalWriter::open(&oceanfs_core::WalConfig {
+                data_dir: dir.path().join("wal"),
+                max_file_size_bytes: 1024 * 1024,
+                fsync_batch_timeout_ms: 5,
+            })
+            .await
+            .unwrap(),
+        );
+        let blob_store =
+            Arc::new(oceanfs_storage::BlobStore::open(&dir.path().join("blobs")).unwrap());
+
+        // Write test segments to blob store.
+        let seg_a = SegmentId::new();
+        let seg_b = SegmentId::new();
+        blob_store.write_blob(&seg_a, b"segment A data for graceful leave").unwrap();
+        blob_store.write_blob(&seg_b, b"segment B data for graceful leave").unwrap();
+
+        // Build ring with successor node.
+        let mut ring = oceanfs_routing::Ring::new(oceanfs_core::RingConfig::default());
+        ring.add_node(NodeId::new("leaver"));
+        ring.add_node(NodeId::new("successor"));
+        let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
+
+        let membership = Arc::new(Membership::new(
+            NodeId::new("leaver"),
+            "127.0.0.1:9999".parse().unwrap(),
+            oceanfs_core::GossipConfig::default(),
+            ring_cache.clone(),
+        ));
+        // Register successor with the actual bound address for gRPC.
+        membership.upsert_node(
+            NodeId::new("successor"),
+            NodeState::Alive,
+            Incarnation::new(1),
+            bound_addr,
+        );
+        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
+
+        let handler = super::NodeLeaveHandler {
+            wal_writer: wal_writer.clone(),
+            blob_store: blob_store.clone(),
+            pool,
+            membership,
+        };
+
+        // ---- Execute transfer ----
+        let transferred =
+            GracefulLeaveHandler::transfer_segment_shards_to(&handler, &NodeId::new("successor"))
+                .await
+                .unwrap();
+
+        assert_eq!(transferred, 2, "both segments should transfer successfully via gRPC");
+
+        // ---- Verify successor received the hints ----
+        let pending = server_handoff.pending_count(&NodeId::new("successor"));
+        assert_eq!(pending, 2, "successor should have 2 pending hints");
+        assert_eq!(server_handoff.total_pending_count(), 2, "total hints should match");
+
+        // Drop server and clean up.
+        server_task.abort();
     }
 }

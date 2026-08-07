@@ -32,6 +32,10 @@ pub enum Error {
     /// An internal error occurred.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// An error during graceful cluster leave.
+    #[error("graceful leave failed: {0}")]
+    Leave(String),
 }
 
 impl Error {

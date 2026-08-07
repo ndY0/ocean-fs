@@ -17,7 +17,7 @@
 /// let codec = CodecType::CauchyRs;
 /// assert!(matches!(codec, CodecType::CauchyRs));
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum CodecType {
     /// Cauchy Reed-Solomon over GF(2^8).

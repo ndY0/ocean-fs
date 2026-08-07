@@ -45,7 +45,8 @@ pub mod mime;
 
 // Re-export handlers used by S3Handler.
 use handlers::{
-    create_bucket, delete_bucket, delete_object, get_object, head_object, list_objects, put_object,
+    create_bucket, delete_bucket, delete_object, get_object, head_object, list_objects,
+    put_bucket_policy, put_object,
 };
 pub use mime::MimeMap;
 
@@ -256,11 +257,13 @@ impl S3Handler {
         let state = self.state;
 
         AxumRouter::new()
-            // Bucket operations: /{bucket} (must come BEFORE the catch-all
-            // route so that bucket CRUD doesn't get captured as object paths)
+            // Bucket operations: /{bucket}
             .route(
                 "/{bucket}",
-                axum::routing::put(create_bucket).get(list_objects).delete(delete_bucket),
+                axum::routing::put(create_bucket)
+                    .get(list_objects)
+                    .post(put_bucket_policy)
+                    .delete(delete_bucket),
             )
             // Object operations: /{bucket}/{*key} (catch-all for S3-style keys)
             .route(
@@ -474,6 +477,8 @@ mod tests {
         };
         let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
 
+        let hinted_handoff = Arc::new(oceanfs_durability::HintedHandoff::new());
+
         let write = Arc::new(WriteCoordinator::new(
             ring_cache.clone(),
             membership.clone(),
@@ -487,6 +492,7 @@ mod tests {
             segment_pool_small,
             segment_pool_standard,
             sealer,
+            hinted_handoff,
         ));
 
         // Create in-memory segment store shared by write and read paths.
@@ -820,5 +826,92 @@ mod tests {
 
         // With no metadata, returns 404 or 200 depending on ReadCoordinator mode.
         let _status = response.status();
+    }
+
+    // ── Bucket Policy (§4.7 / H7) ─────
+
+    #[tokio::test]
+    async fn put_bucket_policy_updates_consistency_config() {
+        let state = make_app_state().await;
+        // Create the bucket first.
+        let _ =
+            super::handlers::create_bucket(State(state.clone()), Path("policy-test".into())).await;
+
+        // Post a policy update with custom write_quorum.
+        let body = serde_json::json!({
+            "consistency": {
+                "write_quorum": 3,
+                "read_quorum": 3,
+                "total_replicas": 5
+            }
+        })
+        .to_string();
+
+        let mut params = HashMap::new();
+        params.insert("policy".to_string(), String::new());
+        let response = super::handlers::put_bucket_policy(
+            State(state.clone()),
+            Path("policy-test".into()),
+            Query(params),
+            body,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK, "policy update must return 200");
+
+        // Verify the policy was stored.
+        let stored = state.buckets.get("policy-test").expect("policy must exist");
+        assert_eq!(stored.consistency.write_quorum, 3);
+        assert_eq!(stored.consistency.read_quorum, 3);
+        assert_eq!(stored.consistency.total_replicas, 5);
+    }
+
+    #[tokio::test]
+    async fn put_bucket_policy_nonexistent_bucket_returns_404() {
+        let state = make_app_state().await;
+        let body = serde_json::json!({}).to_string();
+        let mut params = HashMap::new();
+        params.insert("policy".to_string(), String::new());
+        let response = super::handlers::put_bucket_policy(
+            State(state),
+            Path("ghost-bucket".into()),
+            Query(params),
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn put_bucket_policy_invalid_json_returns_500() {
+        let state = make_app_state().await;
+        let _ =
+            super::handlers::create_bucket(State(state.clone()), Path("json-fail".into())).await;
+
+        let mut params = HashMap::new();
+        params.insert("policy".to_string(), String::new());
+        let response = super::handlers::put_bucket_policy(
+            State(state),
+            Path("json-fail".into()),
+            Query(params),
+            "not valid json {{{".to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn put_bucket_policy_missing_query_param_returns_500() {
+        let state = make_app_state().await;
+        let _ = super::handlers::create_bucket(State(state.clone()), Path("no-param".into())).await;
+
+        let response = super::handlers::put_bucket_policy(
+            State(state),
+            Path("no-param".into()),
+            Query(HashMap::new()),
+            "{}".to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

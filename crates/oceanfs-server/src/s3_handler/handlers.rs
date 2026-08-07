@@ -303,9 +303,9 @@ pub(crate) async fn get_object(
                 let key_clone = object_key.clone();
                 let prefetch_clone = prefetch.clone();
                 tokio::spawn(async move {
-                    // Best-effort: without key ordering context in GET,
-                    // we pass an empty adjacent list. The engine skips.
-                    prefetch_clone.after_get(bucket_clone, &key_clone, &[]);
+                    // M8: Discover adjacent keys from the metadata store
+                    // and prefetch them into L2 cache (best-effort).
+                    prefetch_clone.discover_and_prefetch_adjacent(&bucket_clone, &key_clone);
                 });
             }
 
@@ -459,6 +459,47 @@ pub(crate) async fn create_bucket(
     let mut headers = HeaderMap::new();
     headers.insert(header::LOCATION, header_val(&format!("/{}", bucket)));
     (StatusCode::OK, headers).into_response()
+}
+
+/// POST /{bucket}?policy — sets or updates a bucket's policy.
+///
+/// Accepts a JSON body with the bucket policy configuration.
+/// Returns `200` on success, `400` on invalid JSON, `404` if the
+/// bucket does not exist.
+pub(crate) async fn put_bucket_policy(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: String,
+) -> Response {
+    // Only handle ?policy query parameter.
+    if !params.contains_key("policy") {
+        let err = Error::Internal("missing ?policy query parameter".into());
+        return s3_error_response(&err, &bucket, "");
+    }
+
+    if !state.buckets.exists(&bucket) {
+        let err = Error::NotFound(format!("bucket {bucket} not found"));
+        return s3_error_response(&err, &bucket, "");
+    }
+
+    let policy: crate::bucket_config::BucketPolicy = match serde_json::from_str(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            let err = Error::Internal(format!("invalid bucket policy JSON: {e}"));
+            return s3_error_response(&err, &bucket, "");
+        }
+    };
+
+    if let Err(e) = policy.validate() {
+        let err = Error::Internal(format!("invalid bucket policy: {e}"));
+        return s3_error_response(&err, &bucket, "");
+    }
+
+    state.buckets.put(bucket.clone(), policy);
+    info!(bucket = %bucket, "bucket policy updated");
+
+    (StatusCode::OK).into_response()
 }
 
 /// GET /{bucket}?list-type=2&prefix=... — list objects in a bucket.

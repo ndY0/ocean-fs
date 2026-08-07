@@ -412,19 +412,28 @@ impl Membership {
     /// Gracefully leaves the cluster.
     ///
     /// 1. Announces LEAVING state via gossip.
-    /// 2. Drains in-flight operations.
-    /// 3. Announces LEFT state.
-    /// 4. Removes self from the ring.
+    /// 2. Determines the ring successor for data handoff.
+    /// 3. If a `leave_handler` is provided, seals and transfers WAL
+    ///    data and segment shards to the successor.
+    /// 4. Announces LEFT state and removes self from the ring.
     ///
     /// # Errors
     ///
     /// Returns [`Error::NotStarted`] if background tasks haven't been started.
-    pub async fn leave(&self) -> Result<()> {
+    /// Returns [`Error::Leave`] if the leave handler reports a failure.
+    pub async fn leave(
+        &self,
+        leave_handler: Option<&dyn oceanfs_core::GracefulLeaveHandler>,
+    ) -> Result<()> {
         if !*self.started.read() {
             return Err(Error::NotStarted);
         }
 
         let node_id = self.node_id.clone();
+
+        // Determine the ring successor for data handoff.
+        let successor =
+            self.ring.snapshot().successor_of(&node_id).unwrap_or_else(|| node_id.clone());
 
         // Transition to LEAVING.
         let _ = self.event_tx.send(MembershipEvent {
@@ -433,10 +442,35 @@ impl Membership {
             new_state: NodeState::Leaving,
         });
 
-        info!(node_id = %node_id, "node leaving cluster");
+        info!(
+            node_id = %node_id,
+            successor = %successor,
+            "node leaving cluster"
+        );
 
-        // Simulate drain period.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Execute graceful leave data handoff.
+        if let Some(handler) = leave_handler {
+            if successor != node_id {
+                info!(successor = %successor, "handing off WAL to successor");
+                handler
+                    .handoff_wal_to(&successor)
+                    .await
+                    .map_err(|e| Error::Leave(format!("WAL handoff failed: {e}")))?;
+
+                info!(successor = %successor, "transferring segment shards to successor");
+                let count = handler
+                    .transfer_segment_shards_to(&successor)
+                    .await
+                    .map_err(|e| Error::Leave(format!("segment shard transfer failed: {e}")))?;
+                info!(count, "segment shard transfer complete");
+            } else {
+                info!("no successor found; skipping data handoff");
+            }
+        } else {
+            // No leave handler provided — drain period only.
+            info!("no leave handler configured; draining in-flight requests");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
 
         // Transition to LEFT.
         let _ = self.event_tx.send(MembershipEvent {
@@ -652,7 +686,7 @@ mod tests {
     fn leave_without_start_errors() {
         let (_ring, m) = make_membership("node");
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(m.leave());
+        let result = rt.block_on(m.leave(None));
         assert!(result.is_err());
     }
 
@@ -690,7 +724,7 @@ mod tests {
         ));
 
         m.start().expect("start should succeed");
-        m.leave().await.expect("leave should succeed");
+        m.leave(None).await.expect("leave should succeed");
 
         let snap = ring_cache.snapshot();
         assert!(!snap.nodes().contains(&NodeId::new("leaver")));

@@ -23,6 +23,7 @@ use crate::error::Result;
 /// This function is cancel-safe. The repair is fire-and-forget;
 /// if the task is cancelled, the repair may not complete, but
 /// no data corruption occurs.
+#[allow(dead_code)]
 pub(crate) async fn perform_read_repair(
     resolver: &Arc<dyn ConflictResolver>,
     local_hlc: Hlc,
@@ -74,6 +75,7 @@ pub(crate) async fn perform_read_repair(
 /// The repair is spawned as a background task so the read path
 /// is not blocked by correction writes. Uses the configured
 /// [`ConflictResolver`] to determine which version wins.
+#[allow(dead_code)]
 pub(crate) fn schedule_repair(
     resolver: Arc<dyn ConflictResolver>,
     local_hlc: Hlc,

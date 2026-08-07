@@ -171,7 +171,7 @@ fn leave_transitions_state_and_removes_self_from_ring() {
         membership.start().expect("start should succeed");
 
         // Leave.
-        membership.leave().await.expect("leave should succeed");
+        membership.leave(None).await.expect("leave should succeed");
 
         // After leave, the ring should NOT include the leaver.
         let snap = ring_cache.snapshot();

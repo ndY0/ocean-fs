@@ -1508,6 +1508,7 @@ dependencies = [
 name = "oceanfs-core"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "chrono",
  "oceanfs-hash",
@@ -1617,6 +1618,7 @@ dependencies = [
 name = "oceanfs-node"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "axum 0.8.9",
  "blake3",
  "bytes",

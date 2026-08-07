@@ -21,7 +21,8 @@ use crate::error::{Error, Result};
 /// Replicates a write to a set of remote nodes using parallel fan-out.
 ///
 /// Creates a `FuturesUnordered` of all replication tasks and races them
-/// against a timeout. Returns ack results for each target.
+/// against a timeout. Returns ack results for each target, paired with
+/// the target's NodeId so callers know which node succeeded or failed.
 ///
 /// # Errors
 ///
@@ -38,7 +39,7 @@ pub(crate) async fn replicate_write(
     hlc: Hlc,
     write_timeout_ms: u64,
     req: &super::coordinator::WriteRequest,
-) -> Vec<Result<WriteAck>> {
+) -> Vec<(NodeId, Result<WriteAck>)> {
     if targets.is_empty() {
         return vec![];
     }
@@ -49,7 +50,15 @@ pub(crate) async fn replicate_write(
 
     let mut futs: FuturesUnordered<_> = targets
         .iter()
-        .map(|target| replicate_to_single(pool, membership, target, segment_id, data, hlc, req))
+        .map(|target| {
+            let target = (*target).clone();
+            async move {
+                let result =
+                    replicate_to_single(pool, membership, &target, segment_id, data, hlc, req)
+                        .await;
+                (target, result)
+            }
+        })
         .collect();
 
     let mut results = Vec::with_capacity(targets.len());
@@ -66,8 +75,8 @@ pub(crate) async fn replicate_write(
                 );
                 break;
             }
-            Some(result) = futs.next() => {
-                results.push(result);
+            Some((target, result)) = futs.next() => {
+                results.push((target, result));
                 if results.len() >= targets.len() {
                     break;
                 }
@@ -158,7 +167,7 @@ mod tests {
     use std::net::SocketAddr;
 
     use bytes::Bytes;
-    use oceanfs_core::{BucketId, HashKey, Hlc, Incarnation, NodeState, ObjectKey, SegmentId};
+    use oceanfs_core::{BucketId, Hlc, Incarnation, NodeState, ObjectKey, SegmentId};
     use oceanfs_routing::{Ring, RingCache};
 
     use super::*;
@@ -244,6 +253,6 @@ mod tests {
         )
         .await;
         assert_eq!(results.len(), 1);
-        assert!(results[0].is_err());
+        assert!(results[0].1.is_err());
     }
 }

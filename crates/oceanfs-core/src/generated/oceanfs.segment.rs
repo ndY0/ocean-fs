@@ -92,6 +92,68 @@ pub struct DeleteObjectResponse {
     #[prost(bool, tag = "1")]
     pub deleted: bool,
 }
+/// Request to fetch object metadata from a replica for read repair (4.2).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetObjectMetadataRequest {
+    #[prost(string, tag = "1")]
+    pub bucket_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub object_key: ::prost::alloc::string::String,
+}
+/// Object metadata returned by a replica for read repair comparison.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetObjectMetadataResponse {
+    /// Whether the object was found on this replica.
+    #[prost(bool, tag = "1")]
+    pub found: bool,
+    /// Object size in bytes.
+    #[prost(uint64, tag = "2")]
+    pub size: u64,
+    /// BLAKE3 hash of the object data (32 bytes, empty if not present).
+    #[prost(bytes = "vec", tag = "3")]
+    pub blake3_hash: ::prost::alloc::vec::Vec<u8>,
+    /// HLC timestamp of this object version.
+    #[prost(message, optional, tag = "4")]
+    pub hlc: ::core::option::Option<super::common::HlcTimestamp>,
+    /// Inline data (present for small objects, empty otherwise).
+    #[prost(bytes = "vec", tag = "5")]
+    pub inline_data: ::prost::alloc::vec::Vec<u8>,
+    /// Chunk references for segment-stored objects.
+    #[prost(message, repeated, tag = "6")]
+    pub chunk_segment_ids: ::prost::alloc::vec::Vec<super::common::SegmentId>,
+    #[prost(uint64, repeated, tag = "7")]
+    pub chunk_offsets: ::prost::alloc::vec::Vec<u64>,
+    #[prost(uint32, repeated, tag = "8")]
+    pub chunk_lengths: ::prost::alloc::vec::Vec<u32>,
+}
+/// Request to push corrected object metadata + data to a stale replica (4.2).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PutObjectMetadataRequest {
+    #[prost(string, tag = "1")]
+    pub bucket_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub object_key: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub size: u64,
+    #[prost(bytes = "vec", tag = "4")]
+    pub blake3_hash: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "5")]
+    pub hlc: ::core::option::Option<super::common::HlcTimestamp>,
+    #[prost(bytes = "vec", tag = "6")]
+    pub inline_data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, repeated, tag = "7")]
+    pub chunk_segment_ids: ::prost::alloc::vec::Vec<super::common::SegmentId>,
+    #[prost(uint64, repeated, tag = "8")]
+    pub chunk_offsets: ::prost::alloc::vec::Vec<u64>,
+    #[prost(uint32, repeated, tag = "9")]
+    pub chunk_lengths: ::prost::alloc::vec::Vec<u32>,
+}
+/// Response acknowledging the metadata write.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct PutObjectMetadataResponse {
+    #[prost(bool, tag = "1")]
+    pub written: bool,
+}
 /// Status for segment append acknowledgement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

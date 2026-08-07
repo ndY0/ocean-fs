@@ -13,9 +13,11 @@
 
 mod entry;
 mod reader;
+mod replay;
 mod sync;
 mod writer;
 
 pub use entry::WalEntry;
 pub use reader::WalReader;
+pub use replay::{cleanup_old_wal_files, replay_wal, ReplaySummary};
 pub use writer::WalWriter;

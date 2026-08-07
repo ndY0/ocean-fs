@@ -71,7 +71,7 @@ async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
     let wal = Arc::new(
         WalWriter::open(&WalConfig {
             data_dir: dir.path().join("wal"),
-            max_file_size_bytes: 1024 * 1024,
+            max_file_size_bytes: 64 * 1024 * 1024,
             fsync_batch_timeout_ms: 5,
         })
         .await
@@ -83,6 +83,8 @@ async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
         data_dir: dir.path().join("segments"),
     };
     let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
+
+    let hinted_handoff = Arc::new(oceanfs_durability::HintedHandoff::new_with_pool(pool.clone()));
 
     WriteCoordinator::new(
         ring_cache,
@@ -97,6 +99,7 @@ async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
         segment_pool_small,
         segment_pool_standard,
         sealer,
+        hinted_handoff,
     )
 }
 

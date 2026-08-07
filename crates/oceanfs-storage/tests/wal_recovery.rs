@@ -9,19 +9,32 @@
 //!
 //! Covers the `wal-write-ahead-log` feature's Definition of Done.
 
-use oceanfs_core::{HashOutput, SegmentId, WalConfig};
-use oceanfs_storage::wal::{WalEntry, WalReader, WalWriter};
+use std::sync::Arc;
+
+use oceanfs_core::{HashOutput, PoolConfig, SegmentId, SegmentSizeConfig, SizeTier, WalConfig};
+use oceanfs_storage::{
+    wal::{replay_wal, WalEntry, WalReader, WalWriter},
+    BufferPool, SegmentPool,
+};
 
 fn make_config(dir: &tempfile::TempDir) -> WalConfig {
     WalConfig {
         data_dir: dir.path().join("wal"),
-        max_file_size_bytes: 1024 * 1024, // 1 MB
+        max_file_size_bytes: 64 * 1024 * 1024, // 64 MB
         fsync_batch_timeout_ms: 5,
     }
 }
 
 fn make_entry(segment_id: SegmentId, offset: u64, length: u32) -> WalEntry {
-    WalEntry::new(segment_id, offset, length, HashOutput::from_bytes([0u8; 32]))
+    WalEntry::new(
+        segment_id,
+        offset,
+        length,
+        0,
+        0,
+        HashOutput::from_bytes([0u8; 32]),
+        vec![0u8; length as usize],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -110,9 +123,10 @@ async fn truncate_removes_entries_after_position() {
 
         for i in 0..5 {
             let entry = make_entry(seg_id, i * 100, 100);
+            let entry_size = entry.serialized_size() as u64;
             let pos = writer.append(entry).await.unwrap();
             if i == 2 {
-                truncation_point = pos + WalEntry::serialized_size() as u64;
+                truncation_point = pos + entry_size;
             }
         }
 
@@ -174,11 +188,80 @@ async fn replay_empty_directory_returns_no_entries() {
 #[test]
 fn entry_roundtrip() {
     let seg_id = SegmentId::new();
-    let entry = WalEntry::new(seg_id, 42, 256, HashOutput::from_bytes([0xAA; 32]));
+    let data = vec![0xBBu8; 256];
+    let entry = WalEntry::new(seg_id, 42, 256, 0, 0, HashOutput::from_bytes([0xAA; 32]), data);
 
     let bytes = entry.to_bytes();
     let restored = WalEntry::from_bytes(&bytes).expect("failed to deserialize entry");
 
     assert_eq!(restored.offset, 42);
     assert_eq!(restored.length, 256);
+    assert_eq!(restored.data.len(), 256);
+}
+
+// ---------------------------------------------------------------------------
+// replay_wal function (crate-boundary test)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn replay_wal_recovers_and_truncates() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = make_config(&dir);
+    let size_config = SegmentSizeConfig::default();
+    let buffer_pool = Arc::new(BufferPool::new(65536, 8));
+    let pool_cfg = PoolConfig::default();
+    let pool_small =
+        SegmentPool::new(pool_cfg.clone(), SizeTier::Small, &size_config, buffer_pool.clone())
+            .unwrap();
+    let pool_standard =
+        SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool).unwrap();
+
+    let seg_id = SegmentId::new();
+
+    // Write entries and drop writer (simulating crash).
+    {
+        let writer = WalWriter::open(&config).await.unwrap();
+        for i in 0..5 {
+            let entry = make_entry(seg_id, i * 64, 64);
+            writer.append(entry).await.unwrap();
+        }
+    }
+
+    // On restart: open writer, replay WAL into pools.
+    let wal_writer = WalWriter::open(&config).await.unwrap();
+    let summary = replay_wal(&config, &wal_writer, &pool_small, &pool_standard, &size_config)
+        .await
+        .expect("replay_wal should succeed after crash");
+
+    assert_eq!(summary.entries_replayed, 5);
+    assert_eq!(summary.bytes_replayed, 320);
+    assert_eq!(summary.segments_seen.len(), 1);
+
+    // After replay, WAL should be truncated — verify by re-reading.
+    drop(wal_writer);
+    let reader = WalReader::open(&config).unwrap();
+    let entries: Vec<_> = reader.replay().collect::<Result<Vec<_>, _>>().unwrap();
+    assert!(entries.is_empty(), "WAL should be empty after successful replay with truncation");
+}
+
+#[tokio::test]
+async fn replay_wal_empty_wal_returns_zero_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = make_config(&dir);
+    let size_config = SegmentSizeConfig::default();
+    let buffer_pool = Arc::new(BufferPool::new(65536, 8));
+    let pool_cfg = PoolConfig::default();
+    let pool_small =
+        SegmentPool::new(pool_cfg.clone(), SizeTier::Small, &size_config, buffer_pool.clone())
+            .unwrap();
+    let pool_standard =
+        SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool).unwrap();
+
+    let wal_writer = WalWriter::open(&config).await.unwrap();
+    let summary =
+        replay_wal(&config, &wal_writer, &pool_small, &pool_standard, &size_config).await.unwrap();
+
+    assert_eq!(summary.entries_replayed, 0);
+    assert_eq!(summary.bytes_replayed, 0);
+    assert!(summary.segments_seen.is_empty());
 }

@@ -20,12 +20,13 @@ use oceanfs_core::{
     BucketId, ChunkRef, HashKey, HashOutput, Hlc, HlcClock, NodeId, ObjectKey, ObjectMetadata,
     OperationTimeouts, SegmentId, SegmentSizeConfig, SizeTier, WriteResult,
 };
+use oceanfs_durability::HintedHandoff;
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::RingCache;
 use oceanfs_storage::{
     RocksDbMetadataStore, SegmentPool, SegmentRpcClient, SegmentSealer, SegmentShard,
-    SegmentSplitter, TierRouter,
+    SegmentSplitter, TierRouter, WalEntry,
 };
 use tracing::{info, warn};
 
@@ -93,6 +94,8 @@ pub struct WriteCoordinator {
     sealer: Arc<SegmentSealer>,
     /// Segment size configuration.
     size_config: SegmentSizeConfig,
+    /// Hinted handoff buffer for writes to temporarily unreachable replicas.
+    hinted_handoff: Arc<HintedHandoff>,
 }
 
 impl WriteCoordinator {
@@ -114,6 +117,7 @@ impl WriteCoordinator {
         segment_pool_small: Arc<SegmentPool>,
         segment_pool_standard: Arc<SegmentPool>,
         sealer: Arc<SegmentSealer>,
+        hinted_handoff: Arc<HintedHandoff>,
     ) -> Self {
         let tier_router = TierRouter::new(size_config.clone());
         Self {
@@ -130,6 +134,7 @@ impl WriteCoordinator {
             segment_pool_standard,
             sealer,
             size_config,
+            hinted_handoff,
         }
     }
 
@@ -213,19 +218,39 @@ impl WriteCoordinator {
                     .map_err(|e| Error::Storage(format!("inline metadata write: {e}")))?;
                 smallvec::SmallVec::new()
             }
-            SizeTier::Small => Self::append_to_pool(data_ref, &self.segment_pool_small)
-                .map_err(|e| Error::Storage(format!("small tier append: {e}")))?,
-            SizeTier::Standard => Self::append_to_pool(data_ref, &self.segment_pool_standard)
-                .map_err(|e| Error::Storage(format!("standard tier append: {e}")))?,
+            SizeTier::Small => {
+                let (segment_id, offset, length) = self
+                    .segment_pool_small
+                    .append(data_ref)
+                    .map_err(|e| Error::Storage(format!("small tier append: {e}")))?;
+                // Write WAL entry for crash-recovery durability (C4-storage, D6).
+                self.write_wal_entry(segment_id, offset, data_ref, length, hlc).await?;
+                let mut chunks = smallvec::SmallVec::new();
+                chunks.push(ChunkRef { segment_id, offset, length });
+                chunks
+            }
+            SizeTier::Standard => {
+                let (segment_id, offset, length) = self
+                    .segment_pool_standard
+                    .append(data_ref)
+                    .map_err(|e| Error::Storage(format!("standard tier append: {e}")))?;
+                // Write WAL entry for crash-recovery durability (C4-storage, D6).
+                self.write_wal_entry(segment_id, offset, data_ref, length, hlc).await?;
+                let mut chunks = smallvec::SmallVec::new();
+                chunks.push(ChunkRef { segment_id, offset, length });
+                chunks
+            }
             SizeTier::Multi => {
                 let splitter = SegmentSplitter::new(self.size_config.default_target_size);
                 let split_chunks = splitter.split(data_ref);
                 let mut chunks = smallvec::SmallVec::new();
                 for (chunk_offset, chunk_data) in &split_chunks {
-                    let (seg_id, _offset, length) =
-                        self.segment_pool_standard
-                            .append(chunk_data)
-                            .map_err(|e| Error::Storage(format!("multi tier append: {e}")))?;
+                    let (seg_id, seg_offset, length) = self
+                        .segment_pool_standard
+                        .append(chunk_data)
+                        .map_err(|e| Error::Storage(format!("multi tier append: {e}")))?;
+                    // Write WAL entry for each chunk (C4-storage, D6).
+                    self.write_wal_entry(seg_id, seg_offset, chunk_data, length, hlc).await?;
                     chunks.push(ChunkRef { segment_id: seg_id, offset: *chunk_offset, length });
                 }
                 chunks
@@ -235,7 +260,8 @@ impl WriteCoordinator {
             }
         };
 
-        let segment_id = chunks.first().map(|c| c.segment_id).unwrap_or_else(SegmentId::new);
+        let segment_id =
+            chunks.first().map(|c: &ChunkRef| c.segment_id).unwrap_or_else(SegmentId::new);
 
         info!(
             bucket = %req.bucket,
@@ -269,7 +295,7 @@ impl WriteCoordinator {
             )
             .await;
 
-            for ack_result in results {
+            for (target, ack_result) in results {
                 match ack_result {
                     Ok(_) => {
                         acks_received += 1;
@@ -278,7 +304,22 @@ impl WriteCoordinator {
                         }
                     }
                     Err(e) => {
-                        warn!(error = %e, "replica write failed");
+                        warn!(target = %target, error = %e, "replica write failed");
+                        // Store hinted handoff for the unreachable replica.
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let hint = oceanfs_durability::HintRecord {
+                            intended_for: target.clone(),
+                            segment_id,
+                            offset: 0,
+                            length: req.data.len() as u32,
+                            timestamp: hlc,
+                            data: req.data.to_vec(),
+                            stored_at_secs: now_secs,
+                        };
+                        let _ = self.hinted_handoff.handoff(target.clone(), hint).await;
                     }
                 }
             }
@@ -299,15 +340,35 @@ impl WriteCoordinator {
         })
     }
 
-    /// Appends data to a segment pool and returns the chunk reference.
-    fn append_to_pool(
+    /// Writes a WAL entry for crash-recovery durability.
+    ///
+    /// Records the segment append in the write-ahead log so that unsealed
+    /// segment data can be replayed on crash recovery (C4-storage, D6).
+    async fn write_wal_entry(
+        &self,
+        segment_id: SegmentId,
+        offset: u64,
         data: &[u8],
-        pool: &SegmentPool,
-    ) -> std::result::Result<smallvec::SmallVec<[ChunkRef; 4]>, oceanfs_storage::Error> {
-        let (segment_id, offset, length) = pool.append(data)?;
-        let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id, offset, length });
-        Ok(chunks)
+        length: u32,
+        hlc: Hlc,
+    ) -> std::result::Result<(), Error> {
+        let chunk_hash = blake3::hash(data);
+        let checksum = HashOutput::from_bytes(*chunk_hash.as_bytes());
+        let entry = WalEntry::new(
+            segment_id,
+            offset,
+            length,
+            hlc.wall_time,
+            hlc.logical,
+            checksum,
+            data.to_vec(),
+        );
+        self.sealer
+            .wal_writer()
+            .append(entry)
+            .await
+            .map_err(|e| Error::Storage(format!("WAL append failed: {e}")))?;
+        Ok(())
     }
 
     /// Returns a reference to the HLC clock.
@@ -421,7 +482,7 @@ impl WriteCoordinator {
             chunks,
             size: req.data.len() as u64,
             blake3_hash: Some(blake3_hash),
-            hlc: Hlc::zero(),
+            hlc,
         })
     }
 
@@ -495,8 +556,8 @@ mod tests {
     use std::net::SocketAddr;
 
     use oceanfs_core::{
-        GossipConfig, Incarnation, MetadataConfig, NodeId, NodeState, PoolConfig, RingConfig,
-        RpcConfig, SizeTier, WalConfig,
+        GossipConfig, Incarnation, NodeId, NodeState, PoolConfig, RingConfig, RpcConfig, SizeTier,
+        WalConfig,
     };
     use oceanfs_routing::{hash_key, Ring};
     use oceanfs_storage::{BufferPool, SealConfig, WalWriter};
@@ -568,6 +629,8 @@ mod tests {
         };
         let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
 
+        let hinted_handoff = Arc::new(HintedHandoff::new());
+
         WriteCoordinator::new(
             ring_cache,
             membership,
@@ -581,6 +644,7 @@ mod tests {
             segment_pool_small,
             segment_pool_standard,
             sealer,
+            hinted_handoff,
         )
     }
 
@@ -842,7 +906,7 @@ mod tests {
         .await;
 
         assert_eq!(results.len(), 2, "should return one result per target");
-        for result in &results {
+        for (_target, result) in &results {
             assert!(result.is_err(), "all should fail without gRPC server");
         }
     }

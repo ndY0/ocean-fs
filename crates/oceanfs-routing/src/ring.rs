@@ -180,6 +180,17 @@ impl Ring {
     pub fn nodes(&self) -> &[NodeId] {
         &self.node_ids
     }
+
+    /// Returns the first successor of the given node in the ring.
+    ///
+    /// Hashes the node ID to find its ring position, then returns
+    /// the next distinct node clockwise. Returns `None` if no other
+    /// nodes are in the ring.
+    pub fn successor_of(&self, node_id: &NodeId) -> Option<NodeId> {
+        let key_hash = hash_node(node_id.as_str(), 0);
+        let successors = self.lookup(&key_hash);
+        successors.into_iter().find(|n| n != node_id)
+    }
 }
 
 #[cfg(test)]

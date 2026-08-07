@@ -188,10 +188,10 @@ The reviewer returned PASS with 6 low-severity gaps, accepted as follows:
    `try_acquire` (non-blocking), so wait time is always zero. No timing
    to measure until blocking acquires are added.
 
-2. **SegmentPool `segment_active_count` gauge deferred** —
-   `SegmentShard::register_metrics()` code exists but `SegmentShard` is
-   never constructed in `node.rs`. Belongs to Epic 3
-   (write-path-unification).
+2. **SegmentPool `segment_active_count` gauge — RESOLVED** —
+   `SegmentShard` is now constructed in `node.rs:378-382` by Epic 3
+   (write-path-unification). The `segment_active_count` gauge is now
+   properly registered and observable via the `/admin/metrics` endpoint.
 
 3. **Compress/decompress/hash timing hooks deferred** — Histograms are
    registered on `AccelDispatcher` and observable, but actual `observe()`
@@ -204,8 +204,12 @@ The reviewer returned PASS with 6 low-severity gaps, accepted as follows:
    protobuf is hardcoded to 0. Implemented as a monotonic gauge that
    increments on each `ring.update()` call — a pragmatic proxy.
 
-5. **`hints_expired_total` counter registered but not incremented** — No
-   expiry logic exists yet to hook into. Belongs to Epic 4 (durability).
+5. **`hints_expired_total` counter — RESOLVED** — `HintRecord` now has a
+   `stored_at_secs` field for tracking hint age. `HintedHandoff` has a
+   configurable `hint_ttl_secs` field (default 0 = never expire). The
+   `expire_old_hints()` method is called from both `handoff()` and
+   `deliver_pending()`, properly expiring stale hints and incrementing
+   the `hints_expired_total` counter.
 
 6. **RocksDB per-level file gauges** — Only level 0 implemented; levels
    1–6 deferred. Adding them later is trivial (copy the polling

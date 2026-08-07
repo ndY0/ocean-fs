@@ -8,11 +8,16 @@
 //! reading from the local [`SegmentReader`].
 //!
 //! Per performance guideline §8.1 (FuturesUnordered) and §8.2
-//! (tokio::select! for timeout branches).
+//! (timeout branches via `tokio::time::timeout`).
+//!
+//! EC recovery (when enabled via the `ec` feature) is performed
+//! by `try_ec_recovery_for_chunk()`, which splits the segment into
+//! data+parity shards and reconstructs missing data via
+//! `EcRecoveryParams::decode_shards()`.
 
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{stream::FuturesUnordered, StreamExt};
 use oceanfs_core::{
     proto::segment::FetchShardRequest as GprcFetchShardRequest, ChunkRef, ObjectMetadata,
@@ -21,12 +26,47 @@ use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::RingCache;
 use oceanfs_storage::SegmentRpcClient;
-use tracing::debug;
+use tokio::sync::Semaphore;
+use tracing::{debug, warn};
 
 use crate::{
     error::{Error, Result},
     read::coordinator::SegmentReader,
 };
+
+/// Parameters for EC recovery during chunk fetch.
+///
+/// When set, the fetch path will attempt EC-based reconstruction
+/// if the normal chunk fetch fails. Only available when the `ec`
+/// feature is enabled.
+#[cfg(feature = "ec")]
+pub(crate) struct EcRecoveryParams {
+    /// The EC decoder for reconstructing missing data shards.
+    pub decoder: Arc<dyn oceanfs_ec::Decoder>,
+    /// Number of data shards (k).
+    pub data_shards: u8,
+    /// Number of parity shards (m).
+    pub parity_shards: u8,
+}
+
+#[cfg(feature = "ec")]
+impl EcRecoveryParams {
+    /// Decodes available shards to recover missing data shards.
+    ///
+    /// This is the fetch-module counterpart to
+    /// [`ReadCoordinator::decode_ec_shards`] — it uses the same
+    /// underlying decoder but is accessible from the fetch pipeline
+    /// without a coordinator reference.
+    ///
+    /// `available_shards` must have length `data_shards + parity_shards`.
+    /// `None` entries indicate missing shards. At least `data_shards`
+    /// entries must be `Some`.
+    pub(crate) fn decode_shards(&self, available_shards: &[Option<&[u8]>]) -> Result<Vec<Vec<u8>>> {
+        self.decoder
+            .decode(available_shards, self.data_shards, self.parity_shards)
+            .map_err(|e| Error::Internal(format!("EC decode failed: {e}")))
+    }
+}
 
 /// Fetches blob data from segments identified by chunk references.
 ///
@@ -35,6 +75,9 @@ use crate::{
 /// When the local reader is absent or fails, the function falls back
 /// to gRPC `FetchShard` calls to remote replicas (if `pool` and
 /// `membership` are provided).
+///
+/// If `ec_params` is provided and a chunk fetch fails, the function
+/// will attempt EC-based reconstruction using parity shards.
 ///
 /// # Errors
 ///
@@ -46,10 +89,12 @@ pub(crate) async fn fetch_chunks(
     timeout_ms: u64,
     segment_reader: Option<&Arc<dyn SegmentReader>>,
 ) -> Result<Vec<Bytes>> {
-    fetch_chunks_inner(ring, metadata, timeout_ms, segment_reader, None, None).await
+    fetch_chunks_inner(ring, metadata, timeout_ms, segment_reader, None, None, None, true, None)
+        .await
 }
 
 /// Internal version that accepts optional gRPC dependencies.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetch_chunks_with_grpc(
     ring: &Arc<RingCache>,
     metadata: &ObjectMetadata,
@@ -57,11 +102,63 @@ pub(crate) async fn fetch_chunks_with_grpc(
     segment_reader: Option<&Arc<dyn SegmentReader>>,
     pool: Option<&Arc<ConnectionPool>>,
     membership: Option<&Arc<Membership>>,
+    parallel_fetch: bool,
+    stripe_semaphore: Option<&Arc<Semaphore>>,
 ) -> Result<Vec<Bytes>> {
-    fetch_chunks_inner(ring, metadata, timeout_ms, segment_reader, pool, membership).await
+    fetch_chunks_inner(
+        ring,
+        metadata,
+        timeout_ms,
+        segment_reader,
+        pool,
+        membership,
+        None,
+        parallel_fetch,
+        stripe_semaphore,
+    )
+    .await
 }
 
-/// Internal implementation that supports both local and gRPC fetch.
+/// Fetches chunk data with optional EC recovery support.
+///
+/// When `ec_params` is provided and the EC feature is enabled,
+/// the fetch path will attempt EC-based shard reconstruction
+/// as a fallback if normal chunk fetch fails.
+#[cfg(feature = "ec")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fetch_chunks_with_ec(
+    ring: &Arc<RingCache>,
+    metadata: &ObjectMetadata,
+    timeout_ms: u64,
+    segment_reader: Option<&Arc<dyn SegmentReader>>,
+    pool: Option<&Arc<ConnectionPool>>,
+    membership: Option<&Arc<Membership>>,
+    ec_params: &EcRecoveryParams,
+    parallel_fetch: bool,
+    stripe_semaphore: Option<&Arc<Semaphore>>,
+) -> Result<Vec<Bytes>> {
+    fetch_chunks_inner(
+        ring,
+        metadata,
+        timeout_ms,
+        segment_reader,
+        pool,
+        membership,
+        Some(ec_params),
+        parallel_fetch,
+        stripe_semaphore,
+    )
+    .await
+}
+
+/// Internal implementation that supports both local and gRPC fetch,
+/// plus optional EC recovery, concurrency control, and fetch strategy.
+///
+/// - `parallel_fetch`: when `false`, chunks are fetched sequentially
+///   (one at a time) instead of in parallel via `FuturesUnordered`.
+/// - `stripe_semaphore`: when set, EC recovery tasks acquire a permit
+///   before decoding, bounding concurrent EC work per perf §2.7/8.5.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_chunks_inner(
     ring: &Arc<RingCache>,
     metadata: &ObjectMetadata,
@@ -69,6 +166,9 @@ async fn fetch_chunks_inner(
     segment_reader: Option<&Arc<dyn SegmentReader>>,
     pool: Option<&Arc<ConnectionPool>>,
     membership: Option<&Arc<Membership>>,
+    #[cfg_attr(not(feature = "ec"), allow(unused_variables))] ec_params: Option<&EcRecoveryParams>,
+    parallel_fetch: bool,
+    stripe_semaphore: Option<&Arc<Semaphore>>,
 ) -> Result<Vec<Bytes>> {
     if metadata.is_inline() {
         if let Some(ref data) = metadata.inline_data {
@@ -81,14 +181,41 @@ async fn fetch_chunks_inner(
         return Ok(vec![]);
     }
 
-    fetch_all_chunks_parallel(ring, &metadata.chunks, timeout_ms, segment_reader, pool, membership)
+    if parallel_fetch {
+        fetch_all_chunks_parallel(
+            ring,
+            &metadata.chunks,
+            timeout_ms,
+            segment_reader,
+            pool,
+            membership,
+            ec_params,
+            stripe_semaphore,
+        )
         .await
+    } else {
+        fetch_all_chunks_serial(
+            ring,
+            &metadata.chunks,
+            timeout_ms,
+            segment_reader,
+            pool,
+            membership,
+            ec_params,
+            stripe_semaphore,
+        )
+        .await
+    }
 }
 
 /// Fetches all chunk data in parallel using `FuturesUnordered`.
 ///
 /// Each chunk is fetched independently with its own timeout. Results are
 /// collected as they complete and ordered by chunk index.
+///
+/// When `ec_params` is provided, each chunk fetch will attempt EC recovery
+/// as a fallback if the normal fetch path fails.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_all_chunks_parallel(
     ring: &Arc<RingCache>,
     chunks: &[ChunkRef],
@@ -96,10 +223,21 @@ async fn fetch_all_chunks_parallel(
     segment_reader: Option<&Arc<dyn SegmentReader>>,
     pool: Option<&Arc<ConnectionPool>>,
     membership: Option<&Arc<Membership>>,
+    ec_params: Option<&EcRecoveryParams>,
+    stripe_semaphore: Option<&Arc<Semaphore>>,
 ) -> Result<Vec<Bytes>> {
     let chunk_count = chunks.len();
 
     // Spawn a fetch future per chunk in FuturesUnordered.
+    let ec_params_arc = ec_params.map(|p| {
+        Arc::new(EcRecoveryParams {
+            decoder: Arc::clone(&p.decoder),
+            data_shards: p.data_shards,
+            parity_shards: p.parity_shards,
+        })
+    });
+    let sem = stripe_semaphore.cloned();
+
     let mut futs: FuturesUnordered<_> = chunks
         .iter()
         .enumerate()
@@ -109,6 +247,8 @@ async fn fetch_all_chunks_parallel(
             let segment_reader = segment_reader.cloned();
             let pool = pool.cloned();
             let membership = membership.cloned();
+            let ec = ec_params_arc.clone();
+            let sem = sem.clone();
             async move {
                 let result = fetch_single_chunk(
                     &ring,
@@ -117,6 +257,8 @@ async fn fetch_all_chunks_parallel(
                     segment_reader.as_ref(),
                     pool.as_ref(),
                     membership.as_ref(),
+                    ec.as_ref(),
+                    sem.as_ref(),
                 )
                 .await;
                 (idx, result)
@@ -152,14 +294,65 @@ async fn fetch_all_chunks_parallel(
     Ok(chunk_data.into_iter().map(|d| d.unwrap()).collect())
 }
 
-/// Fetches a single chunk from the local segment reader or via gRPC fallback.
-async fn fetch_single_chunk(
+/// Fetches all chunks sequentially (one at a time).
+///
+/// Used when `ReadTuningConfig::parallel_fetch = false`. Each chunk is
+/// fetched, then the next one starts. The semaphore (if set) bounds EC
+/// recovery concurrency.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_all_chunks_serial(
     ring: &Arc<RingCache>,
-    chunk: &ChunkRef,
-    _timeout_ms: u64,
+    chunks: &[ChunkRef],
+    timeout_ms: u64,
     segment_reader: Option<&Arc<dyn SegmentReader>>,
     pool: Option<&Arc<ConnectionPool>>,
     membership: Option<&Arc<Membership>>,
+    ec_params: Option<&EcRecoveryParams>,
+    stripe_semaphore: Option<&Arc<Semaphore>>,
+) -> Result<Vec<Bytes>> {
+    let ec_params_arc = ec_params.map(|p| {
+        Arc::new(EcRecoveryParams {
+            decoder: Arc::clone(&p.decoder),
+            data_shards: p.data_shards,
+            parity_shards: p.parity_shards,
+        })
+    });
+    let sem = stripe_semaphore.cloned();
+
+    let mut results = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let result = fetch_single_chunk(
+            ring,
+            chunk,
+            timeout_ms,
+            segment_reader,
+            pool,
+            membership,
+            ec_params_arc.as_ref(),
+            sem.as_ref(),
+        )
+        .await?;
+        results.push(result);
+    }
+    Ok(results)
+}
+
+/// Fetches a single chunk from the local segment reader or via gRPC fallback.
+///
+/// When `ec_params` is set and the EC feature is enabled, attempts
+/// EC-based shard reconstruction if the normal fetch path fails.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_single_chunk(
+    ring: &Arc<RingCache>,
+    chunk: &ChunkRef,
+    timeout_ms: u64,
+    segment_reader: Option<&Arc<dyn SegmentReader>>,
+    pool: Option<&Arc<ConnectionPool>>,
+    membership: Option<&Arc<Membership>>,
+    #[cfg_attr(not(feature = "ec"), allow(unused_variables))] ec_params: Option<
+        &Arc<EcRecoveryParams>,
+    >,
+    stripe_semaphore: Option<&Arc<Semaphore>>,
 ) -> Result<Bytes> {
     // Fast path: local segment reader.
     if let Some(reader) = segment_reader {
@@ -188,6 +381,28 @@ async fn fetch_single_chunk(
     let replica_set = ring.lookup(segment_hash.as_bytes());
 
     if replica_set.is_empty() {
+        // If no replicas but EC recovery is available, try it before giving up.
+        #[cfg(feature = "ec")]
+        {
+            if let Some(params) = ec_params {
+                if let Some(reader) = segment_reader {
+                    if let Ok(data) = try_ec_recovery_for_chunk(
+                        reader,
+                        chunk,
+                        params,
+                        ring,
+                        pool,
+                        membership,
+                        timeout_ms,
+                        stripe_semaphore,
+                    )
+                    .await
+                    {
+                        return Ok(data);
+                    }
+                }
+            }
+        }
         return Err(Error::Routing(format!(
             "no replicas for segment {} and no local reader",
             chunk.segment_id
@@ -223,10 +438,16 @@ async fn fetch_single_chunk(
                 length: chunk.length as u64,
             });
 
-            match client.fetch_shard(request).await {
-                Ok(response) => {
+            let fetch_result = tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms),
+                client.fetch_shard(request),
+            )
+            .await;
+
+            match fetch_result {
+                Ok(Ok(response)) => {
                     let mut stream = response.into_inner();
-                    let mut data = Vec::new();
+                    let mut data = BytesMut::new();
                     while let Some(chunk_result) = stream.message().await.unwrap_or(None) {
                         if chunk_result.data.is_empty() {
                             break; // EOF sentinel
@@ -240,15 +461,59 @@ async fn fetch_single_chunk(
                             bytes = data.len(),
                             "chunk fetched via gRPC from replica"
                         );
-                        return Ok(Bytes::from(data));
+                        return Ok(data.freeze());
                     }
                 }
-                Err(status) => {
+                Ok(Err(status)) => {
                     debug!(
                         replica = %replica,
                         error = %status,
                         "gRPC fetch failed for replica"
                     );
+                }
+                Err(_elapsed) => {
+                    debug!(
+                        replica = %replica,
+                        timeout_ms,
+                        "gRPC fetch timed out for replica"
+                    );
+                }
+            }
+        }
+    }
+
+    // EC recovery fallback: attempt shard-level reconstruction.
+    #[cfg(feature = "ec")]
+    {
+        if let Some(params) = ec_params {
+            if let Some(reader) = segment_reader {
+                match try_ec_recovery_for_chunk(
+                    reader,
+                    chunk,
+                    params,
+                    ring,
+                    pool,
+                    membership,
+                    timeout_ms,
+                    stripe_semaphore,
+                )
+                .await
+                {
+                    Ok(data) => {
+                        debug!(
+                            segment_id = %chunk.segment_id,
+                            bytes = data.len(),
+                            "chunk recovered via EC decode"
+                        );
+                        return Ok(data);
+                    }
+                    Err(e) => {
+                        warn!(
+                            segment_id = %chunk.segment_id,
+                            error = %e,
+                            "EC recovery attempt failed"
+                        );
+                    }
                 }
             }
         }
@@ -259,6 +524,269 @@ async fn fetch_single_chunk(
         "cannot fetch chunk {} — no segment reader and gRPC not available",
         chunk.segment_id
     )))
+}
+
+/// Fetches a single parity shard from a remote replica via gRPC
+/// `FetchShard`.
+///
+/// Uses the ring to find replicas for the segment and tries each
+/// replica in order. The `shard_index` parameter must be in the
+/// parity range (k..k+m-1) to request a parity shard.
+///
+/// Each gRPC call is wrapped in a timeout of `timeout_ms`
+/// milliseconds to satisfy perf §8.2.
+///
+/// Only compiled when the `ec` feature is enabled.
+#[cfg(feature = "ec")]
+async fn fetch_parity_shard_via_grpc(
+    ring: &Arc<RingCache>,
+    chunk: &ChunkRef,
+    shard_index: u32,
+    shard_size: u64,
+    pool: &Arc<ConnectionPool>,
+    membership: &Arc<Membership>,
+    timeout_ms: u64,
+) -> Result<Bytes> {
+    let segment_hash = blake3::hash(chunk.segment_id.to_string().as_bytes());
+    let replica_set = ring.lookup(segment_hash.as_bytes());
+
+    for replica in &replica_set {
+        let addr = match membership.address_of(replica) {
+            Some(a) => a,
+            None => continue,
+        };
+        let pooled = match pool.get_channel(addr).await {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let channel = pooled.channel().clone();
+        drop(pooled);
+
+        let proto_sid = chunk.segment_id.into();
+        let mut client = SegmentRpcClient::new(channel);
+        let request = tonic::Request::new(GprcFetchShardRequest {
+            segment_id: Some(proto_sid),
+            shard_index,
+            offset: 0,
+            length: shard_size,
+        });
+
+        let fetch_result = tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            client.fetch_shard(request),
+        )
+        .await;
+
+        match fetch_result {
+            Ok(Ok(response)) => {
+                let mut stream = response.into_inner();
+                let mut data = BytesMut::with_capacity(shard_size as usize);
+                while let Some(chunk_result) = stream.message().await.unwrap_or(None) {
+                    if chunk_result.data.is_empty() {
+                        break;
+                    }
+                    data.extend_from_slice(&chunk_result.data);
+                }
+                if !data.is_empty() {
+                    debug!(
+                        segment_id = %chunk.segment_id,
+                        shard_index,
+                        bytes = data.len(),
+                        "parity shard fetched via gRPC"
+                    );
+                    return Ok(data.freeze());
+                }
+            }
+            Ok(Err(status)) => {
+                debug!(
+                    replica = %replica,
+                    shard_index,
+                    error = %status,
+                    "gRPC parity shard fetch failed"
+                );
+            }
+            Err(_elapsed) => {
+                debug!(
+                    replica = %replica,
+                    shard_index,
+                    timeout_ms,
+                    "gRPC parity shard fetch timed out"
+                );
+            }
+        }
+    }
+
+    Err(Error::Internal(format!(
+        "cannot fetch parity shard {shard_index} for segment {} — no replica responded",
+        chunk.segment_id
+    )))
+}
+
+/// Attempts EC-based reconstruction for a chunk when the normal fetch
+/// path fails.
+///
+/// First tries to read the full segment from the local segment reader.
+/// When `pool` and `membership` are provided, additionally attempts to
+/// fetch individual parity shards from remote replicas via per-shard
+/// gRPC `FetchShard` calls (using `shard_index` values k..k+m-1).
+///
+/// Splits the segment into `k` data shards and `m` parity shards, and
+/// uses EC decoding to reconstruct any data shard that appears to be
+/// missing or corrupted.
+///
+/// Only compiled when the `ec` feature is enabled.
+#[cfg(feature = "ec")]
+#[allow(clippy::too_many_arguments)]
+async fn try_ec_recovery_for_chunk(
+    reader: &Arc<dyn SegmentReader>,
+    chunk: &ChunkRef,
+    params: &Arc<EcRecoveryParams>,
+    ring: &Arc<RingCache>,
+    pool: Option<&Arc<ConnectionPool>>,
+    membership: Option<&Arc<Membership>>,
+    timeout_ms: u64,
+    stripe_semaphore: Option<&Arc<Semaphore>>,
+) -> Result<Bytes> {
+    let k = params.data_shards as usize;
+    let m = params.parity_shards as usize;
+    let total_shards = k + m;
+
+    if total_shards == 0 {
+        return Err(Error::Internal("EC codec shard count is zero".into()));
+    }
+
+    // Read the full segment (offset 0, length = max). The
+    // SegmentReader implementation is expected to return the full
+    // segment data.
+    let segment_data = reader.read_chunk(&chunk.segment_id, 0, u32::MAX).map_err(|e| {
+        Error::Internal(format!(
+            "EC recovery: failed to read full segment {}: {e}",
+            chunk.segment_id
+        ))
+    })?;
+
+    if segment_data.len() < total_shards {
+        return Err(Error::Internal(format!(
+            "EC recovery: segment {} too small ({} bytes, need {} shards)",
+            chunk.segment_id,
+            segment_data.len(),
+            total_shards
+        )));
+    }
+
+    let shard_size = segment_data.len() / total_shards;
+    if shard_size == 0 {
+        return Err(Error::Internal("EC recovery: computed shard size is zero".into()));
+    }
+
+    // Determine which data shards the chunk spans.
+    let chunk_start = chunk.offset as usize;
+    let chunk_len = chunk.length as usize;
+    let chunk_end = chunk_start.saturating_add(chunk_len);
+    let first_shard = chunk_start / shard_size;
+    let last_shard = (chunk_end.saturating_sub(1)) / shard_size;
+
+    if first_shard >= k || last_shard >= k {
+        return Err(Error::Internal(format!(
+            "EC recovery: chunk spans parity shards (shards {first_shard}..{last_shard})"
+        )));
+    }
+
+    // Check if the first shard of the chunk is corrupted (all zeros).
+    let first_shard_start = first_shard * shard_size;
+    let first_shard_slice = &segment_data[first_shard_start..first_shard_start + shard_size];
+    let is_shard_corrupted = first_shard_slice.iter().all(|&b| b == 0);
+
+    // If the target shard is intact, read directly from the segment.
+    if !is_shard_corrupted {
+        let mut result = BytesMut::with_capacity(chunk_len);
+        for shard_idx in first_shard..=last_shard {
+            let s_start = shard_idx * shard_size;
+            let slice_start = if shard_idx == first_shard { chunk_start - s_start } else { 0 };
+            let slice_end = if shard_idx == last_shard {
+                (chunk_end - s_start).min(shard_size)
+            } else {
+                shard_size
+            };
+            result.extend_from_slice(&segment_data[s_start + slice_start..s_start + slice_end]);
+        }
+        return Ok(result.freeze());
+    }
+
+    // Data shard appears corrupted — use EC decode to reconstruct.
+    let mut available: Vec<Option<&[u8]>> = Vec::with_capacity(total_shards);
+
+    // Data shards (0..k): mark the corrupted shards as missing.
+    // We only know that the first shard we checked is corrupted; if the
+    // chunk spans multiple shards, mark only those as missing.
+    for i in 0..k {
+        let start = i * shard_size;
+        let end = start + shard_size;
+        if i >= first_shard && i <= last_shard && segment_data[start..end].iter().all(|&b| b == 0) {
+            available.push(None);
+        } else {
+            available.push(Some(&segment_data[start..end]));
+        }
+    }
+
+    // Parity shards (k..k+m): try gRPC fetch first, fall back to local.
+    // We hold fetched parity data in an owned Vec so it outlives the
+    // borrows passed to decode_shards.
+    let mut fetched_parity: Vec<Bytes> = Vec::with_capacity(m);
+    if let (Some(pool), Some(membership)) = (pool, membership) {
+        for i in 0..m {
+            let shard_idx = (k + i) as u32;
+            let parity_data = fetch_parity_shard_via_grpc(
+                ring,
+                chunk,
+                shard_idx,
+                shard_size as u64,
+                pool,
+                membership,
+                timeout_ms,
+            )
+            .await?;
+            fetched_parity.push(parity_data);
+        }
+        for p in &fetched_parity {
+            available.push(Some(p.as_ref()));
+        }
+    } else {
+        for i in 0..m {
+            let start = (k + i) * shard_size;
+            let end = start + shard_size;
+            available.push(Some(&segment_data[start..end]));
+        }
+    }
+
+    // Acquire the stripe-parallelism semaphore before the CPU-intensive
+    // EC decode, bounding concurrent decode tasks (perf §2.7, §8.5).
+    let _decode_permit = if let Some(sem) = stripe_semaphore {
+        Some(Arc::clone(sem).acquire_owned().await)
+    } else {
+        None
+    };
+
+    let recovered = params.decode_shards(&available)?;
+
+    // Extract the chunk from the recovered data shards (may span multiple).
+    let mut result = BytesMut::with_capacity(chunk_len);
+    for shard_idx in first_shard..=last_shard {
+        let rec = recovered.get(shard_idx).ok_or_else(|| {
+            Error::Internal("EC decode: recovered shard index out of bounds".into())
+        })?;
+        let slice_start =
+            if shard_idx == first_shard { chunk_start - (shard_idx * shard_size) } else { 0 };
+        let slice_end = if shard_idx == last_shard {
+            (chunk_end - (shard_idx * shard_size)).min(shard_size)
+        } else {
+            shard_size
+        };
+        result.extend_from_slice(rec.get(slice_start..slice_end).ok_or_else(|| {
+            Error::Internal("EC recovery: chunk range out of recovered bounds".into())
+        })?);
+    }
+    Ok(result.freeze())
 }
 
 #[cfg(test)]
@@ -357,5 +885,173 @@ mod tests {
         let mut ring = Ring::new(RingConfig::default());
         ring.add_node(NodeId::new("n1"));
         Arc::new(RingCache::new(ring))
+    }
+
+    // ── EC Decode Tests ───────────────────────────────────────────
+
+    #[cfg(feature = "ec")]
+    mod ec_tests {
+        use oceanfs_core::CodecConfig;
+        use oceanfs_ec::{CauchyEncoder, Decoder, Encoder};
+
+        use super::*;
+        use crate::read::{coordinator::InMemorySegmentReader, fetch::EcRecoveryParams};
+
+        fn make_ec_params() -> Arc<EcRecoveryParams> {
+            let decoder: Arc<dyn Decoder> = Arc::new(CauchyEncoder::new(CodecConfig {
+                data_shards: 4,
+                parity_shards: 2,
+                ..Default::default()
+            }));
+            Arc::new(EcRecoveryParams { decoder, data_shards: 4, parity_shards: 2 })
+        }
+
+        fn make_ring_for_ec() -> Arc<RingCache> {
+            let mut ring = Ring::new(RingConfig::default());
+            ring.add_node(NodeId::new("n1"));
+            Arc::new(RingCache::new(ring))
+        }
+
+        /// Convenience: build an EC(4,2)-encoded segment from 4 equal-size
+        /// data shards, returning (data_shards, parity_shards, full_segment).
+        fn encode_ec_segment(data: &[Vec<u8>; 4]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<u8>) {
+            let data_refs: [&[u8]; 4] = [&data[0], &data[1], &data[2], &data[3]];
+            let shard_size = data[0].len();
+            let encoder = CauchyEncoder::new(CodecConfig {
+                data_shards: 4,
+                parity_shards: 2,
+                strip_size_bytes: shard_size,
+                ..Default::default()
+            });
+            let parity = encoder.encode(&data_refs, 2).unwrap();
+            let mut segment = Vec::with_capacity(6 * shard_size);
+            for s in data {
+                segment.extend_from_slice(s);
+            }
+            for p in &parity {
+                segment.extend_from_slice(p);
+            }
+            (data.to_vec(), parity, segment)
+        }
+
+        /// `EcRecoveryParams::decode_shards` recovers missing shards.
+        #[test]
+        fn ec_params_decode_shards_recovers_missing_data() {
+            let params = make_ec_params();
+            let shard = vec![0xAAu8; 16];
+            let available: Vec<Option<&[u8]>> = vec![
+                None,         // shard 0 missing
+                Some(&shard), // shard 1
+                Some(&shard), // shard 2
+                Some(&shard), // shard 3
+                Some(&shard), // parity 0
+                Some(&shard), // parity 1
+            ];
+            let recovered = params.decode_shards(&available).unwrap();
+            assert_eq!(recovered.len(), 4);
+            assert_eq!(recovered[0].len(), 16);
+        }
+
+        /// `EcRecoveryParams::decode_shards` errors with too few shards.
+        #[test]
+        fn ec_params_decode_shards_errors_on_too_few_shards() {
+            let params = make_ec_params();
+            let shard = vec![0xBBu8; 16];
+            let available: Vec<Option<&[u8]>> = vec![
+                None,
+                None,
+                None, // 3 missing → only 3 available
+                Some(&shard),
+                Some(&shard),
+                Some(&shard),
+            ];
+            let result = params.decode_shards(&available);
+            assert!(result.is_err());
+        }
+
+        /// `try_ec_recovery_for_chunk` recovers a corrupted data shard
+        /// by reading the full segment, detecting the all-zeros shard,
+        /// and reconstructing via EC decode.
+        #[tokio::test]
+        async fn try_ec_recovery_recovers_corrupted_shard() {
+            let data: [Vec<u8>; 4] = [
+                b"DATA_SHARD_0____".to_vec(),
+                b"DATA_SHARD_1____".to_vec(),
+                b"DATA_SHARD_2____".to_vec(),
+                b"DATA_SHARD_3____".to_vec(),
+            ];
+            let (original_data, _parity, mut segment) = encode_ec_segment(&data);
+
+            // Zero out shard 0 to simulate corruption.
+            let shard_len = data[0].len();
+            for b in &mut segment[0..shard_len] {
+                *b = 0;
+            }
+
+            let seg_id = SegmentId::new();
+            let reader = Arc::new(InMemorySegmentReader::new());
+            reader.put(seg_id, Bytes::from(segment));
+            let reader: Arc<dyn SegmentReader> = reader;
+            let ring = make_ring_for_ec();
+            let params = make_ec_params();
+
+            // Chunk is the first 8 bytes of shard 0 (offset 0, length 8).
+            let chunk = ChunkRef { segment_id: seg_id, offset: 0, length: 8 };
+
+            let recovered =
+                try_ec_recovery_for_chunk(&reader, &chunk, &params, &ring, None, None, 5000, None)
+                    .await
+                    .unwrap();
+
+            // Should recover the original shard 0 data.
+            assert_eq!(&recovered[..], &original_data[0][0..8]);
+        }
+
+        /// `try_ec_recovery_for_chunk` succeeds when the target shard
+        /// is intact (no EC decode needed) — fast path.
+        #[tokio::test]
+        async fn try_ec_recovery_intact_shard_reads_directly() {
+            let data: [Vec<u8>; 4] = [
+                b"INTACT_SHARD_0__".to_vec(),
+                b"INTACT_SHARD_1__".to_vec(),
+                b"INTACT_SHARD_2__".to_vec(),
+                b"INTACT_SHARD_3__".to_vec(),
+            ];
+            let (original_data, _parity, segment) = encode_ec_segment(&data);
+
+            let seg_id = SegmentId::new();
+            let reader = Arc::new(InMemorySegmentReader::new());
+            reader.put(seg_id, Bytes::from(segment));
+            let reader: Arc<dyn SegmentReader> = reader;
+            let ring = make_ring_for_ec();
+            let params = make_ec_params();
+
+            // Chunk at offset 0, length 8 (normal, no corruption).
+            let chunk = ChunkRef { segment_id: seg_id, offset: 0, length: 8 };
+
+            let recovered =
+                try_ec_recovery_for_chunk(&reader, &chunk, &params, &ring, None, None, 5000, None)
+                    .await
+                    .unwrap();
+
+            assert_eq!(&recovered[..], &original_data[0][0..8]);
+        }
+
+        /// `try_ec_recovery_for_chunk` errors when segment is too small.
+        #[tokio::test]
+        async fn try_ec_recovery_errors_on_too_small_segment() {
+            let seg_id = SegmentId::new();
+            let reader = Arc::new(InMemorySegmentReader::new());
+            reader.put(seg_id, Bytes::from_static(b"tiny"));
+            let reader: Arc<dyn SegmentReader> = reader;
+            let ring = make_ring_for_ec();
+            let params = make_ec_params();
+            let chunk = ChunkRef { segment_id: seg_id, offset: 0, length: 8 };
+
+            let result =
+                try_ec_recovery_for_chunk(&reader, &chunk, &params, &ring, None, None, 5000, None)
+                    .await;
+            assert!(result.is_err());
+        }
     }
 }

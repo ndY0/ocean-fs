@@ -79,6 +79,8 @@ async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
     };
     let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
 
+    let hinted_handoff = Arc::new(oceanfs_durability::HintedHandoff::new());
+
     WriteCoordinator::new(
         ring_cache,
         membership,
@@ -92,6 +94,7 @@ async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
         segment_pool_small,
         segment_pool_standard,
         sealer,
+        hinted_handoff,
     )
 }
 

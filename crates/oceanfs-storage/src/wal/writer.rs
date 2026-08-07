@@ -9,6 +9,7 @@
 use std::{
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use oceanfs_core::{Counter, LabelSet, WalConfig};
@@ -32,15 +33,15 @@ use crate::{
 /// # async fn main() {
 /// let config = WalConfig::default();
 /// let writer = WalWriter::open(&config).await.unwrap();
-/// let entry = WalEntry::new(SegmentId::new(), 0, 100, HashOutput::from_bytes([0u8; 32]));
+/// let entry = WalEntry::new(SegmentId::new(), 0, 3, 0, 0, HashOutput::from_bytes([0u8; 32]), vec![1,2,3]);
 /// let _position = writer.append(entry).await.unwrap();
 /// # }
 /// ```
 pub struct WalWriter {
     /// WAL configuration.
     config: WalConfig,
-    /// Current WAL file handle.
-    file: Mutex<std::fs::File>,
+    /// Current WAL file handle (shared with sync group for true fsync).
+    file: Arc<Mutex<std::fs::File>>,
     /// Current file sequence number.
     file_seq: Mutex<u64>,
     /// Current byte position within the current file.
@@ -71,13 +72,17 @@ impl WalWriter {
         // Find the highest existing WAL file number.
         let (file_seq, file, existing_size) = Self::find_latest_file(config).await?;
 
+        let file = Arc::new(Mutex::new(file));
+
+        let sync_group = Self::create_sync_group(config, file.clone());
+
         let writer = Self {
             config: config.clone(),
-            file: Mutex::new(file),
+            file,
             file_seq: Mutex::new(file_seq),
             position: Mutex::new(existing_size),
             global_position: Mutex::new(existing_size),
-            sync_group: Self::create_sync_group(config),
+            sync_group,
             bytes_written_total: Counter::new(
                 "wal_bytes_written_total".into(),
                 "Bytes written to WAL".into(),
@@ -239,13 +244,28 @@ impl WalWriter {
         Ok((max_seq, file, existing_size))
     }
 
-    fn create_sync_group(config: &WalConfig) -> WalSyncGroup {
-        // For now, the sync group just ensures data is flushed.
-        // In a real implementation, this would call fsync/fdatasync.
+    fn create_sync_group(config: &WalConfig, file: Arc<Mutex<std::fs::File>>) -> WalSyncGroup {
+        // True group commit: the closure calls sync_all() on the current
+        // WAL file, so all pending entries in the batch are flushed to
+        // durable storage in a single fsync call.
+        // The Arc<Mutex<File>> is shared with the WalWriter — when the
+        // file is rotated, the mutex contents are replaced atomically
+        // and the next batch syncs the new file.
         WalSyncGroup::new(
-            || {
-                // No-op for in-memory tests; real fsync happens in append's flush().
-                Ok(())
+            move || {
+                // Blocking fsync on the current file.
+                // The flusher task runs on a tokio worker thread.
+                if let Ok(file) = file.try_lock() {
+                    file.sync_all().map_err(|e| {
+                        crate::error::Error::Io(std::io::Error::new(
+                            e.kind(),
+                            format!("WAL fsync failed: {e}"),
+                        ))
+                    })
+                } else {
+                    // File is locked by a write — try again next batch.
+                    Ok(())
+                }
             },
             config.fsync_batch_timeout_ms,
         )
@@ -269,7 +289,15 @@ mod tests {
     }
 
     fn make_entry(offset: u64, length: u32) -> WalEntry {
-        WalEntry::new(SegmentId::new(), offset, length, HashOutput::from_bytes([0u8; 32]))
+        WalEntry::new(
+            SegmentId::new(),
+            offset,
+            length,
+            0,
+            0,
+            HashOutput::from_bytes([0u8; 32]),
+            vec![0u8; length as usize],
+        )
     }
 
     #[tokio::test]

@@ -1,7 +1,8 @@
 //! WAL reader — replay entries on node restart.
 //!
-//! Scans all WAL files in sequence, deserializes entries, and yields
-//! them in order. Used to rebuild unsealed active segments after a crash.
+//! Scans all WAL files in sequence, deserializes variable-length entries
+//! (80-byte header + inline data), and yields them in order. Used to
+//! rebuild unsealed active segments after a crash.
 
 use std::{io::Read, path::PathBuf};
 
@@ -14,10 +15,13 @@ use crate::{error::Result, wal::entry::WalEntry};
 /// Uses the standard library's synchronous I/O because WAL replay
 /// happens during startup, before the async runtime is fully active.
 ///
+/// Each WAL entry is stored as an 80-byte header followed by `length`
+/// bytes of inline data. The reader reads both and assembles full
+/// [`WalEntry`] values for the caller.
+///
 /// # Examples
 ///
 /// ```ignore
-/// // WalReader requires WAL files on disk; examples are in unit tests.
 /// use oceanfs_core::WalConfig;
 /// use oceanfs_storage::wal::WalReader;
 ///
@@ -54,16 +58,15 @@ impl WalReader {
             }
         }
 
-        // Sort by filename for sequential replay.
         files.sort();
-
         Ok(Self { files })
     }
 
     /// Replays all WAL entries from all files.
     ///
-    /// Returns an iterator over entries. Invalid entries (wrong magic,
-    /// CRC failure) are silently skipped and logged.
+    /// Returns an iterator over full entries (header + data). Invalid
+    /// entries (wrong magic, CRC failure, truncated data) are silently
+    /// skipped and logged.
     pub fn replay(&self) -> impl Iterator<Item = Result<WalEntry>> + '_ {
         WalReplayIter { file_paths: &self.files, current_reader: None }
     }
@@ -79,21 +82,45 @@ impl Iterator for WalReplayIter<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            // Try to read from the current file.
             if let Some(ref mut reader) = self.current_reader {
-                let entry_size = WalEntry::serialized_size();
-                let mut buf = vec![0u8; entry_size];
+                // Read the 80-byte header.
+                let header_size = WalEntry::header_size();
+                let mut header_buf = vec![0u8; header_size];
 
-                match reader.read_exact(&mut buf) {
-                    Ok(()) => match WalEntry::from_bytes(&buf) {
-                        Some(entry) if entry.verify_crc() => {
-                            return Some(Ok(entry));
+                match reader.read_exact(&mut header_buf) {
+                    Ok(()) => {
+                        // Parse the header.
+                        let parsed = match WalEntry::from_header_bytes(&header_buf) {
+                            Some(e) => e,
+                            None => {
+                                tracing::warn!("corrupted WAL entry header skipped");
+                                continue;
+                            }
+                        };
+
+                        // Read the inline data.
+                        let data_len = parsed.length as usize;
+                        let mut data_buf = vec![0u8; data_len];
+                        if let Err(e) = reader.read_exact(&mut data_buf) {
+                            tracing::warn!("truncated WAL entry data: {e}");
+                            return Some(Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                e,
+                            )
+                            .into()));
                         }
-                        _ => {
-                            tracing::warn!("corrupted WAL entry skipped");
+
+                        // Assemble full entry.
+                        let mut entry = parsed;
+                        entry.data = data_buf;
+
+                        if !entry.verify_crc() {
+                            tracing::warn!("WAL entry CRC mismatch skipped");
                             continue;
                         }
-                    },
+
+                        return Some(Ok(entry));
+                    }
                     Err(_) => {
                         // End of file or read error — advance to next file.
                     }
@@ -126,15 +153,22 @@ mod tests {
     use super::*;
     use crate::wal::writer::WalWriter;
 
+    fn make_test_entry(segment_id: SegmentId, offset: u64, length: u32, i: u8) -> WalEntry {
+        WalEntry::new(
+            segment_id,
+            offset,
+            length,
+            0,
+            0,
+            HashOutput::from_bytes([i; 32]),
+            vec![i; length as usize],
+        )
+    }
+
     async fn write_entries(config: &WalConfig, count: usize) {
         let writer = WalWriter::open(config).await.unwrap();
         for i in 0..count {
-            let entry = WalEntry::new(
-                SegmentId::new(),
-                (i * 100) as u64,
-                100,
-                HashOutput::from_bytes([i as u8; 32]),
-            );
+            let entry = make_test_entry(SegmentId::new(), (i * 100) as u64, 100, i as u8);
             writer.append(entry).await.unwrap();
         }
     }
@@ -178,25 +212,16 @@ mod tests {
             fsync_batch_timeout_ms: 5,
         };
 
-        // Write 10 entries.
         {
             let writer = WalWriter::open(&config).await.unwrap();
             for i in 0..10 {
-                let entry = WalEntry::new(
-                    SegmentId::new(),
-                    i * 100,
-                    100,
-                    HashOutput::from_bytes([i as u8; 32]),
-                );
+                let entry = make_test_entry(SegmentId::new(), i * 100, 100, i as u8);
                 writer.append(entry).await.unwrap();
             }
-            // Truncate at position of 5th entry.
-            // (Hard to get exact position without tracking, so skip this sub-test for now)
         }
 
         let reader = WalReader::open(&config).unwrap();
         let entries: Vec<_> = reader.replay().collect::<Result<Vec<_>>>().unwrap();
-        // All 10 should be present since we didn't actually truncate here.
         assert_eq!(entries.len(), 10);
     }
 }

@@ -36,6 +36,10 @@ const MAX_PENDING_HINTS: usize = 10_000;
 /// Maximum hints per node to prevent a single node from monopolizing storage.
 const MAX_HINTS_PER_NODE: usize = 1_000;
 
+/// Default TTL for hinted handoff entries in seconds (0 = never expire).
+/// Set to a positive value to enable automatic expiry of stale hints.
+const DEFAULT_HINT_TTL_SECS: u64 = 0;
+
 /// A buffered write intended for a specific node.
 ///
 /// Each hint is keyed by the intended node. When the node returns,
@@ -54,6 +58,8 @@ pub struct HintRecord {
     pub timestamp: Hlc,
     /// The actual blob data to deliver.
     pub data: Vec<u8>,
+    /// Wall-clock time when this hint was stored (for TTL expiry).
+    pub stored_at_secs: u64,
 }
 
 /// Manages hinted handoff storage and delivery.
@@ -78,6 +84,8 @@ pub struct HintedHandoff {
     pool: Arc<ConnectionPool>,
     /// Membership for resolving node addresses.
     membership: Option<Arc<Membership>>,
+    /// TTL for hint entries in seconds (hints older than this are expired).
+    hint_ttl_secs: u64,
     hints_stored_total: Counter,
     hints_delivered_total: Counter,
     hints_expired_total: Counter,
@@ -93,6 +101,7 @@ impl HintedHandoff {
             hints: RwLock::new(HashMap::new()),
             pool,
             membership,
+            hint_ttl_secs: DEFAULT_HINT_TTL_SECS,
             hints_stored_total: Counter::new(
                 "hinted_handoff_hints_stored_total".into(),
                 "Hints stored for unreachable nodes".into(),
@@ -117,6 +126,7 @@ impl HintedHandoff {
             hints: RwLock::new(HashMap::new()),
             pool,
             membership: None,
+            hint_ttl_secs: DEFAULT_HINT_TTL_SECS,
             hints_stored_total: Counter::new(
                 "hinted_handoff_hints_stored_total".into(),
                 "help".into(),
@@ -142,6 +152,7 @@ impl HintedHandoff {
             hints: RwLock::new(HashMap::new()),
             pool: Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default())),
             membership: None,
+            hint_ttl_secs: DEFAULT_HINT_TTL_SECS,
             hints_stored_total: Counter::new(
                 "hinted_handoff_hints_stored_total".into(),
                 "help".into(),
@@ -176,6 +187,9 @@ impl HintedHandoff {
     ///
     /// Returns an error if the hint storage is at capacity.
     pub async fn handoff(&self, intended_for: NodeId, entry: HintRecord) -> Result<()> {
+        // Expire old hints before storing new ones to bound storage growth.
+        self.expire_old_hints();
+
         {
             let hints = self.hints.read();
             let per_node_count = hints.get(&intended_for).map(|v| v.len()).unwrap_or(0);
@@ -229,6 +243,9 @@ impl HintedHandoff {
     ///
     /// Returns an error if delivery fails for all hints.
     pub async fn deliver_pending(&self, node: NodeId) -> Result<usize> {
+        // Expire old hints before delivery to avoid pushing stale data.
+        self.expire_old_hints();
+
         let hints_to_deliver = {
             let hints = self.hints.read();
             hints.get(&node).cloned().unwrap_or_default()
@@ -300,6 +317,59 @@ impl HintedHandoff {
     pub fn with_membership(mut self, membership: Arc<Membership>) -> Self {
         self.membership = Some(membership);
         self
+    }
+
+    /// Returns the configured hint TTL in seconds.
+    pub fn hint_ttl_secs(&self) -> u64 {
+        self.hint_ttl_secs
+    }
+
+    /// Expires hints older than the TTL from all nodes.
+    ///
+    /// Removes expired hints and increments the `hints_expired_total` counter.
+    /// When `hint_ttl_secs` is 0, this is a no-op (hints never expire).
+    pub fn expire_old_hints(&self) -> usize {
+        if self.hint_ttl_secs == 0 {
+            return 0; // Never expire by default.
+        }
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut total_expired = 0usize;
+        let mut empty_nodes: Vec<NodeId> = Vec::new();
+
+        {
+            let mut hints = self.hints.write();
+            for (node, records) in hints.iter_mut() {
+                let before = records.len();
+                records.retain(|hint| {
+                    let age_secs = now_secs.saturating_sub(hint.stored_at_secs);
+                    age_secs < self.hint_ttl_secs
+                });
+                let expired = before - records.len();
+                total_expired += expired;
+                if records.is_empty() {
+                    empty_nodes.push(node.clone());
+                }
+            }
+            // Clean up empty node entries.
+            for node in &empty_nodes {
+                hints.remove(node);
+            }
+        }
+
+        if total_expired > 0 {
+            self.hints_expired_total.add(total_expired as u64);
+            info!(
+                expired = total_expired,
+                ttl_secs = self.hint_ttl_secs,
+                "expired old hinted handoff entries"
+            );
+        }
+
+        total_expired
     }
 
     // ------------------------------------------------------------------
@@ -405,6 +475,7 @@ mod tests {
             length: 100,
             timestamp: Hlc::zero(),
             data: vec![1, 2, 3],
+            stored_at_secs: 0,
         };
 
         hh.handoff(node.clone(), hint).await.unwrap();
@@ -427,6 +498,7 @@ mod tests {
                 length: 50,
                 timestamp: Hlc::zero(),
                 data: vec![1],
+                stored_at_secs: 0,
             },
         )
         .await
@@ -441,6 +513,7 @@ mod tests {
                 length: 50,
                 timestamp: Hlc::zero(),
                 data: vec![2],
+                stored_at_secs: 0,
             },
         )
         .await
@@ -455,6 +528,7 @@ mod tests {
                 length: 200,
                 timestamp: Hlc::zero(),
                 data: vec![3],
+                stored_at_secs: 0,
             },
         )
         .await
@@ -479,6 +553,7 @@ mod tests {
                 length: 100,
                 timestamp: Hlc::zero(),
                 data: vec![1, 2, 3],
+                stored_at_secs: 0,
             },
         )
         .await
@@ -514,6 +589,7 @@ mod tests {
                 length: 42,
                 timestamp: Hlc::zero(),
                 data: vec![1],
+                stored_at_secs: 0,
             },
         )
         .await
@@ -538,6 +614,7 @@ mod tests {
                     length: 10,
                     timestamp: Hlc::zero(),
                     data: vec![i as u8],
+                    stored_at_secs: 0,
                 },
             )
             .await
@@ -556,6 +633,7 @@ mod tests {
                     length: 10,
                     timestamp: Hlc::zero(),
                     data: vec![0],
+                    stored_at_secs: 0,
                 },
             )
             .await;
@@ -578,6 +656,7 @@ mod tests {
             length: 10,
             timestamp: Hlc::zero(),
             data: vec![1, 2, 3],
+            stored_at_secs: 0,
         };
 
         // Store the same hint twice.
@@ -628,6 +707,7 @@ mod tests {
             length: 42,
             timestamp: Hlc::zero(),
             data: vec![9, 8, 7],
+            stored_at_secs: 0,
         };
         hh.handoff(node_id.clone(), hint).await.unwrap();
         assert_eq!(hh.pending_count(&node_id), 1);

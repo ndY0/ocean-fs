@@ -75,3 +75,45 @@ message DeleteObjectRequest {
 message DeleteObjectResponse {
   bool deleted = 1;
 }
+
+// Request to fetch object metadata from a replica for read repair (4.2).
+message GetObjectMetadataRequest {
+  string bucket_id = 1;
+  string object_key = 2;
+}
+
+// Object metadata returned by a replica for read repair comparison.
+message GetObjectMetadataResponse {
+  // Whether the object was found on this replica.
+  bool found = 1;
+  // Object size in bytes.
+  uint64 size = 2;
+  // BLAKE3 hash of the object data (32 bytes, empty if not present).
+  bytes blake3_hash = 3;
+  // HLC timestamp of this object version.
+  oceanfs.common.HlcTimestamp hlc = 4;
+  // Inline data (present for small objects, empty otherwise).
+  bytes inline_data = 5;
+  // Chunk references for segment-stored objects.
+  repeated oceanfs.common.SegmentId chunk_segment_ids = 6;
+  repeated uint64 chunk_offsets = 7;
+  repeated uint32 chunk_lengths = 8;
+}
+
+// Request to push corrected object metadata + data to a stale replica (4.2).
+message PutObjectMetadataRequest {
+  string bucket_id = 1;
+  string object_key = 2;
+  uint64 size = 3;
+  bytes blake3_hash = 4;
+  oceanfs.common.HlcTimestamp hlc = 5;
+  bytes inline_data = 6;
+  repeated oceanfs.common.SegmentId chunk_segment_ids = 7;
+  repeated uint64 chunk_offsets = 8;
+  repeated uint32 chunk_lengths = 9;
+}
+
+// Response acknowledging the metadata write.
+message PutObjectMetadataResponse {
+  bool written = 1;
+}

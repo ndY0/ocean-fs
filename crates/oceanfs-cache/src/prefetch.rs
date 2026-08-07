@@ -90,6 +90,8 @@ pub struct PrefetchEngine {
     config: PrefetchConfig,
     /// Sender for the bounded work queue. Dropping this shuts down the worker.
     sender: mpsc::Sender<PrefetchTask>,
+    /// Metadata store for adjacent-key discovery (M8).
+    metadata: Arc<dyn MetadataStore>,
 }
 
 impl PrefetchEngine {
@@ -105,6 +107,7 @@ impl PrefetchEngine {
         metadata: Arc<dyn MetadataStore>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(config.queue_capacity);
+        let metadata_for_engine = Arc::clone(&metadata);
 
         // Spawn the worker only if a tokio runtime is active.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -119,7 +122,7 @@ impl PrefetchEngine {
         }
         // If no runtime, the worker is not spawned; tasks are silently dropped.
 
-        Self { config, sender }
+        Self { config, sender, metadata: metadata_for_engine }
     }
 
     /// Enqueues prefetch tasks for keys after the given cursor.
@@ -144,6 +147,9 @@ impl PrefetchEngine {
     ///
     /// Called after a GET response. Prefetches up to `after_get` subsequent
     /// keys in the provided list. This is a best-effort hint.
+    ///
+    /// For automatic adjacent-key discovery (M8), use [`discover_and_prefetch_adjacent`]
+    /// which queries the metadata store to find nearby keys.
     pub fn after_get(&self, bucket: BucketId, _key: &ObjectKey, adjacent_keys: &[ObjectKey]) {
         if !self.config.enabled {
             return;
@@ -151,6 +157,37 @@ impl PrefetchEngine {
 
         let count = self.config.after_get.min(adjacent_keys.len());
         for k in adjacent_keys.iter().take(count) {
+            let task = PrefetchTask { bucket: bucket.clone(), key: k.clone() };
+            let _ = self.sender.try_send(task);
+        }
+    }
+
+    /// Discovers keys adjacent to the given key via the metadata store
+    /// and enqueues them for prefetch (M8).
+    ///
+    /// Queries `list_object_keys` for the bucket, sorts the keys
+    /// lexicographically, finds the position of `key`, and prefetches
+    /// up to `after_get` keys following it. Best-effort: failures are
+    /// silent and do not affect the response.
+    pub fn discover_and_prefetch_adjacent(&self, bucket: &BucketId, key: &ObjectKey) {
+        if !self.config.enabled || self.config.after_get == 0 {
+            return;
+        }
+
+        // List all keys in the bucket.
+        let mut keys = match self.metadata.list_object_keys(bucket) {
+            Ok(keys) => keys.into_iter().map(|(_, k)| k).collect::<Vec<_>>(),
+            Err(_) => return,
+        };
+        // Sort lexicographically for consistent adjacency.
+        keys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+
+        // Find the position of the current key and select subsequent keys.
+        let pos = keys.iter().position(|k| k == key).unwrap_or(keys.len());
+        let adjacent: Vec<ObjectKey> =
+            keys[pos.saturating_add(1)..].iter().take(self.config.after_get).cloned().collect();
+
+        for k in &adjacent {
             let task = PrefetchTask { bucket: bucket.clone(), key: k.clone() };
             let _ = self.sender.try_send(task);
         }

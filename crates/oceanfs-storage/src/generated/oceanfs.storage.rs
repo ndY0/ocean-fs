@@ -177,6 +177,64 @@ pub mod segment_rpc_client {
                 .insert(GrpcMethod::new("oceanfs.storage.SegmentRpc", "DeleteObject"));
             self.inner.unary(req, path, codec).await
         }
+        /// Fetch object metadata from a replica for read repair comparison (4.2).
+        pub async fn get_object_metadata(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                ::oceanfs_core::proto::segment::GetObjectMetadataRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<::oceanfs_core::proto::segment::GetObjectMetadataResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/oceanfs.storage.SegmentRpc/GetObjectMetadata",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("oceanfs.storage.SegmentRpc", "GetObjectMetadata"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Push corrected object metadata to a stale replica during read repair (4.2).
+        pub async fn put_object_metadata(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                ::oceanfs_core::proto::segment::PutObjectMetadataRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<::oceanfs_core::proto::segment::PutObjectMetadataResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/oceanfs.storage.SegmentRpc/PutObjectMetadata",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("oceanfs.storage.SegmentRpc", "PutObjectMetadata"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -225,6 +283,26 @@ pub mod segment_rpc_server {
             request: tonic::Request<::oceanfs_core::proto::segment::DeleteObjectRequest>,
         ) -> std::result::Result<
             tonic::Response<::oceanfs_core::proto::segment::DeleteObjectResponse>,
+            tonic::Status,
+        >;
+        /// Fetch object metadata from a replica for read repair comparison (4.2).
+        async fn get_object_metadata(
+            &self,
+            request: tonic::Request<
+                ::oceanfs_core::proto::segment::GetObjectMetadataRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<::oceanfs_core::proto::segment::GetObjectMetadataResponse>,
+            tonic::Status,
+        >;
+        /// Push corrected object metadata to a stale replica during read repair (4.2).
+        async fn put_object_metadata(
+            &self,
+            request: tonic::Request<
+                ::oceanfs_core::proto::segment::PutObjectMetadataRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<::oceanfs_core::proto::segment::PutObjectMetadataResponse>,
             tonic::Status,
         >;
     }
@@ -437,6 +515,104 @@ pub mod segment_rpc_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = DeleteObjectSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/oceanfs.storage.SegmentRpc/GetObjectMetadata" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetObjectMetadataSvc<T: SegmentRpc>(pub Arc<T>);
+                    impl<
+                        T: SegmentRpc,
+                    > tonic::server::UnaryService<
+                        ::oceanfs_core::proto::segment::GetObjectMetadataRequest,
+                    > for GetObjectMetadataSvc<T> {
+                        type Response = ::oceanfs_core::proto::segment::GetObjectMetadataResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                ::oceanfs_core::proto::segment::GetObjectMetadataRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SegmentRpc>::get_object_metadata(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetObjectMetadataSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/oceanfs.storage.SegmentRpc/PutObjectMetadata" => {
+                    #[allow(non_camel_case_types)]
+                    struct PutObjectMetadataSvc<T: SegmentRpc>(pub Arc<T>);
+                    impl<
+                        T: SegmentRpc,
+                    > tonic::server::UnaryService<
+                        ::oceanfs_core::proto::segment::PutObjectMetadataRequest,
+                    > for PutObjectMetadataSvc<T> {
+                        type Response = ::oceanfs_core::proto::segment::PutObjectMetadataResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                ::oceanfs_core::proto::segment::PutObjectMetadataRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SegmentRpc>::put_object_metadata(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PutObjectMetadataSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

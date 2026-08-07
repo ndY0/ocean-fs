@@ -61,6 +61,7 @@ impl HealingRpc for HealingGrpcService {
             length: req.data.len() as u32,
             timestamp: hlc,
             data: req.data,
+            stored_at_secs: 0,
         };
 
         match self.handoff.handoff(intended_for.clone(), hint).await {

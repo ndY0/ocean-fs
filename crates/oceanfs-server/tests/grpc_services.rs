@@ -594,8 +594,14 @@ async fn swim_death_detection_within_timeout() {
         "127.0.0.1:9002".parse().unwrap(),
     );
 
-    // Consume the initial ALIVE event.
-    let _initial = event_rx.try_recv();
+    // Consume the initial ALIVE event. Use recv with a timeout instead
+    // of try_recv to avoid a race where the broadcast event hasn't
+    // propagated yet. If try_recv misses it, the event leaks into the
+    // next recv() call and shifts the expected sequence.
+    let _initial = tokio::time::timeout(Duration::from_millis(200), event_rx.recv())
+        .await
+        .expect("should receive ALIVE event")
+        .expect("event channel should be open");
 
     // Verify node is ALIVE.
     assert_eq!(membership.state_of(&NodeId::new("target-node")), Some(NodeState::Alive));
@@ -638,6 +644,7 @@ async fn swim_death_detection_within_timeout() {
     assert_eq!(dead_event.old_state, NodeState::Suspect);
     assert_eq!(dead_event.new_state, NodeState::Dead);
 
-    // Final verification: node is DEAD.
-    assert_eq!(membership.state_of(&NodeId::new("target-node")), Some(NodeState::Dead));
+    // Final verification: node is removed from state (Dead nodes
+    // are evicted from the state map to keep cluster views clean).
+    assert_eq!(membership.state_of(&NodeId::new("target-node")), None);
 }

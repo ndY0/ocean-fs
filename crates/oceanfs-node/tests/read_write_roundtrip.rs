@@ -142,7 +142,7 @@ impl RoundTripEnv {
         let wal = Arc::new(
             WalWriter::open(&WalConfig {
                 data_dir: dir.path().join("wal"),
-                max_file_size_bytes: 1024 * 1024,
+                max_file_size_bytes: 64 * 1024 * 1024,
                 fsync_batch_timeout_ms: 5,
             })
             .await
@@ -154,6 +154,9 @@ impl RoundTripEnv {
             data_dir: dir.path().join("segments"),
         };
         let sealer = Arc::new(SegmentSealer::new(seal_config, metadata_store.clone(), wal));
+
+        let hinted_handoff =
+            Arc::new(oceanfs_durability::HintedHandoff::new_with_pool(pool.clone()));
 
         let write = Arc::new(WriteCoordinator::new(
             ring_cache.clone(),
@@ -168,6 +171,7 @@ impl RoundTripEnv {
             segment_pool_small,
             segment_pool_standard,
             sealer,
+            hinted_handoff,
         ));
 
         let segment_store = Arc::new(InMemorySegmentReader::new());

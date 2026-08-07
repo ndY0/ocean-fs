@@ -1,15 +1,12 @@
 //! Test 9: WAL crash recovery.
 //!
-//! **PARTIAL BLOCKER**: After SIGKILL and respawn with the same data directory,
-//! GET requests currently return 500 instead of 200 for objects written before
-//! the crash. The WAL recovery path may not fully replay unsealed segment data
-//! in the current in-memory write path.
+//! After SIGKILL and respawn with the same data directory, GET requests return
+//! 200 for objects written before the crash. Data survives via BlobStore
+//! persistence on disk (the in-memory segment reader is repopulated from persisted
+//! blobs at startup in `Node::start()`).
 //!
-//! ## Proposed Fix
-//!
-//! 1. Ensure the WAL writer flushes data before the crash (fsync on PUT).
-//! 2. In `Node::start`, verify that WAL replay recovers unsealed segment data.
-//! 3. The in-memory segment store should be populated from WAL replay on restart.
+//! The WAL replay scaffolding (C4-storage) is wired at startup but produces zero
+//! entries until Epic 3 (write-path-unification) activates the segment pipeline.
 //!
 //! ## Current Test Behavior
 //!

@@ -8,7 +8,11 @@
 
 use std::sync::Arc;
 
-use oceanfs_core::{Counter, LabelSet, MetricRegistrar, NodeId, SegmentId, SegmentMetadata};
+use oceanfs_core::{
+    Counter, LabelSet, MetricRegistrar, NodeId, NodeState, SegmentId, SegmentMetadata,
+};
+use oceanfs_membership::Membership;
+use oceanfs_network::ConnectionPool;
 use oceanfs_storage::{metadata::RocksDbMetadataStore, Error, Result};
 use tokio::sync::Semaphore;
 
@@ -495,6 +499,10 @@ impl ScrubWorker {
 /// ```
 pub struct ScrubCoordinator {
     config: ScrubConfig,
+    /// Optional membership for distributed partition assignment (H5).
+    membership: Option<Arc<Membership>>,
+    /// Optional connection pool for distributed partition distribution (H5).
+    pool: Option<Arc<ConnectionPool>>,
     segments_checked_total: Counter,
     segments_corrupt_total: Counter,
 }
@@ -503,9 +511,13 @@ impl ScrubCoordinator {
     /// Creates a new scrub coordinator with unregistered counters.
     ///
     /// Use [`register_metrics`](Self::register_metrics) to wire them.
+    /// For distributed operation, call [`with_distributed`](Self::with_distributed)
+    /// to provide membership and connection pool.
     pub fn new(config: ScrubConfig) -> Self {
         Self {
             config,
+            membership: None,
+            pool: None,
             segments_checked_total: Counter::new(
                 "scrub_segments_checked_total".into(),
                 "Segments checked by scrub".into(),
@@ -517,6 +529,55 @@ impl ScrubCoordinator {
                 LabelSet::empty(),
             ),
         }
+    }
+
+    /// Enables distributed partition assignment (H5).
+    ///
+    /// When set, [`partition_for_current_nodes`] uses the membership to
+    /// discover alive nodes and distribute segments across them instead
+    /// of requiring the caller to pass node IDs manually.
+    pub fn with_distributed(
+        mut self,
+        membership: Arc<Membership>,
+        pool: Arc<ConnectionPool>,
+    ) -> Self {
+        self.membership = Some(membership);
+        self.pool = Some(pool);
+        self
+    }
+
+    /// Returns the list of alive node IDs from the membership view,
+    /// excluding the current node. Returns an empty vec when membership
+    /// is not configured.
+    pub fn alive_peers(&self) -> Vec<NodeId> {
+        match &self.membership {
+            Some(m) => m
+                .nodes()
+                .into_iter()
+                .filter(|(id, state)| *id != *m.node_id() && *state == NodeState::Alive)
+                .map(|(id, _)| id)
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Partitions all sealed segments across currently-alive nodes.
+    ///
+    /// When membership is configured, discovers alive peers automatically
+    /// and distributes the workload. When membership is `None`, falls back
+    /// to local-only operation (all segments assigned to self).
+    #[allow(dead_code)] // Infrastructure for distributed scrub (H5); called by future phases.
+    pub(crate) fn partition_for_current_nodes(
+        &self,
+        segment_ids: &[SegmentId],
+    ) -> Vec<SegmentPartition> {
+        let node_ids = self.alive_peers();
+        if node_ids.is_empty() {
+            // No peers: assign all segments to the local node.
+            let local = oceanfs_core::NodeId::new("local");
+            return vec![SegmentPartition { node_id: local, segment_ids: segment_ids.to_vec() }];
+        }
+        self.partition_segments(segment_ids, &node_ids)
     }
 
     /// Registers scrub counters with a metrics registrar.
@@ -532,7 +593,6 @@ impl ScrubCoordinator {
 
     /// Splits segment IDs into equal ranges across nodes. No gaps, no overlaps.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub(crate) fn partition_segments(
         &self,
         segment_ids: &[SegmentId],

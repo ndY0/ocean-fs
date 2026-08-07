@@ -19,6 +19,7 @@
 //! strings with the appropriate settings and ports.
 
 use std::{
+    fs,
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -26,6 +27,107 @@ use std::{
 };
 
 use tempfile::TempDir;
+
+/// Name of the port-preservation file written into each node's data directory.
+///
+/// On first spawn, the harness writes the HTTP and gRPC ports to this file so
+/// that a subsequent restart (crash recovery) can reuse the same ports. Without
+/// port preservation, the restarted node binds to new ephemeral ports and
+/// cannot rejoin the cluster because peers still have the old address in their
+/// gossip state.
+const PORTS_FILE_NAME: &str = "ports.toml";
+
+/// Binds a random ephemeral port on localhost.
+fn bind_random_port() -> Result<SocketAddr, Error> {
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(Error::PortDiscovery)?;
+    let addr = listener.local_addr().map_err(Error::PortDiscovery)?;
+    drop(listener);
+    Ok(addr)
+}
+
+/// Saves the assigned HTTP and gRPC ports to a TOML file so a
+/// subsequent restart can reuse the same ports.
+fn save_ports(ports_file: &Path, http_port: u16, grpc_port: u16) -> Result<(), Error> {
+    let content = format!("http_port = {http_port}\ngrpc_port = {grpc_port}\n");
+    fs::write(ports_file, content).map_err(Error::ConfigWrite)?;
+    Ok(())
+}
+
+/// Attempts to restore previously-saved ports from the port file.
+///
+/// Returns `Some((http, grpc))` on success, or `None` if the file is
+/// missing or corrupt.
+fn restore_ports(ports_file: &Path) -> Option<(u16, u16)> {
+    let content = fs::read_to_string(ports_file).ok()?;
+    let http = content
+        .lines()
+        .find(|l| l.starts_with("http_port"))
+        .and_then(|l| l.split('=').nth(1))
+        .and_then(|v| v.trim().parse().ok())?;
+    let grpc = content
+        .lines()
+        .find(|l| l.starts_with("grpc_port"))
+        .and_then(|l| l.split('=').nth(1))
+        .and_then(|v| v.trim().parse().ok())?;
+    Some((http, grpc))
+}
+
+/// Acquires the HTTP and gRPC ports for a node.
+///
+/// On first spawn (`ports_file` does not exist) two random ephemeral
+/// ports are bound, then saved. On restart (`ports_file` exists) the
+/// saved ports are reused if available; if they have been taken by
+/// another process the function falls back to random ports and
+/// overwrites the file.
+fn bind_ports(ports_file: &Path) -> Result<(SocketAddr, SocketAddr), Error> {
+    // Try to restore ports from a previous run.
+    if let Some((http_port, grpc_port)) = restore_ports(ports_file) {
+        // Try to bind to the saved HTTP port.
+        let http_addr = match TcpListener::bind(format!("127.0.0.1:{http_port}"))
+            .map_err(Error::PortDiscovery)
+        {
+            Ok(listener) => {
+                let addr = listener.local_addr().map_err(Error::PortDiscovery)?;
+                drop(listener);
+                addr
+            }
+            Err(_) => {
+                // Port was taken since last run — fall back to random.
+                bind_random_port()?
+            }
+        };
+
+        // Try to bind to the saved gRPC port.
+        let grpc_addr = if http_addr.port() == http_port {
+            // HTTP port was restored successfully; try gRPC port too.
+            match TcpListener::bind(format!("127.0.0.1:{grpc_port}")).map_err(Error::PortDiscovery)
+            {
+                Ok(listener) => {
+                    let addr = listener.local_addr().map_err(Error::PortDiscovery)?;
+                    drop(listener);
+                    addr
+                }
+                Err(_) => {
+                    // gRPC port was taken — fall back to random.
+                    bind_random_port()?
+                }
+            }
+        } else {
+            // HTTP port changed — gRPC port is probably also gone.
+            bind_random_port()?
+        };
+
+        // Always save the actual ports used (may differ from saved values).
+        save_ports(ports_file, http_addr.port(), grpc_addr.port())?;
+        return Ok((http_addr, grpc_addr));
+    }
+
+    // First spawn: bind random ports and save them.
+    let http_addr = bind_random_port()?;
+    let grpc_addr = bind_random_port()?;
+    save_ports(ports_file, http_addr.port(), grpc_addr.port())?;
+    Ok((http_addr, grpc_addr))
+}
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -162,19 +264,14 @@ impl NodeProcess {
         temp_dir: Option<TempDir>,
         create_dir: bool,
     ) -> Result<Self, Error> {
-        // ---- 1. Discover available ports ----
-        let http_listener = TcpListener::bind("127.0.0.1:0").map_err(Error::PortDiscovery)?;
-        let http_addr = http_listener.local_addr().map_err(Error::PortDiscovery)?;
-        drop(http_listener);
-
-        let grpc_listener = TcpListener::bind("127.0.0.1:0").map_err(Error::PortDiscovery)?;
-        let grpc_addr = grpc_listener.local_addr().map_err(Error::PortDiscovery)?;
-        drop(grpc_listener);
-
-        // ---- 2. Ensure data directory exists ----
+        // ---- 1. Ensure data directory exists ----
         if create_dir {
             std::fs::create_dir_all(&data_dir).map_err(Error::ConfigWrite)?;
         }
+
+        // ---- 2. Discover / restore ports ----
+        let ports_file = data_dir.join(PORTS_FILE_NAME);
+        let (http_addr, grpc_addr) = bind_ports(&ports_file)?;
 
         // ---- 3. Build config with resolved ports ----
         let resolved_config = config_toml
@@ -531,6 +628,9 @@ prefetch_enabled = false
 write_quorum = 2
 read_quorum = 2
 replication_factor = 3
+
+[gossip]
+interval_ms = 100
 "#
     .to_string()
 }
@@ -993,5 +1093,124 @@ mod tests {
         // The release binary should exist since we just built it.
         let path = resolve_binary_path();
         assert!(path.exists(), "binary not found at {:?}", path);
+    }
+
+    // ── Port Preservation (§4.7) ─────
+
+    #[test]
+    fn save_and_restore_ports_roundtrip() {
+        let dir = TempDir::new().expect("temp dir");
+        let ports_file = dir.path().join(PORTS_FILE_NAME);
+
+        // Save known ports.
+        save_ports(&ports_file, 12345, 12346).expect("save");
+        assert!(ports_file.exists(), "port file must exist after save");
+
+        // Restore.
+        let (http, grpc) = restore_ports(&ports_file).expect("restore");
+        assert_eq!(http, 12345);
+        assert_eq!(grpc, 12346);
+    }
+
+    #[test]
+    fn restore_ports_returns_none_when_file_missing() {
+        let dir = TempDir::new().expect("temp dir");
+        let ports_file = dir.path().join(PORTS_FILE_NAME);
+        assert!(restore_ports(&ports_file).is_none());
+    }
+
+    #[test]
+    fn bind_ports_first_spawn_creates_port_file() {
+        let dir = TempDir::new().expect("temp dir");
+        let ports_file = dir.path().join(PORTS_FILE_NAME);
+
+        assert!(!ports_file.exists(), "no port file before first spawn");
+        let (http, grpc) = bind_ports(&ports_file).expect("bind");
+        assert!(ports_file.exists(), "port file must exist after first spawn");
+        assert_ne!(http.port(), 0, "HTTP port must be non-zero");
+        assert_ne!(grpc.port(), 0, "gRPC port must be non-zero");
+    }
+
+    #[test]
+    fn bind_ports_restart_reuses_saved_ports() {
+        let dir = TempDir::new().expect("temp dir");
+        let ports_file = dir.path().join(PORTS_FILE_NAME);
+
+        // First spawn: write ports.
+        let (first_http, first_grpc) = bind_ports(&ports_file).expect("first bind");
+        assert_ne!(first_http.port(), first_grpc.port(), "ports must differ");
+
+        // Restart: should reuse the same ports.
+        let (second_http, second_grpc) = bind_ports(&ports_file).expect("second bind");
+        assert_eq!(
+            first_http.port(),
+            second_http.port(),
+            "HTTP port must be preserved across restart"
+        );
+        assert_eq!(
+            first_grpc.port(),
+            second_grpc.port(),
+            "gRPC port must be preserved across restart"
+        );
+    }
+
+    #[test]
+    fn bind_ports_restart_falls_back_when_port_taken() {
+        let dir = TempDir::new().expect("temp dir");
+        let ports_file = dir.path().join(PORTS_FILE_NAME);
+
+        // First spawn.
+        let (first_http, first_grpc) = bind_ports(&ports_file).expect("first bind");
+
+        // Hold the HTTP port so the restart cannot bind to it.
+        let _holder =
+            TcpListener::bind(format!("127.0.0.1:{}", first_http.port())).expect("hold HTTP port");
+
+        // Restart: HTTP port is taken — falls back to random, but
+        // must still succeed.
+        let (second_http, second_grpc) =
+            bind_ports(&ports_file).expect("second bind with fallback");
+        assert_ne!(
+            second_http.port(),
+            first_http.port(),
+            "HTTP port must change when saved port is taken"
+        );
+        // gRPC port should also change (one port changed → both reassigned).
+        assert_ne!(
+            second_grpc.port(),
+            first_grpc.port(),
+            "gRPC port must also change when HTTP port is taken"
+        );
+        drop(_holder);
+    }
+
+    /// Verifies that `bind_ports` succeeds even when the parent
+    /// directory does not exist (the caller must create it first).
+    /// This test guards against the regression where `save_ports`
+    /// was called before `create_dir_all`.
+    #[test]
+    fn bind_ports_first_spawn_with_nonexistent_dir() {
+        let dir = TempDir::new().expect("temp dir");
+        // Construct a path under a non-existent subdirectory.
+        let subdir = dir.path().join("node-0");
+        assert!(!subdir.exists(), "subdirectory must not exist before test");
+
+        // Create the directory BEFORE binding (mimics the fix).
+        std::fs::create_dir_all(&subdir).expect("create subdir");
+
+        let ports_file = subdir.join(PORTS_FILE_NAME);
+        let result = bind_ports(&ports_file);
+        assert!(result.is_ok(), "bind_ports must succeed when parent dir exists");
+        assert!(ports_file.exists(), "port file must be created");
+    }
+
+    /// Verifies that `restore_ports` returns `None` when the port
+    /// file contains garbled content.
+    #[test]
+    fn restore_ports_returns_none_when_file_garbled() {
+        let dir = TempDir::new().expect("temp dir");
+        let ports_file = dir.path().join(PORTS_FILE_NAME);
+        std::fs::write(&ports_file, "not a valid port file at all").expect("write garbled file");
+        assert!(restore_ports(&ports_file).is_none(), "garbled file must return None");
     }
 }

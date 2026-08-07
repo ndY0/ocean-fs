@@ -32,26 +32,35 @@ use parking_lot::RwLock;
 /// let policy = BucketPolicy::default();
 /// assert_eq!(policy.consistency.write_quorum, 2);
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BucketPolicy {
     /// Consistency configuration (write quorum, read quorum, replicas).
+    #[serde(default)]
     pub consistency: ConsistencyConfig,
     /// Segment sizing and active-pool configuration.
+    #[serde(default)]
     pub segment: SegmentConfig,
     /// Erasure-coding parameters.
+    #[serde(default)]
     pub ec: EcConfig,
     /// Caching tier configuration.
+    #[serde(default)]
     pub cache: CacheConfig,
     /// Performance-tuning knobs.
+    #[serde(default)]
     pub tuning: TuningConfig,
     /// Read-path performance tuning.
+    #[serde(default)]
     pub read_tuning: ReadTuningConfig,
     /// Healing/recovery configuration.
+    #[serde(default)]
     pub heal: HealConfig,
     /// Garbage collection configuration.
+    #[serde(default)]
     pub gc: GcConfig,
     /// Compression configuration (per-bucket tier + level).
     /// Per ADR-0007, the effective tier is capped by the node-level ceiling.
+    #[serde(default)]
     pub compression: CompressConfig,
 }
 
@@ -60,7 +69,7 @@ pub struct BucketPolicy {
 // ---------------------------------------------------------------------------
 
 /// Write/read quorum and replica count for a bucket.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConsistencyConfig {
     /// Number of nodes that must acknowledge a write (W).
     pub write_quorum: u8,
@@ -121,7 +130,7 @@ impl ConsistencyConfig {
 ///
 /// Maps to `SegmentSizeConfig` in `oceanfs-core` but adds
 /// pool and sealing parameters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SegmentConfig {
     /// Objects smaller than this are stored inline in metadata.
     pub inline_threshold_bytes: u64,
@@ -174,7 +183,7 @@ impl SegmentConfig {
 // ---------------------------------------------------------------------------
 
 /// Erasure-coding parameters for a bucket.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EcConfig {
     /// Number of data shards (k).
     pub data_shards: u8,
@@ -221,7 +230,7 @@ impl EcConfig {
 // ---------------------------------------------------------------------------
 
 /// Cache tier enable/disable and sizing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CacheConfig {
     /// Enable L1 object data cache.
     pub l1_enabled: bool,
@@ -252,7 +261,7 @@ impl Default for CacheConfig {
 // ---------------------------------------------------------------------------
 
 /// Performance-tuning parameters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TuningConfig {
     /// Maximum concurrent segment encodes.
     pub max_concurrent_encodes: usize,
@@ -280,7 +289,7 @@ impl Default for TuningConfig {
 ///
 /// Controls parallelism, shard fetch strategy, and stripe decode
 /// concurrency for distributed blob reads.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReadTuningConfig {
     /// When `true`, fetch all k+m shards simultaneously.
     /// When `false`, fetch only the k data shards first.
@@ -309,7 +318,7 @@ impl Default for ReadTuningConfig {
 // ---------------------------------------------------------------------------
 
 /// Healing/recovery configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HealConfig {
     /// Whether automatic read-repair is enabled.
     pub auto_repair: bool,
@@ -330,7 +339,7 @@ impl Default for HealConfig {
 // ---------------------------------------------------------------------------
 
 /// Garbage collection configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GcConfig {
     /// Minimum age in seconds before a tombstone can be compacted.
     pub tombstone_ttl_seconds: u64,

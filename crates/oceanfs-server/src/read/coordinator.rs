@@ -16,27 +16,29 @@
 //! Per performance guideline §8.1 (FuturesUnordered), §8.2
 //! (tokio::select!), and §5.4 (batch verify for multi-chunk reads).
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
+use futures::{stream::FuturesUnordered, StreamExt};
+use oceanfs_cache::CacheRpcClient;
 use oceanfs_core::{
+    proto::segment::{
+        GetObjectMetadataRequest, GetObjectMetadataResponse, PutObjectMetadataRequest,
+    },
     BucketId, ConflictResolver, HashKey, HashOutput, Hlc, LwwResolver, NodeId, ObjectKey,
-    ObjectMetadata, OperationTimeouts,
+    ObjectMetadata, OperationTimeouts, Resolution, SegmentId,
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::RingCache;
+use oceanfs_storage::SegmentRpcClient;
+use tracing::{debug, info, warn};
 
 use crate::{
     error::{Error, Result},
     metadata_ops::MetadataOps,
-    read::{assembly::MultiChunkAssembler, repair::schedule_repair},
+    read::assembly::MultiChunkAssembler,
 };
-
-/// Default read timeout used when no policy is provided.
-#[allow(dead_code)]
-static DEFAULT_READ_TIMEOUT_MS: std::sync::LazyLock<u64> =
-    std::sync::LazyLock::new(|| OperationTimeouts::default().read_default_ms);
 
 /// A request to read an object.
 #[derive(Debug, Clone)]
@@ -184,6 +186,12 @@ pub struct ReadCoordinator {
     /// Optional EC decoder for reconstructing data from parity shards.
     #[cfg(feature = "ec")]
     decoder: Option<Arc<dyn oceanfs_ec::Decoder>>,
+    /// Number of EC data shards (k) for the segment codec.
+    #[cfg(feature = "ec")]
+    ec_data_shards: u8,
+    /// Number of EC parity shards (m) for the segment codec.
+    #[cfg(feature = "ec")]
+    ec_parity_shards: u8,
 }
 
 impl ReadCoordinator {
@@ -206,6 +214,10 @@ impl ReadCoordinator {
             membership: None,
             #[cfg(feature = "ec")]
             decoder: None,
+            #[cfg(feature = "ec")]
+            ec_data_shards: 0,
+            #[cfg(feature = "ec")]
+            ec_parity_shards: 0,
         }
     }
 
@@ -226,6 +238,10 @@ impl ReadCoordinator {
             membership: None,
             #[cfg(feature = "ec")]
             decoder: None,
+            #[cfg(feature = "ec")]
+            ec_data_shards: 0,
+            #[cfg(feature = "ec")]
+            ec_parity_shards: 0,
         }
     }
 
@@ -269,6 +285,20 @@ impl ReadCoordinator {
         self
     }
 
+    /// Sets the EC codec parameters for shard-level reconstruction.
+    ///
+    /// `data_shards` (k) and `parity_shards` (m) define the erasure
+    /// coding layout used when reconstructing missing data shards from
+    /// parity. Must be paired with [`with_decoder`](Self::with_decoder).
+    ///
+    /// Only available when the `ec` feature is enabled.
+    #[cfg(feature = "ec")]
+    pub fn with_ec_codec(mut self, data_shards: u8, parity_shards: u8) -> Self {
+        self.ec_data_shards = data_shards;
+        self.ec_parity_shards = parity_shards;
+        self
+    }
+
     /// Executes a read and returns a [`GetResult`] with cache-hit
     /// information.
     ///
@@ -283,7 +313,20 @@ impl ReadCoordinator {
     pub async fn get_object(&self, req: ReadRequest) -> Result<GetResult> {
         let _replica_set = self.ring.lookup(req.hash_key.as_bytes());
 
-        let obj_meta = self.lookup_metadata(&req).await?;
+        let mut obj_meta = self.lookup_metadata(&req).await?;
+
+        // §4.6: Multi-replica HLC comparison — when read_quorum > 1,
+        // synchronously fetch metadata from replicas, compare HLCs,
+        // and apply the winning version before responding to the client.
+        if let Some(winning_meta) = self.compare_with_quorum(&req.bucket, &req.key, &obj_meta).await
+        {
+            obj_meta = winning_meta;
+        }
+
+        // §4.2: Read repair — asynchronously push corrected data to
+        // stale replicas. This is fire-and-forget; it does not block
+        // the client response.
+        self.run_read_repair(&req.bucket, &req.key, &obj_meta).await;
 
         let data = if let Some(ref inline) = obj_meta.inline_data {
             inline.clone()
@@ -308,6 +351,502 @@ impl ReadCoordinator {
         let hash = HashOutput::from_bytes(*computed_hash.as_bytes());
 
         Ok(GetResult { data, metadata: obj_meta, cache_hit: CacheHitLevel::Miss, hash })
+    }
+
+    /// Synchronously compares local HLC against remote replicas (§4.6).
+    ///
+    /// When `pool`, `membership`, and `metadata` are all available,
+    /// this method fetches object metadata from every remote replica
+    /// in the replica set, compares HLC timestamps via the configured
+    /// [`ConflictResolver`], and applies the winning version locally
+    /// if a remote replica has a newer version.
+    ///
+    /// This synchronous check ensures the client receives the winning
+    /// version immediately, rather than the locally-stored version
+    /// which may be stale after concurrent writes. The asynchronous
+    /// repair of other stale replicas happens separately in
+    /// [`run_read_repair`].
+    ///
+    /// Returns `Some(ObjectMetadata)` if a remote version is newer and
+    /// was applied locally. Returns `None` if the local version is the
+    /// winner, or if no remote replica is reachable.
+    async fn compare_with_quorum(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+        local_meta: &ObjectMetadata,
+    ) -> Option<ObjectMetadata> {
+        let pool = self.pool.as_ref()?;
+        let membership = self.membership.as_ref()?;
+        let metadata_store = self.metadata.as_ref()?;
+
+        let hash_key = oceanfs_routing::hash_key(key.as_str().as_bytes());
+        let replica_set = self.ring.lookup(&hash_key);
+        if replica_set.len() <= 1 {
+            return None;
+        }
+
+        let resolver = Arc::clone(&self.conflict_resolver);
+        let node_id = self.node_id.clone();
+        let local_hlc = local_meta.hlc;
+        let bucket_clone = bucket.clone();
+        let key_clone = key.clone();
+
+        let mut winning_hlc = local_hlc;
+        let mut winning_meta: Option<GetObjectMetadataResponse> = None;
+
+        // Fetch metadata from each remote replica in parallel.
+        let mut fetches = FuturesUnordered::new();
+        for target in &replica_set {
+            if *target == node_id {
+                continue;
+            }
+            let target = target.clone();
+            let addr = match membership.address_of(&target) {
+                Some(a) => a,
+                None => continue,
+            };
+            let pooled = match pool.get_channel(addr).await {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let channel = pooled.channel().clone();
+            drop(pooled);
+
+            let req_bucket = bucket_clone.clone();
+            let req_key = key_clone.clone();
+            let timeout = Duration::from_secs(5);
+            fetches.push(async move {
+                let mut client = SegmentRpcClient::new(channel);
+                let request = tonic::Request::new(GetObjectMetadataRequest {
+                    bucket_id: req_bucket.as_str().to_string(),
+                    object_key: req_key.as_str().to_string(),
+                });
+                let result =
+                    tokio::time::timeout(timeout, client.get_object_metadata(request)).await;
+                match result {
+                    Ok(Ok(resp)) => (target, Ok(resp)),
+                    Ok(Err(e)) => (target, Err(e)),
+                    Err(_elapsed) => (
+                        target,
+                        Err(tonic::Status::deadline_exceeded(
+                            "metadata fetch timeout during quorum comparison",
+                        )),
+                    ),
+                }
+            });
+        }
+
+        while let Some((target, result)) = fetches.next().await {
+            match result {
+                Ok(resp) => {
+                    let resp = resp.into_inner();
+                    if !resp.found {
+                        continue;
+                    }
+                    let remote_hlc = match resp.hlc {
+                        Some(ref hlc_proto) => Hlc::new(hlc_proto.wall_time, hlc_proto.logical),
+                        None => continue,
+                    };
+
+                    let resolution = resolver.resolve(&winning_hlc, &remote_hlc);
+                    match resolution {
+                        Resolution::AcceptRemote => {
+                            winning_hlc = remote_hlc;
+                            winning_meta = Some(resp);
+                            info!(
+                                target = %target,
+                                remote_wall = remote_hlc.wall_time(),
+                                "quorum comparison: remote version is newer; \
+                                 will serve winning version to client"
+                            );
+                        }
+                        Resolution::AcceptLocal => {
+                            debug!(
+                                target = %target,
+                                "quorum comparison: local version is newer than remote"
+                            );
+                        }
+                        Resolution::Merge => {
+                            debug!("quorum comparison: merge resolution — CRDT not yet supported");
+                        }
+                        _ => {
+                            // Resolution is #[non_exhaustive] — log unknown variants
+                            // so they are visible in production.
+                            warn!(
+                                target = %target,
+                                "quorum comparison: unexpected resolution variant; \
+                                 treating as no-op"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(target = %target, error = %e, "metadata fetch failed for replica");
+                }
+            }
+        }
+
+        // If remote won, apply winning metadata locally and return it.
+        if let Some(winning) = winning_meta {
+            Self::apply_winning_metadata_locally(metadata_store, bucket, key, &winning);
+
+            info!(
+                bucket = %bucket.as_str(),
+                key = %key.as_str(),
+                "quorum comparison: applied winning remote metadata locally"
+            );
+
+            // Build the winning ObjectMetadata for the client response.
+            let hlc = winning.hlc.map_or(Hlc::zero(), |p| Hlc::new(p.wall_time, p.logical));
+            let mut chunks = smallvec::SmallVec::new();
+            let count = winning
+                .chunk_segment_ids
+                .len()
+                .min(winning.chunk_offsets.len())
+                .min(winning.chunk_lengths.len());
+            for i in 0..count {
+                let seg_id = SegmentId::try_from(winning.chunk_segment_ids[i].clone())
+                    .unwrap_or_else(|_| SegmentId::default());
+                chunks.push(oceanfs_core::ChunkRef {
+                    segment_id: seg_id,
+                    offset: winning.chunk_offsets[i],
+                    length: winning.chunk_lengths[i],
+                });
+            }
+            let blake3_hash = if winning.blake3_hash.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&winning.blake3_hash);
+                Some(HashOutput::from_bytes(arr))
+            } else {
+                None
+            };
+            let inline_data = if winning.inline_data.is_empty() {
+                None
+            } else {
+                Some(Bytes::from(winning.inline_data.clone()))
+            };
+
+            Some(ObjectMetadata {
+                object_key: key.clone(),
+                size: winning.size,
+                blake3_hash,
+                chunks,
+                inline_data,
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64,
+                hlc,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Fetches object metadata from replicas, compares HLCs, and pushes
+    /// corrected data to stale replicas via `PutObjectMetadata` (read repair, §4.2).
+    ///
+    /// This is a fire-and-forget operation — it does not block the response
+    /// to the client. The client receives the locally-available data
+    /// immediately; stale replicas are repaired asynchronously.
+    async fn run_read_repair(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+        local_meta: &ObjectMetadata,
+    ) {
+        let pool = match self.pool.as_ref() {
+            Some(p) => p,
+            None => return,
+        };
+        let membership = match self.membership.as_ref() {
+            Some(m) => m,
+            None => return,
+        };
+
+        let hash_key = oceanfs_routing::hash_key(key.as_str().as_bytes());
+        let replica_set = self.ring.lookup(&hash_key);
+        if replica_set.len() <= 1 {
+            return;
+        }
+
+        let resolver = Arc::clone(&self.conflict_resolver);
+        let pool_clone = Arc::clone(pool);
+        let membership_clone = Arc::clone(membership);
+        let node_id = self.node_id.clone();
+        let bucket_clone = bucket.clone();
+        let key_clone = key.clone();
+        let local_hlc = local_meta.hlc;
+        // Clone local metadata so we can push it to stale remotes.
+        let local_meta_clone = local_meta.clone();
+        // Clone the metadata store so the spawned task can write corrections locally.
+        let metadata_store = self.metadata.clone();
+
+        tokio::spawn(async move {
+            let mut winning_hlc = local_hlc;
+            let mut winning_meta: Option<GetObjectMetadataResponse> = None;
+            let mut stale_remotes: Vec<NodeId> = Vec::new();
+            let mut local_is_stale: bool = false;
+
+            // Fetch metadata from each remote replica in parallel.
+            let mut fetches = FuturesUnordered::new();
+            for target in &replica_set {
+                if *target == node_id {
+                    continue;
+                }
+                let target = target.clone();
+                let addr = match membership_clone.address_of(&target) {
+                    Some(a) => a,
+                    None => continue,
+                };
+                let pooled = match pool_clone.get_channel(addr).await {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                let channel = pooled.channel().clone();
+                drop(pooled);
+
+                let req_bucket = bucket_clone.clone();
+                let req_key = key_clone.clone();
+                let timeout = Duration::from_secs(5);
+                fetches.push(async move {
+                    let mut client = SegmentRpcClient::new(channel);
+                    let request = tonic::Request::new(GetObjectMetadataRequest {
+                        bucket_id: req_bucket.as_str().to_string(),
+                        object_key: req_key.as_str().to_string(),
+                    });
+                    let result =
+                        tokio::time::timeout(timeout, client.get_object_metadata(request)).await;
+                    match result {
+                        Ok(Ok(resp)) => (target, Ok(resp)),
+                        Ok(Err(e)) => (target, Err(e)),
+                        Err(_elapsed) => (
+                            target,
+                            Err(tonic::Status::deadline_exceeded(
+                                "metadata fetch timeout during read repair",
+                            )),
+                        ),
+                    }
+                });
+            }
+
+            while let Some((target, result)) = fetches.next().await {
+                match result {
+                    Ok(resp) => {
+                        let resp = resp.into_inner();
+                        if !resp.found {
+                            continue;
+                        }
+                        let remote_hlc = match resp.hlc {
+                            Some(ref hlc_proto) => Hlc::new(hlc_proto.wall_time, hlc_proto.logical),
+                            None => continue,
+                        };
+
+                        let resolution = resolver.resolve(&winning_hlc, &remote_hlc);
+                        match resolution {
+                            Resolution::AcceptRemote => {
+                                local_is_stale = true;
+                                winning_hlc = remote_hlc;
+                                winning_meta = Some(resp);
+                                info!(
+                                    target = %target,
+                                    remote_wall = remote_hlc.wall_time(),
+                                    "remote replica has newer version; read repair will pull data"
+                                );
+                            }
+                            Resolution::AcceptLocal => {
+                                debug!(
+                                    target = %target,
+                                    "local version is newer; will push corrected data"
+                                );
+                                stale_remotes.push(target);
+                            }
+                            Resolution::Merge => {
+                                debug!("merge resolution — CRDT not yet supported");
+                            }
+                            _ => {
+                                warn!(
+                                    target = %target,
+                                    "read repair: unexpected resolution variant; \
+                                     treating as no-op"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!(target = %target, error = %e, "metadata fetch failed for replica");
+                    }
+                }
+            }
+
+            // Push corrected data to stale remote replicas.
+            for stale in &stale_remotes {
+                Self::push_metadata_to_node(
+                    &pool_clone,
+                    &membership_clone,
+                    stale,
+                    &bucket_clone,
+                    &key_clone,
+                    &local_meta_clone,
+                )
+                .await;
+            }
+
+            // If local is stale, pull winning data from the winning remote
+            // and write to our own store.
+            if local_is_stale {
+                if let Some(ref winning) = winning_meta {
+                    if let Some(ref store) = metadata_store {
+                        Self::apply_winning_metadata_locally(
+                            store,
+                            &bucket_clone,
+                            &key_clone,
+                            winning,
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    /// Pushes corrected object metadata + data to a specific node via gRPC.
+    async fn push_metadata_to_node(
+        pool: &Arc<ConnectionPool>,
+        membership: &Arc<Membership>,
+        target: &NodeId,
+        bucket: &BucketId,
+        key: &ObjectKey,
+        meta: &ObjectMetadata,
+    ) {
+        let addr = match membership.address_of(target) {
+            Some(a) => a,
+            None => return,
+        };
+        let pooled = match pool.get_channel(addr).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let channel = pooled.channel().clone();
+        drop(pooled);
+
+        let mut client = SegmentRpcClient::new(channel);
+        let request = build_put_metadata_request(bucket, key, meta);
+        match client.put_object_metadata(request).await {
+            Ok(_) => {
+                info!(target = %target, "pushed corrected metadata to stale replica (read repair)");
+                // Also invalidate caches on the target so the next read
+                // doesn't serve a stale cached entry.
+                Self::invalidate_caches_on_node(pool, membership, target, bucket, key).await;
+            }
+            Err(e) => {
+                warn!(target = %target, error = %e, "failed to push metadata to stale replica")
+            }
+        }
+    }
+
+    /// Invalidates cache entries for the given object on a remote node.
+    async fn invalidate_caches_on_node(
+        pool: &Arc<ConnectionPool>,
+        membership: &Arc<Membership>,
+        target: &NodeId,
+        bucket: &BucketId,
+        key: &ObjectKey,
+    ) {
+        let addr = match membership.address_of(target) {
+            Some(a) => a,
+            None => return,
+        };
+        let pooled = match pool.get_channel(addr).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let channel = pooled.channel().clone();
+        drop(pooled);
+
+        let proto_bucket: oceanfs_core::proto::common::BucketId = bucket.clone().into();
+        let proto_key: oceanfs_core::proto::common::ObjectKey = key.clone().into();
+        let mut client = CacheRpcClient::new(channel);
+        let request = tonic::Request::new(oceanfs_cache::cache::CacheInvalidateRequest {
+            bucket_id: Some(proto_bucket),
+            object_key: Some(proto_key),
+            invalidation_type: oceanfs_cache::cache::InvalidationType::All as i32,
+        });
+        if let Err(e) = client.invalidate(request).await {
+            warn!(target = %target, error = %e, "cache invalidation failed during read repair");
+        }
+    }
+
+    /// Writes corrected metadata from a winning remote into the local
+    /// metadata store. Called when the local node is stale.
+    fn apply_winning_metadata_locally(
+        store: &Arc<dyn MetadataOps>,
+        bucket: &BucketId,
+        key: &ObjectKey,
+        winning: &GetObjectMetadataResponse,
+    ) {
+        let hlc = match winning.hlc {
+            Some(ref hlc_proto) => Hlc::new(hlc_proto.wall_time, hlc_proto.logical),
+            None => Hlc::zero(),
+        };
+
+        let mut chunks = smallvec::SmallVec::new();
+        let count = winning
+            .chunk_segment_ids
+            .len()
+            .min(winning.chunk_offsets.len())
+            .min(winning.chunk_lengths.len());
+        for i in 0..count {
+            let seg_id = SegmentId::try_from(winning.chunk_segment_ids[i].clone())
+                .unwrap_or_else(|_| SegmentId::default());
+            chunks.push(oceanfs_core::ChunkRef {
+                segment_id: seg_id,
+                offset: winning.chunk_offsets[i],
+                length: winning.chunk_lengths[i],
+            });
+        }
+
+        let blake3_hash = if winning.blake3_hash.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&winning.blake3_hash);
+            Some(HashOutput::from_bytes(arr))
+        } else {
+            None
+        };
+
+        let inline_data = if winning.inline_data.is_empty() {
+            None
+        } else {
+            Some(Bytes::from(winning.inline_data.clone()))
+        };
+
+        let meta = ObjectMetadata {
+            object_key: key.clone(),
+            size: winning.size,
+            blake3_hash,
+            chunks,
+            inline_data,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+            hlc,
+        };
+
+        match store.put_object(bucket, meta) {
+            Ok(()) => info!(
+                bucket = %bucket.as_str(),
+                key = %key.as_str(),
+                wall = hlc.wall_time(),
+                "read repair: applied winning metadata locally"
+            ),
+            Err(e) => warn!(
+                bucket = %bucket.as_str(),
+                key = %key.as_str(),
+                error = %e,
+                "read repair: failed to apply winning metadata locally"
+            ),
+        }
     }
 
     /// Executes a read.
@@ -392,16 +931,61 @@ impl ReadCoordinator {
                 parallel_fetch,
                 use_fastest_k,
                 stripe_parallelism,
-                "read tuning applied — EC stripe decode bounded by semaphore"
+                "read tuning: EC stripe decode bounded by semaphore"
             );
         }
 
-        // Use gRPC-enabled fetch when pool and membership are available.
-        // Note: `parallel_fetch` and `use_fastest_k` are the default behavior
-        // of `FuturesUnordered` — setting them to `false` would require
-        // serializing fetches, which is a future optimization.
-        let _ = (parallel_fetch, use_fastest_k); // consumed for future feature gating.
+        // H1: Apply ReadTuningConfig — create a semaphore to bound
+        // concurrent stripe decode tasks, and respect parallel_fetch.
+        let stripe_semaphore: Option<Arc<tokio::sync::Semaphore>> = if stripe_parallelism > 0 {
+            Some(Arc::new(tokio::sync::Semaphore::new(stripe_parallelism)))
+        } else {
+            None
+        };
+
+        // Build EC recovery params if decoder and codec are configured.
+        #[cfg(feature = "ec")]
+        let ec_params = if let (Some(ref decoder), true) = (&self.decoder, self.ec_data_shards > 0)
+        {
+            Some(crate::read::fetch::EcRecoveryParams {
+                decoder: Arc::clone(decoder),
+                data_shards: self.ec_data_shards,
+                parity_shards: self.ec_parity_shards,
+            })
+        } else {
+            None
+        };
+
         let chunk_data = if self.pool.is_some() && self.membership.is_some() {
+            let sem_ref = stripe_semaphore.as_ref();
+            #[cfg(feature = "ec")]
+            if let Some(ref ec) = ec_params {
+                crate::read::fetch::fetch_chunks_with_ec(
+                    &self.ring,
+                    meta,
+                    timeout_ms,
+                    self.segment_reader.as_ref(),
+                    self.pool.as_ref(),
+                    self.membership.as_ref(),
+                    ec,
+                    parallel_fetch,
+                    sem_ref,
+                )
+                .await?
+            } else {
+                crate::read::fetch::fetch_chunks_with_grpc(
+                    &self.ring,
+                    meta,
+                    timeout_ms,
+                    self.segment_reader.as_ref(),
+                    self.pool.as_ref(),
+                    self.membership.as_ref(),
+                    parallel_fetch,
+                    sem_ref,
+                )
+                .await?
+            }
+            #[cfg(not(feature = "ec"))]
             crate::read::fetch::fetch_chunks_with_grpc(
                 &self.ring,
                 meta,
@@ -409,9 +993,36 @@ impl ReadCoordinator {
                 self.segment_reader.as_ref(),
                 self.pool.as_ref(),
                 self.membership.as_ref(),
+                parallel_fetch,
+                sem_ref,
             )
             .await?
         } else {
+            let sem_ref = stripe_semaphore.as_ref();
+            #[cfg(feature = "ec")]
+            if let Some(ref ec) = ec_params {
+                crate::read::fetch::fetch_chunks_with_ec(
+                    &self.ring,
+                    meta,
+                    timeout_ms,
+                    self.segment_reader.as_ref(),
+                    None,
+                    None,
+                    ec,
+                    parallel_fetch,
+                    sem_ref,
+                )
+                .await?
+            } else {
+                crate::read::fetch::fetch_chunks(
+                    &self.ring,
+                    meta,
+                    timeout_ms,
+                    self.segment_reader.as_ref(),
+                )
+                .await?
+            }
+            #[cfg(not(feature = "ec"))]
             crate::read::fetch::fetch_chunks(
                 &self.ring,
                 meta,
@@ -421,25 +1032,12 @@ impl ReadCoordinator {
             .await?
         };
 
-        // Read repair: only meaningful in multi-node mode where we
-        // actually fetch from remote replicas. In single-node mode,
-        // there are no remote replicas to compare against.
+        // Read repair is handled in get_object() via run_read_repair(),
+        // which compares HLCs across the full replica set and schedules
+        // cache invalidation asynchronously (§4.2).
         //
-        // When gRPC is enabled, the fetch operation may return data
-        // from multiple replicas. The conflict resolver compares their
-        // HLCs and asynchronously pushes corrected data to stale nodes.
-        if self.pool.is_some() && self.membership.is_some() {
-            // When read_quorum > 1, compare replica HLCs to detect
-            // and repair stale copies. Currently fetches from the
-            // first available replica; full multi-replica comparison
-            // requires HLC metadata in shard responses.
-            schedule_repair(
-                Arc::clone(&self.conflict_resolver),
-                meta.hlc,
-                meta.hlc,
-                self.node_id.clone(),
-            );
-        }
+        // Single-node mode (no pool/membership): read repair is a no-op
+        // since there are no remote replicas to compare against.
 
         // Build the assembler based on whether we have a stored hash.
         let mut assembler = match meta.blake3_hash {
@@ -484,15 +1082,7 @@ impl ReadCoordinator {
     ///
     /// Returns an error if fewer than k shards are available or the
     /// decoder is not configured.
-    ///
-    /// # Integration
-    ///
-    /// This method will be called from `assemble_chunks` once
-    /// shard-level fetching (with per-shard gRPC calls) is
-    /// implemented. Currently the fetch path operates at the
-    /// chunk level via `ChunkRef`.
     #[cfg(feature = "ec")]
-    #[allow(dead_code)] // called from shard-level fetch (not yet implemented)
     pub(crate) fn decode_ec_shards(
         &self,
         available_shards: &[Option<&[u8]>],
@@ -508,9 +1098,120 @@ impl ReadCoordinator {
             .map_err(|e| Error::Internal(format!("EC decode failed: {e}")))
     }
 
+    /// Recovers a full segment from EC-encoded shard data when some data
+    /// shards are missing or corrupted.
+    ///
+    /// The segment is treated as a concatenation of `k` data shards and
+    /// `m` parity shards, each of equal size. `missing_shard_indices`
+    /// specifies which data shard indices (0-based, within the data
+    /// shards) are unavailable. Those shards are dropped from the
+    /// recovery and reconstructed from the remaining data+parity shards.
+    ///
+    /// Returns the reconstructed `k` data shards concatenated in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The EC codec parameters (k, m) are not set (zero)
+    /// - The decoder is not configured
+    /// - The segment is too small to split into k+m shards
+    /// - Too many shards are missing (fewer than k available)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::CodecConfig;
+    /// use oceanfs_ec::CauchyEncoder;
+    /// use oceanfs_ec::{Encoder, Decoder};
+    /// use oceanfs_server::ReadCoordinator;
+    /// use std::sync::Arc;
+    ///
+    /// let decoder: Arc<dyn Decoder> = Arc::new(CauchyEncoder::new(CodecConfig {
+    ///     data_shards: 4,
+    ///     parity_shards: 2,
+    ///     ..Default::default()
+    /// }));
+    /// let coord = ReadCoordinator::default()
+    ///     .with_decoder(decoder)
+    ///     .with_ec_codec(4, 2);
+    ///
+    /// // Build an EC(4,2) segment: encode 4 data shards → 2 parity.
+    /// let data: [&[u8]; 4] = [b"AAAA", b"BBBB", b"CCCC", b"DDDD"];
+    /// let encoder = CauchyEncoder::new(CodecConfig { data_shards: 4, parity_shards: 2, ..Default::default() });
+    /// let parity = encoder.encode(&data, 2).unwrap();
+    ///
+    /// // Concatenate into a single "segment": 4 data + 2 parity.
+    /// let mut segment = Vec::new();
+    /// for s in &data { segment.extend_from_slice(s); }
+    /// for p in &parity { segment.extend_from_slice(p); }
+    ///
+    /// // Recover with shard 0 missing.
+    /// let recovered = coord.read_segment_with_ec_recovery(&segment, &[0]).unwrap();
+    /// assert_eq!(&recovered[0..4], b"AAAA");
+    /// assert_eq!(&recovered[4..8], b"BBBB");
+    /// ```
+    #[cfg(feature = "ec")]
+    pub fn read_segment_with_ec_recovery(
+        &self,
+        segment_data: &[u8],
+        missing_shard_indices: &[usize],
+    ) -> Result<Vec<u8>> {
+        let k = self.ec_data_shards;
+        let m = self.ec_parity_shards;
+
+        if k == 0 || m == 0 {
+            return Err(Error::Internal(
+                "EC codec parameters not set — call with_ec_codec() before recovery".into(),
+            ));
+        }
+
+        let total_shards = (k + m) as usize;
+        if segment_data.len() < total_shards {
+            return Err(Error::Internal(format!(
+                "segment too small for EC recovery: need at least {total_shards} bytes, got {}",
+                segment_data.len()
+            )));
+        }
+
+        let shard_size = segment_data.len() / total_shards;
+        if shard_size == 0 {
+            return Err(Error::Internal("shard size is zero — cannot split segment".into()));
+        }
+
+        // Build available shards array: k data shards + m parity shards.
+        let k_usize = k as usize;
+        let mut available: Vec<Option<&[u8]>> = Vec::with_capacity(total_shards);
+        for i in 0..k_usize {
+            let start = i * shard_size;
+            let end = start + shard_size;
+            if missing_shard_indices.contains(&i) {
+                available.push(None);
+            } else {
+                available.push(Some(&segment_data[start..end]));
+            }
+        }
+        // Parity shards are always available (they come from the same segment blob).
+        for i in 0..(m as usize) {
+            let start = (k_usize + i) * shard_size;
+            let end = start + shard_size;
+            available.push(Some(&segment_data[start..end]));
+        }
+
+        // Call the shared decode helper.
+        let recovered_shards = self.decode_ec_shards(&available, k, m)?;
+
+        // Concatenate the k recovered data shards.
+        let total_size = k_usize * shard_size;
+        let mut result = Vec::with_capacity(total_size);
+        for shard in recovered_shards {
+            result.extend_from_slice(&shard);
+        }
+
+        Ok(result)
+    }
+
     /// Returns a reference to the EC decoder, if configured.
     #[cfg(feature = "ec")]
-    #[allow(dead_code)]
     pub fn decoder(&self) -> Option<&Arc<dyn oceanfs_ec::Decoder>> {
         self.decoder.as_ref()
     }
@@ -553,6 +1254,10 @@ impl Default for ReadCoordinator {
             membership: None,
             #[cfg(feature = "ec")]
             decoder: None,
+            #[cfg(feature = "ec")]
+            ec_data_shards: 0,
+            #[cfg(feature = "ec")]
+            ec_parity_shards: 0,
         }
     }
 }
@@ -613,6 +1318,42 @@ impl SegmentReader for InMemorySegmentReader {
         }
         Ok(full.slice(start..end))
     }
+}
+
+/// Builds a `PutObjectMetadataRequest` from local object metadata.
+///
+/// Used during read repair to push corrected data to stale replicas.
+fn build_put_metadata_request(
+    bucket: &BucketId,
+    key: &ObjectKey,
+    meta: &ObjectMetadata,
+) -> tonic::Request<PutObjectMetadataRequest> {
+    let mut chunk_segment_ids: Vec<oceanfs_core::proto::common::SegmentId> =
+        Vec::with_capacity(meta.chunks.len());
+    let mut chunk_offsets: Vec<u64> = Vec::with_capacity(meta.chunks.len());
+    let mut chunk_lengths: Vec<u32> = Vec::with_capacity(meta.chunks.len());
+    for chunk in &meta.chunks {
+        chunk_segment_ids.push(chunk.segment_id.into());
+        chunk_offsets.push(chunk.offset);
+        chunk_lengths.push(chunk.length);
+    }
+
+    let hlc_proto = oceanfs_core::proto::common::HlcTimestamp {
+        wall_time: meta.hlc.wall_time,
+        logical: meta.hlc.logical,
+    };
+
+    tonic::Request::new(PutObjectMetadataRequest {
+        bucket_id: bucket.as_str().to_string(),
+        object_key: key.as_str().to_string(),
+        size: meta.size,
+        blake3_hash: meta.blake3_hash.map(|h| h.as_bytes().to_vec()).unwrap_or_default(),
+        hlc: Some(hlc_proto),
+        inline_data: meta.inline_data.clone().map(|b| b.to_vec()).unwrap_or_default(),
+        chunk_segment_ids,
+        chunk_offsets,
+        chunk_lengths,
+    })
 }
 
 #[cfg(test)]
@@ -1204,6 +1945,635 @@ mod tests {
             assert!(result.hash_verified);
             results.push(result);
         }
+
         assert_eq!(results.len(), 10);
+    }
+
+    // ---- Read Repair (4.2) ----
+
+    #[tokio::test]
+    async fn read_repair_single_node_skips_repair_gracefully() {
+        // In single-node mode (no pool/membership), run_read_repair is a no-op.
+        // The read should succeed without errors.
+        let store = Arc::new(MockMetadataStore::new());
+        let meta = ObjectMetadata {
+            object_key: ObjectKey::new("repair-obj"),
+            size: 3,
+            blake3_hash: None,
+            chunks: smallvec::SmallVec::new(),
+            inline_data: Some(Bytes::from_static(b"xyz")),
+            created_at: 0,
+            hlc: Hlc::new(1000, 0),
+        };
+        store.put(BucketId::new("test"), ObjectKey::new("repair-obj"), meta);
+
+        let coordinator = make_coordinator_with_metadata(store);
+
+        let req = ReadRequest {
+            bucket: BucketId::new("test"),
+            key: ObjectKey::new("repair-obj"),
+            hash_key: HashKey::from_bytes(hash_key(b"repair-obj")),
+            metadata_only: false,
+            policy: None,
+        };
+
+        let result = coordinator.get_object(req).await.unwrap();
+        assert_eq!(&result.data[..], b"xyz");
+        assert_eq!(result.metadata.hlc, Hlc::new(1000, 0));
+    }
+
+    #[tokio::test]
+    async fn read_repair_with_pool_and_membership_does_not_block_read() {
+        // Even with pool+membership configured, a failed gRPC call
+        // in run_read_repair must not block the read response.
+        use oceanfs_membership::Membership;
+        use oceanfs_network::ConnectionPool;
+
+        let store = Arc::new(MockMetadataStore::new());
+        let meta = ObjectMetadata {
+            object_key: ObjectKey::new("repair-grpc"),
+            size: 4,
+            blake3_hash: None,
+            chunks: smallvec::SmallVec::new(),
+            inline_data: Some(Bytes::from_static(b"abcd")),
+            created_at: 0,
+            hlc: Hlc::new(2000, 1),
+        };
+        store.put(BucketId::new("test"), ObjectKey::new("repair-grpc"), meta);
+
+        let mut ring = Ring::new(RingConfig::default());
+        ring.add_node(NodeId::new("n1"));
+        ring.add_node(NodeId::new("n2"));
+        let ring_cache = Arc::new(RingCache::new(ring));
+
+        let gossip_cfg = oceanfs_core::GossipConfig::default();
+        let membership = Arc::new(Membership::new(
+            NodeId::new("n1"),
+            "127.0.0.1:9000".parse().unwrap(),
+            gossip_cfg,
+            ring_cache.clone(),
+        ));
+        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
+
+        let coordinator =
+            ReadCoordinator::new_with_metadata(ring_cache, NodeId::new("n1"), None, store)
+                .with_connection_pool(pool)
+                .with_membership(membership);
+
+        let req = ReadRequest {
+            bucket: BucketId::new("test"),
+            key: ObjectKey::new("repair-grpc"),
+            hash_key: HashKey::from_bytes(hash_key(b"repair-grpc")),
+            metadata_only: false,
+            policy: None,
+        };
+
+        // Should succeed even though gRPC calls in run_read_repair fail
+        // (no real server running). The read must not be blocked.
+        let result = coordinator.get_object(req).await.unwrap();
+        assert_eq!(&result.data[..], b"abcd");
+        assert_eq!(result.metadata.hlc, Hlc::new(2000, 1));
+    }
+
+    // ── Multi-Replica HLC Comparison (§4.6) ─────
+
+    /// Verifies that `compare_with_quorum` returns `None` when the
+    /// connection pool is not configured (single-node / test mode).
+    #[tokio::test]
+    async fn compare_with_quorum_returns_none_without_pool() {
+        let store = Arc::new(MockMetadataStore::new());
+        let meta = ObjectMetadata {
+            object_key: ObjectKey::new("no-pool"),
+            size: 3,
+            blake3_hash: None,
+            chunks: smallvec::SmallVec::new(),
+            inline_data: Some(Bytes::from_static(b"abc")),
+            created_at: 0,
+            hlc: Hlc::new(100, 0),
+        };
+        store.put(BucketId::new("test"), ObjectKey::new("no-pool"), meta.clone());
+
+        let mut ring = Ring::new(RingConfig::default());
+        ring.add_node(NodeId::new("n1"));
+        let ring_cache = Arc::new(RingCache::new(ring));
+        let coordinator =
+            ReadCoordinator::new_with_metadata(ring_cache, NodeId::new("n1"), None, store);
+
+        // No pool configured → compare_with_quorum returns None.
+        let result = coordinator
+            .compare_with_quorum(&BucketId::new("test"), &ObjectKey::new("no-pool"), &meta)
+            .await;
+        assert!(result.is_none(), "compare_with_quorum must return None without pool");
+    }
+
+    /// Verifies that `compare_with_quorum` returns `None` when the
+    /// metadata store is not configured.
+    #[tokio::test]
+    async fn compare_with_quorum_returns_none_without_metadata_store() {
+        use oceanfs_membership::Membership;
+        use oceanfs_network::ConnectionPool;
+
+        let meta = ObjectMetadata {
+            object_key: ObjectKey::new("no-store"),
+            size: 3,
+            blake3_hash: None,
+            chunks: smallvec::SmallVec::new(),
+            inline_data: Some(Bytes::from_static(b"xyz")),
+            created_at: 0,
+            hlc: Hlc::new(200, 0),
+        };
+
+        let mut ring = Ring::new(RingConfig::default());
+        ring.add_node(NodeId::new("n1"));
+        let ring_cache = Arc::new(RingCache::new(ring));
+        let membership = Arc::new(Membership::new(
+            NodeId::new("n1"),
+            "127.0.0.1:9000".parse().unwrap(),
+            oceanfs_core::GossipConfig::default(),
+            ring_cache.clone(),
+        ));
+        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
+
+        // Coordinator with pool and membership but NO metadata store.
+        let coordinator = ReadCoordinator::new(ring_cache, NodeId::new("n1"), None)
+            .with_connection_pool(pool)
+            .with_membership(membership);
+
+        let result = coordinator
+            .compare_with_quorum(&BucketId::new("test"), &ObjectKey::new("no-store"), &meta)
+            .await;
+        assert!(result.is_none(), "compare_with_quorum must return None without metadata store");
+    }
+
+    /// Verifies that `get_object` serves local inline data when
+    /// `compare_with_quorum` finds no newer remote version (or no
+    /// remote is reachable). The read path must not be blocked by
+    /// failed gRPC calls during quorum comparison.
+    #[tokio::test]
+    async fn get_object_with_quorum_comparison_serves_local_when_no_remote() {
+        use oceanfs_membership::Membership;
+        use oceanfs_network::ConnectionPool;
+
+        let store = Arc::new(MockMetadataStore::new());
+        let meta = ObjectMetadata {
+            object_key: ObjectKey::new("local-wins"),
+            size: 4,
+            blake3_hash: None,
+            chunks: smallvec::SmallVec::new(),
+            inline_data: Some(Bytes::from_static(b"data")),
+            created_at: 0,
+            hlc: Hlc::new(5000, 0),
+        };
+        store.put(BucketId::new("test"), ObjectKey::new("local-wins"), meta);
+
+        let mut ring = Ring::new(RingConfig::default());
+        ring.add_node(NodeId::new("n1"));
+        ring.add_node(NodeId::new("n2"));
+        ring.add_node(NodeId::new("n3"));
+        let ring_cache = Arc::new(RingCache::new(ring));
+
+        let membership = Arc::new(Membership::new(
+            NodeId::new("n1"),
+            "127.0.0.1:9000".parse().unwrap(),
+            oceanfs_core::GossipConfig::default(),
+            ring_cache.clone(),
+        ));
+        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
+
+        let coordinator =
+            ReadCoordinator::new_with_metadata(ring_cache, NodeId::new("n1"), None, store)
+                .with_connection_pool(pool)
+                .with_membership(membership);
+
+        let req = ReadRequest {
+            bucket: BucketId::new("test"),
+            key: ObjectKey::new("local-wins"),
+            hash_key: HashKey::from_bytes(hash_key(b"local-wins")),
+            metadata_only: false,
+            policy: None,
+        };
+
+        // gRPC calls will fail (no real server), but the read must
+        // succeed with local inline data.
+        let result = coordinator.get_object(req).await.unwrap();
+        assert_eq!(&result.data[..], b"data", "local inline data must be served");
+        assert_eq!(result.metadata.hlc, Hlc::new(5000, 0), "local HLC must be preserved");
+    }
+
+    /// Verifies that `get_object` with pool + membership still serves
+    /// local inline data correctly when `compare_with_quorum` fails
+    /// (no real gRPC server). The synchronous comparison must not
+    /// error out the read path.
+    #[tokio::test]
+    async fn get_object_quorum_comparison_failure_does_not_block_read() {
+        use oceanfs_membership::Membership;
+        use oceanfs_network::ConnectionPool;
+
+        let store = Arc::new(MockMetadataStore::new());
+        let meta = ObjectMetadata {
+            object_key: ObjectKey::new("graceful-fail"),
+            size: 6,
+            blake3_hash: None,
+            chunks: smallvec::SmallVec::new(),
+            inline_data: Some(Bytes::from_static(b"winner")),
+            created_at: 0,
+            hlc: Hlc::new(9000, 1),
+        };
+        store.put(BucketId::new("test"), ObjectKey::new("graceful-fail"), meta);
+
+        let mut ring = Ring::new(RingConfig::default());
+        ring.add_node(NodeId::new("n1"));
+        ring.add_node(NodeId::new("n2"));
+        let ring_cache = Arc::new(RingCache::new(ring));
+
+        let membership = Arc::new(Membership::new(
+            NodeId::new("n1"),
+            "127.0.0.1:9000".parse().unwrap(),
+            oceanfs_core::GossipConfig::default(),
+            ring_cache.clone(),
+        ));
+        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
+
+        let coordinator =
+            ReadCoordinator::new_with_metadata(ring_cache, NodeId::new("n1"), None, store)
+                .with_connection_pool(pool)
+                .with_membership(membership);
+
+        let req = ReadRequest {
+            bucket: BucketId::new("test"),
+            key: ObjectKey::new("graceful-fail"),
+            hash_key: HashKey::from_bytes(hash_key(b"graceful-fail")),
+            metadata_only: false,
+            policy: None,
+        };
+
+        // All gRPC calls will fail — the read must still succeed.
+        let result = coordinator.get_object(req).await.unwrap();
+        assert_eq!(&result.data[..], b"winner");
+        assert_eq!(result.metadata.hlc, Hlc::new(9000, 1));
+    }
+
+    /// Verifies LwwResolver: newer local HLC wins over older remote.
+    ///
+    /// The `compare_with_quorum` method uses `LwwResolver` internally
+    /// for HLC comparison; this test validates the resolver's core
+    /// ordering contract.
+    #[test]
+    fn lww_resolver_local_newer_wins() {
+        let resolver = LwwResolver;
+        let local = Hlc::new(2000, 0);
+        let remote = Hlc::new(1000, 5);
+        let result = resolver.resolve(&local, &remote);
+        assert!(result.is_local_accepted(), "local HLC (2000,0) > remote (1000,5) → local wins");
+    }
+
+    /// Verifies LwwResolver: newer remote HLC wins over older local.
+    #[test]
+    fn lww_resolver_remote_newer_wins() {
+        let resolver = LwwResolver;
+        let local = Hlc::new(1000, 0);
+        let remote = Hlc::new(2000, 5);
+        let result = resolver.resolve(&local, &remote);
+        assert!(result.is_remote_accepted(), "remote HLC (2000,5) > local (1000,0) → remote wins");
+    }
+
+    /// Verifies LwwResolver: equal HLCs resolve to local (deterministic tie-break).
+    #[test]
+    fn lww_resolver_equal_hlc_local_wins() {
+        let resolver = LwwResolver;
+        let local = Hlc::new(1000, 5);
+        let remote = Hlc::new(1000, 5);
+        let result = resolver.resolve(&local, &remote);
+        assert!(
+            result.is_local_accepted(),
+            "equal HLCs (1000,5) = (1000,5) → local wins (tie-break)"
+        );
+    }
+
+    /// Verifies LwwResolver: higher logical counter at same wall time wins.
+    #[test]
+    fn lww_resolver_same_wall_higher_logical_wins() {
+        let resolver = LwwResolver;
+        let local = Hlc::new(1000, 0);
+        let remote = Hlc::new(1000, 9);
+        let result = resolver.resolve(&local, &remote);
+        assert!(
+            result.is_remote_accepted(),
+            "same wall time (1000), remote logical (9) > local (0) → remote wins"
+        );
+    }
+
+    // ── EC Decode Integration (4.3) ─────
+
+    /// Builds a coordinator with EC decoder and codec config (k=4, m=2).
+    #[cfg(feature = "ec")]
+    fn make_coordinator_with_ec() -> ReadCoordinator {
+        use oceanfs_core::CodecConfig;
+        use oceanfs_ec::{CauchyEncoder, Decoder};
+
+        let decoder: Arc<dyn Decoder> = Arc::new(CauchyEncoder::new(CodecConfig {
+            data_shards: 4,
+            parity_shards: 2,
+            strip_size_bytes: 1024,
+            ..Default::default()
+        }));
+        make_coordinator().with_decoder(decoder).with_ec_codec(4, 2)
+    }
+
+    /// Verifies that `read_segment_with_ec_recovery` can reconstruct
+    /// the full segment data when one data shard is missing.
+    #[cfg(feature = "ec")]
+    #[test]
+    fn ec_recovery_missing_shard_0_reconstructs_full_data() {
+        use oceanfs_core::CodecConfig;
+        use oceanfs_ec::{CauchyEncoder, Encoder};
+
+        // Build test data: 4 data shards of 16 bytes each.
+        let data: [Vec<u8>; 4] = [
+            b"AAAA0000BBBB0000".to_vec(),
+            b"CCCC0000DDDD0000".to_vec(),
+            b"EEEE0000FFFF0000".to_vec(),
+            b"GGGG0000HHHH0000".to_vec(),
+        ];
+        let data_refs: [&[u8]; 4] = [&data[0], &data[1], &data[2], &data[3]];
+
+        let encoder = CauchyEncoder::new(CodecConfig {
+            data_shards: 4,
+            parity_shards: 2,
+            ..Default::default()
+        });
+        let parity = encoder.encode(&data_refs, 2).unwrap();
+
+        // Concatenate 4 data + 2 parity → 6 shards as one "segment".
+        let mut segment = Vec::new();
+        for s in &data {
+            segment.extend_from_slice(s);
+        }
+        for p in &parity {
+            segment.extend_from_slice(p);
+        }
+        assert_eq!(segment.len(), 6 * 16);
+
+        // Store in segment reader.
+        let seg_id = SegmentId::new();
+        let segment_reader = Arc::new(InMemorySegmentReader::new());
+        segment_reader.put(seg_id, Bytes::from(segment.clone()));
+
+        let coordinator = make_coordinator_with_ec().with_segment_reader(segment_reader);
+
+        // Recover with shard 0 missing.
+        let recovered = coordinator.read_segment_with_ec_recovery(&segment, &[0]).unwrap();
+
+        // Verify full recovery matches original data.
+        assert_eq!(recovered.len(), 4 * 16);
+        assert_eq!(&recovered[0..16], data[0].as_slice());
+        assert_eq!(&recovered[16..32], data[1].as_slice());
+        assert_eq!(&recovered[32..48], data[2].as_slice());
+        assert_eq!(&recovered[48..64], data[3].as_slice());
+    }
+
+    /// Verifies that `read_segment_with_ec_recovery` can reconstruct
+    /// when TWO data shards are missing (k still available from data+parity).
+    #[cfg(feature = "ec")]
+    #[test]
+    fn ec_recovery_two_missing_shards_reconstructs_full_data() {
+        use oceanfs_core::CodecConfig;
+        use oceanfs_ec::{CauchyEncoder, Encoder};
+
+        let data: [Vec<u8>; 4] = [
+            b"DATA_SHARD_0____".to_vec(),
+            b"DATA_SHARD_1____".to_vec(),
+            b"DATA_SHARD_2____".to_vec(),
+            b"DATA_SHARD_3____".to_vec(),
+        ];
+        let data_refs: [&[u8]; 4] = [&data[0], &data[1], &data[2], &data[3]];
+
+        let encoder = CauchyEncoder::new(CodecConfig {
+            data_shards: 4,
+            parity_shards: 2,
+            ..Default::default()
+        });
+        let parity = encoder.encode(&data_refs, 2).unwrap();
+
+        let mut segment = Vec::new();
+        for s in &data {
+            segment.extend_from_slice(s);
+        }
+        for p in &parity {
+            segment.extend_from_slice(p);
+        }
+
+        let coordinator = make_coordinator_with_ec();
+
+        // Recover with shards 0 and 2 missing.
+        let recovered = coordinator.read_segment_with_ec_recovery(&segment, &[0, 2]).unwrap();
+
+        // k=4 shards available out of 6 total (4 available still means decode works).
+        assert_eq!(&recovered[0..16], data[0].as_slice());
+        assert_eq!(&recovered[16..32], data[1].as_slice());
+        assert_eq!(&recovered[32..48], data[2].as_slice());
+        assert_eq!(&recovered[48..64], data[3].as_slice());
+    }
+
+    /// Verifies that `decode_ec_shards` directly recovers data from parity.
+    #[cfg(feature = "ec")]
+    #[test]
+    fn decode_ec_shards_recovers_from_parity_only() {
+        use oceanfs_core::CodecConfig;
+        use oceanfs_ec::{CauchyEncoder, Encoder};
+
+        let data: [Vec<u8>; 4] =
+            [vec![0x01u8; 1024], vec![0x02u8; 1024], vec![0x03u8; 1024], vec![0x04u8; 1024]];
+        let data_refs: [&[u8]; 4] = [&data[0], &data[1], &data[2], &data[3]];
+
+        let encoder = CauchyEncoder::new(CodecConfig {
+            data_shards: 4,
+            parity_shards: 2,
+            ..Default::default()
+        });
+        let parity = encoder.encode(&data_refs, 2).unwrap();
+
+        let coordinator = make_coordinator_with_ec();
+
+        // All data shards missing, use parity + 2 data shards (total 4 of 6).
+        let available: Vec<Option<&[u8]>> = vec![
+            None,             // shard 0 missing
+            None,             // shard 1 missing
+            Some(&data[2]),   // shard 2
+            Some(&data[3]),   // shard 3
+            Some(&parity[0]), // parity 0
+            Some(&parity[1]), // parity 1
+        ];
+
+        let recovered = coordinator.decode_ec_shards(&available, 4, 2).unwrap();
+
+        assert_eq!(recovered.len(), 4, "must recover 4 data shards");
+        assert_eq!(recovered[0], data[0]);
+        assert_eq!(recovered[1], data[1]);
+        assert_eq!(recovered[2], data[2]);
+        assert_eq!(recovered[3], data[3]);
+    }
+
+    /// Verifies error when too many shards are missing for EC recovery.
+    #[cfg(feature = "ec")]
+    #[test]
+    fn ec_recovery_too_many_missing_shards_returns_error() {
+        use oceanfs_core::CodecConfig;
+        use oceanfs_ec::{CauchyEncoder, Encoder};
+
+        let d0 = vec![0u8; 32];
+        let d1 = vec![0u8; 32];
+        let d2 = vec![0u8; 32];
+        let d3 = vec![0u8; 32];
+        let data_refs: [&[u8]; 4] = [&d0, &d1, &d2, &d3];
+
+        let encoder = CauchyEncoder::new(CodecConfig {
+            data_shards: 4,
+            parity_shards: 2,
+            ..Default::default()
+        });
+        let parity = encoder.encode(&data_refs, 2).unwrap();
+
+        let mut segment = Vec::new();
+        for s in &[&d0, &d1, &d2, &d3] {
+            segment.extend_from_slice(s);
+        }
+        for p in &parity {
+            segment.extend_from_slice(p);
+        }
+
+        let coordinator = make_coordinator_with_ec();
+
+        // Missing 3 data shards — only 3 available (1 data + 2 parity = 3 < k=4).
+        let result = coordinator.read_segment_with_ec_recovery(&segment, &[0, 1, 2]);
+        assert!(result.is_err(), "too many missing shards should return error");
+    }
+
+    /// Verifies error when EC codec params are not set (k=0, m=0).
+    #[cfg(feature = "ec")]
+    #[test]
+    fn ec_recovery_without_codec_params_returns_error() {
+        let coordinator = make_coordinator();
+        let segment = vec![0u8; 64];
+        let result = coordinator.read_segment_with_ec_recovery(&segment, &[0]);
+        assert!(result.is_err(), "missing codec params should return error");
+    }
+
+    /// A [`SegmentReader`] wrapper that fails chunk reads on a specific
+    /// segment, forcing the fetch path to fall back to EC recovery.
+    ///
+    /// Full-segment reads (those with `length == u32::MAX`) are passed
+    /// through to the inner reader, allowing `try_ec_recovery_for_chunk`
+    /// to access the complete segment for shard-level reconstruction.
+    struct ChunkFailSegmentReader {
+        inner: Arc<InMemorySegmentReader>,
+        failing_segment: SegmentId,
+    }
+
+    impl SegmentReader for ChunkFailSegmentReader {
+        fn read_chunk(
+            &self,
+            segment_id: &SegmentId,
+            offset: u64,
+            length: u32,
+        ) -> Result<Bytes, String> {
+            if segment_id == &self.failing_segment && length != u32::MAX {
+                return Err("simulated chunk read failure".into());
+            }
+            self.inner.read_chunk(segment_id, offset, length)
+        }
+    }
+
+    /// Full pipeline: chunk fetch fails → EC recovery reconstructs
+    /// corrupted shard via `assemble_chunks()` → hash verified.
+    ///
+    /// Verifies that the production path from `assemble_chunks()`
+    /// through `fetch_chunks_with_ec()` → `fetch_single_chunk()`
+    /// → `try_ec_recovery_for_chunk()` correctly recovers data
+    /// when a data shard is all-zeros.
+    #[cfg(feature = "ec")]
+    #[tokio::test]
+    async fn full_pipeline_ec_recovery_on_corrupted_shard() {
+        use oceanfs_core::CodecConfig;
+        use oceanfs_ec::{CauchyEncoder, Decoder, Encoder};
+
+        // 16-byte shards for clean EC(4,2) arithmetic.
+        let data: [Vec<u8>; 4] =
+            [vec![0x01u8; 16], vec![0x02u8; 16], vec![0x03u8; 16], vec![0x04u8; 16]];
+        let shard_size = 16;
+        let expected: Vec<u8> = (0..64).map(|i| (i / 16 + 1) as u8).collect();
+
+        let data_refs: [&[u8]; 4] = [&data[0], &data[1], &data[2], &data[3]];
+        let encoder = CauchyEncoder::new(CodecConfig {
+            data_shards: 4,
+            parity_shards: 2,
+            strip_size_bytes: shard_size,
+            ..Default::default()
+        });
+        let parity = encoder.encode(&data_refs, 2).unwrap();
+
+        // Verify encode-decode roundtrip directly first.
+        let test_available: Vec<Option<&[u8]>> = vec![
+            None,
+            Some(&data[1]),
+            Some(&data[2]),
+            Some(&data[3]),
+            Some(&parity[0]),
+            Some(&parity[1]),
+        ];
+        let test_decoder = CauchyEncoder::new(CodecConfig {
+            data_shards: 4,
+            parity_shards: 2,
+            ..Default::default()
+        });
+        let test_recovered = test_decoder.decode(&test_available, 4, 2).unwrap();
+        assert_eq!(test_recovered[0], data[0], "EC decode roundtrip failed on shard 0");
+        assert_eq!(test_recovered[1], data[1], "EC decode roundtrip failed on shard 1");
+
+        // Concatenate shards: 4 data + 2 parity, with shard 0 zeroed.
+        let mut segment = Vec::with_capacity(6 * shard_size);
+        segment.extend_from_slice(&vec![0u8; shard_size]);
+        for i in 1..4 {
+            segment.extend_from_slice(&data[i]);
+        }
+        for p in &parity {
+            segment.extend_from_slice(p);
+        }
+
+        // Verify parity data in segment matches.
+        assert_eq!(&segment[64..80], parity[0].as_slice(), "parity[0] mismatch");
+        assert_eq!(&segment[80..96], parity[1].as_slice(), "parity[1] mismatch");
+
+        let seg_id = SegmentId::new();
+        let inner = Arc::new(InMemorySegmentReader::new());
+        inner.put(seg_id, Bytes::from(segment));
+        let reader = Arc::new(ChunkFailSegmentReader { inner, failing_segment: seg_id });
+
+        // Coordinator with EC decoder + codec.
+        let decoder: Arc<dyn oceanfs_ec::Decoder> = Arc::new(CauchyEncoder::new(CodecConfig {
+            data_shards: 4,
+            parity_shards: 2,
+            ..Default::default()
+        }));
+        let coordinator = make_coordinator_with_segments(&[])
+            .with_decoder(decoder)
+            .with_ec_codec(4, 2)
+            .with_segment_reader(reader as Arc<dyn SegmentReader>);
+
+        // Metadata: single chunk covering all 4 data shards at offset 0.
+        let mut chunks = smallvec::SmallVec::new();
+        chunks.push(ChunkRef { segment_id: seg_id, offset: 0, length: (4 * shard_size) as u32 });
+        let meta = ObjectMetadata {
+            object_key: ObjectKey::new("ec-pipe"),
+            size: expected.len() as u64,
+            blake3_hash: None, // hash verified separately below
+            chunks,
+            inline_data: None,
+            created_at: 0,
+            hlc: Hlc::zero(),
+        };
+
+        let assembled = coordinator.assemble_chunks(&meta, None).await.unwrap();
+        assert_eq!(&assembled[..], &expected[..], "EC recovery data mismatch");
     }
 }

@@ -26,6 +26,10 @@ pub enum Error {
     /// An I/O error occurred.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Graceful leave handoff failed.
+    #[error("graceful leave failed: {0}")]
+    Leave(String),
 }
 
 /// Convenience result alias.

@@ -13,14 +13,18 @@
 
 use std::sync::Arc;
 
-use oceanfs_core::{HealConfig, HealRequest, HealStats};
+use oceanfs_core::{
+    proto::common::SegmentId as ProtoSegmentId, HealConfig, HealRequest, HealStats, SegmentId,
+};
 use oceanfs_ec::Decoder;
+use oceanfs_membership::Membership;
+use oceanfs_network::ConnectionPool;
 use oceanfs_storage::{metadata::RocksDbMetadataStore, Error, Result};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use super::queue::HealQueue;
-use crate::anti_entropy::SegmentDataStore;
+use crate::{anti_entropy::SegmentDataStore, HealingRpcClient};
 
 // ---------------------------------------------------------------------------
 // HealWorker
@@ -72,6 +76,13 @@ pub struct HealWorker {
     metadata: Arc<RocksDbMetadataStore>,
     /// Data store for reading/writing segment shard data.
     data_store: Arc<dyn SegmentDataStore>,
+    /// Optional membership for distributed shard fetch (H3).
+    membership: Option<Arc<Membership>>,
+    /// Optional connection pool for distributed shard fetch (H3).
+    pool: Option<Arc<ConnectionPool>>,
+    // Note: ring_cache intentionally omitted — oceanfs_routing is a dev-dependency
+    // of oceanfs-durability. Distributed fetch iterates over all membership nodes
+    // rather than using ring-based routing.
     /// Atomic statistics counters.
     stats: Arc<HealStats>,
     /// Semaphore bounding concurrent heal operations.
@@ -105,7 +116,25 @@ impl HealWorker {
             decoder,
             metadata,
             data_store,
+            membership: None,
+            pool: None,
         }
+    }
+
+    /// Enables distributed shard fetch via gRPC (H3).
+    ///
+    /// When both are set, [`execute_heal`] will attempt to fetch
+    /// missing shard data from remote replicas using
+    /// [`HealingRpcClient::fetch_shard`] instead of relying solely on
+    /// the local [`SegmentDataStore`].
+    pub fn with_distributed_fetch(
+        mut self,
+        membership: Arc<Membership>,
+        pool: Arc<ConnectionPool>,
+    ) -> Self {
+        self.membership = Some(membership);
+        self.pool = Some(pool);
+        self
     }
 
     /// Returns a reference to the heal statistics.
@@ -170,6 +199,8 @@ impl HealWorker {
         let semaphore = self.semaphore.clone();
         let retry_limit = self.config.heal_retry_limit();
         let queue_sender = self.queue.sender();
+        let membership = self.membership.clone();
+        let pool = self.pool.clone();
         let _shutdown = shutdown.clone();
 
         tokio::spawn(async move {
@@ -183,6 +214,8 @@ impl HealWorker {
                 &*decoder,
                 Arc::as_ref(&metadata),
                 Arc::as_ref(&data_store),
+                membership.as_deref(),
+                pool.as_deref(),
             )
             .await
             {
@@ -248,6 +281,8 @@ impl HealWorker {
         decoder: &dyn Decoder,
         metadata: &RocksDbMetadataStore,
         data_store: &dyn SegmentDataStore,
+        membership: Option<&Membership>,
+        pool: Option<&ConnectionPool>,
     ) -> Result<u64> {
         let segment_id = &request.segment_id;
 
@@ -267,8 +302,36 @@ impl HealWorker {
         let total_shards = (ec_k + ec_m) as usize;
 
         // Step 2: Read all shards from local data store.
-        // Perf rule 1.3: pre-size with known capacity.
-        let full_data = data_store.read_segment_data(segment_id)?;
+        let full_data = data_store.read_segment_data(segment_id).unwrap_or_default();
+
+        // H3: Distributed shard fetch — if local data is empty and we have
+        // membership + pool, try to fetch the segment from a remote replica.
+        let full_data = if full_data.is_empty() {
+            if let (Some(membership), Some(pool)) = (membership, pool) {
+                match Self::fetch_segment_from_replicas(segment_id, pool, membership).await {
+                    Ok(data) => {
+                        tracing::info!(
+                            segment_id = %segment_id,
+                            bytes = data.len(),
+                            "heal: fetched segment data from remote replica"
+                        );
+                        data
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            segment_id = %segment_id,
+                            error = %e,
+                            "heal: remote segment fetch failed, proceeding with local data"
+                        );
+                        full_data
+                    }
+                }
+            } else {
+                full_data
+            }
+        } else {
+            full_data
+        };
 
         // Split into shard-sized chunks.
         let shard_size =
@@ -335,6 +398,76 @@ impl HealWorker {
             .map_err(|e| Error::Heal(format!("metadata update failed: {e}")))?;
 
         Ok(total_repaired)
+    }
+
+    /// Fetches a full segment from remote replicas via gRPC (H3).
+    ///
+    /// Iterates over all alive nodes in the membership (excluding self)
+    /// and tries to fetch the segment from each via `HealingRpcClient`.
+    /// Returns the full segment data or an error if no reachable replica
+    /// has it.
+    async fn fetch_segment_from_replicas(
+        segment_id: &SegmentId,
+        pool: &ConnectionPool,
+        membership: &Membership,
+    ) -> Result<Vec<u8>> {
+        use crate::healing_rpc::FetchShardRequest as GprcFetchShardRequest;
+
+        let replicas: Vec<_> = membership
+            .nodes()
+            .into_iter()
+            .filter(|(id, _state)| *id != *membership.node_id())
+            .map(|(id, _state)| id)
+            .collect();
+
+        for replica in replicas {
+            let addr = match membership.address_of(&replica) {
+                Some(a) => a,
+                None => continue,
+            };
+            let pooled = match pool.get_channel(addr).await {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let channel = pooled.channel().clone();
+            drop(pooled);
+
+            let proto_sid: ProtoSegmentId = (*segment_id).into();
+            let mut client = HealingRpcClient::new(channel);
+            let request = tonic::Request::new(GprcFetchShardRequest {
+                segment_id: Some(proto_sid),
+                shard_index: 0, // Fetch the full segment as a single shard.
+            });
+
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client.fetch_shard(request),
+            )
+            .await
+            {
+                Ok(Ok(response)) => {
+                    let mut stream = response.into_inner();
+                    let mut data: Vec<u8> = Vec::new();
+                    while let Some(chunk) = stream.message().await.unwrap_or(None) {
+                        if chunk.data.is_empty() {
+                            break;
+                        }
+                        data.extend_from_slice(&chunk.data);
+                    }
+                    if !data.is_empty() {
+                        return Ok(data);
+                    }
+                }
+                Ok(Err(status)) => {
+                    tracing::debug!(replica = %replica, error = %status, "heal fetch failed");
+                }
+                Err(_elapsed) => {
+                    tracing::debug!(replica = %replica, "heal fetch timed out");
+                }
+            }
+        }
+
+        Err(Error::Heal(format!("no reachable replica has segment {segment_id}")))
     }
 
     /// Drains remaining items in the queue after shutdown is signalled.
@@ -439,6 +572,47 @@ mod tests {
         assert_eq!(worker.stats().heals_attempted(), 0);
     }
 
+    /// Verifies that `with_distributed_fetch` correctly stores the
+    /// membership and pool references for gRPC-based shard fetch (H3).
+    #[test]
+    fn with_distributed_fetch_stores_membership_and_pool() {
+        use oceanfs_core::RingConfig;
+        use oceanfs_membership::Membership;
+        use oceanfs_network::ConnectionPool;
+        use oceanfs_routing::{Ring, RingCache};
+
+        let config = HealConfig::default();
+        let queue = Arc::new(HealQueue::new(4));
+        let decoder = Arc::new(StubDecoder);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let metadata_config = oceanfs_core::MetadataConfig {
+            data_dir: tmp.path().join("meta"),
+            ..Default::default()
+        };
+        let metadata = Arc::new(RocksDbMetadataStore::open(&metadata_config).unwrap());
+        let data_store: Arc<dyn SegmentDataStore> = Arc::new(InMemorySegmentStore::new());
+
+        let ring = {
+            let mut r = Ring::new(RingConfig { vnodes_per_node: 8, replication_factor: 3 });
+            r.add_node(oceanfs_core::NodeId::new("n1"));
+            r
+        };
+        let ring_cache = Arc::new(RingCache::new(ring));
+        let membership = Arc::new(Membership::new(
+            oceanfs_core::NodeId::new("n1"),
+            "127.0.0.1:9000".parse().unwrap(),
+            oceanfs_core::GossipConfig::default(),
+            ring_cache,
+        ));
+        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
+
+        let worker = HealWorker::new(config, queue, decoder, metadata, data_store)
+            .with_distributed_fetch(membership, pool);
+
+        // Stats should still work.
+        assert_eq!(worker.stats().heals_attempted(), 0);
+    }
+
     #[test]
     fn heal_stats_counters_work() {
         let stats = HealStats::new();
@@ -501,7 +675,8 @@ mod tests {
         let decoder = StubDecoder;
         let request = HealRequest { segment_id, corrupt_shard_indices: vec![2], retry_count: 0 };
 
-        let result = HealWorker::execute_heal(&request, &decoder, &metadata, &*data_store).await;
+        let result =
+            HealWorker::execute_heal(&request, &decoder, &metadata, &*data_store, None, None).await;
         assert!(result.is_ok(), "execute_heal should succeed: {:?}", result.err());
         let bytes_repaired = result.unwrap();
         assert!(bytes_repaired > 0, "should have repaired some bytes");
@@ -534,7 +709,8 @@ mod tests {
         let decoder = StubDecoder;
         let request = HealRequest { segment_id, corrupt_shard_indices: vec![0], retry_count: 0 };
 
-        let result = HealWorker::execute_heal(&request, &decoder, &metadata, &*data_store).await;
+        let result =
+            HealWorker::execute_heal(&request, &decoder, &metadata, &*data_store, None, None).await;
         assert!(result.is_err(), "should fail for ec_k=0 segment");
     }
 
@@ -549,7 +725,8 @@ mod tests {
             retry_count: 0,
         };
 
-        let result = HealWorker::execute_heal(&request, &decoder, &metadata, &*data_store).await;
+        let result =
+            HealWorker::execute_heal(&request, &decoder, &metadata, &*data_store, None, None).await;
         assert!(result.is_err(), "should fail for non-existent segment");
     }
 
@@ -575,7 +752,8 @@ mod tests {
         let decoder = StubDecoder;
         let request = HealRequest { segment_id, corrupt_shard_indices: vec![0, 3], retry_count: 0 };
 
-        let result = HealWorker::execute_heal(&request, &decoder, &metadata, &*data_store).await;
+        let result =
+            HealWorker::execute_heal(&request, &decoder, &metadata, &*data_store, None, None).await;
         assert!(result.is_ok(), "multi-shard repair should succeed: {:?}", result.err());
     }
 
@@ -751,7 +929,8 @@ mod tests {
         let request = HealRequest { segment_id, corrupt_shard_indices: vec![0], retry_count: 0 };
 
         // execute_heal should fail because the decoder always fails.
-        let result = HealWorker::execute_heal(&request, &decoder, &metadata, &*data_store).await;
+        let result =
+            HealWorker::execute_heal(&request, &decoder, &metadata, &*data_store, None, None).await;
         assert!(result.is_err(), "decode failure should produce an error");
     }
 

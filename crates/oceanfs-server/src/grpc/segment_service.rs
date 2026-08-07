@@ -21,7 +21,8 @@ use std::sync::Arc;
 use oceanfs_core::{
     proto::segment::{
         AckStatus, DeleteObjectRequest, DeleteObjectResponse, FetchShardRequest,
-        SegmentAppendRequest, SegmentAppendResponse, ShardResponse,
+        GetObjectMetadataRequest, GetObjectMetadataResponse, PutObjectMetadataRequest,
+        PutObjectMetadataResponse, SegmentAppendRequest, SegmentAppendResponse, ShardResponse,
     },
     BucketId, ChunkRef, Hlc, ObjectKey, ObjectMetadata, SegmentId,
 };
@@ -311,6 +312,141 @@ impl SegmentRpc for SegmentGrpcService {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    /// Handles a metadata fetch request for read repair (4.2).
+    ///
+    /// Queries the local metadata store for the given object and returns
+    /// its HLC timestamp, size, hash, and chunk references so the caller
+    /// can compare versions across replicas.
+    async fn get_object_metadata(
+        &self,
+        request: Request<GetObjectMetadataRequest>,
+    ) -> Result<Response<GetObjectMetadataResponse>, Status> {
+        let req = request.into_inner();
+        let bucket = BucketId::new(&req.bucket_id);
+        let key = ObjectKey::new(&req.object_key);
+
+        let md_store = self
+            .metadata_store
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("no metadata store configured"))?;
+
+        match md_store
+            .get_object(&bucket, &key)
+            .map_err(|e| Status::internal(format!("metadata lookup: {e}")))?
+        {
+            Some(meta) => {
+                let mut chunk_segment_ids: Vec<oceanfs_core::proto::common::SegmentId> =
+                    Vec::with_capacity(meta.chunks.len());
+                let mut chunk_offsets: Vec<u64> = Vec::with_capacity(meta.chunks.len());
+                let mut chunk_lengths: Vec<u32> = Vec::with_capacity(meta.chunks.len());
+                for chunk in &meta.chunks {
+                    chunk_segment_ids.push(chunk.segment_id.into());
+                    chunk_offsets.push(chunk.offset);
+                    chunk_lengths.push(chunk.length);
+                }
+
+                let hlc_proto = oceanfs_core::proto::common::HlcTimestamp {
+                    wall_time: meta.hlc.wall_time,
+                    logical: meta.hlc.logical,
+                };
+
+                Ok(Response::new(GetObjectMetadataResponse {
+                    found: true,
+                    size: meta.size,
+                    blake3_hash: meta
+                        .blake3_hash
+                        .map(|h| h.as_bytes().to_vec())
+                        .unwrap_or_default(),
+                    hlc: Some(hlc_proto),
+                    inline_data: meta.inline_data.map(|b| b.to_vec()).unwrap_or_default(),
+                    chunk_segment_ids,
+                    chunk_offsets,
+                    chunk_lengths,
+                }))
+            }
+            None => Ok(Response::new(GetObjectMetadataResponse {
+                found: false,
+                size: 0,
+                blake3_hash: vec![],
+                hlc: None,
+                inline_data: vec![],
+                chunk_segment_ids: vec![],
+                chunk_offsets: vec![],
+                chunk_lengths: vec![],
+            })),
+        }
+    }
+
+    /// Handles a metadata push request from read repair (4.2).
+    ///
+    /// Receives corrected object metadata + inline data from a peer
+    /// and writes it to the local metadata store, overwriting any
+    /// stale entry.
+    async fn put_object_metadata(
+        &self,
+        request: Request<PutObjectMetadataRequest>,
+    ) -> Result<Response<PutObjectMetadataResponse>, Status> {
+        let req = request.into_inner();
+        let bucket = BucketId::new(&req.bucket_id);
+        let key = ObjectKey::new(&req.object_key);
+
+        let md_store = self
+            .metadata_store
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("no metadata store configured"))?;
+
+        let hlc = match req.hlc {
+            Some(ref hlc_proto) => Hlc::new(hlc_proto.wall_time, hlc_proto.logical),
+            None => Hlc::zero(),
+        };
+
+        let mut chunks = smallvec::SmallVec::new();
+        let count =
+            req.chunk_segment_ids.len().min(req.chunk_offsets.len()).min(req.chunk_lengths.len());
+        for i in 0..count {
+            let seg_id = SegmentId::try_from(req.chunk_segment_ids[i].clone())
+                .unwrap_or_else(|_| SegmentId::default());
+            chunks.push(ChunkRef {
+                segment_id: seg_id,
+                offset: req.chunk_offsets[i],
+                length: req.chunk_lengths[i],
+            });
+        }
+
+        let blake3_hash = if req.blake3_hash.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&req.blake3_hash);
+            Some(oceanfs_core::HashOutput::from_bytes(arr))
+        } else {
+            None
+        };
+
+        let inline_data = if req.inline_data.is_empty() {
+            None
+        } else {
+            Some(bytes::Bytes::from(req.inline_data))
+        };
+
+        let meta = ObjectMetadata {
+            object_key: key,
+            size: req.size,
+            blake3_hash,
+            chunks,
+            inline_data,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+            hlc,
+        };
+
+        md_store
+            .put_object_in_bucket(&bucket, meta)
+            .map_err(|e| Status::internal(format!("metadata write during read repair: {e}")))?;
+
+        Ok(Response::new(PutObjectMetadataResponse { written: true }))
     }
 }
 

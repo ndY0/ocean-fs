@@ -28,4 +28,12 @@ service SegmentRpc {
   // to propagate deletes across the replica set).
   rpc DeleteObject(oceanfs.segment.DeleteObjectRequest)
       returns (oceanfs.segment.DeleteObjectResponse);
+
+  // Fetch object metadata from a replica for read repair comparison (4.2).
+  rpc GetObjectMetadata(oceanfs.segment.GetObjectMetadataRequest)
+      returns (oceanfs.segment.GetObjectMetadataResponse);
+
+  // Push corrected object metadata to a stale replica during read repair (4.2).
+  rpc PutObjectMetadata(oceanfs.segment.PutObjectMetadataRequest)
+      returns (oceanfs.segment.PutObjectMetadataResponse);
 }
