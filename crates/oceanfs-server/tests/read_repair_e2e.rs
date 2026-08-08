@@ -17,6 +17,7 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+use bytes::Bytes;
 use oceanfs_core::{
     proto::segment::{
         GetObjectMetadataRequest, GetObjectMetadataResponse, PutObjectMetadataRequest,
@@ -32,7 +33,7 @@ use tonic::transport::Server;
 
 // In-memory segment data store for testing.
 struct InMemorySegments {
-    data: parking_lot::Mutex<std::collections::HashMap<SegmentId, Vec<u8>>>,
+    data: parking_lot::Mutex<std::collections::HashMap<SegmentId, Bytes>>,
 }
 
 impl InMemorySegments {
@@ -43,11 +44,11 @@ impl InMemorySegments {
 
 impl SegmentDataStore for InMemorySegments {
     fn write_segment_data(&self, segment_id: &SegmentId, data: &[u8]) -> Result<(), StorageError> {
-        self.data.lock().insert(*segment_id, data.to_vec());
+        self.data.lock().insert(*segment_id, Bytes::from(data.to_vec()));
         Ok(())
     }
 
-    fn read_segment_data(&self, segment_id: &SegmentId) -> Result<Vec<u8>, StorageError> {
+    fn read_segment_data(&self, segment_id: &SegmentId) -> Result<Bytes, StorageError> {
         self.data
             .lock()
             .get(segment_id)
@@ -118,12 +119,12 @@ async fn put_get_metadata_roundtrip() {
         bucket_id: bucket.as_str().to_string(),
         object_key: key.as_str().to_string(),
         size: 5,
-        blake3_hash: vec![],
+        blake3_hash: vec![].into(),
         hlc: Some(hlc_proto),
-        inline_data: b"hello".to_vec(),
-        chunk_segment_ids: vec![],
-        chunk_offsets: vec![],
-        chunk_lengths: vec![],
+        inline_data: b"hello".to_vec().into(),
+        chunk_segment_ids: vec![].into(),
+        chunk_offsets: vec![].into(),
+        chunk_lengths: vec![].into(),
     });
     let push_resp = client.put_object_metadata(push_req).await.unwrap();
     assert!(push_resp.into_inner().written);
@@ -138,7 +139,7 @@ async fn put_get_metadata_roundtrip() {
 
     assert!(meta.found);
     assert_eq!(meta.size, 5);
-    assert_eq!(meta.inline_data, b"hello");
+    assert_eq!(meta.inline_data.as_ref(), b"hello" as &[u8]);
     assert_eq!(meta.hlc.unwrap().wall_time, 1000);
     assert_eq!(meta.hlc.unwrap().logical, 5);
 }
@@ -159,12 +160,12 @@ async fn put_overwrites_stale_version() {
             bucket_id: bucket.as_str().to_string(),
             object_key: key.as_str().to_string(),
             size: 5,
-            blake3_hash: vec![],
+            blake3_hash: vec![].into(),
             hlc: Some(hlc1),
-            inline_data: b"v5000".to_vec(),
-            chunk_segment_ids: vec![],
-            chunk_offsets: vec![],
-            chunk_lengths: vec![],
+            inline_data: vec![].into(),
+            chunk_segment_ids: vec![].into(),
+            chunk_offsets: vec![].into(),
+            chunk_lengths: vec![].into(),
         }))
         .await
         .unwrap();
@@ -176,12 +177,12 @@ async fn put_overwrites_stale_version() {
             bucket_id: bucket.as_str().to_string(),
             object_key: key.as_str().to_string(),
             size: 5,
-            blake3_hash: vec![],
+            blake3_hash: vec![].into(),
             hlc: Some(hlc2),
-            inline_data: b"v2000".to_vec(),
-            chunk_segment_ids: vec![],
-            chunk_offsets: vec![],
-            chunk_lengths: vec![],
+            inline_data: b"v2000".to_vec().into(),
+            chunk_segment_ids: vec![].into(),
+            chunk_offsets: vec![].into(),
+            chunk_lengths: vec![].into(),
         }))
         .await
         .unwrap();
@@ -194,7 +195,7 @@ async fn put_overwrites_stale_version() {
     let meta = client.get_object_metadata(fetch_req).await.unwrap().into_inner();
 
     assert!(meta.found);
-    assert_eq!(meta.inline_data, b"v2000");
+    assert_eq!(meta.inline_data.as_ref(), b"v2000" as &[u8]);
     assert_eq!(meta.hlc.unwrap().wall_time, 2000);
     assert_eq!(meta.hlc.unwrap().logical, 1);
 }
@@ -231,9 +232,9 @@ async fn put_object_with_chunks_roundtrip() {
             bucket_id: bucket.as_str().to_string(),
             object_key: key.as_str().to_string(),
             size: 200,
-            blake3_hash: vec![0xABu8; 32],
+            blake3_hash: vec![0xABu8; 32].into(),
             hlc: Some(hlc),
-            inline_data: vec![],
+            inline_data: vec![].into(),
             chunk_segment_ids: vec![proto_sid],
             chunk_offsets: vec![100],
             chunk_lengths: vec![200],

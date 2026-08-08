@@ -22,6 +22,7 @@ fn open_temp_metadata() -> Arc<RocksDbMetadataStore> {
         data_dir: dir.path().to_path_buf(),
         block_cache_size: 8 * 1024 * 1024,
         memtable_size: 8 * 1024 * 1024,
+        ..Default::default()
     };
     // Keep tempdir alive via leak (test scope ensures cleanup)
     // SAFETY: tempfile will clean up on process exit

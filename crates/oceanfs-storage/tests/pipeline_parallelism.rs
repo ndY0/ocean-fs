@@ -34,6 +34,7 @@ fn pool_config_custom_sizes() {
         shard_count: 16,
         max_inflight_encodes: 32,
         encode_queue_capacity: 128,
+        ec_streaming_encode: false,
     };
     assert_eq!(cfg.active_pool_size, 8);
     assert_eq!(cfg.shard_count, 16);
@@ -50,7 +51,7 @@ fn buffer_pool_concurrent_acquire_release() {
         let counter = Arc::clone(&counter);
         let h = thread::spawn(move || {
             for _ in 0..10 {
-                let buf = pool.acquire().unwrap();
+                let buf = pool.acquire();
                 // Simulate some work.
                 thread::sleep(std::time::Duration::from_micros(10));
                 pool.release(buf);

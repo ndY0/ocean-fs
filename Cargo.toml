@@ -69,6 +69,9 @@ dashmap          = "6"
 arc-swap         = "1"
 rayon            = "1"
 
+# --- Networking ---
+socket2 = "0.5"
+
 # --- Storage ---
 rocksdb = "0.22"
 num_cpus = "1"

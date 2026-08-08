@@ -29,15 +29,20 @@
 //! I/O requests are dispatched to a dedicated background thread running an
 //! `io_uring` event loop — fully asynchronous, no thread-pool contention.
 
+pub mod atomic_write;
 pub mod direct;
 pub mod mmap;
+pub mod sched;
 pub mod segment_reader;
 #[cfg(feature = "sendfile")]
 pub mod sendfile;
 pub mod uring;
 
+pub(crate) use atomic_write::write_atomic;
+pub use atomic_write::SegmentWriteMode;
 pub use direct::DirectIoBuf;
 pub use mmap::SegmentFileCache;
+pub use sched::{apply_background_cpu_sched, apply_background_io_class};
 pub use segment_reader::{
     DiskSegmentReader, InMemorySegmentReader, SegmentReadSource, SegmentReader,
 };

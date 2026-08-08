@@ -9,9 +9,11 @@
 //! On x86_64, run-time CPU feature detection selects the fastest available
 //! SIMD path for batched GF(2^8) multiplication:
 //!
-//! - **SSE4.1** (PSHUFB split-table): 16 elements/instruction, ~1.5× portable
-//! - **AVX2** (VPSHUFB split-table): 32 elements/instruction, ~2× portable
+//! - **GFNI** (VGF2P8MULB): 64 bytes/instruction with AVX-512, 32 with AVX2.
+//!   Single-instruction GF(2^8) multiply — no table lookups. ~8.7× portable.
 //! - **AVX-512** (VPSHUFB split-table): 64 elements/instruction, ~4× portable
+//! - **AVX2** (VPSHUFB split-table): 32 elements/instruction, ~2× portable
+//! - **SSE4.1** (PSHUFB split-table): 16 elements/instruction, ~1.5× portable
 //!
 //! The SIMD code lives in the `simd_x86` module. Use [`gf_mul_simd`] to
 //! multiply a byte slice by a single coefficient using the fastest available

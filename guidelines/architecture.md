@@ -443,17 +443,28 @@ Unsafe code is permitted only in the following crates:
 - `oceanfs-accel` (GPU FFI, SIMD intrinsics)
 - `oceanfs-hash` (BLAKE3 implementation if not using the upstream crate)
 - `oceanfs-ec` (SIMD-accelerated GF arithmetic)
-- `oceanfs-storage` (memory-mapped segment I/O via `memmap2::Mmap`;
-  see [ADR-0011]). Uses `#![deny(unsafe_code)]` rather than
-  `#![forbid(unsafe_code)]` — individual `#[allow(unsafe_code)]`
-  annotations with `// SAFETY:` comments are required at each
-  `unsafe` block. Limited to mmap operations; new unsafe use-cases
-  require a new ADR.
+- `oceanfs-storage` (mmap segment I/O, Linux syscall wrappers for
+  WAL range-sync, atomic segment writes, page cache hints,
+  background thread scheduling, and bounds-check elimination via raw
+  pointer arithmetic on provably-bounded hot iteration paths;
+  see [ADR-0011], [ADR-0012], and [ADR-0014]).
+  Uses `#![deny(unsafe_code)]` rather than `#![forbid(unsafe_code)]`
+  — individual `#[allow(unsafe_code)]` annotations with
+  `// SAFETY:` comments are required at each `unsafe` block.
+  Limited to the six categories documented in ADR-0011,
+  ADR-0012, and ADR-0014; new unsafe use-cases require a new ADR.
+- `oceanfs-network` (Linux `setsockopt` wrappers for gRPC socket tuning:
+  `SO_BUSY_POLL` for low-latency busy-wait polling; see [ADR-0013]).
+  Uses `#![deny(unsafe_code)]` rather than `#![forbid(unsafe_code)]`
+  — individual `#[allow(unsafe_code)]` annotations with
+  `// SAFETY:` comments are required at each `unsafe` block.
+  Limited to `libc::setsockopt` for Linux socket tuning as documented
+  in ADR-0013; new unsafe use-cases require a new ADR.
 
 All other crates are `#![forbid(unsafe_code)]`.
 
 **Enforcement:** CI checks each crate's `lib.rs` for
-`#![forbid(unsafe_code)]` (or `#![deny(unsafe_code)]` for the four
+`#![forbid(unsafe_code)]` (or `#![deny(unsafe_code)]` for the five
 permitted crates).
 
 ### 7.3 Panic Policy

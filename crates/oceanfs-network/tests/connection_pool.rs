@@ -70,6 +70,7 @@ fn custom_config_is_respected() {
         request_timeout_ms: 60000,
         tls_cert_path: None,
         health_check_interval_sec: 30,
+        ..Default::default()
     };
     assert_eq!(config.pool_size_per_peer, 8);
     assert_eq!(config.keepalive_sec, 60);

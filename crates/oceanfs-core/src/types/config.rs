@@ -167,6 +167,23 @@ pub struct RpcConfig {
     /// Interval in seconds for periodic health checks on all peer channels.
     /// Set to 0 to disable periodic health checking.
     pub health_check_interval_sec: u64,
+    /// SO_BUSY_POLL timeout in microseconds for gRPC sockets (Linux only,
+    /// default 50). When non-zero, the kernel busy-waits for up to this many
+    /// microseconds for data on the socket, eliminating interrupt wakeup
+    /// latency for small RPCs. Set to 0 to disable busy polling.
+    /// Requires Linux 3.11+.
+    pub busy_poll_us: u32,
+    /// Enable TCP_QUICKACK on gRPC sockets (Linux only, default true).
+    /// Disables delayed ACKs, eliminating up to 40ms of ack delay per RPC
+    /// round-trip. Ideal for independent request-response patterns where
+    /// ACKs cannot piggyback on response data.
+    pub quickack: bool,
+    /// Number of gRPC server sockets to bind via SO_REUSEPORT (Linux only).
+    /// When > 0, creates N sockets on the same port; the kernel distributes
+    /// connections via 4-tuple hash, eliminating single-accept-queue
+    /// contention. Set to 0 to auto-detect (num_cpus). Set to 1 to disable.
+    /// Requires Linux 3.9+.
+    pub reuseport_sockets: usize,
 }
 
 impl Default for RpcConfig {
@@ -179,6 +196,9 @@ impl Default for RpcConfig {
             request_timeout_ms: 30000,
             tls_cert_path: None,
             health_check_interval_sec: 30,
+            busy_poll_us: 50,
+            quickack: cfg!(target_os = "linux"),
+            reuseport_sockets: 0,
         }
     }
 }
@@ -213,6 +233,10 @@ pub struct PoolConfig {
     pub max_inflight_encodes: usize,
     /// Capacity of the EC encoding work queue (backpressure channel).
     pub encode_queue_capacity: usize,
+    /// When `true`, EC encode is spread across the write lifetime via
+    /// streaming stripe encode instead of being concentrated at seal time.
+    /// Eliminates the seal-time latency spike. Default: `false`.
+    pub ec_streaming_encode: bool,
 }
 
 impl Default for PoolConfig {
@@ -222,6 +246,7 @@ impl Default for PoolConfig {
             shard_count: 4,
             max_inflight_encodes: 8,
             encode_queue_capacity: 64,
+            ec_streaming_encode: true,
         }
     }
 }
@@ -585,6 +610,14 @@ mod tests {
         assert_eq!(cfg.connect_timeout_ms, 5000);
         assert_eq!(cfg.request_timeout_ms, 30000);
         assert!(cfg.tls_cert_path.is_none());
+    }
+
+    #[test]
+    fn rpc_config_socket_opts_defaults() {
+        let cfg = RpcConfig::default();
+        assert_eq!(cfg.busy_poll_us, 50);
+        assert_eq!(cfg.quickack, cfg!(target_os = "linux"));
+        assert_eq!(cfg.reuseport_sockets, 0);
     }
 
     // -- PoolConfig --

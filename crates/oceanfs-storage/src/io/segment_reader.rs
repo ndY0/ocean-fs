@@ -143,6 +143,12 @@ pub struct DiskSegmentReader {
     segment_dir: PathBuf,
     /// Tracks the source of the most recent read, keyed by segment_id.
     last_source: Mutex<HashMap<SegmentId, SegmentReadSource>>,
+    /// When `true`, call `madvise(MADV_DONTNEED)` after reading from mmap
+    /// to eagerly evict segment data from the page cache. Set to `true`
+    /// when `read_cache_segments = false` (write-optimised profile) so
+    /// large segment reads don't pollute the page cache and evict hot
+    /// metadata/WAL pages. No-op on non-Linux.
+    evict_after_read: bool,
 }
 
 impl DiskSegmentReader {
@@ -162,7 +168,19 @@ impl DiskSegmentReader {
             mmap_cache,
             segment_dir,
             last_source: Mutex::new(HashMap::new()),
+            evict_after_read: false,
         }
+    }
+
+    /// Enables `madvise(MADV_DONTNEED)` after each mmap read to eagerly
+    /// evict segment data from the page cache.
+    ///
+    /// Set to `true` when `read_cache_segments = false` (write-optimised
+    /// profile). When `false` (read-optimised profile), segment data
+    /// remains in the page cache for subsequent reads.
+    pub fn with_evict_after_read(mut self, evict: bool) -> Self {
+        self.evict_after_read = evict;
+        self
     }
 
     /// Returns the filesystem path for a segment file.
@@ -191,8 +209,29 @@ impl SegmentReader for DiskSegmentReader {
                         Ok(mmap) => {
                             let start = file_offset as usize;
                             let end = start.saturating_add(length as usize).min(mmap.len());
+                            #[cfg(target_os = "linux")]
+                            {
+                                // Tell the kernel this is a sequential forward scan
+                                // so it can do aggressive read-ahead.
+                                let _ = madvise_sequential(mmap.as_ptr(), mmap.len());
+                            }
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                let _ = mmap.len(); // suppress unused warning
+                            }
                             let slice = &mmap[start..end];
                             let data = Bytes::copy_from_slice(slice);
+                            #[cfg(target_os = "linux")]
+                            {
+                                // Eagerly evict pages from the page cache so segment
+                                // reads don't push hot metadata/WAL data out of cache.
+                                // Only when the write-optimised profile is in use
+                                // (read_cache_segments=false). When caching is enabled,
+                                // we want pages to stay resident.
+                                if self.evict_after_read {
+                                    let _ = madvise_dontneed(mmap.as_ptr(), mmap.len());
+                                }
+                            }
                             let source = SegmentReadSource::MmapBacked {
                                 segment_id: *segment_id,
                                 file_path: path.clone(),
@@ -318,6 +357,45 @@ impl SegmentReader for InMemorySegmentReader {
         let start = offset as usize;
         let end = start.saturating_add(length as usize).min(full.len());
         Ok(full.slice(start..end))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// madvise helpers (Linux only)
+// ---------------------------------------------------------------------------
+
+/// Calls `madvise(addr, len, MADV_SEQUENTIAL)` to hint that the mapped
+/// region will be accessed sequentially — the kernel can do aggressive
+/// read-ahead. No-op on non-Linux.
+#[cfg(target_os = "linux")]
+fn madvise_sequential(addr: *const u8, len: usize) -> std::io::Result<()> {
+    // SAFETY: `addr` points to a valid memory-mapped region of `len` bytes.
+    // `MADV_SEQUENTIAL` is a pure hint — it cannot cause UB even if the
+    // addresses are invalid (the kernel may ignore the hint).
+    #[allow(unsafe_code)]
+    let ret = unsafe { libc::madvise(addr as *mut libc::c_void, len, libc::MADV_SEQUENTIAL) };
+    if ret != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Calls `madvise(addr, len, MADV_DONTNEED)` to hint that the mapped
+/// region will not be accessed again soon — the kernel can eagerly evict
+/// these pages from the page cache. No-op on non-Linux.
+#[cfg(target_os = "linux")]
+fn madvise_dontneed(addr: *const u8, len: usize) -> std::io::Result<()> {
+    // SAFETY: `addr` points to a valid memory-mapped region of `len` bytes.
+    // `MADV_DONTNEED` is advisory — it tells the kernel to drop these pages
+    // from the page cache. If the address is invalid, the kernel returns
+    // an error but does not cause UB.
+    #[allow(unsafe_code)]
+    let ret = unsafe { libc::madvise(addr as *mut libc::c_void, len, libc::MADV_DONTNEED) };
+    if ret != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 

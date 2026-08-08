@@ -102,29 +102,29 @@ fn active_segment_tier_is_stored() {
 fn buffer_pool_acquire_release() {
     let pool = BufferPool::new(4096, 4);
 
-    let buf1 = pool.acquire().unwrap();
-    let _buf2 = pool.acquire().unwrap();
-    let _buf3 = pool.acquire().unwrap();
-    let _buf4 = pool.acquire().unwrap();
+    let buf1 = pool.acquire();
+    let _buf2 = pool.acquire();
+    let _buf3 = pool.acquire();
+    let _buf4 = pool.acquire();
 
     // Release and re-acquire.
     pool.release(buf1);
 
     // Should be able to acquire again.
-    let _buf5 = pool.acquire().unwrap();
+    let _buf5 = pool.acquire();
 }
 
 #[test]
-fn buffer_pool_exhaustion() {
+fn buffer_pool_allocates_on_demand() {
     let pool = BufferPool::new(1024, 2);
 
-    // Acquire all buffers.
-    let _a = pool.acquire().unwrap();
-    let _b = pool.acquire().unwrap();
+    // Acquire all pre-allocated buffers.
+    let _a = pool.acquire();
+    let _b = pool.acquire();
 
-    // Pool is exhausted.
-    let result = pool.acquire();
-    assert!(result.is_err());
+    // Pool is exhausted but allocates a fresh buffer on demand.
+    let c = pool.acquire();
+    assert_eq!(c.capacity(), 1024);
 }
 
 // ---------------------------------------------------------------------------

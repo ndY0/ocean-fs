@@ -3,6 +3,13 @@
 //! An `ActiveSegment` accumulates blob writes in a `BytesMut` buffer.
 //! When the buffer reaches its target size, the segment is sealed and
 //! a new active segment takes its place.
+//!
+//! ## SegmentBuffer
+//!
+//! `SegmentBuffer` is an enum wrapper that can hold either a plain
+//! `ActiveSegment` or a streaming variant that performs EC encode
+//! as stripes complete. The pool creates the appropriate variant
+//! based on the `ec_streaming_encode` configuration flag.
 
 use bytes::BytesMut;
 use oceanfs_core::{SegmentId, SegmentSizeConfig, SizeTier};
@@ -75,11 +82,7 @@ impl ActiveSegment {
             }
         };
 
-        let buffer = pool.acquire()?;
-        // Ensure the buffer has sufficient capacity. BytesMut will
-        // grow automatically, but pre-reserving avoids reallocation.
-        let mut buffer = buffer;
-        buffer.reserve(target_size as usize);
+        let buffer = pool.acquire_sized(target_size as usize);
 
         Ok(Self { id: SegmentId::new(), tier, buffer, cursor: 0, target_size })
     }
@@ -157,6 +160,124 @@ impl ActiveSegment {
     /// Consumes the segment, returning the backing buffer for pool reuse.
     pub fn into_buffer(self) -> BytesMut {
         self.buffer
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SegmentBuffer — enum dispatch over plain vs streaming-encode segments
+// ---------------------------------------------------------------------------
+
+/// A segment buffer that can be either plain or streaming-EC-aware.
+///
+/// When [`PoolConfig::ec_streaming_encode`] is enabled, the pool creates
+/// [`SegmentBuffer::Streaming`] variants which spread EC encode work across
+/// individual stripe completions instead of waiting until seal time.
+pub(crate) enum SegmentBuffer {
+    /// Standard append-only segment without EC awareness.
+    Plain(ActiveSegment),
+    /// Streaming EC segment that encodes each stripe row as soon as its
+    /// data shards become available.
+    Streaming(super::streaming::StreamingEcSegment),
+}
+
+impl SegmentBuffer {
+    /// Creates a new segment buffer.
+    ///
+    /// When `ec_config` is `Some` and streaming is requested, creates a
+    /// [`SegmentBuffer::Streaming`] variant. Otherwise creates a plain
+    /// [`SegmentBuffer::Plain`].
+    pub fn new(
+        tier: SizeTier,
+        size_config: &SegmentSizeConfig,
+        pool: &BufferPool,
+        ec_config: Option<&oceanfs_core::CodecConfig>,
+    ) -> Result<Self> {
+        match ec_config {
+            Some(codec) => {
+                let inner = ActiveSegment::new(tier, size_config, pool)?;
+                Ok(Self::Streaming(super::streaming::StreamingEcSegment::new(inner, codec)))
+            }
+            None => Ok(Self::Plain(ActiveSegment::new(tier, size_config, pool)?)),
+        }
+    }
+
+    /// Appends data to the segment. Delegates to the inner variant.
+    pub fn append(&mut self, data: &[u8]) -> Result<(u64, usize)> {
+        match self {
+            Self::Plain(s) => s.append(data),
+            Self::Streaming(s) => s.append(data),
+        }
+    }
+
+    /// Returns `true` if the segment has reached or exceeded its target size.
+    pub fn is_full(&self) -> bool {
+        match self {
+            Self::Plain(s) => s.is_full(),
+            Self::Streaming(s) => s.is_full(),
+        }
+    }
+
+    /// Returns the segment's unique identifier.
+    pub fn id(&self) -> SegmentId {
+        match self {
+            Self::Plain(s) => s.id(),
+            Self::Streaming(s) => s.id(),
+        }
+    }
+
+    /// Returns the storage tier of this segment.
+    pub fn tier(&self) -> SizeTier {
+        match self {
+            Self::Plain(s) => s.tier(),
+            Self::Streaming(s) => s.tier(),
+        }
+    }
+
+    /// Returns the current size of the segment in bytes.
+    #[allow(dead_code)]
+    pub fn size(&self) -> u64 {
+        match self {
+            Self::Plain(s) => s.size(),
+            Self::Streaming(s) => s.size(),
+        }
+    }
+
+    /// Returns the target size of the segment in bytes.
+    #[allow(dead_code)]
+    pub fn target_size(&self) -> u64 {
+        match self {
+            Self::Plain(s) => s.target_size(),
+            Self::Streaming(s) => s.target_size(),
+        }
+    }
+
+    /// Returns a reference to the accumulated data.
+    #[allow(dead_code)]
+    pub fn data(&self) -> &[u8] {
+        match self {
+            Self::Plain(s) => s.data(),
+            Self::Streaming(s) => s.data(),
+        }
+    }
+
+    /// Consumes the segment, returning the backing buffer for pool reuse.
+    pub fn into_buffer(self) -> BytesMut {
+        match self {
+            Self::Plain(s) => s.into_buffer(),
+            Self::Streaming(s) => s.into_buffer(),
+        }
+    }
+
+    /// Returns any pre-computed parity shards from streaming EC encode.
+    ///
+    /// Returns `None` for [`SegmentBuffer::Plain`]. For
+    /// [`SegmentBuffer::Streaming`], returns the accumulated parity shards
+    /// from all fully-encoded stripes.
+    pub fn parity_shards(&self) -> Option<Vec<bytes::Bytes>> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Streaming(s) => s.parity_shards(),
+        }
     }
 }
 

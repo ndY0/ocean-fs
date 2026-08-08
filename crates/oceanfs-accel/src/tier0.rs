@@ -60,6 +60,7 @@ pub(crate) fn cpu_capabilities() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
         match GfSimdLevel::detect() {
+            GfSimdLevel::Gfni => "GFNI+VGF2P8MULB",
             GfSimdLevel::Avx512 => "AVX-512+VPSHUFB",
             GfSimdLevel::Avx2 => "AVX2+VPSHUFB",
             GfSimdLevel::Sse41 => "SSE4.1+PSHUFB",

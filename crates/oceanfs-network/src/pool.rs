@@ -10,6 +10,7 @@
 //! [`get_channel`] call.
 
 use std::{
+    io,
     net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -19,6 +20,7 @@ use std::{
 };
 
 use dashmap::DashMap;
+use hyper_util::rt::TokioIo;
 use oceanfs_core::{Counter, Gauge, LabelSet, MetricRegistrar, RpcConfig};
 use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -26,6 +28,8 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
 use tonic_health::pb::health_client::HealthClient;
 use tracing::{debug, info, warn};
+
+use crate::socket_opts::{set_busy_poll, set_quickack};
 
 /// Error type for connection pool operations.
 #[derive(Debug, thiserror::Error)]
@@ -327,12 +331,17 @@ impl ConnectionPool {
     }
 
     /// Creates a new peer pool with pre-established channels.
+    ///
+    /// Socket-level options (TCP_QUICKACK, SO_BUSY_POLL) are applied
+    /// via a custom connector that wraps tonic's TCP transport.
     async fn create_peer_pool(&self, peer: SocketAddr) -> Result<Arc<PeerPool>> {
         let pool_size = self.config.pool_size_per_peer;
         let mut channels = Vec::with_capacity(pool_size);
 
-        let uri = format!("http://{peer}");
-        let endpoint = Endpoint::from_shared(uri)
+        let uri_str = format!("http://{peer}");
+
+        // Build the endpoint with standard tonic options.
+        let endpoint = Endpoint::from_shared(uri_str.clone())
             .map_err(|e| Error::ConnectionFailed(peer.to_string(), e))?
             .tcp_nodelay(true)
             .keep_alive_while_idle(true)
@@ -340,10 +349,46 @@ impl ConnectionPool {
             .connect_timeout(Duration::from_millis(self.config.connect_timeout_ms))
             .timeout(Duration::from_millis(self.config.request_timeout_ms));
 
-        // Pre-connect all channels in the pool.
+        let quickack = self.config.quickack;
+        let busy_poll = self.config.busy_poll_us;
+
+        // Pre-connect all channels in the pool via a custom connector
+        // that applies TCP_QUICKACK and SO_BUSY_POLL after connect.
         for _ in 0..pool_size {
+            let connector = {
+                tower::service_fn(move |_: http::Uri| {
+                    let peer = peer;
+                    let quickack = quickack;
+                    let busy_poll = busy_poll;
+                    async move {
+                        use socket2::{Domain, Protocol, Socket, Type};
+                        let addr: socket2::SockAddr = peer.into();
+
+                        let socket = Socket::new(
+                            Domain::for_address(peer),
+                            Type::STREAM,
+                            Some(Protocol::TCP),
+                        )?;
+
+                        if quickack {
+                            let _ = set_quickack(&socket);
+                        }
+                        if busy_poll > 0 {
+                            let _ = set_busy_poll(&socket, busy_poll);
+                        }
+
+                        socket.connect(&addr)?;
+
+                        let tcp: std::net::TcpStream = socket.into();
+                        tcp.set_nonblocking(true)?;
+                        let tokio_stream = tokio::net::TcpStream::from_std(tcp)?;
+                        Ok::<_, io::Error>(TokioIo::new(tokio_stream))
+                    }
+                })
+            };
+
             let channel = endpoint
-                .connect()
+                .connect_with_connector(connector)
                 .await
                 .map_err(|e| Error::ConnectionFailed(peer.to_string(), e))?;
             channels.push(channel);
@@ -442,6 +487,7 @@ mod tests {
             request_timeout_ms: 60000,
             tls_cert_path: None,
             health_check_interval_sec: 15,
+            ..Default::default()
         };
         let pool = ConnectionPool::new(config);
         assert_eq!(pool.config().pool_size_per_peer, 8);

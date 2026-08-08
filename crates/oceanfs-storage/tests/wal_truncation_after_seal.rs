@@ -43,6 +43,7 @@ async fn wal_truncation_called_during_seal() {
             data_dir: dir.path().join("wal"),
             max_file_size_bytes: 1024 * 1024,
             fsync_batch_timeout_ms: 5,
+            ..Default::default()
         })
         .await
         .unwrap(),
@@ -72,6 +73,7 @@ async fn wal_truncation_called_during_seal() {
         seal_timeout_ms: 5000,
         data_dir: dir.path().join("segments"),
         io_mode: IoReadMode::Buffered,
+        write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
     };
     let sealer = SegmentSealer::new(seal_config, metadata, wal.clone());
 
@@ -118,6 +120,7 @@ async fn wal_writer_truncation_is_idempotent() {
         data_dir: dir.path().join("wal"),
         max_file_size_bytes: 1024 * 1024,
         fsync_batch_timeout_ms: 5,
+        ..Default::default()
     })
     .await
     .unwrap();

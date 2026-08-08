@@ -565,7 +565,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let metadata_config = oceanfs_core::MetadataConfig {
             data_dir: tmp.path().join("meta"),
-            ..Default::default()..Default::default()
+            ..Default::default()
         };
         let metadata = Arc::new(RocksDbMetadataStore::open(&metadata_config).unwrap());
         let data_store = Arc::new(InMemorySegmentStore::new());
@@ -589,7 +589,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let metadata_config = oceanfs_core::MetadataConfig {
             data_dir: tmp.path().join("meta"),
-            ..Default::default()..Default::default()
+            ..Default::default()
         };
         let metadata = Arc::new(RocksDbMetadataStore::open(&metadata_config).unwrap());
         let data_store: Arc<dyn SegmentDataStore> = Arc::new(InMemorySegmentStore::new());
@@ -636,7 +636,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let metadata_config = oceanfs_core::MetadataConfig {
             data_dir: tmp.path().join("meta"),
-            ..Default::default()..Default::default()
+            ..Default::default()
         };
         let metadata = Arc::new(RocksDbMetadataStore::open(&metadata_config).unwrap());
         let data_store = Arc::new(InMemorySegmentStore::new());
@@ -648,7 +648,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let metadata_config = oceanfs_core::MetadataConfig {
             data_dir: tmp.path().join("meta"),
-            ..Default::default()..Default::default()
+            ..Default::default()
         };
         let metadata = Arc::new(RocksDbMetadataStore::open(&metadata_config).unwrap());
         let data_store = Arc::new(InMemorySegmentStore::new());

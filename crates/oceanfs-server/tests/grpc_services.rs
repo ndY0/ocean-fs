@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
 use oceanfs_core::{
     proto::{
         common::SegmentId as ProtoSegmentId,
@@ -38,7 +39,7 @@ use tonic::transport::Server;
 
 /// In-memory segment data store for testing.
 struct TestStore {
-    data: Mutex<HashMap<SegmentId, Vec<u8>>>,
+    data: Mutex<HashMap<SegmentId, Bytes>>,
 }
 
 impl TestStore {
@@ -49,11 +50,11 @@ impl TestStore {
 
 impl SegmentDataStore for TestStore {
     fn write_segment_data(&self, segment_id: &SegmentId, data: &[u8]) -> Result<(), StorageError> {
-        self.data.lock().unwrap().insert(segment_id.clone(), data.to_vec());
+        self.data.lock().unwrap().insert(segment_id.clone(), Bytes::from(data.to_vec()));
         Ok(())
     }
 
-    fn read_segment_data(&self, segment_id: &SegmentId) -> Result<Vec<u8>, StorageError> {
+    fn read_segment_data(&self, segment_id: &SegmentId) -> Result<Bytes, StorageError> {
         self.data
             .lock()
             .unwrap()
@@ -166,15 +167,15 @@ async fn append_to_node(
         segment_id: Some(proto_sid),
         shard_index: None,
         offset: 0,
-        data: data.to_vec(),
+        data: Bytes::from(data.to_vec()),
         hlc: None,
         bucket_id: String::new(),
         object_key: String::new(),
         object_size: 0,
-        blake3_hash: vec![],
-        chunk_segment_ids: vec![],
-        chunk_offsets: vec![],
-        chunk_lengths: vec![],
+        blake3_hash: vec![].into(),
+        chunk_segment_ids: vec![].into(),
+        chunk_offsets: vec![].into(),
+        chunk_lengths: vec![].into(),
     };
     let stream = tokio_stream::iter(vec![chunk]);
     let response = client.append_segment(tonic::Request::new(stream)).await.unwrap();
@@ -322,15 +323,15 @@ async fn three_node_write_with_w2_via_grpc() {
         segment_id: Some(proto_sid.clone()),
         shard_index: None,
         offset: 0,
-        data: test_data.clone(),
+        data: Bytes::from(test_data.clone()),
         hlc: None,
         bucket_id: String::new(),
         object_key: String::new(),
         object_size: 0,
-        blake3_hash: vec![],
-        chunk_segment_ids: vec![],
-        chunk_offsets: vec![],
-        chunk_lengths: vec![],
+        blake3_hash: vec![].into(),
+        chunk_segment_ids: vec![].into(),
+        chunk_offsets: vec![].into(),
+        chunk_lengths: vec![].into(),
     };
     let stream_data = vec![chunk];
 
@@ -477,15 +478,15 @@ async fn three_node_cluster_with_node_kill() {
         segment_id: Some(proto1.clone()),
         shard_index: None,
         offset: 0,
-        data: blob1.clone(),
+        data: Bytes::from(blob1.clone()),
         hlc: None,
         bucket_id: String::new(),
         object_key: String::new(),
         object_size: 0,
-        blake3_hash: vec![],
-        chunk_segment_ids: vec![],
-        chunk_offsets: vec![],
-        chunk_lengths: vec![],
+        blake3_hash: vec![].into(),
+        chunk_segment_ids: vec![].into(),
+        chunk_offsets: vec![].into(),
+        chunk_lengths: vec![].into(),
     };
 
     // Replicate blob1 to nodes 1 and 2.
@@ -528,15 +529,15 @@ async fn three_node_cluster_with_node_kill() {
         segment_id: Some(proto2.clone()),
         shard_index: None,
         offset: 0,
-        data: blob2.clone(),
+        data: Bytes::from(blob2.clone()),
         hlc: None,
         bucket_id: String::new(),
         object_key: String::new(),
         object_size: 0,
-        blake3_hash: vec![],
-        chunk_segment_ids: vec![],
-        chunk_offsets: vec![],
-        chunk_lengths: vec![],
+        blake3_hash: vec![].into(),
+        chunk_segment_ids: vec![].into(),
+        chunk_offsets: vec![].into(),
+        chunk_lengths: vec![].into(),
     };
 
     // Write to node-1 (the only available replica).

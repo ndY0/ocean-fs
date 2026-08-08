@@ -12,6 +12,7 @@ pub(crate) mod route_write;
 pub mod sealer;
 pub mod shard;
 pub mod splitter;
+pub(crate) mod streaming;
 pub mod tier;
 
 pub use buffer::ActiveSegment;

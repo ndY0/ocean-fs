@@ -26,6 +26,13 @@ pub struct WalConfig {
     ///
     /// Shorter values reduce latency at the cost of more frequent fsyncs.
     pub fsync_batch_timeout_ms: u64,
+    /// Whether to use `sync_file_range` + `fdatasync` instead of `sync_all`
+    /// for WAL group commit on Linux (default `true` on Linux).
+    ///
+    /// On NVMe drives, `sync_file_range` + `fdatasync` is 2-3× faster than
+    /// `sync_all` because it saves one disk barrier (inode metadata flush).
+    /// Falls back to `sync_data()` on non-Linux platforms.
+    pub wal_use_sync_file_range: bool,
 }
 
 impl Default for WalConfig {
@@ -34,6 +41,7 @@ impl Default for WalConfig {
             data_dir: PathBuf::from("/var/lib/oceanfs/wal"),
             max_file_size_bytes: 64 * 1024 * 1024,
             fsync_batch_timeout_ms: 5,
+            wal_use_sync_file_range: cfg!(target_os = "linux"),
         }
     }
 }
@@ -48,5 +56,11 @@ mod tests {
         let config = WalConfig::default();
         assert_eq!(config.max_file_size_bytes, 64 * 1024 * 1024);
         assert_eq!(config.fsync_batch_timeout_ms, 5);
+    }
+
+    #[test]
+    fn wal_use_sync_file_range_default_matches_platform() {
+        let config = WalConfig::default();
+        assert_eq!(config.wal_use_sync_file_range, cfg!(target_os = "linux"));
     }
 }

@@ -11,8 +11,6 @@ use bytes::BytesMut;
 use oceanfs_core::{Gauge, LabelSet, MetricRegistrar};
 use parking_lot::Mutex;
 
-use crate::error::{Error, Result};
-
 /// A pool of reusable `BytesMut` buffers for active segment writing.
 ///
 /// Buffers are acquired from the pool when a new active segment is
@@ -25,7 +23,7 @@ use crate::error::{Error, Result};
 /// use oceanfs_storage::BufferPool;
 ///
 /// let pool = BufferPool::new(65536, 4);
-/// let mut buf = pool.acquire().unwrap();
+/// let mut buf = pool.acquire();
 /// buf.extend_from_slice(b"hello");
 /// pool.release(buf);
 /// ```
@@ -59,14 +57,40 @@ impl BufferPool {
 
     /// Acquires a buffer from the pool.
     ///
-    /// Returns an error if no free buffers are available.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the pool has no free buffers.
-    pub fn acquire(&self) -> Result<BytesMut> {
+    /// Returns a pre-allocated buffer from the free list if available;
+    /// otherwise allocates a new buffer on demand. This fallback
+    /// allocation allows the pool to tolerate temporary demand spikes
+    /// and zero-copy freeze paths without blocking.
+    pub fn acquire(&self) -> BytesMut {
         let mut free = self.free.lock();
-        free.pop().ok_or(Error::BufferPoolExhausted)
+        free.pop().unwrap_or_else(|| BytesMut::with_capacity(self.chunk_size))
+    }
+
+    /// Acquires a buffer with at least `capacity` bytes.
+    ///
+    /// Prefer this over [`acquire()`](Self::acquire) when the required size is known
+    /// (e.g., segment buffers whose target size exceeds the pool's
+    /// chunk size). If the acquired buffer is smaller than `capacity`,
+    /// it is transparently resized — avoiding a second `reserve()` call
+    /// and the associated reallocation in the caller.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_storage::BufferPool;
+    ///
+    /// let pool = BufferPool::new(65536, 4);
+    /// // Request 4 MB — the pool's 64 KB chunks are too small, so
+    /// // the buffer is transparently grown.
+    /// let buf = pool.acquire_sized(4_194_304);
+    /// assert!(buf.capacity() >= 4_194_304);
+    /// ```
+    pub fn acquire_sized(&self, capacity: usize) -> BytesMut {
+        let mut buf = self.acquire();
+        if buf.capacity() < capacity {
+            buf.reserve(capacity - buf.capacity());
+        }
+        buf
     }
 
     /// Releases a buffer back to the pool for reuse.
@@ -132,23 +156,25 @@ mod tests {
     #[test]
     fn acquire_returns_pre_allocated_buffer() {
         let pool = BufferPool::new(1024, 2);
-        let buf = pool.acquire().unwrap();
+        let buf = pool.acquire();
         assert_eq!(buf.capacity(), 1024);
         assert!(buf.is_empty());
     }
 
     #[test]
-    fn acquire_all_exhausts_pool() {
+    fn acquire_allocates_on_demand_when_pool_empty() {
         let pool = BufferPool::new(1024, 2);
-        let _b1 = pool.acquire().unwrap();
-        let _b2 = pool.acquire().unwrap();
-        assert!(pool.acquire().is_err());
+        let _b1 = pool.acquire();
+        let _b2 = pool.acquire();
+        // Pool is exhausted but acquire allocates a fresh buffer.
+        let b3 = pool.acquire();
+        assert_eq!(b3.capacity(), 1024);
     }
 
     #[test]
     fn release_makes_buffer_available_again() {
         let pool = BufferPool::new(1024, 2);
-        let b1 = pool.acquire().unwrap();
+        let b1 = pool.acquire();
         assert_eq!(pool.free_count(), 1);
         pool.release(b1);
         assert_eq!(pool.free_count(), 2);
@@ -157,23 +183,23 @@ mod tests {
     #[test]
     fn release_clears_buffer() {
         let pool = BufferPool::new(1024, 1);
-        let mut buf = pool.acquire().unwrap();
+        let mut buf = pool.acquire();
         buf.extend_from_slice(&[1, 2, 3]);
         pool.release(buf);
-        let reused = pool.acquire().unwrap();
+        let reused = pool.acquire();
         assert!(reused.is_empty());
     }
 
     #[test]
     fn release_beyond_max_drops_buffer() {
         let pool = BufferPool::new(1024, 1);
-        let b1 = pool.acquire().unwrap();
+        let b1 = pool.acquire();
         // Acquire another (the pool creates one on demand? No — it was
         // pre-allocated. Let's take the only slot, release it, acquire
         // it again, then release a second buffer.
         pool.release(b1);
-        let _b2 = pool.acquire().unwrap(); // pool is now empty
-                                           // Create an external buffer and release it
+        let _b2 = pool.acquire(); // pool is now empty
+                                  // Create an external buffer and release it
         let extra = BytesMut::with_capacity(1024);
         pool.release(extra); // pool had 0 free, now 1
         assert_eq!(pool.free_count(), 1);
@@ -187,7 +213,7 @@ mod tests {
     fn free_count_is_accurate() {
         let pool = BufferPool::new(1024, 5);
         assert_eq!(pool.free_count(), 5);
-        let _b = pool.acquire().unwrap();
+        let _b = pool.acquire();
         assert_eq!(pool.free_count(), 4);
     }
 

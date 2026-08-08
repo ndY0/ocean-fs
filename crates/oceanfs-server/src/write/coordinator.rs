@@ -574,7 +574,14 @@ impl WriteCoordinator {
                         }
 
                         let result = sealer_arc
-                            .seal_from_data(segment_id, tier, work.segment_data, &entries)
+                            .seal_from_data(
+                                segment_id,
+                                tier,
+                                work.segment_data,
+                                &entries,
+                                work.ec_k,
+                                work.ec_m,
+                            )
                             .await;
 
                         match result {
@@ -726,11 +733,18 @@ mod tests {
 
         let pool_cfg = PoolConfig::default();
         let segment_pool_small = Arc::new(
-            SegmentPool::new(pool_cfg.clone(), SizeTier::Small, &size_config, buffer_pool.clone())
-                .unwrap(),
+            SegmentPool::new(
+                pool_cfg.clone(),
+                SizeTier::Small,
+                &size_config,
+                buffer_pool.clone(),
+                None,
+            )
+            .unwrap(),
         );
         let segment_pool_standard = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool).unwrap(),
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None)
+                .unwrap(),
         );
 
         let wal = Arc::new(
@@ -738,6 +752,7 @@ mod tests {
                 data_dir: dir.path().join("wal"),
                 max_file_size_bytes: 1024 * 1024,
                 fsync_batch_timeout_ms: 5,
+                ..Default::default()
             })
             .await
             .unwrap(),
@@ -748,6 +763,7 @@ mod tests {
             seal_timeout_ms: 5000,
             data_dir: dir.path().join("segments"),
             io_mode: oceanfs_storage::io::IoReadMode::Buffered,
+            write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
         };
         let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
 

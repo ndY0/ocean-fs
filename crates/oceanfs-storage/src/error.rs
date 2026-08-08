@@ -45,6 +45,8 @@ pub enum Error {
     },
 
     /// The buffer pool is exhausted and cannot allocate a new buffer.
+    /// (No longer raised — `BufferPool::acquire` allocates on demand.)
+    #[allow(dead_code)]
     #[error("buffer pool exhausted")]
     BufferPoolExhausted,
 

@@ -18,7 +18,7 @@ async fn handoff_create_deliver_cleanup() {
         offset: 0,
         length: 100,
         timestamp: Hlc::zero(),
-        data: vec![1, 2, 3],
+        data: vec![1, 2, 3].into(),
         stored_at_secs: 0,
     };
     hh.handoff(target.clone(), hint).await.unwrap();
@@ -44,7 +44,7 @@ async fn handoff_multiple_hints_stored_and_counted() {
                 offset: i * 64,
                 length: 64,
                 timestamp: Hlc::zero(),
-                data: vec![i as u8; 64],
+                data: vec![i as u8; 64].into(),
                 stored_at_secs: 0,
             },
         )
@@ -83,7 +83,7 @@ async fn handoff_bounded_capacity_rejects_excess() {
                 offset: i as u64,
                 length: 10,
                 timestamp: Hlc::zero(),
-                data: vec![i as u8],
+                data: vec![i as u8].into(),
                 stored_at_secs: 0,
             },
         )
@@ -101,7 +101,7 @@ async fn handoff_bounded_capacity_rejects_excess() {
                 offset: 1000,
                 length: 10,
                 timestamp: Hlc::zero(),
-                data: vec![0],
+                data: vec![0].into(),
                 stored_at_secs: 0,
             },
         )
@@ -191,18 +191,26 @@ async fn write_coordinator_handoff_on_replica_failure() {
             oceanfs_core::SizeTier::Small,
             &size_config,
             buffer_pool.clone(),
+            None,
         )
         .unwrap(),
     );
     let segment_pool_standard = Arc::new(
-        SegmentPool::new(pool_cfg, oceanfs_core::SizeTier::Standard, &size_config, buffer_pool)
-            .unwrap(),
+        SegmentPool::new(
+            pool_cfg,
+            oceanfs_core::SizeTier::Standard,
+            &size_config,
+            buffer_pool,
+            None,
+        )
+        .unwrap(),
     );
     let wal = Arc::new(
         WalWriter::open(&oceanfs_core::WalConfig {
             data_dir: dir.path().join("wal"),
             max_file_size_bytes: 1024 * 1024,
             fsync_batch_timeout_ms: 5,
+            ..Default::default()
         })
         .await
         .unwrap(),
@@ -212,6 +220,7 @@ async fn write_coordinator_handoff_on_replica_failure() {
         seal_timeout_ms: 5000,
         data_dir: dir.path().join("segments"),
         io_mode: oceanfs_storage::io::IoReadMode::Buffered,
+        write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
     };
     let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
 

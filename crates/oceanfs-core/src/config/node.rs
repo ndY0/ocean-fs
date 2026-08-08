@@ -120,6 +120,25 @@ pub struct NodeConfig {
     /// Default: 64.
     #[serde(default = "default_segment_cache_max_entries")]
     pub segment_cache_max_entries: usize,
+    /// Whether to set I/O scheduling class to `IOPRIO_CLASS_IDLE` for
+    /// background task threads (GC, scrub, anti-entropy, heal, orphan
+    /// reaper) on Linux (default `true` on Linux).
+    ///
+    /// Threads with `IOPRIO_CLASS_IDLE` only receive disk I/O bandwidth
+    /// when no other thread wants it — preventing background scans from
+    /// competing with client I/O for NVMe command slots.
+    /// No-op on non-Linux platforms.
+    #[serde(default = "default_background_io_class_idle")]
+    pub background_io_class_idle: bool,
+    /// Whether to set CPU scheduling policy to `SCHED_IDLE` for background
+    /// task threads on Linux (default `true` on Linux).
+    ///
+    /// These threads only execute when no other thread wants the CPU —
+    /// they literally run in idle CPU time. Requires `CAP_SYS_NICE`
+    /// capability; gracefully degrades on `EPERM` with a log message.
+    /// No-op on non-Linux platforms.
+    #[serde(default = "default_background_cpu_sched_idle")]
+    pub background_cpu_sched_idle: bool,
 }
 
 fn default_node_id() -> String {
@@ -188,6 +207,12 @@ fn default_io_uring_enabled() -> bool {
 fn default_segment_cache_max_entries() -> usize {
     64
 }
+fn default_background_io_class_idle() -> bool {
+    cfg!(target_os = "linux")
+}
+fn default_background_cpu_sched_idle() -> bool {
+    cfg!(target_os = "linux")
+}
 
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -217,6 +242,8 @@ impl Default for NodeConfig {
             read_cache_segments: false,
             io_uring_enabled: cfg!(target_os = "linux"),
             segment_cache_max_entries: 64,
+            background_io_class_idle: cfg!(target_os = "linux"),
+            background_cpu_sched_idle: cfg!(target_os = "linux"),
         }
     }
 }
@@ -277,5 +304,17 @@ mod tests {
     fn default_segment_cache_max_entries_is_64() {
         let config = NodeConfig::default();
         assert_eq!(config.segment_cache_max_entries, 64);
+    }
+
+    #[test]
+    fn default_background_io_class_idle_matches_platform() {
+        let config = NodeConfig::default();
+        assert_eq!(config.background_io_class_idle, cfg!(target_os = "linux"));
+    }
+
+    #[test]
+    fn default_background_cpu_sched_idle_matches_platform() {
+        let config = NodeConfig::default();
+        assert_eq!(config.background_cpu_sched_idle, cfg!(target_os = "linux"));
     }
 }

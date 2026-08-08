@@ -1,11 +1,16 @@
 //! x86 SIMD-accelerated GF(2^8) multiplication by a constant coefficient.
 //!
-//! Implements the **split-table PSHUFB algorithm** (same as ARM NEON in
-//! `oceanfs-accel/src/arm_sve.rs`) using x86 intrinsics:
+//! Implements two SIMD paths:
 //!
-//! - **SSE4.1** (`_mm_shuffle_epi8`):  16 elements/instruction
-//! - **AVX2**   (`_mm256_shuffle_epi8`): 32 elements/instruction
-//! - **AVX-512** (`_mm512_shuffle_epi8`): 64 elements/instruction
+//! - **GFNI** (`VGF2P8MULB`): Single-instruction GF(2^8) multiply —
+//!   64 elements/instruction on AVX-512+GFNI, 32 on AVX2+GFNI. No
+//!   precomputed tables — the instruction directly multiplies bytes in
+//!   GF(2^8). Available on Intel Ice Lake+ (2021), AMD Zen 4+ (2022).
+//!
+//! - **PSHUFB split-table** (fallback when GFNI unavailable):
+//!   - **SSE4.1** (`_mm_shuffle_epi8`):  16 elements/instruction
+//!   - **AVX2**   (`_mm256_shuffle_epi8`): 32 elements/instruction
+//!   - **AVX-512** (`_mm512_shuffle_epi8`): 64 elements/instruction
 //!
 //! ## Split-Table Algorithm
 //!
@@ -58,7 +63,11 @@ use super::gf_mul;
 /// let level = GfSimdLevel::detect();
 /// assert!(matches!(
 ///     level,
-///     GfSimdLevel::Portable | GfSimdLevel::Sse41 | GfSimdLevel::Avx2 | GfSimdLevel::Avx512
+///     GfSimdLevel::Portable
+///         | GfSimdLevel::Sse41
+///         | GfSimdLevel::Avx2
+///         | GfSimdLevel::Avx512
+///         | GfSimdLevel::Gfni
 /// ));
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -75,6 +84,13 @@ pub enum GfSimdLevel {
     /// AVX-512 VPSHUFB 512-bit split-table lookup. 64 bytes/instruction.
     /// Available on Intel Skylake-X+ (2017), Ice Lake+, AMD Zen 4+ (2022).
     Avx512 = 3,
+    /// GFNI (Galois Field New Instructions) — single-instruction GF(2^8)
+    /// multiplication via `VGF2P8MULB`. Replaces PSHUFB split-table
+    /// lookup entirely: 64 bytes/instruction without any precomputed
+    /// tables. Available on Intel Ice Lake+ (2021) and AMD Zen 4+ (2022)
+    /// when paired with at least AVX2. The dispatcher selects the widest
+    /// available vector width (AVX-512 if available, else AVX2).
+    Gfni = 4,
 }
 
 static GF_SIMD_LEVEL: AtomicU8 = AtomicU8::new(u8::MAX);
@@ -92,10 +108,18 @@ impl GfSimdLevel {
         if cached != u8::MAX {
             return Self::from_u8(cached);
         }
-
         #[cfg(target_arch = "x86_64")]
         let level = {
-            if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+            // GFNI is the highest priority — single-instruction GF(2^8)
+            // multiply, no table lookups. Requires at least AVX2 as the
+            // vector foundation; prefers AVX-512 for wider vectors.
+            // The actual vector width (512 vs 256) is resolved at dispatch
+            // time via `is_x86_feature_detected!("avx512f")`.
+            if is_x86_feature_detected!("gfni")
+                && (is_x86_feature_detected!("avx512f") || is_x86_feature_detected!("avx2"))
+            {
+                Self::Gfni
+            } else if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
                 Self::Avx512
             } else if is_x86_feature_detected!("avx2") {
                 Self::Avx2
@@ -105,7 +129,6 @@ impl GfSimdLevel {
                 Self::Portable
             }
         };
-
         #[cfg(not(target_arch = "x86_64"))]
         let level = Self::Portable;
 
@@ -120,6 +143,7 @@ impl GfSimdLevel {
             1 => Self::Sse41,
             2 => Self::Avx2,
             3 => Self::Avx512,
+            4 => Self::Gfni,
             _ => Self::Portable,
         }
     }
@@ -227,6 +251,103 @@ unsafe fn gf_mul_avx512_64(table: &GfMulTableX86, data_ptr: *const u8) -> __m512
     let lo_result = _mm512_shuffle_epi8(lo_table, lo_nibbles);
     let hi_result = _mm512_shuffle_epi8(hi_table, hi_nibbles);
     _mm512_xor_si512(lo_result, hi_result)
+}
+
+// ---------------------------------------------------------------------------
+// GFNI kernel — 64 elements per VGF2P8MULB (AVX-512+GFNI)
+// ---------------------------------------------------------------------------
+
+/// GFNI AVX-512 kernel: multiply 64 bytes by `coeff` in GF(2^8) using
+/// `_mm512_gf2p8mul_epi8` — a single instruction, no table lookups.
+///
+/// This is the fastest possible GF(2^8) path: one instruction for 64
+/// bytes, ~8.7× faster than portable log/exp per-byte.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,gfni")]
+unsafe fn gf_mul_gfni_avx512_64(coeff: u8, data_ptr: *const u8) -> __m512i {
+    // SAFETY: caller guarantees data_ptr points to 64 readable bytes
+    let data = _mm512_loadu_si512(data_ptr as *const __m512i);
+    let coeff_vec = _mm512_set1_epi8(coeff as i8);
+    _mm512_gf2p8mul_epi8(data, coeff_vec)
+}
+
+// ---------------------------------------------------------------------------
+// GFNI kernel — 32 elements per VGF2P8MULB (AVX2+GFNI, no AVX-512)
+// ---------------------------------------------------------------------------
+
+/// GFNI AVX2 kernel: multiply 32 bytes by `coeff` in GF(2^8) using
+/// `_mm256_gf2p8mul_epi8`. Used when GFNI is available but AVX-512 is not
+/// (e.g., some Ice Lake client SKUs).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,gfni")]
+unsafe fn gf_mul_gfni_avx2_32(coeff: u8, data_ptr: *const u8) -> __m256i {
+    // SAFETY: caller guarantees data_ptr points to 32 readable bytes
+    let data = _mm256_loadu_si256(data_ptr as *const __m256i);
+    let coeff_vec = _mm256_set1_epi8(coeff as i8);
+    _mm256_gf2p8mul_epi8(data, coeff_vec)
+}
+
+// ---------------------------------------------------------------------------
+// GFNI batch functions — process entire slice with a single coefficient
+// ---------------------------------------------------------------------------
+
+/// GFNI AVX-512 batched multiply: `dst[i] = coeff × data[i]` for all i.
+///
+/// Uses `_mm512_gf2p8mul_epi8` for 512-bit chunks, falling back to the
+/// 256-bit GFNI path for remainder, then portable for the final bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,gfni")]
+unsafe fn gf_mul_gfni_avx512_batch(coeff: u8, data: &[u8], dst: &mut [u8]) {
+    assert_eq!(data.len(), dst.len());
+    let len = data.len();
+    let chunks = len / 64;
+
+    for chunk in 0..chunks {
+        let offset = chunk * 64;
+        let result = gf_mul_gfni_avx512_64(coeff, data.as_ptr().add(offset));
+        _mm512_storeu_si512(dst.as_mut_ptr().add(offset) as *mut __m512i, result);
+    }
+
+    // Remainder: use GFNI AVX2 for the next ≤32 bytes, then portable
+    let remainder_start = chunks * 64;
+    if remainder_start < len {
+        gf_mul_gfni_avx2_batch(coeff, &data[remainder_start..], &mut dst[remainder_start..]);
+    }
+}
+
+/// GFNI AVX2 batched multiply (GFNI without AVX-512).
+///
+/// Uses `_mm256_gf2p8mul_epi8` for 256-bit chunks, falling back to
+/// SSE4.1 for the next 16 bytes, then portable for the final bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,gfni")]
+unsafe fn gf_mul_gfni_avx2_batch(coeff: u8, data: &[u8], dst: &mut [u8]) {
+    assert_eq!(data.len(), dst.len());
+    let len = data.len();
+    let chunks = len / 32;
+
+    for chunk in 0..chunks {
+        let offset = chunk * 32;
+        let result = gf_mul_gfni_avx2_32(coeff, data.as_ptr().add(offset));
+        _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, result);
+    }
+
+    // Remainder: use SSE4.1 for the next 16 bytes, then portable
+    let remainder_start = chunks * 32;
+    let remainder = len - remainder_start;
+    if remainder >= 16 {
+        let table = GfMulTableX86::new(coeff);
+        let sse_result = gf_mul_sse41_16(&table, data.as_ptr().add(remainder_start));
+        _mm_storeu_si128(dst.as_mut_ptr().add(remainder_start) as *mut __m128i, sse_result);
+        let sse_end = remainder_start + 16;
+        for i in sse_end..len {
+            dst[i] = gf_mul(coeff, data[i]);
+        }
+    } else {
+        for i in remainder_start..len {
+            dst[i] = gf_mul(coeff, data[i]);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +467,16 @@ pub fn gf_mul_simd(coeff: u8, data: &[u8], dst: &mut [u8]) {
 
     match level {
         #[cfg(target_arch = "x86_64")]
+        GfSimdLevel::Gfni => {
+            if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+                // SAFETY: GFNI + AVX-512F + AVX-512BW detected by GfSimdLevel::detect
+                unsafe { gf_mul_gfni_avx512_batch(coeff, data, dst) }
+            } else {
+                // SAFETY: GFNI + AVX2 detected by GfSimdLevel::detect
+                unsafe { gf_mul_gfni_avx2_batch(coeff, data, dst) }
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
         GfSimdLevel::Avx512 => {
             // SAFETY: AVX-512F + AVX-512BW detected by GfSimdLevel::detect
             unsafe { gf_mul_avx512_batch(coeff, data, dst) }
@@ -383,6 +514,16 @@ pub unsafe fn gf_mul_simd_unchecked(coeff: u8, data: &[u8], dst: &mut [u8]) {
     let level = GfSimdLevel::detect();
 
     match level {
+        #[cfg(target_arch = "x86_64")]
+        GfSimdLevel::Gfni => {
+            if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+                // SAFETY: GFNI + AVX-512F + AVX-512BW confirmed by GfSimdLevel::detect
+                unsafe { gf_mul_gfni_avx512_batch(coeff, data, dst) }
+            } else {
+                // SAFETY: GFNI + AVX2 confirmed by GfSimdLevel::detect
+                unsafe { gf_mul_gfni_avx2_batch(coeff, data, dst) }
+            }
+        }
         #[cfg(target_arch = "x86_64")]
         // SAFETY: AVX-512F + AVX-512BW confirmed by GfSimdLevel::detect
         GfSimdLevel::Avx512 => unsafe { gf_mul_avx512_batch(coeff, data, dst) },
@@ -422,6 +563,7 @@ mod tests {
 
     #[test]
     fn simd_level_is_ordered() {
+        assert!(GfSimdLevel::Gfni > GfSimdLevel::Avx512);
         assert!(GfSimdLevel::Avx512 > GfSimdLevel::Avx2);
         assert!(GfSimdLevel::Avx2 > GfSimdLevel::Sse41);
         assert!(GfSimdLevel::Sse41 > GfSimdLevel::Portable);
@@ -553,7 +695,7 @@ mod tests {
         let encoder = CauchyEncoder::new(config);
 
         let data: Vec<Vec<u8>> = (0..4).map(|i| vec![b'a' + i; 64]).collect();
-        let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let data_refs: Vec<&[u8]> = data.iter().map(|v| &v[..]).collect();
 
         let parity = encoder.encode(&data_refs, 2).unwrap();
         assert_eq!(parity.len(), 2);
@@ -598,6 +740,104 @@ mod tests {
         let level = GfSimdLevel::detect();
         let cached = GfSimdLevel::cached().unwrap();
         assert_eq!(level, cached, "cached level must equal detected level");
+    }
+
+    // ── GFNI-specific tests ──────────────────────────────────────────
+
+    #[test]
+    fn gfni_level_is_highest_priority() {
+        // Gfni must be the maximum-valued variant (highest priority).
+        let levels = [
+            GfSimdLevel::Portable,
+            GfSimdLevel::Sse41,
+            GfSimdLevel::Avx2,
+            GfSimdLevel::Avx512,
+            GfSimdLevel::Gfni,
+        ];
+        let max = levels.iter().max().unwrap();
+        assert_eq!(*max, GfSimdLevel::Gfni);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn gfni_batch_crosscheck_against_portable() {
+        // When GFNI is available at runtime, verify the GFNI batch
+        // functions produce identical results to scalar portable mul.
+        if !is_x86_feature_detected!("gfni") {
+            // GFNI not available on this CPU — skip.
+            return;
+        }
+
+        let coeff = 0x7Bu8;
+        let len = 1024;
+        let data: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(3).wrapping_add(1)).collect();
+
+        // Portable baseline
+        let mut portable = vec![0u8; len];
+        for i in 0..len {
+            portable[i] = gf_mul(coeff, data[i]);
+        }
+
+        // GFNI via SIMD dispatch
+        let mut gfni_out = vec![0u8; len];
+        gf_mul_simd(coeff, &data, &mut gfni_out);
+
+        // The dispatch should have selected Gfni
+        let level = GfSimdLevel::detect();
+        assert_eq!(level, GfSimdLevel::Gfni, "expected Gfni level when gfni feature is available");
+
+        assert_eq!(gfni_out, portable, "GFNI output must match portable for all elements");
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn gfni_batch_crosscheck_various_sizes() {
+        // Like `gf_mul_simd_matches_portable_various_sizes` but with
+        // an explicit check that GFNI is the active path.
+        if !is_x86_feature_detected!("gfni") {
+            return;
+        }
+
+        let coeff = 0xA3u8;
+        // Sizes that exercise the SIMD boundary and remainder logic
+        let sizes: &[usize] =
+            &[0, 1, 15, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 511, 512, 1023, 1024];
+
+        for &len in sizes {
+            let data: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_add(1)).collect();
+            let mut gfni_out = vec![0u8; len];
+            let mut scalar = vec![0u8; len];
+
+            gf_mul_simd(coeff, &data, &mut gfni_out);
+            for i in 0..len {
+                scalar[i] = gf_mul(coeff, data[i]);
+            }
+            assert_eq!(gfni_out, scalar, "GFNI mismatch at len={len}");
+        }
+    }
+
+    /// Verify that the `from_u8` round-trip preserves all variants
+    /// including `Gfni`.
+    #[test]
+    fn from_u8_roundtrip_all_variants() {
+        let variants: &[(GfSimdLevel, u8)] = &[
+            (GfSimdLevel::Portable, 0),
+            (GfSimdLevel::Sse41, 1),
+            (GfSimdLevel::Avx2, 2),
+            (GfSimdLevel::Avx512, 3),
+            (GfSimdLevel::Gfni, 4),
+        ];
+        for &(level, expected_val) in variants {
+            assert_eq!(level as u8, expected_val);
+            assert_eq!(GfSimdLevel::from_u8(expected_val), level);
+        }
+    }
+
+    /// Unknown discriminant values fall back to `Portable`.
+    #[test]
+    fn from_u8_unknown_falls_back_to_portable() {
+        assert_eq!(GfSimdLevel::from_u8(255), GfSimdLevel::Portable);
+        assert_eq!(GfSimdLevel::from_u8(5), GfSimdLevel::Portable);
     }
 
     // ── Edge cases: sizes around SIMD boundaries ─────────────────────
@@ -665,12 +905,12 @@ mod tests {
             ..Default::default()
         });
         // Build reference parity with portable encoder
-        let data_refs: Vec<&[u8]> = batch.data.iter().map(|v| v.as_slice()).collect();
+        let data_refs: Vec<&[u8]> = batch.data.iter().map(|v| &v[..]).collect();
         let ref_parity = cauchy.encode(&data_refs, 2).unwrap();
         // Verify SIMD parity matches portable parity
         for i in 0..2 {
             assert_eq!(
-                batch.parity[i].as_slice(),
+                &batch.parity[i][..],
                 ref_parity[i].as_ref(),
                 "SIMD parity shard {i} must match portable"
             );

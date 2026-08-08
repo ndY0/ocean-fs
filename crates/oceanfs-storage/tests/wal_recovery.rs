@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use oceanfs_core::{HashOutput, PoolConfig, SegmentId, SegmentSizeConfig, SizeTier, WalConfig};
 use oceanfs_storage::{
     wal::{replay_wal, WalEntry, WalReader, WalWriter},
@@ -22,6 +23,7 @@ fn make_config(dir: &tempfile::TempDir) -> WalConfig {
         data_dir: dir.path().join("wal"),
         max_file_size_bytes: 64 * 1024 * 1024, // 64 MB
         fsync_batch_timeout_ms: 5,
+        ..Default::default()
     }
 }
 
@@ -33,7 +35,7 @@ fn make_entry(segment_id: SegmentId, offset: u64, length: u32) -> WalEntry {
         0,
         0,
         HashOutput::from_bytes([0u8; 32]),
-        vec![0u8; length as usize],
+        vec![0u8; length as usize].into(),
     )
 }
 
@@ -188,7 +190,7 @@ async fn replay_empty_directory_returns_no_entries() {
 #[test]
 fn entry_roundtrip() {
     let seg_id = SegmentId::new();
-    let data = vec![0xBBu8; 256];
+    let data: Bytes = vec![0xBBu8; 256].into();
     let entry = WalEntry::new(seg_id, 42, 256, 0, 0, HashOutput::from_bytes([0xAA; 32]), data);
 
     let bytes = entry.to_bytes();
@@ -210,11 +212,16 @@ async fn replay_wal_recovers_and_truncates() {
     let size_config = SegmentSizeConfig::default();
     let buffer_pool = Arc::new(BufferPool::new(65536, 8));
     let pool_cfg = PoolConfig::default();
-    let pool_small =
-        SegmentPool::new(pool_cfg.clone(), SizeTier::Small, &size_config, buffer_pool.clone())
-            .unwrap();
+    let pool_small = SegmentPool::new(
+        pool_cfg.clone(),
+        SizeTier::Small,
+        &size_config,
+        buffer_pool.clone(),
+        None,
+    )
+    .unwrap();
     let pool_standard =
-        SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool).unwrap();
+        SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None).unwrap();
 
     let seg_id = SegmentId::new();
 
@@ -251,11 +258,16 @@ async fn replay_wal_empty_wal_returns_zero_summary() {
     let size_config = SegmentSizeConfig::default();
     let buffer_pool = Arc::new(BufferPool::new(65536, 8));
     let pool_cfg = PoolConfig::default();
-    let pool_small =
-        SegmentPool::new(pool_cfg.clone(), SizeTier::Small, &size_config, buffer_pool.clone())
-            .unwrap();
+    let pool_small = SegmentPool::new(
+        pool_cfg.clone(),
+        SizeTier::Small,
+        &size_config,
+        buffer_pool.clone(),
+        None,
+    )
+    .unwrap();
     let pool_standard =
-        SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool).unwrap();
+        SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None).unwrap();
 
     let wal_writer = WalWriter::open(&config).await.unwrap();
     let summary =

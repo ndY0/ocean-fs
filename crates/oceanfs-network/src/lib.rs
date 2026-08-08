@@ -11,8 +11,15 @@
 //!
 //! Storage, healing, scrub, and cache service stubs are generated in
 //! their owning crates (oceanfs-storage, oceanfs-cache) per architecture §2.4.
+//!
+//! ## Unsafe Code Policy
+//!
+//! This crate uses `#![deny(unsafe_code)]` rather than `#![forbid(unsafe_code)]`
+//! to permit `#[allow(unsafe_code)]` on individual `libc::setsockopt` wrappers
+//! for Linux socket tuning (`SO_BUSY_POLL`). These are advisory hints with
+//! trivial safety invariants. All other unsafe is forbidden. See ADR-0012.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -27,10 +34,14 @@
 
 mod client;
 mod pool;
+mod socket_opts;
 mod tls;
 
 pub use client::RpcClient;
 pub use pool::{ConnectionPool, PooledChannel};
+pub use socket_opts::{
+    apply_opts_to_fd, create_reuseport_listener, set_busy_poll, set_quickack, set_reuseport,
+};
 
 // ---------------------------------------------------------------------------
 // Generated gRPC service stubs

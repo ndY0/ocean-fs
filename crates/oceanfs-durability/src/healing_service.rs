@@ -313,7 +313,7 @@ mod tests {
                 id: "target-node".to_string(),
             }),
             segment_id: Some(SegmentId::new().into()),
-            data: b"test hint data".to_vec(),
+            data: Bytes::from(b"test hint data".as_slice()),
             hlc: None,
         });
 

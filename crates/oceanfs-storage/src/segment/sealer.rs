@@ -14,7 +14,7 @@ use oceanfs_hash::Blake3Hasher;
 
 use crate::{
     error::{Error, Result},
-    io::IoReadMode,
+    io::{write_atomic, IoReadMode, SegmentWriteMode},
     metadata::RocksDbMetadataStore,
     segment::{
         buffer::ActiveSegment,
@@ -40,6 +40,13 @@ pub struct SealConfig {
     /// to bypass the OS page cache. When `Mmap`, segment files are
     /// memory-mapped for zero-copy reads. Default is `Buffered`.
     pub io_mode: IoReadMode,
+    /// Write strategy for sealed segment files.
+    ///
+    /// `Tmpfile` uses `O_TMPFILE` + `linkat` for atomic writes
+    /// (Linux 3.11+). `Rename` uses the traditional create→write→
+    /// rename path. Probe once at startup with
+    /// `SegmentWriteMode::probe()`.
+    pub write_mode: SegmentWriteMode,
 }
 
 /// Orchestrates the sealing of active segments.
@@ -117,15 +124,16 @@ impl SegmentSealer {
         let segment_id = active.id();
         let tier = active.tier();
         let data = Bytes::copy_from_slice(active.data());
-        self.seal_from_data(segment_id, tier, data, entries).await
+        self.seal_from_data(segment_id, tier, data, entries, 0, 0).await
     }
 
     /// Seals a segment from raw data bytes, without requiring an `ActiveSegment`.
     ///
     /// This is the primary sealing entry point — works with segments that have
     /// already been extracted from the pool. Accepts the segment's identity,
-    /// data bytes, tier, and blob index entries. Writes the segment file to
-    /// disk, persists metadata, and truncates the WAL past the sealed boundary.
+    /// data bytes, tier, blob index entries, and EC parameters. Writes the
+    /// segment file to disk, persists metadata, and truncates the WAL past
+    /// the sealed boundary.
     ///
     /// # Errors
     ///
@@ -137,6 +145,8 @@ impl SegmentSealer {
         tier: SizeTier,
         data: Bytes,
         entries: &[SegmentIndexEntry],
+        ec_k: u8,
+        ec_m: u8,
     ) -> Result<SegmentHandle> {
         let size = data.len() as u64;
         let blob_count = entries.len() as u32;
@@ -201,15 +211,24 @@ impl SegmentSealer {
                 }
             }
             _ => {
-                tokio::fs::write(&path, &file_data).await?;
+                // Write atomically when O_TMPFILE is available (Linux 3.11+),
+                // falling back to a plain sync write on other platforms.
+                let filename = format!("{segment_id}.dat");
+                write_atomic(self.config.write_mode, &self.config.data_dir, &filename, &file_data)
+                    .map_err(|e| {
+                        Error::Io(std::io::Error::new(
+                            e.kind(),
+                            format!("segment write failed for {segment_id}: {e}"),
+                        ))
+                    })?;
             }
         }
 
         // Persist segment metadata.
         let meta = SegmentMetadata {
             segment_id,
-            ec_k: 0, // set during EC encoding (Phase 3)
-            ec_m: 0,
+            ec_k,
+            ec_m,
             size_tier: tier,
             merkle_root,
             storage_locations: smallvec::SmallVec::new(),
@@ -270,6 +289,7 @@ mod tests {
                 data_dir: dir.path().join("wal"),
                 max_file_size_bytes: 1024 * 1024,
                 fsync_batch_timeout_ms: 5,
+                ..Default::default()
             })
             .await
             .unwrap(),
@@ -280,6 +300,7 @@ mod tests {
             seal_timeout_ms: 1000,
             data_dir: dir.path().join("segments"),
             io_mode: IoReadMode::Buffered,
+            write_mode: SegmentWriteMode::Rename,
         };
 
         let pool = BufferPool::new(65536, 4);
@@ -340,6 +361,7 @@ mod tests {
                 data_dir: dir.path().join("wal"),
                 max_file_size_bytes: 1024 * 1024,
                 fsync_batch_timeout_ms: 5,
+                ..Default::default()
             })
             .await
             .unwrap(),
@@ -349,6 +371,7 @@ mod tests {
             seal_timeout_ms: 1000,
             data_dir: dir.path().join("segments"),
             io_mode: IoReadMode::Buffered,
+            write_mode: SegmentWriteMode::Rename,
         };
         let pool = BufferPool::new(65536, 4);
         let size_config =

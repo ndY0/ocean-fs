@@ -181,6 +181,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             max_file_size_bytes: 1024 * 1024,
             fsync_batch_timeout_ms: 5,
+            ..Default::default()
         };
 
         write_entries(&config, 5).await;
@@ -197,6 +198,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             max_file_size_bytes: 1024 * 1024,
             fsync_batch_timeout_ms: 5,
+            ..Default::default()
         };
 
         let reader = WalReader::open(&config).unwrap();
@@ -211,6 +213,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             max_file_size_bytes: 1024 * 1024,
             fsync_batch_timeout_ms: 5,
+            ..Default::default()
         };
 
         {

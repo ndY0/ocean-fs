@@ -21,6 +21,7 @@ fn open_temp_metadata() -> Arc<RocksDbMetadataStore> {
         data_dir: dir.path().to_path_buf(),
         block_cache_size: 8 * 1024 * 1024,
         memtable_size: 8 * 1024 * 1024,
+        ..Default::default()
     };
     let _dir_leaked = Box::leak(Box::new(dir));
     Arc::new(RocksDbMetadataStore::open(&config).expect("open metadata store"))

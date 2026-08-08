@@ -67,8 +67,31 @@ impl CauchyEncoder {
         self.m
     }
 
-    /// Generates the Cauchy matrix for (k, m).
+    /// Generates the Cauchy matrix for (k, m), preferring compile-time const
+    /// values when available.
     fn cauchy_matrix(k: u8, m: u8) -> Vec<Vec<gf::Gf8>> {
+        // Fast path: use precomputed const matrix, avoiding GF computation.
+        if let Some(flat) = crate::matrix::get_const_cauchy_matrix(k, m) {
+            let ki = k as usize;
+            let mi = m as usize;
+            return (0..mi).map(|i| flat[i * ki..(i + 1) * ki].to_vec()).collect();
+        }
+
+        // Slow path: compute the Cauchy matrix at runtime.
+        Self::compute_cauchy_matrix(k, m)
+    }
+
+    /// Computes the Cauchy matrix at runtime — always, even for common (k,m).
+    ///
+    /// Used as the fallback for uncommon (k,m) pairs, and exposed for tests
+    /// to verify the const matrices match runtime computation.
+    #[doc(hidden)]
+    pub fn runtime_cauchy_matrix(k: u8, m: u8) -> Vec<Vec<gf::Gf8>> {
+        Self::compute_cauchy_matrix(k, m)
+    }
+
+    /// Computes the Cauchy matrix at runtime via GF(2⁸) inverses.
+    fn compute_cauchy_matrix(k: u8, m: u8) -> Vec<Vec<gf::Gf8>> {
         let ki = k as usize;
         let mi = m as usize;
 

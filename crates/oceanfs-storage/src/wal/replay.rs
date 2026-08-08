@@ -218,6 +218,7 @@ mod tests {
             data_dir: dir.path().join("wal"),
             max_file_size_bytes: 64 * 1024 * 1024,
             fsync_batch_timeout_ms: 5,
+            ..Default::default()
         };
         let size_config = SegmentSizeConfig::default();
         let buffer_pool = Arc::new(BufferPool::new(65536, 8));
@@ -229,11 +230,16 @@ mod tests {
         size_config: &SegmentSizeConfig,
     ) -> (SegmentPool, SegmentPool) {
         let pool_cfg = PoolConfig::default();
-        let small =
-            SegmentPool::new(pool_cfg.clone(), SizeTier::Small, size_config, buffer_pool.clone())
-                .unwrap();
+        let small = SegmentPool::new(
+            pool_cfg.clone(),
+            SizeTier::Small,
+            size_config,
+            buffer_pool.clone(),
+            None,
+        )
+        .unwrap();
         let standard =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, size_config, buffer_pool.clone())
+            SegmentPool::new(pool_cfg, SizeTier::Standard, size_config, buffer_pool.clone(), None)
                 .unwrap();
         (small, standard)
     }

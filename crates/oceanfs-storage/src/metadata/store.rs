@@ -230,6 +230,90 @@ impl RocksDbMetadataStore {
         let db = Arc::new(db);
         let metrics = Arc::new(RocksDbMetrics::default());
 
+        // Attempt to mlock the RocksDB block cache in physical RAM as
+        // swap defense (perf rule §3.4, Feature 6). The Rust rocksdb crate
+        // does not expose the raw memory region of the LRU cache, so this
+        // is a best-effort advisory log. A future C FFI extension or a
+        // rocksdb crate upgrade may enable actual mlock semantics.
+        //
+        // When `mlock_block_cache = true` and the platform is Linux, we
+        // attempt to mlock the existing process pages. This is a
+        // less-precise fallback: it locks ALL existing pages, not just
+        // the block cache, but it prevents swap of the cache pages that
+        // are already resident. New pages allocated by RocksDB after this
+        // call are not locked.
+        if config.mlock_block_cache && !cfg!(test) {
+            #[cfg(target_os = "linux")]
+            {
+                // SAFETY: `mlockall(MCL_CURRENT | MCL_FUTURE)` locks all
+                // currently mapped pages AND all future pages of the
+                // calling process into physical RAM. This prevents the
+                // kernel from swapping any RocksDB-allocated pages
+                // (block cache, memtables, SST index blocks) under
+                // memory pressure. The call requires `CAP_IPC_LOCK`;
+                // if not held, fails with EPERM and we log a warning.
+                #[allow(unsafe_code)]
+                let ret = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) };
+                if ret != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EPERM) {
+                        tracing::warn!(
+                            "mlockall(MCL_CURRENT|MCL_FUTURE) failed: CAP_IPC_LOCK not held. \
+                             RocksDB block cache is not pinned in RAM — \
+                             system may swap it under memory pressure. \
+                             See deployment docs for capability requirements."
+                        );
+                    } else {
+                        tracing::warn!(
+                            error = %err,
+                            "mlockall(MCL_CURRENT|MCL_FUTURE) failed — \
+                             RocksDB block cache is not pinned in RAM"
+                        );
+                    }
+                } else {
+                    // Verify the kernel actually honoured mlockall by
+                    // reading VmLck from /proc/self/status. The syscall
+                    // can return success even when RLIMIT_MEMLOCK silently
+                    // caps the locked amount below the block cache size.
+                    let locked_kb = read_vmlck_kb();
+                    let cache_mb = config.block_cache_size / (1024 * 1024);
+                    let locked_mb = locked_kb / 1024;
+
+                    if locked_kb == 0 {
+                        tracing::warn!(
+                            cache_mb,
+                            "mlockall returned success but VmLck = 0 kB. \
+                             RLIMIT_MEMLOCK is likely too low. \
+                             RocksDB block cache is NOT pinned in RAM. \
+                             Raise RLIMIT_MEMLOCK in systemd unit or \
+                             /etc/security/limits.conf to at least {cache_mb} MB."
+                        );
+                    } else if locked_mb < cache_mb as u64 / 2 {
+                        tracing::warn!(
+                            cache_mb,
+                            locked_mb,
+                            "mlockall locked only {locked_mb} MB but block cache \
+                             is {cache_mb} MB. RLIMIT_MEMLOCK may be insufficient. \
+                             RocksDB block cache is partially pinned — \
+                             some pages may still be swapped."
+                        );
+                    } else {
+                        tracing::info!(
+                            cache_mb,
+                            locked_mb,
+                            "RocksDB block cache pages pinned in RAM via \
+                             mlockall(MCL_CURRENT|MCL_FUTURE): \
+                             VmLck = {locked_mb} MB (cache = {cache_mb} MB)"
+                        );
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                tracing::info!("mlock_block_cache=true ignored on non-Linux platform");
+            }
+        }
+
         Ok(Self { db, metrics })
     }
 
@@ -780,6 +864,35 @@ pub enum BatchOp {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// mlock verification helper
+// ---------------------------------------------------------------------------
+
+/// Reads the current process's locked memory (VmLck) from /proc/self/status.
+///
+/// Returns the value in kilobytes, or 0 if the file cannot be read or parsed.
+/// Used to verify that `mlockall` actually pinned pages in physical RAM.
+#[cfg(target_os = "linux")]
+fn read_vmlck_kb() -> u64 {
+    let content = match std::fs::read_to_string("/proc/self/status") {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    for line in content.lines() {
+        if let Some(val) = line.strip_prefix("VmLck:") {
+            // Format: "VmLck:\t  123456 kB"
+            let kb_str = val.split_whitespace().next().unwrap_or("0");
+            return kb_str.parse::<u64>().unwrap_or(0);
+        }
+    }
+    0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_vmlck_kb() -> u64 {
+    0
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

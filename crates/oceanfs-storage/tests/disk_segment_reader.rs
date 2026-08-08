@@ -242,9 +242,7 @@ async fn segment_cache_invalidation_allows_re_read() {
 mod write_read_roundtrip {
     use std::sync::Arc;
 
-    use oceanfs_core::{
-        MetadataConfig, SegmentId, SegmentIndexEntry, SegmentSizeConfig, SizeTier, WalConfig,
-    };
+    use oceanfs_core::{MetadataConfig, SegmentId, SegmentIndexEntry, SizeTier, WalConfig};
     use oceanfs_storage::{
         io::{DiskIo, DiskSegmentReader, IoReadMode, SegmentReader},
         metadata::RocksDbMetadataStore,
@@ -271,6 +269,7 @@ mod write_read_roundtrip {
                 data_dir: dir.path().join("wal"),
                 max_file_size_bytes: 1024 * 1024,
                 fsync_batch_timeout_ms: 5,
+                ..Default::default()
             })
             .await
             .unwrap(),
@@ -283,6 +282,7 @@ mod write_read_roundtrip {
                 seal_timeout_ms: 5000,
                 data_dir: segments_dir.clone(),
                 io_mode,
+                write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
             },
             metadata,
             wal,
@@ -316,6 +316,8 @@ mod write_read_roundtrip {
                     length: data.len() as u32,
                     blob_key_hash: [0xAA; 32],
                 }],
+                0,
+                0,
             )
             .await
             .unwrap();
@@ -343,6 +345,8 @@ mod write_read_roundtrip {
                     length: data.len() as u32,
                     blob_key_hash: [0xBB; 32],
                 }],
+                0,
+                0,
             )
             .await
             .unwrap();

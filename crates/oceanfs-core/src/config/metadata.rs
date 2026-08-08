@@ -62,6 +62,17 @@ pub struct MetadataConfig {
     /// Operators with very large metadata stores or low `ulimit` values
     /// should cap this at 4096.
     pub max_open_files: i32,
+    /// Whether to pin the RocksDB block cache in physical RAM with
+    /// `mlock(2)` (default `true` on Linux).
+    ///
+    /// Prevents the kernel from swapping the block cache under memory
+    /// pressure. Swapping the block cache is worse than OOM — it turns
+    /// microsecond lookups into millisecond disk reads. Requires
+    /// `CAP_IPC_LOCK` capability; if `mlock` fails for any reason
+    /// (e.g., capability not held, mlock limit reached), the system
+    /// logs a warning and continues without pinning.
+    /// No-op on non-Linux platforms.
+    pub mlock_block_cache: bool,
 }
 
 impl Default for MetadataConfig {
@@ -74,6 +85,7 @@ impl Default for MetadataConfig {
             segments_write_buffer_mb: 256,
             deletions_write_buffer_mb: 16,
             max_open_files: -1,
+            mlock_block_cache: cfg!(target_os = "linux"),
         }
     }
 }
@@ -93,5 +105,11 @@ mod tests {
         assert_eq!(config.segments_write_buffer_mb, 256);
         assert_eq!(config.deletions_write_buffer_mb, 16);
         assert_eq!(config.max_open_files, -1);
+    }
+
+    #[test]
+    fn mlock_block_cache_default_matches_platform() {
+        let config = MetadataConfig::default();
+        assert_eq!(config.mlock_block_cache, cfg!(target_os = "linux"));
     }
 }

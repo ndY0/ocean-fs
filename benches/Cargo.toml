@@ -27,12 +27,27 @@ name = "io_benchmark"
 harness = false
 path = "io_benchmark.rs"
 
+[[bench]]
+name = "wal_sync_benchmark"
+harness = false
+path = "wal_sync_benchmark.rs"
+
+[[bench]]
+name = "network_benchmark"
+harness = false
+path = "network_benchmark.rs"
+
 [dependencies]
 blake3.workspace = true
 bytes.workspace = true
 criterion.workspace = true
+libc = "0.2"
+oceanfs-accel.workspace = true
 oceanfs-core.workspace = true
 oceanfs-ec.workspace = true
+oceanfs-network.workspace = true
 oceanfs-storage.workspace = true
+rand = "0.8"
+socket2.workspace = true
 tempfile = "3"
 tokio.workspace = true

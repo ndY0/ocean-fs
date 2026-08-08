@@ -49,7 +49,7 @@ use oceanfs_core::{
 /// let response = handler.handle_probe(&request);
 /// assert!(response.ack);
 /// ```
-pub(crate) struct ProbeHandler {
+pub struct ProbeHandler {
     /// The local node's identifier.
     node_id: NodeId,
     /// The local node's current incarnation number.

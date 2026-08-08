@@ -134,17 +134,25 @@ impl RoundTripEnv {
             Arc::new(SegmentShard::new(4, SizeTier::Standard, &size_config, &buffer_pool).unwrap());
         let pool_cfg = PoolConfig::default();
         let segment_pool_small = Arc::new(
-            SegmentPool::new(pool_cfg.clone(), SizeTier::Small, &size_config, buffer_pool.clone())
-                .unwrap(),
+            SegmentPool::new(
+                pool_cfg.clone(),
+                SizeTier::Small,
+                &size_config,
+                buffer_pool.clone(),
+                None,
+            )
+            .unwrap(),
         );
         let segment_pool_standard = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool).unwrap(),
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None)
+                .unwrap(),
         );
         let wal = Arc::new(
             WalWriter::open(&WalConfig {
                 data_dir: dir.path().join("wal"),
                 max_file_size_bytes: 64 * 1024 * 1024,
                 fsync_batch_timeout_ms: 5,
+                ..Default::default()
             })
             .await
             .unwrap(),
@@ -153,6 +161,8 @@ impl RoundTripEnv {
             target_size_bytes: size_config.default_target_size,
             seal_timeout_ms: 5000,
             data_dir: dir.path().join("segments"),
+            io_mode: oceanfs_storage::io::IoReadMode::Buffered,
+            write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
         };
         let sealer = Arc::new(SegmentSealer::new(seal_config, metadata_store.clone(), wal));
 

@@ -29,6 +29,7 @@ mod error;
 pub mod gf;
 #[cfg(feature = "isa-l")]
 mod isal;
+pub mod matrix;
 mod shard;
 mod stripe;
 mod traits;

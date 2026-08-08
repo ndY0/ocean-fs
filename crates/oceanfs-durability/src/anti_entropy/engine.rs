@@ -846,6 +846,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             block_cache_size: 8 * 1024 * 1024,
             memtable_size: 8 * 1024 * 1024,
+            ..Default::default()
         }
     }
 
@@ -1106,7 +1107,7 @@ mod tests {
         assert_eq!(count, 1);
 
         let uuid_bytes: [u8; 16] = encoded[4..20].try_into().unwrap();
-        assert_eq!(uuid_bytes, seg_id.as_uuid().as_bytes().as_slice());
+        assert_eq!(uuid_bytes, &seg_id.as_uuid().as_bytes()[..]);
     }
 
     #[test]
@@ -1332,14 +1333,16 @@ mod tests {
         let (data_shards, parity) = ec_encode_test_data(&data, k, m);
 
         // Corrupt shard 1 by flipping a byte
-        let mut corrupted_shards = data_shards.clone();
+        // Bytes is immutable — convert to Vec<u8>, mutate, then back
+        let mut corrupted_shards: Vec<Vec<u8>> = data_shards.iter().map(|b| b.to_vec()).collect();
         corrupted_shards[1][100] ^= 0x01;
+        let corrupted_shards: Vec<Bytes> = corrupted_shards.into_iter().map(Bytes::from).collect();
 
         // Mark shard 1 as missing (None) for EC decode
         let mut available: Vec<Option<&[u8]>> =
-            (0..k as usize).map(|i| Some(corrupted_shards[i].as_slice())).collect();
-        available.push(Some(parity[0].as_slice()));
-        available.push(Some(parity[1].as_slice()));
+            (0..k as usize).map(|i| Some(&corrupted_shards[i][..])).collect();
+        available.push(Some(&parity[0][..]));
+        available.push(Some(&parity[1][..]));
 
         // Now mark shard 1 as missing for reconstruction
         available[1] = None;
@@ -1368,11 +1371,11 @@ mod tests {
         // Mark shards 0 and 3 as missing
         let available: Vec<Option<&[u8]>> = vec![
             None,
-            Some(data_shards[1].as_slice()),
-            Some(data_shards[2].as_slice()),
+            Some(&data_shards[1][..]),
+            Some(&data_shards[2][..]),
             None,
-            Some(parity[0].as_slice()),
-            Some(parity[1].as_slice()),
+            Some(&parity[0][..]),
+            Some(&parity[1][..]),
         ];
 
         let codec = CauchyEncoder::new(oceanfs_core::CodecConfig {
@@ -1445,7 +1448,7 @@ mod tests {
             }
         }
         for p in &original_parity {
-            available.push(Some(p.as_slice()));
+            available.push(Some(&p[..]));
         }
 
         let recovered = codec

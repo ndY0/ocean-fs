@@ -88,6 +88,7 @@ async fn sealed_segment_produces_metadata_in_rocksdb() {
             data_dir: dir.path().join("wal"),
             max_file_size_bytes: 1024 * 1024,
             fsync_batch_timeout_ms: 5,
+            ..Default::default()
         })
         .await
         .unwrap(),
@@ -97,6 +98,8 @@ async fn sealed_segment_produces_metadata_in_rocksdb() {
         target_size_bytes: size_config.default_target_size,
         seal_timeout_ms: 5000,
         data_dir: dir.path().join("segments"),
+        io_mode: oceanfs_storage::io::IoReadMode::Buffered,
+        write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
     };
     let sealer = SegmentSealer::new(seal_config, store.clone(), wal);
 

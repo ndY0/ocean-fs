@@ -192,3 +192,27 @@ actual compilation speed. No more feature-gating, no more mock types.
     reviewer subagent in the same tool-call batch. Never end a message with
     just a report — that leaves you waiting for a user prompt that the
     workflow already says should be automated.
+
+### 4.6 Parallel Test Caveat: RocksDB SIGABRT
+
+**RocksDB's C++ thread pool is not safe for concurrent open/close across
+multiple DB instances within a single process.** When tests open and close
+RocksDB in parallel (default `cargo test` uses `N` threads where `N =
+num_cpus`), the C++ background-thread destructors race and the process
+aborts with `SIGABRT` (`terminate called without an active exception`).
+
+**Affected crates:** `oceanfs-storage`, `oceanfs-node`, `oceanfs-durability`,
+`oceanfs-server` — any crate whose tests open `RocksDbMetadataStore`.
+
+**Remedy:** Always run RocksDB-affected crates with `--test-threads=1`:
+
+```bash
+cargo test -p oceanfs-storage --lib -- --test-threads=1
+cargo test -p oceanfs-node     --lib -- --test-threads=1
+cargo test -p oceanfs-server   --lib -- --test-threads=1
+cargo test -p oceanfs-durability --lib -- --test-threads=1
+```
+
+**Reviewers:** do **not** flag `SIGABRT` under parallel test execution as
+a defect — it is a known RocksDB C++ limitation, not an OceanFS bug.
+Only flag test failures that reproduce under `--test-threads=1`.

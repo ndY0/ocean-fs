@@ -561,7 +561,11 @@ impl AccelDispatcher {
     }
 
     /// Resolves an EC decoder for a specific tier override.
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// Currently unused but kept as the decoder counterpart to
+    /// [`resolve_encoder_for_tier`]; will be wired when per-bucket
+    /// decoding tier overrides are added.
+    #[allow(dead_code)]
     pub(crate) fn resolve_decoder_for_tier(&self, tier: AccelTier) -> DecoderBackend {
         if tier == self.active_ec_tier {
             return self.decoder.clone();
