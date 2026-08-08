@@ -32,6 +32,7 @@ oceanfs-cache = { workspace = true, optional = true }
 # backends for improved throughput.
 oceanfs-accel = { workspace = true, optional = true }
 arc-swap.workspace = true
+async-trait = "0.1"
 axum.workspace = true
 blake3.workspace = true
 bytes.workspace = true
@@ -69,6 +70,8 @@ ec = ["dep:oceanfs-ec"]
 cache = ["dep:oceanfs-cache"]
 # Enables GPU-accelerated EC encoding via hardware backends.
 accel = ["dep:oceanfs-accel"]
+# Enables sendfile/splice body for file-backed segment responses.
+sendfile = ["oceanfs-storage/sendfile"]
 
 [dev-dependencies]
 tokio-test = "0.4"

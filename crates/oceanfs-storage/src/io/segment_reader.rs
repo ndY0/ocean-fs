@@ -1,0 +1,484 @@
+//! Segment reader — disk-backed and in-memory implementations.
+//!
+//! The [`SegmentReader`] trait is the abstraction for reading blob chunk
+//! data from segments. Two implementations are provided:
+//!
+//! - [`DiskSegmentReader`] — reads from segment files on disk via the
+//!   configured [`IoReadMode`] (mmap / O_DIRECT / buffered). Uses
+//!   [`SegmentFileCache`] for zero-copy mmap reads and [`DiskIo`] for
+//!   io_uring-accelerated I/O.
+//!
+//! - [`InMemorySegmentReader`] — stores segment data in a `HashMap`.
+//!   Used for testing and as a fast path for recently-written segments
+//!   that haven't been sealed to disk yet.
+//!
+//! ## Read source tracking
+//!
+//! [`SegmentReadSource`] accompanies each read result so the HTTP handler
+//! can choose between `Body::from(Bytes)` (memory) and `SegmentFileBody`
+//! (file-backed, for sendfile path).
+
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
+
+use bytes::Bytes;
+use oceanfs_core::SegmentId;
+use parking_lot::{Mutex, RwLock};
+
+use super::{DiskIo, IoReadMode, SegmentFileCache};
+use crate::segment::header::SEGMENT_HEADER_SIZE;
+
+// ---------------------------------------------------------------------------
+// SegmentReader trait
+// ---------------------------------------------------------------------------
+
+/// Reads blob chunk data from segments.
+///
+/// The trait is async because disk-backed implementations need
+/// asynchronous I/O. Use `#[async_trait::async_trait]` on impls.
+///
+/// # Examples
+///
+/// ```ignore
+/// use oceanfs_storage::io::SegmentReader;
+/// use oceanfs_core::SegmentId;
+///
+/// # async fn example(reader: &dyn SegmentReader) {
+/// let data = reader
+///     .read_chunk(&SegmentId::new(), 0, 1024)
+///     .await
+///     .expect("read failed");
+/// # }
+/// ```
+#[async_trait::async_trait]
+pub trait SegmentReader: Send + Sync {
+    /// Reads a chunk of data from a segment.
+    ///
+    /// Returns the chunk data as `Bytes`. The returned data may be
+    /// backed by an mmap region (zero-copy) or a heap allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if the segment is not found or the
+    /// read fails.
+    async fn read_chunk(
+        &self,
+        segment_id: &SegmentId,
+        offset: u64,
+        length: u32,
+    ) -> std::result::Result<Bytes, String>;
+
+    /// Returns the source metadata for the most recent `read_chunk` call.
+    ///
+    /// The default implementation returns [`SegmentReadSource::Memory`].
+    /// Disk-backed readers override this to return file-backed information
+    /// for sendfile integration.
+    fn last_read_source(&self, _segment_id: &SegmentId) -> SegmentReadSource {
+        SegmentReadSource::Memory
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SegmentReadSource
+// ---------------------------------------------------------------------------
+
+/// Describes the data source for a segment chunk read.
+///
+/// Used by upper layers to choose the response body strategy:
+/// - `Memory` → `Body::from(Bytes)` (zero-copy from Bytes)
+/// - `MmapBacked` → `SegmentFileBody` (mmap-backed, sendfile path)
+/// - `DirectIo` → `SegmentFileBody` or `Body::from(Bytes)` (both fine)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SegmentReadSource {
+    /// Data was served from an in-memory cache (HashMap, L1, inline
+    /// metadata). The `Bytes` owns its data.
+    Memory,
+    /// Data was sliced from an mmap region backed by a segment file.
+    /// The `Bytes` shares the mmap's `Arc` — zero additional allocation.
+    MmapBacked {
+        /// The segment that was mapped.
+        segment_id: SegmentId,
+        /// The file path on disk.
+        file_path: PathBuf,
+    },
+    /// Data was read from disk via O_DIRECT or buffered I/O into a
+    /// temporary buffer.
+    DirectIo {
+        /// The segment that was read.
+        segment_id: SegmentId,
+        /// The file path on disk.
+        file_path: PathBuf,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// DiskSegmentReader
+// ---------------------------------------------------------------------------
+
+/// Disk-backed segment reader implementing [`SegmentReader`].
+///
+/// Routes reads through the configured I/O backend based on
+/// [`IoReadMode`], resolved from `NodeConfig::read_cache_segments`.
+///
+/// ## I/O Mode Selection
+///
+/// | `IoReadMode` | Read Path |
+/// |---|---|
+/// | `Mmap` | `SegmentFileCache::get_or_map()` → `&[u8]` slice → `Bytes` |
+/// | `Direct` | `DirectIoBuf` → `DiskIo::read()` → `Bytes` |
+/// | `Buffered` | `tokio::fs::File::read_at()` → `Bytes` |
+///
+/// ## Memory Bounds
+///
+/// Memory is bounded by the `SegmentFileCache` (max mmap entries ×
+/// segment size) plus temporary `DirectIoBuf` allocations (per-read,
+/// returned to pool). There is no unbounded HashMap.
+pub struct DiskSegmentReader {
+    /// The configured read mode, resolved at construction.
+    read_mode: IoReadMode,
+    /// The disk I/O backend (io_uring or tokio::fs).
+    disk_io: Arc<DiskIo>,
+    /// Optional LRU cache of memory-mapped segment files.
+    mmap_cache: Option<Arc<SegmentFileCache>>,
+    /// Base directory for segment files.
+    segment_dir: PathBuf,
+    /// Tracks the source of the most recent read, keyed by segment_id.
+    last_source: Mutex<HashMap<SegmentId, SegmentReadSource>>,
+}
+
+impl DiskSegmentReader {
+    /// Creates a new disk-backed segment reader.
+    ///
+    /// `mmap_cache` should be `Some` when `read_mode == IoReadMode::Mmap`.
+    /// Otherwise it is ignored.
+    pub fn new(
+        read_mode: IoReadMode,
+        disk_io: Arc<DiskIo>,
+        mmap_cache: Option<Arc<SegmentFileCache>>,
+        segment_dir: PathBuf,
+    ) -> Self {
+        Self {
+            read_mode,
+            disk_io,
+            mmap_cache,
+            segment_dir,
+            last_source: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns the filesystem path for a segment file.
+    fn segment_path(&self, segment_id: &SegmentId) -> PathBuf {
+        self.segment_dir.join(format!("{segment_id}.dat"))
+    }
+}
+
+#[async_trait::async_trait]
+impl SegmentReader for DiskSegmentReader {
+    async fn read_chunk(
+        &self,
+        segment_id: &SegmentId,
+        offset: u64,
+        length: u32,
+    ) -> std::result::Result<Bytes, String> {
+        let path = self.segment_path(segment_id);
+        // Blob offsets are relative to the data region, AFTER the
+        // 76-byte segment header. Convert to file-level offset.
+        let file_offset = offset + SEGMENT_HEADER_SIZE as u64;
+
+        let (data, source) = match self.read_mode {
+            IoReadMode::Mmap => {
+                if let Some(ref cache) = self.mmap_cache {
+                    match cache.get_or_map(*segment_id, &path) {
+                        Ok(mmap) => {
+                            let start = file_offset as usize;
+                            let end = start.saturating_add(length as usize).min(mmap.len());
+                            let slice = &mmap[start..end];
+                            let data = Bytes::copy_from_slice(slice);
+                            let source = SegmentReadSource::MmapBacked {
+                                segment_id: *segment_id,
+                                file_path: path.clone(),
+                            };
+                            (data, source)
+                        }
+                        Err(e) => {
+                            return Err(format!("mmap read failed for {segment_id}: {e}"));
+                        }
+                    }
+                } else {
+                    // Mmap mode but no cache configured — fall back to buffered.
+                    read_buffered(segment_id, &path, file_offset, length).await?
+                }
+            }
+            IoReadMode::Direct => {
+                let len = length as usize;
+                let mut buf = vec![0u8; len];
+                self.disk_io
+                    .read(&path, &mut buf, file_offset)
+                    .await
+                    .map_err(|e| format!("O_DIRECT read failed for {segment_id}: {e}"))?;
+                buf.truncate(len);
+                let data = Bytes::from(buf);
+                let source = SegmentReadSource::DirectIo {
+                    segment_id: *segment_id,
+                    file_path: path.clone(),
+                };
+                (data, source)
+            }
+            IoReadMode::Buffered => read_buffered(segment_id, &path, file_offset, length).await?,
+        };
+
+        self.last_source.lock().insert(*segment_id, source);
+        Ok(data)
+    }
+
+    fn last_read_source(&self, segment_id: &SegmentId) -> SegmentReadSource {
+        self.last_source.lock().get(segment_id).cloned().unwrap_or(SegmentReadSource::Memory)
+    }
+}
+
+/// Buffered read fallback using `tokio::fs`.
+async fn read_buffered(
+    segment_id: &SegmentId,
+    path: &std::path::Path,
+    offset: u64,
+    length: u32,
+) -> std::result::Result<(Bytes, SegmentReadSource), String> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("failed to open segment file {segment_id}: {e}"))?;
+    file.seek(std::io::SeekFrom::Start(offset))
+        .await
+        .map_err(|e| format!("seek failed for {segment_id}: {e}"))?;
+    let mut buf = vec![0u8; length as usize];
+    file.read_exact(&mut buf)
+        .await
+        .map_err(|e| format!("buffered read failed for {segment_id}: {e}"))?;
+    let source =
+        SegmentReadSource::DirectIo { segment_id: *segment_id, file_path: path.to_path_buf() };
+    Ok((Bytes::from(buf), source))
+}
+
+// ---------------------------------------------------------------------------
+// InMemorySegmentReader (moved from coordinator.rs, for tests)
+// ---------------------------------------------------------------------------
+
+/// In-memory segment reader for testing and fast-path reads.
+///
+/// Stores full segment data in a `HashMap<SegmentId, Bytes>`.
+/// Does not read from disk — all data must be pre-loaded via [`put`].
+///
+/// [`put`]: InMemorySegmentReader::put
+pub struct InMemorySegmentReader {
+    segments: RwLock<HashMap<SegmentId, Bytes>>,
+}
+
+impl InMemorySegmentReader {
+    /// Creates an empty in-memory segment reader.
+    pub fn new() -> Self {
+        Self { segments: RwLock::new(HashMap::new()) }
+    }
+
+    /// Stores segment data in the in-memory store.
+    pub fn put(&self, segment_id: SegmentId, data: Bytes) {
+        self.segments.write().insert(segment_id, data);
+    }
+
+    /// Returns the number of segments stored.
+    pub fn len(&self) -> usize {
+        self.segments.read().len()
+    }
+
+    /// Returns `true` if the store is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Default for InMemorySegmentReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl SegmentReader for InMemorySegmentReader {
+    async fn read_chunk(
+        &self,
+        segment_id: &SegmentId,
+        offset: u64,
+        length: u32,
+    ) -> std::result::Result<Bytes, String> {
+        let segments = self.segments.read();
+        let full = segments
+            .get(segment_id)
+            .cloned()
+            .ok_or_else(|| format!("segment {segment_id} not found in memory"))?;
+
+        let start = offset as usize;
+        let end = start.saturating_add(length as usize).min(full.len());
+        Ok(full.slice(start..end))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn temp_segment_file(dir: &tempfile::TempDir, id: SegmentId) -> PathBuf {
+        let path = dir.path().join(format!("{id}.dat"));
+        // Write a minimal segment file with a 76-byte header followed by
+        // the test data. The header is zeroed except for magic bytes.
+        let header = vec![0u8; SEGMENT_HEADER_SIZE];
+        let data = vec![0xABu8; 4096];
+        let mut file_data = header;
+        file_data.extend_from_slice(&data);
+        std::fs::write(&path, &file_data).unwrap();
+        path
+    }
+
+    // --- InMemorySegmentReader tests ---
+
+    #[tokio::test]
+    async fn in_memory_read_chunk_returns_correct_slice() {
+        let reader = InMemorySegmentReader::new();
+        let id = SegmentId::new();
+        reader.put(id, Bytes::from_static(&[0, 1, 2, 3, 4, 5, 6, 7]));
+
+        let chunk = reader.read_chunk(&id, 2, 4).await.unwrap();
+        assert_eq!(&chunk[..], &[2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn in_memory_read_chunk_missing_segment_returns_err() {
+        let reader = InMemorySegmentReader::new();
+        let result = reader.read_chunk(&SegmentId::new(), 0, 100).await;
+        assert!(result.is_err());
+    }
+
+    // --- DiskSegmentReader tests ---
+
+    #[tokio::test]
+    async fn disk_reader_buffered_reads_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = SegmentId::new();
+        let path = temp_segment_file(&dir, id);
+
+        let reader = DiskSegmentReader::new(
+            IoReadMode::Buffered,
+            Arc::new(DiskIo::TokioFs),
+            None,
+            dir.path().to_path_buf(),
+        );
+
+        let data = reader.read_chunk(&id, 0, 100).await.unwrap();
+        assert_eq!(data.len(), 100);
+        assert_eq!(data[0], 0xAB);
+    }
+
+    #[tokio::test]
+    async fn disk_reader_mmap_reads_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = SegmentId::new();
+        let path = temp_segment_file(&dir, id);
+
+        let cache = Arc::new(SegmentFileCache::new(4));
+        let reader = DiskSegmentReader::new(
+            IoReadMode::Mmap,
+            Arc::new(DiskIo::TokioFs),
+            Some(cache),
+            dir.path().to_path_buf(),
+        );
+
+        let data = reader.read_chunk(&id, 0, 512).await.unwrap();
+        assert_eq!(data.len(), 512);
+        assert_eq!(data[0], 0xAB);
+
+        // Source should be mmap-backed.
+        let source = reader.last_read_source(&id);
+        assert!(matches!(source, SegmentReadSource::MmapBacked { .. }));
+    }
+
+    #[tokio::test]
+    async fn disk_reader_mmap_cache_hit_second_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = SegmentId::new();
+        let path = temp_segment_file(&dir, id);
+
+        let cache = Arc::new(SegmentFileCache::new(4));
+        let reader = DiskSegmentReader::new(
+            IoReadMode::Mmap,
+            Arc::new(DiskIo::TokioFs),
+            Some(cache.clone()),
+            dir.path().to_path_buf(),
+        );
+
+        let _data1 = reader.read_chunk(&id, 0, 100).await.unwrap();
+        assert_eq!(cache.len(), 1);
+
+        let _data2 = reader.read_chunk(&id, 0, 100).await.unwrap();
+        assert_eq!(cache.len(), 1); // Still one entry — cache hit.
+    }
+
+    #[tokio::test]
+    async fn disk_reader_missing_file_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let reader = DiskSegmentReader::new(
+            IoReadMode::Buffered,
+            Arc::new(DiskIo::TokioFs),
+            None,
+            dir.path().to_path_buf(),
+        );
+
+        let result = reader.read_chunk(&SegmentId::new(), 0, 100).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn disk_reader_direct_reads_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = SegmentId::new();
+        let path = temp_segment_file(&dir, id);
+
+        let reader = DiskSegmentReader::new(
+            IoReadMode::Direct,
+            Arc::new(DiskIo::TokioFs),
+            None,
+            dir.path().to_path_buf(),
+        );
+
+        let data = reader.read_chunk(&id, 0, 256).await.unwrap();
+        assert_eq!(data.len(), 256);
+        assert_eq!(data[0], 0xAB);
+
+        let source = reader.last_read_source(&id);
+        assert!(matches!(source, SegmentReadSource::DirectIo { .. }));
+    }
+
+    #[tokio::test]
+    async fn disk_reader_large_read_across_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = SegmentId::new();
+        let path = dir.path().join(format!("{id}.dat"));
+        let segment_data = vec![0xCDu8; 65536]; // 64 KB
+        std::fs::write(&path, &segment_data).unwrap();
+
+        for &mode in &[IoReadMode::Buffered, IoReadMode::Direct] {
+            let reader = DiskSegmentReader::new(
+                mode,
+                Arc::new(DiskIo::TokioFs),
+                None,
+                dir.path().to_path_buf(),
+            );
+
+            let data = reader.read_chunk(&id, 1024, 8192).await.unwrap();
+            assert_eq!(data.len(), 8192);
+            assert!(data.iter().all(|&b| b == 0xCD));
+        }
+    }
+}

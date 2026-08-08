@@ -443,11 +443,17 @@ Unsafe code is permitted only in the following crates:
 - `oceanfs-accel` (GPU FFI, SIMD intrinsics)
 - `oceanfs-hash` (BLAKE3 implementation if not using the upstream crate)
 - `oceanfs-ec` (SIMD-accelerated GF arithmetic)
+- `oceanfs-storage` (memory-mapped segment I/O via `memmap2::Mmap`;
+  see [ADR-0011]). Uses `#![deny(unsafe_code)]` rather than
+  `#![forbid(unsafe_code)]` — individual `#[allow(unsafe_code)]`
+  annotations with `// SAFETY:` comments are required at each
+  `unsafe` block. Limited to mmap operations; new unsafe use-cases
+  require a new ADR.
 
 All other crates are `#![forbid(unsafe_code)]`.
 
 **Enforcement:** CI checks each crate's `lib.rs` for
-`#![forbid(unsafe_code)]` (or the absence of it, for the three
+`#![forbid(unsafe_code)]` (or `#![deny(unsafe_code)]` for the four
 permitted crates).
 
 ### 7.3 Panic Policy

@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use oceanfs_core::{HashOutput, SegmentId, SegmentSizeConfig, SizeTier, WalConfig};
 use oceanfs_storage::{
-    segment::buffer::ActiveSegment, BufferPool, SealConfig, SegmentSealer, WalEntry, WalWriter,
+    io::IoReadMode, segment::buffer::ActiveSegment, BufferPool, SealConfig, SegmentSealer,
+    WalEntry, WalWriter,
 };
 
 fn make_test_entry(segment_id: SegmentId, offset: u64, length: u32) -> WalEntry {
@@ -24,7 +25,7 @@ fn make_test_entry(segment_id: SegmentId, offset: u64, length: u32) -> WalEntry 
         0,
         0,
         HashOutput::from_bytes([0u8; 32]),
-        vec![0u8; length as usize],
+        vec![0u8; length as usize].into(),
     )
 }
 
@@ -70,6 +71,7 @@ async fn wal_truncation_called_during_seal() {
         target_size_bytes: 100,
         seal_timeout_ms: 5000,
         data_dir: dir.path().join("segments"),
+        io_mode: IoReadMode::Buffered,
     };
     let sealer = SegmentSealer::new(seal_config, metadata, wal.clone());
 

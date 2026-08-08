@@ -407,7 +407,7 @@ async fn fetch_single_chunk(
 ) -> Result<Bytes> {
     // Fast path: local segment reader.
     if let Some(reader) = segment_reader {
-        match reader.read_chunk(&chunk.segment_id, chunk.offset, chunk.length) {
+        match reader.read_chunk(&chunk.segment_id, chunk.offset, chunk.length).await {
             Ok(data) => {
                 debug!(
                     segment_id = %chunk.segment_id,
@@ -709,7 +709,7 @@ async fn try_ec_recovery_for_chunk(
     // Read the full segment (offset 0, length = max). The
     // SegmentReader implementation is expected to return the full
     // segment data.
-    let segment_data = reader.read_chunk(&chunk.segment_id, 0, u32::MAX).map_err(|e| {
+    let segment_data = reader.read_chunk(&chunk.segment_id, 0, u32::MAX).await.map_err(|e| {
         Error::Internal(format!(
             "EC recovery: failed to read full segment {}: {e}",
             chunk.segment_id

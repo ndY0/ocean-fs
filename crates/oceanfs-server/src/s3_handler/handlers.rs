@@ -97,23 +97,10 @@ pub(crate) async fn put_object(
         Ok(result) => {
             let etag = result.blake3_hash.map(|h| h.to_hex()).unwrap_or_default();
 
-            // Store segment data in the in-memory store for subsequent reads.
-            if let Some(ref store) = state.segment_store {
-                for chunk in &result.chunks {
-                    store.put(chunk.segment_id, body.clone());
-                }
-            }
-
-            // Persist blob data to disk so it survives node restarts.
-            if let Some(ref blob_dir) = state.blob_dir {
-                for chunk in &result.chunks {
-                    let path = blob_dir.join(format!("{}.blob", chunk.segment_id.as_uuid()));
-                    if let Err(e) = std::fs::write(&path, &body) {
-                        error!(segment_id = %chunk.segment_id, path = %path.display(), error = %e,
-                            "failed to persist blob data to disk");
-                    }
-                }
-            }
+            // Segment data is persisted by the SegmentSealer (O_DIRECT
+            // or buffered I/O) during the seal worker. The WAL provides
+            // crash recovery for data between PUT completion and seal.
+            // No synchronous disk write on the hot path.
 
             // Persist object metadata so reads can locate the data.
             let meta = ObjectMetadata {
@@ -351,7 +338,35 @@ pub(crate) async fn get_object(
             headers.insert(header::ETAG, header_val(&etag));
             headers.insert(header::CONTENT_LENGTH, header_val(&result.data.len().to_string()));
 
-            (StatusCode::OK, headers, Body::from(result.data)).into_response()
+            // Response body: when data is file-backed (mmap or O_DIRECT),
+            // wrap in SegmentFileBody for sendfile path via reverse proxy.
+            // For true kernel-space sendfile(2), deploy nginx in front.
+            let body = {
+                #[cfg(feature = "sendfile")]
+                {
+                    match &result.segment_source {
+                        Some(
+                            oceanfs_storage::io::SegmentReadSource::MmapBacked { .. }
+                            | oceanfs_storage::io::SegmentReadSource::DirectIo { .. },
+                        ) => {
+                            let file_body = oceanfs_storage::io::SegmentFileBody::new(
+                                result.data.clone(),
+                                0,
+                                result.data.len() as u64,
+                            );
+                            Body::new(file_body)
+                        }
+                        _ => Body::from(result.data),
+                    }
+                }
+                #[cfg(not(feature = "sendfile"))]
+                {
+                    let _ = &result.segment_source;
+                    Body::from(result.data)
+                }
+            };
+
+            (StatusCode::OK, headers, body).into_response()
         }
         Err(e) => s3_error_response(&e, &bucket, &key),
     }

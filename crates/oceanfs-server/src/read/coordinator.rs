@@ -64,6 +64,11 @@ pub struct ReadResult {
     pub metadata: ObjectMetadata,
     /// Whether the BLAKE3 hash was verified against the stored hash.
     pub hash_verified: bool,
+    /// The data source for sendfile integration.
+    ///
+    /// When `Some`, the HTTP handler SHOULD use `SegmentFileBody`.
+    /// When `None`, use `Body::from(Bytes)`.
+    pub segment_source: Option<oceanfs_storage::io::SegmentReadSource>,
 }
 
 /// The result of a complete read, including cache-hit information.
@@ -80,6 +85,14 @@ pub struct GetResult {
     pub cache_hit: CacheHitLevel,
     /// The BLAKE3 hash of the data (always computed).
     pub hash: HashOutput,
+    /// The data source for sendfile integration.
+    ///
+    /// When `Some(SegmentReadSource::MmapBacked { .. })` or
+    /// `Some(SegmentReadSource::DirectIo { .. })`, the HTTP handler
+    /// SHOULD use `SegmentFileBody` for the response.
+    /// When `None` or `Some(SegmentReadSource::Memory)`, use
+    /// `Body::from(Bytes)`.
+    pub segment_source: Option<oceanfs_storage::io::SegmentReadSource>,
 }
 
 /// Which cache level served a read request.
@@ -150,19 +163,8 @@ pub enum ReadOutcome {
 ///     }
 /// }
 /// ```
-pub trait SegmentReader: Send + Sync {
-    /// Reads a chunk of data from a segment.
-    ///
-    /// # Errors
-    ///
-    /// Returns a string error if the segment or chunk is not found.
-    fn read_chunk(
-        &self,
-        segment_id: &oceanfs_core::SegmentId,
-        offset: u64,
-        length: u32,
-    ) -> Result<Bytes, String>;
-}
+pub use oceanfs_storage::io::SegmentReader; // re-exported for backward compatibility
+pub use oceanfs_storage::io::{DiskSegmentReader, InMemorySegmentReader, SegmentReadSource};
 
 /// Coordinates distributed blob reads with parallel shard fetch.
 ///
@@ -336,9 +338,20 @@ impl ReadCoordinator {
                 metadata: obj_meta,
                 cache_hit: CacheHitLevel::Miss,
                 hash: HashOutput::from_bytes([0u8; 32]),
+                segment_source: None,
             });
         } else if !obj_meta.chunks.is_empty() {
-            self.assemble_chunks(&obj_meta, req.policy.as_deref()).await?
+            let (data, source) = self.assemble_chunks(&obj_meta, req.policy.as_deref()).await?;
+            // Build result with source metadata.
+            let computed_hash = blake3::hash(&data);
+            let hash = HashOutput::from_bytes(*computed_hash.as_bytes());
+            return Ok(GetResult {
+                data,
+                metadata: obj_meta,
+                cache_hit: CacheHitLevel::Miss,
+                hash,
+                segment_source: source,
+            });
         } else if self.metadata.is_some() {
             // Has a metadata store but no data: genuinely not found.
             return Err(Error::NotFound(format!("{}/{}", req.bucket, req.key)));
@@ -350,7 +363,13 @@ impl ReadCoordinator {
         let computed_hash = blake3::hash(&data);
         let hash = HashOutput::from_bytes(*computed_hash.as_bytes());
 
-        Ok(GetResult { data, metadata: obj_meta, cache_hit: CacheHitLevel::Miss, hash })
+        Ok(GetResult {
+            data,
+            metadata: obj_meta,
+            cache_hit: CacheHitLevel::Miss,
+            hash,
+            segment_source: None,
+        })
     }
 
     /// Synchronously compares local HLC against remote replicas (§4.6).
@@ -865,7 +884,12 @@ impl ReadCoordinator {
         // hash_verified is true only when a stored hash was actually verified.
         // We use the presence of a stored hash in metadata as the indicator.
         let hash_verified = result.metadata.blake3_hash.is_some();
-        Ok(ReadResult { data: result.data, metadata: result.metadata, hash_verified })
+        Ok(ReadResult {
+            data: result.data,
+            metadata: result.metadata,
+            hash_verified,
+            segment_source: result.segment_source,
+        })
     }
 
     /// Looks up object metadata from the metadata store.
@@ -910,10 +934,10 @@ impl ReadCoordinator {
         &self,
         meta: &ObjectMetadata,
         policy: Option<&crate::BucketPolicy>,
-    ) -> Result<Bytes> {
+    ) -> Result<(Bytes, Option<oceanfs_storage::io::SegmentReadSource>)> {
         let chunk_count = meta.chunks.len();
         if chunk_count == 0 {
-            return Ok(Bytes::new());
+            return Ok((Bytes::new(), None));
         }
 
         let timeout_ms = OperationTimeouts::default().read_default_ms;
@@ -1050,7 +1074,15 @@ impl ReadCoordinator {
             assembler.push_chunk(index, data)?;
         }
 
-        assembler.finalize()
+        // Query the segment reader for file-backed source metadata.
+        // Uses the first chunk's segment as the representative source —
+        // multi-segment blobs are rare and mixing sources is harmless.
+        let source = self
+            .segment_reader
+            .as_ref()
+            .and_then(|reader| meta.chunks.first().map(|c| reader.last_read_source(&c.segment_id)));
+
+        assembler.finalize().map(|data| (data, source))
     }
 
     /// Verifies the BLAKE3 hash of data against stored metadata.
@@ -1263,64 +1295,6 @@ impl Default for ReadCoordinator {
     }
 }
 
-/// A simple in-memory segment reader for testing and single-node
-/// operation.
-///
-/// Maps segment IDs to their data payloads.
-pub struct InMemorySegmentReader {
-    segments: parking_lot::RwLock<std::collections::HashMap<oceanfs_core::SegmentId, Bytes>>,
-}
-
-impl InMemorySegmentReader {
-    /// Creates a new empty segment reader.
-    pub fn new() -> Self {
-        Self { segments: parking_lot::RwLock::new(std::collections::HashMap::new()) }
-    }
-
-    /// Stores data for a segment.
-    pub fn put(&self, segment_id: oceanfs_core::SegmentId, data: Bytes) {
-        self.segments.write().insert(segment_id, data);
-    }
-}
-
-impl Default for InMemorySegmentReader {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SegmentReader for InMemorySegmentReader {
-    /// Reads a chunk from the in-memory store, respecting the given offset.
-    ///
-    /// Uses the `(offset, length)` from the chunk ref to slice the stored
-    /// segment data. This mirrors the behavior of `SegmentIndex::lookup(offset)`
-    /// in on-disk segments, where the B-tree index maps blob offsets to
-    /// data ranges within the segment file.
-    fn read_chunk(
-        &self,
-        segment_id: &oceanfs_core::SegmentId,
-        offset: u64,
-        length: u32,
-    ) -> Result<Bytes, String> {
-        let full = self
-            .segments
-            .read()
-            .get(segment_id)
-            .cloned()
-            .ok_or_else(|| format!("segment {segment_id} not found"))?;
-
-        let start = offset as usize;
-        let end = (offset as usize).saturating_add(length as usize).min(full.len());
-        if start >= full.len() {
-            return Err(format!(
-                "offset {offset} out of bounds for segment {segment_id} (len {})",
-                full.len()
-            ));
-        }
-        Ok(full.slice(start..end))
-    }
-}
-
 /// Builds a `PutObjectMetadataRequest` from local object metadata.
 ///
 /// Used during read repair to push corrected data to stale replicas.
@@ -1440,7 +1414,7 @@ mod tests {
             hlc: Hlc::zero(),
         };
 
-        let assembled = coordinator.assemble_chunks(&meta, None).await.unwrap();
+        let (assembled, _source) = coordinator.assemble_chunks(&meta, None).await.unwrap();
         assert_eq!(&assembled[..], data);
     }
 
@@ -1470,7 +1444,7 @@ mod tests {
             hlc: Hlc::zero(),
         };
 
-        let assembled = coordinator.assemble_chunks(&meta, None).await.unwrap();
+        let (assembled, _source) = coordinator.assemble_chunks(&meta, None).await.unwrap();
         assert_eq!(&assembled[..], &combined[..]);
     }
 
@@ -1629,17 +1603,18 @@ mod tests {
             },
             cache_hit: CacheHitLevel::Miss,
             hash: HashOutput::from_bytes([1u8; 32]),
+            segment_source: None,
         };
         assert_eq!(result.cache_hit, CacheHitLevel::Miss);
         assert_eq!(&result.data[..], b"test");
     }
 
-    #[test]
-    fn segment_reader_trait_is_object_safe() {
+    #[tokio::test]
+    async fn segment_reader_trait_is_object_safe() {
         // Verify SegmentReader can be used as trait object.
         let reader: Arc<dyn SegmentReader> = Arc::new(InMemorySegmentReader::new());
         let seg_id = SegmentId::new();
-        let result = reader.read_chunk(&seg_id, 0, 100);
+        let result = reader.read_chunk(&seg_id, 0, 100).await;
         assert!(result.is_err());
     }
 
@@ -2474,8 +2449,9 @@ mod tests {
         failing_segment: SegmentId,
     }
 
+    #[async_trait::async_trait]
     impl SegmentReader for ChunkFailSegmentReader {
-        fn read_chunk(
+        async fn read_chunk(
             &self,
             segment_id: &SegmentId,
             offset: u64,
@@ -2484,7 +2460,7 @@ mod tests {
             if segment_id == &self.failing_segment && length != u32::MAX {
                 return Err("simulated chunk read failure".into());
             }
-            self.inner.read_chunk(segment_id, offset, length)
+            self.inner.read_chunk(segment_id, offset, length).await
         }
     }
 
@@ -2577,7 +2553,7 @@ mod tests {
             hlc: Hlc::zero(),
         };
 
-        let assembled = coordinator.assemble_chunks(&meta, None).await.unwrap();
+        let (assembled, _source) = coordinator.assemble_chunks(&meta, None).await.unwrap();
         assert_eq!(&assembled[..], &expected[..], "EC recovery data mismatch");
     }
 }

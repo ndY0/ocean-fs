@@ -325,6 +325,37 @@ pub struct InMemorySegmentShardStore {
     bytes_per_segment: u64,
 }
 
+/// Production segment shard store that deletes segment data files
+/// from the filesystem.
+///
+/// Used by the [`OrphanReaper`] to physically remove orphaned
+/// segment `.dat` files from `{segment_dir}/`.
+pub struct DiskSegmentShardStore {
+    segment_dir: std::path::PathBuf,
+}
+
+impl DiskSegmentShardStore {
+    /// Creates a new disk-backed shard store.
+    ///
+    /// `segment_dir` is the directory containing `{segment_id}.dat` files.
+    pub fn new(segment_dir: std::path::PathBuf) -> Self {
+        Self { segment_dir }
+    }
+}
+
+impl SegmentShardStore for DiskSegmentShardStore {
+    fn delete_shards(&self, segment_id: SegmentId) -> Result<u64> {
+        let path = self.segment_dir.join(format!("{segment_id}.dat"));
+        let metadata = match std::fs::metadata(&path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(crate::Error::Io(e)),
+        };
+        std::fs::remove_file(&path).map_err(crate::Error::Io)?;
+        Ok(metadata)
+    }
+}
+
 impl InMemorySegmentShardStore {
     /// Creates a new in-memory shard store that reports `bytes_per_segment`
     /// as reclaimed for each deleted segment.

@@ -211,6 +211,7 @@ async fn write_coordinator_handoff_on_replica_failure() {
         target_size_bytes: size_config.default_target_size,
         seal_timeout_ms: 5000,
         data_dir: dir.path().join("segments"),
+        io_mode: oceanfs_storage::io::IoReadMode::Buffered,
     };
     let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
 

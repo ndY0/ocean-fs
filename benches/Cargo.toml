@@ -22,8 +22,17 @@ name = "storage_benchmark"
 harness = false
 path = "storage_benchmark.rs"
 
+[[bench]]
+name = "io_benchmark"
+harness = false
+path = "io_benchmark.rs"
+
 [dependencies]
 blake3.workspace = true
+bytes.workspace = true
 criterion.workspace = true
 oceanfs-core.workspace = true
 oceanfs-ec.workspace = true
+oceanfs-storage.workspace = true
+tempfile = "3"
+tokio.workspace = true

@@ -13,7 +13,7 @@
 //! - **Metadata:** RocksDB-backed object and segment metadata
 //! - **Segment store:** manages sealed segments on disk
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -24,15 +24,14 @@
     missing_docs
 )]
 
-mod blob_store;
 mod buffer_pool;
 mod error;
+pub mod io;
 pub mod metadata;
 pub mod segment;
 mod traits;
 pub mod wal;
 
-pub use blob_store::BlobStore;
 pub use buffer_pool::BufferPool;
 pub use error::{Error, Result};
 pub use metadata::{BatchOp, RocksDbMetadataStore, RocksDbMetrics};

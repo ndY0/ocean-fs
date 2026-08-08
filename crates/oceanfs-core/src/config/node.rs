@@ -100,6 +100,26 @@ pub struct NodeConfig {
     /// Default per-request timeout in milliseconds (default 30000).
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
+    /// Whether to cache segment reads via mmap.
+    ///
+    /// When `true` (read-optimized profile), frequently-accessed segment
+    /// shard files are memory-mapped for zero-copy reads from the kernel
+    /// page cache. When `false` (write-optimized profile), segment data
+    /// files are opened with `O_DIRECT` to bypass the page cache.
+    #[serde(default = "default_read_cache_segments")]
+    pub read_cache_segments: bool,
+    /// Whether to use io_uring for disk I/O (Linux only).
+    ///
+    /// When `true` and running on Linux 5.1+, `tokio-uring` provides
+    /// true async disk I/O. Falls back to `tokio::fs` on non-Linux
+    /// platforms or when the feature is disabled.
+    #[serde(default = "default_io_uring_enabled")]
+    pub io_uring_enabled: bool,
+    /// Maximum number of segment files to keep memory-mapped in the
+    /// `SegmentFileCache`. Only meaningful when `read_cache_segments = true`.
+    /// Default: 64.
+    #[serde(default = "default_segment_cache_max_entries")]
+    pub segment_cache_max_entries: usize,
 }
 
 fn default_node_id() -> String {
@@ -159,6 +179,15 @@ fn default_connect_timeout_ms() -> u64 {
 fn default_request_timeout_ms() -> u64 {
     30000
 }
+fn default_read_cache_segments() -> bool {
+    false
+}
+fn default_io_uring_enabled() -> bool {
+    cfg!(target_os = "linux")
+}
+fn default_segment_cache_max_entries() -> usize {
+    64
+}
 
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -185,6 +214,9 @@ impl Default for NodeConfig {
             keepalive_sec: 30,
             connect_timeout_ms: 5000,
             request_timeout_ms: 30000,
+            read_cache_segments: false,
+            io_uring_enabled: cfg!(target_os = "linux"),
+            segment_cache_max_entries: 64,
         }
     }
 }
@@ -227,5 +259,23 @@ mod tests {
         assert_eq!(config.block_cache_size, 128 * 1024 * 1024);
         assert_eq!(config.memtable_size, 64 * 1024 * 1024);
         assert_eq!(config.data_dir, std::path::PathBuf::from("/var/lib/oceanfs/metadata"));
+    }
+
+    #[test]
+    fn default_read_cache_segments_is_false() {
+        let config = NodeConfig::default();
+        assert!(!config.read_cache_segments);
+    }
+
+    #[test]
+    fn default_io_uring_enabled_matches_platform() {
+        let config = NodeConfig::default();
+        assert_eq!(config.io_uring_enabled, cfg!(target_os = "linux"));
+    }
+
+    #[test]
+    fn default_segment_cache_max_entries_is_64() {
+        let config = NodeConfig::default();
+        assert_eq!(config.segment_cache_max_entries, 64);
     }
 }

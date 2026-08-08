@@ -1,13 +1,11 @@
 //! Trait implementations: bridges concrete storage types to `oceanfs-storage-api` traits.
 //!
-//! This module implements `BlobStore`, `WalWriter` from `oceanfs_storage_api`
+//! This module implements `WalWriter` from `oceanfs_storage_api`
 //! for the concrete RocksDB-backed types in this crate.
 
-use bytes::Bytes;
-use oceanfs_core::SegmentId;
-use oceanfs_storage_api::{error::Error as ApiError, BlobStore as BlobStoreTrait};
+use oceanfs_storage_api::error::Error as ApiError;
 
-use crate::{wal::WalEntry, BlobStore, WalWriter};
+use crate::{wal::WalEntry, WalWriter};
 
 /// Converts a crate-local error into a storage-API error.
 ///
@@ -17,24 +15,6 @@ fn map_error(e: crate::Error) -> ApiError {
         crate::Error::Io(io) => ApiError::Io(io),
         crate::Error::SegmentNotFound(id) => ApiError::SegmentNotFound(id),
         other => ApiError::Internal(other.to_string()),
-    }
-}
-
-impl BlobStoreTrait for BlobStore {
-    fn write_blob(&self, segment_id: &SegmentId, data: &[u8]) -> Result<(), ApiError> {
-        self.write_blob(segment_id, data).map_err(map_error)
-    }
-
-    fn read_blob(&self, segment_id: &SegmentId) -> Result<Option<Bytes>, ApiError> {
-        self.read_blob(segment_id).map_err(map_error)
-    }
-
-    fn delete_blob(&self, segment_id: &SegmentId) -> Result<(), ApiError> {
-        self.delete_blob(segment_id).map_err(map_error)
-    }
-
-    fn list_blobs(&self) -> Result<Vec<SegmentId>, ApiError> {
-        self.list_blobs().map_err(map_error)
     }
 }
 

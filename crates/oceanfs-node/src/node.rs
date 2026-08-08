@@ -63,12 +63,45 @@ impl oceanfs_storage_api::MetadataStore for PrefetchStoreAdapter {
 struct NodeLeaveHandler {
     /// WAL writer for flushing pending entries.
     wal_writer: Arc<oceanfs_storage::WalWriter>,
-    /// Blob store for listing and reading owned segments.
-    blob_store: Arc<oceanfs_storage::BlobStore>,
+    /// Directory containing authoritative segment files.
+    segment_dir: std::path::PathBuf,
     /// Connection pool for gRPC data transfer.
     pool: Arc<oceanfs_network::ConnectionPool>,
     /// Membership for resolving successor node addresses.
     membership: Arc<oceanfs_membership::Membership>,
+}
+
+impl NodeLeaveHandler {
+    /// Lists segment IDs from the segments directory.
+    fn list_segments(&self) -> std::io::Result<Vec<oceanfs_core::SegmentId>> {
+        let mut ids = Vec::new();
+        for entry in std::fs::read_dir(&self.segment_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map(|e| e == "dat").unwrap_or(false) {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    if let Ok(parsed) = uuid::Uuid::parse_str(stem) {
+                        ids.push(oceanfs_core::SegmentId::from_uuid_bytes(*parsed.as_bytes()));
+                    }
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Reads segment data, skipping the 76-byte header.
+    fn read_segment_data(
+        &self,
+        seg_id: &oceanfs_core::SegmentId,
+    ) -> std::io::Result<Option<bytes::Bytes>> {
+        let path = self.segment_dir.join(format!("{seg_id}.dat"));
+        match std::fs::read(&path) {
+            Ok(data) if data.len() >= 76 => Ok(Some(bytes::Bytes::from(data[76..].to_vec()))),
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -90,16 +123,14 @@ impl oceanfs_membership::GracefulLeaveHandler for NodeLeaveHandler {
         // WAL-protected and has been sealed. Transferring them completes
         // the WAL handoff.
         let segments = self
-            .blob_store
-            .list_blobs()
-            .map_err(|e| oceanfs_core::Error::Leave(format!("blob list failed: {e}")))?;
+            .list_segments()
+            .map_err(|e| oceanfs_core::Error::Leave(format!("segment list failed: {e}")))?;
 
         let mut transferred = 0usize;
         for seg_id in &segments {
             if let Some(data) = self
-                .blob_store
-                .read_blob(seg_id)
-                .map_err(|e| oceanfs_core::Error::Leave(format!("blob read failed: {e}")))?
+                .read_segment_data(seg_id)
+                .map_err(|e| oceanfs_core::Error::Leave(format!("segment read failed: {e}")))?
             {
                 if self.push_data_to_node(successor, seg_id, &data).await.is_ok() {
                     transferred += 1;
@@ -121,9 +152,8 @@ impl oceanfs_membership::GracefulLeaveHandler for NodeLeaveHandler {
     ) -> oceanfs_core::Result<usize> {
         // Enumerate owned segments.
         let segments = self
-            .blob_store
-            .list_blobs()
-            .map_err(|e| oceanfs_core::Error::Leave(format!("blob list failed: {e}")))?;
+            .list_segments()
+            .map_err(|e| oceanfs_core::Error::Leave(format!("segment list failed: {e}")))?;
 
         if segments.is_empty() {
             info!(successor = %successor, "no segments to transfer");
@@ -141,9 +171,8 @@ impl oceanfs_membership::GracefulLeaveHandler for NodeLeaveHandler {
         // Transfer each segment via hinted handoff gRPC.
         for seg_id in &segments {
             let data = self
-                .blob_store
-                .read_blob(seg_id)
-                .map_err(|e| oceanfs_core::Error::Leave(format!("blob read failed: {e}")))?;
+                .read_segment_data(seg_id)
+                .map_err(|e| oceanfs_core::Error::Leave(format!("segment read failed: {e}")))?;
 
             let data = match data {
                 Some(d) => d,
@@ -464,22 +493,18 @@ impl Node {
             target_size_bytes: segment_size.default_target_size,
             seal_timeout_ms: 5000,
             data_dir: config.data_dir.join("segments"),
+            io_mode: oceanfs_storage::io::IoReadMode::from_config(config.read_cache_segments),
         };
-        // SegmentSealer constructed here; wired into the write path below.
-        // Pass the blob store so sealed segments are available for heal/scrub/AE
-        // via SegmentDataStore (M5-storage).
-        let blob_store = Arc::new(
-            oceanfs_storage::BlobStore::open(&config.data_dir.join("blobs"))
-                .map_err(|e| format!("failed to open blob store: {e}"))?,
-        );
-        let sealer = Arc::new(
-            oceanfs_storage::SegmentSealer::new(
-                seal_config,
-                metadata_store.clone(),
-                wal_writer.clone(),
-            )
-            .with_blob_store(blob_store.clone()),
-        );
+        // SegmentSealer is the authoritative persistence path. Sealed
+        // segments are written to {data_dir}/segments/ with the configured
+        // I/O mode (O_DIRECT or buffered). The shared segment data store
+        // is used by anti-entropy and healing below.
+        let segment_dir = config.data_dir.join("segments");
+        let sealer = Arc::new(oceanfs_storage::SegmentSealer::new(
+            seal_config,
+            metadata_store.clone(),
+            wal_writer.clone(),
+        ));
         // ---- 7. Construct durability workers ----
         let gc_config = oceanfs_durability::GcConfig::new(
             config.gc_interval_sec,
@@ -494,14 +519,18 @@ impl Node {
             membership.clone(),
             metadata_store.clone(),
             pool.clone(),
-            Arc::new(oceanfs_durability::InMemorySegmentStore::new()),
+            // DiskSegmentStore reads/writes segment files from the
+            // authoritative {data_dir}/segments/ — same files written
+            // by the SegmentSealer and read by DiskSegmentReader.
+            Arc::new(oceanfs_durability::DiskSegmentStore::new(segment_dir.clone())),
         ));
         let scrub_config = oceanfs_durability::ScrubConfig::default();
         let scrub_worker = Arc::new(oceanfs_durability::ScrubCoordinator::new(scrub_config));
-        // OrphanReaper needs a SegmentShardStore for deleting shard files.
-        // In production this is the on-disk segment store; tests/early builds use in-memory.
-        let reaper_shard_store: Arc<dyn oceanfs_durability::SegmentShardStore> =
-            Arc::new(oceanfs_durability::InMemorySegmentShardStore::new(4194304));
+        // OrphanReaper deletes segment data files from disk when reclaiming
+        // orphaned segments after GC compaction.
+        let reaper_shard_store: Arc<dyn oceanfs_durability::SegmentShardStore> = Arc::new(
+            oceanfs_durability::DiskSegmentShardStore::new(config.data_dir.join("segments")),
+        );
         let reaper = Arc::new(oceanfs_durability::OrphanReaper::new(
             metadata_store.clone(),
             reaper_shard_store,
@@ -509,8 +538,9 @@ impl Node {
         ));
 
         // ---- 7b. Construct segment data store (shared by heal and gRPC) ----
-        // BlobStore is already created in section 6 and passed to the sealer.
-        let heal_data_store: Arc<dyn oceanfs_durability::SegmentDataStore> = blob_store.clone();
+        // DiskSegmentStore reads/writes the authoritative segment files.
+        let heal_data_store: Arc<dyn oceanfs_durability::SegmentDataStore> =
+            Arc::new(oceanfs_durability::DiskSegmentStore::new(segment_dir.clone()));
 
         // ---- 7c. Construct heal dispatch pipeline ----
         let heal_config = oceanfs_durability::HealConfig::default();
@@ -559,28 +589,32 @@ impl Node {
         let metadata_ops: Arc<dyn MetadataOps> =
             Arc::new(MetadataStoreAdapter::new(metadata_store.clone()));
 
-        // ---- 11. Construct coordinators ----
+        // ---- 11. Construct I/O infrastructure ----
         let hlc_clock = Arc::new(HlcClock::new());
+        let disk_io = Arc::new(oceanfs_storage::io::DiskIo::new());
+        let io_mode = oceanfs_storage::io::IoReadMode::from_config(config.read_cache_segments);
 
-        // Shared in-memory segment reader: used by ReadCoordinator for
-        // chunk assembly and by S3Handler to store segment data on PUT.
-        let segment_reader = Arc::new(oceanfs_server::InMemorySegmentReader::new());
+        // Build the mmap segment cache when read-optimised mode is enabled.
+        let mmap_cache = if io_mode == oceanfs_storage::io::IoReadMode::Mmap {
+            Some(Arc::new(oceanfs_storage::io::SegmentFileCache::new(
+                config.segment_cache_max_entries,
+            )))
+        } else {
+            None
+        };
 
-        // On startup, repopulate the in-memory segment reader from any
-        // blob data persisted on disk (surviving a previous restart).
-        {
-            let blob_ids = blob_store
-                .list_blobs()
-                .map_err(|e| format!("failed to list blob data on startup: {e}"))?;
-            for id in &blob_ids {
-                if let Ok(Some(data)) = blob_store.read_blob(id) {
-                    segment_reader.put(*id, data);
-                }
-            }
-            if !blob_ids.is_empty() {
-                info!(count = blob_ids.len(), "loaded persisted blob data into segment reader");
-            }
-        }
+        // Disk-backed segment reader: reads sealed segment files from disk
+        // via the configured I/O mode (mmap / O_DIRECT / buffered).
+        // Replaces the previous InMemorySegmentReader — segment data is read
+        // on demand from the filesystem. No startup preload, no unbounded
+        // HashMap growth.
+        let segment_reader: Arc<dyn oceanfs_storage::io::SegmentReader> =
+            Arc::new(oceanfs_storage::io::DiskSegmentReader::new(
+                io_mode,
+                disk_io.clone(),
+                mmap_cache,
+                config.data_dir.join("segments"),
+            ));
 
         let hinted_handoff = Arc::new(
             HintedHandoff::new_with_pool(pool.clone()).with_membership(membership.clone()),
@@ -639,8 +673,6 @@ impl Node {
             Some(metadata_cache.clone()),
             Some(negative_cache.clone()),
         )
-        .with_segment_store(segment_reader)
-        .with_blob_dir(config.data_dir.join("blobs"))
         .with_prefetch_engine(prefetch_engine.clone())
         .with_router(router);
 
@@ -879,7 +911,7 @@ impl Node {
         // ---- 18. Construct graceful leave handler ----
         let leave_handler = Arc::new(NodeLeaveHandler {
             wal_writer: wal_writer.clone(),
-            blob_store: blob_store.clone(),
+            segment_dir: segment_dir.clone(),
             pool: pool.clone(),
             membership: membership.clone(),
         });
@@ -1772,8 +1804,6 @@ mod tests {
             .await
             .unwrap(),
         );
-        let blob_store =
-            Arc::new(oceanfs_storage::BlobStore::open(&dir.path().join("blobs")).unwrap());
 
         let ring = oceanfs_routing::Ring::new(oceanfs_core::RingConfig::default());
         let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
@@ -1785,7 +1815,12 @@ mod tests {
         ));
         let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
 
-        let handler = super::NodeLeaveHandler { wal_writer, blob_store, pool, membership };
+        let handler = super::NodeLeaveHandler {
+            wal_writer,
+            segment_dir: dir.path().join("segments"),
+            pool,
+            membership,
+        };
 
         // handoff_wal_to should sync and succeed even without a real successor.
         let result =
@@ -1812,8 +1847,6 @@ mod tests {
             .await
             .unwrap(),
         );
-        let blob_store =
-            Arc::new(oceanfs_storage::BlobStore::open(&dir.path().join("blobs")).unwrap());
 
         let ring = oceanfs_routing::Ring::new(oceanfs_core::RingConfig::default());
         let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
@@ -1825,7 +1858,12 @@ mod tests {
         ));
         let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
 
-        let handler = super::NodeLeaveHandler { wal_writer, blob_store, pool, membership };
+        let handler = super::NodeLeaveHandler {
+            wal_writer,
+            segment_dir: dir.path().join("segments"),
+            pool,
+            membership,
+        };
 
         let transferred =
             GracefulLeaveHandler::transfer_segment_shards_to(&handler, &NodeId::new("successor"))
@@ -1855,12 +1893,15 @@ mod tests {
             .await
             .unwrap(),
         );
-        let blob_store =
-            Arc::new(oceanfs_storage::BlobStore::open(&dir.path().join("blobs")).unwrap());
 
-        // Write some segments.
+        // Write some segments to the segments directory.
+        let seg_dir = dir.path().join("segments");
+        std::fs::create_dir_all(&seg_dir).unwrap();
         for i in 0..3 {
-            blob_store.write_blob(&SegmentId::new(), &[i as u8; 64]).unwrap();
+            let id = SegmentId::new();
+            let mut data = vec![0u8; 76]; // header
+            data.extend_from_slice(&[i as u8; 64]);
+            std::fs::write(seg_dir.join(format!("{id}.dat")), &data).unwrap();
         }
 
         let ring = oceanfs_routing::Ring::new(oceanfs_core::RingConfig::default());
@@ -1881,7 +1922,12 @@ mod tests {
         );
         let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
 
-        let handler = super::NodeLeaveHandler { wal_writer, blob_store, pool, membership };
+        let handler = super::NodeLeaveHandler {
+            wal_writer,
+            segment_dir: dir.path().join("segments"),
+            pool,
+            membership,
+        };
 
         // Transfer: gRPC to successor will fail (no server), but we verify
         // the enumeration happened and attempts were made.
@@ -2022,14 +2068,18 @@ mod tests {
             .await
             .unwrap(),
         );
-        let blob_store =
-            Arc::new(oceanfs_storage::BlobStore::open(&dir.path().join("blobs")).unwrap());
 
-        // Write test segments to blob store.
+        // Write test segments to the segments directory.
+        let seg_dir = dir.path().join("segments");
+        std::fs::create_dir_all(&seg_dir).unwrap();
         let seg_a = SegmentId::new();
         let seg_b = SegmentId::new();
-        blob_store.write_blob(&seg_a, b"segment A data for graceful leave").unwrap();
-        blob_store.write_blob(&seg_b, b"segment B data for graceful leave").unwrap();
+        let mut data_a = vec![0u8; 76];
+        data_a.extend_from_slice(b"segment A data for graceful leave");
+        std::fs::write(seg_dir.join(format!("{seg_a}.dat")), &data_a).unwrap();
+        let mut data_b = vec![0u8; 76];
+        data_b.extend_from_slice(b"segment B data for graceful leave");
+        std::fs::write(seg_dir.join(format!("{seg_b}.dat")), &data_b).unwrap();
 
         // Build ring with successor node.
         let mut ring = oceanfs_routing::Ring::new(oceanfs_core::RingConfig::default());
@@ -2054,7 +2104,7 @@ mod tests {
 
         let handler = super::NodeLeaveHandler {
             wal_writer: wal_writer.clone(),
-            blob_store: blob_store.clone(),
+            segment_dir: dir.path().join("segments"),
             pool,
             membership,
         };

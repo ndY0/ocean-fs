@@ -3,8 +3,15 @@
 //! Collects pending fsync waiters and wakes them all after a single
 //! fsync call, amortizing the cost across many concurrent appends.
 //! Per performance guideline §3.4.
+//!
+//! ## Async closure support
+//!
+//! The flusher task accepts a generic async closure so both
+//! synchronous (`tokio::fs` / `std::fs`) and asynchronous
+//! (`io_uring`) backends can be used without dynamic dispatch.
+//! The closure is monomorphized at compile time.
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -14,7 +21,8 @@ use crate::error::Result;
 ///
 /// Writers register their append with `submit`, receiving a oneshot
 /// that resolves when the batch is flushed. The background flusher
-/// task collects waiters and calls `fsync` once per batch.
+/// task collects waiters and calls the async fsync closure once per
+/// batch.
 pub(crate) struct WalSyncGroup {
     /// Sender for fsync requests.
     tx: mpsc::Sender<oneshot::Sender<()>>,
@@ -25,12 +33,19 @@ pub(crate) struct WalSyncGroup {
 impl WalSyncGroup {
     /// Creates a new sync group and spawns the background flusher.
     ///
-    /// `fsync_fn` is called to flush pending writes. `batch_timeout_ms`
-    /// controls the maximum delay before a batch is flushed even if
-    /// the batch hasn't filled.
-    pub fn new<F>(fsync_fn: F, batch_timeout_ms: u64) -> Self
+    /// `fsync_fn` is an async closure called to flush pending writes.
+    /// `batch_timeout_ms` controls the maximum delay before a batch
+    /// is flushed even if the batch hasn't reached `max_waiters`.
+    /// `max_waiters` caps the number of waiters collected per batch.
+    ///
+    /// The closure is generic — monomorphized at compile time for
+    /// zero-overhead dispatch. Both synchronous wrappers (via
+    /// `spawn_blocking`) and native async io_uring backends work
+    /// without boxing or vtables.
+    pub fn new<F, Fut>(fsync_fn: F, batch_timeout_ms: u64, max_waiters: usize) -> Self
     where
-        F: Fn() -> Result<()> + Send + Sync + 'static,
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send,
     {
         let (tx, mut rx) = mpsc::channel::<oneshot::Sender<()>>(1024);
 
@@ -42,7 +57,7 @@ impl WalSyncGroup {
                     tokio::time::sleep(std::time::Duration::from_millis(batch_timeout_ms));
                 tokio::pin!(timeout);
 
-                let mut waiters: Vec<oneshot::Sender<()>> = Vec::with_capacity(64);
+                let mut waiters: Vec<oneshot::Sender<()>> = Vec::with_capacity(max_waiters.min(64));
 
                 // Collect the first waiter.
                 let first = tokio::select! {
@@ -61,13 +76,13 @@ impl WalSyncGroup {
                 // Drain any additional waiters without blocking.
                 while let Ok(waiter) = rx.try_recv() {
                     waiters.push(waiter);
-                    if waiters.len() >= 64 {
+                    if waiters.len() >= max_waiters {
                         break;
                     }
                 }
 
-                // Perform the fsync.
-                if let Err(e) = fsync_fn() {
+                // Perform the fsync via the async closure.
+                if let Err(e) = fsync_fn().await {
                     tracing::error!(?e, "WAL fsync failed");
                 }
 
@@ -110,18 +125,22 @@ mod tests {
 
     use super::*;
 
+    /// Helper: wraps a sync closure into an async-compatible future
+    /// using `std::future::ready`.
+    fn async_noop(
+        count: Arc<AtomicU32>,
+    ) -> impl Fn() -> std::future::Ready<Result<()>> + Send + Sync + 'static {
+        move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(()))
+        }
+    }
+
     #[tokio::test]
     async fn group_commit_flushes_batch() {
         let flush_count = Arc::new(AtomicU32::new(0));
-        let fc = flush_count.clone();
 
-        let group = WalSyncGroup::new(
-            move || {
-                fc.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            },
-            50, // 50ms timeout
-        );
+        let group = WalSyncGroup::new(async_noop(flush_count.clone()), 50, 64);
 
         // Submit 3 entries in quick succession.
         let rx1 = group.submit().await.unwrap();
@@ -140,20 +159,35 @@ mod tests {
     #[tokio::test]
     async fn timeout_flushes_empty_batch() {
         let flush_count = Arc::new(AtomicU32::new(0));
-        let fc = flush_count.clone();
 
-        let group = WalSyncGroup::new(
-            move || {
-                fc.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            },
-            10, // short timeout
-        );
+        let group = WalSyncGroup::new(async_noop(flush_count.clone()), 10, 64);
 
         // Submit one entry.
         let rx = group.submit().await.unwrap();
         rx.await.unwrap();
 
         drop(group);
+    }
+
+    #[tokio::test]
+    async fn respects_max_waiters_limit() {
+        let flush_count = Arc::new(AtomicU32::new(0));
+
+        // Small max_waiters to force multiple batches.
+        let group = WalSyncGroup::new(async_noop(flush_count.clone()), 100, 2);
+
+        // Submit 5 entries — they'll be flushed in batches of 2 (or timeout).
+        let mut rxs = Vec::with_capacity(5);
+        for _ in 0..5 {
+            rxs.push(group.submit().await.unwrap());
+        }
+
+        // Wait for all to complete.
+        for rx in rxs {
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx).await.unwrap().unwrap();
+        }
+
+        // At least 2 batches should have been flushed (ceil(5/2) = 3 batches).
+        assert!(flush_count.load(Ordering::SeqCst) >= 2);
     }
 }

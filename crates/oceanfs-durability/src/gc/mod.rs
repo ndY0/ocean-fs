@@ -12,6 +12,8 @@ mod segment_compactor;
 mod stats;
 
 pub use config::GcConfig;
-pub use garbage_collector::{GarbageCollector, InMemorySegmentShardStore, SegmentShardStore};
+pub use garbage_collector::{
+    DiskSegmentShardStore, GarbageCollector, InMemorySegmentShardStore, SegmentShardStore,
+};
 pub use orphan_reaper::{OrphanReaper, OrphanStats};
 pub use stats::GcStats;

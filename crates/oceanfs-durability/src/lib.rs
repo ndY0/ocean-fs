@@ -24,12 +24,12 @@
 )]
 
 pub mod anti_entropy;
-mod blob_store_impl;
 pub mod error;
 pub mod gc;
 pub mod heal;
 pub mod hinted_handoff;
 pub mod scrub;
+mod segment_store_impl;
 
 // gRPC service stubs — moved from oceanfs-server
 pub mod healing_service;
@@ -41,14 +41,15 @@ pub use anti_entropy::{
 };
 pub use error::{Error, Result};
 pub use gc::{
-    GarbageCollector, GcConfig, GcStats, InMemorySegmentShardStore, OrphanReaper, OrphanStats,
-    SegmentShardStore,
+    DiskSegmentShardStore, GarbageCollector, GcConfig, GcStats, InMemorySegmentShardStore,
+    OrphanReaper, OrphanStats, SegmentShardStore,
 };
 pub use heal::{
     enqueue_heal, HealConfig, HealQueue, HealQueueSender, HealRequest, HealStats, HealWorker,
 };
 pub use hinted_handoff::{HintRecord, HintedHandoff};
 pub use scrub::{ScrubConfig, ScrubCoordinator, ScrubReport, ScrubReportBuilder};
+pub use segment_store_impl::DiskSegmentStore;
 
 // ---------------------------------------------------------------------------
 // Generated gRPC service stubs

@@ -301,6 +301,13 @@ pub struct ReadTuningConfig {
     /// Maximum concurrent stripe decode tasks.
     /// Bounded by a `tokio::sync::Semaphore`. Set to 0 for unlimited.
     pub stripe_parallelism: usize,
+    /// When `true`, cache segment reads via `mmap` for zero-copy
+    /// access from the kernel page cache. When `false`, use
+    /// `O_DIRECT` for segment writes to bypass the page cache.
+    /// Overrides the node-level `NodeConfig::read_cache_segments`
+    /// for this bucket.
+    #[serde(default)]
+    pub read_cache_segments: Option<bool>,
 }
 
 impl Default for ReadTuningConfig {
@@ -309,6 +316,7 @@ impl Default for ReadTuningConfig {
             parallel_fetch: true,
             use_fastest_k: true,
             stripe_parallelism: 0, // unlimited
+            read_cache_segments: None,
         }
     }
 }

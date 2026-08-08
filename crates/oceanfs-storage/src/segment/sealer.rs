@@ -13,8 +13,8 @@ use oceanfs_core::{Counter, LabelSet, SegmentId, SegmentMetadata, SizeTier};
 use oceanfs_hash::Blake3Hasher;
 
 use crate::{
-    blob_store::BlobStore,
     error::{Error, Result},
+    io::IoReadMode,
     metadata::RocksDbMetadataStore,
     segment::{
         buffer::ActiveSegment,
@@ -34,6 +34,12 @@ pub struct SealConfig {
     pub seal_timeout_ms: u64,
     /// Directory where sealed segment files are written.
     pub data_dir: PathBuf,
+    /// I/O read mode for segment data I/O.
+    ///
+    /// When `Direct`, segment data files are opened with `O_DIRECT`
+    /// to bypass the OS page cache. When `Mmap`, segment files are
+    /// memory-mapped for zero-copy reads. Default is `Buffered`.
+    pub io_mode: IoReadMode,
 }
 
 /// Orchestrates the sealing of active segments.
@@ -41,11 +47,6 @@ pub struct SegmentSealer {
     config: SealConfig,
     metadata: Arc<RocksDbMetadataStore>,
     wal: Arc<WalWriter>,
-    /// Optional blob store for unified segment data access (M5-storage).
-    /// When set, sealed segment data is also written here so that the
-    /// durability subsystem (heal, scrub, anti-entropy) reads from the
-    /// same physical storage as the write path.
-    blob_store: Option<Arc<BlobStore>>,
     /// Segment seal error counter.
     seal_errors: Counter,
 }
@@ -61,7 +62,6 @@ impl SegmentSealer {
             config,
             metadata,
             wal,
-            blob_store: None,
             seal_errors: Counter::new(
                 "segment_seal_errors_total".into(),
                 "Number of segment sealing failures".into(),
@@ -72,14 +72,6 @@ impl SegmentSealer {
 
     /// Sets an optional blob store for unified segment data access.
     ///
-    /// When set, sealed segment data is also written to the blob store,
-    /// making it available to the durability subsystem (heal, scrub,
-    /// anti-entropy) via `SegmentDataStore`.
-    pub fn with_blob_store(mut self, blob_store: Arc<BlobStore>) -> Self {
-        self.blob_store = Some(blob_store);
-        self
-    }
-
     /// Attempts to seal an active segment.
     ///
     /// `entries` are the blob index entries mapping (offset, length, hash) for
@@ -175,13 +167,42 @@ impl SegmentSealer {
         file_data.extend_from_slice(&header_bytes);
         file_data.extend_from_slice(&data);
         file_data.extend_from_slice(&index_bytes);
-        tokio::fs::write(&path, &file_data).await?;
 
-        // Also write raw segment data to the blob store for unified storage
-        // access (M5-storage). The durability subsystem (heal, scrub,
-        // anti-entropy) reads segment data via BlobStore → SegmentDataStore.
-        if let Some(ref blob_store) = self.blob_store {
-            blob_store.write_blob(&segment_id, &data)?;
+        // Select the I/O path based on the configured read mode.
+        match self.config.io_mode {
+            IoReadMode::Direct => {
+                // O_DIRECT requires the buffer to be 512-byte aligned
+                // AND the I/O size to be a multiple of 512 bytes.
+                const BLOCK_SIZE: usize = 512;
+                let pad = (BLOCK_SIZE - (file_data.len() % BLOCK_SIZE)) % BLOCK_SIZE;
+                file_data.resize(file_data.len() + pad, 0);
+
+                #[cfg(target_os = "linux")]
+                {
+                    use std::io::Write;
+
+                    use crate::io::{direct::OpenOptionsDirectExt, DirectIoBuf};
+                    // Copy into a page-aligned buffer for O_DIRECT.
+                    let mut aligned = DirectIoBuf::new(file_data.len())?;
+                    aligned.copy_from_slice(&file_data);
+
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .with_direct()
+                        .open(&path)?;
+                    file.write_all(aligned.as_bytes())?;
+                    file.flush()?;
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    tokio::fs::write(&path, &file_data).await?;
+                }
+            }
+            _ => {
+                tokio::fs::write(&path, &file_data).await?;
+            }
         }
 
         // Persist segment metadata.
@@ -258,6 +279,7 @@ mod tests {
             target_size_bytes: 100,
             seal_timeout_ms: 1000,
             data_dir: dir.path().join("segments"),
+            io_mode: IoReadMode::Buffered,
         };
 
         let pool = BufferPool::new(65536, 4);
@@ -326,6 +348,7 @@ mod tests {
             target_size_bytes: 100,
             seal_timeout_ms: 1000,
             data_dir: dir.path().join("segments"),
+            io_mode: IoReadMode::Buffered,
         };
         let pool = BufferPool::new(65536, 4);
         let size_config =

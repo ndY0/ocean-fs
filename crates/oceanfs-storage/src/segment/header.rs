@@ -11,6 +11,9 @@ pub(crate) const SEGMENT_MAGIC: [u8; 4] = *b"OFSG";
 /// Current segment format version.
 pub(crate) const SEGMENT_VERSION: u16 = 1;
 
+/// On-disk size of a [`SegmentHeader`] in bytes.
+pub const SEGMENT_HEADER_SIZE: usize = 76;
+
 /// On-disk header for a sealed segment.
 ///
 /// Written at offset 0 of every segment data file. Contains the
