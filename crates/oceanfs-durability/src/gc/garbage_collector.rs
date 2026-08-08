@@ -8,13 +8,13 @@ use std::{
 
 use oceanfs_core::{Counter, LabelSet, MetricRegistrar, SegmentId};
 use oceanfs_storage::{metadata::RocksDbMetadataStore, segment::TierRouter};
-use crate::{Error, Result};
 use tokio::sync::Semaphore;
 
 use super::{
     config::GcConfig, liveness_tracker::LivenessTracker, segment_compactor::SegmentCompactor,
     stats::GcStats,
 };
+use crate::{Error, Result};
 
 // ---------------------------------------------------------------------------
 // GarbageCollector
@@ -366,6 +366,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             block_cache_size: 8 * 1024 * 1024,
             memtable_size: 8 * 1024 * 1024,
+            ..Default::default()
         }
     }
 

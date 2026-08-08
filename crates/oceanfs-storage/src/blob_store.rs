@@ -12,6 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use bytes::Bytes;
 use oceanfs_core::SegmentId;
 
 use crate::error::Result;
@@ -67,7 +68,7 @@ impl BlobStore {
     /// # Errors
     ///
     /// Returns an I/O error if the file exists but cannot be read.
-    pub fn read_blob(&self, segment_id: &SegmentId) -> Result<Option<Vec<u8>>> {
+    pub fn read_blob(&self, segment_id: &SegmentId) -> Result<Option<Bytes>> {
         let path = self.blob_path(segment_id);
         if !path.exists() {
             return Ok(None);
@@ -76,7 +77,7 @@ impl BlobStore {
         let md = file.metadata()?;
         let mut data = Vec::with_capacity(md.len() as usize);
         file.read_to_end(&mut data)?;
-        Ok(Some(data))
+        Ok(Some(Bytes::from(data)))
     }
 
     /// Deletes a blob file for a segment.
@@ -137,7 +138,7 @@ mod tests {
         let data = b"hello blob store";
         store.write_blob(&id, data).unwrap();
         let read = store.read_blob(&id).unwrap().unwrap();
-        assert_eq!(read, data);
+        assert_eq!(&read[..], data);
     }
 
     #[test]

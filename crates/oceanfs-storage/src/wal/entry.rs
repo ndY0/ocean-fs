@@ -4,6 +4,7 @@
 //! On crash recovery, the data can be replayed directly into active segments
 //! without consulting external storage.
 
+use bytes::Bytes;
 use oceanfs_core::{HashOutput, SegmentId};
 
 /// Magic bytes at the start of every WAL entry header (4 bytes: "WAL\0").
@@ -51,7 +52,8 @@ pub struct WalEntry {
     /// CRC32 of the preceding header fields for integrity verification.
     pub crc: u32,
     /// Inline blob data for crash recovery reconstruction.
-    pub data: Vec<u8>,
+    /// Stored as `Bytes` for zero-copy sharing from the network layer.
+    pub data: Bytes,
 }
 
 impl WalEntry {
@@ -67,7 +69,7 @@ impl WalEntry {
         hlc_wall_time: u64,
         hlc_logical: u32,
         checksum: HashOutput,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Self {
         debug_assert_eq!(data.len(), length as usize, "data length must match declared length");
         let mut entry = Self {
@@ -177,7 +179,7 @@ impl WalEntry {
             hlc_logical,
             checksum,
             crc,
-            data: Vec::new(),
+            data: Bytes::new(),
         };
 
         if !entry.verify_crc() {
@@ -197,7 +199,7 @@ impl WalEntry {
         if data.len() < header_sz + data_len {
             return None;
         }
-        entry.data = data[header_sz..header_sz + data_len].to_vec();
+        entry.data = Bytes::copy_from_slice(&data[header_sz..header_sz + data_len]);
         Some(entry)
     }
 
@@ -234,7 +236,7 @@ mod tests {
             1000,
             1,
             HashOutput::from_bytes([0u8; 32]),
-            vec![1, 2, 3],
+            vec![1, 2, 3].into(),
         );
         assert_eq!(entry.magic, WAL_ENTRY_MAGIC);
     }
@@ -242,7 +244,7 @@ mod tests {
     #[test]
     fn new_entry_preserves_fields() {
         let id = SegmentId::new();
-        let data = b"hello world".to_vec();
+        let data = Bytes::from_static(b"hello world");
         let len = data.len() as u32;
         let checksum = HashOutput::from_bytes([0xABu8; 32]);
         let entry = WalEntry::new(id, 1024, len, 5000, 3, checksum, data.clone());
@@ -257,7 +259,7 @@ mod tests {
 
     #[test]
     fn entry_roundtrip_serialize_deserialize() {
-        let data = vec![0xABu8; 128];
+        let data = Bytes::from(vec![0xABu8; 128]);
         let len = data.len() as u32;
         let entry = WalEntry::new(
             SegmentId::new(),
@@ -290,7 +292,7 @@ mod tests {
             100,
             0,
             HashOutput::from_bytes([1u8; 32]),
-            vec![7, 8, 9],
+            vec![7, 8, 9].into(),
         );
         assert!(entry.verify_crc());
     }
@@ -304,7 +306,7 @@ mod tests {
             100,
             0,
             HashOutput::from_bytes([1u8; 32]),
-            vec![7, 8, 9],
+            vec![7, 8, 9].into(),
         );
         entry.length = 999; // corrupt
         assert!(!entry.verify_crc());
@@ -319,7 +321,7 @@ mod tests {
             0,
             0,
             HashOutput::from_bytes([0u8; 32]),
-            vec![1, 2, 3],
+            vec![1, 2, 3].into(),
         );
         let mut header = entry.to_header_bytes();
         header[0] = b'X';
@@ -340,7 +342,7 @@ mod tests {
             0,
             0,
             HashOutput::from_bytes([0u8; 32]),
-            vec![0u8; 100],
+            vec![0u8; 100].into(),
         );
         let bytes = entry.to_bytes();
         // Truncate: keep header only, drop data.
@@ -356,8 +358,15 @@ mod tests {
 
     #[test]
     fn empty_data_entry_roundtrip() {
-        let entry =
-            WalEntry::new(SegmentId::new(), 0, 0, 0, 0, HashOutput::from_bytes([0u8; 32]), vec![]);
+        let entry = WalEntry::new(
+            SegmentId::new(),
+            0,
+            0,
+            0,
+            0,
+            HashOutput::from_bytes([0u8; 32]),
+            Bytes::new(),
+        );
         let bytes = entry.to_bytes();
         let restored = WalEntry::from_bytes(&bytes).unwrap();
         assert_eq!(restored.length, 0);

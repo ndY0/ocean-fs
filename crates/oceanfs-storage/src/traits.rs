@@ -3,6 +3,7 @@
 //! This module implements `BlobStore`, `WalWriter` from `oceanfs_storage_api`
 //! for the concrete RocksDB-backed types in this crate.
 
+use bytes::Bytes;
 use oceanfs_core::SegmentId;
 use oceanfs_storage_api::{error::Error as ApiError, BlobStore as BlobStoreTrait};
 
@@ -24,7 +25,7 @@ impl BlobStoreTrait for BlobStore {
         self.write_blob(segment_id, data).map_err(map_error)
     }
 
-    fn read_blob(&self, segment_id: &SegmentId) -> Result<Option<Vec<u8>>, ApiError> {
+    fn read_blob(&self, segment_id: &SegmentId) -> Result<Option<Bytes>, ApiError> {
         self.read_blob(segment_id).map_err(map_error)
     }
 

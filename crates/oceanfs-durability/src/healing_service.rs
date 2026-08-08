@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use oceanfs_core::{Hlc, NodeId, SegmentId};
 use tonic::{Request, Response, Status};
 
@@ -98,8 +99,8 @@ impl HealingRpc for HealingGrpcService {
         // Process all requested segment IDs and return Merkle data for the first one
         // with available data. In a full multi-segment exchange, we would return
         // a batch response.
-        let mut best_root_hash = vec![0u8; 32];
-        let mut best_leaf_hashes: Vec<Vec<u8>> = Vec::new();
+        let mut best_root_hash = Bytes::from(vec![0u8; 32]);
+        let mut best_leaf_hashes: Vec<Bytes> = Vec::new();
         let mut chosen_sid: Option<oceanfs_core::proto::common::SegmentId> = None;
 
         for proto_sid in &req.segment_ids {
@@ -123,11 +124,11 @@ impl HealingRpc for HealingGrpcService {
             let leaf_size: usize = 65536; // 64 KB leaf size per spec §11.2
             if let Some(tree) = crate::MerkleTree::build(&segment_data, leaf_size) {
                 let root = tree.root();
-                best_root_hash = root.hash().as_bytes().to_vec();
+                best_root_hash = Bytes::copy_from_slice(root.hash().as_bytes());
 
                 // Collect all leaf hashes for the response.
                 best_leaf_hashes = (0..tree.leaf_count() as usize)
-                    .filter_map(|i| tree.leaf_hash(i).map(|h| h.as_bytes().to_vec()))
+                    .filter_map(|i| tree.leaf_hash(i).map(|h| Bytes::copy_from_slice(h.as_bytes())))
                     .collect();
 
                 chosen_sid = Some(proto_sid.clone());
@@ -149,8 +150,8 @@ impl HealingRpc for HealingGrpcService {
                 .filter_map(|r| r.ok())
                 .find(|s| s.segment_id == sid)
                 .and_then(|seg| seg.merkle_root)
-                .map(|h| h.as_bytes().to_vec())
-                .unwrap_or_else(|| vec![0u8; 32]);
+                .map(|h| Bytes::copy_from_slice(h.as_bytes()))
+                .unwrap_or_else(|| Bytes::from(vec![0u8; 32]));
 
             chosen_sid = req.segment_ids.first().cloned();
         }
@@ -190,15 +191,18 @@ impl HealingRpc for HealingGrpcService {
 
         let start = shard_index * shard_size;
         let end = (start + shard_size).min(data.len());
-        let shard_data: Vec<u8> =
-            if start < data.len() { data[start..end].to_vec() } else { Vec::new() };
+        let shard_data: Bytes =
+            if start < data.len() { data.slice(start..end) } else { Bytes::new() };
 
         // Stream the shard data in chunks.
         let chunk_size = 65536; // 64 KB chunks
-        let chunks: Vec<FetchShardChunk> = shard_data
-            .chunks(chunk_size)
+        let chunks: Vec<FetchShardChunk> = (0..shard_data.len())
+            .step_by(chunk_size)
             .enumerate()
-            .map(|(i, chunk)| FetchShardChunk { chunk_index: i as u32, data: chunk.to_vec() })
+            .map(|(i, off)| {
+                let end = (off + chunk_size).min(shard_data.len());
+                FetchShardChunk { chunk_index: i as u32, data: shard_data.slice(off..end) }
+            })
             .collect();
 
         let (tx, rx) = tokio::sync::mpsc::channel(chunks.len().max(1));
@@ -254,7 +258,7 @@ mod tests {
 
     /// In-memory store for healing tests.
     struct TestHealStore {
-        data: Mutex<HashMap<SegmentId, Vec<u8>>>,
+        data: Mutex<HashMap<SegmentId, Bytes>>,
     }
 
     impl TestHealStore {
@@ -269,14 +273,14 @@ mod tests {
             segment_id: &SegmentId,
             data: &[u8],
         ) -> Result<(), oceanfs_storage::Error> {
-            self.data.lock().unwrap().insert(segment_id.clone(), data.to_vec());
+            self.data.lock().unwrap().insert(segment_id.clone(), Bytes::copy_from_slice(data));
             Ok(())
         }
 
         fn read_segment_data(
             &self,
             segment_id: &SegmentId,
-        ) -> Result<Vec<u8>, oceanfs_storage::Error> {
+        ) -> Result<Bytes, oceanfs_storage::Error> {
             self.data
                 .lock()
                 .unwrap()

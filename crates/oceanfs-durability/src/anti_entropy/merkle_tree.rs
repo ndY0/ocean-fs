@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use bytes::Bytes;
 use oceanfs_core::{HashOutput, SegmentId};
 use oceanfs_hash::{Blake3Hasher, Hasher as _};
 use oceanfs_storage::Result;
@@ -38,7 +39,7 @@ pub trait SegmentDataStore: Send + Sync {
     ///
     /// Returns an error if the segment data cannot be read (e.g., segment
     /// not found, I/O error).
-    fn read_segment_data(&self, segment_id: &SegmentId) -> Result<Vec<u8>>;
+    fn read_segment_data(&self, segment_id: &SegmentId) -> Result<Bytes>;
 
     /// Writes the raw data for the given segment, replacing any existing data.
     ///
@@ -53,11 +54,11 @@ pub trait SegmentDataStore: Send + Sync {
 
 /// An in-memory segment data store for testing anti-entropy.
 ///
-/// Stores segment data in a `HashMap<SegmentId, Vec<u8>>` protected by
+/// Stores segment data in a `HashMap<SegmentId, Bytes>` protected by
 /// a `parking_lot::RwLock`. Suitable for unit and integration tests
 /// where an on-disk segment store is not needed.
 pub struct InMemorySegmentStore {
-    data: parking_lot::RwLock<HashMap<SegmentId, Vec<u8>>>,
+    data: parking_lot::RwLock<HashMap<SegmentId, Bytes>>,
 }
 
 impl InMemorySegmentStore {
@@ -74,7 +75,7 @@ impl Default for InMemorySegmentStore {
 }
 
 impl SegmentDataStore for InMemorySegmentStore {
-    fn read_segment_data(&self, segment_id: &SegmentId) -> Result<Vec<u8>> {
+    fn read_segment_data(&self, segment_id: &SegmentId) -> Result<Bytes> {
         self.data
             .read()
             .get(segment_id)
@@ -83,7 +84,7 @@ impl SegmentDataStore for InMemorySegmentStore {
     }
 
     fn write_segment_data(&self, segment_id: &SegmentId, data: &[u8]) -> Result<()> {
-        self.data.write().insert(*segment_id, data.to_vec());
+        self.data.write().insert(*segment_id, Bytes::copy_from_slice(data));
         Ok(())
     }
 }
@@ -138,7 +139,7 @@ impl MerkleTree {
         let leaf_hashes: Vec<HashOutput> = data.chunks(leaf_size).map(Blake3Hasher::hash).collect();
 
         let leaf_count = leaf_hashes.len() as u64;
-        let (tree_levels, root_hash) = Self::build_tree_from_leaves(&leaf_hashes);
+        let (tree_levels, root_hash) = Self::build_tree_from_leaves(leaf_hashes.clone());
 
         let total_size = data_len;
         let root = MerkleRoot { hash: root_hash, leaf_count, total_size };
@@ -158,20 +159,23 @@ impl MerkleTree {
         }
 
         let leaf_count = leaf_hashes.len() as u64;
-        let leaf_hashes_vec = leaf_hashes.to_vec();
-        let (tree_levels, root_hash) = Self::build_tree_from_leaves(&leaf_hashes_vec);
+        let (tree_levels, root_hash) = Self::build_tree_from_leaves(leaf_hashes.to_vec());
 
         let total_size = 0; // unknown when building from pre-computed hashes
         let root = MerkleRoot { hash: root_hash, leaf_count, total_size };
 
-        Some(Self { root, leaf_hashes: leaf_hashes_vec, tree_levels })
+        Some(Self {
+            root,
+            leaf_hashes: tree_levels.first().cloned().unwrap_or_default(),
+            tree_levels,
+        })
     }
 
     /// Core tree-building logic: given leaf hashes, builds all intermediate
     /// levels and returns (levels, root_hash).
-    fn build_tree_from_leaves(leaf_hashes: &[HashOutput]) -> (Vec<Vec<HashOutput>>, HashOutput) {
+    fn build_tree_from_leaves(leaf_hashes: Vec<HashOutput>) -> (Vec<Vec<HashOutput>>, HashOutput) {
         let mut tree_levels: Vec<Vec<HashOutput>> = Vec::new();
-        let mut current_level: Vec<HashOutput> = leaf_hashes.to_vec();
+        let mut current_level: Vec<HashOutput> = leaf_hashes;
 
         // Save leaf level (level 0)
         tree_levels.push(current_level.clone());

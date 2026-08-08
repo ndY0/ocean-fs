@@ -280,7 +280,7 @@ impl SegmentRpc for SegmentGrpcService {
 
         // Convert to Bytes once for zero-copy slicing — avoids double-copy
         // (first copy: segment → Vec, then chunk.to_vec() per 64 KB).
-        let segment_bytes = Bytes::from(segment_data);
+        let segment_bytes = segment_data;
         let shard_bytes = segment_bytes.slice(shard_start..shard_end);
 
         let (tx, rx) = mpsc::channel(16);
@@ -470,7 +470,7 @@ mod tests {
 
     /// In-memory segment data store for testing.
     struct TestSegmentStore {
-        data: Mutex<HashMap<SegmentId, Vec<u8>>>,
+        data: Mutex<HashMap<SegmentId, Bytes>>,
     }
 
     impl TestSegmentStore {
@@ -485,14 +485,14 @@ mod tests {
             segment_id: &SegmentId,
             data: &[u8],
         ) -> Result<(), oceanfs_storage::Error> {
-            self.data.lock().unwrap().insert(segment_id.clone(), data.to_vec());
+            self.data.lock().unwrap().insert(segment_id.clone(), Bytes::copy_from_slice(data));
             Ok(())
         }
 
         fn read_segment_data(
             &self,
             segment_id: &SegmentId,
-        ) -> Result<Vec<u8>, oceanfs_storage::Error> {
+        ) -> Result<Bytes, oceanfs_storage::Error> {
             self.data
                 .lock()
                 .unwrap()
@@ -544,7 +544,7 @@ mod tests {
 
         let seg_id = SegmentId::new();
         let proto_sid: ProtoSegmentId = seg_id.into();
-        let test_data = b"hello world append test data".to_vec();
+        let test_data = Bytes::from_static(b"hello world append test data");
 
         let chunk = SegmentAppendRequest {
             segment_id: Some(proto_sid),
@@ -555,7 +555,7 @@ mod tests {
             bucket_id: String::new(),
             object_key: String::new(),
             object_size: 0,
-            blake3_hash: vec![],
+            blake3_hash: Bytes::new(),
             chunk_segment_ids: vec![],
             chunk_offsets: vec![],
             chunk_lengths: vec![],
@@ -628,7 +628,7 @@ mod tests {
             let computed = blake3::hash(&chunk_result.data);
             assert_eq!(
                 computed.as_bytes(),
-                chunk_result.checksum.as_slice(),
+                chunk_result.checksum.as_ref(),
                 "checksum mismatch in chunk {}",
                 chunk_result.chunk_index
             );

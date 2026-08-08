@@ -123,7 +123,7 @@ impl RoundTripEnv {
                 block_cache_size: 1024,
                 memtable_size: 1024,
                 ..Default::default()
-        })
+            })
             .unwrap(),
         );
         let size_config = SegmentSizeConfig::default();

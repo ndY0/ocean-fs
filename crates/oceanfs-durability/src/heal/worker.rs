@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use oceanfs_core::{
     proto::common::SegmentId as ProtoSegmentId, HealConfig, HealRequest, HealStats, SegmentId,
 };
@@ -20,12 +21,11 @@ use oceanfs_ec::Decoder;
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_storage::metadata::RocksDbMetadataStore;
-use crate::{Error, Result};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use super::queue::HealQueue;
-use crate::{anti_entropy::SegmentDataStore, HealingRpcClient};
+use crate::{anti_entropy::SegmentDataStore, Error, HealingRpcClient, Result};
 
 // ---------------------------------------------------------------------------
 // HealWorker
@@ -373,13 +373,14 @@ impl HealWorker {
                 continue;
             }
             let shard_data = reconstructed.get(corrupt_idx).ok_or_else(|| {
-                Error::Storage(format!("decoder did not return shard for corrupt index {corrupt_idx}"))
+                Error::Storage(format!(
+                    "decoder did not return shard for corrupt index {corrupt_idx}"
+                ))
             })?;
 
             if !shard_data.is_empty() {
                 // Write the repaired shard into the data store.
-                // In a distributed setting, this would be a PushRepairedShard RPC.
-                let mut updated_data = full_data.clone();
+                let mut updated_data = full_data.to_vec();
                 let start = corrupt_idx * shard_size;
                 let end = (start + shard_data.len()).min(updated_data.len());
                 updated_data.splice(start..end, shard_data.iter().copied());
@@ -411,7 +412,7 @@ impl HealWorker {
         segment_id: &SegmentId,
         pool: &ConnectionPool,
         membership: &Membership,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Bytes> {
         use crate::healing_rpc::FetchShardRequest as GprcFetchShardRequest;
 
         let replicas: Vec<_> = membership
@@ -448,7 +449,7 @@ impl HealWorker {
             {
                 Ok(Ok(response)) => {
                     let mut stream = response.into_inner();
-                    let mut data: Vec<u8> = Vec::new();
+                    let mut data = bytes::BytesMut::new();
                     while let Some(chunk) = stream.message().await.unwrap_or(None) {
                         if chunk.data.is_empty() {
                             break;
@@ -456,7 +457,7 @@ impl HealWorker {
                         data.extend_from_slice(&chunk.data);
                     }
                     if !data.is_empty() {
-                        return Ok(data);
+                        return Ok(data.freeze());
                     }
                 }
                 Ok(Err(status)) => {
@@ -503,7 +504,7 @@ mod tests {
             available_shards: &[Option<&[u8]>],
             _data_count: u8,
             _parity_count: u8,
-        ) -> std::result::Result<Vec<Vec<u8>>, oceanfs_ec::Error> {
+        ) -> std::result::Result<Vec<Bytes>, oceanfs_ec::Error> {
             // Fill missing slots with zeros (stub behavior).
             let shard_len = available_shards
                 .iter()
@@ -511,11 +512,11 @@ mod tests {
                 .max()
                 .unwrap_or(0);
 
-            let result: Vec<Vec<u8>> = available_shards
+            let result: Vec<Bytes> = available_shards
                 .iter()
                 .map(|opt| match opt {
-                    Some(data) => data.to_vec(),
-                    None => vec![0u8; shard_len],
+                    Some(data) => Bytes::copy_from_slice(data),
+                    None => Bytes::from(vec![0u8; shard_len]),
                 })
                 .collect();
             Ok(result)
@@ -527,7 +528,7 @@ mod tests {
             &self,
             _data_shards: &[&[u8]],
             _parity_count: u8,
-        ) -> std::result::Result<Vec<Vec<u8>>, oceanfs_ec::Error> {
+        ) -> std::result::Result<Vec<Bytes>, oceanfs_ec::Error> {
             Ok(vec![])
         }
     }
@@ -541,7 +542,7 @@ mod tests {
             _available_shards: &[Option<&[u8]>],
             _data_count: u8,
             _parity_count: u8,
-        ) -> std::result::Result<Vec<Vec<u8>>, oceanfs_ec::Error> {
+        ) -> std::result::Result<Vec<Bytes>, oceanfs_ec::Error> {
             Err(oceanfs_ec::Error::DecodingFailed("simulated decode failure".into()))
         }
     }
@@ -551,7 +552,7 @@ mod tests {
             &self,
             _data_shards: &[&[u8]],
             _parity_count: u8,
-        ) -> std::result::Result<Vec<Vec<u8>>, oceanfs_ec::Error> {
+        ) -> std::result::Result<Vec<Bytes>, oceanfs_ec::Error> {
             Ok(vec![])
         }
     }
@@ -564,7 +565,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let metadata_config = oceanfs_core::MetadataConfig {
             data_dir: tmp.path().join("meta"),
-            ..Default::default()
+            ..Default::default()..Default::default()
         };
         let metadata = Arc::new(RocksDbMetadataStore::open(&metadata_config).unwrap());
         let data_store = Arc::new(InMemorySegmentStore::new());
@@ -588,7 +589,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let metadata_config = oceanfs_core::MetadataConfig {
             data_dir: tmp.path().join("meta"),
-            ..Default::default()
+            ..Default::default()..Default::default()
         };
         let metadata = Arc::new(RocksDbMetadataStore::open(&metadata_config).unwrap());
         let data_store: Arc<dyn SegmentDataStore> = Arc::new(InMemorySegmentStore::new());
@@ -635,7 +636,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let metadata_config = oceanfs_core::MetadataConfig {
             data_dir: tmp.path().join("meta"),
-            ..Default::default()
+            ..Default::default()..Default::default()
         };
         let metadata = Arc::new(RocksDbMetadataStore::open(&metadata_config).unwrap());
         let data_store = Arc::new(InMemorySegmentStore::new());
@@ -647,7 +648,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let metadata_config = oceanfs_core::MetadataConfig {
             data_dir: tmp.path().join("meta"),
-            ..Default::default()
+            ..Default::default()..Default::default()
         };
         let metadata = Arc::new(RocksDbMetadataStore::open(&metadata_config).unwrap());
         let data_store = Arc::new(InMemorySegmentStore::new());

@@ -6,6 +6,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use bytes::Bytes;
 use oceanfs_core::{
     Counter, HashOutput, LabelSet, MetricRegistrar, NodeState, SegmentId, SegmentMetadata,
 };
@@ -13,7 +14,6 @@ use oceanfs_ec::{CauchyEncoder, Decoder, Encoder};
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_storage::metadata::RocksDbMetadataStore;
-use crate::{Error, Result};
 use rand::seq::SliceRandom;
 
 use super::{
@@ -21,6 +21,7 @@ use super::{
     merkle_root::MerkleRoot,
     merkle_tree::{MerkleTree, SegmentDataStore, DEFAULT_LEAF_SIZE},
 };
+use crate::{Error, Result};
 // ---------------------------------------------------------------------------
 // AntiEntropy
 // ---------------------------------------------------------------------------
@@ -481,11 +482,16 @@ impl AntiEntropy {
         let shard_size = current_data.len().div_ceil(k);
         let padded_len = shard_size * k;
 
-        let mut padded = current_data.to_vec();
+        // Pad with zeros if needed (Bytes is immutable, so use Vec for padding).
+        let mut padded = Vec::with_capacity(padded_len);
+        padded.extend_from_slice(current_data.as_ref());
         padded.resize(padded_len, 0u8);
+        let padded_bytes = Bytes::from(padded);
 
-        let data_shards: Vec<Vec<u8>> =
-            (0..k).map(|i| padded[i * shard_size..(i + 1) * shard_size].to_vec()).collect();
+        // Slice into data shards without copying (zero-copy via Bytes::slice).
+        let data_shard_slices: Vec<Bytes> =
+            (0..k).map(|i| padded_bytes.slice(i * shard_size..(i + 1) * shard_size)).collect();
+        let data_shard_refs: Vec<&[u8]> = data_shard_slices.iter().map(|b| b.as_ref()).collect();
 
         let codec = CauchyEncoder::new(oceanfs_core::CodecConfig {
             data_shards: ec_k,
@@ -496,12 +502,12 @@ impl AntiEntropy {
 
         // Encode parity from current (possibly corrupted) data
         let parity_shards = codec
-            .encode(&data_shards.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), ec_m)
+            .encode(&data_shard_refs, ec_m)
             .map_err(|e| Error::Storage(format!("EC encode failed for {segment_id}: {e}")))?;
 
         // Attempt to reconstruct each data shard by treating it as "missing"
         // and using the remaining k-1 shards + parity to decode
-        let mut reconstructed_data = padded.clone();
+        let mut reconstructed_data = padded_bytes.to_vec();
         let mut repaired_count = 0usize;
 
         for shard_idx in 0..k {
@@ -511,11 +517,11 @@ impl AntiEntropy {
                 if i == shard_idx {
                     available.push(None);
                 } else {
-                    available.push(Some(&padded[i * shard_size..(i + 1) * shard_size]));
+                    available.push(Some(&padded_bytes[i * shard_size..(i + 1) * shard_size]));
                 }
             }
             for p in &parity_shards {
-                available.push(Some(p.as_slice()));
+                available.push(Some(&p[..]));
             }
 
             // Try to decode — this reconstructs shard_idx from the others
@@ -524,7 +530,7 @@ impl AntiEntropy {
                 let shard_end = (shard_offset + shard_size).min(padded_len);
                 let copy_len = shard_end - shard_offset;
 
-                if recovered[shard_idx][..copy_len] != padded[shard_offset..shard_end] {
+                if recovered[shard_idx][..copy_len] != padded_bytes[shard_offset..shard_end] {
                     // Shard was corrupted — apply the fix
                     reconstructed_data[shard_offset..shard_end]
                         .copy_from_slice(&recovered[shard_idx][..copy_len]);
@@ -810,6 +816,7 @@ pub struct AntiEntropyStats {
 mod tests {
     use std::sync::Arc;
 
+    use bytes::Bytes;
     use oceanfs_core::{
         GossipConfig, HashOutput, MetadataConfig, NodeId, NodeState, RingConfig, RpcConfig,
         SegmentId, SegmentMetadata, SizeTier,
@@ -1293,16 +1300,17 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper: creates a CauchyEncoder with given k,m and encodes data.
-    fn ec_encode_test_data(data: &[u8], k: u8, m: u8) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    fn ec_encode_test_data(data: &[u8], k: u8, m: u8) -> (Vec<Bytes>, Vec<Bytes>) {
         let shard_size = data.len().div_ceil(k as usize);
         let padded_len = shard_size * k as usize;
         let mut padded = data.to_vec();
         padded.resize(padded_len, 0u8);
+        let padded_bytes = Bytes::from(padded);
 
-        let data_shards: Vec<Vec<u8>> = (0..k as usize)
-            .map(|i| padded[i * shard_size..(i + 1) * shard_size].to_vec())
+        let data_shards: Vec<Bytes> = (0..k as usize)
+            .map(|i| padded_bytes.slice(i * shard_size..(i + 1) * shard_size))
             .collect();
-        let data_refs: Vec<&[u8]> = data_shards.iter().map(|v| v.as_slice()).collect();
+        let data_refs: Vec<&[u8]> = data_shards.iter().map(|b| b.as_ref()).collect();
 
         let codec = CauchyEncoder::new(oceanfs_core::CodecConfig {
             data_shards: k,

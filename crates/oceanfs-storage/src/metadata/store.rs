@@ -288,7 +288,11 @@ impl RocksDbMetadataStore {
         }
     }
 
-    /// Deletes object metadata (soft delete — data remains until GC).
+    /// Deletes object metadata and writes a deletion tombstone.
+    ///
+    /// Removes the object row from `CF_OBJECTS` and records a tombstone
+    /// in `CF_DELETIONS` so that garbage collection can identify and
+    /// compact this key across all replicas.
     pub fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> Result<()> {
         let cf = self
             .db
@@ -297,7 +301,19 @@ impl RocksDbMetadataStore {
 
         let db_key = cf::encode_object_key(bucket.as_str(), key.as_str());
 
-        self.db.delete_cf(&cf, db_key).map_err(|e| Error::Io(io_err(e)))?;
+        self.db.delete_cf(&cf, &db_key).map_err(|e| Error::Io(io_err(e)))?;
+
+        // Write a deletion tombstone so that GC can compact this key
+        // across replicas. Without this, cross-node deletion compaction
+        // is non-functional.
+        let tombstone = Tombstone {
+            deletion_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+            hlc: oceanfs_core::Hlc::zero(),
+        };
+        self.put_tombstone(bucket, key, tombstone)?;
 
         Ok(())
     }
@@ -782,7 +798,7 @@ mod tests {
             segments_write_buffer_mb: 8,
             deletions_write_buffer_mb: 1,
             max_open_files: 1024,
-                    ..Default::default()
+            ..Default::default()
         }
     }
 

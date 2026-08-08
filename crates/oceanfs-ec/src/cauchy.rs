@@ -5,7 +5,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use oceanfs_core::CodecConfig;
 
 use crate::{
@@ -120,7 +120,7 @@ impl CauchyEncoder {
         let cm = Self::cauchy_matrix(k, m);
         let shard_size = data_shards[0].len();
 
-        let mut parity: Vec<Vec<u8>> = (0..mi).map(|_| vec![0u8; shard_size]).collect();
+        let mut parity: Vec<BytesMut> = (0..mi).map(|_| BytesMut::zeroed(shard_size)).collect();
 
         // Reusable SIMD temp buffer — thread-local to avoid per-call allocation.
         #[cfg(target_arch = "x86_64")]
@@ -155,7 +155,7 @@ impl CauchyEncoder {
             }
         }
 
-        Ok(parity.into_iter().map(Bytes::from).collect())
+        Ok(parity.into_iter().map(|b| b.freeze()).collect())
     }
 
     /// Inverts a square matrix over GF(2^8) using Gauss-Jordan elimination.
@@ -288,7 +288,7 @@ impl Decoder for CauchyEncoder {
             .ok_or_else(|| Error::DecodingFailed("matrix is singular".into()))?;
 
         // Reconstruct data shards: data[i] = sum_j inv[i][j] * sub_data[j].
-        let mut recovered: Vec<Vec<u8>> = (0..k).map(|_| vec![0u8; shard_size]).collect();
+        let mut recovered: Vec<BytesMut> = (0..k).map(|_| BytesMut::zeroed(shard_size)).collect();
 
         for i in 0..k {
             for byte_idx in 0..shard_size {
@@ -301,7 +301,7 @@ impl Decoder for CauchyEncoder {
         }
 
         // Recovered data is the original k data shards in order.
-        Ok(recovered.into_iter().map(Bytes::from).collect())
+        Ok(recovered.into_iter().map(|b| b.freeze()).collect())
     }
 }
 

@@ -6,6 +6,7 @@
 
 use std::{io::Read, path::PathBuf};
 
+use bytes::Bytes;
 use oceanfs_core::WalConfig;
 
 use crate::{error::Result, wal::entry::WalEntry};
@@ -112,7 +113,7 @@ impl Iterator for WalReplayIter<'_> {
 
                         // Assemble full entry.
                         let mut entry = parsed;
-                        entry.data = data_buf;
+                        entry.data = Bytes::from(data_buf);
 
                         if !entry.verify_crc() {
                             tracing::warn!("WAL entry CRC mismatch skipped");
@@ -161,7 +162,7 @@ mod tests {
             0,
             0,
             HashOutput::from_bytes([i; 32]),
-            vec![i; length as usize],
+            vec![i; length as usize].into(),
         )
     }
 

@@ -1,15 +1,15 @@
 //! Active segment pool with pipeline parallelism.
 //!
-//! A pool of N active segments decouples append latency from EC encode
-//! time. While one segment is being EC-encoded (asynchronously), the next
-//! segment in the pool accepts writes. Combined with per-core segment
-//! sharding, this eliminates write blocking during seal+encode cycles.
+//! A pool of N active segments decouples append latency from seal-time I/O.
+//! While one segment is being sealed (written to disk, metadata persisted),
+//! the next segment in the pool accepts writes. Combined with per-core segment
+//! sharding, this eliminates write blocking during seal cycles.
 //!
 //! ## Pool States
 //!
 //! Each slot transitions through a lifecycle:
 //! ```text
-//! Idle → Appending → Sealing → Encoding → Idle
+//! Idle → Appending → Sealing → Idle
 //! ```
 //!
 //! Per performance guideline §2.5 (sharded segment buffer), §2.6 (bounded
@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use oceanfs_core::{PoolConfig, SegmentId, SizeTier};
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, Semaphore};
@@ -27,6 +28,21 @@ use crate::{
     segment::buffer::ActiveSegment,
 };
 
+/// A work item sent to the seal worker when a segment is filled.
+///
+/// Contains the segment's identity, its data (copied before the
+/// backing buffer is returned to the pool), and the storage tier.
+#[derive(Debug)]
+pub struct SealingWork {
+    /// The unique identifier of the segment to seal.
+    pub segment_id: SegmentId,
+    /// The segment data bytes, copied from the active segment buffer
+    /// before the backing buffer was returned to the pool.
+    pub segment_data: Bytes,
+    /// The storage tier of the segment (Small or Standard).
+    pub tier: SizeTier,
+}
+
 /// The state of a pool slot throughout its lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PoolSlotState {
@@ -34,10 +50,8 @@ pub(crate) enum PoolSlotState {
     Idle,
     /// Segment is actively accepting writes.
     Appending,
-    /// Segment is being sealed (WAL flush, checksum).
+    /// Segment has been filled and extracted for sealing.
     Sealing,
-    /// Segment data is being EC-encoded asynchronously.
-    Encoding,
 }
 
 /// A single slot in the segment pool, holding one active segment and its state.
@@ -95,12 +109,12 @@ pub struct SegmentPool {
     size_config: oceanfs_core::SegmentSizeConfig,
     /// Index of the current appending slot (round-robin).
     current_index: Mutex<usize>,
-    /// Sender for the EC encoding work queue.
-    encode_tx: mpsc::Sender<SegmentId>,
-    /// Receiver for the EC encoding work queue (held by the pool's worker).
-    encode_rx: Mutex<Option<mpsc::Receiver<SegmentId>>>,
-    /// Semaphore limiting in-flight EC encodes.
-    encode_semaphore: Arc<Semaphore>,
+    /// Sender for the seal work queue.
+    seal_tx: mpsc::Sender<SealingWork>,
+    /// Receiver for the seal work queue (held by the pool, drained by a seal worker).
+    seal_rx: Mutex<Option<mpsc::Receiver<SealingWork>>>,
+    /// Semaphore limiting in-flight seals (enforces bounded concurrency).
+    seal_semaphore: Arc<Semaphore>,
     /// Pool configuration.
     #[allow(dead_code)]
     config: PoolConfig,
@@ -121,7 +135,7 @@ impl SegmentPool {
         size_config: &oceanfs_core::SegmentSizeConfig,
         buffer_pool: Arc<BufferPool>,
     ) -> Result<Self> {
-        let (encode_tx, encode_rx) = mpsc::channel(config.encode_queue_capacity);
+        let (seal_tx, seal_rx) = mpsc::channel(config.encode_queue_capacity);
 
         // Create pool_size appending slots.
         let mut slots = Vec::with_capacity(config.active_pool_size);
@@ -130,16 +144,16 @@ impl SegmentPool {
             slots.push(Arc::new(slot));
         }
 
-        let encode_semaphore = Arc::new(Semaphore::new(config.max_inflight_encodes));
+        let seal_semaphore = Arc::new(Semaphore::new(config.max_inflight_encodes));
 
         Ok(Self {
             slots,
             tier,
             size_config: size_config.clone(),
             current_index: Mutex::new(0),
-            encode_tx,
-            encode_rx: Mutex::new(Some(encode_rx)),
-            encode_semaphore,
+            seal_tx,
+            seal_rx: Mutex::new(Some(seal_rx)),
+            seal_semaphore,
             config,
             buffer_pool: Arc::clone(&buffer_pool),
         })
@@ -211,9 +225,12 @@ impl SegmentPool {
 
             if let Some(seg) = sealed_segment {
                 let seg_id = seg.id();
-                // Return the buffer to the pool for reuse (perf §1.2).
+                let seg_tier = seg.tier();
+                // Copy segment data before releasing the buffer back to
+                // the pool. The seal worker will write this data to disk.
+                let seg_data = Bytes::copy_from_slice(seg.data());
                 self.buffer_pool.release(seg.into_buffer());
-                self.enqueue_encoding(seg_id);
+                self.enqueue_seal(seg_id, seg_data, seg_tier);
             }
 
             // Try to activate a new segment in this slot (or another idle one).
@@ -254,9 +271,10 @@ impl SegmentPool {
                         let sealed = slot.segment.lock().take();
                         if let Some(seg) = sealed {
                             let seg_id = seg.id();
-                            // Return the buffer to the pool for reuse (perf §1.2).
+                            let seg_tier = seg.tier();
+                            let seg_data = Bytes::copy_from_slice(seg.data());
                             self.buffer_pool.release(seg.into_buffer());
-                            self.enqueue_encoding(seg_id);
+                            self.enqueue_seal(seg_id, seg_data, seg_tier);
                         }
                         self.try_activate_slot();
                     }
@@ -267,24 +285,25 @@ impl SegmentPool {
         Err(Error::InvalidConfig("no appending segment available in pool".into()))
     }
 
-    /// Enqueues a segment ID for EC encoding on the bounded work channel.
+    /// Enqueues a filled segment for sealing on the bounded work channel.
     ///
     /// Uses `try_send` for non-blocking enqueue. If the channel is full,
-    /// the encoding is deferred and will be retried later by the pool
+    /// the seal is deferred and will be retried later by the pool
     /// rotation logic. This avoids blocking the caller in async contexts.
-    fn enqueue_encoding(&self, segment_id: SegmentId) {
-        match self.encode_tx.try_send(segment_id) {
+    fn enqueue_seal(&self, segment_id: SegmentId, segment_data: Bytes, tier: SizeTier) {
+        let work = SealingWork { segment_id, segment_data, tier };
+        match self.seal_tx.try_send(work) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 tracing::warn!(
                     segment_id = %segment_id,
-                    "EC encoding queue full; encoding deferred"
+                    "seal queue full; seal deferred"
                 );
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 tracing::error!(
                     segment_id = %segment_id,
-                    "EC encoding queue closed; segment will not be encoded"
+                    "seal queue closed; segment will not be sealed"
                 );
             }
         }
@@ -297,10 +316,7 @@ impl SegmentPool {
             let mut seg = slot.segment.lock();
             if seg.is_none() {
                 let state = slot.state();
-                if state == PoolSlotState::Sealing
-                    || state == PoolSlotState::Encoding
-                    || state == PoolSlotState::Idle
-                {
+                if state == PoolSlotState::Sealing || state == PoolSlotState::Idle {
                     // Try to create a new active segment from the buffer pool.
                     match ActiveSegment::new(
                         self.tier,
@@ -329,14 +345,18 @@ impl SegmentPool {
         }
     }
 
-    /// Returns the EC encoding receiver channel, if available.
-    pub fn take_encode_rx(&self) -> Option<mpsc::Receiver<SegmentId>> {
-        self.encode_rx.lock().take()
+    /// Returns the seal receiver channel, if available.
+    ///
+    /// The seal worker must call this to obtain the receiver for
+    /// draining sealed segments. Only one worker should take the
+    /// receiver; subsequent calls return `None`.
+    pub fn take_seal_rx(&self) -> Option<mpsc::Receiver<SealingWork>> {
+        self.seal_rx.lock().take()
     }
 
-    /// Returns a clone of the encoding semaphore for worker tasks.
-    pub fn encode_semaphore(&self) -> Arc<Semaphore> {
-        Arc::clone(&self.encode_semaphore)
+    /// Returns a clone of the seal semaphore for worker tasks.
+    pub fn seal_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.seal_semaphore)
     }
 }
 
@@ -422,8 +442,8 @@ mod tests {
         let buf_pool = test_pool();
         let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool).unwrap();
 
-        let rx = pool.take_encode_rx();
-        assert!(rx.is_some(), "encode receiver must exist");
+        let rx = pool.take_seal_rx();
+        assert!(rx.is_some(), "seal receiver must exist");
     }
 
     #[test]
@@ -434,7 +454,7 @@ mod tests {
             SegmentPool::new(pool_cfg.clone(), SizeTier::Standard, &size_cfg, buf_pool.clone())
                 .unwrap();
 
-        let sem = pool.encode_semaphore();
+        let sem = pool.seal_semaphore();
         // Verify that the semaphore has been created with the expected count.
         // We can't directly inspect Semaphore internals, but we can acquire
         // all permits and then try one more.
@@ -505,9 +525,9 @@ mod tests {
         // (the filled slot was replaced with a newly activated one).
         assert_eq!(pool.active_count(), 4, "pool should re-activate after fill");
 
-        // The encoding queue should have received the sealed segment ID.
-        let rx = pool.take_encode_rx();
-        assert!(rx.is_some(), "encoding queue should have entries after fill");
+        // The seal queue should have received the sealed segment.
+        let rx = pool.take_seal_rx();
+        assert!(rx.is_some(), "seal queue should have entries after fill");
 
         // Verify subsequent appends succeed (pool is still functional).
         let (seg_id2, offset2, _len2) = pool.append(b"more data").unwrap();
@@ -547,10 +567,10 @@ mod tests {
     // ── Backpressure test ─────────────────────────────────────────
 
     #[test]
-    fn encode_queue_backpressure_config_is_respected() {
+    fn seal_queue_backpressure_config_is_respected() {
         // Verify that a pool with small encode_queue_capacity can be
         // created and used without panicking, even when the queue fills.
-        // Uses a large target size so enqueue_encoding is never called
+        // Uses a large target size so enqueue_seal is never called
         // (segment never fills). This tests the configuration path.
         let pool_cfg =
             PoolConfig { active_pool_size: 4, encode_queue_capacity: 2, ..PoolConfig::default() };
@@ -558,9 +578,9 @@ mod tests {
         let buf_pool = test_pool();
         let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool).unwrap();
 
-        // The encode queue should exist with the configured capacity.
-        let rx = pool.take_encode_rx();
-        assert!(rx.is_some(), "encode queue must exist");
+        // The seal queue should exist with the configured capacity.
+        let rx = pool.take_seal_rx();
+        assert!(rx.is_some(), "seal queue must exist");
 
         // Appends should succeed normally (segment won't fill with 4MB target).
         for _ in 0..10 {
@@ -569,10 +589,10 @@ mod tests {
     }
 
     #[test]
-    fn pool_handles_segment_full_with_encode_queue_not_draining() {
-        // Create a pool with tiny target and take the encode receiver.
+    fn pool_handles_segment_full_with_seal_queue_not_draining() {
+        // Create a pool with tiny target and take the seal receiver.
         // Verify that appends still succeed after the segment fills
-        // (the enqueue_encoding timeout path is exercised but doesn't panic).
+        // (enqueue_seal handles full channel gracefully without panic).
         use std::sync::Arc as StdArc;
 
         let pool_cfg =
@@ -591,13 +611,13 @@ mod tests {
         );
 
         // Take the receiver but don't drain — the channel will fill.
-        let _rx = pool.take_encode_rx();
+        let _rx = pool.take_seal_rx();
 
-        // Execute on the runtime so block_on works for enqueue_encoding.
+        // Execute on the runtime so block_on works for enqueue_seal.
         rt.block_on(async {
             // Fill segments. With encode_queue_capacity=2, after 2 fills
-            // the channel is full. Subsequent fills trigger the 500ms
-            // timeout in enqueue_encoding but should not panic.
+            // the channel is full. Subsequent fills trigger the enqueue_seal
+            // try_send failure path but should not panic.
             for i in 0..5 {
                 let pool = StdArc::clone(&pool);
                 let data = format!("fill-data-{i:02}-enough-bytes-to-overflow");

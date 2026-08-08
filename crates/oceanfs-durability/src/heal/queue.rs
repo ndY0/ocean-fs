@@ -4,8 +4,9 @@
 //! to enforce backpressure when the heal pipeline is saturated.
 
 use oceanfs_core::{HealRequest, SegmentId};
-use crate::{Error, Result};
 use tokio::sync::mpsc;
+
+use crate::{Error, Result};
 
 /// A global sender for submitting heal requests without direct queue access.
 ///

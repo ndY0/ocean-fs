@@ -574,7 +574,7 @@ impl Node {
                 .map_err(|e| format!("failed to list blob data on startup: {e}"))?;
             for id in &blob_ids {
                 if let Ok(Some(data)) = blob_store.read_blob(id) {
-                    segment_reader.put(*id, Bytes::from(data));
+                    segment_reader.put(*id, data);
                 }
             }
             if !blob_ids.is_empty() {
@@ -601,6 +601,10 @@ impl Node {
             sealer.clone(),
             hinted_handoff.clone(),
         ));
+
+        // Start background seal worker — drains filled segments from both
+        // pools and writes them to disk via the segment sealer (Epic 3).
+        let _seal_handle = write_coordinator.start_seal_worker();
 
         let read_coordinator = Arc::new(
             ReadCoordinator::new_with_metadata(
@@ -1537,7 +1541,7 @@ mod tests {
             data_dir: dir.path().join("meta"),
             block_cache_size: 1024,
             memtable_size: 1024,
-                    ..Default::default()
+            ..Default::default()
         })
         .expect("open metadata store");
 
@@ -1555,7 +1559,7 @@ mod tests {
             data_dir: dir.path().join("meta"),
             block_cache_size: 1024,
             memtable_size: 1024,
-                    ..Default::default()
+            ..Default::default()
         })
         .expect("open metadata store");
 
@@ -1984,9 +1988,8 @@ mod tests {
                     let p = d.path().to_path_buf();
                     // Keep tempdir alive
                     std::mem::forget(d);
-                    p.join("meta")
-                            ..Default::default()
-        },
+                    p.join("meta")..Default::default()
+                },
                 block_cache_size: 1024,
                 memtable_size: 1024,
             })

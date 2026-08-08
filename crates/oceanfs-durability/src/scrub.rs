@@ -14,10 +14,12 @@ use oceanfs_core::{
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_storage::metadata::RocksDbMetadataStore;
-use crate::{Error, Result};
 use tokio::sync::Semaphore;
 
-use crate::anti_entropy::{MerkleTree, SegmentDataStore};
+use crate::{
+    anti_entropy::{MerkleTree, SegmentDataStore},
+    Error, Result,
+};
 
 // ---------------------------------------------------------------------------
 // ScrubConfig

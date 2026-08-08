@@ -8,8 +8,11 @@
 //! the sub-modules below, and this file only declares sub-modules and
 //! re-exports their public API. Downstream consumers continue to write
 //! `use oceanfs_core::types::SegmentId` with zero changes.
+//!
+//! Note: The canonical `BucketPolicy` type lives in `oceanfs-server`; the
+//! former `oceanfs_core::types::bucket::BucketPolicy` was an orphaned stub
+//! with no consumers.
 
-mod bucket;
 mod cache;
 mod codec;
 mod config;
@@ -21,8 +24,6 @@ mod node;
 
 // --- Identifier types ---
 // --- Cache types ---
-// --- Bucket policy types ---
-pub use bucket::BucketPolicy;
 pub use cache::CacheInvalidateRequest;
 // --- Codec types ---
 pub use codec::{CodecConfig, CodecType, EncodingPlan};

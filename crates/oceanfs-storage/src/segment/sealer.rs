@@ -7,9 +7,9 @@
 use std::{path::PathBuf, sync::Arc};
 
 use bytes::Bytes;
-use oceanfs_core::{Counter, LabelSet, SegmentMetadata};
 #[cfg(test)]
-use oceanfs_core::{SegmentSizeConfig, SizeTier};
+use oceanfs_core::SegmentSizeConfig;
+use oceanfs_core::{Counter, LabelSet, SegmentId, SegmentMetadata, SizeTier};
 use oceanfs_hash::Blake3Hasher;
 
 use crate::{
@@ -125,7 +125,28 @@ impl SegmentSealer {
         let segment_id = active.id();
         let tier = active.tier();
         let data = Bytes::copy_from_slice(active.data());
-        let size = active.size();
+        self.seal_from_data(segment_id, tier, data, entries).await
+    }
+
+    /// Seals a segment from raw data bytes, without requiring an `ActiveSegment`.
+    ///
+    /// This is the primary sealing entry point — works with segments that have
+    /// already been extracted from the pool. Accepts the segment's identity,
+    /// data bytes, tier, and blob index entries. Writes the segment file to
+    /// disk, persists metadata, and truncates the WAL past the sealed boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if disk I/O fails, metadata persistence fails, or
+    /// WAL truncation fails.
+    pub async fn seal_from_data(
+        &self,
+        segment_id: SegmentId,
+        tier: SizeTier,
+        data: Bytes,
+        entries: &[SegmentIndexEntry],
+    ) -> Result<SegmentHandle> {
+        let size = data.len() as u64;
         let blob_count = entries.len() as u32;
 
         // Build the blob index from the provided entries.

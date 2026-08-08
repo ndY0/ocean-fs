@@ -1156,7 +1156,7 @@ impl ReadCoordinator {
         &self,
         segment_data: &[u8],
         missing_shard_indices: &[usize],
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Bytes> {
         let k = self.ec_data_shards;
         let m = self.ec_parity_shards;
 
@@ -1201,14 +1201,14 @@ impl ReadCoordinator {
         // Call the shared decode helper.
         let recovered_shards = self.decode_ec_shards(&available, k, m)?;
 
-        // Concatenate the k recovered data shards.
+        // Concatenate the k recovered data shards into a Bytes.
         let total_size = k_usize * shard_size;
-        let mut result = Vec::with_capacity(total_size);
+        let mut result = bytes::BytesMut::with_capacity(total_size);
         for shard in recovered_shards {
             result.extend_from_slice(&shard);
         }
 
-        Ok(result)
+        Ok(result.freeze())
     }
 
     /// Returns a reference to the EC decoder, if configured.

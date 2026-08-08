@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use oceanfs_core::EncodingPlan;
 use rayon::prelude::*;
 use tokio::sync::Semaphore;
@@ -106,9 +106,9 @@ impl<E: Encoder + ?Sized> ParallelEncoder<E> {
 
         // Build data shards in SoA layout with pre-sized capacity.
         // Each shard holds total_stripes * shard_size bytes.
-        let mut data_shards: Vec<Vec<u8>> = Vec::with_capacity(k);
+        let mut data_shards: Vec<BytesMut> = Vec::with_capacity(k);
         for _ in 0..k {
-            data_shards.push(vec![0u8; total_stripes * shard_size]);
+            data_shards.push(BytesMut::zeroed(total_stripes * shard_size));
         }
 
         // Copy segment data into interleaved shards, zero-padding the
@@ -131,7 +131,8 @@ impl<E: Encoder + ?Sized> ParallelEncoder<E> {
 
         // Encode each stripe in parallel.
         let m8 = m as u8;
-        let mut parity_shards: Vec<Vec<u8>> = vec![vec![0u8; total_stripes * shard_size]; m];
+        let mut parity_shards: Vec<BytesMut> =
+            (0..m).map(|_| BytesMut::zeroed(total_stripes * shard_size)).collect();
 
         let results: Vec<Result<Vec<Bytes>>> = (0..total_stripes)
             .into_par_iter()
@@ -211,7 +212,7 @@ impl<D: Decoder + ?Sized> ParallelDecoder<D> {
         available: &StripeBatch,
         plan: &EncodingPlan,
         missing_indices: &[usize],
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<BytesMut>> {
         let _permit = self.semaphore.as_ref().map(|s| s.acquire());
 
         let k = available.data.len() as u8;
@@ -219,8 +220,8 @@ impl<D: Decoder + ?Sized> ParallelDecoder<D> {
         let total_stripes = plan.stripe_count;
         let shard_size = plan.shard_size;
 
-        let mut recovered_data: Vec<Vec<u8>> =
-            vec![vec![0u8; total_stripes * shard_size]; k as usize];
+        let mut recovered_data: Vec<BytesMut> =
+            (0..k as usize).map(|_| BytesMut::zeroed(total_stripes * shard_size)).collect();
 
         let results: Vec<Result<Vec<Bytes>>> = (0..total_stripes)
             .into_par_iter()

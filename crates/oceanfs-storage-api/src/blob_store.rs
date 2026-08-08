@@ -3,6 +3,7 @@
 //! Abstracts disk-persisted blob data storage. Backend implementations
 //! (RocksDB, FUSE, S3, in-memory) implement this trait.
 
+use bytes::Bytes;
 use oceanfs_core::SegmentId;
 
 use crate::error::Error;
@@ -23,7 +24,7 @@ use crate::error::Error;
 ///         Ok(())
 ///     }
 ///
-///     fn read_blob(&self, _segment_id: &SegmentId) -> Result<Option<Vec<u8>>, Error> {
+///     fn read_blob(&self, _segment_id: &SegmentId) -> Result<Option<Bytes>, Error> {
 ///         Ok(None)
 ///     }
 ///
@@ -51,7 +52,7 @@ pub trait BlobStore: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the data exists but cannot be read.
-    fn read_blob(&self, segment_id: &SegmentId) -> Result<Option<Vec<u8>>, Error>;
+    fn read_blob(&self, segment_id: &SegmentId) -> Result<Option<Bytes>, Error>;
 
     /// Deletes a blob for a segment.
     ///

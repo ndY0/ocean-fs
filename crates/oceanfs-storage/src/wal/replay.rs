@@ -246,7 +246,7 @@ mod tests {
             0,
             0,
             HashOutput::from_bytes([0u8; 32]),
-            vec![0u8; length as usize],
+            vec![0u8; length as usize].into(),
         )
     }
 
@@ -264,7 +264,7 @@ mod tests {
             wall,
             logical,
             HashOutput::from_bytes([0u8; 32]),
-            vec![0u8; length as usize],
+            vec![0u8; length as usize].into(),
         )
     }
 

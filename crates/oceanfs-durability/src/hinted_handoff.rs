@@ -58,7 +58,8 @@ pub struct HintRecord {
     /// HLC timestamp of the original write (for conflict resolution on delivery).
     pub timestamp: Hlc,
     /// The actual blob data to deliver.
-    pub data: Vec<u8>,
+    /// Stored as `Bytes` for zero-copy delivery to gRPC.
+    pub data: Bytes,
     /// Wall-clock time when this hint was stored (for TTL expiry).
     pub stored_at_secs: u64,
 }
@@ -413,7 +414,7 @@ impl HintedHandoff {
         let request = HintRequest {
             intended_for: Some(proto_intended),
             segment_id: Some(proto_segment_id),
-            data: Bytes::from(hint.data.clone()),
+            data: hint.data.clone(),
             hlc: Some(proto_hlc),
         };
 
@@ -475,7 +476,7 @@ mod tests {
             offset: 0,
             length: 100,
             timestamp: Hlc::zero(),
-            data: vec![1, 2, 3],
+            data: vec![1, 2, 3].into(),
             stored_at_secs: 0,
         };
 
@@ -498,7 +499,7 @@ mod tests {
                 offset: 0,
                 length: 50,
                 timestamp: Hlc::zero(),
-                data: vec![1],
+                data: vec![1].into(),
                 stored_at_secs: 0,
             },
         )
@@ -513,7 +514,7 @@ mod tests {
                 offset: 50,
                 length: 50,
                 timestamp: Hlc::zero(),
-                data: vec![2],
+                data: vec![2].into(),
                 stored_at_secs: 0,
             },
         )
@@ -528,7 +529,7 @@ mod tests {
                 offset: 0,
                 length: 200,
                 timestamp: Hlc::zero(),
-                data: vec![3],
+                data: vec![3].into(),
                 stored_at_secs: 0,
             },
         )
@@ -553,7 +554,7 @@ mod tests {
                 offset: 0,
                 length: 100,
                 timestamp: Hlc::zero(),
-                data: vec![1, 2, 3],
+                data: vec![1, 2, 3].into(),
                 stored_at_secs: 0,
             },
         )
@@ -589,7 +590,7 @@ mod tests {
                 offset: 0,
                 length: 42,
                 timestamp: Hlc::zero(),
-                data: vec![1],
+                data: vec![1].into(),
                 stored_at_secs: 0,
             },
         )
@@ -614,7 +615,7 @@ mod tests {
                     offset: i as u64,
                     length: 10,
                     timestamp: Hlc::zero(),
-                    data: vec![i as u8],
+                    data: vec![i as u8].into(),
                     stored_at_secs: 0,
                 },
             )
@@ -633,7 +634,7 @@ mod tests {
                     offset: 1000,
                     length: 10,
                     timestamp: Hlc::zero(),
-                    data: vec![0],
+                    data: vec![0].into(),
                     stored_at_secs: 0,
                 },
             )
@@ -656,7 +657,7 @@ mod tests {
             offset: 0,
             length: 10,
             timestamp: Hlc::zero(),
-            data: vec![1, 2, 3],
+            data: vec![1, 2, 3].into(),
             stored_at_secs: 0,
         };
 
@@ -707,7 +708,7 @@ mod tests {
             offset: 0,
             length: 42,
             timestamp: Hlc::zero(),
-            data: vec![9, 8, 7],
+            data: vec![9, 8, 7].into(),
             stored_at_secs: 0,
         };
         hh.handoff(node_id.clone(), hint).await.unwrap();
