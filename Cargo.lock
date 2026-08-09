@@ -1590,8 +1590,11 @@ dependencies = [
 name = "oceanfs-durability"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "blake3",
  "bytes",
+ "crc32fast",
+ "dashmap",
  "oceanfs-core",
  "oceanfs-ec",
  "oceanfs-hash",

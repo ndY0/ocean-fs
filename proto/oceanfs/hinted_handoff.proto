@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package oceanfs.hinted_handoff;
+
+import "oceanfs/common.proto";
+
+// ---------------------------------------------------------------------------
+// Hinted handoff record types — stored in the HintWal and delivered
+// via batched gRPC when the intended node returns.
+// ---------------------------------------------------------------------------
+
+// Inline hint record — blob data stored directly in the WAL.
+// Suitable for blobs ≤ the inline_threshold_bytes (default 4096).
+message HintInline {
+  // The node this write was originally intended for.
+  oceanfs.common.NodeId intended_for = 1;
+  // The bucket the object belongs to.
+  oceanfs.common.BucketId bucket_id = 2;
+  // The object key.
+  string object_key = 3;
+  // The blob payload stored inline.
+  bytes data = 4;
+}
+
+// Segment-reference hint record — large blobs reference a sealed segment.
+// The segment data is shipped separately via segment fetch.
+message HintSegmentRef {
+  // The node this write was originally intended for.
+  oceanfs.common.NodeId intended_for = 1;
+  // The bucket the object belongs to.
+  oceanfs.common.BucketId bucket_id = 2;
+  // The object key.
+  string object_key = 3;
+  // The segment containing the blob.
+  oceanfs.common.SegmentId segment_id = 4;
+  // Byte offset of the blob within the segment.
+  uint64 offset = 5;
+  // Length of the blob in bytes.
+  uint32 length = 6;
+}
+
+// A hinted handoff record — either inline or segment reference.
+message HintRecord {
+  oneof record {
+    HintInline inline = 1;
+    HintSegmentRef segment_ref = 2;
+  }
+}
+
+// Batched hinted handoff delivery request.
+message HintedHandoffRequest {
+  // Hints to deliver, grouped by intended_for node.
+  repeated HintRecord hints = 1;
+}
+
+// Response to a batched hinted handoff delivery.
+message HintedHandoffResponse {
+  // Whether all hints were accepted and persisted.
+  bool accepted = 1;
+  // Number of hints accepted.
+  uint32 accepted_count = 2;
+}

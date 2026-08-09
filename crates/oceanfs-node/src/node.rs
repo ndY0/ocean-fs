@@ -13,7 +13,9 @@ use oceanfs_core::{
     ObjectMetadata, PoolConfig, RingConfig, RpcConfig, SegmentId, SegmentMetadata,
     SegmentSizeConfig, SizeTier, Tombstone, WalConfig,
 };
-use oceanfs_durability::HintedHandoff;
+use oceanfs_durability::{
+    GrpcHintDeliveryClient, HintWal, HintedHandoff, HintedHandoffConfig, HintedHandoffManager,
+};
 use oceanfs_network::{apply_opts_to_fd, create_reuseport_listener};
 use oceanfs_server::{
     auth::AuthMiddleware, metadata_ops::MetadataOps, AdminHandler, BucketConfigStore,
@@ -302,7 +304,7 @@ impl NodeLeaveHandler {
         let timeout_ms = 5000u64;
         let response = tokio::time::timeout(
             std::time::Duration::from_millis(timeout_ms),
-            client.hinted_handoff(request),
+            client.hinted_handoff_single(request),
         )
         .await
         .map_err(|_| format!("gRPC hinted_handoff to {node} timed out after {timeout_ms}ms"))?
@@ -747,6 +749,27 @@ impl Node {
                 .with_timeouts(op_timeouts.clone()),
         );
 
+        // Construct the persistent HintWal and HintedHandoffManager for
+        // durable hinted handoff (Hinted Handoff Durability feature).
+        let hint_wal_path =
+            config.hint_wal_path.clone().unwrap_or_else(|| config.data_dir.join("hints.wal"));
+        let hint_wal = Arc::new(HintWal::open(&hint_wal_path).await?);
+        let hint_delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
+            Arc::new(GrpcHintDeliveryClient::new(pool.clone()));
+        let hint_config = HintedHandoffConfig {
+            wal_path: hint_wal_path,
+            inline_threshold_bytes: config.hint_inline_threshold_bytes,
+            max_batch_size: config.hint_max_batch_size,
+        };
+        let hinted_handoff_manager = Arc::new(
+            HintedHandoffManager::new(hint_wal, hint_delivery_client, hint_config)
+                .with_membership(membership.clone())
+                .with_timeouts(op_timeouts.clone()),
+        );
+
+        // Replay existing hints from the WAL into in-memory queues.
+        let _replayed = hinted_handoff_manager.replay_and_enqueue().await?;
+
         let write_coordinator = Arc::new(
             WriteCoordinator::new(
                 ring_cache.clone(),
@@ -761,7 +784,7 @@ impl Node {
                 segment_pool_small,
                 segment_pool_standard,
                 sealer.clone(),
-                hinted_handoff.clone(),
+                hinted_handoff_manager.clone(),
             )
             .with_timeouts(op_timeouts.clone()),
         );
@@ -1010,7 +1033,7 @@ impl Node {
         // ---- 17. Spawn hinted handoff delivery watcher ----
         // Watches for membership state transitions to ALIVE and drains
         // the handoff buffer for returning nodes.
-        let hh = hinted_handoff.clone();
+        let hh = hinted_handoff_manager.clone();
         let mut events = membership.subscribe();
         let delivery_token = background.delivery_cancel.clone();
         let delivery_handle = tokio::spawn(async move {

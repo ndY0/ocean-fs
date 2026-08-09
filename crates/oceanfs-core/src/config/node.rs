@@ -234,6 +234,20 @@ pub struct NodeConfig {
     /// Default: "local_first".
     #[serde(default)]
     pub default_fetch_strategy: crate::FetchStrategy,
+
+    // ── Hinted handoff configuration ──
+    /// Path to hinted handoff WAL file. When `None`, defaults to
+    /// `"{data_dir}/hints.wal"`.
+    #[serde(default)]
+    pub hint_wal_path: Option<PathBuf>,
+    /// Maximum blob size stored inline in hinted handoff WAL (bytes).
+    /// Blobs above this threshold are stored as segment references.
+    /// Default: 4096 (4 KB).
+    #[serde(default = "default_hint_inline_threshold_bytes")]
+    pub hint_inline_threshold_bytes: u64,
+    /// Maximum hints per batched gRPC delivery call. Default: 256.
+    #[serde(default = "default_hint_max_batch_size")]
+    pub hint_max_batch_size: usize,
 }
 
 fn default_node_id() -> String {
@@ -378,6 +392,15 @@ fn default_segment_shard_count_max() -> usize {
     16
 }
 
+// ── Hinted handoff default functions ──
+
+fn default_hint_inline_threshold_bytes() -> u64 {
+    4096
+}
+fn default_hint_max_batch_size() -> usize {
+    256
+}
+
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
@@ -440,6 +463,10 @@ impl Default for NodeConfig {
             segment_shard_count_max: 16,
             // Item 10: Fetch strategy
             default_fetch_strategy: crate::FetchStrategy::default(),
+            // Hinted handoff
+            hint_wal_path: None,
+            hint_inline_threshold_bytes: 4096,
+            hint_max_batch_size: 256,
         }
     }
 }

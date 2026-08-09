@@ -15,6 +15,7 @@ use crate::{
         HintResponse, MerkleRequest, MerkleResponse, PushRepairedShardRequest,
         PushRepairedShardResponse,
     },
+    hinted_handoff_rpc::{hint_record::Record, HintedHandoffRequest, HintedHandoffResponse},
     SegmentDataStore,
 };
 
@@ -43,7 +44,7 @@ impl HealingGrpcService {
 impl HealingRpc for HealingGrpcService {
     type FetchShardStream = tokio_stream::wrappers::ReceiverStream<Result<FetchShardChunk, Status>>;
 
-    async fn hinted_handoff(
+    async fn hinted_handoff_single(
         &self,
         request: Request<HintRequest>,
     ) -> Result<Response<HintResponse>, Status> {
@@ -70,7 +71,7 @@ impl HealingRpc for HealingGrpcService {
                 tracing::debug!(
                     intended_for = %intended_for,
                     segment_id = %segment_id,
-                    "received and stored hinted handoff"
+                    "received and stored hinted handoff (single)"
                 );
 
                 let proto_segment_id: oceanfs_core::proto::common::SegmentId = segment_id.into();
@@ -83,11 +84,105 @@ impl HealingRpc for HealingGrpcService {
                 tracing::warn!(
                     intended_for = %intended_for,
                     error = %e,
-                    "failed to store hinted handoff"
+                    "failed to store hinted handoff (single)"
                 );
                 Ok(Response::new(HintResponse { accepted: false, stored_segment_id: None }))
             }
         }
+    }
+
+    /// Handles batched hinted handoff delivery.
+    ///
+    /// Receives up to `max_batch_size` hints in a single gRPC call and
+    /// stores each in the in-memory handoff buffer for delivery to the
+    /// intended node.
+    async fn hinted_handoff(
+        &self,
+        request: Request<HintedHandoffRequest>,
+    ) -> Result<Response<HintedHandoffResponse>, Status> {
+        let req = request.into_inner();
+        let hint_count = req.hints.len() as u32;
+        let mut accepted_count = 0u32;
+
+        for proto_hint in &req.hints {
+            // Convert proto-based HintRecord to the legacy HintRecord for storage.
+            // The existing HintedHandoff uses the legacy struct.
+            match &proto_hint.record {
+                Some(Record::Inline(inline)) => {
+                    let intended_for = inline
+                        .intended_for
+                        .clone()
+                        .map(NodeId::from)
+                        .unwrap_or_else(|| NodeId::new("unknown"));
+
+                    let legacy_hint = crate::HintRecord {
+                        intended_for: intended_for.clone(),
+                        segment_id: SegmentId::new(), // inline hints don't have a segment
+                        offset: 0,
+                        length: inline.data.len() as u32,
+                        timestamp: Hlc::zero(),
+                        data: inline.data.clone(),
+                        stored_at_secs: 0,
+                    };
+
+                    match self.handoff.handoff(intended_for.clone(), legacy_hint).await {
+                        Ok(()) => {
+                            accepted_count += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                intended_for = %intended_for,
+                                error = %e,
+                                "failed to store batched hint (inline)"
+                            );
+                        }
+                    }
+                }
+                Some(Record::SegmentRef(seg_ref)) => {
+                    let intended_for = seg_ref
+                        .intended_for
+                        .clone()
+                        .map(NodeId::from)
+                        .unwrap_or_else(|| NodeId::new("unknown"));
+
+                    // For segment refs, store as a legacy hint with empty data.
+                    let legacy_hint = crate::HintRecord {
+                        intended_for: intended_for.clone(),
+                        segment_id: seg_ref
+                            .segment_id
+                            .as_ref()
+                            .and_then(|sid| SegmentId::try_from(sid.clone()).ok())
+                            .unwrap_or_default(),
+                        offset: seg_ref.offset,
+                        length: seg_ref.length,
+                        timestamp: Hlc::zero(),
+                        data: bytes::Bytes::new(),
+                        stored_at_secs: 0,
+                    };
+
+                    match self.handoff.handoff(intended_for.clone(), legacy_hint).await {
+                        Ok(()) => {
+                            accepted_count += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                intended_for = %intended_for,
+                                error = %e,
+                                "failed to store batched hint (segment ref)"
+                            );
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!("batched hint with no record variant; skipping");
+                }
+            }
+        }
+
+        Ok(Response::new(HintedHandoffResponse {
+            accepted: accepted_count == hint_count,
+            accepted_count,
+        }))
     }
 
     async fn merkle_exchange(
@@ -317,7 +412,7 @@ mod tests {
             hlc: None,
         });
 
-        let response = service.hinted_handoff(request).await.unwrap();
+        let response = service.hinted_handoff_single(request).await.unwrap();
         let resp = response.into_inner();
         assert!(resp.accepted, "valid hint should be accepted");
         assert!(resp.stored_segment_id.is_some(), "should return a stored_segment_id");

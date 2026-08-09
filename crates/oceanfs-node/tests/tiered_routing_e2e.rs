@@ -94,7 +94,21 @@ async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
     };
     let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
 
-    let hinted_handoff = Arc::new(oceanfs_durability::HintedHandoff::new_with_pool(pool.clone()));
+    let hinted_handoff = {
+        let hint_wal = Arc::new(
+            oceanfs_durability::HintWal::open(&dir.path().join("hints.wal")).await.unwrap(),
+        );
+        let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
+            Arc::new(oceanfs_durability::GrpcHintDeliveryClient::new(pool.clone()));
+        Arc::new(oceanfs_durability::HintedHandoffManager::new(
+            hint_wal,
+            delivery_client,
+            oceanfs_durability::HintedHandoffConfig {
+                wal_path: dir.path().join("hints.wal"),
+                ..Default::default()
+            },
+        ))
+    };
 
     WriteCoordinator::new(
         ring_cache,

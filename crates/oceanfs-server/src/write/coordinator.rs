@@ -21,7 +21,7 @@ use oceanfs_core::{
     BucketId, ChunkRef, HashKey, HashOutput, Hlc, HlcClock, NodeId, ObjectKey, ObjectMetadata,
     OperationTimeouts, SegmentId, SegmentIndexEntry, SegmentSizeConfig, SizeTier, WriteResult,
 };
-use oceanfs_durability::HintedHandoff;
+use oceanfs_durability::HintedHandoffManager;
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::RingCache;
@@ -98,7 +98,7 @@ pub struct WriteCoordinator {
     /// Segment size configuration.
     size_config: SegmentSizeConfig,
     /// Hinted handoff buffer for writes to temporarily unreachable replicas.
-    hinted_handoff: Arc<HintedHandoff>,
+    hinted_handoff: Arc<HintedHandoffManager>,
     /// Accumulated blob index entries per segment, keyed by segment ID.
     /// Entries are drained when the segment is sealed.
     segment_entries: DashMap<SegmentId, Vec<SegmentIndexEntry>>,
@@ -125,7 +125,7 @@ impl WriteCoordinator {
         segment_pool_small: Arc<SegmentPool>,
         segment_pool_standard: Arc<SegmentPool>,
         sealer: Arc<SegmentSealer>,
-        hinted_handoff: Arc<HintedHandoff>,
+        hinted_handoff: Arc<HintedHandoffManager>,
     ) -> Self {
         let tier_router = TierRouter::new(size_config.clone());
         Self {
@@ -339,20 +339,13 @@ impl WriteCoordinator {
                     Err(e) => {
                         warn!(target = %target, error = %e, "replica write failed");
                         // Store hinted handoff for the unreachable replica.
-                        let now_secs = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let hint = oceanfs_durability::HintRecord {
-                            intended_for: target.clone(),
-                            segment_id,
-                            offset: 0,
-                            length: req.data.len() as u32,
-                            timestamp: hlc,
-                            data: req.data.clone(),
-                            stored_at_secs: now_secs,
-                        };
-                        let _ = self.hinted_handoff.handoff(target.clone(), hint).await;
+                        let hint = oceanfs_durability::hinted_handoff_rpc::HintRecord::new_inline(
+                            target.clone(),
+                            req.bucket.clone(),
+                            req.key.to_string(),
+                            req.data.clone(),
+                        );
+                        let _ = self.hinted_handoff.enqueue(hint).await;
                     }
                 }
             }
@@ -779,7 +772,18 @@ mod tests {
         };
         let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
 
-        let hinted_handoff = Arc::new(HintedHandoff::new());
+        use oceanfs_durability::{
+            GrpcHintDeliveryClient, HintWal, HintedHandoffConfig, HintedHandoffManager,
+        };
+
+        let hint_wal_path = dir.path().join("hints.wal");
+        let hint_wal = Arc::new(HintWal::open(&hint_wal_path).await.unwrap());
+        let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
+            Arc::new(GrpcHintDeliveryClient::new(pool.clone()));
+        let hint_config =
+            HintedHandoffConfig { wal_path: hint_wal_path, ..HintedHandoffConfig::default() };
+        let hinted_handoff =
+            Arc::new(HintedHandoffManager::new(hint_wal, delivery_client, hint_config));
 
         WriteCoordinator::new(
             ring_cache,

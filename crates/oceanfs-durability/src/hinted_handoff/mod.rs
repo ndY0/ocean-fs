@@ -6,6 +6,12 @@
 //! (detected via membership gossip), the fallback node pushes the
 //! buffered data and clears the hint.
 //!
+//! ## Modules
+//!
+//! - [`HintedHandoff`] (legacy): in-memory hint buffer with per-hint gRPC delivery.
+//! - [`HintWal`]: persistent write-ahead log for hinted handoff records.
+//! - [`HintedHandoffManager`]: WAL-backed hint manager with batched gRPC delivery.
+//!
 //! ## Interface
 //!
 //! - [`HintedHandoff::handoff()`]: store a write for an unreachable node.
@@ -16,9 +22,16 @@
 //! Per performance guideline §2.6 (bounded channels) and §4.5 (adaptive
 //! per-operation timeouts).
 
+pub mod hint_delivery;
+pub mod hint_wal;
+
 use std::{collections::HashMap, sync::Arc};
 
 use bytes::Bytes;
+pub use hint_delivery::{
+    GrpcHintDeliveryClient, HintDeliveryClient, HintedHandoffConfig, HintedHandoffManager,
+};
+pub use hint_wal::HintWal;
 use oceanfs_core::{Counter, Hlc, LabelSet, MetricRegistrar, NodeId, OperationTimeouts, SegmentId};
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
@@ -431,8 +444,10 @@ impl HintedHandoff {
         };
 
         let delivery = async {
-            let response: tonic::Response<HintResponse> =
-                client.hinted_handoff(request).await.map_err(|status| Error::ForwardFailed {
+            let response: tonic::Response<HintResponse> = client
+                .hinted_handoff_single(request)
+                .await
+                .map_err(|status| Error::ForwardFailed {
                     target: node.to_string(),
                     reason: format!("gRPC hint delivery failed: {status}"),
                 })?;

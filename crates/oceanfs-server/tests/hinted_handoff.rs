@@ -5,7 +5,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use oceanfs_core::{Hlc, NodeId, SegmentId};
-use oceanfs_durability::{HintRecord, HintedHandoff};
+use oceanfs_durability::{
+    HintRecord, HintWal, HintedHandoff, HintedHandoffConfig, HintedHandoffManager,
+};
 
 #[tokio::test]
 async fn handoff_create_deliver_cleanup() {
@@ -161,12 +163,25 @@ async fn write_coordinator_handoff_on_replica_failure() {
     );
 
     let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
-    let hinted_handoff =
-        Arc::new(HintedHandoff::new_with_pool(pool.clone()).with_membership(membership.clone()));
+    let dir = tempfile::tempdir().unwrap();
+
+    let hinted_handoff = {
+        let hint_wal_path = dir.path().join("hints.wal");
+        let hint_wal = Arc::new(HintWal::open(&hint_wal_path).await.unwrap());
+        let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
+            Arc::new(oceanfs_durability::GrpcHintDeliveryClient::new(pool.clone()));
+        let hint_config = oceanfs_durability::HintedHandoffConfig {
+            wal_path: hint_wal_path,
+            ..Default::default()
+        };
+        Arc::new(
+            oceanfs_durability::HintedHandoffManager::new(hint_wal, delivery_client, hint_config)
+                .with_membership(membership.clone()),
+        )
+    };
     let hlc_clock = Arc::new(HlcClock::new());
 
-    // Segment pipeline (temp dir).
-    let dir = tempfile::tempdir().unwrap();
+    // Segment pipeline.
     let metadata = Arc::new(
         RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
             data_dir: dir.path().join("meta"),
@@ -272,9 +287,9 @@ async fn write_coordinator_handoff_on_replica_failure() {
     assert_eq!(total, 2, "should have exactly 2 hints total");
 
     // Verify delivery attempt with membership:
-    // Without a real gRPC server, delivery fails but the attempt is made.
-    let delivered = hinted_handoff.deliver_pending(n2.clone()).await.unwrap();
-    assert_eq!(delivered, 0, "delivery fails without gRPC server");
+    // Without a real gRPC server, delivery fails and returns an error.
+    let result = hinted_handoff.deliver_pending(n2.clone()).await;
+    assert!(result.is_err(), "delivery should fail without gRPC server");
     // Hints retained after failed delivery (retry semantics).
     assert_eq!(hinted_handoff.pending_count(&n2), 1, "hints retained for retry");
     assert_eq!(hinted_handoff.total_pending_count(), 2, "total hints unchanged");

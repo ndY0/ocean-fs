@@ -3,12 +3,15 @@ syntax = "proto3";
 package oceanfs.healing;
 
 import "oceanfs/common.proto";
+import "oceanfs/hinted_handoff.proto";
 
 // ---------------------------------------------------------------------------
 // Healing and hinted-handoff messages and service.
 // ---------------------------------------------------------------------------
 
 // A hinted handoff request carrying data intended for a different node.
+// DEPRECATED: retained for backward-compat with existing clients.
+// New clients should use HintedHandoffRequest.
 message HintRequest {
   oceanfs.common.NodeId intended_for = 1;
   oceanfs.common.SegmentId segment_id = 2;
@@ -17,6 +20,7 @@ message HintRequest {
 }
 
 // Response to a hinted handoff delivery.
+// DEPRECATED: retained for backward-compat.
 message HintResponse {
   bool accepted = 1;
   oceanfs.common.SegmentId stored_segment_id = 2;
@@ -38,8 +42,12 @@ message MerkleResponse {
 
 // Healing RPC service for hinted handoff, anti-entropy, and EC-based repair.
 service HealingRpc {
-  // Deliver a hinted handoff to a returning node.
-  rpc HintedHandoff(HintRequest) returns (HintResponse);
+  // Deliver a single hinted handoff to a returning node (legacy).
+  rpc HintedHandoffSingle(HintRequest) returns (HintResponse);
+
+  // Deliver batched hinted handoffs to a returning node.
+  rpc HintedHandoff(oceanfs.hinted_handoff.HintedHandoffRequest)
+      returns (oceanfs.hinted_handoff.HintedHandoffResponse);
 
   // Exchange Merkle tree hashes for anti-entropy comparison.
   rpc MerkleExchange(MerkleRequest) returns (MerkleResponse);

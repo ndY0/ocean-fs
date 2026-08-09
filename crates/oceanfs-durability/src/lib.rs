@@ -47,7 +47,10 @@ pub use gc::{
 pub use heal::{
     enqueue_heal, HealConfig, HealQueue, HealQueueSender, HealRequest, HealStats, HealWorker,
 };
-pub use hinted_handoff::{HintRecord, HintedHandoff};
+pub use hinted_handoff::{
+    GrpcHintDeliveryClient, HintDeliveryClient, HintRecord, HintWal, HintedHandoff,
+    HintedHandoffConfig, HintedHandoffManager,
+};
 pub use scrub::{ScrubConfig, ScrubCoordinator, ScrubReport, ScrubReportBuilder};
 pub use segment_store_impl::DiskSegmentStore;
 
@@ -65,6 +68,12 @@ pub mod healing_rpc {
 #[allow(missing_docs, clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::all)]
 pub mod scrub_rpc {
     include!("generated/oceanfs.scrub.rs");
+}
+
+/// Generated protobuf types for hinted handoff records and batched delivery.
+#[allow(missing_docs, clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::all)]
+pub mod hinted_handoff_rpc {
+    include!("generated/oceanfs.hinted_handoff.rs");
 }
 
 // Re-export generated client and server types for ergonomic use.
