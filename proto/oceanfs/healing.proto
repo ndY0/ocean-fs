@@ -27,17 +27,39 @@ message HintResponse {
 }
 
 // Request to exchange Merkle roots for anti-entropy.
+// Supports two modes:
+// - Root-only exchange (include_full_tree = false): lightweight, 32 bytes per segment.
+// - Full tree exchange (include_full_tree = true): the responder sends its pre-built
+//   tree structure, avoiding peer-side CPU cost of reconstruction.
 message MerkleRequest {
   repeated oceanfs.common.SegmentId segment_ids = 1;
   uint32 tree_depth = 2;
   oceanfs.common.NodeId node_id = 3;
+  // When true, the responder serialises its pre-built Merkle tree.
+  bool include_full_tree = 4;
 }
 
-// Response with Merkle roots and leaf hashes.
+// A single node in the Merkle tree for gRPC exchange.
+message TreeNode {
+  // Position of this node in the binary tree (root = 0).
+  uint32 node_index = 1;
+  // BLAKE3 hash of this node's subtree (32 bytes).
+  bytes hash = 2;
+  // Child node indices. [left_child_index, right_child_index] for internal
+  // nodes; empty for leaf nodes.
+  repeated uint32 children = 3;
+}
+
+// Response with Merkle roots and optional full tree structure.
 message MerkleResponse {
   oceanfs.common.SegmentId segment_id = 1;
   bytes root_hash = 2;               // 32 bytes BLAKE3
   repeated bytes leaf_hashes = 3;    // each 32 bytes BLAKE3
+  // When true, internal_nodes contains the full tree structure.
+  bool full_tree_included = 4;
+  // The full pre-built Merkle tree (only populated when include_full_tree = true
+  // or when the server detected a root mismatch).
+  repeated TreeNode internal_nodes = 5;
 }
 
 // Healing RPC service for hinted handoff, anti-entropy, and EC-based repair.

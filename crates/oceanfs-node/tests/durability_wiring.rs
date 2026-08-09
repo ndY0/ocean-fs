@@ -10,12 +10,22 @@ use std::sync::Arc;
 
 use oceanfs_core::{MetadataConfig, NodeId, RpcConfig};
 use oceanfs_durability::{
+    merkle::{IncrementalMerkleTree, MerkleTreeConfig, MerkleWal},
     AntiEntropy, AntiEntropyConfig, GarbageCollector, GcConfig, HealConfig, HealQueue,
     InMemorySegmentShardStore, InMemorySegmentStore, OrphanReaper, ScrubConfig, ScrubCoordinator,
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::{Ring, RingCache};
+
+/// Creates a test IncrementalMerkleTree backed by a temp MerkleWal.
+fn make_test_tree() -> Arc<IncrementalMerkleTree> {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_path = dir.path().join("merkle.wal");
+    let wal = Arc::new(MerkleWal::open(&wal_path).unwrap());
+    std::mem::forget(dir);
+    Arc::new(IncrementalMerkleTree::new(wal, MerkleTreeConfig::default()))
+}
 use oceanfs_storage::RocksDbMetadataStore;
 use oceanfs_storage_api::MetadataStore;
 use tokio_util::sync::CancellationToken;
@@ -59,6 +69,7 @@ async fn durability_components_are_wireable_and_spawnable() {
         metadata_store.clone(),
         pool.clone(),
         Arc::new(InMemorySegmentStore::new()),
+        make_test_tree(),
     ));
     let ae_cancel = CancellationToken::new();
     let _ae_handle = tokio::spawn({
@@ -164,7 +175,14 @@ async fn test_anti_entropy_accepts_trait_object() {
         Arc::new(InMemorySegmentStore::new());
 
     // AntiEntropy::new accepts Arc<dyn MetadataStore>.
-    let ae = AntiEntropy::new(AntiEntropyConfig::default(), membership, store, pool, data_store);
+    let ae = AntiEntropy::new(
+        AntiEntropyConfig::default(),
+        membership,
+        store,
+        pool,
+        data_store,
+        make_test_tree(),
+    );
     let stats = ae.run_cycle().await.expect("AE cycle with trait object");
     assert_eq!(stats.segments_compared, 0);
 }

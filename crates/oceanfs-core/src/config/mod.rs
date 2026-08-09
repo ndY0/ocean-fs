@@ -17,6 +17,6 @@ pub use accel::AccelConfig;
 pub use auth::AuthConfig;
 pub use compression::CompressionConfig;
 pub use metadata::MetadataConfig;
-pub use node::NodeConfig;
+pub use node::{AntiEntropyConfig, NodeConfig};
 pub use ring::RingConfig;
 pub use wal::WalConfig;

@@ -13,12 +13,23 @@ use oceanfs_core::{
     RpcConfig, SegmentId, SegmentMetadata, SizeTier,
 };
 use oceanfs_durability::{
+    merkle::{IncrementalMerkleTree, MerkleTreeConfig, MerkleWal},
     AntiEntropy, AntiEntropyConfig, InMemorySegmentStore, MerkleTree, SegmentDataStore,
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::{Ring, RingCache};
 use oceanfs_storage::RocksDbMetadataStore;
+
+/// Creates a test IncrementalMerkleTree backed by a temp MerkleWal.
+fn make_test_tree() -> Arc<IncrementalMerkleTree> {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_path = dir.path().join("merkle.wal");
+    let wal = Arc::new(MerkleWal::open(&wal_path).unwrap());
+    // Leak the tempdir to keep the WAL alive.
+    std::mem::forget(dir);
+    Arc::new(IncrementalMerkleTree::new(wal, MerkleTreeConfig::default()))
+}
 
 /// Builds a test Membership for the given node.
 fn make_membership(node_id_str: &str) -> (Arc<Membership>, Arc<RingCache>) {
@@ -45,7 +56,7 @@ fn make_anti_entropy(
     let segment_store = Arc::new(InMemorySegmentStore::new());
     let config = AntiEntropyConfig::default();
 
-    AntiEntropy::new(config, membership, metadata, pool, segment_store)
+    AntiEntropy::new(config, membership, metadata, pool, segment_store, make_test_tree())
 }
 
 fn make_metadata_config() -> MetadataConfig {
@@ -221,6 +232,7 @@ async fn anti_entropy_start_background_and_shutdown() {
         metadata,
         pool,
         segment_store,
+        make_test_tree(),
     ));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
@@ -404,6 +416,7 @@ async fn real_two_node_anti_entropy_cycle() {
         metadata_a.clone(),
         pool_a,
         segment_store_a.clone(),
+        make_test_tree(),
     );
 
     let stats = ae.run_cycle().await.unwrap();
@@ -475,8 +488,14 @@ async fn anti_entropy_handles_unreachable_peer() {
     };
     metadata.put_segment(seg).unwrap();
 
-    let ae =
-        AntiEntropy::new(AntiEntropyConfig::default(), membership_a, metadata, pool, segment_store);
+    let ae = AntiEntropy::new(
+        AntiEntropyConfig::default(),
+        membership_a,
+        metadata,
+        pool,
+        segment_store,
+        make_test_tree(),
+    );
 
     // Should not panic even though the peer is unreachable
     let stats = ae.run_cycle().await.unwrap();
@@ -509,8 +528,14 @@ async fn anti_entropy_with_no_alive_peers() {
     };
     metadata.put_segment(seg).unwrap();
 
-    let ae =
-        AntiEntropy::new(AntiEntropyConfig::default(), membership, metadata, pool, segment_store);
+    let ae = AntiEntropy::new(
+        AntiEntropyConfig::default(),
+        membership,
+        metadata,
+        pool,
+        segment_store,
+        make_test_tree(),
+    );
 
     // No alive peers — should still complete gracefully
     let stats = ae.run_cycle().await.unwrap();

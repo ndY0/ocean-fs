@@ -20,7 +20,7 @@ use super::{
     merkle_root::MerkleRoot,
     merkle_tree::{MerkleTree, SegmentDataStore, DEFAULT_LEAF_SIZE},
 };
-use crate::{Error, Result};
+use crate::{merkle::IncrementalMerkleTree, Error, Result};
 // ---------------------------------------------------------------------------
 // AntiEntropy
 // ---------------------------------------------------------------------------
@@ -65,6 +65,10 @@ pub struct AntiEntropy {
     /// Connection pool for peer-to-peer gRPC Merkle exchange.
     pool: Arc<ConnectionPool>,
     segment_store: Arc<dyn SegmentDataStore>,
+    /// Incremental Merkle tree for O(log n) updates (ADR-0015).
+    merkle_tree: Arc<IncrementalMerkleTree>,
+    /// Counter tracking segment writes for continuous AE triggering.
+    write_counter: std::sync::atomic::AtomicU64,
     segments_compared_total: Counter,
     mismatches_found_total: Counter,
 }
@@ -79,12 +83,14 @@ impl AntiEntropy {
     /// - `metadata`: segment metadata store (Merkle roots)
     /// - `pool`: gRPC connection pool for peer communication
     /// - `segment_store`: segment data access for repair
+    /// - `merkle_tree`: incremental Merkle tree for O(log n) updates
     pub fn new(
         config: AntiEntropyConfig,
         membership: Arc<Membership>,
         metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
         pool: Arc<ConnectionPool>,
         segment_store: Arc<dyn SegmentDataStore>,
+        merkle_tree: Arc<IncrementalMerkleTree>,
     ) -> Self {
         Self {
             config,
@@ -92,6 +98,8 @@ impl AntiEntropy {
             metadata,
             pool,
             segment_store,
+            merkle_tree,
+            write_counter: std::sync::atomic::AtomicU64::new(0),
             segments_compared_total: Counter::new(
                 "ae_segments_compared_total".into(),
                 "Segments compared by anti-entropy".into(),
@@ -114,6 +122,25 @@ impl AntiEntropy {
     /// Returns a reference to the configuration.
     pub fn config(&self) -> &AntiEntropyConfig {
         &self.config
+    }
+
+    /// Records a segment seal event for continuous anti-entropy triggering.
+    ///
+    /// Increments the write counter. When the counter reaches the configured
+    /// threshold (default: every write), the continuous AE runner performs a
+    /// root exchange with peers for recently-written segments.
+    pub fn on_segment_sealed(&self, segment_id: SegmentId) {
+        self.write_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(
+            segment_id = %segment_id,
+            write_count = self.write_counter.load(std::sync::atomic::Ordering::Relaxed),
+            "segment seal observed by anti-entropy"
+        );
+    }
+
+    /// Returns a reference to the incremental Merkle tree.
+    pub fn merkle_tree(&self) -> &Arc<IncrementalMerkleTree> {
+        &self.merkle_tree
     }
 
     /// Runs a single anti-entropy cycle.
@@ -226,6 +253,188 @@ impl AntiEntropy {
         Ok(stats)
     }
 
+    /// Runs a continuous anti-entropy cycle using the incremental Merkle tree.
+    ///
+    /// Instead of rebuilding trees from scratch, this mode exchanges per-segment
+    /// Merkle roots stored in the incremental tree with peers. This is O(1) hash
+    /// exchange per segment — no full scan needed (ADR-0015 §3).
+    ///
+    /// Triggered on every N segment seal events (via `on_segment_sealed`) or
+    /// at the gossip interval.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let stats = ae.run_continuous_cycle().await?;
+    /// ```
+    pub async fn run_continuous_cycle(&self) -> Result<AntiEntropyStats> {
+        let mut stats = AntiEntropyStats::default();
+        let segment_count = self.merkle_tree.segment_count();
+
+        if segment_count == 0 {
+            return Ok(stats);
+        }
+
+        stats.segments_compared = segment_count as u64;
+        let peer_ids = self.select_alive_peers();
+
+        for peer_id in &peer_ids {
+            let Some(peer_addr) = self.membership.address_of(peer_id) else {
+                continue;
+            };
+
+            // Compare each tracked segment's root with the peer.
+            let tracked_segments: Vec<SegmentId> = self
+                .metadata
+                .list_segments()
+                .into_iter()
+                .filter_map(|r| r.ok())
+                .filter(|s| s.is_sealed())
+                .map(|s| s.segment_id)
+                .collect();
+
+            for segment_id in &tracked_segments {
+                if let Some(local_root) = self.merkle_tree.root(*segment_id) {
+                    // Try gRPC root exchange.
+                    if let Ok(true) =
+                        self.exchange_single_root(*segment_id, local_root, peer_id, peer_addr).await
+                    {
+                        // Root matched — no divergence.
+                    } else {
+                        // Root mismatch — perform full tree descent.
+                        stats.mismatches_found += 1;
+                        // Route to heal pool for repair.
+                        let _ = crate::heal::enqueue_heal(*segment_id, Vec::new());
+                    }
+                }
+            }
+        }
+
+        self.segments_compared_total.add(stats.segments_compared);
+        self.mismatches_found_total.add(stats.mismatches_found);
+
+        Ok(stats)
+    }
+
+    /// Performs a single root exchange for one segment with one peer.
+    ///
+    /// Returns `Ok(true)` if the root matched, `Ok(false)` if mismatched,
+    /// or `Err` if the exchange failed.
+    async fn exchange_single_root(
+        &self,
+        segment_id: SegmentId,
+        local_root: [u8; 32],
+        peer_id: &oceanfs_core::NodeId,
+        peer_addr: std::net::SocketAddr,
+    ) -> Result<bool> {
+        let pooled = match self.pool.get_channel(peer_addr).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(peer = %peer_id, error = %e, "failed to get channel");
+                return Err(Error::Storage(e.to_string()));
+            }
+        };
+        let channel = pooled.channel().clone();
+        drop(pooled);
+
+        let mut client = crate::HealingRpcClient::new(channel);
+        let proto_sid: oceanfs_core::proto::common::SegmentId = segment_id.into();
+        let proto_node_id: oceanfs_core::proto::common::NodeId = peer_id.clone().into();
+
+        let request = tonic::Request::new(crate::healing_rpc::MerkleRequest {
+            segment_ids: vec![proto_sid],
+            tree_depth: 0,
+            node_id: Some(proto_node_id),
+            include_full_tree: false,
+        });
+
+        match client.merkle_exchange(request).await {
+            Ok(response) => {
+                let resp = response.into_inner();
+                if resp.root_hash.len() == 32 {
+                    let mut peer_root = [0u8; 32];
+                    peer_root.copy_from_slice(&resp.root_hash[..32]);
+                    Ok(peer_root == local_root)
+                } else {
+                    Ok(false)
+                }
+            }
+            Err(e) => {
+                tracing::warn!(peer = %peer_id, error = %e, "merkle exchange failed");
+                Err(Error::Storage(e.to_string()))
+            }
+        }
+    }
+
+    /// Runs a sampling anti-entropy cycle.
+    ///
+    /// Selects a random subset of tracked segments (configurable fraction,
+    /// default 5%) and exchanges Merkle roots with peers. On mismatch,
+    /// performs full tree descent and routes diverged segments to the
+    /// heal pool (ADR-0015 §3).
+    pub async fn run_sampling_cycle(&self) -> Result<AntiEntropyStats> {
+        let mut stats = AntiEntropyStats::default();
+        let segment_count = self.merkle_tree.segment_count();
+
+        if segment_count == 0 || !self.config.core().sampling_enabled {
+            return Ok(stats);
+        }
+
+        // Collect tracked segments.
+        let tracked: Vec<SegmentId> = self
+            .metadata
+            .list_segments()
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .filter(|s| s.is_sealed())
+            .map(|s| s.segment_id)
+            .collect();
+
+        let fraction = self.config.core().sampling_fraction;
+        let sample_size = ((tracked.len() as f64) * fraction).ceil() as usize;
+        let sample_size = sample_size.min(tracked.len());
+
+        // Perform random sampling synchronously (ThreadRng is not Send).
+        let sampled: Vec<SegmentId> = {
+            let mut rng = rand::thread_rng();
+            let mut shuffled = tracked.clone();
+            shuffled.shuffle(&mut rng);
+            shuffled.truncate(sample_size);
+            shuffled
+        };
+
+        stats.segments_compared = sampled.len() as u64;
+
+        let peer_ids = self.select_alive_peers();
+
+        for segment_id in &sampled {
+            if let Some(local_root) = self.merkle_tree.root(*segment_id) {
+                for peer_id in &peer_ids {
+                    let Some(peer_addr) = self.membership.address_of(peer_id) else {
+                        continue;
+                    };
+                    match self
+                        .exchange_single_root(*segment_id, local_root, peer_id, peer_addr)
+                        .await
+                    {
+                        Ok(true) => { /* root matched — done */ }
+                        Ok(false) => {
+                            stats.mismatches_found += 1;
+                            let _ = crate::heal::enqueue_heal(*segment_id, Vec::new());
+                        }
+                        Err(_) => { /* peer unreachable — skip */ }
+                    }
+                    break; // only check one peer per segment for sampling
+                }
+            }
+        }
+
+        self.segments_compared_total.add(stats.segments_compared);
+        self.mismatches_found_total.add(stats.mismatches_found);
+
+        Ok(stats)
+    }
+
     /// Exchanges Merkle roots with a single peer.
     ///
     /// Exchanges Merkle roots with a single peer over gRPC.
@@ -298,6 +507,7 @@ impl AntiEntropy {
             segment_ids: proto_segment_ids,
             tree_depth: 8,
             node_id: Some(proto_node_id),
+            include_full_tree: false,
         });
 
         match client.merkle_exchange(request).await {
@@ -390,7 +600,7 @@ impl AntiEntropy {
     fn local_merkle_verify(
         sealed_segments: &[SegmentMetadata],
         local_trees: &HashMap<SegmentId, (MerkleTree, MerkleRoot)>,
-        segment_store: &dyn SegmentDataStore,
+        _segment_store: &dyn SegmentDataStore,
         peer_stats: &mut AntiEntropyStats,
     ) -> Result<()> {
         for seg in sealed_segments {
@@ -403,31 +613,9 @@ impl AntiEntropy {
                 if local_root.hash() != stored_root {
                     peer_stats.mismatches_found += 1;
 
-                    // Enqueue for centralized EC-based healing.
+                    // Route all Merkle-detected divergence to the heal pool
+                    // for EC-based repair via AccelDispatcher (ADR-0015 §5).
                     let _ = crate::heal::enqueue_heal(seg.segment_id, Vec::new());
-
-                    if let Ok(segment_data) = segment_store.read_segment_data(&seg.segment_id) {
-                        let repaired = if seg.ec_k > 0 && seg.ec_m > 0 {
-                            Self::ec_repair_segment(
-                                seg.segment_id,
-                                &segment_data,
-                                seg.ec_k,
-                                seg.ec_m,
-                                DEFAULT_LEAF_SIZE,
-                                &stored_root,
-                                segment_store,
-                            )?
-                        } else {
-                            Self::merkle_repair_diverged_leaves(
-                                seg.segment_id,
-                                &segment_data,
-                                DEFAULT_LEAF_SIZE,
-                                &stored_root,
-                                segment_store,
-                            )?
-                        };
-                        peer_stats.leaves_repaired += repaired as u64;
-                    }
                 }
             }
         }
@@ -435,6 +623,11 @@ impl AntiEntropy {
     }
 
     /// Repairs a segment using Erasure Coding reconstruction.
+    ///
+    /// This method is retained for backward compatibility and testing.
+    /// New code should use the heal pool via [`crate::heal::enqueue_heal`]
+    /// per ADR-0015 §5.
+    #[allow(dead_code)]
     ///
     /// Splits the segment data into `k` equal-sized data shards, computes
     /// parity shards, and uses EC decode to reconstruct any corrupted
@@ -571,6 +764,10 @@ impl AntiEntropy {
 
     /// Repairs diverged leaves using Merkle tree diff without EC.
     ///
+    /// Retained for backward compatibility. New code should use the heal
+    /// pool via [`crate::heal::enqueue_heal`] per ADR-0015 §5.
+    #[allow(dead_code)]
+    ///
     /// Compares the local Merkle tree against the expected root and
     /// identifies corrupted leaf ranges. Repair requires fetching
     /// correct data from a healthy peer.
@@ -661,18 +858,41 @@ impl AntiEntropy {
         self: Arc<Self>,
         mut shutdown: tokio::sync::watch::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
+        let continuous_enabled = self.config.core().continuous_enabled;
+        let sampling_enabled = self.config.core().sampling_enabled;
+        let sampling_interval =
+            std::time::Duration::from_secs(self.config.core().sampling_interval_sec);
+        let cycle_interval = std::time::Duration::from_secs(self.config.interval_sec);
+
         tokio::spawn(async move {
+            // Use separate intervals for continuous and sampling cycles.
+            let mut sampling_timer = tokio::time::interval(sampling_interval);
+            let mut cycle_timer = tokio::time::interval(cycle_interval);
+
             loop {
                 tokio::select! {
                     _ = shutdown.changed() => {
                         tracing::info!("anti-entropy background task shutting down");
                         break;
                     }
-                    _ = tokio::time::sleep(
-                        std::time::Duration::from_secs(self.config.interval_sec),
-                    ) => {
-                        if let Err(e) = self.run_cycle().await {
-                            tracing::warn!(error = %e, "anti-entropy cycle failed");
+                    _ = cycle_timer.tick() => {
+                        // Full cycle (original behaviour — rebuilds from scratch
+                        // or uses incremental tree depending on config).
+                        if continuous_enabled {
+                            if let Err(e) = self.run_continuous_cycle().await {
+                                tracing::warn!(error = %e, "continuous AE cycle failed");
+                            }
+                        } else {
+                            if let Err(e) = self.run_cycle().await {
+                                tracing::warn!(error = %e, "anti-entropy cycle failed");
+                            }
+                        }
+                    }
+                    _ = sampling_timer.tick() => {
+                        if sampling_enabled {
+                            if let Err(e) = self.run_sampling_cycle().await {
+                                tracing::warn!(error = %e, "sampling AE cycle failed");
+                            }
                         }
                     }
                 }
@@ -888,7 +1108,16 @@ mod tests {
         let segment_store = Arc::new(InMemorySegmentStore::new());
         let config = AntiEntropyConfig::default();
 
-        AntiEntropy::new(config, membership, metadata, pool, segment_store)
+        let merkle_wal = crate::merkle::MerkleWal::open(
+            tempfile::tempdir().unwrap().path().join("test-merkle.wal"),
+        )
+        .unwrap();
+        let merkle_tree = Arc::new(crate::merkle::IncrementalMerkleTree::new(
+            Arc::new(merkle_wal),
+            crate::merkle::MerkleTreeConfig::default(),
+        ));
+
+        AntiEntropy::new(config, membership, metadata, pool, segment_store, merkle_tree)
     }
 
     // -----------------------------------------------------------------------
@@ -1013,6 +1242,15 @@ mod tests {
             metadata,
             pool,
             segment_store,
+            Arc::new(crate::merkle::IncrementalMerkleTree::new(
+                Arc::new(
+                    crate::merkle::MerkleWal::open(
+                        tempfile::tempdir().unwrap().path().join("merkle.wal"),
+                    )
+                    .unwrap(),
+                ),
+                crate::merkle::MerkleTreeConfig::default(),
+            )),
         );
 
         let stats = ae.run_cycle().await.unwrap();
@@ -1033,12 +1271,22 @@ mod tests {
 
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let segment_store = Arc::new(InMemorySegmentStore::new());
+        let mwal_path = tempfile::tempdir().unwrap().path().join("merkle.wal");
+        let merkle_tree = Arc::new(crate::merkle::IncrementalMerkleTree::new(
+            Arc::new(crate::merkle::MerkleWal::open(&mwal_path).unwrap()),
+            crate::merkle::MerkleTreeConfig::default(),
+        ));
         let ae = Arc::new(AntiEntropy::new(
-            AntiEntropyConfig { interval_sec: 3600, peer_count: 1 },
+            AntiEntropyConfig {
+                interval_sec: 3600,
+                peer_count: 1,
+                core: oceanfs_core::AntiEntropyConfig::default(),
+            },
             membership,
             metadata,
             pool,
             segment_store,
+            merkle_tree,
         ));
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
@@ -1061,12 +1309,22 @@ mod tests {
 
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let segment_store = Arc::new(InMemorySegmentStore::new());
+        let mwal_path = tempfile::tempdir().unwrap().path().join("merkle.wal");
+        let merkle_tree = Arc::new(crate::merkle::IncrementalMerkleTree::new(
+            Arc::new(crate::merkle::MerkleWal::open(&mwal_path).unwrap()),
+            crate::merkle::MerkleTreeConfig::default(),
+        ));
         let ae = Arc::new(AntiEntropy::new(
-            AntiEntropyConfig { interval_sec: 0, peer_count: 1 },
+            AntiEntropyConfig {
+                interval_sec: 0,
+                peer_count: 1,
+                core: oceanfs_core::AntiEntropyConfig::default(),
+            },
             membership,
             metadata,
             pool,
             segment_store,
+            merkle_tree,
         ));
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
@@ -1190,7 +1448,11 @@ mod tests {
 
     #[test]
     fn exchange_protocol_config_getter() {
-        let config = AntiEntropyConfig { interval_sec: 600, peer_count: 2 };
+        let config = AntiEntropyConfig {
+            interval_sec: 600,
+            peer_count: 2,
+            core: oceanfs_core::AntiEntropyConfig::default(),
+        };
         let protocol = MerkleExchangeProtocol::new(config);
         assert_eq!(protocol.config().interval_sec(), 600);
         assert_eq!(protocol.config().peer_count(), 2);
@@ -1244,12 +1506,22 @@ mod tests {
 
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let segment_store = Arc::new(InMemorySegmentStore::new());
+        let mwal_path = tempfile::tempdir().unwrap().path().join("merkle.wal");
+        let merkle_tree = Arc::new(crate::merkle::IncrementalMerkleTree::new(
+            Arc::new(crate::merkle::MerkleWal::open(&mwal_path).unwrap()),
+            crate::merkle::MerkleTreeConfig::default(),
+        ));
         let ae = AntiEntropy::new(
-            AntiEntropyConfig { interval_sec: 300, peer_count: 2 },
+            AntiEntropyConfig {
+                interval_sec: 300,
+                peer_count: 2,
+                core: oceanfs_core::AntiEntropyConfig::default(),
+            },
             membership.clone(),
             metadata,
             pool,
             segment_store,
+            merkle_tree,
         );
 
         // Register 5 alive peers

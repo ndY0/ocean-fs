@@ -25,6 +25,10 @@ pub struct HintResponse {
     >,
 }
 /// Request to exchange Merkle roots for anti-entropy.
+/// Supports two modes:
+/// - Root-only exchange (include_full_tree = false): lightweight, 32 bytes per segment.
+/// - Full tree exchange (include_full_tree = true): the responder sends its pre-built
+///    tree structure, avoiding peer-side CPU cost of reconstruction.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MerkleRequest {
     #[prost(message, repeated, tag = "1")]
@@ -33,8 +37,25 @@ pub struct MerkleRequest {
     pub tree_depth: u32,
     #[prost(message, optional, tag = "3")]
     pub node_id: ::core::option::Option<::oceanfs_core::proto::common::NodeId>,
+    /// When true, the responder serialises its pre-built Merkle tree.
+    #[prost(bool, tag = "4")]
+    pub include_full_tree: bool,
 }
-/// Response with Merkle roots and leaf hashes.
+/// A single node in the Merkle tree for gRPC exchange.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TreeNode {
+    /// Position of this node in the binary tree (root = 0).
+    #[prost(uint32, tag = "1")]
+    pub node_index: u32,
+    /// BLAKE3 hash of this node's subtree (32 bytes).
+    #[prost(bytes = "bytes", tag = "2")]
+    pub hash: ::prost::bytes::Bytes,
+    /// Child node indices. \[left_child_index, right_child_index\] for internal
+    /// nodes; empty for leaf nodes.
+    #[prost(uint32, repeated, tag = "3")]
+    pub children: ::prost::alloc::vec::Vec<u32>,
+}
+/// Response with Merkle roots and optional full tree structure.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MerkleResponse {
     #[prost(message, optional, tag = "1")]
@@ -45,6 +66,13 @@ pub struct MerkleResponse {
     /// each 32 bytes BLAKE3
     #[prost(bytes = "bytes", repeated, tag = "3")]
     pub leaf_hashes: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
+    /// When true, internal_nodes contains the full tree structure.
+    #[prost(bool, tag = "4")]
+    pub full_tree_included: bool,
+    /// The full pre-built Merkle tree (only populated when include_full_tree = true
+    /// or when the server detected a root mismatch).
+    #[prost(message, repeated, tag = "5")]
+    pub internal_nodes: ::prost::alloc::vec::Vec<TreeNode>,
 }
 /// Request to fetch a single shard from a specific segment.
 #[derive(Clone, PartialEq, ::prost::Message)]

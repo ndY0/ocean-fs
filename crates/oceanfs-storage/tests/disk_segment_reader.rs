@@ -286,6 +286,7 @@ mod write_read_roundtrip {
             },
             metadata,
             wal,
+            None,
         ));
 
         let reader = Arc::new(DiskSegmentReader::new(

@@ -262,6 +262,8 @@ impl HealingRpc for HealingGrpcService {
             segment_id: chosen_sid,
             root_hash: best_root_hash,
             leaf_hashes: best_leaf_hashes,
+            full_tree_included: false,
+            internal_nodes: vec![],
         }))
     }
 
@@ -444,6 +446,7 @@ mod tests {
             segment_ids: vec![proto_sid],
             tree_depth: 8,
             node_id: None,
+            include_full_tree: false,
         });
 
         let response = service.merkle_exchange(request).await.unwrap();

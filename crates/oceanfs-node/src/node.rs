@@ -597,10 +597,16 @@ impl Node {
         // I/O mode (O_DIRECT or buffered). The shared segment data store
         // is used by anti-entropy and healing below.
         let segment_dir = config.data_dir.join("segments");
+
+        // Create notifier channel for segment seal → Merkle tree updates.
+        let (segment_sealed_tx, mut segment_sealed_rx) =
+            tokio::sync::mpsc::unbounded_channel::<SegmentId>();
+
         let sealer = Arc::new(oceanfs_storage::SegmentSealer::new(
             seal_config,
             metadata_store.clone(),
             wal_writer.clone(),
+            Some(segment_sealed_tx),
         ));
         // ---- 7. Construct durability workers ----
         let gc_config = oceanfs_durability::GcConfig::new(
@@ -611,18 +617,113 @@ impl Node {
             config.gc_compaction_queue_capacity,
         );
         let gc_worker = Arc::new(oceanfs_durability::GarbageCollector::new(gc_config.clone()));
+
+        // Construct MerkleWal and IncrementalMerkleTree for anti-entropy
+        // (ADR-0015: incremental Merkle tree protocol).
+        let merkle_wal_path = config.data_dir.join("merkle.wal");
+        let merkle_wal = Arc::new(
+            oceanfs_durability::merkle::MerkleWal::open(&merkle_wal_path)
+                .map_err(|e| std::io::Error::other(e.to_string()))?,
+        );
+        let merkle_tree_config = oceanfs_durability::merkle::MerkleTreeConfig::default();
+
+        let merkle_tree = {
+            let tree = oceanfs_durability::merkle::IncrementalMerkleTree::new(
+                merkle_wal.clone(),
+                merkle_tree_config.clone(),
+            );
+            // Replay Merkle WAL to restore in-memory state after restart.
+            match oceanfs_durability::merkle::IncrementalMerkleTree::rebuild_from_mutations(
+                &tree,
+                &merkle_wal,
+            ) {
+                Ok(()) => Arc::new(tree),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "MerkleWal replay failed; rebuilding from segment scan"
+                    );
+                    Arc::new(
+                        oceanfs_durability::merkle::IncrementalMerkleTree::rebuild_from_segment_scan(
+                            metadata_store.as_ref(),
+                            merkle_wal.clone(),
+                            &merkle_tree_config,
+                        )
+                        .map_err(|e| {
+                            std::io::Error::other(format!(
+                                "failed to rebuild Merkle tree from scan: {e}"
+                            ))
+                        })?,
+                    )
+                }
+            }
+        };
+
+        // Spawn background task: forward segment seal events to the
+        // incremental Merkle tree for continuous anti-entropy tracking.
+        let merkle_tree_bg = merkle_tree.clone();
+        let metadata_bg = metadata_store.clone();
+        let _merkle_seal_handle = tokio::spawn(async move {
+            while let Some(segment_id) = segment_sealed_rx.recv().await {
+                // Look up the segment from metadata to get its merkle root hash.
+                match metadata_bg.get_segment(segment_id) {
+                    Ok(Some(meta)) => {
+                        let leaf_hash = if let Some(root) = meta.merkle_root {
+                            *root.as_bytes()
+                        } else {
+                            // Fallback: compute a placeholder hash from the segment ID.
+                            // In production, the segment's BLAKE3 checksum is always
+                            // stored as the merkle_root at seal time.
+                            use std::hash::{Hash, Hasher};
+                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                            segment_id.hash(&mut h);
+                            let val = h.finish();
+                            let mut hash = [0u8; 32];
+                            hash[..8].copy_from_slice(&val.to_le_bytes());
+                            hash
+                        };
+                        if let Err(e) = merkle_tree_bg.insert_leaf(segment_id, leaf_hash) {
+                            tracing::error!(
+                                %segment_id,
+                                error = %e,
+                                "Failed to insert leaf into Merkle tree"
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            %segment_id,
+                            "segment sealed notification received but segment not found in metadata"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            %segment_id,
+                            error = %e,
+                            "Failed to look up segment metadata for Merkle tree"
+                        );
+                    }
+                }
+            }
+        });
+
         let ae_worker = Arc::new(oceanfs_durability::AntiEntropy::new(
             oceanfs_durability::AntiEntropyConfig::new(
                 config.ae_interval_sec,
                 config.ae_peer_count,
-            ),
+            )
+            .with_core(oceanfs_core::AntiEntropyConfig {
+                continuous_enabled: config.anti_entropy.continuous_enabled,
+                continuous_max_segments: config.anti_entropy.continuous_max_segments,
+                sampling_enabled: config.anti_entropy.sampling_enabled,
+                sampling_interval_sec: config.anti_entropy.sampling_interval_sec,
+                sampling_fraction: config.anti_entropy.sampling_fraction,
+            }),
             membership.clone(),
             metadata_store.clone(),
             pool.clone(),
-            // DiskSegmentStore reads/writes segment files from the
-            // authoritative {data_dir}/segments/ — same files written
-            // by the SegmentSealer and read by DiskSegmentReader.
             Arc::new(oceanfs_durability::DiskSegmentStore::new(segment_dir.clone())),
+            merkle_tree.clone(),
         ));
         let mut scrub_config = oceanfs_durability::ScrubConfig::default();
         scrub_config.set_interval_sec(config.scrub_interval_sec);
@@ -1660,6 +1761,13 @@ mod tests {
             metadata_store.clone(),
             pool,
             Arc::new(oceanfs_durability::InMemorySegmentStore::new()),
+            Arc::new(oceanfs_durability::merkle::IncrementalMerkleTree::new(
+                Arc::new(
+                    oceanfs_durability::merkle::MerkleWal::open(&tmp.path().join("merkle.wal"))
+                        .unwrap(),
+                ),
+                oceanfs_durability::merkle::MerkleTreeConfig::default(),
+            )),
         ));
         let scrub_config = oceanfs_durability::ScrubConfig::default();
         let scrub_worker = Arc::new(oceanfs_durability::ScrubCoordinator::new(scrub_config));

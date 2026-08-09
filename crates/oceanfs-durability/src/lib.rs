@@ -28,6 +28,7 @@ pub mod error;
 pub mod gc;
 pub mod heal;
 pub mod hinted_handoff;
+pub mod merkle;
 pub mod scrub;
 mod segment_store_impl;
 

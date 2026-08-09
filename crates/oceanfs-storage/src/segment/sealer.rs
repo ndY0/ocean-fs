@@ -54,21 +54,33 @@ pub struct SegmentSealer {
     config: SealConfig,
     metadata: Arc<RocksDbMetadataStore>,
     wal: Arc<WalWriter>,
+    /// Notifier channel for sealed segments.
+    ///
+    /// The durability crate (oceanfs-durability) observes this channel to
+    /// update the incremental Merkle tree on each segment seal. When `None`,
+    /// notifications are disabled (e.g., in tests or standalone deployment).
+    on_sealed: Option<tokio::sync::mpsc::UnboundedSender<SegmentId>>,
     /// Segment seal error counter.
     seal_errors: Counter,
 }
 
 impl SegmentSealer {
     /// Creates a new segment sealer.
+    ///
+    /// `on_sealed` is an optional unbounded sender that receives a
+    /// notification (the `SegmentId`) every time a segment is sealed.
+    /// The durability crate uses this to update the incremental Merkle tree.
     pub fn new(
         config: SealConfig,
         metadata: Arc<RocksDbMetadataStore>,
         wal: Arc<WalWriter>,
+        on_sealed: Option<tokio::sync::mpsc::UnboundedSender<SegmentId>>,
     ) -> Self {
         Self {
             config,
             metadata,
             wal,
+            on_sealed,
             seal_errors: Counter::new(
                 "segment_seal_errors_total".into(),
                 "Number of segment sealing failures".into(),
@@ -243,6 +255,12 @@ impl SegmentSealer {
             .put_segment(meta)
             .map_err(|e| Error::Io(std::io::Error::other(format!("metadata write failed: {e}"))))?;
 
+        // Notify durability subsystem of the newly sealed segment so
+        // the incremental Merkle tree is updated.
+        if let Some(tx) = &self.on_sealed {
+            let _ = tx.send(segment_id);
+        }
+
         // Truncate the WAL (entries for this segment are no longer needed).
         let wal_pos = self.wal.global_position().await;
         self.wal.truncate(wal_pos).await?;
@@ -314,7 +332,7 @@ mod tests {
         // Build an index entry covering the appended data.
         let entries = vec![SegmentIndexEntry { offset: 0, length: 50, blob_key_hash: [0xAB; 32] }];
 
-        let sealer = SegmentSealer::new(config, metadata, wal);
+        let sealer = SegmentSealer::new(config, metadata, wal, None);
         (sealer, active, entries, dir)
     }
 
@@ -377,7 +395,7 @@ mod tests {
         let size_config =
             SegmentSizeConfig { default_target_size: 100, ..SegmentSizeConfig::default() };
         let mut active = ActiveSegment::new(SizeTier::Standard, &size_config, &pool).unwrap();
-        let sealer = SegmentSealer::new(config, metadata, wal);
+        let sealer = SegmentSealer::new(config, metadata, wal, None);
 
         // Empty segment should not seal.
         let result = sealer.try_seal(&mut active, 2000, &[]).await.unwrap();

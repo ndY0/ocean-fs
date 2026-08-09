@@ -6,6 +6,69 @@
 
 use std::path::PathBuf;
 
+// ---------------------------------------------------------------------------
+// AntiEntropyConfig
+// ---------------------------------------------------------------------------
+
+/// Configuration for the incremental Merkle tree anti-entropy protocol.
+///
+/// Controls two modes: continuous root-only exchange (triggered on every
+/// segment write) and periodic sampling mode (random fraction of segments).
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::AntiEntropyConfig;
+///
+/// let config = AntiEntropyConfig::default();
+/// assert!(config.continuous_enabled);
+/// assert_eq!(config.continuous_max_segments, 10000);
+/// ```
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AntiEntropyConfig {
+    /// Whether continuous anti-entropy is enabled (root exchange on every
+    /// segment write or gossip interval).
+    #[serde(default = "default_true")]
+    pub continuous_enabled: bool,
+    /// Maximum number of segments tracked in continuous mode before evicting
+    /// the oldest. Memory is bounded: ~4.5 MB at default 10000 segments.
+    #[serde(default = "default_continuous_max_segments")]
+    pub continuous_max_segments: usize,
+    /// Whether sampling anti-entropy is enabled (periodic random subset).
+    #[serde(default = "default_true")]
+    pub sampling_enabled: bool,
+    /// Interval in seconds between sampling anti-entropy cycles.
+    #[serde(default = "default_ae_sampling_interval_sec")]
+    pub sampling_interval_sec: u64,
+    /// Fraction of tracked segments to exchange per sampling cycle, in (0.0, 1.0].
+    #[serde(default = "default_ae_sampling_fraction")]
+    pub sampling_fraction: f64,
+}
+
+impl Default for AntiEntropyConfig {
+    fn default() -> Self {
+        Self {
+            continuous_enabled: true,
+            continuous_max_segments: 10000,
+            sampling_enabled: true,
+            sampling_interval_sec: 300,
+            sampling_fraction: 0.05,
+        }
+    }
+}
+
+fn default_continuous_max_segments() -> usize {
+    10000
+}
+
+fn default_ae_sampling_interval_sec() -> u64 {
+    300
+}
+
+fn default_ae_sampling_fraction() -> f64 {
+    0.05
+}
+
 /// Root configuration for an OceanFS node.
 ///
 /// Loaded from `oceanfs.toml` on startup. All fields have sensible
@@ -139,6 +202,12 @@ pub struct NodeConfig {
     /// No-op on non-Linux platforms.
     #[serde(default = "default_background_cpu_sched_idle")]
     pub background_cpu_sched_idle: bool,
+    /// Anti-entropy configuration.
+    ///
+    /// Controls the incremental Merkle tree protocol: continuous
+    /// root-only exchange and periodic sampling mode.
+    #[serde(default)]
+    pub anti_entropy: AntiEntropyConfig,
 
     // ── Item 1: Garbage collection tuning ──
     /// GC compaction liveness-ratio threshold (0.0–1.0, default 0.5).
@@ -431,6 +500,8 @@ impl Default for NodeConfig {
             segment_cache_max_entries: 64,
             background_io_class_idle: cfg!(target_os = "linux"),
             background_cpu_sched_idle: cfg!(target_os = "linux"),
+            // Anti-entropy
+            anti_entropy: AntiEntropyConfig::default(),
             // Item 1: GC
             gc_compact_threshold: 0.5,
             gc_max_concurrent_compactions: 4,

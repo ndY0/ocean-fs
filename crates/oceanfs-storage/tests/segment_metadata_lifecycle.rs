@@ -101,7 +101,7 @@ async fn sealed_segment_produces_metadata_in_rocksdb() {
         io_mode: oceanfs_storage::io::IoReadMode::Buffered,
         write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
     };
-    let sealer = SegmentSealer::new(seal_config, store.clone(), wal);
+    let sealer = SegmentSealer::new(seal_config, store.clone(), wal, None);
 
     // Create an active segment and fill it.
     let mut active =

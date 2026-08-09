@@ -164,7 +164,8 @@ mod helpers {
                 io_mode: oceanfs_storage::io::IoReadMode::Buffered,
                 write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
             };
-            let sealer = Arc::new(SegmentSealer::new(seal_config, metadata_store.clone(), wal));
+            let sealer =
+                Arc::new(SegmentSealer::new(seal_config, metadata_store.clone(), wal, None));
 
             let hinted_handoff = {
                 let hint_wal = Arc::new(

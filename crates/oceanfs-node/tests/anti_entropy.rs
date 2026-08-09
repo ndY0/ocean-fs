@@ -12,12 +12,22 @@ use std::sync::Arc;
 
 use oceanfs_core::{HashOutput, MetadataConfig, NodeId, SegmentId, SegmentMetadata, SizeTier};
 use oceanfs_durability::{
+    merkle::{IncrementalMerkleTree, MerkleTreeConfig, MerkleWal},
     AntiEntropy, AntiEntropyConfig, InMemorySegmentStore, MerkleTree, SegmentDataStore,
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::{Ring, RingCache};
 use oceanfs_storage::RocksDbMetadataStore;
+
+/// Creates a test IncrementalMerkleTree backed by a temp MerkleWal.
+fn make_test_tree() -> Arc<IncrementalMerkleTree> {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_path = dir.path().join("merkle.wal");
+    let wal = Arc::new(MerkleWal::open(&wal_path).unwrap());
+    std::mem::forget(dir);
+    Arc::new(IncrementalMerkleTree::new(wal, MerkleTreeConfig::default()))
+}
 
 /// Helper: create a temporary metadata store.
 fn open_temp_metadata() -> Arc<RocksDbMetadataStore> {
@@ -75,7 +85,14 @@ async fn ae_empty_segments_produces_zero_stats() {
     let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
     let data_store: Arc<dyn SegmentDataStore> = Arc::new(InMemorySegmentStore::new());
 
-    let ae = AntiEntropy::new(AntiEntropyConfig::default(), membership, metadata, pool, data_store);
+    let ae = AntiEntropy::new(
+        AntiEntropyConfig::default(),
+        membership,
+        metadata,
+        pool,
+        data_store,
+        make_test_tree(),
+    );
 
     let stats = ae.run_cycle().await.expect("AE cycle");
     assert_eq!(stats.segments_compared, 0);
@@ -101,7 +118,14 @@ async fn ae_sealed_segment_with_matching_root_no_mismatch() {
     let (membership, _ring_cache) = make_membership("test-node");
     let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
 
-    let ae = AntiEntropy::new(AntiEntropyConfig::default(), membership, metadata, pool, data_store);
+    let ae = AntiEntropy::new(
+        AntiEntropyConfig::default(),
+        membership,
+        metadata,
+        pool,
+        data_store,
+        make_test_tree(),
+    );
 
     let stats = ae.run_cycle().await.expect("AE cycle");
     assert_eq!(stats.segments_compared, 1);
@@ -127,7 +151,14 @@ async fn ae_sealed_segment_with_mismatched_root_detected() {
     let (membership, _ring_cache) = make_membership("test-node");
     let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
 
-    let ae = AntiEntropy::new(AntiEntropyConfig::default(), membership, metadata, pool, data_store);
+    let ae = AntiEntropy::new(
+        AntiEntropyConfig::default(),
+        membership,
+        metadata,
+        pool,
+        data_store,
+        make_test_tree(),
+    );
 
     let stats = ae.run_cycle().await.expect("AE cycle");
     assert_eq!(stats.segments_compared, 1);
@@ -151,7 +182,14 @@ async fn ae_sealed_segment_without_merkle_root_is_flagged() {
     let (membership, _ring_cache) = make_membership("test-node");
     let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
 
-    let ae = AntiEntropy::new(AntiEntropyConfig::default(), membership, metadata, pool, data_store);
+    let ae = AntiEntropy::new(
+        AntiEntropyConfig::default(),
+        membership,
+        metadata,
+        pool,
+        data_store,
+        make_test_tree(),
+    );
 
     let stats = ae.run_cycle().await.expect("AE cycle");
     assert_eq!(stats.segments_compared, 1);
@@ -178,7 +216,14 @@ async fn ae_multiple_segments_all_compared() {
     let (membership, _ring_cache) = make_membership("test-node");
     let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
 
-    let ae = AntiEntropy::new(AntiEntropyConfig::default(), membership, metadata, pool, data_store);
+    let ae = AntiEntropy::new(
+        AntiEntropyConfig::default(),
+        membership,
+        metadata,
+        pool,
+        data_store,
+        make_test_tree(),
+    );
 
     let stats = ae.run_cycle().await.expect("AE cycle");
     assert_eq!(stats.segments_compared, 5);
@@ -219,7 +264,7 @@ async fn test_ae_config_peer_count_respected() {
 
     // Custom peer_count = 3 (vs default 1).
     let config = AntiEntropyConfig::new(300, 3);
-    let ae = AntiEntropy::new(config, membership, metadata, pool, data_store);
+    let ae = AntiEntropy::new(config, membership, metadata, pool, data_store, make_test_tree());
 
     // select_alive_peers should not panic; with only self node, returns empty.
     let peers = ae.select_alive_peers();
