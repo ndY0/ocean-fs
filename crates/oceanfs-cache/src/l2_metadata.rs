@@ -453,4 +453,25 @@ mod tests {
         let stats = cache.stats();
         assert!(stats.evictions.get() > 0, "expected some evictions when max_size_bytes=1");
     }
+
+    /// T3.4: Metadata cache with `enabled = false` bypasses all operations.
+    #[test]
+    fn test_metadata_cache_disabled_bypassed() {
+        let config = MetadataCacheConfig { enabled: false, ..Default::default() };
+        let cache = MetadataCache::new(config);
+        let bucket = BucketId::new("b");
+        let key = ObjectKey::new("k");
+        let meta = ObjectMetadata {
+            object_key: key.clone(),
+            size: 100,
+            blake3_hash: None,
+            chunks: smallvec::SmallVec::new(),
+            inline_data: None,
+            created_at: 0,
+            hlc: oceanfs_core::Hlc::zero(),
+        };
+        cache.put(bucket.clone(), key.clone(), meta);
+        // Disabled cache should always return None.
+        assert!(cache.get(&bucket, &key).is_none());
+    }
 }

@@ -18,7 +18,7 @@
 /// assert!(timeouts.wal_write_ms <= 500);
 /// assert!(timeouts.metadata_read_ms <= 50);
 /// ```
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct OperationTimeouts {
     /// Timeout for WAL write acknowledgments (ms). Default: 500ms.
     pub wal_write_ms: u64,
@@ -36,6 +36,10 @@ pub struct OperationTimeouts {
     pub write_default_ms: u64,
     /// Default generic read timeout. Default: 10_000ms (10s).
     pub read_default_ms: u64,
+    /// Timeout for segment seal + EC encode post-seal operations (ms). Default: 120_000ms.
+    pub segment_seal_ms: u64,
+    /// Timeout for gossip roundtrip (push-pull sync message) (ms). Default: 10_000ms.
+    pub gossip_roundtrip_ms: u64,
 }
 
 impl Default for OperationTimeouts {
@@ -49,6 +53,8 @@ impl Default for OperationTimeouts {
             hint_delivery_ms: 10_000,
             write_default_ms: 5_000,
             read_default_ms: 10_000,
+            segment_seal_ms: 120_000,
+            gossip_roundtrip_ms: 10_000,
         }
     }
 }
@@ -68,6 +74,8 @@ mod tests {
         assert_eq!(t.hint_delivery_ms, 10_000);
         assert_eq!(t.write_default_ms, 5_000);
         assert_eq!(t.read_default_ms, 10_000);
+        assert_eq!(t.segment_seal_ms, 120_000);
+        assert_eq!(t.gossip_roundtrip_ms, 10_000);
     }
 
     #[test]
@@ -81,7 +89,32 @@ mod tests {
             hint_delivery_ms: 2_000,
             write_default_ms: 2_000,
             read_default_ms: 3_000,
+            segment_seal_ms: 60_000,
+            gossip_roundtrip_ms: 5_000,
         };
         assert_eq!(t.wal_write_ms, 100);
+    }
+
+    #[test]
+    fn operation_timeouts_serde_roundtrip() {
+        let t = OperationTimeouts {
+            wal_write_ms: 100,
+            metadata_read_ms: 10,
+            shard_fetch_ms: 5_000,
+            ec_encode_ms: 10_000,
+            gossip_ping_ms: 1_000,
+            hint_delivery_ms: 2_000,
+            write_default_ms: 2_000,
+            read_default_ms: 3_000,
+            segment_seal_ms: 60_000,
+            gossip_roundtrip_ms: 5_000,
+        };
+        let toml_str = toml::to_string(&t).unwrap();
+        let roundtripped: OperationTimeouts = toml::from_str(&toml_str).unwrap();
+        assert_eq!(roundtripped.wal_write_ms, 100);
+        assert_eq!(roundtripped.metadata_read_ms, 10);
+        assert_eq!(roundtripped.shard_fetch_ms, 5_000);
+        assert_eq!(roundtripped.segment_seal_ms, 60_000);
+        assert_eq!(roundtripped.gossip_roundtrip_ms, 5_000);
     }
 }

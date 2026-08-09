@@ -638,6 +638,7 @@ mod tests {
             shard_count: 8,
             max_inflight_encodes: 32,
             encode_queue_capacity: 256,
+            ..Default::default()
         };
         assert_eq!(cfg.active_pool_size, 16);
         assert_eq!(cfg.shard_count, 8);
@@ -684,5 +685,44 @@ mod tests {
         assert_eq!(cfg.device_id, 1);
         assert_eq!(cfg.batch_size, 128);
         assert_eq!(cfg.max_concurrent_ops, 4);
+    }
+
+    // ── Item 2: HealConfig (T2.2) ──
+
+    #[test]
+    fn heal_config_default_values() {
+        let config = HealConfig::default();
+        assert_eq!(config.max_concurrent_heals(), 4);
+        assert_eq!(config.heal_retry_limit(), 3);
+        assert_eq!(config.heal_throttle_bytes_sec(), 0);
+        assert_eq!(config.queue_capacity(), 256);
+    }
+
+    /// T2.2: HealConfig builder with_throttle_bytes_sec is respected.
+    #[test]
+    fn test_heal_config_throttled() {
+        let config = HealConfig::default().with_heal_throttle_bytes_sec(1024);
+        assert_eq!(config.heal_throttle_bytes_sec(), 1024);
+
+        let config = config.with_max_concurrent_heals(16);
+        assert_eq!(config.max_concurrent_heals(), 16);
+        // Other fields unchanged.
+        assert_eq!(config.heal_retry_limit(), 3);
+    }
+
+    /// NodeConfig→HealConfig flow: builder pattern preserves explicit values.
+    #[test]
+    fn test_heal_config_from_node_config_flow() {
+        // Simulate the node.rs construction pattern:
+        //   let heal_config = HealConfig::default()
+        //       .with_max_concurrent_heals(config.heal_parallel_segments)
+        //       .with_heal_throttle_bytes_sec(config.heal_throttle_bytes_sec);
+        let heal_parallel_segments = 16;
+        let heal_throttle_bytes_sec = 1048576;
+        let config = HealConfig::default()
+            .with_max_concurrent_heals(heal_parallel_segments)
+            .with_heal_throttle_bytes_sec(heal_throttle_bytes_sec);
+        assert_eq!(config.max_concurrent_heals(), 16);
+        assert_eq!(config.heal_throttle_bytes_sec(), 1048576);
     }
 }

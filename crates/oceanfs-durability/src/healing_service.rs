@@ -23,7 +23,7 @@ pub struct HealingGrpcService {
     /// Handoff buffer for storing hints.
     handoff: Arc<crate::HintedHandoff>,
     /// Metadata store for Merkle root lookups during anti-entropy.
-    metadata_store: Arc<oceanfs_storage::RocksDbMetadataStore>,
+    metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore>,
     /// Segment data store for shard fetch and repair.
     data_store: Arc<dyn SegmentDataStore>,
 }
@@ -32,7 +32,7 @@ impl HealingGrpcService {
     /// Creates a new healing gRPC service.
     pub fn new(
         handoff: Arc<crate::HintedHandoff>,
-        metadata_store: Arc<oceanfs_storage::RocksDbMetadataStore>,
+        metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore>,
         data_store: Arc<dyn SegmentDataStore>,
     ) -> Self {
         Self { handoff, metadata_store, data_store }

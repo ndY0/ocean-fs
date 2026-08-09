@@ -16,13 +16,13 @@
 mod cache;
 mod codec;
 mod config;
+mod fetch_strategy;
 mod hash;
 mod heal;
 mod id;
 mod metadata;
 mod node;
 
-// --- Identifier types ---
 // --- Cache types ---
 pub use cache::CacheInvalidateRequest;
 // --- Codec types ---
@@ -32,6 +32,8 @@ pub use config::{
     CompressConfig, CompressionTier, GossipConfig, GpuConfig, HealConfig, NvcompCodec,
     NvcompConfig, PoolConfig, RpcConfig, SegmentSizeConfig, SizeTier,
 };
+// --- Fetch strategy ---
+pub use fetch_strategy::{FetchStrategy, FetchStrategyConfig};
 // --- Hash types ---
 pub use hash::HashKey;
 // --- Heal pipeline types ---

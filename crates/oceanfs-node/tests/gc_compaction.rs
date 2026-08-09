@@ -217,3 +217,37 @@ async fn gc_multiple_cycles_dont_panic() {
         assert_eq!(stats.segments_compacted, 0);
     }
 }
+
+/// T1.1: GC config constructed from NodeConfig fields flows correctly to
+/// `GarbageCollector::run_cycle()`. Verifies `compact_threshold`,
+/// `max_concurrent_compactions`, and `compaction_queue_capacity` are wired.
+#[tokio::test]
+async fn test_gc_config_flow_from_node_config() {
+    let metadata = open_temp_metadata();
+
+    // Simulate the NodeConfig→GcConfig wiring from node.rs.
+    let gc_interval_sec = 1800;
+    let tombstone_ttl_sec = 86400;
+    let gc_compact_threshold = 0.3;
+    let gc_max_concurrent_compactions = 8;
+    let gc_compaction_queue_capacity = 128;
+
+    let config = GcConfig::new(
+        gc_interval_sec,
+        tombstone_ttl_sec,
+        gc_compact_threshold,
+        gc_max_concurrent_compactions,
+        gc_compaction_queue_capacity,
+    );
+
+    // Verify the config fields are preserved through the constructor.
+    assert_eq!(config.interval_sec(), 1800);
+    assert_eq!(config.tombstone_ttl_sec(), 86400);
+    assert!((config.compact_threshold() - 0.3).abs() < f64::EPSILON);
+
+    // Config accepts trait object (Item 6 verification).
+    let gc = GarbageCollector::new(config);
+    let stats = gc.run_cycle(metadata).await.expect("GC cycle");
+    assert_eq!(stats.segments_scanned, 0, "empty store produces zero scanned");
+    assert_eq!(stats.segments_compacted, 0);
+}

@@ -11,7 +11,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use arc_swap::ArcSwap;
-use oceanfs_core::{CodecType, CompressConfig};
+use oceanfs_core::{CodecType, CompressConfig, FetchStrategy};
 use parking_lot::RwLock;
 
 // ---------------------------------------------------------------------------
@@ -62,6 +62,10 @@ pub struct BucketPolicy {
     /// Per ADR-0007, the effective tier is capped by the node-level ceiling.
     #[serde(default)]
     pub compression: CompressConfig,
+    /// Per-bucket fetch strategy override.
+    /// When `None`, the node-level `default_fetch_strategy` is used.
+    #[serde(default)]
+    pub fetch_strategy: Option<FetchStrategy>,
 }
 
 // ---------------------------------------------------------------------------
@@ -469,6 +473,15 @@ impl BucketPolicy {
         self.ec.validate()?;
         Ok(())
     }
+
+    /// Resolves the effective fetch strategy for this bucket.
+    ///
+    /// If the bucket has an explicit `fetch_strategy` override, it is used.
+    /// Otherwise, the node-level default is inherited.
+    #[must_use]
+    pub fn effective_fetch_strategy(&self, node_default: FetchStrategy) -> FetchStrategy {
+        self.fetch_strategy.unwrap_or(node_default)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -659,5 +672,47 @@ mod tests {
 
         // Old snapshot is still valid (unchanged)
         assert_eq!(snap1.consistency.write_quorum, 2);
+    }
+
+    // ── Item 10: FetchStrategy bucket tests ──
+
+    #[test]
+    fn bucket_inherits_default_fetch_strategy() {
+        let policy = BucketPolicy::default();
+        // When no override, effective_fetch_strategy inherits the node default.
+        assert_eq!(policy.fetch_strategy, None);
+        assert_eq!(
+            policy.effective_fetch_strategy(FetchStrategy::LocalFirst),
+            FetchStrategy::LocalFirst
+        );
+        assert_eq!(
+            policy.effective_fetch_strategy(FetchStrategy::FastestK),
+            FetchStrategy::FastestK
+        );
+    }
+
+    #[test]
+    fn bucket_overrides_fetch_strategy() {
+        let mut policy = BucketPolicy::default();
+        policy.fetch_strategy = Some(FetchStrategy::FastestK);
+        // Per-bucket override takes precedence over node default.
+        assert_eq!(
+            policy.effective_fetch_strategy(FetchStrategy::LocalFirst),
+            FetchStrategy::FastestK
+        );
+        // Even when node default differs, override wins.
+        assert_eq!(
+            policy.effective_fetch_strategy(FetchStrategy::BandwidthOptimized),
+            FetchStrategy::FastestK
+        );
+    }
+
+    #[test]
+    fn bucket_fetch_strategy_serde_roundtrip() {
+        let mut policy = BucketPolicy::default();
+        policy.fetch_strategy = Some(FetchStrategy::CpuOptimized);
+        let toml_str = toml::to_string(&policy).unwrap();
+        let roundtripped: BucketPolicy = toml::from_str(&toml_str).unwrap();
+        assert_eq!(roundtripped.fetch_strategy, Some(FetchStrategy::CpuOptimized));
     }
 }

@@ -13,7 +13,6 @@ use oceanfs_core::{
 use oceanfs_ec::{CauchyEncoder, Decoder, Encoder};
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
-use oceanfs_storage::metadata::RocksDbMetadataStore;
 use rand::seq::SliceRandom;
 
 use super::{
@@ -35,7 +34,7 @@ use crate::{Error, Result};
 /// Requires:
 /// - [`Membership`] for discovering alive peer nodes
 /// - [`ConnectionPool`] for gRPC transport to peers
-/// - [`RocksDbMetadataStore`] for segment metadata (Merkle roots)
+/// - [`oceanfs_storage_api::MetadataStore`] for segment metadata (Merkle roots)
 /// - [`SegmentDataStore`] for reading/writing segment data during repair
 ///
 /// # Examples
@@ -62,7 +61,7 @@ use crate::{Error, Result};
 pub struct AntiEntropy {
     config: AntiEntropyConfig,
     membership: Arc<Membership>,
-    metadata: Arc<RocksDbMetadataStore>,
+    metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
     /// Connection pool for peer-to-peer gRPC Merkle exchange.
     pool: Arc<ConnectionPool>,
     segment_store: Arc<dyn SegmentDataStore>,
@@ -83,7 +82,7 @@ impl AntiEntropy {
     pub fn new(
         config: AntiEntropyConfig,
         membership: Arc<Membership>,
-        metadata: Arc<RocksDbMetadataStore>,
+        metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
         pool: Arc<ConnectionPool>,
         segment_store: Arc<dyn SegmentDataStore>,
     ) -> Self {
@@ -883,7 +882,7 @@ mod tests {
 
     fn make_anti_entropy(
         membership: Arc<Membership>,
-        metadata: Arc<RocksDbMetadataStore>,
+        metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
     ) -> AntiEntropy {
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let segment_store = Arc::new(InMemorySegmentStore::new());

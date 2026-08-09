@@ -13,6 +13,7 @@ oceanfs-ec.workspace = true
 oceanfs-hash.workspace = true
 oceanfs-membership.workspace = true
 oceanfs-network.workspace = true
+oceanfs-routing.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 parking_lot.workspace = true
@@ -37,5 +38,4 @@ tonic-build.workspace = true
 workspace = true
 
 [dev-dependencies]
-oceanfs-routing.workspace = true
 tempfile = "3"

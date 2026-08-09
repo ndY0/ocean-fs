@@ -10,6 +10,7 @@ mod compression;
 mod metadata;
 mod node;
 mod ring;
+pub mod shard;
 mod wal;
 
 pub use accel::AccelConfig;

@@ -7,7 +7,7 @@ use std::{
 };
 
 use oceanfs_core::{Counter, LabelSet, MetricRegistrar, SegmentId};
-use oceanfs_storage::{metadata::RocksDbMetadataStore, segment::TierRouter};
+use oceanfs_storage::segment::TierRouter;
 use tokio::sync::Semaphore;
 
 use super::{
@@ -92,14 +92,17 @@ impl GarbageCollector {
     ///
     /// Returns an error if metadata operations fail or if the compaction
     /// semaphore cannot be acquired.
-    pub async fn run_cycle(&self, metadata: Arc<RocksDbMetadataStore>) -> Result<GcStats> {
+    pub async fn run_cycle(
+        &self,
+        metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
+    ) -> Result<GcStats> {
         let mut stats = GcStats::default();
         let mut tracker = LivenessTracker::new();
 
         // Phase 1: Scan deletions and compute liveness.
         // Also returns the set of dead object keys (eligible tombstones past TTL)
         // so compaction can skip them when re-packing.
-        let dead_keys = self.process_tombstones(&metadata, &mut tracker, &mut stats)?;
+        let dead_keys = self.process_tombstones(&*metadata, &mut tracker, &mut stats)?;
 
         // Phase 2: Identify compaction candidates
         let candidates = tracker.compaction_candidates(self.config.compact_threshold);
@@ -197,7 +200,7 @@ impl GarbageCollector {
     /// Runs cycles at the configured interval until cancelled.
     pub async fn start_background(
         self: Arc<Self>,
-        metadata: Arc<RocksDbMetadataStore>,
+        metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
@@ -227,7 +230,7 @@ impl GarbageCollector {
     /// reclamation of recently deleted objects (data-loss prevention).
     pub(crate) fn process_tombstones(
         &self,
-        metadata: &RocksDbMetadataStore,
+        metadata: &dyn oceanfs_storage_api::MetadataStore,
         tracker: &mut LivenessTracker,
         stats: &mut GcStats,
     ) -> Result<HashSet<String>> {
@@ -328,7 +331,7 @@ pub struct InMemorySegmentShardStore {
 /// Production segment shard store that deletes segment data files
 /// from the filesystem.
 ///
-/// Used by the [`OrphanReaper`] to physically remove orphaned
+/// Used by the orphan reaper to physically remove orphaned
 /// segment `.dat` files from `{segment_dir}/`.
 pub struct DiskSegmentShardStore {
     segment_dir: std::path::PathBuf,

@@ -91,6 +91,8 @@ pub struct HintedHandoff {
     hints_stored_total: Counter,
     hints_delivered_total: Counter,
     hints_expired_total: Counter,
+    /// Per-operation timeout configuration.
+    timeouts: Arc<OperationTimeouts>,
 }
 
 impl HintedHandoff {
@@ -119,6 +121,7 @@ impl HintedHandoff {
                 "Hints expired before delivery".into(),
                 LabelSet::empty(),
             ),
+            timeouts: Arc::new(OperationTimeouts::default()),
         }
     }
 
@@ -144,6 +147,7 @@ impl HintedHandoff {
                 "help".into(),
                 LabelSet::empty(),
             ),
+            timeouts: Arc::new(OperationTimeouts::default()),
         }
     }
 
@@ -170,6 +174,7 @@ impl HintedHandoff {
                 "help".into(),
                 LabelSet::empty(),
             ),
+            timeouts: Arc::new(OperationTimeouts::default()),
         }
     }
 
@@ -321,6 +326,13 @@ impl HintedHandoff {
         self
     }
 
+    /// Sets the per-operation timeout configuration.
+    #[must_use]
+    pub fn with_timeouts(mut self, timeouts: Arc<OperationTimeouts>) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
     /// Returns the configured hint TTL in seconds.
     pub fn hint_ttl_secs(&self) -> u64 {
         self.hint_ttl_secs
@@ -385,7 +397,7 @@ impl HintedHandoff {
     /// 3. Builds a `HealingRpcClient` and sends the hint via gRPC.
     /// 4. Returns `Ok(())` on successful delivery.
     async fn deliver_single(&self, node: &NodeId, hint: &HintRecord) -> Result<()> {
-        let timeout_ms = OperationTimeouts::default().hint_delivery_ms;
+        let timeout_ms = self.timeouts.hint_delivery_ms;
 
         let membership = self
             .membership

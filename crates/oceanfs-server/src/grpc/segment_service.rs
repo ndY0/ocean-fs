@@ -28,7 +28,7 @@ use oceanfs_core::{
     BucketId, ChunkRef, Hlc, ObjectKey, ObjectMetadata, SegmentId,
 };
 use oceanfs_durability::SegmentDataStore;
-use oceanfs_storage::SegmentRpc;
+use oceanfs_storage::{BufferPool, SegmentRpc};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -43,7 +43,9 @@ pub struct SegmentGrpcService {
     data_store: Arc<dyn SegmentDataStore>,
     /// Optional metadata store for persisting object metadata
     /// replicated alongside segment data.
-    metadata_store: Option<Arc<oceanfs_storage::RocksDbMetadataStore>>,
+    metadata_store: Option<Arc<dyn oceanfs_storage_api::MetadataStore>>,
+    /// Buffer pool for segment data buffers (perf rule §1.2).
+    buffer_pool: Arc<BufferPool>,
 }
 
 impl SegmentGrpcService {
@@ -53,11 +55,13 @@ impl SegmentGrpcService {
     ///
     /// * `data_store` - The segment data store backing append and fetch operations.
     /// * `metadata_store` - Optional metadata store for cross-node metadata replication.
+    /// * `buffer_pool` - Buffer pool for pre-allocated segment data buffers.
     pub fn new(
         data_store: Arc<dyn SegmentDataStore>,
-        metadata_store: Option<Arc<oceanfs_storage::RocksDbMetadataStore>>,
+        metadata_store: Option<Arc<dyn oceanfs_storage_api::MetadataStore>>,
+        buffer_pool: Arc<BufferPool>,
     ) -> Self {
-        Self { data_store, metadata_store }
+        Self { data_store, metadata_store, buffer_pool }
     }
 
     /// Returns a reference to the underlying data store (for testing).
@@ -65,6 +69,48 @@ impl SegmentGrpcService {
     pub fn data_store(&self) -> &Arc<dyn SegmentDataStore> {
         &self.data_store
     }
+}
+
+/// Stream bytes in 64 KB chunks with BLAKE3 checksums, ending with EOF sentinel.
+///
+/// Shared by single-shard and batched fetch_shard paths (Item 9).
+fn stream_shard_bytes(shard_bytes: Bytes) -> ReceiverStream<Result<ShardResponse, Status>> {
+    let (tx, rx) = mpsc::channel(16);
+    let chunk_size = 65536; // 64 KB chunks
+
+    tokio::spawn(async move {
+        let mut chunk_idx = 0u32;
+        let mut offset = 0usize;
+        while offset < shard_bytes.len() {
+            let end = (offset + chunk_size).min(shard_bytes.len());
+            let chunk = shard_bytes.slice(offset..end);
+            let checksum = blake3::hash(&chunk[..]);
+
+            if tx
+                .send(Ok(ShardResponse {
+                    data: chunk,
+                    checksum: Bytes::copy_from_slice(checksum.as_bytes()),
+                    chunk_index: chunk_idx,
+                }))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            offset = end;
+            chunk_idx += 1;
+        }
+
+        let _ = tx
+            .send(Ok(ShardResponse {
+                data: Bytes::new(),
+                checksum: Bytes::from_static(&[0u8; 32]),
+                chunk_index: u32::MAX,
+            }))
+            .await;
+    });
+
+    ReceiverStream::new(rx)
 }
 
 #[tonic::async_trait]
@@ -83,16 +129,16 @@ impl SegmentRpc for SegmentGrpcService {
     ) -> Result<Response<SegmentAppendResponse>, Status> {
         let mut stream = request.into_inner();
         let mut total_bytes: u64 = 0;
-        let mut segment_data = BytesMut::with_capacity(65536); // 64 KB initial capacity
+        let mut segment_data = self.buffer_pool.acquire();
         let mut segment_id = SegmentId::default();
         // Collect metadata from the first chunk that carries it.
         let mut bucket_id: Option<String> = None;
         let mut object_key: Option<String> = None;
         let mut object_size: u64 = 0;
         let mut blake3_hash = Bytes::new();
-        let mut chunk_segment_ids: Vec<Bytes> = vec![];
-        let mut chunk_offsets: Vec<u64> = vec![];
-        let mut chunk_lengths: Vec<u32> = vec![];
+        let mut chunk_segment_ids: Vec<Bytes> = Vec::with_capacity(64);
+        let mut chunk_offsets: Vec<u64> = Vec::with_capacity(64);
+        let mut chunk_lengths: Vec<u32> = Vec::with_capacity(64);
 
         // Collect all chunks from the stream.
         while let Some(chunk) = stream
@@ -166,9 +212,10 @@ impl SegmentRpc for SegmentGrpcService {
                     .as_millis() as i64,
                 hlc: Hlc::zero(),
             };
-            if let Err(e) =
-                md_store.put_object_in_bucket(&oceanfs_core::BucketId::new(&bucket), meta)
-            {
+            if let Err(e) = {
+                let bucket_id = oceanfs_core::BucketId::new(&bucket);
+                oceanfs_storage_api::MetadataStore::put_object(md_store.as_ref(), &bucket_id, meta)
+            } {
                 tracing::warn!(
                     bucket = %bucket,
                     key = %key,
@@ -237,15 +284,7 @@ impl SegmentRpc for SegmentGrpcService {
             .and_then(|sid| SegmentId::try_from(sid).ok())
             .ok_or_else(|| Status::invalid_argument("missing or invalid segment_id"))?;
 
-        tracing::debug!(
-            segment_id = %segment_id,
-            shard_index = req.shard_index,
-            offset = req.offset,
-            length = req.length,
-            "fetch_shard requested"
-        );
-
-        // Read the full segment data from the store.
+        // Read the full segment data from the store once.
         let segment_data = self
             .data_store
             .read_segment_data(&segment_id)
@@ -255,73 +294,59 @@ impl SegmentRpc for SegmentGrpcService {
             return Err(Status::not_found(format!("segment {} has no data", segment_id)));
         }
 
+        let segment_bytes = segment_data;
+
         // Determine total shards from known configuration (k+m).
-        // For a production system, ec_k and ec_m would be read from
-        // segment metadata. Here we use a sensible default.
         let total_shards = 6; // default k=4, m=2
+
+        // Batched mode (Item 9): iterate over repeated shard ranges.
+        if !req.shards.is_empty() {
+            let shard_size =
+                if segment_bytes.is_empty() { 0 } else { segment_bytes.len() / total_shards };
+            let mut all_data = BytesMut::new();
+            for range in &req.shards {
+                let si = range.shard_index as usize;
+                let start = range.offset as usize;
+                let len = if range.length == 0 {
+                    shard_size.saturating_sub(start)
+                } else {
+                    range.length as usize
+                };
+                let shard_start = (si * shard_size) + start;
+                let shard_end = (shard_start + len).min(segment_bytes.len());
+                if shard_start < segment_bytes.len() {
+                    all_data.extend_from_slice(&segment_bytes[shard_start..shard_end]);
+                }
+            }
+            tracing::debug!(
+                segment_id = %segment_id,
+                shard_count = req.shards.len(),
+                total_bytes = all_data.len(),
+                "fetch_shard batched response"
+            );
+            return Ok(Response::new(stream_shard_bytes(all_data.freeze())));
+        }
+
+        // Single-shard mode (existing behavior).
         let shard_size =
-            if segment_data.is_empty() { 0 } else { segment_data.len() / total_shards };
-
-        let shard_index = req.shard_index as usize;
+            if segment_bytes.is_empty() { 0 } else { segment_bytes.len() / total_shards };
+        let si = req.shard_index as usize;
         let start = req.offset as usize;
-        let length =
+        let len =
             if req.length == 0 { shard_size.saturating_sub(start) } else { req.length as usize };
+        let shard_start = (si * shard_size) + start;
+        let shard_end = (shard_start + len).min(segment_bytes.len());
 
-        let shard_start = (shard_index * shard_size) + start;
-        let shard_end = (shard_start + length).min(segment_data.len());
-
-        if shard_start >= segment_data.len() {
+        if shard_start >= segment_bytes.len() {
             return Err(Status::out_of_range(format!(
                 "shard index {} out of range for segment of {} bytes",
-                shard_index,
-                segment_data.len()
+                si,
+                segment_bytes.len()
             )));
         }
 
-        // Convert to Bytes once for zero-copy slicing — avoids double-copy
-        // (first copy: segment → Vec, then chunk.to_vec() per 64 KB).
-        let segment_bytes = segment_data;
         let shard_bytes = segment_bytes.slice(shard_start..shard_end);
-
-        let (tx, rx) = mpsc::channel(16);
-        let chunk_size = 65536; // 64 KB chunks per perf §4.4
-
-        tokio::spawn(async move {
-            let mut chunk_idx = 0u32;
-            let mut offset = 0usize;
-            while offset < shard_bytes.len() {
-                let end = (offset + chunk_size).min(shard_bytes.len());
-                let chunk = shard_bytes.slice(offset..end);
-                // Compute BLAKE3 checksum for this chunk.
-                let checksum = blake3::hash(&chunk[..]);
-
-                if tx
-                    .send(Ok(ShardResponse {
-                        data: chunk,
-                        checksum: Bytes::copy_from_slice(checksum.as_bytes()),
-                        chunk_index: chunk_idx,
-                    }))
-                    .await
-                    .is_err()
-                {
-                    // Receiver dropped — client disconnected.
-                    break;
-                }
-                offset = end;
-                chunk_idx += 1;
-            }
-
-            // Send EOF sentinel: empty data chunk.
-            let _ = tx
-                .send(Ok(ShardResponse {
-                    data: Bytes::new(),
-                    checksum: Bytes::from_static(&[0u8; 32]),
-                    chunk_index: u32::MAX,
-                }))
-                .await;
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(stream_shard_bytes(shard_bytes)))
     }
 
     /// Handles a metadata fetch request for read repair (4.2).
@@ -342,9 +367,12 @@ impl SegmentRpc for SegmentGrpcService {
             .as_ref()
             .ok_or_else(|| Status::unimplemented("no metadata store configured"))?;
 
-        match md_store
-            .get_object(&bucket, &key)
-            .map_err(|e| Status::internal(format!("metadata lookup: {e}")))?
+        match oceanfs_storage_api::MetadataStore::get_object_metadata(
+            md_store.as_ref(),
+            &bucket,
+            &key,
+        )
+        .map_err(|e| Status::internal(format!("metadata lookup: {e}")))?
         {
             Some(meta) => {
                 let mut chunk_segment_ids: Vec<oceanfs_core::proto::common::SegmentId> =
@@ -448,8 +476,7 @@ impl SegmentRpc for SegmentGrpcService {
             hlc,
         };
 
-        md_store
-            .put_object_in_bucket(&bucket, meta)
+        oceanfs_storage_api::MetadataStore::put_object(md_store.as_ref(), &bucket, meta)
             .map_err(|e| Status::internal(format!("metadata write during read repair: {e}")))?;
 
         Ok(Response::new(PutObjectMetadataResponse { written: true }))
@@ -507,7 +534,7 @@ mod tests {
         store: Arc<dyn SegmentDataStore>,
     ) -> SegmentRpcClient<tonic::transport::Channel> {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let service = SegmentGrpcService::new(store, None);
+        let service = SegmentGrpcService::new(store, None, Arc::new(BufferPool::new(65536, 1024)));
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -587,6 +614,7 @@ mod tests {
             shard_index: 0,
             offset: 0,
             length: 0,
+            shards: vec![],
         });
 
         let result = client.fetch_shard(request).await;
@@ -615,6 +643,7 @@ mod tests {
             shard_index: 0,
             offset: 0,
             length: 0,
+            shards: vec![],
         });
 
         let mut response_stream = client.fetch_shard(request).await.unwrap().into_inner();
@@ -658,6 +687,7 @@ mod tests {
             shard_index: 0,
             offset: 100,
             length: 50,
+            shards: vec![],
         });
 
         let mut response_stream = client.fetch_shard(request).await.unwrap().into_inner();

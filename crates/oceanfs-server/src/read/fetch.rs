@@ -24,7 +24,7 @@ use oceanfs_core::{
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
-use oceanfs_routing::RingCache;
+use oceanfs_routing::{shard_batch, RingCache};
 use oceanfs_storage::SegmentRpcClient;
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
@@ -461,9 +461,35 @@ async fn fetch_single_chunk(
     }
 
     // gRPC fallback: try to fetch from remote replicas via FetchShard.
+    // Item 9: group shard requests by target node for batched per-node RPCs.
     if let (Some(pool), Some(membership)) = (pool, membership) {
-        for replica in &replica_set {
-            let addr = match membership.address_of(replica) {
+        use oceanfs_core::proto::segment::ShardRange;
+
+        // Build one ShardRequest per replica. All entries are value-identical
+        // (same chunk) but occupy distinct positions in the vec for ptr::eq
+        // identity comparison when grouping by target node.
+        let shard_requests: Vec<shard_batch::ShardRequest> = replica_set
+            .iter()
+            .map(|_| shard_batch::ShardRequest {
+                segment_id: chunk.segment_id,
+                shard_index: 0,
+                offset: chunk.offset,
+                length: chunk.length as u64,
+            })
+            .collect();
+        // Side-car mapping from shard-request index to the owning NodeId.
+        let replica_index: Vec<_> = replica_set.iter().cloned().collect();
+
+        let node_groups = shard_batch::group_by_node(&shard_requests, |req| {
+            // Use ptr::eq for identity comparison — all ShardRequest values are
+            // identical for a single chunk, so PartialEq-based position() would
+            // always return index 0 (Review Gap Item 9).
+            let idx = shard_requests.iter().position(|r| std::ptr::eq(r, req))?;
+            replica_index.get(idx).cloned()
+        });
+
+        for (replica, node_shards) in node_groups {
+            let addr = match membership.address_of(&replica) {
                 Some(a) => a,
                 None => continue,
             };
@@ -482,11 +508,22 @@ async fn fetch_single_chunk(
             let proto_sid = chunk.segment_id.into();
             let mut client = SegmentRpcClient::new(channel);
 
+            // Build batched shard ranges from the node's group.
+            let shard_ranges: Vec<ShardRange> = node_shards
+                .iter()
+                .map(|s| ShardRange {
+                    shard_index: s.shard_index,
+                    offset: s.offset,
+                    length: s.length,
+                })
+                .collect();
+
             let request = tonic::Request::new(GprcFetchShardRequest {
                 segment_id: Some(proto_sid),
                 shard_index: 0,
-                offset: chunk.offset,
-                length: chunk.length as u64,
+                offset: 0,
+                length: 0,
+                shards: shard_ranges,
             });
 
             let fetch_result = tokio::time::timeout(
@@ -620,6 +657,7 @@ async fn fetch_parity_shard_via_grpc(
             shard_index,
             offset: 0,
             length: shard_size,
+            shards: vec![],
         });
 
         let fetch_result = tokio::time::timeout(

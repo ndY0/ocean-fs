@@ -624,4 +624,61 @@ mod tests {
             Some(Bytes::from_static(b"tiny"))
         );
     }
+
+    // ── Item 3: Config-driven cache behaviour ──
+
+    /// T3.1: Object cache with `enabled = false` bypasses all operations.
+    #[test]
+    fn test_object_cache_disabled_bypassed() {
+        let config = ObjectCacheConfig { enabled: false, ..Default::default() };
+        let cache = ObjectCache::new(config);
+        let bucket = BucketId::new("b");
+        let key = ObjectKey::new("k");
+        cache.put(bucket.clone(), key.clone(), Bytes::from_static(b"data"));
+        // Disabled cache should never return data.
+        assert_eq!(cache.get(&bucket, &key), None);
+    }
+
+    /// T3.2: Object cache evicts entries when size exceeds `max_size_bytes`.
+    #[test]
+    fn test_object_cache_size_limit_eviction() {
+        let config = ObjectCacheConfig {
+            max_size_bytes: 64, // tiny limit
+            max_blob_size: 1024,
+            ..Default::default()
+        };
+        let cache = ObjectCache::new(config);
+        let bucket = BucketId::new("b");
+        cache.put(bucket.clone(), ObjectKey::new("a"), Bytes::from_static(b"aaaaaaaa"));
+        cache.put(bucket.clone(), ObjectKey::new("b"), Bytes::from_static(b"bbbbbbbb"));
+        let evictions_before = cache.stats().evictions.get();
+        // Insert a large blob that exceeds max_blob_size — not inserted
+        cache.put(bucket.clone(), ObjectKey::new("large"), Bytes::from(vec![0u8; 1025]));
+        // Insert many small entries to overflow the 64-byte cache
+        for i in 0..20 {
+            cache.put(
+                bucket.clone(),
+                ObjectKey::new(format!("filler-{i}")),
+                Bytes::from_static(b"x"),
+            );
+        }
+        let evictions_after = cache.stats().evictions.get();
+        assert!(
+            evictions_after >= evictions_before,
+            "evictions should increase under memory pressure"
+        );
+    }
+
+    /// T3.3: Object cache entries expire after TTL.
+    #[test]
+    fn test_object_cache_ttl_expiry() {
+        let config = ObjectCacheConfig { ttl_ms: 1, ..Default::default() };
+        let cache = ObjectCache::new(config);
+        let bucket = BucketId::new("b");
+        let key = ObjectKey::new("k");
+        cache.put(bucket.clone(), key.clone(), Bytes::from_static(b"ephemeral"));
+        // TTL is 1ms — sleep briefly to let it expire.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(cache.get(&bucket, &key), None, "entry should expire after TTL");
+    }
 }

@@ -249,13 +249,13 @@ impl SegmentReader for DiskSegmentReader {
             }
             IoReadMode::Direct => {
                 let len = length as usize;
-                let mut buf = vec![0u8; len];
+                let mut buf = crate::io::DirectIoBuf::new(len)
+                    .map_err(|e| format!("DirectIoBuf allocation failed for {segment_id}: {e}"))?;
                 self.disk_io
-                    .read(&path, &mut buf, file_offset)
+                    .read(&path, buf.as_bytes_mut(), file_offset)
                     .await
-                    .map_err(|e| format!("O_DIRECT read failed for {segment_id}: {e}"))?;
-                buf.truncate(len);
-                let data = Bytes::from(buf);
+                    .map_err(|e| format!("Direct read failed for {segment_id}: {e}"))?;
+                let data = Bytes::copy_from_slice(&buf.as_bytes()[..len]);
                 let source = SegmentReadSource::DirectIo {
                     segment_id: *segment_id,
                     file_path: path.clone(),

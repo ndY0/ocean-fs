@@ -7,7 +7,7 @@ use std::{
 };
 
 use oceanfs_core::{Counter, LabelSet, MetricRegistrar, SegmentId};
-use oceanfs_storage::{metadata::RocksDbMetadataStore, Result};
+use oceanfs_storage::Result;
 
 use super::{config::GcConfig, garbage_collector::SegmentShardStore};
 
@@ -46,7 +46,7 @@ pub struct OrphanStats {
 /// use oceanfs_storage::{OrphanReaper, GcConfig};
 /// ```
 pub struct OrphanReaper {
-    metadata: Arc<RocksDbMetadataStore>,
+    metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
     store: Arc<dyn SegmentShardStore>,
     config: GcConfig,
     orphans_deleted_total: Counter,
@@ -62,7 +62,7 @@ impl OrphanReaper {
     /// use oceanfs_storage::{OrphanReaper, GcConfig};
     /// ```
     pub fn new(
-        metadata: Arc<RocksDbMetadataStore>,
+        metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
         store: Arc<dyn SegmentShardStore>,
         config: GcConfig,
     ) -> Self {

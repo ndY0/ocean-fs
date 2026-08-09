@@ -297,7 +297,7 @@ pub(crate) struct AdminState {
     pub scrub_coordinator: Option<Arc<oceanfs_durability::ScrubCoordinator>>,
     /// Metadata store for scrub verification (storage feature only).
     #[cfg(feature = "storage")]
-    pub metadata_store: Option<Arc<oceanfs_storage::RocksDbMetadataStore>>,
+    pub metadata_store: Option<Arc<dyn oceanfs_storage_api::MetadataStore>>,
     /// Segment data store for scrub (storage feature only).
     #[cfg(feature = "storage")]
     pub data_store: Option<Arc<dyn oceanfs_durability::SegmentDataStore>>,
@@ -394,7 +394,7 @@ impl AdminHandler {
     pub fn with_scrub(
         mut self,
         coordinator: Arc<oceanfs_durability::ScrubCoordinator>,
-        metadata: Arc<oceanfs_storage::RocksDbMetadataStore>,
+        metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
         data_store: Arc<dyn oceanfs_durability::SegmentDataStore>,
     ) -> Self {
         self.state.scrub_coordinator = Some(coordinator);

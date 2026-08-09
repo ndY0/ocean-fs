@@ -67,4 +67,16 @@ mod tests {
         assert_eq!(config.interval_sec(), 300);
         assert_eq!(config.peer_count(), 1);
     }
+
+    /// T2.3: Custom peer count via `new()` is respected.
+    #[test]
+    fn test_ae_config_peer_count_respected() {
+        let config = AntiEntropyConfig::new(300, 3);
+        assert_eq!(config.interval_sec(), 300);
+        assert_eq!(config.peer_count(), 3);
+
+        let config = AntiEntropyConfig::new(600, 5);
+        assert_eq!(config.interval_sec(), 600);
+        assert_eq!(config.peer_count(), 5);
+    }
 }

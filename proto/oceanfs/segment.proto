@@ -42,11 +42,23 @@ message SegmentAppendResponse {
 }
 
 // A request to fetch a shard from a sealed segment.
+// Single-shard mode: set segment_id, shard_index, offset, length.
+// Batched mode: set segment_id and fill the shards repeated field.
+// The server streams back all requested shard ranges in sequence.
 message FetchShardRequest {
   oceanfs.common.SegmentId segment_id = 1;
   uint32 shard_index = 2;
   uint64 offset = 3;
   uint64 length = 4;
+  // Batched shard ranges for single-RPC-per-node fetching (Item 9).
+  repeated ShardRange shards = 5;
+}
+
+// A range within a single shard to fetch.
+message ShardRange {
+  uint32 shard_index = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
 }
 
 // A chunk of shard data streamed back to the requester.

@@ -15,12 +15,12 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use oceanfs_core::{
-    proto::common::SegmentId as ProtoSegmentId, HealConfig, HealRequest, HealStats, SegmentId,
+    proto::common::SegmentId as ProtoSegmentId, HealConfig, HealRequest, HealStats,
+    OperationTimeouts, SegmentId,
 };
 use oceanfs_ec::Decoder;
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
-use oceanfs_storage::metadata::RocksDbMetadataStore;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -74,7 +74,7 @@ pub struct HealWorker {
     /// EC decoder for reconstructing corrupt shards.
     decoder: Arc<dyn Decoder>,
     /// Metadata store for segment lookups and updates.
-    metadata: Arc<RocksDbMetadataStore>,
+    metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
     /// Data store for reading/writing segment shard data.
     data_store: Arc<dyn SegmentDataStore>,
     /// Optional membership for distributed shard fetch (H3).
@@ -88,6 +88,8 @@ pub struct HealWorker {
     stats: Arc<HealStats>,
     /// Semaphore bounding concurrent heal operations.
     semaphore: Arc<Semaphore>,
+    /// Per-operation timeout configuration.
+    timeouts: Arc<OperationTimeouts>,
 }
 
 impl HealWorker {
@@ -103,7 +105,7 @@ impl HealWorker {
         config: HealConfig,
         queue: Arc<HealQueue>,
         decoder: Arc<dyn Decoder>,
-        metadata: Arc<RocksDbMetadataStore>,
+        metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
         data_store: Arc<dyn SegmentDataStore>,
     ) -> Self {
         let max_concurrent = config.max_concurrent_heals();
@@ -119,12 +121,20 @@ impl HealWorker {
             data_store,
             membership: None,
             pool: None,
+            timeouts: Arc::new(OperationTimeouts::default()),
         }
+    }
+
+    /// Sets the per-operation timeout configuration.
+    #[must_use]
+    pub fn with_timeouts(mut self, timeouts: Arc<OperationTimeouts>) -> Self {
+        self.timeouts = timeouts;
+        self
     }
 
     /// Enables distributed shard fetch via gRPC (H3).
     ///
-    /// When both are set, [`execute_heal`] will attempt to fetch
+    /// When both are set, the heal execution path will attempt to fetch
     /// missing shard data from remote replicas using
     /// [`HealingRpcClient::fetch_shard`] instead of relying solely on
     /// the local [`SegmentDataStore`].
@@ -202,6 +212,7 @@ impl HealWorker {
         let queue_sender = self.queue.sender();
         let membership = self.membership.clone();
         let pool = self.pool.clone();
+        let timeouts = self.timeouts.clone();
         let _shutdown = shutdown.clone();
 
         tokio::spawn(async move {
@@ -217,6 +228,7 @@ impl HealWorker {
                 Arc::as_ref(&data_store),
                 membership.as_deref(),
                 pool.as_deref(),
+                &timeouts,
             )
             .await
             {
@@ -280,10 +292,11 @@ impl HealWorker {
     async fn execute_heal(
         request: &HealRequest,
         decoder: &dyn Decoder,
-        metadata: &RocksDbMetadataStore,
+        metadata: &dyn oceanfs_storage_api::MetadataStore,
         data_store: &dyn SegmentDataStore,
         membership: Option<&Membership>,
         pool: Option<&ConnectionPool>,
+        timeouts: &OperationTimeouts,
     ) -> Result<u64> {
         let segment_id = &request.segment_id;
 
@@ -309,7 +322,9 @@ impl HealWorker {
         // membership + pool, try to fetch the segment from a remote replica.
         let full_data = if full_data.is_empty() {
             if let (Some(membership), Some(pool)) = (membership, pool) {
-                match Self::fetch_segment_from_replicas(segment_id, pool, membership).await {
+                match Self::fetch_segment_from_replicas(segment_id, pool, membership, timeouts)
+                    .await
+                {
                     Ok(data) => {
                         tracing::info!(
                             segment_id = %segment_id,
@@ -412,6 +427,7 @@ impl HealWorker {
         segment_id: &SegmentId,
         pool: &ConnectionPool,
         membership: &Membership,
+        timeouts: &OperationTimeouts,
     ) -> Result<Bytes> {
         use crate::healing_rpc::FetchShardRequest as GprcFetchShardRequest;
 
@@ -422,7 +438,28 @@ impl HealWorker {
             .map(|(id, _state)| id)
             .collect();
 
-        for replica in replicas {
+        // Group replicas by target node using group_by_node (Item 9).
+        // Note: the healing proto doesn't yet support repeated shard ranges,
+        // so we still iterate per-replica within each node group. The grouping
+        // ensures we don't open duplicate connections to the same node.
+        let shard_requests: Vec<oceanfs_routing::shard_batch::ShardRequest> = replicas
+            .iter()
+            .map(|_node| oceanfs_routing::shard_batch::ShardRequest {
+                segment_id: *segment_id,
+                shard_index: 0,
+                offset: 0,
+                length: 0,
+            })
+            .collect();
+        let node_groups = oceanfs_routing::shard_batch::group_by_node(&shard_requests, |req| {
+            // Use std::ptr::eq for identity comparison — all ShardRequest
+            // values are identical for a single segment, so PartialEq-based
+            // position() would always return index 0 (Review Gap Item 9).
+            let idx = shard_requests.iter().position(|r| std::ptr::eq(r, req))?;
+            replicas.get(idx).cloned()
+        });
+
+        for (replica, _node_shards) in node_groups {
             let addr = match membership.address_of(&replica) {
                 Some(a) => a,
                 None => continue,
@@ -442,7 +479,7 @@ impl HealWorker {
             });
 
             match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_millis(timeouts.shard_fetch_ms),
                 client.fetch_shard(request),
             )
             .await
@@ -491,6 +528,7 @@ impl HealWorker {
 mod tests {
     use oceanfs_core::{SegmentId, SegmentMetadata};
     use oceanfs_ec::Encoder;
+    use oceanfs_storage::metadata::RocksDbMetadataStore;
 
     use super::*;
     use crate::anti_entropy::InMemorySegmentStore;
@@ -677,8 +715,16 @@ mod tests {
         let decoder = StubDecoder;
         let request = HealRequest { segment_id, corrupt_shard_indices: vec![2], retry_count: 0 };
 
-        let result =
-            HealWorker::execute_heal(&request, &decoder, &metadata, &*data_store, None, None).await;
+        let result = HealWorker::execute_heal(
+            &request,
+            &decoder,
+            &*metadata,
+            &*data_store,
+            None,
+            None,
+            &OperationTimeouts::default(),
+        )
+        .await;
         assert!(result.is_ok(), "execute_heal should succeed: {:?}", result.err());
         let bytes_repaired = result.unwrap();
         assert!(bytes_repaired > 0, "should have repaired some bytes");
@@ -711,8 +757,16 @@ mod tests {
         let decoder = StubDecoder;
         let request = HealRequest { segment_id, corrupt_shard_indices: vec![0], retry_count: 0 };
 
-        let result =
-            HealWorker::execute_heal(&request, &decoder, &metadata, &*data_store, None, None).await;
+        let result = HealWorker::execute_heal(
+            &request,
+            &decoder,
+            &*metadata,
+            &*data_store,
+            None,
+            None,
+            &OperationTimeouts::default(),
+        )
+        .await;
         assert!(result.is_err(), "should fail for ec_k=0 segment");
     }
 
@@ -727,8 +781,16 @@ mod tests {
             retry_count: 0,
         };
 
-        let result =
-            HealWorker::execute_heal(&request, &decoder, &metadata, &*data_store, None, None).await;
+        let result = HealWorker::execute_heal(
+            &request,
+            &decoder,
+            &*metadata,
+            &*data_store,
+            None,
+            None,
+            &OperationTimeouts::default(),
+        )
+        .await;
         assert!(result.is_err(), "should fail for non-existent segment");
     }
 
@@ -754,8 +816,16 @@ mod tests {
         let decoder = StubDecoder;
         let request = HealRequest { segment_id, corrupt_shard_indices: vec![0, 3], retry_count: 0 };
 
-        let result =
-            HealWorker::execute_heal(&request, &decoder, &metadata, &*data_store, None, None).await;
+        let result = HealWorker::execute_heal(
+            &request,
+            &decoder,
+            &*metadata,
+            &*data_store,
+            None,
+            None,
+            &OperationTimeouts::default(),
+        )
+        .await;
         assert!(result.is_ok(), "multi-shard repair should succeed: {:?}", result.err());
     }
 
@@ -931,8 +1001,16 @@ mod tests {
         let request = HealRequest { segment_id, corrupt_shard_indices: vec![0], retry_count: 0 };
 
         // execute_heal should fail because the decoder always fails.
-        let result =
-            HealWorker::execute_heal(&request, &decoder, &metadata, &*data_store, None, None).await;
+        let result = HealWorker::execute_heal(
+            &request,
+            &decoder,
+            &*metadata,
+            &*data_store,
+            None,
+            None,
+            &OperationTimeouts::default(),
+        )
+        .await;
         assert!(result.is_err(), "decode failure should produce an error");
     }
 

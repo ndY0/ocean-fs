@@ -126,5 +126,19 @@ mod tests {
         assert!((config.compact_threshold() - 0.3).abs() < f64::EPSILON);
     }
 
+    /// T1.1/T2: GC config from NodeConfig flow — verifies `GcConfig::new()`
+    /// constructor preserves all fields including max_concurrent_compactions
+    /// and compaction_queue_capacity.
+    #[test]
+    fn test_gc_config_new_preserves_all_fields() {
+        let config = GcConfig::new(1800, 432000, 0.75, 8, 128);
+        assert_eq!(config.interval_sec(), 1800);
+        assert_eq!(config.tombstone_ttl_sec(), 432000);
+        assert!((config.compact_threshold() - 0.75).abs() < f64::EPSILON);
+        // Verify non-public fields via struct literal access (same-module).
+        assert_eq!(config.max_concurrent_compactions, 8);
+        assert_eq!(config.compaction_queue_capacity, 128);
+    }
+
     // -----------------------------------------------------------------------
 }

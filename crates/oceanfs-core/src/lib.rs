@@ -57,7 +57,8 @@ pub mod proto {
 pub mod proto_convert;
 
 pub use config::{
-    AccelConfig, AuthConfig, CompressionConfig, MetadataConfig, NodeConfig, RingConfig, WalConfig,
+    shard, AccelConfig, AuthConfig, CompressionConfig, MetadataConfig, NodeConfig, RingConfig,
+    WalConfig,
 };
 pub use conflict::{ConflictResolver, LwwResolver, Resolution};
 pub use error::{Error, Result};
@@ -70,9 +71,10 @@ pub use proto_convert::ConversionError;
 pub use timeouts::OperationTimeouts;
 pub use types::{
     BucketId, CacheInvalidateRequest, ChunkRef, CodecConfig, CodecType, CompressConfig,
-    CompressionTier, EncodingPlan, GossipConfig, GpuConfig, HashKey, HashOutput, HealConfig,
-    HealRequest, HealStats, Incarnation, IntendedFor, NodeId, NodeState, NvcompCodec, NvcompConfig,
-    ObjectKey, ObjectMetadata, OperationType, PeerAddress, PoolConfig, RpcConfig, SegmentId,
-    SegmentIndexEntry, SegmentMetadata, SegmentSizeConfig, ShardIndex, SizeTier, StorageLocation,
-    Tombstone, VnodeRange, WriteAck, WriteQuorum, WriteResult,
+    CompressionTier, EncodingPlan, FetchStrategy, FetchStrategyConfig, GossipConfig, GpuConfig,
+    HashKey, HashOutput, HealConfig, HealRequest, HealStats, Incarnation, IntendedFor, NodeId,
+    NodeState, NvcompCodec, NvcompConfig, ObjectKey, ObjectMetadata, OperationType, PeerAddress,
+    PoolConfig, RpcConfig, SegmentId, SegmentIndexEntry, SegmentMetadata, SegmentSizeConfig,
+    ShardIndex, SizeTier, StorageLocation, Tombstone, VnodeRange, WriteAck, WriteQuorum,
+    WriteResult,
 };

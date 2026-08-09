@@ -23,6 +23,7 @@
 
 mod metadata_adapter;
 mod node;
+pub mod startup;
 
 pub use metadata_adapter::MetadataStoreAdapter;
 pub use node::{BackgroundTasks, Node};

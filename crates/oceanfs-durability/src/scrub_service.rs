@@ -21,7 +21,7 @@ use crate::{
 pub struct ScrubGrpcService {
     /// Metadata store for segment enumeration during scrub.
     #[allow(dead_code)]
-    metadata_store: Arc<oceanfs_storage::RocksDbMetadataStore>,
+    metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore>,
     /// Segment data store for reading shard data during verification.
     #[allow(dead_code)]
     data_store: Arc<dyn SegmentDataStore>,
@@ -30,7 +30,7 @@ pub struct ScrubGrpcService {
 impl ScrubGrpcService {
     /// Creates a new scrub gRPC service.
     pub fn new(
-        metadata_store: Arc<oceanfs_storage::RocksDbMetadataStore>,
+        metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore>,
         data_store: Arc<dyn SegmentDataStore>,
     ) -> Self {
         Self { metadata_store, data_store }

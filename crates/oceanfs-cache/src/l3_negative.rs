@@ -396,4 +396,19 @@ mod tests {
         // With 1MB filter and 1000 keys, FP rate should be very low.
         assert!(fp_rate < 0.10, "false-positive rate {:.4} exceeds 10% threshold", fp_rate);
     }
+
+    /// T3.5: Negative cache with `enabled = false` always returns true
+    /// (bypasses the filter — callers treat this as "not in cache",
+    ///  which means they check the real store).
+    #[test]
+    fn test_negative_cache_disabled_bypassed() {
+        let config = NegativeCacheConfig { enabled: false, ..Default::default() };
+        let cache = NegativeCache::new(config);
+        let bucket = BucketId::new("b");
+        let key = ObjectKey::new("k");
+        cache.insert(&bucket, &key);
+        // When disabled, contains() returns true so callers fall through
+        // to the real metadata store.
+        assert!(cache.contains(&bucket, &key));
+    }
 }

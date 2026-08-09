@@ -17,6 +17,8 @@
 use std::path::PathBuf;
 use std::{io, path::Path};
 
+use crate::io::direct::TokioOpenOptionsDirectExt;
+
 /// The disk I/O backend.
 pub enum DiskIo {
     /// Portable fallback using `tokio::fs`. Always available.
@@ -79,6 +81,21 @@ impl DiskIo {
                 file.read(buf).await
             }
         }
+    }
+
+    /// Reads data from a file opened with O_DIRECT (bypasses OS page cache).
+    ///
+    /// Uses aligned I/O via `DirectIoBuf`. On Linux, opens the file with
+    /// `O_DIRECT`. Falls back to buffered I/O on non-Linux platforms.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the file cannot be opened or the read fails.
+    pub async fn read_direct(&self, path: &Path, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        let mut file = tokio::fs::OpenOptions::new().read(true).with_direct().open(path).await?;
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        file.read(buf).await
     }
 
     /// Writes `buf` to a file, creating parent directories if needed.

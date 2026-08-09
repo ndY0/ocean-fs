@@ -26,8 +26,8 @@ use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::RingCache;
 use oceanfs_storage::{
-    RocksDbMetadataStore, SegmentPool, SegmentRpcClient, SegmentSealer, SegmentShard,
-    SegmentSplitter, TierRouter, WalEntry,
+    SegmentPool, SegmentRpcClient, SegmentSealer, SegmentShard, SegmentSplitter, TierRouter,
+    WalEntry,
 };
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -78,7 +78,7 @@ pub struct WriteCoordinator {
     /// HLC clock for write timestamping.
     hlc_clock: Arc<HlcClock>,
     /// Metadata store for inline writes and segment metadata.
-    metadata_store: Arc<RocksDbMetadataStore>,
+    metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore>,
     /// Tier router for classifying blob sizes.
     tier_router: TierRouter,
     /// Per-core sharded segment groups (Small tier).
@@ -102,6 +102,8 @@ pub struct WriteCoordinator {
     /// Accumulated blob index entries per segment, keyed by segment ID.
     /// Entries are drained when the segment is sealed.
     segment_entries: DashMap<SegmentId, Vec<SegmentIndexEntry>>,
+    /// Per-operation timeout configuration.
+    timeouts: Arc<OperationTimeouts>,
 }
 
 impl WriteCoordinator {
@@ -116,7 +118,7 @@ impl WriteCoordinator {
         pool: Arc<ConnectionPool>,
         node_id: NodeId,
         hlc_clock: Arc<HlcClock>,
-        metadata_store: Arc<RocksDbMetadataStore>,
+        metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore>,
         size_config: SegmentSizeConfig,
         shard_small: Arc<SegmentShard>,
         shard_standard: Arc<SegmentShard>,
@@ -142,7 +144,17 @@ impl WriteCoordinator {
             size_config,
             hinted_handoff,
             segment_entries: DashMap::new(),
+            timeouts: Arc::new(OperationTimeouts::default()),
         }
+    }
+
+    /// Sets the per-operation timeout configuration for this coordinator.
+    ///
+    /// Call this at startup to inject config-driven timeouts.
+    #[must_use]
+    pub fn with_timeouts(mut self, timeouts: Arc<OperationTimeouts>) -> Self {
+        self.timeouts = timeouts;
+        self
     }
 
     /// Executes a distributed write through the segment pipeline.
@@ -224,7 +236,7 @@ impl WriteCoordinator {
                     hlc,
                 };
                 self.metadata_store
-                    .put_object(meta)
+                    .put_object(&req.bucket, meta)
                     .map_err(|e| Error::Storage(format!("inline metadata write: {e}")))?;
                 smallvec::SmallVec::new()
             }
@@ -303,7 +315,7 @@ impl WriteCoordinator {
             replica_set.iter().filter(|n| *n != &self.node_id).take(MAX_REPLICA_FANOUT).collect();
 
         if !remote_targets.is_empty() {
-            let write_timeout_ms = OperationTimeouts::default().wal_write_ms;
+            let write_timeout_ms = self.timeouts.wal_write_ms;
             let results = replicate_write(
                 &self.membership,
                 &self.pool,
@@ -687,7 +699,7 @@ mod tests {
         WalConfig,
     };
     use oceanfs_routing::{hash_key, Ring};
-    use oceanfs_storage::{BufferPool, SealConfig, WalWriter};
+    use oceanfs_storage::{BufferPool, RocksDbMetadataStore, SealConfig, WalWriter};
 
     use super::*;
 

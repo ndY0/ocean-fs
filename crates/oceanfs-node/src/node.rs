@@ -9,8 +9,9 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use oceanfs_core::{
-    AccelConfig, BucketId, HlcClock, MetadataConfig, NodeConfig, NodeId, ObjectKey, ObjectMetadata,
-    PoolConfig, RingConfig, RpcConfig, SegmentSizeConfig, SizeTier, WalConfig,
+    shard, AccelConfig, BucketId, HlcClock, MetadataConfig, NodeConfig, NodeId, ObjectKey,
+    ObjectMetadata, PoolConfig, RingConfig, RpcConfig, SegmentId, SegmentMetadata,
+    SegmentSizeConfig, SizeTier, Tombstone, WalConfig,
 };
 use oceanfs_durability::HintedHandoff;
 use oceanfs_network::{apply_opts_to_fd, create_reuseport_listener};
@@ -53,6 +54,70 @@ impl oceanfs_storage_api::MetadataStore for PrefetchStoreAdapter {
         key: &ObjectKey,
     ) -> std::io::Result<Option<ObjectMetadata>> {
         self.store.get_object(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn list_objects(
+        &self,
+        bucket: &BucketId,
+        prefix: &str,
+    ) -> Vec<std::io::Result<ObjectMetadata>> {
+        self.store
+            .list_objects(bucket, prefix)
+            .into_iter()
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+            .collect()
+    }
+
+    fn get_segment(&self, id: SegmentId) -> std::io::Result<Option<SegmentMetadata>> {
+        self.store.get_segment(id).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn list_segments(&self) -> Vec<std::io::Result<SegmentMetadata>> {
+        self.store
+            .list_segments()
+            .into_iter()
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+            .collect()
+    }
+
+    fn list_tombstones(&self, bucket: &BucketId) -> Vec<std::io::Result<(ObjectKey, Tombstone)>> {
+        self.store
+            .list_tombstones(bucket)
+            .into_iter()
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+            .collect()
+    }
+
+    fn put_segment(&self, meta: SegmentMetadata) -> std::io::Result<()> {
+        self.store.put_segment(meta).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn delete_segment(&self, id: SegmentId) -> std::io::Result<()> {
+        self.store.delete_segment(id).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn put_object(&self, bucket: &BucketId, meta: ObjectMetadata) -> std::io::Result<()> {
+        self.store
+            .put_object_in_bucket(bucket, meta)
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn batch_write(&self, ops: Vec<oceanfs_storage_api::BatchOp>) -> std::io::Result<()> {
+        // Fall back to sequential writes for the adapter.
+        for op in ops {
+            match op {
+                oceanfs_storage_api::BatchOp::PutSegment(meta) => self.put_segment(meta)?,
+                oceanfs_storage_api::BatchOp::DeleteSegment(id) => self.delete_segment(id)?,
+                oceanfs_storage_api::BatchOp::PutObject(_, _) => {}
+                oceanfs_storage_api::BatchOp::DeleteObject(_, _) => {}
+                oceanfs_storage_api::BatchOp::PutTombstone(_, _, _) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<()> {
+        self.store.delete_object(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
     }
 }
 
@@ -210,14 +275,15 @@ impl NodeLeaveHandler {
             .address_of(node)
             .ok_or_else(|| format!("no address for node {node}"))?;
 
-        let pooled = self
-            .pool
-            .get_channel(addr)
-            .await
-            .map_err(|e| format!("connection pool error for {node}: {e}"))?;
+        let channel = {
+            let pooled = self
+                .pool
+                .get_channel(addr)
+                .await
+                .map_err(|e| format!("connection pool error for {node}: {e}"))?;
 
-        let channel = pooled.channel().clone();
-        drop(pooled);
+            pooled.channel().clone()
+        };
 
         use oceanfs_core::Hlc;
         use oceanfs_durability::{healing_rpc::HintRequest, HealingRpcClient};
@@ -439,27 +505,28 @@ impl Node {
             .map_err(|e| format!("failed to open WAL writer: {e}"))?;
         let wal_writer = Arc::new(wal_writer);
 
-        // Tiered buffer pools — each tier gets buffers pre-sized to its
-        // segment target. Sizing: shard_count (4) × active_pool_size (4)
-        // = 16 active segments, plus max_inflight_encodes (8) for frozen
-        // buffers in the seal pipeline → 24 buffers per tier.
-        let small_buffer_pool = Arc::new(oceanfs_storage::BufferPool::new(65_536, 24));
-        let standard_buffer_pool = Arc::new(oceanfs_storage::BufferPool::new(4_194_304, 24));
-
         // Per-core segment shards for write concurrency (perf rule §2.5).
-        let shard_count = 4;
+        let shard_count =
+            shard::derive_shard_count(config.segment_shard_count, config.segment_shard_count_max);
+        // Scale buffer pool max chunks by shard count (Item 8, D8.5).
+        let total_pool_chunks = config.buffer_pool_max_chunks * shard_count;
+        // Validate memory budget (Item 8, D8.3).
+        let _ = crate::startup::validate_shard_memory_budget(
+            shard_count,
+            config.buffer_pool_chunk_bytes,
+            oceanfs_core::SegmentSizeConfig::default().default_target_size,
+        );
+        let shard_buffer_pool = Arc::new(oceanfs_storage::BufferPool::new(
+            config.buffer_pool_chunk_bytes,
+            total_pool_chunks,
+        ));
         let shard_small = Arc::new(
-            SegmentShard::new(shard_count, SizeTier::Small, &segment_size, &small_buffer_pool)
+            SegmentShard::new(shard_count, SizeTier::Small, &segment_size, &shard_buffer_pool)
                 .map_err(|e| format!("failed to create small segment shard: {e}"))?,
         );
         let shard_standard = Arc::new(
-            SegmentShard::new(
-                shard_count,
-                SizeTier::Standard,
-                &segment_size,
-                &standard_buffer_pool,
-            )
-            .map_err(|e| format!("failed to create standard segment shard: {e}"))?,
+            SegmentShard::new(shard_count, SizeTier::Standard, &segment_size, &shard_buffer_pool)
+                .map_err(|e| format!("failed to create standard segment shard: {e}"))?,
         );
 
         // Segment pools for pipeline parallelism (perf rule §2.7).
@@ -471,7 +538,7 @@ impl Node {
                 pool_config.clone(),
                 SizeTier::Small,
                 &segment_size,
-                small_buffer_pool.clone(),
+                shard_buffer_pool.clone(),
                 None,
             )
             .map_err(|e| format!("failed to create small segment pool: {e}"))?,
@@ -481,7 +548,7 @@ impl Node {
                 pool_config,
                 SizeTier::Standard,
                 &segment_size,
-                standard_buffer_pool.clone(),
+                shard_buffer_pool.clone(),
                 None,
             )
             .map_err(|e| format!("failed to create standard segment pool: {e}"))?,
@@ -537,13 +604,16 @@ impl Node {
         let gc_config = oceanfs_durability::GcConfig::new(
             config.gc_interval_sec,
             config.tombstone_ttl_sec,
-            0.5,
-            4,
-            64,
+            config.gc_compact_threshold,
+            config.gc_max_concurrent_compactions,
+            config.gc_compaction_queue_capacity,
         );
         let gc_worker = Arc::new(oceanfs_durability::GarbageCollector::new(gc_config.clone()));
         let ae_worker = Arc::new(oceanfs_durability::AntiEntropy::new(
-            oceanfs_durability::AntiEntropyConfig::default(),
+            oceanfs_durability::AntiEntropyConfig::new(
+                config.ae_interval_sec,
+                config.ae_peer_count,
+            ),
             membership.clone(),
             metadata_store.clone(),
             pool.clone(),
@@ -552,7 +622,9 @@ impl Node {
             // by the SegmentSealer and read by DiskSegmentReader.
             Arc::new(oceanfs_durability::DiskSegmentStore::new(segment_dir.clone())),
         ));
-        let scrub_config = oceanfs_durability::ScrubConfig::default();
+        let mut scrub_config = oceanfs_durability::ScrubConfig::default();
+        scrub_config.set_interval_sec(config.scrub_interval_sec);
+        scrub_config.set_parallel_nodes(config.scrub_parallel_nodes);
         let scrub_worker = Arc::new(oceanfs_durability::ScrubCoordinator::new(scrub_config));
         // OrphanReaper deletes segment data files from disk when reclaiming
         // orphaned segments after GC compaction.
@@ -571,7 +643,9 @@ impl Node {
             Arc::new(oceanfs_durability::DiskSegmentStore::new(segment_dir.clone()));
 
         // ---- 7c. Construct heal dispatch pipeline ----
-        let heal_config = oceanfs_durability::HealConfig::default();
+        let heal_config = oceanfs_durability::HealConfig::default()
+            .with_max_concurrent_heals(config.heal_parallel_segments)
+            .with_heal_throttle_bytes_sec(config.heal_throttle_bytes_sec);
         let heal_queue = Arc::new(oceanfs_durability::HealQueue::new(heal_config.queue_capacity()));
         // Initialize the global heal sender so scrub and anti-entropy can
         // call enqueue_heal() without direct queue access.
@@ -581,27 +655,48 @@ impl Node {
             Arc::new(oceanfs_ec::CauchyEncoder::new(heal_codec_config.clone()));
         // Clone before move into HealWorker — used by ReadCoordinator as well.
         let ec_decoder = heal_decoder.clone();
+
+        // ---- 7d. Construct per-operation timeouts (Item 4) ----
+        // Must be constructed before heal, hinted_handoff, write_coordinator,
+        // and read_coordinator so they can accept it via their with_timeouts() setters.
+        let op_timeouts = Arc::new(config.operation_timeouts);
+
         let heal_worker = oceanfs_durability::HealWorker::new(
             heal_config,
             heal_queue.clone(),
             heal_decoder,
             metadata_store.clone(),
             heal_data_store.clone(),
-        );
+        )
+        .with_timeouts(op_timeouts.clone());
 
         // ---- 8. Construct caches ----
         let object_cache =
-            Arc::new(oceanfs_cache::ObjectCache::new(oceanfs_cache::ObjectCacheConfig::default()));
-        let metadata_cache = Arc::new(oceanfs_cache::MetadataCache::new(
-            oceanfs_cache::MetadataCacheConfig::default(),
-        ));
-        let negative_cache = Arc::new(oceanfs_cache::NegativeCache::new(
-            oceanfs_cache::NegativeCacheConfig::default(),
-        ));
+            Arc::new(oceanfs_cache::ObjectCache::new(oceanfs_cache::ObjectCacheConfig {
+                enabled: config.object_cache_enabled,
+                max_size_bytes: config.object_cache_size_bytes,
+                ttl_ms: config.object_cache_ttl_ms,
+                max_blob_size: config.object_cache_max_blob_size,
+            }));
+        let metadata_cache =
+            Arc::new(oceanfs_cache::MetadataCache::new(oceanfs_cache::MetadataCacheConfig {
+                enabled: config.metadata_cache_enabled,
+                max_size_bytes: config.metadata_cache_size_bytes,
+                ttl_ms: config.metadata_cache_ttl_ms,
+            }));
+        let negative_cache =
+            Arc::new(oceanfs_cache::NegativeCache::new(oceanfs_cache::NegativeCacheConfig {
+                enabled: config.negative_cache_enabled,
+                size_bytes: config.negative_cache_size_bytes,
+                rebuild_interval_sec: config.negative_cache_rebuild_sec,
+                ..Default::default()
+            }));
 
         // ---- 9. Construct prefetch engine ----
         let prefetch_config = oceanfs_cache::PrefetchConfig {
             enabled: config.prefetch_enabled,
+            after_list: config.prefetch_after_list,
+            after_get: config.prefetch_after_get,
             ..Default::default()
         };
         let prefetch_store: Arc<dyn oceanfs_storage_api::MetadataStore> =
@@ -647,24 +742,29 @@ impl Node {
         );
 
         let hinted_handoff = Arc::new(
-            HintedHandoff::new_with_pool(pool.clone()).with_membership(membership.clone()),
+            HintedHandoff::new_with_pool(pool.clone())
+                .with_membership(membership.clone())
+                .with_timeouts(op_timeouts.clone()),
         );
 
-        let write_coordinator = Arc::new(WriteCoordinator::new(
-            ring_cache.clone(),
-            membership.clone(),
-            pool.clone(),
-            NodeId::new(&config.node_id),
-            hlc_clock,
-            metadata_store.clone(),
-            segment_size.clone(),
-            shard_small,
-            shard_standard,
-            segment_pool_small,
-            segment_pool_standard,
-            sealer.clone(),
-            hinted_handoff.clone(),
-        ));
+        let write_coordinator = Arc::new(
+            WriteCoordinator::new(
+                ring_cache.clone(),
+                membership.clone(),
+                pool.clone(),
+                NodeId::new(&config.node_id),
+                hlc_clock,
+                metadata_store.clone(),
+                segment_size.clone(),
+                shard_small,
+                shard_standard,
+                segment_pool_small,
+                segment_pool_standard,
+                sealer.clone(),
+                hinted_handoff.clone(),
+            )
+            .with_timeouts(op_timeouts.clone()),
+        );
 
         // Start background seal worker — drains filled segments from both
         // pools and writes them to disk via the segment sealer (Epic 3).
@@ -681,7 +781,9 @@ impl Node {
             .with_connection_pool(pool.clone())
             .with_membership(membership.clone())
             .with_decoder(ec_decoder.clone())
-            .with_ec_codec(heal_codec_config.data_shards, heal_codec_config.parity_shards),
+            .with_ec_codec(heal_codec_config.data_shards, heal_codec_config.parity_shards)
+            .with_timeouts(op_timeouts.clone())
+            .with_default_fetch_strategy(config.default_fetch_strategy),
         );
 
         // Router handles request forwarding to correct coordinator nodes.
@@ -714,8 +816,7 @@ impl Node {
         negative_cache.register_metrics(&*metrics);
         accel.register_metrics(&*metrics);
         heal_worker.register_metrics(&*metrics);
-        small_buffer_pool.register_metrics(&*metrics);
-        standard_buffer_pool.register_metrics(&*metrics);
+        shard_buffer_pool.register_metrics(&*metrics);
         s3_handler.register_metrics(&*metrics);
 
         // Phase D: durability subsystem counters.
@@ -833,6 +934,7 @@ impl Node {
         let segment_service = oceanfs_server::grpc::segment_service::SegmentGrpcService::new(
             heal_data_store.clone(),
             Some(metadata_store.clone()),
+            shard_buffer_pool.clone(),
         );
         let gossip_service =
             oceanfs_membership::grpc::gossip_service::GossipGrpcService::new(membership.clone());

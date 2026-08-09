@@ -8,7 +8,7 @@
 //! ## Dependencies
 //!
 //! Requires `Membership` for peer discovery, `ConnectionPool` for gRPC
-//! transport to peers, and [`oceanfs_storage::RocksDbMetadataStore`] for segment metadata.
+//! transport to peers, and `MetadataStore` for segment metadata.
 
 mod config;
 mod engine;

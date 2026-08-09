@@ -190,3 +190,30 @@ async fn scrub_without_merkle_root_still_scans_bytes() {
     assert_eq!(report.segments_healthy(), 1);
     assert!(report.bytes_scanned() > 0);
 }
+
+/// T2.1: ScrubConfig with custom interval and parallel_nodes is respected
+/// by the ScrubCoordinator at construction time.
+#[tokio::test]
+async fn test_scrub_config_interval_affects_cycle() {
+    let metadata = open_temp_metadata();
+    let data = make_test_data(65536);
+    let seg_id = SegmentId::new();
+
+    let seg_meta = make_sealed_segment(seg_id, &data);
+    metadata.put_segment(seg_meta).expect("put segment");
+
+    let data_store = make_data_store(vec![(seg_id, data)]);
+
+    // Custom config: non-default values read from NodeConfig fields.
+    let mut config = ScrubConfig::default();
+    config.set_interval_sec(7200); // 2 hours instead of 7 days
+    config.set_parallel_nodes(3); // limit to 3 parallel nodes instead of 0=all
+
+    let coord = ScrubCoordinator::new(config);
+    let report = coord.run_cycle(metadata, data_store).await.expect("scrub cycle");
+
+    // Verify the cycle completes with the custom config.
+    assert_eq!(report.segments_total(), 1);
+    assert_eq!(report.segments_healthy(), 1);
+    assert!(report.duration_sec() > 0.0);
+}

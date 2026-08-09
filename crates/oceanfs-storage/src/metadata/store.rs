@@ -19,9 +19,6 @@
 //!
 //! `max_open_files = -1` lets RocksDB keep all SST file descriptors open,
 //! avoiding repeated open/close overhead.
-
-#![allow(clippy::missing_errors_doc)]
-
 use std::{sync::Arc, time::Duration};
 
 use oceanfs_core::{
@@ -892,6 +889,97 @@ fn read_vmlck_kb() -> u64 {
 #[cfg(not(target_os = "linux"))]
 fn read_vmlck_kb() -> u64 {
     0
+}
+
+// ---------------------------------------------------------------------------
+// MetadataStore trait implementation (Item 6: RocksDB coupling fix)
+// ---------------------------------------------------------------------------
+
+impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
+    fn list_object_keys(&self, bucket: &BucketId) -> std::io::Result<Vec<(BucketId, ObjectKey)>> {
+        self.list_objects(bucket, "")
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .map(|meta| Ok((bucket.clone(), meta.object_key)))
+            .collect::<std::io::Result<Vec<_>>>()
+    }
+
+    fn get_object_metadata(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+    ) -> std::io::Result<Option<ObjectMetadata>> {
+        self.get_object(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn list_objects(
+        &self,
+        bucket: &BucketId,
+        prefix: &str,
+    ) -> Vec<std::io::Result<ObjectMetadata>> {
+        self.list_objects(bucket, prefix)
+            .into_iter()
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+            .collect()
+    }
+
+    fn get_segment(&self, id: SegmentId) -> std::io::Result<Option<SegmentMetadata>> {
+        self.get_segment(id).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn list_segments(&self) -> Vec<std::io::Result<SegmentMetadata>> {
+        self.list_segments()
+            .into_iter()
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+            .collect()
+    }
+
+    fn list_tombstones(&self, bucket: &BucketId) -> Vec<std::io::Result<(ObjectKey, Tombstone)>> {
+        self.list_tombstones(bucket)
+            .into_iter()
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+            .collect()
+    }
+
+    fn put_segment(&self, meta: SegmentMetadata) -> std::io::Result<()> {
+        self.put_segment(meta).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn delete_segment(&self, id: SegmentId) -> std::io::Result<()> {
+        self.delete_segment(id).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn put_object(&self, bucket: &BucketId, meta: ObjectMetadata) -> std::io::Result<()> {
+        self.put_object_in_bucket(bucket, meta).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<()> {
+        self.delete_object(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn batch_write(&self, ops: Vec<oceanfs_storage_api::BatchOp>) -> std::io::Result<()> {
+        let rocks_ops: Vec<crate::metadata::store::BatchOp> = ops
+            .into_iter()
+            .map(|op| match op {
+                oceanfs_storage_api::BatchOp::PutObject(key, meta) => {
+                    crate::metadata::store::BatchOp::PutObject(key, meta)
+                }
+                oceanfs_storage_api::BatchOp::DeleteObject(bucket, key) => {
+                    crate::metadata::store::BatchOp::DeleteObject(bucket, key)
+                }
+                oceanfs_storage_api::BatchOp::PutTombstone(bucket, key, tombstone) => {
+                    crate::metadata::store::BatchOp::PutTombstone(bucket, key, tombstone)
+                }
+                oceanfs_storage_api::BatchOp::PutSegment(meta) => {
+                    crate::metadata::store::BatchOp::PutSegment(meta)
+                }
+                oceanfs_storage_api::BatchOp::DeleteSegment(id) => {
+                    crate::metadata::store::BatchOp::DeleteSegment(id)
+                }
+            })
+            .collect();
+        self.batch_write(rocks_ops).map_err(|e| std::io::Error::other(e.to_string()))
+    }
 }
 
 #[cfg(test)]

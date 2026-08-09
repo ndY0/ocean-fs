@@ -20,6 +20,7 @@ mod error;
 mod hash;
 mod ring;
 mod ring_cache;
+pub mod shard_batch;
 
 pub use error::{Error, Result};
 pub use hash::hash_key;

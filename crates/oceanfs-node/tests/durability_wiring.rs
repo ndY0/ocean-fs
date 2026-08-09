@@ -17,6 +17,7 @@ use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::{Ring, RingCache};
 use oceanfs_storage::RocksDbMetadataStore;
+use oceanfs_storage_api::MetadataStore;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
@@ -107,4 +108,63 @@ async fn durability_components_are_wireable_and_spawnable() {
     scrub_cancel.cancel();
     reaper_cancel.cancel();
     heal_cancel.cancel();
+}
+
+/// T6.1: `GarbageCollector::run_cycle()` accepts `Arc<dyn MetadataStore>`.
+#[tokio::test]
+async fn test_gc_accepts_trait_object() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let metadata_config =
+        MetadataConfig { data_dir: tmp.path().join("metadata"), ..Default::default() };
+    let store: Arc<dyn MetadataStore> =
+        Arc::new(RocksDbMetadataStore::open(&metadata_config).expect("open metadata store"));
+
+    // GC accepts Arc<dyn MetadataStore> via coercion.
+    let gc = GarbageCollector::new(GcConfig::default());
+    let stats = gc.run_cycle(store).await.expect("GC cycle with trait object");
+    assert_eq!(stats.segments_scanned, 0);
+    assert_eq!(stats.segments_compacted, 0);
+}
+
+/// T6.2: `ScrubCoordinator` accepts `Arc<dyn MetadataStore>`.
+#[tokio::test]
+async fn test_scrub_accepts_trait_object() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let metadata_config =
+        MetadataConfig { data_dir: tmp.path().join("metadata"), ..Default::default() };
+    let store: Arc<dyn MetadataStore> =
+        Arc::new(RocksDbMetadataStore::open(&metadata_config).expect("open metadata store"));
+
+    let data_store: Arc<dyn oceanfs_durability::SegmentDataStore> =
+        Arc::new(InMemorySegmentStore::new());
+    let coord = ScrubCoordinator::new(ScrubConfig::default());
+    let report = coord.run_cycle(store, data_store).await.expect("scrub with trait object");
+    assert_eq!(report.segments_total(), 0);
+}
+
+/// T6.3: `AntiEntropy::new()` accepts `Arc<dyn MetadataStore>`.
+#[tokio::test]
+async fn test_anti_entropy_accepts_trait_object() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let metadata_config =
+        MetadataConfig { data_dir: tmp.path().join("metadata"), ..Default::default() };
+    let store: Arc<dyn MetadataStore> =
+        Arc::new(RocksDbMetadataStore::open(&metadata_config).expect("open metadata store"));
+
+    let ring = Ring::new(oceanfs_core::RingConfig::default());
+    let ring_cache = Arc::new(RingCache::new(ring));
+    let membership = Arc::new(Membership::new(
+        NodeId::new("test-ae-trait"),
+        "127.0.0.1:9002".parse().unwrap(),
+        oceanfs_core::GossipConfig::default(),
+        ring_cache.clone(),
+    ));
+    let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
+    let data_store: Arc<dyn oceanfs_durability::SegmentDataStore> =
+        Arc::new(InMemorySegmentStore::new());
+
+    // AntiEntropy::new accepts Arc<dyn MetadataStore>.
+    let ae = AntiEntropy::new(AntiEntropyConfig::default(), membership, store, pool, data_store);
+    let stats = ae.run_cycle().await.expect("AE cycle with trait object");
+    assert_eq!(stats.segments_compared, 0);
 }

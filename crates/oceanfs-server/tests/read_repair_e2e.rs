@@ -27,7 +27,7 @@ use oceanfs_core::{
 use oceanfs_durability::SegmentDataStore;
 use oceanfs_server::grpc::segment_service::SegmentGrpcService;
 use oceanfs_storage::{
-    Error as StorageError, RocksDbMetadataStore, SegmentRpcClient, SegmentRpcServer,
+    BufferPool, Error as StorageError, RocksDbMetadataStore, SegmentRpcClient, SegmentRpcServer,
 };
 use tonic::transport::Server;
 
@@ -62,7 +62,8 @@ async fn start_server(
     metadata: Arc<RocksDbMetadataStore>,
     data_store: Arc<dyn SegmentDataStore>,
 ) -> (SocketAddr, SegmentRpcClient<tonic::transport::Channel>) {
-    let svc = SegmentGrpcService::new(data_store, Some(metadata));
+    let svc =
+        SegmentGrpcService::new(data_store, Some(metadata), Arc::new(BufferPool::new(65536, 1024)));
     let router = Server::builder().add_service(SegmentRpcServer::new(svc));
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();

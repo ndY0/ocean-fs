@@ -19,7 +19,7 @@ use std::path::PathBuf;
 /// let config = NodeConfig::default();
 /// assert_eq!(config.data_dir.to_str().unwrap(), "/var/lib/oceanfs");
 /// ```
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NodeConfig {
     /// Unique identifier for this node.
     #[serde(default = "default_node_id")]
@@ -139,6 +139,101 @@ pub struct NodeConfig {
     /// No-op on non-Linux platforms.
     #[serde(default = "default_background_cpu_sched_idle")]
     pub background_cpu_sched_idle: bool,
+
+    // ── Item 1: Garbage collection tuning ──
+    /// GC compaction liveness-ratio threshold (0.0–1.0, default 0.5).
+    #[serde(default = "default_gc_compact_threshold")]
+    pub gc_compact_threshold: f64,
+    /// Maximum concurrent compactions (default 4).
+    #[serde(default = "default_gc_max_concurrent_compactions")]
+    pub gc_max_concurrent_compactions: usize,
+    /// Bounded channel capacity for compaction work queue (default 64).
+    #[serde(default = "default_gc_compaction_queue_capacity")]
+    pub gc_compaction_queue_capacity: usize,
+
+    // ── Item 2: Scrub, anti-entropy, heal tuning ──
+    /// Maximum nodes participating in distributed scrub (0 = all, default 0).
+    #[serde(default)]
+    pub scrub_parallel_nodes: usize,
+    /// Anti-entropy peer count per cycle (default 1).
+    #[serde(default = "default_ae_peer_count")]
+    pub ae_peer_count: usize,
+    /// Maximum concurrent heal operations (default 16).
+    #[serde(default = "default_heal_parallel_segments")]
+    pub heal_parallel_segments: usize,
+    /// Heal throughput throttle in bytes/sec (0 = unlimited, default 0).
+    #[serde(default)]
+    pub heal_throttle_bytes_sec: u64,
+
+    // ── Item 3: Cache configuration ──
+    /// Whether the L1 object cache is enabled (default true).
+    #[serde(default = "default_true")]
+    pub object_cache_enabled: bool,
+    /// Maximum size of the L1 object cache in bytes (default 512 MB).
+    #[serde(default = "default_object_cache_size_bytes")]
+    pub object_cache_size_bytes: u64,
+    /// TTL for cached objects in milliseconds (default 60000).
+    #[serde(default = "default_object_cache_ttl_ms")]
+    pub object_cache_ttl_ms: u64,
+    /// Maximum blob size eligible for the object cache (default 1 MB).
+    #[serde(default = "default_object_cache_max_blob_size")]
+    pub object_cache_max_blob_size: u64,
+
+    /// Whether the L2 metadata cache is enabled (default true).
+    #[serde(default = "default_true")]
+    pub metadata_cache_enabled: bool,
+    /// Maximum size of the L2 metadata cache in bytes (default 1 GB).
+    #[serde(default = "default_metadata_cache_size_bytes")]
+    pub metadata_cache_size_bytes: u64,
+    /// TTL for cached metadata in milliseconds (default 300000).
+    #[serde(default = "default_metadata_cache_ttl_ms")]
+    pub metadata_cache_ttl_ms: u64,
+
+    /// Whether the L3 negative cache is enabled (default true).
+    #[serde(default = "default_true")]
+    pub negative_cache_enabled: bool,
+    /// Size of the negative cache in bytes (default 64 MB).
+    #[serde(default = "default_negative_cache_size_bytes")]
+    pub negative_cache_size_bytes: u64,
+    /// Rebuild interval for the negative cache in seconds (default 3600).
+    #[serde(default = "default_negative_cache_rebuild_sec")]
+    pub negative_cache_rebuild_sec: u64,
+
+    /// Number of objects to prefetch after a LIST operation (default 16).
+    #[serde(default = "default_prefetch_after_list")]
+    pub prefetch_after_list: usize,
+    /// Number of objects to prefetch after a GET operation (default 4).
+    #[serde(default = "default_prefetch_after_get")]
+    pub prefetch_after_get: usize,
+
+    // ── Item 4: Per-operation timeouts ──
+    /// Per-operation timeout configuration.
+    #[serde(default)]
+    pub operation_timeouts: crate::OperationTimeouts,
+
+    // ── Item 5: Buffer pool configuration ──
+    /// Buffer pool chunk size in bytes (default 65536 = 64 KB).
+    #[serde(default = "default_buffer_pool_chunk_bytes")]
+    pub buffer_pool_chunk_bytes: usize,
+    /// Maximum number of buffers in the pool (default 1024).
+    #[serde(default = "default_buffer_pool_max_chunks")]
+    pub buffer_pool_max_chunks: usize,
+
+    // ── Item 8: Shard count configuration ──
+    /// Number of segment shards. Set to 0 for auto-detect from CPU count.
+    /// Default: 0 (auto).
+    #[serde(default)]
+    pub segment_shard_count: usize,
+    /// Maximum shard count when auto-detecting. Ignored when segment_shard_count > 0.
+    /// Default: 16.
+    #[serde(default = "default_segment_shard_count_max")]
+    pub segment_shard_count_max: usize,
+
+    // ── Item 10: Fetch strategy ──
+    /// Default fetch strategy for buckets that don't override it.
+    /// Default: "local_first".
+    #[serde(default)]
+    pub default_fetch_strategy: crate::FetchStrategy,
 }
 
 fn default_node_id() -> String {
@@ -214,6 +309,75 @@ fn default_background_cpu_sched_idle() -> bool {
     cfg!(target_os = "linux")
 }
 
+// ── Item 1: GC default functions ──
+
+fn default_gc_compact_threshold() -> f64 {
+    0.5
+}
+fn default_gc_max_concurrent_compactions() -> usize {
+    4
+}
+fn default_gc_compaction_queue_capacity() -> usize {
+    64
+}
+
+// ── Item 2: Scrub / AE / heal default functions ──
+
+fn default_ae_peer_count() -> usize {
+    1
+}
+fn default_heal_parallel_segments() -> usize {
+    16
+}
+
+// ── Item 3: Cache default functions ──
+
+const fn default_true() -> bool {
+    true
+}
+fn default_object_cache_size_bytes() -> u64 {
+    512 * 1024 * 1024 // 512 MB
+}
+fn default_object_cache_ttl_ms() -> u64 {
+    60_000
+}
+fn default_object_cache_max_blob_size() -> u64 {
+    1024 * 1024 // 1 MB
+}
+fn default_metadata_cache_size_bytes() -> u64 {
+    1024 * 1024 * 1024 // 1 GB
+}
+fn default_metadata_cache_ttl_ms() -> u64 {
+    300_000
+}
+fn default_negative_cache_size_bytes() -> u64 {
+    64 * 1024 * 1024 // 64 MB
+}
+fn default_negative_cache_rebuild_sec() -> u64 {
+    3600
+}
+fn default_prefetch_after_list() -> usize {
+    16
+}
+fn default_prefetch_after_get() -> usize {
+    4
+}
+
+// ── Item 5: Buffer pool default functions ──
+
+fn default_buffer_pool_chunk_bytes() -> usize {
+    65536 // 64 KB
+}
+fn default_buffer_pool_max_chunks() -> usize {
+    1024
+}
+
+// ── Item 8: Shard count default functions ──
+
+fn default_segment_shard_count_max() -> usize {
+    16
+}
+
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
@@ -244,6 +408,38 @@ impl Default for NodeConfig {
             segment_cache_max_entries: 64,
             background_io_class_idle: cfg!(target_os = "linux"),
             background_cpu_sched_idle: cfg!(target_os = "linux"),
+            // Item 1: GC
+            gc_compact_threshold: 0.5,
+            gc_max_concurrent_compactions: 4,
+            gc_compaction_queue_capacity: 64,
+            // Item 2: Scrub / AE / heal
+            scrub_parallel_nodes: 0,
+            ae_peer_count: 1,
+            heal_parallel_segments: 16,
+            heal_throttle_bytes_sec: 0,
+            // Item 3: Cache
+            object_cache_enabled: true,
+            object_cache_size_bytes: 512 * 1024 * 1024,
+            object_cache_ttl_ms: 60_000,
+            object_cache_max_blob_size: 1024 * 1024,
+            metadata_cache_enabled: true,
+            metadata_cache_size_bytes: 1024 * 1024 * 1024,
+            metadata_cache_ttl_ms: 300_000,
+            negative_cache_enabled: true,
+            negative_cache_size_bytes: 64 * 1024 * 1024,
+            negative_cache_rebuild_sec: 3600,
+            prefetch_after_list: 16,
+            prefetch_after_get: 4,
+            // Item 4: Operation timeouts
+            operation_timeouts: crate::OperationTimeouts::default(),
+            // Item 5: Buffer pool
+            buffer_pool_chunk_bytes: 65536,
+            buffer_pool_max_chunks: 1024,
+            // Item 8: Shard count
+            segment_shard_count: 0,
+            segment_shard_count_max: 16,
+            // Item 10: Fetch strategy
+            default_fetch_strategy: crate::FetchStrategy::default(),
         }
     }
 }
@@ -316,5 +512,120 @@ mod tests {
     fn default_background_cpu_sched_idle_matches_platform() {
         let config = NodeConfig::default();
         assert_eq!(config.background_cpu_sched_idle, cfg!(target_os = "linux"));
+    }
+
+    // ── Item 1: GC config tests ──
+
+    #[test]
+    fn gc_config_default_values() {
+        let config = NodeConfig::default();
+        assert!((config.gc_compact_threshold - 0.5).abs() < f64::EPSILON);
+        assert_eq!(config.gc_max_concurrent_compactions, 4);
+        assert_eq!(config.gc_compaction_queue_capacity, 64);
+    }
+
+    #[test]
+    fn gc_config_serde_roundtrip() {
+        let config = NodeConfig {
+            gc_compact_threshold: 0.3,
+            gc_max_concurrent_compactions: 8,
+            gc_compaction_queue_capacity: 128,
+            ..NodeConfig::default()
+        };
+        let toml_str = toml::to_string(&config).unwrap();
+        let roundtripped: NodeConfig = toml::from_str(&toml_str).unwrap();
+        assert!((roundtripped.gc_compact_threshold - 0.3).abs() < f64::EPSILON);
+        assert_eq!(roundtripped.gc_max_concurrent_compactions, 8);
+        assert_eq!(roundtripped.gc_compaction_queue_capacity, 128);
+    }
+
+    // ── Item 2: Scrub / AE / Heal config tests ──
+
+    #[test]
+    fn ae_peer_count_default_is_1() {
+        let config = NodeConfig::default();
+        assert_eq!(config.ae_peer_count, 1);
+    }
+
+    #[test]
+    fn heal_parallel_segments_default_is_16() {
+        let config = NodeConfig::default();
+        assert_eq!(config.heal_parallel_segments, 16);
+    }
+
+    #[test]
+    fn scrub_parallel_nodes_default_is_0() {
+        let config = NodeConfig::default();
+        assert_eq!(config.scrub_parallel_nodes, 0);
+    }
+
+    // ── Item 3: Cache config tests ──
+
+    #[test]
+    fn object_cache_defaults() {
+        let config = NodeConfig::default();
+        assert!(config.object_cache_enabled);
+        assert_eq!(config.object_cache_size_bytes, 512 * 1024 * 1024);
+        assert_eq!(config.object_cache_ttl_ms, 60_000);
+        assert_eq!(config.object_cache_max_blob_size, 1024 * 1024);
+    }
+
+    #[test]
+    fn metadata_cache_defaults() {
+        let config = NodeConfig::default();
+        assert!(config.metadata_cache_enabled);
+        assert_eq!(config.metadata_cache_size_bytes, 1024 * 1024 * 1024);
+        assert_eq!(config.metadata_cache_ttl_ms, 300_000);
+    }
+
+    #[test]
+    fn negative_cache_defaults() {
+        let config = NodeConfig::default();
+        assert!(config.negative_cache_enabled);
+        assert_eq!(config.negative_cache_size_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.negative_cache_rebuild_sec, 3600);
+    }
+
+    #[test]
+    fn prefetch_defaults() {
+        let config = NodeConfig::default();
+        assert_eq!(config.prefetch_after_list, 16);
+        assert_eq!(config.prefetch_after_get, 4);
+    }
+
+    // ── Item 4: OperationTimeouts config test ──
+
+    #[test]
+    fn operation_timeouts_field_default() {
+        let config = NodeConfig::default();
+        assert_eq!(config.operation_timeouts.wal_write_ms, 500);
+        assert_eq!(config.operation_timeouts.segment_seal_ms, 120_000);
+        assert_eq!(config.operation_timeouts.gossip_roundtrip_ms, 10_000);
+    }
+
+    // ── Item 5: Buffer pool config tests ──
+
+    #[test]
+    fn buffer_pool_defaults() {
+        let config = NodeConfig::default();
+        assert_eq!(config.buffer_pool_chunk_bytes, 65536);
+        assert_eq!(config.buffer_pool_max_chunks, 1024);
+    }
+
+    // ── Item 8: Shard count config tests ──
+
+    #[test]
+    fn shard_count_defaults() {
+        let config = NodeConfig::default();
+        assert_eq!(config.segment_shard_count, 0); // auto
+        assert_eq!(config.segment_shard_count_max, 16);
+    }
+
+    // ── Item 10: FetchStrategy config test ──
+
+    #[test]
+    fn default_fetch_strategy_is_local_first() {
+        let config = NodeConfig::default();
+        assert_eq!(config.default_fetch_strategy, crate::FetchStrategy::LocalFirst);
     }
 }

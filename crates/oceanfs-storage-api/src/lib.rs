@@ -39,7 +39,7 @@ mod segment_store;
 mod wal_writer;
 
 pub use blob_store::BlobStore;
-pub use metadata_store::MetadataStore;
+pub use metadata_store::{BatchOp, MetadataStore};
 // Re-export relevant oceanfs-core types used in trait signatures.
 pub use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata, SegmentId, SegmentMetadata};
 pub use segment_store::{SegmentHandle, SegmentStore};

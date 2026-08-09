@@ -148,8 +148,8 @@ impl PrefetchEngine {
     /// Called after a GET response. Prefetches up to `after_get` subsequent
     /// keys in the provided list. This is a best-effort hint.
     ///
-    /// For automatic adjacent-key discovery (M8), use [`discover_and_prefetch_adjacent`]
-    /// which queries the metadata store to find nearby keys.
+    /// For automatic adjacent-key discovery (M8), query the metadata store
+    /// to find nearby keys via range scan.
     pub fn after_get(&self, bucket: BucketId, _key: &ObjectKey, adjacent_keys: &[ObjectKey]) {
         if !self.config.enabled {
             return;
@@ -250,7 +250,7 @@ impl PrefetchWorker {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use oceanfs_core::{Hlc, ObjectMetadata};
+    use oceanfs_core::{Hlc, ObjectMetadata, SegmentId, SegmentMetadata, Tombstone};
 
     use super::*;
 
@@ -286,6 +286,49 @@ mod tests {
                 .iter()
                 .find(|(b, k, _)| b == bucket && k == key)
                 .map(|(_, _, m)| m.clone()))
+        }
+
+        fn list_objects(
+            &self,
+            _bucket: &BucketId,
+            _prefix: &str,
+        ) -> Vec<std::io::Result<ObjectMetadata>> {
+            self.entries.iter().map(|(_, _, m)| Ok(m.clone())).collect()
+        }
+
+        fn get_segment(&self, _id: SegmentId) -> std::io::Result<Option<SegmentMetadata>> {
+            Ok(None)
+        }
+
+        fn list_segments(&self) -> Vec<std::io::Result<SegmentMetadata>> {
+            vec![]
+        }
+
+        fn list_tombstones(
+            &self,
+            _bucket: &BucketId,
+        ) -> Vec<std::io::Result<(ObjectKey, Tombstone)>> {
+            vec![]
+        }
+
+        fn put_segment(&self, _meta: SegmentMetadata) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn delete_segment(&self, _id: SegmentId) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn put_object(&self, _bucket: &BucketId, _meta: ObjectMetadata) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn delete_object(&self, _bucket: &BucketId, _key: &ObjectKey) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn batch_write(&self, _ops: Vec<oceanfs_storage_api::BatchOp>) -> std::io::Result<()> {
+            Ok(())
         }
     }
 

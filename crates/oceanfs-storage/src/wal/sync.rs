@@ -247,4 +247,42 @@ mod tests {
         // At least 2 batches should have been flushed (ceil(5/2) = 3 batches).
         assert!(flush_count.load(Ordering::SeqCst) >= 2);
     }
+
+    /// Item 7 (T7.1): Concurrent WAL group commit batching.
+    ///
+    /// Proves that 100 concurrent submissions result in fewer than 100
+    /// fsync calls — demonstrating that the group commit batches waiters.
+    #[tokio::test]
+    async fn concurrent_wal_group_commit_batches_100_entries() {
+        let flush_count = Arc::new(AtomicU32::new(0));
+
+        // Use a batch timeout large enough to collect all 100 submissions.
+        let group = Arc::new(WalSyncGroup::new(async_noop(flush_count.clone()), 500, 128));
+
+        // Submit 100 entries concurrently.
+        let mut handles = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let group = group.clone();
+            handles.push(tokio::spawn(async move {
+                let rx = group.submit().await.unwrap();
+                rx.await.unwrap();
+            }));
+        }
+
+        // Wait for all to complete.
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let flushes = flush_count.load(Ordering::SeqCst);
+        // With max_waiters=128 and 100 entries, they should all fit in
+        // at most a few batches — far fewer than 100 individual fsyncs.
+        assert!(
+            flushes < 100,
+            "expected group commit batching (flush_count={flushes} < 100), \
+             but got {flushes} individual fsyncs",
+        );
+        // At least one flush must have occurred.
+        assert!(flushes >= 1, "expected at least 1 fsync, got 0");
+    }
 }

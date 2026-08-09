@@ -178,23 +178,27 @@ fn bench_segment_file_body(c: &mut Criterion) {
     let data = bytes::Bytes::from(vec![0xEEu8; 4 * 1024 * 1024]);
 
     let mut group = c.benchmark_group("segment_file_body");
-    group.throughput(Throughput::Bytes(4 * 1024 * 1024));
+    #[cfg(feature = "sendfile")]
+    {
+        group.throughput(Throughput::Bytes(4 * 1024 * 1024));
 
-    group.bench_function("build_body", |b| {
-        let data = data.clone();
-        b.iter(|| {
-            let _body =
+        group.bench_function("build_body", |b| {
+            let data = data.clone();
+            b.iter(|| {
+                let _body =
+                    oceanfs_storage::io::SegmentFileBody::new(data.clone(), 0, data.len() as u64);
+            });
+        });
+
+        group.bench_function("body_size_hint", |b| {
+            let body =
                 oceanfs_storage::io::SegmentFileBody::new(data.clone(), 0, data.len() as u64);
+            b.iter(|| {
+                let _hint = body.size_hint();
+                black_box(_hint);
+            });
         });
-    });
-
-    group.bench_function("body_size_hint", |b| {
-        let body = oceanfs_storage::io::SegmentFileBody::new(data.clone(), 0, data.len() as u64);
-        b.iter(|| {
-            let _hint = body.size_hint();
-            black_box(_hint);
-        });
-    });
+    }
 
     group.finish();
 }

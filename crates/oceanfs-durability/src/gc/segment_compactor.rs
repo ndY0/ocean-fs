@@ -7,11 +7,7 @@ use std::{
 };
 
 use oceanfs_core::{ChunkRef, ObjectMetadata, SegmentId, SegmentMetadata};
-use oceanfs_storage::{
-    metadata::{BatchOp, RocksDbMetadataStore},
-    segment::TierRouter,
-    Result,
-};
+use oceanfs_storage::{segment::TierRouter, Result};
 
 use super::config::tier_target_size;
 
@@ -26,7 +22,7 @@ use super::config::tier_target_size;
 /// the old segment.
 pub(crate) struct SegmentCompactor {
     /// The metadata store for reading object metadata and updating chunk refs.
-    metadata: Arc<RocksDbMetadataStore>,
+    metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
     /// The tier router for classifying blobs by size.
     /// Wired for future tier-specific segment pool routing during repacking.
     tier_router: TierRouter,
@@ -34,7 +30,10 @@ pub(crate) struct SegmentCompactor {
 
 impl SegmentCompactor {
     /// Creates a new segment compactor.
-    pub(crate) fn new(metadata: Arc<RocksDbMetadataStore>, tier_router: TierRouter) -> Self {
+    pub(crate) fn new(
+        metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
+        tier_router: TierRouter,
+    ) -> Self {
         Self { metadata, tier_router }
     }
 
@@ -122,33 +121,35 @@ impl SegmentCompactor {
             sealed_at: Some(now_ms),
         };
 
-        // Build batch operations: update object metadata, create new segment, delete old.
-        let mut ops: Vec<BatchOp> = Vec::with_capacity(live_objects.len() + 2);
-
-        for obj in &live_objects {
-            let mut new_chunks = smallvec::SmallVec::<[ChunkRef; 4]>::new();
-
-            for chunk in &obj.chunks {
-                if chunk.segment_id == segment_id {
-                    // This chunk is being repacked — use the new reference.
-                    let key = (chunk.segment_id, chunk.offset, chunk.length);
-                    if let Some(new_ref) = chunk_remap.get(&key) {
-                        new_chunks.push(*new_ref);
+        // Write all mutations atomically via batch.
+        let ops: Vec<oceanfs_storage_api::BatchOp> = {
+            let mut ops = Vec::with_capacity(live_objects.len() + 2);
+            for obj in &live_objects {
+                let mut new_chunks = smallvec::SmallVec::<[ChunkRef; 4]>::new();
+                for chunk in &obj.chunks {
+                    if chunk.segment_id == segment_id {
+                        let key = (chunk.segment_id, chunk.offset, chunk.length);
+                        if let Some(new_ref) = chunk_remap.get(&key) {
+                            new_chunks.push(*new_ref);
+                        }
+                    } else {
+                        new_chunks.push(*chunk);
                     }
-                } else {
-                    // Chunk references a different segment — keep as-is.
-                    new_chunks.push(*chunk);
                 }
+                let updated_meta = ObjectMetadata { chunks: new_chunks, ..(*obj).clone() };
+                ops.push(oceanfs_storage_api::BatchOp::PutObject(
+                    obj.object_key.clone(),
+                    updated_meta,
+                ));
             }
+            ops.push(oceanfs_storage_api::BatchOp::PutSegment(new_seg_meta));
+            ops.push(oceanfs_storage_api::BatchOp::DeleteSegment(segment_id));
+            ops
+        };
 
-            let updated_meta = ObjectMetadata { chunks: new_chunks, ..(*obj).clone() };
-            ops.push(BatchOp::PutObject(obj.object_key.clone(), updated_meta));
-        }
-
-        ops.push(BatchOp::PutSegment(new_seg_meta));
-        ops.push(BatchOp::DeleteSegment(segment_id));
-
-        self.metadata.batch_write(ops)?;
+        self.metadata
+            .batch_write(ops)
+            .map_err(|e| oceanfs_storage::Error::Io(std::io::Error::other(e.to_string())))?;
 
         tracing::info!(
             segment_id = %segment_id,

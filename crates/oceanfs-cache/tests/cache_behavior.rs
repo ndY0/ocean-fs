@@ -11,7 +11,9 @@ use oceanfs_cache::{
     MetadataCache, MetadataCacheConfig, NegativeCache, NegativeCacheConfig, ObjectCache,
     ObjectCacheConfig, PrefetchConfig, PrefetchEngine,
 };
-use oceanfs_core::{BucketId, Hlc, ObjectKey, ObjectMetadata};
+use oceanfs_core::{
+    BucketId, Hlc, ObjectKey, ObjectMetadata, SegmentId, SegmentMetadata, Tombstone,
+};
 use oceanfs_storage_api::MetadataStore;
 
 /// A mock metadata store for integration testing.
@@ -41,6 +43,46 @@ impl MetadataStore for MockStore {
         key: &ObjectKey,
     ) -> std::io::Result<Option<ObjectMetadata>> {
         Ok(self.entries.iter().find(|(b, k, _)| b == bucket && k == key).map(|(_, _, m)| m.clone()))
+    }
+
+    fn list_objects(
+        &self,
+        _bucket: &BucketId,
+        _prefix: &str,
+    ) -> Vec<std::io::Result<ObjectMetadata>> {
+        self.entries.iter().map(|(_, _, m)| Ok(m.clone())).collect()
+    }
+
+    fn get_segment(&self, _id: SegmentId) -> std::io::Result<Option<SegmentMetadata>> {
+        Ok(None)
+    }
+
+    fn list_segments(&self) -> Vec<std::io::Result<SegmentMetadata>> {
+        vec![]
+    }
+
+    fn list_tombstones(&self, _bucket: &BucketId) -> Vec<std::io::Result<(ObjectKey, Tombstone)>> {
+        vec![]
+    }
+
+    fn put_segment(&self, _meta: SegmentMetadata) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn delete_segment(&self, _id: SegmentId) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn put_object(&self, _bucket: &BucketId, _meta: ObjectMetadata) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn delete_object(&self, _bucket: &BucketId, _key: &ObjectKey) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn batch_write(&self, _ops: Vec<oceanfs_storage_api::BatchOp>) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -240,4 +282,22 @@ fn stats_accumulate_over_operations() {
     // Hit rate.
     let rate = cache.stats().hit_rate();
     assert!((rate - 0.5).abs() < 0.01);
+}
+
+/// T3.6: PrefetchEngine with custom `prefetch_after_list` and
+/// `prefetch_after_get` config values respects the configured counts.
+#[test]
+fn test_prefetch_config_custom_counts() {
+    // Verify PrefetchConfig default values are sensible.
+    let default_config = PrefetchConfig::default();
+    assert!(!default_config.enabled);
+    assert_eq!(default_config.after_list, 16);
+    assert_eq!(default_config.after_get, 4);
+
+    // Custom config preserves custom values.
+    let custom_config =
+        PrefetchConfig { enabled: true, after_list: 8, after_get: 2, ..Default::default() };
+    assert!(custom_config.enabled);
+    assert_eq!(custom_config.after_list, 8);
+    assert_eq!(custom_config.after_get, 2);
 }

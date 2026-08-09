@@ -39,6 +39,9 @@ pub struct SegmentAppendResponse {
     pub ack: i32,
 }
 /// A request to fetch a shard from a sealed segment.
+/// Single-shard mode: set segment_id, shard_index, offset, length.
+/// Batched mode: set segment_id and fill the shards repeated field.
+/// The server streams back all requested shard ranges in sequence.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FetchShardRequest {
     #[prost(message, optional, tag = "1")]
@@ -48,6 +51,19 @@ pub struct FetchShardRequest {
     #[prost(uint64, tag = "3")]
     pub offset: u64,
     #[prost(uint64, tag = "4")]
+    pub length: u64,
+    /// Batched shard ranges for single-RPC-per-node fetching (Item 9).
+    #[prost(message, repeated, tag = "5")]
+    pub shards: ::prost::alloc::vec::Vec<ShardRange>,
+}
+/// A range within a single shard to fetch.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ShardRange {
+    #[prost(uint32, tag = "1")]
+    pub shard_index: u32,
+    #[prost(uint64, tag = "2")]
+    pub offset: u64,
+    #[prost(uint64, tag = "3")]
     pub length: u64,
 }
 /// A chunk of shard data streamed back to the requester.

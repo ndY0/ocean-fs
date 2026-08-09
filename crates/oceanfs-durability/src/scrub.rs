@@ -13,7 +13,6 @@ use oceanfs_core::{
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
-use oceanfs_storage::metadata::RocksDbMetadataStore;
 use tokio::sync::Semaphore;
 
 use crate::{
@@ -287,7 +286,7 @@ pub(crate) struct SegmentPartition {
 /// builds a [`MerkleTree`] over the data, and compares the computed
 /// Merkle root against the stored root in [`SegmentMetadata`].
 pub(crate) struct ScrubWorker {
-    metadata: Arc<RocksDbMetadataStore>,
+    metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
     data_store: Arc<dyn SegmentDataStore>,
     /// Throughput limit in bytes per second (reserved for future rate-limiting).
     #[allow(dead_code)]
@@ -297,7 +296,7 @@ pub(crate) struct ScrubWorker {
 impl ScrubWorker {
     /// Creates a new scrub worker.
     pub(crate) fn new(
-        metadata: Arc<RocksDbMetadataStore>,
+        metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
         data_store: Arc<dyn SegmentDataStore>,
         throttle_bytes_sec: u64,
     ) -> Self {
@@ -536,8 +535,8 @@ impl ScrubCoordinator {
 
     /// Enables distributed partition assignment (H5).
     ///
-    /// When set, [`partition_for_current_nodes`] uses the membership to
-    /// discover alive nodes and distribute segments across them instead
+    /// When set, the scrub coordinator uses the membership to discover
+    /// alive nodes and distributes segment partitions across them instead
     /// of requiring the caller to pass node IDs manually.
     pub fn with_distributed(
         mut self,
@@ -650,7 +649,7 @@ impl ScrubCoordinator {
     /// cannot be acquired.
     pub async fn run_cycle(
         &self,
-        metadata: Arc<RocksDbMetadataStore>,
+        metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
         data_store: Arc<dyn SegmentDataStore>,
     ) -> Result<ScrubReport> {
         use std::time::Instant;
@@ -779,7 +778,7 @@ impl ScrubCoordinator {
     /// Returns an error if the background task cannot be spawned.
     pub async fn trigger_manual(
         &self,
-        metadata: Arc<RocksDbMetadataStore>,
+        metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
         data_store: Arc<dyn SegmentDataStore>,
     ) -> Result<()> {
         let config = self.config.clone();
@@ -814,7 +813,7 @@ impl ScrubCoordinator {
     /// graceful shutdown coordination.
     pub async fn start_background(
         self: Arc<Self>,
-        metadata: Arc<RocksDbMetadataStore>,
+        metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
         data_store: Arc<dyn SegmentDataStore>,
         mut shutdown: tokio::sync::watch::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
@@ -854,6 +853,7 @@ impl ScrubCoordinator {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use oceanfs_core::{MetadataConfig, NodeId, SegmentId, SegmentMetadata, SizeTier};
+    use oceanfs_storage::metadata::RocksDbMetadataStore;
 
     use super::*;
     use crate::anti_entropy::InMemorySegmentStore;
