@@ -258,6 +258,13 @@ pub struct NodeConfig {
     #[serde(default = "default_metadata_cache_ttl_ms")]
     pub metadata_cache_ttl_ms: u64,
 
+    /// Eviction policy for the L1 object cache (default: "gdsf").
+    #[serde(default = "default_eviction_policy_l1")]
+    pub eviction_policy_l1: crate::EvictionPolicyType,
+    /// Eviction policy for the L2 metadata cache (default: "ttl_lru").
+    #[serde(default = "default_eviction_policy_l2")]
+    pub eviction_policy_l2: crate::EvictionPolicyType,
+
     /// Whether the L3 negative cache is enabled (default true).
     #[serde(default = "default_true")]
     pub negative_cache_enabled: bool,
@@ -433,6 +440,12 @@ fn default_metadata_cache_size_bytes() -> u64 {
 fn default_metadata_cache_ttl_ms() -> u64 {
     300_000
 }
+fn default_eviction_policy_l1() -> crate::EvictionPolicyType {
+    crate::EvictionPolicyType::Gdsf
+}
+fn default_eviction_policy_l2() -> crate::EvictionPolicyType {
+    crate::EvictionPolicyType::TtlLru
+}
 fn default_negative_cache_size_bytes() -> u64 {
     64 * 1024 * 1024 // 64 MB
 }
@@ -519,6 +532,8 @@ impl Default for NodeConfig {
             metadata_cache_enabled: true,
             metadata_cache_size_bytes: 1024 * 1024 * 1024,
             metadata_cache_ttl_ms: 300_000,
+            eviction_policy_l1: crate::EvictionPolicyType::Gdsf,
+            eviction_policy_l2: crate::EvictionPolicyType::TtlLru,
             negative_cache_enabled: true,
             negative_cache_size_bytes: 64 * 1024 * 1024,
             negative_cache_rebuild_sec: 3600,
@@ -689,6 +704,20 @@ mod tests {
         let config = NodeConfig::default();
         assert_eq!(config.prefetch_after_list, 16);
         assert_eq!(config.prefetch_after_get, 4);
+    }
+
+    /// T3.9: Eviction policy config serde roundtrip.
+    #[test]
+    fn test_eviction_policy_config_serde_roundtrip() {
+        let config = NodeConfig {
+            eviction_policy_l1: crate::EvictionPolicyType::Gdsf,
+            eviction_policy_l2: crate::EvictionPolicyType::TtlLru,
+            ..NodeConfig::default()
+        };
+        let toml_str = toml::to_string(&config).unwrap();
+        let roundtripped: NodeConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(roundtripped.eviction_policy_l1, crate::EvictionPolicyType::Gdsf);
+        assert_eq!(roundtripped.eviction_policy_l2, crate::EvictionPolicyType::TtlLru);
     }
 
     // ── Item 4: OperationTimeouts config test ──

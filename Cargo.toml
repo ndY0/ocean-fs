@@ -103,6 +103,7 @@ cudarc = "0.12"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest          = "1"
 static_assertions = "1"
+ordered-float     = "4"
 
 # --- Build ---
 tonic            = "0.12"

@@ -1,22 +1,26 @@
-//! L2 Metadata Cache — LRU of ObjectMetadata entries.
+//! L2 Metadata Cache — cache of ObjectMetadata entries.
 //!
 //! Avoids RocksDB lookups for hot objects. For inline blobs, a metadata
 //! cache hit serves the blob directly from the cached metadata value.
 //! Supports gossip-based invalidation. Per-bucket configuration with
-//! LRU eviction when `max_size_bytes` is exceeded.
+//! policy-driven eviction via [`EvictionPolicy`].
+//!
+//! The eviction policy (e.g. [`TtlLruPolicy`]) replaces the previous
+//! O(n) linear scan with O(1) / O(log n) victim selection.
 
 use std::{
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use dashmap::DashMap;
 use oceanfs_core::{
-    BucketId, CacheInvalidateRequest, Counter, Gauge, LabelSet, MetricRegistrar, ObjectKey,
-    ObjectMetadata,
+    BucketId, CacheInvalidateRequest, Counter, EvictionPolicyType, Gauge, LabelSet,
+    MetricRegistrar, ObjectKey, ObjectMetadata,
+};
+
+use crate::eviction::{
+    AccessMetadata, CacheKey, EvictionPolicy, GdsfConfig, GdsfPolicy, TtlLruConfig, TtlLruPolicy,
 };
 
 /// Statistics for the L2 metadata cache.
@@ -37,6 +41,9 @@ pub struct MetadataCacheStats {
 }
 
 /// Configuration for the L2 metadata cache.
+///
+/// Set [`eviction_policy_type`](Self::eviction_policy_type) to override
+/// the cache-wide eviction policy for a specific bucket.
 #[derive(Debug, Clone)]
 pub struct MetadataCacheConfig {
     /// Whether the cache is enabled.
@@ -45,11 +52,19 @@ pub struct MetadataCacheConfig {
     pub max_size_bytes: u64,
     /// TTL in milliseconds (0 = no expiry).
     pub ttl_ms: u64,
+    /// Optional per-bucket eviction policy override.
+    /// `None` means use the cache-wide default policy.
+    pub eviction_policy_type: Option<EvictionPolicyType>,
 }
 
 impl Default for MetadataCacheConfig {
     fn default() -> Self {
-        Self { enabled: true, max_size_bytes: 1024 * 1024 * 1024, ttl_ms: 300_000 }
+        Self {
+            enabled: true,
+            max_size_bytes: 1024 * 1024 * 1024,
+            ttl_ms: 300_000,
+            eviction_policy_type: None,
+        }
     }
 }
 
@@ -57,23 +72,11 @@ impl Default for MetadataCacheConfig {
 struct MetadataEntry {
     metadata: Arc<ObjectMetadata>,
     inserted_at: Instant,
-    /// Approximate last-access generation for LRU ordering.
-    last_access: AtomicU64,
 }
 
 impl MetadataEntry {
     fn new(metadata: Arc<ObjectMetadata>) -> Self {
-        Self { metadata, inserted_at: Instant::now(), last_access: AtomicU64::new(0) }
-    }
-
-    fn touch(&self, generation: u64) {
-        self.last_access.store(generation, Ordering::Relaxed);
-    }
-
-    fn approximate_size(&self) -> usize {
-        // Approximate memory: metadata struct + inline data if present.
-        std::mem::size_of::<ObjectMetadata>()
-            + self.metadata.inline_data.as_ref().map(|d| d.len()).unwrap_or(0)
+        Self { metadata, inserted_at: Instant::now() }
     }
 }
 
@@ -89,31 +92,20 @@ impl BucketMetadataCache {
     }
 }
 
-/// Global access-generation counter for LRU ordering.
-struct LruClock {
-    generation: AtomicU64,
-}
-
-impl LruClock {
-    fn new() -> Self {
-        Self { generation: AtomicU64::new(1) }
-    }
-
-    fn next(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::Relaxed)
-    }
-}
-
 /// L2 metadata cache — avoids RocksDB lookups.
+///
+/// Uses a pluggable [`EvictionPolicy`] (default: [`TtlLruPolicy`](crate::eviction::TtlLruPolicy))
+/// for staleness-based victim selection.
 ///
 /// # Examples
 ///
 /// ```
-/// use oceanfs_cache::MetadataCache;
-/// use oceanfs_cache::MetadataCacheConfig;
+/// use oceanfs_cache::{MetadataCache, MetadataCacheConfig};
+/// use oceanfs_cache::eviction::{TtlLruConfig, TtlLruPolicy};
 /// use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata, Hlc};
 ///
-/// let cache = MetadataCache::new(MetadataCacheConfig::default());
+/// let policy = Box::new(TtlLruPolicy::new(TtlLruConfig::default()));
+/// let cache = MetadataCache::new(MetadataCacheConfig::default(), policy);
 /// let meta = ObjectMetadata {
 ///     object_key: ObjectKey::new("data.txt"),
 ///     size: 256,
@@ -130,17 +122,21 @@ impl LruClock {
 pub struct MetadataCache {
     default_config: MetadataCacheConfig,
     buckets: DashMap<BucketId, Arc<BucketMetadataCache>>,
-    lru_clock: LruClock,
+    /// The cache-wide default eviction policy.
+    default_policy: Arc<dyn EvictionPolicy>,
+    /// Per-bucket policy overrides.
+    per_bucket_policies: DashMap<BucketId, Arc<dyn EvictionPolicy>>,
     stats: MetadataCacheStats,
 }
 
 impl MetadataCache {
-    /// Creates a new metadata cache with the given configuration.
-    pub fn new(config: MetadataCacheConfig) -> Self {
+    /// Creates a new metadata cache with the given configuration and eviction policy.
+    pub fn new(config: MetadataCacheConfig, eviction_policy: Box<dyn EvictionPolicy>) -> Self {
         Self {
             default_config: config,
             buckets: DashMap::new(),
-            lru_clock: LruClock::new(),
+            default_policy: Arc::from(eviction_policy),
+            per_bucket_policies: DashMap::new(),
             stats: MetadataCacheStats {
                 hits: Counter::new(
                     "cache_hits_total".into(),
@@ -171,9 +167,49 @@ impl MetadataCache {
         }
     }
 
+    /// Returns the eviction policy for the given bucket, falling back
+    /// to the cache-wide default if no per-bucket policy is registered.
+    fn policy_for(&self, bucket: &BucketId) -> Arc<dyn EvictionPolicy> {
+        self.per_bucket_policies
+            .get(bucket)
+            .map(|p| Arc::clone(p.value()))
+            .unwrap_or_else(|| Arc::clone(&self.default_policy))
+    }
+
+    /// Constructs an L2 eviction policy from a config type.
+    fn make_l2_policy(policy_type: EvictionPolicyType, ttl_ms: u64) -> Arc<dyn EvictionPolicy> {
+        match policy_type {
+            EvictionPolicyType::TtlLru => {
+                Arc::new(TtlLruPolicy::new(TtlLruConfig { default_ttl_ms: ttl_ms }))
+            }
+            EvictionPolicyType::Gdsf => Arc::new(GdsfPolicy::new(GdsfConfig::default())),
+            EvictionPolicyType::Adaptive => {
+                tracing::warn!(
+                    "Adaptive eviction policy not yet implemented; falling back to TTL-LRU for L2 bucket"
+                );
+                Arc::new(TtlLruPolicy::new(TtlLruConfig::default()))
+            }
+            _ => {
+                tracing::warn!("Unknown L2 eviction policy; falling back to TTL-LRU");
+                Arc::new(TtlLruPolicy::new(TtlLruConfig::default()))
+            }
+        }
+    }
+
+    /// Ensures a per-bucket policy exists if the config specifies one.
+    fn ensure_bucket_policy(&self, bucket: &BucketId, config: &MetadataCacheConfig) {
+        if let Some(policy_type) = config.eviction_policy_type {
+            if !self.per_bucket_policies.contains_key(bucket) {
+                let policy = Self::make_l2_policy(policy_type, config.ttl_ms);
+                self.per_bucket_policies.insert(bucket.clone(), policy);
+            }
+        }
+    }
+
     /// Retrieves cached metadata.
     ///
-    /// Returns `None` on miss or TTL expiry.
+    /// Returns `None` on miss or TTL expiry. On hit, notifies
+    /// the eviction policy via [`EvictionPolicy::on_access`].
     pub fn get(&self, bucket: &BucketId, key: &ObjectKey) -> Option<Arc<ObjectMetadata>> {
         let Some(bucket_cache) = self.buckets.get(bucket) else {
             self.stats.misses.inc();
@@ -189,21 +225,23 @@ impl MetadataCache {
             if bucket_cache.config.ttl_ms > 0 {
                 let age = entry.inserted_at.elapsed();
                 if age > Duration::from_millis(bucket_cache.config.ttl_ms) {
-                    let _entry_size = entry.approximate_size();
                     drop(entry);
                     bucket_cache.entries.remove(key);
+                    let cache_key = CacheKey::new(bucket.clone(), key.clone());
+                    self.policy_for(bucket).on_remove(&cache_key);
                     self.stats.misses.inc();
                     self.stats.evictions.inc();
                     self.stats.entry_count.dec();
-                    // Note: we don't track size_bytes for simplicity.
                     return None;
                 }
             }
             if entry.metadata.is_inline() {
                 self.stats.inline_hits.inc();
             }
-            let gen = self.lru_clock.next();
-            entry.touch(gen);
+            // Notify policy of access.
+            let meta = AccessMetadata::new(bucket.clone(), entry.metadata.size);
+            let cache_key = CacheKey::new(bucket.clone(), key.clone());
+            self.policy_for(bucket).on_access(&cache_key, &meta);
             self.stats.hits.inc();
             return Some(entry.metadata.clone());
         }
@@ -214,12 +252,17 @@ impl MetadataCache {
 
     /// Inserts metadata into the cache.
     ///
-    /// If the bucket's cache exceeds `max_size_bytes`, LRU entries are evicted.
+    /// If the bucket's cache exceeds `max_size_bytes`, the eviction
+    /// policy selects victims until within limits.
     pub fn put(&self, bucket: BucketId, key: ObjectKey, metadata: ObjectMetadata) {
         let bucket_cache = self
             .buckets
             .entry(bucket.clone())
-            .or_insert_with(|| Arc::new(BucketMetadataCache::new(self.default_config.clone())))
+            .or_insert_with(|| {
+                let config = self.default_config.clone();
+                self.ensure_bucket_policy(&bucket, &config);
+                Arc::new(BucketMetadataCache::new(config))
+            })
             .clone();
 
         if !bucket_cache.config.enabled {
@@ -229,18 +272,23 @@ impl MetadataCache {
         // If the key already exists, update in place.
         if let Some(mut existing) = bucket_cache.entries.get_mut(&key) {
             existing.metadata = Arc::new(metadata);
-            let gen = self.lru_clock.next();
-            existing.touch(gen);
+            let meta = AccessMetadata::new(bucket.clone(), existing.metadata.size);
+            let cache_key = CacheKey::new(bucket.clone(), key);
+            self.policy_for(&bucket).on_access(&cache_key, &meta);
             return;
         }
 
-        // Check capacity and evict if needed.
-        self.evict_if_needed(&bucket_cache);
+        let entry_size = std::mem::size_of::<MetadataEntry>()
+            + metadata.inline_data.as_ref().map(|d| d.len()).unwrap_or(0);
 
-        let gen = self.lru_clock.next();
+        // Evict until room using the policy.
+        self.evict_for_space(&bucket, &bucket_cache, entry_size);
+
+        let meta = AccessMetadata::new(bucket.clone(), metadata.size);
+        let cache_key = CacheKey::new(bucket.clone(), key.clone());
+        self.policy_for(&bucket).on_insert(&cache_key, entry_size, &meta);
+
         let entry = MetadataEntry::new(Arc::new(metadata));
-        entry.touch(gen);
-
         bucket_cache.entries.insert(key, entry);
         self.stats.entry_count.inc();
     }
@@ -248,9 +296,12 @@ impl MetadataCache {
     /// Invalidates a cache entry for the given bucket and key.
     ///
     /// Called locally after a PUT or DELETE.
+    /// Notifies the eviction policy via [`EvictionPolicy::on_remove`].
     pub fn invalidate(&self, bucket: &BucketId, key: &ObjectKey) {
         if let Some(bucket_cache) = self.buckets.get(bucket) {
             if bucket_cache.entries.remove(key).is_some() {
+                let cache_key = CacheKey::new(bucket.clone(), key.clone());
+                self.policy_for(bucket).on_remove(&cache_key);
                 self.stats.evictions.inc();
                 self.stats.entry_count.dec();
             }
@@ -271,6 +322,8 @@ impl MetadataCache {
     /// If the bucket already exists, its config is updated and entries
     /// are migrated to a new cache with the new settings.
     pub fn set_bucket_config(&self, bucket: BucketId, config: MetadataCacheConfig) {
+        // Register per-bucket policy if the config specifies one.
+        self.ensure_bucket_policy(&bucket, &config);
         if let Some(mut entry) = self.buckets.get_mut(&bucket) {
             let old_entries = &entry.entries;
             let new_cache = Arc::new(BucketMetadataCache {
@@ -279,9 +332,7 @@ impl MetadataCache {
             });
             for item in old_entries.iter() {
                 let (k, v) = item.pair();
-                let new_entry = MetadataEntry::new(v.metadata.clone());
-                new_entry.touch(v.last_access.load(Ordering::Relaxed));
-                new_cache.entries.insert(k.clone(), new_entry);
+                new_cache.entries.insert(k.clone(), MetadataEntry::new(v.metadata.clone()));
             }
             *entry = new_cache;
         } else {
@@ -303,27 +354,43 @@ impl MetadataCache {
         reg.register_gauge(self.stats.entry_count.clone());
     }
 
-    /// Evicts LRU entries until the bucket cache is below its size limit.
-    fn evict_if_needed(&self, bucket_cache: &BucketMetadataCache) {
-        let max_entries = bucket_cache.config.max_size_bytes as usize
-            / (std::mem::size_of::<MetadataEntry>() + 64); // rough estimate
+    /// Evicts entries via the policy until the target bucket has room
+    /// for `needed_bytes`, or the policy returns `None`.
+    ///
+    /// Uses a count-based heuristic: converts `max_size_bytes` to
+    /// an approximate max entry count.
+    fn evict_for_space(
+        &self,
+        bucket: &BucketId,
+        target_bucket: &BucketMetadataCache,
+        _needed_bytes: usize,
+    ) {
+        // Rough conversion from bytes to entry count.
+        let entry_overhead = std::mem::size_of::<MetadataEntry>() + 64;
+        let max_entries = (target_bucket.config.max_size_bytes as usize / entry_overhead).max(1);
+        let policy = self.policy_for(bucket);
 
-        let mut to_remove: Option<ObjectKey> = None;
-
-        while bucket_cache.entries.len() > max_entries && !bucket_cache.entries.is_empty() {
-            let mut min_gen = u64::MAX;
-            for entry in bucket_cache.entries.iter() {
-                let gen = entry.last_access.load(Ordering::Relaxed);
-                if gen < min_gen {
-                    min_gen = gen;
-                    to_remove = Some(entry.key().clone());
-                }
+        for _ in 0..100 {
+            // Evict one more than allowed, so there's room for the incoming entry.
+            if target_bucket.entries.len() < max_entries {
+                break;
             }
 
-            if let Some(key) = to_remove.take() {
-                bucket_cache.entries.remove(&key);
-                self.stats.evictions.inc();
-                self.stats.entry_count.dec();
+            let Some(victim) = policy.select_victim() else {
+                break;
+            };
+
+            // Find the bucket containing the victim.
+            if let Some(victim_bucket) = self.buckets.get(victim.bucket()) {
+                if victim_bucket.entries.remove(victim.object_key()).is_some() {
+                    let victim_policy = self.policy_for(victim.bucket());
+                    victim_policy.on_evict(&victim);
+                    self.stats.evictions.inc();
+                    self.stats.entry_count.dec();
+                }
+            } else {
+                let victim_policy = self.policy_for(victim.bucket());
+                victim_policy.on_evict(&victim);
             }
         }
     }
@@ -335,6 +402,11 @@ mod tests {
     use oceanfs_core::Hlc;
 
     use super::*;
+    use crate::eviction::TtlLruPolicy;
+
+    fn make_policy() -> Box<dyn EvictionPolicy> {
+        Box::new(TtlLruPolicy::new(crate::eviction::TtlLruConfig::default()))
+    }
 
     fn make_meta(key: &str, inline: bool) -> ObjectMetadata {
         ObjectMetadata {
@@ -350,7 +422,7 @@ mod tests {
 
     #[test]
     fn put_then_get_returns_metadata() {
-        let cache = MetadataCache::new(MetadataCacheConfig::default());
+        let cache = MetadataCache::new(MetadataCacheConfig::default(), make_policy());
         let meta = make_meta("k", false);
         cache.put(BucketId::new("b"), ObjectKey::new("k"), meta);
 
@@ -360,7 +432,7 @@ mod tests {
 
     #[test]
     fn inline_hit_increments_counter() {
-        let cache = MetadataCache::new(MetadataCacheConfig::default());
+        let cache = MetadataCache::new(MetadataCacheConfig::default(), make_policy());
         cache.put(BucketId::new("b"), ObjectKey::new("k"), make_meta("k", true));
         cache.get(&BucketId::new("b"), &ObjectKey::new("k"));
         assert_eq!(cache.stats().inline_hits.get(), 1);
@@ -368,7 +440,7 @@ mod tests {
 
     #[test]
     fn invalidate_removes_entry() {
-        let cache = MetadataCache::new(MetadataCacheConfig::default());
+        let cache = MetadataCache::new(MetadataCacheConfig::default(), make_policy());
         cache.put(BucketId::new("b"), ObjectKey::new("k"), make_meta("k", false));
         cache.invalidate(&BucketId::new("b"), &ObjectKey::new("k"));
         assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k")).is_none());
@@ -376,7 +448,7 @@ mod tests {
 
     #[test]
     fn invalidate_increments_evictions() {
-        let cache = MetadataCache::new(MetadataCacheConfig::default());
+        let cache = MetadataCache::new(MetadataCacheConfig::default(), make_policy());
         cache.put(BucketId::new("b"), ObjectKey::new("k"), make_meta("k", false));
         cache.invalidate(&BucketId::new("b"), &ObjectKey::new("k"));
         assert_eq!(cache.stats().evictions.get(), 1);
@@ -384,7 +456,7 @@ mod tests {
 
     #[test]
     fn handle_invalidation_removes_entry() {
-        let cache = MetadataCache::new(MetadataCacheConfig::default());
+        let cache = MetadataCache::new(MetadataCacheConfig::default(), make_policy());
         cache.put(BucketId::new("b"), ObjectKey::new("k"), make_meta("k", false));
 
         let req = CacheInvalidateRequest { bucket: BucketId::new("b"), key: ObjectKey::new("k") };
@@ -396,7 +468,7 @@ mod tests {
 
     #[test]
     fn handle_invalidation_of_missing_key_is_noop() {
-        let cache = MetadataCache::new(MetadataCacheConfig::default());
+        let cache = MetadataCache::new(MetadataCacheConfig::default(), make_policy());
         let req = CacheInvalidateRequest {
             bucket: BucketId::new("b"),
             key: ObjectKey::new("nonexistent"),
@@ -408,7 +480,7 @@ mod tests {
     #[test]
     fn disabled_cache_always_returns_none() {
         let config = MetadataCacheConfig { enabled: false, ..Default::default() };
-        let cache = MetadataCache::new(config);
+        let cache = MetadataCache::new(config, make_policy());
         cache.put(BucketId::new("b"), ObjectKey::new("k"), make_meta("k", false));
         assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k")).is_none());
     }
@@ -416,7 +488,7 @@ mod tests {
     #[test]
     fn ttl_expiry_returns_none_and_increments_evictions() {
         let config = MetadataCacheConfig { ttl_ms: 10, ..Default::default() };
-        let cache = MetadataCache::new(config);
+        let cache = MetadataCache::new(config, make_policy());
         cache.put(BucketId::new("b"), ObjectKey::new("k"), make_meta("k", false));
 
         std::thread::sleep(Duration::from_millis(20));
@@ -427,7 +499,7 @@ mod tests {
 
     #[test]
     fn per_bucket_isolation() {
-        let cache = MetadataCache::new(MetadataCacheConfig::default());
+        let cache = MetadataCache::new(MetadataCacheConfig::default(), make_policy());
         cache.put(BucketId::new("b1"), ObjectKey::new("k"), make_meta("k-b1", false));
         cache.put(BucketId::new("b2"), ObjectKey::new("k"), make_meta("k-b2", false));
 
@@ -440,11 +512,16 @@ mod tests {
     #[test]
     fn lru_eviction_when_cache_full() {
         let config = MetadataCacheConfig {
-            max_size_bytes: 1, // Very small — effectively 0 entries.
+            max_size_bytes: 1,
             ttl_ms: 0,
             enabled: true,
+            ..Default::default()
         };
-        let cache = MetadataCache::new(config);
+        // Use TTL-LRU with ttl_ms=0 so all entries are immediately stale
+        // and can be selected as victims.
+        let policy =
+            Box::new(TtlLruPolicy::new(crate::eviction::TtlLruConfig { default_ttl_ms: 0 }));
+        let cache = MetadataCache::new(config, policy);
 
         cache.put(BucketId::new("b"), ObjectKey::new("k1"), make_meta("k1", false));
         cache.put(BucketId::new("b"), ObjectKey::new("k2"), make_meta("k2", false));
@@ -458,7 +535,7 @@ mod tests {
     #[test]
     fn test_metadata_cache_disabled_bypassed() {
         let config = MetadataCacheConfig { enabled: false, ..Default::default() };
-        let cache = MetadataCache::new(config);
+        let cache = MetadataCache::new(config, make_policy());
         let bucket = BucketId::new("b");
         let key = ObjectKey::new("k");
         let meta = ObjectMetadata {

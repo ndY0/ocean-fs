@@ -7,10 +7,15 @@
 
 use bytes::Bytes;
 use oceanfs_cache::{
+    eviction::{GdsfConfig, GdsfPolicy, TtlLruConfig, TtlLruPolicy},
     MetadataCache, MetadataCacheConfig, NegativeCache, NegativeCacheConfig, ObjectCache,
     ObjectCacheConfig,
 };
 use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata};
+
+fn make_meta_cache(config: MetadataCacheConfig) -> MetadataCache {
+    MetadataCache::new(config, Box::new(TtlLruPolicy::new(TtlLruConfig::default())))
+}
 
 fn make_bucket() -> BucketId {
     BucketId::new("test-bucket")
@@ -20,13 +25,18 @@ fn make_key(name: &str) -> ObjectKey {
     ObjectKey::new(name)
 }
 
+fn make_obj_cache(config: ObjectCacheConfig) -> ObjectCache {
+    ObjectCache::new(config, Box::new(GdsfPolicy::new(GdsfConfig::default())))
+}
+
 #[test]
 fn l1_cache_put_and_get_returns_data() {
-    let cache = ObjectCache::new(ObjectCacheConfig {
+    let cache = make_obj_cache(ObjectCacheConfig {
         enabled: true,
         max_size_bytes: 64 * 1024,
         ttl_ms: 60_000,
         max_blob_size: 1024 * 1024,
+        ..Default::default()
     });
 
     let bucket = make_bucket();
@@ -40,11 +50,12 @@ fn l1_cache_put_and_get_returns_data() {
 
 #[test]
 fn l1_cache_miss_returns_none() {
-    let cache = ObjectCache::new(ObjectCacheConfig {
+    let cache = make_obj_cache(ObjectCacheConfig {
         enabled: true,
         max_size_bytes: 64 * 1024,
         ttl_ms: 60_000,
         max_blob_size: 1024 * 1024,
+        ..Default::default()
     });
 
     let result = cache.get(&make_bucket(), &make_key("nonexistent"));
@@ -53,11 +64,12 @@ fn l1_cache_miss_returns_none() {
 
 #[test]
 fn l1_cache_invalidate_removes_entry() {
-    let cache = ObjectCache::new(ObjectCacheConfig {
+    let cache = make_obj_cache(ObjectCacheConfig {
         enabled: true,
         max_size_bytes: 64 * 1024,
         ttl_ms: 60_000,
         max_blob_size: 1024 * 1024,
+        ..Default::default()
     });
 
     let bucket = make_bucket();
@@ -73,10 +85,11 @@ fn l1_cache_invalidate_removes_entry() {
 
 #[test]
 fn l2_metadata_cache_put_and_get() {
-    let cache = MetadataCache::new(MetadataCacheConfig {
+    let cache = make_meta_cache(MetadataCacheConfig {
         enabled: true,
         max_size_bytes: 1024 * 1024,
         ttl_ms: 300_000,
+        ..Default::default()
     });
 
     let bucket = make_bucket();
@@ -99,10 +112,11 @@ fn l2_metadata_cache_put_and_get() {
 
 #[test]
 fn l2_cache_miss_returns_none() {
-    let cache = MetadataCache::new(MetadataCacheConfig {
+    let cache = make_meta_cache(MetadataCacheConfig {
         enabled: true,
         max_size_bytes: 1024 * 1024,
         ttl_ms: 300_000,
+        ..Default::default()
     });
 
     let result = cache.get(&make_bucket(), &make_key("not-cached"));
@@ -111,10 +125,11 @@ fn l2_cache_miss_returns_none() {
 
 #[test]
 fn l2_cache_invalidate_removes_entry() {
-    let cache = MetadataCache::new(MetadataCacheConfig {
+    let cache = make_meta_cache(MetadataCacheConfig {
         enabled: true,
         max_size_bytes: 1024 * 1024,
         ttl_ms: 300_000,
+        ..Default::default()
     });
 
     let bucket = make_bucket();
@@ -171,11 +186,12 @@ fn l3_negative_cache_disabled_always_returns_true() {
 
 #[test]
 fn object_cache_stats_reflect_operations() {
-    let cache = ObjectCache::new(ObjectCacheConfig {
+    let cache = make_obj_cache(ObjectCacheConfig {
         enabled: true,
         max_size_bytes: 64 * 1024,
         ttl_ms: 60_000,
         max_blob_size: 1024 * 1024,
+        ..Default::default()
     });
 
     let bucket = make_bucket();

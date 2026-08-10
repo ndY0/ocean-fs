@@ -774,19 +774,81 @@ impl Node {
         .with_timeouts(op_timeouts.clone());
 
         // ---- 8. Construct caches ----
-        let object_cache =
-            Arc::new(oceanfs_cache::ObjectCache::new(oceanfs_cache::ObjectCacheConfig {
+        let l1_policy: Box<dyn oceanfs_cache::eviction::EvictionPolicy> = match config
+            .eviction_policy_l1
+        {
+            oceanfs_core::EvictionPolicyType::Gdsf => {
+                Box::new(oceanfs_cache::eviction::GdsfPolicy::new(
+                    oceanfs_cache::eviction::GdsfConfig::default(),
+                ))
+            }
+            oceanfs_core::EvictionPolicyType::TtlLru => Box::new(
+                oceanfs_cache::eviction::TtlLruPolicy::new(oceanfs_cache::eviction::TtlLruConfig {
+                    default_ttl_ms: config.object_cache_ttl_ms,
+                }),
+            ),
+            oceanfs_core::EvictionPolicyType::Adaptive => {
+                tracing::warn!(
+                    "Adaptive eviction policy not yet implemented; falling back to GDSF for L1"
+                );
+                Box::new(oceanfs_cache::eviction::GdsfPolicy::new(
+                    oceanfs_cache::eviction::GdsfConfig::default(),
+                ))
+            }
+            _ => {
+                tracing::warn!("Unknown L1 eviction policy; falling back to GDSF");
+                Box::new(oceanfs_cache::eviction::GdsfPolicy::new(
+                    oceanfs_cache::eviction::GdsfConfig::default(),
+                ))
+            }
+        };
+        let l2_policy: Box<dyn oceanfs_cache::eviction::EvictionPolicy> = match config
+            .eviction_policy_l2
+        {
+            oceanfs_core::EvictionPolicyType::TtlLru => Box::new(
+                oceanfs_cache::eviction::TtlLruPolicy::new(oceanfs_cache::eviction::TtlLruConfig {
+                    default_ttl_ms: config.metadata_cache_ttl_ms,
+                }),
+            ),
+            oceanfs_core::EvictionPolicyType::Gdsf => {
+                Box::new(oceanfs_cache::eviction::GdsfPolicy::new(
+                    oceanfs_cache::eviction::GdsfConfig::default(),
+                ))
+            }
+            oceanfs_core::EvictionPolicyType::Adaptive => {
+                tracing::warn!(
+                    "Adaptive eviction policy not yet implemented; falling back to TTL-LRU for L2"
+                );
+                Box::new(oceanfs_cache::eviction::TtlLruPolicy::new(
+                    oceanfs_cache::eviction::TtlLruConfig::default(),
+                ))
+            }
+            _ => {
+                tracing::warn!("Unknown L2 eviction policy; falling back to TTL-LRU");
+                Box::new(oceanfs_cache::eviction::TtlLruPolicy::new(
+                    oceanfs_cache::eviction::TtlLruConfig::default(),
+                ))
+            }
+        };
+        let object_cache = Arc::new(oceanfs_cache::ObjectCache::new(
+            oceanfs_cache::ObjectCacheConfig {
                 enabled: config.object_cache_enabled,
                 max_size_bytes: config.object_cache_size_bytes,
                 ttl_ms: config.object_cache_ttl_ms,
                 max_blob_size: config.object_cache_max_blob_size,
-            }));
-        let metadata_cache =
-            Arc::new(oceanfs_cache::MetadataCache::new(oceanfs_cache::MetadataCacheConfig {
+                ..Default::default()
+            },
+            l1_policy,
+        ));
+        let metadata_cache = Arc::new(oceanfs_cache::MetadataCache::new(
+            oceanfs_cache::MetadataCacheConfig {
                 enabled: config.metadata_cache_enabled,
                 max_size_bytes: config.metadata_cache_size_bytes,
                 ttl_ms: config.metadata_cache_ttl_ms,
-            }));
+                ..Default::default()
+            },
+            l2_policy,
+        ));
         let negative_cache =
             Arc::new(oceanfs_cache::NegativeCache::new(oceanfs_cache::NegativeCacheConfig {
                 enabled: config.negative_cache_enabled,
@@ -1784,6 +1846,9 @@ mod tests {
             Arc::new(PrefetchStoreAdapter { store: metadata_store.clone() });
         let _metadata_cache = Arc::new(oceanfs_cache::MetadataCache::new(
             oceanfs_cache::MetadataCacheConfig::default(),
+            Box::new(oceanfs_cache::eviction::TtlLruPolicy::new(
+                oceanfs_cache::eviction::TtlLruConfig::default(),
+            )),
         ));
         let prefetch_engine = Arc::new(oceanfs_cache::PrefetchEngine::new(
             prefetch_config,

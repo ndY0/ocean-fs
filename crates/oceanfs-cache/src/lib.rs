@@ -20,12 +20,16 @@
 )]
 
 mod error;
+pub mod eviction;
 mod l1_object;
 mod l2_metadata;
 mod l3_negative;
 mod prefetch;
 
 pub use error::{Error, Result};
+pub use eviction::{
+    AccessMetadata, CacheKey, EvictionPolicy, GdsfConfig, GdsfPolicy, TtlLruConfig, TtlLruPolicy,
+};
 pub use l1_object::{CacheStats, ObjectCache, ObjectCacheConfig};
 pub use l2_metadata::{MetadataCache, MetadataCacheConfig, MetadataCacheStats};
 pub use l3_negative::{NegativeCache, NegativeCacheConfig, NegativeCacheStats};

@@ -10,6 +10,7 @@ oceanfs-core.workspace = true
 oceanfs-storage-api.workspace = true
 bytes.workspace = true
 dashmap.workspace = true
+ordered-float.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
 smallvec.workspace = true

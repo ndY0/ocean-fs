@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use oceanfs_cache::{
+    eviction::{GdsfConfig, GdsfPolicy, TtlLruConfig, TtlLruPolicy},
     MetadataCache, MetadataCacheConfig, NegativeCache, NegativeCacheConfig, ObjectCache,
     ObjectCacheConfig, PrefetchConfig, PrefetchEngine,
 };
@@ -86,6 +87,17 @@ impl MetadataStore for MockStore {
     }
 }
 
+fn make_object_cache() -> ObjectCache {
+    ObjectCache::new(ObjectCacheConfig::default(), Box::new(GdsfPolicy::new(GdsfConfig::default())))
+}
+
+fn make_metadata_cache() -> MetadataCache {
+    MetadataCache::new(
+        MetadataCacheConfig::default(),
+        Box::new(TtlLruPolicy::new(TtlLruConfig::default())),
+    )
+}
+
 fn make_meta(key: &str, inline: Option<&[u8]>) -> ObjectMetadata {
     ObjectMetadata {
         object_key: ObjectKey::new(key),
@@ -110,7 +122,7 @@ fn make_meta(key: &str, inline: Option<&[u8]>) -> ObjectMetadata {
 
 #[test]
 fn l1_cache_hit_miss_scenario() {
-    let cache = ObjectCache::new(ObjectCacheConfig::default());
+    let cache = make_object_cache();
     let bucket = BucketId::new("photos");
     let key = ObjectKey::new("sunset.jpg");
     let data = Bytes::from_static(b"image data here");
@@ -129,7 +141,7 @@ fn l1_cache_hit_miss_scenario() {
 
 #[test]
 fn l2_cache_inline_serving() {
-    let cache = MetadataCache::new(MetadataCacheConfig::default());
+    let cache = make_metadata_cache();
     let bucket = BucketId::new("data");
     let key = ObjectKey::new("small.txt");
 
@@ -172,8 +184,8 @@ fn l3_negative_cache_filters_nonexistent() {
 #[test]
 fn l1_l2_cascade_scenario() {
     // Simulate read path: L1 miss → L2 hit with inline data.
-    let l1 = ObjectCache::new(ObjectCacheConfig::default());
-    let l2 = MetadataCache::new(MetadataCacheConfig::default());
+    let l1 = make_object_cache();
+    let l2 = make_metadata_cache();
     let bucket = BucketId::new("b");
     let key = ObjectKey::new("obj");
 
@@ -230,8 +242,8 @@ async fn prefetch_warms_metadata_cache() {
         (bucket.clone(), ObjectKey::new("img-002.jpg"), make_meta("img-002.jpg", Some(b"data2"))),
     ];
     let store: Arc<dyn MetadataStore> = Arc::new(MockStore::new(entries));
-    let metadata_cache = Arc::new(MetadataCache::new(MetadataCacheConfig::default()));
-    let object_cache = Arc::new(ObjectCache::new(ObjectCacheConfig::default()));
+    let metadata_cache = Arc::new(make_metadata_cache());
+    let object_cache = Arc::new(make_object_cache());
 
     let engine = PrefetchEngine::new(
         PrefetchConfig {
@@ -266,7 +278,7 @@ async fn prefetch_warms_metadata_cache() {
 
 #[test]
 fn stats_accumulate_over_operations() {
-    let cache = ObjectCache::new(ObjectCacheConfig::default());
+    let cache = make_object_cache();
     let bucket = BucketId::new("stats-bucket");
     let key = ObjectKey::new("stats-key");
 

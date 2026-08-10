@@ -358,8 +358,10 @@ mod tests {
 
     #[tokio::test]
     async fn after_list_enqueues_tasks() {
-        let metadata_cache =
-            Arc::new(MetadataCache::new(crate::l2_metadata::MetadataCacheConfig::default()));
+        let metadata_cache = Arc::new(MetadataCache::new(
+            crate::l2_metadata::MetadataCacheConfig::default(),
+            Box::new(crate::eviction::TtlLruPolicy::new(crate::eviction::TtlLruConfig::default())),
+        ));
         let entries = vec![
             (BucketId::new("b"), ObjectKey::new("k1"), make_meta("k1", None)),
             (BucketId::new("b"), ObjectKey::new("k2"), make_meta("k2", None)),
@@ -391,8 +393,10 @@ mod tests {
 
     #[tokio::test]
     async fn after_get_prefetches_adjacent_keys() {
-        let metadata_cache =
-            Arc::new(MetadataCache::new(crate::l2_metadata::MetadataCacheConfig::default()));
+        let metadata_cache = Arc::new(MetadataCache::new(
+            crate::l2_metadata::MetadataCacheConfig::default(),
+            Box::new(crate::eviction::TtlLruPolicy::new(crate::eviction::TtlLruConfig::default())),
+        ));
         let entries = vec![
             (BucketId::new("b"), ObjectKey::new("k1"), make_meta("k1", None)),
             (BucketId::new("b"), ObjectKey::new("k2"), make_meta("k2", None)),
@@ -422,8 +426,10 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_engine_is_noop() {
-        let metadata_cache =
-            Arc::new(MetadataCache::new(crate::l2_metadata::MetadataCacheConfig::default()));
+        let metadata_cache = Arc::new(MetadataCache::new(
+            crate::l2_metadata::MetadataCacheConfig::default(),
+            Box::new(crate::eviction::TtlLruPolicy::new(crate::eviction::TtlLruConfig::default())),
+        ));
         let store = Arc::new(MockStore::new(vec![]));
         let engine = PrefetchEngine::new(
             PrefetchConfig { enabled: false, ..Default::default() },
@@ -440,9 +446,14 @@ mod tests {
 
     #[tokio::test]
     async fn inline_blob_warms_object_cache() {
-        let obj_cache = Arc::new(ObjectCache::new(crate::l1_object::ObjectCacheConfig::default()));
-        let metadata_cache =
-            Arc::new(MetadataCache::new(crate::l2_metadata::MetadataCacheConfig::default()));
+        let obj_cache = Arc::new(ObjectCache::new(
+            crate::l1_object::ObjectCacheConfig::default(),
+            Box::new(crate::eviction::GdsfPolicy::new(crate::eviction::GdsfConfig::default())),
+        ));
+        let metadata_cache = Arc::new(MetadataCache::new(
+            crate::l2_metadata::MetadataCacheConfig::default(),
+            Box::new(crate::eviction::TtlLruPolicy::new(crate::eviction::TtlLruConfig::default())),
+        ));
         let entries = vec![(
             BucketId::new("b"),
             ObjectKey::new("inline-key"),
@@ -475,8 +486,10 @@ mod tests {
 
     #[tokio::test]
     async fn queue_full_silently_drops() {
-        let metadata_cache =
-            Arc::new(MetadataCache::new(crate::l2_metadata::MetadataCacheConfig::default()));
+        let metadata_cache = Arc::new(MetadataCache::new(
+            crate::l2_metadata::MetadataCacheConfig::default(),
+            Box::new(crate::eviction::TtlLruPolicy::new(crate::eviction::TtlLruConfig::default())),
+        ));
         let store = Arc::new(MockStore::new(vec![]));
         let engine = PrefetchEngine::new(
             PrefetchConfig {

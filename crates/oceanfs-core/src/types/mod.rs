@@ -16,6 +16,7 @@
 mod cache;
 mod codec;
 mod config;
+mod eviction;
 mod fetch_strategy;
 mod hash;
 mod heal;
@@ -32,6 +33,8 @@ pub use config::{
     CompressConfig, CompressionTier, GossipConfig, GpuConfig, HealConfig, NvcompCodec,
     NvcompConfig, PoolConfig, RpcConfig, SegmentSizeConfig, SizeTier,
 };
+// --- Eviction policy types ---
+pub use eviction::EvictionPolicyType;
 // --- Fetch strategy ---
 pub use fetch_strategy::{FetchStrategy, FetchStrategyConfig};
 // --- Hash types ---

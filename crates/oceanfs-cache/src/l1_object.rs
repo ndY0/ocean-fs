@@ -1,20 +1,26 @@
-//! L1 Object Data Cache — in-memory LRU of hot blob payloads.
+//! L1 Object Data Cache — in-memory cache of hot blob payloads.
 //!
 //! Serves frequently accessed blobs with zero disk I/O. Bucket-scoped,
-//! TTL-based eviction, LRU eviction when size exceeds limit.
+//! TTL-based expiry, policy-driven eviction via [`EvictionPolicy`].
 //! DashMap for concurrent access.
+//!
+//! The eviction policy (e.g. [`GdsfPolicy`]) replaces the previous
+//! O(n) linear scan with O(log n) victim selection.
 
 use std::{
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use oceanfs_core::{BucketId, Counter, Gauge, LabelSet, MetricRegistrar, ObjectKey};
+use oceanfs_core::{
+    BucketId, Counter, EvictionPolicyType, Gauge, LabelSet, MetricRegistrar, ObjectKey,
+};
+
+use crate::eviction::{
+    AccessMetadata, CacheKey, EvictionPolicy, GdsfConfig, GdsfPolicy, TtlLruConfig, TtlLruPolicy,
+};
 
 /// Statistics for the L1 object cache.
 ///
@@ -53,16 +59,21 @@ impl CacheStats {
 /// Configuration for the L1 object cache.
 ///
 /// Can be specified per-bucket or used as a global default.
+/// Set [`eviction_policy_type`](Self::eviction_policy_type) to
+/// override the cache-wide eviction policy for a specific bucket.
 #[derive(Debug, Clone)]
 pub struct ObjectCacheConfig {
     /// Whether the cache is enabled.
     pub enabled: bool,
-    /// Maximum cache size in bytes (approximate).
+    /// Maximum cache size in bytes (approximate). Enforced per-bucket.
     pub max_size_bytes: u64,
     /// Time-to-live for cache entries in milliseconds (0 = no expiry).
     pub ttl_ms: u64,
     /// Maximum blob size to cache. Blobs larger than this are not inserted.
     pub max_blob_size: u64,
+    /// Optional per-bucket eviction policy override.
+    /// `None` means use the cache-wide default policy.
+    pub eviction_policy_type: Option<EvictionPolicyType>,
 }
 
 impl Default for ObjectCacheConfig {
@@ -72,6 +83,7 @@ impl Default for ObjectCacheConfig {
             max_size_bytes: 512 * 1024 * 1024,
             ttl_ms: 60_000,
             max_blob_size: 1024 * 1024,
+            eviction_policy_type: None,
         }
     }
 }
@@ -82,18 +94,11 @@ struct CacheEntry {
     data: Bytes,
     /// When this entry was inserted (used for TTL checks).
     inserted_at: Instant,
-    /// Approximate last-access timestamp for LRU eviction.
-    /// Stored as an opaque counter; higher = more recently accessed.
-    last_access: AtomicU64,
 }
 
 impl CacheEntry {
     fn new(data: Bytes) -> Self {
-        Self { data, inserted_at: Instant::now(), last_access: AtomicU64::new(0) }
-    }
-
-    fn touch(&self, generation: u64) {
-        self.last_access.store(generation, Ordering::Relaxed);
+        Self { data, inserted_at: Instant::now() }
     }
 }
 
@@ -109,37 +114,22 @@ impl BucketCache {
     }
 }
 
-/// Global access-generation counter for LRU ordering.
+/// L1 object data cache — bucket-scoped cache of blob payloads.
 ///
-/// Each get/put increments this; entries touched by those operations
-/// record the current generation. During eviction we find the entry
-/// with the smallest generation value (oldest access).
-struct LruClock {
-    generation: AtomicU64,
-}
-
-impl LruClock {
-    fn new() -> Self {
-        Self { generation: AtomicU64::new(1) }
-    }
-
-    /// Returns the next generation number (monotonically increasing).
-    fn next(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::Relaxed)
-    }
-}
-
-/// L1 object data cache — bucket-scoped LRU of blob payloads.
+/// Uses a pluggable [`EvictionPolicy`] (default: [`GdsfPolicy`](crate::eviction::GdsfPolicy)) for
+/// size-aware victim selection. Each bucket can override the default policy
+/// via [`ObjectCacheConfig::eviction_policy_type`].
 ///
 /// # Examples
 ///
 /// ```
 /// use bytes::Bytes;
-/// use oceanfs_cache::ObjectCache;
-/// use oceanfs_cache::ObjectCacheConfig;
+/// use oceanfs_cache::{ObjectCache, ObjectCacheConfig};
+/// use oceanfs_cache::eviction::{GdsfConfig, GdsfPolicy};
 /// use oceanfs_core::{BucketId, ObjectKey};
 ///
-/// let cache = ObjectCache::new(ObjectCacheConfig::default());
+/// let policy = Box::new(GdsfPolicy::new(GdsfConfig::default()));
+/// let cache = ObjectCache::new(ObjectCacheConfig::default(), policy);
 /// let data = Bytes::from_static(b"hello world");
 /// cache.put(BucketId::new("photos"), ObjectKey::new("sunset.jpg"), data.clone());
 /// let hit = cache.get(&BucketId::new("photos"), &ObjectKey::new("sunset.jpg"));
@@ -148,17 +138,22 @@ impl LruClock {
 pub struct ObjectCache {
     default_config: ObjectCacheConfig,
     buckets: DashMap<BucketId, Arc<BucketCache>>,
-    lru_clock: LruClock,
+    /// The cache-wide default eviction policy.
+    default_policy: Arc<dyn EvictionPolicy>,
+    /// Per-bucket policy overrides (populated via `set_bucket_config` or auto-created
+    /// when the config specifies a policy type).
+    per_bucket_policies: DashMap<BucketId, Arc<dyn EvictionPolicy>>,
     stats: CacheStats,
 }
 
 impl ObjectCache {
-    /// Creates a new object cache with a default configuration for all buckets.
-    pub fn new(config: ObjectCacheConfig) -> Self {
+    /// Creates a new object cache with the given configuration and eviction policy.
+    pub fn new(config: ObjectCacheConfig, eviction_policy: Box<dyn EvictionPolicy>) -> Self {
         Self {
             default_config: config,
             buckets: DashMap::new(),
-            lru_clock: LruClock::new(),
+            default_policy: Arc::from(eviction_policy),
+            per_bucket_policies: DashMap::new(),
             stats: CacheStats {
                 hits: Counter::new(
                     "cache_hits_total".into(),
@@ -189,9 +184,49 @@ impl ObjectCache {
         }
     }
 
+    /// Returns the eviction policy for the given bucket, falling back
+    /// to the cache-wide default if no per-bucket policy is registered.
+    fn policy_for(&self, bucket: &BucketId) -> Arc<dyn EvictionPolicy> {
+        self.per_bucket_policies
+            .get(bucket)
+            .map(|p| Arc::clone(p.value()))
+            .unwrap_or_else(|| Arc::clone(&self.default_policy))
+    }
+
+    /// Constructs an L1 eviction policy from a config type.
+    fn make_l1_policy(policy_type: EvictionPolicyType, ttl_ms: u64) -> Arc<dyn EvictionPolicy> {
+        match policy_type {
+            EvictionPolicyType::Gdsf => Arc::new(GdsfPolicy::new(GdsfConfig::default())),
+            EvictionPolicyType::TtlLru => {
+                Arc::new(TtlLruPolicy::new(TtlLruConfig { default_ttl_ms: ttl_ms }))
+            }
+            EvictionPolicyType::Adaptive => {
+                tracing::warn!(
+                    "Adaptive eviction policy not yet implemented; falling back to GDSF for L1 bucket"
+                );
+                Arc::new(GdsfPolicy::new(GdsfConfig::default()))
+            }
+            _ => {
+                tracing::warn!("Unknown L1 eviction policy; falling back to GDSF");
+                Arc::new(GdsfPolicy::new(GdsfConfig::default()))
+            }
+        }
+    }
+
+    /// Ensures a per-bucket policy exists if the config specifies one.
+    fn ensure_bucket_policy(&self, bucket: &BucketId, config: &ObjectCacheConfig) {
+        if let Some(policy_type) = config.eviction_policy_type {
+            if !self.per_bucket_policies.contains_key(bucket) {
+                let policy = Self::make_l1_policy(policy_type, config.ttl_ms);
+                self.per_bucket_policies.insert(bucket.clone(), policy);
+            }
+        }
+    }
+
     /// Retrieves a blob from the cache.
     ///
     /// Returns `None` on miss, TTL expiry, or if the cache is disabled.
+    /// On hit, notifies the eviction policy via [`EvictionPolicy::on_access`].
     pub fn get(&self, bucket: &BucketId, key: &ObjectKey) -> Option<Bytes> {
         let Some(bucket_cache) = self.buckets.get(bucket) else {
             self.stats.misses.inc();
@@ -210,6 +245,8 @@ impl ObjectCache {
                     let data_len = entry.data.len();
                     drop(entry);
                     bucket_cache.entries.remove(key);
+                    let cache_key = CacheKey::new(bucket.clone(), key.clone());
+                    self.policy_for(bucket).on_remove(&cache_key);
                     self.stats.evictions.inc();
                     self.stats.entry_count.dec();
                     self.stats.size_bytes.sub(data_len as u64);
@@ -217,9 +254,10 @@ impl ObjectCache {
                     return None;
                 }
             }
-            // Touch for LRU.
-            let gen = self.lru_clock.next();
-            entry.touch(gen);
+            // Notify policy of access.
+            let meta = AccessMetadata::new(bucket.clone(), entry.data.len() as u64);
+            let cache_key = CacheKey::new(bucket.clone(), key.clone());
+            self.policy_for(bucket).on_access(&cache_key, &meta);
             self.stats.hits.inc();
             return Some(entry.data.clone());
         }
@@ -231,31 +269,39 @@ impl ObjectCache {
     /// Inserts a blob into the cache.
     ///
     /// Blobs larger than the bucket's `max_blob_size` are silently skipped.
-    /// If inserting would exceed `max_size_bytes`, LRU entries are evicted
-    /// until there is room.
+    /// If inserting would exceed `max_size_bytes`, the eviction policy
+    /// selects victims until there is room.
     pub fn put(&self, bucket_id: BucketId, key: ObjectKey, data: Bytes) {
         // Get or create bucket cache.
         let bucket_cache = self
             .buckets
             .entry(bucket_id.clone())
-            .or_insert_with(|| Arc::new(BucketCache::new(self.default_config.clone())))
+            .or_insert_with(|| {
+                let config = self.default_config.clone();
+                self.ensure_bucket_policy(&bucket_id, &config);
+                Arc::new(BucketCache::new(config))
+            })
             .clone();
 
         if !bucket_cache.config.enabled {
             return;
         }
 
+        let blob_len = data.len();
+
         // Size-gated: skip blobs larger than the threshold.
-        if data.len() as u64 > bucket_cache.config.max_blob_size {
+        if blob_len as u64 > bucket_cache.config.max_blob_size {
             return;
         }
 
-        // If key already exists, update in place (no size change detection).
+        // If key already exists, update in place.
         if let Some(mut existing) = bucket_cache.entries.get_mut(&key) {
-            let delta = data.len() as i64 - existing.data.len() as i64;
+            let delta = blob_len as i64 - existing.data.len() as i64;
             existing.data = data;
-            let gen = self.lru_clock.next();
-            existing.touch(gen);
+            // Notify policy of update (access + re-insert to update size).
+            let meta = AccessMetadata::new(bucket_id.clone(), blob_len as u64);
+            let cache_key = CacheKey::new(bucket_id.clone(), key);
+            self.policy_for(&bucket_id).on_access(&cache_key, &meta);
             if delta > 0 {
                 self.stats.size_bytes.add(delta as u64);
             } else if delta < 0 {
@@ -264,26 +310,31 @@ impl ObjectCache {
             return;
         }
 
-        // Check capacity and evict if needed.
-        self.evict_if_needed(&bucket_cache, data.len());
+        // Notify policy of insert.
+        let meta = AccessMetadata::new(bucket_id.clone(), blob_len as u64);
+        let cache_key = CacheKey::new(bucket_id.clone(), key.clone());
 
-        let gen = self.lru_clock.next();
+        // Evict until there is room (policy-driven, cross-bucket).
+        self.evict_for_space(&bucket_id, &bucket_cache, blob_len);
+
+        self.policy_for(&bucket_id).on_insert(&cache_key, blob_len, &meta);
+
         let entry = CacheEntry::new(data);
-        entry.touch(gen);
-
-        let data_len = entry.data.len();
         bucket_cache.entries.insert(key, entry);
-        self.stats.size_bytes.add(data_len as u64);
+        self.stats.size_bytes.add(blob_len as u64);
         self.stats.entry_count.inc();
     }
 
     /// Invalidates a cache entry for the given bucket and key.
     ///
     /// Best-effort: may miss entries due to concurrent access or TTL races.
+    /// Notifies the eviction policy via [`EvictionPolicy::on_remove`].
     pub fn invalidate(&self, bucket: &BucketId, key: &ObjectKey) {
         if let Some(bucket_cache) = self.buckets.get(bucket) {
             if let Some((_k, entry)) = bucket_cache.entries.remove(key) {
                 let data_len = entry.data.len();
+                let cache_key = CacheKey::new(bucket.clone(), key.clone());
+                self.policy_for(bucket).on_remove(&cache_key);
                 self.stats.size_bytes.sub(data_len as u64);
                 self.stats.entry_count.dec();
             }
@@ -301,10 +352,6 @@ impl ObjectCache {
     }
 
     /// Registers the cache's counters and gauges with a metrics registry.
-    ///
-    /// After registration, the cached counters are included in
-    /// Prometheus text-format output when calling `gather()` on
-    /// the registry.
     pub fn register_metrics(&self, reg: &dyn MetricRegistrar) {
         reg.register_counter(self.stats.hits.clone());
         reg.register_counter(self.stats.misses.clone());
@@ -315,22 +362,25 @@ impl ObjectCache {
 
     /// Adds or updates a bucket-specific configuration.
     ///
-    /// If the bucket already exists, its config is updated.
+    /// If the bucket already exists, its config is updated. Existing
+    /// entries are migrated; entries exceeding the new `max_blob_size`
+    /// are dropped and notified to the eviction policy.
     pub fn set_bucket_config(&self, bucket: BucketId, config: ObjectCacheConfig) {
+        // Register per-bucket policy if the config specifies one.
+        self.ensure_bucket_policy(&bucket, &config);
         if let Some(mut entry) = self.buckets.get_mut(&bucket) {
-            // Replace the bucket cache with a new one using the new config.
-            // Existing entries are preserved by moving them into a new cache.
             let old_entries = &entry.entries;
             let new_cache = Arc::new(BucketCache {
                 config,
                 entries: DashMap::with_capacity(old_entries.len()),
             });
-            // Move entries.
             for item in old_entries.iter() {
                 let (k, v) = item.pair();
-                // Only move entries that fit within the new size gate.
                 if v.data.len() as u64 <= new_cache.config.max_blob_size {
                     new_cache.entries.insert(k.clone(), CacheEntry::new(v.data.clone()));
+                } else {
+                    let cache_key = CacheKey::new(bucket.clone(), k.clone());
+                    self.policy_for(&bucket).on_remove(&cache_key);
                 }
             }
             *entry = new_cache;
@@ -340,56 +390,56 @@ impl ObjectCache {
     }
 
     /// Removes all entries for a given bucket.
+    ///
+    /// Notifies the eviction policy for each removed entry.
     pub fn clear_bucket(&self, bucket: &BucketId) {
         if let Some((_k, bucket_cache)) = self.buckets.remove(bucket) {
             let removed_count = bucket_cache.entries.len();
             let removed_size: usize =
                 bucket_cache.entries.iter().map(|entry| entry.data.len()).sum();
+            // Notify policy for each removed entry.
+            for item in bucket_cache.entries.iter() {
+                let (key, _) = item.pair();
+                let cache_key = CacheKey::new(bucket.clone(), key.clone());
+                self.policy_for(bucket).on_remove(&cache_key);
+            }
             self.stats.entry_count.sub(removed_count as u64);
             self.stats.size_bytes.sub(removed_size as u64);
         }
     }
 
-    /// Evicts LRU entries until there is enough space for `needed_bytes`.
-    fn evict_if_needed(&self, bucket_cache: &BucketCache, needed_bytes: usize) {
-        let max_bytes = bucket_cache.config.max_size_bytes as usize;
-        let current_size = approximate_size(&bucket_cache.entries);
-        let target = current_size.saturating_add(needed_bytes);
+    /// Evicts entries via the policy until the target bucket has room
+    /// for `needed_bytes`, or the policy returns `None`.
+    ///
+    /// Victims may come from any bucket — eviction is global. The loop
+    /// is bounded to prevent pathological stalls (max 100 iterations).
+    fn evict_for_space(&self, bucket: &BucketId, target_bucket: &BucketCache, needed_bytes: usize) {
+        let max_bytes = target_bucket.config.max_size_bytes as usize;
+        let policy = self.policy_for(bucket);
 
-        if target <= max_bytes {
-            return;
-        }
-
-        // Scan all entries, find the one with the lowest last_access.
-        // Evict one entry, then check again.
-        let mut evicted = 0usize;
-        let mut to_remove: Option<ObjectKey> = None;
-
-        // We limit the eviction scan to avoid blocking too long on very large caches.
-        // In practice, eviction is rare, so a linear scan is acceptable.
-        loop {
-            let current = approximate_size(&bucket_cache.entries);
-            if current.saturating_add(needed_bytes) <= max_bytes || evicted >= 100 {
+        for _ in 0..100 {
+            let current = approximate_size(&target_bucket.entries);
+            if current.saturating_add(needed_bytes) <= max_bytes {
                 break;
             }
 
-            let mut min_gen = u64::MAX;
-            for entry in bucket_cache.entries.iter() {
-                let gen = entry.last_access.load(Ordering::Relaxed);
-                if gen < min_gen {
-                    min_gen = gen;
-                    to_remove = Some(entry.key().clone());
-                }
-            }
+            let Some(victim) = policy.select_victim() else {
+                break;
+            };
 
-            if let Some(key) = to_remove.take() {
-                if let Some((_, entry)) = bucket_cache.entries.remove(&key) {
+            // Find the bucket containing the victim.
+            if let Some(victim_bucket) = self.buckets.get(victim.bucket()) {
+                if let Some((_, entry)) = victim_bucket.entries.remove(victim.object_key()) {
                     let data_len = entry.data.len();
+                    let victim_policy = self.policy_for(victim.bucket());
+                    victim_policy.on_evict(&victim);
                     self.stats.size_bytes.sub(data_len as u64);
                     self.stats.entry_count.dec();
                     self.stats.evictions.inc();
-                    evicted += 1;
                 }
+            } else {
+                let victim_policy = self.policy_for(victim.bucket());
+                victim_policy.on_evict(&victim);
             }
         }
     }
@@ -404,16 +454,21 @@ fn approximate_size(entries: &DashMap<ObjectKey, CacheEntry>) -> usize {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::eviction::GdsfPolicy;
+
+    fn make_policy() -> Box<dyn EvictionPolicy> {
+        Box::new(GdsfPolicy::new(crate::eviction::GdsfConfig::default()))
+    }
 
     #[test]
     fn get_miss_returns_none() {
-        let cache = ObjectCache::new(ObjectCacheConfig::default());
+        let cache = ObjectCache::new(ObjectCacheConfig::default(), make_policy());
         assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k")).is_none());
     }
 
     #[test]
     fn put_then_get_returns_data() {
-        let cache = ObjectCache::new(ObjectCacheConfig::default());
+        let cache = ObjectCache::new(ObjectCacheConfig::default(), make_policy());
         let data = Bytes::from_static(b"hello");
         cache.put(BucketId::new("b"), ObjectKey::new("k"), data.clone());
 
@@ -423,7 +478,7 @@ mod tests {
 
     #[test]
     fn invalidate_removes_entry() {
-        let cache = ObjectCache::new(ObjectCacheConfig::default());
+        let cache = ObjectCache::new(ObjectCacheConfig::default(), make_policy());
         cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"data"));
         cache.invalidate(&BucketId::new("b"), &ObjectKey::new("k"));
         assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k")).is_none());
@@ -432,14 +487,14 @@ mod tests {
     #[test]
     fn max_blob_size_gate() {
         let config = ObjectCacheConfig { max_blob_size: 10, ..Default::default() };
-        let cache = ObjectCache::new(config);
+        let cache = ObjectCache::new(config, make_policy());
         cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from(vec![0u8; 20]));
         assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k")).is_none());
     }
 
     #[test]
     fn hit_rate_computes_correctly() {
-        let cache = ObjectCache::new(ObjectCacheConfig::default());
+        let cache = ObjectCache::new(ObjectCacheConfig::default(), make_policy());
         cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"x"));
         cache.get(&BucketId::new("b"), &ObjectKey::new("k"));
         cache.get(&BucketId::new("b"), &ObjectKey::new("nope"));
@@ -454,8 +509,9 @@ mod tests {
             max_blob_size: 100,
             ttl_ms: 0, // no TTL
             enabled: true,
+            ..Default::default()
         };
-        let cache = ObjectCache::new(config);
+        let cache = ObjectCache::new(config, make_policy());
 
         // Insert entries that will fill the cache.
         let data1 = Bytes::from(vec![1u8; 60]);
@@ -464,7 +520,6 @@ mod tests {
         cache.put(BucketId::new("b"), ObjectKey::new("k2"), data2.clone());
 
         // Both should be present since 60 + 60 = 120 > 100, one should be evicted.
-        // The first entry (k1) should be evicted as it's least recently accessed.
         let k1 = cache.get(&BucketId::new("b"), &ObjectKey::new("k1"));
         let k2 = cache.get(&BucketId::new("b"), &ObjectKey::new("k2"));
 
@@ -477,7 +532,7 @@ mod tests {
     #[test]
     fn ttl_expiry_returns_none() {
         let config = ObjectCacheConfig { ttl_ms: 10, max_blob_size: 1024, ..Default::default() };
-        let cache = ObjectCache::new(config);
+        let cache = ObjectCache::new(config, make_policy());
         cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"data"));
 
         // Wait for TTL to expire.
@@ -488,7 +543,7 @@ mod tests {
 
     #[test]
     fn per_bucket_isolation() {
-        let cache = ObjectCache::new(ObjectCacheConfig::default());
+        let cache = ObjectCache::new(ObjectCacheConfig::default(), make_policy());
         cache.put(BucketId::new("b1"), ObjectKey::new("k"), Bytes::from_static(b"b1-data"));
         cache.put(BucketId::new("b2"), ObjectKey::new("k"), Bytes::from_static(b"b2-data"));
 
@@ -504,7 +559,7 @@ mod tests {
 
     #[test]
     fn update_existing_key_replaces_value() {
-        let cache = ObjectCache::new(ObjectCacheConfig::default());
+        let cache = ObjectCache::new(ObjectCacheConfig::default(), make_policy());
         cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"old"));
         cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"new"));
 
@@ -514,7 +569,7 @@ mod tests {
 
     #[test]
     fn entry_count_tracks_insertions() {
-        let cache = ObjectCache::new(ObjectCacheConfig::default());
+        let cache = ObjectCache::new(ObjectCacheConfig::default(), make_policy());
         assert_eq!(cache.stats().entry_count.get(), 0);
 
         cache.put(BucketId::new("b"), ObjectKey::new("k1"), Bytes::from_static(b"a"));
@@ -528,7 +583,7 @@ mod tests {
     #[test]
     fn disabled_cache_always_misses() {
         let config = ObjectCacheConfig { enabled: false, ..Default::default() };
-        let cache = ObjectCache::new(config);
+        let cache = ObjectCache::new(config, make_policy());
         cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"data"));
         assert!(cache.get(&BucketId::new("b"), &ObjectKey::new("k")).is_none());
     }
@@ -555,7 +610,7 @@ mod tests {
 
     #[test]
     fn set_bucket_config_changes_existing_bucket() {
-        let cache = ObjectCache::new(ObjectCacheConfig::default());
+        let cache = ObjectCache::new(ObjectCacheConfig::default(), make_policy());
         cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"data"));
 
         // Disable the bucket.
@@ -570,7 +625,7 @@ mod tests {
 
     #[test]
     fn clear_bucket_removes_all_entries() {
-        let cache = ObjectCache::new(ObjectCacheConfig::default());
+        let cache = ObjectCache::new(ObjectCacheConfig::default(), make_policy());
         cache.put(BucketId::new("b"), ObjectKey::new("k1"), Bytes::from_static(b"a"));
         cache.put(BucketId::new("b"), ObjectKey::new("k2"), Bytes::from_static(b"bb"));
 
@@ -583,11 +638,10 @@ mod tests {
 
     #[test]
     fn update_existing_with_larger_value_adjusts_size() {
-        let cache = ObjectCache::new(ObjectCacheConfig {
-            max_size_bytes: 1024,
-            max_blob_size: 1024,
-            ..Default::default()
-        });
+        let cache = ObjectCache::new(
+            ObjectCacheConfig { max_size_bytes: 1024, max_blob_size: 1024, ..Default::default() },
+            make_policy(),
+        );
         cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"small"));
         let size_before = cache.stats().size_bytes.get();
 
@@ -607,11 +661,10 @@ mod tests {
 
     #[test]
     fn update_existing_with_smaller_value_adjusts_size() {
-        let cache = ObjectCache::new(ObjectCacheConfig {
-            max_size_bytes: 1024,
-            max_blob_size: 1024,
-            ..Default::default()
-        });
+        let cache = ObjectCache::new(
+            ObjectCacheConfig { max_size_bytes: 1024, max_blob_size: 1024, ..Default::default() },
+            make_policy(),
+        );
         cache.put(BucketId::new("b"), ObjectKey::new("k"), Bytes::from_static(b"large value here"));
         let size_before = cache.stats().size_bytes.get();
 
@@ -631,7 +684,7 @@ mod tests {
     #[test]
     fn test_object_cache_disabled_bypassed() {
         let config = ObjectCacheConfig { enabled: false, ..Default::default() };
-        let cache = ObjectCache::new(config);
+        let cache = ObjectCache::new(config, make_policy());
         let bucket = BucketId::new("b");
         let key = ObjectKey::new("k");
         cache.put(bucket.clone(), key.clone(), Bytes::from_static(b"data"));
@@ -647,7 +700,7 @@ mod tests {
             max_blob_size: 1024,
             ..Default::default()
         };
-        let cache = ObjectCache::new(config);
+        let cache = ObjectCache::new(config, make_policy());
         let bucket = BucketId::new("b");
         cache.put(bucket.clone(), ObjectKey::new("a"), Bytes::from_static(b"aaaaaaaa"));
         cache.put(bucket.clone(), ObjectKey::new("b"), Bytes::from_static(b"bbbbbbbb"));
@@ -673,7 +726,7 @@ mod tests {
     #[test]
     fn test_object_cache_ttl_expiry() {
         let config = ObjectCacheConfig { ttl_ms: 1, ..Default::default() };
-        let cache = ObjectCache::new(config);
+        let cache = ObjectCache::new(config, make_policy());
         let bucket = BucketId::new("b");
         let key = ObjectKey::new("k");
         cache.put(bucket.clone(), key.clone(), Bytes::from_static(b"ephemeral"));

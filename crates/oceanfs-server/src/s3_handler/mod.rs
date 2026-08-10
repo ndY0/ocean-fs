@@ -778,17 +778,29 @@ mod tests {
         let state = make_app_state().await;
 
         // Wire L1, L2, L3 caches.
-        let l1 = Arc::new(oceanfs_cache::ObjectCache::new(oceanfs_cache::ObjectCacheConfig {
-            enabled: true,
-            max_size_bytes: 64 * 1024,
-            ttl_ms: 60_000,
-            max_blob_size: 1024 * 1024,
-        }));
-        let l2 = Arc::new(oceanfs_cache::MetadataCache::new(oceanfs_cache::MetadataCacheConfig {
-            enabled: true,
-            max_size_bytes: 1024 * 1024,
-            ttl_ms: 300_000,
-        }));
+        let l1 = Arc::new(oceanfs_cache::ObjectCache::new(
+            oceanfs_cache::ObjectCacheConfig {
+                enabled: true,
+                max_size_bytes: 64 * 1024,
+                ttl_ms: 60_000,
+                max_blob_size: 1024 * 1024,
+                ..Default::default()
+            },
+            Box::new(oceanfs_cache::eviction::GdsfPolicy::new(
+                oceanfs_cache::eviction::GdsfConfig::default(),
+            )),
+        ));
+        let l2 = Arc::new(oceanfs_cache::MetadataCache::new(
+            oceanfs_cache::MetadataCacheConfig {
+                enabled: true,
+                max_size_bytes: 1024 * 1024,
+                ttl_ms: 300_000,
+                ..Default::default()
+            },
+            Box::new(oceanfs_cache::eviction::TtlLruPolicy::new(
+                oceanfs_cache::eviction::TtlLruConfig::default(),
+            )),
+        ));
         let l3 = Arc::new(oceanfs_cache::NegativeCache::new(oceanfs_cache::NegativeCacheConfig {
             enabled: true,
             size_bytes: 64 * 1024,

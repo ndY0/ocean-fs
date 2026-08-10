@@ -71,10 +71,10 @@ pub use proto_convert::ConversionError;
 pub use timeouts::OperationTimeouts;
 pub use types::{
     BucketId, CacheInvalidateRequest, ChunkRef, CodecConfig, CodecType, CompressConfig,
-    CompressionTier, EncodingPlan, FetchStrategy, FetchStrategyConfig, GossipConfig, GpuConfig,
-    HashKey, HashOutput, HealConfig, HealRequest, HealStats, Incarnation, IntendedFor, NodeId,
-    NodeState, NvcompCodec, NvcompConfig, ObjectKey, ObjectMetadata, OperationType, PeerAddress,
-    PoolConfig, RpcConfig, SegmentId, SegmentIndexEntry, SegmentMetadata, SegmentSizeConfig,
-    ShardIndex, SizeTier, StorageLocation, Tombstone, VnodeRange, WriteAck, WriteQuorum,
-    WriteResult,
+    CompressionTier, EncodingPlan, EvictionPolicyType, FetchStrategy, FetchStrategyConfig,
+    GossipConfig, GpuConfig, HashKey, HashOutput, HealConfig, HealRequest, HealStats, Incarnation,
+    IntendedFor, NodeId, NodeState, NvcompCodec, NvcompConfig, ObjectKey, ObjectMetadata,
+    OperationType, PeerAddress, PoolConfig, RpcConfig, SegmentId, SegmentIndexEntry,
+    SegmentMetadata, SegmentSizeConfig, ShardIndex, SizeTier, StorageLocation, Tombstone,
+    VnodeRange, WriteAck, WriteQuorum, WriteResult,
 };
