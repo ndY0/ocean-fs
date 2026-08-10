@@ -244,7 +244,7 @@ impl Encoder for IsalEncoder<'_> {
 
         // Use precomputed tables if m matches, otherwise build temporary tables.
         // Tables are borrowed, not cloned — the buffer content is read-only.
-        let temp_tables: Vec<u8>;
+        let mut temp_tables: Vec<u8>;
         let tables_ptr: *const u8 = if m == self.tables.m() {
             self.tables.as_ptr()
         } else {

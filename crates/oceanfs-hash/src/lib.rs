@@ -19,6 +19,5 @@ mod hasher;
 
 pub use batch::{BatchHasher, Blake3BatchHasher};
 pub use hasher::{Blake3Hasher, Hasher};
-
 // HashOutput is defined in oceanfs-core; re-export for backward compatibility.
 pub use oceanfs_core::HashOutput;

@@ -7,10 +7,8 @@
 
 use std::fmt;
 
-use crate::types::hash_output::HashOutput;
-
 use super::id::{NodeId, ObjectKey};
-use crate::Hlc;
+use crate::{types::hash_output::HashOutput, Hlc};
 
 // ---------------------------------------------------------------------------
 // Incarnation

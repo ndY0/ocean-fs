@@ -40,6 +40,8 @@ pub use eviction::EvictionPolicyType;
 pub use fetch_strategy::{FetchStrategy, FetchStrategyConfig};
 // --- Hash types ---
 pub use hash::HashKey;
+// HashOutput is a foundational type owned by oceanfs-core; oceanfs-hash re-exports it.
+pub use hash_output::HashOutput;
 // --- Heal pipeline types ---
 pub use heal::{HealRequest, HealStats, ShardIndex};
 pub use id::{BucketId, NodeId, ObjectKey, SegmentId};
@@ -52,5 +54,3 @@ pub use node::{
     Incarnation, IntendedFor, NodeState, OperationType, PeerAddress, VnodeRange, WriteAck,
     WriteQuorum, WriteResult,
 };
-// HashOutput is a foundational type owned by oceanfs-core; oceanfs-hash re-exports it.
-pub use hash_output::HashOutput;

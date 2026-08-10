@@ -4,8 +4,9 @@
 //! Used for verifying multi-chunk blobs where each chunk's hash must be
 //! compared against the stored segment index entry.
 
-use crate::hasher::{Blake3Hasher, Hasher};
 use oceanfs_core::HashOutput;
+
+use crate::hasher::{Blake3Hasher, Hasher};
 
 /// A hasher that processes multiple chunks independently.
 ///
