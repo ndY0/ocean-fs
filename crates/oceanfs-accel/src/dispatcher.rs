@@ -953,9 +953,7 @@ impl AccelDispatcher {
         #[cfg(all(target_arch = "x86_64", feature = "isa-l"))]
         {
             match crate::isal::IsalTables::new(config.data_shards, config.parity_shards) {
-                Some(_) => {
-                    DecoderBackend::Isal(Arc::new(crate::isal::IsalDecoder::new()))
-                }
+                Some(_) => DecoderBackend::Isal(Arc::new(crate::isal::IsalDecoder::new())),
                 None => {
                     tracing::warn!("ISA-L decoder construction failed; using CPU fallback");
                     DecoderBackend::Cpu(Arc::new(CpuEncoder::new(config)))

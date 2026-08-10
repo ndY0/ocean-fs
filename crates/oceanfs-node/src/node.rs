@@ -872,10 +872,8 @@ impl Node {
         // by WriteCoordinator below. PoolFallbackReader checks active
         // (unsealed) segments before falling back to DiskSegmentReader,
         // closing the read-after-write gap for recently-written data.
-        let active_pools: Vec<Arc<SegmentPool>> = vec![
-            segment_pool_small.clone(),
-            segment_pool_standard.clone(),
-        ];
+        let active_pools: Vec<Arc<SegmentPool>> =
+            vec![segment_pool_small.clone(), segment_pool_standard.clone()];
         let segment_reader = Arc::new(oceanfs_storage::io::PoolFallbackReader::new(
             active_pools,
             segment_reader.clone(),

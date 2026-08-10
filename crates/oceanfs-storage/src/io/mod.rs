@@ -44,8 +44,7 @@ pub use direct::DirectIoBuf;
 pub use mmap::SegmentFileCache;
 pub use sched::{apply_background_cpu_sched, apply_background_io_class};
 pub use segment_reader::{
-    DiskSegmentReader, InMemorySegmentReader, PoolFallbackReader, SegmentReadSource,
-    SegmentReader,
+    DiskSegmentReader, InMemorySegmentReader, PoolFallbackReader, SegmentReadSource, SegmentReader,
 };
 #[cfg(feature = "sendfile")]
 pub use sendfile::SegmentFileBody;

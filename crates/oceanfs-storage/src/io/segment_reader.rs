@@ -390,7 +390,10 @@ impl PoolFallbackReader {
     ///
     /// `pools` are searched in order. The first pool containing a matching
     /// `segment_id` wins. `fallback` is consulted only when no pool match.
-    pub fn new(pools: Vec<Arc<crate::segment::pool::SegmentPool>>, fallback: Arc<dyn SegmentReader>) -> Self {
+    pub fn new(
+        pools: Vec<Arc<crate::segment::pool::SegmentPool>>,
+        fallback: Arc<dyn SegmentReader>,
+    ) -> Self {
         Self { pools, fallback }
     }
 }
@@ -464,10 +467,10 @@ fn madvise_dontneed(addr: *const u8, len: usize) -> std::io::Result<()> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::*;
-    use crate::segment::SegmentPool;
     use oceanfs_core::{PoolConfig, SegmentSizeConfig, SizeTier};
-    use crate::buffer_pool::BufferPool;
+
+    use super::*;
+    use crate::{buffer_pool::BufferPool, segment::SegmentPool};
 
     fn temp_segment_file(dir: &tempfile::TempDir, id: SegmentId) -> PathBuf {
         let path = dir.path().join(format!("{id}.dat"));

@@ -282,12 +282,7 @@ impl SegmentPool {
     /// Returns `None` if no active segment in this pool matches the id.
     /// This is a fast, synchronous operation — only a memcpy under the
     /// segment mutex, same lock used by `append`.
-    pub fn try_read(
-        &self,
-        segment_id: SegmentId,
-        offset: u64,
-        length: u32,
-    ) -> Option<Bytes> {
+    pub fn try_read(&self, segment_id: SegmentId, offset: u64, length: u32) -> Option<Bytes> {
         for slot in self.slots.iter() {
             let seg_guard = slot.segment.lock();
             if let Some(segment) = seg_guard.as_ref() {
