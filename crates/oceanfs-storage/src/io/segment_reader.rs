@@ -465,6 +465,9 @@ fn madvise_dontneed(addr: *const u8, len: usize) -> std::io::Result<()> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::segment::SegmentPool;
+    use oceanfs_core::{PoolConfig, SegmentSizeConfig, SizeTier};
+    use crate::buffer_pool::BufferPool;
 
     fn temp_segment_file(dir: &tempfile::TempDir, id: SegmentId) -> PathBuf {
         let path = dir.path().join(format!("{id}.dat"));
@@ -616,5 +619,58 @@ mod tests {
             assert_eq!(data.len(), 8192);
             assert!(data.iter().all(|&b| b == 0xCD));
         }
+    }
+
+    // --- PoolFallbackReader tests ---
+
+    fn test_pool() -> Arc<SegmentPool> {
+        let pool_cfg = PoolConfig::default();
+        let size_cfg = SegmentSizeConfig::default();
+        let buf_pool = Arc::new(BufferPool::new(65536, 32));
+        Arc::new(SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap())
+    }
+
+    #[tokio::test]
+    async fn pool_fallback_reader_hits_active_segment() {
+        let pool = test_pool();
+        let fallback = Arc::new(InMemorySegmentReader::new());
+
+        // Write data into the active pool.
+        let data = b"active segment test data";
+        let (seg_id, offset, length) = pool.append(data).unwrap();
+
+        let reader = PoolFallbackReader::new(vec![pool], fallback);
+
+        // Should hit the pool, not the fallback.
+        let chunk = reader.read_chunk(&seg_id, offset, length).await.unwrap();
+        assert_eq!(&chunk[..], data);
+    }
+
+    #[tokio::test]
+    async fn pool_fallback_reader_falls_back_when_pool_misses() {
+        let pool = test_pool();
+        let fallback = Arc::new(InMemorySegmentReader::new());
+
+        // Write data into the fallback, not the pool.
+        let fallback_id = SegmentId::new();
+        fallback.put(fallback_id, Bytes::from_static(&[1, 2, 3, 4, 5]));
+
+        let reader = PoolFallbackReader::new(vec![pool], fallback);
+
+        // Pool doesn't have this segment — should hit fallback.
+        let chunk = reader.read_chunk(&fallback_id, 1, 3).await.unwrap();
+        assert_eq!(&chunk[..], &[2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn pool_fallback_reader_returns_error_when_both_miss() {
+        let pool = test_pool();
+        let fallback = Arc::new(InMemorySegmentReader::new());
+
+        let reader = PoolFallbackReader::new(vec![pool], fallback);
+
+        // Neither pool nor fallback have this segment.
+        let result = reader.read_chunk(&SegmentId::new(), 0, 10).await;
+        assert!(result.is_err());
     }
 }

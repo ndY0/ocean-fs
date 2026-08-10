@@ -739,4 +739,73 @@ mod tests {
         }
         assert!(pool.active_count() > 0, "pool must still have active slots");
     }
+
+    // ── try_read tests ───────────────────────────────────────────
+
+    #[test]
+    fn try_read_returns_data_after_append() {
+        let (pool_cfg, size_cfg) = test_config();
+        let buf_pool = test_pool();
+        let pool =
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+
+        let data = b"hello world, this is a test segment read";
+        let (seg_id, offset, length) = pool.append(data).unwrap();
+
+        // Data should be readable immediately from the active segment.
+        let chunk = pool.try_read(seg_id, offset, length).expect("try_read should find segment");
+        assert_eq!(chunk.len(), length as usize);
+        assert_eq!(&chunk[..], &data[..length as usize]);
+    }
+
+    #[test]
+    fn try_read_returns_none_for_unknown_segment() {
+        let (pool_cfg, size_cfg) = test_config();
+        let buf_pool = test_pool();
+        let pool =
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+
+        // A segment id that was never appended.
+        let unknown_id = SegmentId::new();
+        let result = pool.try_read(unknown_id, 0, 10);
+        assert!(result.is_none(), "try_read must return None for unknown segment");
+    }
+
+    #[test]
+    fn try_read_respects_offset_and_length() {
+        let (pool_cfg, size_cfg) = test_config();
+        let buf_pool = test_pool();
+        let pool =
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+
+        let data = b"abcdefghijklmnopqrstuvwxyz";
+        let (seg_id, offset, length) = pool.append(data).unwrap();
+        assert_eq!(offset, 0);
+        assert_eq!(length, 26);
+
+        // Read a sub-range: bytes 5..10 = "fghij"
+        let chunk = pool.try_read(seg_id, 5, 5).expect("sub-range read");
+        assert_eq!(&chunk[..], b"fghij");
+
+        // Read from non-zero offset to end.
+        let chunk = pool.try_read(seg_id, 20, 10).expect("tail read");
+        assert_eq!(&chunk[..], b"uvwxyz");
+    }
+
+    #[test]
+    fn try_read_clamped_at_buffer_end() {
+        let (pool_cfg, size_cfg) = test_config();
+        let buf_pool = test_pool();
+        let pool =
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+
+        let data = b"short";
+        let (seg_id, offset, _length) = pool.append(data).unwrap();
+        assert_eq!(offset, 0);
+
+        // Request more bytes than written — should be clamped.
+        let chunk = pool.try_read(seg_id, 0, 100).expect("clamped read");
+        assert_eq!(chunk.len(), 5);
+        assert_eq!(&chunk[..], b"short");
+    }
 }
