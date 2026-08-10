@@ -5,7 +5,7 @@
 //! around the upstream `blake3::Hasher`, which handles runtime SIMD
 //! feature detection (AVX-512, AVX2, SSE4.1, NEON).
 
-use crate::hash_output::HashOutput;
+use oceanfs_core::HashOutput;
 
 /// A streaming content hasher.
 ///

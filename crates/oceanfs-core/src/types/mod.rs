@@ -19,6 +19,7 @@ mod config;
 mod eviction;
 mod fetch_strategy;
 mod hash;
+mod hash_output;
 mod heal;
 mod id;
 mod metadata;
@@ -51,5 +52,5 @@ pub use node::{
     Incarnation, IntendedFor, NodeState, OperationType, PeerAddress, VnodeRange, WriteAck,
     WriteQuorum, WriteResult,
 };
-// HashOutput moved to oceanfs-hash per ADR-0008; re-exported for backward compatibility.
-pub use oceanfs_hash::HashOutput;
+// HashOutput is a foundational type owned by oceanfs-core; oceanfs-hash re-exports it.
+pub use hash_output::HashOutput;

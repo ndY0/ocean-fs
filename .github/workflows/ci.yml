@@ -82,6 +82,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+      - name: Install system libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - name: Build with CUDA (no GPU needed)
         run: cargo build -p oceanfs-accel --all-targets --features cuda
@@ -93,6 +97,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+      - name: Install system libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - name: Test with CUDA (no GPU needed)
         run: cargo test -p oceanfs-accel --lib --features cuda

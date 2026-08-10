@@ -1,9 +1,8 @@
 //! The `HashOutput` type — a 256-bit BLAKE3 hash.
 //!
 //! Used throughout the system as the object-content checksum, segment
-//! checksum, and Merkle tree node hash. Moved from `oceanfs-core` to
-//! `oceanfs-hash` as part of ADR-0008 so that the `Hasher` trait and
-//! its output type live in the same crate.
+//! checksum, and Merkle tree node hash. Defined in `oceanfs-core` as
+//! a foundational type; `oceanfs-hash` re-exports it.
 
 use std::fmt;
 
@@ -15,7 +14,7 @@ use std::fmt;
 /// # Examples
 ///
 /// ```
-/// use oceanfs_hash::HashOutput;
+/// use oceanfs_core::HashOutput;
 ///
 /// let hash = HashOutput::from_bytes([0u8; 32]);
 /// let hex = hash.to_hex();

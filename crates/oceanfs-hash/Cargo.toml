@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+oceanfs-core.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 serde.workspace = true

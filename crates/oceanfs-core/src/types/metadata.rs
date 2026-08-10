@@ -5,7 +5,7 @@
 //! `SegmentIndexEntry` (in-segment blob index), `Tombstone` (deletion marker),
 //! `StorageLocation` (node + shard), and the `MetadataStore` trait.
 
-use oceanfs_hash::HashOutput;
+use crate::types::hash_output::HashOutput;
 
 use super::{
     config::SizeTier,

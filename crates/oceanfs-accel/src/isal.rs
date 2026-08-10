@@ -230,7 +230,7 @@ impl Encoder for IsalEncoder<'_> {
         // Verify all shards have the same length
         let shard_size = data_shards.first().map(|s| s.len()).unwrap_or(0);
         if shard_size == 0 {
-            return Ok(vec![Vec::new(); m as usize]);
+            return Ok(vec![Bytes::new(); m as usize]);
         }
 
         for shard in data_shards.iter() {
@@ -370,7 +370,7 @@ impl Decoder for IsalDecoder<'_> {
             .len();
 
         if shard_size == 0 {
-            return Ok(vec![Vec::new(); k]);
+            return Ok(vec![Bytes::new(); k]);
         }
 
         // --- Build generator matrix G: (k+m) rows, k columns ---
@@ -438,7 +438,7 @@ impl Decoder for IsalDecoder<'_> {
             );
         }
 
-        Ok(output_buffers)
+        Ok(output_buffers.into_iter().map(Bytes::from).collect())
     }
 }
 

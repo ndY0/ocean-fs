@@ -210,6 +210,7 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+    use oceanfs_core::GossipConfig;
 
     /// Writes a TOML snippet to a temp directory and returns the path.
     fn write_temp_toml(dir: &std::path::Path, content: &str) -> PathBuf {

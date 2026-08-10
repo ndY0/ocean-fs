@@ -8,7 +8,6 @@ rust-version.workspace = true
 
 [dependencies]
 # Workspace
-oceanfs-hash.workspace = true
 bytes.workspace = true
 smallvec.workspace = true
 uuid.workspace = true

@@ -1574,7 +1574,6 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
- "oceanfs-hash",
  "prost",
  "serde",
  "smallvec",
@@ -1643,6 +1642,7 @@ version = "0.2.0"
 dependencies = [
  "blake3",
  "bytes",
+ "oceanfs-core",
  "serde",
 ]
 

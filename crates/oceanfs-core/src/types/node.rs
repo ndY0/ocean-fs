@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use oceanfs_hash::HashOutput;
+use crate::types::hash_output::HashOutput;
 
 use super::id::{NodeId, ObjectKey};
 use crate::Hlc;
