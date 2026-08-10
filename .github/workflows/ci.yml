@@ -24,7 +24,7 @@ jobs:
       - name: Install system libraries
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq librocksdb-dev
+          sudo apt-get install -y -qq librocksdb-dev protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - name: Build workspace
         run: cargo build --all-targets --workspace
@@ -39,7 +39,7 @@ jobs:
       - name: Install system libraries
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq librocksdb-dev
+          sudo apt-get install -y -qq librocksdb-dev protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - name: Test workspace
         run: cargo test --all-targets --workspace
@@ -56,7 +56,7 @@ jobs:
       - name: Install system libraries
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq librocksdb-dev libisal-dev
+          sudo apt-get install -y -qq librocksdb-dev libisal-dev protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - name: Build with ISA-L
         run: cargo build -p oceanfs-accel -p oceanfs-ec --all-targets --features isa-l
@@ -71,7 +71,7 @@ jobs:
       - name: Install system libraries
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq librocksdb-dev libisal-dev
+          sudo apt-get install -y -qq librocksdb-dev libisal-dev protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - name: Test with ISA-L
         run: cargo test -p oceanfs-accel -p oceanfs-ec --all-targets --features isa-l
@@ -131,7 +131,7 @@ jobs:
       - name: Install system libraries
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq librocksdb-dev libisal-dev
+          sudo apt-get install -y -qq librocksdb-dev libisal-dev protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (default)
         run: cargo clippy --all-targets --workspace -- -D warnings
@@ -166,7 +166,7 @@ jobs:
       - name: Install system libraries
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq librocksdb-dev libisal-dev
+          sudo apt-get install -y -qq librocksdb-dev libisal-dev protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - name: Build docs (all features, deny warnings)
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features isa-l
@@ -180,6 +180,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+      - name: Install system libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler
       - name: oceanfs-core must have no internal deps
         run: |
           if cargo tree --edges normal -p oceanfs-core 2>/dev/null | grep 'oceanfs-' | grep -qv 'oceanfs-core'; then
@@ -198,6 +202,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+      - name: Install system libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler
       - name: Detect circular dependencies
         run: |
           cargo tree --edges normal --depth 1 -p oceanfs-node 2>/dev/null | grep oceanfs || true
@@ -215,7 +223,7 @@ jobs:
       - name: Install system libraries
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq librocksdb-dev
+          sudo apt-get install -y -qq librocksdb-dev protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - name: Build benchmarks
         run: cargo bench --no-run --manifest-path benches/Cargo.toml
