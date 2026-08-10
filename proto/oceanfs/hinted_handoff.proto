@@ -45,6 +45,10 @@ message HintRecord {
     HintInline inline = 1;
     HintSegmentRef segment_ref = 2;
   }
+
+  // Unix timestamp (seconds) when this hint was written.
+  // Used for TTL-based pruning of stale entries.
+  uint64 stored_at_secs = 10;
 }
 
 // Batched hinted handoff delivery request.

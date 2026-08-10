@@ -1108,12 +1108,7 @@ mod tests {
         let segment_store = Arc::new(InMemorySegmentStore::new());
         let config = AntiEntropyConfig::default();
 
-        let merkle_wal = crate::merkle::MerkleWal::open(
-            tempfile::tempdir().unwrap().path().join("test-merkle.wal"),
-        )
-        .unwrap();
         let merkle_tree = Arc::new(crate::merkle::IncrementalMerkleTree::new(
-            Arc::new(merkle_wal),
             crate::merkle::MerkleTreeConfig::default(),
         ));
 
@@ -1243,12 +1238,6 @@ mod tests {
             pool,
             segment_store,
             Arc::new(crate::merkle::IncrementalMerkleTree::new(
-                Arc::new(
-                    crate::merkle::MerkleWal::open(
-                        tempfile::tempdir().unwrap().path().join("merkle.wal"),
-                    )
-                    .unwrap(),
-                ),
                 crate::merkle::MerkleTreeConfig::default(),
             )),
         );
@@ -1271,9 +1260,7 @@ mod tests {
 
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let segment_store = Arc::new(InMemorySegmentStore::new());
-        let mwal_path = tempfile::tempdir().unwrap().path().join("merkle.wal");
         let merkle_tree = Arc::new(crate::merkle::IncrementalMerkleTree::new(
-            Arc::new(crate::merkle::MerkleWal::open(&mwal_path).unwrap()),
             crate::merkle::MerkleTreeConfig::default(),
         ));
         let ae = Arc::new(AntiEntropy::new(
@@ -1309,9 +1296,7 @@ mod tests {
 
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let segment_store = Arc::new(InMemorySegmentStore::new());
-        let mwal_path = tempfile::tempdir().unwrap().path().join("merkle.wal");
         let merkle_tree = Arc::new(crate::merkle::IncrementalMerkleTree::new(
-            Arc::new(crate::merkle::MerkleWal::open(&mwal_path).unwrap()),
             crate::merkle::MerkleTreeConfig::default(),
         ));
         let ae = Arc::new(AntiEntropy::new(
@@ -1506,9 +1491,7 @@ mod tests {
 
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let segment_store = Arc::new(InMemorySegmentStore::new());
-        let mwal_path = tempfile::tempdir().unwrap().path().join("merkle.wal");
         let merkle_tree = Arc::new(crate::merkle::IncrementalMerkleTree::new(
-            Arc::new(crate::merkle::MerkleWal::open(&mwal_path).unwrap()),
             crate::merkle::MerkleTreeConfig::default(),
         ));
         let ae = AntiEntropy::new(
@@ -1527,7 +1510,7 @@ mod tests {
         // Register 5 alive peers
         for i in 0..5 {
             membership.upsert_node(
-                NodeId::new(&format!("peer-{i}")),
+                NodeId::new(format!("peer-{i}")),
                 NodeState::Alive,
                 oceanfs_core::Incarnation::new(1),
                 format!("127.0.0.1:{}", 9001 + i).parse().unwrap(),

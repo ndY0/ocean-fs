@@ -42,6 +42,7 @@ use tracing_subscriber::EnvFilter;
 /// 4. Starts the OceanFS node.
 /// 5. Waits for shutdown signal (SIGTERM or SIGINT).
 /// 6. Gracefully shuts down the node.
+#[allow(clippy::expect_used)]
 fn main() {
     // Build the tokio runtime with configurable worker threads.
     // Default: num_cpus. Override with OCEANFS_TOKIO_WORKERS env var.

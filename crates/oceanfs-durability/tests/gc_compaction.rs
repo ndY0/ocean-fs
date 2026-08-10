@@ -192,10 +192,11 @@ async fn full_gc_cycle_compacts_segment() {
         assert_ne!(obj.chunks[0].segment_id, seg_id, "live object should reference new segment");
     }
 
-    // Dead objects still have metadata (their tombstone records deletion)
+    // Dead object metadata is cleaned up after compaction — their data
+    // was not copied to the new segment and their tombstone was consumed.
     for i in 0..3 {
         let obj = metadata.get_object(&bucket, &ObjectKey::new(format!("obj{i}.txt"))).unwrap();
-        assert!(obj.is_some(), "dead object metadata still exists");
+        assert!(obj.is_none(), "dead object metadata should be cleaned up after compaction");
     }
 }
 

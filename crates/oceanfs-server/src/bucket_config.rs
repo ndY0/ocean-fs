@@ -489,7 +489,7 @@ impl BucketPolicy {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -693,8 +693,10 @@ mod tests {
 
     #[test]
     fn bucket_overrides_fetch_strategy() {
-        let mut policy = BucketPolicy::default();
-        policy.fetch_strategy = Some(FetchStrategy::FastestK);
+        let policy = BucketPolicy {
+            fetch_strategy: Some(FetchStrategy::FastestK),
+            ..BucketPolicy::default()
+        };
         // Per-bucket override takes precedence over node default.
         assert_eq!(
             policy.effective_fetch_strategy(FetchStrategy::LocalFirst),
@@ -709,8 +711,10 @@ mod tests {
 
     #[test]
     fn bucket_fetch_strategy_serde_roundtrip() {
-        let mut policy = BucketPolicy::default();
-        policy.fetch_strategy = Some(FetchStrategy::CpuOptimized);
+        let policy = BucketPolicy {
+            fetch_strategy: Some(FetchStrategy::CpuOptimized),
+            ..BucketPolicy::default()
+        };
         let toml_str = toml::to_string(&policy).unwrap();
         let roundtripped: BucketPolicy = toml::from_str(&toml_str).unwrap();
         assert_eq!(roundtripped.fetch_strategy, Some(FetchStrategy::CpuOptimized));

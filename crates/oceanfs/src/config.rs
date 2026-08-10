@@ -224,11 +224,7 @@ mod tests {
     #[test]
     fn merge_config_applies_gc_interval_from_toml() {
         let mut target = NodeConfig::default();
-        let source = {
-            let mut s = NodeConfig::default();
-            s.gc_interval_sec = 10;
-            s
-        };
+        let source = NodeConfig { gc_interval_sec: 10, ..NodeConfig::default() };
         let cli = CliArgs::default();
         merge_config(&mut target, &source, &cli).expect("merge_config");
         assert_eq!(target.gc_interval_sec, 10, "gc_interval_sec should carry through merge");
@@ -237,11 +233,7 @@ mod tests {
     #[test]
     fn merge_config_applies_ae_interval_from_toml() {
         let mut target = NodeConfig::default();
-        let source = {
-            let mut s = NodeConfig::default();
-            s.ae_interval_sec = 600;
-            s
-        };
+        let source = NodeConfig { ae_interval_sec: 600, ..NodeConfig::default() };
         let cli = CliArgs::default();
         merge_config(&mut target, &source, &cli).expect("merge_config");
         assert_eq!(target.ae_interval_sec, 600);
@@ -250,11 +242,7 @@ mod tests {
     #[test]
     fn merge_config_applies_orphan_reaper_interval_from_toml() {
         let mut target = NodeConfig::default();
-        let source = {
-            let mut s = NodeConfig::default();
-            s.orphan_reaper_interval_sec = 7200;
-            s
-        };
+        let source = NodeConfig { orphan_reaper_interval_sec: 7200, ..NodeConfig::default() };
         let cli = CliArgs::default();
         merge_config(&mut target, &source, &cli).expect("merge_config");
         assert_eq!(target.orphan_reaper_interval_sec, 7200);
@@ -263,11 +251,7 @@ mod tests {
     #[test]
     fn merge_config_applies_max_body_size_from_toml() {
         let mut target = NodeConfig::default();
-        let source = {
-            let mut s = NodeConfig::default();
-            s.max_body_size = 10 * 1024 * 1024; // 10 MB
-            s
-        };
+        let source = NodeConfig { max_body_size: 10 * 1024 * 1024, ..NodeConfig::default() };
         let cli = CliArgs::default();
         merge_config(&mut target, &source, &cli).expect("merge_config");
         assert_eq!(target.max_body_size, 10 * 1024 * 1024);
@@ -276,30 +260,32 @@ mod tests {
     #[test]
     fn merge_config_applies_all_fields() {
         let mut target = NodeConfig::default();
-        let source = {
-            let mut s = NodeConfig::default();
-            s.node_id = "custom-node".into();
-            s.listen_addr = "127.0.0.1:8080".into();
-            s.grpc_listen_addr = "127.0.0.1:8081".into();
-            s.gc_interval_sec = 60;
-            s.tombstone_ttl_sec = 7200;
-            s.ae_interval_sec = 100;
-            s.scrub_interval_sec = 7200;
-            s.orphan_reaper_interval_sec = 1800;
-            s.max_body_size = 5 * 1024 * 1024;
-            s.metrics_enabled = false;
-            s.prefetch_enabled = true;
-            s.s3_auth_enabled = true;
-            s.vnodes_per_node = 512;
-            s.replication_factor = 5;
-            s.pool_size_per_peer = 8;
-            s.keepalive_sec = 60;
-            s.connect_timeout_ms = 10000;
-            s.request_timeout_ms = 60000;
-            s.gossip.interval_ms = 500;
-            s.gossip.suspicion_timeout_ms = 10000;
-            s.gossip.failure_timeout_ms = 30000;
-            s
+        let source = NodeConfig {
+            node_id: "custom-node".into(),
+            listen_addr: "127.0.0.1:8080".into(),
+            grpc_listen_addr: "127.0.0.1:8081".into(),
+            gc_interval_sec: 60,
+            tombstone_ttl_sec: 7200,
+            ae_interval_sec: 100,
+            scrub_interval_sec: 7200,
+            orphan_reaper_interval_sec: 1800,
+            max_body_size: 5 * 1024 * 1024,
+            metrics_enabled: false,
+            prefetch_enabled: true,
+            s3_auth_enabled: true,
+            vnodes_per_node: 512,
+            replication_factor: 5,
+            pool_size_per_peer: 8,
+            keepalive_sec: 60,
+            connect_timeout_ms: 10000,
+            request_timeout_ms: 60000,
+            gossip: GossipConfig {
+                interval_ms: 500,
+                suspicion_timeout_ms: 10000,
+                failure_timeout_ms: 30000,
+                ..Default::default()
+            },
+            ..NodeConfig::default()
         };
         let cli = CliArgs::default();
         merge_config(&mut target, &source, &cli).expect("merge_config");

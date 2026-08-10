@@ -3,6 +3,8 @@
 //! Verifies that the orphan reaper:
 //! 1. Scans all segments and identifies unreferenced ones
 //! 2. Respects the TTL for recently-sealed segments
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! 3. Deletes orphan segment metadata and shard data
 //! 4. Reports accurate statistics
 

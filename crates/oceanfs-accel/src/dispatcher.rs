@@ -1487,22 +1487,22 @@ mod tests {
         use oceanfs_core::MetricRegistrar;
 
         struct TestRegistrar {
-            names: std::sync::Mutex<Vec<String>>,
+            names: parking_lot::Mutex<Vec<String>>,
         }
         impl MetricRegistrar for TestRegistrar {
             fn register_counter(&self, _: oceanfs_core::Counter) {}
             fn register_gauge(&self, _: oceanfs_core::Gauge) {}
             fn register_histogram(&self, h: std::sync::Arc<oceanfs_core::Histogram>) {
-                self.names.lock().unwrap().push(h.name().to_string());
+                self.names.lock().push(h.name().to_string());
             }
         }
 
         let dispatcher = AccelDispatcher::new(AccelConfig::default());
-        let reg = TestRegistrar { names: std::sync::Mutex::new(Vec::new()) };
+        let reg = TestRegistrar { names: parking_lot::Mutex::new(Vec::new()) };
 
         dispatcher.register_metrics(&reg);
 
-        let names = reg.names.lock().unwrap();
+        let names = reg.names.lock();
         assert!(
             names.contains(&"accel_encode_duration_us".to_string()),
             "missing encode histogram, names: {names:?}"

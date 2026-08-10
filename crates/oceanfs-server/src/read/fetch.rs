@@ -478,7 +478,7 @@ async fn fetch_single_chunk(
             })
             .collect();
         // Side-car mapping from shard-request index to the owning NodeId.
-        let replica_index: Vec<_> = replica_set.iter().cloned().collect();
+        let replica_index: Vec<_> = replica_set.to_vec();
 
         let node_groups = shard_batch::group_by_node(&shard_requests, |req| {
             // Use ptr::eq for identity comparison — all ShardRequest values are

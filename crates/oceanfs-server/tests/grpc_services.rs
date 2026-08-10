@@ -5,12 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use oceanfs_core::{
@@ -30,6 +25,7 @@ use oceanfs_network::gossip::{
 use oceanfs_routing::{Ring, RingCache};
 use oceanfs_server::grpc::segment_service::SegmentGrpcService;
 use oceanfs_storage::{BufferPool, Error as StorageError, SegmentRpcClient, SegmentRpcServer};
+use parking_lot::Mutex;
 use tokio_stream::StreamExt;
 use tonic::transport::Server;
 
@@ -50,17 +46,12 @@ impl TestStore {
 
 impl SegmentDataStore for TestStore {
     fn write_segment_data(&self, segment_id: &SegmentId, data: &[u8]) -> Result<(), StorageError> {
-        self.data.lock().unwrap().insert(segment_id.clone(), Bytes::from(data.to_vec()));
+        self.data.lock().insert(*segment_id, Bytes::from(data.to_vec()));
         Ok(())
     }
 
     fn read_segment_data(&self, segment_id: &SegmentId) -> Result<Bytes, StorageError> {
-        self.data
-            .lock()
-            .unwrap()
-            .get(segment_id)
-            .cloned()
-            .ok_or_else(|| StorageError::SegmentNotFound(*segment_id))
+        self.data.lock().get(segment_id).cloned().ok_or(StorageError::SegmentNotFound(*segment_id))
     }
 }
 
@@ -181,9 +172,9 @@ async fn append_to_node(
         object_key: String::new(),
         object_size: 0,
         blake3_hash: vec![].into(),
-        chunk_segment_ids: vec![].into(),
-        chunk_offsets: vec![].into(),
-        chunk_lengths: vec![].into(),
+        chunk_segment_ids: vec![],
+        chunk_offsets: vec![],
+        chunk_lengths: vec![],
     };
     let stream = tokio_stream::iter(vec![chunk]);
     let response = client.append_segment(tonic::Request::new(stream)).await.unwrap();
@@ -338,9 +329,9 @@ async fn three_node_write_with_w2_via_grpc() {
         object_key: String::new(),
         object_size: 0,
         blake3_hash: vec![].into(),
-        chunk_segment_ids: vec![].into(),
-        chunk_offsets: vec![].into(),
-        chunk_lengths: vec![].into(),
+        chunk_segment_ids: vec![],
+        chunk_offsets: vec![],
+        chunk_lengths: vec![],
     };
     let stream_data = vec![chunk];
 
@@ -495,9 +486,9 @@ async fn three_node_cluster_with_node_kill() {
         object_key: String::new(),
         object_size: 0,
         blake3_hash: vec![].into(),
-        chunk_segment_ids: vec![].into(),
-        chunk_offsets: vec![].into(),
-        chunk_lengths: vec![].into(),
+        chunk_segment_ids: vec![],
+        chunk_offsets: vec![],
+        chunk_lengths: vec![],
     };
 
     // Replicate blob1 to nodes 1 and 2.
@@ -546,9 +537,9 @@ async fn three_node_cluster_with_node_kill() {
         object_key: String::new(),
         object_size: 0,
         blake3_hash: vec![].into(),
-        chunk_segment_ids: vec![].into(),
-        chunk_offsets: vec![].into(),
-        chunk_lengths: vec![].into(),
+        chunk_segment_ids: vec![],
+        chunk_offsets: vec![],
+        chunk_lengths: vec![],
     };
 
     // Write to node-1 (the only available replica).

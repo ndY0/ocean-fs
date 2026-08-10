@@ -5,7 +5,7 @@
 //! crate but allowed in integration test crates.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use oceanfs::config::{apply_env_overrides, CliArgs};
+use oceanfs::config::apply_env_overrides;
 use oceanfs_core::NodeConfig;
 
 #[test]
@@ -22,6 +22,7 @@ fn env_var_gc_interval_overrides_default() {
 
 #[test]
 fn env_var_ae_interval_overrides_default() {
+    // SAFETY: test is single-threaded, no other test manipulates this env var.
     unsafe {
         std::env::set_var("OCEANFS_AE_INTERVAL", "120");
     }
@@ -33,6 +34,7 @@ fn env_var_ae_interval_overrides_default() {
 
 #[test]
 fn env_var_metrics_enabled_toggle() {
+    // SAFETY: test is single-threaded, no other test manipulates this env var.
     unsafe {
         std::env::set_var("OCEANFS_METRICS_ENABLED", "false");
     }
@@ -44,6 +46,7 @@ fn env_var_metrics_enabled_toggle() {
 
 #[test]
 fn env_var_s3_auth_enabled_toggle() {
+    // SAFETY: test is single-threaded, no other test manipulates this env var.
     unsafe {
         std::env::set_var("OCEANFS_S3_AUTH_ENABLED", "1");
     }
@@ -55,6 +58,7 @@ fn env_var_s3_auth_enabled_toggle() {
 
 #[test]
 fn env_var_max_body_size_overrides() {
+    // SAFETY: test is single-threaded, no other test manipulates this env var.
     unsafe {
         std::env::set_var("OCEANFS_MAX_BODY_SIZE", "10485760");
     }
@@ -66,6 +70,7 @@ fn env_var_max_body_size_overrides() {
 
 #[test]
 fn env_var_gossip_interval_ms_overrides() {
+    // SAFETY: test is single-threaded, no other test manipulates this env var.
     unsafe {
         std::env::set_var("OCEANFS_GOSSIP_INTERVAL_MS", "200");
     }
@@ -77,6 +82,7 @@ fn env_var_gossip_interval_ms_overrides() {
 
 #[test]
 fn env_var_suspicion_timeout_ms_overrides() {
+    // SAFETY: test is single-threaded, no other test manipulates this env var.
     unsafe {
         std::env::set_var("OCEANFS_SUSPICION_TIMEOUT_MS", "7500");
     }
@@ -88,6 +94,7 @@ fn env_var_suspicion_timeout_ms_overrides() {
 
 #[test]
 fn env_var_failure_timeout_ms_overrides() {
+    // SAFETY: test is single-threaded, no other test manipulates this env var.
     unsafe {
         std::env::set_var("OCEANFS_FAILURE_TIMEOUT_MS", "20000");
     }
@@ -99,6 +106,7 @@ fn env_var_failure_timeout_ms_overrides() {
 
 #[test]
 fn env_var_scrub_interval_overrides() {
+    // SAFETY: test is single-threaded, no other test manipulates this env var.
     unsafe {
         std::env::set_var("OCEANFS_SCRUB_INTERVAL", "43200");
     }
@@ -110,6 +118,7 @@ fn env_var_scrub_interval_overrides() {
 
 #[test]
 fn env_var_orphan_reaper_interval_overrides() {
+    // SAFETY: test is single-threaded, no other test manipulates this env var.
     unsafe {
         std::env::set_var("OCEANFS_ORPHAN_REAPER_INTERVAL", "600");
     }
@@ -121,6 +130,7 @@ fn env_var_orphan_reaper_interval_overrides() {
 
 #[test]
 fn env_var_prefetch_enabled_true() {
+    // SAFETY: test is single-threaded, no other test manipulates this env var.
     unsafe {
         std::env::set_var("OCEANFS_PREFETCH_ENABLED", "yes");
     }

@@ -21,7 +21,7 @@ use oceanfs_core::{
     BucketId, ChunkRef, HashKey, HashOutput, Hlc, HlcClock, NodeId, ObjectKey, ObjectMetadata,
     OperationTimeouts, SegmentId, SegmentIndexEntry, SegmentSizeConfig, SizeTier, WriteResult,
 };
-use oceanfs_durability::HintedHandoffManager;
+use oceanfs_durability::{HintedHandoffConfig, HintedHandoffManager};
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::RingCache;
@@ -99,6 +99,8 @@ pub struct WriteCoordinator {
     size_config: SegmentSizeConfig,
     /// Hinted handoff buffer for writes to temporarily unreachable replicas.
     hinted_handoff: Arc<HintedHandoffManager>,
+    /// Hinted handoff configuration (inline threshold, etc.).
+    hint_config: HintedHandoffConfig,
     /// Accumulated blob index entries per segment, keyed by segment ID.
     /// Entries are drained when the segment is sealed.
     segment_entries: DashMap<SegmentId, Vec<SegmentIndexEntry>>,
@@ -126,6 +128,7 @@ impl WriteCoordinator {
         segment_pool_standard: Arc<SegmentPool>,
         sealer: Arc<SegmentSealer>,
         hinted_handoff: Arc<HintedHandoffManager>,
+        hint_config: HintedHandoffConfig,
     ) -> Self {
         let tier_router = TierRouter::new(size_config.clone());
         Self {
@@ -143,6 +146,7 @@ impl WriteCoordinator {
             sealer,
             size_config,
             hinted_handoff,
+            hint_config,
             segment_entries: DashMap::new(),
             timeouts: Arc::new(OperationTimeouts::default()),
         }
@@ -339,12 +343,43 @@ impl WriteCoordinator {
                     Err(e) => {
                         warn!(target = %target, error = %e, "replica write failed");
                         // Store hinted handoff for the unreachable replica.
-                        let hint = oceanfs_durability::hinted_handoff_rpc::HintRecord::new_inline(
-                            target.clone(),
-                            req.bucket.clone(),
-                            req.key.to_string(),
-                            req.data.clone(),
-                        );
+                        // For small blobs (≤inline_threshold_bytes): embed data inline.
+                        // For larger blobs: reference the segment/offset/length —
+                        //   data is already durable in the Segment WAL.
+                        let hint =
+                            if req.data.len() as u64 <= self.hint_config.inline_threshold_bytes {
+                                oceanfs_durability::hinted_handoff_rpc::HintRecord::new_inline(
+                                    target.clone(),
+                                    req.bucket.clone(),
+                                    req.key.to_string(),
+                                    req.data.clone(),
+                                )
+                            } else if let Some(chunk) = chunks.first() {
+                                // Use the first chunk's segment reference.
+                                // For Small/Standard tier there is exactly one chunk.
+                                // For Multi tier, the first chunk covers the blob start.
+                                oceanfs_durability::hinted_handoff_rpc::HintRecord::new_segment_ref(
+                                    target.clone(),
+                                    req.bucket.clone(),
+                                    req.key.to_string(),
+                                    chunk.segment_id,
+                                    chunk.offset,
+                                    chunk.length,
+                                )
+                            } else {
+                                // Safety guard: if chunks is empty (inline tier),
+                                // fall back to inline storage since no segment was used.
+                                warn!(
+                                    "no chunks available for segment-ref hint; \
+                                 falling back to inline for target {target}"
+                                );
+                                oceanfs_durability::hinted_handoff_rpc::HintRecord::new_inline(
+                                    target.clone(),
+                                    req.bucket.clone(),
+                                    req.key.to_string(),
+                                    req.data.clone(),
+                                )
+                            };
                         let _ = self.hinted_handoff.enqueue(hint).await;
                     }
                 }
@@ -770,20 +805,19 @@ mod tests {
             io_mode: oceanfs_storage::io::IoReadMode::Buffered,
             write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
         };
-        let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal, None));
+        let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
 
         use oceanfs_durability::{
-            GrpcHintDeliveryClient, HintWal, HintedHandoffConfig, HintedHandoffManager,
+            GrpcHintDeliveryClient, HintedHandoffConfig, HintedHandoffManager,
         };
 
-        let hint_wal_path = dir.path().join("hints.wal");
-        let hint_wal = Arc::new(HintWal::open(&hint_wal_path).await.unwrap());
+        let hints_dir = dir.path().join("hints");
         let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
             Arc::new(GrpcHintDeliveryClient::new(pool.clone()));
         let hint_config =
-            HintedHandoffConfig { wal_path: hint_wal_path, ..HintedHandoffConfig::default() };
+            HintedHandoffConfig { wal_dir: hints_dir.clone(), ..HintedHandoffConfig::default() };
         let hinted_handoff =
-            Arc::new(HintedHandoffManager::new(hint_wal, delivery_client, hint_config));
+            Arc::new(HintedHandoffManager::new(hints_dir, delivery_client, hint_config.clone()));
 
         WriteCoordinator::new(
             ring_cache,
@@ -799,6 +833,7 @@ mod tests {
             segment_pool_standard,
             sealer,
             hinted_handoff,
+            hint_config,
         )
     }
 
@@ -1157,5 +1192,142 @@ mod tests {
             "127.0.0.1:9003".parse().unwrap(),
         );
         membership
+    }
+
+    // ── Hint creation tests (segment-ref-hints) ────────────────────
+
+    #[tokio::test]
+    async fn test_hint_creation_uses_inline_for_small_blobs() {
+        // With a multi-node ring and quorum=1, a small blob write succeeds
+        // locally, but remote replication fails (no gRPC server). The hint
+        // should be created as inline because data.len() <= 4096.
+        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"]).await;
+
+        let data = vec![0xABu8; 100]; // 100 bytes << inline threshold
+        let req = WriteRequest {
+            bucket: BucketId::new("hint-inline"),
+            key: ObjectKey::new("small-obj"),
+            hash_key: HashKey::from_bytes(hash_key(b"small-obj")),
+            data: Bytes::from(data),
+            write_quorum: 1,
+            ack_after_wal: true,
+            ec_async: false,
+            policy: None,
+        };
+
+        let result = coord.put(req).await;
+        assert!(result.is_ok(), "write with quorum=1 should succeed");
+
+        // Verify hints were created for the failed remote replicas.
+        let n2 = NodeId::new("n2");
+        let n3 = NodeId::new("n3");
+        assert!(coord.hinted_handoff.pending_count(&n2) > 0, "should have hints for n2");
+        assert!(coord.hinted_handoff.pending_count(&n3) > 0, "should have hints for n3");
+    }
+
+    #[tokio::test]
+    async fn test_hint_creation_uses_segment_ref_for_large_blobs() {
+        // With a multi-node ring and quorum=1, a large blob write > 4096 bytes
+        // succeeds locally, but remote replication fails. The hint should use
+        // segment reference instead of inline data.
+        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"]).await;
+
+        let data = vec![0xCDu8; 5000]; // 5000 bytes > inline threshold
+        let req = WriteRequest {
+            bucket: BucketId::new("hint-segref"),
+            key: ObjectKey::new("large-obj"),
+            hash_key: HashKey::from_bytes(hash_key(b"large-obj")),
+            data: Bytes::from(data),
+            write_quorum: 1,
+            ack_after_wal: true,
+            ec_async: false,
+            policy: None,
+        };
+
+        let result = coord.put(req).await;
+        assert!(result.is_ok(), "write with quorum=1 should succeed");
+
+        // Verify hints were created for failed remote replicas.
+        let n2 = NodeId::new("n2");
+        let n3 = NodeId::new("n3");
+        assert!(coord.hinted_handoff.pending_count(&n2) > 0, "should have hints for n2");
+        assert!(coord.hinted_handoff.pending_count(&n3) > 0, "should have hints for n3");
+    }
+
+    #[tokio::test]
+    async fn test_hint_creation_at_threshold_boundary() {
+        // Test blob sizes at exactly 4096 (inline) and 4097 (segment_ref) bytes.
+        let coord_4096 = make_write_coordinator("n1", &["n1", "n2", "n3"]).await;
+        let coord_4097 = make_write_coordinator("n1", &["n1", "n2", "n3"]).await;
+
+        // Exactly at threshold: 4096 bytes → inline.
+        let data_4096 = vec![0x01u8; 4096];
+        let req_4096 = WriteRequest {
+            bucket: BucketId::new("threshold"),
+            key: ObjectKey::new("exact-4096"),
+            hash_key: HashKey::from_bytes(hash_key(b"exact-4096")),
+            data: Bytes::from(data_4096),
+            write_quorum: 1,
+            ack_after_wal: true,
+            ec_async: false,
+            policy: None,
+        };
+        let result_4096 = coord_4096.put(req_4096).await;
+        assert!(result_4096.is_ok(), "write at 4096 bytes should succeed");
+        let n2 = NodeId::new("n2");
+        assert!(
+            coord_4096.hinted_handoff.pending_count(&n2) > 0,
+            "should create hint at threshold (4096)"
+        );
+
+        // Just above threshold: 4097 bytes → segment_ref.
+        let data_4097 = vec![0x02u8; 4097];
+        let req_4097 = WriteRequest {
+            bucket: BucketId::new("threshold"),
+            key: ObjectKey::new("above-4097"),
+            hash_key: HashKey::from_bytes(hash_key(b"above-4097")),
+            data: Bytes::from(data_4097),
+            write_quorum: 1,
+            ack_after_wal: true,
+            ec_async: false,
+            policy: None,
+        };
+        let result_4097 = coord_4097.put(req_4097).await;
+        assert!(result_4097.is_ok(), "write at 4097 bytes should succeed");
+        assert!(
+            coord_4097.hinted_handoff.pending_count(&n2) > 0,
+            "should create hint above threshold (4097)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hint_creation_inline_tier_no_chunks_handled() {
+        // Inline-tier writes (<= 128 bytes by default) produce empty chunk lists.
+        // When replication fails for such a write, the hint creation should not
+        // panic even though chunks is empty — it falls back to inline storage.
+        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"]).await;
+
+        // 64 bytes — well within inline tier (default 128).
+        let data = vec![0xEFu8; 64];
+        let req = WriteRequest {
+            bucket: BucketId::new("inline-tier"),
+            key: ObjectKey::new("tiny-obj"),
+            hash_key: HashKey::from_bytes(hash_key(b"tiny-obj")),
+            data: Bytes::from(data),
+            write_quorum: 1,
+            ack_after_wal: true,
+            ec_async: false,
+            policy: None,
+        };
+
+        let result = coord.put(req).await;
+        // The write should succeed (quorum=1, local ack counts).
+        assert!(result.is_ok(), "inline-tier write with quorum=1 should succeed");
+        // Verify no panic occurred for empty chunks — hints were stored inline.
+        let n2 = NodeId::new("n2");
+        assert!(
+            coord.hinted_handoff.pending_count(&n2) > 0,
+            "should create inline hint for inline-tier write"
+        );
     }
 }

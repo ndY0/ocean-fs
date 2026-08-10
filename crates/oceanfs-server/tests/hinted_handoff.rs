@@ -5,9 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use oceanfs_core::{Hlc, NodeId, SegmentId};
-use oceanfs_durability::{
-    HintRecord, HintWal, HintedHandoff, HintedHandoffConfig, HintedHandoffManager,
-};
+use oceanfs_durability::{HintRecord, HintedHandoff};
 
 #[tokio::test]
 async fn handoff_create_deliver_cleanup() {
@@ -125,7 +123,6 @@ async fn write_coordinator_handoff_on_replica_failure() {
         BucketId, GossipConfig, HashKey, HlcClock, Incarnation, NodeId, NodeState, ObjectKey,
         RingConfig, RpcConfig, SegmentSizeConfig,
     };
-    use oceanfs_durability::HintedHandoff;
     use oceanfs_membership::Membership;
     use oceanfs_network::ConnectionPool;
     use oceanfs_routing::{hash_key, Ring, RingCache};
@@ -166,19 +163,26 @@ async fn write_coordinator_handoff_on_replica_failure() {
     let dir = tempfile::tempdir().unwrap();
 
     let hinted_handoff = {
-        let hint_wal_path = dir.path().join("hints.wal");
-        let hint_wal = Arc::new(HintWal::open(&hint_wal_path).await.unwrap());
+        let hints_dir = dir.path().join("hints");
         let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
             Arc::new(oceanfs_durability::GrpcHintDeliveryClient::new(pool.clone()));
         let hint_config = oceanfs_durability::HintedHandoffConfig {
-            wal_path: hint_wal_path,
+            wal_dir: hints_dir.clone(),
             ..Default::default()
         };
-        Arc::new(
-            oceanfs_durability::HintedHandoffManager::new(hint_wal, delivery_client, hint_config)
+        (
+            Arc::new(
+                oceanfs_durability::HintedHandoffManager::new(
+                    hints_dir,
+                    delivery_client,
+                    hint_config.clone(),
+                )
                 .with_membership(membership.clone()),
+            ),
+            hint_config,
         )
     };
+    let (hinted_handoff, hint_config) = (hinted_handoff.0, hinted_handoff.1);
     let hlc_clock = Arc::new(HlcClock::new());
 
     // Segment pipeline.
@@ -237,7 +241,7 @@ async fn write_coordinator_handoff_on_replica_failure() {
         io_mode: oceanfs_storage::io::IoReadMode::Buffered,
         write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
     };
-    let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal, None));
+    let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
 
     let coordinator = WriteCoordinator::new(
         ring_cache,
@@ -253,6 +257,7 @@ async fn write_coordinator_handoff_on_replica_failure() {
         segment_pool_standard,
         sealer,
         hinted_handoff.clone(),
+        hint_config,
     );
 
     // Write with quorum=1: local ack is sufficient, but we still

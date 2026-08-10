@@ -88,7 +88,7 @@ impl BufferPool {
     pub fn acquire_sized(&self, capacity: usize) -> BytesMut {
         let mut buf = self.acquire();
         if buf.capacity() < capacity {
-            buf.reserve(capacity - buf.capacity());
+            buf.reserve(capacity);
         }
         buf
     }

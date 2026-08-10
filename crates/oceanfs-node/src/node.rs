@@ -14,7 +14,7 @@ use oceanfs_core::{
     SegmentSizeConfig, SizeTier, Tombstone, WalConfig,
 };
 use oceanfs_durability::{
-    GrpcHintDeliveryClient, HintWal, HintedHandoff, HintedHandoffConfig, HintedHandoffManager,
+    GrpcHintDeliveryClient, HintedHandoff, HintedHandoffConfig, HintedHandoffManager,
 };
 use oceanfs_network::{apply_opts_to_fd, create_reuseport_listener};
 use oceanfs_server::{
@@ -90,6 +90,10 @@ impl oceanfs_storage_api::MetadataStore for PrefetchStoreAdapter {
             .collect()
     }
 
+    fn delete_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<()> {
+        self.store.delete_tombstone(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
     fn put_segment(&self, meta: SegmentMetadata) -> std::io::Result<()> {
         self.store.put_segment(meta).map_err(|e| std::io::Error::other(e.to_string()))
     }
@@ -113,6 +117,9 @@ impl oceanfs_storage_api::MetadataStore for PrefetchStoreAdapter {
                 oceanfs_storage_api::BatchOp::PutObject(_, _) => {}
                 oceanfs_storage_api::BatchOp::DeleteObject(_, _) => {}
                 oceanfs_storage_api::BatchOp::PutTombstone(_, _, _) => {}
+                oceanfs_storage_api::BatchOp::DeleteTombstone(bucket, key) => {
+                    self.delete_tombstone(&bucket, &key)?;
+                }
             }
         }
         Ok(())
@@ -371,6 +378,11 @@ pub struct BackgroundTasks {
     /// Hinted handoff delivery cancellation token.
     pub(crate) delivery_cancel: CancellationToken,
 
+    /// Hinted handoff WAL prune task.
+    pub(crate) hinted_handoff_prune: JoinHandle<()>,
+    /// Hinted handoff WAL prune cancellation token.
+    pub(crate) hint_prune_cancel: CancellationToken,
+
     /// gRPC server task handle for graceful shutdown.
     pub(crate) grpc_server: Option<JoinHandle<()>>,
     /// gRPC server cancellation token.
@@ -598,15 +610,10 @@ impl Node {
         // is used by anti-entropy and healing below.
         let segment_dir = config.data_dir.join("segments");
 
-        // Create notifier channel for segment seal → Merkle tree updates.
-        let (segment_sealed_tx, mut segment_sealed_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SegmentId>();
-
         let sealer = Arc::new(oceanfs_storage::SegmentSealer::new(
             seal_config,
             metadata_store.clone(),
             wal_writer.clone(),
-            Some(segment_sealed_tx),
         ));
         // ---- 7. Construct durability workers ----
         let gc_config = oceanfs_durability::GcConfig::new(
@@ -618,94 +625,23 @@ impl Node {
         );
         let gc_worker = Arc::new(oceanfs_durability::GarbageCollector::new(gc_config.clone()));
 
-        // Construct MerkleWal and IncrementalMerkleTree for anti-entropy
-        // (ADR-0015: incremental Merkle tree protocol).
-        let merkle_wal_path = config.data_dir.join("merkle.wal");
-        let merkle_wal = Arc::new(
-            oceanfs_durability::merkle::MerkleWal::open(&merkle_wal_path)
-                .map_err(|e| std::io::Error::other(e.to_string()))?,
-        );
+        // Construct IncrementalMerkleTree for anti-entropy by scanning
+        // the segments column family (ADR-0018 Decision 1).
         let merkle_tree_config = oceanfs_durability::merkle::MerkleTreeConfig::default();
 
         let merkle_tree = {
-            let tree = oceanfs_durability::merkle::IncrementalMerkleTree::new(
-                merkle_wal.clone(),
-                merkle_tree_config.clone(),
-            );
-            // Replay Merkle WAL to restore in-memory state after restart.
-            match oceanfs_durability::merkle::IncrementalMerkleTree::rebuild_from_mutations(
-                &tree,
-                &merkle_wal,
-            ) {
-                Ok(()) => Arc::new(tree),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "MerkleWal replay failed; rebuilding from segment scan"
-                    );
-                    Arc::new(
-                        oceanfs_durability::merkle::IncrementalMerkleTree::rebuild_from_segment_scan(
-                            metadata_store.as_ref(),
-                            merkle_wal.clone(),
-                            &merkle_tree_config,
-                        )
-                        .map_err(|e| {
-                            std::io::Error::other(format!(
-                                "failed to rebuild Merkle tree from scan: {e}"
-                            ))
-                        })?,
-                    )
-                }
-            }
+            Arc::new(
+                oceanfs_durability::merkle::IncrementalMerkleTree::rebuild_from_segment_scan(
+                    metadata_store.as_ref(),
+                    &merkle_tree_config,
+                )
+                .map_err(|e| {
+                    std::io::Error::other(format!(
+                        "failed to rebuild Merkle tree from segment scan: {e}"
+                    ))
+                })?,
+            )
         };
-
-        // Spawn background task: forward segment seal events to the
-        // incremental Merkle tree for continuous anti-entropy tracking.
-        let merkle_tree_bg = merkle_tree.clone();
-        let metadata_bg = metadata_store.clone();
-        let _merkle_seal_handle = tokio::spawn(async move {
-            while let Some(segment_id) = segment_sealed_rx.recv().await {
-                // Look up the segment from metadata to get its merkle root hash.
-                match metadata_bg.get_segment(segment_id) {
-                    Ok(Some(meta)) => {
-                        let leaf_hash = if let Some(root) = meta.merkle_root {
-                            *root.as_bytes()
-                        } else {
-                            // Fallback: compute a placeholder hash from the segment ID.
-                            // In production, the segment's BLAKE3 checksum is always
-                            // stored as the merkle_root at seal time.
-                            use std::hash::{Hash, Hasher};
-                            let mut h = std::collections::hash_map::DefaultHasher::new();
-                            segment_id.hash(&mut h);
-                            let val = h.finish();
-                            let mut hash = [0u8; 32];
-                            hash[..8].copy_from_slice(&val.to_le_bytes());
-                            hash
-                        };
-                        if let Err(e) = merkle_tree_bg.insert_leaf(segment_id, leaf_hash) {
-                            tracing::error!(
-                                %segment_id,
-                                error = %e,
-                                "Failed to insert leaf into Merkle tree"
-                            );
-                        }
-                    }
-                    Ok(None) => {
-                        tracing::warn!(
-                            %segment_id,
-                            "segment sealed notification received but segment not found in metadata"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            %segment_id,
-                            error = %e,
-                            "Failed to look up segment metadata for Merkle tree"
-                        );
-                    }
-                }
-            }
-        });
 
         let ae_worker = Arc::new(oceanfs_durability::AntiEntropy::new(
             oceanfs_durability::AntiEntropyConfig::new(
@@ -912,20 +848,19 @@ impl Node {
                 .with_timeouts(op_timeouts.clone()),
         );
 
-        // Construct the persistent HintWal and HintedHandoffManager for
-        // durable hinted handoff (Hinted Handoff Durability feature).
-        let hint_wal_path =
-            config.hint_wal_path.clone().unwrap_or_else(|| config.data_dir.join("hints.wal"));
-        let hint_wal = Arc::new(HintWal::open(&hint_wal_path).await?);
+        // Construct the persistent per-node HintWAL directory and
+        // HintedHandoffManager for durable hinted handoff (ADR-0018 Decision 2).
+        let hints_dir =
+            config.hint_wal_dir.clone().unwrap_or_else(|| config.data_dir.join("hints"));
         let hint_delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
             Arc::new(GrpcHintDeliveryClient::new(pool.clone()));
         let hint_config = HintedHandoffConfig {
-            wal_path: hint_wal_path,
+            wal_dir: hints_dir.clone(),
             inline_threshold_bytes: config.hint_inline_threshold_bytes,
             max_batch_size: config.hint_max_batch_size,
         };
         let hinted_handoff_manager = Arc::new(
-            HintedHandoffManager::new(hint_wal, hint_delivery_client, hint_config)
+            HintedHandoffManager::new(hints_dir.clone(), hint_delivery_client, hint_config.clone())
                 .with_membership(membership.clone())
                 .with_timeouts(op_timeouts.clone()),
         );
@@ -948,6 +883,7 @@ impl Node {
                 segment_pool_standard,
                 sealer.clone(),
                 hinted_handoff_manager.clone(),
+                hint_config,
             )
             .with_timeouts(op_timeouts.clone()),
         );
@@ -1188,6 +1124,7 @@ impl Node {
             prefetch_engine,
             heal_worker,
             heal_data_store.clone(),
+            hinted_handoff_manager.clone(),
             &config,
         );
         background.grpc_shutdown = grpc_shutdown;
@@ -1319,6 +1256,7 @@ impl Node {
         self.background.fd_cancel.cancel();
         self.background.heal_cancel.cancel();
         self.background.delivery_cancel.cancel();
+        self.background.hint_prune_cancel.cancel();
         self.background.health_check_cancel.cancel();
 
         // ---- 5. Wait for background tasks with a timeout ----
@@ -1331,6 +1269,7 @@ impl Node {
                 async { self.background.orphan_reaper.await.map_err(|e| format!("{e}")) },
                 async { self.background.failure_detector.await.map_err(|e| format!("{e}")) },
                 async { self.background.heal.await.map_err(|e| format!("{e}")) },
+                async { self.background.hinted_handoff_prune.await.map_err(|e| format!("{e}")) },
             );
         })
         .await;
@@ -1426,6 +1365,7 @@ impl Node {
         prefetch_engine: Arc<oceanfs_cache::PrefetchEngine>,
         heal_worker: oceanfs_durability::HealWorker,
         data_store: Arc<dyn oceanfs_durability::SegmentDataStore>,
+        hinted_handoff_manager: Arc<HintedHandoffManager>,
         config: &oceanfs_core::NodeConfig,
     ) -> BackgroundTasks {
         // Gossip: Membership drives the gossip protocol internally via
@@ -1612,6 +1552,35 @@ impl Node {
         // the join handle retroactively.
         let delivery_cancel = CancellationToken::new();
 
+        // Hinted handoff WAL periodic prune — removes expired entries
+        // from all per-node WAL files to bound storage growth.
+        let hint_prune_cancel = CancellationToken::new();
+        let hint_prune_token = hint_prune_cancel.clone();
+        let hint_ttl_secs = config.hint_ttl_sec;
+        let hint_prune_interval = Duration::from_secs(config.hint_prune_interval_sec);
+        let hinted_handoff_prune = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(hint_prune_interval);
+            loop {
+                tokio::select! {
+                    _ = hint_prune_token.cancelled() => {
+                        info!("Hinted handoff WAL prune task cancelled");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        match hinted_handoff_manager.prune_all_expired(hint_ttl_secs).await {
+                            Ok(0) => {}
+                            Ok(n) => {
+                                info!(pruned = n, "pruned expired hinted handoff entries from per-node WALs");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "hinted handoff WAL prune cycle error");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         BackgroundTasks {
             gossip,
             gossip_cancel,
@@ -1631,6 +1600,8 @@ impl Node {
             heal_cancel,
             hinted_handoff_delivery: None,
             delivery_cancel,
+            hinted_handoff_prune,
+            hint_prune_cancel,
             grpc_server: None,
             grpc_shutdown: CancellationToken::new(),
             health_check_cancel: CancellationToken::new(),
@@ -1824,10 +1795,6 @@ mod tests {
             pool,
             Arc::new(oceanfs_durability::InMemorySegmentStore::new()),
             Arc::new(oceanfs_durability::merkle::IncrementalMerkleTree::new(
-                Arc::new(
-                    oceanfs_durability::merkle::MerkleWal::open(&tmp.path().join("merkle.wal"))
-                        .unwrap(),
-                ),
                 oceanfs_durability::merkle::MerkleTreeConfig::default(),
             )),
         ));
@@ -1874,6 +1841,16 @@ mod tests {
             heal_data_store,
         );
 
+        let hints_dir = tmp.path().join("bg_hints");
+        let hint_delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
+            Arc::new(GrpcHintDeliveryClient::new(Arc::new(oceanfs_network::ConnectionPool::new(
+                oceanfs_core::RpcConfig::default(),
+            ))));
+        let hint_config =
+            HintedHandoffConfig { wal_dir: hints_dir.clone(), ..HintedHandoffConfig::default() };
+        let hinted_handoff_manager =
+            Arc::new(HintedHandoffManager::new(hints_dir, hint_delivery_client, hint_config));
+
         let bg = Node::spawn_background_tasks(
             gc_worker,
             metadata_store.clone(),
@@ -1883,6 +1860,7 @@ mod tests {
             prefetch_engine,
             heal_worker,
             bg_data_store,
+            hinted_handoff_manager,
             &NodeConfig::default(),
         );
 
@@ -1895,6 +1873,7 @@ mod tests {
         assert!(bg.prefetch.is_some());
         assert!(!bg.failure_detector.is_finished());
         assert!(!bg.heal.is_finished());
+        assert!(!bg.hinted_handoff_prune.is_finished());
 
         // Cancel all and wait.
         bg.gossip_cancel.cancel();
@@ -1905,23 +1884,8 @@ mod tests {
         bg.prefetch_cancel.cancel();
         bg.fd_cancel.cancel();
         bg.heal_cancel.cancel();
+        bg.hint_prune_cancel.cancel();
     }
-
-    #[test]
-    fn prefetch_store_adapter_list_object_keys() {
-        let tmp = TempDir::new().expect("tempdir");
-        let metadata_config =
-            MetadataConfig { data_dir: tmp.path().join("metadata"), ..Default::default() };
-        let store = Arc::new(
-            oceanfs_storage::RocksDbMetadataStore::open(&metadata_config)
-                .expect("open metadata store"),
-        );
-        let adapter = PrefetchStoreAdapter { store };
-        let bucket = BucketId::new("test-bucket");
-        let result = adapter.list_object_keys(&bucket).expect("list_object_keys");
-        assert!(result.is_empty(), "new bucket should have no keys");
-    }
-
     #[test]
     fn prefetch_store_adapter_get_object_metadata_nonexistent() {
         let tmp = TempDir::new().expect("tempdir");

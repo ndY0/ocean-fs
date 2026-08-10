@@ -484,13 +484,14 @@ impl SegmentRpc for SegmentGrpcService {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::{collections::HashMap, net::SocketAddr, sync::Mutex};
+    use std::{collections::HashMap, net::SocketAddr};
 
     use oceanfs_core::{proto::common::SegmentId as ProtoSegmentId, SegmentId};
     use oceanfs_durability::SegmentDataStore;
     use oceanfs_storage::{SegmentRpcClient, SegmentRpcServer};
+    use parking_lot::Mutex;
     use tonic::transport::Server;
 
     use super::*;
@@ -512,7 +513,7 @@ mod tests {
             segment_id: &SegmentId,
             data: &[u8],
         ) -> Result<(), oceanfs_storage::Error> {
-            self.data.lock().unwrap().insert(segment_id.clone(), Bytes::copy_from_slice(data));
+            self.data.lock().insert(*segment_id, Bytes::copy_from_slice(data));
             Ok(())
         }
 
@@ -522,10 +523,9 @@ mod tests {
         ) -> Result<Bytes, oceanfs_storage::Error> {
             self.data
                 .lock()
-                .unwrap()
                 .get(segment_id)
                 .cloned()
-                .ok_or_else(|| oceanfs_storage::Error::SegmentNotFound(*segment_id))
+                .ok_or(oceanfs_storage::Error::SegmentNotFound(*segment_id))
         }
     }
 

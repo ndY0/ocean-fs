@@ -1,66 +1,99 @@
 ---
-feature: "VM Skills — Agent Commands for VM Lifecycle Management"
+feature: "VM Skills — Agent Commands for Two-VM Lifecycle Management"
 epic: "agent-skills"
 status: proposed
 priority: high
 owner: ""
 dependencies:
   - epic: operational-tooling/vm-provisioning
-    reason: Need vm-provision.sh script for vm-up and vm-down
-adr: []
+    reason: Need vm-provision.sh script for two-VM provisioning
+adr:
+  - 0019-test-harness-topology-cost-guardrails
 perf: []
 created: 2026-08-05
-updated: 2026-08-05
+updated: 2026-08-10
 ---
 
-# VM Skills — Agent Commands for VM Lifecycle Management
+# VM Skills — Agent Commands for Two-VM Lifecycle Management
 
 ## Summary
 
 Create four OpenCode skill files under `.opencode/skills/` that agents use to
-manage the load test VM lifecycle: `vm-status`, `vm-up`, `vm-down`, and
-`vm-deploy`. Each skill is a concise instruction file that tells the agent
-what command to execute via SSH and what to return. These skills abstract
-away SSH connection details, providing a consistent interface for all agents
-(Architect, Reviewer, Implementer) to interact with the load test VM.
+manage the two-VM test topology (SUT VM + Harness VM, per ADR-0019):
+`vm-status`, `vm-up`, `vm-down`, and `vm-deploy`. Each skill is a concise
+instruction file that tells the agent what command to execute via SSH and what
+to return. These skills abstract away the two-VM complexity, providing a
+consistent interface for all agents (Architect, Reviewer, Implementer) to
+interact with the load test infrastructure.
 
 ## Scope
 
 ### In Scope
 
 #### `vm-status.md`
-- SSH to VM (hostname from `~/.ssh/config` alias `oceanfs-vm`)
-- Check if OceanFS process is running: `systemctl is-active oceanfs`
-- Check if Prometheus is running: `systemctl is-active prometheus`
-- Return structured status: `{status: "running"|"stopped", ip: "...", oceanfs: "active"|"inactive", prometheus: "active"|"inactive", uptime: "...", cost_to_date: "..."}`
-- If VM doesn't exist or is unreachable, return `{status: "not_found"}` with error details
+- SSH to **both** VMs (hostnames from `~/.ssh/config` aliases `oceanfs-sut` and `oceanfs-harness`)
+- Check if OceanFS process is running on SUT VM: `systemctl is-active oceanfs`
+- Check if Prometheus is running on SUT VM: `systemctl is-active prometheus`
+- Check if TTL timer is active on both VMs: `systemctl is-active oceanfs-ttl.timer`
+- Return structured two-VM status:
+  ```json
+  {
+    "sut": {
+      "status": "running",
+      "ip": "10.0.0.5",
+      "public_ip": "1.2.3.4",
+      "type": "cx32",
+      "oceanfs": "active",
+      "prometheus": "active",
+      "ttl_timer": "active",
+      "uptime": "2026-08-10T10:00:00Z"
+    },
+    "harness": {
+      "status": "running",
+      "ip": "10.0.0.6",
+      "public_ip": "1.2.3.5",
+      "type": "cx22",
+      "ttl_timer": "active",
+      "uptime": "2026-08-10T10:00:00Z"
+    }
+  }
+  ```
+- If either VM doesn't exist or is unreachable, set `status: "not_found"` with error details
 
 #### `vm-up.md`
-- Invoke `scripts/vm-provision.sh --phase {phase} --branch {branch}`
-- Accepts: `phase` (required, 1-6), `branch` (optional, default main), `provider` (optional)
-- Return: `{ip: "...", name: "...", phase: N, provider: "..."}`
-- If VM already running, return existing IP (idempotent)
-- Updates `~/.ssh/config` with the VM's IP under alias `oceanfs-vm`
+- Determine phase → VM types via `scripts/vm-provision.sh --phase {phase} --dry-run` for sizing info
+- Invoke `scripts/vm-provision.sh --phase {phase} --branch {branch} [--confirm yes] [--single-vm] [--ttl N]`
+- Accepts: `phase` (required, 1-6), `branch` (optional, default main), `provider` (optional), `confirm` (auto-passes `--confirm yes` for phases 3-4), `single-vm` (optional, for Phase 2 budget mode), `ttl` (optional, default 4h)
+- Return: two-VM JSON object (see vm-provisioning output format)
+- If VMs already running, return existing IPs (idempotent)
+- Updates `~/.ssh/config` with two entries:
+  - `Host oceanfs-sut` → `HostName <sut-public-ip>`
+  - `Host oceanfs-harness` → `HostName <harness-public-ip>`
+- For Phase 3-4, skill file instructs agent to always pass `--confirm yes` (since agent intends to provision)
+- For Phase 1, prints "Phase 1 runs in CI, no VMs needed" (no provisioning)
 
 #### `vm-down.md`
-- Invoke `scripts/vm-provision.sh --destroy {name}`
-- Before teardown: rsync Prometheus TSDB snapshot and load reports to persistent storage (optional, controlled by `--preserve-data` flag)
-- Return: `{destroyed: true, preserved_data: true|false}`
-- If VM doesn't exist, return success (idempotent)
+- Invoke `scripts/vm-provision.sh --destroy {name}` (tears down both VMs)
+- Before teardown: rsync Prometheus TSDB snapshot and load reports from both VMs to persistent storage (controlled by `--preserve-data` flag)
+- Return: `{destroyed: true, sut: {name: "...", destroyed: true}, harness: {name: "...", destroyed: true}, preserved_data: true|false}`
+- If VMs don't exist, return success (idempotent)
 
 #### `vm-deploy.md`
-- Rsync workspace to VM: `rsync -avz --exclude target . oceanfs-vm:~/ocean-fs/`
-- SSH: `cd ~/ocean-fs && cargo build --release -p oceanfs -p e2e`
-- Accepts: `branch` (optional — if provided, `git checkout {branch} && git pull` before build)
-- Return: `{commit: "...", build_duration_secs: N, build_success: true|false}`
+- **Build on Harness VM** (has Rust toolchain): `cd ~/ocean-fs && cargo build --release -p oceanfs -p e2e`
+- **Deploy binary to SUT VM**: `scp ~/ocean-fs/target/release/oceanfs oceanfs-sut:~/oceanfs`
+- SUT VM does NOT have Rust installed — binary is cross-deployed via `scp` over internal network
+- Accepts: `branch` (optional — if provided, `git checkout {branch} && git pull` on Harness VM before build)
+- Return: `{commit: "...", build_duration_secs: N, build_success: true|false, deploy_success: true|false}`
 - On build failure, return stderr output
+- On deploy failure (scp error), return error details
+- Also syncs workspace to Harness VM via rsync if needed: `rsync -avz --exclude target . oceanfs-harness:~/ocean-fs/`
 
 ### Out of Scope
 
-- Agent authentication or SSH key management (assumes `~/.ssh/config` is pre-configured)
-- Multi-VM cluster deployment (single VM for Phases 1-4)
-- Automated cost reporting beyond `hcloud server describe`
+- Agent authentication or SSH key management (assumes `~/.ssh/config` is pre-configured with both aliases)
+- Automated cost reporting beyond `hcloud server describe` (vm-status shows VM type, not cost-to-date in MVP)
 - VM performance tuning (kernel params, ulimits) — handled by vm-provision.sh
+- `vm-deploy` does NOT install Prometheus on SUT VM (that's feature 3.1: prometheus-grafana-setup)
 
 ## Crate Impact
 
@@ -75,19 +108,15 @@ Each skill is a Markdown file with a YAML-like structure that an agent can parse
 ```markdown
 # vm-status
 
-Check the status of the OceanFS load test VM.
+Check the status of both OceanFS load test VMs (SUT + Harness).
 
 ## Command
-ssh oceanfs-vm "systemctl is-active oceanfs; systemctl is-active prometheus; uptime -s"
+ssh oceanfs-sut "systemctl is-active oceanfs; systemctl is-active prometheus; systemctl is-active oceanfs-ttl.timer; uptime -s"
+ssh oceanfs-harness "systemctl is-active oceanfs-ttl.timer; uptime -s"
 
 ## Returns
-{
-  "status": "running" | "stopped" | "not_found",
-  "ip": "...",
-  "oceanfs": "active" | "inactive",
-  "prometheus": "active" | "inactive",
-  "uptime": "2026-08-05T10:00:00Z"
-}
+{ sut: { status, ip, public_ip, type, oceanfs, prometheus, ttl_timer, uptime },
+  harness: { status, ip, public_ip, type, ttl_timer, uptime } }
 ```
 
 ## Data Flow
@@ -95,33 +124,40 @@ ssh oceanfs-vm "systemctl is-active oceanfs; systemctl is-active prometheus; upt
 ```
 Agent: vm-up phase=2
   → ./scripts/vm-provision.sh --phase 2 --branch main
-  → Script: hcloud server create → wait → install deps → build
-  → returns { ip: "1.2.3.4", name: "oceanfs-loadtest-2", phase: 2 }
-  → Agent updates ~/.ssh/config: Host oceanfs-vm → HostName 1.2.3.4
+  → Script: creates SUT CX22 + Harness CX22 in same Hetzner network
+  → Script: installs Rust + builds oceanfs/e2e on Harness VM only
+  → returns { sut: { ip: "10.0.0.5", ... }, harness: { ip: "10.0.0.6", ... } }
+  → Agent updates ~/.ssh/config:
+      Host oceanfs-sut → HostName <sut-public-ip>
+      Host oceanfs-harness → HostName <harness-public-ip>
 
 Agent: vm-deploy
-  → rsync workspace to oceanfs-vm:~/ocean-fs/
-  → ssh oceanfs-vm "cd ocean-fs && git log -1 --format='%H' && cargo build --release"
-  → returns { commit: "abc1234", build_duration_secs: 120, build_success: true }
+  → ssh oceanfs-harness "cd ~/ocean-fs && git pull && cargo build --release -p oceanfs -p e2e"
+  → scp oceanfs-harness:~/ocean-fs/target/release/oceanfs oceanfs-sut:~/oceanfs
+  → returns { commit: "abc1234", build_duration_secs: 120, build_success: true, deploy_success: true }
 
 Agent: vm-status
-  → ssh oceanfs-vm "systemctl is-active oceanfs && systemctl is-active prometheus && uptime -s"
-  → returns { status: "running", oceanfs: "active", prometheus: "active", uptime: "..." }
+  → ssh oceanfs-sut "systemctl is-active oceanfs && systemctl is-active prometheus && uptime -s"
+  → ssh oceanfs-harness "uptime -s"
+  → returns { sut: { status: "running", oceanfs: "active", ... }, harness: { status: "running", ... } }
 
 Agent: vm-down
-  → rsync oceanfs-vm:~/ocean-fs/target/load-reports/ ./local-results/
+  → rsync oceanfs-sut:~/ocean-fs/target/load-reports/ ./local-results/
   → ./scripts/vm-provision.sh --destroy oceanfs-loadtest-2
   → returns { destroyed: true, preserved_data: true }
 ```
 
 ## Definition of Done
 
-- [ ] **Files:** `.opencode/skills/vm-status.md` exists with full command and return schema
-- [ ] **Files:** `.opencode/skills/vm-up.md` exists with parameter and return schema
-- [ ] **Files:** `.opencode/skills/vm-down.md` exists with parameter and return schema
-- [ ] **Files:** `.opencode/skills/vm-deploy.md` exists with parameter and return schema
+- [ ] **Files:** `.opencode/skills/vm-status.md` exists with two-VM return schema
+- [ ] **Files:** `.opencode/skills/vm-up.md` exists with parameters (phase, branch, confirm, single-vm, ttl) and two-VM return schema
+- [ ] **Files:** `.opencode/skills/vm-down.md` exists with `--preserve-data` parameter and two-VM teardown schema
+- [ ] **Files:** `.opencode/skills/vm-deploy.md` exists with build-on-harness + scp-to-sut workflow
 - [ ] **Validation:** Each skill file is syntactically valid (can be parsed by an agent)
-- [ ] **Validation:** `vm-up` skill correctly invokes `scripts/vm-provision.sh` with all parameters
-- [ ] **Validation:** `vm-deploy` skill includes both rsync and cargo build steps
+- [ ] **Validation:** `vm-up` skill correctly passes `--confirm yes` for Phase 3-4
+- [ ] **Validation:** `vm-up` skill correctly handles Phase 1 (prints "runs in CI" and exits)
+- [ ] **Validation:** `vm-deploy` skill includes both `cargo build` on Harness VM and `scp` to SUT VM
+- [ ] **Validation:** `vm-down` skill tears down both VMs and supports `--preserve-data`
 - [ ] **Docs:** Each skill file documents its purpose, inputs, outputs, and error conditions
-- [ ] **Integration:** An agent can execute the full lifecycle: vm-up → vm-deploy → vm-status → vm-down using only these skill files
+- [ ] **Integration:** An agent can execute the full two-VM lifecycle: vm-up → vm-deploy → vm-status → vm-down using only these skill files
+- [ ] **Integration:** SSH config correctly configured with two aliases (`oceanfs-sut`, `oceanfs-harness`)

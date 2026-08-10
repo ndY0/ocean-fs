@@ -1,5 +1,6 @@
 //! Integration test: GC compaction cycle.
 //!
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Verifies that the garbage collector:
 //! 1. Processes tombstones older than TTL
 //! 2. Identifies under-live segments
@@ -148,7 +149,7 @@ async fn gc_write_delete_verify_stats() {
         metadata
             .put_tombstone(
                 &bucket,
-                &ObjectKey::new(&format!("obj_{i}")),
+                &ObjectKey::new(format!("obj_{i}")),
                 Tombstone {
                     deletion_time: 1, // very old — definitely past TTL
                     hlc: Hlc::new(1, i),

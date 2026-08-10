@@ -26,6 +26,8 @@ pub enum BatchOp {
     PutSegment(SegmentMetadata),
     /// Delete a segment metadata entry.
     DeleteSegment(SegmentId),
+    /// Delete a tombstone entry for the given object key.
+    DeleteTombstone(BucketId, ObjectKey),
 }
 
 /// Trait for metadata access needed by caching, prefetch, and durability layers.
@@ -57,6 +59,9 @@ pub enum BatchOp {
 ///     }
 ///     fn list_tombstones(&self, _bucket: &BucketId) -> Vec<io::Result<(ObjectKey, Tombstone)>> {
 ///         vec![]
+///     }
+///     fn delete_tombstone(&self, _bucket: &BucketId, _key: &ObjectKey) -> io::Result<()> {
+///         Ok(())
 ///     }
 ///     fn put_segment(&self, _meta: SegmentMetadata) -> io::Result<()> {
 ///         Ok(())
@@ -108,6 +113,17 @@ pub trait MetadataStore: Send + Sync {
     ///
     /// Each element is a Result. Used by GC to find expired deletion markers.
     fn list_tombstones(&self, bucket: &BucketId) -> Vec<std::io::Result<(ObjectKey, Tombstone)>>;
+
+    /// Deletes a tombstone entry for the given object key.
+    ///
+    /// Called by the garbage collector after successfully compacting a segment
+    /// and reclaiming the dead chunks for objects whose tombstones have been
+    /// processed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the deletion fails.
+    fn delete_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<()>;
 
     /// Stores (or updates) segment metadata.
     ///

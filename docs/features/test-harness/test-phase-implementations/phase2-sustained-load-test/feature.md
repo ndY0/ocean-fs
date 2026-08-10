@@ -26,11 +26,12 @@ dependencies:
 adr:
   - 0001-segment-packing
   - 0004-tiered-segment-sizing
+  - 0019-test-harness-topology-cost-guardrails
 perf:
   - "11.1 Atomic counters on hot paths"
   - "11.2 Resource monitoring instrumentation"
 created: 2026-08-05
-updated: 2026-08-05
+updated: 2026-08-10
 ---
 
 # Phase 2 — Single-Node Sustained Load & Resource Stability Test
@@ -38,22 +39,31 @@ updated: 2026-08-05
 ## Summary
 
 Implement `e2e/tests/load_sustained.rs` — a `#[tokio::test]` that validates
-single-node resource stability under sustained load. Spawns one `NodeProcess`
-with shortened background intervals (GC=10s, AE=10s, scrub=60s), runs a
-sustained PUT+GET+DELETE loop with randomized blob sizes for 5 minutes (quick
-mode, CI) or 60 minutes (full mode, nightly) controlled by
-`LOAD_TEST_DURATION_SECS`. Polls `/admin/metrics` every 10 seconds and asserts
-resource invariants on each snapshot. At the end, kills the node (SIGKILL),
-restarts with the same data directory, and verifies all pre-crash objects are
-readable (WAL recovery). Produces a `LoadReport` with metric time-series data.
+single-node resource stability under sustained load. In two-VM topology (Phase 2
+cloud runs), the harness runs on the Harness VM and connects to a single
+already-running OceanFS process on the SUT VM via `TARGET_HOST=<sut-ip>:9000`
+env var (per ADR-0019). In local-spawn mode (Phase 2 quick mode in CI), the
+harness spawns one `NodeProcess` directly. The test runs with shortened
+background intervals (GC=10s, AE=10s, scrub=60s), a sustained PUT+GET+DELETE
+loop with randomized blob sizes for 5 minutes (quick mode, CI) or 60 minutes
+(full mode, cloud) controlled by `LOAD_TEST_DURATION_SECS`. Polls
+`/admin/metrics` every 10 seconds and asserts resource invariants on each
+snapshot. At the end, kills the node (SIGKILL), restarts with the same data
+directory, and verifies all pre-crash objects are readable (WAL recovery).
+Produces a `LoadReport` with metric time-series data. The report is written to
+`/tmp` (tmpfs) on the Harness VM so that disk-fill scenarios in Phase 4 cannot
+prevent report output.
 
 ## Scope
 
 ### In Scope
 
 - `#[tokio::test]` function in `e2e/tests/load_sustained.rs`
-- Two modes: "quick" (5 min, CI) and "full" (60 min, nightly) controlled by `LOAD_TEST_DURATION_SECS` env var
-- Spawns 1 `NodeProcess` with config: shortened GC (10s cycle, 5s TTL), AE (10s), scrub (60s), gossip disabled (single-node)
+- Two topology modes (per ADR-0019):
+  - **Remote target** (cloud, two-VM): connects to running OceanFS at `TARGET_HOST=<ip>:9000`; does not spawn processes
+  - **Local spawn** (CI quick mode): spawns `NodeProcess` directly via existing `Cluster` API
+- Two duration modes: "quick" (5 min, CI) and "full" (60 min, cloud) controlled by `LOAD_TEST_DURATION_SECS` env var
+- Spawns/connects to 1 oceanfs node with config: shortened GC (10s cycle, 5s TTL), AE (10s), scrub (60s), gossip disabled (single-node)
 - `LoadScenario` configuration:
   - Concurrency: `num_cpus::get() * 2` workers (moderate load to avoid overwhelming single node)
   - Duration: from env var (default 300s quick / 3600s full)
@@ -77,6 +87,9 @@ readable (WAL recovery). Produces a `LoadReport` with metric time-series data.
   11. WAL recovery verification: `manifest.verify(&restarted_cluster)` → 0 mismatches (all pre-crash data readable)
   12. Assert `/admin/health` returns 200 after restart
 - LoadReport populated with all metric snapshots (time-series), all assertions, manifest summary
+- **Report path:** Always writes `LoadReport` JSON to `/tmp` (tmpfs) on the machine where the harness runs (Harness VM in two-VM mode, CI runner in local mode), per ADR-0019 Decision 4
+- **Single-VM mode:** If `--single-vm` flag is active (harness co-located with SUT), the harness monitors its own `/proc` metrics separately and includes them in the report as metadata. Relaxed gossip parameters are NOT needed for Phase 2 (single-node, gossip disabled).
+- **Harness self-monitoring:** In all modes, the harness records its own `process_open_fds` and `process_resident_memory_bytes` from `/proc` and includes them in the `LoadReport` as metadata (not assertions), per ADR-0019 Decision 4
 
 ### Out of Scope
 
@@ -99,16 +112,25 @@ No new `pub` items — this is a `#[tokio::test]` function.
 
 ```
 Test: load_sustained
-  1. Parse LOAD_TEST_SEED, LOAD_TEST_DURATION_SECS
+
+Topology detection:
+  → If TARGET_HOST is set (cloud two-VM mode):
+      connect to remote OceanFS at $TARGET_HOST (e.g., 10.0.0.5:9000)
+      metrics scraping targets remote /admin/metrics
+  → Else (CI local spawn mode):
+      spawn NodeProcess locally
+
+Test flow (both modes):
+  1. Parse LOAD_TEST_SEED, LOAD_TEST_DURATION_SECS, TARGET_HOST
   2. Build LoadScenario (duration from env var)
   3. Build config with shortened intervals: gc_interval=10, tombstone_ttl=5, ae_interval=10, scrub_interval=60
-  4. Spawn NodeProcess; obtain data_dir
+  4. Connect to or spawn NodeProcess; obtain data_dir
   5. Initial metrics: scrape /admin/metrics → initial_snapshot
   6. Spawn metric polling task (tokio::spawn):
-       every 10s:
-         snapshot = MetricsSnapshot::scrape(&node)
-         check per-snapshot assertions, record violations
-         store snapshot in Vec
+        every 10s:
+          snapshot = MetricsSnapshot::scrape(&node)
+          check per-snapshot assertions, record violations
+          store snapshot in Vec
   7. Spawn orchestrator with workers
   8. Wait for duration; join workers and metric poller
   9. Final metrics: scrape one last time
@@ -117,7 +139,7 @@ Test: load_sustained
   12. Restart: NodeProcess::spawn_with_data_dir(config, data_dir)
   13. Wait for /admin/health
   14. manifest.verify(&restarted_cluster) → 0 mismatches
-  15. Build LoadReport; write JSON + textfile
+  15. Build LoadReport; write JSON to /tmp (tmpfs) + textfile
   16. assert!(report.result == Pass)
 ```
 
@@ -125,8 +147,9 @@ Test: load_sustained
 
 - [ ] **Code:** `cargo build --all-targets` succeeds in `e2e` crate
 - [ ] **Code:** Test file `e2e/tests/load_sustained.rs` compiles and links
-- [ ] **Tests:** Quick mode (5 min): `LOAD_TEST_DURATION_SECS=300 cargo test -p e2e -- load_sustained` passes
-- [ ] **Tests:** Full mode (60 min): `LOAD_TEST_DURATION_SECS=3600 cargo test -p e2e -- load_sustained` passes on nightly runner
+- [ ] **Code:** Test supports both remote-target mode (`TARGET_HOST` env var) and local-spawn mode (CI)
+- [ ] **Tests:** Quick mode (5 min): `LOAD_TEST_DURATION_SECS=300 cargo test -p e2e -- load_sustained` passes (CI, local spawn)
+- [ ] **Tests:** Full mode (60 min): `TARGET_HOST=10.0.0.5:9000 LOAD_TEST_DURATION_SECS=3600 cargo test -p e2e -- load_sustained` passes on cloud VM (remote target)
 - [ ] **Tests:** Memory bounded: RSS growth < 2× over run duration
 - [ ] **Tests:** FDs stable: open fd count growth < 50
 - [ ] **Tests:** RocksDB level-0 files < 20 throughout run
@@ -134,6 +157,8 @@ Test: load_sustained
 - [ ] **Tests:** Segment seal errors: 0
 - [ ] **Tests:** Cache hit rate: L1 object cache > 50% by end of run
 - [ ] **Tests:** Deterministic: same seed produces same assertion outcomes
-- [ ] **Docs:** Test doc comment explains quick vs full mode, environment variables, and expected invariants
+- [ ] **Tests:** LoadReport JSON written to `/tmp` (tmpfs), not to OceanFS data directory
+- [ ] **Tests:** Remote target mode: harness successfully connects to oceanfs at TARGET_HOST address (does not spawn locally)
+- [ ] **Docs:** Test doc comment explains quick vs full mode, remote-target vs local-spawn, environment variables, and expected invariants
 - [ ] **Perf:** Metric polling does not add >5% latency to worker operations (polling is async and non-blocking)
 - [ ] **Integration:** LoadReport JSON contains all metric snapshots (time-series) for offline analysis

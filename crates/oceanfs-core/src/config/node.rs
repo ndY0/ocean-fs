@@ -312,10 +312,10 @@ pub struct NodeConfig {
     pub default_fetch_strategy: crate::FetchStrategy,
 
     // ── Hinted handoff configuration ──
-    /// Path to hinted handoff WAL file. When `None`, defaults to
-    /// `"{data_dir}/hints.wal"`.
+    /// Directory for per-node hinted handoff WAL files. When `None`, defaults to
+    /// `"{data_dir}/hints"`.
     #[serde(default)]
-    pub hint_wal_path: Option<PathBuf>,
+    pub hint_wal_dir: Option<PathBuf>,
     /// Maximum blob size stored inline in hinted handoff WAL (bytes).
     /// Blobs above this threshold are stored as segment references.
     /// Default: 4096 (4 KB).
@@ -324,6 +324,17 @@ pub struct NodeConfig {
     /// Maximum hints per batched gRPC delivery call. Default: 256.
     #[serde(default = "default_hint_max_batch_size")]
     pub hint_max_batch_size: usize,
+
+    /// TTL in seconds for hinted handoff entries before they are pruned
+    /// from the persistent WAL (default 604800 = 7 days). Entries older
+    /// than this are permanently discarded.
+    #[serde(default = "default_hint_ttl_sec")]
+    pub hint_ttl_sec: u64,
+
+    /// Interval in seconds between hinted handoff WAL pruning cycles
+    /// (default 3600 = 1 hour).
+    #[serde(default = "default_hint_prune_interval")]
+    pub hint_prune_interval_sec: u64,
 }
 
 fn default_node_id() -> String {
@@ -483,6 +494,14 @@ fn default_hint_max_batch_size() -> usize {
     256
 }
 
+fn default_hint_ttl_sec() -> u64 {
+    604800
+}
+
+fn default_hint_prune_interval() -> u64 {
+    3600
+}
+
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
@@ -550,9 +569,11 @@ impl Default for NodeConfig {
             // Item 10: Fetch strategy
             default_fetch_strategy: crate::FetchStrategy::default(),
             // Hinted handoff
-            hint_wal_path: None,
+            hint_wal_dir: None,
             hint_inline_threshold_bytes: 4096,
             hint_max_batch_size: 256,
+            hint_ttl_sec: 604800,
+            hint_prune_interval_sec: 3600,
         }
     }
 }

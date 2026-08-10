@@ -42,6 +42,10 @@ pub struct HintSegmentRef {
 /// A hinted handoff record — either inline or segment reference.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct HintRecord {
+    /// Unix timestamp (seconds) when this hint was written.
+    /// Used for TTL-based pruning of stale entries.
+    #[prost(uint64, tag = "10")]
+    pub stored_at_secs: u64,
     #[prost(oneof = "hint_record::Record", tags = "1, 2")]
     pub record: ::core::option::Option<hint_record::Record>,
 }

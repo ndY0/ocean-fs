@@ -908,10 +908,10 @@ mod tests {
         let data_refs: Vec<&[u8]> = batch.data.iter().map(|v| &v[..]).collect();
         let ref_parity = cauchy.encode(&data_refs, 2).unwrap();
         // Verify SIMD parity matches portable parity
-        for i in 0..2 {
+        for (i, ref_p) in ref_parity.iter().enumerate().take(2) {
             assert_eq!(
                 &batch.parity[i][..],
-                ref_parity[i].as_ref(),
+                ref_p.as_ref(),
                 "SIMD parity shard {i} must match portable"
             );
         }

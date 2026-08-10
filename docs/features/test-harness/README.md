@@ -1,9 +1,13 @@
 # Test Harness — Master Index
 
-**Date:** 2026-08-05
+**Date:** 2026-08-10
 **Context:** Implementation plan for the OceanFS load test harness, test phases,
 and operational tooling. Derived from three brainstorm design documents and
-cross-referenced with the gap-closure plan.
+cross-referenced with the gap-closure plan. Updated per
+[ADR-0019](../../adr/0019-test-harness-topology-cost-guardrails.md) to use a
+**two-VM topology** for cloud-based phases (Phase 2–4): a dedicated **SUT VM**
+(running OceanFS + Prometheus) and a dedicated **Harness VM** (running the e2e
+harness + Rust toolchain) communicating over Hetzner's internal network.
 
 **Source Documents:**
 
@@ -13,17 +17,52 @@ cross-referenced with the gap-closure plan.
 | [`docs/brainstorm/load-test-framework.md`](../../brainstorm/load-test-framework.md) | Harness architecture, VM topology, key types, skills catalog, results format |
 | [`docs/brainstorm/load-test-metrics.md`](../../brainstorm/load-test-metrics.md) | 200+ metrics required per phase, remediation plan (Phases A–E) |
 | [`docs/brainstorm/implementation-gap-plan.md`](../../brainstorm/implementation-gap-plan.md) | Dependency chain: config fix → metrics → write-path → correctness → background tasks |
+| [`docs/adr/0019-test-harness-topology-cost-guardrails.md`](../../adr/0019-test-harness-topology-cost-guardrails.md) | Two-VM topology, cost guardrails, network bandwidth analysis |
+
+---
+
+## Topology Overview (per ADR-0019)
+
+Phase 1 runs entirely in CI with local process spawning. Phases 2–4 use a
+two-VM cloud topology:
+
+```
+┌─ Developer Laptop ─────────────────────────────────────┐
+│  Grafana :3000  (datasource → tunneled :9090)          │
+│  ssh oceanfs-sut     (SUT VM)                          │
+│  ssh oceanfs-harness (Harness VM, optionally)          │
+│  (Zero load generation. SSH + browser only.)           │
+└──────────┬──────────────────────────┬──────────────────┘
+           │ SSH                      │ SSH
+           ▼                          ▼
+┌─ SUT VM ──────────────────┐  ┌─ Harness VM (CX22) ─────┐
+│  oceanfs (1-5 processes)   │  │  e2e harness             │
+│  prometheus :9090          │  │  Rust toolchain          │
+│  No harness.               │  │  Targets SUT via         │
+│  No compile toolchain.     │  │  internal 10.x.x.x:9000  │
+│  Internal net: 10.0.0.x    │  │  Internal net: 10.0.0.x  │
+└────────────────────────────┘  └──────────────────────────┘
+         ▲                               │
+         └─── Hetzner internal network ──┘
+              (free, uncapped, <0.5ms RTT)
+```
+
+| Phase | SUT VM | Harness VM | Mode |
+|---|---|---|---|
+| Phase 1 | None (CI runner) | None (CI runner) | Local spawn in CI |
+| Phase 2 | CX22 (2 vCPU, 4 GB) | CX22 (2 vCPU, 4 GB) | Remote target (`TARGET_HOST`) |
+| Phase 3-4 | CX32 (4 vCPU, 8 GB) | CX22 (2 vCPU, 4 GB) | Remote target (`TARGET_HOSTS`) |
 
 ---
 
 ## Epic Summary
 
 | # | Epic | Priority | Features | Blocks | Blocked By |
-|---|---|---|---|---|---|
+|---|---|---|---|---|---|---|
 | 1 | [test-harness-extensions](#epic-1-test-harness-extensions) | **critical** | 6 | Epics 2, 3, 4 | gap-closure (config, metrics) |
 | 2 | [test-phase-implementations](#epic-2-test-phase-implementations) | **critical** | 4 | Epic 4 | Epic 1 + gap-closure (write-path, correctness) |
-| 3 | [operational-tooling](#epic-3-operational-tooling) | **high** | 3 | Epic 4 | Epic 1 (shared types) |
-| 4 | [agent-skills](#epic-4-agent-skills) | **high** | 3 | — | Epics 1, 2, 3 |
+| 3 | [operational-tooling](#epic-3-operational-tooling) | **high** | 3 | Epic 4 | Epic 1 (shared types), ADR-0019 (guardrails design) |
+| 4 | [agent-skills](#epic-4-agent-skills) | **high** | 3 | — | Epics 1, 2, 3, ADR-0019 (two-VM topology design) |
 
 ---
 
@@ -37,6 +76,8 @@ gap-closure/metrics-infrastructure ───────────────
 gap-closure/write-path-unification ────────────────┤         │
 gap-closure/correctness-gaps ──────────────────────┤         ├───► Epic 3: operational-tooling
                                                    │         │         │
+                                                   │         │    (ADR-0019 guardrails)
+ADR-0019 (topology + cost guardrails) ─────────────┘         │         │
                                                    │         │         │
                                                    ▼         │         │
                                               Epic 2: test-phase-implementations
@@ -47,8 +88,8 @@ gap-closure/correctness-gaps ─────────────────
 
 **Execution order:**
 1. **Sprint A:** gap-closure (config + metrics) — launched before this epic
-2. **Sprint B:** Epic 1 (harness extensions) + Epic 3 (tooling) — parallel
-3. **Sprint C:** Epic 2 (test implementations) — depends on Sprint A + B
+2. **Sprint B:** Epic 1 (harness extensions) + Epic 3 (tooling, incorporating ADR-0019 guardrails) — parallel
+3. **Sprint C:** Epic 2 (test implementations) — depends on Sprint A + B; test harness must support `TARGET_HOST`/`TARGET_HOSTS` remote target mode for Phase 2+
 4. **Sprint D:** Epic 4 (agent skills) — depends on all above
 
 ---
@@ -69,15 +110,15 @@ which epics must be completed first:
 
 ## Phase-to-Epic Mapping
 
-| Load Test Phase | Implementation Location | Gated By |
-|---|---|---|
-| Phase 0 (micro-benchmarks) | `benches/` — CI job (out of scope for this epic) | CI workflow only |
-| Phase 1 (concurrency + TSAN) | Epic 2: `phase1-concurrency-test` | Config fix + metrics wiring |
-| Phase 2 (sustained single-node) | Epic 2: `phase2-sustained-load-test` | Write path + correctness + metrics |
-| Phase 3 (cluster churn) | Epic 2: `phase3-cluster-churn-test` | Phase 1-2 passing + all gap-closure |
-| Phase 4 (degraded mode) | Epic 2: `phase4-degraded-mode-test` | Phase 3 passing + all gap-closure |
-| Phase 5 (scale properties) | Epic 3: `loadgen-binary` | Phase 4 passing |
-| Phase 6 (simulation 1000+ nodes) | NOT in this plan (separate `oceanfs-sim` crate, tracked in campaign doc §7) | Phase 3-4 passing |
+| Load Test Phase | Implementation Location | Topology | Gated By |
+|---|---|---|---|
+| Phase 0 (micro-benchmarks) | `benches/` — CI job (out of scope for this epic) | CI runner | CI workflow only |
+| Phase 1 (concurrency + TSAN) | Epic 2: `phase1-concurrency-test` | CI runner (single process, local spawn) | Config fix + metrics wiring |
+| Phase 2 (sustained single-node) | Epic 2: `phase2-sustained-load-test` | Two-VM (SUT=CX22 + Harness=CX22) | Write path + correctness + metrics + `TARGET_HOST` remote target mode |
+| Phase 3 (cluster churn) | Epic 2: `phase3-cluster-churn-test` | Two-VM (SUT=CX32 + Harness=CX22) | Phase 1-2 passing + all gap-closure |
+| Phase 4 (degraded mode) | Epic 2: `phase4-degraded-mode-test` | Two-VM (SUT=CX32 + Harness=CX22) | Phase 3 passing + all gap-closure |
+| Phase 5 (scale properties) | Epic 3: `loadgen-binary` | Dedicated loadgen binary targeting remote cluster | Phase 4 passing |
+| Phase 6 (simulation 1000+ nodes) | NOT in this plan (separate `oceanfs-sim` crate, tracked in campaign doc §7) | Simulation | Phase 3-4 passing |
 
 ---
 
@@ -86,19 +127,26 @@ which epics must be completed first:
 ```
 Every PR:
   ├── Phase 0 (micro-benchmarks, <2 min)
-  └── Phase 1 (concurrency + TSAN, <2 min)   ← Epic 2, Feature 1
+  └── Phase 1 (concurrency + TSAN, <2 min)   ← Epic 2, Feature 1 (runs in CI, local spawn)
 
 Merge to main:
   ├── Phase 0 + Phase 1
-  └── Phase 2 "quick mode" (5 minutes)       ← Epic 2, Feature 2
+  └── Phase 2 "quick mode" (5 min, local spawn in CI)       ← Epic 2, Feature 2
 
-Nightly:
-  ├── Phase 0-2
-  └── Phase 3 (3-node cluster + churn, <15 min)  ← Epic 2, Feature 3
+Nightly / Agent-driven (cloud VMs, two-VM topology):
+  ├── Phase 2 "full mode" (30-60 min)       ← SUT=CX22 + Harness=CX22, remote target
+  └── Phase 3 (3-node cluster + churn, <15 min)  ← SUT=CX32 + Harness=CX22, remote target
 
-Pre-release / weekly:
-  ├── Phase 0-4 (including failure injection)     ← Epic 2, Feature 4
+Pre-release / Agent-driven (cloud VMs):
+  └── Phase 4 (failure injection)           ← SUT=CX32 + Harness=CX22, remote target
 ```
+
+**Note on CI vs Cloud:** Phase 1 always runs in CI with local process spawning
+(`NodeProcess::spawn`). Phase 2 "quick mode" (5 min) also runs in CI with local
+spawning. Phase 2 "full mode" and all Phase 3-4 runs use the two-VM cloud
+topology with the harness in remote-target mode (`TARGET_HOST`/`TARGET_HOSTS` env
+vars). This keeps CI fast and cheap while enabling full-length, contention-free
+runs on demand via agent skills.
 
 ---
 
@@ -133,25 +181,29 @@ Implement the actual load test functions. Each is a `#[tokio::test]` in `e2e/tes
 
 ## Epic 3: operational-tooling
 
-Build the tools that make the test VM usable by both humans and agents.
+Build the tools that make the test VMs usable by both humans and agents.
+Per ADR-0019, this provisions **two VMs** (SUT + Harness) for Phase 2–4
+with cost guardrails (size cap, confirmation gate, auto-shutdown TTL).
 
 | # | Feature | Summary |
 |---|---|---|
-| 3.1 | [prometheus-grafana-setup](operational-tooling/prometheus-grafana-setup/feature.md) | Prometheus config, systemd unit, Grafana dashboard JSON, SSH tunnel |
-| 3.2 | [loadgen-binary](operational-tooling/loadgen-binary/feature.md) | Standalone `loadgen` binary for Phase 5 remote cluster targeting |
-| 3.3 | [vm-provisioning](operational-tooling/vm-provisioning/feature.md) | `scripts/vm-provision.sh` — cloud VM provisioning per phase |
+| 3.1 | [prometheus-grafana-setup](operational-tooling/prometheus-grafana-setup/feature.md) | Prometheus config, systemd unit, Grafana dashboard JSON, SSH tunnel (runs on SUT VM) |
+| 3.2 | [loadgen-binary](operational-tooling/loadgen-binary/feature.md) | Standalone `loadgen` binary for Phase 5 remote cluster targeting (also serves as remote-target mode foundation for Phase 2+ harness) |
+| 3.3 | [vm-provisioning](operational-tooling/vm-provisioning/feature.md) | `scripts/vm-provision.sh` — two-VM provisioning per phase with cost guardrails |
 
 ---
 
 ## Epic 4: agent-skills
 
-Create OpenCode skills that agents use to drive the test VM and consume results.
+Create OpenCode skills that agents use to drive the two-VM test topology and consume results.
+Per ADR-0019, skills manage two VMs: the SUT VM (OceanFS + Prometheus) and the
+Harness VM (e2e harness + Rust toolchain), connected over Hetzner internal network.
 
 | # | Feature | Summary |
 |---|---|---|
-| 4.1 | [vm-skills](agent-skills/vm-skills/feature.md) | `vm-status`, `vm-up`, `vm-down`, `vm-deploy` skill files |
-| 4.2 | [test-execution-skills](agent-skills/test-execution-skills/feature.md) | `vm-test-phase`, `vm-results`, `vm-metrics`, `vm-logs` skill files |
-| 4.3 | [agent-integration-test](agent-skills/agent-integration-test/feature.md) | End-to-end agent workflow test script |
+| 4.1 | [vm-skills](agent-skills/vm-skills/feature.md) | `vm-status`, `vm-up`, `vm-down`, `vm-deploy` — two-VM lifecycle management |
+| 4.2 | [test-execution-skills](agent-skills/test-execution-skills/feature.md) | `vm-test-phase`, `vm-results`, `vm-metrics`, `vm-logs` — remote-target test execution |
+| 4.3 | [agent-integration-test](agent-skills/agent-integration-test/feature.md) | End-to-end agent workflow test script (two-VM topology) |
 
 ---
 
@@ -168,3 +220,11 @@ Create OpenCode skills that agents use to drive the test VM and consume results.
    (5 min quick, 60 min full). `LOAD_TEST_SEED` for reproducibility.
 5. **Platform awareness** — Linux-specific injectors (`tc netem`) skip with
    warning on macOS. TSAN requires nightly Rust.
+6. **Remote target mode** — For Phase 2–4 cloud runs, the harness connects to
+   already-running OceanFS processes via `TARGET_HOST` (single-node) or
+   `TARGET_HOSTS` (multi-node) env vars. Local `NodeProcess::spawn` is
+   preserved for Phase 1 CI runs. The `NodeProcess`/`Cluster` abstractions
+   grow a `Remote` variant for connecting to running processes (ADR-0019).
+7. **Harness report path** — Harness always writes `LoadReport` JSON to
+   `/tmp` (tmpfs) regardless of topology, so disk-fill tests cannot prevent
+   report output (ADR-0019 Decision 4).

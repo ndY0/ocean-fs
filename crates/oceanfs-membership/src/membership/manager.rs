@@ -782,22 +782,22 @@ mod tests {
         use oceanfs_core::MetricRegistrar;
 
         struct TestRegistrar {
-            gauge_names: std::sync::Mutex<Vec<String>>,
+            gauge_names: parking_lot::Mutex<Vec<String>>,
         }
         impl MetricRegistrar for TestRegistrar {
             fn register_counter(&self, _: oceanfs_core::Counter) {}
             fn register_gauge(&self, gauge: oceanfs_core::Gauge) {
-                self.gauge_names.lock().unwrap().push(gauge.name().to_string());
+                self.gauge_names.lock().push(gauge.name().to_string());
             }
             fn register_histogram(&self, _: std::sync::Arc<oceanfs_core::Histogram>) {}
         }
 
         let (_ring, m) = make_membership("node");
-        let reg = TestRegistrar { gauge_names: std::sync::Mutex::new(Vec::new()) };
+        let reg = TestRegistrar { gauge_names: parking_lot::Mutex::new(Vec::new()) };
 
         m.register_gossip_metrics(&reg);
 
-        let names = reg.gauge_names.lock().unwrap();
+        let names = reg.gauge_names.lock();
         assert!(
             names.contains(&"ring_version".to_string()),
             "ring_version gauge should be registered, got: {names:?}"

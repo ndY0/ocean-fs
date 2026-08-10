@@ -319,6 +319,11 @@ impl RocksDbMetadataStore {
     // ------------------------------------------------------------------
 
     /// Stores object metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the objects column family is not found, serialization
+    /// fails, or the underlying RocksDB write fails.
     pub fn put_object(&self, meta: ObjectMetadata) -> Result<()> {
         let cf = self
             .db
@@ -334,6 +339,11 @@ impl RocksDbMetadataStore {
     }
 
     /// Stores object metadata with an explicit bucket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the objects column family is not found, serialization
+    /// fails, or the RocksDB write fails.
     pub fn put_object_in_bucket(&self, bucket: &BucketId, meta: ObjectMetadata) -> Result<()> {
         let cf = self
             .db
@@ -349,6 +359,11 @@ impl RocksDbMetadataStore {
     }
 
     /// Retrieves object metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the objects column family is not found,
+    /// deserialization fails, or the RocksDB read fails.
     pub fn get_object(&self, bucket: &BucketId, key: &ObjectKey) -> Result<Option<ObjectMetadata>> {
         let cf = self
             .db
@@ -374,6 +389,11 @@ impl RocksDbMetadataStore {
     /// Removes the object row from `CF_OBJECTS` and records a tombstone
     /// in `CF_DELETIONS` so that garbage collection can identify and
     /// compact this key across all replicas.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the objects or deletions column family is not found,
+    /// or if the RocksDB delete/write fails.
     pub fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> Result<()> {
         let cf = self
             .db
@@ -438,6 +458,11 @@ impl RocksDbMetadataStore {
     // ------------------------------------------------------------------
 
     /// Stores segment metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the segments column family is not found, serialization
+    /// fails, or the RocksDB write fails.
     pub fn put_segment(&self, meta: SegmentMetadata) -> Result<()> {
         let cf = self
             .db
@@ -453,6 +478,11 @@ impl RocksDbMetadataStore {
     }
 
     /// Retrieves segment metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the segments column family is not found,
+    /// deserialization fails, or the RocksDB read fails.
     pub fn get_segment(&self, id: SegmentId) -> Result<Option<SegmentMetadata>> {
         let cf = self
             .db
@@ -495,6 +525,11 @@ impl RocksDbMetadataStore {
     }
 
     /// Deletes a segment metadata entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the segments column family is not found or
+    /// the RocksDB delete fails.
     pub fn delete_segment(&self, id: SegmentId) -> Result<()> {
         let cf = self
             .db
@@ -512,6 +547,11 @@ impl RocksDbMetadataStore {
     // ------------------------------------------------------------------
 
     /// Records a deletion tombstone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the deletions column family is not found, serialization
+    /// fails, or the RocksDB write fails.
     pub fn put_tombstone(
         &self,
         bucket: &BucketId,
@@ -531,7 +571,28 @@ impl RocksDbMetadataStore {
         Ok(())
     }
 
+    /// Deletes a tombstone entry for the given object key from the deletions CF.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the deletions column family is not found or if
+    /// the RocksDB delete operation fails.
+    pub fn delete_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(cf::CF_DELETIONS)
+            .ok_or_else(|| Error::InvalidConfig("deletions CF not found".into()))?;
+        let encoded_key = cf::encode_object_key(bucket.as_str(), key.as_str());
+        self.db.delete_cf(&cf, &encoded_key).map_err(|e| Error::Io(io_err(e)))?;
+        Ok(())
+    }
+
     /// Checks if a deletion tombstone exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the deletions column family is not found or
+    /// the RocksDB read fails.
     pub fn has_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> Result<bool> {
         let cf = self
             .db
@@ -593,6 +654,11 @@ impl RocksDbMetadataStore {
     // ------------------------------------------------------------------
 
     /// Async version of [`Self::put_object`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blocking task fails to spawn, the objects column
+    /// family is not found, serialization fails, or the RocksDB write fails.
     pub async fn put_object_async(&self, meta: ObjectMetadata) -> Result<()> {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
@@ -609,6 +675,11 @@ impl RocksDbMetadataStore {
     }
 
     /// Async version of [`Self::get_object`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blocking task fails to spawn, the objects column
+    /// family is not found, deserialization fails, or the RocksDB read fails.
     pub async fn get_object_async(
         &self,
         bucket: BucketId,
@@ -636,6 +707,11 @@ impl RocksDbMetadataStore {
     }
 
     /// Async version of [`Self::delete_object`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blocking task fails to spawn, the objects column
+    /// family is not found, or the RocksDB delete fails.
     pub async fn delete_object_async(&self, bucket: BucketId, key: ObjectKey) -> Result<()> {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
@@ -655,6 +731,11 @@ impl RocksDbMetadataStore {
     // ------------------------------------------------------------------
 
     /// Atomically writes a batch of metadata operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required column family is not found, serialization
+    /// fails for any operation, or the RocksDB batch write fails.
     pub fn batch_write(&self, ops: Vec<BatchOp>) -> Result<()> {
         let mut batch = rocksdb::WriteBatch::default();
 
@@ -703,6 +784,14 @@ impl RocksDbMetadataStore {
                     let k = cf::encode_segment_key(segment_id);
                     batch.delete_cf(&cf, k);
                 }
+                BatchOp::DeleteTombstone(bucket, key) => {
+                    let cf = self
+                        .db
+                        .cf_handle(cf::CF_DELETIONS)
+                        .ok_or_else(|| Error::InvalidConfig("deletions CF not found".into()))?;
+                    let encoded = cf::encode_object_key(bucket.as_str(), key.as_str());
+                    batch.delete_cf(&cf, encoded);
+                }
             }
         }
 
@@ -722,6 +811,10 @@ impl RocksDbMetadataStore {
     }
 
     /// Flushes all column families to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the RocksDB flush operation fails.
     pub fn close(&self) -> Result<()> {
         self.db.flush().map_err(|e| Error::Io(io_err(e)))
     }
@@ -856,6 +949,8 @@ pub enum BatchOp {
     PutSegment(SegmentMetadata),
     /// Delete a segment metadata entry.
     DeleteSegment(SegmentId),
+    /// Delete a tombstone entry.
+    DeleteTombstone(BucketId, ObjectKey),
 }
 
 // ---------------------------------------------------------------------------
@@ -941,6 +1036,10 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
             .collect()
     }
 
+    fn delete_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<()> {
+        self.delete_tombstone(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
     fn put_segment(&self, meta: SegmentMetadata) -> std::io::Result<()> {
         self.put_segment(meta).map_err(|e| std::io::Error::other(e.to_string()))
     }
@@ -975,6 +1074,9 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
                 }
                 oceanfs_storage_api::BatchOp::DeleteSegment(id) => {
                     crate::metadata::store::BatchOp::DeleteSegment(id)
+                }
+                oceanfs_storage_api::BatchOp::DeleteTombstone(bucket, key) => {
+                    crate::metadata::store::BatchOp::DeleteTombstone(bucket, key)
                 }
             })
             .collect();

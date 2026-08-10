@@ -311,6 +311,10 @@ mod tests {
             vec![]
         }
 
+        fn delete_tombstone(&self, _bucket: &BucketId, _key: &ObjectKey) -> std::io::Result<()> {
+            Ok(())
+        }
+
         fn put_segment(&self, _meta: SegmentMetadata) -> std::io::Result<()> {
             Ok(())
         }

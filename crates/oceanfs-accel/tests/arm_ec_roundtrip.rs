@@ -4,6 +4,8 @@
 //! vice versa) and SIMD level detection. On non-aarch64 platforms,
 //! the portable fallback is used and verified to produce correct results.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use oceanfs_accel::{ArmDecoder, ArmEncoder};
 use oceanfs_ec::{Decoder, Encoder};
 

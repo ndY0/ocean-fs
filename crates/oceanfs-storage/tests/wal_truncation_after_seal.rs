@@ -75,7 +75,7 @@ async fn wal_truncation_called_during_seal() {
         io_mode: IoReadMode::Buffered,
         write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
     };
-    let sealer = SegmentSealer::new(seal_config, metadata, wal.clone(), None);
+    let sealer = SegmentSealer::new(seal_config, metadata, wal.clone());
 
     // Create and fill an active segment.
     let size_config = SegmentSizeConfig {

@@ -930,8 +930,8 @@ mod tests {
 
         // Corrupt shard 1 (bytes 10..20) by zeroing it.
         let mut corrupted = data.clone();
-        for i in 10..20 {
-            corrupted[i] = 0;
+        for b in corrupted.iter_mut().take(20).skip(10) {
+            *b = 0;
         }
         data_store.write_segment_data(&segment_id, &corrupted).unwrap();
 

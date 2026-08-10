@@ -323,7 +323,7 @@ mod tests {
 
         let parity = {
             let buf = seg.parity_buf.lock();
-            buf.get(0).cloned()
+            buf.first().cloned()
         };
         assert!(parity.is_some(), "parity should be computed for stripe 0");
         let p = parity.unwrap();
@@ -383,7 +383,7 @@ mod tests {
 
         // --- Compare ---
         let buf = streaming.parity_buf.lock();
-        let streaming_parity = buf.get(0).expect("stripe 0 parity should exist");
+        let streaming_parity = buf.first().expect("stripe 0 parity should exist");
         for i in 0..2 {
             assert_eq!(
                 &streaming_parity[i][..],

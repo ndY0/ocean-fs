@@ -1,5 +1,6 @@
 //! Integration test: Scrub cycle verification.
 //!
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Verifies that the scrub coordinator:
 //! 1. Scans all segments from the metadata store
 //! 2. Verifies Merkle root integrity for each segment

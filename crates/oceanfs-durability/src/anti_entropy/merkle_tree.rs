@@ -958,7 +958,7 @@ mod tests {
         let original_tree = MerkleTree::build(&original, 65536).unwrap();
 
         let mut corrupted = original.clone();
-        corrupted[1 * 65536] ^= 0x01;
+        corrupted[65536] ^= 0x01;
         corrupted[5 * 65536 + 100] ^= 0x02;
         let corrupted_tree = MerkleTree::build(&corrupted, 65536).unwrap();
 

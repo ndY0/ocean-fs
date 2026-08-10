@@ -9,10 +9,7 @@
 //! Run with:
 //!   cargo bench --bench io_benchmark
 
-use std::{
-    io::{Read, Write},
-    time::Duration,
-};
+use std::{io::Write, time::Duration};
 
 use criterion::{black_box, Criterion, Throughput};
 use oceanfs_storage::io::{direct::DirectIoBuf, mmap::SegmentFileCache, uring::DiskIo};
@@ -175,9 +172,7 @@ fn bench_disk_io_write_throughput(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_segment_file_body(c: &mut Criterion) {
-    let data = bytes::Bytes::from(vec![0xEEu8; 4 * 1024 * 1024]);
-
-    let mut group = c.benchmark_group("segment_file_body");
+    let group = c.benchmark_group("segment_file_body");
     #[cfg(feature = "sendfile")]
     {
         group.throughput(Throughput::Bytes(4 * 1024 * 1024));

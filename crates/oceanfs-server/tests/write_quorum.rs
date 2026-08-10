@@ -87,24 +87,27 @@ async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
         io_mode: oceanfs_storage::io::IoReadMode::Buffered,
         write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
     };
-    let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal, None));
+    let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
 
     let hinted_handoff = {
-        let hint_wal = Arc::new(
-            oceanfs_durability::HintWal::open(&dir.path().join("hints.wal")).await.unwrap(),
-        );
+        let hints_dir = dir.path().join("hints");
         let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
             Arc::new(oceanfs_durability::GrpcHintDeliveryClient::new(pool.clone()));
-        Arc::new(oceanfs_durability::HintedHandoffManager::new(
-            hint_wal,
-            delivery_client,
-            oceanfs_durability::HintedHandoffConfig {
-                wal_path: dir.path().join("hints.wal"),
-                ..Default::default()
-            },
-        ))
+        let hint_config = oceanfs_durability::HintedHandoffConfig {
+            wal_dir: hints_dir.clone(),
+            ..Default::default()
+        };
+        (
+            Arc::new(oceanfs_durability::HintedHandoffManager::new(
+                hints_dir,
+                delivery_client,
+                hint_config.clone(),
+            )),
+            hint_config,
+        )
     };
 
+    let (hinted_handoff, hint_config) = (hinted_handoff.0, hinted_handoff.1);
     WriteCoordinator::new(
         ring_cache,
         membership,
@@ -119,6 +122,7 @@ async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
         segment_pool_standard,
         sealer,
         hinted_handoff,
+        hint_config,
     )
 }
 

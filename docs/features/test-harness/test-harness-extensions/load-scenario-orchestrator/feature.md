@@ -12,11 +12,12 @@ dependencies:
 adr:
   - 0001-segment-packing
   - 0004-tiered-segment-sizing
+  - 0019-test-harness-topology-cost-guardrails
 perf:
   - "2.2 DashMap for concurrent caches"
   - "11.1 Atomic counters on hot paths"
 created: 2026-08-05
-updated: 2026-08-05
+updated: 2026-08-10
 ---
 
 # Load Scenario Orchestrator — Worker Framework & Stats Collection
@@ -49,7 +50,7 @@ and collects `AggregateStats`. This is the engine behind every Phase 1-4 test.
 
 ### Out of Scope
 
-- Remote cluster targeting (this feature targets locally spawned `Cluster`)
+- Remote cluster targeting (the `Worker` and `Orchestrator` are topology-agnostic — they operate against a `Cluster` handle which may be either locally spawned or remote-connected; the topology decision is made by the test entrypoint via `TARGET_HOST`/`TARGET_HOSTS` env vars per ADR-0019)
 - Metrics scraping during the run (handled by `MetricsSnapshot` in separate feature)
 - Churn injection (handled by `ChurnScheduler` in separate feature)
 - Custom S3 operations beyond PUT/GET/DELETE/HEAD (no List, no multipart upload)

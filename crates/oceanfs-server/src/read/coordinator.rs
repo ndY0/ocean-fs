@@ -146,13 +146,15 @@ pub enum ReadOutcome {
 /// # use bytes::Bytes;
 /// # use oceanfs_core::SegmentId;
 /// # use oceanfs_server::SegmentReader;
+/// # use async_trait::async_trait;
 /// // A simple in-memory implementation for testing.
 /// struct InMemorySegments {
 ///     data: HashMap<SegmentId, Bytes>,
 /// }
 ///
+/// #[async_trait]
 /// impl SegmentReader for InMemorySegments {
-///     fn read_chunk(
+///     async fn read_chunk(
 ///         &self,
 ///         segment_id: &SegmentId,
 ///         _offset: u64,
@@ -2550,8 +2552,8 @@ mod tests {
         // Concatenate shards: 4 data + 2 parity, with shard 0 zeroed.
         let mut segment = Vec::with_capacity(6 * shard_size);
         segment.extend_from_slice(&vec![0u8; shard_size]);
-        for i in 1..4 {
-            segment.extend_from_slice(&data[i]);
+        for chunk in &data[1..4] {
+            segment.extend_from_slice(chunk);
         }
         for p in &parity {
             segment.extend_from_slice(p);

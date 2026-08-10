@@ -164,22 +164,24 @@ impl RoundTripEnv {
             io_mode: oceanfs_storage::io::IoReadMode::Buffered,
             write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
         };
-        let sealer = Arc::new(SegmentSealer::new(seal_config, metadata_store.clone(), wal, None));
+        let sealer = Arc::new(SegmentSealer::new(seal_config, metadata_store.clone(), wal));
 
-        let hinted_handoff = {
-            let hint_wal = Arc::new(
-                oceanfs_durability::HintWal::open(&dir.path().join("hints.wal")).await.unwrap(),
-            );
+        let (hinted_handoff, hint_config) = {
+            let hints_dir = dir.path().join("hints");
             let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
                 Arc::new(oceanfs_durability::GrpcHintDeliveryClient::new(pool.clone()));
-            Arc::new(oceanfs_durability::HintedHandoffManager::new(
-                hint_wal,
-                delivery_client,
-                oceanfs_durability::HintedHandoffConfig {
-                    wal_path: dir.path().join("hints.wal"),
-                    ..Default::default()
-                },
-            ))
+            let hint_config = oceanfs_durability::HintedHandoffConfig {
+                wal_dir: hints_dir.clone(),
+                ..Default::default()
+            };
+            (
+                Arc::new(oceanfs_durability::HintedHandoffManager::new(
+                    hints_dir,
+                    delivery_client,
+                    hint_config.clone(),
+                )),
+                hint_config,
+            )
         };
 
         let write = Arc::new(WriteCoordinator::new(
@@ -196,6 +198,7 @@ impl RoundTripEnv {
             segment_pool_standard,
             sealer,
             hinted_handoff,
+            hint_config,
         ));
 
         let segment_store = Arc::new(InMemorySegmentReader::new());

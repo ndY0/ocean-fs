@@ -243,7 +243,6 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn open_options_direct_sets_flag_on_linux() {
-        use std::os::unix::fs::OpenOptionsExt;
         let mut opts = std::fs::OpenOptions::new();
         opts.with_direct();
         // Just verify no panic; we can't inspect custom_flags directly.

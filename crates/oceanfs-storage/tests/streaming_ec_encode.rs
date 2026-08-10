@@ -4,6 +4,8 @@
 //! `ec_streaming_encode = true`, extract sealed segments, and confirm that
 //! streaming-computed parity shards match batch (seal-time) encode.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::sync::Arc;
 
 use oceanfs_core::{CodecConfig, PoolConfig, SegmentSizeConfig, SizeTier};

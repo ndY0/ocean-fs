@@ -609,22 +609,22 @@ mod tests {
         use oceanfs_core::MetricRegistrar;
 
         struct TestRegistrar {
-            names: std::sync::Mutex<Vec<String>>,
+            names: parking_lot::Mutex<Vec<String>>,
         }
         impl MetricRegistrar for TestRegistrar {
             fn register_counter(&self, counter: oceanfs_core::Counter) {
-                self.names.lock().unwrap().push(counter.name().to_string());
+                self.names.lock().push(counter.name().to_string());
             }
             fn register_gauge(&self, _: oceanfs_core::Gauge) {}
             fn register_histogram(&self, _: std::sync::Arc<oceanfs_core::Histogram>) {}
         }
 
         let protocol = make_protocol();
-        let reg = TestRegistrar { names: std::sync::Mutex::new(Vec::new()) };
+        let reg = TestRegistrar { names: parking_lot::Mutex::new(Vec::new()) };
 
         protocol.register_metrics(&reg);
 
-        let names = reg.names.lock().unwrap();
+        let names = reg.names.lock();
         assert!(names.contains(&"gossip_messages_dropped_total".to_string()));
         assert!(names.contains(&"gossip_messages_sent_total".to_string()));
         assert!(names.contains(&"gossip_messages_received_total".to_string()));

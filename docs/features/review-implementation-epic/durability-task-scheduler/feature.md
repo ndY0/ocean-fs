@@ -1,7 +1,7 @@
 ---
 feature: "Durability Task Scheduler"
 epic: "review-implementation-epic"
-status: proposed
+status: rejected
 priority: critical
 owner: ""
 dependencies:

@@ -721,7 +721,7 @@ mod tests {
 
         let mut tracker = LivenessTracker::new();
         let mut stats = GcStats::default();
-        let dead_keys = gc.process_tombstones(&metadata, &mut tracker, &mut stats).unwrap();
+        let (dead_keys, _) = gc.process_tombstones(&metadata, &mut tracker, &mut stats).unwrap();
 
         // The tombstone is within TTL, so it should NOT be in the dead set
         assert!(!dead_keys.contains("recently_deleted.txt"));

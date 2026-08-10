@@ -3,6 +3,8 @@
 //! Exercises the full read path: write segment to disk → read via
 //! DiskSegmentReader → verify data and source metadata.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -286,7 +288,6 @@ mod write_read_roundtrip {
             },
             metadata,
             wal,
-            None,
         ));
 
         let reader = Arc::new(DiskSegmentReader::new(

@@ -1,12 +1,12 @@
 //! Garbage collector — orchestrates liveness analysis, compaction, and reaping.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use oceanfs_core::{Counter, LabelSet, MetricRegistrar, SegmentId};
+use oceanfs_core::{BucketId, Counter, LabelSet, MetricRegistrar, ObjectKey, SegmentId};
 use oceanfs_storage::segment::TierRouter;
 use tokio::sync::Semaphore;
 
@@ -36,6 +36,8 @@ pub struct GarbageCollector {
     bytes_reclaimed_total: Counter,
     compaction_bytes_total: Counter,
 }
+
+type TombstoneResult = Result<(HashSet<String>, HashMap<SegmentId, Vec<(BucketId, ObjectKey)>>)>;
 
 impl GarbageCollector {
     /// Creates a new garbage collector with unregistered counters.
@@ -102,7 +104,8 @@ impl GarbageCollector {
         // Phase 1: Scan deletions and compute liveness.
         // Also returns the set of dead object keys (eligible tombstones past TTL)
         // so compaction can skip them when re-packing.
-        let dead_keys = self.process_tombstones(&*metadata, &mut tracker, &mut stats)?;
+        let (dead_keys, tombstone_keys_by_segment) =
+            self.process_tombstones(&*metadata, &mut tracker, &mut stats)?;
 
         // Phase 2: Identify compaction candidates
         let candidates = tracker.compaction_candidates(self.config.compact_threshold);
@@ -177,9 +180,24 @@ impl GarbageCollector {
         drop(tx);
 
         // Collect results
-        while let Some((_segment_id, reclaimed)) = rx.recv().await {
+        while let Some((segment_id, reclaimed)) = rx.recv().await {
             stats.segments_compacted += 1;
             stats.bytes_reclaimed += reclaimed;
+
+            if let Some(tombstone_keys) = tombstone_keys_by_segment.get(&segment_id) {
+                for (bucket, key) in tombstone_keys {
+                    if let Err(e) = metadata.delete_tombstone(bucket, key) {
+                        tracing::warn!(
+                            bucket = %bucket,
+                            key = %key,
+                            segment_id = %segment_id,
+                            error = %e,
+                            "failed to delete tombstone after compaction"
+                        );
+                    }
+                    let _ = metadata.delete_object(bucket, key);
+                }
+            }
         }
 
         // Await all spawned tasks
@@ -233,7 +251,7 @@ impl GarbageCollector {
         metadata: &dyn oceanfs_storage_api::MetadataStore,
         tracker: &mut LivenessTracker,
         stats: &mut GcStats,
-    ) -> Result<HashSet<String>> {
+    ) -> TombstoneResult {
         let now_ms =
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
         let ttl_ms = (self.config.tombstone_ttl_sec * 1000) as i64;
@@ -273,18 +291,26 @@ impl GarbageCollector {
         }
 
         if eligible_keys.is_empty() {
-            return Ok(eligible_keys);
+            return Ok((eligible_keys, HashMap::new()));
         }
 
         // Phase 2: Scan objects to accumulate live/dead bytes per segment.
         // Objects whose key is in the eligible set → mark their chunks as dead.
         // All other objects → add their chunks as live bytes.
+        // Also track which (bucket, object_key) pairs belong to which segment
+        // so that tombstones can be deleted after compaction.
         let all_objects = metadata.list_objects(&bucket, "");
+        let mut tombstone_keys_by_segment: HashMap<SegmentId, Vec<(BucketId, ObjectKey)>> =
+            HashMap::new();
 
         for obj in all_objects.into_iter().flatten() {
             if eligible_keys.contains(obj.object_key.as_str()) {
                 for chunk in &obj.chunks {
                     tracker.mark_dead(chunk);
+                    tombstone_keys_by_segment
+                        .entry(chunk.segment_id)
+                        .or_default()
+                        .push((bucket.clone(), obj.object_key.clone()));
                 }
             } else {
                 for chunk in &obj.chunks {
@@ -293,7 +319,7 @@ impl GarbageCollector {
             }
         }
 
-        Ok(eligible_keys)
+        Ok((eligible_keys, tombstone_keys_by_segment))
     }
 }
 
@@ -393,7 +419,7 @@ mod tests {
     };
     use oceanfs_storage::metadata::RocksDbMetadataStore;
 
-    use super::super::{config::tier_target_size, *};
+    use super::super::*;
     fn test_config() -> MetadataConfig {
         let dir = tempfile::tempdir().unwrap();
         MetadataConfig {
@@ -402,10 +428,6 @@ mod tests {
             memtable_size: 8 * 1024 * 1024,
             ..Default::default()
         }
-    }
-
-    fn test_shard_store() -> Arc<InMemorySegmentShardStore> {
-        Arc::new(InMemorySegmentShardStore::new(tier_target_size(SizeTier::Standard)))
     }
 
     fn make_object_meta(key: &str, size: u64, chunk: ChunkRef) -> ObjectMetadata {

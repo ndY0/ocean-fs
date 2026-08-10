@@ -25,10 +25,11 @@ dependencies:
     reason: Need ChurnScheduler for periodic node kill/restart
 adr:
   - 0001-segment-packing
+  - 0019-test-harness-topology-cost-guardrails
 perf:
   - "11.1 Atomic counters on hot paths"
 created: 2026-08-05
-updated: 2026-08-05
+updated: 2026-08-10
 ---
 
 # Phase 3 — 3-5 Node Cluster Churn Under Load Test
@@ -36,23 +37,34 @@ updated: 2026-08-05
 ## Summary
 
 Implement `e2e/tests/load_cluster_churn.rs` — a `#[tokio::test]` that validates
-distributed protocol correctness under sustained load with node churn. Spawns
-a 3-5 node `Cluster` with shortened gossip/SWIM/anti-entropy intervals (1s gossip,
-3s suspicion, 8s failure, 10s anti-entropy). Runs concurrent PUT/GET/DELETE from
-all nodes simultaneously for 2-5 minutes while a `ChurnScheduler` kills and
-restarts random nodes every 10-30 seconds. Asserts membership convergence after
-every churn event, manifest integrity (all writes readable from at least R nodes),
-hinted handoff delivery completeness, cache invalidation propagation, HLC
-monotonicity, and ring consistency. Produces a `LoadReport` with churn events
-and distributed protocol metrics.
+distributed protocol correctness under sustained load with node churn. In the
+two-VM topology (per ADR-0019), the harness runs on the dedicated Harness VM
+(CX22) and connects to 3-5 already-running OceanFS processes on the SUT VM
+(CX32) via `TARGET_HOSTS=<sut-ip>:9000,<sut-ip>:9001,...`. This eliminates CPU
+contention between the harness and OceanFS processes — SWIM gossip, failure
+detection, and churn convergence are not affected by the harness's 16-32 Workers.
+All 3-5 OceanFS processes run on the single SUT VM (multi-process, not
+multi-VM). The test uses shortened gossip/SWIM/anti-entropy intervals (1s gossip,
+3s suspicion, 8s failure, 10s anti-entropy) and runs concurrent PUT/GET/DELETE
+while a `ChurnScheduler` kills and restarts random nodes every 10-30 seconds.
+
+For single-VM mode (`--single-vm` flag, NOT recommended per ADR-0019 Decision 4):
+the harness and OceanFS processes share one VM. CPU contention can cause false
+gossip timeouts. The test configures **relaxed gossip parameters** to compensate:
+`gossip_interval_ms=3000`, `suspicion_timeout_ms=10000`, `failure_timeout_ms=30000`.
+A WARNING banner is printed before the test runs.
 
 ## Scope
 
 ### In Scope
 
 - `#[tokio::test]` function in `e2e/tests/load_cluster_churn.rs`
+- Two topology modes (per ADR-0019):
+  - **Two-VM (default, recommended):** Harness on Harness VM connects via `TARGET_HOSTS=<sut-ip>:9000,<sut-ip>:9001,...` to 3-5 OceanFS processes on SUT VM. No CPU contention — gossip timing is reliable.
+  - **Single-VM (opt-in via `--single-vm`):** Harness and all OceanFS processes on same VM. Sets relaxed gossip params. Prints WARNING banner.
 - Duration: 2-5 minutes (`LOAD_TEST_DURATION_SECS` env var, default 120s quick / 300s full)
-- Spawns 3-5 node `Cluster` with config: `config_fast_gossip()` + shortened AE (10s) + shortened SWIM (suspicion 3s, failure 8s)
+- Spawns or connects to 3-5 oceanfs processes with config: `config_fast_gossip()` + shortened AE (10s) + shortened SWIM (suspicion 3s, failure 8s) in two-VM mode
+- For single-VM mode, gossip params relaxed to: `gossip_interval=3s, suspicion_timeout=10s, failure_timeout=30s` (per ADR-0019 Decision 4)
 - Workers route randomly to any node (not just one coordinator) — exercises per-node routing
 - `ChurnScheduler` configuration: churn interval 10-30s random, restart delay 15s, deterministic mode for reproducibility
 - Churn mode: Poisson-distributed or fixed-interval with seed; at most 1 node dead at a time (keep quorum)
@@ -61,7 +73,7 @@ and distributed protocol metrics.
   - Blob sizes: Tiered across all 4 tiers
   - Key space: RandomUuid (large, 10K keys)
 - Assertions (checked at end of run, plus some checked per-churn-event):
-  1. **membership_convergence**: After each churn event, `cluster.wait_for_convergence(alive_count)` within 10s
+  1. **membership_convergence**: After each churn event, `cluster.wait_for_convergence(alive_count)` within 10s (30s for single-VM relaxed mode)
   2. **manifest_integrity**: `manifest.verify(&cluster)` → 0 mismatches (any alive node can serve the data)
   3. **manifest_read_quorum**: For each key in manifest, read from R nodes; at least R nodes return correct data
   4. **hinted_handoff_delivery**: `hinted_handoff_hints_stored` ≈ `hinted_handoff_hints_delivered` at end (within 5% tolerance)
@@ -72,6 +84,7 @@ and distributed protocol metrics.
   9. **cache_invalidation**: After node B PUTs new version of key K, node A's subsequent GET returns new version within cache TTL (15s test: wait, verify)
   10. **all_churn_succeeded**: All churn events have `success=true`
 - LoadReport includes churn events list and per-event convergence timing
+- **Report path:** Always writes `LoadReport` JSON to `/tmp` (tmpfs) on the Harness VM, per ADR-0019 Decision 4
 
 ### Out of Scope
 
@@ -94,13 +107,25 @@ No new `pub` items — this is a `#[tokio::test]` function.
 
 ```
 Test: load_cluster_churn
-  1. Parse LOAD_TEST_SEED, LOAD_TEST_DURATION_SECS
-  2. Build config: fast_gossip + fast_swim + fast_ae
-  3. Spawn 3-node Cluster
-  4. Wait for initial convergence (cluster.wait_for_convergence(3))
+
+Topology detection:
+  → If TARGET_HOSTS is set (cloud two-VM mode):
+      parse comma-separated host:port pairs
+      connect to remote OceanFS processes (no spawning)
+      config: fast_gossip (gossip=1s, suspicion=3s, failure=8s)
+  → Else if --single-vm flag or no TARGET_HOSTS:
+      spawn 3-5 NodeProcess locally
+      if --single-vm: config relaxed gossip (gossip=3s, suspicion=10s, failure=30s)
+      else: config fast_gossip
+
+Test flow (both modes):
+  1. Parse LOAD_TEST_SEED, LOAD_TEST_DURATION_SECS, TARGET_HOSTS
+  2. Build config: fast_gossip + fast_swim + fast_ae (or relaxed if single-VM)
+  3. Connect to or spawn 3-5 node Cluster
+  4. Wait for initial convergence (cluster.wait_for_convergence(alive_count))
   5. Create Manifest, Orchestrator with per-node worker distribution
   6. Create ChurnScheduler (deterministic, 10-30s interval, 15s restart delay)
-  7. Spawn metric scraper: poll all 3 nodes every 10s → MetricsSnapshot per node
+  7. Spawn metric scraper: poll all nodes every 10s → MetricsSnapshot per node
   8. Spawn churn task: tokio::spawn(churn_scheduler.run(duration))
   9. Spawn load workers: orchestrator.run(scenario, cluster, manifest)
   10. Wait for duration
@@ -110,7 +135,7 @@ Test: load_cluster_churn
   14. Per-node metric assertions: hinted handoff, gossip, ring, heal
   15. Cache invalidation test: sequential PUT/GET across nodes, verify propagation
   16. Ring consistency: compare ring views across all alive nodes
-  17. Build LoadReport; write JSON + textfile
+  17. Build LoadReport; write JSON to /tmp (tmpfs) + textfile
   18. assert!(report.result == Pass)
 ```
 
@@ -118,13 +143,17 @@ Test: load_cluster_churn
 
 - [ ] **Code:** `cargo build --all-targets` succeeds in `e2e` crate
 - [ ] **Code:** Test file `e2e/tests/load_cluster_churn.rs` compiles and links
-- [ ] **Tests:** `cargo test -p e2e -- load_cluster_churn` passes in 2-5 minutes
-- [ ] **Tests:** Membership convergence: all churn events converge within 10 gossip rounds
+- [ ] **Code:** Test supports remote-target mode (`TARGET_HOSTS` env var) and local-spawn mode
+- [ ] **Tests:** `cargo test -p e2e -- load_cluster_churn` passes in 2-5 minutes (local spawn, CI quick mode)
+- [ ] **Tests:** Remote target: `TARGET_HOSTS=10.0.0.5:9000,10.0.0.5:9001,10.0.0.5:9002 cargo test -p e2e -- load_cluster_churn` passes (cloud two-VM)
+- [ ] **Tests:** Membership convergence: all churn events converge within 10 gossip rounds (30s for single-VM relaxed mode)
 - [ ] **Tests:** Manifest integrity: 100% of written keys readable from at least R nodes
 - [ ] **Tests:** Hinted handoff: stored ≈ delivered at end (within 5%)
 - [ ] **Tests:** Ring consistency: `ring.lookup(h)` returns identical successors on all alive nodes
 - [ ] **Tests:** Cache invalidation: cross-node PUT → GET sequence returns newest version
 - [ ] **Tests:** All churn events report `success=true`
 - [ ] **Tests:** Deterministic: same seed produces same churn event sequence
-- [ ] **Docs:** Test doc comment explains cluster topology, churn model, and each assertion
+- [ ] **Tests:** Single-VM mode: WARNING printed, relaxed gossip params applied, convergence timeout extended to 30s
+- [ ] **Tests:** LoadReport JSON written to `/tmp` (tmpfs) on Harness VM
+- [ ] **Docs:** Test doc comment explains cluster topology, two-VM vs single-VM modes, churn model, and each assertion
 - [ ] **Integration:** LoadReport includes churn event timeline and per-node metric snapshots

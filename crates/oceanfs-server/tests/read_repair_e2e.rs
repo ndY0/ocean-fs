@@ -49,11 +49,7 @@ impl SegmentDataStore for InMemorySegments {
     }
 
     fn read_segment_data(&self, segment_id: &SegmentId) -> Result<Bytes, StorageError> {
-        self.data
-            .lock()
-            .get(segment_id)
-            .cloned()
-            .ok_or_else(|| StorageError::SegmentNotFound(*segment_id))
+        self.data.lock().get(segment_id).cloned().ok_or(StorageError::SegmentNotFound(*segment_id))
     }
 }
 
@@ -123,9 +119,9 @@ async fn put_get_metadata_roundtrip() {
         blake3_hash: vec![].into(),
         hlc: Some(hlc_proto),
         inline_data: b"hello".to_vec().into(),
-        chunk_segment_ids: vec![].into(),
-        chunk_offsets: vec![].into(),
-        chunk_lengths: vec![].into(),
+        chunk_segment_ids: vec![],
+        chunk_offsets: vec![],
+        chunk_lengths: vec![],
     });
     let push_resp = client.put_object_metadata(push_req).await.unwrap();
     assert!(push_resp.into_inner().written);
@@ -164,9 +160,9 @@ async fn put_overwrites_stale_version() {
             blake3_hash: vec![].into(),
             hlc: Some(hlc1),
             inline_data: vec![].into(),
-            chunk_segment_ids: vec![].into(),
-            chunk_offsets: vec![].into(),
-            chunk_lengths: vec![].into(),
+            chunk_segment_ids: vec![],
+            chunk_offsets: vec![],
+            chunk_lengths: vec![],
         }))
         .await
         .unwrap();
@@ -181,9 +177,9 @@ async fn put_overwrites_stale_version() {
             blake3_hash: vec![].into(),
             hlc: Some(hlc2),
             inline_data: b"v2000".to_vec().into(),
-            chunk_segment_ids: vec![].into(),
-            chunk_offsets: vec![].into(),
-            chunk_lengths: vec![].into(),
+            chunk_segment_ids: vec![],
+            chunk_offsets: vec![],
+            chunk_lengths: vec![],
         }))
         .await
         .unwrap();

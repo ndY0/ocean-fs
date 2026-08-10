@@ -17,6 +17,11 @@
 /// let result = validate_shard_memory_budget(4, 65536, 4_194_304);
 /// assert!(result.is_ok());
 /// ```
+///
+/// # Errors
+///
+/// Returns an error if the total estimated memory budget exceeds 80% of
+/// available system memory.
 pub fn validate_shard_memory_budget(
     shard_count: usize,
     pool_size_bytes: usize,

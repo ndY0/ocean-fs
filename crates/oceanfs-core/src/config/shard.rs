@@ -51,7 +51,7 @@ mod tests {
         let num_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         // Result should be min(num_cpus, 64) but at least 1
         assert!(result >= 1);
-        assert!(result <= num_cpus.min(64).max(1));
+        assert!(result <= num_cpus.clamp(1, 64));
     }
 
     #[test]

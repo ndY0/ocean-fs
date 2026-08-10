@@ -185,13 +185,9 @@ impl SegmentCompactor {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::{
-        collections::HashSet,
-        sync::Arc,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::{collections::HashSet, sync::Arc};
 
     use oceanfs_core::{
         BucketId, ChunkRef, Hlc, MetadataConfig, ObjectKey, ObjectMetadata, SegmentId,
@@ -200,11 +196,8 @@ mod tests {
     use oceanfs_storage::{metadata::RocksDbMetadataStore, segment::TierRouter};
 
     use super::super::{
-        config::tier_target_size,
-        garbage_collector::{GarbageCollector, InMemorySegmentShardStore},
-        liveness_tracker::LivenessTracker,
-        segment_compactor::SegmentCompactor,
-        *,
+        garbage_collector::GarbageCollector, liveness_tracker::LivenessTracker,
+        segment_compactor::SegmentCompactor, *,
     };
 
     fn test_config() -> MetadataConfig {
@@ -215,10 +208,6 @@ mod tests {
             memtable_size: 8 * 1024 * 1024,
             ..Default::default()
         }
-    }
-
-    fn test_shard_store() -> Arc<InMemorySegmentShardStore> {
-        Arc::new(InMemorySegmentShardStore::new(tier_target_size(SizeTier::Standard)))
     }
 
     fn make_object_meta(key: &str, size: u64, chunk: ChunkRef) -> ObjectMetadata {
@@ -357,7 +346,7 @@ mod tests {
 
         let mut tracker = LivenessTracker::new();
         let mut stats = GcStats::default();
-        let dead_keys = gc.process_tombstones(&metadata, &mut tracker, &mut stats).unwrap();
+        let (dead_keys, _) = gc.process_tombstones(&metadata, &mut tracker, &mut stats).unwrap();
 
         // The tombstone is past TTL, so it should be in the dead set
         assert!(dead_keys.contains("old_deleted.txt"));

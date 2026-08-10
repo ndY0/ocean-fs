@@ -22,6 +22,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use oceanfs_core::NodeId;
@@ -33,10 +34,6 @@ use crate::{
     error::{Error, Result},
     hinted_handoff_rpc::{hint_record::Record, HintInline, HintRecord, HintSegmentRef},
 };
-
-/// Default maximum file size before rotating (64 MB).
-/// Hint records are small — this is generous for a hints-only WAL.
-const DEFAULT_MAX_FILE_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A write-ahead log for hinted handoff records.
 ///
@@ -67,9 +64,6 @@ pub struct HintWal {
     file: Mutex<File>,
     /// Current byte position in the file (always at end after append).
     position: Mutex<u64>,
-    /// Maximum file size before rotation (unused in single-file mode).
-    #[allow(dead_code)]
-    max_file_size_bytes: u64,
 }
 
 impl HintWal {
@@ -85,7 +79,7 @@ impl HintWal {
 
         // Ensure parent directory exists.
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| Error::Io(e))?;
+            fs::create_dir_all(parent).map_err(Error::Io)?;
         }
 
         let file = OpenOptions::new()
@@ -93,9 +87,9 @@ impl HintWal {
             .append(true)
             .read(true)
             .open(&path)
-            .map_err(|e| Error::Io(e))?;
+            .map_err(Error::Io)?;
 
-        let existing_size = file.metadata().map_err(|e| Error::Io(e))?.len();
+        let existing_size = file.metadata().map_err(Error::Io)?.len();
 
         info!(
             path = %path.display(),
@@ -103,12 +97,7 @@ impl HintWal {
             "opened hint WAL"
         );
 
-        Ok(Self {
-            path,
-            file: Mutex::new(file),
-            position: Mutex::new(existing_size),
-            max_file_size_bytes: DEFAULT_MAX_FILE_SIZE_BYTES,
-        })
+        Ok(Self { path, file: Mutex::new(file), position: Mutex::new(existing_size) })
     }
 
     /// Writes a hint record to the WAL and returns `(start_position, end_position)`.
@@ -132,10 +121,10 @@ impl HintWal {
 
             let start_pos = *pos;
 
-            file.write_all(&frame).map_err(|e| Error::Io(e))?;
-            file.flush().map_err(|e| Error::Io(e))?;
+            file.write_all(&frame).map_err(Error::Io)?;
+            file.flush().map_err(Error::Io)?;
             // fsync for durability — hinted handoff entries must survive crashes.
-            file.sync_all().map_err(|e| Error::Io(e))?;
+            file.sync_all().map_err(Error::Io)?;
 
             *pos = start_pos + frame.len() as u64;
 
@@ -159,16 +148,16 @@ impl HintWal {
     /// (CRC32 mismatch), or a record fails to decode.
     pub async fn replay(&self) -> Result<Vec<(u64, u64, HintRecord)>> {
         let mut file = self.file.lock();
-        let file_size = file.metadata().map_err(|e| Error::Io(e))?.len();
+        let file_size = file.metadata().map_err(Error::Io)?.len();
 
         if file_size == 0 {
             return Ok(Vec::new());
         }
 
-        file.seek(SeekFrom::Start(0)).map_err(|e| Error::Io(e))?;
+        file.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
 
         let mut buffer = vec![0u8; file_size as usize];
-        file.read_exact(&mut buffer).map_err(|e| Error::Io(e))?;
+        file.read_exact(&mut buffer).map_err(Error::Io)?;
 
         drop(file);
 
@@ -248,9 +237,9 @@ impl HintWal {
         let mut file = self.file.lock();
         let mut pos = self.position.lock();
 
-        file.set_len(position).map_err(|e| Error::Io(e))?;
-        file.seek(SeekFrom::Start(position)).map_err(|e| Error::Io(e))?;
-        file.flush().map_err(|e| Error::Io(e))?;
+        file.set_len(position).map_err(Error::Io)?;
+        file.seek(SeekFrom::Start(position)).map_err(Error::Io)?;
+        file.flush().map_err(Error::Io)?;
 
         *pos = position;
 
@@ -261,6 +250,45 @@ impl HintWal {
         );
 
         Ok(())
+    }
+
+    /// Replays all entries, filters out those older than `ttl_secs`,
+    /// truncates the WAL, and re-writes surviving entries.
+    ///
+    /// Entries without a `stored_at_secs` timestamp (from before this field was added)
+    /// are preserved — they survive the filter.
+    ///
+    /// Returns the number of entries pruned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if WAL replay, truncation, or re-write fails.
+    pub async fn prune_expired(&self, ttl_secs: u64) -> Result<usize> {
+        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+        let records = self.replay().await?;
+
+        let (survivors, expired): (Vec<_>, Vec<_>) =
+            records.into_iter().partition(|(_, _, record)| {
+                !(record.stored_at_secs > 0
+                    && now_secs.saturating_sub(record.stored_at_secs) >= ttl_secs)
+            });
+
+        if expired.is_empty() {
+            return Ok(0);
+        }
+
+        let pruned = expired.len();
+
+        // Clear the WAL.
+        self.truncate_after(0).await?;
+
+        // Re-write survivors.
+        for (_, _, record) in &survivors {
+            self.write_hint(record).await?;
+        }
+
+        Ok(pruned)
     }
 
     /// Returns the current WAL position (bytes written).
@@ -313,9 +341,9 @@ impl oceanfs_storage_api::WalWriter for HintWal {
 
             let start_pos = *pos;
 
-            file.write_all(&frame).map_err(|e| oceanfs_storage_api::error::Error::Io(e))?;
-            file.flush().map_err(|e| oceanfs_storage_api::error::Error::Io(e))?;
-            file.sync_all().map_err(|e| oceanfs_storage_api::error::Error::Io(e))?;
+            file.write_all(&frame).map_err(oceanfs_storage_api::error::Error::Io)?;
+            file.flush().map_err(oceanfs_storage_api::error::Error::Io)?;
+            file.sync_all().map_err(oceanfs_storage_api::error::Error::Io)?;
 
             *pos = start_pos + frame.len() as u64;
             start_pos
@@ -337,7 +365,7 @@ impl oceanfs_storage_api::WalWriter for HintWal {
     /// Force-syncs the WAL file to disk.
     async fn sync(&self) -> std::result::Result<(), oceanfs_storage_api::error::Error> {
         let file = self.file.lock();
-        file.sync_all().map_err(|e| oceanfs_storage_api::error::Error::Io(e))
+        file.sync_all().map_err(oceanfs_storage_api::error::Error::Io)
     }
 
     /// Returns the current global WAL position.
@@ -368,6 +396,7 @@ impl HintRecord {
                 object_key,
                 data,
             })),
+            stored_at_secs: 0,
         }
     }
 
@@ -393,6 +422,7 @@ impl HintRecord {
                 offset,
                 length,
             })),
+            stored_at_secs: 0,
         }
     }
 
@@ -648,5 +678,66 @@ mod tests {
         let wal = HintWal::open(&wal_path).await.unwrap();
         let records = wal.replay().await.unwrap();
         assert!(records.is_empty());
+    }
+
+    /// Verifies that prune_expired() removes entries older than TTL
+    /// and preserves newer entries.
+    #[tokio::test]
+    async fn test_prune_expired_removes_old_entries() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("hints.wal");
+        let wal = HintWal::open(&wal_path).await.unwrap();
+
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+
+        let ttl = 3600; // 1 hour
+
+        // Hint 1: old — should be pruned.
+        let mut r1 = HintRecord::new_inline(
+            NodeId::new("n1"),
+            BucketId::new("b"),
+            "obj1".into(),
+            vec![1, 2, 3].into(),
+        );
+        r1.stored_at_secs = now - ttl - 100;
+
+        // Hint 2: borderline — just within TTL, should survive.
+        let mut r2 = HintRecord::new_inline(
+            NodeId::new("n2"),
+            BucketId::new("b"),
+            "obj2".into(),
+            vec![4, 5, 6].into(),
+        );
+        r2.stored_at_secs = now - (ttl / 2);
+
+        // Hint 3: very new — should survive.
+        let mut r3 = HintRecord::new_inline(
+            NodeId::new("n3"),
+            BucketId::new("b"),
+            "obj3".into(),
+            vec![7, 8, 9].into(),
+        );
+        r3.stored_at_secs = now;
+
+        wal.write_hint(&r1).await.unwrap();
+        wal.write_hint(&r2).await.unwrap();
+        wal.write_hint(&r3).await.unwrap();
+
+        let pruned = wal.prune_expired(ttl).await.unwrap();
+        assert_eq!(pruned, 1, "exactly 1 entry should be pruned");
+
+        let survivors = wal.replay().await.unwrap();
+        assert_eq!(survivors.len(), 2, "2 entries should survive");
+        let keys: Vec<&str> = survivors
+            .iter()
+            .map(|(_, _, r)| match r.record.as_ref().unwrap() {
+                Record::Inline(i) => i.object_key.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert!(keys.contains(&"obj2"), "obj2 should survive");
+        assert!(keys.contains(&"obj3"), "obj3 should survive");
+        assert!(!keys.contains(&"obj1"), "obj1 should be pruned");
     }
 }

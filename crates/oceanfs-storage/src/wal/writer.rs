@@ -234,6 +234,9 @@ impl WalWriter {
         *file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
         *pos = 0;
 
+        // Best-effort cleanup of old rotated WAL files.
+        super::cleanup_old_wal_files(&self.config).await;
+
         Ok(())
     }
 

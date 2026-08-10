@@ -13,7 +13,7 @@ use oceanfs_core::{
     RpcConfig, SegmentId, SegmentMetadata, SizeTier,
 };
 use oceanfs_durability::{
-    merkle::{IncrementalMerkleTree, MerkleTreeConfig, MerkleWal},
+    merkle::{IncrementalMerkleTree, MerkleTreeConfig},
     AntiEntropy, AntiEntropyConfig, InMemorySegmentStore, MerkleTree, SegmentDataStore,
 };
 use oceanfs_membership::Membership;
@@ -21,14 +21,9 @@ use oceanfs_network::ConnectionPool;
 use oceanfs_routing::{Ring, RingCache};
 use oceanfs_storage::RocksDbMetadataStore;
 
-/// Creates a test IncrementalMerkleTree backed by a temp MerkleWal.
+/// Creates a test IncrementalMerkleTree.
 fn make_test_tree() -> Arc<IncrementalMerkleTree> {
-    let dir = tempfile::tempdir().unwrap();
-    let wal_path = dir.path().join("merkle.wal");
-    let wal = Arc::new(MerkleWal::open(&wal_path).unwrap());
-    // Leak the tempdir to keep the WAL alive.
-    std::mem::forget(dir);
-    Arc::new(IncrementalMerkleTree::new(wal, MerkleTreeConfig::default()))
+    Arc::new(IncrementalMerkleTree::new(MerkleTreeConfig::default()))
 }
 
 /// Builds a test Membership for the given node.

@@ -346,9 +346,10 @@ impl HealingRpc for HealingGrpcService {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use std::{collections::HashMap, sync::Mutex};
+    use std::collections::HashMap;
 
     use oceanfs_core::{proto::common::SegmentId as ProtoSegmentId, SegmentId};
+    use parking_lot::Mutex;
 
     use super::*;
     use crate::{HintedHandoff, SegmentDataStore};
@@ -370,7 +371,7 @@ mod tests {
             segment_id: &SegmentId,
             data: &[u8],
         ) -> Result<(), oceanfs_storage::Error> {
-            self.data.lock().unwrap().insert(segment_id.clone(), Bytes::copy_from_slice(data));
+            self.data.lock().insert(*segment_id, Bytes::copy_from_slice(data));
             Ok(())
         }
 
@@ -380,10 +381,9 @@ mod tests {
         ) -> Result<Bytes, oceanfs_storage::Error> {
             self.data
                 .lock()
-                .unwrap()
                 .get(segment_id)
                 .cloned()
-                .ok_or_else(|| oceanfs_storage::Error::SegmentNotFound(*segment_id))
+                .ok_or(oceanfs_storage::Error::SegmentNotFound(*segment_id))
         }
     }
 

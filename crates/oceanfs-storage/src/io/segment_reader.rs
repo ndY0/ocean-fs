@@ -445,7 +445,7 @@ mod tests {
     async fn disk_reader_buffered_reads_file() {
         let dir = tempfile::tempdir().unwrap();
         let id = SegmentId::new();
-        let path = temp_segment_file(&dir, id);
+        let _ = temp_segment_file(&dir, id);
 
         let reader = DiskSegmentReader::new(
             IoReadMode::Buffered,
@@ -463,7 +463,7 @@ mod tests {
     async fn disk_reader_mmap_reads_file() {
         let dir = tempfile::tempdir().unwrap();
         let id = SegmentId::new();
-        let path = temp_segment_file(&dir, id);
+        let _ = temp_segment_file(&dir, id);
 
         let cache = Arc::new(SegmentFileCache::new(4));
         let reader = DiskSegmentReader::new(
@@ -486,7 +486,7 @@ mod tests {
     async fn disk_reader_mmap_cache_hit_second_read() {
         let dir = tempfile::tempdir().unwrap();
         let id = SegmentId::new();
-        let path = temp_segment_file(&dir, id);
+        let _ = temp_segment_file(&dir, id);
 
         let cache = Arc::new(SegmentFileCache::new(4));
         let reader = DiskSegmentReader::new(
@@ -521,7 +521,7 @@ mod tests {
     async fn disk_reader_direct_reads_file() {
         let dir = tempfile::tempdir().unwrap();
         let id = SegmentId::new();
-        let path = temp_segment_file(&dir, id);
+        let _ = temp_segment_file(&dir, id);
 
         let reader = DiskSegmentReader::new(
             IoReadMode::Direct,
