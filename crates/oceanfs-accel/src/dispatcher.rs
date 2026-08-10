@@ -120,7 +120,7 @@ pub(crate) enum DecoderBackend {
     Cpu(Arc<CpuEncoder>),
     /// Tier 1: ISA-L (x86_64 only).
     #[cfg(all(target_arch = "x86_64", feature = "isa-l"))]
-    Isal(Arc<crate::isal::IsalDecoder<'static>>),
+    Isal(Arc<crate::isal::IsalDecoder>),
     /// Tier 1: ARM SVE/NEON (aarch64 only).
     #[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
     Arm(Arc<crate::arm_sve::ArmDecoder>),
@@ -953,9 +953,8 @@ impl AccelDispatcher {
         #[cfg(all(target_arch = "x86_64", feature = "isa-l"))]
         {
             match crate::isal::IsalTables::new(config.data_shards, config.parity_shards) {
-                Some(tables) => {
-                    let tables_ref: &'static crate::isal::IsalTables = Box::leak(Box::new(tables));
-                    DecoderBackend::Isal(Arc::new(crate::isal::IsalDecoder::new(tables_ref)))
+                Some(_) => {
+                    DecoderBackend::Isal(Arc::new(crate::isal::IsalDecoder::new()))
                 }
                 None => {
                     tracing::warn!("ISA-L decoder construction failed; using CPU fallback");

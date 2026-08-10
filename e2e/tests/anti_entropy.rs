@@ -21,12 +21,26 @@ async fn anti_entropy_verifies_segments_without_changes() {
     let bucket = "ae-test";
     node.put(&format!("/{bucket}"), &[]).await.expect("create bucket");
 
-    // PUT several objects to create segments.
-    for i in 1..=5 {
+    // PUT objects > 4 KB to hit the segment path (inline threshold is
+    // 4096 bytes). Each object is 100 KB — classified as SizeTier::Small
+    // (≤ 256 KB). The small segment target is 64 KB, so a single object
+    // fills the segment, triggering immediate sealing.
+    for i in 1..=3 {
         let key = format!("obj-{i}.txt");
-        let body = format!("ae test object {i}").into_bytes();
+        // 100 KB of unique-ish data; tier classification: Small
+        let body = vec![b'A' + (i as u8); 100_000];
         let resp = node.put(&format!("/{bucket}/{key}"), &body).await.expect("PUT");
         assert_eq!(resp.status(), 200, "PUT obj-{i} should return 200");
+    }
+
+    // Brief wait for seal worker to flush segments to disk.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Verify objects are readable before AE.
+    for i in 1..=3 {
+        let key = format!("obj-{i}.txt");
+        let resp = node.get(&format!("/{bucket}/{key}")).await.expect("GET before AE");
+        assert_eq!(resp.status(), 200, "obj-{i} should be readable before AE");
     }
 
     // Record baseline segment count.
@@ -67,7 +81,7 @@ async fn anti_entropy_verifies_segments_without_changes() {
     );
 
     // Verify all objects are still readable.
-    for i in 1..=5 {
+    for i in 1..=3 {
         let key = format!("obj-{i}.txt");
         let resp = node.get(&format!("/{bucket}/{key}")).await.expect("GET after AE");
         assert_eq!(resp.status(), 200, "obj-{i} should still be readable after AE");

@@ -11,6 +11,10 @@
 //! - [`InMemorySegmentReader`] — stores segment data in a `HashMap`.
 //!   Used for testing and as a fast path for recently-written segments
 //!   that haven't been sealed to disk yet.
+//! - [`PoolFallbackReader`] — composite reader that checks active
+//!   (unsealed) segment buffers in one or more [`SegmentPool`]s before
+//!   falling back to a disk-backed reader. Closes the read-after-write
+//!   gap for recently-written data.
 //!
 //! ## Read source tracking
 //!
@@ -357,6 +361,60 @@ impl SegmentReader for InMemorySegmentReader {
         let start = offset as usize;
         let end = start.saturating_add(length as usize).min(full.len());
         Ok(full.slice(start..end))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PoolFallbackReader — checks active segments before falling back
+// ---------------------------------------------------------------------------
+
+/// A composite [`SegmentReader`] that first checks active (unsealed) segments
+/// in one or more [`SegmentPool`]s, then falls back to a disk-backed reader.
+///
+/// This closes the read-after-write gap: data acknowledged by a PUT may still
+/// reside in an active segment buffer and not yet be sealed to disk. Without
+/// this composite, GET requests would return 500 for recently-written objects.
+///
+/// The pool check is synchronous and lock-free in practice — it acquires the
+/// same `parking_lot::Mutex` used by `append`, copies the byte range, and
+/// releases. No async I/O, no scheduling yields.
+pub struct PoolFallbackReader {
+    /// Segment pools to check before falling back to disk.
+    pools: Vec<Arc<crate::segment::SegmentPool>>,
+    /// The fallback reader (typically a [`DiskSegmentReader`]).
+    fallback: Arc<dyn SegmentReader>,
+}
+
+impl PoolFallbackReader {
+    /// Creates a new composite reader.
+    ///
+    /// `pools` are searched in order. The first pool containing a matching
+    /// `segment_id` wins. `fallback` is consulted only when no pool match.
+    pub fn new(pools: Vec<Arc<crate::segment::pool::SegmentPool>>, fallback: Arc<dyn SegmentReader>) -> Self {
+        Self { pools, fallback }
+    }
+}
+
+#[async_trait::async_trait]
+impl SegmentReader for PoolFallbackReader {
+    async fn read_chunk(
+        &self,
+        segment_id: &SegmentId,
+        offset: u64,
+        length: u32,
+    ) -> std::result::Result<Bytes, String> {
+        // Check active pools first — synchronous, microsecond-scale.
+        for pool in &self.pools {
+            if let Some(data) = pool.try_read(*segment_id, offset, length) {
+                return Ok(data);
+            }
+        }
+        // Fall back to disk-backed reader.
+        self.fallback.read_chunk(segment_id, offset, length).await
+    }
+
+    fn last_read_source(&self, segment_id: &SegmentId) -> SegmentReadSource {
+        self.fallback.last_read_source(segment_id)
     }
 }
 

@@ -868,6 +868,19 @@ impl Node {
         // Replay existing hints from the WAL into in-memory queues.
         let _replayed = hinted_handoff_manager.replay_and_enqueue().await?;
 
+        // Clone pool Arcs for the read path — the originals are consumed
+        // by WriteCoordinator below. PoolFallbackReader checks active
+        // (unsealed) segments before falling back to DiskSegmentReader,
+        // closing the read-after-write gap for recently-written data.
+        let active_pools: Vec<Arc<SegmentPool>> = vec![
+            segment_pool_small.clone(),
+            segment_pool_standard.clone(),
+        ];
+        let segment_reader = Arc::new(oceanfs_storage::io::PoolFallbackReader::new(
+            active_pools,
+            segment_reader.clone(),
+        ));
+
         let write_coordinator = Arc::new(
             WriteCoordinator::new(
                 ring_cache.clone(),

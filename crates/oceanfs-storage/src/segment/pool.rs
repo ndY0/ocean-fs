@@ -273,6 +273,37 @@ impl SegmentPool {
         self.slots.len()
     }
 
+    /// Reads a chunk from an active (unsealed) segment in this pool.
+    ///
+    /// Searches all appending slots for a segment matching `segment_id`.
+    /// If found, copies the [offset, offset+length) range from the
+    /// in-memory buffer into a new `Bytes`.
+    ///
+    /// Returns `None` if no active segment in this pool matches the id.
+    /// This is a fast, synchronous operation — only a memcpy under the
+    /// segment mutex, same lock used by `append`.
+    pub fn try_read(
+        &self,
+        segment_id: SegmentId,
+        offset: u64,
+        length: u32,
+    ) -> Option<Bytes> {
+        for slot in self.slots.iter() {
+            let seg_guard = slot.segment.lock();
+            if let Some(segment) = seg_guard.as_ref() {
+                if segment.id() == segment_id {
+                    let data = segment.data();
+                    let start = offset as usize;
+                    let end = start.saturating_add(length as usize).min(data.len());
+                    if start < data.len() {
+                        return Some(Bytes::copy_from_slice(&data[start..end]));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     // ------------------------------------------------------------------
     // Internal helpers
     // ------------------------------------------------------------------

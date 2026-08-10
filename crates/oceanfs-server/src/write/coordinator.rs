@@ -249,10 +249,13 @@ impl WriteCoordinator {
                     .segment_pool_small
                     .append(&wal_data[..])
                     .map_err(|e| Error::Storage(format!("small tier append: {e}")))?;
+                // Record blob index entry BEFORE WAL write to prevent a race:
+                // if the append fills the segment, the seal worker can pick
+                // up the seal request on the next tokio yield point and find
+                // an empty entries map if we record after the WAL await.
+                self.record_blob_entry(segment_id, offset, length, blake3_hash);
                 // Write WAL entry for crash-recovery durability (C4-storage, D6).
                 self.write_wal_entry(segment_id, offset, wal_data.clone(), length, hlc).await?;
-                // Record blob index entry for later sealing.
-                self.record_blob_entry(segment_id, offset, length, blake3_hash);
                 let mut chunks = smallvec::SmallVec::new();
                 chunks.push(ChunkRef { segment_id, offset, length });
                 chunks
@@ -262,10 +265,11 @@ impl WriteCoordinator {
                     .segment_pool_standard
                     .append(&wal_data[..])
                     .map_err(|e| Error::Storage(format!("standard tier append: {e}")))?;
+                // Record blob index entry BEFORE WAL write to prevent race
+                // with seal worker (same rationale as Small tier above).
+                self.record_blob_entry(segment_id, offset, length, blake3_hash);
                 // Write WAL entry for crash-recovery durability (C4-storage, D6).
                 self.write_wal_entry(segment_id, offset, wal_data.clone(), length, hlc).await?;
-                // Record blob index entry for later sealing.
-                self.record_blob_entry(segment_id, offset, length, blake3_hash);
                 let mut chunks = smallvec::SmallVec::new();
                 chunks.push(ChunkRef { segment_id, offset, length });
                 chunks

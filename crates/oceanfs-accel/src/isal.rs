@@ -309,22 +309,18 @@ impl Encoder for IsalEncoder<'_> {
 ///
 /// let tables = IsalTables::new(4, 2).unwrap();
 /// let encoder = IsalEncoder::new(&tables);
-/// let decoder = IsalDecoder::new(&tables);
+/// let decoder = IsalDecoder::new();
 /// // ... encode, decode with ISA-L
 /// ```
-pub struct IsalDecoder<'a> {
-    /// Reference to precomputed encoding tables (with validated k, m).
-    tables: &'a IsalTables,
+pub struct IsalDecoder {
+    // decoder is stateless — it builds generator/decode tables per-decode
+    // call based on data_count/parity_count, so no precomputed tables needed.
 }
 
-impl<'a> IsalDecoder<'a> {
-    /// Creates a new ISA-L decoder backed by the given precomputed tables.
-    ///
-    /// The tables must have been created with `IsalTables::new(k, m)`.
-    /// The decoder borrows the tables — they may be shared across
-    /// multiple encoder/decoder instances.
-    pub fn new(tables: &'a IsalTables) -> Self {
-        Self { tables }
+impl IsalDecoder {
+    /// Creates a new ISA-L decoder.
+    pub fn new() -> Self {
+        Self {}
     }
 
     /// Checks whether the ISA-L backend is available on this system.
@@ -339,7 +335,7 @@ impl<'a> IsalDecoder<'a> {
 // Decoder implementation (Gauss-Jordan + ISA-L SIMD decode)
 // ---------------------------------------------------------------------------
 
-impl Decoder for IsalDecoder<'_> {
+impl Decoder for IsalDecoder {
     fn decode(
         &self,
         available_shards: &[Option<&[u8]>],
@@ -650,7 +646,7 @@ mod tests {
     fn encode_decode_roundtrip_k4_m2_lose_shard0() {
         let tables = IsalTables::new(4, 2).unwrap();
         let encoder = IsalEncoder::new(&tables);
-        let decoder = IsalDecoder::new(&tables);
+        let decoder = IsalDecoder::new();
 
         let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 128]).collect();
         let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
@@ -677,7 +673,7 @@ mod tests {
     fn encode_decode_roundtrip_k4_m2_lose_two_shards() {
         let tables = IsalTables::new(4, 2).unwrap();
         let encoder = IsalEncoder::new(&tables);
-        let decoder = IsalDecoder::new(&tables);
+        let decoder = IsalDecoder::new();
 
         let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 128]).collect();
         let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
@@ -697,7 +693,7 @@ mod tests {
     fn encode_decode_no_missing_shards() {
         let tables = IsalTables::new(4, 2).unwrap();
         let encoder = IsalEncoder::new(&tables);
-        let decoder = IsalDecoder::new(&tables);
+        let decoder = IsalDecoder::new();
 
         let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 64]).collect();
         let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
@@ -717,7 +713,7 @@ mod tests {
     fn encode_decode_k8_m4_lose_two_shards() {
         let tables = IsalTables::new(8, 4).unwrap();
         let encoder = IsalEncoder::new(&tables);
-        let decoder = IsalDecoder::new(&tables);
+        let decoder = IsalDecoder::new();
 
         let data: Vec<Vec<u8>> = (0..8).map(|i| vec![i; 64]).collect();
         let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
@@ -753,7 +749,7 @@ mod tests {
     fn encode_decode_k8_m4_lose_four_shards() {
         let tables = IsalTables::new(8, 4).unwrap();
         let encoder = IsalEncoder::new(&tables);
-        let decoder = IsalDecoder::new(&tables);
+        let decoder = IsalDecoder::new();
 
         let data: Vec<Vec<u8>> = (0..8).map(|i| vec![i; 64]).collect();
         let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
@@ -785,7 +781,7 @@ mod tests {
     fn encode_decode_k16_m8() {
         let tables = IsalTables::new(16, 8).unwrap();
         let encoder = IsalEncoder::new(&tables);
-        let decoder = IsalDecoder::new(&tables);
+        let decoder = IsalDecoder::new();
 
         let data: Vec<Vec<u8>> = (0..16).map(|i| vec![i; 32]).collect();
         let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
@@ -914,7 +910,7 @@ mod tests {
         use oceanfs_ec::CauchyEncoder;
 
         let tables = IsalTables::new(4, 2).unwrap();
-        let isal_dec = IsalDecoder::new(&tables);
+        let isal_dec = IsalDecoder::new();
         let cauchy = CauchyEncoder::new(CodecConfig {
             data_shards: 4,
             parity_shards: 2,
