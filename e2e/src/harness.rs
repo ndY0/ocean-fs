@@ -1028,14 +1028,15 @@ fn build_node_config(base_config: &str, index: usize, seed: &str) -> String {
         1,
     );
 
-    // Add seed_nodes if needed.
+    // Add seed_nodes under [gossip] if needed.
     if seed.is_empty() {
         config
-    } else if config.contains("seed_nodes") {
-        // Replace placeholder or add to existing seed_nodes value.
-        config.replace("{seed_node}", seed)
+    } else if config.contains("[gossip]") {
+        // Append seed_nodes inside the existing [gossip] section.
+        format!("{config}seed_nodes = [\"{seed}\"]\n")
     } else {
-        format!("{}seed_nodes = [\"{}\"]\n", config, seed)
+        // Add a [gossip] section with seed_nodes.
+        format!("{config}\n[gossip]\nseed_nodes = [\"{seed}\"]\n")
     }
 }
 
