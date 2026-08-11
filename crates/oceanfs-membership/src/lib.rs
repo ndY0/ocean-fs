@@ -14,6 +14,10 @@
     clippy::missing_panics_doc,
     missing_docs
 )]
+// async_trait generates #[must_use] on methods returning Result,
+// which is redundant (Result is already #[must_use]). This lint fires
+// in nightly-2026-08-10+ clippy and is denied via workspace RUSTFLAGS.
+#![allow(clippy::double_must_use)]
 // Internal infrastructure types are constructed by future integration code.
 #![allow(dead_code)]
 
