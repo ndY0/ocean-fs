@@ -50,6 +50,11 @@ impl SegmentDataStore for DiskSegmentStore {
         data: &[u8],
     ) -> std::result::Result<(), Error> {
         let path = self.segment_dir.join(format!("{segment_id}.dat"));
+        // Ensure the segment directory exists — the gRPC append_segment
+        // handler must be able to write segments even if no local segment
+        // sealing has ever created the directory.
+        std::fs::create_dir_all(&self.segment_dir)
+            .map_err(|e| Error::Io(std::io::Error::other(format!("{e}"))))?;
         let header = vec![0u8; 76];
         let mut file_data = header;
         file_data.extend_from_slice(data);
