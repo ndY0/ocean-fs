@@ -904,7 +904,14 @@ impl Cluster {
     /// The node is respawned with the same config (and thus same ports,
     /// though the OS may assign different ports if the original ones were
     /// released). For cluster rejoin tests, the seed is still configured.
+    ///
+    /// A brief delay before restart lets the OS release TCP sockets from
+    /// the killed process (TIME_WAIT can hold ports for up to 60s, but
+    /// localhost sockets typically clean up faster).
     pub async fn restart(&mut self, i: usize) -> Result<(), Error> {
+        // Let the OS release the killed process's ports.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
         let seed = if i == 0 {
             String::new()
         } else {
