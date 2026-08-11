@@ -14,13 +14,14 @@ mod isal_tests {
     use oceanfs_ec::{CauchyEncoder, Decoder, Encoder};
 
     /// Helper: create ISA-L tables for given k, m.
-    fn setup_isal(k: u8, m: u8) -> (IsalTables, IsalEncoder<'static>, IsalDecoder) {
-        let tables = IsalTables::new(k, m).expect("ISA-L tables should be constructable");
+    /// Returns `None` if AVX-512 is not available.
+    fn setup_isal(k: u8, m: u8) -> Option<(IsalTables, IsalEncoder<'static>, IsalDecoder)> {
+        let tables = IsalTables::new(k, m)?;
         // Leak to get 'static lifetime for the integration test
         let tables_ref: &'static IsalTables = Box::leak(Box::new(tables.clone()));
         let encoder = IsalEncoder::new(tables_ref);
         let decoder = IsalDecoder::new();
-        (tables, encoder, decoder)
+        Some((tables, encoder, decoder))
     }
 
     // -- AVX-512 detection tests --
@@ -39,7 +40,9 @@ mod isal_tests {
 
     #[test]
     fn isal_tables_k_m_accessors() {
-        let tables = IsalTables::new(4, 2).expect("should be available on this hardware");
+        let Some(tables) = IsalTables::new(4, 2) else {
+            return;
+        };
         assert_eq!(tables.k(), 4);
         assert_eq!(tables.m(), 2);
     }
@@ -48,7 +51,9 @@ mod isal_tests {
 
     #[test]
     fn isal_encode_cauchy_decode_roundtrip_k4_m2() {
-        let tables = IsalTables::new(4, 2).expect("ISA-L should be available");
+        let Some(tables) = IsalTables::new(4, 2) else {
+            return;
+        };
         let isal_enc = IsalEncoder::new(&tables);
         let cauchy = CauchyEncoder::new(CodecConfig {
             data_shards: 4,
@@ -82,7 +87,9 @@ mod isal_tests {
 
     #[test]
     fn cauchy_encode_isal_decode_roundtrip_k4_m2() {
-        let _ = IsalTables::new(4, 2).expect("ISA-L should be available");
+        let Some(_) = IsalTables::new(4, 2) else {
+            return;
+        };
         let isal_dec = IsalDecoder::new();
         let cauchy = CauchyEncoder::new(CodecConfig {
             data_shards: 4,
@@ -113,7 +120,9 @@ mod isal_tests {
 
     #[test]
     fn isal_encode_decode_roundtrip_k8_m4_lose_two_shards() {
-        let (_, enc, dec) = setup_isal(8, 4);
+        let Some((_, enc, dec)) = setup_isal(8, 4) else {
+            return;
+        };
 
         let data: Vec<Vec<u8>> = (0..8).map(|i| vec![i; 128]).collect();
         let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
@@ -143,7 +152,9 @@ mod isal_tests {
 
     #[test]
     fn isal_encode_decode_large_data_k16_m8() {
-        let (_, enc, dec) = setup_isal(16, 8);
+        let Some((_, enc, dec)) = setup_isal(16, 8) else {
+            return;
+        };
 
         // 1 KB per shard, 16 shards = 16 KB total
         let data: Vec<Vec<u8>> = (0..16).map(|i| vec![i; 1024]).collect();
@@ -168,7 +179,9 @@ mod isal_tests {
 
     #[test]
     fn isal_encode_decode_zero_length_shards() {
-        let (_, enc, dec) = setup_isal(4, 2);
+        let Some((_, enc, dec)) = setup_isal(4, 2) else {
+            return;
+        };
 
         let data: Vec<Vec<u8>> = vec![vec![]; 4];
         let shard_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
