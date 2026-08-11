@@ -26,6 +26,7 @@ use std::{
     time::Duration,
 };
 
+use parking_lot::RwLock;
 use tempfile::TempDir;
 
 /// Name of the port-preservation file written into each node's data directory.
@@ -768,22 +769,19 @@ pub async fn response_json<T: serde::de::DeserializeOwned>(
 /// # }
 /// ```
 pub struct Cluster {
-    /// All node processes in this cluster.
-    nodes: Vec<Option<NodeProcess>>,
+    /// All node processes in this cluster (interior-mutability for churn).
+    nodes: RwLock<Vec<Option<NodeProcess>>>,
     /// Shared temporary directory root (cleaned on drop).
     _temp_dir: TempDir,
     /// Base config template string.
     base_config: String,
     /// HTTP client for admin polling.
-    #[allow(dead_code)]
     client: reqwest::Client,
 }
 
 impl Drop for Cluster {
     fn drop(&mut self) {
-        // Kill any remaining node processes so that panics don't leave
-        // orphaned oceanfs instances consuming CPU and ports.
-        for node in self.nodes.iter_mut().flatten() {
+        for node in self.nodes.get_mut().iter_mut().flatten() {
             let _ = node.child.kill();
             let _ = node.child.wait();
         }
@@ -792,9 +790,10 @@ impl Drop for Cluster {
 
 impl std::fmt::Debug for Cluster {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let nodes = self.nodes.read();
         f.debug_struct("Cluster")
-            .field("node_count", &self.nodes.len())
-            .field("alive_count", &self.alive_count())
+            .field("node_count", &nodes.len())
+            .field("alive_count", &nodes.iter().filter(|n| n.is_some()).count())
             .finish_non_exhaustive()
     }
 }
@@ -837,7 +836,12 @@ impl Cluster {
             nodes.push(Some(node));
         }
 
-        Ok(Self { nodes, _temp_dir, base_config: base_config.to_string(), client })
+        Ok(Self {
+            nodes: RwLock::new(nodes),
+            _temp_dir,
+            base_config: base_config.to_string(),
+            client,
+        })
     }
 
     /// Returns a reference to node `i`.
@@ -846,18 +850,32 @@ impl Cluster {
     ///
     /// Panics if `i` is out of bounds or if the node has been killed
     /// without being restarted.
-    pub fn node(&self, i: usize) -> &NodeProcess {
-        self.nodes[i].as_ref().expect("node has been killed and not restarted")
+    ///
+    /// The returned guard holds a read lock on the nodes vector.
+    /// It implements `Deref<Target = NodeProcess>` so all `NodeProcess`
+    /// methods are available. The lock is released when the guard drops.
+    pub fn node(&self, i: usize) -> parking_lot::MappedRwLockReadGuard<'_, NodeProcess> {
+        parking_lot::RwLockReadGuard::map(self.nodes.read(), |nodes| {
+            nodes[i].as_ref().expect("node has been killed and not restarted")
+        })
+    }
+
+    /// Returns the HTTP address of node `i` without holding the lock
+    /// across an await point. Prefer this over `node(i).http_addr()` in
+    /// async contexts.
+    pub fn node_http_addr(&self, i: usize) -> SocketAddr {
+        let nodes = self.nodes.read();
+        nodes[i].as_ref().expect("node killed").http_addr()
     }
 
     /// Returns the number of nodes in the cluster (including killed ones).
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.nodes.read().len()
     }
 
     /// Returns `true` if the cluster has no nodes.
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.nodes.read().is_empty()
     }
 
     /// HTTP GET from node `i`.
@@ -866,7 +884,8 @@ impl Cluster {
     ///
     /// Panics if `i` is out of bounds or the node is killed.
     pub async fn get(&self, i: usize, path: &str) -> Result<reqwest::Response, Error> {
-        self.node(i).get(path).await
+        let url = format!("http://{}{}", self.node_http_addr(i), path);
+        Ok(self.client.get(&url).send().await?)
     }
 
     /// HTTP PUT to node `i`.
@@ -875,7 +894,8 @@ impl Cluster {
     ///
     /// Panics if `i` is out of bounds or the node is killed.
     pub async fn put(&self, i: usize, path: &str, body: &[u8]) -> Result<reqwest::Response, Error> {
-        self.node(i).put(path, body).await
+        let url = format!("http://{}{}", self.node_http_addr(i), path);
+        Ok(self.client.put(&url).body(body.to_vec()).send().await?)
     }
 
     /// HTTP DELETE from node `i`.
@@ -884,17 +904,37 @@ impl Cluster {
     ///
     /// Panics if `i` is out of bounds or the node is killed.
     pub async fn delete(&self, i: usize, path: &str) -> Result<reqwest::Response, Error> {
-        self.node(i).delete(path).await
+        let url = format!("http://{}{}", self.node_http_addr(i), path);
+        Ok(self.client.delete(&url).send().await?)
+    }
+
+    /// HTTP HEAD from node `i`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` is out of bounds or the node is killed.
+    pub async fn head(&self, i: usize, path: &str) -> Result<reqwest::Response, Error> {
+        let url = format!("http://{}{}", self.node_http_addr(i), path);
+        Ok(self.client.head(&url).send().await?)
+    }
+
+    /// HTTP POST to node `i`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` is out of bounds or the node is killed.
+    pub async fn post(&self, i: usize, path: &str) -> Result<reqwest::Response, Error> {
+        let url = format!("http://{}{}", self.node_http_addr(i), path);
+        Ok(self.client.post(&url).send().await?)
     }
 
     /// Kill node `i` with SIGKILL (hard crash for failure tests).
     ///
     /// After calling this, `node(i)` will panic until `restart(i)` is called.
     /// The node's data directory is preserved for restart.
-    pub fn kill(&mut self, i: usize) -> std::io::Result<()> {
-        let mut node = self.nodes[i].take().expect("node already killed");
+    pub fn kill(&self, i: usize) -> std::io::Result<()> {
+        let mut node = self.nodes.write()[i].take().expect("node already killed");
         let result = node.kill();
-        // Drop the NodeProcess handle so the OS releases the process.
         drop(node);
         result
     }
@@ -908,23 +948,26 @@ impl Cluster {
     /// A brief delay before restart lets the OS release TCP sockets from
     /// the killed process (TIME_WAIT can hold ports for up to 60s, but
     /// localhost sockets typically clean up faster).
-    pub async fn restart(&mut self, i: usize) -> Result<(), Error> {
+    pub async fn restart(&self, i: usize) -> Result<(), Error> {
         // Let the OS release the killed process's ports.
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        let seed = if i == 0 {
-            String::new()
-        } else {
-            self.nodes[0]
-                .as_ref()
-                .map(|n| format!("127.0.0.1:{}", n.grpc_addr().port()))
-                .unwrap_or_default()
+        let seed = {
+            let nodes = self.nodes.read();
+            if i == 0 {
+                String::new()
+            } else {
+                nodes[0]
+                    .as_ref()
+                    .map(|n| format!("127.0.0.1:{}", n.grpc_addr().port()))
+                    .unwrap_or_default()
+            }
         };
 
         let node_dir = self._temp_dir.path().join(format!("node-{i}"));
         let node_config = build_node_config(&self.base_config, i, &seed);
         let node = NodeProcess::spawn_with_data_dir(&node_config, &node_dir).await?;
-        self.nodes[i] = Some(node);
+        self.nodes.write()[i] = Some(node);
 
         Ok(())
     }
@@ -944,25 +987,29 @@ impl Cluster {
                 return Err(Error::HealthTimeout(timeout));
             }
 
+            // Collect node addresses without holding the lock across await.
+            let node_addrs: Vec<SocketAddr> = {
+                let nodes = self.nodes.read();
+                nodes.iter().filter_map(|n| n.as_ref().map(|np| np.http_addr())).collect()
+            };
+
             let mut all_converged = true;
-            for (i, node_opt) in self.nodes.iter().enumerate() {
-                if let Some(node) = node_opt {
-                    match self.get_cluster_node_count(node).await {
-                        Ok(count) if count == expected_nodes => {}
-                        Ok(count) => {
-                            eprintln!(
-                                "  cluster: node {i} reports {count} nodes (expected {expected_nodes})"
-                            );
-                            all_converged = false;
-                        }
-                        Err(_) => {
-                            all_converged = false;
-                        }
+            for &addr in &node_addrs {
+                match self.get_cluster_node_count(addr).await {
+                    Ok(count) if count == expected_nodes => {}
+                    Ok(count) => {
+                        eprintln!(
+                            "  cluster: {addr} reports {count} nodes (expected {expected_nodes})"
+                        );
+                        all_converged = false;
+                    }
+                    Err(_) => {
+                        all_converged = false;
                     }
                 }
             }
 
-            if all_converged && self.alive_count() > 0 {
+            if all_converged && !node_addrs.is_empty() {
                 return Ok(());
             }
 
@@ -971,14 +1018,16 @@ impl Cluster {
     }
 
     /// Returns the number of alive nodes (not killed).
-    fn alive_count(&self) -> usize {
-        self.nodes.iter().filter(|n| n.is_some()).count()
+    #[allow(dead_code)]
+    pub(crate) fn alive_count(&self) -> usize {
+        self.nodes.read().iter().filter(|n| n.is_some()).count()
     }
 
     /// Queries `/admin/cluster` on a node and returns the number of nodes
     /// in the cluster view.
-    async fn get_cluster_node_count(&self, node: &NodeProcess) -> Result<usize, Error> {
-        let resp = node.get("/admin/cluster").await?;
+    async fn get_cluster_node_count(&self, addr: SocketAddr) -> Result<usize, Error> {
+        let url = format!("http://{addr}/admin/cluster");
+        let resp = self.client.get(&url).send().await?;
         if !resp.status().is_success() {
             return Err(Error::ClusterError(format!(
                 "cluster endpoint returned {}",
@@ -994,9 +1043,11 @@ impl Cluster {
     }
 
     /// Shut down all nodes gracefully (SIGTERM), waiting for each to exit.
-    pub async fn shutdown(mut self) -> Result<(), Error> {
-        for i in 0..self.nodes.len() {
-            if let Some(node) = self.nodes[i].take() {
+    pub async fn shutdown(self) -> Result<(), Error> {
+        let len = self.nodes.read().len();
+        for i in 0..len {
+            let node = self.nodes.write()[i].take();
+            if let Some(node) = node {
                 let _ = node.shutdown().await;
             }
         }

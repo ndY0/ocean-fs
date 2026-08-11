@@ -26,3 +26,4 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 pub mod harness;
+pub mod load;

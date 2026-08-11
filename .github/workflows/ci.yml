@@ -220,6 +220,26 @@ jobs:
           echo "PASS: manual review required — ensure no bidirectional oceanfs-* edges"
 
   # ------------------------------------------------------------------
+  # TSAN — Phase 1 concurrency correctness: catches data races
+  # ------------------------------------------------------------------
+  test-tsan:
+    name: Test (TSAN)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install system libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq librocksdb-dev protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      - name: Phase 1 — single-node concurrency under TSAN
+        env:
+          RUSTFLAGS: "-Z sanitizer=thread"
+        run: cargo test -p e2e --test load_concurrency -- --test-threads=1
+
+  # ------------------------------------------------------------------
   # Benchmark compile check
   # ------------------------------------------------------------------
   benchmarks:
