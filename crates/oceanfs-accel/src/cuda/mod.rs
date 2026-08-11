@@ -336,7 +336,7 @@ impl CudaBackend {
         }
         let shard_size = data_shards.first().map(|s| s.len()).unwrap_or(0);
         if shard_size == 0 {
-            return Ok(vec![Vec::new(); m as usize]);
+            return Ok(vec![Bytes::new(); m as usize]);
         }
 
         // Build split-tables and flatten data

@@ -152,7 +152,9 @@ async fn t25_dead_on_suspicion_timeout() {
     cluster.kill(2).expect("kill node 2");
 
     // Wait for failure detection to progress from SUSPECT to DEAD.
-    let dead = wait_for_state(&cluster, 0, "cluster-2", "Dead", 20).await;
+    // SWIM protocol: suspicion_timeout(2s) + failure_timeout(5s) = 7s total.
+    // The 30s timeout accounts for CI runner variability.
+    let dead = wait_for_state(&cluster, 0, "cluster-2", "Dead", 30).await;
     let suspect =
         if !dead { wait_for_state(&cluster, 0, "cluster-2", "Suspect", 5).await } else { true };
 

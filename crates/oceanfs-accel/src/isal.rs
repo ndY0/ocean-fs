@@ -331,6 +331,12 @@ impl IsalDecoder {
     }
 }
 
+impl Default for IsalDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Decoder implementation (Gauss-Jordan + ISA-L SIMD decode)
 // ---------------------------------------------------------------------------

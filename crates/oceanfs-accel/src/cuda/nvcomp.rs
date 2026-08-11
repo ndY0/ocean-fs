@@ -177,8 +177,10 @@ pub struct NvcompCompressor {
 
 // SAFETY: CudaDevice is Send + Sync (cudarc guarantees thread-safe device access
 // via internal Arc). Semaphore is Send + Sync. nvCOMP stateless batch functions
-// are thread-safe per NVIDIA documentation.
+// are thread-safe per NVIDIA documentation. Multiple threads may share a
+// reference to the compressor safely.
 unsafe impl Send for NvcompCompressor {}
+// SAFETY: See above — same thread-safety guarantees apply to shared access.
 unsafe impl Sync for NvcompCompressor {}
 
 impl NvcompCompressor {
