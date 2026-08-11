@@ -309,7 +309,7 @@ unsafe fn neon_encode(
         }
     }
 
-    Ok(parity)
+    Ok(parity.into_iter().map(Bytes::from).collect())
 }
 
 /// Portable EC encode (used when NEON is unavailable or for remainder bytes).
@@ -411,11 +411,11 @@ unsafe fn encode_sve2(
                 // lo_nib indices are 0..15, well within VL.
                 let lo_res = svtbl_u8(lo_tbl, lo_nib);
                 let hi_res = svtbl_u8(hi_tbl, hi_nib);
-                let product = sveor_u8(lo_res, hi_res);
+                let product = sveor_u8_x(pred, lo_res, hi_res);
 
                 // Accumulate: load current parity, XOR with product, store back
                 let cur = svld1_u8(pred, parity_ptr.add(offset));
-                let acc = sveor_u8(cur, product);
+                let acc = sveor_u8_x(pred, cur, product);
                 svst1_u8(pred, parity_ptr.add(offset), acc);
 
                 offset += vl;
@@ -486,7 +486,7 @@ unsafe fn decode_sve2(
     shard_size: usize,
 ) -> oceanfs_ec::Result<Vec<bytes::Bytes>> {
     let k = data_count as usize;
-    let m = parity_count as usize;
+    let _m = parity_count as usize;
     let vl = svcntb() as usize;
 
     // Build generator matrix and invert (portable)
@@ -550,7 +550,7 @@ unsafe fn decode_sve2(
                 let hi_tbl = svld1_u8(pred, hi_tbl_ptr);
                 let lo_res = svtbl_u8(lo_tbl, lo_nib);
                 let hi_res = svtbl_u8(hi_tbl, hi_nib);
-                acc = sveor_u8(acc, sveor_u8(lo_res, hi_res));
+                acc = sveor_u8_x(pred, acc, sveor_u8_x(pred, lo_res, hi_res));
             }
 
             svst1_u8(pred, buf_ptr.add(offset), acc);
@@ -570,7 +570,7 @@ unsafe fn decode_sve2(
         recovered.push(buf);
     }
 
-    Ok(recovered)
+    Ok(recovered.into_iter().map(Bytes::from).collect())
 }
 
 /// SVE decode kernel: delegates to the NEON decode kernel.
@@ -586,7 +586,8 @@ fn decode_sve(
     parity_count: u8,
     shard_size: usize,
 ) -> oceanfs_ec::Result<Vec<bytes::Bytes>> {
-    neon_decode(available_shards, present_indices, data_count, parity_count, shard_size)
+    // SAFETY: delegates to neon_decode with valid pointers passed through.
+    unsafe { neon_decode(available_shards, present_indices, data_count, parity_count, shard_size) }
 }
 
 // ---------------------------------------------------------------------------
@@ -854,17 +855,18 @@ impl Decoder for ArmDecoder {
         // --- SIMD accelerated decode (aarch64 + arm-sve feature) ---
         #[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
         if shard_size >= 16 {
-            let result = if self.level == ArmSveLevel::Sve2 {
-                // SAFETY: SVE2 intrinsics with properly-bounded data pointers
-                unsafe {
+            // SAFETY: SVE/SVE2/NEON intrinsics with properly-bounded data
+            // pointers. All shard data and table pointers are valid.
+            let result = unsafe {
+                if self.level == ArmSveLevel::Sve2 {
                     decode_sve2(available_shards, &present, data_count, parity_count, shard_size)
+                } else if self.level >= ArmSveLevel::Sve {
+                    decode_sve(available_shards, &present, data_count, parity_count, shard_size)
+                } else if self.level >= ArmSveLevel::Neon {
+                    neon_decode(available_shards, &present, data_count, parity_count, shard_size)
+                } else {
+                    Err(oceanfs_ec::Error::InvalidConfig("no SIMD available".into()))
                 }
-            } else if self.level >= ArmSveLevel::Sve {
-                decode_sve(available_shards, &present, data_count, parity_count, shard_size)
-            } else if self.level >= ArmSveLevel::Neon {
-                neon_decode(available_shards, &present, data_count, parity_count, shard_size)
-            } else {
-                Err(oceanfs_ec::Error::InvalidConfig("no SIMD available".into()))
             };
 
             match result {
@@ -899,7 +901,7 @@ impl Decoder for ArmDecoder {
 /// The caller guarantees available_shards contains valid data pointers.
 /// NEON intrinsics are used within safely-constructed bounds.
 #[cfg(all(target_arch = "aarch64", feature = "arm-sve"))]
-fn neon_decode(
+unsafe fn neon_decode(
     available_shards: &[Option<&[u8]>],
     present_indices: &[usize],
     data_count: u8,
@@ -907,7 +909,7 @@ fn neon_decode(
     shard_size: usize,
 ) -> oceanfs_ec::Result<Vec<bytes::Bytes>> {
     let k = data_count as usize;
-    let m = parity_count as usize;
+    let _m = parity_count as usize;
 
     // --- Build generator matrix G: (k+m) rows, k columns ---
     // Top k rows: identity. Bottom m rows: Cauchy encoding matrix.
@@ -976,7 +978,7 @@ fn neon_decode(
         recovered.push(buf);
     }
 
-    Ok(recovered)
+    Ok(recovered.into_iter().map(Bytes::from).collect())
 }
 
 /// Builds the full generator matrix G: (k+m) rows, k columns over GF(2^8).
