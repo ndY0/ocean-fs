@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use e2e::harness::{config_3node_w2_r2, random_bytes, response_bytes, Cluster};
-use tokio::sync::Barrier;
+use tokio::sync::{Barrier, Mutex};
 
 // ---------------------------------------------------------------------------
 // T44: Concurrent writes to different keys
@@ -181,13 +181,19 @@ async fn t45_concurrent_writes_to_same_key_hlc_resolves_single_winner() {
 /// with remaining W acks (or fails gracefully if quorum lost).
 #[tokio::test]
 async fn t46_write_during_node_failure_graceful_degradation() {
-    let cluster =
-        Arc::new(Cluster::spawn(3, &config_3node_w2_r2()).await.expect("spawn 3-node cluster"));
+    let cluster = Cluster::spawn(3, &config_3node_w2_r2()).await.expect("spawn 3-node cluster");
+    let cluster = Arc::new(Mutex::new(cluster));
 
-    cluster.wait_for_convergence(3).await.expect("cluster convergence");
+    {
+        let c = cluster.lock().await;
+        c.wait_for_convergence(3).await.expect("cluster convergence");
+    }
 
     let bucket = "fail-write";
-    cluster.put(0, &format!("/{bucket}"), &[]).await.expect("create bucket");
+    {
+        let c = cluster.lock().await;
+        c.put(0, &format!("/{bucket}"), &[]).await.expect("create bucket");
+    }
 
     let key = "degrade.txt";
     let body = b"Write during node failure test";
@@ -203,23 +209,22 @@ async fn t46_write_during_node_failure_graceful_degradation() {
 
     let write_handle = tokio::spawn(async move {
         barrier_write.wait().await;
-        cluster_write.put(0, &format!("/{}/{}", bucket_w, key_w), &body_w).await
+        cluster_write.lock().await.put(0, &format!("/{}/{}", bucket_w, key_w), &body_w).await
     });
 
     // Wait for the write task to be ready, then kill node 2.
     barrier.wait().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // Kill node 2. The write is in-flight; it will either
+    // Kill node 2 mid-write. The write is in-flight; it will either
     // complete with surviving acks or fail gracefully.
-    // We await the write handle first, then examine the outcome.
-    // kill() needs &mut self so we drop the write Arc clone and
-    // unwrap the Arc after the write completes.
-    let write_result = write_handle.await;
-    let mut cluster_mut = Arc::try_unwrap(cluster).unwrap();
-    cluster_mut.kill(2).expect("kill node 2");
+    {
+        let mut c = cluster.lock().await;
+        c.kill(2).expect("kill node 2 mid-write");
+    }
 
     // Get the write result. Must complete or fail gracefully — no panic.
+    let write_result = write_handle.await;
     assert!(
         write_result.is_ok(),
         "write task must not panic during node failure: {:?}",
@@ -235,8 +240,9 @@ async fn t46_write_during_node_failure_graceful_degradation() {
             // surviving node.
             if resp.status() == 200 {
                 let mut readable = false;
+                let c = cluster.lock().await;
                 for i in 0..2 {
-                    if let Ok(r) = cluster_mut.get(i, &format!("/{bucket}/{key}")).await {
+                    if let Ok(r) = c.get(i, &format!("/{bucket}/{key}")).await {
                         if r.status() == 200 {
                             readable = true;
                         }
@@ -249,6 +255,4 @@ async fn t46_write_during_node_failure_graceful_degradation() {
             // Write failed gracefully — acceptable.
         }
     }
-
-    drop(cluster_mut);
 }

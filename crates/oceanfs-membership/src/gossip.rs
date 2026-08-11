@@ -341,7 +341,10 @@ impl GossipProtocol {
     ///
     /// Uses incarnation numbers for conflict resolution:
     /// higher incarnation always wins. If incarnations are equal,
-    /// the more "active" state wins (Alive > Suspect > Dead).
+    /// - For nodes present in local state, the more terminal state
+    ///   (Dead > Suspect > Alive) wins — a DEAD node is not revived.
+    /// - For nodes absent from local state (previously removed via
+    ///   Death), only a higher incarnation re-admits them.
     fn merge_delta(&mut self, delta: &GossipDelta) {
         for entry in &delta.changed {
             let current_incarnation =
@@ -358,8 +361,46 @@ impl GossipProtocol {
                 continue;
             }
 
-            let old_state =
-                self.state.nodes.get(&entry.node_id).map(|e| e.state).unwrap_or(NodeState::Alive);
+            let local_entry = self.state.nodes.get(&entry.node_id);
+
+            let old_state = local_entry.map(|e| e.state).unwrap_or(NodeState::Alive);
+
+            // At equal incarnation, don't let a less-terminal state
+            // overwrite a more-terminal one. Also, don't re-add a
+            // previously-removed node (present in incarnations but
+            // absent from state.nodes) at the same incarnation.
+            if entry.incarnation == current_incarnation {
+                let terminality = |s: NodeState| -> u8 {
+                    match s {
+                        NodeState::Dead => 3,
+                        NodeState::Left => 3,
+                        NodeState::Leaving => 2,
+                        NodeState::Suspect => 1,
+                        NodeState::Alive => 0,
+                    }
+                };
+                // Reject if incoming state is not more terminal than
+                // what we already know.
+                if terminality(entry.state) <= terminality(old_state) {
+                    trace!(
+                        node_id = %entry.node_id,
+                        incoming = ?entry.state,
+                        current = ?old_state,
+                        "ignoring delta: current state is equally or more terminal"
+                    );
+                    continue;
+                }
+                // Also reject if node was previously removed (absent
+                // from state.nodes) and re-adding at same incarnation.
+                if local_entry.is_none() && current_incarnation > Incarnation::new(0) {
+                    trace!(
+                        node_id = %entry.node_id,
+                        incarnation = current_incarnation.value(),
+                        "ignoring delta: node was removed and re-added at same incarnation"
+                    );
+                    continue;
+                }
+            }
 
             // Update local state.
             self.state.nodes.insert(entry.node_id.clone(), entry.clone());

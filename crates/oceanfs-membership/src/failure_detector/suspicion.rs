@@ -13,7 +13,15 @@ use super::FailureDetector;
 use crate::membership::MembershipEvent;
 
 /// Marks a node as SUSPECT and starts the suspicion timer.
+/// If the node is already SUSPECT, the timer is NOT reset —
+/// resetting would prevent the SUSPECT→DEAD transition from
+/// ever firing under continuous ping failures.
 pub(crate) fn mark_suspect(detector: &mut FailureDetector, node_id: &NodeId) {
+    // Don't reset an existing timer — it would restart the countdown.
+    if detector.suspicion_timers.contains_key(node_id) {
+        return;
+    }
+
     let now = Instant::now();
 
     // Look up the current incarnation from alive_nodes via the new

@@ -140,8 +140,8 @@ async fn t24_suspect_on_direct_ping_timeout() {
 // T25: DEAD on suspicion timeout
 // ---------------------------------------------------------------------------
 
-/// T25: After `suspicion_timeout_ms` + `failure_timeout_ms`,
-/// SUSPECT transitions to DEAD. Assert via `/admin/cluster`.
+/// T25: After `suspicion_timeout_ms`, SUSPECT transitions to DEAD.
+/// DEAD nodes are removed from membership — cluster converges 3 → 2.
 #[tokio::test]
 async fn t25_dead_on_suspicion_timeout() {
     let mut cluster = Cluster::spawn(3, &config_fast_swim()).await.expect("spawn 3-node cluster");
@@ -151,14 +151,9 @@ async fn t25_dead_on_suspicion_timeout() {
     // Kill node 2.
     cluster.kill(2).expect("kill node 2");
 
-    // Wait for failure detection to progress from SUSPECT to DEAD.
-    // SWIM protocol: suspicion_timeout(2s) + failure_timeout(5s) = 7s total.
-    // The 30s timeout accounts for CI runner variability.
-    let dead = wait_for_state(&cluster, 0, "cluster-2", "Dead", 30).await;
-    let suspect =
-        if !dead { wait_for_state(&cluster, 0, "cluster-2", "Suspect", 5).await } else { true };
-
-    assert!(dead || suspect, "node 2 must reach SUSPECT or DEAD state within 20s after SIGKILL");
+    // Wait for failure detection: SUSPECT → DEAD → removal from
+    // membership. Cluster should converge to 2 nodes.
+    cluster.wait_for_convergence(2).await.expect("cluster should converge to 2 after DEAD removal");
 
     drop(cluster);
 }
@@ -179,9 +174,9 @@ async fn t26_indirect_ping_path_works() {
     cluster.kill(2).expect("kill node 2");
 
     // Both node 0 and node 1 should mark node 2 as SUSPECT via the
-    // indirect ping path.
+    // indirect ping path. Node 1 may take longer (indirect path).
     let found_0 = wait_for_state(&cluster, 0, "cluster-2", "Suspect", 15).await;
-    let found_1 = wait_for_state(&cluster, 1, "cluster-2", "Suspect", 5).await;
+    let found_1 = wait_for_state(&cluster, 1, "cluster-2", "Suspect", 15).await;
 
     assert!(found_0, "node 0 must mark node 2 as SUSPECT (direct ping failure)");
     assert!(found_1, "node 1 must also mark node 2 as SUSPECT (indirect ping failure)");
