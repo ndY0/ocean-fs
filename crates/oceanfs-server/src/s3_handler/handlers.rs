@@ -103,25 +103,31 @@ pub(crate) async fn put_object(
             // No synchronous disk write on the hot path.
 
             // Persist object metadata so reads can locate the data.
-            let meta = ObjectMetadata {
-                object_key: object_key.clone(),
-                size: result.size,
-                blake3_hash: result.blake3_hash,
-                chunks: result.chunks.clone(),
-                inline_data: None,
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64,
-                hlc: result.hlc,
-            };
-            if let Err(e) = state.metadata.put_object(&bucket_id, meta) {
-                error!(key = %key, error = %e, "failed to persist object metadata");
-                return s3_error_response(
-                    &Error::Internal(format!("metadata write failed: {e}")),
-                    &bucket,
-                    &key,
-                );
+            // For inline-tier blobs (≤ threshold), the WriteCoordinator
+            // has already stored the complete ObjectMetadata (with
+            // inline_data populated) — skip the redundant write to avoid
+            // overwriting it with inline_data: None.
+            if !result.chunks.is_empty() {
+                let meta = ObjectMetadata {
+                    object_key: object_key.clone(),
+                    size: result.size,
+                    blake3_hash: result.blake3_hash,
+                    chunks: result.chunks.clone(),
+                    inline_data: None,
+                    created_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64,
+                    hlc: result.hlc,
+                };
+                if let Err(e) = state.metadata.put_object(&bucket_id, meta) {
+                    error!(key = %key, error = %e, "failed to persist object metadata");
+                    return s3_error_response(
+                        &Error::Internal(format!("metadata write failed: {e}")),
+                        &bucket,
+                        &key,
+                    );
+                }
             }
 
             // Invalidate caches for this key — locally and on replicas.

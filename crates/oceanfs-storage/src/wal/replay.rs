@@ -53,7 +53,7 @@ pub struct ReplaySummary {
 ///
 /// This function is called during node startup before the HTTP server
 /// binds. It reads every WAL file, deserializes each entry, appends the
-/// inline data into the appropriate tier's [`SegmentPool`], tracks the
+/// inline data into the appropriate tier's [`crate::segment::SegmentPool`], tracks the
 /// maximum HLC timestamp, and truncates the WAL to prevent double-replay
 /// on a subsequent restart.
 ///

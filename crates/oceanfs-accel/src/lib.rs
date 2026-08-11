@@ -48,6 +48,10 @@
     clippy::missing_panics_doc,
     missing_docs
 )]
+// Enable unstable SVE intrinsics when cross-compiling for aarch64 with
+// the `arm-sve` feature. Required by `arm_sve.rs` which uses `sveor_u8`,
+// `svptrue_b8`, `svld1_u8`, etc.
+#![cfg_attr(all(target_arch = "aarch64", feature = "arm-sve"), feature(stdarch_aarch64_sve))]
 // Custom cfgs set by build.rs when CUDA/nvCOMP tools are absent.
 #![allow(unexpected_cfgs)]
 

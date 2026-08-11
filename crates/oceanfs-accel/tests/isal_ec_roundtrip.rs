@@ -14,12 +14,12 @@ mod isal_tests {
     use oceanfs_ec::{CauchyEncoder, Decoder, Encoder};
 
     /// Helper: create ISA-L tables for given k, m.
-    fn setup_isal(k: u8, m: u8) -> (IsalTables, IsalEncoder<'static>, IsalDecoder<'static>) {
+    fn setup_isal(k: u8, m: u8) -> (IsalTables, IsalEncoder<'static>, IsalDecoder) {
         let tables = IsalTables::new(k, m).expect("ISA-L tables should be constructable");
         // Leak to get 'static lifetime for the integration test
         let tables_ref: &'static IsalTables = Box::leak(Box::new(tables.clone()));
         let encoder = IsalEncoder::new(tables_ref);
-        let decoder = IsalDecoder::new(tables_ref);
+        let decoder = IsalDecoder::new();
         (tables, encoder, decoder)
     }
 
@@ -82,8 +82,8 @@ mod isal_tests {
 
     #[test]
     fn cauchy_encode_isal_decode_roundtrip_k4_m2() {
-        let tables = IsalTables::new(4, 2).expect("ISA-L should be available");
-        let isal_dec = IsalDecoder::new(&tables);
+        let _ = IsalTables::new(4, 2).expect("ISA-L should be available");
+        let isal_dec = IsalDecoder::new();
         let cauchy = CauchyEncoder::new(CodecConfig {
             data_shards: 4,
             parity_shards: 2,

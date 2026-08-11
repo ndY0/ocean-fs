@@ -12,9 +12,9 @@
 //!   Used for testing and as a fast path for recently-written segments
 //!   that haven't been sealed to disk yet.
 //! - [`PoolFallbackReader`] — composite reader that checks active
-//!   (unsealed) segment buffers in one or more [`SegmentPool`]s before
-//!   falling back to a disk-backed reader. Closes the read-after-write
-//!   gap for recently-written data.
+//!   (unsealed) segment buffers in one or more [`crate::segment::SegmentPool`]s
+//!   before falling back to a disk-backed reader. Closes the
+//!   read-after-write gap for recently-written data.
 //!
 //! ## Read source tracking
 //!
@@ -369,7 +369,8 @@ impl SegmentReader for InMemorySegmentReader {
 // ---------------------------------------------------------------------------
 
 /// A composite [`SegmentReader`] that first checks active (unsealed) segments
-/// in one or more [`SegmentPool`]s, then falls back to a disk-backed reader.
+/// in one or more [`crate::segment::SegmentPool`]s, then falls back to a
+/// disk-backed reader.
 ///
 /// This closes the read-after-write gap: data acknowledged by a PUT may still
 /// reside in an active segment buffer and not yet be sealed to disk. Without

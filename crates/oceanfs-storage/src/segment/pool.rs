@@ -15,11 +15,11 @@
 //! Per performance guideline §2.5 (sharded segment buffer), §2.6 (bounded
 //! channels), and §2.7 (semaphore-bounded concurrency).
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use bytes::Bytes;
 use oceanfs_core::{CodecConfig, PoolConfig, SegmentId, SizeTier};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::{mpsc, Semaphore};
 
 use crate::{
@@ -131,6 +131,14 @@ pub struct SegmentPool {
     config: PoolConfig,
     /// Reference to the buffer pool for creating new active segments.
     buffer_pool: Arc<BufferPool>,
+    /// Segment data for segments that have been dequeued from active slots
+    /// but not yet written to disk by the seal worker. Serves reads during
+    /// the seal window (read-after-write gap).
+    ///
+    /// `RwLock<HashMap>` is appropriate here because writes (insert, remove)
+    /// happen once per segment lifecycle (every ~64 MB of data), while reads
+    /// are much more frequent (every GET request via `try_read`).
+    sealing_data: RwLock<HashMap<SegmentId, Bytes>>,
 }
 
 impl SegmentPool {
@@ -176,6 +184,7 @@ impl SegmentPool {
             seal_semaphore,
             config,
             buffer_pool: Arc::clone(&buffer_pool),
+            sealing_data: RwLock::new(HashMap::new()),
         })
     }
 
@@ -251,6 +260,9 @@ impl SegmentPool {
                 // The buffer is consumed — the pool allocates a fresh
                 // one on the next acquire, avoiding the 4 MB memcpy.
                 let seg_data = seg.into_buffer().freeze();
+                // Retain a handle in the sealing set so reads can
+                // reach this segment during the seal-to-disk window.
+                self.sealing_data.write().insert(seg_id, seg_data.clone());
                 self.enqueue_seal(seg_id, seg_data, seg_tier, parity);
             }
 
@@ -296,6 +308,14 @@ impl SegmentPool {
                 }
             }
         }
+        // Check segments currently being sealed (fill→disk window).
+        if let Some(seg_data) = self.sealing_data.read().get(&segment_id) {
+            let start = offset as usize;
+            let end = start.saturating_add(length as usize).min(seg_data.len());
+            if start < seg_data.len() {
+                return Some(seg_data.slice(start..end));
+            }
+        }
         None
     }
 
@@ -321,6 +341,9 @@ impl SegmentPool {
                             let seg_tier = seg.tier();
                             let parity = seg.parity_shards();
                             let seg_data = seg.into_buffer().freeze();
+                            // Retain a handle in the sealing set so reads can
+                            // reach this segment during the seal-to-disk window.
+                            self.sealing_data.write().insert(seg_id, seg_data.clone());
                             self.enqueue_seal(seg_id, seg_data, seg_tier, parity);
                         }
                         self.try_activate_slot();
@@ -350,12 +373,16 @@ impl SegmentPool {
         match self.seal_tx.try_send(work) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
+                // The segment was not enqueued for sealing; remove
+                // the sealing-data entry to avoid leaking the Bytes.
+                self.sealing_data.write().remove(&segment_id);
                 tracing::warn!(
                     segment_id = %segment_id,
-                    "seal queue full; seal deferred"
+                    "seal queue full; seal deferred, sealing-data entry removed"
                 );
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.sealing_data.write().remove(&segment_id);
                 tracing::error!(
                     segment_id = %segment_id,
                     "seal queue closed; segment will not be sealed"
@@ -413,6 +440,16 @@ impl SegmentPool {
     /// Returns a clone of the seal semaphore for worker tasks.
     pub fn seal_semaphore(&self) -> Arc<Semaphore> {
         Arc::clone(&self.seal_semaphore)
+    }
+
+    /// Removes a segment from the sealing-data set after it has been
+    /// successfully written to disk.
+    ///
+    /// Called by the seal worker after `seal_from_data()` returns `Ok`.
+    /// This frees the held `Bytes` reference, allowing the buffer memory
+    /// to be reclaimed.
+    pub fn remove_seal_buffer(&self, segment_id: SegmentId) {
+        self.sealing_data.write().remove(&segment_id);
     }
 }
 

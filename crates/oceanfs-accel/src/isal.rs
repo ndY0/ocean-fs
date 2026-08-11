@@ -909,7 +909,7 @@ mod tests {
         use oceanfs_core::CodecConfig;
         use oceanfs_ec::CauchyEncoder;
 
-        let tables = IsalTables::new(4, 2).unwrap();
+        let _ = IsalTables::new(4, 2).unwrap();
         let isal_dec = IsalDecoder::new();
         let cauchy = CauchyEncoder::new(CodecConfig {
             data_shards: 4,

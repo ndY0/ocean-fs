@@ -84,6 +84,7 @@ impl SegmentHandle {
 /// }
 /// ```
 #[async_trait::async_trait]
+#[allow(clippy::double_must_use)]
 pub trait SegmentStore: Send + Sync {
     /// Appends data to the active segment for the given bucket and key.
     ///

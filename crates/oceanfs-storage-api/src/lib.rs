@@ -31,6 +31,10 @@
     clippy::undocumented_unsafe_blocks,
     missing_docs
 )]
+// async_trait generates #[must_use] on methods returning Result,
+// which is redundant (Result is already #[must_use]). This lint fires
+// in nightly-2026-08-10+ clippy and is denied via workspace RUSTFLAGS.
+#![allow(clippy::double_must_use)]
 
 mod blob_store;
 pub mod error;

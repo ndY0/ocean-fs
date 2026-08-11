@@ -35,6 +35,7 @@ use crate::error::Error;
 /// }
 /// ```
 #[async_trait::async_trait]
+#[allow(clippy::double_must_use)]
 pub trait WalWriter: Send + Sync {
     /// Appends an entry to the WAL.
     ///

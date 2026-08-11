@@ -630,6 +630,16 @@ impl WriteCoordinator {
 
                         match result {
                             Ok(_handle) => {
+                                // Segment is now on disk — remove from the
+                                // sealing-data set so reads no longer hit the
+                                // in-memory buffer.
+                                if work.tier == SizeTier::Small {
+                                    self_small.segment_pool_small.remove_seal_buffer(segment_id);
+                                } else {
+                                    self_standard
+                                        .segment_pool_standard
+                                        .remove_seal_buffer(segment_id);
+                                }
                                 info!(
                                     segment_id = %segment_id,
                                     tier = ?tier,
