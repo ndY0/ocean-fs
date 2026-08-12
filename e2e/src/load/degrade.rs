@@ -516,7 +516,7 @@ mod tests {
         // but we can test the platform gating logic by checking the
         // helper function behavior directly.
         // Verifying the platform check inline.
-         const { assert!(!cfg!(target_os = "linux"), "this test expects non-Linux") };
+        const { assert!(!cfg!(target_os = "linux"), "this test expects non-Linux") };
     }
 
     #[test]

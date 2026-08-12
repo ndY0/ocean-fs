@@ -230,7 +230,7 @@ pub fn parse_prometheus_text(text: &str) -> HashMap<String, f64> {
 mod tests {
     use std::f64::consts::PI;
 
-use super::*;
+    use super::*;
 
     /// Sample Prometheus text output covering counters, gauges, histograms,
     /// and labeled metrics.
