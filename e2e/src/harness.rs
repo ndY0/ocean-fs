@@ -292,15 +292,44 @@ impl NodeProcess {
         let bin_path = resolve_binary_path();
 
         // ---- 5. Spawn the process ----
-        let child = Command::new(&bin_path)
-            .arg("--config")
-            .arg(&config_path)
-            .arg("--log-level")
-            .arg("error")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(Error::Spawn)?;
+        // Debug tracing is opt-in for debugging sessions:
+        //   * `E2E_NODE_LOG_LEVEL` overrides the node log level
+        //     (default "error").
+        //   * `E2E_CAPTURE_NODE_LOGS=1` captures the node's
+        //     stdout/stderr into `target/e2e-logs/<node>.log` instead
+        //     of discarding them, so debug traces survive temp-dir
+        //     cleanup and remain analyzable after the run.
+        let log_level = std::env::var("E2E_NODE_LOG_LEVEL").unwrap_or_else(|_| "error".to_string());
+        let capture_logs = std::env::var("E2E_CAPTURE_NODE_LOGS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        let mut cmd = Command::new(&bin_path);
+        cmd.arg("--config").arg(&config_path).arg("--log-level").arg(&log_level);
+
+        let child = if capture_logs {
+            let log_dir = PathBuf::from("target/e2e-logs");
+            let _ = std::fs::create_dir_all(&log_dir);
+            let parent = data_dir
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let base =
+                data_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let log_path = log_dir.join(format!("{parent}-{base}-{}.log", uuid::Uuid::now_v7()));
+            let log_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .map_err(Error::Spawn)?;
+            cmd.stdout(Stdio::from(log_file.try_clone().map_err(Error::Spawn)?))
+                .stderr(Stdio::from(log_file))
+                .spawn()
+                .map_err(Error::Spawn)?
+        } else {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(Error::Spawn)?
+        };
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
