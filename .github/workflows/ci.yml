@@ -237,7 +237,7 @@ jobs:
       - name: Phase 1 — single-node concurrency under TSAN
         env:
           RUSTFLAGS: "-Z sanitizer=thread"
-        run: cargo test -p e2e --test load_concurrency -- --test-threads=1
+        run: cargo +nightly test -Z build-std --target x86_64-unknown-linux-gnu -p e2e --test load_concurrency -- --test-threads=1
 
   # ------------------------------------------------------------------
   # Benchmark compile check

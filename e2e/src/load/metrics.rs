@@ -298,7 +298,7 @@ storage_segment_count 16
         let text = "\
 good_counter 42
 bad_line_no_value
-another_good 3.14
+another_good 3.141592653589793
 not_a_number abc
 still_good 7.0
 ";
