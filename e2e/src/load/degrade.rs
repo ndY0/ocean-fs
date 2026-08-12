@@ -504,30 +504,6 @@ impl FailureInjectionRecord {
 mod tests {
     use super::*;
 
-    // ── Platform gating tests ─────
-
-    #[tokio::test]
-    async fn inject_latency_on_non_linux_returns_error() {
-        if cfg!(target_os = "linux") {
-            // On Linux, this test would modify the real system. Skip it.
-            return;
-        }
-        // We can't construct a real Cluster in unit tests (requires binary),
-        // but we can test the platform gating logic by checking the
-        // helper function behavior directly.
-        // Verifying the platform check inline.
-        const { assert!(!cfg!(target_os = "linux"), "this test expects non-Linux") };
-    }
-
-    #[test]
-    fn platform_gating_documented_for_each_injector() {
-        // All injectors have a cfg!(target_os = "linux") check.
-        // This test verifies the constants are in place.
-        let is_linux = cfg!(target_os = "linux");
-        // Just a sanity check — this test is always valid.
-        assert!(is_linux || !is_linux);
-    }
-
     // ── corrupt_shard unit tests ─────
 
     #[test]
