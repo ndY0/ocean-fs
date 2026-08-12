@@ -151,7 +151,7 @@ async fn t42_crash_recovery_wal_replay_restores_data() {
 /// Rejoins cluster. Ring converges. A's pre-crash data is still readable.
 #[tokio::test]
 async fn t43_crash_recovery_rejoin_and_ring_converges() {
-    let mut cluster = Cluster::spawn(3, &config_3node_w2_r2()).await.expect("spawn 3-node cluster");
+    let cluster = Cluster::spawn(3, &config_3node_w2_r2()).await.expect("spawn 3-node cluster");
 
     cluster.wait_for_convergence(3).await.expect("cluster convergence");
 

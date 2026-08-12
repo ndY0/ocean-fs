@@ -516,7 +516,7 @@ mod tests {
         // but we can test the platform gating logic by checking the
         // helper function behavior directly.
         // Verifying the platform check inline.
-        assert!(!cfg!(target_os = "linux"), "this test expects non-Linux");
+         const { assert!(!cfg!(target_os = "linux"), "this test expects non-Linux") };
     }
 
     #[test]
@@ -557,7 +557,7 @@ mod tests {
     fn overwrite_random_bytes_on_empty_file_returns_error() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let file_path = dir.path().join("empty.dat");
-        fs::write(&file_path, &[]).expect("write empty");
+        fs::write(&file_path, []).expect("write empty");
 
         let result = overwrite_random_bytes(&file_path, 64);
         assert!(result.is_err(), "should error on empty file");
@@ -674,6 +674,6 @@ mod tests {
     fn fill_disk_requires_linux() {
         // On non-Linux, fill_disk should not work at the platform check level.
         // On Linux, it requires a real Cluster.
-        assert!(cfg!(target_os = "linux") || !cfg!(target_os = "linux"));
+        const { assert!(cfg!(target_os = "linux") || !cfg!(target_os = "linux")) };
     }
 }

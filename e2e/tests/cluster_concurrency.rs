@@ -219,7 +219,7 @@ async fn t46_write_during_node_failure_graceful_degradation() {
     // Kill node 2 mid-write. The write is in-flight; it will either
     // complete with surviving acks or fail gracefully.
     {
-        let mut c = cluster.lock().await;
+        let c = cluster.lock().await;
         c.kill(2).expect("kill node 2 mid-write");
     }
 

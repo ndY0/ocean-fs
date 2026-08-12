@@ -228,7 +228,9 @@ pub fn parse_prometheus_text(text: &str) -> HashMap<String, f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::f64::consts::PI;
+
+use super::*;
 
     /// Sample Prometheus text output covering counters, gauges, histograms,
     /// and labeled metrics.
@@ -302,7 +304,7 @@ still_good 7.0
 ";
         let metrics = parse_prometheus_text(text);
         assert_eq!(metrics.get("good_counter"), Some(&42.0));
-        assert_eq!(metrics.get("another_good"), Some(&3.14));
+        assert_eq!(metrics.get("another_good"), Some(&PI));
         assert_eq!(metrics.get("still_good"), Some(&7.0));
         // Malformed lines are skipped, no panic.
         assert_eq!(metrics.len(), 3);

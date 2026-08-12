@@ -140,7 +140,7 @@ async fn t34_ring_rebalance_on_node_add_affects_minimal_keys() {
 /// returns `replication_factor` distinct nodes.
 #[tokio::test]
 async fn t35_ring_rebalance_on_node_remove_maintains_distinct_replicas() {
-    let mut cluster = Cluster::spawn(3, &config_fast_swim()).await.expect("spawn 3-node cluster");
+    let cluster = Cluster::spawn(3, &config_fast_swim()).await.expect("spawn 3-node cluster");
 
     cluster.wait_for_convergence(3).await.expect("cluster convergence");
 

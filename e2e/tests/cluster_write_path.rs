@@ -111,7 +111,7 @@ async fn t11_full_write_all_nodes_ack_and_readable() {
 /// 503 on quorum failure.
 #[tokio::test]
 async fn t12_quorum_not_met_insufficient_replicas() {
-    let mut cluster = Cluster::spawn(3, &config_3node_w2_r2()).await.expect("spawn 3-node cluster");
+    let cluster = Cluster::spawn(3, &config_3node_w2_r2()).await.expect("spawn 3-node cluster");
 
     cluster.wait_for_convergence(3).await.expect("cluster convergence");
 
@@ -172,7 +172,7 @@ async fn t13_write_forwarding_to_non_replica_succeeds() {
 /// to the next alive successor. Write succeeds.
 #[tokio::test]
 async fn t14_write_to_dead_node_successor_succeeds() {
-    let mut cluster = Cluster::spawn(3, &config_3node_w2_r2()).await.expect("spawn 3-node cluster");
+    let cluster = Cluster::spawn(3, &config_3node_w2_r2()).await.expect("spawn 3-node cluster");
 
     cluster.wait_for_convergence(3).await.expect("cluster convergence");
 

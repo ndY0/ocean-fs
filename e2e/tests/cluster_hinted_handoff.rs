@@ -13,7 +13,7 @@ use e2e::harness::{config_3node_w2_r2, response_bytes, Cluster};
 /// hinted handoff to fallback node. Hint stored.
 #[tokio::test]
 async fn t20_hint_stored_on_unreachable_successor() {
-    let mut cluster = Cluster::spawn(3, &config_3node_w2_r2()).await.expect("spawn 3-node cluster");
+    let cluster = Cluster::spawn(3, &config_3node_w2_r2()).await.expect("spawn 3-node cluster");
 
     cluster.wait_for_convergence(3).await.expect("cluster convergence");
 
@@ -53,7 +53,7 @@ async fn t20_hint_stored_on_unreachable_successor() {
 /// data. Object readable from the returned node.
 #[tokio::test]
 async fn t21_hint_delivered_when_successor_returns() {
-    let mut cluster = Cluster::spawn(3, &config_3node_w2_r2()).await.expect("spawn 3-node cluster");
+    let cluster = Cluster::spawn(3, &config_3node_w2_r2()).await.expect("spawn 3-node cluster");
 
     cluster.wait_for_convergence(3).await.expect("cluster convergence");
 
@@ -102,7 +102,7 @@ async fn t21_hint_delivered_when_successor_returns() {
 /// No delivery attempted.
 #[tokio::test]
 async fn t22_expired_hints_discarded() {
-    let mut cluster = Cluster::spawn(3, &config_3node_w2_r2()).await.expect("spawn 3-node cluster");
+    let cluster = Cluster::spawn(3, &config_3node_w2_r2()).await.expect("spawn 3-node cluster");
 
     cluster.wait_for_convergence(3).await.expect("cluster convergence");
 

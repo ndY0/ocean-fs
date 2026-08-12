@@ -145,7 +145,7 @@ async fn t30_heal_after_corruption_reconstructs_shard() {
 /// reconstructs missing shard on a new node. Data integrity maintained.
 #[tokio::test]
 async fn t31_heal_after_node_failure_reconstructs_lost_shard() {
-    let mut cluster = Cluster::spawn(3, &config_3node_w2_r2()).await.expect("spawn 3-node cluster");
+    let cluster = Cluster::spawn(3, &config_3node_w2_r2()).await.expect("spawn 3-node cluster");
 
     cluster.wait_for_convergence(3).await.expect("cluster convergence");
 

@@ -122,7 +122,7 @@ async fn t23_direct_ping_all_nodes_alive_no_false_state_changes() {
 /// mark C as SUSPECT. Assert via `/admin/cluster`.
 #[tokio::test]
 async fn t24_suspect_on_direct_ping_timeout() {
-    let mut cluster = Cluster::spawn(3, &config_fast_swim()).await.expect("spawn 3-node cluster");
+    let cluster = Cluster::spawn(3, &config_fast_swim()).await.expect("spawn 3-node cluster");
 
     cluster.wait_for_convergence(3).await.expect("cluster convergence");
 
@@ -144,7 +144,7 @@ async fn t24_suspect_on_direct_ping_timeout() {
 /// DEAD nodes are removed from membership — cluster converges 3 → 2.
 #[tokio::test]
 async fn t25_dead_on_suspicion_timeout() {
-    let mut cluster = Cluster::spawn(3, &config_fast_swim()).await.expect("spawn 3-node cluster");
+    let cluster = Cluster::spawn(3, &config_fast_swim()).await.expect("spawn 3-node cluster");
 
     cluster.wait_for_convergence(3).await.expect("cluster convergence");
 
@@ -166,7 +166,7 @@ async fn t25_dead_on_suspicion_timeout() {
 /// indirect pings from B. B's ping to C also fails. A marks C SUSPECT.
 #[tokio::test]
 async fn t26_indirect_ping_path_works() {
-    let mut cluster = Cluster::spawn(3, &config_fast_swim()).await.expect("spawn 3-node cluster");
+    let cluster = Cluster::spawn(3, &config_fast_swim()).await.expect("spawn 3-node cluster");
 
     cluster.wait_for_convergence(3).await.expect("cluster convergence");
 
@@ -192,7 +192,7 @@ async fn t26_indirect_ping_path_works() {
 /// Node is NOT marked DEAD if it responds to indirect pings.
 #[tokio::test]
 async fn t27_false_positive_resistance_brief_hiccup_not_dead() {
-    let mut cluster = Cluster::spawn(3, &config_fast_swim()).await.expect("spawn 3-node cluster");
+    let cluster = Cluster::spawn(3, &config_fast_swim()).await.expect("spawn 3-node cluster");
 
     cluster.wait_for_convergence(3).await.expect("cluster convergence");
 

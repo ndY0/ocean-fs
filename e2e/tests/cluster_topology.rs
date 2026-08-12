@@ -106,7 +106,7 @@ async fn t2_three_node_join_all_rings_converged() {
 /// and ring within `failure_timeout_ms`.
 #[tokio::test]
 async fn t3_graceful_leave_departed_node_removed_from_rings() {
-    let mut cluster = Cluster::spawn(3, &config_fast_swim()).await.expect("spawn 3-node cluster");
+    let cluster = Cluster::spawn(3, &config_fast_swim()).await.expect("spawn 3-node cluster");
 
     cluster.wait_for_convergence(3).await.expect("cluster convergence");
 
@@ -143,7 +143,7 @@ async fn t3_graceful_leave_departed_node_removed_from_rings() {
 /// Ring converges to 3 again.
 #[tokio::test]
 async fn t4_rejoin_after_leave_ring_converges_to_3_again() {
-    let mut cluster = Cluster::spawn(3, &config_fast_gossip()).await.expect("spawn 3-node cluster");
+    let cluster = Cluster::spawn(3, &config_fast_gossip()).await.expect("spawn 3-node cluster");
 
     cluster.wait_for_convergence(3).await.expect("cluster convergence");
 

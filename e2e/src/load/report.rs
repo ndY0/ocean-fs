@@ -643,8 +643,8 @@ mod tests {
         // We'll verify the output is a valid date.
         let (y, m, d) = days_to_civil(20676);
         assert!(y >= 2026, "year should be >= 2026, got {y}");
-        assert!(m >= 1 && m <= 12, "month {m} out of range");
-        assert!(d >= 1 && d <= 31, "day {d} out of range");
+        assert!((1..=12).contains(&m), "month {m} out of range");
+        assert!((1..=31).contains(&d), "day {d} out of range");
     }
 
     #[test]

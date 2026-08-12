@@ -1074,7 +1074,7 @@ mod tests {
         let mut rng = rand::thread_rng();
         for _ in 0..1000 {
             let size = dist.sample(&mut rng);
-            assert!(size >= 100 && size <= 200, "size {size} out of [100,200]");
+            assert!((100..=200).contains(&size), "size {size} out of [100,200]");
         }
     }
 
@@ -1148,7 +1148,7 @@ mod tests {
             let key = ks.next_key(&mut rng);
             assert!(key.starts_with("obj-"));
             let num: u64 = key.strip_prefix("obj-").unwrap().parse().unwrap();
-            assert!(num >= 10 && num < 15, "sequential key {num} out of [10,15)");
+            assert!((10..15).contains(&num), "sequential key {num} out of [10,15)");
         }
     }
 

@@ -126,7 +126,7 @@ async fn t7_ring_version_propagation_generation_converges() {
 /// On rejoin, incarnation increments.
 #[tokio::test]
 async fn t8_incarnation_monotonicity_never_decreases() {
-    let mut cluster = Cluster::spawn(3, &config_fast_gossip()).await.expect("spawn 3-node cluster");
+    let cluster = Cluster::spawn(3, &config_fast_gossip()).await.expect("spawn 3-node cluster");
 
     cluster.wait_for_convergence(3).await.expect("cluster convergence");
 

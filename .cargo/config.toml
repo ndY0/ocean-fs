@@ -4,3 +4,7 @@
 [env]
 ROCKSDB_LIB_DIR = "/lib/x86_64-linux-gnu"
 ROCKSDB_STATIC = "0"
+CARGO_TERM_COLOR = "always"
+RUSTFLAGS = "-D warnings"
+RUSTDOCFLAGS = "-D warnings"
+CLIPPYFLAGS = "-D warnings"
