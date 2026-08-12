@@ -21,6 +21,7 @@
     missing_docs
 )]
 
+mod membership_state;
 mod metadata_adapter;
 mod node;
 pub mod startup;

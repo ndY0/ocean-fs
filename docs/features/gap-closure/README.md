@@ -274,7 +274,7 @@ from hash, the `RpcClient` marker trait, and async wrappers. Consolidates
 
 | Test | Status | Resolved By |
 |---|---|---|
-| T21 (hinted handoff delivery) | → Pass | Epic 4 — correctness-gaps §4.4 |
-| T43 (crash recovery rejoin) | → Pass | Epic 4 — correctness-gaps §4.7 |
+| T21 (hinted handoff delivery) | → Pass | refactoring epic — membership-stability-fixes (ADR-0022 incarnation bump + address-merge rule) |
+| T43 (crash recovery rejoin) | → Pass | refactoring epic — membership-stability-fixes (ADR-0022 persisted incarnation + fallback seeds) |
 | T45 (concurrent writes same key) | → Pass | Epic 4 — correctness-gaps §4.6 |
-| T24/T26 (SWIM intermittent) | → Pass | Epic 5 — background-task-cleanup (SWIM probe + incarnation fix) |
+| T24/T26 (SWIM intermittent) | → Pass | refactoring epic — membership-stability-fixes (F1 SWIM state-machine fixes; earlier Epic 5 attempt was incomplete) |

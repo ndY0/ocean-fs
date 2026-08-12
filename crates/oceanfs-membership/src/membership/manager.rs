@@ -9,7 +9,7 @@ use oceanfs_core::{Gauge, Incarnation, LabelSet, NodeId, NodeState};
 use oceanfs_network::ConnectionPool;
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::{
     state::{MembershipState, NodeEntry},
@@ -174,15 +174,20 @@ impl Membership {
                 tokio::select! {
                     event = event_rx.recv() => {
                         match event {
-                            Ok(MembershipEvent { node_id, new_state, .. }) => {
-                                // Look up the node's current incarnation and address.
-                                let (incarnation, address) = {
-                                    let state = event_membership.state.read();
-                                    state.nodes.get(&node_id)
-                                        .map(|(_, inc, addr)| (*inc, *addr))
-                                        .unwrap_or((Incarnation::new(1),
-                                            std::net::SocketAddr::from(([127, 0, 0, 1], 9001))))
-                                };
+                            Ok(MembershipEvent {
+                                node_id,
+                                new_state,
+                                incarnation,
+                                address,
+                                ..
+                            }) => {
+                                // The event itself carries the incarnation and
+                                // address (ADR-0022): a re-admitted node is
+                                // absent from local state, so only the event
+                                // can supply its fresh incarnation/address.
+                                // Deriving them from state.nodes would regress
+                                // the incarnation to a stale value and block
+                                // legitimate re-admission (t24/t43).
                                 event_membership.upsert_node(
                                     node_id, new_state, incarnation, address,
                                 );
@@ -235,28 +240,36 @@ impl Membership {
 
     /// Joins the cluster by contacting seed nodes via gRPC.
     ///
-    /// 1. Contacts each seed node via `GossipRpcClient::pull` to receive
-    ///    the current membership state.
-    /// 2. Merges received entries into the local membership.
-    /// 3. Announces self as ALIVE to the seed via `GossipRpcClient::push`.
-    /// 4. Adds self to the ring.
+    /// 1. Contacts each configured seed node via `GossipRpcClient::pull` to
+    ///    receive the current membership state.
+    /// 2. If no configured seed is reachable (or none is configured),
+    ///    contacts the fallback seeds — last-known member addresses
+    ///    persisted by the composition root (ADR-0022 Decision 3, t43).
+    /// 3. Announces self as ALIVE to the joined seed via
+    ///    `GossipRpcClient::push`, using `self_incarnation`.
+    /// 4. Adds self to the ring at `self_incarnation`.
     ///
-    /// If no seed nodes are configured, the node starts as the first
-    /// cluster member.
+    /// `self_incarnation` is the incarnation to announce with: the
+    /// composition root computes `persisted + 1` on restart, or `1` on
+    /// first boot (spec §13.1). `fallback_seeds` is the persisted list
+    /// of last-known member addresses; it may be empty.
     ///
     /// # Errors
     ///
     /// Returns [`Error::JoinFailed`] if seed nodes are configured but
-    /// none are reachable, or if no connection pool has been set.
-    pub async fn join(&self) -> Result<()> {
+    /// none (configured or fallback) are reachable, or if no connection
+    /// pool has been set while seeds must be contacted.
+    pub async fn join(
+        &self,
+        self_incarnation: Incarnation,
+        fallback_seeds: &[String],
+    ) -> Result<()> {
         let seed_nodes = &self.config.seed_nodes;
-        if seed_nodes.is_empty() {
-            info!(
-                node_id = %self.node_id,
-                "no seed nodes configured, starting as first node"
-            );
-            // Self is added via upsert_node() below.
-        } else {
+
+        let mut joined_seed_addr: Option<SocketAddr> = None;
+
+        let must_contact = !seed_nodes.is_empty() || !fallback_seeds.is_empty();
+        if must_contact {
             // Contact seed nodes via gRPC to receive initial state.
             let pool = {
                 self.pool
@@ -266,87 +279,28 @@ impl Membership {
                     .clone()
             };
 
-            let mut joined = false;
-            let mut joined_seed_addr: Option<SocketAddr> = None;
-
-            for seed_str in seed_nodes {
-                let seed_addr: SocketAddr = match seed_str.parse() {
-                    Ok(a) => a,
-                    Err(e) => {
-                        warn!(seed = %seed_str, error = %e, "invalid seed address");
-                        continue;
-                    }
-                };
-
-                debug!(
-                    node_id = %self.node_id,
-                    seed = %seed_addr,
-                    "contacting seed node via gRPC"
-                );
-
-                let pooled = match pool.get_channel(seed_addr).await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!(seed = %seed_addr, error = %e, "failed to connect to seed");
-                        continue;
-                    }
-                };
-
-                let channel = pooled.channel().clone();
-                drop(pooled);
-
-                // Pull the full membership list from the seed.
-                let mut client = oceanfs_network::GossipRpcClient::new(channel);
-                let request = tonic::Request::new(oceanfs_network::gossip::GossipPullRequest {
-                    node_id: Some(oceanfs_core::proto::common::NodeId {
-                        id: self.node_id.to_string(),
-                    }),
-                    last_known_version: 0,
-                });
-
-                match client.pull(request).await {
-                    Ok(response) => {
-                        let mut stream = response.into_inner();
-                        while let Some(Ok(msg)) = tokio_stream::StreamExt::next(&mut stream).await {
-                            if let Some(delta) = msg.delta {
-                                for entry in &delta.entries {
-                                    let nid = entry.node_id.as_ref().map(|n| NodeId::new(&n.id));
-                                    let state = match entry.state {
-                                        0 => NodeState::Alive,
-                                        1 => NodeState::Suspect,
-                                        2 => NodeState::Dead,
-                                        3 => NodeState::Leaving,
-                                        4 => NodeState::Left,
-                                        _ => continue,
-                                    };
-                                    let inc = Incarnation::new(entry.incarnation);
-                                    let addr =
-                                        entry.address.parse::<SocketAddr>().unwrap_or_else(|_| {
-                                            SocketAddr::from(([127, 0, 0, 1], 9001))
-                                        });
-                                    if let Some(id) = nid {
-                                        self.upsert_node(id, state, inc, addr);
-                                    }
-                                }
-                            }
-                        }
-                        joined = true;
-                        joined_seed_addr = Some(seed_addr);
-                        info!(seed = %seed_addr, "received membership state from seed");
-                        break;
-                    }
-                    Err(status) => {
-                        warn!(
-                            seed = %seed_addr,
-                            error = %status,
-                            "pull from seed failed"
-                        );
-                    }
-                }
+            // Primary: configured seed nodes.
+            if !seed_nodes.is_empty() {
+                joined_seed_addr = self.pull_membership_from_seeds(&pool, seed_nodes).await;
             }
 
-            if !joined {
-                return Err(Error::JoinFailed("could not contact any seed node".into()));
+            // Fallback: persisted last-known member addresses, used when
+            // configured seeds are unreachable or empty (ADR-0022 D3).
+            // Covers the seedless bootstrap-node restart (t43).
+            if joined_seed_addr.is_none() && !fallback_seeds.is_empty() {
+                warn!(
+                    node_id = %self.node_id,
+                    count = fallback_seeds.len(),
+                    "configured seed nodes unreachable or empty; \
+                     trying persisted fallback seeds"
+                );
+                joined_seed_addr = self.pull_membership_from_seeds(&pool, fallback_seeds).await;
+            }
+
+            if joined_seed_addr.is_none() && !seed_nodes.is_empty() {
+                return Err(Error::JoinFailed(
+                    "could not contact any seed node (configured or fallback)".into(),
+                ));
             }
 
             // PR5: After receiving membership list, announce self to the seed
@@ -367,7 +321,7 @@ impl Membership {
                         id: self.node_id.to_string(),
                     }),
                     state: 0, // ALIVE
-                    incarnation: 1,
+                    incarnation: self_incarnation.value(),
                     address: self.address.to_string(),
                     last_seen: None,
                 };
@@ -399,14 +353,116 @@ impl Membership {
                     }
                 }
             }
+        } else {
+            info!(
+                node_id = %self.node_id,
+                "no seed nodes configured, starting as first node"
+            );
         }
 
         // Announce self as ALIVE via upsert_node so the gossip protocol is
-        // notified.
-        self.upsert_node(self.node_id.clone(), NodeState::Alive, Incarnation::new(1), self.address);
+        // notified. The incarnation is the announcement value (persisted + 1
+        // on restart, 1 on first boot) — never a hardcoded 1 (ADR-0022 D1).
+        self.upsert_node(
+            self.node_id.clone(),
+            NodeState::Alive,
+            self_incarnation,
+            Some(self.address),
+        );
+
+        // Keep the failure detector's probe responses in sync with the
+        // announced incarnation so peers observe monotonic values.
+        if let Some(tx) = self.detector_tx.read().as_ref() {
+            let _ = tx
+                .try_send(DetectorCommand::UpdateSelfIncarnation { incarnation: self_incarnation });
+        }
 
         info!(node_id = %self.node_id, "joined cluster successfully");
         Ok(())
+    }
+
+    /// Contacts each seed in `seeds` and merges its membership list.
+    ///
+    /// Returns the address of the first seed that answered, or `None`
+    /// if none were reachable. Best-effort: individual failures are
+    /// logged at `warn!` and skipped.
+    async fn pull_membership_from_seeds(
+        &self,
+        pool: &Arc<ConnectionPool>,
+        seeds: &[String],
+    ) -> Option<SocketAddr> {
+        for seed_str in seeds {
+            let seed_addr: SocketAddr = match seed_str.parse() {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(seed = %seed_str, error = %e, "invalid seed address");
+                    continue;
+                }
+            };
+
+            debug!(
+                node_id = %self.node_id,
+                seed = %seed_addr,
+                "contacting seed node via gRPC"
+            );
+
+            let pooled = match pool.get_channel(seed_addr).await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(seed = %seed_addr, error = %e, "failed to connect to seed");
+                    continue;
+                }
+            };
+
+            let channel = pooled.channel().clone();
+            drop(pooled);
+
+            // Pull the full membership list from the seed.
+            let mut client = oceanfs_network::GossipRpcClient::new(channel);
+            let request = tonic::Request::new(oceanfs_network::gossip::GossipPullRequest {
+                node_id: Some(oceanfs_core::proto::common::NodeId { id: self.node_id.to_string() }),
+                last_known_version: 0,
+            });
+
+            match client.pull(request).await {
+                Ok(response) => {
+                    let mut stream = response.into_inner();
+                    while let Some(Ok(msg)) = tokio_stream::StreamExt::next(&mut stream).await {
+                        if let Some(delta) = msg.delta {
+                            for entry in &delta.entries {
+                                let nid = entry.node_id.as_ref().map(|n| NodeId::new(&n.id));
+                                let state = match entry.state {
+                                    0 => NodeState::Alive,
+                                    1 => NodeState::Suspect,
+                                    2 => NodeState::Dead,
+                                    3 => NodeState::Leaving,
+                                    4 => NodeState::Left,
+                                    _ => continue,
+                                };
+                                let inc = Incarnation::new(entry.incarnation);
+                                let addr = entry
+                                    .address
+                                    .parse::<SocketAddr>()
+                                    .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 9001)));
+                                if let Some(id) = nid {
+                                    self.upsert_node(id, state, inc, Some(addr));
+                                }
+                            }
+                        }
+                    }
+                    info!(seed = %seed_addr, "received membership state from seed");
+                    return Some(seed_addr);
+                }
+                Err(status) => {
+                    warn!(
+                        seed = %seed_addr,
+                        error = %status,
+                        "pull from seed failed"
+                    );
+                }
+            }
+        }
+        None
     }
 
     /// Gracefully leaves the cluster.
@@ -435,11 +491,25 @@ impl Membership {
         let successor =
             self.ring.snapshot().successor_of(&node_id).unwrap_or_else(|| node_id.clone());
 
+        // Self incarnation for the leave events: use the recorded value
+        // so the transition never regresses the incarnation (T8).
+        let self_incarnation = {
+            let state = self.state.read();
+            state
+                .incarnations
+                .get(&node_id)
+                .copied()
+                .or_else(|| state.nodes.get(&node_id).map(|(_, inc, _)| *inc))
+                .unwrap_or_else(|| Incarnation::new(1))
+        };
+
         // Transition to LEAVING.
         let _ = self.event_tx.send(MembershipEvent {
             node_id: node_id.clone(),
             old_state: NodeState::Alive,
             new_state: NodeState::Leaving,
+            incarnation: self_incarnation,
+            address: Some(self.address),
         });
 
         info!(
@@ -477,6 +547,8 @@ impl Membership {
             node_id: node_id.clone(),
             old_state: NodeState::Leaving,
             new_state: NodeState::Left,
+            incarnation: self_incarnation,
+            address: Some(self.address),
         });
 
         // Remove self from ring.
@@ -497,32 +569,85 @@ impl Membership {
 
     /// Adds or updates a node's state from external input (e.g., gossip merge).
     /// New ALIVE nodes are added to the ring; Dead/Left nodes are removed.
+    ///
+    /// Enforces the F1d invariant: *if a node id is absent from
+    /// `state.nodes` and present in `state.incarnations` with value `N`,
+    /// only an entry with incarnation `> N` may (re)insert it.* A lower or
+    /// equal incarnation for a previously removed node is dropped — this
+    /// closes the Dead↔Alive oscillation loop (t24) and permits the
+    /// legitimate ADR-0022 self-rejoin (strictly higher incarnation with a
+    /// fresh address, t21/t43).
+    ///
+    /// `address` may be `None` when the caller (e.g. the failure detector)
+    /// does not know it; the existing stored address is then preserved.
+    /// A previously removed node cannot be re-admitted without an address.
     pub fn upsert_node(
         &self,
         node_id: NodeId,
         state: NodeState,
         incarnation: Incarnation,
-        address: SocketAddr,
+        address: Option<SocketAddr>,
     ) {
         let mut inner = self.state.write();
 
-        // Capture old state before modifying.
+        // Capture old state and the recorded incarnation before modifying.
         let old = inner.nodes.get(&node_id).map(|(s, _, _)| *s);
+        let stored_address = inner.nodes.get(&node_id).map(|(_, _, addr)| *addr);
+        let recorded = inner.incarnations.get(&node_id).copied();
         let old_state = old.unwrap_or(NodeState::Alive);
         let is_new = old.is_none();
 
-        // Remove dead/left nodes from state so they don't appear in cluster views.
+        // F1d re-admission guard.
+        if is_new && recorded.is_some_and(|last| incarnation <= last) {
+            trace!(
+                node_id = %node_id,
+                incoming = incarnation.value(),
+                recorded = recorded.map(|i| i.value()).unwrap_or(0),
+                "upsert_node: rejecting re-admission at incarnation <= recorded"
+            );
+            drop(inner);
+            return;
+        }
+
+        // Incarnation must never regress below the recorded value (T8).
+        let effective_incarnation = recorded.map_or(incarnation, |last| last.max(incarnation));
+
+        // Apply the transition. Dead/Left removal does not require an
+        // address; re/admission does.
+        let effective_address: Option<SocketAddr>;
         if state == NodeState::Dead || state == NodeState::Left {
             inner.nodes.remove(&node_id);
+            // Retain the last-known incarnation so a later re-admission at
+            // equal incarnation is rejected (F1d invariant).
+            inner.incarnations.insert(node_id.clone(), effective_incarnation);
+            effective_address = address.or(stored_address);
         } else {
-            inner.nodes.insert(node_id.clone(), (state, incarnation, address));
+            let addr = match address.or(stored_address) {
+                Some(addr) => addr,
+                None => {
+                    // Cannot admit a brand-new node without an address.
+                    trace!(
+                        node_id = %node_id,
+                        state = ?state,
+                        "upsert_node: dropping admission without a known address"
+                    );
+                    drop(inner);
+                    return;
+                }
+            };
+            effective_address = Some(addr);
+            inner.nodes.insert(node_id.clone(), (state, effective_incarnation, addr));
+            inner.incarnations.insert(node_id.clone(), effective_incarnation);
         }
         drop(inner);
+
         if is_new || old_state != state {
             let _ = self.event_tx.send(MembershipEvent {
                 node_id: node_id.clone(),
                 old_state: if is_new { NodeState::Alive } else { old_state },
                 new_state: state,
+                incarnation: effective_incarnation,
+                address: effective_address,
             });
 
             // PR4: Update ring synchronously on membership changes.
@@ -546,9 +671,24 @@ impl Membership {
             self.ring.update(ring_snapshot);
             self.ring_version.inc();
 
-            // Notify the gossip protocol of membership changes.
+            // F1c: stop the failure detector from probing a dead/left node.
+            if state == NodeState::Dead || state == NodeState::Left {
+                if let Some(tx) = self.detector_tx.read().as_ref() {
+                    let _ = tx.try_send(DetectorCommand::RemoveNode { node_id: node_id.clone() });
+                }
+            }
+
+            // Notify the gossip protocol of membership changes. For a Dead
+            // entry the address is irrelevant to peers; fall back to the
+            // loopback placeholder only in that degenerate case.
             if let Some(tx) = self.gossip_tx.read().as_ref() {
-                let entry = NodeEntry { node_id: node_id.clone(), incarnation, state, address };
+                let entry = NodeEntry {
+                    node_id: node_id.clone(),
+                    incarnation: effective_incarnation,
+                    state,
+                    address: effective_address
+                        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 9001))),
+                };
                 let _ = tx.try_send(GossipCommand::AddNode { entry });
                 debug!(
                     node_id = %node_id,
@@ -599,7 +739,7 @@ mod tests {
             NodeId::new("remote"),
             NodeState::Alive,
             Incarnation::new(1),
-            "127.0.0.1:9002".parse().unwrap(),
+            Some("127.0.0.1:9002".parse().unwrap()),
         );
 
         let event = rx.try_recv().expect("should receive event for new node");
@@ -617,7 +757,7 @@ mod tests {
             NodeId::new("target"),
             NodeState::Alive,
             Incarnation::new(1),
-            "127.0.0.1:9003".parse().unwrap(),
+            Some("127.0.0.1:9003".parse().unwrap()),
         );
         let _ = rx.try_recv(); // consume add event
 
@@ -626,12 +766,133 @@ mod tests {
             NodeId::new("target"),
             NodeState::Suspect,
             Incarnation::new(1),
-            "127.0.0.1:9003".parse().unwrap(),
+            Some("127.0.0.1:9003".parse().unwrap()),
         );
 
         let event = rx.try_recv().expect("should receive transition event");
         assert_eq!(event.old_state, NodeState::Alive);
         assert_eq!(event.new_state, NodeState::Suspect);
+    }
+
+    /// F1d invariant: a node absent from `nodes` but present in
+    /// `incarnations` may only be re-inserted at a strictly higher
+    /// incarnation. A stale ALIVE at equal or lower incarnation must
+    /// be dropped (this is the t24 Dead↔Alive oscillation loop).
+    #[test]
+    fn upsert_rejects_readmission_at_equal_or_lower_incarnation() {
+        let (_ring, m) = make_membership("observer");
+
+        // Node was known Alive at incarnation 5.
+        m.upsert_node(
+            NodeId::new("victim"),
+            NodeState::Alive,
+            Incarnation::new(5),
+            Some("127.0.0.1:9100".parse().unwrap()),
+        );
+        // Declared Dead → removed from nodes, incarnation retained.
+        m.upsert_node(NodeId::new("victim"), NodeState::Dead, Incarnation::new(5), None);
+        assert_eq!(m.state_of(&NodeId::new("victim")), None);
+
+        // Stale gossip tries to revive at equal incarnation → rejected.
+        m.upsert_node(
+            NodeId::new("victim"),
+            NodeState::Alive,
+            Incarnation::new(5),
+            Some("127.0.0.1:9100".parse().unwrap()),
+        );
+        assert_eq!(
+            m.state_of(&NodeId::new("victim")),
+            None,
+            "equal-incarnation re-admission must be rejected"
+        );
+
+        // Lower incarnation → rejected too.
+        m.upsert_node(
+            NodeId::new("victim"),
+            NodeState::Alive,
+            Incarnation::new(4),
+            Some("127.0.0.1:9100".parse().unwrap()),
+        );
+        assert_eq!(m.state_of(&NodeId::new("victim")), None);
+    }
+
+    /// ADR-0022 Decision 2: a self-rejoin announcing a strictly higher
+    /// incarnation with a fresh address is accepted and the address is
+    /// updated (t21/t43 stale-address failures).
+    #[test]
+    fn upsert_accepts_readmission_at_strictly_higher_incarnation() {
+        let (_ring, m) = make_membership("observer");
+
+        m.upsert_node(
+            NodeId::new("rejoiner"),
+            NodeState::Alive,
+            Incarnation::new(5),
+            Some("127.0.0.1:9100".parse().unwrap()),
+        );
+        m.upsert_node(NodeId::new("rejoiner"), NodeState::Dead, Incarnation::new(5), None);
+        assert_eq!(m.state_of(&NodeId::new("rejoiner")), None);
+
+        // Rejoin at incarnation 6 with a NEW address.
+        let new_addr: SocketAddr = "127.0.0.1:9200".parse().unwrap();
+        m.upsert_node(
+            NodeId::new("rejoiner"),
+            NodeState::Alive,
+            Incarnation::new(6),
+            Some(new_addr),
+        );
+
+        assert_eq!(m.state_of(&NodeId::new("rejoiner")), Some(NodeState::Alive));
+        assert_eq!(
+            m.address_of(&NodeId::new("rejoiner")),
+            Some(new_addr),
+            "re-admission must carry the fresh address"
+        );
+    }
+
+    /// F1d: Dead removal retains the last-known incarnation so later
+    /// re-admission checks compare against the right value (not a
+    /// fabricated fallback of 1).
+    #[test]
+    fn dead_removal_retains_recorded_incarnation() {
+        let (_ring, m) = make_membership("observer");
+
+        m.upsert_node(
+            NodeId::new("victim"),
+            NodeState::Alive,
+            Incarnation::new(7),
+            Some("127.0.0.1:9300".parse().unwrap()),
+        );
+        m.upsert_node(NodeId::new("victim"), NodeState::Dead, Incarnation::new(1), None);
+
+        let recorded = m.state.read().incarnations.get(&NodeId::new("victim")).copied();
+        assert_eq!(recorded, Some(Incarnation::new(7)), "Dead removal must retain incarnation 7");
+    }
+
+    /// F2a: `join` announces with the caller-provided incarnation —
+    /// never a hardcoded 1.
+    #[tokio::test]
+    async fn join_announces_with_given_incarnation() {
+        let mut ring = Ring::new(RingConfig::default());
+        ring.add_node(NodeId::new("existing"));
+        let ring_cache = Arc::new(RingCache::new(ring));
+
+        let m = Membership::new(
+            NodeId::new("rejoiner"),
+            "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
+            GossipConfig { seed_nodes: vec![], ..GossipConfig::default() },
+            ring_cache.clone(),
+        );
+
+        m.join(Incarnation::new(6), &[]).await.expect("join should succeed");
+
+        let (_, stored_incarnation, _) = m
+            .state
+            .read()
+            .nodes
+            .get(&NodeId::new("rejoiner"))
+            .copied()
+            .expect("self must be in membership state");
+        assert_eq!(stored_incarnation, Incarnation::new(6));
     }
 
     #[test]
@@ -642,13 +903,13 @@ mod tests {
             NodeId::new("a"),
             NodeState::Alive,
             Incarnation::new(1),
-            "127.0.0.1:9010".parse().unwrap(),
+            Some("127.0.0.1:9010".parse().unwrap()),
         );
         m.upsert_node(
             NodeId::new("b"),
             NodeState::Suspect,
             Incarnation::new(1),
-            "127.0.0.1:9011".parse().unwrap(),
+            Some("127.0.0.1:9011".parse().unwrap()),
         );
 
         let nodes = m.nodes();
@@ -667,7 +928,7 @@ mod tests {
             NodeId::new("known"),
             NodeState::Suspect,
             Incarnation::new(1),
-            "127.0.0.1:9020".parse().unwrap(),
+            Some("127.0.0.1:9020".parse().unwrap()),
         );
 
         assert_eq!(m.state_of(&NodeId::new("known")), Some(NodeState::Suspect));
@@ -703,7 +964,7 @@ mod tests {
             ring_cache.clone(),
         );
 
-        m.join().await.expect("join should succeed");
+        m.join(Incarnation::new(1), &[]).await.expect("join should succeed");
 
         let snap = ring_cache.snapshot();
         assert!(snap.nodes().contains(&NodeId::new("joiner")));
@@ -740,7 +1001,7 @@ mod tests {
             NodeId::new("sub-test"),
             NodeState::Alive,
             Incarnation::new(1),
-            "127.0.0.1:9050".parse().unwrap(),
+            Some("127.0.0.1:9050".parse().unwrap()),
         );
 
         let event = rx.try_recv().expect("should receive event via subscribe");

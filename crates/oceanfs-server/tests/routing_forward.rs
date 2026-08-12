@@ -33,7 +33,7 @@ fn make_router(local_node: &str, ring_nodes: &[&str]) -> Router {
             NodeId::new(*node),
             NodeState::Alive,
             Incarnation::new(1),
-            "127.0.0.1:9001".parse().unwrap(),
+            Some("127.0.0.1:9001".parse().unwrap()),
         );
     }
 
@@ -97,13 +97,13 @@ async fn route_with_all_dead_nodes_still_returns_replica_set() {
             NodeId::new("dead-1"),
             NodeState::Dead,
             Incarnation::new(1),
-            "127.0.0.1:9002".parse().unwrap(),
+            Some("127.0.0.1:9002".parse().unwrap()),
         );
         membership.upsert_node(
             NodeId::new("dead-2"),
             NodeState::Dead,
             Incarnation::new(1),
-            "127.0.0.1:9003".parse().unwrap(),
+            Some("127.0.0.1:9003".parse().unwrap()),
         );
 
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));

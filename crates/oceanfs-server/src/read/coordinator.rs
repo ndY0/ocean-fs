@@ -734,6 +734,31 @@ impl ReadCoordinator {
                 }
             }
 
+            // Re-validate the local object before applying ANY repair
+            // decision. A DELETE (or a newer PUT) that landed after this
+            // read supersedes the version we read: propagating it would
+            // resurrect deleted objects — a read repair fired by a
+            // pre-delete GET re-pushed the object to replicas AFTER the
+            // tombstone reached them (t19). The local delete is
+            // authoritative; genuine repair of lost data is the job of
+            // anti-entropy/healing, not read repair.
+            let local_still_authoritative = match metadata_store.as_ref() {
+                Some(store) => match store.get_object(&bucket_clone, &key_clone) {
+                    Ok(Some(current)) => current.hlc == local_hlc,
+                    Ok(None) | Err(_) => false,
+                },
+                None => true, // No local store: nothing can supersede the read.
+            };
+
+            if !local_still_authoritative {
+                debug!(
+                    bucket = %bucket_clone,
+                    key = %key_clone,
+                    "read repair skipped: local object changed or was deleted since the read"
+                );
+                return;
+            }
+
             // Push corrected data to stale remote replicas.
             for stale in &stale_remotes {
                 Self::push_metadata_to_node(

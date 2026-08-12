@@ -354,8 +354,18 @@ async fn real_two_node_anti_entropy_cycle() {
     let segment_store_b = Arc::new(InMemorySegmentStore::new());
 
     // --- Cross-register each node in the other's membership ---
-    membership_a.upsert_node(NodeId::new("node-b"), NodeState::Alive, Incarnation::new(1), addr_b);
-    membership_b.upsert_node(NodeId::new("node-a"), NodeState::Alive, Incarnation::new(1), addr_a);
+    membership_a.upsert_node(
+        NodeId::new("node-b"),
+        NodeState::Alive,
+        Incarnation::new(1),
+        Some(addr_b),
+    );
+    membership_b.upsert_node(
+        NodeId::new("node-a"),
+        NodeState::Alive,
+        Incarnation::new(1),
+        Some(addr_a),
+    );
 
     // --- Both nodes write the same segment ---
     let seg_id = SegmentId::new();
@@ -457,7 +467,7 @@ async fn anti_entropy_handles_unreachable_peer() {
         NodeId::new("node-c"),
         NodeState::Alive,
         Incarnation::new(1),
-        "192.0.2.1:9999".parse().unwrap(), // unreachable test address
+        Some("192.0.2.1:9999".parse().unwrap()), // unreachable test address
     );
 
     // Add a segment with a Merkle root

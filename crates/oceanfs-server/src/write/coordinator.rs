@@ -30,7 +30,7 @@ use oceanfs_storage::{
     WalEntry,
 };
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     error::{Error, Result},
@@ -434,6 +434,15 @@ impl WriteCoordinator {
         &self.hlc_clock
     }
 
+    /// Returns the number of replicas in the ring for the given key.
+    ///
+    /// Used by the delete handler to cap the required quorum at the
+    /// replica count (a single-node cluster cannot confirm more than
+    /// one deletion), mirroring the write path's quorum capping.
+    pub fn replica_count(&self, hash_key: &HashKey) -> usize {
+        self.ring.lookup(hash_key.as_bytes()).len()
+    }
+
     /// Invalidates cached object data on all remote replicas in the ring.
     ///
     /// Called after a write or delete to ensure remote nodes don't serve
@@ -671,9 +680,13 @@ impl WriteCoordinator {
     ///
     /// 1. Looks up the replica set from the ring.
     /// 2. Sends a `DeleteObject` gRPC call to each remote replica.
-    /// 3. Deletes locally from the metadata store.
+    /// 3. Returns the number of remote replicas that confirmed deletion.
     ///
-    /// Returns `true` if the object was deleted on at least one node.
+    /// The local tombstone is written by the caller (the S3 handler)
+    /// before this is invoked, so the local delete is not counted here.
+    /// Every replica attempt is logged at `debug!` and every skip or
+    /// failure at `warn!` — deletion is no longer silently swallowed
+    /// (F3a: the caller needs the confirmed count to enforce quorum).
     ///
     /// # Errors
     ///
@@ -683,28 +696,48 @@ impl WriteCoordinator {
         bucket: &BucketId,
         key: &ObjectKey,
         hash_key: &HashKey,
-    ) -> Result<bool> {
+    ) -> Result<usize> {
         let replica_set = self.ring.lookup(hash_key.as_bytes());
         if replica_set.is_empty() {
             return Err(Error::Routing("ring returned empty replica set".into()));
         }
 
-        let mut deleted = false;
+        let mut deleted: usize = 0;
 
         // Delete on remote replicas.
         for target in &replica_set {
             if *target == self.node_id {
-                continue; // local delete handled by caller
+                // Local delete is handled by the caller.
+                debug!(target = %target, bucket = %bucket, key = %key, "delete: skipping self (local delete handled by caller)");
+                continue;
             }
 
             let addr = match self.membership.address_of(target) {
                 Some(a) => a,
-                None => continue,
+                None => {
+                    warn!(
+                        target = %target,
+                        bucket = %bucket,
+                        key = %key,
+                        "delete replication skipped: no address in membership"
+                    );
+                    continue;
+                }
             };
 
             let pooled = match self.pool.get_channel(addr).await {
                 Ok(p) => p,
-                Err(_) => continue,
+                Err(e) => {
+                    warn!(
+                        target = %target,
+                        addr = %addr,
+                        error = %e,
+                        bucket = %bucket,
+                        key = %key,
+                        "delete replication skipped: failed to acquire channel"
+                    );
+                    continue;
+                }
             };
             let channel = pooled.channel().clone();
             drop(pooled);
@@ -715,14 +748,45 @@ impl WriteCoordinator {
                 object_key: key.to_string(),
             });
 
+            debug!(
+                target = %target,
+                addr = %addr,
+                bucket = %bucket,
+                key = %key,
+                "delete replication attempt"
+            );
+
             match client.delete_object(request).await {
                 Ok(resp) => {
-                    if resp.into_inner().deleted {
-                        deleted = true;
+                    let confirmed = resp.into_inner().deleted;
+                    debug!(
+                        target = %target,
+                        addr = %addr,
+                        deleted = confirmed,
+                        bucket = %bucket,
+                        key = %key,
+                        "delete replication outcome"
+                    );
+                    if confirmed {
+                        deleted += 1;
+                    } else {
+                        warn!(
+                            target = %target,
+                            bucket = %bucket,
+                            key = %key,
+                            "replica reported deletion not confirmed"
+                        );
                     }
                 }
                 Err(e) => {
-                    warn!(target = %target, error = %e, "delete replication failed");
+                    warn!(
+                        target = %target,
+                        addr = %addr,
+                        error = %e,
+                        bucket = %bucket,
+                        key = %key,
+                        "delete replication failed"
+                    );
                 }
             }
         }
@@ -737,8 +801,8 @@ mod tests {
     use std::net::SocketAddr;
 
     use oceanfs_core::{
-        GossipConfig, Incarnation, NodeId, NodeState, PoolConfig, RingConfig, RpcConfig, SizeTier,
-        WalConfig,
+        GossipConfig, Incarnation, NodeId, NodeState, PoolConfig, RingConfig, RpcConfig,
+        SegmentMetadata, SizeTier, Tombstone, WalConfig,
     };
     use oceanfs_routing::{hash_key, Ring};
     use oceanfs_storage::{BufferPool, RocksDbMetadataStore, SealConfig, WalWriter};
@@ -761,7 +825,12 @@ mod tests {
         ));
 
         for node in ring_nodes {
-            membership.upsert_node(NodeId::new(*node), NodeState::Alive, Incarnation::new(1), addr);
+            membership.upsert_node(
+                NodeId::new(*node),
+                NodeState::Alive,
+                Incarnation::new(1),
+                Some(addr),
+            );
         }
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let hlc_clock = Arc::new(HlcClock::new());
@@ -1197,13 +1266,13 @@ mod tests {
             NodeId::new("n2"),
             NodeState::Alive,
             Incarnation::new(1),
-            "127.0.0.1:9002".parse().unwrap(),
+            Some("127.0.0.1:9002".parse().unwrap()),
         );
         membership.upsert_node(
             NodeId::new("n3"),
             NodeState::Alive,
             Incarnation::new(1),
-            "127.0.0.1:9003".parse().unwrap(),
+            Some("127.0.0.1:9003".parse().unwrap()),
         );
         membership
     }
@@ -1343,5 +1412,199 @@ mod tests {
             coord.hinted_handoff.pending_count(&n2) > 0,
             "should create inline hint for inline-tier write"
         );
+    }
+
+    // ── Delete replication tests (F3d) ───────────────────────────
+
+    /// Minimal `MetadataStore` whose `delete_object` either confirms
+    /// the deletion or fails, driving the F3d test scenarios.
+    struct MockDeleteMetadata {
+        /// When `true`, `delete_object` returns an error.
+        fail_deletes: bool,
+    }
+
+    impl oceanfs_storage_api::MetadataStore for MockDeleteMetadata {
+        fn list_object_keys(
+            &self,
+            _bucket: &BucketId,
+        ) -> std::io::Result<Vec<(BucketId, ObjectKey)>> {
+            Ok(Vec::new())
+        }
+
+        fn get_object_metadata(
+            &self,
+            _bucket: &BucketId,
+            _key: &ObjectKey,
+        ) -> std::io::Result<Option<ObjectMetadata>> {
+            Ok(None)
+        }
+
+        fn list_objects(
+            &self,
+            _bucket: &BucketId,
+            _prefix: &str,
+        ) -> Vec<std::io::Result<ObjectMetadata>> {
+            Vec::new()
+        }
+
+        fn get_segment(&self, _id: SegmentId) -> std::io::Result<Option<SegmentMetadata>> {
+            Ok(None)
+        }
+
+        fn list_segments(&self) -> Vec<std::io::Result<SegmentMetadata>> {
+            Vec::new()
+        }
+
+        fn list_tombstones(
+            &self,
+            _bucket: &BucketId,
+        ) -> Vec<std::io::Result<(ObjectKey, Tombstone)>> {
+            Vec::new()
+        }
+
+        fn delete_tombstone(&self, _bucket: &BucketId, _key: &ObjectKey) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn has_tombstone(&self, _bucket: &BucketId, _key: &ObjectKey) -> std::io::Result<bool> {
+            Ok(false)
+        }
+
+        fn put_segment(&self, _meta: SegmentMetadata) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn delete_segment(&self, _id: SegmentId) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn put_object(&self, _bucket: &BucketId, _meta: ObjectMetadata) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn delete_object(&self, _bucket: &BucketId, _key: &ObjectKey) -> std::io::Result<()> {
+            if self.fail_deletes {
+                Err(std::io::Error::other("mock delete failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn batch_write(&self, _ops: Vec<oceanfs_storage_api::BatchOp>) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Spins up a live `SegmentRpc` server handling `DeleteObject`
+    /// (plus the rest of the data plane) on an ephemeral port.
+    /// Returns the bound address; the server runs until the test ends.
+    async fn spawn_segment_server(fail_deletes: bool) -> SocketAddr {
+        let data_store: Arc<dyn oceanfs_durability::SegmentDataStore> =
+            Arc::new(oceanfs_durability::anti_entropy::InMemorySegmentStore::new());
+        let metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore> =
+            Arc::new(MockDeleteMetadata { fail_deletes });
+        let buffer_pool = Arc::new(BufferPool::new(65536, 4));
+        let service = crate::grpc::segment_service::SegmentGrpcService::new(
+            data_store,
+            Some(metadata_store),
+            buffer_pool,
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio_stream::wrappers::TcpListenerStream;
+            tonic::transport::Server::builder()
+                .add_service(oceanfs_storage::SegmentRpcServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        // Give the server a moment to start.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        addr
+    }
+
+    /// F3d(1): when every remote replica is reachable, `delete` returns
+    /// the full replica count.
+    #[tokio::test]
+    async fn delete_all_replicas_reachable_returns_replica_count() {
+        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"]).await;
+
+        // Point the remote replicas at live gRPC servers via a higher
+        // incarnation + fresh address (the ADR-0022 merge semantics).
+        let n2 = NodeId::new("n2");
+        let n3 = NodeId::new("n3");
+        let addr_n2 = spawn_segment_server(false).await;
+        let addr_n3 = spawn_segment_server(false).await;
+        coord.membership.upsert_node(
+            n2.clone(),
+            NodeState::Alive,
+            Incarnation::new(2),
+            Some(addr_n2),
+        );
+        coord.membership.upsert_node(
+            n3.clone(),
+            NodeState::Alive,
+            Incarnation::new(2),
+            Some(addr_n3),
+        );
+
+        let deleted = coord
+            .delete(
+                &BucketId::new("test"),
+                &ObjectKey::new("obj"),
+                &HashKey::from_bytes(hash_key(b"obj")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2, "both remote replicas must confirm the deletion");
+    }
+
+    /// F3d(2): one reachable + one unreachable replica → partial count
+    /// returned (the caller decides whether quorum is met).
+    #[tokio::test]
+    async fn delete_partial_failure_returns_partial_count() {
+        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"]).await;
+
+        // n2 gets a live server; n3 keeps the helper's default address
+        // (127.0.0.1:9001) where nothing is listening.
+        let n2 = NodeId::new("n2");
+        let addr_n2 = spawn_segment_server(false).await;
+        coord.membership.upsert_node(
+            n2.clone(),
+            NodeState::Alive,
+            Incarnation::new(2),
+            Some(addr_n2),
+        );
+
+        let deleted = coord
+            .delete(
+                &BucketId::new("test"),
+                &ObjectKey::new("obj"),
+                &HashKey::from_bytes(hash_key(b"obj")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1, "only the reachable replica confirms");
+    }
+
+    /// F3d(3): an empty ring returns the existing `Routing` error path.
+    #[tokio::test]
+    async fn delete_empty_replica_set_returns_routing_error() {
+        let coord = make_write_coordinator("n1", &[]).await;
+
+        let result = coord
+            .delete(
+                &BucketId::new("test"),
+                &ObjectKey::new("obj"),
+                &HashKey::from_bytes(hash_key(b"obj")),
+            )
+            .await;
+        assert!(result.is_err(), "empty ring should return routing error");
+        match result.unwrap_err() {
+            Error::Routing(msg) => assert!(msg.contains("empty"), "error should mention empty set"),
+            other => panic!("expected Routing, got {other:?}"),
+        }
     }
 }

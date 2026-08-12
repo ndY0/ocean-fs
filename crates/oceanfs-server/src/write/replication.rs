@@ -188,13 +188,13 @@ mod tests {
             NodeId::new("n2"),
             NodeState::Alive,
             Incarnation::new(1),
-            "127.0.0.1:9002".parse().unwrap(),
+            Some("127.0.0.1:9002".parse().unwrap()),
         );
         membership.upsert_node(
             NodeId::new("n3"),
             NodeState::Alive,
             Incarnation::new(1),
-            "127.0.0.1:9003".parse().unwrap(),
+            Some("127.0.0.1:9003".parse().unwrap()),
         );
         membership
     }

@@ -256,6 +256,13 @@ impl SegmentRpc for SegmentGrpcService {
                 .map_err(|e| Status::internal(format!("metadata delete failed: {e}")))?;
         }
 
+        tracing::debug!(
+            bucket = %bucket,
+            key = %key,
+            has_metadata_store = self.metadata_store.is_some(),
+            "delete_object: tombstone applied"
+        );
+
         Ok(Response::new(DeleteObjectResponse { deleted: true }))
     }
 
@@ -422,6 +429,12 @@ impl SegmentRpc for SegmentGrpcService {
     /// Receives corrected object metadata + inline data from a peer
     /// and writes it to the local metadata store, overwriting any
     /// stale entry.
+    ///
+    /// A tombstoned key is authoritative and MUST NOT be resurrected:
+    /// a read repair fired by a pre-delete GET could otherwise re-write
+    /// the object after the tombstone landed (t19). Only a genuine new
+    /// write (which clears the tombstone via `put_object`) may replace a
+    /// tombstoned key, so the push is rejected with `failed_precondition`.
     async fn put_object_metadata(
         &self,
         request: Request<PutObjectMetadataRequest>,
@@ -434,6 +447,23 @@ impl SegmentRpc for SegmentGrpcService {
             .metadata_store
             .as_ref()
             .ok_or_else(|| Status::unimplemented("no metadata store configured"))?;
+
+        // F3/t19: refuse to resurrect a deleted object. The tombstone
+        // check and the write are not atomic, but the residual window is
+        // a delete racing a repair push on the same key — the delete
+        // re-writes the tombstone and the next read observes it; the
+        // sender-side re-validation in `run_read_repair` shrinks this
+        // window to near zero.
+        if oceanfs_storage_api::MetadataStore::has_tombstone(md_store.as_ref(), &bucket, &key)
+            .map_err(|e| Status::internal(format!("tombstone check failed: {e}")))?
+        {
+            tracing::warn!(
+                bucket = %bucket,
+                key = %key,
+                "rejecting read-repair metadata push: object is tombstoned"
+            );
+            return Err(Status::failed_precondition("object is tombstoned"));
+        }
 
         let hlc = match req.hlc {
             Some(ref hlc_proto) => Hlc::new(hlc_proto.wall_time, hlc_proto.logical),
@@ -488,7 +518,9 @@ impl SegmentRpc for SegmentGrpcService {
 mod tests {
     use std::{collections::HashMap, net::SocketAddr};
 
-    use oceanfs_core::{proto::common::SegmentId as ProtoSegmentId, SegmentId};
+    use oceanfs_core::{
+        proto::common::SegmentId as ProtoSegmentId, SegmentId, SegmentMetadata, Tombstone,
+    };
     use oceanfs_durability::SegmentDataStore;
     use oceanfs_storage::{SegmentRpcClient, SegmentRpcServer};
     use parking_lot::Mutex;
@@ -702,5 +734,144 @@ mod tests {
 
         assert_eq!(received_bytes.len(), 50);
         assert_eq!(&received_bytes[..], &test_data[100..150]);
+    }
+
+    // ── Tombstone gate tests (F3/t19) ────────────────────────────
+
+    /// Metadata mock with a configurable tombstone state.
+    struct TombstoneMockMetadata {
+        tombstoned: Mutex<HashMap<(String, String), bool>>,
+    }
+
+    impl oceanfs_storage_api::MetadataStore for TombstoneMockMetadata {
+        fn list_object_keys(
+            &self,
+            _bucket: &BucketId,
+        ) -> std::io::Result<Vec<(BucketId, ObjectKey)>> {
+            Ok(Vec::new())
+        }
+
+        fn get_object_metadata(
+            &self,
+            _bucket: &BucketId,
+            _key: &ObjectKey,
+        ) -> std::io::Result<Option<ObjectMetadata>> {
+            Ok(None)
+        }
+
+        fn list_objects(
+            &self,
+            _bucket: &BucketId,
+            _prefix: &str,
+        ) -> Vec<std::io::Result<ObjectMetadata>> {
+            Vec::new()
+        }
+
+        fn get_segment(&self, _id: SegmentId) -> std::io::Result<Option<SegmentMetadata>> {
+            Ok(None)
+        }
+
+        fn list_segments(&self) -> Vec<std::io::Result<SegmentMetadata>> {
+            Vec::new()
+        }
+
+        fn list_tombstones(
+            &self,
+            _bucket: &BucketId,
+        ) -> Vec<std::io::Result<(ObjectKey, Tombstone)>> {
+            Vec::new()
+        }
+
+        fn delete_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<()> {
+            self.tombstoned.lock().remove(&(bucket.as_str().into(), key.as_str().into()));
+            Ok(())
+        }
+
+        fn has_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<bool> {
+            Ok(self
+                .tombstoned
+                .lock()
+                .get(&(bucket.as_str().into(), key.as_str().into()))
+                .copied()
+                .unwrap_or(false))
+        }
+
+        fn put_segment(&self, _meta: SegmentMetadata) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn delete_segment(&self, _id: SegmentId) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn put_object(&self, bucket: &BucketId, meta: ObjectMetadata) -> std::io::Result<()> {
+            // Mirror the real store: a genuine write clears the tombstone.
+            self.delete_tombstone(bucket, &meta.object_key)?;
+            Ok(())
+        }
+
+        fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<()> {
+            self.tombstoned.lock().insert((bucket.as_str().into(), key.as_str().into()), true);
+            Ok(())
+        }
+
+        fn batch_write(&self, _ops: Vec<oceanfs_storage_api::BatchOp>) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn make_put_metadata_request(bucket: &str, key: &str) -> PutObjectMetadataRequest {
+        PutObjectMetadataRequest {
+            bucket_id: bucket.to_string(),
+            object_key: key.to_string(),
+            size: 5,
+            blake3_hash: Bytes::new(),
+            hlc: None,
+            inline_data: Bytes::from_static(b"hello"),
+            chunk_segment_ids: vec![],
+            chunk_offsets: vec![],
+            chunk_lengths: vec![],
+        }
+    }
+
+    /// F3/t19: a read-repair push for a tombstoned key is rejected —
+    /// a deleted object must never be resurrected by read repair.
+    #[tokio::test]
+    async fn put_object_metadata_rejects_tombstoned_key() {
+        let metadata: Arc<dyn oceanfs_storage_api::MetadataStore> =
+            Arc::new(TombstoneMockMetadata { tombstoned: Mutex::new(HashMap::new()) });
+        // Tombstone the key first.
+        metadata.delete_object(&BucketId::new("b"), &ObjectKey::new("k")).unwrap();
+
+        let service = SegmentGrpcService::new(
+            Arc::new(TestSegmentStore::new()),
+            Some(metadata),
+            Arc::new(BufferPool::new(65536, 4)),
+        );
+
+        let result = service
+            .put_object_metadata(tonic::Request::new(make_put_metadata_request("b", "k")))
+            .await;
+        assert!(result.is_err(), "tombstoned key must reject read-repair pushes");
+        assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+    }
+
+    /// The tombstone gate must not block a legitimate repair push for a
+    /// key that was never deleted.
+    #[tokio::test]
+    async fn put_object_metadata_accepts_clean_key() {
+        let metadata: Arc<dyn oceanfs_storage_api::MetadataStore> =
+            Arc::new(TombstoneMockMetadata { tombstoned: Mutex::new(HashMap::new()) });
+
+        let service = SegmentGrpcService::new(
+            Arc::new(TestSegmentStore::new()),
+            Some(metadata),
+            Arc::new(BufferPool::new(65536, 4)),
+        );
+
+        let result = service
+            .put_object_metadata(tonic::Request::new(make_put_metadata_request("b", "k")))
+            .await;
+        assert!(result.is_ok(), "clean key must accept read-repair push");
     }
 }

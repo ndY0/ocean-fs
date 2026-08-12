@@ -34,6 +34,12 @@ pub(crate) enum DetectorCommand {
     IndirectPingResult { origin: NodeId, target: NodeId, success: bool },
     /// Update the list of alive nodes for periodic ping selection.
     UpdateAliveNodes { nodes: Vec<(NodeId, NodeState, SocketAddr, Incarnation)> },
+    /// Drop a node from the probe set — called when a node is declared
+    /// Dead/Left so the detector stops probing it (F1c).
+    RemoveNode { node_id: NodeId },
+    /// Update the local node's incarnation (after a rejoin bump,
+    /// ADR-0022) so probe responses carry the announced value.
+    UpdateSelfIncarnation { incarnation: Incarnation },
     /// Shut down the detector.
     Shutdown,
 }

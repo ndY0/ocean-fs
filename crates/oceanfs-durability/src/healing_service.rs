@@ -27,6 +27,10 @@ pub struct HealingGrpcService {
     metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore>,
     /// Segment data store for shard fetch and repair.
     data_store: Arc<dyn SegmentDataStore>,
+    /// This node's identifier. When set, hints whose `intended_for`
+    /// matches it are APPLIED to the local metadata store instead of
+    /// being buffered (a hint for oneself is a delayed write — t21).
+    local_node_id: Option<NodeId>,
 }
 
 impl HealingGrpcService {
@@ -36,7 +40,68 @@ impl HealingGrpcService {
         metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore>,
         data_store: Arc<dyn SegmentDataStore>,
     ) -> Self {
-        Self { handoff, metadata_store, data_store }
+        Self { handoff, metadata_store, data_store, local_node_id: None }
+    }
+
+    /// Sets this node's identifier so that self-intended hints are
+    /// applied instead of buffered.
+    #[must_use]
+    pub fn with_local_node_id(mut self, node_id: NodeId) -> Self {
+        self.local_node_id = Some(node_id);
+        self
+    }
+
+    /// Returns `true` when the hint is intended for this node and must
+    /// be applied locally rather than buffered for remote delivery.
+    fn is_local_hint(&self, intended_for: &NodeId) -> bool {
+        self.local_node_id.as_ref() == Some(intended_for)
+    }
+
+    /// Applies an inline hint intended for this node: writes the object
+    /// metadata (with inline data) to the local metadata store so reads
+    /// succeed once hinted-handoff delivery completes (t21).
+    ///
+    /// The original HLC is not carried by the hint protocol; the applied
+    /// metadata uses `Hlc::zero()`. The multi-replica HLC comparison
+    /// treats equal timestamps as non-conflicting, so this is safe for
+    /// the delayed-write case.
+    fn apply_inline_hint(&self, bucket: oceanfs_core::BucketId, object_key: String, data: Bytes) {
+        let meta = oceanfs_core::ObjectMetadata {
+            object_key: oceanfs_core::ObjectKey::new(&object_key),
+            size: data.len() as u64,
+            blake3_hash: Some(oceanfs_core::HashOutput::from_bytes(
+                *blake3::hash(&data).as_bytes(),
+            )),
+            chunks: smallvec::SmallVec::new(),
+            inline_data: Some(data.clone()),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+            hlc: Hlc::zero(),
+        };
+        match oceanfs_storage_api::MetadataStore::put_object(
+            self.metadata_store.as_ref(),
+            &bucket,
+            meta,
+        ) {
+            Ok(()) => {
+                tracing::info!(
+                    bucket = %bucket,
+                    key = %object_key,
+                    size = data.len(),
+                    "applied inline hinted handoff locally"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    bucket = %bucket,
+                    key = %object_key,
+                    error = %e,
+                    "failed to apply inline hinted handoff locally"
+                );
+            }
+        }
     }
 }
 
@@ -115,6 +180,23 @@ impl HealingRpc for HealingGrpcService {
                         .map(NodeId::from)
                         .unwrap_or_else(|| NodeId::new("unknown"));
 
+                    // A hint intended for this node is a delayed write:
+                    // apply it to the local metadata store (t21).
+                    if self.is_local_hint(&intended_for) {
+                        let bucket = inline
+                            .bucket_id
+                            .clone()
+                            .map(oceanfs_core::BucketId::from)
+                            .unwrap_or_else(|| oceanfs_core::BucketId::new("default"));
+                        self.apply_inline_hint(
+                            bucket,
+                            inline.object_key.clone(),
+                            inline.data.clone(),
+                        );
+                        accepted_count += 1;
+                        continue;
+                    }
+
                     let legacy_hint = crate::HintRecord {
                         intended_for: intended_for.clone(),
                         segment_id: SegmentId::new(), // inline hints don't have a segment
@@ -144,6 +226,18 @@ impl HealingRpc for HealingGrpcService {
                         .clone()
                         .map(NodeId::from)
                         .unwrap_or_else(|| NodeId::new("unknown"));
+
+                    // Segment-ref hints carry a reference but not the data;
+                    // applying them locally requires fetching the segment
+                    // shard from the origin, which the current hint protocol
+                    // does not support. Buffered as before.
+                    if self.is_local_hint(&intended_for) {
+                        tracing::warn!(
+                            intended_for = %intended_for,
+                            "segment-ref hint intended for self cannot be applied \
+                             without the segment data; buffering"
+                        );
+                    }
 
                     // For segment refs, store as a legacy hint with empty data.
                     let legacy_hint = crate::HintRecord {

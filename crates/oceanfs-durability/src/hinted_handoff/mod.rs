@@ -722,7 +722,7 @@ mod tests {
             node_id.clone(),
             oceanfs_core::NodeState::Alive,
             oceanfs_core::Incarnation::new(1),
-            addr,
+            Some(addr),
         );
 
         let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
@@ -766,5 +766,179 @@ mod tests {
 
         assert_eq!(hh.hints_stored_total.get(), 2);
         assert_eq!(hh.hints_delivered_total.get(), 5);
+    }
+
+    // ── ADR-0022: stale-address hint delivery (F2e) ──────────────
+
+    /// Minimal metadata store for the healing service: the
+    /// `hinted_handoff_single` path never touches metadata, so all
+    /// operations are inert stubs.
+    struct F2eMockMetadata;
+
+    impl oceanfs_storage_api::MetadataStore for F2eMockMetadata {
+        fn list_object_keys(
+            &self,
+            _bucket: &oceanfs_core::BucketId,
+        ) -> std::io::Result<Vec<(oceanfs_core::BucketId, oceanfs_core::ObjectKey)>> {
+            Ok(Vec::new())
+        }
+
+        fn get_object_metadata(
+            &self,
+            _bucket: &oceanfs_core::BucketId,
+            _key: &oceanfs_core::ObjectKey,
+        ) -> std::io::Result<Option<oceanfs_core::ObjectMetadata>> {
+            Ok(None)
+        }
+
+        fn list_objects(
+            &self,
+            _bucket: &oceanfs_core::BucketId,
+            _prefix: &str,
+        ) -> Vec<std::io::Result<oceanfs_core::ObjectMetadata>> {
+            Vec::new()
+        }
+
+        fn get_segment(
+            &self,
+            _id: oceanfs_core::SegmentId,
+        ) -> std::io::Result<Option<oceanfs_core::SegmentMetadata>> {
+            Ok(None)
+        }
+
+        fn list_segments(&self) -> Vec<std::io::Result<oceanfs_core::SegmentMetadata>> {
+            Vec::new()
+        }
+
+        fn list_tombstones(
+            &self,
+            _bucket: &oceanfs_core::BucketId,
+        ) -> Vec<std::io::Result<(oceanfs_core::ObjectKey, oceanfs_core::Tombstone)>> {
+            Vec::new()
+        }
+
+        fn delete_tombstone(
+            &self,
+            _bucket: &oceanfs_core::BucketId,
+            _key: &oceanfs_core::ObjectKey,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn put_segment(&self, _meta: oceanfs_core::SegmentMetadata) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn delete_segment(&self, _id: oceanfs_core::SegmentId) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn put_object(
+            &self,
+            _bucket: &oceanfs_core::BucketId,
+            _meta: oceanfs_core::ObjectMetadata,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn delete_object(
+            &self,
+            _bucket: &oceanfs_core::BucketId,
+            _key: &oceanfs_core::ObjectKey,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn batch_write(&self, _ops: Vec<oceanfs_storage_api::BatchOp>) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// F2e: a hint enqueued while membership still holds a stale
+    /// address is delivered after the node rejoins with a higher
+    /// incarnation carrying its fresh address (ADR-0022 Decision 2) —
+    /// delivery resolves `address_of()` at send time.
+    #[tokio::test]
+    async fn hint_enqueued_against_stale_address_delivered_after_address_update() {
+        use std::{net::SocketAddr, sync::Arc};
+
+        use tonic::transport::Server;
+
+        let node_id = NodeId::new("restarted-node");
+        // Nothing listens on this port — the stale, pre-restart address.
+        let stale_addr: SocketAddr = "127.0.0.1:19998".parse().unwrap();
+
+        // Live healing gRPC server on an ephemeral port = the fresh address.
+        let server_handoff = Arc::new(HintedHandoff::new());
+        let server_store: Arc<dyn crate::SegmentDataStore> =
+            Arc::new(crate::anti_entropy::InMemorySegmentStore::new());
+        let server_meta: Arc<dyn oceanfs_storage_api::MetadataStore> = Arc::new(F2eMockMetadata);
+        let healing_service = crate::healing_service::HealingGrpcService::new(
+            server_handoff,
+            server_meta,
+            server_store,
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fresh_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(crate::HealingRpcServer::new(healing_service))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        // Give the server a moment to start.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Membership still points at the stale address (pre-restart view).
+        let ring = oceanfs_routing::Ring::new(oceanfs_core::RingConfig::default());
+        let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
+        let membership = Arc::new(Membership::new(
+            node_id.clone(),
+            stale_addr,
+            oceanfs_core::GossipConfig::default(),
+            ring_cache,
+        ));
+        membership.upsert_node(
+            node_id.clone(),
+            oceanfs_core::NodeState::Alive,
+            oceanfs_core::Incarnation::new(1),
+            Some(stale_addr),
+        );
+
+        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
+        let hh = HintedHandoff::new_with_pool_and_membership(pool, Some(membership.clone()));
+
+        // Hint enqueued while the address is stale.
+        let hint = HintRecord {
+            intended_for: node_id.clone(),
+            segment_id: SegmentId::new(),
+            offset: 0,
+            length: 42,
+            timestamp: Hlc::zero(),
+            data: vec![7, 7, 7].into(),
+            stored_at_secs: 0,
+        };
+        hh.handoff(node_id.clone(), hint).await.unwrap();
+        assert_eq!(hh.pending_count(&node_id), 1);
+
+        // Delivery against the stale address fails; the hint is retained.
+        let delivered = hh.deliver_pending(node_id.clone()).await.unwrap();
+        assert_eq!(delivered, 0, "delivery must fail against the stale address");
+        assert_eq!(hh.pending_count(&node_id), 1, "failed delivery retains the hint");
+
+        // The node rejoins: strictly higher incarnation + fresh address.
+        membership.upsert_node(
+            node_id.clone(),
+            oceanfs_core::NodeState::Alive,
+            oceanfs_core::Incarnation::new(2),
+            Some(fresh_addr),
+        );
+
+        // Delivery now resolves the fresh address and succeeds.
+        let delivered = hh.deliver_pending(node_id.clone()).await.unwrap();
+        assert_eq!(delivered, 1, "hint must be delivered after the address update");
+        assert_eq!(hh.pending_count(&node_id), 0, "delivered hints are cleared");
     }
 }

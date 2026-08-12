@@ -34,7 +34,7 @@ async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
         ring_cache.clone(),
     ));
     for n in nodes {
-        membership.upsert_node(NodeId::new(*n), NodeState::Alive, Incarnation::new(1), addr);
+        membership.upsert_node(NodeId::new(*n), NodeState::Alive, Incarnation::new(1), Some(addr));
     }
     let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
     let hlc_clock = Arc::new(HlcClock::new());

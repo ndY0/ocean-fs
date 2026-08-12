@@ -191,7 +191,10 @@ impl GossipProtocol {
             .state
             .nodes
             .iter()
-            .filter(|(id, e)| e.state == NodeState::Alive && *id != &self.node_id)
+            .filter(|(id, e)| {
+                (e.state == NodeState::Alive || e.state == NodeState::Suspect)
+                    && *id != &self.node_id
+            })
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -364,7 +367,13 @@ impl GossipProtocol {
             let local_entry = self.state.nodes.get(&entry.node_id);
 
             let old_state = local_entry.map(|e| e.state).unwrap_or(NodeState::Alive);
-
+            // Whether the node is new to the local gossip state — captured
+            // before the insert so the event condition below can use it.
+            let is_new_entry = local_entry.is_none();
+            // Snapshot of the previous entry for change detection — a
+            // higher-incarnation rejoin may keep the same state while
+            // changing the address (ADR-0022), which must still propagate.
+            let previous_entry = local_entry.cloned();
             // At equal incarnation, don't let a less-terminal state
             // overwrite a more-terminal one. Also, don't re-add a
             // previously-removed node (present in incarnations but
@@ -406,12 +415,40 @@ impl GossipProtocol {
             self.state.nodes.insert(entry.node_id.clone(), entry.clone());
             self.incarnations.insert(entry.node_id.clone(), entry.incarnation);
 
-            // Emit membership event if state changed.
-            if old_state != entry.state {
+            debug!(
+                node_id = %entry.node_id,
+                state = ?entry.state,
+                incarnation = entry.incarnation.value(),
+                "merge_delta: accepted entry"
+            );
+
+            // Emit a membership event when anything meaningful changed:
+            // state, address, incarnation — or when the node is new.
+            // ADR-0022: a strictly-higher-incarnation rejoin keeps the
+            // state (Alive→Alive) but carries a fresh address; without
+            // emission on address change, the membership manager never
+            // learns the new address and hint delivery keeps dialing the
+            // stale one (t21). New nodes must emit too: the gRPC push
+            // path routes peer deltas through `merge_delta` (F1d), so a
+            // brand-new joiner has no state transition.
+            let changed = old_state != entry.state
+                || is_new_entry
+                || previous_entry.as_ref().is_some_and(|e| {
+                    e.address != entry.address || e.incarnation != entry.incarnation
+                });
+            if changed {
+                debug!(
+                    node_id = %entry.node_id,
+                    old = ?old_state,
+                    new = ?entry.state,
+                    "merge_delta: emitting membership event"
+                );
                 let _ = self.membership_event_tx.send(crate::membership::MembershipEvent {
                     node_id: entry.node_id.clone(),
                     old_state,
                     new_state: entry.state,
+                    incarnation: entry.incarnation,
+                    address: Some(entry.address),
                 });
 
                 // If a node is declared DEAD, notify the failure detector.
@@ -433,7 +470,37 @@ impl GossipProtocol {
     }
 
     /// Adds a node to the local state (typically on join).
+    ///
+    /// Enforces the F1d invariant: after a Dead removal, no path may
+    /// re-apply an entry for a node id at an incarnation ≤ the recorded
+    /// one. A stale re-add of a previously removed node is dropped;
+    /// a stale update of a present node keeps the existing entry and
+    /// never regresses the incarnation map (T8 monotonicity).
     pub(crate) fn add_node(&mut self, entry: NodeEntry) {
+        let recorded =
+            self.incarnations.get(&entry.node_id).copied().unwrap_or(Incarnation::new(0));
+
+        if entry.incarnation < recorded {
+            trace!(
+                node_id = %entry.node_id,
+                incoming = entry.incarnation.value(),
+                recorded = recorded.value(),
+                "add_node: dropping stale entry (incarnation below recorded)"
+            );
+            return;
+        }
+        if entry.incarnation == recorded
+            && recorded > Incarnation::new(0)
+            && !self.state.nodes.contains_key(&entry.node_id)
+        {
+            trace!(
+                node_id = %entry.node_id,
+                incarnation = entry.incarnation.value(),
+                "add_node: dropping re-add of removed node at equal incarnation"
+            );
+            return;
+        }
+
         self.incarnations.insert(entry.node_id.clone(), entry.incarnation);
         self.state.nodes.insert(entry.node_id.clone(), entry);
     }
@@ -530,6 +597,187 @@ mod tests {
         protocol.merge_delta(&delta);
 
         assert_eq!(protocol.alive_nodes().len(), 1);
+    }
+
+    /// F1d: a node removed as Dead (present in `incarnations`, absent
+    /// from `state.nodes`) must NOT be re-admitted at an equal
+    /// incarnation by a gossip delta — this is the t24 oscillation
+    /// source (stale Alive deltas from peers).
+    #[test]
+    fn merge_delta_rejects_readmission_of_removed_node_at_equal_incarnation() {
+        let mut protocol = make_protocol();
+
+        // Node known at incarnation 5.
+        protocol.add_node(make_node_entry("victim", 5, NodeState::Alive));
+        // Declared Dead at incarnation 5 via merge.
+        protocol.merge_delta(&GossipDelta {
+            changed: vec![make_node_entry("victim", 5, NodeState::Dead)],
+        });
+        // Remove it from the gossip state the way the membership state
+        // does on Dead (the node is no longer in state.nodes but its
+        // incarnation is recorded).
+        protocol.state.nodes.remove(&NodeId::new("victim"));
+        assert!(!protocol.state.nodes.contains_key(&NodeId::new("victim")));
+
+        // A peer whose view still lists the node as Alive at inc 5
+        // sends a delta — it must be rejected.
+        protocol.merge_delta(&GossipDelta {
+            changed: vec![make_node_entry("victim", 5, NodeState::Alive)],
+        });
+
+        assert!(
+            !protocol.state.nodes.contains_key(&NodeId::new("victim")),
+            "removed node must not be re-admitted at equal incarnation"
+        );
+    }
+
+    /// ADR-0022 Decision 2 / F2c: an entry with a strictly higher
+    /// incarnation is accepted even for a previously removed node,
+    /// and it updates BOTH state and address (the rejoin carries the
+    /// fresh address — t21/t43).
+    #[test]
+    fn merge_delta_accepts_higher_incarnation_with_updated_address() {
+        use std::net::SocketAddr;
+
+        let mut protocol = make_protocol();
+
+        // Node known at incarnation 5, old address.
+        protocol.add_node(make_node_entry("rejoiner", 5, NodeState::Alive));
+        // Removed as Dead at incarnation 5.
+        protocol.merge_delta(&GossipDelta {
+            changed: vec![make_node_entry("rejoiner", 5, NodeState::Dead)],
+        });
+        protocol.state.nodes.remove(&NodeId::new("rejoiner"));
+
+        // Self-rejoin: Alive at incarnation 6 with a NEW address.
+        let new_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let mut rejoined = make_node_entry("rejoiner", 6, NodeState::Alive);
+        rejoined.address = new_addr;
+        protocol.merge_delta(&GossipDelta { changed: vec![rejoined] });
+
+        let entry = protocol
+            .state
+            .nodes
+            .get(&NodeId::new("rejoiner"))
+            .unwrap_or_else(|| panic!("strictly-higher incarnation must re-admit the node"));
+        assert_eq!(entry.state, NodeState::Alive);
+        assert_eq!(entry.incarnation, Incarnation::new(6));
+        assert_eq!(
+            entry.address, new_addr,
+            "rejoin must update the address so call sites resolve the fresh one"
+        );
+    }
+
+    /// F2c: a higher-incarnation merge of a node that is already present
+    /// updates its address (address churn without removal).
+    #[test]
+    fn merge_delta_higher_incarnation_updates_address_of_present_node() {
+        use std::net::SocketAddr;
+
+        let mut protocol = make_protocol();
+
+        protocol.add_node(make_node_entry("churner", 2, NodeState::Alive));
+
+        let new_addr: SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let mut updated = make_node_entry("churner", 3, NodeState::Alive);
+        updated.address = new_addr;
+        protocol.merge_delta(&GossipDelta { changed: vec![updated] });
+
+        let entry = protocol.state.nodes.get(&NodeId::new("churner")).unwrap();
+        assert_eq!(entry.incarnation, Incarnation::new(3));
+        assert_eq!(entry.address, new_addr);
+    }
+
+    /// F1d: `add_node` (the manager→gossip path) must not re-add a
+    /// previously removed node at an equal incarnation, and must not
+    /// regress the incarnation map on stale entries.
+    #[test]
+    fn add_node_enforces_readmission_invariant() {
+        let mut protocol = make_protocol();
+
+        protocol.add_node(make_node_entry("victim", 5, NodeState::Alive));
+        protocol.add_node(make_node_entry("victim", 5, NodeState::Dead));
+        protocol.state.nodes.remove(&NodeId::new("victim"));
+        // Incarnation 5 recorded, node absent.
+
+        // Stale Alive at equal incarnation via AddNode — rejected.
+        protocol.add_node(make_node_entry("victim", 5, NodeState::Alive));
+        assert!(
+            !protocol.state.nodes.contains_key(&NodeId::new("victim")),
+            "add_node must reject equal-incarnation re-admission"
+        );
+
+        // Stale entry at lower incarnation — dropped, map not regressed.
+        protocol.add_node(make_node_entry("victim", 3, NodeState::Alive));
+        assert_eq!(
+            protocol.incarnations.get(&NodeId::new("victim")).copied(),
+            Some(Incarnation::new(5)),
+            "incarnation map must not regress"
+        );
+
+        // Strictly higher incarnation — accepted.
+        protocol.add_node(make_node_entry("victim", 6, NodeState::Alive));
+        assert!(protocol.state.nodes.contains_key(&NodeId::new("victim")));
+    }
+
+    /// A brand-new node must emit a membership event from `merge_delta`
+    /// even though its state "transition" is Alive→Alive: the gRPC push
+    /// path routes peer deltas through `merge_delta`, and the membership
+    /// manager only learns new nodes from these events.
+    #[test]
+    fn merge_delta_emits_event_for_new_node() {
+        let mut protocol = make_protocol();
+        let mut membership_rx = protocol.membership_event_tx.subscribe();
+
+        let delta = GossipDelta { changed: vec![make_node_entry("fresh", 1, NodeState::Alive)] };
+        protocol.merge_delta(&delta);
+
+        assert!(protocol.state.nodes.contains_key(&NodeId::new("fresh")));
+
+        let mut emitted = false;
+        while let Ok(event) = membership_rx.try_recv() {
+            if event.node_id.as_str() == "fresh" && event.new_state == NodeState::Alive {
+                assert_eq!(event.incarnation, Incarnation::new(1));
+                emitted = true;
+            }
+        }
+        assert!(emitted, "new node must emit a membership event");
+    }
+
+    /// F1d: a stale Alive delta from a peer whose view is behind the
+    /// local Suspect must NOT clobber the Suspect (t24 oscillation).
+    #[test]
+    fn merge_delta_rejects_stale_alive_against_local_suspect() {
+        let mut protocol = make_protocol();
+        let mut membership_rx = protocol.membership_event_tx.subscribe();
+
+        // Node known Alive at 1.
+        protocol.add_node(make_node_entry("victim", 1, NodeState::Alive));
+        let _ = membership_rx.try_recv(); // drain any event
+
+        // Local view moves to Suspect (same incarnation).
+        protocol.add_node(make_node_entry("victim", 1, NodeState::Suspect));
+
+        // Peer pushes stale Alive at the same incarnation — rejected.
+        protocol.merge_delta(&GossipDelta {
+            changed: vec![make_node_entry("victim", 1, NodeState::Alive)],
+        });
+
+        let entry = protocol.state.nodes.get(&NodeId::new("victim")).unwrap();
+        assert_eq!(
+            entry.state,
+            NodeState::Suspect,
+            "stale Alive must not clobber the local Suspect"
+        );
+
+        // No Alive event may have been emitted for the victim.
+        while let Ok(event) = membership_rx.try_recv() {
+            assert_ne!(
+                (event.node_id.as_str(), event.new_state),
+                ("victim", NodeState::Alive),
+                "stale Alive must not emit a membership event"
+            );
+        }
     }
 
     #[test]

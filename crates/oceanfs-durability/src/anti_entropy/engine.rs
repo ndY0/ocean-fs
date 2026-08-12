@@ -1459,7 +1459,7 @@ mod tests {
             NodeId::new("node-b"),
             NodeState::Alive,
             oceanfs_core::Incarnation::new(1),
-            "127.0.0.1:9001".parse().unwrap(),
+            Some("127.0.0.1:9001".parse().unwrap()),
         );
 
         let peers = ae.select_alive_peers();
@@ -1513,7 +1513,7 @@ mod tests {
                 NodeId::new(format!("peer-{i}")),
                 NodeState::Alive,
                 oceanfs_core::Incarnation::new(1),
-                format!("127.0.0.1:{}", 9001 + i).parse().unwrap(),
+                Some(format!("127.0.0.1:{}", 9001 + i).parse().unwrap()),
             );
         }
 
@@ -1533,13 +1533,13 @@ mod tests {
             NodeId::new("dead-peer"),
             NodeState::Dead,
             oceanfs_core::Incarnation::new(1),
-            "127.0.0.1:9001".parse().unwrap(),
+            Some("127.0.0.1:9001".parse().unwrap()),
         );
         membership.upsert_node(
             NodeId::new("alive-peer"),
             NodeState::Alive,
             oceanfs_core::Incarnation::new(1),
-            "127.0.0.1:9002".parse().unwrap(),
+            Some("127.0.0.1:9002".parse().unwrap()),
         );
 
         let peers = ae.select_alive_peers();

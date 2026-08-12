@@ -1,7 +1,18 @@
-//! Test 3: Segment lifecycle — all four size tiers produce correct segments.
+//! Test 3: Segment lifecycle — size tiers produce the correct segments.
 //!
 //! Verifies that objects of different sizes (inline, small, standard, multi)
 //! are stored correctly and the segment report reflects them.
+//!
+//! ## Inline-tier design (ADR-0001)
+//!
+//! Objects ≤ 4 KB (`inline` tier, see `oceanfs-core` `classify`) are stored
+//! directly in object metadata with empty chunk lists — the write path
+//! intentionally registers **no segment** for them. Therefore
+//! `/admin/segments` (built from `list_segments()`) never reports an
+//! `inline` tier entry: this test asserts exactly that, instead of the old
+//! "one segment per PUT" assumption. The 1.5 MB blob lands in the
+//! `standard` tier (`multi` starts above 4 MB), so no `multi` entry is
+//! assumed either.
 
 use e2e::harness::{config_standard, random_bytes, response_json, NodeProcess};
 use serde::Deserialize;
@@ -68,8 +79,13 @@ async fn segment_lifecycle_all_four_tiers() {
     );
     // Verify per-tier breakdown includes entries.
     eprintln!("segment_report: total={}, by_tier={:?}", report.total, report.by_tier);
-    // At minimum we expect inline, small, and standard tiers present.
-    assert!(report.by_tier.contains_key("inline"), "by_tier should include inline tier");
+    // The inline blob (≤ 4 KB) is stored in metadata with no segment —
+    // assert the DESIGN, not a phantom segment entry (ADR-0001).
+    assert_eq!(
+        report.by_tier.get("inline").copied().unwrap_or(0),
+        0,
+        "inline-tier blobs create no segment records"
+    );
     assert!(report.by_tier.contains_key("small"), "by_tier should include small tier");
     assert!(
         report.by_tier.get("standard").copied().unwrap_or(0) > 0,

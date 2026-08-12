@@ -9,8 +9,8 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use oceanfs_core::{
-    shard, AccelConfig, BucketId, HlcClock, MetadataConfig, NodeConfig, NodeId, ObjectKey,
-    ObjectMetadata, PoolConfig, RingConfig, RpcConfig, SegmentId, SegmentMetadata,
+    shard, AccelConfig, BucketId, HlcClock, Incarnation, MetadataConfig, NodeConfig, NodeId,
+    ObjectKey, ObjectMetadata, PoolConfig, RingConfig, RpcConfig, SegmentId, SegmentMetadata,
     SegmentSizeConfig, SizeTier, Tombstone, WalConfig,
 };
 use oceanfs_durability::{
@@ -26,7 +26,10 @@ use tokio::{sync::broadcast, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::metadata_adapter::MetadataStoreAdapter;
+use crate::{
+    membership_state::{default_state_path, MembershipStateStore},
+    metadata_adapter::MetadataStoreAdapter,
+};
 
 // ---------------------------------------------------------------------------
 // PrefetchStoreAdapter — bridges concrete store to oceanfs_storage_api::MetadataStore
@@ -92,6 +95,10 @@ impl oceanfs_storage_api::MetadataStore for PrefetchStoreAdapter {
 
     fn delete_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<()> {
         self.store.delete_tombstone(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn has_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<bool> {
+        self.store.has_tombstone(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
     }
 
     fn put_segment(&self, meta: SegmentMetadata) -> std::io::Result<()> {
@@ -499,16 +506,42 @@ impl Node {
             ring_cache.clone(),
         ));
 
+        // ---- 4a. Rejoin state (ADR-0022) ----
+        // Load the persisted incarnation and fallback seeds so a restart
+        // rejoins as the same identity with a bumped incarnation (D1) and
+        // can re-contact the cluster when configured seeds are unreachable
+        // or empty (D3).
+        let membership_state_store =
+            MembershipStateStore::new(default_state_path(&config.data_dir));
+        let durable_state = membership_state_store.load().map_err(|e| {
+            format!(
+                "failed to load membership state at {}: {e}",
+                default_state_path(&config.data_dir).display()
+            )
+        })?;
+
+        // Announce with persisted + 1; first boot keeps 1 (spec §13.1).
+        let announce_incarnation = durable_state.self_incarnation.map_or(1, |p| p + 1);
+
+        // Write-through the bump BEFORE announcing: if the process dies
+        // after announcing but before persisting, the next restart would
+        // re-announce the same incarnation and be rejected as stale.
+        membership_state_store
+            .save_incarnation(announce_incarnation)
+            .map_err(|e| format!("failed to persist self incarnation: {e}"))?;
+        info!(
+            node_id = %config.node_id,
+            incarnation = announce_incarnation,
+            fallback_seeds = durable_state.fallback_seeds.len(),
+            "rejoin state loaded: announcing with bumped incarnation"
+        );
+
         // ---- 5. Construct connection pool ----
         let rpc_config = RpcConfig::default();
         let quickack = rpc_config.quickack;
         let busy_poll = rpc_config.busy_poll_us;
         let pool = Arc::new(oceanfs_network::ConnectionPool::new(rpc_config));
         membership.set_pool(pool.clone());
-
-        // Bootstrap membership: start failure detection + gossip, then join the ring.
-        membership.start().map_err(|e| format!("failed to start membership: {e}"))?;
-        membership.join().await.map_err(|e| format!("failed to join cluster: {e}"))?;
 
         // ---- 6. Construct storage components ----
         let segment_size = SegmentSizeConfig::default();
@@ -524,11 +557,13 @@ impl Node {
             shard::derive_shard_count(config.segment_shard_count, config.segment_shard_count_max);
         // Scale buffer pool max chunks by shard count (Item 8, D8.5).
         let total_pool_chunks = config.buffer_pool_max_chunks * shard_count;
-        // Validate memory budget (Item 8, D8.3).
+        // Validate memory budget (Item 8, D8.3). The budget is the real
+        // buffer-pool memory: per-shard pool bytes (chunk bytes × max
+        // chunks) × shard count. The old call multiplied by segment size
+        // as well, producing a 2.2 TB false positive on every boot (F5).
         let _ = crate::startup::validate_shard_memory_budget(
             shard_count,
-            config.buffer_pool_chunk_bytes,
-            oceanfs_core::SegmentSizeConfig::default().default_target_size,
+            config.buffer_pool_chunk_bytes * config.buffer_pool_max_chunks,
         );
         let shard_buffer_pool = Arc::new(oceanfs_storage::BufferPool::new(
             config.buffer_pool_chunk_bytes,
@@ -1076,7 +1111,8 @@ impl Node {
             hinted_handoff.clone(),
             metadata_store.clone(),
             heal_data_store.clone(),
-        );
+        )
+        .with_local_node_id(NodeId::new(&config.node_id));
         let cache_service = oceanfs_server::grpc::cache_service::CacheGrpcService::new(
             Some(object_cache.clone()),
             Some(metadata_cache.clone()),
@@ -1125,6 +1161,37 @@ impl Node {
             }
         });
 
+        // ---- 15a. Bootstrap membership: start failure detection +
+        // gossip, then join the ring. MUST happen after the gRPC server
+        // is bound: peers probe and deliver hinted handoffs to our gRPC
+        // listener immediately after the join announcement, and a join
+        // that precedes the bind produces join-time false Suspects and
+        // refused hint deliveries (t5/t21).
+        membership.start().map_err(|e| format!("failed to start membership: {e}"))?;
+        membership
+            .join(Incarnation::new(announce_incarnation), &durable_state.fallback_seeds)
+            .await
+            .map_err(|e| format!("failed to join cluster: {e}"))?;
+
+        // After a successful join, snapshot the known member addresses as
+        // fallback seeds. Events emitted during join are missed by the
+        // watcher spawned later (broadcast channels do not replay), so
+        // this write also captures members learned from the seed pull.
+        // Self is excluded: its own old address is useless after a
+        // restart (t43).
+        {
+            let self_id = NodeId::new(&config.node_id);
+            let seeds: Vec<String> = membership
+                .nodes_full()
+                .iter()
+                .filter(|(id, _, _, _)| *id != self_id)
+                .map(|(_, _, _, addr)| addr.to_string())
+                .collect();
+            if let Err(e) = membership_state_store.save_fallback_seeds(&seeds) {
+                warn!(error = %e, "failed to persist fallback seeds after join");
+            }
+        }
+
         // ---- 16. Spawn background tasks ----
         let mut background = Self::spawn_background_tasks(
             gc_worker,
@@ -1142,9 +1209,17 @@ impl Node {
         background.grpc_server = Some(grpc_server_handle);
 
         // ---- 17. Spawn hinted handoff delivery watcher ----
-        // Watches for membership state transitions to ALIVE and drains
-        // the handoff buffer for returning nodes.
+        // Watches for membership events and drains the handoff buffer
+        // for nodes that are (or return to) ALIVE. Any Alive event —
+        // including an Alive→Alive address update from a rejoin
+        // (ADR-0022, t21) — triggers delivery: `deliver_pending` is a
+        // no-op when nothing is buffered. On the same events it also
+        // records the node's address in the persisted fallback-seed
+        // list (ADR-0022 D3) — incrementally from the event itself, so
+        // the write never races the membership manager's apply step.
         let hh = hinted_handoff_manager.clone();
+        let seed_store = membership_state_store.clone();
+        let self_node_id = NodeId::new(&config.node_id);
         let mut events = membership.subscribe();
         let delivery_token = background.delivery_cancel.clone();
         let delivery_handle = tokio::spawn(async move {
@@ -1156,14 +1231,58 @@ impl Node {
                     }
                     event = events.recv() => {
                         match event {
-                            Ok(ev) if ev.new_state == oceanfs_core::NodeState::Alive &&
-                                      ev.old_state != oceanfs_core::NodeState::Alive => {
+                            Ok(ev) if ev.new_state == oceanfs_core::NodeState::Alive => {
                                 info!(
                                     node = %ev.node_id,
                                     "node returned to cluster; delivering pending hinted handoffs"
                                 );
-                                if let Err(e) = hh.deliver_pending(ev.node_id).await {
-                                    warn!(error = %e, "hinted handoff delivery failed on rejoin");
+                                // Only spend retries when hints are actually
+                                // buffered: the returning node's gRPC listener
+                                // may still be binding when the Alive event
+                                // lands. A failed batch is re-enqueued, so
+                                // bounded retries are safe (duplicates are
+                                // overwritten on the receiving side).
+                                if hh.pending_count(&ev.node_id) > 0 {
+                                    for attempt in 1..=5 {
+                                        match hh.deliver_pending(ev.node_id.clone()).await {
+                                            Ok(delivered) => {
+                                                info!(
+                                                    node = %ev.node_id,
+                                                    delivered,
+                                                    attempt,
+                                                    "hinted handoff delivery"
+                                                );
+                                                if delivered > 0 {
+                                                    break;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    node = %ev.node_id,
+                                                    attempt,
+                                                    error = %e,
+                                                    "hinted handoff delivery failed on rejoin"
+                                                );
+                                            }
+                                        }
+                                        tokio::time::sleep(std::time::Duration::from_millis(500))
+                                            .await;
+                                    }
+                                }
+                                // Record the member address as a fallback
+                                // seed (ADR-0022 D3). Self is skipped: the
+                                // node's own old address is useless after a
+                                // restart (t43). Events without an address
+                                // (detector recoveries) are skipped — the
+                                // address was recorded when the node joined.
+                                if ev.node_id != self_node_id {
+                                    if let Some(addr) = ev.address {
+                                        if let Err(e) = seed_store
+                                            .add_fallback_seed(&addr.to_string())
+                                        {
+                                            warn!(error = %e, "failed to persist fallback seed");
+                                        }
+                                    }
                                 }
                             }
                             Ok(_) => {}
@@ -2000,7 +2119,7 @@ mod tests {
             target.clone(),
             NodeState::Suspect,
             Incarnation::new(1),
-            "127.0.0.1:9200".parse().unwrap(),
+            Some("127.0.0.1:9200".parse().unwrap()),
         );
 
         let hint = HintRecord {
@@ -2048,7 +2167,7 @@ mod tests {
             target.clone(),
             NodeState::Alive,
             Incarnation::new(2),
-            "127.0.0.1:9200".parse().unwrap(),
+            Some("127.0.0.1:9200".parse().unwrap()),
         );
 
         // Wait for the watcher to process the event (with timeout).
@@ -2095,7 +2214,7 @@ mod tests {
             target.clone(),
             NodeState::Alive,
             Incarnation::new(1),
-            "127.0.0.1:9300".parse().unwrap(),
+            Some("127.0.0.1:9300".parse().unwrap()),
         );
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2129,7 +2248,7 @@ mod tests {
             target.clone(),
             NodeState::Suspect,
             Incarnation::new(2),
-            "127.0.0.1:9300".parse().unwrap(),
+            Some("127.0.0.1:9300".parse().unwrap()),
         );
 
         let received = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
@@ -2285,7 +2404,7 @@ mod tests {
             NodeId::new("successor"),
             oceanfs_core::NodeState::Alive,
             oceanfs_core::Incarnation::new(1),
-            addr,
+            Some(addr),
         );
         let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
 
@@ -2354,7 +2473,7 @@ mod tests {
             NodeId::new("successor"),
             oceanfs_core::NodeState::Alive,
             oceanfs_core::Incarnation::new(1),
-            "127.0.0.1:9500".parse().unwrap(),
+            Some("127.0.0.1:9500".parse().unwrap()),
         );
 
         let handler = RecordingHandler {
@@ -2364,7 +2483,7 @@ mod tests {
 
         // leave() requires started membership; start background tasks.
         membership.start().unwrap();
-        membership.join().await.unwrap();
+        membership.join(oceanfs_core::Incarnation::new(1), &[]).await.unwrap();
 
         let result = membership.leave(Some(&handler)).await;
         assert!(result.is_ok(), "leave should succeed");
@@ -2467,7 +2586,7 @@ mod tests {
             NodeId::new("successor"),
             NodeState::Alive,
             Incarnation::new(1),
-            bound_addr,
+            Some(bound_addr),
         );
         let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
 

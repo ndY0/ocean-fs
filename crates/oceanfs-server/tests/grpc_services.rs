@@ -594,7 +594,7 @@ async fn swim_death_detection_within_timeout() {
         NodeId::new("target-node"),
         NodeState::Alive,
         Incarnation::new(1),
-        "127.0.0.1:9002".parse().unwrap(),
+        Some("127.0.0.1:9002".parse().unwrap()),
     );
 
     // Consume the initial ALIVE event. Use recv with a timeout instead
@@ -615,7 +615,7 @@ async fn swim_death_detection_within_timeout() {
         NodeId::new("target-node"),
         NodeState::Suspect,
         Incarnation::new(1),
-        "127.0.0.1:9002".parse().unwrap(),
+        Some("127.0.0.1:9002".parse().unwrap()),
     );
 
     // Verify the SUSPECT event was emitted.
@@ -636,7 +636,7 @@ async fn swim_death_detection_within_timeout() {
         NodeId::new("target-node"),
         NodeState::Dead,
         Incarnation::new(1),
-        "127.0.0.1:9002".parse().unwrap(),
+        Some("127.0.0.1:9002".parse().unwrap()),
     );
 
     let dead_event = tokio::time::timeout(Duration::from_millis(500), event_rx.recv())

@@ -14,16 +14,23 @@ use super::FailureDetector;
 
 /// Called on each SWIM interval tick.
 ///
-/// Selects a random alive peer (excluding self), sends a direct
+/// Selects a random peer (excluding self), sends a direct
 /// ping, and registers a pending ping for timeout tracking.
+///
+/// Suspect nodes are probed too: the suspicion window exists precisely
+/// so that a transient failure (e.g. a joiner whose gRPC listener is
+/// not bound yet) gets a chance to respond. If Suspect nodes were
+/// excluded, the successful-ping recovery path could never fire and
+/// every transient failure would escalate to DEAD (t5/t24).
 pub(crate) fn on_ping_tick(detector: &mut FailureDetector) {
-    // Filter alive nodes that are not self and not already pending.
+    // Filter nodes that are Alive or Suspect, not self, and not already
+    // pending.
     let target = {
         let alive: Vec<_> = detector
             .alive_nodes
             .iter()
             .filter(|(id, state, _, _)| {
-                *state == NodeState::Alive
+                (*state == NodeState::Alive || *state == NodeState::Suspect)
                     && *id != detector.node_id
                     && !detector.pending_pings.contains_key(id)
             })

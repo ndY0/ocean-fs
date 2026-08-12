@@ -70,12 +70,17 @@ pub(crate) enum GossipDirection {
 pub(crate) struct MembershipState {
     /// Per-node state.
     pub(crate) nodes: HashMap<NodeId, (NodeState, Incarnation, SocketAddr)>,
+    /// Last-known incarnation per node, **retained after Dead/Left
+    /// removal** (F1d). A node absent from `nodes` but present here
+    /// may only be re-admitted at a strictly higher incarnation —
+    /// this closes the Dead↔Alive oscillation loop (t24).
+    pub(crate) incarnations: HashMap<NodeId, Incarnation>,
 }
 
 impl MembershipState {
     /// Creates an empty membership state.
     pub(crate) fn new() -> Self {
-        Self { nodes: HashMap::new() }
+        Self { nodes: HashMap::new(), incarnations: HashMap::new() }
     }
 }
 

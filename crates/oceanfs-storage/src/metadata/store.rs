@@ -340,6 +340,11 @@ impl RocksDbMetadataStore {
 
     /// Stores object metadata with an explicit bucket.
     ///
+    /// A fresh write supersedes any prior deletion of this key: the
+    /// deletion tombstone is cleared so that later read-repair pushes
+    /// for the new version are not rejected by the tombstone gate
+    /// (membership-stability-fixes F3/t19).
+    ///
     /// # Errors
     ///
     /// Returns an error if the objects column family is not found, serialization
@@ -354,6 +359,9 @@ impl RocksDbMetadataStore {
         let value = bincode::serialize(&meta).map_err(|e| Error::Io(io_err(e)))?;
 
         self.db.put_cf(&cf, key, value).map_err(|e| Error::Io(io_err(e)))?;
+
+        // Clear any stale tombstone: the object is alive again.
+        self.delete_tombstone(bucket, &meta.object_key)?;
 
         Ok(())
     }
@@ -1040,6 +1048,10 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
         self.delete_tombstone(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
     }
 
+    fn has_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<bool> {
+        self.has_tombstone(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
     fn put_segment(&self, meta: SegmentMetadata) -> std::io::Result<()> {
         self.put_segment(meta).map_err(|e| std::io::Error::other(e.to_string()))
     }
@@ -1130,6 +1142,32 @@ mod tests {
         assert_eq!(got.object_key.as_str(), "photo.jpg");
         assert_eq!(got.size, 1024);
         assert!(got.is_inline());
+    }
+
+    /// F3/t19: a fresh write clears the deletion tombstone so that a
+    /// later read-repair push for the new version is not rejected by
+    /// the tombstone gate.
+    #[test]
+    fn put_object_in_bucket_clears_stale_tombstone() {
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        let bucket = BucketId::new("bucket");
+        let key = ObjectKey::new("rekey");
+
+        // Delete → tombstone exists.
+        store.put_object_in_bucket(&bucket, make_object_meta("rekey", 5, None)).unwrap();
+        store.delete_object(&bucket, &key).unwrap();
+        assert!(store.has_tombstone(&bucket, &key).unwrap(), "tombstone must exist after delete");
+
+        // Fresh write → tombstone cleared.
+        store.put_object_in_bucket(&bucket, make_object_meta("rekey", 6, None)).unwrap();
+        assert!(
+            !store.has_tombstone(&bucket, &key).unwrap(),
+            "fresh write must clear the tombstone"
+        );
+
+        // The new version is readable.
+        let got = store.get_object(&bucket, &key).unwrap().unwrap();
+        assert_eq!(got.size, 6);
     }
 
     #[test]

@@ -158,7 +158,12 @@ mod tests {
         ));
 
         for node in ring_nodes {
-            membership.upsert_node(NodeId::new(*node), NodeState::Alive, Incarnation::new(1), addr);
+            membership.upsert_node(
+                NodeId::new(*node),
+                NodeState::Alive,
+                Incarnation::new(1),
+                Some(addr),
+            );
         }
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
 

@@ -7,7 +7,7 @@
 
 use std::{net::SocketAddr, sync::Arc};
 
-use oceanfs_core::{Counter, Gauge, GossipConfig, NodeId, NodeState};
+use oceanfs_core::{Counter, Gauge, GossipConfig, Incarnation, NodeId, NodeState};
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::RingCache;
 use parking_lot::RwLock;
@@ -22,6 +22,12 @@ pub mod manager;
 pub mod state;
 
 /// An event emitted when a node's state changes.
+///
+/// Carries the node's incarnation and, when known, its address so that
+/// consumers (the membership event handler) can apply the transition
+/// without re-deriving them from local state — a re-admitted node is
+/// absent from local state, so the event is the only carrier of the
+/// fresh address (ADR-0022 Decision 2).
 #[derive(Debug, Clone)]
 pub struct MembershipEvent {
     /// The node whose state changed.
@@ -30,6 +36,10 @@ pub struct MembershipEvent {
     pub old_state: NodeState,
     /// New state.
     pub new_state: NodeState,
+    /// The node's incarnation for this transition.
+    pub incarnation: Incarnation,
+    /// The node's address, when the emitter knows it.
+    pub address: Option<SocketAddr>,
 }
 
 /// Cluster membership tracker with SWIM failure detection and gossip.

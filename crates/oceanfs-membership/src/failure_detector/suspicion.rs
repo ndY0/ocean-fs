@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use oceanfs_core::{Incarnation, NodeId, NodeState};
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 
 use super::FailureDetector;
 use crate::membership::MembershipEvent;
@@ -22,28 +22,32 @@ pub(crate) fn mark_suspect(detector: &mut FailureDetector, node_id: &NodeId) {
         return;
     }
 
-    let now = Instant::now();
-
-    // Look up the current incarnation from alive_nodes via the new
-    // incarnation_for() accessor. If the node is not found in the
-    // alive list, fall back to Incarnation::new(1) with a WARN log.
-    let incarnation = detector.incarnation_for(node_id).unwrap_or_else(|| {
-        tracing::warn!(
+    // F1a: only a node that was known-Alive can be suspected. A node
+    // absent from alive_nodes is either a brand-new joiner whose
+    // AddNode has not been applied yet (t5 join-time false Suspect),
+    // or a node already removed as Dead — neither may create a
+    // suspicion timer, because the timer's incarnation feeds the
+    // Suspect→Dead event and a fabricated default would let stale
+    // gossip revive the node (t24 oscillation).
+    let Some(incarnation) = detector.incarnation_for(node_id) else {
+        trace!(
             node_id = %node_id,
-            "mark_suspect: node not found in alive_nodes, using default incarnation"
+            "mark_suspect: node not in alive_nodes — skipping suspicion"
         );
-        Incarnation::new(1)
-    });
+        return;
+    };
 
-    detector.suspicion_timers.insert(node_id.clone(), (incarnation, now));
+    detector.suspicion_timers.insert(node_id.clone(), (incarnation, Instant::now()));
 
     let _ = detector.event_tx.send(MembershipEvent {
         node_id: node_id.clone(),
         old_state: NodeState::Alive,
         new_state: NodeState::Suspect,
+        incarnation,
+        address: None,
     });
 
-    info!(node_id = %node_id, "node marked SUSPECT");
+    info!(node_id = %node_id, incarnation = incarnation.value(), "node marked SUSPECT");
 }
 
 /// Checks all suspicion timers and transitions expired ones to DEAD.
@@ -59,12 +63,30 @@ pub(crate) fn check_suspicion_timers(detector: &mut FailureDetector) {
     }
 
     for node_id in expired {
-        detector.suspicion_timers.remove(&node_id);
+        let timer = detector.suspicion_timers.remove(&node_id);
+
+        // F1c: a Dead node must leave the probe set immediately — the
+        // membership manager also sends RemoveNode, but the detector
+        // is the authority on its own structures and must not keep
+        // probing the removed node between sync ticks.
+        detector.alive_nodes.retain(|(id, _, _, _)| id != &node_id);
+        detector.pending_pings.remove(&node_id);
+        detector.pending_indirect.remove(&node_id);
+
+        let incarnation =
+            timer.map(|(incarnation, _)| incarnation).unwrap_or_else(|| Incarnation::new(1));
+
         let _ = detector.event_tx.send(MembershipEvent {
             node_id: node_id.clone(),
             old_state: NodeState::Suspect,
             new_state: NodeState::Dead,
+            incarnation,
+            address: None,
         });
-        warn!(node_id = %node_id, "node declared DEAD (suspicion timeout)");
+        warn!(
+            node_id = %node_id,
+            incarnation = incarnation.value(),
+            "node declared DEAD (suspicion timeout)"
+        );
     }
 }

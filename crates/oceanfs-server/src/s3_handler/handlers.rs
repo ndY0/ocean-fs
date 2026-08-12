@@ -15,7 +15,7 @@ use axum::{
 use bytes::Bytes;
 use oceanfs_core::{BucketId, HashKey, HashOutput, ObjectKey, ObjectMetadata};
 use oceanfs_routing::hash_key;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::{header_val, infer_content_type, s3_error_response, AppState};
 use crate::{
@@ -444,8 +444,12 @@ pub(crate) async fn head_object(
 
 /// DELETE /{bucket}/{key} — soft-delete an object.
 ///
-/// Writes a tombstone via [`MetadataOps::delete_object`].
-/// Returns `204 No Content` on success.
+/// Writes a tombstone via [`MetadataOps::delete_object`], replicates the
+/// deletion to the remote replicas, and returns `204 No Content` when the
+/// confirmed deletions (local + remote) meet the bucket's `write_quorum`.
+/// Returns `503 Service Unavailable` when the quorum is not met — a
+/// DELETE is no longer reported as successful when replicas never saw
+/// it (F3b).
 ///
 /// Invalidates L1 and L2 caches for the deleted key.
 /// Inserts the key into the L3 negative cache.
@@ -463,9 +467,38 @@ pub(crate) async fn delete_object(
 
     match state.metadata.delete_object(&bucket_id, &object_key) {
         Ok(()) => {
-            // Replicate deletion to other replicas in the ring.
+            // Replicate deletion to other replicas in the ring. The local
+            // tombstone counts as one confirmed deletion; `write.delete`
+            // returns the number of remote confirmations.
             let hk = HashKey::from_bytes(hash_key(object_key.as_str().as_bytes()));
-            let _ = state.write.delete(&bucket_id, &object_key, &hk).await;
+            let remote_deleted = match state.write.delete(&bucket_id, &object_key, &hk).await {
+                Ok(count) => count,
+                Err(e) => {
+                    warn!(error = %e, key = %key, "delete replication failed");
+                    return s3_error_response(&e, &bucket, &key);
+                }
+            };
+
+            // Quorum check: local (1) + confirmed remote deletions. The
+            // required quorum is capped at the replica count — a
+            // single-node cluster cannot confirm more than one deletion
+            // (mirrors the write path's capping).
+            let write_quorum =
+                state.buckets.get(&bucket).map(|p| p.consistency.write_quorum).unwrap_or(1);
+            let required_quorum =
+                (write_quorum as usize).min(state.write.replica_count(&hk)).max(1);
+            let confirmed = 1 + remote_deleted;
+            if confirmed < required_quorum {
+                let err =
+                    Error::QuorumNotMet { required: required_quorum as u8, received: confirmed };
+                warn!(
+                    key = %key,
+                    required = required_quorum,
+                    received = confirmed,
+                    "DELETE quorum not met"
+                );
+                return s3_error_response(&err, &bucket, &key);
+            }
 
             // Invalidate caches for this key — locally and on replicas.
             if let Some(ref l1) = state.object_cache {
@@ -475,13 +508,16 @@ pub(crate) async fn delete_object(
                 l2.invalidate(&bucket_id, &object_key);
             }
             state.write.invalidate_cache_on_replicas(&bucket_id, &object_key, &hk).await;
-            state.write.invalidate_cache_on_replicas(&bucket_id, &object_key, &hk).await;
             // Add to negative cache so subsequent HEAD/GET skip RocksDB.
             if let Some(ref l3) = state.negative_cache {
                 l3.insert(&bucket_id, &object_key);
             }
 
-            info!(key = %key, "DELETE object success");
+            info!(
+                key = %key,
+                remote_deleted,
+                "DELETE object success"
+            );
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {

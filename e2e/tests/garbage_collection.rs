@@ -21,10 +21,13 @@ async fn garbage_collection_compacts_deleted_objects() {
     let bucket = "gc-test";
     node.put(&format!("/{bucket}"), &[]).await.expect("create bucket");
 
-    // PUT several objects (each creates its own segment).
+    // PUT several objects with bodies ABOVE the 4 KB inline threshold
+    // (ADR-0001 four-tier storage): inline objects are stored in metadata
+    // with empty chunk lists and create no segment, so bodies must be
+    // > 4 KB for each PUT to create a real segment. 8 KB does that.
     for i in 1..=3 {
         let key = format!("obj-{i}.txt");
-        let body = format!("gc test object {i}").into_bytes();
+        let body = vec![b'a' + i as u8; 8 * 1024];
         let resp = node.put(&format!("/{bucket}/{key}"), &body).await.expect("PUT");
         assert_eq!(resp.status(), 200, "PUT obj-{i} should return 200");
     }

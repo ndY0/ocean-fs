@@ -145,18 +145,18 @@ async fn write_coordinator_handoff_on_replica_failure() {
         GossipConfig::default(),
         ring_cache.clone(),
     ));
-    membership.upsert_node(NodeId::new("n1"), NodeState::Alive, Incarnation::new(1), addr);
+    membership.upsert_node(NodeId::new("n1"), NodeState::Alive, Incarnation::new(1), Some(addr));
     membership.upsert_node(
         NodeId::new("n2"),
         NodeState::Alive,
         Incarnation::new(1),
-        "127.0.0.1:9101".parse().unwrap(),
+        Some("127.0.0.1:9101".parse().unwrap()),
     );
     membership.upsert_node(
         NodeId::new("n3"),
         NodeState::Alive,
         Incarnation::new(1),
-        "127.0.0.1:9102".parse().unwrap(),
+        Some("127.0.0.1:9102".parse().unwrap()),
     );
 
     let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));

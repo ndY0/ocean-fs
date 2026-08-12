@@ -71,4 +71,16 @@ impl Membership {
     pub fn ring(&self) -> &Arc<oceanfs_routing::RingCache> {
         &self.ring
     }
+
+    /// Returns the gossip protocol command sender, if the background
+    /// gossip task has been started.
+    ///
+    /// Used by the gossip gRPC service to route peer pushes through the
+    /// protocol's guarded `merge_delta` instead of bypassing it with a
+    /// direct `upsert_node` (F1d).
+    pub(crate) fn gossip_command_sender(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Sender<crate::gossip::GossipCommand>> {
+        self.gossip_tx.read().clone()
+    }
 }

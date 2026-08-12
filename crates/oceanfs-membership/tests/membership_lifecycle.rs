@@ -47,7 +47,7 @@ fn subscribe_receives_state_change_events() {
         NodeId::new("remote-node"),
         NodeState::Alive,
         Incarnation::new(1),
-        "127.0.0.1:9002".parse().unwrap(),
+        Some("127.0.0.1:9002".parse().unwrap()),
     );
 
     // The upsert of a new node emits an event (old_state=Alive → new_state=Alive).
@@ -69,7 +69,7 @@ fn state_transition_emits_event_with_correct_old_and_new_state() {
         NodeId::new("target"),
         NodeState::Alive,
         Incarnation::new(1),
-        "127.0.0.1:9003".parse().unwrap(),
+        Some("127.0.0.1:9003".parse().unwrap()),
     );
     // Drain the initial add event.
     let _ = rx.try_recv();
@@ -79,7 +79,7 @@ fn state_transition_emits_event_with_correct_old_and_new_state() {
         NodeId::new("target"),
         NodeState::Suspect,
         Incarnation::new(1),
-        "127.0.0.1:9003".parse().unwrap(),
+        Some("127.0.0.1:9003".parse().unwrap()),
     );
     let event = rx.try_recv().expect("should receive SUSPECT event");
     assert_eq!(event.old_state, NodeState::Alive);
@@ -96,13 +96,13 @@ fn nodes_returns_all_known_nodes() {
         NodeId::new("a"),
         NodeState::Alive,
         Incarnation::new(1),
-        "127.0.0.1:9010".parse().unwrap(),
+        Some("127.0.0.1:9010".parse().unwrap()),
     );
     membership.upsert_node(
         NodeId::new("b"),
         NodeState::Suspect,
         Incarnation::new(1),
-        "127.0.0.1:9011".parse().unwrap(),
+        Some("127.0.0.1:9011".parse().unwrap()),
     );
 
     let nodes = membership.nodes();
@@ -121,7 +121,7 @@ fn state_of_returns_correct_state_for_known_node() {
         NodeId::new("known"),
         NodeState::Suspect,
         Incarnation::new(1),
-        "127.0.0.1:9020".parse().unwrap(),
+        Some("127.0.0.1:9020".parse().unwrap()),
     );
 
     assert_eq!(membership.state_of(&NodeId::new("known")), Some(NodeState::Suspect));
@@ -143,7 +143,7 @@ fn join_without_seed_nodes_adds_self_to_ring() {
             ring_cache.clone(),
         );
 
-        membership.join().await.expect("join should succeed");
+        membership.join(Incarnation::new(1), &[]).await.expect("join should succeed");
 
         // After join, the ring should include the joiner.
         let snap = ring_cache.snapshot();
@@ -239,7 +239,10 @@ fn seed_learns_joiner_on_join_via_push_after_pull() {
         joiner_membership.set_pool(pool);
 
         // ---- Join ----
-        joiner_membership.join().await.expect("joiner should join successfully");
+        joiner_membership
+            .join(Incarnation::new(1), &[])
+            .await
+            .expect("joiner should join successfully");
 
         // ---- Assertions ----
         // The joiner's ring should contain itself.
@@ -260,6 +263,90 @@ fn seed_learns_joiner_on_join_via_push_after_pull() {
         assert!(
             seed_snap.nodes().contains(&NodeId::new("seed-node")),
             "seed's ring should contain the seed"
+        );
+    });
+}
+
+/// ADR-0022 Decision 3 (t43): a node with NO configured seed nodes
+/// rejoins the cluster by contacting persisted fallback seeds
+/// (last-known member addresses).
+#[test]
+fn seedless_node_rejoins_via_fallback_seeds() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // ---- Seed setup (an existing cluster member) ----
+        let mut seed_ring = Ring::new(RingConfig::default());
+        seed_ring.add_node(NodeId::new("seed-node"));
+        let seed_ring_cache = Arc::new(RingCache::new(seed_ring));
+        let seed_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        let seed_membership = Arc::new(Membership::new(
+            NodeId::new("seed-node"),
+            seed_addr,
+            GossipConfig::default(),
+            seed_ring_cache.clone(),
+        ));
+        // The seed is an existing cluster member: join as first node so
+        // its membership state (served by pull) contains itself.
+        seed_membership
+            .join(Incarnation::new(1), &[])
+            .await
+            .expect("seed should join as first node");
+
+        // Start a gRPC server for the seed's gossip service.
+        let seed_grpc = seed_membership.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind seed gRPC");
+        let seed_listen_addr = listener.local_addr().expect("seed listen addr");
+
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(GossipRpcServer::new(GossipGrpcService::new(seed_grpc)))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .expect("seed server failed");
+        });
+
+        // Give the server a moment to start.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // ---- Restarted bootstrap node: NO configured seeds ----
+        let mut joiner_ring = Ring::new(RingConfig::default());
+        joiner_ring.add_node(NodeId::new("bootstrap-node"));
+        let joiner_ring_cache = Arc::new(RingCache::new(joiner_ring));
+        let joiner_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+
+        let joiner_config = GossipConfig { seed_nodes: vec![], ..GossipConfig::default() };
+        let joiner_membership = Arc::new(Membership::new(
+            NodeId::new("bootstrap-node"),
+            joiner_addr,
+            joiner_config,
+            joiner_ring_cache.clone(),
+        ));
+
+        let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
+        joiner_membership.set_pool(pool);
+
+        // The persisted fallback seeds point at the seed node.
+        let fallback_seeds = vec![seed_listen_addr.to_string()];
+
+        // Join with a bumped incarnation (persisted + 1 semantics).
+        joiner_membership
+            .join(Incarnation::new(3), &fallback_seeds)
+            .await
+            .expect("fallback-seed rejoin should succeed");
+
+        // The joiner learned the seed's membership (seed present in state).
+        let joiner_nodes = joiner_membership.nodes();
+        assert!(
+            joiner_nodes.iter().any(|(id, _)| id.as_str() == "seed-node"),
+            "joiner should have learned the seed node from the fallback pull"
+        );
+
+        // The seed learned the joiner via the self-announcement push.
+        let seed_snap = seed_ring_cache.snapshot();
+        assert!(
+            seed_snap.nodes().contains(&NodeId::new("bootstrap-node")),
+            "seed's ring should contain the rejoin after push"
         );
     });
 }

@@ -51,8 +51,12 @@ impl GossipRpc for GossipGrpcService {
     /// Handles a client-streaming gossip push.
     ///
     /// Each `GossipMessage` in the stream may contain a membership
-    /// delta with one or more entries. Each entry is merged into the
-    /// local membership state via `Membership::upsert_node`.
+    /// delta with one or more entries. Entries are routed through the
+    /// gossip protocol's guarded `merge_delta` (F1d): merging them
+    /// directly via `upsert_node` would bypass the incarnation and
+    /// terminality guards and let a peer's stale view clobber the local
+    /// Suspect/Dead state (t24 oscillation). When the protocol task is
+    /// not running (tests), the direct upsert fallback is used.
     ///
     /// Returns `GossipAck { accepted: true, updated_entries: N }`.
     async fn push(
@@ -68,6 +72,7 @@ impl GossipRpc for GossipGrpcService {
             .map_err(|e| Status::internal(format!("gossip push stream error: {e}")))?
         {
             if let Some(delta) = msg.delta {
+                let mut changed = Vec::with_capacity(delta.entries.len());
                 for entry in &delta.entries {
                     let node_id = entry
                         .node_id
@@ -92,8 +97,31 @@ impl GossipRpc for GossipGrpcService {
                         .parse::<SocketAddr>()
                         .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 9001)));
 
-                    self.membership.upsert_node(node_id, state, incarnation, address);
+                    changed.push(crate::membership::state::NodeEntry {
+                        node_id,
+                        incarnation,
+                        state,
+                        address,
+                    });
                     entry_count += 1;
+                }
+
+                // Route through the guarded merge when the protocol is
+                // running; fall back to direct upserts otherwise.
+                if let Some(tx) = self.membership.gossip_command_sender() {
+                    let _ = tx.try_send(crate::gossip::GossipCommand::ReceiveDelta {
+                        from: NodeId::new("gossip-push"),
+                        delta: crate::membership::state::GossipDelta { changed },
+                    });
+                } else {
+                    for entry in changed {
+                        self.membership.upsert_node(
+                            entry.node_id,
+                            entry.state,
+                            entry.incarnation,
+                            Some(entry.address),
+                        );
+                    }
                 }
             }
         }
@@ -275,7 +303,7 @@ mod tests {
             NodeId::new("node-b"),
             NodeState::Alive,
             Incarnation::new(5),
-            "127.0.0.1:9002".parse().unwrap(),
+            Some("127.0.0.1:9002".parse().unwrap()),
         );
 
         let mut client = test_server(membership).await;
@@ -313,7 +341,7 @@ mod tests {
             NodeId::new("node-b"),
             NodeState::Alive,
             Incarnation::new(1),
-            "127.0.0.1:9002".parse().unwrap(),
+            Some("127.0.0.1:9002".parse().unwrap()),
         );
 
         let mut client = test_server(membership).await;

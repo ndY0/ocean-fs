@@ -125,6 +125,25 @@ pub trait MetadataStore: Send + Sync {
     /// Returns an I/O error if the deletion fails.
     fn delete_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<()>;
 
+    /// Checks whether a deletion tombstone exists for the given key.
+    ///
+    /// Used by the gRPC segment service to reject read-repair pushes that
+    /// would resurrect a deleted object: a tombstoned key is authoritative
+    /// and may only be overwritten by a genuine new write (which clears the
+    /// tombstone via `put_object`).
+    ///
+    /// Implementors with real tombstone storage MUST override this; the
+    /// default exists so that in-memory test doubles can stay minimal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the lookup fails.
+    fn has_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<bool> {
+        // In-memory doubles without tombstone tracking default to "no
+        // tombstone" — a test store that needs the gate must override.
+        Ok(self.list_tombstones(bucket).into_iter().filter_map(|r| r.ok()).any(|(k, _)| &k == key))
+    }
+
     /// Stores (or updates) segment metadata.
     ///
     /// Used by heal worker to update metadata after repairing a segment.
