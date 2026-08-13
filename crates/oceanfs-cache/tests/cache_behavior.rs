@@ -172,6 +172,7 @@ fn l3_negative_cache_filters_nonexistent() {
         size_bytes: 1024,
         fp_rate: 0.01,
         rebuild_interval_sec: 3600,
+        ..Default::default()
     });
     let bucket = BucketId::new("archive");
     let existing = ObjectKey::new("exists.txt");
@@ -224,6 +225,7 @@ fn negative_cache_rebuild_from_store() {
         size_bytes: 1024 * 1024,
         fp_rate: 0.0001,
         rebuild_interval_sec: 3600,
+        ..Default::default()
     });
 
     // Before rebuild, a key is definitely absent.

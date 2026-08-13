@@ -167,10 +167,13 @@ impl StreamingEcSegment {
                         dst.copy_from_slice(src);
                     }
                     // Signal that this stripe's encode has completed.
-                    // `parity_shards()` uses this to know which slots are
-                    // safe to read. fetch_max ensures monotonic progress
-                    // even if rayon workers complete out of order.
-                    completed.fetch_max(stripe_idx + 1, Ordering::Release);
+                    // `parity_shards()` uses this to know how many slots
+                    // are safe to read. A plain count (not an index max)
+                    // keeps the prefix property: the reader only proceeds
+                    // when EVERY dispatched stripe has finished, so
+                    // out-of-order rayon completion can never expose a
+                    // not-yet-written (zeroed) slot.
+                    completed.fetch_add(1, Ordering::Release);
                     // Mutex guard is dropped here — the Release above
                     // pairs with the Acquire in parity_shards().
                 }
@@ -232,7 +235,8 @@ impl StreamingEcSegment {
     pub fn parity_shards(&self) -> Option<Vec<Bytes>> {
         // Spin-wait for all dispatched stripes to complete encoding.
         // `dispatched` is set by `append()` before the seal is triggered;
-        // we wait here until every rayon worker has finished.
+        // `completed` counts finished encodes, so the wait only ends when
+        // every stripe's parity has been written into its slot.
         let dispatched = self.dispatched;
         while self.completed.load(Ordering::Acquire) < dispatched {
             std::hint::spin_loop();

@@ -158,6 +158,7 @@ fn l3_negative_cache_insert_and_query() {
         size_bytes: 64 * 1024,
         fp_rate: 0.01,
         rebuild_interval_sec: 3600,
+        ..Default::default()
     });
 
     let bucket = make_bucket();
@@ -166,22 +167,23 @@ fn l3_negative_cache_insert_and_query() {
     // Insert the key into the filter (should not panic).
     cache.insert(&bucket, &key);
 
-    // After insertion, contains may return true or false depending
-    // on implementation details. Verify it doesn't panic.
-    let _ = cache.contains(&bucket, &key);
+    // A key in the negative set is reported as definitely absent.
+    assert!(cache.contains(&bucket, &key));
 }
 
 #[test]
-fn l3_negative_cache_disabled_always_returns_true() {
+fn l3_negative_cache_disabled_never_reports_absent() {
     let cache = NegativeCache::new(NegativeCacheConfig {
         enabled: false,
         size_bytes: 64 * 1024,
         fp_rate: 0.01,
         rebuild_interval_sec: 3600,
+        ..Default::default()
     });
 
-    // When disabled, always returns true ("maybe present").
-    assert!(cache.contains(&make_bucket(), &make_key("anything")));
+    // When disabled, the cache must never claim a key is absent —
+    // callers fall through to the real metadata store.
+    assert!(!cache.contains(&make_bucket(), &make_key("anything")));
 }
 
 #[test]

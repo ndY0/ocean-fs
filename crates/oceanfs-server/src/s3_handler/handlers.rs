@@ -137,6 +137,13 @@ pub(crate) async fn put_object(
             if let Some(ref l2) = state.metadata_cache {
                 l2.invalidate(&bucket_id, &object_key);
             }
+            // Clear the L3 negative-cache entry: the Bloom filter cannot
+            // remove individual entries, so a key deleted earlier would
+            // otherwise keep answering "definitely absent" and serve
+            // stale 404s for the freshly written object.
+            if let Some(ref l3) = state.negative_cache {
+                l3.invalidate(&bucket_id, &object_key);
+            }
             state.write.invalidate_cache_on_replicas(&bucket_id, &object_key, &hk).await;
 
             // Register segment metadata for each unique segment so

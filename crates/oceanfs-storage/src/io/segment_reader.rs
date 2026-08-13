@@ -255,10 +255,29 @@ impl SegmentReader for DiskSegmentReader {
                 let len = length as usize;
                 let mut buf = crate::io::DirectIoBuf::new(len)
                     .map_err(|e| format!("DirectIoBuf allocation failed for {segment_id}: {e}"))?;
-                self.disk_io
-                    .read(&path, buf.as_bytes_mut(), file_offset)
-                    .await
-                    .map_err(|e| format!("Direct read failed for {segment_id}: {e}"))?;
+                // `DiskIo::read` performs a single read syscall per call.
+                // `tokio::fs::File` caps a single read at 2 MiB, so a
+                // larger request returns short — loop until the buffer
+                // is full (read-path-integrity-under-load: the ignored
+                // short read previously zero-padded every >2 MiB chunk,
+                // producing BadDigest on every multi-tier read).
+                let mut filled: usize = 0;
+                while filled < len {
+                    let n = self
+                        .disk_io
+                        .read(&path, &mut buf.as_bytes_mut()[filled..], file_offset + filled as u64)
+                        .await
+                        .map_err(|e| format!("Direct read failed for {segment_id}: {e}"))?;
+                    if n == 0 {
+                        break;
+                    }
+                    filled += n;
+                }
+                if filled < len {
+                    return Err(format!(
+                        "Direct read short for {segment_id}: got {filled} of {len} bytes"
+                    ));
+                }
                 let data = Bytes::copy_from_slice(&buf.as_bytes()[..len]);
                 let source = SegmentReadSource::DirectIo {
                     segment_id: *segment_id,
@@ -623,6 +642,33 @@ mod tests {
             assert_eq!(data.len(), 8192);
             assert!(data.iter().all(|&b| b == 0xCD));
         }
+    }
+
+    #[tokio::test]
+    async fn disk_reader_direct_reads_larger_than_2mib() {
+        // tokio::fs::File caps a single read syscall at 2 MiB — a chunk
+        // read larger than that must still return complete, correct data.
+        // Regression test for read-path-integrity-under-load (the Direct
+        // arm previously ignored the short-read count and zero-padded
+        // every read beyond 2 MiB, producing BadDigest on multi-tier GETs).
+        let dir = tempfile::tempdir().unwrap();
+        let id = SegmentId::new();
+        let path = dir.path().join(format!("{id}.dat"));
+        let payload: Vec<u8> = (0..3_200_000u32).map(|i| (i % 251) as u8).collect();
+        let mut file_data = vec![0u8; SEGMENT_HEADER_SIZE];
+        file_data.extend_from_slice(&payload);
+        std::fs::write(&path, &file_data).unwrap();
+
+        let reader = DiskSegmentReader::new(
+            IoReadMode::Direct,
+            Arc::new(DiskIo::TokioFs),
+            None,
+            dir.path().to_path_buf(),
+        );
+
+        let data = reader.read_chunk(&id, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(data.len(), payload.len());
+        assert_eq!(&data[..], &payload[..], "Direct-mode read must not zero-pad past 2 MiB");
     }
 
     // --- PoolFallbackReader tests ---

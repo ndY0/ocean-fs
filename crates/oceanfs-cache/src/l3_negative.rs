@@ -26,6 +26,12 @@ pub struct NegativeCacheConfig {
     pub fp_rate: f64,
     /// Interval between automatic rebuilds in seconds (0 = no auto-rebuild).
     pub rebuild_interval_sec: u64,
+    /// Maximum number of recently re-written keys tracked per bucket in
+    /// the invalidation overlay (0 = unlimited). The Bloom filter cannot
+    /// remove individual entries, so keys re-written after a DELETE are
+    /// tracked separately; when the overlay exceeds this bound, both the
+    /// overlay and the bucket's filter are conservatively cleared.
+    pub max_recent_writes: usize,
 }
 
 impl Default for NegativeCacheConfig {
@@ -35,6 +41,7 @@ impl Default for NegativeCacheConfig {
             size_bytes: 64 * 1024 * 1024,
             fp_rate: 0.0001,
             rebuild_interval_sec: 3600,
+            max_recent_writes: 100_000,
         }
     }
 }
@@ -138,6 +145,10 @@ impl BucketNegativeCache {
 pub struct NegativeCache {
     config: NegativeCacheConfig,
     buckets: DashMap<BucketId, Arc<BucketNegativeCache>>,
+    /// Keys re-written after a deletion. The Bloom filter cannot remove
+    /// individual entries, so `invalidate` records the key here; `contains`
+    /// consults this overlay before trusting a "definitely absent" answer.
+    recent_writes: DashMap<BucketId, dashmap::DashSet<ObjectKey>>,
     stats: NegativeCacheStats,
 }
 
@@ -147,6 +158,7 @@ impl NegativeCache {
         Self {
             config,
             buckets: DashMap::new(),
+            recent_writes: DashMap::new(),
             stats: NegativeCacheStats {
                 hits: Counter::new(
                     "cache_hits_total".into(),
@@ -172,12 +184,23 @@ impl NegativeCache {
         }
     }
 
-    /// Returns `true` if the key MAY exist (possible false positive).
-    /// Returns `false` if the key DEFINITELY does not exist.
+    /// Returns `true` if the key is known to be absent (in the negative
+    /// set), `false` otherwise.
+    ///
+    /// The handler treats `true` as "definitely absent" and skips the
+    /// metadata lookup. Keys invalidated after a re-write always return
+    /// `false` so a freshly written object is never served a stale 404.
     pub fn contains(&self, bucket: &BucketId, key: &ObjectKey) -> bool {
         if !self.config.enabled {
             // When disabled, always say "maybe" to force a real lookup.
-            return true;
+            return false;
+        }
+
+        // Re-written keys override the Bloom filter.
+        if let Some(recent) = self.recent_writes.get(bucket) {
+            if recent.contains(key) {
+                return false;
+            }
         }
 
         // Get or create the bucket filter (empty filter = all keys definitely absent).
@@ -188,14 +211,14 @@ impl NegativeCache {
             .clone();
 
         let result = bucket_cache.filter.read().contains(bucket, key);
-        if !result {
-            // Definitely absent — record as a hit for the negative cache.
+        if result {
+            // In the negative set — a real cache hit.
             self.stats.hits.inc();
         }
         result
     }
 
-    /// Inserts a key into the filter.
+    /// Inserts a key into the negative set.
     pub fn insert(&self, bucket: &BucketId, key: &ObjectKey) {
         if !self.config.enabled {
             return;
@@ -209,6 +232,36 @@ impl NegativeCache {
 
         bucket_cache.filter.write().insert(bucket, key);
         self.stats.entry_count.inc();
+    }
+
+    /// Removes a key from the negative set after a successful write.
+    ///
+    /// Bloom filters cannot remove individual entries, so this records
+    /// the key in a bounded overlay consulted by [`contains`](Self::contains).
+    /// When the overlay exceeds `max_recent_writes`, both the overlay and
+    /// the bucket's filter are cleared — a conservative reset that costs
+    /// a few extra metadata lookups but can never serve a stale 404.
+    pub fn invalidate(&self, bucket: &BucketId, key: &ObjectKey) {
+        if !self.config.enabled {
+            return;
+        }
+
+        // NOTE: no `.clone()` here — DashSet's Clone is a deep copy,
+        // which would divert the insert into a private copy instead of
+        // the map's entry.
+        let recent = self.recent_writes.entry(bucket.clone()).or_default();
+        recent.insert(key.clone());
+
+        if self.config.max_recent_writes > 0 && recent.len() > self.config.max_recent_writes {
+            // Bound the overlay: conservatively clear it and reset the
+            // bucket's filter so no stale "definitely absent" answer can
+            // be served for any key in this bucket.
+            recent.clear();
+            if let Some(entry) = self.buckets.get(bucket) {
+                let mut filter = entry.value().filter.write();
+                *filter = BloomFilter::new(self.config.size_bytes, self.config.fp_rate);
+            }
+        }
     }
 
     /// Rebuilds the bucket's Bloom filter from the metadata store.
@@ -296,6 +349,7 @@ mod tests {
             size_bytes: 1024,
             fp_rate: 0.01,
             rebuild_interval_sec: 3600,
+            ..Default::default()
         });
         assert!(!cache.contains(&BucketId::new("b"), &ObjectKey::new("k")));
     }
@@ -307,6 +361,7 @@ mod tests {
             size_bytes: 1024,
             fp_rate: 0.01,
             rebuild_interval_sec: 3600,
+            ..Default::default()
         });
         cache.insert(&BucketId::new("b"), &ObjectKey::new("k"));
         assert!(cache.contains(&BucketId::new("b"), &ObjectKey::new("k")));
@@ -319,6 +374,7 @@ mod tests {
             size_bytes: 1024,
             fp_rate: 0.01,
             rebuild_interval_sec: 3600,
+            ..Default::default()
         });
         cache.insert(&BucketId::new("b"), &ObjectKey::new("k1"));
         assert!(!cache.contains(&BucketId::new("b"), &ObjectKey::new("k2")));
@@ -331,6 +387,7 @@ mod tests {
             size_bytes: 1024,
             fp_rate: 0.01,
             rebuild_interval_sec: 3600,
+            ..Default::default()
         });
         cache.insert(&BucketId::new("b1"), &ObjectKey::new("k"));
         assert!(cache.contains(&BucketId::new("b1"), &ObjectKey::new("k")));
@@ -344,8 +401,12 @@ mod tests {
             size_bytes: 1024,
             fp_rate: 0.01,
             rebuild_interval_sec: 3600,
+            ..Default::default()
         });
-        cache.contains(&BucketId::new("b"), &ObjectKey::new("nope"));
+        // A key in the negative set is a cache hit: the answer
+        // "definitely absent" skips the metadata lookup.
+        cache.insert(&BucketId::new("b"), &ObjectKey::new("nope"));
+        assert!(cache.contains(&BucketId::new("b"), &ObjectKey::new("nope")));
         assert_eq!(cache.stats().hits.get(), 1);
     }
 
@@ -358,11 +419,55 @@ mod tests {
     }
 
     #[test]
-    fn disabled_cache_always_returns_true() {
+    fn disabled_cache_returns_false_to_force_real_lookup() {
         let cache =
             NegativeCache::new(NegativeCacheConfig { enabled: false, ..Default::default() });
-        // When disabled, always say "maybe" to force a real lookup.
-        assert!(cache.contains(&BucketId::new("b"), &ObjectKey::new("nonexistent")));
+        // When disabled, the cache must never claim a key is absent —
+        // callers fall through to the real metadata store.
+        assert!(!cache.contains(&BucketId::new("b"), &ObjectKey::new("nonexistent")));
+    }
+
+    #[test]
+    fn invalidate_after_insert_returns_false() {
+        // The core read-path-integrity regression: DELETE inserts the key
+        // into the negative set; a later PUT invalidates it; the next
+        // contains() must NOT report the key as definitely absent.
+        let cache = NegativeCache::new(NegativeCacheConfig {
+            enabled: true,
+            size_bytes: 1024,
+            fp_rate: 0.01,
+            rebuild_interval_sec: 3600,
+            ..Default::default()
+        });
+        let bucket = BucketId::new("b");
+        let key = ObjectKey::new("k");
+        cache.insert(&bucket, &key);
+        assert!(cache.contains(&bucket, &key), "deleted key is in the negative set");
+        cache.invalidate(&bucket, &key);
+        assert!(!cache.contains(&bucket, &key), "re-written key must not be reported absent");
+        // Other keys are unaffected.
+        assert!(!cache.contains(&bucket, &ObjectKey::new("other")));
+    }
+
+    #[test]
+    fn invalidate_overflow_clears_filter_conservatively() {
+        let cache = NegativeCache::new(NegativeCacheConfig {
+            enabled: true,
+            size_bytes: 1024,
+            fp_rate: 0.01,
+            rebuild_interval_sec: 3600,
+            max_recent_writes: 2,
+        });
+        let bucket = BucketId::new("b");
+        cache.insert(&bucket, &ObjectKey::new("deleted-1"));
+        cache.insert(&bucket, &ObjectKey::new("deleted-2"));
+        // Three invalidations exceed the bound → overlay + filter cleared.
+        for i in 0..3 {
+            cache.invalidate(&bucket, &ObjectKey::new(format!("rewritten-{i}")));
+        }
+        // Conservative reset: nothing is reported absent anymore.
+        assert!(!cache.contains(&bucket, &ObjectKey::new("deleted-1")));
+        assert!(!cache.contains(&bucket, &ObjectKey::new("rewritten-0")));
     }
 
     #[test]
@@ -374,6 +479,7 @@ mod tests {
             size_bytes: 1024 * 1024, // 1 MB
             fp_rate: 0.01,           // 1% target
             rebuild_interval_sec: 3600,
+            ..Default::default()
         });
 
         // Insert 1000 keys.
@@ -397,9 +503,8 @@ mod tests {
         assert!(fp_rate < 0.10, "false-positive rate {:.4} exceeds 10% threshold", fp_rate);
     }
 
-    /// T3.5: Negative cache with `enabled = false` always returns true
-    /// (bypasses the filter — callers treat this as "not in cache",
-    ///  which means they check the real store).
+    /// T3.5: Negative cache with `enabled = false` never reports a key
+    /// as absent — callers fall through to the real metadata store.
     #[test]
     fn test_negative_cache_disabled_bypassed() {
         let config = NegativeCacheConfig { enabled: false, ..Default::default() };
@@ -407,8 +512,8 @@ mod tests {
         let bucket = BucketId::new("b");
         let key = ObjectKey::new("k");
         cache.insert(&bucket, &key);
-        // When disabled, contains() returns true so callers fall through
-        // to the real metadata store.
-        assert!(cache.contains(&bucket, &key));
+        // When disabled, contains() returns false so callers fall through
+        // to the real metadata store instead of serving a stale 404.
+        assert!(!cache.contains(&bucket, &key));
     }
 }

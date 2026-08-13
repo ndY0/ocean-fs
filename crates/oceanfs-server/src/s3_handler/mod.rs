@@ -819,6 +819,7 @@ mod tests {
             size_bytes: 64 * 1024,
             fp_rate: 0.01,
             rebuild_interval_sec: 3600,
+            ..Default::default()
         }));
 
         AppState {
