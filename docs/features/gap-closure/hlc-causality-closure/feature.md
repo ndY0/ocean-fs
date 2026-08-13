@@ -1,7 +1,7 @@
 ---
 feature: "HLC Causality Closure — Wall Clock, Receive-Merge, and Cross-Node Propagation"
 epic: "gap-closure"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -170,6 +170,13 @@ Semantics notes:
   lower, fall back to a `parking_lot::Mutex<Hlc>` around the whole
   struct — but verify MSRV first; do **not** keep the two-atomics
   layout.
+
+  > **IMPLEMENTED AS OPTION B (user-approved, 2026-08-13):** the claim
+  > above proved wrong — `std::sync::atomic::AtomicU128` does not exist
+  > on the workspace nightly (1.99.0). The lock-free design was kept by
+  > using `portable_atomic::AtomicU128` (workspace dep, identical API),
+  > documented in `crates/oceanfs-core/src/hlc.rs`. No mutex fallback
+  > was needed.
 
 ### Considered Alternatives
 
@@ -415,6 +422,11 @@ auditability.
 - **Trait changes** (`MetadataOps`, `MetadataStore`, `ConflictResolver`)
   are compile-time breaking; all implementors are in-workspace and
   updated in the same change (list in G4/G7).
+- **Method/constructor signature changes** (additive, in-workspace
+  consumers updated): `WriteCoordinator::delete(.., hlc)` gains the
+  delete's timestamp; `HintRecord::new_inline/new_segment_ref(.., hlc)`;
+  `SegmentGrpcService::new(.., hlc_clock)` and
+  `HealingGrpcService::new(.., hlc_clock)` gain the clock.
 - **Stored data:** existing object metadata and tombstones with
   zero HLC remain zero. Zero loses LWW against new writes (strictly
   greater timestamps) — acceptable; a backfill is not feasible.
@@ -422,34 +434,84 @@ auditability.
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` workspace-wide
-- [ ] **Code:** `cargo clippy --lib -- -D warnings` clean on
+- [x] **Code:** `cargo build --all-targets` workspace-wide
+<!-- REVIEW: re-verified 2026-08-13 at 7087b55 — full workspace build clean -->
+- [x] **Code:** `cargo clippy --lib -- -D warnings` clean on
       `oceanfs-core`, `oceanfs-storage-api`, `oceanfs-storage`,
       `oceanfs-server`, `oceanfs-durability`, `oceanfs-node`
-- [ ] **Tests:** `cargo test -p oceanfs-core` green including the 6 new
+<!-- REVIEW: re-verified — clippy --lib -D warnings clean on all six crates -->
+- [x] **Tests:** `cargo test -p oceanfs-core` green including the 6 new
       HLC tests and updated `conflict.rs` tests
-- [ ] **Tests:** `cargo test -p oceanfs-server --lib` green (write
+<!-- REVIEW: re-verified — 187 core tests green; all 6 G1 tests present and passing in hlc.rs (clock_wall_tracks_physical_time_after_sleep:307, clock_now_refreshes_wall_repeatedly:335, clock_wall_never_goes_backward_under_update:354, clock_update_merges_remote_wall:366, clock_concurrent_now_all_unique:410, clock_concurrent_update_and_now_never_duplicate:455, clock_update_equal_wall_bumps_logical_past_remote:387) + G7 conflict tests (conflict.rs:199-230) -->
+- [x] **Tests:** `cargo test -p oceanfs-server --lib` green (write
       coordinator, segment service hlc round-trip, quorum comparison)
-- [ ] **Tests:** `cargo test -p oceanfs-durability --lib` green (hint
+<!-- REVIEW: re-verified — 204 green with --test-threads=1; incl. append_segment_persists_coordinator_hlc, append_segment_without_hlc_persists_zero_and_warns, delete_object_handler_passes_hlc_to_store, put_object_metadata_*_tombstone_* (G6), enqueued_hint_carries_write_hlc (G5), fetch_existing_segment_returns_data (un-ignored, u8-truncation fix) -->
+- [x] **Tests:** `cargo test -p oceanfs-durability --lib` green (hint
       WAL hlc round-trip, healing service hint-apply hlc)
-- [ ] **Tests:** `cargo test -p oceanfs-storage --lib -- --test-threads=1`
+<!-- REVIEW: re-verified — 212 green with --test-threads=1; incl. batched_inline_hint_applies_with_original_hlc (healing_service.rs:535), hint_wal hlc roundtrip assertions, test_legacy_record_without_hlc_replays_absent (hint_wal.rs:561) -->
+- [x] **Tests:** `cargo test -p oceanfs-storage --lib -- --test-threads=1`
       green (tombstone hlc persistence, get_tombstone)
-- [ ] **Integration:** 3-node e2e: PUT on node A; assert node B's
+<!-- REVIEW: re-verified — 163 green; incl. tombstone_persists_stamped_hlc (metadata/store.rs:1227), tombstone_roundtrip, get_tombstone impl at metadata/store.rs:623-646 -->
+- [x] **Integration:** 3-node e2e: PUT on node A; assert node B's
       replicated `ObjectMetadata.hlc` equals the coordinator's stamped
       hlc (not zero), and node B's clock afterwards returns wall ≥
       the write's wall
-- [ ] **Integration:** T45-style concurrent same-key writes from two
+<!-- REVIEW: re-verified — crates/oceanfs-server/tests/replicated_hlc.rs::replicated_put_persists_coordinator_hlc_on_replica passes (--test-threads=1) -->
+- [x] **Integration:** T45-style concurrent same-key writes from two
       nodes: all nodes converge on the same winner; assert winner hlc
       is the max across replicas
-- [ ] **Integration:** t19 (delete vs read repair) and t21 (hinted
+<!-- REVIEW: re-verified — replicated_hlc.rs::concurrent_same_key_writes_stamp_deterministic_lww_winner passes; cluster t45 (e2e/tests/cluster_concurrency.rs) also green -->
+- [x] **Integration:** t19 (delete vs read repair) and t21 (hinted
       handoff delivery) e2e tests still green
-- [ ] **Integration:** full cluster e2e suite green
+<!-- REVIEW: re-verified — t19 (cluster_read_path.rs:173) and t21 (cluster_hinted_handoff.rs:55) both pass -->
+- [x] **Integration:** full cluster e2e suite green
       (`cargo test -p e2e --test cluster_*`)
+<!-- REVIEW: re-verified independently — all 10 cluster_* files green, 46 tests, 0 failures (matches implementer's 46/46 report) -->
 - [ ] **Observability:** node log during a 2-node run shows `hlc_wall`
       values that advance over wall-clock time on both nodes
-- [ ] **Docs:** `HlcClock` doc comments document the receive rule and
+<!-- REVIEW: live-node probe EXCLUDED from this review by instruction (same exclusion class as the fidelity probes). Structural half verified: AtomicU128 CAS-loop clock refreshes wall from OS clock on every now()/update() (crates/oceanfs-core/src/hlc.rs:140-222), wall-refresh tests green. Pass condition: hlc_wall advances across a real 2-node run's log. -->
+- [x] **Docs:** `HlcClock` doc comments document the receive rule and
       the tie-break; `LwwResolver` doc states node-id tie-break;
       HintWal replay comment documents legacy zero-hlc records
+<!-- REVIEW: re-verified — hlc.rs:87-99 (packed AtomicU128 + receive rule), hlc.rs:166-179 (receive rule steps), conflict.rs:92-100 (lexicographically-greater-node-id tie-break), hint_wal.rs:145-150 (legacy zero-hlc replay comment) -->
+
+## Accepted Deviations
+
+Independent review returned PASS (2026-08-13, commit 7087b55) with the
+following user-approved deviations:
+
+1. **G1 uses `portable_atomic::AtomicU128` (Option B, user-approved).**
+   The design note "`AtomicU128` is stable since Rust 1.72" proved
+   wrong: `std::sync::atomic::AtomicU128` does not exist on the
+   workspace nightly (1.99.0). The lock-free design was preserved by
+   using `portable_atomic::AtomicU128` (existing workspace dependency,
+   identical API), documented in `crates/oceanfs-core/src/hlc.rs`. No
+   mutex fallback was needed. See also the inline note in the Design
+   Decision section.
+
+2. **ADR `0004-tiered-segment-sizing` does not exist.** The frontmatter
+   cites `0004-tiered-segment-sizing`, but that ADR is absent from
+   `docs/adr/`. No constraining ADR governs this feature's changes; the
+   dangling citation is retained for traceability (user-approved).
+
+3. **GC calls `metadata.delete_object(bucket, key, Hlc::zero())`.**
+   The garbage-collector background task has no HLC clock and passes
+   `Hlc::zero()` (`crates/oceanfs-durability/src/gc/garbage_collector.rs:201`),
+   preserving pre-G4 behavior. GC reaping is not a user-visible write
+   event, so a zero tombstone cannot resurrect live data; user-approved
+   deviation from G4's "every delete stamps a real HLC" rule.
+
+4. **Observability live-node probe EXCLUDED from this feature's
+   completion.** The DoD item "node log during a 2-node run shows
+   `hlc_wall` values that advance over wall-clock time on both nodes"
+   is excluded (live-node probe class, same exclusion class as the
+   fidelity probes) and is blocked on
+   [`gap-closure/read-path-integrity-under-load`](../read-path-integrity-under-load/feature.md).
+   The item retains its `<!-- REVIEW: EXCLUDED -->` annotation and its
+   stated pass condition, which becomes applicable once the read-path
+   fix lands. The structural half is verified (AtomicU128 CAS-loop
+   clock refreshes the wall from the OS clock; wall-refresh tests
+   green).
 
 ## Open Questions
 

@@ -1,7 +1,7 @@
 ---
 feature: "Load Test Harness Fidelity — Phase 1 Result Correction"
 epic: "refactoring"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -114,7 +114,7 @@ Traced run key facts (worker trace + node log cross-reference):
 | F4d assertions | Landed | zero_4xx_puts, zero_transport_errors, all_workers_active, minimum_write_volume |
 | F5 test side | Landed | `accel_ec_fallback_total` + fail-on-absent |
 | F6 413 logging | Landed | node.rs middleware (outermost layer, logs 413 with uri + max_body_size) |
-| F5 production side | Landed (EC) | `resolve_ec_tier` records both counters; accel tests 75 green. Compression counter still missing → metrics-infrastructure amendment. |
+| F5 production side | Landed (EC + compression) | `resolve_ec_tier` and `resolve_compression_tier_with_fallback` record both counters; accel tests 76 green (incl. `compression_fallback_records_both_counters`). See metrics-infrastructure §Post-Completion Defect — both halves RESOLVED. |
 
 **Post-landing verification run (30 s, seed 42):** 970 ops (vs ~90),
 `puts_4xx=0`, `errors_total=0`, `active_workers=32/32`, p50 1.30 s,
@@ -459,6 +459,8 @@ node log" becomes impossible.
 
 - **No public API changes** in any crate. `AggregateStats` gains
   serialized fields (additive — older report JSONs stay readable).
+  Note: `e2e::load::generator::Worker::new` gains an `activity`
+  parameter (harness-internal crate; all call sites in-workspace).
 - **Meaning changes:** `puts_inline/…/puts_multi` now count successful
   PUTs (report consumers: Grafana dashboard reads only
   `load_test_*_total` textfile metrics — unaffected).
@@ -478,40 +480,93 @@ Status key: `[x]` verified 2026-08-13 · `[b]` blocked by
 fixed harness exposed) · `[ ]` pending.
 
 - [x] **Code:** `cargo build --all-targets` succeeds workspace-wide
-      (verified: core/accel/node/e2e all build)
-- [ ] **Code:** `cargo clippy --lib -- -D warnings` clean on
+      (review re-verified: full workspace build clean at 7087b55)
+- [x] **Code:** `cargo clippy --lib -- -D warnings` clean on
       `oceanfs-core`, `oceanfs-accel`, `oceanfs-node`
+<!-- REVIEW: re-verified 2026-08-13 — clippy --lib -D warnings clean on all eight affected crates -->
 - [x] **Tests:** `cargo test -p oceanfs-core hlc` passes, including the
-      2 wall-refresh tests (verified: 24 hlc tests green)
-- [x] **Tests:** `cargo test -p oceanfs-accel` passes (75 green); 
-      `cargo test -p oceanfs-server` pending
-- [b] **Tests:** `cargo test -p e2e -- load_concurrency` passes
+      2 wall-refresh tests (re-verified: 31 hlc tests green, incl.
+      wall-refresh pair + 6 G1 tests from hlc-causality-closure)
+- [x] **Tests:** `cargo test -p oceanfs-accel` passes (re-verified:
+      76 green); `cargo test -p oceanfs-server --lib` green
+      (re-verified: 204 green, `--test-threads=1`)
+- [ ] **Tests:** `cargo test -p e2e -- load_concurrency` passes
       (30 s run, seed 42), **and** the report shows:
       `puts_4xx == 0`, `errors_total == 0`, `active_workers ==
       concurrency`, `objects_written >= 6` — all stats conditions now
       verified true (970 ops, 0×4xx, 0 errors, 32/32 workers), but the
       run fails `manifest_integrity` (176/417 unreadable) due to the
       multi-tier read-path defect
-- [x] **Perf:** 30 s run report: `put_p50_us < 1_000_000` (was ~12 s),
+<!-- REVIEW: EXCLUDED from this review by instruction — the load_concurrency run gates (puts_4xx/errors/active_workers/objects_written) are skipped; the read-path defect is tracked by gap-closure/read-path-integrity-under-load. Pass condition: a fresh 30 s seed-42 run with puts_4xx==0, errors_total==0, active_workers==concurrency, objects_written>=6, and manifest_integrity clean once the read-path fix lands. -->
+- [ ] **Perf:** 30 s run report: `put_p50_us < 1_000_000` (was ~12 s),
       `ops_total >= duration_secs * 20` (was ~90), `elapsed_secs <=
       duration_secs * 1.5` (was ~1.7×)
-      — verified: p50 1.30 s (slightly above the 1 s target), ops 970,
+      — previously: p50 1.30 s (slightly above the 1 s target), ops 970,
       elapsed 31.4 s. Re-check p50 after the integrity fix.
+<!-- REVIEW: EXCLUDED from this review by instruction — perf gates (put_p50_us, ops_total, elapsed_secs) are not judged here. Pass condition: fresh load run with put_p50_us < 1_000_000, ops_total >= duration_secs*20, elapsed_secs <= duration_secs*1.5 after the read-path fix. -->
 - [ ] **Perf:** run 3× with `LOAD_TEST_SEED=42` and 3× with random
       seeds — zero flaky failures
-- [b] **Integration:** node log for a load run contains
+<!-- REVIEW: EXCLUDED from this review by instruction — 3×+3× flake runs are not judged here. Pass condition: 6 runs (3 seeded, 3 random) with zero failures after the read-path fix. -->
+- [ ] **Integration:** node log for a load run contains
       `hlc_wall` values that advance across the run (not constant) —
-      the wall-clock patch landed, but the full HLC rewrite is owned by
-      `gap-closure/hlc-causality-closure` G1
-- [x] **Integration:** `/admin/metrics` on a running node contains
+      structurally verified: the AtomicU128 HlcClock rewrite (G1)
+      refreshes the wall from the OS clock on every `now()` (hlc.rs
+      `clock_wall_tracks_physical_time_after_sleep`,
+      `clock_now_refreshes_wall_repeatedly` green)
+<!-- REVIEW: live-node probe EXCLUDED from this review by instruction. Structural half verified in crates/oceanfs-core/src/hlc.rs:140-164 + tests at hlc.rs:307-349. Pass condition: node log of a real load run shows advancing hlc_wall values once the read-path fix unblocks load runs. -->
+- [ ] **Integration:** `/admin/metrics` on a running node contains
       `accel_ec_fallback_total`, and the value is 0 during a CPU-only
-      load run (verified: report shows `accel_ec_fallback_total = 0`)
-- [x] **Integration:** a manual oversized-PUT probe (e.g.
+      load run
+<!-- REVIEW: live-node probe EXCLUDED from this review by instruction. Structural half verified: accel_ec_fallback_total registered in AccelMetrics (accel/metrics.rs:66-69), wired to record_ec_fallback() at all three EC fallback sites (accel/dispatcher.rs:841,848,858), fail-on-absent assertion at e2e/tests/load_concurrency.rs:143-153. Pass condition: /admin/metrics shows accel_ec_fallback_total == 0 during a CPU-only load run. -->
+- [ ] **Integration:** a manual oversized-PUT probe (e.g.
       `curl -X PUT --data-binary @20MiB.bin`) produces a node-log
-      `request body rejected by max_body_size limit` ERROR line —
-      middleware landed; probe itself pending
+      `request body rejected by max_body_size limit` ERROR line
+<!-- REVIEW: live-node probe EXCLUDED from this review by instruction. Structural half verified: outermost 413-logging middleware landed at crates/oceanfs-node/src/node.rs:1073-1097 (wraps DefaultBodyLimit; captures only max_body_size). Pass condition: an oversized PUT to a running node logs "request body rejected by max_body_size limit" at ERROR. -->
 - [x] **Docs:** `LOAD_TEST_DEBUG` documented in the test module doc
       comment of `load_concurrency.rs` (with the env-var table)
+<!-- REVIEW: re-verified — module doc + env-var table at e2e/tests/load_concurrency.rs:17-32; per-op trace (gen_ms/total_ms/status) at e2e/src/load/generator.rs:869-1060 -->
+
+## Accepted Deviations
+
+Independent review returned PASS (2026-08-13, commit 7087b55) with the
+following user-approved deviations. The runtime load-test validation
+items are explicitly excluded from this feature's completion (item 4)
+and are blocked on the separate read-path defect tracked by
+[`gap-closure/read-path-integrity-under-load`](../../gap-closure/read-path-integrity-under-load/feature.md).
+
+1. **ADR `0004-tiered-segment-sizing` does not exist.** The frontmatter
+   cites `0004-tiered-segment-sizing`, but that ADR is absent from
+   `docs/adr/`. No constraining ADR governs the harness-fidelity
+   changes; the dangling citation is retained for traceability
+   (user-approved).
+
+2. **`manifest_integrity` made LWW-aware (version-set per key).** The
+   manifest readback assertion was semantically corrected: it records a
+   version set per key and verifies that the final content matches *one
+   of* the recorded versions (`e2e/src/load/manifest.rs`) instead of
+   demanding a single exact version. Test-harness semantic correction,
+   user-approved. It does not mask the read-path defect — objects whose
+   content matches none of the written versions still fail the
+   assertion.
+
+3. **`LOAD_TEST_DEBUG` trace keeps `total_ms` = generation + HTTP.**
+   The per-op debug trace reports `gen_ms` (blob generation) and
+   `total_ms` (generation + HTTP round-trip). Only the latency
+   histogram is HTTP-only (F2c). Kept as-is, user-approved.
+
+4. **Runtime load-test DoD items EXCLUDED from this feature's
+   completion.** The `load_concurrency` run gates (`puts_4xx == 0`,
+   `errors_total == 0`, `active_workers == concurrency`,
+   `objects_written >= 6`, clean `manifest_integrity`), the perf gates
+   (`put_p50_us < 1_000_000`, `ops_total >= duration_secs * 20`,
+   `elapsed_secs <= duration_secs * 1.5`), the 3×+3× flake runs, and
+   the live-node probes (advancing `hlc_wall` values in the node log,
+   live `/admin/metrics` `accel_ec_fallback_total == 0`,
+   oversized-PUT 413 log line) are excluded from this feature and are
+   blocked on the read-path-integrity-under-load feature. The DoD
+   checklist items retain their `<!-- REVIEW: EXCLUDED -->`
+   annotations and their stated pass conditions; those become
+   applicable once the read-path fix lands.
 
 ## Open Questions
 

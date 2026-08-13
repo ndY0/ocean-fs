@@ -13,7 +13,7 @@ perf:
   - "2.2 dashmap for concurrent caches"
   - "11.1 Atomic counters on hot paths"
 created: 2026-08-05
-updated: 2026-08-07
+updated: 2026-08-13
 ---
 
 # Metrics Infrastructure — Registry, Gauges, Labels, Wiring
@@ -240,12 +240,11 @@ Verified state in `crates/oceanfs-accel/src/dispatcher.rs`:
 | `accel_ec_fallback_total` | **RESOLVED 2026-08-13.** Parallel implementer wired it: `resolve_ec_tier` now takes `&AccelMetrics` and calls `metrics.record_ec_fallback()` at all three fallback sites (dispatcher.rs:834, 841, 851), with tests asserting both counters agree (`resolve_ec_tier_fallback_records_both_counters` + per-tier assertions). `cargo test -p oceanfs-accel`: 75 green. | **Wired** |
 | `accel_compression_fallback_total` | **RESOLVED 2026-08-13.** `resolve_compression_tier_with_fallback` now takes `&AccelMetrics` and calls `metrics.record_compression_fallback()` at both fallback sites (GpuNvcomp→Igzip/Zstd, Igzip→Zstd), mirroring the EC fix. Test `compression_fallback_records_both_counters` forces a GpuNvcomp fallback on a non-CUDA build and asserts `compression_fallback_count() == 1` AND `metrics().compression_fallback_count() == 1`. `cargo test -p oceanfs-accel --lib`: 76 green. | **Wired** |
 
-**Remaining fix (small, single file):** `resolve_compression_tier_with_fallback`
-must also call `metrics.record_compression_fallback()` at each fallback
-site, mirroring the EC fix. The private atomics stay for the
-`/admin/acceleration` JSON endpoint; both views must then agree.
+**Remaining fix — RESOLVED (2026-08-13):** the compression half is now
+wired identically to the EC fix (see the table above and the reviewer
+note below). No fix remains open in this feature.
 
-**Fix (small, single file):** every site that increments a private
+**Fix as applied (2026-08-13):** every site that increments a private
 `*_fallback_count` atomic (or sets the runtime-fallback flag) must also
 call the matching `AccelMetrics` recorder —
 `metrics.record_ec_fallback()`, `metrics.record_compression_fallback()`,
@@ -256,12 +255,29 @@ call `record_ec_fallback()` on the constructed dispatcher before
 returning from `new()`. The private atomics stay for the
 `/admin/acceleration` JSON endpoint; both views must then agree.
 
-**DoD:** `cargo test -p oceanfs-accel` green — **DONE (2026-08-13):**
-EC half and compression half are both wired and tested; remaining
-verification-only item: `/admin/metrics` on a running node containing
-`accel_compression_fallback_total` with a non-zero value after a
-forced-fallback run (covered by the fidelity DoD's manual probe on the
-EC counter; the same wiring pattern applies to compression).
+**DoD:** `cargo test -p oceanfs-accel` green — **DONE (2026-08-13):
+RESOLVED.** EC half and compression half are both wired and tested
+(76 accel tests green; the reviewer independently re-verified both
+counter-agreement tests). The only remaining item is the live-node
+verification probe — `/admin/metrics` on a running node showing
+`accel_compression_fallback_total` (and `accel_ec_fallback_total`)
+non-zero after a forced-fallback run — which is EXCLUDED from this
+feature's completion (live-node probe class) and blocked on
+[`gap-closure/read-path-integrity-under-load`](../read-path-integrity-under-load/feature.md),
+together with the fidelity DoD's manual probes on the same counter
+class.
+
+<!-- REVIEW 2026-08-13 (independent): compression-fallback half re-verified.
+`resolve_compression_tier_with_fallback` takes `&AccelMetrics` and calls
+`metrics.record_compression_fallback()` at both fallback sites
+(dispatcher.rs:719 GpuNvcomp→Igzip/Zstd, dispatcher.rs:729 Igzip→Zstd);
+`AccelMetrics` is constructed before startup tier resolution so startup
+fallbacks increment the registered counters (dispatcher.rs:266-272).
+Tests `compression_fallback_records_both_counters` (dispatcher.rs:1490) and
+`resolve_ec_tier_fallback_records_both_counters` (dispatcher.rs:1213) both
+pass — `cargo test -p oceanfs-accel --lib`: 76 green, independently run.
+The live `/admin/metrics` non-zero probe remains excluded from this review
+per instruction (live-node probe class). -->
 
 **Test-side counterpart:** the `load_concurrency` assertion fix lives in
 `refactoring/load-test-harness-fidelity` work item F5 (correct metric
