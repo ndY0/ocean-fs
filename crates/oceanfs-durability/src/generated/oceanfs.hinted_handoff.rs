@@ -15,6 +15,11 @@ pub struct HintInline {
     /// The blob payload stored inline.
     #[prost(bytes = "bytes", tag = "4")]
     pub data: ::prost::bytes::Bytes,
+    /// HLC timestamp of the original write (hlc-causality-closure G5).
+    /// Absent in records written before this field existed — such records
+    /// replay with the zero timestamp.
+    #[prost(message, optional, tag = "5")]
+    pub hlc: ::core::option::Option<::oceanfs_core::proto::common::HlcTimestamp>,
 }
 /// Segment-reference hint record — large blobs reference a sealed segment.
 /// The segment data is shipped separately via segment fetch.
@@ -38,6 +43,9 @@ pub struct HintSegmentRef {
     /// Length of the blob in bytes.
     #[prost(uint32, tag = "6")]
     pub length: u32,
+    /// HLC timestamp of the original write (hlc-causality-closure G5).
+    #[prost(message, optional, tag = "7")]
+    pub hlc: ::core::option::Option<::oceanfs_core::proto::common::HlcTimestamp>,
 }
 /// A hinted handoff record — either inline or segment reference.
 #[derive(Clone, PartialEq, ::prost::Message)]

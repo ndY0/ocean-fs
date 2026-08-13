@@ -5,8 +5,9 @@
 //! with randomized blob sizes across all 4 segment tiers, including concurrent
 //! writes to the same key (testing HLC conflict resolution). Runs for 60 seconds
 //! (configurable via `LOAD_TEST_DURATION_SECS`). Asserts manifest integrity,
-//! zero panics, zero deadlocks, `/admin/health` healthy, and
-//! `accel_fallback_total == 0`.
+//! zero 4xx PUT rejections, zero transport errors, all workers active,
+//! minimum write volume, all four tiers successfully exercised,
+//! `/admin/health` healthy, and `accel_ec_fallback_total == 0`.
 //!
 //! This is the cheapest test that catches the most dangerous bugs:
 //! data races, deadlocks, and data corruption under concurrent access.
@@ -28,6 +29,7 @@
 //! |---|---|---|
 //! | `LOAD_TEST_SEED` | random | Deterministic seed for reproducible runs. Logged at start. |
 //! | `LOAD_TEST_DURATION_SECS` | 60 | Override the test duration (e.g., `10` for CI smoke). |
+//! | `LOAD_TEST_DEBUG` | unset | When `1` (or `true`), prints a per-op debug trace `[worker-N] PUT … gen_ms=… total_ms=… status=…` to stderr, breaking down client-side blob generation vs HTTP round-trip per operation. |
 
 use std::{path::Path, sync::Arc, time::Duration};
 
@@ -47,7 +49,12 @@ use e2e::{
 /// performing PUT/GET/DELETE/HEAD with tiered blob sizes and same-key
 /// concurrency. Runs for 60 seconds (configurable). Asserts manifest
 /// integrity, health, `accel_fallback_total == 0`, and non-zero worker stats.
-#[tokio::test]
+///
+/// Uses the multi-threaded tokio runtime: the default `current_thread`
+/// flavor would serialize all workers and their blob generation on a
+/// single OS thread, making the harness measure itself instead of the
+/// server.
+#[tokio::test(flavor = "multi_thread")]
 async fn load_concurrency() {
     // ── Parse environment variables ────────────────────────────
     let seed: u64 =
@@ -134,39 +141,63 @@ async fn load_concurrency() {
 
     report.assert(assert_that(
         "accel_fallback_zero",
-        accel_fallback.map_or(true, |v| v == 0.0),
-        "accel_fallback_total == 0 (no acceleration fallbacks)",
+        accel_fallback.map_or(false, |v| v == 0.0),
+        "accel_ec_fallback_total == 0 (no acceleration fallbacks)",
         format!(
-            "accel_fallback_total = {}",
-            accel_fallback.map_or("N/A (metrics not wired)".to_string(), |v| v.to_string()),
+            "accel_ec_fallback_total = {}",
+            accel_fallback.map_or("N/A (metric absent — defect)".to_string(), |v| v.to_string()),
         ),
     ));
 
     let ops_total = stats.ops_total;
     let puts_total = stats.puts_total;
+    let puts_4xx = stats.puts_4xx;
     let gets_total = stats.gets_total;
     let deletes_total = stats.deletes_total;
     let heads_total = stats.heads_total;
     let errors_total = stats.errors_total;
+    let active_workers = stats.active_workers;
     let puts_inline = stats.puts_inline;
     let puts_small = stats.puts_small;
     let puts_standard = stats.puts_standard;
     let puts_multi = stats.puts_multi;
+    let min_writes: u64 = std::cmp::max(5, duration_secs / 5);
 
     report.assert(assert_that(
-        "worker_stats_nonzero",
-        ops_total > 0,
-        "all workers performed at least some operations",
+        "zero_4xx_puts",
+        puts_4xx == 0,
+        "zero PUTs rejected with an HTTP 4xx status (body-limit 413s were silently invisible)",
+        format!("{} PUTs rejected with 4xx (of {} total)", puts_4xx, puts_total),
+    ));
+
+    report.assert(assert_that(
+        "zero_transport_errors",
+        errors_total == 0,
+        "zero transport errors (pooled-connection teardown, mid-upload resets)",
+        format!("{} transport errors ({} total ops)", errors_total, ops_total),
+    ));
+
+    report.assert(assert_that(
+        "all_workers_active",
+        active_workers == concurrency as u64,
+        format!("all {concurrency} workers completed at least one operation"),
+        format!("{active_workers} active workers"),
+    ));
+
+    report.assert(assert_that(
+        "minimum_write_volume",
+        manifest_objects_written as u64 >= min_writes,
+        format!("at least {min_writes} objects written (the manifest must prove something)"),
         format!(
-            "{} total ops ({} PUTs, {} GETs, {} DELETEs, {} HEADs, {} errors)",
-            ops_total, puts_total, gets_total, deletes_total, heads_total, errors_total,
+            "{} objects written ({} PUTs, {} GETs, {} DELETEs, {} HEADs)",
+            manifest_objects_written, puts_total, gets_total, deletes_total, heads_total,
         ),
     ));
 
     report.assert(assert_that(
         "all_four_tiers_exercised",
         puts_inline > 0 && puts_small > 0 && puts_standard > 0 && puts_multi > 0,
-        "all 4 blob size tiers exercised (inline, small, standard, multi)",
+        "all 4 blob size tiers successfully PUT (inline, small, standard, multi)",
         format!(
             "tiers: inline={}, small={}, standard={}, multi={}",
             puts_inline, puts_small, puts_standard, puts_multi,
@@ -195,14 +226,23 @@ async fn load_concurrency() {
     // ── Final assertion ────────────────────────────────────────
     let fail_msg = format!(
         "load concurrency test FAILED:\n\
-         manifest_integrity: {} mismatches\n\
+         manifest_integrity: {} mismatches ({} written, {} verified)\n\
          health: {}\n\
          accel_fallback: {:?}\n\
+         puts_4xx: {}\n\
+         errors_total: {}\n\
+         active_workers: {} / {}\n\
          ops_total: {}\n\
          tiers: inline={}, small={}, standard={}, multi={}",
         manifest_mismatches,
+        manifest_objects_written,
+        manifest_objects_verified,
         if health_ok { "OK" } else { "FAIL" },
         accel_fallback,
+        puts_4xx,
+        errors_total,
+        active_workers,
+        concurrency,
         ops_total,
         puts_inline,
         puts_small,
@@ -215,8 +255,9 @@ async fn load_concurrency() {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Scrapes `/admin/metrics` from the cluster and returns the value of
-/// `accel_fallback_total`, or `None` if the endpoint is unavailable or
-/// not yet wired.
+/// `accel_ec_fallback_total`, or `None` if the endpoint is unavailable
+/// or the metric is absent (which the assertion treats as a defect —
+/// the counter is registered at node startup).
 async fn scrape_accel_fallback(cluster: &Cluster) -> Option<f64> {
     match cluster.get(0, "/admin/metrics").await {
         Ok(resp) if resp.status().is_success() => {
@@ -225,7 +266,7 @@ async fn scrape_accel_fallback(cluster: &Cluster) -> Option<f64> {
                 return None;
             }
             let metrics = parse_prometheus_text(&text);
-            metrics.get("accel_fallback_total").copied()
+            metrics.get("accel_ec_fallback_total").copied()
         }
         _ => None,
     }

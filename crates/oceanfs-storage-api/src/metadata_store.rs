@@ -6,7 +6,9 @@
 //! scrub, heal, anti-entropy) consume this trait to avoid coupling to
 //! RocksDB.
 
-use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata, SegmentId, SegmentMetadata, Tombstone};
+use oceanfs_core::{
+    BucketId, Hlc, ObjectKey, ObjectMetadata, SegmentId, SegmentMetadata, Tombstone,
+};
 
 /// A single batch operation for atomic metadata writes.
 ///
@@ -70,6 +72,9 @@ pub enum BatchOp {
 ///         Ok(())
 ///     }
 ///     fn put_object(&self, _bucket: &BucketId, _meta: ObjectMetadata) -> io::Result<()> {
+///         Ok(())
+///     }
+///     fn delete_object(&self, _bucket: &BucketId, _key: &ObjectKey, _hlc: oceanfs_core::Hlc) -> io::Result<()> {
 ///         Ok(())
 ///     }
 ///     fn batch_write(&self, _ops: Vec<BatchOp>) -> std::io::Result<()> {
@@ -144,6 +149,30 @@ pub trait MetadataStore: Send + Sync {
         Ok(self.list_tombstones(bucket).into_iter().filter_map(|r| r.ok()).any(|(k, _)| &k == key))
     }
 
+    /// Retrieves the deletion tombstone for the given key, if one exists.
+    ///
+    /// Used by the gRPC segment service for order-aware delete-vs-write
+    /// resolution at the repair-push boundary (hlc-causality-closure G6).
+    ///
+    /// Implementors with real tombstone storage MUST override this; the
+    /// default exists so that in-memory test doubles can stay minimal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the lookup fails.
+    fn get_tombstone(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+    ) -> std::io::Result<Option<Tombstone>> {
+        Ok(self
+            .list_tombstones(bucket)
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .find(|(k, _)| k == key)
+            .map(|(_, t)| t))
+    }
+
     /// Stores (or updates) segment metadata.
     ///
     /// Used by heal worker to update metadata after repairing a segment.
@@ -159,10 +188,21 @@ pub trait MetadataStore: Send + Sync {
     /// Used by segment compactor to update object chunk references after repacking.
     fn put_object(&self, bucket: &BucketId, meta: ObjectMetadata) -> std::io::Result<()>;
 
-    /// Deletes object metadata for a given key.
+    /// Deletes object metadata for a given key and stamps the deletion
+    /// tombstone with the given HLC.
     ///
-    /// Used by the gRPC segment service to handle object deletion requests.
-    fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<()>;
+    /// The `hlc` is the delete's timestamp, minted by the originating
+    /// node's clock (hlc-causality-closure G4): the tombstone must carry
+    /// the version of the delete itself so delete-vs-write LWW is
+    /// decidable across replicas.
+    ///
+    /// Used by the gRPC segment service to handle object deletion
+    /// requests and by the S3 delete handler for the local tombstone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the delete or the tombstone write fails.
+    fn delete_object(&self, bucket: &BucketId, key: &ObjectKey, hlc: Hlc) -> std::io::Result<()>;
 
     /// Atomically writes a batch of metadata operations.
     ///

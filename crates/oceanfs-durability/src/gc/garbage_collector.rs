@@ -195,7 +195,10 @@ impl GarbageCollector {
                             "failed to delete tombstone after compaction"
                         );
                     }
-                    let _ = metadata.delete_object(bucket, key);
+                    // GC-driven metadata removal carries no user event,
+                    // so there is no delete HLC to stamp; zero preserves
+                    // the pre-G4 behavior for this path.
+                    let _ = metadata.delete_object(bucket, key, oceanfs_core::Hlc::zero());
                 }
             }
         }

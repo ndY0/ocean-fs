@@ -1,9 +1,18 @@
 //! PUT recording and post-run verification for load tests.
 //!
-//! The [`Manifest`] tracks every PUT operation's (bucket, key, BLAKE3 hash)
-//! during a load test run. After the run, [`verify`](Manifest::verify) GETs
-//! every non-deleted key from the cluster and compares the response hash
-//! against the recorded value.
+//! The [`Manifest`] tracks every PUT operation's (bucket, key, BLAKE3
+//! hash) during a load test run. After the run, [`verify`](Manifest::verify)
+//! GETs every non-deleted key from the cluster and checks the response
+//! hash against the recorded value.
+//!
+//! ## Concurrent same-key writes (LWW)
+//!
+//! Under concurrent same-key PUTs, Last-Write-Wins resolves the final
+//! content to *one of* the versions written. The manifest therefore
+//! records the **set** of version hashes per key, and verification
+//! passes when the response hash matches any recorded version — a
+//! mismatch means the content matches none of them (real corruption or
+//! loss), not merely that another writer won the race.
 //!
 //! ## Concurrency
 //!
@@ -11,7 +20,10 @@
 //! multiple concurrent tokio worker tasks. The underlying [`DashMap`]
 //! provides shard-level internal locking for concurrent safety.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::{
+    collections::HashSet,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use dashmap::DashMap;
 use serde::Serialize;
@@ -24,9 +36,10 @@ use crate::harness::Cluster;
 
 /// A concurrent-safe tracker for written objects during a load test.
 ///
-/// Stores the BLAKE3 hash of every successfully PUT object. During
-/// post-run verification, every non-deleted entry is GET'd from the
-/// cluster and the response hash is compared to the recorded value.
+/// Stores the set of BLAKE3 hashes of every successfully PUT version of
+/// an object. During post-run verification, every non-deleted entry is
+/// GET'd from the cluster and the response hash is compared against the
+/// recorded version set.
 ///
 /// # Examples
 ///
@@ -41,9 +54,9 @@ use crate::harness::Cluster;
 /// # }
 /// ```
 pub struct Manifest {
-    /// Map from `"{bucket}/{key}"` to `(blake3_hash, is_deleted)`.
-    entries: DashMap<String, ([u8; 32], AtomicBool)>,
-    /// Total number of entries ever inserted (including deleted ones).
+    /// Map from `"{bucket}/{key}"` to `(version_hash_set, is_deleted)`.
+    entries: DashMap<String, (HashSet<[u8; 32]>, AtomicBool)>,
+    /// Total number of keys ever inserted (including deleted ones).
     total_count: AtomicUsize,
 }
 
@@ -55,15 +68,19 @@ impl Manifest {
 
     /// Records a successful PUT operation.
     ///
-    /// Computes the BLAKE3 hash of `body` and stores it under
-    /// `"{bucket}/{key}"`. If a previous entry exists for this key
-    /// (e.g., from a re-PUT during the test), it is overwritten.
+    /// Computes the BLAKE3 hash of `body` and adds it to the set of
+    /// versions written for `"{bucket}/{key}"`. A re-PUT of an existing
+    /// key (including one previously deleted) clears any delete marker
+    /// and adds the new version to the set.
     pub fn record(&self, bucket: &str, key: &str, body: &[u8]) {
         let composite_key = format!("{bucket}/{key}");
         let hash = *blake3::hash(body).as_bytes();
-        if self.entries.insert(composite_key, (hash, AtomicBool::new(false))).is_none() {
+        let mut entry = self.entries.entry(composite_key).or_insert_with(|| {
             self.total_count.fetch_add(1, Ordering::Relaxed);
-        }
+            (HashSet::new(), AtomicBool::new(false))
+        });
+        entry.0.insert(hash);
+        entry.1.store(false, Ordering::Relaxed);
     }
 
     /// Marks a key as deleted so that [`verify`](Self::verify) skips it.
@@ -96,23 +113,25 @@ impl Manifest {
     ///
     /// Runs sequentially (single-threaded) after all workers stop.
     /// For each key: GET from a random alive node, compute BLAKE3
-    /// hash of the response body, and compare against the recorded
-    /// hash. On connection errors, retries with exponential backoff
+    /// hash of the response body, and check it against the set of
+    /// versions recorded for the key (any recorded version passes —
+    /// concurrent LWW writes may legitimately resolve to any of them).
+    /// On connection errors, retries with exponential backoff
     /// (100ms, 200ms, 400ms, 800ms).
     ///
-    /// Returns a vector of [`Mismatch`] entries for any keys that
-    /// could not be verified.
+    /// Returns a vector of [`Mismatch`] entries for any keys whose
+    /// final content matches none of the written versions.
     pub async fn verify(&self, cluster: &Cluster) -> Vec<Mismatch> {
         let mut mismatches = Vec::new();
 
         for entry in self.entries.iter() {
             let key = entry.key().clone();
-            let (expected_hash, deleted) = entry.value();
+            let (versions, deleted) = entry.value();
             if deleted.load(Ordering::Relaxed) {
                 continue;
             }
 
-            if let Some(mismatch) = verify_one(cluster, &key, expected_hash).await {
+            if let Some(mismatch) = verify_one(cluster, &key, versions).await {
                 mismatches.push(mismatch);
             }
         }
@@ -131,12 +150,14 @@ impl Default for Manifest {
 // Mismatch
 // ---------------------------------------------------------------------------
 
-/// A single verification failure: GET response didn't match the recorded hash.
+/// A single verification failure: the GET response matched none of the
+/// recorded version hashes.
 #[derive(Debug, Clone, Serialize)]
 pub struct Mismatch {
     /// The composite key `"{bucket}/{key}"`.
     pub key: String,
-    /// The expected BLAKE3 hash (hex).
+    /// Description of the recorded versions, e.g.
+    /// `"one of 3 recorded versions"`.
     pub expected_hash: String,
     /// The actual hash from the response body (hex), or `"unreachable"` if
     /// all retry attempts failed.
@@ -151,14 +172,15 @@ pub struct Mismatch {
 
 /// Verifies a single manifest entry against the cluster.
 ///
-/// Returns `None` on success (hash matched), or `Some(Mismatch)` on failure.
+/// Returns `None` on success (the response hash matched one of the
+/// recorded versions), or `Some(Mismatch)` on failure.
 ///
 /// Retries with exponential backoff on transient errors. Reports the key
 /// as `"unreachable"` if all retries are exhausted.
 async fn verify_one(
     cluster: &Cluster,
     composite_key: &str,
-    expected: &[u8; 32],
+    expected: &HashSet<[u8; 32]>,
 ) -> Option<Mismatch> {
     let backoffs = [100u64, 200, 400, 800];
 
@@ -166,7 +188,7 @@ async fn verify_one(
         if cluster.is_empty() {
             return Some(Mismatch {
                 key: composite_key.to_string(),
-                expected_hash: hex::encode(expected),
+                expected_hash: format!("one of {} recorded versions", expected.len()),
                 actual_hash: "unreachable".to_string(),
                 node: "(no nodes)".to_string(),
             });
@@ -180,12 +202,12 @@ async fn verify_one(
             Ok(resp) if resp.status().is_success() => {
                 let body = resp.bytes().await.unwrap_or_default();
                 let actual_hash = blake3::hash(&body);
-                if actual_hash.as_bytes() == expected {
-                    return None; // Success!
+                if expected.contains(actual_hash.as_bytes()) {
+                    return None; // Success — matched a written version.
                 }
                 return Some(Mismatch {
                     key: composite_key.to_string(),
-                    expected_hash: hex::encode(expected),
+                    expected_hash: format!("one of {} recorded versions", expected.len()),
                     actual_hash: hex::encode(actual_hash.as_bytes()),
                     node: node_addr,
                 });
@@ -199,7 +221,7 @@ async fn verify_one(
                 }
                 return Some(Mismatch {
                     key: composite_key.to_string(),
-                    expected_hash: hex::encode(expected),
+                    expected_hash: format!("one of {} recorded versions", expected.len()),
                     actual_hash: format!("HTTP {}", resp.status()),
                     node: node_addr,
                 });
@@ -220,7 +242,7 @@ async fn verify_one(
     };
     Some(Mismatch {
         key: composite_key.to_string(),
-        expected_hash: hex::encode(expected),
+        expected_hash: format!("one of {} recorded versions", expected.len()),
         actual_hash: "unreachable".to_string(),
         node,
     })
@@ -322,6 +344,31 @@ mod tests {
     }
 
     #[test]
+    fn record_after_delete_reactivates_key() {
+        let manifest = Manifest::new();
+        manifest.record("bucket", "key1", b"hello");
+        manifest.record_delete("bucket", "key1");
+        assert_eq!(manifest.active_count(), 0);
+        // A re-PUT after a delete must clear the delete marker; the
+        // key count stays stable.
+        manifest.record("bucket", "key1", b"world");
+        assert_eq!(manifest.active_count(), 1);
+        assert_eq!(manifest.len(), 1);
+    }
+
+    #[test]
+    fn record_multiple_versions_keeps_single_key() {
+        // LWW-aware recording: concurrent same-key writes accumulate
+        // versions under one key without inflating the count.
+        let manifest = Manifest::new();
+        manifest.record("bucket", "key1", b"v1");
+        manifest.record("bucket", "key1", b"v2");
+        manifest.record("bucket", "key1", b"v3");
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest.active_count(), 1);
+    }
+
+    #[test]
     fn concurrent_records_no_data_race() {
         use std::sync::Arc;
 
@@ -418,8 +465,11 @@ mod tests {
 
         let expected = blake3::hash(body);
         let entry = manifest.entries.get("bucket/key1").expect("entry should exist");
-        let (stored_hash, deleted) = entry.value();
-        assert_eq!(stored_hash, expected.as_bytes());
+        let (versions, deleted) = entry.value();
+        assert!(
+            versions.contains(expected.as_bytes()),
+            "recorded version set must contain the hash"
+        );
         assert!(!deleted.load(Ordering::Relaxed));
     }
 

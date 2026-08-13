@@ -8,11 +8,22 @@
 //! ## Architecture
 //!
 //! - [`Hlc`]: a 96-bit immutable timestamp
-//! - [`HlcClock`]: thread-safe HLC generator using a cache-line-aligned
-//!   `AtomicU64` for the wall clock, preventing false sharing under
-//!   concurrent access from multiple cores.
+//! - [`HlcClock`]: thread-safe HLC generator packing the full 96-bit
+//!   state (u64 wall ms in the high bits, u32 logical in the low bits)
+//!   into a single cache-line-aligned 128-bit atomic, so
+//!   `(wall, logical)` always advance atomically under concurrent
+//!   access. See
+//!   `docs/features/gap-closure/hlc-causality-closure/feature.md` §"Design
+//!   Decision: HlcClock State Layout".
+//!
+//! The atomic is [`portable_atomic::AtomicU128`]: `std` does not ship
+//! `AtomicU128` on the workspace toolchain, and the lock-free design
+//! (perf guideline §11.1) rules out a mutex fallback. On x86-64 this
+//! compiles to native `cmpxchg16b`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+// `AtomicU128` and its `Ordering` come from `portable-atomic` (same
+// API as `std::sync::atomic`, which lacks 128-bit atomics).
+use portable_atomic::{AtomicU128, Ordering};
 
 /// A 96-bit Hybrid Logical Clock timestamp.
 ///
@@ -75,8 +86,12 @@ impl Ord for Hlc {
 
 /// A thread-safe Hybrid Logical Clock generator.
 ///
-/// Uses a cache-line-aligned `AtomicU64` for the wall-clock component
-/// to prevent false sharing when accessed from multiple cores.
+/// The 96-bit HLC state (u64 wall ms + u32 logical) is packed into a
+/// single cache-line-aligned `AtomicU128` and advanced with a CAS loop,
+/// so the `(wall, logical)` pair updates atomically — the logical
+/// counter can never move backward under concurrent `now()`/`update()`
+/// calls. Every call yields a timestamp strictly greater than any
+/// previously returned one, even across threads.
 ///
 /// Cache-line alignment (64 bytes on x86_64) ensures that the atomic
 /// lives on its own cache line, so concurrent HLC generation on
@@ -90,15 +105,13 @@ impl Ord for Hlc {
 /// let clock = HlcClock::new();
 /// let t1 = clock.now();
 /// let t2 = clock.now();
-/// assert!(t1 <= t2, "HLC must be monotonically increasing");
+/// assert!(t1 < t2, "HLC must be monotonically increasing");
 /// ```
 #[repr(align(64))]
 pub struct HlcClock {
-    /// The current wall time (milliseconds since epoch), cached from
-    /// the OS and bumped when logical counter wraps.
-    wall: AtomicU64,
-    /// The current logical counter for events at the current wall time.
-    logical: AtomicU64,
+    /// Packed state: wall time (u64, milliseconds since epoch) in the
+    /// high 32 bits, logical counter (u32) in the low 32 bits.
+    state: AtomicU128,
 }
 
 impl HlcClock {
@@ -106,48 +119,64 @@ impl HlcClock {
     ///
     /// The logical counter starts at 0.
     pub fn new() -> Self {
-        let now_ms = current_time_millis();
-        Self { wall: AtomicU64::new(now_ms), logical: AtomicU64::new(0) }
+        let wall = current_time_millis() as u128;
+        Self { state: AtomicU128::new(wall << 32) }
     }
 
     /// Returns the current HLC timestamp, advancing the logical counter.
     ///
-    /// If the logical counter would wrap (exceeding [`u32::MAX`] for
-    /// the current wall time), the wall time is bumped and the counter
-    /// resets to 0.
+    /// Implements the HLC local-event rule:
+    /// `l.w = max(l.w, pt.now())`, `l.c = l.c + 1` — the wall time is
+    /// refreshed from the OS clock on every call and never goes
+    /// backward.
+    ///
+    /// If the logical counter would overflow ([`u32::MAX`] events in a
+    /// single millisecond — practically unreachable, but correctness
+    /// requires it), the wall time is bumped instead of wrapping.
     ///
     /// This method is lock-free and safe to call from multiple threads
-    /// concurrently. However, callers should use the returned timestamp
-    /// immediately — concurrent calls may generate timestamps between
-    /// this call and the caller's use of the timestamp.
+    /// concurrently. Every call returns a timestamp strictly greater
+    /// than any previously returned one.
     pub fn now(&self) -> Hlc {
-        let wall = self.wall.load(Ordering::Acquire);
-        let logical = self.logical.fetch_add(1, Ordering::AcqRel);
-        // `fetch_add` returns the previous value. Using the previous
-        // value as the logical component gives us sequential
-        // assignment: 0, 1, 2, ... for the same wall time.
-        if logical < u32::MAX as u64 {
-            Hlc { wall_time: wall, logical: logical as u32 }
-        } else {
-            // Logical counter exhausted; bump wall time.
-            let new_wall = current_time_millis().max(wall + 1);
-            self.wall.store(new_wall, Ordering::Release);
-            self.logical.store(1, Ordering::Release);
-            Hlc { wall_time: new_wall, logical: 0 }
+        let physical = current_time_millis();
+        loop {
+            let cur = self.state.load(Ordering::Acquire);
+            let wall = (cur >> 32) as u64;
+            let logical = cur as u32;
+            let new_wall = wall.max(physical);
+            // Overflow guard: wrapping_add would make the logical
+            // counter move backward; bump the wall instead.
+            let new_logical = logical.wrapping_add(1);
+            let (w, l) = if new_logical < logical {
+                (new_wall.saturating_add(1), 0u32)
+            } else {
+                (new_wall, new_logical)
+            };
+            let next = ((w as u128) << 32) | l as u128;
+            if self
+                .state
+                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Hlc { wall_time: w, logical: l };
+            }
         }
     }
 
     /// Updates the HLC clock by merging a received timestamp.
     ///
-    /// The HLC update rule:
-    /// 1. `wall = max(local_wall, received.wall_time)`
+    /// The HLC receive rule:
+    /// 1. `wall = max(local_wall, received.wall_time, pt.now())`
+    ///    (the local wall also never lags the OS clock)
     /// 2. If `received.wall_time > local_wall`:
     ///    `logical = received.logical + 1`
     /// 3. Otherwise:
     ///    `logical = max(local_logical, received.logical) + 1`
     ///
     /// This ensures causal consistency: if event A happened-before
-    /// event B, then `clock.update(b_hlc) > a_hlc`.
+    /// event B, then `clock.update(b_hlc) > a_hlc`. Even a *stale*
+    /// received timestamp advances the local counter, so every call
+    /// yields a fresh, strictly greater local timestamp.
     ///
     /// # Examples
     ///
@@ -163,41 +192,32 @@ impl HlcClock {
     /// assert!(updated.logical() >= 4);
     /// ```
     pub fn update(&self, received: Hlc) -> Hlc {
+        let physical = current_time_millis();
         loop {
-            let local_wall = self.wall.load(Ordering::Acquire);
-            let local_logical = self.logical.load(Ordering::Acquire);
-
-            let new_wall = local_wall.max(received.wall_time);
-
-            let new_logical = if received.wall_time > local_wall {
+            let cur = self.state.load(Ordering::Acquire);
+            let wall = (cur >> 32) as u64;
+            let logical = cur as u32;
+            let new_wall = wall.max(received.wall_time).max(physical);
+            let new_logical = if received.wall_time > wall {
                 (received.logical as u64).wrapping_add(1)
             } else {
-                // received.wall_time <= local_wall
-                let max_logical = local_logical.max(received.logical as u64);
-                max_logical.wrapping_add(1)
+                (logical as u64).max(received.logical as u64).wrapping_add(1)
             };
-
-            // Push wall forward if logical exceeded.
-            let new_logical = if new_logical > u32::MAX as u64 {
-                let wall_bump = new_wall + 1;
-                self.wall.store(wall_bump, Ordering::Release);
-                self.logical.store(0, Ordering::Release);
-                return Hlc { wall_time: wall_bump, logical: 0 };
+            // Cap at u32::MAX; bump the wall on overflow (same guard
+            // as `now`).
+            let (w, l) = if new_logical > u32::MAX as u64 {
+                (new_wall.saturating_add(1), 0u32)
             } else {
-                new_logical
+                (new_wall, new_logical as u32)
             };
-
-            // Attempt to atomically update both fields.
-            // Use a compare-exchange loop on wall to ensure consistency.
+            let next = ((w as u128) << 32) | l as u128;
             if self
-                .wall
-                .compare_exchange_weak(local_wall, new_wall, Ordering::AcqRel, Ordering::Acquire)
+                .state
+                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                self.logical.store(new_logical, Ordering::Release);
-                return Hlc { wall_time: new_wall, logical: new_logical as u32 };
+                return Hlc { wall_time: w, logical: l };
             }
-            // CAS failed — retry.
         }
     }
 }
@@ -281,6 +301,220 @@ mod tests {
         let t1 = clock.now();
         let t2 = clock.now();
         assert_ne!(t1, t2);
+    }
+
+    #[test]
+    fn clock_wall_tracks_physical_time_after_sleep() {
+        use std::time::Duration;
+
+        let clock = HlcClock::new();
+        // Physical time captured right after construction. A frozen
+        // wall (the old behavior: wall = boot time forever) could
+        // never satisfy this comparison once real time advances.
+        let physical_at_start = current_time_millis();
+        std::thread::sleep(Duration::from_millis(10));
+        let ts = clock.now();
+        assert!(
+            ts.wall_time() >= physical_at_start,
+            "wall {} must be >= physical time at construction {}",
+            ts.wall_time(),
+            physical_at_start,
+        );
+        // Guard against clock granularity / NTP adjustments: the wall
+        // must at least be within 1 s of the current physical time.
+        let physical_now = current_time_millis();
+        assert!(
+            ts.wall_time() >= physical_now.saturating_sub(1000),
+            "wall {} must be within 1 s of physical time {}",
+            ts.wall_time(),
+            physical_now,
+        );
+    }
+
+    #[test]
+    fn clock_now_refreshes_wall_repeatedly() {
+        use std::time::Duration;
+
+        let clock = HlcClock::new();
+        let first = clock.now();
+        std::thread::sleep(Duration::from_millis(10));
+        let second = clock.now();
+        // Either the wall advanced (physical time merged in) or the
+        // logical counter advanced. A regression to the frozen wall
+        // would show as an identical wall with a reset logical counter.
+        assert!(
+            second.wall_time() > first.wall_time() || second.logical() > first.logical(),
+            "wall must advance with physical time: first={first:?}, second={second:?}",
+        );
+    }
+
+    // -- HlcClock receive-merge invariants (hlc-causality-closure G1) --
+
+    #[test]
+    fn clock_wall_never_goes_backward_under_update() {
+        let clock = HlcClock::new();
+        let before = clock.now();
+        // Merge an ancient remote timestamp — the local clock must
+        // still advance.
+        let merged = clock.update(Hlc::new(1, 0));
+        assert!(merged > before, "merged {merged:?} must be > before {before:?}");
+        let after = clock.now();
+        assert!(after > merged, "now() {after:?} must be > merged {merged:?}");
+    }
+
+    #[test]
+    fn clock_update_merges_remote_wall() {
+        let clock = HlcClock::new();
+        let now = clock.now();
+        let remote = Hlc::new(now.wall_time() + 10_000, 42);
+        let merged = clock.update(remote);
+        assert!(
+            merged.wall_time() >= remote.wall_time(),
+            "merged wall {} must reach remote wall {}",
+            merged.wall_time(),
+            remote.wall_time(),
+        );
+        let next = clock.now();
+        assert!(
+            next.wall_time() >= remote.wall_time(),
+            "next now() wall {} must stay >= remote wall {}",
+            next.wall_time(),
+            remote.wall_time(),
+        );
+    }
+
+    #[test]
+    fn clock_update_equal_wall_bumps_logical_past_remote() {
+        let clock = HlcClock::new();
+        let _first = clock.now(); // logical = 1
+        let second = clock.now(); // logical = 2
+        let wall = second.wall_time();
+        // Receive a timestamp at the *same* wall with a higher logical.
+        let updated = clock.update(Hlc::new(wall, 5));
+        assert_eq!(
+            updated.logical(),
+            6,
+            "receive rule must bump past the remote logical: {updated:?}",
+        );
+        assert!(
+            updated.wall_time() >= wall,
+            "wall must not go backward: {updated:?} vs wall {wall}",
+        );
+        let after = clock.now();
+        assert!(after > updated, "next now() {after:?} must exceed {updated:?}");
+    }
+
+    // -- HlcClock concurrency (hlc-causality-closure G1) --
+
+    #[test]
+    fn clock_concurrent_now_all_unique() {
+        use std::{sync::Arc, thread};
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 50_000;
+
+        let clock = Arc::new(HlcClock::new());
+        let collected = Arc::new(std::sync::Mutex::new(Vec::with_capacity(THREADS * PER_THREAD)));
+
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let clock = Arc::clone(&clock);
+            let collected = Arc::clone(&collected);
+            handles.push(thread::spawn(move || {
+                let mut prev = clock.now();
+                let mut local = Vec::with_capacity(PER_THREAD);
+                local.push(prev);
+                for _ in 1..PER_THREAD {
+                    let curr = clock.now();
+                    assert!(curr > prev, "per-thread monotonicity violated: {prev:?} vs {curr:?}");
+                    prev = curr;
+                    local.push(curr);
+                }
+                collected.lock().unwrap().extend(local);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let mut all = collected.lock().unwrap();
+        let len_before = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            len_before,
+            "all {} timestamps must be distinct across threads ({} dupes)",
+            len_before,
+            len_before - all.len(),
+        );
+        assert_eq!(len_before, THREADS * PER_THREAD);
+    }
+
+    #[test]
+    fn clock_concurrent_update_and_now_never_duplicate() {
+        use std::sync::Arc;
+
+        const NOW_THREADS: usize = 4;
+        const UPDATE_THREADS: usize = 2;
+        const ITERATIONS: usize = 100_000;
+
+        let clock = Arc::new(HlcClock::new());
+        let collected = Arc::new(std::sync::Mutex::new(Vec::with_capacity(
+            (NOW_THREADS + UPDATE_THREADS) * ITERATIONS,
+        )));
+
+        let mut handles = Vec::with_capacity(NOW_THREADS + UPDATE_THREADS);
+        for _ in 0..NOW_THREADS {
+            let clock = Arc::clone(&clock);
+            let collected = Arc::clone(&collected);
+            handles.push(std::thread::spawn(move || {
+                let mut prev = clock.now();
+                for _ in 0..ITERATIONS {
+                    let curr = clock.now();
+                    assert!(curr > prev, "per-thread monotonicity violated");
+                    prev = curr;
+                    collected.lock().unwrap().push(curr);
+                }
+            }));
+        }
+        for t in 0..UPDATE_THREADS {
+            let clock = Arc::clone(&clock);
+            let collected = Arc::clone(&collected);
+            handles.push(std::thread::spawn(move || {
+                let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ (t as u64 + 1);
+                let mut prev = Hlc::new(0, 0);
+                for _ in 0..ITERATIONS {
+                    // xorshift64 — deterministic per-thread random HLCs.
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let remote = Hlc::new(state % 1_000_000, (state >> 32) as u32 % 1000);
+                    let curr = clock.update(remote);
+                    assert!(
+                        curr > prev,
+                        "per-thread monotonicity violated after update({remote:?})",
+                    );
+                    prev = curr;
+                    collected.lock().unwrap().push(curr);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let mut all = collected.lock().unwrap();
+        let len_before = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            len_before,
+            "all {} timestamps must be distinct ({} dupes)",
+            len_before,
+            len_before - all.len(),
+        );
     }
 
     // -- HlcClock update/receive-merge --

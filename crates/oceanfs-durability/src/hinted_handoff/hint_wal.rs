@@ -142,6 +142,13 @@ impl HintWal {
     /// The end position is the byte offset immediately after the frame,
     /// suitable for precise truncation.
     ///
+    /// ## Legacy records (hlc-causality-closure G5)
+    ///
+    /// WAL files written before the `hlc` fields existed contain records
+    /// with no timestamp; those replay with `hlc: None` (proto3 default),
+    /// which consumers interpret as `Hlc::zero()` — the pre-G5 behavior.
+    /// No on-disk format bump is needed.
+    ///
     /// # Errors
     ///
     /// Returns an error if the file cannot be read, a frame is corrupted
@@ -380,14 +387,21 @@ impl oceanfs_storage_api::WalWriter for HintWal {
 
 impl HintRecord {
     /// Creates a new `HintRecord` from an `HintInline`.
+    ///
+    /// `hlc` is the original write's timestamp (hlc-causality-closure
+    /// G5): the delivered hint must carry the version of the write it
+    /// replays, so a late delivery never resurrects data overwritten by
+    /// a newer write.
     pub fn new_inline(
         intended_for: NodeId,
         bucket_id: oceanfs_core::BucketId,
         object_key: String,
         data: bytes::Bytes,
+        hlc: oceanfs_core::Hlc,
     ) -> Self {
         let proto_intended: oceanfs_core::proto::common::NodeId = intended_for.into();
         let proto_bucket: oceanfs_core::proto::common::BucketId = bucket_id.into();
+        let proto_hlc: oceanfs_core::proto::common::HlcTimestamp = hlc.into();
 
         HintRecord {
             record: Some(Record::Inline(HintInline {
@@ -395,12 +409,16 @@ impl HintRecord {
                 bucket_id: Some(proto_bucket),
                 object_key,
                 data,
+                hlc: Some(proto_hlc),
             })),
             stored_at_secs: 0,
         }
     }
 
     /// Creates a new `HintRecord` from an `HintSegmentRef`.
+    ///
+    /// `hlc` is the original write's timestamp (hlc-causality-closure
+    /// G5) — see [`new_inline`](Self::new_inline).
     pub fn new_segment_ref(
         intended_for: NodeId,
         bucket_id: oceanfs_core::BucketId,
@@ -408,10 +426,12 @@ impl HintRecord {
         segment_id: oceanfs_core::SegmentId,
         offset: u64,
         length: u32,
+        hlc: oceanfs_core::Hlc,
     ) -> Self {
         let proto_intended: oceanfs_core::proto::common::NodeId = intended_for.into();
         let proto_bucket: oceanfs_core::proto::common::BucketId = bucket_id.into();
         let proto_segment: oceanfs_core::proto::common::SegmentId = segment_id.into();
+        let proto_hlc: oceanfs_core::proto::common::HlcTimestamp = hlc.into();
 
         HintRecord {
             record: Some(Record::SegmentRef(HintSegmentRef {
@@ -421,6 +441,7 @@ impl HintRecord {
                 segment_id: Some(proto_segment),
                 offset,
                 length,
+                hlc: Some(proto_hlc),
             })),
             stored_at_secs: 0,
         }
@@ -466,6 +487,7 @@ mod tests {
                 BucketId::new("bucket-a"),
                 format!("key-inline-{i}"),
                 vec![i as u8; 16].into(),
+                oceanfs_core::Hlc::new(1000 + i as u64, i as u32),
             );
             let _ = wal.write_hint(&record).await.unwrap();
         }
@@ -479,6 +501,7 @@ mod tests {
                 SegmentId::new(),
                 i * 100,
                 (i as u32 + 1) * 50,
+                oceanfs_core::Hlc::new(2000 + i as u64, i as u32),
             );
             let _ = wal.write_hint(&record).await.unwrap();
         }
@@ -499,6 +522,13 @@ mod tests {
                 assert_eq!(h.object_key, format!("key-inline-{idx}"));
                 assert_eq!(h.data.len(), 16);
                 assert_eq!(h.data.as_ref(), &vec![idx as u8; 16]);
+                // G5: the original write's HLC must survive the WAL roundtrip.
+                let stamped = h.hlc.as_ref().map(|p| (p.wall_time, p.logical));
+                assert_eq!(
+                    stamped,
+                    Some((1000 + idx as u64, idx as u32)),
+                    "inline hint hlc must roundtrip",
+                );
             } else {
                 panic!("expected HintInline at index {idx}");
             }
@@ -514,9 +544,53 @@ mod tests {
                 assert_eq!(h.object_key, format!("key-seg-{ref_idx}"));
                 assert_eq!(h.offset, ref_idx as u64 * 100);
                 assert_eq!(h.length, (ref_idx as u32 + 1) * 50);
+                // G5: the original write's HLC must survive the WAL roundtrip.
+                let stamped = h.hlc.as_ref().map(|p| (p.wall_time, p.logical));
+                assert_eq!(
+                    stamped,
+                    Some((2000 + ref_idx as u64, ref_idx as u32)),
+                    "segment-ref hint hlc must roundtrip",
+                );
             } else {
                 panic!("expected HintSegmentRef at index {idx}");
             }
+        }
+    }
+
+    // ── T1.1b: Legacy records (pre-G5) replay with absent hlc ─────────
+
+    #[tokio::test]
+    async fn test_legacy_record_without_hlc_replays_absent() {
+        // Records written before the hlc field existed carry no
+        // timestamp; they must replay with `hlc: None` so consumers
+        // fall back to the zero timestamp (hlc-causality-closure G5
+        // migration note). No on-disk format bump is needed — proto3
+        // defaults the field to absent.
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("legacy.wal");
+        let wal = HintWal::open(&wal_path).await.unwrap();
+
+        let legacy = HintRecord {
+            record: Some(Record::Inline(HintInline {
+                intended_for: Some(NodeId::new("node-a").into()),
+                bucket_id: Some(BucketId::new("b").into()),
+                object_key: "legacy-key".into(),
+                data: vec![1u8; 8].into(),
+                hlc: None,
+            })),
+            stored_at_secs: 0,
+        };
+        wal.write_hint(&legacy).await.unwrap();
+        drop(wal);
+
+        let wal2 = HintWal::open(&wal_path).await.unwrap();
+        let records = wal2.replay().await.unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0].2.record {
+            Some(Record::Inline(h)) => {
+                assert!(h.hlc.is_none(), "legacy record must replay with absent hlc");
+            }
+            other => panic!("expected inline record, got {other:?}"),
         }
     }
 
@@ -537,6 +611,7 @@ mod tests {
                 BucketId::new("b"),
                 format!("key-{i}"),
                 vec![i as u8].into(),
+                oceanfs_core::Hlc::zero(),
             );
             let (pos, _end) = wal.write_hint(&record).await.unwrap();
             start_positions.push(pos);
@@ -575,6 +650,7 @@ mod tests {
                 BucketId::new("b"),
                 format!("key-{i}"),
                 vec![i as u8; 10].into(),
+                oceanfs_core::Hlc::zero(),
             );
             let _ = wal.write_hint(&record).await.unwrap();
         }
@@ -699,6 +775,7 @@ mod tests {
             BucketId::new("b"),
             "obj1".into(),
             vec![1, 2, 3].into(),
+            oceanfs_core::Hlc::zero(),
         );
         r1.stored_at_secs = now - ttl - 100;
 
@@ -708,6 +785,7 @@ mod tests {
             BucketId::new("b"),
             "obj2".into(),
             vec![4, 5, 6].into(),
+            oceanfs_core::Hlc::zero(),
         );
         r2.stored_at_secs = now - (ttl / 2);
 
@@ -717,6 +795,7 @@ mod tests {
             BucketId::new("b"),
             "obj3".into(),
             vec![7, 8, 9].into(),
+            oceanfs_core::Hlc::zero(),
         );
         r3.stored_at_secs = now;
 

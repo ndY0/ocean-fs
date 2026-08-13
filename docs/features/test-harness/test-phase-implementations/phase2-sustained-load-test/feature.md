@@ -23,6 +23,8 @@ dependencies:
     reason: Need LoadReport for structured results output
   - epic: test-harness-extensions/failure-injectors
     reason: Need Cluster::kill() for post-crash recovery test
+  - epic: refactoring/load-test-harness-fidelity
+    reason: Corrects measurement fidelity (multi-thread runtime, 16 MiB max_body_size, 4xx tracking, HTTP-only latency) that Phase 2 builds on
 adr:
   - 0001-segment-packing
   - 0004-tiered-segment-sizing

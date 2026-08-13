@@ -845,6 +845,7 @@ mod tests {
             &self,
             _bucket: &oceanfs_core::BucketId,
             _key: &oceanfs_core::ObjectKey,
+            _hlc: oceanfs_core::Hlc,
         ) -> std::io::Result<()> {
             Ok(())
         }
@@ -877,6 +878,7 @@ mod tests {
             server_handoff,
             server_meta,
             server_store,
+            Arc::new(oceanfs_core::HlcClock::new()),
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

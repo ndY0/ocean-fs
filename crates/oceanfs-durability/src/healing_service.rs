@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use oceanfs_core::{Hlc, NodeId, SegmentId};
+use oceanfs_core::{Hlc, HlcClock, NodeId, SegmentId};
 use tonic::{Request, Response, Status};
 
 use crate::{
@@ -31,6 +31,10 @@ pub struct HealingGrpcService {
     /// matches it are APPLIED to the local metadata store instead of
     /// being buffered (a hint for oneself is a delayed write — t21).
     local_node_id: Option<NodeId>,
+    /// HLC clock for receive-merge (hlc-causality-closure G2). Remote
+    /// hint timestamps are merged via [`HlcClock::update`] so the local
+    /// clock never lags the nodes that sent them.
+    hlc_clock: Arc<HlcClock>,
 }
 
 impl HealingGrpcService {
@@ -39,8 +43,9 @@ impl HealingGrpcService {
         handoff: Arc<crate::HintedHandoff>,
         metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore>,
         data_store: Arc<dyn SegmentDataStore>,
+        hlc_clock: Arc<HlcClock>,
     ) -> Self {
-        Self { handoff, metadata_store, data_store, local_node_id: None }
+        Self { handoff, metadata_store, data_store, local_node_id: None, hlc_clock }
     }
 
     /// Sets this node's identifier so that self-intended hints are
@@ -61,11 +66,16 @@ impl HealingGrpcService {
     /// metadata (with inline data) to the local metadata store so reads
     /// succeed once hinted-handoff delivery completes (t21).
     ///
-    /// The original HLC is not carried by the hint protocol; the applied
-    /// metadata uses `Hlc::zero()`. The multi-replica HLC comparison
-    /// treats equal timestamps as non-conflicting, so this is safe for
-    /// the delayed-write case.
-    fn apply_inline_hint(&self, bucket: oceanfs_core::BucketId, object_key: String, data: Bytes) {
+    /// `hlc` is the original write's timestamp (hlc-causality-closure
+    /// G5): the applied metadata persists the *original* version, not
+    /// zero, so a late delivery loses LWW against newer writes.
+    fn apply_inline_hint(
+        &self,
+        bucket: oceanfs_core::BucketId,
+        object_key: String,
+        data: Bytes,
+        hlc: Hlc,
+    ) {
         let meta = oceanfs_core::ObjectMetadata {
             object_key: oceanfs_core::ObjectKey::new(&object_key),
             size: data.len() as u64,
@@ -78,7 +88,7 @@ impl HealingGrpcService {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as i64,
-            hlc: Hlc::zero(),
+            hlc,
         };
         match oceanfs_storage_api::MetadataStore::put_object(
             self.metadata_store.as_ref(),
@@ -120,6 +130,10 @@ impl HealingRpc for HealingGrpcService {
         let segment_id =
             req.segment_id.and_then(|sid| SegmentId::try_from(sid).ok()).unwrap_or_default();
         let hlc = req.hlc.and_then(|h| Hlc::try_from(h).ok()).unwrap_or_else(Hlc::zero);
+
+        // Receive rule (G2): merge the remote hint's timestamp into the
+        // local clock.
+        self.hlc_clock.update(hlc);
 
         let hint = crate::HintRecord {
             intended_for: intended_for.clone(),
@@ -180,6 +194,17 @@ impl HealingRpc for HealingGrpcService {
                         .map(NodeId::from)
                         .unwrap_or_else(|| NodeId::new("unknown"));
 
+                    // G5: the hint carries the original write's HLC.
+                    // Legacy records (written before the field existed)
+                    // replay with None → zero timestamp.
+                    let hlc = inline
+                        .hlc
+                        .as_ref()
+                        .map(|h| Hlc::new(h.wall_time, h.logical))
+                        .unwrap_or_else(Hlc::zero);
+                    // Receive rule (G2): merge the remote timestamp.
+                    self.hlc_clock.update(hlc);
+
                     // A hint intended for this node is a delayed write:
                     // apply it to the local metadata store (t21).
                     if self.is_local_hint(&intended_for) {
@@ -192,6 +217,7 @@ impl HealingRpc for HealingGrpcService {
                             bucket,
                             inline.object_key.clone(),
                             inline.data.clone(),
+                            hlc,
                         );
                         accepted_count += 1;
                         continue;
@@ -202,7 +228,7 @@ impl HealingRpc for HealingGrpcService {
                         segment_id: SegmentId::new(), // inline hints don't have a segment
                         offset: 0,
                         length: inline.data.len() as u32,
-                        timestamp: Hlc::zero(),
+                        timestamp: hlc,
                         data: inline.data.clone(),
                         stored_at_secs: 0,
                     };
@@ -227,6 +253,15 @@ impl HealingRpc for HealingGrpcService {
                         .map(NodeId::from)
                         .unwrap_or_else(|| NodeId::new("unknown"));
 
+                    // G5: the hint carries the original write's HLC.
+                    let hlc = seg_ref
+                        .hlc
+                        .as_ref()
+                        .map(|h| Hlc::new(h.wall_time, h.logical))
+                        .unwrap_or_else(Hlc::zero);
+                    // Receive rule (G2): merge the remote timestamp.
+                    self.hlc_clock.update(hlc);
+
                     // Segment-ref hints carry a reference but not the data;
                     // applying them locally requires fetching the segment
                     // shard from the origin, which the current hint protocol
@@ -249,7 +284,7 @@ impl HealingRpc for HealingGrpcService {
                             .unwrap_or_default(),
                         offset: seg_ref.offset,
                         length: seg_ref.length,
-                        timestamp: Hlc::zero(),
+                        timestamp: hlc,
                         data: bytes::Bytes::new(),
                         stored_at_secs: 0,
                     };
@@ -492,7 +527,58 @@ mod tests {
             .unwrap(),
         );
         let data_store: Arc<dyn SegmentDataStore> = Arc::new(TestHealStore::new());
-        HealingGrpcService::new(handoff, metadata_store, data_store)
+        HealingGrpcService::new(handoff, metadata_store, data_store, Arc::new(HlcClock::new()))
+    }
+
+    /// G5: a batched inline hint intended for this node applies with the
+    /// *original* write's HLC — not zero.
+    #[tokio::test]
+    async fn batched_inline_hint_applies_with_original_hlc() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore> = Arc::new(
+            oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let handoff = Arc::new(HintedHandoff::new());
+        let data_store: Arc<dyn SegmentDataStore> = Arc::new(TestHealStore::new());
+        let service = HealingGrpcService::new(
+            handoff,
+            metadata_store.clone(),
+            data_store,
+            Arc::new(HlcClock::new()),
+        )
+        .with_local_node_id(NodeId::new("self-node"));
+
+        let hint = crate::hinted_handoff_rpc::HintRecord {
+            record: Some(Record::Inline(crate::hinted_handoff_rpc::HintInline {
+                intended_for: Some(NodeId::new("self-node").into()),
+                bucket_id: Some(oceanfs_core::BucketId::new("b").into()),
+                object_key: "k".to_string(),
+                data: Bytes::from_static(b"hello"),
+                hlc: Some(oceanfs_core::proto::common::HlcTimestamp { wall_time: 555, logical: 3 }),
+            })),
+            stored_at_secs: 0,
+        };
+
+        let request = tonic::Request::new(HintedHandoffRequest { hints: vec![hint] });
+        let response = service.hinted_handoff(request).await.unwrap();
+        assert!(response.into_inner().accepted, "self-intended hint must apply");
+
+        let meta = oceanfs_storage_api::MetadataStore::get_object_metadata(
+            metadata_store.as_ref(),
+            &oceanfs_core::BucketId::new("b"),
+            &oceanfs_core::ObjectKey::new("k"),
+        )
+        .unwrap()
+        .expect("applied hint must persist object metadata");
+        assert_eq!(
+            meta.hlc,
+            Hlc::new(555, 3),
+            "applied metadata must carry the original write's HLC",
+        );
     }
 
     #[tokio::test]
@@ -533,7 +619,8 @@ mod tests {
         test_store.write_segment_data(&seg_id, &data).unwrap();
 
         let data_store: Arc<dyn SegmentDataStore> = test_store;
-        let service = HealingGrpcService::new(handoff, metadata_store, data_store);
+        let service =
+            HealingGrpcService::new(handoff, metadata_store, data_store, Arc::new(HlcClock::new()));
 
         let proto_sid: ProtoSegmentId = seg_id.into();
         let request = tonic::Request::new(MerkleRequest {

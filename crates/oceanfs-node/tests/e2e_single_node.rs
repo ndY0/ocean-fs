@@ -9,7 +9,7 @@ mod helpers {
     use std::{collections::HashMap, sync::Arc};
 
     use bytes::Bytes;
-    use oceanfs_core::{BucketId, HashKey, HashOutput, ObjectKey, ObjectMetadata};
+    use oceanfs_core::{BucketId, HashKey, HashOutput, Hlc, ObjectKey, ObjectMetadata};
     use oceanfs_routing::hash_key;
     use oceanfs_server::{
         metadata_ops::{MetadataError, MetadataOps},
@@ -50,7 +50,12 @@ mod helpers {
             Ok(())
         }
 
-        fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> Result<(), MetadataError> {
+        fn delete_object(
+            &self,
+            bucket: &BucketId,
+            key: &ObjectKey,
+            _hlc: Hlc,
+        ) -> Result<(), MetadataError> {
             self.objects.write().remove(&(bucket.as_str().to_string(), key.as_str().to_string()));
             Ok(())
         }

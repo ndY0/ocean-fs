@@ -17,6 +17,7 @@ tracing.workspace = true
 prost.workspace = true
 tonic.workspace = true
 async-trait = "0.1"
+portable-atomic.workspace = true
 
 # External
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }

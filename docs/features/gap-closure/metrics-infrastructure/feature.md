@@ -214,3 +214,56 @@ The reviewer returned PASS with 6 low-severity gaps, accepted as follows:
 6. **RocksDB per-level file gauges** — Only level 0 implemented; levels
    1–6 deferred. Adding them later is trivial (copy the polling
    pattern).
+
+## Post-Completion Defect (2026-08-13) — Registered Fallback Counters Never Incremented
+
+**Found during** the `load_concurrency` results analysis. The fidelity
+feature's `accel_fallback_zero` assertion was doubly vacuous: (a) it
+scraped the wrong metric name, and (b) the registered counter it *should*
+have read is never incremented in production.
+
+**Defect:** this feature registered the fallback counters, but the
+production fallback paths increment only the dispatcher's **private**
+atomics — `ec_fallback_count`, `compression_fallback_count`,
+`runtime_fallback` flag — never the registered `AccelMetrics` counters.
+`/admin/metrics` therefore reports permanent 0s for
+`accel_ec_fallback_total` and `accel_compression_fallback_total`
+regardless of actual fallbacks. `/admin/acceleration` (which reads the
+private atomics) and `/admin/metrics` (which reads the registered
+counters) disagree.
+
+Verified state in `crates/oceanfs-accel/src/dispatcher.rs`:
+
+| Registered counter | Production increment site | Status |
+|---|---|---|
+| `accel_runtime_fallback_total` | `record_runtime_fallback()` at dispatcher.rs:502, 508 | **Wired** |
+| `accel_ec_fallback_total` | **RESOLVED 2026-08-13.** Parallel implementer wired it: `resolve_ec_tier` now takes `&AccelMetrics` and calls `metrics.record_ec_fallback()` at all three fallback sites (dispatcher.rs:834, 841, 851), with tests asserting both counters agree (`resolve_ec_tier_fallback_records_both_counters` + per-tier assertions). `cargo test -p oceanfs-accel`: 75 green. | **Wired** |
+| `accel_compression_fallback_total` | **RESOLVED 2026-08-13.** `resolve_compression_tier_with_fallback` now takes `&AccelMetrics` and calls `metrics.record_compression_fallback()` at both fallback sites (GpuNvcomp→Igzip/Zstd, Igzip→Zstd), mirroring the EC fix. Test `compression_fallback_records_both_counters` forces a GpuNvcomp fallback on a non-CUDA build and asserts `compression_fallback_count() == 1` AND `metrics().compression_fallback_count() == 1`. `cargo test -p oceanfs-accel --lib`: 76 green. | **Wired** |
+
+**Remaining fix (small, single file):** `resolve_compression_tier_with_fallback`
+must also call `metrics.record_compression_fallback()` at each fallback
+site, mirroring the EC fix. The private atomics stay for the
+`/admin/acceleration` JSON endpoint; both views must then agree.
+
+**Fix (small, single file):** every site that increments a private
+`*_fallback_count` atomic (or sets the runtime-fallback flag) must also
+call the matching `AccelMetrics` recorder —
+`metrics.record_ec_fallback()`, `metrics.record_compression_fallback()`,
+`metrics.record_runtime_fallback()` (methods already exist at
+`oceanfs-accel/src/metrics.rs:141,146,151`). For the startup EC tier
+fallback: capture a `fallback_happened` flag during tier resolution and
+call `record_ec_fallback()` on the constructed dispatcher before
+returning from `new()`. The private atomics stay for the
+`/admin/acceleration` JSON endpoint; both views must then agree.
+
+**DoD:** `cargo test -p oceanfs-accel` green — **DONE (2026-08-13):**
+EC half and compression half are both wired and tested; remaining
+verification-only item: `/admin/metrics` on a running node containing
+`accel_compression_fallback_total` with a non-zero value after a
+forced-fallback run (covered by the fidelity DoD's manual probe on the
+EC counter; the same wiring pattern applies to compression).
+
+**Test-side counterpart:** the `load_concurrency` assertion fix lives in
+`refactoring/load-test-harness-fidelity` work item F5 (correct metric
+name + fail-on-absent). This section supplies the production half it
+asserts against.

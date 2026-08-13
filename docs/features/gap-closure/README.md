@@ -123,6 +123,8 @@ Wires the segment pipeline (TierRouter → SegmentPool → ActiveSegment → Seg
 
 **Feature:** [`correctness-gaps/feature.md`](correctness-gaps/feature.md)
 
+**Feature:** [`hlc-causality-closure/feature.md`](hlc-causality-closure/feature.md)
+
 Fixes seven functional correctness bugs: WAL crash recovery (fixes D6), read
 repair with multi-replica HLC comparison + corrective push, EC decode integration
 into read path, hinted handoff delivery wiring (fixes T21), graceful leave with
@@ -130,6 +132,17 @@ WAL handoff + shard streaming, multi-replica HLC comparison for concurrent write
 (fixes T45), and port preservation in Cluster harness (fixes T43). Also wires
 `ReadTuningConfig`, implements group commit fsync, distributed shard fetch,
 peer-to-peer Merkle exchange, distributed scrub, and the bucket policy endpoint.
+
+The `hlc-causality-closure` feature provides the causality substrate the
+multi-replica comparisons depend on: a live wall clock, the HLC
+receive-merge rule wired into every remote-HLC reception site, and HLC
+propagation through replication, tombstones, and hinted handoff.
+
+**Feature:** [`read-path-integrity-under-load/feature.md`](read-path-integrity-under-load/feature.md)
+
+Discovered 2026-08-13 by the fidelity-fixed load test: 176/417 objects
+unreadable after a 30 s run. Two confirmed multi-tier write-path defects
+(blob-relative chunk offsets, missing blob-index registration).
 
 ### Audit Findings Covered
 

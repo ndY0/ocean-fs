@@ -455,6 +455,7 @@ pub struct WorkerStats {
     // ── PUT counters ────
     puts_total: AtomicU64,
     puts_200: AtomicU64,
+    puts_4xx: AtomicU64,
     puts_5xx: AtomicU64,
     // ── GET counters ────
     gets_total: AtomicU64,
@@ -496,6 +497,12 @@ impl WorkerStats {
     pub fn puts_200(&self) -> u64 {
         self.puts_200.load(Ordering::Relaxed)
     }
+    /// PUTs rejected with an HTTP 4xx status (e.g., 413 body-limit
+    /// rejections). These are silent in the old counters — 200/5xx/errors
+    /// only — so a run can "pass" while nearly half of its PUTs fail.
+    pub fn puts_4xx(&self) -> u64 {
+        self.puts_4xx.load(Ordering::Relaxed)
+    }
     /// Failed PUTs (HTTP 5xx).
     pub fn puts_5xx(&self) -> u64 {
         self.puts_5xx.load(Ordering::Relaxed)
@@ -532,19 +539,19 @@ impl WorkerStats {
     pub fn errors_total(&self) -> u64 {
         self.errors_total.load(Ordering::Relaxed)
     }
-    /// PUTs classified as inline tier (≤4 KiB).
+    /// Successful PUTs (HTTP 200) classified as inline tier (≤4 KiB).
     pub fn puts_inline(&self) -> u64 {
         self.puts_inline.load(Ordering::Relaxed)
     }
-    /// PUTs classified as small tier (4–256 KiB).
+    /// Successful PUTs (HTTP 200) classified as small tier (4–256 KiB).
     pub fn puts_small(&self) -> u64 {
         self.puts_small.load(Ordering::Relaxed)
     }
-    /// PUTs classified as standard tier (256 KiB–4 MiB).
+    /// Successful PUTs (HTTP 200) classified as standard tier (256 KiB–4 MiB).
     pub fn puts_standard(&self) -> u64 {
         self.puts_standard.load(Ordering::Relaxed)
     }
-    /// PUTs classified as multi tier (>4 MiB).
+    /// Successful PUTs (HTTP 200) classified as multi tier (>4 MiB).
     pub fn puts_multi(&self) -> u64 {
         self.puts_multi.load(Ordering::Relaxed)
     }
@@ -556,6 +563,8 @@ impl WorkerStats {
         self.puts_total.fetch_add(1, Ordering::Relaxed);
         if status == 200 {
             self.puts_200.fetch_add(1, Ordering::Relaxed);
+        } else if (400..500).contains(&status) {
+            self.puts_4xx.fetch_add(1, Ordering::Relaxed);
         } else if status >= 500 {
             self.puts_5xx.fetch_add(1, Ordering::Relaxed);
         }
@@ -596,9 +605,13 @@ impl WorkerStats {
         self.errors_total.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Records the blob size tier for a PUT operation.
+    /// Records the blob size tier for a **successful** PUT operation.
     ///
-    /// Classifies the blob size into one of four tiers:
+    /// Callers must invoke this only when the PUT returned HTTP 200 —
+    /// the tier counters measure *successful* coverage, not attempts
+    /// (an attempt that is rejected by the body limit never exercises
+    /// the storage path). Classifies the blob size into one of four
+    /// tiers:
     /// - inline (≤4 KiB)
     /// - small (4–256 KiB)
     /// - standard (256 KiB–4 MiB)
@@ -620,6 +633,7 @@ impl WorkerStats {
     fn merge_from(&self, other: &WorkerStats) {
         self.puts_total.fetch_add(other.puts_total(), Ordering::Relaxed);
         self.puts_200.fetch_add(other.puts_200(), Ordering::Relaxed);
+        self.puts_4xx.fetch_add(other.puts_4xx(), Ordering::Relaxed);
         self.puts_5xx.fetch_add(other.puts_5xx(), Ordering::Relaxed);
         self.gets_total.fetch_add(other.gets_total(), Ordering::Relaxed);
         self.gets_200.fetch_add(other.gets_200(), Ordering::Relaxed);
@@ -645,6 +659,7 @@ impl std::fmt::Debug for WorkerStats {
         f.debug_struct("WorkerStats")
             .field("puts_total", &self.puts_total())
             .field("puts_200", &self.puts_200())
+            .field("puts_4xx", &self.puts_4xx())
             .field("puts_5xx", &self.puts_5xx())
             .field("gets_total", &self.gets_total())
             .field("gets_200", &self.gets_200())
@@ -677,6 +692,8 @@ pub struct AggregateStats {
     pub puts_total: u64,
     /// Successful PUTs (HTTP 200).
     pub puts_200: u64,
+    /// PUTs rejected with an HTTP 4xx status (e.g., 413).
+    pub puts_4xx: u64,
     /// Failed PUTs (HTTP 5xx).
     pub puts_5xx: u64,
     /// Total GETs attempted.
@@ -697,14 +714,19 @@ pub struct AggregateStats {
     pub errors_total: u64,
     /// Total operations across all types.
     pub ops_total: u64,
-    /// PUTs classified as inline tier (≤4 KiB).
+    /// PUTs classified as inline tier (≤4 KiB) — successful PUTs only.
     pub puts_inline: u64,
-    /// PUTs classified as small tier (4–256 KiB).
+    /// PUTs classified as small tier (4–256 KiB) — successful PUTs only.
     pub puts_small: u64,
-    /// PUTs classified as standard tier (256 KiB–4 MiB).
+    /// PUTs classified as standard tier (256 KiB–4 MiB) — successful PUTs only.
     pub puts_standard: u64,
-    /// PUTs classified as multi tier (>4 MiB).
+    /// PUTs classified as multi tier (>4 MiB) — successful PUTs only.
     pub puts_multi: u64,
+    /// Number of workers that completed at least one operation.
+    ///
+    /// Set by the orchestrator after joining workers; a worker that
+    /// panicked before its first completed operation is not counted.
+    pub active_workers: u64,
     /// PUT latency p50 (microseconds).
     pub put_p50_us: u64,
     /// PUT latency p99 (microseconds).
@@ -737,6 +759,7 @@ impl AggregateStats {
 
         let puts_total = merged.puts_total();
         let puts_200 = merged.puts_200();
+        let puts_4xx = merged.puts_4xx();
         let puts_5xx = merged.puts_5xx();
         let gets_total = merged.gets_total();
         let gets_200 = merged.gets_200();
@@ -755,6 +778,7 @@ impl AggregateStats {
         Self {
             puts_total,
             puts_200,
+            puts_4xx,
             puts_5xx,
             gets_total,
             gets_200,
@@ -769,6 +793,7 @@ impl AggregateStats {
             puts_small,
             puts_standard,
             puts_multi,
+            active_workers: 0, // set by the orchestrator after join
             put_p50_us: merged.put_latency.percentile(0.50),
             put_p99_us: merged.put_latency.percentile(0.99),
             get_p50_us: merged.get_latency.percentile(0.50),
@@ -802,17 +827,26 @@ pub struct Worker {
     scenario: Arc<LoadScenario>,
     /// Per-worker statistics (collected during execution).
     stats: WorkerStats,
+    /// Shared activity counter incremented once this worker completes
+    /// its first operation (owned by the orchestrator).
+    activity: Arc<AtomicU64>,
 }
 
 impl Worker {
     /// Creates a new worker.
+    ///
+    /// `activity` is a shared counter owned by the orchestrator: the
+    /// worker increments it exactly once, when its first operation
+    /// completes, so the orchestrator can distinguish workers that ran
+    /// from workers that panicked before doing any work.
     pub fn new(
         id: usize,
         cluster: Arc<Cluster>,
         manifest: Arc<Manifest>,
         scenario: Arc<LoadScenario>,
+        activity: Arc<AtomicU64>,
     ) -> Self {
-        Self { id, cluster, manifest, scenario, stats: WorkerStats::new() }
+        Self { id, cluster, manifest, scenario, stats: WorkerStats::new(), activity }
     }
 
     /// Runs the worker loop until the scenario duration elapses.
@@ -831,6 +865,18 @@ impl Worker {
         let bucket = "load-test";
         let node_count = self.cluster.len();
         let scenario_start = Instant::now();
+
+        // Per-op debug tracing (opt-in via LOAD_TEST_DEBUG=1). Logs the
+        // client-side cost breakdown of every operation: blob generation
+        // time (PUTs only), total round-trip time, and the HTTP status.
+        let debug_trace = std::env::var("LOAD_TEST_DEBUG")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        // Activity is reported once, on the first *completed* operation,
+        // so a worker that panics before finishing any op is not counted
+        // as active.
+        let mut first_op_completed = false;
 
         loop {
             // ── Check elapsed time ──
@@ -852,71 +898,171 @@ impl Worker {
             let node_idx = if node_count > 0 { rng.gen_range(0..node_count) } else { 0 };
             let path = format!("/{bucket}/{key}");
 
-            let start = Instant::now();
             match op {
                 Operation::Put => {
+                    // Blob generation is timed separately and excluded
+                    // from the latency histogram — the timer starts at
+                    // the HTTP boundary so the histogram measures
+                    // server round-trips, not client-side generation.
+                    let gen_start = Instant::now();
                     let body = random_bytes(size);
+                    let gen_elapsed = gen_start.elapsed(); // kept for debug trace
+                    let start = Instant::now(); // HTTP-only latency
                     match self.cluster.put(node_idx, &path, &body).await {
                         Ok(resp) => {
                             let status = resp.status().as_u16();
                             let _ = resp.bytes().await; // consume body
                             let latency = start.elapsed();
+                            if debug_trace {
+                                // `total_ms` keeps its original meaning:
+                                // generation + HTTP round-trip.
+                                eprintln!(
+                                    "[worker-{}] PUT {} size={} gen_ms={:.2} total_ms={:.2} status={}",
+                                    self.id,
+                                    key,
+                                    size,
+                                    gen_elapsed.as_secs_f64() * 1e3,
+                                    (gen_elapsed + latency).as_secs_f64() * 1e3,
+                                    status
+                                );
+                            }
                             if status == 200 {
                                 self.manifest.record(bucket, &key, &body);
+                                // Tier counters count successes, not
+                                // attempts: a 413-rejected PUT never
+                                // exercised that tier's storage path.
+                                self.stats.record_blob_size_tier(size);
                             }
                             self.stats.record_put(status, latency);
-                            self.stats.record_blob_size_tier(size);
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            if debug_trace {
+                                // `total_ms` keeps its original meaning:
+                                // generation + HTTP round-trip.
+                                eprintln!(
+                                    "[worker-{}] PUT {} size={} gen_ms={:.2} total_ms={:.2} ERR={}",
+                                    self.id,
+                                    key,
+                                    size,
+                                    gen_elapsed.as_secs_f64() * 1e3,
+                                    (gen_elapsed + start.elapsed()).as_secs_f64() * 1e3,
+                                    e
+                                );
+                            }
                             self.stats.record_put(0, start.elapsed());
                             self.stats.record_error();
-                            self.stats.record_blob_size_tier(size);
                         }
                     }
                 }
                 Operation::Get => {
+                    let start = Instant::now();
                     match self.cluster.get(node_idx, &path).await {
                         Ok(resp) => {
                             let status = resp.status().as_u16();
                             let _ = resp.bytes().await; // consume body
-                            self.stats.record_get(status, start.elapsed());
+                            let latency = start.elapsed();
+                            if debug_trace {
+                                eprintln!(
+                                    "[worker-{}] GET  {} total_ms={:.2} status={}",
+                                    self.id,
+                                    key,
+                                    latency.as_secs_f64() * 1e3,
+                                    status
+                                );
+                            }
+                            self.stats.record_get(status, latency);
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            if debug_trace {
+                                eprintln!(
+                                    "[worker-{}] GET  {} total_ms={:.2} ERR={}",
+                                    self.id,
+                                    key,
+                                    start.elapsed().as_secs_f64() * 1e3,
+                                    e
+                                );
+                            }
                             self.stats.record_get(0, start.elapsed());
                             self.stats.record_error();
                         }
                     }
                 }
                 Operation::Delete => {
+                    let start = Instant::now();
                     match self.cluster.delete(node_idx, &path).await {
                         Ok(resp) => {
                             let status = resp.status().as_u16();
                             let _ = resp.bytes().await; // consume body
                             let latency = start.elapsed();
+                            if debug_trace {
+                                eprintln!(
+                                    "[worker-{}] DEL  {} total_ms={:.2} status={}",
+                                    self.id,
+                                    key,
+                                    latency.as_secs_f64() * 1e3,
+                                    status
+                                );
+                            }
                             if status == 204 {
                                 self.manifest.record_delete(bucket, &key);
                             }
                             self.stats.record_delete(status, latency);
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            if debug_trace {
+                                eprintln!(
+                                    "[worker-{}] DEL  {} total_ms={:.2} ERR={}",
+                                    self.id,
+                                    key,
+                                    start.elapsed().as_secs_f64() * 1e3,
+                                    e
+                                );
+                            }
                             self.stats.record_delete(0, start.elapsed());
                             self.stats.record_error();
                         }
                     }
                 }
                 Operation::Head => {
+                    let start = Instant::now();
                     match self.cluster.head(node_idx, &path).await {
                         Ok(resp) => {
                             let status = resp.status().as_u16();
                             let _ = resp.bytes().await; // consume body
-                            self.stats.record_head(status, start.elapsed());
+                            let latency = start.elapsed();
+                            if debug_trace {
+                                eprintln!(
+                                    "[worker-{}] HEAD {} total_ms={:.2} status={}",
+                                    self.id,
+                                    key,
+                                    latency.as_secs_f64() * 1e3,
+                                    status
+                                );
+                            }
+                            self.stats.record_head(status, latency);
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            if debug_trace {
+                                eprintln!(
+                                    "[worker-{}] HEAD {} total_ms={:.2} ERR={}",
+                                    self.id,
+                                    key,
+                                    start.elapsed().as_secs_f64() * 1e3,
+                                    e
+                                );
+                            }
                             self.stats.record_head(0, start.elapsed());
                             self.stats.record_error();
                         }
                     }
                 }
+            }
+
+            // The operation completed (any outcome counts as "ran");
+            // report activity exactly once.
+            if !first_op_completed {
+                first_op_completed = true;
+                self.activity.fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -1012,11 +1158,21 @@ impl Orchestrator {
         // Workers PUT to /load-test/{key}; this ensures the bucket exists.
         let _ = cluster.put(0, "/load-test", &[]).await;
 
+        // Shared activity counter: each worker increments it once on its
+        // first completed operation, so the orchestrator can assert that
+        // every worker actually ran.
+        let activity = Arc::new(AtomicU64::new(0));
+
         // Spawn N workers.
         let mut handles = Vec::with_capacity(scenario.concurrency);
         for id in 0..scenario.concurrency {
-            let worker =
-                Worker::new(id, Arc::clone(&cluster), Arc::clone(&manifest), Arc::clone(&scenario));
+            let worker = Worker::new(
+                id,
+                Arc::clone(&cluster),
+                Arc::clone(&manifest),
+                Arc::clone(&scenario),
+                Arc::clone(&activity),
+            );
             handles.push(tokio::spawn(async move { worker.run().await }));
         }
 
@@ -1045,6 +1201,7 @@ impl Orchestrator {
 
         let mut aggregate = AggregateStats::merge(&all_stats);
         aggregate.elapsed_secs = start.elapsed().as_secs_f64();
+        aggregate.active_workers = activity.load(Ordering::Relaxed);
         aggregate
     }
 }
@@ -1198,6 +1355,34 @@ mod tests {
         assert_eq!(stats.heads_200(), 1);
     }
 
+    #[test]
+    fn worker_stats_put_4xx_counted_separately_from_5xx() {
+        let stats = WorkerStats::new();
+        stats.record_put(200, Duration::from_millis(10));
+        stats.record_put(413, Duration::from_millis(10));
+        stats.record_put(404, Duration::from_millis(10));
+        stats.record_put(500, Duration::from_millis(10));
+
+        assert_eq!(stats.puts_total(), 4);
+        assert_eq!(stats.puts_200(), 1);
+        assert_eq!(stats.puts_4xx(), 2);
+        assert_eq!(stats.puts_5xx(), 1);
+    }
+
+    #[test]
+    fn blob_size_tier_classification_matches_boundaries() {
+        let stats = WorkerStats::new();
+        stats.record_blob_size_tier(INLINE_MAX); // 4 KiB — inline
+        stats.record_blob_size_tier(SMALL_MAX); // 256 KiB — small
+        stats.record_blob_size_tier(STANDARD_MAX); // 4 MiB — standard
+        stats.record_blob_size_tier(MULTI_MAX); // 16 MiB — multi
+
+        assert_eq!(stats.puts_inline(), 1);
+        assert_eq!(stats.puts_small(), 1);
+        assert_eq!(stats.puts_standard(), 1);
+        assert_eq!(stats.puts_multi(), 1);
+    }
+
     // ── AggregateStats tests ─────
 
     #[test]
@@ -1205,15 +1390,17 @@ mod tests {
         let s1 = WorkerStats::new();
         s1.record_put(200, Duration::from_millis(10));
         s1.record_put(200, Duration::from_millis(15));
+        s1.record_put(413, Duration::from_millis(15));
 
         let s2 = WorkerStats::new();
         s2.record_put(200, Duration::from_millis(5));
         s2.record_get(200, Duration::from_millis(8));
 
         let agg = AggregateStats::merge(&[s1, s2]);
-        assert_eq!(agg.puts_total, 3);
+        assert_eq!(agg.puts_total, 4);
+        assert_eq!(agg.puts_4xx, 1);
         assert_eq!(agg.gets_total, 1);
-        assert_eq!(agg.ops_total, 4);
+        assert_eq!(agg.ops_total, 5);
     }
 
     #[test]

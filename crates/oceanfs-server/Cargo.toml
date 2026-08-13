@@ -76,6 +76,7 @@ sendfile = ["oceanfs-storage/sendfile"]
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

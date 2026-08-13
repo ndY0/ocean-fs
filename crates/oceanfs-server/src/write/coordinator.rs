@@ -357,6 +357,7 @@ impl WriteCoordinator {
                                     req.bucket.clone(),
                                     req.key.to_string(),
                                     req.data.clone(),
+                                    hlc,
                                 )
                             } else if let Some(chunk) = chunks.first() {
                                 // Use the first chunk's segment reference.
@@ -369,6 +370,7 @@ impl WriteCoordinator {
                                     chunk.segment_id,
                                     chunk.offset,
                                     chunk.length,
+                                    hlc,
                                 )
                             } else {
                                 // Safety guard: if chunks is empty (inline tier),
@@ -382,6 +384,7 @@ impl WriteCoordinator {
                                     req.bucket.clone(),
                                     req.key.to_string(),
                                     req.data.clone(),
+                                    hlc,
                                 )
                             };
                         let _ = self.hinted_handoff.enqueue(hint).await;
@@ -432,6 +435,12 @@ impl WriteCoordinator {
     /// Returns a reference to the HLC clock.
     pub fn hlc_clock(&self) -> &Arc<HlcClock> {
         &self.hlc_clock
+    }
+
+    /// Returns a reference to the hinted-handoff manager (for testing).
+    #[doc(hidden)]
+    pub fn hinted_handoff_for_test(&self) -> &Arc<HintedHandoffManager> {
+        &self.hinted_handoff
     }
 
     /// Returns the number of replicas in the ring for the given key.
@@ -688,6 +697,11 @@ impl WriteCoordinator {
     /// failure at `warn!` — deletion is no longer silently swallowed
     /// (F3a: the caller needs the confirmed count to enforce quorum).
     ///
+    /// `hlc` is the delete's timestamp stamped by the caller — the same
+    /// value the caller persisted in the local tombstone — so all
+    /// replicas converge on one tombstone version
+    /// (hlc-causality-closure G4/G8).
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Routing`] if the ring returns an empty replica set.
@@ -696,6 +710,7 @@ impl WriteCoordinator {
         bucket: &BucketId,
         key: &ObjectKey,
         hash_key: &HashKey,
+        hlc: Hlc,
     ) -> Result<usize> {
         let replica_set = self.ring.lookup(hash_key.as_bytes());
         if replica_set.is_empty() {
@@ -743,9 +758,11 @@ impl WriteCoordinator {
             drop(pooled);
 
             let mut client = SegmentRpcClient::new(channel);
+            let proto_hlc: oceanfs_core::proto::common::HlcTimestamp = hlc.into();
             let request = tonic::Request::new(oceanfs_core::proto::segment::DeleteObjectRequest {
                 bucket_id: bucket.to_string(),
                 object_key: key.to_string(),
+                hlc: Some(proto_hlc),
             });
 
             debug!(
@@ -811,6 +828,23 @@ mod tests {
 
     /// Creates a test coordinator with a fully wired segment pipeline.
     async fn make_write_coordinator(node_id: &str, ring_nodes: &[&str]) -> WriteCoordinator {
+        use oceanfs_durability::GrpcHintDeliveryClient;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
+        let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
+            Arc::new(GrpcHintDeliveryClient::new(pool.clone()));
+        make_write_coordinator_with_delivery(node_id, ring_nodes, dir, pool, delivery_client).await
+    }
+
+    /// Creates a test coordinator with a caller-provided hint delivery client.
+    async fn make_write_coordinator_with_delivery(
+        node_id: &str,
+        ring_nodes: &[&str],
+        dir: tempfile::TempDir,
+        pool: Arc<ConnectionPool>,
+        delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient>,
+    ) -> WriteCoordinator {
         let mut ring = Ring::new(RingConfig { vnodes_per_node: 8, replication_factor: 3 });
         for node in ring_nodes {
             ring.add_node(NodeId::new(*node));
@@ -832,11 +866,9 @@ mod tests {
                 Some(addr),
             );
         }
-        let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let hlc_clock = Arc::new(HlcClock::new());
 
         // Segment pipeline components (in-memory / temp dir).
-        let dir = tempfile::tempdir().unwrap();
         let metadata = Arc::new(
             RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
                 data_dir: dir.path().join("meta"),
@@ -890,13 +922,9 @@ mod tests {
         };
         let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
 
-        use oceanfs_durability::{
-            GrpcHintDeliveryClient, HintedHandoffConfig, HintedHandoffManager,
-        };
+        use oceanfs_durability::{HintedHandoffConfig, HintedHandoffManager};
 
         let hints_dir = dir.path().join("hints");
-        let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
-            Arc::new(GrpcHintDeliveryClient::new(pool.clone()));
         let hint_config =
             HintedHandoffConfig { wal_dir: hints_dir.clone(), ..HintedHandoffConfig::default() };
         let hinted_handoff =
@@ -918,6 +946,90 @@ mod tests {
             hinted_handoff,
             hint_config,
         )
+    }
+
+    /// Hint delivery client that captures delivered hint requests.
+    #[derive(Default)]
+    struct CaptureDeliveryClient {
+        delivered:
+            parking_lot::Mutex<Vec<oceanfs_durability::hinted_handoff_rpc::HintedHandoffRequest>>,
+    }
+
+    impl CaptureDeliveryClient {
+        fn delivered(&self) -> Vec<oceanfs_durability::hinted_handoff_rpc::HintedHandoffRequest> {
+            self.delivered.lock().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl oceanfs_durability::HintDeliveryClient for CaptureDeliveryClient {
+        async fn deliver_hints(
+            &self,
+            _target_addr: std::net::SocketAddr,
+            request: oceanfs_durability::hinted_handoff_rpc::HintedHandoffRequest,
+            _timeout_ms: u64,
+        ) -> std::result::Result<
+            oceanfs_durability::hinted_handoff_rpc::HintedHandoffResponse,
+            oceanfs_durability::Error,
+        > {
+            self.delivered.lock().push(request);
+            Ok(oceanfs_durability::hinted_handoff_rpc::HintedHandoffResponse {
+                accepted: true,
+                accepted_count: 1,
+            })
+        }
+    }
+
+    /// G5: the hint enqueued for a failed replica carries the write's HLC.
+    #[tokio::test]
+    async fn enqueued_hint_carries_write_hlc() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
+        let capture = Arc::new(CaptureDeliveryClient::default());
+        let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> = capture.clone();
+        let coord = make_write_coordinator_with_delivery(
+            "n1",
+            &["n1", "n2", "n3"],
+            dir,
+            pool,
+            delivery_client,
+        )
+        .await;
+
+        // The write is routed to n2/n3 (dead addresses) → replication
+        // fails → hints are enqueued with the write's stamped HLC.
+        let data = Bytes::from_static(b"hinted payload");
+        let req = WriteRequest {
+            bucket: BucketId::new("test"),
+            key: ObjectKey::new("hinted-obj"),
+            hash_key: HashKey::from_bytes(hash_key(b"hinted-obj")),
+            data,
+            write_quorum: 1,
+            ack_after_wal: true,
+            ec_async: false,
+            policy: None,
+        };
+        let result = coord.put(req.clone()).await;
+        // Quorum 1 is satisfied by the local write; hints are best-effort.
+        assert!(result.is_ok(), "local write must succeed: {result:?}");
+
+        // Drain pending hints for n2 — the capture client receives them.
+        let delivered = coord.hinted_handoff_for_test().drain_and_deliver(NodeId::new("n2")).await;
+        let _ = delivered; // delivery outcome irrelevant; the capture holds the payload
+
+        let requests = capture.delivered();
+        assert!(!requests.is_empty(), "hints must have been delivered to the capture client");
+        let hint_hlc = requests
+            .iter()
+            .flat_map(|r| r.hints.iter())
+            .find_map(|h| match &h.record {
+                Some(oceanfs_durability::hinted_handoff_rpc::hint_record::Record::Inline(
+                    inline,
+                )) => inline.hlc.as_ref().map(|p| Hlc::new(p.wall_time, p.logical)),
+                _ => None,
+            })
+            .expect("captured request must contain an inline hint with an hlc");
+        assert!(hint_hlc > Hlc::zero(), "the hint must carry the write's stamped HLC");
     }
 
     #[tokio::test]
@@ -1482,7 +1594,12 @@ mod tests {
             Ok(())
         }
 
-        fn delete_object(&self, _bucket: &BucketId, _key: &ObjectKey) -> std::io::Result<()> {
+        fn delete_object(
+            &self,
+            _bucket: &BucketId,
+            _key: &ObjectKey,
+            _hlc: Hlc,
+        ) -> std::io::Result<()> {
             if self.fail_deletes {
                 Err(std::io::Error::other("mock delete failure"))
             } else {
@@ -1508,6 +1625,7 @@ mod tests {
             data_store,
             Some(metadata_store),
             buffer_pool,
+            Arc::new(oceanfs_core::HlcClock::new()),
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1555,6 +1673,7 @@ mod tests {
                 &BucketId::new("test"),
                 &ObjectKey::new("obj"),
                 &HashKey::from_bytes(hash_key(b"obj")),
+                Hlc::zero(),
             )
             .await
             .unwrap();
@@ -1583,6 +1702,7 @@ mod tests {
                 &BucketId::new("test"),
                 &ObjectKey::new("obj"),
                 &HashKey::from_bytes(hash_key(b"obj")),
+                Hlc::zero(),
             )
             .await
             .unwrap();
@@ -1599,6 +1719,7 @@ mod tests {
                 &BucketId::new("test"),
                 &ObjectKey::new("obj"),
                 &HashKey::from_bytes(hash_key(b"obj")),
+                Hlc::zero(),
             )
             .await;
         assert!(result.is_err(), "empty ring should return routing error");

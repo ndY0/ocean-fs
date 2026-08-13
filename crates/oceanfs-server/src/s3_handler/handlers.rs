@@ -465,13 +465,18 @@ pub(crate) async fn delete_object(
     let bucket_id = BucketId::new(&bucket);
     let object_key = ObjectKey::new(&key);
 
-    match state.metadata.delete_object(&bucket_id, &object_key) {
+    // Stamp the delete's HLC once — the local tombstone AND every
+    // remote replica receive the same timestamp so delete-vs-write LWW
+    // converges (hlc-causality-closure G4/G8).
+    let hlc = state.write.hlc_clock().now();
+
+    match state.metadata.delete_object(&bucket_id, &object_key, hlc) {
         Ok(()) => {
             // Replicate deletion to other replicas in the ring. The local
             // tombstone counts as one confirmed deletion; `write.delete`
             // returns the number of remote confirmations.
             let hk = HashKey::from_bytes(hash_key(object_key.as_str().as_bytes()));
-            let remote_deleted = match state.write.delete(&bucket_id, &object_key, &hk).await {
+            let remote_deleted = match state.write.delete(&bucket_id, &object_key, &hk, hlc).await {
                 Ok(count) => count,
                 Err(e) => {
                     warn!(error = %e, key = %key, "delete replication failed");

@@ -9,7 +9,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use oceanfs_core::{
-    shard, AccelConfig, BucketId, HlcClock, Incarnation, MetadataConfig, NodeConfig, NodeId,
+    shard, AccelConfig, BucketId, Hlc, HlcClock, Incarnation, MetadataConfig, NodeConfig, NodeId,
     ObjectKey, ObjectMetadata, PoolConfig, RingConfig, RpcConfig, SegmentId, SegmentMetadata,
     SegmentSizeConfig, SizeTier, Tombstone, WalConfig,
 };
@@ -132,8 +132,8 @@ impl oceanfs_storage_api::MetadataStore for PrefetchStoreAdapter {
         Ok(())
     }
 
-    fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<()> {
-        self.store.delete_object(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
+    fn delete_object(&self, bucket: &BucketId, key: &ObjectKey, hlc: Hlc) -> std::io::Result<()> {
+        self.store.delete_object(bucket, key, hlc).map_err(|e| std::io::Error::other(e.to_string()))
     }
 }
 
@@ -920,7 +920,7 @@ impl Node {
                 membership.clone(),
                 pool.clone(),
                 NodeId::new(&config.node_id),
-                hlc_clock,
+                hlc_clock.clone(),
                 metadata_store.clone(),
                 segment_size.clone(),
                 shard_small,
@@ -951,7 +951,8 @@ impl Node {
             .with_decoder(ec_decoder.clone())
             .with_ec_codec(heal_codec_config.data_shards, heal_codec_config.parity_shards)
             .with_timeouts(op_timeouts.clone())
-            .with_default_fetch_strategy(config.default_fetch_strategy),
+            .with_default_fetch_strategy(config.default_fetch_strategy)
+            .with_hlc_clock(hlc_clock.clone()),
         );
 
         // Router handles request forwarding to correct coordinator nodes.
@@ -1069,10 +1070,31 @@ impl Node {
         } else {
             AuthMiddleware::passthrough()
         };
+        // `DefaultBodyLimit` rejects oversized requests before any
+        // handler runs, which historically made 413s invisible in the
+        // node log (F6). The logging middleware below is added *after*
+        // the limit layer — axum runs the last-added layer first — so it
+        // wraps the limit and observes its 413 responses. The closure
+        // captures only the `usize` value, not the whole config.
+        let max_body_size = config.max_body_size;
         let app = axum::Router::new()
             .merge(s3_handler.into_router_with_auth(auth_middleware))
             .merge(admin_handler.into_router())
-            .layer(axum::extract::DefaultBodyLimit::max(config.max_body_size));
+            .layer(axum::extract::DefaultBodyLimit::max(max_body_size))
+            .layer(axum::middleware::from_fn(
+                move |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                    let uri = req.uri().clone();
+                    let resp = next.run(req).await;
+                    if resp.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+                        tracing::error!(
+                            uri = %uri,
+                            max_body_size,
+                            "request body rejected by max_body_size limit"
+                        );
+                    }
+                    resp
+                },
+            ));
 
         // ---- 14. Bind HTTP server ----
         let http_listener = tokio::net::TcpListener::bind(&config.listen_addr)
@@ -1103,6 +1125,7 @@ impl Node {
             heal_data_store.clone(),
             Some(metadata_store.clone()),
             shard_buffer_pool.clone(),
+            hlc_clock.clone(),
         );
         let gossip_service =
             oceanfs_membership::grpc::gossip_service::GossipGrpcService::new(membership.clone());
@@ -1111,6 +1134,7 @@ impl Node {
             hinted_handoff.clone(),
             metadata_store.clone(),
             heal_data_store.clone(),
+            hlc_clock.clone(),
         )
         .with_local_node_id(NodeId::new(&config.node_id));
         let cache_service = oceanfs_server::grpc::cache_service::CacheGrpcService::new(
@@ -2530,8 +2554,12 @@ mod tests {
         );
         // Use a fixed port for the test gRPC server.
         let bound_addr: std::net::SocketAddr = "127.0.0.1:15550".parse().unwrap();
-        let healing_svc =
-            HealingGrpcService::new(server_handoff.clone(), server_meta.clone(), server_store);
+        let healing_svc = HealingGrpcService::new(
+            server_handoff.clone(),
+            server_meta.clone(),
+            server_store,
+            Arc::new(HlcClock::new()),
+        );
 
         let server_task = tokio::spawn(async move {
             Server::builder()

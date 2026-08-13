@@ -339,7 +339,7 @@ mod tests {
     use bytes::Bytes;
     use http::StatusCode;
     use oceanfs_core::{
-        BucketId, GossipConfig, HlcClock, Incarnation, MetadataConfig, NodeId, NodeState,
+        BucketId, GossipConfig, Hlc, HlcClock, Incarnation, MetadataConfig, NodeId, NodeState,
         ObjectKey, ObjectMetadata, PoolConfig, RingConfig, RpcConfig, SegmentSizeConfig, SizeTier,
         WalConfig,
     };
@@ -391,7 +391,12 @@ mod tests {
             Ok(())
         }
 
-        fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> Result<(), MetadataError> {
+        fn delete_object(
+            &self,
+            bucket: &BucketId,
+            key: &ObjectKey,
+            _hlc: Hlc,
+        ) -> Result<(), MetadataError> {
             let k = (bucket.as_str().into(), key.as_str().into());
             self.objects.write().remove(&k);
             self.tombstones.write().insert(k, true);

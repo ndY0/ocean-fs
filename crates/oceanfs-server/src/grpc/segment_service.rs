@@ -25,7 +25,7 @@ use oceanfs_core::{
         GetObjectMetadataRequest, GetObjectMetadataResponse, PutObjectMetadataRequest,
         PutObjectMetadataResponse, SegmentAppendRequest, SegmentAppendResponse, ShardResponse,
     },
-    BucketId, ChunkRef, Hlc, ObjectKey, ObjectMetadata, SegmentId,
+    BucketId, ChunkRef, Hlc, HlcClock, ObjectKey, ObjectMetadata, SegmentId,
 };
 use oceanfs_durability::SegmentDataStore;
 use oceanfs_storage::{BufferPool, SegmentRpc};
@@ -46,6 +46,10 @@ pub struct SegmentGrpcService {
     metadata_store: Option<Arc<dyn oceanfs_storage_api::MetadataStore>>,
     /// Buffer pool for segment data buffers (perf rule §1.2).
     buffer_pool: Arc<BufferPool>,
+    /// HLC clock for receive-merge (hlc-causality-closure G2). Remote
+    /// timestamps arriving on this service are merged via
+    /// [`HlcClock::update`] so the local clock never lags replicas.
+    hlc_clock: Arc<HlcClock>,
 }
 
 impl SegmentGrpcService {
@@ -56,18 +60,26 @@ impl SegmentGrpcService {
     /// * `data_store` - The segment data store backing append and fetch operations.
     /// * `metadata_store` - Optional metadata store for cross-node metadata replication.
     /// * `buffer_pool` - Buffer pool for pre-allocated segment data buffers.
+    /// * `hlc_clock` - HLC clock for receive-merge of remote timestamps.
     pub fn new(
         data_store: Arc<dyn SegmentDataStore>,
         metadata_store: Option<Arc<dyn oceanfs_storage_api::MetadataStore>>,
         buffer_pool: Arc<BufferPool>,
+        hlc_clock: Arc<HlcClock>,
     ) -> Self {
-        Self { data_store, metadata_store, buffer_pool }
+        Self { data_store, metadata_store, buffer_pool, hlc_clock }
     }
 
     /// Returns a reference to the underlying data store (for testing).
     #[doc(hidden)]
     pub fn data_store(&self) -> &Arc<dyn SegmentDataStore> {
         &self.data_store
+    }
+
+    /// Returns a reference to the HLC clock (for testing).
+    #[doc(hidden)]
+    pub fn hlc_clock(&self) -> &Arc<HlcClock> {
+        &self.hlc_clock
     }
 }
 
@@ -139,6 +151,9 @@ impl SegmentRpc for SegmentGrpcService {
         let mut chunk_segment_ids: Vec<Bytes> = Vec::with_capacity(64);
         let mut chunk_offsets: Vec<u64> = Vec::with_capacity(64);
         let mut chunk_lengths: Vec<u32> = Vec::with_capacity(64);
+        // The coordinator's HLC for the object, carried on the first
+        // metadata-bearing chunk (hlc-causality-closure G3).
+        let mut first_hlc: Option<Hlc> = None;
 
         // Collect all chunks from the stream.
         while let Some(chunk) = stream
@@ -161,6 +176,16 @@ impl SegmentRpc for SegmentGrpcService {
                 chunk_segment_ids = chunk.chunk_segment_ids.clone();
                 chunk_offsets = chunk.chunk_offsets.clone();
                 chunk_lengths = chunk.chunk_lengths.clone();
+                first_hlc = chunk.hlc.as_ref().map(|p| Hlc::new(p.wall_time, p.logical));
+                if first_hlc.is_none() {
+                    // A sender that omits the HLC is a bug (every fixed
+                    // coordinator stamps it); make it visible.
+                    tracing::warn!(
+                        object_key = %chunk.object_key,
+                        "append_segment: metadata-bearing chunk has no HLC — \
+                         persisting zero timestamp (legacy sender?)"
+                    );
+                }
             }
             let chunk_len = chunk.data.len() as u64;
             segment_data.extend_from_slice(&chunk.data);
@@ -184,6 +209,14 @@ impl SegmentRpc for SegmentGrpcService {
         if let (Some(ref md_store), Some(bucket), Some(key)) =
             (&self.metadata_store, bucket_id, object_key)
         {
+            // G3: the coordinator's HLC travels with the request and is
+            // persisted — replicated metadata must carry the original
+            // version, not zero. Zero only for legacy senders.
+            let hlc = first_hlc.unwrap_or_else(Hlc::zero);
+            // Receive rule (G2): merge the remote timestamp into the
+            // local clock before persisting.
+            self.hlc_clock.update(hlc);
+
             let mut chunks = smallvec::SmallVec::new();
             for i in 0..chunk_segment_ids.len().min(chunk_offsets.len()).min(chunk_lengths.len()) {
                 let seg_bytes: [u8; 16] =
@@ -210,7 +243,7 @@ impl SegmentRpc for SegmentGrpcService {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as i64,
-                hlc: Hlc::zero(),
+                hlc,
             };
             if let Err(e) = {
                 let bucket_id = oceanfs_core::BucketId::new(&bucket);
@@ -241,7 +274,10 @@ impl SegmentRpc for SegmentGrpcService {
     /// Handles a delete-object request from the write coordinator.
     ///
     /// Removes object metadata from the local metadata store so that
-    /// subsequent reads return 404.
+    /// subsequent reads return 404. The tombstone carries the delete's
+    /// HLC from the request (G4/G8) — the same timestamp the originating
+    /// node stamped locally — so all replicas converge on one tombstone
+    /// version.
     async fn delete_object(
         &self,
         request: Request<DeleteObjectRequest>,
@@ -250,9 +286,17 @@ impl SegmentRpc for SegmentGrpcService {
         let bucket = BucketId::new(&req.bucket_id);
         let key = ObjectKey::new(&req.object_key);
 
+        // Parse the delete's HLC (zero for legacy senders) and merge it
+        // into the local clock (receive rule, G2).
+        let hlc = match req.hlc {
+            Some(ref hlc_proto) => Hlc::new(hlc_proto.wall_time, hlc_proto.logical),
+            None => Hlc::zero(),
+        };
+        self.hlc_clock.update(hlc);
+
         if let Some(ref md_store) = self.metadata_store {
             md_store
-                .delete_object(&bucket, &key)
+                .delete_object(&bucket, &key, hlc)
                 .map_err(|e| Status::internal(format!("metadata delete failed: {e}")))?;
         }
 
@@ -448,27 +492,51 @@ impl SegmentRpc for SegmentGrpcService {
             .as_ref()
             .ok_or_else(|| Status::unimplemented("no metadata store configured"))?;
 
-        // F3/t19: refuse to resurrect a deleted object. The tombstone
-        // check and the write are not atomic, but the residual window is
-        // a delete racing a repair push on the same key — the delete
-        // re-writes the tombstone and the next read observes it; the
-        // sender-side re-validation in `run_read_repair` shrinks this
-        // window to near zero.
-        if oceanfs_storage_api::MetadataStore::has_tombstone(md_store.as_ref(), &bucket, &key)
-            .map_err(|e| Status::internal(format!("tombstone check failed: {e}")))?
-        {
-            tracing::warn!(
-                bucket = %bucket,
-                key = %key,
-                "rejecting read-repair metadata push: object is tombstoned"
-            );
-            return Err(Status::failed_precondition("object is tombstoned"));
-        }
-
         let hlc = match req.hlc {
             Some(ref hlc_proto) => Hlc::new(hlc_proto.wall_time, hlc_proto.logical),
             None => Hlc::zero(),
         };
+
+        // Receive rule (G2): merge the remote timestamp into the local
+        // clock before acting on it.
+        self.hlc_clock.update(hlc);
+
+        // G6: order-aware delete-vs-write resolution. A tombstone
+        // rejects the repair push only when the incoming write did NOT
+        // happen after the delete. A strictly newer HLC legitimately
+        // resurrects the object (the write happened after the delete,
+        // on some node); a zero HLC (legacy sender, un-migrated hint)
+        // never resurrects. The lookup and the write are not atomic,
+        // but the residual window is a delete racing a repair push on
+        // the same key — the sender-side re-validation in
+        // `run_read_repair` shrinks it to near zero.
+        if let Some(tombstone) =
+            oceanfs_storage_api::MetadataStore::get_tombstone(md_store.as_ref(), &bucket, &key)
+                .map_err(|e| Status::internal(format!("tombstone lookup failed: {e}")))?
+        {
+            if hlc == Hlc::zero() || hlc <= tombstone.hlc {
+                tracing::warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    push_wall = hlc.wall_time(),
+                    push_logical = hlc.logical(),
+                    tombstone_wall = tombstone.hlc.wall_time(),
+                    "rejecting read-repair metadata push: object is tombstoned \
+                     and the incoming HLC is not newer"
+                );
+                return Err(Status::failed_precondition("object is tombstoned"));
+            }
+            // The write happened after the delete: legitimate
+            // resurrection. Clear the tombstone so the object is live.
+            oceanfs_storage_api::MetadataStore::delete_tombstone(md_store.as_ref(), &bucket, &key)
+                .map_err(|e| Status::internal(format!("tombstone clear failed: {e}")))?;
+            tracing::info!(
+                bucket = %bucket,
+                key = %key,
+                push_wall = hlc.wall_time(),
+                "read-repair push newer than tombstone; clearing tombstone (legitimate resurrection)"
+            );
+        }
 
         let mut chunks = smallvec::SmallVec::new();
         let count =
@@ -523,6 +591,7 @@ mod tests {
     };
     use oceanfs_durability::SegmentDataStore;
     use oceanfs_storage::{SegmentRpcClient, SegmentRpcServer};
+    use oceanfs_storage_api::MetadataStore;
     use parking_lot::Mutex;
     use tonic::transport::Server;
 
@@ -566,7 +635,12 @@ mod tests {
         store: Arc<dyn SegmentDataStore>,
     ) -> SegmentRpcClient<tonic::transport::Channel> {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let service = SegmentGrpcService::new(store, None, Arc::new(BufferPool::new(65536, 1024)));
+        let service = SegmentGrpcService::new(
+            store,
+            None,
+            Arc::new(BufferPool::new(65536, 1024)),
+            Arc::new(HlcClock::new()),
+        );
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -656,15 +730,17 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "test infrastructure issue: server roundtrip with store; verify separately"]
     async fn fetch_existing_segment_returns_data() {
         let store = Arc::new(TestSegmentStore::new());
         let seg_id = SegmentId::new();
 
-        // Write test data where total_shards=6, so each shard is data.len()/6
+        // Write test data where total_shards=6, so each shard is data.len()/6.
+        // (The previous version cast the byte count to u8, which truncated
+        // 6144 to 0 and produced an empty segment — the server correctly
+        // answered NotFound, masking the test's own bug.)
         let total_shards = 6;
         let shard_size = 1024;
-        let test_data: Vec<u8> = (0..(shard_size * total_shards) as u8).collect();
+        let test_data: Vec<u8> = (0..shard_size * total_shards).map(|v| (v % 256) as u8).collect();
         store.write_segment_data(&seg_id, &test_data).unwrap();
 
         let mut client = test_server(store).await;
@@ -707,7 +783,9 @@ mod tests {
         let seg_id = SegmentId::new();
         let total_shards = 6;
         let shard_size = 500;
-        let test_data: Vec<u8> = (0..(shard_size * total_shards) as u8).collect();
+        // Same u8-truncation bug class as `fetch_existing_segment_returns_data`:
+        // 3000 as u8 would truncate to 184. Generate the full 3000 bytes.
+        let test_data: Vec<u8> = (0..shard_size * total_shards).map(|v| (v % 256) as u8).collect();
         store.write_segment_data(&seg_id, &test_data).unwrap();
 
         let mut client = test_server(store).await;
@@ -736,11 +814,27 @@ mod tests {
         assert_eq!(&received_bytes[..], &test_data[100..150]);
     }
 
-    // ── Tombstone gate tests (F3/t19) ────────────────────────────
+    // ── Tombstone gate tests (F3/t19 + hlc-causality-closure G6) ─────
 
-    /// Metadata mock with a configurable tombstone state.
+    /// Metadata mock with configurable tombstone state (storing real
+    /// [`Tombstone`] values so `get_tombstone` returns stamped HLCs).
     struct TombstoneMockMetadata {
-        tombstoned: Mutex<HashMap<(String, String), bool>>,
+        tombstoned: Mutex<HashMap<(String, String), Tombstone>>,
+        last_put: Mutex<Option<ObjectMetadata>>,
+    }
+
+    impl TombstoneMockMetadata {
+        fn new() -> Self {
+            Self { tombstoned: Mutex::new(HashMap::new()), last_put: Mutex::new(None) }
+        }
+
+        fn get_tombstone_value(&self, key: &str) -> Option<Tombstone> {
+            self.tombstoned.lock().get(&("b".to_string(), key.to_string())).cloned()
+        }
+
+        fn last_put(&self) -> Option<ObjectMetadata> {
+            self.last_put.lock().clone()
+        }
     }
 
     impl oceanfs_storage_api::MetadataStore for TombstoneMockMetadata {
@@ -788,12 +882,15 @@ mod tests {
         }
 
         fn has_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<bool> {
-            Ok(self
-                .tombstoned
-                .lock()
-                .get(&(bucket.as_str().into(), key.as_str().into()))
-                .copied()
-                .unwrap_or(false))
+            Ok(self.tombstoned.lock().contains_key(&(bucket.as_str().into(), key.as_str().into())))
+        }
+
+        fn get_tombstone(
+            &self,
+            bucket: &BucketId,
+            key: &ObjectKey,
+        ) -> std::io::Result<Option<Tombstone>> {
+            Ok(self.tombstoned.lock().get(&(bucket.as_str().into(), key.as_str().into())).cloned())
         }
 
         fn put_segment(&self, _meta: SegmentMetadata) -> std::io::Result<()> {
@@ -807,11 +904,26 @@ mod tests {
         fn put_object(&self, bucket: &BucketId, meta: ObjectMetadata) -> std::io::Result<()> {
             // Mirror the real store: a genuine write clears the tombstone.
             self.delete_tombstone(bucket, &meta.object_key)?;
+            *self.last_put.lock() = Some(meta);
             Ok(())
         }
 
-        fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<()> {
-            self.tombstoned.lock().insert((bucket.as_str().into(), key.as_str().into()), true);
+        fn delete_object(
+            &self,
+            bucket: &BucketId,
+            key: &ObjectKey,
+            hlc: Hlc,
+        ) -> std::io::Result<()> {
+            self.tombstoned.lock().insert(
+                (bucket.as_str().into(), key.as_str().into()),
+                Tombstone {
+                    deletion_time: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64,
+                    hlc,
+                },
+            );
             Ok(())
         }
 
@@ -821,12 +933,20 @@ mod tests {
     }
 
     fn make_put_metadata_request(bucket: &str, key: &str) -> PutObjectMetadataRequest {
+        make_put_metadata_request_with_hlc(bucket, key, None)
+    }
+
+    fn make_put_metadata_request_with_hlc(
+        bucket: &str,
+        key: &str,
+        hlc: Option<oceanfs_core::proto::common::HlcTimestamp>,
+    ) -> PutObjectMetadataRequest {
         PutObjectMetadataRequest {
             bucket_id: bucket.to_string(),
             object_key: key.to_string(),
             size: 5,
             blake3_hash: Bytes::new(),
-            hlc: None,
+            hlc,
             inline_data: Bytes::from_static(b"hello"),
             chunk_segment_ids: vec![],
             chunk_offsets: vec![],
@@ -839,14 +959,15 @@ mod tests {
     #[tokio::test]
     async fn put_object_metadata_rejects_tombstoned_key() {
         let metadata: Arc<dyn oceanfs_storage_api::MetadataStore> =
-            Arc::new(TombstoneMockMetadata { tombstoned: Mutex::new(HashMap::new()) });
+            Arc::new(TombstoneMockMetadata::new());
         // Tombstone the key first.
-        metadata.delete_object(&BucketId::new("b"), &ObjectKey::new("k")).unwrap();
+        metadata.delete_object(&BucketId::new("b"), &ObjectKey::new("k"), Hlc::zero()).unwrap();
 
         let service = SegmentGrpcService::new(
             Arc::new(TestSegmentStore::new()),
             Some(metadata),
             Arc::new(BufferPool::new(65536, 4)),
+            Arc::new(HlcClock::new()),
         );
 
         let result = service
@@ -861,17 +982,366 @@ mod tests {
     #[tokio::test]
     async fn put_object_metadata_accepts_clean_key() {
         let metadata: Arc<dyn oceanfs_storage_api::MetadataStore> =
-            Arc::new(TombstoneMockMetadata { tombstoned: Mutex::new(HashMap::new()) });
+            Arc::new(TombstoneMockMetadata::new());
 
         let service = SegmentGrpcService::new(
             Arc::new(TestSegmentStore::new()),
             Some(metadata),
             Arc::new(BufferPool::new(65536, 4)),
+            Arc::new(HlcClock::new()),
         );
 
         let result = service
             .put_object_metadata(tonic::Request::new(make_put_metadata_request("b", "k")))
             .await;
         assert!(result.is_ok(), "clean key must accept read-repair push");
+    }
+
+    /// G6: a repair push newer than the tombstone is a legitimate
+    /// resurrection — it succeeds and clears the tombstone.
+    #[tokio::test]
+    async fn put_object_metadata_newer_than_tombstone_succeeds_and_clears() {
+        let metadata = Arc::new(TombstoneMockMetadata::new());
+        // Delete stamped at (1000, 0).
+        metadata
+            .delete_object(&BucketId::new("b"), &ObjectKey::new("k"), Hlc::new(1000, 0))
+            .unwrap();
+
+        let service = SegmentGrpcService::new(
+            Arc::new(TestSegmentStore::new()),
+            Some(metadata.clone() as Arc<dyn oceanfs_storage_api::MetadataStore>),
+            Arc::new(BufferPool::new(65536, 4)),
+            Arc::new(HlcClock::new()),
+        );
+
+        // Push a write stamped at (2000, 0) — after the delete.
+        let request = make_put_metadata_request_with_hlc(
+            "b",
+            "k",
+            Some(oceanfs_core::proto::common::HlcTimestamp { wall_time: 2000, logical: 0 }),
+        );
+        let result = service.put_object_metadata(tonic::Request::new(request)).await;
+        assert!(result.is_ok(), "newer push must resurrect the object: {result:?}");
+
+        assert!(metadata.get_tombstone_value("k").is_none(), "tombstone must be cleared");
+        let put = metadata.last_put().expect("push must persist object metadata");
+        assert_eq!(put.hlc, Hlc::new(2000, 0), "persisted metadata carries the push's HLC");
+    }
+
+    /// G6: a repair push older than the tombstone is rejected.
+    #[tokio::test]
+    async fn put_object_metadata_older_than_tombstone_rejected() {
+        let metadata = Arc::new(TombstoneMockMetadata::new());
+        metadata
+            .delete_object(&BucketId::new("b"), &ObjectKey::new("k"), Hlc::new(2000, 0))
+            .unwrap();
+
+        let service = SegmentGrpcService::new(
+            Arc::new(TestSegmentStore::new()),
+            Some(metadata.clone() as Arc<dyn oceanfs_storage_api::MetadataStore>),
+            Arc::new(BufferPool::new(65536, 4)),
+            Arc::new(HlcClock::new()),
+        );
+
+        let request = make_put_metadata_request_with_hlc(
+            "b",
+            "k",
+            Some(oceanfs_core::proto::common::HlcTimestamp { wall_time: 1000, logical: 0 }),
+        );
+        let result = service.put_object_metadata(tonic::Request::new(request)).await;
+        assert_eq!(
+            result.unwrap_err().code(),
+            tonic::Code::FailedPrecondition,
+            "older push must be rejected",
+        );
+        assert!(metadata.get_tombstone_value("k").is_some(), "tombstone must remain");
+    }
+
+    /// G6: a repair push with an HLC equal to the tombstone is rejected.
+    #[tokio::test]
+    async fn put_object_metadata_equal_to_tombstone_rejected() {
+        let metadata = Arc::new(TombstoneMockMetadata::new());
+        metadata
+            .delete_object(&BucketId::new("b"), &ObjectKey::new("k"), Hlc::new(1000, 5))
+            .unwrap();
+
+        let service = SegmentGrpcService::new(
+            Arc::new(TestSegmentStore::new()),
+            Some(metadata.clone() as Arc<dyn oceanfs_storage_api::MetadataStore>),
+            Arc::new(BufferPool::new(65536, 4)),
+            Arc::new(HlcClock::new()),
+        );
+
+        let request = make_put_metadata_request_with_hlc(
+            "b",
+            "k",
+            Some(oceanfs_core::proto::common::HlcTimestamp { wall_time: 1000, logical: 5 }),
+        );
+        let result = service.put_object_metadata(tonic::Request::new(request)).await;
+        assert_eq!(
+            result.unwrap_err().code(),
+            tonic::Code::FailedPrecondition,
+            "equal-HLC push must be rejected",
+        );
+        assert!(metadata.get_tombstone_value("k").is_some(), "tombstone must remain");
+    }
+
+    // ── Replicated metadata HLC tests (hlc-causality-closure G3) ────
+
+    /// Metadata mock that records the last `put_object` call.
+    struct RecordingMetadata {
+        last_put: Mutex<Option<ObjectMetadata>>,
+        last_delete: Mutex<Option<Hlc>>,
+    }
+
+    impl RecordingMetadata {
+        fn new() -> Self {
+            Self { last_put: Mutex::new(None), last_delete: Mutex::new(None) }
+        }
+
+        fn last_put(&self) -> Option<ObjectMetadata> {
+            self.last_put.lock().clone()
+        }
+
+        fn last_delete(&self) -> Option<Hlc> {
+            *self.last_delete.lock()
+        }
+    }
+
+    impl oceanfs_storage_api::MetadataStore for RecordingMetadata {
+        fn list_object_keys(
+            &self,
+            _bucket: &BucketId,
+        ) -> std::io::Result<Vec<(BucketId, ObjectKey)>> {
+            Ok(Vec::new())
+        }
+
+        fn get_object_metadata(
+            &self,
+            _bucket: &BucketId,
+            _key: &ObjectKey,
+        ) -> std::io::Result<Option<ObjectMetadata>> {
+            Ok(None)
+        }
+
+        fn list_objects(
+            &self,
+            _bucket: &BucketId,
+            _prefix: &str,
+        ) -> Vec<std::io::Result<ObjectMetadata>> {
+            Vec::new()
+        }
+
+        fn get_segment(&self, _id: SegmentId) -> std::io::Result<Option<SegmentMetadata>> {
+            Ok(None)
+        }
+
+        fn list_segments(&self) -> Vec<std::io::Result<SegmentMetadata>> {
+            Vec::new()
+        }
+
+        fn list_tombstones(
+            &self,
+            _bucket: &BucketId,
+        ) -> Vec<std::io::Result<(ObjectKey, Tombstone)>> {
+            Vec::new()
+        }
+
+        fn delete_tombstone(&self, _bucket: &BucketId, _key: &ObjectKey) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn has_tombstone(&self, _bucket: &BucketId, _key: &ObjectKey) -> std::io::Result<bool> {
+            Ok(false)
+        }
+
+        fn put_segment(&self, _meta: SegmentMetadata) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn delete_segment(&self, _id: SegmentId) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn put_object(&self, _bucket: &BucketId, meta: ObjectMetadata) -> std::io::Result<()> {
+            *self.last_put.lock() = Some(meta);
+            Ok(())
+        }
+
+        fn delete_object(
+            &self,
+            _bucket: &BucketId,
+            _key: &ObjectKey,
+            hlc: Hlc,
+        ) -> std::io::Result<()> {
+            *self.last_delete.lock() = Some(hlc);
+            Ok(())
+        }
+
+        fn batch_write(&self, _ops: Vec<oceanfs_storage_api::BatchOp>) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Builds a metadata-bearing append chunk for the G3 tests.
+    fn make_append_chunk(
+        hlc: Option<oceanfs_core::proto::common::HlcTimestamp>,
+    ) -> SegmentAppendRequest {
+        SegmentAppendRequest {
+            segment_id: Some(SegmentId::new().into()),
+            shard_index: None,
+            offset: 0,
+            data: Bytes::from_static(b"hello"),
+            hlc,
+            bucket_id: "b".to_string(),
+            object_key: "k".to_string(),
+            object_size: 5,
+            blake3_hash: Bytes::new(),
+            chunk_segment_ids: vec![],
+            chunk_offsets: vec![],
+            chunk_lengths: vec![],
+        }
+    }
+
+    /// Starts a gRPC server with the given service and returns a client.
+    async fn start_server_with(
+        service: SegmentGrpcService,
+    ) -> (SocketAddr, SegmentRpcClient<tonic::transport::Channel>) {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(SegmentRpcServer::new(service))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let client = SegmentRpcClient::connect(format!("http://{addr}")).await.unwrap();
+        (addr, client)
+    }
+
+    /// G3: a replicated append persists the coordinator's HLC, not zero.
+    #[tokio::test]
+    async fn append_segment_persists_coordinator_hlc() {
+        let recorded = Arc::new(RecordingMetadata::new());
+        let metadata: Arc<dyn oceanfs_storage_api::MetadataStore> = recorded.clone();
+        let clock = Arc::new(HlcClock::new());
+        let service = SegmentGrpcService::new(
+            Arc::new(TestSegmentStore::new()),
+            Some(metadata),
+            Arc::new(BufferPool::new(65536, 4)),
+            Arc::clone(&clock),
+        );
+        let (_addr, mut client) = start_server_with(service).await;
+
+        let chunk = make_append_chunk(Some(oceanfs_core::proto::common::HlcTimestamp {
+            wall_time: 1_234_567,
+            logical: 89,
+        }));
+        let response = client
+            .append_segment(tonic::Request::new(tokio_stream::iter(vec![chunk])))
+            .await
+            .unwrap();
+        assert_eq!(response.into_inner().ack, AckStatus::Ok as i32);
+
+        let put = recorded.last_put().expect("replicated metadata must be persisted");
+        assert_eq!(put.hlc, Hlc::new(1_234_567, 89), "persisted hlc must equal the coordinator's");
+        // The service clock must have merged the remote timestamp (G2).
+        assert!(
+            clock.now().wall_time() >= 1_234_567,
+            "service clock wall must reach the remote wall",
+        );
+    }
+
+    /// G3: a legacy append without an HLC degrades to zero with a warning.
+    #[test]
+    fn append_segment_without_hlc_persists_zero_and_warns() {
+        // Capture WARN+ events emitted by the service into a buffer.
+        struct CaptureWriter(Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                CaptureWriter(Arc::clone(&self.0))
+            }
+        }
+
+        let log_buf = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(Arc::clone(&log_buf)))
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        let recorded = Arc::new(RecordingMetadata::new());
+        let metadata: Arc<dyn oceanfs_storage_api::MetadataStore> = recorded.clone();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let service = SegmentGrpcService::new(
+                    Arc::new(TestSegmentStore::new()),
+                    Some(metadata),
+                    Arc::new(BufferPool::new(65536, 4)),
+                    Arc::new(HlcClock::new()),
+                );
+                let (_addr, mut client) = start_server_with(service).await;
+                let response = client
+                    .append_segment(tonic::Request::new(tokio_stream::iter(vec![
+                        make_append_chunk(None),
+                    ])))
+                    .await
+                    .unwrap();
+                assert_eq!(response.into_inner().ack, AckStatus::Ok as i32);
+            });
+        });
+
+        let put = recorded.last_put().expect("replicated metadata must be persisted");
+        assert_eq!(put.hlc, Hlc::zero(), "missing HLC must degrade to zero");
+        let logs = String::from_utf8(log_buf.lock().clone()).unwrap();
+        assert!(logs.contains("has no HLC"), "expected a warning about the missing HLC: {logs}");
+    }
+
+    /// G4/G8: a remote delete carries the coordinator's HLC to the store.
+    #[tokio::test]
+    async fn delete_object_handler_passes_hlc_to_store() {
+        let recorded = Arc::new(RecordingMetadata::new());
+        let metadata: Arc<dyn oceanfs_storage_api::MetadataStore> = recorded.clone();
+        let clock = Arc::new(HlcClock::new());
+        let service = SegmentGrpcService::new(
+            Arc::new(TestSegmentStore::new()),
+            Some(metadata),
+            Arc::new(BufferPool::new(65536, 4)),
+            Arc::clone(&clock),
+        );
+
+        let request = tonic::Request::new(DeleteObjectRequest {
+            bucket_id: "b".to_string(),
+            object_key: "k".to_string(),
+            hlc: Some(oceanfs_core::proto::common::HlcTimestamp {
+                wall_time: 2_222_222,
+                logical: 9,
+            }),
+        });
+        let response = service.delete_object(request).await.unwrap();
+        assert!(response.into_inner().deleted);
+
+        assert_eq!(
+            recorded.last_delete(),
+            Some(Hlc::new(2_222_222, 9)),
+            "the store must receive the delete's HLC from the request",
+        );
+        // The service clock must have merged the remote timestamp (G2).
+        assert!(clock.now().wall_time() >= 2_222_222, "clock must merge the remote delete HLC");
     }
 }

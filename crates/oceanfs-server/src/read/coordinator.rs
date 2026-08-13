@@ -26,7 +26,8 @@ use oceanfs_core::{
         GetObjectMetadataRequest, GetObjectMetadataResponse, PutObjectMetadataRequest,
     },
     BucketId, ConflictResolver, FetchStrategy, FetchStrategyConfig, HashKey, HashOutput, Hlc,
-    LwwResolver, NodeId, ObjectKey, ObjectMetadata, OperationTimeouts, Resolution, SegmentId,
+    HlcClock, LwwResolver, NodeId, ObjectKey, ObjectMetadata, OperationTimeouts, Resolution,
+    SegmentId,
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
@@ -200,6 +201,11 @@ pub struct ReadCoordinator {
     timeouts: Arc<OperationTimeouts>,
     /// Default fetch strategy for buckets without a per-bucket override.
     default_fetch_strategy: FetchStrategy,
+    /// HLC clock for receive-merge (hlc-causality-closure G2). When
+    /// set, remote HLCs observed during quorum comparison and read
+    /// repair are merged via [`HlcClock::update`] so the local clock
+    /// never lags the replicas this node talks to.
+    hlc_clock: Option<Arc<HlcClock>>,
 }
 
 impl ReadCoordinator {
@@ -228,6 +234,7 @@ impl ReadCoordinator {
             ec_parity_shards: 0,
             timeouts: Arc::new(OperationTimeouts::default()),
             default_fetch_strategy: FetchStrategy::default(),
+            hlc_clock: None,
         }
     }
 
@@ -254,6 +261,7 @@ impl ReadCoordinator {
             ec_parity_shards: 0,
             timeouts: Arc::new(OperationTimeouts::default()),
             default_fetch_strategy: FetchStrategy::default(),
+            hlc_clock: None,
         }
     }
 
@@ -325,6 +333,18 @@ impl ReadCoordinator {
     #[must_use]
     pub fn with_default_fetch_strategy(mut self, strategy: FetchStrategy) -> Self {
         self.default_fetch_strategy = strategy;
+        self
+    }
+
+    /// Sets the HLC clock for receive-merge (hlc-causality-closure G2).
+    ///
+    /// When set, remote HLC timestamps observed during quorum comparison
+    /// and read repair are merged into the local clock via
+    /// [`HlcClock::update`] (the HLC receive rule), so the local clock
+    /// never lags the replicas this node communicates with.
+    #[must_use]
+    pub fn with_hlc_clock(mut self, clock: Arc<HlcClock>) -> Self {
+        self.hlc_clock = Some(clock);
         self
     }
 
@@ -503,7 +523,14 @@ impl ReadCoordinator {
                         None => continue,
                     };
 
-                    let resolution = resolver.resolve(&winning_hlc, &remote_hlc);
+                    // Receive rule (G2): merge the remote timestamp so
+                    // the local clock never lags replicas we talk to.
+                    if let Some(clock) = &self.hlc_clock {
+                        clock.update(remote_hlc);
+                    }
+
+                    // G7: node ids are passed for the equal-HLC tie-break.
+                    let resolution = resolver.resolve(&winning_hlc, &remote_hlc, &node_id, &target);
                     match resolution {
                         Resolution::AcceptRemote => {
                             winning_hlc = remote_hlc;
@@ -636,6 +663,8 @@ impl ReadCoordinator {
         let local_meta_clone = local_meta.clone();
         // Clone the metadata store so the spawned task can write corrections locally.
         let metadata_store = self.metadata.clone();
+        // Clone the HLC clock for receive-merge inside the spawned task (G2).
+        let hlc_clock = self.hlc_clock.clone();
 
         tokio::spawn(async move {
             let mut winning_hlc = local_hlc;
@@ -697,7 +726,15 @@ impl ReadCoordinator {
                             None => continue,
                         };
 
-                        let resolution = resolver.resolve(&winning_hlc, &remote_hlc);
+                        // Receive rule (G2): merge the remote timestamp
+                        // into the local clock.
+                        if let Some(clock) = &hlc_clock {
+                            clock.update(remote_hlc);
+                        }
+
+                        // G7: node ids are passed for the equal-HLC tie-break.
+                        let resolution =
+                            resolver.resolve(&winning_hlc, &remote_hlc, &node_id, &target);
                         match resolution {
                             Resolution::AcceptRemote => {
                                 local_is_stale = true;
@@ -1353,6 +1390,7 @@ impl Default for ReadCoordinator {
             ec_parity_shards: 0,
             timeouts: Arc::new(OperationTimeouts::default()),
             default_fetch_strategy: FetchStrategy::default(),
+            hlc_clock: None,
         }
     }
 }
@@ -1723,6 +1761,7 @@ mod tests {
             &self,
             _bucket: &BucketId,
             _key: &ObjectKey,
+            _hlc: Hlc,
         ) -> std::result::Result<(), crate::metadata_ops::MetadataError> {
             Ok(())
         }
@@ -2266,7 +2305,7 @@ mod tests {
         let resolver = LwwResolver;
         let local = Hlc::new(2000, 0);
         let remote = Hlc::new(1000, 5);
-        let result = resolver.resolve(&local, &remote);
+        let result = resolver.resolve(&local, &remote, &NodeId::new("n1"), &NodeId::new("n2"));
         assert!(result.is_local_accepted(), "local HLC (2000,0) > remote (1000,5) → local wins");
     }
 
@@ -2276,21 +2315,20 @@ mod tests {
         let resolver = LwwResolver;
         let local = Hlc::new(1000, 0);
         let remote = Hlc::new(2000, 5);
-        let result = resolver.resolve(&local, &remote);
+        let result = resolver.resolve(&local, &remote, &NodeId::new("n1"), &NodeId::new("n2"));
         assert!(result.is_remote_accepted(), "remote HLC (2000,5) > local (1000,0) → remote wins");
     }
 
-    /// Verifies LwwResolver: equal HLCs resolve to local (deterministic tie-break).
+    /// Verifies LwwResolver: equal HLCs tie-break by node id — the
+    /// greater remote id wins (G7).
     #[test]
-    fn lww_resolver_equal_hlc_local_wins() {
+    fn lww_resolver_equal_hlc_greater_remote_node_wins() {
         let resolver = LwwResolver;
         let local = Hlc::new(1000, 5);
         let remote = Hlc::new(1000, 5);
-        let result = resolver.resolve(&local, &remote);
-        assert!(
-            result.is_local_accepted(),
-            "equal HLCs (1000,5) = (1000,5) → local wins (tie-break)"
-        );
+        let result =
+            resolver.resolve(&local, &remote, &NodeId::new("node-a"), &NodeId::new("node-z"));
+        assert!(result.is_remote_accepted(), "equal HLCs → greater node id (node-z) wins",);
     }
 
     /// Verifies LwwResolver: higher logical counter at same wall time wins.
@@ -2299,7 +2337,7 @@ mod tests {
         let resolver = LwwResolver;
         let local = Hlc::new(1000, 0);
         let remote = Hlc::new(1000, 9);
-        let result = resolver.resolve(&local, &remote);
+        let result = resolver.resolve(&local, &remote, &NodeId::new("n1"), &NodeId::new("n2"));
         assert!(
             result.is_remote_accepted(),
             "same wall time (1000), remote logical (9) > local (0) → remote wins"

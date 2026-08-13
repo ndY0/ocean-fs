@@ -264,11 +264,18 @@ impl AccelDispatcher {
         // --- Resolve EC tier ---
         let requested_tier = Self::parse_ec_tier(&config.ec_tier);
         let ec_fallback_counter = AtomicU64::new(0);
+        // Construct metrics *before* tier resolution so fallbacks
+        // detected during resolution are recorded on the registered
+        // Prometheus counter (F5). `Counter` is Arc-backed, so these
+        // pre-registration increments survive until the node registers
+        // the metrics via `register_metrics`.
+        let metrics = AccelMetrics::default();
         let active_ec_tier = Self::resolve_ec_tier(
             requested_tier,
             cuda_available,
             tier1_available,
             &ec_fallback_counter,
+            &metrics,
         );
 
         if active_ec_tier != requested_tier && requested_tier != AccelTier::Auto {
@@ -402,7 +409,7 @@ impl AccelDispatcher {
             node_compression: config.compression.clone(),
             compression_fallback_count: AtomicU64::new(0),
             ec_fallback_count: ec_fallback_counter,
-            metrics: AccelMetrics::default(),
+            metrics,
             ec_backend_unhealthy: AtomicBool::new(false),
             compression_backend_unhealthy: AtomicBool::new(false),
             #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
@@ -601,6 +608,7 @@ impl AccelDispatcher {
             capped,
             &self.tier_compressors,
             &self.compression_fallback_count,
+            &self.metrics,
         );
         self.tier_compressors.get(&effective).cloned().unwrap_or_else(|| {
             // Ultimate fallback: zstd, always available
@@ -676,12 +684,16 @@ impl AccelDispatcher {
     /// GpuNvcomp → CpuIgzip → CpuZstd (terminal). The `None` tier
     /// means "no compression" — returns immediately without fallback.
     ///
-    /// Increments `fallback_counter` on each fallback event so operators
-    /// can monitor when the node ceiling is being hit.
+    /// Increments `fallback_counter` **and** records the event on the
+    /// registered [`AccelMetrics::compression_fallback_total`] counter
+    /// (metrics-infrastructure post-completion defect, 2026-08-13), so
+    /// `/admin/acceleration` (private atomics) and `/admin/metrics`
+    /// (registered counters) always agree.
     fn resolve_compression_tier_with_fallback(
         requested: CompressionTier,
         cache: &HashMap<CompressionTier, Arc<dyn Compressor>>,
         fallback_counter: &AtomicU64,
+        metrics: &AccelMetrics,
     ) -> CompressionTier {
         match requested {
             CompressionTier::None => {
@@ -704,6 +716,7 @@ impl AccelDispatcher {
                     "nvCOMP requested but unavailable; falling back to CpuIgzip or CpuZstd"
                 );
                 fallback_counter.fetch_add(1, Ordering::Relaxed);
+                metrics.record_compression_fallback();
                 if cache.contains_key(&CompressionTier::CpuIgzip) {
                     CompressionTier::CpuIgzip
                 } else {
@@ -713,6 +726,7 @@ impl AccelDispatcher {
             CompressionTier::CpuIgzip => {
                 tracing::warn!("ISA-L igzip requested but unavailable; falling back to CpuZstd");
                 fallback_counter.fetch_add(1, Ordering::Relaxed);
+                metrics.record_compression_fallback();
                 CompressionTier::CpuZstd
             }
             CompressionTier::CpuZstd => CompressionTier::CpuZstd,
@@ -793,11 +807,18 @@ impl AccelDispatcher {
     }
 
     /// Resolves a requested tier to the best available backend.
+    ///
+    /// On each fallback event, increments both `fallback_counter` (the
+    /// private atomic exposed via
+    /// [`ec_fallback_count`](Self::ec_fallback_count)) and the
+    /// registered [`AccelMetrics::ec_fallback_total`] counter, so the
+    /// two observations always agree (F5).
     fn resolve_ec_tier(
         requested: AccelTier,
         cuda_available: bool,
         isal_available: bool,
         fallback_counter: &AtomicU64,
+        metrics: &AccelMetrics,
     ) -> AccelTier {
         let resolved = match requested {
             AccelTier::Auto => {
@@ -817,12 +838,14 @@ impl AccelDispatcher {
                         "GPU acceleration requested but CUDA unavailable; falling back to ISA-L"
                     );
                     fallback_counter.fetch_add(1, Ordering::Relaxed);
+                    metrics.record_ec_fallback();
                     AccelTier::IsaL
                 } else {
                     tracing::warn!(
                         "GPU acceleration requested but CUDA and ISA-L unavailable; falling back to CPU SIMD"
                     );
                     fallback_counter.fetch_add(1, Ordering::Relaxed);
+                    metrics.record_ec_fallback();
                     AccelTier::CpuSimd
                 }
             }
@@ -832,6 +855,7 @@ impl AccelDispatcher {
                 } else {
                     tracing::warn!("ISA-L requested but not available; falling back to CPU SIMD");
                     fallback_counter.fetch_add(1, Ordering::Relaxed);
+                    metrics.record_ec_fallback();
                     AccelTier::CpuSimd
                 }
             }
@@ -1120,50 +1144,82 @@ mod tests {
     #[test]
     fn resolve_auto_without_hardware_resolves_to_cpu_simd() {
         let counter = AtomicU64::new(0);
-        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::Auto, false, false, &counter);
+        let metrics = AccelMetrics::default();
+        let tier =
+            AccelDispatcher::resolve_ec_tier(AccelTier::Auto, false, false, &counter, &metrics);
         assert_eq!(tier, AccelTier::CpuSimd);
     }
 
     #[test]
     fn resolve_cpu_simd_always_resolves_to_cpu_simd() {
         let counter = AtomicU64::new(0);
-        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::CpuSimd, false, false, &counter);
+        let metrics = AccelMetrics::default();
+        let tier =
+            AccelDispatcher::resolve_ec_tier(AccelTier::CpuSimd, false, false, &counter, &metrics);
         assert_eq!(tier, AccelTier::CpuSimd);
     }
 
     #[test]
     fn resolve_gpu_cuda_without_cuda_falls_back_to_cpu_simd() {
         let counter = AtomicU64::new(0);
-        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::GpuCuda, false, false, &counter);
+        let metrics = AccelMetrics::default();
+        let tier =
+            AccelDispatcher::resolve_ec_tier(AccelTier::GpuCuda, false, false, &counter, &metrics);
         assert_eq!(tier, AccelTier::CpuSimd);
+        assert_eq!(metrics.ec_fallback_count(), 1);
     }
 
     #[test]
     fn resolve_isal_without_isal_falls_back_to_cpu_simd() {
         let counter = AtomicU64::new(0);
-        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::IsaL, false, false, &counter);
+        let metrics = AccelMetrics::default();
+        let tier =
+            AccelDispatcher::resolve_ec_tier(AccelTier::IsaL, false, false, &counter, &metrics);
         assert_eq!(tier, AccelTier::CpuSimd);
+        assert_eq!(metrics.ec_fallback_count(), 1);
     }
 
     #[test]
     fn resolve_auto_with_cuda_prefers_cuda() {
         let counter = AtomicU64::new(0);
-        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::Auto, true, true, &counter);
+        let metrics = AccelMetrics::default();
+        let tier =
+            AccelDispatcher::resolve_ec_tier(AccelTier::Auto, true, true, &counter, &metrics);
         assert_eq!(tier, AccelTier::GpuCuda);
+        assert_eq!(metrics.ec_fallback_count(), 0);
     }
 
     #[test]
     fn resolve_auto_with_isal_prefers_isal_over_cpu() {
         let counter = AtomicU64::new(0);
-        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::Auto, false, true, &counter);
+        let metrics = AccelMetrics::default();
+        let tier =
+            AccelDispatcher::resolve_ec_tier(AccelTier::Auto, false, true, &counter, &metrics);
         assert_eq!(tier, AccelTier::IsaL);
+        assert_eq!(metrics.ec_fallback_count(), 0);
     }
 
     #[test]
     fn resolve_gpu_cuda_with_isal_only_falls_back_to_isal() {
         let counter = AtomicU64::new(0);
-        let tier = AccelDispatcher::resolve_ec_tier(AccelTier::GpuCuda, false, true, &counter);
+        let metrics = AccelMetrics::default();
+        let tier =
+            AccelDispatcher::resolve_ec_tier(AccelTier::GpuCuda, false, true, &counter, &metrics);
         assert_eq!(tier, AccelTier::IsaL);
+        assert_eq!(metrics.ec_fallback_count(), 1);
+    }
+
+    #[test]
+    fn resolve_ec_tier_fallback_records_both_counters() {
+        // F5: the private atomic and the registered Prometheus counter
+        // must agree after a fallback event.
+        let counter = AtomicU64::new(0);
+        let metrics = AccelMetrics::default();
+        let tier =
+            AccelDispatcher::resolve_ec_tier(AccelTier::GpuCuda, false, false, &counter, &metrics);
+        assert_eq!(tier, AccelTier::CpuSimd);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.ec_fallback_count(), 1);
     }
 
     // -- AccelDispatcher construction --
@@ -1426,6 +1482,29 @@ mod tests {
     fn compression_fallback_count_starts_at_zero() {
         let dispatcher = AccelDispatcher::new(AccelConfig::default());
         assert_eq!(dispatcher.compression_fallback_count(), 0);
+        assert_eq!(dispatcher.metrics().compression_fallback_count(), 0);
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn compression_fallback_records_both_counters() {
+        // metrics-infrastructure post-completion defect (2026-08-13):
+        // the registered compression-fallback counter must agree with
+        // the private atomic. GpuNvcomp is never available without the
+        // cuda feature, so the resolver must fall back and record.
+        let dispatcher = AccelDispatcher::new(AccelConfig::default());
+        let compressor = dispatcher.resolve_compressor(CompressionTier::GpuNvcomp);
+        assert!(compressor.is_available(), "fallback must still yield a compressor");
+        assert_eq!(
+            dispatcher.compression_fallback_count(),
+            1,
+            "private atomic must count the fallback",
+        );
+        assert_eq!(
+            dispatcher.metrics().compression_fallback_count(),
+            1,
+            "registered counter must agree with the private atomic",
+        );
     }
 
     // -- resolve_ec_encoder/decoder --

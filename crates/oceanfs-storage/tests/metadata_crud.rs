@@ -97,7 +97,7 @@ fn delete_object_removes_it() {
     // Confirm it exists.
     assert!(store.get_object(&test_bucket(), &test_key("tmp.dat")).unwrap().is_some());
 
-    store.delete_object(&test_bucket(), &test_key("tmp.dat")).unwrap();
+    store.delete_object(&test_bucket(), &test_key("tmp.dat"), oceanfs_core::Hlc::zero()).unwrap();
 
     // Confirm it is gone.
     assert!(store.get_object(&test_bucket(), &test_key("tmp.dat")).unwrap().is_none());

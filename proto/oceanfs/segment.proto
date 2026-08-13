@@ -81,6 +81,10 @@ message SegmentMetadata {
 message DeleteObjectRequest {
   string bucket_id = 1;
   string object_key = 2;
+  // HLC timestamp of the delete, stamped by the originating node's
+  // clock. All replicas converge on this one tombstone timestamp so
+  // delete-vs-write LWW is decidable across replicas (G4/G8).
+  oceanfs.common.HlcTimestamp hlc = 3;
 }
 
 // Response to a delete request.

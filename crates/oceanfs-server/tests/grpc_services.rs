@@ -87,6 +87,7 @@ async fn start_killable_node(store: Arc<dyn SegmentDataStore>) -> RunningNode {
         store.clone(),
         None,
         Arc::new(oceanfs_storage::BufferPool::new(65536, 1024)),
+        Arc::new(oceanfs_core::HlcClock::new()),
     );
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let server_addr = listener.local_addr().unwrap();
@@ -114,6 +115,7 @@ async fn start_segment_server(
         store,
         None,
         Arc::new(oceanfs_storage::BufferPool::new(65536, 1024)),
+        Arc::new(oceanfs_core::HlcClock::new()),
     );
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let server_addr = listener.local_addr().unwrap();
@@ -673,7 +675,12 @@ fn test_segment_service_uses_buffer_pool() {
     drop(b3);
 
     // Construct service: verifies pool wiring doesn't panic.
-    let service = SegmentGrpcService::new(Arc::new(TestStore::new()), None, pool.clone());
+    let service = SegmentGrpcService::new(
+        Arc::new(TestStore::new()),
+        None,
+        pool.clone(),
+        Arc::new(oceanfs_core::HlcClock::new()),
+    );
     // Service holds the pool — verify it's accessible.
     let _buf = pool.acquire();
     drop(_buf);

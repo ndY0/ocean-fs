@@ -327,7 +327,12 @@ mod tests {
             Ok(())
         }
 
-        fn delete_object(&self, _bucket: &BucketId, _key: &ObjectKey) -> std::io::Result<()> {
+        fn delete_object(
+            &self,
+            _bucket: &BucketId,
+            _key: &ObjectKey,
+            _hlc: oceanfs_core::Hlc,
+        ) -> std::io::Result<()> {
             Ok(())
         }
 

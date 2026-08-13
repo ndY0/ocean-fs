@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata, SegmentMetadata};
+use oceanfs_core::{BucketId, Hlc, ObjectKey, ObjectMetadata, SegmentMetadata};
 use oceanfs_server::metadata_ops::{MetadataError, MetadataOps};
 
 /// Bridges `oceanfs_storage::RocksDbMetadataStore` to `oceanfs_server::MetadataOps`.
@@ -54,8 +54,15 @@ impl MetadataOps for MetadataStoreAdapter {
             .map_err(|e| MetadataError::Internal(format!("{e}")))
     }
 
-    fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> Result<(), MetadataError> {
-        self.store.delete_object(bucket, key).map_err(|e| MetadataError::Internal(format!("{e}")))
+    fn delete_object(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+        hlc: Hlc,
+    ) -> Result<(), MetadataError> {
+        self.store
+            .delete_object(bucket, key, hlc)
+            .map_err(|e| MetadataError::Internal(format!("{e}")))
     }
 
     fn list_objects(
@@ -113,7 +120,7 @@ mod tests {
         let bucket = BucketId::new("test-bucket");
         let key = ObjectKey::new("test-key");
         // Deleting a nonexistent object is OK (idempotent delete).
-        let result = adapter.delete_object(&bucket, &key);
+        let result = adapter.delete_object(&bucket, &key, Hlc::new(1234, 5));
         assert!(result.is_ok());
     }
 

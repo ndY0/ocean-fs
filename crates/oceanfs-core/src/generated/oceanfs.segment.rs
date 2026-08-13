@@ -101,6 +101,11 @@ pub struct DeleteObjectRequest {
     pub bucket_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub object_key: ::prost::alloc::string::String,
+    /// HLC timestamp of the delete, stamped by the originating node's
+    /// clock. All replicas converge on this one tombstone timestamp so
+    /// delete-vs-write LWW is decidable across replicas (G4/G8).
+    #[prost(message, optional, tag = "3")]
+    pub hlc: ::core::option::Option<super::common::HlcTimestamp>,
 }
 /// Response to a delete request.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]

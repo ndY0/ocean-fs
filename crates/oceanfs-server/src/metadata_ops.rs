@@ -4,7 +4,7 @@
 //! deletion, and listing. Concrete implementations live in
 //! `oceanfs-storage` and are wired in `oceanfs-node`.
 
-use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata, SegmentMetadata};
+use oceanfs_core::{BucketId, Hlc, ObjectKey, ObjectMetadata, SegmentMetadata};
 
 /// Result type for metadata operations.
 pub type Result<T, E = MetadataError> = std::result::Result<T, E>;
@@ -45,11 +45,16 @@ pub trait MetadataOps: Send + Sync + 'static {
 
     /// Soft-deletes an object by writing a tombstone entry.
     ///
+    /// `hlc` is the delete's timestamp, minted by the caller's clock:
+    /// the tombstone must carry the version of the delete itself so
+    /// delete-vs-write LWW is decidable across replicas
+    /// (hlc-causality-closure G4).
+    ///
     /// # Errors
     ///
     /// Returns an error if the metadata store is unavailable or
     /// the tombstone write fails.
-    fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> Result<()>;
+    fn delete_object(&self, bucket: &BucketId, key: &ObjectKey, hlc: Hlc) -> Result<()>;
 
     /// Stores object metadata.
     ///

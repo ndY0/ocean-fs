@@ -17,6 +17,10 @@ dependencies:
     reason: Need LoadReport for structured results output
   - epic: test-harness-extensions/failure-injectors
     reason: Need Cluster::inject_latency, fill_disk, corrupt_shard, corrupt_and_verify_heal
+  - epic: refactoring/load-test-harness-fidelity
+    reason: Harness fidelity fixes inherited from Phases 1-3
+  - epic: gap-closure/hlc-causality-closure
+    reason: HLC wall clock + propagation required for heal/LWW assertions under failure injection
 adr:
   - 0001-segment-packing
   - 0019-test-harness-topology-cost-guardrails

@@ -5,7 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use oceanfs_core::{ConflictResolver, Hlc, HlcClock, LwwResolver, Resolution};
+use oceanfs_core::{ConflictResolver, Hlc, HlcClock, LwwResolver, NodeId, Resolution};
 
 #[test]
 fn hlc_monotonic_across_multiple_clocks() {
@@ -42,9 +42,11 @@ fn lww_resolver_deterministic() {
     let resolver = LwwResolver;
     let ts1 = Hlc::new(1000, 0);
     let ts2 = Hlc::new(1000, 1);
+    let n1 = NodeId::new("node-1");
+    let n2 = NodeId::new("node-2");
 
-    let r1 = resolver.resolve(&ts1, &ts2);
-    let r2 = resolver.resolve(&ts2, &ts1);
+    let r1 = resolver.resolve(&ts1, &ts2, &n1, &n2);
+    let r2 = resolver.resolve(&ts2, &ts1, &n2, &n1);
 
     assert!(r1.is_remote_accepted(), "newer remote should win");
     assert!(r2.is_local_accepted(), "older remote should lose");
@@ -54,8 +56,15 @@ fn lww_resolver_deterministic() {
 fn lww_resolver_equal_hlc_is_deterministic() {
     let resolver = LwwResolver;
     let ts = Hlc::new(500, 3);
-    // Equal HLCs: local accepted (deterministic tie-break).
-    assert_eq!(resolver.resolve(&ts, &ts), Resolution::AcceptLocal);
+    // Equal HLCs: tie-break by node id — the greater remote id wins (G7).
+    assert_eq!(
+        resolver.resolve(&ts, &ts, &NodeId::new("node-a"), &NodeId::new("node-z")),
+        Resolution::AcceptRemote,
+    );
+    assert_eq!(
+        resolver.resolve(&ts, &ts, &NodeId::new("node-z"), &NodeId::new("node-a")),
+        Resolution::AcceptLocal,
+    );
 }
 
 #[test]

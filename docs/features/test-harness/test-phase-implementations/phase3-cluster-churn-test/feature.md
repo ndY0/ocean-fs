@@ -23,6 +23,10 @@ dependencies:
     reason: Need LoadReport for structured results output
   - epic: test-harness-extensions/churn-scheduler
     reason: Need ChurnScheduler for periodic node kill/restart
+  - epic: refactoring/load-test-harness-fidelity
+    reason: Harness fidelity fixes (multi-thread runtime, 4xx tracking) inherited from Phase 1
+  - epic: gap-closure/hlc-causality-closure
+    reason: HLC wall clock + receive-merge + cross-node propagation required for "timestamps never move backward" and single-winner assertions
 adr:
   - 0001-segment-packing
   - 0019-test-harness-topology-cost-guardrails

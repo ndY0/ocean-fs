@@ -22,7 +22,7 @@
 use std::{sync::Arc, time::Duration};
 
 use oceanfs_core::{
-    BucketId, Gauge, LabelSet, MetadataConfig, MetricRegistrar, ObjectKey, ObjectMetadata,
+    BucketId, Gauge, Hlc, LabelSet, MetadataConfig, MetricRegistrar, ObjectKey, ObjectMetadata,
     SegmentId, SegmentMetadata, Tombstone,
 };
 use rocksdb::{ColumnFamilyDescriptor, Options, DB};
@@ -398,11 +398,15 @@ impl RocksDbMetadataStore {
     /// in `CF_DELETIONS` so that garbage collection can identify and
     /// compact this key across all replicas.
     ///
+    /// The tombstone carries the delete's HLC (`hlc`, stamped by the
+    /// originating node's clock — hlc-causality-closure G4) so that
+    /// delete-vs-write LWW is decidable across replicas.
+    ///
     /// # Errors
     ///
     /// Returns an error if the objects or deletions column family is not found,
     /// or if the RocksDB delete/write fails.
-    pub fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> Result<()> {
+    pub fn delete_object(&self, bucket: &BucketId, key: &ObjectKey, hlc: Hlc) -> Result<()> {
         let cf = self
             .db
             .cf_handle(cf::CF_OBJECTS)
@@ -420,7 +424,7 @@ impl RocksDbMetadataStore {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as i64,
-            hlc: oceanfs_core::Hlc::zero(),
+            hlc,
         };
         self.put_tombstone(bucket, key, tombstone)?;
 
@@ -612,6 +616,35 @@ impl RocksDbMetadataStore {
         match self.db.get_cf(&cf, db_key) {
             Ok(Some(_)) => Ok(true),
             Ok(None) => Ok(false),
+            Err(e) => Err(Error::Io(io_err(e))),
+        }
+    }
+
+    /// Retrieves the deletion tombstone for a key, if one exists.
+    ///
+    /// Used for order-aware delete-vs-write resolution at the
+    /// repair-push boundary (hlc-causality-closure G6).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the deletions column family is not found,
+    /// the RocksDB read fails, or the stored value cannot be decoded.
+    pub fn get_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> Result<Option<Tombstone>> {
+        let cf = self
+            .db
+            .cf_handle(cf::CF_DELETIONS)
+            .ok_or_else(|| Error::InvalidConfig("deletions CF not found".into()))?;
+
+        let db_key = cf::encode_object_key(bucket.as_str(), key.as_str());
+
+        match self.db.get_cf(&cf, db_key) {
+            Ok(Some(value)) => {
+                let tombstone: Tombstone = bincode::deserialize(&value)
+                    .or_else(|_| serde_json::from_slice(&value))
+                    .map_err(|e| Error::Io(io_err(e)))?;
+                Ok(Some(tombstone))
+            }
+            Ok(None) => Ok(None),
             Err(e) => Err(Error::Io(io_err(e))),
         }
     }
@@ -1052,6 +1085,14 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
         self.has_tombstone(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
     }
 
+    fn get_tombstone(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+    ) -> std::io::Result<Option<Tombstone>> {
+        self.get_tombstone(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
     fn put_segment(&self, meta: SegmentMetadata) -> std::io::Result<()> {
         self.put_segment(meta).map_err(|e| std::io::Error::other(e.to_string()))
     }
@@ -1064,8 +1105,8 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
         self.put_object_in_bucket(bucket, meta).map_err(|e| std::io::Error::other(e.to_string()))
     }
 
-    fn delete_object(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<()> {
-        self.delete_object(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
+    fn delete_object(&self, bucket: &BucketId, key: &ObjectKey, hlc: Hlc) -> std::io::Result<()> {
+        self.delete_object(bucket, key, hlc).map_err(|e| std::io::Error::other(e.to_string()))
     }
 
     fn batch_write(&self, ops: Vec<oceanfs_storage_api::BatchOp>) -> std::io::Result<()> {
@@ -1155,7 +1196,7 @@ mod tests {
 
         // Delete → tombstone exists.
         store.put_object_in_bucket(&bucket, make_object_meta("rekey", 5, None)).unwrap();
-        store.delete_object(&bucket, &key).unwrap();
+        store.delete_object(&bucket, &key, oceanfs_core::Hlc::zero()).unwrap();
         assert!(store.has_tombstone(&bucket, &key).unwrap(), "tombstone must exist after delete");
 
         // Fresh write → tombstone cleared.
@@ -1182,11 +1223,57 @@ mod tests {
         let store = RocksDbMetadataStore::open(&test_config()).unwrap();
         let meta = make_object_meta("temp.txt", 100, None);
         store.put_object(meta).unwrap();
-        store.delete_object(&BucketId::new("default"), &ObjectKey::new("temp.txt")).unwrap();
+        store
+            .delete_object(
+                &BucketId::new("default"),
+                &ObjectKey::new("temp.txt"),
+                oceanfs_core::Hlc::zero(),
+            )
+            .unwrap();
 
         let result =
             store.get_object(&BucketId::new("default"), &ObjectKey::new("temp.txt")).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn tombstone_persists_stamped_hlc() {
+        // G4: the tombstone must carry the delete's HLC, not zero.
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        store.put_object(make_object_meta("stamped.txt", 10, None)).unwrap();
+
+        let hlc = Hlc::new(1111, 7);
+        store
+            .delete_object(&BucketId::new("default"), &ObjectKey::new("stamped.txt"), hlc)
+            .unwrap();
+
+        let tombstone = store
+            .get_tombstone(&BucketId::new("default"), &ObjectKey::new("stamped.txt"))
+            .unwrap()
+            .expect("tombstone must exist after delete");
+        assert_eq!(tombstone.hlc, hlc, "tombstone must persist the stamped delete HLC");
+    }
+
+    #[test]
+    fn delete_twice_stamps_monotonically_increasing_hlc() {
+        // G4: the second delete's (higher) HLC must overwrite the first.
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        store.put_object(make_object_meta("twice.txt", 10, None)).unwrap();
+
+        let first = Hlc::new(2000, 1);
+        let second = Hlc::new(3000, 2);
+        store
+            .delete_object(&BucketId::new("default"), &ObjectKey::new("twice.txt"), first)
+            .unwrap();
+        store
+            .delete_object(&BucketId::new("default"), &ObjectKey::new("twice.txt"), second)
+            .unwrap();
+
+        let tombstone = store
+            .get_tombstone(&BucketId::new("default"), &ObjectKey::new("twice.txt"))
+            .unwrap()
+            .expect("tombstone must exist");
+        assert_eq!(tombstone.hlc, second, "latest delete HLC must win");
     }
 
     #[test]

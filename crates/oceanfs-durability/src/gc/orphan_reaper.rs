@@ -463,7 +463,11 @@ mod tests {
         // not tombstones. To make this segment an orphan, we need
         // to also delete the object itself so no chunks reference the segment.
         metadata
-            .delete_object(&BucketId::new("default"), &ObjectKey::new("deleted_obj.txt"))
+            .delete_object(
+                &BucketId::new("default"),
+                &ObjectKey::new("deleted_obj.txt"),
+                oceanfs_core::Hlc::zero(),
+            )
             .unwrap();
         metadata
             .put_tombstone(
@@ -573,7 +577,9 @@ mod tests {
         }
 
         // Now delete the object (and add tombstone)
-        metadata.delete_object(&BucketId::new("default"), &obj_key).unwrap();
+        metadata
+            .delete_object(&BucketId::new("default"), &obj_key, oceanfs_core::Hlc::zero())
+            .unwrap();
         metadata
             .put_tombstone(
                 &BucketId::new("default"),
@@ -617,7 +623,11 @@ mod tests {
         );
         metadata.put_object(obj_meta).unwrap();
         metadata
-            .delete_object(&BucketId::new("default"), &ObjectKey::new("recently_deleted.txt"))
+            .delete_object(
+                &BucketId::new("default"),
+                &ObjectKey::new("recently_deleted.txt"),
+                oceanfs_core::Hlc::zero(),
+            )
             .unwrap();
 
         let store = test_shard_store();

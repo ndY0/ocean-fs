@@ -58,8 +58,12 @@ async fn start_server(
     metadata: Arc<RocksDbMetadataStore>,
     data_store: Arc<dyn SegmentDataStore>,
 ) -> (SocketAddr, SegmentRpcClient<tonic::transport::Channel>) {
-    let svc =
-        SegmentGrpcService::new(data_store, Some(metadata), Arc::new(BufferPool::new(65536, 1024)));
+    let svc = SegmentGrpcService::new(
+        data_store,
+        Some(metadata),
+        Arc::new(BufferPool::new(65536, 1024)),
+        Arc::new(oceanfs_core::HlcClock::new()),
+    );
     let router = Server::builder().add_service(SegmentRpcServer::new(svc));
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();

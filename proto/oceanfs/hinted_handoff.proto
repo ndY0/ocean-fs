@@ -20,6 +20,10 @@ message HintInline {
   string object_key = 3;
   // The blob payload stored inline.
   bytes data = 4;
+  // HLC timestamp of the original write (hlc-causality-closure G5).
+  // Absent in records written before this field existed — such records
+  // replay with the zero timestamp.
+  oceanfs.common.HlcTimestamp hlc = 5;
 }
 
 // Segment-reference hint record — large blobs reference a sealed segment.
@@ -37,6 +41,8 @@ message HintSegmentRef {
   uint64 offset = 5;
   // Length of the blob in bytes.
   uint32 length = 6;
+  // HLC timestamp of the original write (hlc-causality-closure G5).
+  oceanfs.common.HlcTimestamp hlc = 7;
 }
 
 // A hinted handoff record — either inline or segment reference.

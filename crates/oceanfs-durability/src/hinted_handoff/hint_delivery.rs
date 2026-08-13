@@ -702,6 +702,7 @@ mod tests {
                 BucketId::new("bucket-a"),
                 format!("key-a-{i}"),
                 vec![i as u8].into(),
+                oceanfs_core::Hlc::zero(),
             );
             manager.enqueue(record).await.unwrap();
         }
@@ -713,6 +714,7 @@ mod tests {
                 BucketId::new("bucket-b"),
                 format!("key-b-{i}"),
                 vec![i as u8].into(),
+                oceanfs_core::Hlc::zero(),
             );
             manager.enqueue(record).await.unwrap();
         }
@@ -766,6 +768,7 @@ mod tests {
                 BucketId::new("b"),
                 format!("key-{i}"),
                 vec![i as u8].into(),
+                oceanfs_core::Hlc::zero(),
             );
             manager.enqueue(record).await.unwrap();
         }
@@ -812,6 +815,7 @@ mod tests {
                 BucketId::new("b"),
                 format!("key-{i}"),
                 vec![i as u8].into(),
+                oceanfs_core::Hlc::zero(),
             );
             wal1.write_hint(&record).await.unwrap();
         }
@@ -853,6 +857,7 @@ mod tests {
                 BucketId::new("b"),
                 "key-a".into(),
                 vec![1].into(),
+                oceanfs_core::Hlc::zero(),
             ))
             .await
             .unwrap();
@@ -863,6 +868,7 @@ mod tests {
                 BucketId::new("b"),
                 "key-b".into(),
                 vec![2].into(),
+                oceanfs_core::Hlc::zero(),
             ))
             .await
             .unwrap();
@@ -908,6 +914,7 @@ mod tests {
                     BucketId::new("b"),
                     format!("key-a-{i}"),
                     vec![i as u8].into(),
+                    oceanfs_core::Hlc::zero(),
                 ))
                 .await
                 .unwrap();
@@ -918,6 +925,7 @@ mod tests {
                 BucketId::new("b"),
                 "key-b".into(),
                 vec![9].into(),
+                oceanfs_core::Hlc::zero(),
             ))
             .await
             .unwrap();
@@ -964,6 +972,7 @@ mod tests {
                     BucketId::new("b"),
                     "key".into(),
                     vec![n as u8].into(),
+                    oceanfs_core::Hlc::zero(),
                 ))
                 .await
                 .unwrap();
@@ -1002,6 +1011,7 @@ mod tests {
                 BucketId::new("b"),
                 "key-a1".into(),
                 vec![1].into(),
+                oceanfs_core::Hlc::zero(),
             ))
             .await
             .unwrap();
@@ -1011,6 +1021,7 @@ mod tests {
                 BucketId::new("b"),
                 "key-a2".into(),
                 vec![2].into(),
+                oceanfs_core::Hlc::zero(),
             ))
             .await
             .unwrap();
@@ -1023,6 +1034,7 @@ mod tests {
                 BucketId::new("b"),
                 "key-b1".into(),
                 vec![3].into(),
+                oceanfs_core::Hlc::zero(),
             ))
             .await
             .unwrap();
@@ -1056,6 +1068,7 @@ mod tests {
                 BucketId::new("b"),
                 "key".into(),
                 vec![1].into(),
+                oceanfs_core::Hlc::zero(),
             ))
             .await
             .unwrap();
