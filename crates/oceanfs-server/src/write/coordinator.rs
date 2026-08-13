@@ -247,13 +247,14 @@ impl WriteCoordinator {
             SizeTier::Small => {
                 let (segment_id, offset, length) = self
                     .segment_pool_small
-                    .append(&wal_data[..])
+                    .append_with_hook(&wal_data[..], |seg_id, off, len| {
+                        // Recorded under the segment lock, before any
+                        // fill-triggered seal enqueue: the seal worker
+                        // (another thread) can never drain the entries
+                        // map before this entry exists.
+                        self.record_blob_entry(seg_id, off, len, blake3_hash);
+                    })
                     .map_err(|e| Error::Storage(format!("small tier append: {e}")))?;
-                // Record blob index entry BEFORE WAL write to prevent a race:
-                // if the append fills the segment, the seal worker can pick
-                // up the seal request on the next tokio yield point and find
-                // an empty entries map if we record after the WAL await.
-                self.record_blob_entry(segment_id, offset, length, blake3_hash);
                 // Write WAL entry for crash-recovery durability (C4-storage, D6).
                 self.write_wal_entry(segment_id, offset, wal_data.clone(), length, hlc).await?;
                 let mut chunks = smallvec::SmallVec::new();
@@ -263,11 +264,11 @@ impl WriteCoordinator {
             SizeTier::Standard => {
                 let (segment_id, offset, length) = self
                     .segment_pool_standard
-                    .append(&wal_data[..])
+                    .append_with_hook(&wal_data[..], |seg_id, off, len| {
+                        // Same airtight ordering as the Small tier above.
+                        self.record_blob_entry(seg_id, off, len, blake3_hash);
+                    })
                     .map_err(|e| Error::Storage(format!("standard tier append: {e}")))?;
-                // Record blob index entry BEFORE WAL write to prevent race
-                // with seal worker (same rationale as Small tier above).
-                self.record_blob_entry(segment_id, offset, length, blake3_hash);
                 // Write WAL entry for crash-recovery durability (C4-storage, D6).
                 self.write_wal_entry(segment_id, offset, wal_data.clone(), length, hlc).await?;
                 let mut chunks = smallvec::SmallVec::new();
@@ -278,10 +279,18 @@ impl WriteCoordinator {
                 let splitter = SegmentSplitter::new(self.size_config.default_target_size);
                 let split_chunks = splitter.split(&wal_data[..]);
                 let mut chunks = smallvec::SmallVec::new();
-                for (chunk_offset, chunk_data) in &split_chunks {
+                for (_, chunk_data) in &split_chunks {
                     let (seg_id, seg_offset, length) = self
                         .segment_pool_standard
-                        .append(chunk_data)
+                        .append_with_hook(chunk_data, |seg_id, off, len| {
+                            // Record the blob index entry BEFORE any
+                            // fill-triggered seal enqueue (Defect 2).
+                            // Without this, a segment filled entirely by
+                            // multi-tier chunks has no index entries when
+                            // the seal worker drains it, so the seal is
+                            // skipped and the segment never reaches disk.
+                            self.record_blob_entry(seg_id, off, len, blake3_hash);
+                        })
                         .map_err(|e| Error::Storage(format!("multi tier append: {e}")))?;
                     // Write WAL entry for each chunk (C4-storage, D6).
                     self.write_wal_entry(
@@ -292,7 +301,11 @@ impl WriteCoordinator {
                         hlc,
                     )
                     .await?;
-                    chunks.push(ChunkRef { segment_id: seg_id, offset: *chunk_offset, length });
+                    // The chunk ref must carry the segment-relative offset
+                    // returned by `append()`, not the splitter's
+                    // blob-relative `chunk_offset` — readers slice the
+                    // segment, not the blob (Defect 1).
+                    chunks.push(ChunkRef { segment_id: seg_id, offset: seg_offset, length });
                 }
                 chunks
             }
@@ -592,7 +605,6 @@ impl WriteCoordinator {
 
         tokio::spawn(async move {
             // Merge both receivers into a single stream using select.
-            // We process one at a time via the semaphore.
             match (rx_small, rx_standard) {
                 (Some(mut small_rx), Some(mut standard_rx)) => {
                     loop {
@@ -617,12 +629,11 @@ impl WriteCoordinator {
                             self_standard.segment_pool_standard.seal_semaphore()
                         };
 
-                        // Acquire a permit to enforce bounded concurrency.
-                        let permit = sem.acquire().await;
+                        // Drain the blob index entries synchronously — the
+                        // writer's append_with_hook guarantees they are
+                        // already recorded when the work item was enqueued.
                         let segment_id = work.segment_id;
                         let tier = work.tier;
-
-                        // Drain accumulated blob index entries for this segment.
                         let entries =
                             entries_map.remove(&segment_id).map(|(_, v)| v).unwrap_or_default();
 
@@ -631,51 +642,91 @@ impl WriteCoordinator {
                                 segment_id = %segment_id,
                                 "no index entries for sealed segment; skipping seal"
                             );
-                            drop(permit); // permit released
                             continue;
                         }
 
-                        let result = sealer_arc
-                            .seal_from_data(
-                                segment_id,
-                                tier,
-                                work.segment_data,
-                                &entries,
-                                work.ec_k,
-                                work.ec_m,
-                            )
-                            .await;
+                        // Acquire a permit to enforce bounded concurrency
+                        // (perf §2.7/8.5), then seal on a spawned task so
+                        // the worker keeps draining the queues. Sealing
+                        // serially here let the bounded queue overflow
+                        // under write bursts (try_send dropped data);
+                        // concurrent seals keep the drain rate above the
+                        // fill rate (read-path-integrity-under-load).
+                        let self_small = Arc::clone(&self_small);
+                        let self_standard = Arc::clone(&self_standard);
+                        tokio::spawn(async move {
+                            let permit = sem.acquire().await;
 
-                        match result {
-                            Ok(_handle) => {
-                                // Segment is now on disk — remove from the
-                                // sealing-data set so reads no longer hit the
-                                // in-memory buffer.
-                                if work.tier == SizeTier::Small {
-                                    self_small.segment_pool_small.remove_seal_buffer(segment_id);
-                                } else {
-                                    self_standard
-                                        .segment_pool_standard
-                                        .remove_seal_buffer(segment_id);
+                            let result = sealer_arc
+                                .seal_from_data(
+                                    segment_id,
+                                    tier,
+                                    work.segment_data.clone(),
+                                    &entries,
+                                    work.ec_k,
+                                    work.ec_m,
+                                )
+                                .await;
+
+                            match result {
+                                Ok(_handle) => {
+                                    // Segment is now on disk — remove from
+                                    // the sealing-data set so reads no
+                                    // longer hit the in-memory buffer.
+                                    if tier == SizeTier::Small {
+                                        self_small
+                                            .segment_pool_small
+                                            .remove_seal_buffer(segment_id);
+                                    } else {
+                                        self_standard
+                                            .segment_pool_standard
+                                            .remove_seal_buffer(segment_id);
+                                    }
+                                    // Recycle the segment's backing buffer.
+                                    // The sealing-data clone was just dropped
+                                    // and seal_from_data's clone went out of
+                                    // scope, so the work item now holds the
+                                    // last reference to the original BytesMut
+                                    // allocation: try_into_mut recovers it
+                                    // zero-copy for the next activation
+                                    // (pool-backpressure-and-buffer-recycling).
+                                    match work.segment_data.try_into_mut() {
+                                        Ok(buf) => {
+                                            if tier == SizeTier::Small {
+                                                self_small.segment_pool_small.release_buffer(buf);
+                                            } else {
+                                                self_standard
+                                                    .segment_pool_standard
+                                                    .release_buffer(buf);
+                                            }
+                                        }
+                                        // Still referenced (e.g. an in-flight
+                                        // read of the sealing set): drop.
+                                        Err(bytes) => drop(bytes),
+                                    }
+                                    info!(
+                                        segment_id = %segment_id,
+                                        tier = ?tier,
+                                        blob_count = entries.len(),
+                                        "segment sealed successfully"
+                                    );
                                 }
-                                info!(
-                                    segment_id = %segment_id,
-                                    tier = ?tier,
-                                    blob_count = entries.len(),
-                                    "segment sealed successfully"
-                                );
+                                Err(e) => {
+                                    warn!(
+                                        segment_id = %segment_id,
+                                        error = %e,
+                                        "segment seal failed"
+                                    );
+                                    // The in-memory entries were drained above
+                                    // and are dropped. The segment's bytes
+                                    // remain readable via the pool's sealing
+                                    // set, and the WAL still holds the append
+                                    // entries, so crash recovery replays this
+                                    // segment on restart.
+                                }
                             }
-                            Err(e) => {
-                                warn!(
-                                    segment_id = %segment_id,
-                                    error = %e,
-                                    "segment seal failed"
-                                );
-                                // Re-insert entries so they can be retried
-                                // after WAL replay on restart.
-                            }
-                        }
-                        drop(permit); // permit released
+                            drop(permit); // permit released
+                        });
                     }
                 }
                 _ => {
@@ -1727,5 +1778,711 @@ mod tests {
             Error::Routing(msg) => assert!(msg.contains("empty"), "error should mention empty set"),
             other => panic!("expected Routing, got {other:?}"),
         }
+    }
+
+    // ── Multi-tier read-path integrity tests ───────────────────────
+    // (gap-closure/read-path-integrity-under-load: Defect 1 — chunk refs
+    // stored blob-relative offsets; Defect 2 — multi-tier chunks never
+    // registered a blob index entry, so their segments were skipped at
+    // seal time and never reached disk.)
+
+    /// Adapter exposing a `RocksDbMetadataStore` through the server's
+    /// `MetadataOps` trait so the read coordinator can look up object
+    /// metadata in tests. (In production, `oceanfs-node` wires the
+    /// equivalent `MetadataStoreAdapter`.)
+    struct RocksDbMetadataOps {
+        store: Arc<RocksDbMetadataStore>,
+    }
+
+    impl crate::metadata_ops::MetadataOps for RocksDbMetadataOps {
+        fn get_object(
+            &self,
+            bucket: &BucketId,
+            key: &ObjectKey,
+        ) -> std::result::Result<Option<ObjectMetadata>, crate::metadata_ops::MetadataError>
+        {
+            self.store
+                .get_object(bucket, key)
+                .map_err(|e| crate::metadata_ops::MetadataError::Internal(format!("{e}")))
+        }
+
+        fn delete_object(
+            &self,
+            bucket: &BucketId,
+            key: &ObjectKey,
+            hlc: Hlc,
+        ) -> std::result::Result<(), crate::metadata_ops::MetadataError> {
+            self.store
+                .delete_object(bucket, key, hlc)
+                .map_err(|e| crate::metadata_ops::MetadataError::Internal(format!("{e}")))
+        }
+
+        fn put_object(
+            &self,
+            bucket: &BucketId,
+            meta: ObjectMetadata,
+        ) -> std::result::Result<(), crate::metadata_ops::MetadataError> {
+            self.store
+                .put_object_in_bucket(bucket, meta)
+                .map_err(|e| crate::metadata_ops::MetadataError::Internal(format!("{e}")))
+        }
+
+        fn put_segment(
+            &self,
+            meta: SegmentMetadata,
+        ) -> std::result::Result<(), crate::metadata_ops::MetadataError> {
+            self.store
+                .put_segment(meta)
+                .map_err(|e| crate::metadata_ops::MetadataError::Internal(format!("{e}")))
+        }
+
+        fn list_objects(
+            &self,
+            bucket: &BucketId,
+            prefix: &str,
+        ) -> std::result::Result<Vec<ObjectMetadata>, crate::metadata_ops::MetadataError> {
+            self.store
+                .list_objects(bucket, prefix)
+                .into_iter()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| crate::metadata_ops::MetadataError::Internal(format!("{e}")))
+        }
+    }
+
+    /// Complete multi-tier test fixture: write coordinator with a
+    /// single-slot standard pool, metadata store, and read coordinator.
+    struct MultiTierFixture {
+        coord: Arc<WriteCoordinator>,
+        read: crate::ReadCoordinator,
+        metadata: Arc<RocksDbMetadataStore>,
+        standard_pool: Arc<SegmentPool>,
+        seal_dir: std::path::PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    /// Segment sizing for the multi-tier fixtures: 4 KiB standard target
+    /// keeps blobs small while still exercising the multi-segment path.
+    fn multi_tier_size_config() -> SegmentSizeConfig {
+        SegmentSizeConfig {
+            inline_threshold_bytes: 1024,
+            small_threshold_bytes: 1024,
+            small_target_size: 1024,
+            default_target_size: 4096,
+        }
+    }
+
+    /// Builds a coordinator + read path wired to a single-slot standard
+    /// pool. The single slot makes consecutive appends accumulate in one
+    /// segment, so multi-tier chunks land at non-zero segment offsets —
+    /// the exact case the read-path defect corrupted silently.
+    async fn make_multi_tier_fixture() -> MultiTierFixture {
+        use oceanfs_durability::GrpcHintDeliveryClient;
+
+        let dir = tempfile::tempdir().unwrap();
+        let size_config = multi_tier_size_config();
+
+        let mut ring = Ring::new(RingConfig { vnodes_per_node: 8, replication_factor: 3 });
+        ring.add_node(NodeId::new("n1"));
+        let ring_cache = Arc::new(RingCache::new(ring));
+        let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let membership = Arc::new(Membership::new(
+            NodeId::new("n1"),
+            addr,
+            GossipConfig::default(),
+            ring_cache.clone(),
+        ));
+        membership.upsert_node(
+            NodeId::new("n1"),
+            NodeState::Alive,
+            Incarnation::new(1),
+            Some(addr),
+        );
+        let hlc_clock = Arc::new(HlcClock::new());
+
+        let metadata = Arc::new(
+            RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: dir.path().join("meta"),
+                block_cache_size: 1024,
+                memtable_size: 1024,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let buffer_pool = Arc::new(BufferPool::new(65536, 16));
+
+        let shard_small =
+            Arc::new(SegmentShard::new(4, SizeTier::Small, &size_config, &buffer_pool).unwrap());
+        let shard_standard =
+            Arc::new(SegmentShard::new(4, SizeTier::Standard, &size_config, &buffer_pool).unwrap());
+
+        // Single active slot: appends always target slot 0, so chunks
+        // accumulate at sequential offsets within one segment.
+        let pool_cfg =
+            PoolConfig { active_pool_size: 1, encode_queue_capacity: 64, ..PoolConfig::default() };
+        let segment_pool_small = Arc::new(
+            SegmentPool::new(
+                pool_cfg.clone(),
+                SizeTier::Small,
+                &size_config,
+                buffer_pool.clone(),
+                None,
+            )
+            .unwrap(),
+        );
+        let standard_pool = Arc::new(
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None)
+                .unwrap(),
+        );
+
+        let wal = Arc::new(
+            WalWriter::open(&WalConfig {
+                data_dir: dir.path().join("wal"),
+                max_file_size_bytes: 1024 * 1024,
+                fsync_batch_timeout_ms: 5,
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+
+        let seal_dir = dir.path().join("segments");
+        let seal_config = SealConfig {
+            target_size_bytes: size_config.default_target_size,
+            seal_timeout_ms: 5000,
+            data_dir: seal_dir.clone(),
+            io_mode: oceanfs_storage::io::IoReadMode::Buffered,
+            write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
+        };
+        let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
+
+        let hints_dir = dir.path().join("hints");
+        let hint_config =
+            HintedHandoffConfig { wal_dir: hints_dir.clone(), ..HintedHandoffConfig::default() };
+        let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
+        let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
+            Arc::new(GrpcHintDeliveryClient::new(pool.clone()));
+        let hinted_handoff =
+            Arc::new(HintedHandoffManager::new(hints_dir, delivery_client, hint_config.clone()));
+
+        let coord = Arc::new(WriteCoordinator::new(
+            ring_cache.clone(),
+            membership,
+            pool,
+            NodeId::new("n1"),
+            hlc_clock,
+            metadata.clone(),
+            size_config.clone(),
+            shard_small,
+            shard_standard,
+            segment_pool_small,
+            standard_pool.clone(),
+            sealer,
+            hinted_handoff,
+            hint_config,
+        ));
+
+        let metadata_ops: Arc<dyn crate::metadata_ops::MetadataOps> =
+            Arc::new(RocksDbMetadataOps { store: metadata.clone() });
+        let read = crate::ReadCoordinator::new_with_metadata(
+            ring_cache,
+            NodeId::new("n1"),
+            None,
+            metadata_ops,
+        );
+
+        MultiTierFixture { coord, read, metadata, standard_pool, seal_dir, _dir: dir }
+    }
+
+    /// Runs a PUT through the coordinator and persists the resulting
+    /// object metadata, mirroring the S3 handler's post-put step.
+    async fn put_and_persist(
+        coord: &WriteCoordinator,
+        metadata: &Arc<RocksDbMetadataStore>,
+        bucket: &str,
+        key: &str,
+        data: Bytes,
+    ) -> WriteResult {
+        let req = WriteRequest {
+            bucket: BucketId::new(bucket),
+            key: ObjectKey::new(key),
+            hash_key: HashKey::from_bytes(hash_key(key.as_bytes())),
+            data,
+            write_quorum: 1,
+            ack_after_wal: true,
+            ec_async: false,
+            policy: None,
+        };
+        let result = coord.put(req).await.unwrap();
+        if !result.chunks.is_empty() {
+            let meta = ObjectMetadata {
+                object_key: ObjectKey::new(key),
+                size: result.size,
+                blake3_hash: result.blake3_hash,
+                chunks: result.chunks.clone(),
+                inline_data: None,
+                created_at: 0,
+                hlc: result.hlc,
+            };
+            metadata.put_object_in_bucket(&BucketId::new(bucket), meta).unwrap();
+        }
+        result
+    }
+
+    /// GETs an object through the read coordinator and asserts the body
+    /// and BLAKE3 hash match the original PUT payload.
+    async fn get_and_verify(
+        read: &crate::ReadCoordinator,
+        bucket: &str,
+        key: &str,
+        expected: &[u8],
+    ) {
+        let req = crate::ReadRequest {
+            bucket: BucketId::new(bucket),
+            key: ObjectKey::new(key),
+            hash_key: HashKey::from_bytes(hash_key(key.as_bytes())),
+            metadata_only: false,
+            policy: None,
+        };
+        let result = read.get_object(req).await.unwrap();
+        assert_eq!(&result.data[..], expected, "GET must return the exact PUT bytes");
+        let expected_hash = blake3::hash(expected);
+        assert_eq!(result.hash.as_bytes(), expected_hash.as_bytes(), "BLAKE3 must match");
+    }
+
+    /// Unit round-trip (active segments): multi-tier PUT whose first
+    /// chunk lands at a non-zero segment offset, then GET via the
+    /// active-segment pool reader. Covers Defect 1 (blob-relative vs
+    /// segment-relative chunk ref offsets).
+    #[tokio::test]
+    async fn multi_tier_roundtrip_active_segment_reads_back_exact_bytes() {
+        let fx = make_multi_tier_fixture().await;
+
+        // Pre-fill the single standard segment with a Standard-tier blob
+        // so the first multi-tier chunk lands at segment offset 2048 —
+        // the in-bounds case that corrupts silently (BadDigest).
+        let prefill = vec![0x11u8; 2048];
+        put_and_persist(&fx.coord, &fx.metadata, "test", "prefill", Bytes::from(prefill)).await;
+
+        // 10752 bytes > default_target_size (4096) → Multi tier,
+        // split into 4096 + 4096 + 2560 chunks.
+        let payload: Vec<u8> = (0..10752u32).map(|i| (i % 251) as u8).collect();
+        let put = put_and_persist(
+            &fx.coord,
+            &fx.metadata,
+            "test",
+            "multi-obj",
+            Bytes::from(payload.clone()),
+        )
+        .await;
+
+        assert_eq!(put.chunks.len(), 3, "10.5 KiB blob must split into three chunks");
+        // Chunk 0 lands after the 2048-byte pre-fill blob; chunk refs
+        // must carry segment-relative offsets.
+        assert_eq!(put.chunks[0].offset, 2048, "first chunk ref must be segment-relative");
+        assert_eq!(put.chunks[1].offset, 0, "second chunk ref must be segment-relative");
+        assert_eq!(put.chunks[2].offset, 0, "third chunk ref must be segment-relative");
+
+        // Serve reads from the active pool (including segments held in
+        // the seal window), falling back to disk.
+        let disk = Arc::new(oceanfs_storage::io::DiskSegmentReader::new(
+            oceanfs_storage::io::IoReadMode::Direct,
+            Arc::new(oceanfs_storage::io::DiskIo::TokioFs),
+            None,
+            fx.seal_dir.clone(),
+        ));
+        let reader: Arc<dyn oceanfs_storage::io::SegmentReader> = Arc::new(
+            oceanfs_storage::io::PoolFallbackReader::new(vec![fx.standard_pool.clone()], disk),
+        );
+        let read = fx.read.with_segment_reader(reader);
+
+        get_and_verify(&read, "test", "multi-obj", &payload).await;
+    }
+
+    /// Sealed-segment round-trip: the same multi-tier PUT, but the
+    /// segments are forced through the seal worker first and the read
+    /// is served from disk only. Covers Defect 2 (multi-tier chunks
+    /// must register blob index entries or the seal is skipped and the
+    /// segment never reaches disk).
+    #[tokio::test]
+    async fn multi_tier_roundtrip_sealed_segment_reads_back_from_disk() {
+        let fx = make_multi_tier_fixture().await;
+
+        // Pre-fill so chunk 0 lands at a non-zero segment offset.
+        let prefill = vec![0x22u8; 2048];
+        put_and_persist(&fx.coord, &fx.metadata, "test", "prefill", Bytes::from(prefill)).await;
+
+        // Exactly two full chunks (8192 bytes): each fills its segment.
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i % 239) as u8).collect();
+        let put = put_and_persist(
+            &fx.coord,
+            &fx.metadata,
+            "test",
+            "multi-obj",
+            Bytes::from(payload.clone()),
+        )
+        .await;
+        assert_eq!(put.chunks.len(), 2, "8 KiB blob must split into two chunks");
+        assert_eq!(put.chunks[0].offset, 2048, "first chunk ref must be segment-relative");
+
+        // Start the seal worker and wait for both chunk segments to be
+        // sealed to disk.
+        let _seal_handle = fx.coord.start_seal_worker();
+        let sealed_ids: Vec<SegmentId> = put.chunks.iter().map(|c| c.segment_id).collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ids: Vec<SegmentId> = fx
+                .metadata
+                .list_segments()
+                .into_iter()
+                .filter_map(std::result::Result::ok)
+                .map(|m| m.segment_id)
+                .collect();
+            if sealed_ids.iter().all(|id| ids.contains(id)) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "seals did not complete in time");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Assert the sealed blob index contains each multi-tier chunk
+        // (Defect 2 fix: without record_blob_entry the seal is skipped
+        // and no segment file is ever written).
+        for chunk in &put.chunks {
+            let path = fx.seal_dir.join(format!("{}.dat", chunk.segment_id));
+            let file_bytes = std::fs::read(&path).unwrap_or_else(|e| {
+                panic!("sealed segment file missing for {}: {e}", chunk.segment_id)
+            });
+            let header = oceanfs_storage::SegmentHeader::from_bytes(&file_bytes[..76])
+                .unwrap_or_else(|| panic!("invalid segment header for {}", chunk.segment_id));
+            assert!(header.blob_count >= 1, "segment blob index must be non-empty");
+            let index_bytes = &file_bytes[76 + header.size as usize..];
+            let index = oceanfs_storage::SegmentIndex::from_bytes(index_bytes)
+                .unwrap_or_else(|e| panic!("invalid segment index for {}: {e}", chunk.segment_id));
+            assert!(
+                index.lookup(chunk.offset).is_some(),
+                "blob index must contain chunk at offset {}",
+                chunk.offset
+            );
+        }
+
+        // Read back via the DISK reader only — the pool fallback is
+        // deliberately omitted so success proves the data reached disk
+        // through the seal path.
+        let disk = Arc::new(oceanfs_storage::io::DiskSegmentReader::new(
+            oceanfs_storage::io::IoReadMode::Direct,
+            Arc::new(oceanfs_storage::io::DiskIo::TokioFs),
+            None,
+            fx.seal_dir.clone(),
+        ));
+        let read = fx.read.with_segment_reader(disk);
+
+        get_and_verify(&read, "test", "multi-obj", &payload).await;
+    }
+
+    // ── Concurrency regression (read-path-integrity-under-load) ─────
+    // Under concurrent multi-tier load the seal worker runs on another
+    // thread than the PUT tasks; entry recording, seal draining, and
+    // seal-queue overflow were all observed corrupting or losing data.
+    // This test churns segments at production dimensions and verifies
+    // every written object through the full read path.
+
+    /// Adapter exposing a `RocksDbMetadataStore` through `MetadataOps`
+    /// for read-path verification (mirrors the node's adapter).
+    struct StressMetadataOps {
+        store: Arc<RocksDbMetadataStore>,
+    }
+
+    impl crate::metadata_ops::MetadataOps for StressMetadataOps {
+        fn get_object(
+            &self,
+            bucket: &BucketId,
+            key: &ObjectKey,
+        ) -> std::result::Result<Option<ObjectMetadata>, crate::metadata_ops::MetadataError>
+        {
+            self.store
+                .get_object(bucket, key)
+                .map_err(|e| crate::metadata_ops::MetadataError::Internal(format!("{e}")))
+        }
+
+        fn delete_object(
+            &self,
+            bucket: &BucketId,
+            key: &ObjectKey,
+            hlc: Hlc,
+        ) -> std::result::Result<(), crate::metadata_ops::MetadataError> {
+            self.store
+                .delete_object(bucket, key, hlc)
+                .map_err(|e| crate::metadata_ops::MetadataError::Internal(format!("{e}")))
+        }
+
+        fn put_object(
+            &self,
+            bucket: &BucketId,
+            meta: ObjectMetadata,
+        ) -> std::result::Result<(), crate::metadata_ops::MetadataError> {
+            self.store
+                .put_object_in_bucket(bucket, meta)
+                .map_err(|e| crate::metadata_ops::MetadataError::Internal(format!("{e}")))
+        }
+
+        fn put_segment(
+            &self,
+            meta: SegmentMetadata,
+        ) -> std::result::Result<(), crate::metadata_ops::MetadataError> {
+            self.store
+                .put_segment(meta)
+                .map_err(|e| crate::metadata_ops::MetadataError::Internal(format!("{e}")))
+        }
+
+        fn list_objects(
+            &self,
+            bucket: &BucketId,
+            prefix: &str,
+        ) -> std::result::Result<Vec<ObjectMetadata>, crate::metadata_ops::MetadataError> {
+            self.store
+                .list_objects(bucket, prefix)
+                .into_iter()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| crate::metadata_ops::MetadataError::Internal(format!("{e}")))
+        }
+    }
+
+    /// Builds the full pipeline (pools + sealer + coordinators) with the
+    /// given segment sizing, mirroring the production wiring.
+    struct StressFixture {
+        coord: Arc<WriteCoordinator>,
+        metadata: Arc<RocksDbMetadataStore>,
+        read: crate::ReadCoordinator,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn make_stress_fixture(size_config: &SegmentSizeConfig) -> StressFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ring = Ring::new(RingConfig { vnodes_per_node: 8, replication_factor: 3 });
+        ring.add_node(NodeId::new("n1"));
+        let ring_cache = Arc::new(RingCache::new(ring));
+        let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let membership = Arc::new(Membership::new(
+            NodeId::new("n1"),
+            addr,
+            GossipConfig::default(),
+            ring_cache.clone(),
+        ));
+        membership.upsert_node(
+            NodeId::new("n1"),
+            NodeState::Alive,
+            Incarnation::new(1),
+            Some(addr),
+        );
+
+        let metadata = Arc::new(
+            RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: dir.path().join("metadata"),
+                block_cache_size: 1024,
+                memtable_size: 1024,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let buffer_pool = Arc::new(BufferPool::new(65536, 64));
+        let shard_small =
+            Arc::new(SegmentShard::new(4, SizeTier::Small, size_config, &buffer_pool).unwrap());
+        let shard_standard =
+            Arc::new(SegmentShard::new(4, SizeTier::Standard, size_config, &buffer_pool).unwrap());
+        let pool_cfg =
+            PoolConfig { active_pool_size: 4, encode_queue_capacity: 64, ..PoolConfig::default() };
+        let small_pool = Arc::new(
+            SegmentPool::new(
+                pool_cfg.clone(),
+                SizeTier::Small,
+                size_config,
+                buffer_pool.clone(),
+                None,
+            )
+            .unwrap(),
+        );
+        let standard_pool = Arc::new(
+            SegmentPool::new(pool_cfg, SizeTier::Standard, size_config, buffer_pool, None).unwrap(),
+        );
+        let wal = Arc::new(
+            WalWriter::open(&WalConfig {
+                data_dir: dir.path().join("wal"),
+                max_file_size_bytes: 8 * 1024 * 1024,
+                fsync_batch_timeout_ms: 5,
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let seal_dir = dir.path().join("segments");
+        let sealer = Arc::new(SegmentSealer::new(
+            SealConfig {
+                target_size_bytes: size_config.default_target_size,
+                seal_timeout_ms: 5000,
+                data_dir: seal_dir.clone(),
+                io_mode: oceanfs_storage::io::IoReadMode::Buffered,
+                write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
+            },
+            metadata.clone(),
+            wal,
+        ));
+
+        use oceanfs_durability::GrpcHintDeliveryClient;
+        let hints_dir = dir.path().join("hints");
+        let hint_config =
+            HintedHandoffConfig { wal_dir: hints_dir.clone(), ..HintedHandoffConfig::default() };
+        let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
+        let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
+            Arc::new(GrpcHintDeliveryClient::new(pool.clone()));
+        let hinted_handoff =
+            Arc::new(HintedHandoffManager::new(hints_dir, delivery_client, hint_config.clone()));
+
+        let coord = Arc::new(WriteCoordinator::new(
+            ring_cache.clone(),
+            membership,
+            pool,
+            NodeId::new("n1"),
+            Arc::new(HlcClock::new()),
+            metadata.clone(),
+            size_config.clone(),
+            shard_small,
+            shard_standard,
+            small_pool.clone(),
+            standard_pool.clone(),
+            sealer,
+            hinted_handoff,
+            hint_config,
+        ));
+        let _seal_handle = coord.start_seal_worker();
+
+        let ops: Arc<dyn crate::metadata_ops::MetadataOps> =
+            Arc::new(StressMetadataOps { store: metadata.clone() });
+        let disk = Arc::new(oceanfs_storage::io::DiskSegmentReader::new(
+            oceanfs_storage::io::IoReadMode::Buffered,
+            Arc::new(oceanfs_storage::io::DiskIo::TokioFs),
+            None,
+            seal_dir.clone(),
+        ));
+        let reader: Arc<dyn oceanfs_storage::io::SegmentReader> =
+            Arc::new(oceanfs_storage::io::PoolFallbackReader::new(
+                vec![small_pool.clone(), standard_pool.clone()],
+                disk,
+            ));
+        let read =
+            crate::ReadCoordinator::new_with_metadata(ring_cache, NodeId::new("n1"), None, ops)
+                .with_segment_reader(reader);
+
+        StressFixture { coord, metadata, read, _dir: dir }
+    }
+
+    /// Concurrent multi-tier + standard writes at production dimensions:
+    /// every written object must read back byte-exact through the full
+    /// read path (pool fallback + sealed segments on disk).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_multi_tier_writes_remain_readable() {
+        let size_config = SegmentSizeConfig {
+            inline_threshold_bytes: 4096,
+            small_threshold_bytes: 262_144,
+            small_target_size: 65_536,
+            default_target_size: 4_194_304, // 4 MiB — production standard target
+        };
+        let fx = make_stress_fixture(&size_config).await;
+
+        let mut handles = Vec::new();
+        for w in 0..8u32 {
+            let coord = fx.coord.clone();
+            let metadata = fx.metadata.clone();
+            handles.push(tokio::spawn(async move {
+                let mut rng: u64 =
+                    0x9E37_79B9_7F4A_7C15u64.wrapping_mul((w as u64).wrapping_add(1));
+                let mut written: Vec<(String, Vec<u8>)> = Vec::with_capacity(12);
+                for i in 0..12u32 {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    let multi = (rng & 1) == 0;
+                    let len = if multi {
+                        4_300_000 + (rng % 6_000_000) as usize
+                    } else {
+                        300_000 + (rng % 3_800_000) as usize
+                    };
+                    let key = format!("w{w}-i{i}-len{len}");
+                    let data: Vec<u8> =
+                        (0..len).map(|b| ((b as u64).wrapping_add(rng) % 251) as u8).collect();
+                    let req = WriteRequest {
+                        bucket: BucketId::new("test"),
+                        key: ObjectKey::new(&key),
+                        hash_key: HashKey::from_bytes(hash_key(key.as_bytes())),
+                        data: Bytes::from(data.clone()),
+                        write_quorum: 1,
+                        ack_after_wal: true,
+                        ec_async: false,
+                        policy: None,
+                    };
+                    let result = coord.put(req).await.unwrap();
+                    let meta = ObjectMetadata {
+                        object_key: ObjectKey::new(&key),
+                        size: result.size,
+                        blake3_hash: result.blake3_hash,
+                        chunks: result.chunks.clone(),
+                        inline_data: None,
+                        created_at: 0,
+                        hlc: result.hlc,
+                    };
+                    metadata.put_object_in_bucket(&BucketId::new("test"), meta).unwrap();
+                    written.push((key, data));
+                    rng ^= i as u64;
+                }
+                written
+            }));
+        }
+        let mut written = Vec::new();
+        for h in handles {
+            written.extend(h.await.unwrap());
+        }
+
+        // Wait for the seal worker to drain (list_segments stabilizes).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut last_count = usize::MAX;
+        loop {
+            let count =
+                fx.metadata.list_segments().into_iter().filter_map(std::result::Result::ok).count();
+            if count == last_count {
+                break;
+            }
+            last_count = count;
+            assert!(std::time::Instant::now() < deadline, "seal drain timed out");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // Verify every object byte-exact through the read coordinator.
+        let mut failures = 0usize;
+        for (key, expected) in &written {
+            let req = crate::ReadRequest {
+                bucket: BucketId::new("test"),
+                key: ObjectKey::new(key),
+                hash_key: HashKey::from_bytes(hash_key(key.as_bytes())),
+                metadata_only: false,
+                policy: None,
+            };
+            match fx.read.get_object(req).await {
+                Ok(result) => {
+                    if &result.data[..] != &expected[..] {
+                        failures += 1;
+                        eprintln!("MISMATCH: {key} chunks={:?}", result.metadata.chunks);
+                    }
+                }
+                Err(e) => {
+                    failures += 1;
+                    eprintln!("FETCH ERROR: {key}: {e}");
+                }
+            }
+        }
+        assert_eq!(
+            failures,
+            0,
+            "stress: {failures} of {} objects failed round-trip",
+            written.len()
+        );
     }
 }
