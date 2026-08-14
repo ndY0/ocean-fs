@@ -7,7 +7,11 @@
 //! (configurable via `LOAD_TEST_DURATION_SECS`). Asserts manifest integrity,
 //! zero 4xx PUT rejections, zero transport errors, all workers active,
 //! minimum write volume, all four tiers successfully exercised,
-//! `/admin/health` healthy, and `accel_ec_fallback_total == 0`.
+//! `/admin/health` healthy, `accel_ec_fallback_total == 0`, and `logs_clean`
+//! — the captured node logs (default `e2e/target/e2e-logs`, debug level for
+//! this test) contain none of the three gap-closure failure signatures
+//! (`no appending segment available in pool`, `BadDigest`,
+//! `cannot fetch chunk`).
 //!
 //! This is the cheapest test that catches the most dangerous bugs:
 //! data races, deadlocks, and data corruption under concurrent access.
@@ -30,11 +34,15 @@
 //! | `LOAD_TEST_SEED` | random | Deterministic seed for reproducible runs. Logged at start. |
 //! | `LOAD_TEST_DURATION_SECS` | 60 | Override the test duration (e.g., `10` for CI smoke). |
 //! | `LOAD_TEST_DEBUG` | unset | When `1` (or `true`), prints a per-op debug trace `[worker-N] PUT … gen_ms=… total_ms=… status=…` to stderr, breaking down client-side blob generation vs HTTP round-trip per operation. |
+//!
+//! The node log level is forced to `debug` via `NodeOptions` (not the
+//! harness default `info`) so the `logs_clean` assertion can see the
+//! debug-level seal-worker signatures.
 
 use std::{path::Path, sync::Arc, time::Duration};
 
 use e2e::{
-    harness::{config_standard, Cluster},
+    harness::{config_standard, Cluster, NodeOptions},
     load::{
         assert_that, parse_prometheus_text, BlobSizeDist, KeySpace, LoadReport, LoadScenario,
         Manifest, OpWeight, Operation, Orchestrator, ReportResult,
@@ -74,7 +82,16 @@ async fn load_concurrency() {
     eprintln!("load_concurrency: concurrency={concurrency}");
 
     // ── Spawn single-node cluster ──────────────────────────────
-    let cluster = Cluster::spawn(1, &config_standard()).await.expect("cluster spawn");
+    // Debug node logs: the three `logs_clean` signatures are debug-level
+    // or error-level, and the gap-closure forensics relied on debug
+    // traces; capture is on by default into `e2e/target/e2e-logs`.
+    let cluster = Cluster::spawn_with_options(
+        1,
+        &config_standard(),
+        &NodeOptions::default().with_log_level("debug"),
+    )
+    .await
+    .expect("cluster spawn");
     let cluster = Arc::new(cluster);
 
     // ── Build load scenario ────────────────────────────────────
@@ -204,6 +221,46 @@ async fn load_concurrency() {
         ),
     ));
 
+    // ── Log cleanliness ────────────────────────────────────────
+    // The three failure signatures from the gap-closure post-review:
+    // pool exhaustion, hash mismatch (BadDigest), and chunk-fetch
+    // failure. Any occurrence in the captured node logs is a real
+    // failure signature that HTTP-level assertions can miss (e.g. a
+    // retried 500 that ends in success).
+    const LOG_CLEAN_SIGNATURES: [&str; 3] =
+        ["no appending segment available in pool", "BadDigest", "cannot fetch chunk"];
+
+    let log_hits: Vec<(String, Vec<String>)> = LOG_CLEAN_SIGNATURES
+        .iter()
+        .filter(|sig| cluster.any_node_logs_contain(sig))
+        .map(|sig| {
+            // Collect up to two example lines from node 0 for the
+            // assertion message (single-node cluster).
+            let examples =
+                cluster.node(0).grep_logs(sig).unwrap_or_default().into_iter().take(2).collect();
+            ((*sig).to_string(), examples)
+        })
+        .collect();
+    let logs_clean = log_hits.is_empty();
+
+    let log_clean_detail = if logs_clean {
+        "no failure signatures found in captured node logs".to_string()
+    } else {
+        log_hits
+            .iter()
+            .map(|(sig, examples)| format!("{sig}: {examples:?}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+
+    report.assert(assert_that(
+        "logs_clean",
+        logs_clean,
+        "captured node logs contain none of the three failure signatures \
+         (pool exhaustion, hash mismatch, chunk fetch failure)",
+        &log_clean_detail,
+    ));
+
     // Populate report with collected data after assertions are recorded.
     report.worker_stats = Some(stats);
     report.manifest = Some(manifest_summary);
@@ -233,7 +290,8 @@ async fn load_concurrency() {
          errors_total: {}\n\
          active_workers: {} / {}\n\
          ops_total: {}\n\
-         tiers: inline={}, small={}, standard={}, multi={}",
+         tiers: inline={}, small={}, standard={}, multi={}\n\
+         logs_clean: {}",
         manifest_mismatches,
         manifest_objects_written,
         manifest_objects_verified,
@@ -248,6 +306,7 @@ async fn load_concurrency() {
         puts_small,
         puts_standard,
         puts_multi,
+        log_clean_detail,
     );
     assert_eq!(report.result, ReportResult::Pass, "{}", fail_msg);
 }

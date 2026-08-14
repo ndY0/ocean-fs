@@ -21,3 +21,8 @@ dashmap = "6"
 num_cpus = "1"
 parking_lot = "0.12"
 uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+# Deterministic mtime manipulation for binary-staleness unit tests
+# (std does not expose utimensat; filetime is a safe wrapper).
+filetime = "0.2"

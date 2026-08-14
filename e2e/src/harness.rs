@@ -17,13 +17,37 @@
 //! The harness provides config helpers for each test scenario (standard,
 //! short-GC, short-AE, prefetch-enabled, etc.). These generate valid TOML
 //! strings with the appropriate settings and ports.
+//!
+//! ## Binary Verification
+//!
+//! `resolve_binary_path` prefers `target/release/oceanfs` over
+//! `target/debug/oceanfs`. Before spawning, the resolved binary is
+//! checked against the newest source file under `crates/` (recursive
+//! `*.rs`, plus the workspace `Cargo.toml` / `Cargo.lock` / `build.rs`):
+//! an older binary is a silent false-failure risk (a stale release
+//! binary once caused an entire forensics round), so the harness
+//! panics with a clear message instead of testing the stale binary.
+//! A binary pinned via `OCEANFS_BIN` is never staleness-checked — that
+//! is the operator's responsibility.
+//!
+//! ## Log Capture
+//!
+//! Node stdout+stderr are captured **by default** into
+//! `e2e/target/e2e-logs` (anchored to the e2e crate root via
+//! `CARGO_MANIFEST_DIR`, not the process cwd — this is the single
+//! documented convention). Files accumulate across runs; each spawn
+//! appends to a fresh uuid-named file so parallel tests never collide.
+//! Set `E2E_CAPTURE_NODE_LOGS=0` (or `false`) to opt out. The default
+//! node log level is `info`; override via `E2E_NODE_LOG_LEVEL` or
+//! per-spawn [`NodeOptions`]. Use [`NodeProcess::grep_logs`] and
+//! [`Cluster::any_node_logs_contain`] to assert on captured logs.
 
 use std::{
     fs,
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use parking_lot::RwLock;
@@ -158,6 +182,78 @@ pub enum Error {
     /// A cluster node returned an unexpected response.
     #[error("cluster node error: {0}")]
     ClusterError(String),
+    /// The resolved OceanFS binary is older than the newest source file
+    /// under `crates/` — e2e would silently test an outdated binary.
+    #[error("stale binary {bin_path} (mtime {bin_mtime:?}) is older than the newest source file {source_path} (mtime {source_mtime:?}); {hint}")]
+    StaleBinary {
+        /// Path of the resolved binary.
+        bin_path: PathBuf,
+        /// Modification time of the resolved binary.
+        bin_mtime: SystemTime,
+        /// Newest source file under `crates/`.
+        source_path: PathBuf,
+        /// Modification time of the newest source file.
+        source_mtime: SystemTime,
+        /// Actionable remediation advice, tailored to the newest source.
+        hint: String,
+    },
+    /// Failed to read a captured node log file.
+    #[error("failed to read captured log {0}: {1}")]
+    LogRead(PathBuf, #[source] std::io::Error),
+}
+
+// ---------------------------------------------------------------------------
+// NodeOptions
+// ---------------------------------------------------------------------------
+
+/// Per-spawn overrides for node process configuration.
+///
+/// `None` fields fall back to environment defaults:
+/// - `log_level`: `E2E_NODE_LOG_LEVEL`, then `"info"`
+/// - `capture_logs`: `E2E_CAPTURE_NODE_LOGS` (`0`/`false` opt-out), then `true`
+///
+/// # Examples
+///
+/// ```
+/// use e2e::harness::NodeOptions;
+///
+/// // Defaults: env-based log level ("info"), capture on.
+/// let options = NodeOptions::default();
+/// // Per-test override: capture at debug level.
+/// let debug = NodeOptions::default().with_log_level("debug");
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct NodeOptions {
+    log_level: Option<String>,
+    capture_logs: Option<bool>,
+}
+
+impl NodeOptions {
+    /// Returns options with all defaults (env-based).
+    ///
+    /// Equivalent to [`NodeOptions::default`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the node `--log-level` override (e.g. `"debug"`).
+    ///
+    /// Takes precedence over the `E2E_NODE_LOG_LEVEL` environment
+    /// variable. The harness default is `"info"`.
+    pub fn with_log_level(mut self, level: impl Into<String>) -> Self {
+        self.log_level = Some(level.into());
+        self
+    }
+
+    /// Sets whether node stdout+stderr are captured into
+    /// `e2e/target/e2e-logs`.
+    ///
+    /// Takes precedence over the `E2E_CAPTURE_NODE_LOGS` environment
+    /// variable. The default is `true` (capture on).
+    pub fn with_capture(mut self, capture: bool) -> Self {
+        self.capture_logs = Some(capture);
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +300,9 @@ pub struct NodeProcess {
     _config_path: PathBuf,
     /// HTTP client (connection pool reused across requests).
     client: reqwest::Client,
+    /// Log files written for this node process (uuid-named, appended
+    /// into `e2e/target/e2e-logs`). Empty when capture was disabled.
+    log_files: Vec<PathBuf>,
 }
 
 impl Drop for NodeProcess {
@@ -232,9 +331,28 @@ impl NodeProcess {
     /// to start, or the health endpoint does not respond within the
     /// timeout (30 seconds).
     pub async fn spawn(config_toml: &str) -> Result<Self, Error> {
+        Self::spawn_with_options(config_toml, &NodeOptions::default()).await
+    }
+
+    /// Spawns an OceanFS node with the given configuration and per-spawn
+    /// overrides (log level, log capture).
+    ///
+    /// See [`NodeProcess::spawn`] for the general contract; [`NodeOptions`]
+    /// lets a test force a log level (e.g. `"debug"`) or opt out of log
+    /// capture without touching the process environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the binary cannot be found, the process fails
+    /// to start, or the health endpoint does not respond within the
+    /// timeout (30 seconds).
+    pub async fn spawn_with_options(
+        config_toml: &str,
+        options: &NodeOptions,
+    ) -> Result<Self, Error> {
         let temp_dir = TempDir::new().map_err(Error::ConfigWrite)?;
         let data_dir = temp_dir.path().to_path_buf();
-        Self::spawn_inner(config_toml, data_dir, Some(temp_dir), false).await
+        Self::spawn_inner(config_toml, data_dir, Some(temp_dir), false, options).await
     }
 
     /// Spawns an OceanFS node using a specific (possibly pre-existing)
@@ -251,19 +369,46 @@ impl NodeProcess {
     /// to start, or the health endpoint does not respond within the
     /// timeout (30 seconds).
     pub async fn spawn_with_data_dir(config_toml: &str, data_dir: &Path) -> Result<Self, Error> {
-        Self::spawn_inner(config_toml, data_dir.to_path_buf(), None, true).await
+        Self::spawn_with_data_dir_and_options(config_toml, data_dir, &NodeOptions::default()).await
     }
 
-    /// Internal spawn logic shared by `spawn` and `spawn_with_data_dir`.
+    /// Spawns an OceanFS node using a specific data directory and
+    /// per-spawn overrides.
+    ///
+    /// See [`NodeProcess::spawn_with_data_dir`] for the general contract
+    /// and [`NodeOptions`] for the overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the binary cannot be found, the process fails
+    /// to start, or the health endpoint does not respond within the
+    /// timeout (30 seconds).
+    pub async fn spawn_with_data_dir_and_options(
+        config_toml: &str,
+        data_dir: &Path,
+        options: &NodeOptions,
+    ) -> Result<Self, Error> {
+        Self::spawn_inner(config_toml, data_dir.to_path_buf(), None, true, options).await
+    }
+
+    /// Internal spawn logic shared by all spawn entry points.
     ///
     /// `create_dir` controls whether the data directory is created if it
     /// doesn't exist (true for custom dirs, false for temp dirs since
     /// TempDir already created them).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the resolved binary (not pinned via `OCEANFS_BIN`) is
+    /// older than the newest source file under `crates/` — silently
+    /// testing a stale binary has produced false failure signatures in
+    /// the past, so the harness refuses to spawn instead.
     async fn spawn_inner(
         config_toml: &str,
         data_dir: PathBuf,
         temp_dir: Option<TempDir>,
         create_dir: bool,
+        options: &NodeOptions,
     ) -> Result<Self, Error> {
         // ---- 1. Ensure data directory exists ----
         if create_dir {
@@ -289,26 +434,41 @@ impl NodeProcess {
         std::fs::write(&config_path, &full_config).map_err(Error::ConfigWrite)?;
 
         // ---- 4. Find the binary ----
-        let bin_path = resolve_binary_path();
+        let resolved = resolve_binary_path();
+        // Staleness gate: silently testing an outdated binary produced
+        // false failure signatures during gap-closure. Binaries pinned
+        // via `OCEANFS_BIN` are the operator's responsibility and are
+        // never staleness-checked (documented on `resolve_binary_path`).
+        if !resolved.is_operator_pinned() {
+            if let Err(stale) = check_binary_freshness(resolved.path(), &workspace_root()) {
+                panic!("refusing to run e2e tests against a stale binary:\n{stale}");
+            }
+        }
+        let bin_path = resolved.path().to_path_buf();
 
         // ---- 5. Spawn the process ----
-        // Debug tracing is opt-in for debugging sessions:
-        //   * `E2E_NODE_LOG_LEVEL` overrides the node log level
-        //     (default "error").
-        //   * `E2E_CAPTURE_NODE_LOGS=1` captures the node's
-        //     stdout/stderr into `target/e2e-logs/<node>.log` instead
-        //     of discarding them, so debug traces survive temp-dir
-        //     cleanup and remain analyzable after the run.
-        let log_level = std::env::var("E2E_NODE_LOG_LEVEL").unwrap_or_else(|_| "error".to_string());
-        let capture_logs = std::env::var("E2E_CAPTURE_NODE_LOGS")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        // Node logs are captured by default into
+        // `e2e/target/e2e-logs` (anchored to the e2e crate root — see
+        // `log_dir`) so failure signatures survive temp-dir cleanup and
+        // remain analyzable after the run. `E2E_CAPTURE_NODE_LOGS=0`
+        // (or `false`) opts out. The default log level is "info";
+        // `E2E_NODE_LOG_LEVEL` overrides it, and per-spawn
+        // `NodeOptions` take precedence over both.
+        let log_level = resolve_log_level(
+            options.log_level.as_deref(),
+            std::env::var("E2E_NODE_LOG_LEVEL").ok().as_deref(),
+        );
+        let capture_logs = resolve_capture(
+            options.capture_logs,
+            std::env::var("E2E_CAPTURE_NODE_LOGS").ok().as_deref(),
+        );
 
         let mut cmd = Command::new(&bin_path);
         cmd.arg("--config").arg(&config_path).arg("--log-level").arg(&log_level);
 
+        let mut log_files = Vec::new();
         let child = if capture_logs {
-            let log_dir = PathBuf::from("target/e2e-logs");
+            let log_dir = log_dir();
             let _ = std::fs::create_dir_all(&log_dir);
             let parent = data_dir
                 .parent()
@@ -323,6 +483,7 @@ impl NodeProcess {
                 .append(true)
                 .open(&log_path)
                 .map_err(Error::Spawn)?;
+            log_files.push(log_path);
             cmd.stdout(Stdio::from(log_file.try_clone().map_err(Error::Spawn)?))
                 .stderr(Stdio::from(log_file))
                 .spawn()
@@ -344,6 +505,7 @@ impl NodeProcess {
             _temp_dir: temp_dir,
             _config_path: config_path,
             client,
+            log_files,
         };
 
         // ---- 6. Wait for health endpoint ----
@@ -368,6 +530,41 @@ impl NodeProcess {
     /// Returns the gRPC API address (e.g., `127.0.0.1:9001`).
     pub fn grpc_addr(&self) -> SocketAddr {
         self.grpc_addr
+    }
+
+    /// Returns the paths of the log files written for this node process.
+    ///
+    /// Files live under `e2e/target/e2e-logs` (see module docs). The
+    /// slice is empty when log capture was disabled for this spawn
+    /// (`E2E_CAPTURE_NODE_LOGS=0` or `NodeOptions::with_capture(false)`).
+    pub fn captured_logs(&self) -> &[PathBuf] {
+        &self.log_files
+    }
+
+    /// Greps this node's captured logs for `pattern` (substring match).
+    ///
+    /// Returns the matching lines, each prefixed with the log file it
+    /// came from. An empty result means no match (or no captured logs).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use e2e::harness::{config_standard, NodeProcess};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let node = NodeProcess::spawn(&config_standard()).await?;
+    /// let matches = node.grep_logs("seal queue full")?;
+    /// assert!(matches.is_empty(), "no seal-pressure signatures expected");
+    /// node.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a captured log file cannot be read.
+    pub fn grep_logs(&self, pattern: &str) -> Result<Vec<String>, Error> {
+        grep_logs_in_files(&self.log_files, pattern)
     }
 
     // ------------------------------------------------------------------
@@ -528,46 +725,228 @@ impl NodeProcess {
 }
 
 // ---------------------------------------------------------------------------
-// Binary resolution
+// Binary resolution & staleness verification
 // ---------------------------------------------------------------------------
 
-/// Resolves the path to the OceanFS release binary.
+/// The absolute path of the e2e crate root, captured at compile time.
+///
+/// Used to anchor both the workspace root (for the binary staleness
+/// check) and the log directory, so the harness behaves identically
+/// regardless of the process cwd.
+const E2E_CRATE_ROOT: &str = env!("CARGO_MANIFEST_DIR");
+
+/// Returns the workspace root: the parent of the e2e crate directory.
+fn workspace_root() -> PathBuf {
+    Path::new(E2E_CRATE_ROOT).parent().unwrap_or(Path::new(".")).to_path_buf()
+}
+
+/// The result of [`resolve_binary_path`].
+pub(crate) struct ResolvedBinary {
+    path: PathBuf,
+    operator_pinned: bool,
+}
+
+impl ResolvedBinary {
+    /// The resolved binary path.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Whether the path was pinned by the operator via `OCEANFS_BIN`.
+    ///
+    /// Pinned binaries are exists-checked but never staleness-checked.
+    pub(crate) fn is_operator_pinned(&self) -> bool {
+        self.operator_pinned
+    }
+}
+
+/// Resolves the path to the OceanFS binary.
 ///
 /// Checks in order:
-/// 1. `OCEANFS_BIN` environment variable
+/// 1. `OCEANFS_BIN` environment variable — the operator pins a specific
+///    binary. The path must exist (otherwise resolution falls through);
+///    it is **never** staleness-checked: verifying that a pinned binary
+///    matches the sources is the operator's responsibility.
 /// 2. `target/release/oceanfs` relative to workspace root
 /// 3. `target/debug/oceanfs` relative to workspace root
-fn resolve_binary_path() -> PathBuf {
+/// 4. PATH fallback (bare `oceanfs`).
+fn resolve_binary_path() -> ResolvedBinary {
     if let Ok(path) = std::env::var("OCEANFS_BIN") {
         let p = PathBuf::from(&path);
         if p.exists() {
-            return p;
+            return ResolvedBinary { path: p, operator_pinned: true };
         }
     }
 
     // Find workspace root by walking up from the current exe or cwd.
+    let workspace = workspace_root();
     let candidates =
-        [PathBuf::from("target/release/oceanfs"), PathBuf::from("target/debug/oceanfs")];
+        [workspace.join("target/release/oceanfs"), workspace.join("target/debug/oceanfs")];
 
     for candidate in &candidates {
         if candidate.exists() {
-            return candidate.clone();
-        }
-    }
-
-    // Last resort: try to find it relative to the manifest dir.
-    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-        let workspace_root = Path::new(&manifest).parent().unwrap_or(Path::new("."));
-        for candidate in &candidates {
-            let full = workspace_root.join(candidate);
-            if full.exists() {
-                return full;
-            }
+            return ResolvedBinary { path: candidate.clone(), operator_pinned: false };
         }
     }
 
     // Fallback to just "oceanfs" (hope it's on PATH).
-    PathBuf::from("oceanfs")
+    ResolvedBinary { path: PathBuf::from("oceanfs"), operator_pinned: false }
+}
+
+/// Returns the newest source file under the workspace and its mtime.
+///
+/// Scans `crates/` recursively for `*.rs` files (which includes
+/// `build.rs`), plus the workspace `Cargo.toml`, `Cargo.lock`, and
+/// root `build.rs`. Returns `None` when no comparable source exists
+/// (missing `crates/` tree, unreadable metadata).
+fn newest_source_mtime(workspace: &Path) -> Option<(PathBuf, SystemTime)> {
+    let mut newest: Option<(PathBuf, SystemTime)> = None;
+
+    // Consider a candidate file, keeping the one with the newest mtime.
+    let mut consider = |path: &Path| {
+        if let Ok(metadata) = fs::metadata(path) {
+            if let Ok(mtime) = metadata.modified() {
+                if newest.as_ref().map_or(true, |(_, t)| mtime > *t) {
+                    newest = Some((path.to_path_buf(), mtime));
+                }
+            }
+        }
+    };
+
+    // Recursively walk `crates/` for `.rs` sources.
+    let crates_dir = workspace.join("crates");
+    if crates_dir.is_dir() {
+        let mut stack = vec![crates_dir];
+        while let Some(dir) = stack.pop() {
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if path.extension().is_some_and(|e| e == std::ffi::OsStr::new("rs")) {
+                        consider(&path);
+                    }
+                }
+            }
+        }
+    }
+
+    // Workspace-level manifest files drive builds too.
+    consider(&workspace.join("Cargo.toml"));
+    consider(&workspace.join("Cargo.lock"));
+    consider(&workspace.join("build.rs"));
+
+    newest
+}
+
+/// Verifies that the resolved binary is not older than the newest
+/// source file under `crates/`.
+///
+/// The check passes when the binary is at least as new as every source
+/// file (recursive `*.rs` under `crates/`, workspace `Cargo.toml`,
+/// `Cargo.lock`, root `build.rs`). A binary that cannot be inspected
+/// (missing file, unreadable metadata) also passes — a missing binary
+/// fails later at spawn time, and a missing `crates/` tree leaves
+/// nothing to compare against.
+///
+/// # Errors
+///
+/// Returns [`Error::StaleBinary`] when the binary is strictly older
+/// than the newest source file.
+fn check_binary_freshness(bin_path: &Path, workspace: &Path) -> Result<(), Error> {
+    let bin_mtime = match fs::metadata(bin_path).and_then(|m| m.modified()) {
+        Ok(mtime) => mtime,
+        Err(_) => return Ok(()),
+    };
+    let Some((source_path, source_mtime)) = newest_source_mtime(workspace) else {
+        return Ok(());
+    };
+    if bin_mtime < source_mtime {
+        // Tailor the remediation to the kind of file that went stale:
+        // a workspace-manifest change (Cargo.toml/Cargo.lock/build.rs)
+        // may not affect the binary at all (e.g. an e2e-only dev-dependency
+        // bump), in which case `cargo build --release` no-ops and cargo
+        // does not relink — the operator must then explicitly accept the
+        // binary. A `crates/` source change always requires a rebuild.
+        let hint = if source_path.starts_with(workspace.join("crates")) {
+            "run `cargo build --release`, or pin a known-good binary via `OCEANFS_BIN`".to_string()
+        } else {
+            "the newest file is a workspace manifest — run `cargo build --release`; \
+             if it completes without relinking the binary (the manifest change only \
+             affects unrelated crates), the binary is still valid: `touch` the binary \
+             or pin it via `OCEANFS_BIN` to acknowledge"
+                .to_string()
+        };
+        return Err(Error::StaleBinary {
+            bin_path: bin_path.to_path_buf(),
+            bin_mtime,
+            source_path,
+            source_mtime,
+            hint,
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Log capture
+// ---------------------------------------------------------------------------
+
+/// The directory where captured node logs are written.
+///
+/// Convention: `e2e/target/e2e-logs`, anchored to the e2e crate root
+/// (`CARGO_MANIFEST_DIR`) — **not** the process cwd. When tests run
+/// under `cargo test -p e2e` the cwd already equals the crate root, so
+/// the legacy `target/e2e-logs` relative path landed here too; anchoring
+/// makes the location explicit and cwd-independent.
+///
+/// Logs accumulate across runs (append-only); each node spawn appends
+/// to a fresh uuid-named file, so parallel tests never collide.
+fn log_dir() -> PathBuf {
+    Path::new(E2E_CRATE_ROOT).join("target").join("e2e-logs")
+}
+
+/// Resolves the node log level from per-spawn options and environment.
+///
+/// Precedence: explicit options > `E2E_NODE_LOG_LEVEL` > `"info"`.
+fn resolve_log_level(options_level: Option<&str>, env_level: Option<&str>) -> String {
+    options_level.or(env_level).unwrap_or("info").to_string()
+}
+
+/// Resolves whether node logs are captured.
+///
+/// Precedence: explicit options > `E2E_CAPTURE_NODE_LOGS`
+/// (`0`/`false` opt-out) > `true` (capture by default).
+fn resolve_capture(options_capture: Option<bool>, env_capture: Option<&str>) -> bool {
+    match options_capture {
+        Some(capture) => capture,
+        None => !env_capture.is_some_and(|v| v == "0" || v.eq_ignore_ascii_case("false")),
+    }
+}
+
+/// Greps the given log files for `pattern` (substring match).
+///
+/// Returns matching lines, each prefixed with the file it came from.
+/// Non-existent or unreadable files are skipped.
+///
+/// # Errors
+///
+/// Returns an error when a log file exists but cannot be read.
+fn grep_logs_in_files(log_files: &[PathBuf], pattern: &str) -> Result<Vec<String>, Error> {
+    let mut matches = Vec::new();
+    for path in log_files {
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(Error::LogRead(path.clone(), e)),
+        };
+        for line in content.lines() {
+            if line.contains(pattern) {
+                matches.push(format!("{}: {}", path.display(), line));
+            }
+        }
+    }
+    Ok(matches)
 }
 
 // ---------------------------------------------------------------------------
@@ -819,6 +1198,8 @@ pub struct Cluster {
     base_config: String,
     /// HTTP client for admin polling.
     client: reqwest::Client,
+    /// Per-spawn options applied to every node (and to restarts).
+    options: NodeOptions,
 }
 
 impl Drop for Cluster {
@@ -852,6 +1233,23 @@ impl Cluster {
     ///
     /// Returns an error if any node fails to spawn or become healthy.
     pub async fn spawn(count: usize, base_config: &str) -> Result<Self, Error> {
+        Self::spawn_with_options(count, base_config, &NodeOptions::default()).await
+    }
+
+    /// Spawns `count` nodes with per-spawn options applied to every node
+    /// (and to later restarts via [`Cluster::restart`]).
+    ///
+    /// See [`Cluster::spawn`] for the general contract and [`NodeOptions`]
+    /// for the overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any node fails to spawn or become healthy.
+    pub async fn spawn_with_options(
+        count: usize,
+        base_config: &str,
+        options: &NodeOptions,
+    ) -> Result<Self, Error> {
         assert!(count > 0, "Cluster must have at least 1 node");
 
         let _temp_dir = TempDir::new().map_err(Error::ConfigWrite)?;
@@ -866,7 +1264,9 @@ impl Cluster {
         // Spawn node 0 first (no seeds).
         let node0_config = build_node_config(base_config, 0, "");
         let node0_dir = _temp_dir.path().join("node-0");
-        let node0 = NodeProcess::spawn_with_data_dir(&node0_config, &node0_dir).await?;
+        let node0 =
+            NodeProcess::spawn_with_data_dir_and_options(&node0_config, &node0_dir, options)
+                .await?;
         let seed_addr = format!("127.0.0.1:{}", node0.grpc_addr().port());
         nodes.push(Some(node0));
 
@@ -874,7 +1274,9 @@ impl Cluster {
         for i in 1..count {
             let node_config = build_node_config(base_config, i, &seed_addr);
             let node_dir = _temp_dir.path().join(format!("node-{i}"));
-            let node = NodeProcess::spawn_with_data_dir(&node_config, &node_dir).await?;
+            let node =
+                NodeProcess::spawn_with_data_dir_and_options(&node_config, &node_dir, options)
+                    .await?;
             nodes.push(Some(node));
         }
 
@@ -883,6 +1285,7 @@ impl Cluster {
             _temp_dir,
             base_config: base_config.to_string(),
             client,
+            options: options.clone(),
         })
     }
 
@@ -1008,10 +1411,42 @@ impl Cluster {
 
         let node_dir = self._temp_dir.path().join(format!("node-{i}"));
         let node_config = build_node_config(&self.base_config, i, &seed);
-        let node = NodeProcess::spawn_with_data_dir(&node_config, &node_dir).await?;
+        let node =
+            NodeProcess::spawn_with_data_dir_and_options(&node_config, &node_dir, &self.options)
+                .await?;
         self.nodes.write()[i] = Some(node);
 
         Ok(())
+    }
+
+    /// Returns `true` when any alive node's captured logs contain
+    /// `pattern` (substring match).
+    ///
+    /// Nodes whose log files are missing or unreadable are skipped.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use e2e::harness::{config_3node_w2_r2, Cluster};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let cluster = Cluster::spawn(3, &config_3node_w2_r2()).await?;
+    /// let dirty = cluster.any_node_logs_contain("seal queue full");
+    /// assert!(!dirty, "no seal-pressure signatures expected");
+    /// cluster.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn any_node_logs_contain(&self, pattern: &str) -> bool {
+        // Snapshot the log file paths first so file I/O happens outside
+        // the nodes read lock (lock hold times stay minimal).
+        let log_files: Vec<PathBuf> = {
+            let nodes = self.nodes.read();
+            nodes.iter().flatten().flat_map(|node| node.captured_logs().iter().cloned()).collect()
+        };
+        log_files
+            .iter()
+            .any(|path| fs::read_to_string(path).is_ok_and(|content| content.contains(pattern)))
     }
 
     /// Wait until all nodes agree on `expected_nodes` cluster size.
@@ -1201,8 +1636,12 @@ mod tests {
     #[test]
     fn resolve_binary_path_finds_release() {
         // The release binary should exist since we just built it.
-        let path = resolve_binary_path();
-        assert!(path.exists(), "binary not found at {:?}", path);
+        let resolved = resolve_binary_path();
+        assert!(resolved.path().exists(), "binary not found at {:?}", resolved.path());
+        // The pinned flag must mirror whether OCEANFS_BIN points at an
+        // existing binary in this environment.
+        let pinned = std::env::var("OCEANFS_BIN").is_ok_and(|p| PathBuf::from(p).exists());
+        assert_eq!(resolved.is_operator_pinned(), pinned);
     }
 
     // ── Port Preservation (§4.7) ─────
@@ -1322,5 +1761,274 @@ mod tests {
         let ports_file = dir.path().join(PORTS_FILE_NAME);
         std::fs::write(&ports_file, "not a valid port file at all").expect("write garbled file");
         assert!(restore_ports(&ports_file).is_none(), "garbled file must return None");
+    }
+
+    // ── Binary staleness verification (§A) ─────────────────────
+
+    /// Creates a fake workspace: `crates/` tree, `Cargo.toml`,
+    /// `Cargo.lock`, and a fake binary, with controllable mtimes.
+    struct FakeWorkspace {
+        dir: TempDir,
+        bin_path: PathBuf,
+    }
+
+    impl FakeWorkspace {
+        fn new() -> Self {
+            let dir = TempDir::new().expect("temp dir");
+            std::fs::create_dir_all(dir.path().join("crates/oceanfs-core/src"))
+                .expect("create crates tree");
+            std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n")
+                .expect("write Cargo.toml");
+            std::fs::write(dir.path().join("Cargo.lock"), "# lock\n").expect("write Cargo.lock");
+            let bin_path = dir.path().join("target/release/oceanfs");
+            std::fs::create_dir_all(bin_path.parent().expect("bin parent"))
+                .expect("create target dir");
+            std::fs::write(&bin_path, "fake binary").expect("write binary");
+            // Pin the manifest files to a fixed OLD time so tests can
+            // control which file is "newest" via explicit mtimes below.
+            let old = filetime::FileTime::from_unix_time(50, 0);
+            filetime::set_file_mtime(&dir.path().join("Cargo.toml"), old).expect("pin Cargo.toml");
+            filetime::set_file_mtime(&dir.path().join("Cargo.lock"), old).expect("pin Cargo.lock");
+            Self { dir, bin_path }
+        }
+
+        /// Writes a source file and pins both it and the binary to
+        /// explicit mtimes. `bin_mtime`/`source_mtime` use `1.0`-based
+        /// seconds offsets from a fixed epoch for deterministic ordering.
+        fn write_source_with_mtimes(&self, rel: &str, bin_mtime: f64, source_mtime: f64) {
+            let source = self.dir.path().join(rel);
+            std::fs::write(&source, "fn main() {}\n").expect("write source");
+            filetime::set_file_mtime(
+                &source,
+                filetime::FileTime::from_unix_time(source_mtime as i64, 0),
+            )
+            .expect("set source mtime");
+            filetime::set_file_mtime(
+                &self.bin_path,
+                filetime::FileTime::from_unix_time(bin_mtime as i64, 0),
+            )
+            .expect("set binary mtime");
+        }
+
+        fn workspace_root(&self) -> PathBuf {
+            self.dir.path().to_path_buf()
+        }
+    }
+
+    #[test]
+    fn check_binary_freshness_when_stale_returns_error() {
+        let ws = FakeWorkspace::new();
+        // Binary (100.0) older than the newest source (200.0) → stale.
+        ws.write_source_with_mtimes("crates/oceanfs-core/src/lib.rs", 100.0, 200.0);
+
+        let err = check_binary_freshness(&ws.bin_path, &ws.workspace_root())
+            .expect_err("stale binary must fail the freshness check");
+        match err {
+            Error::StaleBinary { bin_path, source_path, .. } => {
+                assert_eq!(bin_path, ws.bin_path);
+                assert_eq!(
+                    source_path,
+                    ws.dir.path().join("crates/oceanfs-core/src/lib.rs"),
+                    "the newest source file must be named in the error"
+                );
+            }
+            other => panic!("expected StaleBinary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_binary_freshness_when_stale_error_message_names_fix() {
+        let ws = FakeWorkspace::new();
+        ws.write_source_with_mtimes("crates/oceanfs-core/src/lib.rs", 100.0, 200.0);
+
+        let err = check_binary_freshness(&ws.bin_path, &ws.workspace_root())
+            .expect_err("stale binary must fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("cargo build --release"),
+            "message must suggest the fix: {message}"
+        );
+        assert!(
+            message.contains("OCEANFS_BIN"),
+            "message must suggest the pinned-binary escape hatch: {message}"
+        );
+    }
+
+    #[test]
+    fn check_binary_freshness_when_lockfile_only_newer_suggests_touch() {
+        // A Cargo.lock change that does not affect the binary (e.g. an
+        // e2e-only dev-dependency bump) must not leave the operator at a
+        // dead end: `cargo build --release` may no-op, so the message
+        // must explain the touch/OCEANFS_BIN acknowledgement.
+        let ws = FakeWorkspace::new();
+        ws.write_source_with_mtimes("crates/oceanfs-core/src/lib.rs", 100.0, 100.0);
+        let lock = ws.dir.path().join("Cargo.lock");
+        filetime::set_file_mtime(&lock, filetime::FileTime::from_unix_time(200, 0))
+            .expect("make the lockfile newer than the binary");
+
+        let err = check_binary_freshness(&ws.bin_path, &ws.workspace_root())
+            .expect_err("lockfile newer than the binary must fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("workspace manifest"),
+            "must explain the manifest case: {message}"
+        );
+        assert!(message.contains("`touch`"), "must suggest touching the binary: {message}");
+        assert!(
+            message.contains("OCEANFS_BIN"),
+            "must suggest the pinned-binary escape hatch: {message}"
+        );
+    }
+
+    #[test]
+    fn check_binary_freshness_when_fresh_passes() {
+        let ws = FakeWorkspace::new();
+        // Binary (200.0) newer than every source (100.0) → fresh.
+        ws.write_source_with_mtimes("crates/oceanfs-core/src/lib.rs", 200.0, 100.0);
+
+        check_binary_freshness(&ws.bin_path, &ws.workspace_root())
+            .expect("fresh binary must pass the freshness check");
+    }
+
+    #[test]
+    fn check_binary_freshness_when_equal_mtime_passes() {
+        // Same-tick builds (coarse filesystems) must not be flagged.
+        let ws = FakeWorkspace::new();
+        ws.write_source_with_mtimes("crates/oceanfs-core/src/lib.rs", 100.0, 100.0);
+
+        check_binary_freshness(&ws.bin_path, &ws.workspace_root())
+            .expect("binary with equal mtime must pass (>= comparison)");
+    }
+
+    #[test]
+    fn check_binary_freshness_skips_missing_binary() {
+        // A missing binary fails at spawn time, not at the freshness
+        // check (which has nothing to compare).
+        let ws = FakeWorkspace::new();
+        ws.write_source_with_mtimes("crates/oceanfs-core/src/lib.rs", 100.0, 200.0);
+        let missing = ws.dir.path().join("target/release/does-not-exist");
+
+        check_binary_freshness(&missing, &ws.workspace_root())
+            .expect("missing binary must not fail the freshness check");
+    }
+
+    #[test]
+    fn newest_source_mtime_finds_deepest_newest_source() {
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("crates/oceanfs-core/src/deep")).expect("mkdir");
+        let older = dir.path().join("crates/oceanfs-core/src/lib.rs");
+        let newest = dir.path().join("crates/oceanfs-core/src/deep/inner.rs");
+        std::fs::write(&older, "a").expect("write older");
+        std::fs::write(&newest, "b").expect("write newest");
+        let epoch = SystemTime::UNIX_EPOCH;
+        filetime::set_file_mtime(&older, filetime::FileTime::from_unix_time(100, 0)).expect("mt");
+        filetime::set_file_mtime(&newest, filetime::FileTime::from_unix_time(300, 0)).expect("mt");
+
+        let (found, mtime) =
+            newest_source_mtime(dir.path()).expect("must find a source file in the fake workspace");
+        assert_eq!(found, newest);
+        let secs = mtime.duration_since(epoch).expect("after epoch").as_secs();
+        assert_eq!(secs, 300);
+    }
+
+    #[test]
+    fn newest_source_mtime_considers_workspace_manifest_files() {
+        // A stale binary with an untouched crates/ tree but a newer
+        // Cargo.lock must still be flagged (dependency changes matter).
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("crates/oceanfs-core/src")).expect("mkdir");
+        std::fs::write(dir.path().join("crates/oceanfs-core/src/lib.rs"), "a").expect("write rs");
+        std::fs::write(dir.path().join("Cargo.lock"), "# lock\n").expect("write lock");
+        filetime::set_file_mtime(
+            &dir.path().join("crates/oceanfs-core/src/lib.rs"),
+            filetime::FileTime::from_unix_time(100, 0),
+        )
+        .expect("mt rs");
+        filetime::set_file_mtime(
+            &dir.path().join("Cargo.lock"),
+            filetime::FileTime::from_unix_time(400, 0),
+        )
+        .expect("mt lock");
+
+        let (found, _) = newest_source_mtime(dir.path()).expect("must find a source");
+        assert_eq!(found, dir.path().join("Cargo.lock"));
+    }
+
+    #[test]
+    fn newest_source_mtime_returns_none_without_crates_tree() {
+        let dir = TempDir::new().expect("temp dir");
+        // No crates/, no manifest files — nothing to compare against.
+        assert!(newest_source_mtime(dir.path()).is_none());
+    }
+
+    // ── Log capture (§B) ────────────────────────────────────────
+
+    #[test]
+    fn log_dir_is_anchored_to_e2e_crate_root() {
+        let dir = log_dir();
+        assert!(
+            dir.starts_with(E2E_CRATE_ROOT),
+            "log dir must be anchored to the e2e crate root, got {dir:?}"
+        );
+        assert!(dir.ends_with(Path::new("target/e2e-logs")));
+    }
+
+    #[test]
+    fn resolve_log_level_precedence_options_env_default() {
+        // Explicit options win over env, which wins over "info".
+        assert_eq!(resolve_log_level(Some("debug"), Some("warn")), "debug");
+        assert_eq!(resolve_log_level(None, Some("warn")), "warn");
+        assert_eq!(resolve_log_level(None, None), "info");
+        assert_eq!(resolve_log_level(Some("trace"), None), "trace");
+    }
+
+    #[test]
+    fn resolve_capture_precedence_options_env_default() {
+        // Explicit options win; env opt-out is "0"/"false"; default on.
+        assert_eq!(resolve_capture(Some(false), Some("1")), false);
+        assert_eq!(resolve_capture(Some(true), Some("0")), true);
+        assert_eq!(resolve_capture(None, Some("0")), false);
+        assert_eq!(resolve_capture(None, Some("false")), false);
+        assert_eq!(resolve_capture(None, Some("1")), true);
+        assert_eq!(resolve_capture(None, Some("true")), true);
+        assert_eq!(resolve_capture(None, None), true);
+    }
+
+    #[test]
+    fn grep_logs_in_files_finds_matching_lines() {
+        let dir = TempDir::new().expect("temp dir");
+        let log = dir.path().join("node.log");
+        std::fs::write(
+            &log,
+            "info: worker started\nwarn: seal queue full; seal deferred\nerror: other\n",
+        )
+        .expect("write fixture log");
+
+        let matches =
+            grep_logs_in_files(&[log.clone()], "seal queue full").expect("grep must succeed");
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].contains("seal queue full; seal deferred"));
+
+        let none = grep_logs_in_files(&[log], "BadDigest").expect("grep must succeed");
+        assert!(none.is_empty(), "pattern not present must yield no matches");
+    }
+
+    #[test]
+    fn grep_logs_in_files_skips_missing_files() {
+        let dir = TempDir::new().expect("temp dir");
+        let missing = dir.path().join("does-not-exist.log");
+        let found = grep_logs_in_files(&[missing], "anything").expect("grep must succeed");
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn grep_logs_in_files_returns_error_on_unreadable_file() {
+        // A directory cannot be read as a log file — deterministic
+        // error regardless of process privileges (no chmod needed).
+        let dir = TempDir::new().expect("temp dir");
+        let log = dir.path().join("not-a-file");
+        std::fs::create_dir_all(&log).expect("mkdir");
+        let err = grep_logs_in_files(&[log], "x").expect_err("a directory must error");
+        assert!(matches!(err, Error::LogRead(..)));
     }
 }

@@ -1,14 +1,14 @@
 ---
 feature: "E2E Binary Verification & Default Log Capture"
 epic: "test-harness"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies: []
 adr: []
 perf: []
 created: 2026-08-13
-updated: 2026-08-13
+updated: 2026-08-14
 ---
 
 # E2E Binary Verification & Default Log Capture
@@ -118,20 +118,43 @@ test assert on log cleanliness rather than leaving it to manual review.
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build -p e2e --tests` succeeds
-- [ ] **Tests:** new unit test — a stale mtime triggers the failure
+- [x] **Code:** `cargo build -p e2e --tests` succeeds
+- [x] **Tests:** new unit test — a stale mtime triggers the failure
       message; a fresh binary passes
-- [ ] **Tests:** existing e2e suites still pass (at minimum load_concurrency
-      30 s seed 42)
-- [ ] **Behavior:** after a default run (no env vars), node logs are
+- [x] **Tests:** existing e2e suites still pass (at minimum load_concurrency
+       30 s seed 42)
+- [x] **Behavior:** after a default run (no env vars), node logs are
       present in `e2e/target/e2e-logs`
-- [ ] **Behavior:** the log-clean assertion in load_concurrency is
+- [x] **Behavior:** the log-clean assertion in load_concurrency is
       verified, and verified to fail pre-fix by construction (mutation
       note: inject a signature or point at a deliberately broken binary)
 
+<!-- REVIEW: all five DoD items independently verified 2026-08-14 (iter 2): build clean; cargo test -p e2e --lib = 119 passed incl. 15 new staleness/log-capture tests (14 iter-1 + check_binary_freshness_when_lockfile_only_newer_suggests_touch harness.rs:1858); clippy -D warnings clean; RUSTDOCFLAGS="-D warnings" cargo doc clean; load_concurrency 30s seed 42 re-run PASS (46.0s) with logs_clean=true (report 1_load_concurrency_20260814T074350.json); default-run log capture verified at e2e/target/e2e-logs (51 files, INFO+ content); live BadDigest injection failing logs_clean previously verified at load_concurrency.rs:311. Iter-1 residual gap CLOSED: StaleBinary.hint (harness.rs:871-879) now branches on crates/ source vs workspace-manifest source and suggests `touch`/OCEANFS_BIN acknowledgement for the lockfile-only no-op case; new unit test verifies both branches. OQ2 unbounded log accumulation remains documented append-only behavior (log_dir doc, harness.rs:903). -->
+
 ## Open Questions
 
-1. mtime vs build-id/hash for staleness detection?
-2. Delete old logs per run, or accumulate (append, like today)?
-3. Default log level per test: "info" everywhere with load_concurrency at
-   "debug", or "debug" as the harness default?
+### Resolved (2026-08-14)
+
+| # | Question | Decision |
+|---|---|---|
+| **OQ1** | mtime vs build-id/hash for staleness detection? | **mtime-based staleness** with `>=` comparison (binary mtime >= newest source mtime). Scan scope: recursive `*.rs` under `crates/`, plus workspace `Cargo.toml`, `Cargo.lock`, and root `build.rs`. Fallback to build-id is the documented escape hatch if mtime proves flaky. The error message is tailored: `crates/` source → "run `cargo build --release`, or pin via `OCEANFS_BIN`"; workspace-manifest-only change (e.g. e2e-only dev-dependency bump in `Cargo.lock`) → explains that `cargo build --release` may no-op and suggests `touch`-ing the binary or `OCEANFS_BIN` as acknowledgement. |
+| **OQ2** | Delete old logs per run, or accumulate (append, like today)? | **Accumulate** (append-only), because tests run in parallel and share `e2e/target/e2e-logs`; uuid-named files avoid collisions. Known trade-off: unbounded growth (~100 files per full-suite run) — accepted and documented in the `log_dir` doc comment; cleanup remains operator-managed. |
+| **OQ3** | Default log level per test: "info" everywhere with load_concurrency at "debug", or "debug" as the harness default? | Harness default **"info"**; `load_concurrency` requests **"debug"** via the new `NodeOptions::with_log_level("debug")` per-test override (no racy env mutation). Precedence: explicit `NodeOptions` > `E2E_NODE_LOG_LEVEL` env > `"info"`. |
+
+## Accepted Deviations & Notes
+
+- **`E2E_CAPTURE_NODE_LOGS` kept but inverted to an opt-out** — `0`/`false`
+  disables capture; default is on.
+- **Log-dir convention anchored to `CARGO_MANIFEST_DIR`** (compile-time
+  `env!`), i.e. `e2e/target/e2e-logs`, cwd-independent.
+- **`filetime` added as a dev-dependency of the `e2e` crate** for
+  deterministic mtime manipulation in unit tests (std has no safe
+  `utimensat`; the e2e crate forbids `unsafe`).
+- **Pre-existing, unrelated failure:** `e2e/tests/negative_cache.rs::
+  negative_cache_delete_then_get_returns_404` fails identically on pristine
+  HEAD (verified by stashing the feature changes) — out of scope for this
+  feature.
+- **Stale release binary confirmed during gap-closure:** the pre-existing
+  release binary was older than `crates/oceanfs-storage/src/segment/pool.rs`,
+  confirming the motivation; the gate now requires a fresh
+  `cargo build --release -p oceanfs` before e2e runs.
