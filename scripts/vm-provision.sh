@@ -373,17 +373,31 @@ create_network() {
             return 0
         fi
         log_warn "Network '${NETWORK_NAME}' exists but has NO subnetwork — adding ${NETWORK_CIDR}..."
-        local subnet_output
-        if ! subnet_output=$(hcloud network add-subnet \
+        # The hcloud CLI takes the network POSITIONALLY for add-subnet
+        # (`hcloud network add-subnet <network> --ip-range …`); older
+        # versions used a --network flag. Try the positional form first,
+        # fall back to the flag form, and report BOTH errors if neither
+        # works so CLI drift stays diagnosable.
+        local out1 out2
+        if out1=$(hcloud network add-subnet \
+            "$NETWORK_NAME" \
+            --type cloud \
+            --network-zone eu-central \
+            --ip-range "$NETWORK_CIDR" \
+            2>&1); then
+            log_info "Subnetwork ${NETWORK_CIDR} added to '${NETWORK_NAME}'."
+            return 0
+        fi
+        if out2=$(hcloud network add-subnet \
             --network "$NETWORK_NAME" \
             --type cloud \
             --network-zone eu-central \
             --ip-range "$NETWORK_CIDR" \
             2>&1); then
-            die "Failed to add subnetwork to '${NETWORK_NAME}': ${subnet_output}"
+            log_info "Subnetwork ${NETWORK_CIDR} added to '${NETWORK_NAME}' (flag form)."
+            return 0
         fi
-        log_info "Subnetwork ${NETWORK_CIDR} added to '${NETWORK_NAME}'."
-        return 0
+        die "Failed to add subnetwork to '${NETWORK_NAME}': positional: ${out1} | flag: ${out2}"
     fi
 
     log_info "Creating network '${NETWORK_NAME}' with CIDR ${NETWORK_CIDR}..."
