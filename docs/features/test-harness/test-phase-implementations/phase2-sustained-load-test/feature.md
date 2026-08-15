@@ -1,7 +1,7 @@
 ---
 feature: "Phase 2 — Single-Node Sustained Load & Resource Stability Test"
 epic: "test-phase-implementations"
-status: proposed
+status: in_progress
 priority: critical
 owner: ""
 dependencies:
@@ -33,7 +33,7 @@ perf:
   - "11.1 Atomic counters on hot paths"
   - "11.2 Resource monitoring instrumentation"
 created: 2026-08-05
-updated: 2026-08-15
+updated: 2026-08-16
 ---
 
 # Phase 2 — Single-Node Sustained Load & Resource Stability Test
@@ -203,109 +203,87 @@ Test flow (both modes):
 <!-- REVIEW: polling is a tokio::spawn'd async task with its own interval (e2e/tests/load_sustained.rs:343-380); no blocking ops on the worker path. Note: the PUT hot path gained one RocksDB point read (get_segment) per unique segment via spawn_blocking (metadata_async.rs:184-198) — negligible at observed rates but on the ack path. -->
 - [x] **Integration:** LoadReport JSON contains all metric snapshots (time-series) for offline analysis
 
-## Current State vs. Spec (2026-08-15)
+## Final State — Deviations, Compromises & Deferrals (2026-08-16)
 
-> **Status snapshot.** All facts below were verified against the working tree
-> on 2026-08-15. Implementation of this feature has NOT begun — the DoD
-> checklist above remains unchecked by design. This section records the delta
-> so a fresh implementer session can start without archaeology. Build order:
-> **1 → 2 → 3 → 4 → 6** (strictly serial through the critical path, gap 3);
-> **5** in parallel with gaps 3–4; **7** after 5 and 6.
+> **Status.** Implementation complete and pushed to `main` (commits
+> `e4ce224`…`6e7009d`). Three review iterations were run; final verdict
+> **FAIL** — every remaining item is product-side (needs a spec/product
+> decision) or operationally blocked (needs a cloud VM). Verified at 60s
+> smoke scale (pass) and 9/10 at 300s; the two open DoD items are
+> (a) the `memory_bounded` threshold calibration decision (product-side)
+> and (b) the full-mode 3600s cloud run (VMs were provisioned and torn
+> down without a payload run). The feature therefore remains
+> `status: in_progress`. The DoD checklist above carries the reviewer's
+> ground-truth notes from all three iterations and is unchanged; the
+> deviations below record the final state.
 
-### What already exists (do not rebuild)
+### Accepted deviations & compromises
 
-- **Epic 1 `test-harness-extensions`: all 6 features `done`** (manifest-tracker,
-  load-scenario-orchestrator, metrics-scraper, load-report, churn-scheduler,
-  failure-injectors). Implemented in `e2e/src/load/`:
-  - `generator.rs` — `LoadScenario`, `Worker`, `Orchestrator`, `WorkerStats`
-    with `put`/`get`/`delete`/`head` `LatencyHistogram` p50/p99,
-    `BlobSizeDist::{Fixed, Range, Tiered}`, `KeySpace::{RandomUuid, Sequential, Zipfian}`
-  - `manifest.rs` — `Manifest`, `ManifestSummary`, `verify_summary`, `record_delete`
-  - `metrics.rs` — `MetricsSnapshot::scrape`, `gauge`/`counter`/`delta`,
-    `parse_prometheus_text`
-  - `report.rs` — `LoadReport`, `assert_that`, `write_json_atomic`,
-    `write_textfile_atomic`
-  - `churn.rs`, `degrade.rs`
-- **`phase1-concurrency-test`: `done`** — `e2e/tests/load_concurrency.rs` passing
-  (seeds 42/7/1234/987654, 30s + seed-42 120s — all PASS on 2026-08-15). Uses
-  50/40/5/5 PUT/GET/DELETE/HEAD, `BlobSizeDist::Tiered` 10/30/40/20, and writes
-  reports to `target/load-reports` (**NOT** `/tmp` — a Phase 2 deviation from
-  the spec, see gap 4).
-- **`operational-tooling`:** `vm-provisioning` `done`
-  (`scripts/vm-provision.sh`, Hetzner hcloud, CX22/CX32 sizing, TTL guardrails
-  per ADR-0019); `prometheus-grafana-setup` `done`
-  (`scripts/setup-observability.sh`); `loadgen-binary` `proposed` (Phase 5
-  only, not needed for Phase 2).
-- **Harness crash primitives:** `Cluster::kill` (SIGKILL),
-  `NodeProcess::restart`, `spawn_with_data_dir` all exist in `e2e/src/harness.rs`.
-- **Config helpers:** `config_standard()` (16 MiB `max_body_size`),
-  `config_short_gc()` (gc 10s / ttl 5s), `config_short_ae()` (ae 10s) exist in
-  `e2e/src/harness.rs`.
-- **RocksDB metrics:** `RocksDbMetrics` in
-  `crates/oceanfs-storage/src/metadata/store.rs` exposes `block_cache_hit/miss`,
-  `memtable_size`, `running_compactions/flushes`, `estimate_num_keys` — polled
-  via `metadata_store.start_metrics_task()`; `node.rs` registers
-  `process_resident_memory_bytes` + `process_open_fds` gauges (15s poller) and
-  the `/admin/metrics` Prometheus endpoint exists.
+1. **`memory_bounded` — open calibration decision (product-side).** RSS
+   sawtooths 1.2–2.5× around the post-warmup baseline — bounded and
+   receding, NOT a leak. The spec's 2× threshold is miscalibrated for the
+   spec's own parameters (16 MiB blobs × 16–32 workers, 512 MiB buffer
+   pool, 256 MiB L1). The test implements the strict 2× with a
+   3-consecutive-poll rule (30s sustained = leak; single teeth = sawtooth,
+   per the spec's "sawtooth acceptable"). Fails 5/5 at 300s. Options
+   pending user decision: raise the threshold, shrink workload buffers, or
+   accept as a documented deviation.
+2. **`fds_stable` — sawtooth tolerance added.** Same 3-consecutive-poll
+   rule as `memory_bounded`. Root cause: RocksDB `max_open_files=-1`
+   (product default) opens one fd per SST; compaction bursts spike fds
+   transiently. Product fix candidate: bound `max_open_files` in the
+   metadata config.
+3. **Warmup + cooldown phases (test design).** A ≤15s warmup runs before
+   the baseline — buffer pools/caches are lazily allocated, and a cold
+   baseline would measure warmup rather than stability. A 30s GET-only
+   cooldown before the crash measures the L1 hit rate — the write-heavy
+   mix invalidates L1 on every PUT, so a whole-run rate would measure
+   invalidation churn. Cache hit rate 79–94% with the test config.
+4. **Test config tuning (documented product findings).** `config_sustained`
+   raises `max_body_size` to 16 MiB (like Phase 1) and sets the L1 cache
+   to 16 MiB max-blob, TTL 0, 256 MiB cap. Production defaults (1 MiB max
+   blob) cap hit rates near 30% under this workload — the >50% assertion
+   only holds with the test tuning.
+5. **Metric name.** The spec's `accel_fallback_total` is
+   `accel_ec_fallback_total` in the product (Phase 1 already used the
+   real name).
+6. **Report path.** `/tmp/oceanfs-reports` (subdir of tmpfs,
+   env-overridable via `LOAD_TEST_REPORT_DIR`) — still ADR-0019
+   Decision 4 compliant.
+7. **Remote crash control.** SSH-based (`TARGET_HOST_SSH` +
+   `TARGET_SERVICE`; systemd unit with `Restart=no` on the SUT, deployed
+   via `scripts/sut-deploy.sh`). Skipped and recorded in the report when
+   `TARGET_HOST_SSH` is unset.
+8. **Product bugs found by the test and fixed (all with regression
+   tests):**
+   - WAL replay rebuilt segments under new ids (data loss on crash) →
+     `append_replayed` preserves original ids
+   - Orphan reaper scanned only the "default" bucket (mass-deleted live
+     segments) → `list_objects_all`
+   - Replay rebuilt sealed segments from partial WAL tails (corrupt pool
+     shadows) → sealed-skip predicate
+   - WAL rotation deleted unsealed segments' entries → seal-aware
+     retention with a new timestamped `deleted_segments` CF (markers
+     written atomically with metadata deletion, periodic prune) — the cap
+     heuristic was removed in favor of exact tracking
+   - PUT handler phantom metadata clobbered sealed entries →
+     `sealed_at: None` at write time + `get_segment` guard
+   - `segment_active_count` was unregistered/vacuous → live pool gauge
+   - RocksDB SST gauges read the empty default CF → per-CF property sums
+   - Pre-existing failing e2e `wal_recovery.rs` now passes
 
-### Implementation gaps (in build order)
+### Deferrals & recorded notes
 
-1. **`config_short_scrub` helper missing** in `e2e/src/harness.rs`
-   (`scrub_interval_sec=60` alongside `config_short_gc`/`config_short_ae`).
-   ~15 min.
-2. **RocksDB level-0/SST gauges missing:** `rocksdb_num_files_at_level_0`,
-   `live-sst-files-size`, `estimate-table-readers-mem` NOT in
-   `RocksDbMetrics`/store poller. Needed for the spec's headline invariant
-   (level-0 < 20) AND serves ADR-0023 Phase 0 (metadata memory attribution;
-   ADR file: `docs/adr/0023-metadata-store-native-replacement-path.md`).
-   ~30 min.
-3. **Remote-target mode (`TARGET_HOST`) does NOT exist anywhere in the e2e
-   crate** — the critical missing piece. No `RemoteNode`/remote variant of
-   `NodeProcess`/`Cluster`; `MetricsSnapshot::scrape` and `Manifest::verify`
-   take spawned-process handles only. Requires: remote HTTP client for S3 +
-   `/admin/metrics` + `/admin/health`, `scrape_remote` + `verify_remote`
-   variants, `LoadReport` self-monitoring (harness's own `/proc` fds/RSS per
-   spec items 93–94). **Blocks Steps 4, 6, 7.** 2–3 h — the design-heavy piece.
-4. **`e2e/tests/load_sustained.rs` does not exist.** The Phase 2 test itself:
-   topology detection (`TARGET_HOST` vs local spawn), short-interval config,
-   10s metric polling with the 6 per-snapshot invariants (RSS <2×, fds <+50,
-   level-0 <20, `seal_errors=0`, `accel_fallback=0`, WAL files <+10),
-   40/50/10 PUT/GET/DELETE on Zipfian 10K keys (delete-rewrite exercises
-   compaction), SIGKILL → `spawn_with_data_dir` restart → `manifest.verify` →
-   `LoadReport` to `/tmp` (spec requires `/tmp` per ADR-0019 Decision 4;
-   current `load_concurrency` writes `target/load-reports` — must differ).
-   3–4 h.
-
-### Agent skills (Epic 4) — all proposed, nothing under `.opencode/skills/` yet
-
-- **`vm-skills`** (`vm-status`/`vm-up`/`vm-down`/`vm-deploy`): depend only on
-  `vm-provision.sh` (done) + ADR-0019 — can proceed in parallel with gaps 3–4.
-  NOTE: Hetzner-specific (hcloud CLI, `~/.ssh/config` aliases
-  `oceanfs-sut`/`oceanfs-harness`); if a non-Hetzner VM is used, skills need
-  adaptation.
-- **`test-execution-skills`** (`vm-test-phase`/`vm-results`/`vm-metrics`/`vm-logs`):
-  `vm-test-phase` hard-depends on `load_sustained` (gap 4); the other three
-  depend on done items (load-report, prometheus setup).
-- **`agent-integration-test`** (`scripts/test-agent-workflow.sh`): depends on
-  both skill groups + phase1 (done); its workflow is Phase-1-based so it can
-  be validated before gap 4 lands.
-
-### Build order
-
-1. `config_short_scrub` helper (gap 1)
-2. RocksDB level-0/SST gauges (gap 2)
-3. Remote-target mode — `RemoteNode`, `scrape_remote`, `verify_remote` (gap 3;
-   **critical path** — everything else blocks on this)
-4. `load_sustained.rs` test itself (gap 4)
-5. `vm-skills` (parallel with gaps 3–4)
-6. `test-execution-skills` + `agent-integration-test` (after 5)
-7. Full Phase 2 campaign on a dedicated VM (intent: sustained load on a
-   dedicated VM; a fresh implementer session picks up at Step 1)
-
-### Dependencies status
-
-All feature-level dependencies are satisfied: `config-system-fix` done,
-`metrics-infrastructure` done, `write-path-unification` done,
-`correctness-gaps` done, all 6 Epic-1 features done, `load-test-harness-fidelity`
-done. The only outstanding dependencies are internal to this feature's gaps
-above.
+9. **Full-mode 3600s (deferral).** Not yet run. Two-VM cloud payload
+   pending; scripts ready (`vm-provision.sh`, `sut-deploy.sh`,
+   `setup-harness.sh`, `run-phase2.sh --harness`, `observe.sh`). The VMs
+   were provisioned (cx23 SUT + Harness, firewalled, observability by
+   default) and torn down without a payload run.
+10. **Stale frontmatter citations (pre-existing doc drift).** `adr:
+    0004-tiered-segment-sizing` — the ADR file does not exist (the content
+    lives in ADR-0001); `perf: "11.2 Resource monitoring instrumentation"`
+    — performance.md §11.2 is "tracing span discipline"; no such rule
+    exists.
+11. **Determinism DoD item.** Workload generation is fully deterministic
+    (seeded ChaCha12); assertion outcomes at 300s vary only via
+    product-side timing races, now resolved to 0/106 crash mismatches.
