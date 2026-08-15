@@ -21,6 +21,9 @@
 #   Layer 2 — Confirmation gate: CX23 auto-approved; CX33 requires --confirm yes
 #   Layer 3 — Auto-shutdown TTL: systemd timer on each VM (default 4h)
 #   Layer 4 — Budget gate: scaffolding (deferrable/v2)
+# Security: Hetzner VMs ship with NO firewall — managed firewalls are
+#   created and applied by default (SUT: SSH + internal-net 9000/9001;
+#   Harness: SSH only). Disable with --no-firewall (not recommended).
 #
 # Requirements:
 #   - hcloud CLI installed and authenticated (HCLOUD_TOKEN env var or config)
@@ -85,6 +88,8 @@ IMAGE="${DEFAULT_IMAGE}"
 DRY_RUN=false
 DEBUG=false
 KEEP_ON_FAILURE=false
+FIREWALLS=true
+SSH_SOURCE_IP="0.0.0.0/0"
 SINGLE_VM=false
 CONFIRM=""
 TTL_HOURS="${DEFAULT_TTL_HOURS}"
@@ -409,6 +414,98 @@ create_network() {
         die "Failed to create network '${NETWORK_NAME}': ${net_output}"
     fi
     log_info "Network '${NETWORK_NAME}' created."
+}
+
+# ---------------------------------------------------------------------------
+# Firewall helpers
+#
+# Hetzner VMs have NO firewall by default — every port is world-exposed.
+# The SUT's OceanFS API (:9000) and gRPC (:9001) must only be reachable
+# from the internal test network; Prometheus (:9090) is reached via an
+# SSH tunnel only and stays closed. Managed firewalls are applied right
+# after each VM is created, BEFORE the config steps (SSH must stay open).
+# ---------------------------------------------------------------------------
+
+# YAML rule file for the SUT firewall (rules-file format of
+# `hcloud firewall create/update`).
+sut_rules_yaml() {
+    cat <<EOF
+rules:
+  - direction: in
+    protocol: tcp
+    port: "22"
+    source_ips:
+      - ${SSH_SOURCE_IP}
+      - ${NETWORK_CIDR}
+      - "::/0"
+  - direction: in
+    protocol: tcp
+    port: "9000"
+    source_ips:
+      - ${NETWORK_CIDR}
+  - direction: in
+    protocol: tcp
+    port: "9001"
+    source_ips:
+      - ${NETWORK_CIDR}
+  - direction: in
+    protocol: icmp
+    source_ips:
+      - 0.0.0.0/0
+      - "::/0"
+EOF
+}
+
+# YAML rule file for the Harness firewall: SSH only.
+harness_rules_yaml() {
+    cat <<EOF
+rules:
+  - direction: in
+    protocol: tcp
+    port: "22"
+    source_ips:
+      - ${SSH_SOURCE_IP}
+      - "::/0"
+  - direction: in
+    protocol: icmp
+    source_ips:
+      - 0.0.0.0/0
+      - "::/0"
+EOF
+}
+
+# Creates (or updates) a managed firewall with the given rules and
+# applies it to the server. Idempotent: re-running with the same name
+# prefix updates the rules in place.
+ensure_firewall() {
+    local fw_name="$1"
+    local server_name="$2"
+    local rules_yaml="$3"
+
+    log_info "Ensuring firewall '${fw_name}' on server '${server_name}'..."
+
+    local rules_file
+    rules_file=$(mktemp)
+    printf '%s' "$rules_yaml" > "$rules_file"
+    trap 'rm -f "$rules_file"' RETURN
+
+    local fw_output
+    if hcloud firewall describe "$fw_name" >/dev/null 2>&1; then
+        if ! fw_output=$(hcloud firewall update "$fw_name" --rules-file "$rules_file" 2>&1); then
+            die "Failed to update firewall '${fw_name}': ${fw_output}"
+        fi
+        log_info "Firewall '${fw_name}' rules updated."
+    else
+        if ! fw_output=$(hcloud firewall create --name "$fw_name" --rules-file "$rules_file" 2>&1); then
+            die "Failed to create firewall '${fw_name}': ${fw_output}"
+        fi
+        log_info "Firewall '${fw_name}' created."
+    fi
+
+    if ! fw_output=$(hcloud firewall apply-to-resources --firewall "$fw_name" --server "$server_name" 2>&1); then
+        die "Failed to apply firewall '${fw_name}' to '${server_name}': ${fw_output}"
+    fi
+    log_info "Firewall '${fw_name}' applied to '${server_name}'."
 }
 
 create_vm() {
@@ -817,8 +914,19 @@ WARNING
         log_info "SUT VM: name=${SUT_NAME}, internal_ip=${SUT_IP}, public_ip=${SUT_PUBLIC_IP}"
 
         if [ "$DRY_RUN" = false ]; then
+            # Firewall BEFORE configuration: SSH stays open (rule above),
+            # everything else is denied from the internet by default.
+            if [ "$FIREWALLS" = true ]; then
+                ensure_firewall "${NAME_PREFIX}-sut-fw" "$sut_name" "$(sut_rules_yaml)"
+            else
+                log_warn "Firewalls DISABLED (--no-firewall) — ${sut_name} is exposed to the internet."
+            fi
             configure_sut_vm "$sut_name" "$SUT_PUBLIC_IP" || die "SUT VM configuration failed."
             setup_ttl_timer "$sut_name" "$SUT_PUBLIC_IP" || log_warn "TTL timer setup failed on SUT VM. Manual TTL enforcement may be needed."
+        else
+            if [ "$FIREWALLS" = true ]; then
+                log_info "[DRY-RUN] Create/update firewall '${NAME_PREFIX}-sut-fw' and apply to '${sut_name}'"
+            fi
         fi
     fi
 
@@ -840,8 +948,17 @@ WARNING
         log_info "Harness VM: name=${HARNESS_NAME}, internal_ip=${HARNESS_IP}, public_ip=${HARNESS_PUBLIC_IP}"
 
         if [ "$DRY_RUN" = false ]; then
+            if [ "$FIREWALLS" = true ]; then
+                ensure_firewall "${NAME_PREFIX}-harness-fw" "$harness_name" "$(harness_rules_yaml)"
+            else
+                log_warn "Firewalls DISABLED (--no-firewall) — ${harness_name} is exposed to the internet."
+            fi
             configure_harness_vm "$harness_name" "$HARNESS_PUBLIC_IP" || die "Harness VM configuration failed."
             setup_ttl_timer "$harness_name" "$HARNESS_PUBLIC_IP" || log_warn "TTL timer setup failed on Harness VM. Manual TTL enforcement may be needed."
+        else
+            if [ "$FIREWALLS" = true ]; then
+                log_info "[DRY-RUN] Create/update firewall '${NAME_PREFIX}-harness-fw' and apply to '${harness_name}'"
+            fi
         fi
     fi
 }
@@ -943,6 +1060,12 @@ OPTIONS:
   --debug              Enable shell tracing (set -x) for full visibility
   --keep-on-failure    Keep already-created VMs when a later step fails
                        (default: cleanup deletes them)
+  --no-firewall        Do NOT create/apply Hetzner managed firewalls
+                       (default: applied — SUT: SSH + internal-net
+                       9000/9001 only; Harness: SSH only)
+  --ssh-source-ip IP   CIDR allowed to SSH into the VMs (default:
+                       0.0.0.0/0). The SUT additionally allows the
+                       internal test network for harness crash control.
   --destroy NAME       Tear down both VMs with given name prefix
   --status NAME        Check status of both VMs
   -h, --help           Show this help
@@ -1075,6 +1198,14 @@ parse_args() {
             --keep-on-failure)
                 KEEP_ON_FAILURE=true
                 shift
+                ;;
+            --no-firewall)
+                FIREWALLS=false
+                shift
+                ;;
+            --ssh-source-ip)
+                SSH_SOURCE_IP="${2:-}"
+                shift 2
                 ;;
             --destroy)
                 DESTROY_NAME="${2:-}"
