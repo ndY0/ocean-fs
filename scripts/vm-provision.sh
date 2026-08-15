@@ -426,29 +426,29 @@ create_network() {
 # after each VM is created, BEFORE the config steps (SSH must stay open).
 # ---------------------------------------------------------------------------
 
-# JSON rule file for the SUT firewall. The current hcloud CLI requires
-# JSON matching the API structure ({"rules": [...]}); older CLIs
-# accepted YAML — the create/replace fallbacks in ensure_firewall cover
-# the old command syntax, and the JSON wrapper is the documented format
-# since the CLI rewrite.
+# JSON rule file for the SUT firewall. The current hcloud CLI unmarshals
+# the file directly into []schema.FirewallRule — a bare JSON array of
+# rule objects (NOT a {"rules": [...]} wrapper; that fails with
+# 'cannot unmarshal object into Go value of type []schema.FirewallRule').
 sut_rules_json() {
     cat <<EOF
-{"rules": [
+[
   {"direction": "in", "protocol": "tcp", "port": "22", "source_ips": ["${SSH_SOURCE_IP}", "${NETWORK_CIDR}", "::/0"]},
   {"direction": "in", "protocol": "tcp", "port": "9000", "source_ips": ["${NETWORK_CIDR}"]},
   {"direction": "in", "protocol": "tcp", "port": "9001", "source_ips": ["${NETWORK_CIDR}"]},
   {"direction": "in", "protocol": "icmp", "source_ips": ["0.0.0.0/0", "::/0"]}
-]}
+]
 EOF
 }
 
-# JSON rule file for the Harness firewall: SSH only.
+# JSON rule file for the Harness firewall: SSH only (bare array, same
+# contract as the SUT rules).
 harness_rules_json() {
     cat <<EOF
-{"rules": [
+[
   {"direction": "in", "protocol": "tcp", "port": "22", "source_ips": ["${SSH_SOURCE_IP}", "::/0"]},
   {"direction": "in", "protocol": "icmp", "source_ips": ["0.0.0.0/0", "::/0"]}
-]}
+]
 EOF
 }
 
