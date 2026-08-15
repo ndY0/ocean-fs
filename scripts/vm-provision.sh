@@ -4,7 +4,7 @@
 #
 # Provisions two VMs (SUT + Harness) on Hetzner Cloud for OceanFS load testing
 # per ADR-0019. The SUT VM runs OceanFS and Prometheus only (no harness, no
-# toolchain). The Harness VM (always CX22) runs the e2e harness and Rust
+# toolchain). The Harness VM (always CX23) runs the e2e harness and Rust
 # toolchain, targeting the SUT VM over Hetzner's internal network.
 #
 # Usage:
@@ -12,13 +12,13 @@
 #
 # VM Size Mapping (per phase):
 #   Phase 1: N/A (runs in CI, no cloud VMs needed)
-#   Phase 2: SUT=CX22 (2 vCPU, 4 GB, 40 GB), Harness=CX22 (2 vCPU, 4 GB, 40 GB)
-#   Phase 3-4: SUT=CX32 (4 vCPU, 8 GB, 80 GB), Harness=CX22 (2 vCPU, 4 GB, 40 GB)
+#   Phase 2: SUT=CX23 (2 vCPU, 4 GB, 40 GB), Harness=CX23 (2 vCPU, 4 GB, 40 GB)
+#   Phase 3-4: SUT=CX33 (4 vCPU, 8 GB, 80 GB), Harness=CX23 (2 vCPU, 4 GB, 40 GB)
 #   Phase 5+: N/A (separate provisioning model)
 #
 # Guardrails (four-layer defense per ADR-0019):
-#   Layer 1 — Hard VM size cap: MAX_AGENT_VM_TYPE="cx32"
-#   Layer 2 — Confirmation gate: CX22 auto-approved; CX32 requires --confirm yes
+#   Layer 1 — Hard VM size cap: MAX_AGENT_VM_TYPE="cx33"
+#   Layer 2 — Confirmation gate: CX23 auto-approved; CX33 requires --confirm yes
 #   Layer 3 — Auto-shutdown TTL: systemd timer on each VM (default 4h)
 #   Layer 4 — Budget gate: scaffolding (deferrable/v2)
 #
@@ -41,7 +41,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Constants & defaults
 # ---------------------------------------------------------------------------
-readonly MAX_AGENT_VM_TYPE="cx32"
+readonly MAX_AGENT_VM_TYPE="cx33"
 readonly DEFAULT_PROVIDER="hetzner"
 readonly DEFAULT_BRANCH="main"
 readonly DEFAULT_IMAGE="ubuntu-24.04"
@@ -51,19 +51,26 @@ readonly NETWORK_CIDR="10.0.0.0/24"
 
 # VM type pricing (approximate, for cost estimates)
 declare -A VM_HOURLY_COST
-VM_HOURLY_COST[cx22]="0.015"
-VM_HOURLY_COST[cx32]="0.03"
-VM_HOURLY_COST[cx42]="0.06"
-VM_HOURLY_COST[cx52]="0.12"
-VM_HOURLY_COST[cx62]="0.24"
+# Approximate hourly prices (2026-08 Hetzner table; verify with
+# `hcloud server-type list --output json`). cx23/cx33 replaced the
+# retired cx22/cx32 (now cx23/cx33); the cpx2x family is the same size class.
+VM_HOURLY_COST[cx23]="0.015"
+VM_HOURLY_COST[cpx22]="0.015"
+VM_HOURLY_COST[cx33]="0.03"
+VM_HOURLY_COST[cpx32]="0.03"
+VM_HOURLY_COST[cx43]="0.06"
+VM_HOURLY_COST[cx53]="0.12"
+VM_HOURLY_COST[cpx62]="0.24"
 
 # VM type ordering for comparison (lower index = smaller)
 declare -A VM_TYPE_RANK
-VM_TYPE_RANK[cx22]=1
-VM_TYPE_RANK[cx32]=2
-VM_TYPE_RANK[cx42]=3
-VM_TYPE_RANK[cx52]=4
-VM_TYPE_RANK[cx62]=5
+VM_TYPE_RANK[cx23]=1
+VM_TYPE_RANK[cpx22]=1
+VM_TYPE_RANK[cx33]=2
+VM_TYPE_RANK[cpx32]=2
+VM_TYPE_RANK[cx43]=3
+VM_TYPE_RANK[cx53]=4
+VM_TYPE_RANK[cpx62]=5
 
 # ---------------------------------------------------------------------------
 # Script state
@@ -127,13 +134,13 @@ vm_type_lte() {
     [ "$rank_a" -le "$rank_b" ]
 }
 
-# Check if VM type requires confirmation (>= CX32)
+# Check if VM type requires confirmation (>= CX33)
 vm_type_needs_confirm() {
     local type="${1,,}"
-    if vm_type_lte "$type" "cx22"; then
-        return 1  # CX22 or smaller: no confirm
+    if vm_type_lte "$type" "cx23"; then
+        return 1  # CX23 or smaller: no confirm
     fi
-    return 0  # CX32 or larger: needs confirm
+    return 0  # CX33 or larger: needs confirm
 }
 
 # Get VM type cost per hour
@@ -155,12 +162,12 @@ resolve_phase() {
             HARNESS_TYPE=""
             ;;
         2)
-            SUT_TYPE="cx22"
-            HARNESS_TYPE="cx22"
+            SUT_TYPE="cx23"
+            HARNESS_TYPE="cx23"
             ;;
         3|4)
-            SUT_TYPE="cx32"
-            HARNESS_TYPE="cx22"
+            SUT_TYPE="cx33"
+            HARNESS_TYPE="cx23"
             ;;
         5|6)
             # Phase 5+ uses separate provisioning model
@@ -199,7 +206,7 @@ check_hard_cap() {
     # If the type is larger than MAX_AGENT_VM_TYPE, reject
     if ! vm_type_lte "$type" "$MAX_AGENT_VM_TYPE"; then
         die "VM type '${type}' exceeds the maximum allowed type '${MAX_AGENT_VM_TYPE}'." \
-            "Larger VMs (≥ CX42) must be provisioned manually via the Hetzner Cloud console." \
+            "Larger VMs (≥ CX43) must be provisioned manually via the Hetzner Cloud console." \
             "See ADR-0019 for cost guardrail details."
     fi
 }
@@ -231,12 +238,12 @@ Re-run with --confirm yes to proceed.
 MSG
             exit 1
         fi
-        log_info "Confirmation gate: CX32 confirmed with --confirm yes."
+        log_info "Confirmation gate: CX33 confirmed with --confirm yes."
     fi
 
-    # CX22 with --confirm yes: accepted but note it wasn't required
+    # CX23 with --confirm yes: accepted but note it wasn't required
     if [ "$CONFIRM" == "yes" ] && ! vm_type_needs_confirm "$type"; then
-        log_info "Note: --confirm yes provided but not required for ${type} (CX22 is auto-approved)."
+        log_info "Note: --confirm yes provided but not required for ${type} (CX23 is auto-approved)."
     fi
 }
 
@@ -731,7 +738,7 @@ provision_vms() {
     # Single-VM mode: warn for Phase 3-4
     if [ "$SINGLE_VM" = true ]; then
         if [ "$PHASE" = "2" ]; then
-            log_info "Single-VM mode: co-locating SUT + Harness on one CX22."
+            log_info "Single-VM mode: co-locating SUT + Harness on one CX23."
             log_info "Reports will be written to /tmp (tmpfs) to avoid disk I/O contention."
         elif [ "$PHASE" = "3" ] || [ "$PHASE" = "4" ]; then
             cat >&2 <<'WARNING'
@@ -878,8 +885,8 @@ Provision two VMs (SUT + Harness) for OceanFS load testing per ADR-0019.
 OPTIONS:
   --phase N            Load test phase (1-6). Determines VM sizes. [required]
                        Phase 1: N/A (runs in CI, no cloud VMs)
-                       Phase 2: SUT=CX22, Harness=CX22
-                       Phase 3-4: SUT=CX32, Harness=CX22
+                       Phase 2: SUT=CX23, Harness=CX23
+                       Phase 3-4: SUT=CX33, Harness=CX23
                        Phase 5+: N/A (separate provisioning model)
   --provider NAME      Cloud provider: hetzner (default), gcp, aws
   --branch BRANCH      Git branch to clone on Harness VM (default: main)
@@ -889,7 +896,7 @@ OPTIONS:
   --image IMAGE        OS image (default: ubuntu-24.04)
   --single-vm          Co-locate SUT+Harness on single VM
                        (Phase 2 only; Phase 3-4 prints warning per ADR-0019)
-  --confirm yes        Required for VM types >= CX32 (confirmation gate)
+  --confirm yes        Required for VM types >= CX33 (confirmation gate)
   --ttl HOURS          Auto-shutdown TTL (default: 4, or LOAD_TEST_TTL_HOURS)
   --dry-run            Print actions without executing
   --debug              Enable shell tracing (set -x) for full visibility
@@ -905,8 +912,8 @@ Environment Variables:
   LOAD_TEST_MAX_MONTHLY_EUR Optional monthly budget cap (deferrable, v2)
 
 Guardrails:
-  - Hard VM size cap: VMs >= CX42 require manual provisioning
-  - Confirmation gate: CX32 requires --confirm yes (CX22 auto-approved)
+  - Hard VM size cap: VMs >= CX43 require manual provisioning
+  - Confirmation gate: CX33 requires --confirm yes (CX23 auto-approved)
   - Auto-shutdown TTL: systemd timer powers off VMs after TTL expires
   - Budget gate: optional LOAD_TEST_MAX_MONTHLY_EUR scaffolding
 
