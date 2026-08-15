@@ -4,7 +4,7 @@
 //! S3 REST API: PUT, GET, HEAD, DELETE on objects, and PUT, GET,
 //! DELETE on buckets.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     body::Body,
@@ -76,6 +76,28 @@ pub(crate) async fn put_object(
     state.s3_put_counter.inc();
     let bucket_id = BucketId::new(&bucket);
     let object_key = ObjectKey::new(&key);
+
+    // ---- Write backpressure gate (bounded request queue) ----
+    // Admit at most `max_inflight_writes` concurrent PUTs into the write
+    // path. Requests beyond the bound wait up to `write_queue_timeout`,
+    // then receive 503 SlowDown — overload propagates to the HTTP layer
+    // (S3 clients retry 503s with backoff) instead of failing mid-write.
+    // Nothing is recorded for a rejected request, so retries are safe.
+    if let Some(semaphore) = &state.write_queue {
+        match tokio::time::timeout(state.write_queue_timeout, Arc::clone(semaphore).acquire_owned())
+            .await
+        {
+            Ok(Ok(permit)) => {
+                // Held until the handler returns: the whole write path
+                // (pool append + WAL + replication + metadata persist)
+                // counts against the in-flight bound.
+                let _permit = permit;
+            }
+            Ok(Err(_)) | Err(_) => {
+                return s3_error_response(&Error::WriteOverloaded, &bucket, &key);
+            }
+        }
+    }
 
     let hk = HashKey::from_bytes(hash_key(object_key.as_str().as_bytes()));
 

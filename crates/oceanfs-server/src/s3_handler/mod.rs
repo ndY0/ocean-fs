@@ -95,6 +95,14 @@ pub(crate) struct AppState {
     /// Optional directory for persisting blob data to disk.
     /// When set, blob data is written to `{blob_dir}/{segment_id}.blob` on PUT.
     pub blob_dir: Option<PathBuf>,
+    /// Bounded write queue: PUT requests acquire a permit before entering
+    /// the write path, so backpressure propagates to the HTTP layer
+    /// (`503 SlowDown` after `write_queue_timeout`) instead of failing
+    /// mid-write. `None` disables the gate (tests / unbounded mode).
+    pub write_queue: Option<Arc<tokio::sync::Semaphore>>,
+    /// How long a PUT waits for a write permit before being rejected
+    /// with `503 SlowDown` (see `write_queue`).
+    pub write_queue_timeout: std::time::Duration,
     /// S3 request counter by method.
     pub s3_put_counter: Counter,
     /// S3 GET request counter.
@@ -165,6 +173,39 @@ impl S3Handler {
         metadata_cache: Option<Arc<oceanfs_cache::MetadataCache>>,
         negative_cache: Option<Arc<oceanfs_cache::NegativeCache>>,
     ) -> Self {
+        Self::new_with_caches_and_backpressure(
+            write,
+            read,
+            metadata,
+            buckets,
+            object_cache,
+            metadata_cache,
+            negative_cache,
+            None,
+            std::time::Duration::from_secs(5),
+        )
+    }
+
+    /// Creates a new S3 handler with cache layers and the bounded write
+    /// queue (backpressure gate).
+    ///
+    /// `write_queue` bounds concurrent in-flight PUTs; `write_queue_timeout`
+    /// is how long a PUT waits for a permit before `503 SlowDown`.
+    // All parameters are distinct composition-root wiring inputs (each
+    // optional subsystem is passed explicitly); bundling them into a
+    // config struct would hide the wiring at the only construction site.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_caches_and_backpressure(
+        write: Arc<WriteCoordinator>,
+        read: Arc<ReadCoordinator>,
+        metadata: Arc<dyn MetadataOps>,
+        buckets: Arc<BucketConfigStore>,
+        object_cache: Option<Arc<oceanfs_cache::ObjectCache>>,
+        metadata_cache: Option<Arc<oceanfs_cache::MetadataCache>>,
+        negative_cache: Option<Arc<oceanfs_cache::NegativeCache>>,
+        write_queue: Option<Arc<tokio::sync::Semaphore>>,
+        write_queue_timeout: std::time::Duration,
+    ) -> Self {
         let state = AppState {
             write,
             read,
@@ -178,6 +219,8 @@ impl S3Handler {
             prefetch_engine: None,
             router: None,
             blob_dir: None,
+            write_queue,
+            write_queue_timeout,
             s3_put_counter: Counter::new(
                 "s3_requests_total".into(),
                 "S3 PUT requests".into(),
@@ -558,6 +601,8 @@ mod tests {
             prefetch_engine: None,
             router: None,
             blob_dir: None,
+            write_queue: None,
+            write_queue_timeout: std::time::Duration::from_secs(5),
             s3_put_counter: Counter::new(
                 "s3_requests_total".into(),
                 "help".into(),
@@ -622,6 +667,49 @@ mod tests {
 
         let headers = response.headers();
         assert!(headers.contains_key(header::ETAG), "ETag header must be set");
+    }
+
+    #[tokio::test]
+    async fn put_object_rejects_with_503_when_write_queue_saturated() {
+        // The bounded write queue must reject PUTs past the permit
+        // bound with 503 SlowDown after the wait timeout — backpressure
+        // propagates to the HTTP layer instead of failing mid-write.
+        let state = make_app_state().await;
+        // Saturate the single-permit queue by holding the only permit.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let _held = semaphore.clone().acquire_owned().await.unwrap();
+        let mut state = state;
+        state.write_queue = Some(semaphore);
+        state.write_queue_timeout = std::time::Duration::from_millis(20);
+        state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
+
+        let response = super::handlers::put_object(
+            State(state),
+            Path(("test-bucket".into(), "gated.txt".into())),
+            Bytes::from_static(b"gated write"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn put_object_succeeds_when_write_queue_has_capacity() {
+        // With a permit available, the gate must not interfere.
+        let state = make_app_state().await;
+        let mut state = state;
+        state.write_queue = Some(Arc::new(tokio::sync::Semaphore::new(8)));
+        state.write_queue_timeout = std::time::Duration::from_secs(5);
+        state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
+
+        let response = super::handlers::put_object(
+            State(state),
+            Path(("test-bucket".into(), "admitted.txt".into())),
+            Bytes::from_static(b"admitted write"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

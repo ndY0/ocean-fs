@@ -14,13 +14,20 @@ use oceanfs_storage::{
         DiskIo, DiskSegmentReader, InMemorySegmentReader, IoReadMode, SegmentFileCache,
         SegmentReadSource, SegmentReader,
     },
-    segment::header::SEGMENT_HEADER_SIZE,
+    segment::header::SEGMENT_HEADER_SIZE_V1 as V1_HEADER_SIZE,
 };
 
 /// Writes a segment file with a 76-byte zeroed header followed by `data`.
+/// Writes a valid v1 segment file (76-byte header with a real checksum,
+/// version 1, no parity) followed by `data`.
 fn write_segment_file(path: &std::path::Path, data: &[u8]) {
-    let header = vec![0u8; SEGMENT_HEADER_SIZE];
-    let mut file_data = header;
+    let mut file_data = vec![0u8; V1_HEADER_SIZE];
+    file_data[0..4].copy_from_slice(b"OFSG");
+    file_data[4..6].copy_from_slice(&1u16.to_le_bytes());
+    file_data[22..30].copy_from_slice(&(data.len() as u64).to_le_bytes());
+    file_data[34..42].copy_from_slice(&((V1_HEADER_SIZE + data.len()) as u64).to_le_bytes());
+    let checksum = *blake3::hash(data).as_bytes();
+    file_data[42..74].copy_from_slice(&checksum);
     file_data.extend_from_slice(data);
     std::fs::write(path, &file_data).unwrap();
 }
@@ -147,7 +154,7 @@ async fn disk_reader_error_on_missing_file() {
     let result = reader.read_chunk(&SegmentId::new(), 0, 100).await;
     assert!(result.is_err(), "missing file should return error");
     assert!(
-        result.unwrap_err().contains("failed to open segment file"),
+        result.unwrap_err().contains("integrity check failed"),
         "error should mention file open failure"
     );
 }
@@ -320,6 +327,8 @@ mod write_read_roundtrip {
                 }],
                 0,
                 0,
+                0,
+                None,
             )
             .await
             .unwrap();
@@ -349,6 +358,8 @@ mod write_read_roundtrip {
                 }],
                 0,
                 0,
+                0,
+                None,
             )
             .await
             .unwrap();

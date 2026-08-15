@@ -10,7 +10,7 @@ use bytes::Bytes;
 #[cfg(test)]
 use oceanfs_core::SegmentSizeConfig;
 use oceanfs_core::{Counter, LabelSet, SegmentId, SegmentMetadata, SizeTier};
-use oceanfs_hash::Blake3Hasher;
+use oceanfs_hash::{Blake3Hasher, Hasher};
 
 use crate::{
     error::{Error, Result},
@@ -21,6 +21,7 @@ use crate::{
         handle::SegmentHandle,
         header::SegmentHeader,
         index::{SegmentIndex, SegmentIndexEntry},
+        parity_section::{build_parity_section, encode_segment_parity},
     },
     wal::WalWriter,
 };
@@ -124,21 +125,33 @@ impl SegmentSealer {
         let segment_id = active.id();
         let tier = active.tier();
         let data = Bytes::copy_from_slice(active.data());
-        self.seal_from_data(segment_id, tier, data, entries, 0, 0).await
+        self.seal_from_data(segment_id, tier, data, entries, 0, 0, 0, None).await
     }
 
     /// Seals a segment from raw data bytes, without requiring an `ActiveSegment`.
     ///
     /// This is the primary sealing entry point — works with segments that have
     /// already been extracted from the pool. Accepts the segment's identity,
-    /// data bytes, tier, blob index entries, and EC parameters. Writes the
-    /// segment file to disk, persists metadata, and truncates the WAL past
-    /// the sealed boundary.
+    /// data bytes, tier, blob index entries, EC parameters (k, m, strip) and
+    /// the seal-time Merkle root (computed by the caller over the data
+    /// section with the durability crate's `MerkleTree`, 64 KiB leaves). When
+    /// EC parameters are non-zero, the segment's complete stripes are encoded
+    /// on the blocking pool (`spawn_blocking` — single scheduler) and the
+    /// shards are persisted in a v2 parity section (with a per-shard hash
+    /// table) so EC recovery can repair corrupt data shards; segments smaller
+    /// than one stripe carry no parity. The Merkle root is persisted in the
+    /// segment metadata so scrub and anti-entropy can verify the segment
+    /// against a trusted seal-time anchor. Writes the segment file to disk,
+    /// persists metadata, and truncates the WAL past the sealed boundary.
     ///
     /// # Errors
     ///
     /// Returns an error if disk I/O fails, metadata persistence fails, or
     /// WAL truncation fails.
+    // Nine parameters: all are distinct pieces of the sealed segment's
+    // on-disk identity (id, tier, data, blob index, EC params, parity,
+    // merkle root) — bundling them would obscure the seal call sites.
+    #[allow(clippy::too_many_arguments)]
     pub async fn seal_from_data(
         &self,
         segment_id: SegmentId,
@@ -147,6 +160,8 @@ impl SegmentSealer {
         entries: &[SegmentIndexEntry],
         ec_k: u8,
         ec_m: u8,
+        strip_size_bytes: usize,
+        merkle_root: Option<oceanfs_core::HashOutput>,
     ) -> Result<SegmentHandle> {
         let size = data.len() as u64;
         let blob_count = entries.len() as u32;
@@ -154,28 +169,101 @@ impl SegmentSealer {
         // Build the blob index from the provided entries.
         let index = SegmentIndex::new(entries.to_vec())?;
 
-        // Compute checksum (BLAKE3 of segment data).
-        let checksum = Blake3Hasher::hash(&data);
-        let checksum_bytes: [u8; 32] = *checksum.as_bytes();
+        // Compute the EC parity at seal time (single scheduler: the
+        // CPU-bound encode runs on the blocking pool, never on the write
+        // path and never on a second scheduler). The parallel encoder
+        // covers every complete stripe; the tail (up to one stripe) is
+        // unprotected. The parity section (v2 format) holds the shards
+        // plus a per-shard hash table so the read path can locate a
+        // corrupt shard precisely and reconstruct it from the others.
+        let parity_bytes = if ec_k > 0 && ec_m > 0 && strip_size_bytes > 0 {
+            let data_for_encode = data.clone();
+            let encoded = tokio::task::spawn_blocking(move || {
+                encode_segment_parity(&data_for_encode, ec_k, ec_m, strip_size_bytes)
+            })
+            .await
+            .map_err(|e| {
+                Error::Io(std::io::Error::other(format!(
+                    "parity encode task failed for {segment_id}: {e}"
+                )))
+            })?;
+            match encoded {
+                Some(shards) => build_parity_section(&data, ec_k, ec_m, Some(&shards)),
+                None => {
+                    tracing::debug!(
+                        segment_id = %segment_id,
+                        "no complete EC stripe; segment sealed without parity"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
-        // Build Merkle tree for anti-entropy integrity verification.
-        // The Merkle tree is now computed by oceanfs-durability (ADR-0009).
-        let merkle_root: Option<oceanfs_core::HashOutput> = None;
+        // Compute checksum. For v2 files with a parity section the
+        // checksum covers data + parity section, so parity corruption is
+        // detected by the read path's integrity check; v1 files hash the
+        // data only.
+        let checksum_bytes = if let Some(section) = parity_bytes.as_ref() {
+            let mut hasher = Blake3Hasher::new();
+            hasher.update(&data);
+            hasher.update(section);
+            let checksum = hasher.finalize();
+            *checksum.as_bytes()
+        } else {
+            let checksum = Blake3Hasher::hash(&data);
+            *checksum.as_bytes()
+        };
+
+        // The Merkle root is computed by the caller (the seal worker)
+        // over the data section with the durability crate's MerkleTree;
+        // it is the persisted seal-time anchor that scrub,
+        // anti-entropy, and the startup incremental-tree rebuild compare
+        // against. `None` when the caller did not provide one
+        // (legacy/test callers).
 
         // Serialize header and index.
-        let header = SegmentHeader::new(segment_id, size, blob_count, size, checksum_bytes);
+        let header = if let Some(ref section) = parity_bytes {
+            let parity_offset = crate::segment::header::SEGMENT_HEADER_SIZE as u64 + size;
+            SegmentHeader::with_parity(
+                segment_id,
+                size,
+                blob_count,
+                parity_offset + section.len() as u64,
+                checksum_bytes,
+                parity_offset,
+                section.len() as u64,
+            )
+        } else {
+            SegmentHeader::new(
+                segment_id,
+                size,
+                blob_count,
+                crate::segment::header::SEGMENT_HEADER_SIZE as u64 + size,
+                checksum_bytes,
+            )
+        };
         let header_bytes = header.to_bytes();
         let index_bytes = index.to_bytes();
 
-        // Write segment file: header + data + index.
+        // Write segment file: header + data + [parity] + index.
         let path = self.config.data_dir.join(format!("{segment_id}.dat"));
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let mut file_data = Vec::with_capacity(header_bytes.len() + data.len() + index_bytes.len());
+        let mut file_data = Vec::with_capacity(
+            header_bytes.len()
+                + data.len()
+                + parity_bytes.as_ref().map_or(0, |p| p.len())
+                + index_bytes.len(),
+        );
         file_data.extend_from_slice(&header_bytes);
         file_data.extend_from_slice(&data);
+        if let Some(section) = parity_bytes.as_ref() {
+            file_data.extend_from_slice(section);
+        }
         file_data.extend_from_slice(&index_bytes);
 
         // Select the I/O path based on the configured read mode.
@@ -261,7 +349,7 @@ impl SegmentSealer {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use oceanfs_core::WalConfig;
 
@@ -407,6 +495,102 @@ mod tests {
         assert!(
             names.contains(&"segment_seal_errors_total".to_string()),
             "seal_errors counter should be registered, got: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn seal_from_data_with_parity_writes_v2_section() {
+        use bytes::Bytes;
+        use oceanfs_core::{SegmentId, SizeTier};
+
+        use crate::segment::{
+            header::SegmentHeader,
+            parity_section::{verify_section_hashes, ParitySection},
+        };
+
+        let (sealer, _seg, _entries, dir) = setup().await;
+        let id = SegmentId::new();
+        let data = Bytes::from(vec![0x42u8; 512]);
+
+        // k=4, m=2, strip=64 → 2 full stripes → 4 parity shards,
+        // computed by the sealer itself at seal time.
+        const K: u8 = 4;
+        const M: u8 = 2;
+
+        let _handle = sealer
+            .seal_from_data(id, SizeTier::Standard, data.clone(), &[], K, M, 64, None)
+            .await
+            .unwrap();
+
+        let path = dir.path().join("segments").join(format!("{id}.dat"));
+        let file = std::fs::read(&path).unwrap();
+        let hdr = SegmentHeader::from_bytes(&file).expect("valid header");
+        assert!(hdr.parity_offset > 0, "v2 file must record the parity section");
+        assert_eq!(hdr.version, crate::segment::header::SEGMENT_VERSION);
+        let section_end = (hdr.parity_offset + hdr.parity_size) as usize;
+        let section = ParitySection::parse(&file[hdr.parity_offset as usize..section_end])
+            .expect("valid section");
+        assert_eq!(section.stripe_count, 2);
+        assert_eq!(section.k, 4);
+        assert_eq!(section.m, 2);
+        assert!(verify_section_hashes(&section, &data), "shard hash table must verify");
+
+        // Oracle: every section shard must equal a fresh encode of its
+        // stripe's data shards. This pins the SoA→AoS shard ORDER — a
+        // permutation (e.g. swapped loop nesting) is otherwise
+        // self-consistent with the hash table and silently breaks repair.
+        use oceanfs_core::CodecConfig;
+        use oceanfs_ec::{CauchyEncoder, Encoder};
+        let codec = CauchyEncoder::new(CodecConfig {
+            data_shards: 4,
+            parity_shards: 2,
+            strip_size_bytes: 64,
+            ..Default::default()
+        });
+        for stripe in 0..2 {
+            let stripe_shards: Vec<&[u8]> =
+                (0..4).map(|d| &data[stripe * 256 + d * 64..stripe * 256 + (d + 1) * 64]).collect();
+            let fresh = codec.encode(&stripe_shards, 2).unwrap();
+            for p in 0..2 {
+                assert_eq!(
+                    section.parity_shard(stripe, p),
+                    &fresh[p][..],
+                    "parity shard (stripe {stripe}, parity {p}) must match a fresh encode"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn seal_time_encode_runs_on_the_blocking_pool_not_the_runtime_worker() {
+        // Pins the single-scheduler boundary: the CPU-bound parity encode
+        // must run on tokio's blocking pool (via spawn_blocking), never
+        // inline on a runtime worker. A regression that removes the
+        // wrapper makes the encode run on this test's runtime thread and
+        // the seam records that thread's id.
+        use std::hash::{Hash, Hasher};
+
+        use oceanfs_core::SegmentId;
+
+        use crate::segment::parity_section::LAST_ENCODE_THREAD;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::thread::current().id().hash(&mut hasher);
+        let test_thread = hasher.finish();
+
+        let (sealer, _seg, _entries, _dir) = setup().await;
+        let id = SegmentId::new();
+        // 256 KiB → exactly one complete stripe (k=4, strip=64 KiB).
+        let data = bytes::Bytes::from(vec![0x77u8; 256 * 1024]);
+
+        let _handle = sealer
+            .seal_from_data(id, SizeTier::Standard, data, &[], 4, 2, 65536, None)
+            .await
+            .unwrap();
+
+        let encode_thread = LAST_ENCODE_THREAD.load(std::sync::atomic::Ordering::Relaxed);
+        assert_ne!(
+            encode_thread, test_thread,
+            "the parity encode must run on the blocking pool, not the runtime worker"
         );
     }
 }

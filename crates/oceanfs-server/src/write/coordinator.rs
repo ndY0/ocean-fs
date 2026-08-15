@@ -37,6 +37,16 @@ use crate::{
     write::replication::replicate_write,
 };
 
+/// Maps a segment-pool append error to a server error, converting the
+/// backpressure timeout into a retryable `503 SlowDown` (the write was
+/// not recorded; the client may retry).
+fn map_append_error(tier: String) -> impl FnOnce(oceanfs_storage::Error) -> Error {
+    move |e| match e {
+        oceanfs_storage::Error::WriteBackpressureTimeout => Error::WriteOverloaded,
+        e => Error::Storage(format!("{tier} tier append: {e}")),
+    }
+}
+
 /// Maximum number of replica nodes to fan out to for a write.
 const MAX_REPLICA_FANOUT: usize = 6;
 
@@ -106,6 +116,12 @@ pub struct WriteCoordinator {
     segment_entries: DashMap<SegmentId, Vec<SegmentIndexEntry>>,
     /// Per-operation timeout configuration.
     timeouts: Arc<OperationTimeouts>,
+    /// Optional notifier invoked after every successful seal, carrying
+    /// the segment id and its seal-time Merkle root. Wired by the
+    /// composition root to the anti-entropy engine so the incremental
+    /// Merkle tree covers segments sealed after startup (continuous
+    /// anti-entropy).
+    segment_sealed_notifier: Option<Arc<dyn Fn(SegmentId, HashOutput) + Send + Sync>>,
 }
 
 impl WriteCoordinator {
@@ -149,6 +165,7 @@ impl WriteCoordinator {
             hint_config,
             segment_entries: DashMap::new(),
             timeouts: Arc::new(OperationTimeouts::default()),
+            segment_sealed_notifier: None,
         }
     }
 
@@ -158,6 +175,20 @@ impl WriteCoordinator {
     #[must_use]
     pub fn with_timeouts(mut self, timeouts: Arc<OperationTimeouts>) -> Self {
         self.timeouts = timeouts;
+        self
+    }
+
+    /// Registers a notifier invoked after every successful seal.
+    ///
+    /// The composition root wires this to the anti-entropy engine's
+    /// `on_segment_sealed` so the incremental Merkle tree is updated
+    /// continuously instead of only at the startup rebuild.
+    #[must_use]
+    pub fn with_segment_sealed_notifier(
+        mut self,
+        notifier: Arc<dyn Fn(SegmentId, HashOutput) + Send + Sync>,
+    ) -> Self {
+        self.segment_sealed_notifier = Some(notifier);
         self
     }
 
@@ -247,14 +278,19 @@ impl WriteCoordinator {
             SizeTier::Small => {
                 let (segment_id, offset, length) = self
                     .segment_pool_small
-                    .append_with_hook(&wal_data[..], |seg_id, off, len| {
-                        // Recorded under the segment lock, before any
-                        // fill-triggered seal enqueue: the seal worker
-                        // (another thread) can never drain the entries
-                        // map before this entry exists.
-                        self.record_blob_entry(seg_id, off, len, blake3_hash);
-                    })
-                    .map_err(|e| Error::Storage(format!("small tier append: {e}")))?;
+                    .append_with_hook_async(
+                        &wal_data[..],
+                        |seg_id, off, len| {
+                            // Recorded under the slot lock, before any
+                            // fill-triggered seal enqueue: the seal worker
+                            // (another thread) can never drain the entries
+                            // map before this entry exists.
+                            self.record_blob_entry(seg_id, off, len, blake3_hash);
+                        },
+                        std::time::Duration::from_millis(self.timeouts.write_queue_ms),
+                    )
+                    .await
+                    .map_err(map_append_error("small".into()))?;
                 // Write WAL entry for crash-recovery durability (C4-storage, D6).
                 self.write_wal_entry(segment_id, offset, wal_data.clone(), length, hlc).await?;
                 let mut chunks = smallvec::SmallVec::new();
@@ -264,11 +300,16 @@ impl WriteCoordinator {
             SizeTier::Standard => {
                 let (segment_id, offset, length) = self
                     .segment_pool_standard
-                    .append_with_hook(&wal_data[..], |seg_id, off, len| {
-                        // Same airtight ordering as the Small tier above.
-                        self.record_blob_entry(seg_id, off, len, blake3_hash);
-                    })
-                    .map_err(|e| Error::Storage(format!("standard tier append: {e}")))?;
+                    .append_with_hook_async(
+                        &wal_data[..],
+                        |seg_id, off, len| {
+                            // Same airtight ordering as the Small tier above.
+                            self.record_blob_entry(seg_id, off, len, blake3_hash);
+                        },
+                        std::time::Duration::from_millis(self.timeouts.write_queue_ms),
+                    )
+                    .await
+                    .map_err(map_append_error("standard".into()))?;
                 // Write WAL entry for crash-recovery durability (C4-storage, D6).
                 self.write_wal_entry(segment_id, offset, wal_data.clone(), length, hlc).await?;
                 let mut chunks = smallvec::SmallVec::new();
@@ -282,16 +323,21 @@ impl WriteCoordinator {
                 for (_, chunk_data) in &split_chunks {
                     let (seg_id, seg_offset, length) = self
                         .segment_pool_standard
-                        .append_with_hook(chunk_data, |seg_id, off, len| {
-                            // Record the blob index entry BEFORE any
-                            // fill-triggered seal enqueue (Defect 2).
-                            // Without this, a segment filled entirely by
-                            // multi-tier chunks has no index entries when
-                            // the seal worker drains it, so the seal is
-                            // skipped and the segment never reaches disk.
-                            self.record_blob_entry(seg_id, off, len, blake3_hash);
-                        })
-                        .map_err(|e| Error::Storage(format!("multi tier append: {e}")))?;
+                        .append_with_hook_async(
+                            chunk_data,
+                            |seg_id, off, len| {
+                                // Record the blob index entry BEFORE any
+                                // fill-triggered seal enqueue (Defect 2).
+                                // Without this, a segment filled entirely by
+                                // multi-tier chunks has no index entries when
+                                // the seal worker drains it, so the seal is
+                                // skipped and the segment never reaches disk.
+                                self.record_blob_entry(seg_id, off, len, blake3_hash);
+                            },
+                            std::time::Duration::from_millis(self.timeouts.write_queue_ms),
+                        )
+                        .await
+                        .map_err(map_append_error("multi".into()))?;
                     // Write WAL entry for each chunk (C4-storage, D6).
                     self.write_wal_entry(
                         seg_id,
@@ -657,6 +703,32 @@ impl WriteCoordinator {
                         tokio::spawn(async move {
                             let permit = sem.acquire().await;
 
+                            // Collect the streaming parity shards (off the
+                            // request path) and persist them with the
+                            // segment so EC recovery can repair corrupt
+                            // data shards. The collect may wait for
+                            // in-flight rayon stripe encodes — acceptable
+                            // here, never on the fill path.
+                            // The seal-time EC parity is computed inside
+                            // `seal_from_data` on the blocking pool
+                            // (single scheduler — the write path never
+                            // touches a second thread pool).
+                            // Compute the seal-time Merkle root over the
+                            // data section (64 KiB leaves — the shared
+                            // default used by scrub and anti-entropy) and
+                            // persist it in the segment metadata: it is
+                            // the trusted anchor for scrub verification,
+                            // anti-entropy's local-vs-stored comparison,
+                            // and the startup rebuild of the incremental
+                            // Merkle tree. Without it, every segment is
+                            // "missing merkle root" (scrub inert,
+                            // anti-entropy flags every segment).
+                            let merkle_root = oceanfs_durability::MerkleTree::build(
+                                &work.segment_data,
+                                0, // 0 selects the shared 64 KiB default
+                            )
+                            .map(|tree| tree.root().hash());
+
                             let result = sealer_arc
                                 .seal_from_data(
                                     segment_id,
@@ -665,6 +737,8 @@ impl WriteCoordinator {
                                     &entries,
                                     work.ec_k,
                                     work.ec_m,
+                                    work.strip_size_bytes,
+                                    merkle_root,
                                 )
                                 .await;
 
@@ -681,6 +755,15 @@ impl WriteCoordinator {
                                         self_standard
                                             .segment_pool_standard
                                             .remove_seal_buffer(segment_id);
+                                    }
+                                    // Notify the anti-entropy engine so the
+                                    // incremental Merkle tree covers this
+                                    // segment without waiting for the next
+                                    // startup rebuild (continuous AE).
+                                    if let Some(notifier) = &self_small.segment_sealed_notifier {
+                                        if let Some(root) = merkle_root {
+                                            notifier(segment_id, root);
+                                        }
                                     }
                                     // Recycle the segment's backing buffer.
                                     // The sealing-data clone was just dropped
@@ -874,6 +957,7 @@ mod tests {
     };
     use oceanfs_routing::{hash_key, Ring};
     use oceanfs_storage::{BufferPool, RocksDbMetadataStore, SealConfig, WalWriter};
+    use parking_lot::Mutex;
 
     use super::*;
 
@@ -1857,6 +1941,8 @@ mod tests {
         metadata: Arc<RocksDbMetadataStore>,
         standard_pool: Arc<SegmentPool>,
         seal_dir: std::path::PathBuf,
+        /// (segment_id, merkle_root) pairs recorded by the seal notifier.
+        sealed_events: Arc<Mutex<Vec<(SegmentId, oceanfs_core::HashOutput)>>>,
         _dir: tempfile::TempDir,
     }
 
@@ -1964,22 +2050,30 @@ mod tests {
         let hinted_handoff =
             Arc::new(HintedHandoffManager::new(hints_dir, delivery_client, hint_config.clone()));
 
-        let coord = Arc::new(WriteCoordinator::new(
-            ring_cache.clone(),
-            membership,
-            pool,
-            NodeId::new("n1"),
-            hlc_clock,
-            metadata.clone(),
-            size_config.clone(),
-            shard_small,
-            shard_standard,
-            segment_pool_small,
-            standard_pool.clone(),
-            sealer,
-            hinted_handoff,
-            hint_config,
-        ));
+        let sealed_events: Arc<Mutex<Vec<(SegmentId, oceanfs_core::HashOutput)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sealed_events_notifier = Arc::clone(&sealed_events);
+        let coord = Arc::new(
+            WriteCoordinator::new(
+                ring_cache.clone(),
+                membership,
+                pool,
+                NodeId::new("n1"),
+                hlc_clock,
+                metadata.clone(),
+                size_config.clone(),
+                shard_small,
+                shard_standard,
+                segment_pool_small,
+                standard_pool.clone(),
+                sealer,
+                hinted_handoff,
+                hint_config,
+            )
+            .with_segment_sealed_notifier(Arc::new(move |segment_id, merkle_root| {
+                sealed_events_notifier.lock().push((segment_id, merkle_root));
+            })),
+        );
 
         let metadata_ops: Arc<dyn crate::metadata_ops::MetadataOps> =
             Arc::new(RocksDbMetadataOps { store: metadata.clone() });
@@ -1990,7 +2084,15 @@ mod tests {
             metadata_ops,
         );
 
-        MultiTierFixture { coord, read, metadata, standard_pool, seal_dir, _dir: dir }
+        MultiTierFixture {
+            coord,
+            read,
+            metadata,
+            standard_pool,
+            seal_dir,
+            sealed_events,
+            _dir: dir,
+        }
     }
 
     /// Runs a PUT through the coordinator and persists the resulting
@@ -2148,14 +2250,53 @@ mod tests {
         // (Defect 2 fix: without record_blob_entry the seal is skipped
         // and no segment file is ever written).
         for chunk in &put.chunks {
+            // Every sealed segment must carry its seal-time Merkle root:
+            // scrub verification, anti-entropy's local-vs-stored
+            // comparison, and the startup incremental-tree rebuild all
+            // depend on the persisted anchor.
+            let meta = fx
+                .metadata
+                .get_segment(chunk.segment_id)
+                .expect("sealed segment metadata must exist")
+                .expect("segment metadata entry present");
+            assert!(
+                meta.merkle_root.is_some(),
+                "sealed segment {} must persist a Merkle root",
+                chunk.segment_id
+            );
+
+            // The seal notifier must have fired for every sealed segment with
+            // its persisted root (the continuous anti-entropy wiring).
+            let events = fx.sealed_events.lock().clone();
+            for chunk in &put.chunks {
+                assert!(
+                    events.iter().any(|(id, _)| *id == chunk.segment_id),
+                    "seal notifier must observe segment {}",
+                    chunk.segment_id
+                );
+            }
+            for (id, root) in &events {
+                let meta = fx
+                    .metadata
+                    .get_segment(*id)
+                    .expect("notified segment exists")
+                    .expect("metadata present");
+                assert_eq!(
+                    meta.merkle_root,
+                    Some(*root),
+                    "notified root must match the persisted root"
+                );
+            }
+
             let path = fx.seal_dir.join(format!("{}.dat", chunk.segment_id));
             let file_bytes = std::fs::read(&path).unwrap_or_else(|e| {
                 panic!("sealed segment file missing for {}: {e}", chunk.segment_id)
             });
-            let header = oceanfs_storage::SegmentHeader::from_bytes(&file_bytes[..76])
+            let header = oceanfs_storage::SegmentHeader::from_bytes(&file_bytes)
                 .unwrap_or_else(|| panic!("invalid segment header for {}", chunk.segment_id));
             assert!(header.blob_count >= 1, "segment blob index must be non-empty");
-            let index_bytes = &file_bytes[76 + header.size as usize..];
+            let index_offset = header.data_end() as usize;
+            let index_bytes = &file_bytes[index_offset..];
             let index = oceanfs_storage::SegmentIndex::from_bytes(index_bytes)
                 .unwrap_or_else(|e| panic!("invalid segment index for {}: {e}", chunk.segment_id));
             assert!(

@@ -233,9 +233,11 @@ pub struct PoolConfig {
     pub max_inflight_encodes: usize,
     /// Capacity of the EC encoding work queue (backpressure channel).
     pub encode_queue_capacity: usize,
-    /// When `true`, EC encode is spread across the write lifetime via
-    /// streaming stripe encode instead of being concentrated at seal time.
-    /// Eliminates the seal-time latency spike. Default: `false`.
+    /// When `true` (and an EC codec is configured), sealed segments carry
+    /// EC parity: the seal worker encodes the segment's complete stripes
+    /// at seal time on the blocking pool (single scheduler — the write
+    /// path never touches a second thread pool) and persists the shards
+    /// in the segment file for read-path repair. Default: `true`.
     pub ec_streaming_encode: bool,
 }
 

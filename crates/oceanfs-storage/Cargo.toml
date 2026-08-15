@@ -19,7 +19,6 @@ bytes.workspace = true
 crc32fast = "1"
 parking_lot.workspace = true
 prost.workspace = true
-rayon.workspace = true
 num_cpus.workspace = true
 rocksdb.workspace = true
 serde_json.workspace = true

@@ -124,13 +124,24 @@ impl AntiEntropy {
         &self.config
     }
 
-    /// Records a segment seal event for continuous anti-entropy triggering.
+    /// Records a segment seal event for continuous anti-entropy.
     ///
-    /// Increments the write counter. When the counter reaches the configured
-    /// threshold (default: every write), the continuous AE runner performs a
-    /// root exchange with peers for recently-written segments.
-    pub fn on_segment_sealed(&self, segment_id: SegmentId) {
+    /// Inserts the segment's seal-time Merkle root into the incremental
+    /// tree (the same leaf semantics as the startup
+    /// [`rebuild_from_segment_scan`](crate::merkle::IncrementalMerkleTree::rebuild_from_segment_scan))
+    /// and increments the write counter. Called by the write path's seal
+    /// worker via the node's notifier wiring, so segments sealed after
+    /// startup are covered by the continuous root exchange without
+    /// waiting for a restart.
+    pub fn on_segment_sealed(&self, segment_id: SegmentId, merkle_root: oceanfs_core::HashOutput) {
         self.write_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Err(e) = self.merkle_tree.insert_leaf(segment_id, *merkle_root.as_bytes()) {
+            tracing::warn!(
+                segment_id = %segment_id,
+                error = %e,
+                "failed to insert sealed segment into the incremental Merkle tree"
+            );
+        }
         tracing::debug!(
             segment_id = %segment_id,
             write_count = self.write_counter.load(std::sync::atomic::Ordering::Relaxed),
@@ -1127,6 +1138,25 @@ mod tests {
         let ae = make_anti_entropy(membership, metadata);
 
         assert_eq!(ae.config().interval_sec(), 300);
+    }
+
+    #[test]
+    fn on_segment_sealed_inserts_leaf_into_incremental_tree() {
+        // The continuous AE path: a seal event must make the segment
+        // visible to the incremental tree immediately (not only after
+        // the next startup rebuild).
+        let (membership, _ring) = make_test_membership("test-node");
+        let metadata_config = test_metadata_config();
+        let metadata = Arc::new(RocksDbMetadataStore::open(&metadata_config).unwrap());
+        let ae = make_anti_entropy(membership, metadata);
+        assert_eq!(ae.merkle_tree().segment_count(), 0);
+
+        let seg_id = SegmentId::new();
+        let root = oceanfs_core::HashOutput::from_bytes([0x42u8; 32]);
+        ae.on_segment_sealed(seg_id, root);
+
+        assert_eq!(ae.merkle_tree().segment_count(), 1);
+        assert_eq!(ae.merkle_tree().root(seg_id), Some(*root.as_bytes()));
     }
 
     // -----------------------------------------------------------------------

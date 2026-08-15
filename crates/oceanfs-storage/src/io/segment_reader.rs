@@ -29,7 +29,6 @@ use oceanfs_core::SegmentId;
 use parking_lot::{Mutex, RwLock};
 
 use super::{DiskIo, IoReadMode, SegmentFileCache};
-use crate::segment::header::SEGMENT_HEADER_SIZE;
 
 // ---------------------------------------------------------------------------
 // SegmentReader trait
@@ -147,6 +146,11 @@ pub struct DiskSegmentReader {
     segment_dir: PathBuf,
     /// Tracks the source of the most recent read, keyed by segment_id.
     last_source: Mutex<HashMap<SegmentId, SegmentReadSource>>,
+    /// First-touch integrity state: maps segment_id → on-disk header
+    /// size (the data section offset). Populated once per segment per
+    /// process by [`verify_and_repair_segment`]; corrupt-but-repairable
+    /// files are repaired on first touch.
+    verified_headers: Mutex<HashMap<SegmentId, usize>>,
     /// When `true`, call `madvise(MADV_DONTNEED)` after reading from mmap
     /// to eagerly evict segment data from the page cache. Set to `true`
     /// when `read_cache_segments = false` (write-optimised profile) so
@@ -172,6 +176,7 @@ impl DiskSegmentReader {
             mmap_cache,
             segment_dir,
             last_source: Mutex::new(HashMap::new()),
+            verified_headers: Mutex::new(HashMap::new()),
             evict_after_read: false,
         }
     }
@@ -185,6 +190,37 @@ impl DiskSegmentReader {
     pub fn with_evict_after_read(mut self, evict: bool) -> Self {
         self.evict_after_read = evict;
         self
+    }
+
+    /// Verifies (and repairs) the segment on first touch, returning the
+    /// on-disk header size — the data section's byte offset.
+    ///
+    /// The whole-data checksum is verified once per segment per process;
+    /// corrupt stripes are repaired from the stored EC parity
+    /// ([`verify_and_repair_segment`]). Subsequent reads skip the
+    /// verification.
+    fn ensure_verified(&self, segment_id: SegmentId) -> std::result::Result<usize, String> {
+        if let Some(hdr_size) = self.verified_headers.lock().get(&segment_id).copied() {
+            return Ok(hdr_size);
+        }
+        let path = self.segment_path(&segment_id);
+        let repaired = crate::segment::repair::verify_and_repair_segment(&path)
+            .map_err(|e| format!("integrity check failed for {segment_id}: {e}"))?;
+        if repaired > 0 {
+            // The mmap cache (if any) may hold the pre-repair mapping;
+            // invalidate it so subsequent reads see the repaired bytes.
+            if let Some(cache) = &self.mmap_cache {
+                cache.invalidate(segment_id);
+            }
+        }
+        // Parse the header (the repair already validated the file) to
+        // learn the format version's data offset.
+        let file = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let header = crate::segment::header::SegmentHeader::from_bytes(&file)
+            .ok_or_else(|| format!("bad segment header for {segment_id}"))?;
+        let hdr_size = header.serialized_size();
+        self.verified_headers.lock().insert(segment_id, hdr_size);
+        Ok(hdr_size)
     }
 
     /// Returns the filesystem path for a segment file.
@@ -202,9 +238,11 @@ impl SegmentReader for DiskSegmentReader {
         length: u32,
     ) -> std::result::Result<Bytes, String> {
         let path = self.segment_path(segment_id);
-        // Blob offsets are relative to the data region, AFTER the
-        // 76-byte segment header. Convert to file-level offset.
-        let file_offset = offset + SEGMENT_HEADER_SIZE as u64;
+        // First touch: verify integrity and learn the format version's
+        // data offset (v1 = 76 bytes, v2 = 92 bytes). Blob offsets are
+        // relative to the data region, AFTER the segment header.
+        let hdr_size = self.ensure_verified(*segment_id).map_err(|e| e.to_string())?;
+        let file_offset = offset + hdr_size as u64;
 
         let (data, source) = match self.read_mode {
             IoReadMode::Mmap => {
@@ -493,13 +531,35 @@ mod tests {
     use crate::{buffer_pool::BufferPool, segment::SegmentPool};
 
     fn temp_segment_file(dir: &tempfile::TempDir, id: SegmentId) -> PathBuf {
+        temp_segment_file_with_data(dir, id, &vec![0xABu8; 4096])
+    }
+
+    /// Writes a valid v1 segment file (76-byte header with a real
+    /// checksum, version 1, no parity) followed by `data`.
+    fn temp_segment_file_with_data(dir: &tempfile::TempDir, id: SegmentId, data: &[u8]) -> PathBuf {
+        const V1_HEADER_SIZE: usize = crate::segment::header::SEGMENT_HEADER_SIZE_V1;
         let path = dir.path().join(format!("{id}.dat"));
-        // Write a minimal segment file with a 76-byte header followed by
-        // the test data. The header is zeroed except for magic bytes.
-        let header = vec![0u8; SEGMENT_HEADER_SIZE];
-        let data = vec![0xABu8; 4096];
-        let mut file_data = header;
-        file_data.extend_from_slice(&data);
+        let checksum = *blake3::hash(data).as_bytes();
+        let header = crate::segment::header::SegmentHeader {
+            magic: crate::segment::header::SEGMENT_MAGIC,
+            version: crate::segment::header::SEGMENT_VERSION_V1,
+            segment_id: id,
+            size: data.len() as u64,
+            blob_count: 0,
+            index_offset: (V1_HEADER_SIZE + data.len()) as u64,
+            checksum,
+            parity_offset: 0,
+            parity_size: 0,
+        };
+        let mut file_data = vec![0u8; V1_HEADER_SIZE];
+        file_data[0..4].copy_from_slice(&header.magic);
+        file_data[4..6].copy_from_slice(&header.version.to_le_bytes());
+        file_data[6..22].copy_from_slice(id.as_uuid().as_bytes());
+        file_data[22..30].copy_from_slice(&header.size.to_le_bytes());
+        file_data[30..34].copy_from_slice(&header.blob_count.to_le_bytes());
+        file_data[34..42].copy_from_slice(&header.index_offset.to_le_bytes());
+        file_data[42..74].copy_from_slice(&header.checksum);
+        file_data.extend_from_slice(data);
         std::fs::write(&path, &file_data).unwrap();
         path
     }
@@ -626,9 +686,10 @@ mod tests {
     async fn disk_reader_large_read_across_mode() {
         let dir = tempfile::tempdir().unwrap();
         let id = SegmentId::new();
-        let path = dir.path().join(format!("{id}.dat"));
+        // Write a valid v1 segment file whose data section is 64 KB of
+        // 0xCD; reads use offsets relative to the data section.
         let segment_data = vec![0xCDu8; 65536]; // 64 KB
-        std::fs::write(&path, &segment_data).unwrap();
+        let _path = temp_segment_file_with_data(&dir, id, &segment_data);
 
         for &mode in &[IoReadMode::Buffered, IoReadMode::Direct] {
             let reader = DiskSegmentReader::new(
@@ -653,11 +714,8 @@ mod tests {
         // every read beyond 2 MiB, producing BadDigest on multi-tier GETs).
         let dir = tempfile::tempdir().unwrap();
         let id = SegmentId::new();
-        let path = dir.path().join(format!("{id}.dat"));
         let payload: Vec<u8> = (0..3_200_000u32).map(|i| (i % 251) as u8).collect();
-        let mut file_data = vec![0u8; SEGMENT_HEADER_SIZE];
-        file_data.extend_from_slice(&payload);
-        std::fs::write(&path, &file_data).unwrap();
+        let _ = temp_segment_file_with_data(&dir, id, &payload);
 
         let reader = DiskSegmentReader::new(
             IoReadMode::Direct,

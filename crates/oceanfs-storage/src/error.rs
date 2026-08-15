@@ -35,6 +35,12 @@ pub enum Error {
     #[error("segment {0} not found")]
     SegmentNotFound(oceanfs_core::SegmentId),
 
+    /// The segment failed its integrity check and could not be repaired
+    /// from the stored EC parity (too many corrupt shards, or the
+    /// corruption is in the un-encoded tail).
+    #[error("segment {0} corrupt and not repairable from parity")]
+    SegmentCorrupt(oceanfs_core::SegmentId),
+
     /// A blob size exceeds the maximum allowed for a single segment.
     #[error("blob size {size} exceeds max segment size {max}")]
     BlobTooLarge {
@@ -57,6 +63,13 @@ pub enum Error {
     /// Invalid configuration provided to the storage engine.
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+
+    /// The async append path waited for a slot re-activation past its
+    /// deadline (bounded backpressure). The caller propagates this as a
+    /// retryable overload response (`503 SlowDown`) — the write was not
+    /// recorded anywhere, so the client may safely retry.
+    #[error("write backpressure timeout: no segment slot re-activated within the deadline")]
+    WriteBackpressureTimeout,
 
     /// An unknown or unsupported storage tier was encountered.
     #[error("invalid storage tier: {0}")]

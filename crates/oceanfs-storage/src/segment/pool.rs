@@ -9,11 +9,26 @@
 //!
 //! Each slot transitions through a lifecycle:
 //! ```text
-//! Idle → Appending → Sealing → Idle
+//! Appending → Sealing (frozen data retained in slot) → Appending
 //! ```
+//!
+//! State and segment live under ONE lock per slot ([`SlotState`]), so the
+//! pair can never drift apart: a slot that reports `Appending` always has
+//! its buffer, the append + fill-check + freeze transition is a single
+//! critical section, and a `Sealing` slot keeps its frozen data until the
+//! replacement is installed (ADR-0021 read window). The three TOCTOU
+//! windows that had to be patched with retries in the two-lock design are
+//! un-representable here (segment-pool-slot-state-machine).
 //!
 //! Per performance guideline §2.5 (sharded segment buffer), §2.6 (bounded
 //! channels), and §2.7 (semaphore-bounded concurrency).
+//!
+//! # LOCK ORDER
+//!
+//! `current_index → slot_state`. `sealing_data` is never acquired while a
+//! slot lock is held — every caller drops all slot guards before touching
+//! the map — so the only ordering constraint is that the round-robin
+//! counter is taken before any slot lock.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -25,7 +40,7 @@ use tokio::sync::{mpsc, Semaphore};
 use crate::{
     buffer_pool::BufferPool,
     error::{Error, Result},
-    segment::buffer::SegmentBuffer,
+    segment::buffer::{ActiveSegment, SealedSegment},
 };
 
 /// Upper bound on how long an append may wait while the pool is silent.
@@ -45,42 +60,75 @@ const SLOT_ACTIVATION_WAIT_SLICE: std::time::Duration = std::time::Duration::fro
 
 /// A work item sent to the seal worker when a segment is filled.
 ///
-/// Contains the segment's identity, its data (copied before the
-/// backing buffer is returned to the pool), the storage tier, and
-/// any pre-computed parity shards from streaming EC encode.
+/// Contains the segment's identity, its data (a shared `Bytes` handle
+/// into the original buffer — recycled via `release_buffer` after the
+/// seal completes), the storage tier, and the EC parameters the seal
+/// worker uses to compute and persist per-segment parity at seal time
+/// (so EC recovery can repair corrupt data shards).
 #[derive(Debug)]
 pub struct SealingWork {
     /// The unique identifier of the segment to seal.
     pub segment_id: SegmentId,
-    /// The segment data bytes, copied from the active segment buffer
-    /// before the backing buffer was returned to the pool.
+    /// The segment data bytes, shared with the sealing-data set and the
+    /// (now replaced) slot's frozen copy.
     pub segment_data: Bytes,
     /// The storage tier of the segment (Small or Standard).
     pub tier: SizeTier,
-    /// Parity shards pre-computed by streaming EC encode.
-    /// `None` when streaming encode is disabled or no stripes were encoded.
-    pub parity_shards: Option<Vec<Bytes>>,
     /// Number of EC data shards (k). 0 if EC is not used.
     pub ec_k: u8,
     /// Number of EC parity shards (m). 0 if EC is not used.
     pub ec_m: u8,
+    /// EC strip size in bytes (the shard size). 0 when EC is not used.
+    /// The seal worker uses (k, m, strip) to compute and persist the
+    /// segment's parity at seal time on the blocking pool.
+    pub strip_size_bytes: usize,
 }
 
 /// The state of a pool slot throughout its lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PoolSlotState {
-    /// Slot is free and can accept a new segment.
+///
+/// State and segment are unified: each variant carries exactly what the
+/// slot holds, so "the slot is Appending" and "the slot has an appendable
+/// segment" are the same fact — enforced by the type, not by retries.
+pub(crate) enum SlotState {
+    /// Slot holds a segment that is actively accepting writes.
+    Appending(ActiveSegment),
+    /// The slot's segment has been filled and frozen; the data is being
+    /// handed to the seal worker while the slot re-arms itself.
+    ///
+    /// The frozen `Bytes` (and its `SegmentId`) remain in the slot until a
+    /// replacement is installed, so the segment stays reachable via
+    /// `try_read` for the whole transit — a preempted filler can never
+    /// strand a data-less slot (ADR-0021 read window).
+    Sealing(SegmentId, Bytes),
+    /// No segment. Never produced by the production paths (construction
+    /// arms slots directly); kept so the state space is total and
+    /// `install_replacement` can also serve future idle slots.
     Idle,
-    /// Segment is actively accepting writes.
-    Appending,
-    /// Segment has been filled and extracted for sealing.
-    Sealing,
+}
+
+/// Result of a successful per-slot append attempt.
+struct AppendOutcome {
+    /// The segment the data was appended to.
+    segment_id: SegmentId,
+    /// Offset of the append within the segment.
+    offset: u64,
+    /// Length of the appended data.
+    length: u32,
+    /// When the append filled the segment: the sealed payload to hand to
+    /// the seal queue (collected outside the slot lock).
+    sealed: Option<SealedSegment>,
 }
 
 /// A single slot in the segment pool, holding one active segment and its state.
+///
+/// ONE lock guards state and segment together: a slot that reports
+/// [`SlotState::Appending`] always has its buffer, and the fill transition
+/// (append → fill-check → freeze → `Sealing`) is a single critical
+/// section. The previous two-lock split let state and segment drift apart,
+/// creating three TOCTOU windows that had to be patched reactively with
+/// retries (segment-pool-slot-state-machine).
 pub(crate) struct PoolSlot {
-    state: Mutex<PoolSlotState>,
-    segment: Mutex<Option<SegmentBuffer>>,
+    state: Mutex<SlotState>,
 }
 
 impl PoolSlot {
@@ -89,26 +137,141 @@ impl PoolSlot {
         tier: SizeTier,
         config: &oceanfs_core::SegmentSizeConfig,
         pool: &BufferPool,
-        ec_config: Option<&CodecConfig>,
     ) -> Result<Self> {
-        let segment = SegmentBuffer::new(tier, config, pool, ec_config)?;
-        Ok(Self { state: Mutex::new(PoolSlotState::Appending), segment: Mutex::new(Some(segment)) })
+        let segment = ActiveSegment::new(tier, config, pool)?;
+        Ok(Self { state: Mutex::new(SlotState::Appending(segment)) })
     }
 
     /// Creates a new pool slot in Idle state (no segment).
     #[allow(dead_code)]
     fn new_idle() -> Self {
-        Self { state: Mutex::new(PoolSlotState::Idle), segment: Mutex::new(None) }
+        Self { state: Mutex::new(SlotState::Idle) }
     }
 
-    /// Returns the current state of this slot.
-    fn state(&self) -> PoolSlotState {
-        *self.state.lock()
+    /// Returns `true` if the slot is accepting writes.
+    fn is_appending(&self) -> bool {
+        matches!(*self.state.lock(), SlotState::Appending(_))
     }
 
-    /// Sets the state of this slot.
-    fn set_state(&self, new_state: PoolSlotState) {
-        *self.state.lock() = new_state;
+    /// Returns `true` if the slot has no appendable segment and may accept
+    /// a replacement (Sealing transit or Idle).
+    fn needs_segment(&self) -> bool {
+        matches!(*self.state.lock(), SlotState::Sealing(..) | SlotState::Idle)
+    }
+
+    /// Atomically moves the slot's segment from `Appending` to `Sealing`,
+    /// freezing its data in the slot and returning the sealed payload.
+    ///
+    /// The transition is a single lock acquisition: the frozen `Bytes`
+    /// lands in the slot in the same critical section that removes the
+    /// segment, so the data is never unreachable (ADR-0021). Parity
+    /// collection is deferred to [`SealedSegment::collect_parity`] so no
+    /// spinning happens under the lock (perf §7.1).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // PoolSlot is pub(crate); examples are in unit tests.
+    /// ```
+    // Non-test builds exercise this transition inline under the append
+    // critical section; the standalone method is used by the tests.
+    #[allow(dead_code)]
+    fn take_for_sealing(&self) -> Option<SealedSegment> {
+        let mut guard = self.state.lock();
+        Self::transition_to_sealing(&mut guard)
+    }
+
+    /// The `Appending` → `Sealing` transition, given that the slot lock is
+    /// already held (single critical section with the appending append).
+    fn transition_to_sealing(
+        guard: &mut parking_lot::MutexGuard<'_, SlotState>,
+    ) -> Option<SealedSegment> {
+        let current = std::mem::replace(&mut **guard, SlotState::Idle);
+        match current {
+            SlotState::Appending(segment) => {
+                let sealed = segment.seal();
+                **guard = SlotState::Sealing(sealed.segment_id, sealed.data.clone());
+                Some(sealed)
+            }
+            other => {
+                **guard = other;
+                None
+            }
+        }
+    }
+
+    /// Installs a replacement segment into a slot that is sealing or idle
+    /// — a single pointer swap under one lock acquisition.
+    ///
+    /// The caller builds the replacement **outside** the lock (perf §7.1);
+    /// if another thread already installed a segment (the activation
+    /// race), this returns `false` and the caller's replacement is
+    /// dropped. The swap shrinks the `Sealing` transit from allocation
+    /// time to a pointer move.
+    fn install_replacement(&self, replacement: ActiveSegment) -> bool {
+        let mut guard = self.state.lock();
+        match &mut *guard {
+            SlotState::Sealing(..) | SlotState::Idle => {
+                *guard = SlotState::Appending(replacement);
+                true
+            }
+            SlotState::Appending(_) => false,
+        }
+    }
+
+    /// Appends to the slot's segment under ONE lock acquisition.
+    ///
+    /// The hook runs while the slot lock is held and **before** any
+    /// fill-triggered seal transition, preserving the `append_with_hook`
+    /// ordering guarantee: the seal work item for this segment can never
+    /// be observed by the seal worker before the hook recorded its state.
+    ///
+    /// Returns `Ok(None)` when the slot is not appending — the hook is
+    /// left unconsumed so the caller can retry another slot. Returns
+    /// `Ok(Some(outcome))` on success, with `outcome.sealed` carrying the
+    /// sealed payload when the append filled the segment.
+    fn try_append_with_hook<F: FnOnce(SegmentId, u64, u32)>(
+        &self,
+        data: &[u8],
+        hook: &mut Option<F>,
+    ) -> Result<Option<AppendOutcome>, Error> {
+        let mut guard = self.state.lock();
+        let SlotState::Appending(_) = &mut *guard else {
+            // Not appending — the caller scans another slot. The hook is
+            // untouched (`FnOnce` lives in the caller's `Option`).
+            return Ok(None);
+        };
+
+        // Scoped borrow keeps the critical section explicit: append, hook,
+        // fill-check and the freeze transition all happen under this lock.
+        let (segment_id, offset, length, full) = {
+            let SlotState::Appending(segment) = &mut *guard else {
+                unreachable!("state checked Appending above and the lock is held")
+            };
+            let (offset, length) = match segment.append(data) {
+                Ok(placed) => placed,
+                // Defensive: an Appending slot's segment cannot be full —
+                // the fill→Sealing transition happens in the same critical
+                // section as the appending append, so no concurrent filler
+                // can interleave. Kept so a future regression degrades to
+                // a retry on the next slot, not a failed write.
+                Err(Error::SegmentFull { .. }) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            let segment_id = segment.id();
+            let length_u32 = u32::try_from(length).unwrap_or(u32::MAX);
+            // Airtight ordering: the hook runs under the slot lock, before
+            // the fill transition below can hand the segment to the seal
+            // queue (read-path-integrity-under-load Defect 2).
+            if let Some(hook) = hook.take() {
+                hook(segment_id, offset, length_u32);
+            }
+            (segment_id, offset, length_u32, segment.is_full())
+        };
+
+        let sealed = if full { Self::transition_to_sealing(&mut guard) } else { None };
+
+        Ok(Some(AppendOutcome { segment_id, offset, length, sealed }))
     }
 }
 
@@ -131,7 +294,8 @@ pub struct SegmentPool {
     tier: SizeTier,
     /// Segment size configuration for creating new active segments.
     size_config: oceanfs_core::SegmentSizeConfig,
-    /// EC codec configuration for streaming encode, if enabled.
+    /// EC codec configuration; when set, the seal worker computes and
+    /// persists per-segment parity at seal time.
     ec_config: Option<CodecConfig>,
     /// Index of the current appending slot (round-robin).
     current_index: Mutex<usize>,
@@ -159,6 +323,11 @@ pub struct SegmentPool {
     /// The mutex guards nothing; it only serves as the wait primitive
     /// for the condvar — waiters re-scan the slot states after waking.
     slot_activation: (Mutex<()>, Condvar),
+    /// Async wakeup for the non-blocking append path
+    /// (`append_with_hook_async`): notified on every slot re-activation
+    /// so async waiters re-scan without a fixed fail budget — the
+    /// caller's deadline bounds the wait (backpressure propagates up).
+    slot_activation_notify: tokio::sync::Notify,
     /// Test-only: when set, slot re-activation fails (simulates a stuck
     /// activation) so the timeout path of the bounded wait is reachable.
     #[cfg(test)]
@@ -168,9 +337,10 @@ pub struct SegmentPool {
 impl SegmentPool {
     /// Creates a new segment pool.
     ///
-    /// If `config.ec_streaming_encode` is `true` and `ec_config` is provided,
-    /// the pool creates streaming EC segments. Otherwise it creates plain
-    /// active segments.
+    /// If `config.ec_streaming_encode` is `true` and `ec_config` is
+    /// provided, seal work items carry the EC parameters (k, m, strip) so
+    /// the seal worker persists per-segment parity; otherwise segments
+    /// are sealed without parity.
     ///
     /// # Errors
     ///
@@ -185,13 +355,14 @@ impl SegmentPool {
     ) -> Result<Self> {
         let (seal_tx, seal_rx) = mpsc::channel(config.encode_queue_capacity);
 
-        // Resolve EC config: only use streaming if flag is set AND config is provided.
+        // Resolve EC config: only carry EC parameters when the flag is
+        // set AND a codec is provided.
         let actual_ec = if config.ec_streaming_encode { ec_config } else { None };
 
         // Create pool_size appending slots.
         let mut slots = Vec::with_capacity(config.active_pool_size);
         for _ in 0..config.active_pool_size {
-            let slot = PoolSlot::new(tier, size_config, buffer_pool.as_ref(), actual_ec.as_ref())?;
+            let slot = PoolSlot::new(tier, size_config, buffer_pool.as_ref())?;
             slots.push(Arc::new(slot));
         }
 
@@ -210,6 +381,7 @@ impl SegmentPool {
             buffer_pool: Arc::clone(&buffer_pool),
             sealing_data: RwLock::new(HashMap::new()),
             slot_activation: (Mutex::new(()), Condvar::new()),
+            slot_activation_notify: tokio::sync::Notify::new(),
             #[cfg(test)]
             fail_activation: std::sync::atomic::AtomicBool::new(false),
         })
@@ -219,16 +391,6 @@ impl SegmentPool {
     ///
     /// If the current segment is full after the append, it triggers a
     /// rotation to the next idle slot.
-    ///
-    /// # Returns
-    ///
-    /// `(segment_id, offset, length)` identifying the written data.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if no segment is available for writing or if
-    /// the underlying append operation fails.
-    /// Appends data to the current active segment.
     ///
     /// This is a synchronous operation because the pool uses `parking_lot::Mutex`
     /// internally — lock hold times are microsecond-scale so blocking the
@@ -255,14 +417,13 @@ impl SegmentPool {
     /// Appends data and invokes `hook(segment_id, offset, length)` after
     /// the append but **before** any fill-triggered seal enqueue.
     ///
-    /// The hook runs while the segment lock is held, which makes the
-    /// ordering airtight: a seal worker running on another thread cannot
-    /// observe the seal work item before the hook has recorded its state
-    /// (e.g. the write coordinator's blob index entry). With a plain
-    /// `append()` + separate record step, the seal worker could drain
-    /// the entries map on the multi-threaded runtime before the writer
-    /// thread recorded its entry, skipping the seal
-    /// (read-path-integrity-under-load).
+    /// The hook runs under the slot lock, which makes the ordering
+    /// airtight: a seal worker running on another thread cannot observe
+    /// the seal work item before the hook has recorded its state (e.g.
+    /// the write coordinator's blob index entry). The slot state machine
+    /// guarantees this structurally — append, hook, fill-check and the
+    /// `Appending → Sealing` transition are one critical section
+    /// (segment-pool-slot-state-machine).
     ///
     /// # Errors
     ///
@@ -272,87 +433,13 @@ impl SegmentPool {
         data: &[u8],
         hook: F,
     ) -> Result<(SegmentId, u64, u32)> {
-        let idx = {
-            let mut current = self.current_index.lock();
-            let idx = *current;
-            *current = (*current + 1) % self.slots.len();
-            idx
-        };
-
-        let slot = &self.slots[idx];
-        let state = slot.state();
-
-        // Find the next available appending slot if the current one is
-        // not in Appending state.
-        if state != PoolSlotState::Appending {
-            return self.append_to_next_available_with_hook(data, hook);
-        }
-
-        let mut seg_guard = slot.segment.lock();
-        let Some(segment) = seg_guard.as_mut() else {
-            // The state check above read `Appending` before a concurrent
-            // filler moved the slot to `Sealing` and took the segment.
-            // Retry through the available-slot path (which also waits
-            // for re-activation) instead of failing the write.
-            drop(seg_guard);
-            return self.append_to_next_available_with_hook(data, hook);
-        };
-
-        let (offset, length) = match segment.append(data) {
-            Ok(placed) => placed,
-            Err(Error::SegmentFull { .. }) => {
-                // A concurrent append filled this segment after our state
-                // check but before we acquired the lock. Retry on the next
-                // available slot instead of failing the write.
-                drop(seg_guard);
-                return self.append_to_next_available_with_hook(data, hook);
-            }
-            Err(e) => return Err(e),
-        };
-        let segment_id = segment.id();
-        let length_u32 = u32::try_from(length).unwrap_or(u32::MAX);
-
-        // Invoke the hook while still holding the segment lock — before
-        // the fill check below can enqueue the seal — so the seal worker
-        // can never observe the work item before the hook ran.
-        hook(segment_id, offset, length_u32);
-
-        // Check if the segment is full after this append.
-        if segment.is_full() {
-            drop(seg_guard);
-
-            // Move slot to Sealing state.
-            slot.set_state(PoolSlotState::Sealing);
-
-            // Extract the segment for sealing.
-            let sealed_segment = slot.segment.lock().take();
-
-            if let Some(seg) = sealed_segment {
-                let seg_id = seg.id();
-                let seg_tier = seg.tier();
-                let parity = seg.parity_shards();
-                // Freeze the backing buffer into a zero-copy `Bytes`.
-                // The backing memory stays alive for the seal window; the
-                // seal worker recycles it back to the buffer pool via
-                // `release_buffer` after the seal completes.
-                let seg_data = seg.into_buffer().freeze();
-                // Retain a handle in the sealing set so reads can
-                // reach this segment during the seal-to-disk window.
-                self.sealing_data.write().insert(seg_id, seg_data.clone());
-                self.enqueue_seal(seg_id, seg_data, seg_tier, parity);
-            }
-
-            // Try to activate a new segment in this slot (or another idle one).
-            self.try_activate_slot();
-        }
-
-        Ok((segment_id, offset, length_u32))
+        self.append_to_next_available_with_hook(data, hook)
     }
 
     /// Returns the number of slots in Appending state.
     #[allow(dead_code)]
     pub(crate) fn active_count(&self) -> usize {
-        self.slots.iter().filter(|s| s.state() == PoolSlotState::Appending).count()
+        self.slots.iter().filter(|slot| slot.is_appending()).count()
     }
 
     /// Returns the number of pool slots.
@@ -363,18 +450,20 @@ impl SegmentPool {
 
     /// Reads a chunk from an active (unsealed) segment in this pool.
     ///
-    /// Searches all appending slots for a segment matching `segment_id`.
-    /// If found, copies the [offset, offset+length) range from the
-    /// in-memory buffer into a new `Bytes`.
+    /// Searches all slots for a segment matching `segment_id`: appending
+    /// segments serve from the live buffer, `Sealing` slots serve from
+    /// the frozen data retained in the slot (ADR-0021 read window), and
+    /// after the replacement is installed the sealing-data set covers the
+    /// rest of the seal-to-disk window.
     ///
-    /// Returns `None` if no active segment in this pool matches the id.
+    /// Returns `None` if no segment in this pool matches the id.
     /// This is a fast, synchronous operation — only a memcpy under the
-    /// segment mutex, same lock used by `append`.
+    /// slot mutex, same lock used by `append`.
     pub fn try_read(&self, segment_id: SegmentId, offset: u64, length: u32) -> Option<Bytes> {
         for slot in self.slots.iter() {
-            let seg_guard = slot.segment.lock();
-            if let Some(segment) = seg_guard.as_ref() {
-                if segment.id() == segment_id {
+            let guard = slot.state.lock();
+            match &*guard {
+                SlotState::Appending(segment) if segment.id() == segment_id => {
                     let data = segment.data();
                     let start = offset as usize;
                     let end = start.saturating_add(length as usize).min(data.len());
@@ -382,6 +471,17 @@ impl SegmentPool {
                         return Some(Bytes::copy_from_slice(&data[start..end]));
                     }
                 }
+                // A slot in the Sealing transit still holds its frozen
+                // data: reads hit it here until the replacement is
+                // installed, then fall through to `sealing_data` below.
+                SlotState::Sealing(id, data) if *id == segment_id => {
+                    let start = offset as usize;
+                    let end = start.saturating_add(length as usize).min(data.len());
+                    if start < data.len() {
+                        return Some(data.slice(start..end));
+                    }
+                }
+                _ => {}
             }
         }
         // Check segments currently being sealed (fill→disk window).
@@ -402,10 +502,10 @@ impl SegmentPool {
     /// Appends data to the next available appending slot (round-robin).
     ///
     /// When every slot is transiently unavailable — a concurrent burst can
-    /// fill all slots at once, leaving each in the `Sealing` state while its
-    /// replacement segment is allocated — this method self-heals stranded
-    /// slots, then waits (bounded by `SLOT_ACTIVATION_WAIT`) for a slot
-    /// re-activation instead of failing the write. Re-activation is
+    /// fill all slots at once, leaving each in the `Sealing` transit while
+    /// its replacement segment is allocated — this method self-heals
+    /// stranded slots, then waits (bounded by `SLOT_ACTIVATION_WAIT`) for
+    /// a slot re-activation instead of failing the write. Re-activation is
     /// performed synchronously by the filling thread right after the seal
     /// enqueue, so the wait is normally microseconds; the terminal error is
     /// only reachable when segment creation itself keeps failing.
@@ -419,54 +519,20 @@ impl SegmentPool {
         let mut hook = Some(hook);
         let mut deadline = std::time::Instant::now() + SLOT_ACTIVATION_WAIT;
         loop {
-            for slot in self.slots.iter() {
-                if slot.state() == PoolSlotState::Appending {
-                    let mut seg_guard = slot.segment.lock();
-                    if let Some(segment) = seg_guard.as_mut() {
-                        let (offset, length) = match segment.append(data) {
-                            Ok(placed) => placed,
-                            Err(Error::SegmentFull { .. }) => {
-                                // This slot's segment filled concurrently —
-                                // continue scanning for another slot.
-                                drop(seg_guard);
-                                continue;
-                            }
-                            Err(e) => return Err(e),
-                        };
-                        let segment_id = segment.id();
-                        let length_u32 = u32::try_from(length).unwrap_or(u32::MAX);
-                        // Same airtight ordering as `append_with_hook`: the
-                        // hook runs under the segment lock, before the seal
-                        // work item for this segment can be enqueued.
-                        if let Some(hook) = hook.take() {
-                            hook(segment_id, offset, length_u32);
-                        }
-                        if segment.is_full() {
-                            drop(seg_guard);
-                            slot.set_state(PoolSlotState::Sealing);
-                            let sealed = slot.segment.lock().take();
-                            if let Some(seg) = sealed {
-                                let seg_id = seg.id();
-                                let seg_tier = seg.tier();
-                                let parity = seg.parity_shards();
-                                let seg_data = seg.into_buffer().freeze();
-                                // Retain a handle in the sealing set so reads can
-                                // reach this segment during the seal-to-disk window.
-                                self.sealing_data.write().insert(seg_id, seg_data.clone());
-                                self.enqueue_seal(seg_id, seg_data, seg_tier, parity);
-                            }
-                            self.try_activate_slot();
-                        }
-                        return Ok((segment_id, offset, length_u32));
-                    }
-                }
+            if let Some(outcome) = self.try_append_single_pass(data, &mut hook)? {
+                // Sync hand-off: `try_send`, drop-on-full as a safety
+                // valve (the sync path cannot await; the production
+                // async path guarantees the enqueue instead).
+                self.finish_seal_handoff(outcome.sealed);
+                return Ok((outcome.segment_id, outcome.offset, outcome.length));
             }
 
             // Every slot is unavailable. Before waiting, self-heal: if a
-            // concurrent filler was descheduled between taking its segment
-            // and re-activating the slot (or its activation attempt raced),
-            // a waiter activates the stranded slot itself — a Sealing slot
-            // with no segment can never block the pool indefinitely.
+            // concurrent filler was descheduled between freezing its
+            // segment and installing the replacement, a waiter installs it
+            // — a Sealing slot (whose frozen data is already in the slot
+            // and the sealing-data set) can never block the pool
+            // indefinitely.
             self.try_activate_slot();
 
             // Wait for a re-activation signal in short slices, re-scanning
@@ -495,21 +561,196 @@ impl SegmentPool {
         Err(Error::InvalidConfig("no appending segment available in pool".into()))
     }
 
+    /// Appends data with asynchronous backpressure: never fails on a
+    /// transiently exhausted pool, never blocks a runtime worker, and
+    /// **never drops a seal work item** — the filled segment's enqueue
+    /// awaits queue space (bounded by `timeout`), so a write that
+    /// returns `Ok` is guaranteed to be enqueued for sealing before the
+    /// caller records its WAL entry (no orphaned acknowledged writes).
+    ///
+    /// Scans the slots once per iteration; when every slot is in the
+    /// `Sealing` transit, self-heals stranded slots and awaits a
+    /// re-activation notification (tokio) instead of failing. The wait
+    /// is bounded by `timeout` — on expiry the write is rejected with
+    /// [`Error::WriteBackpressureTimeout`], which callers propagate as a
+    /// retryable `503 SlowDown` (nothing was recorded; the client may
+    /// safely retry). This is the production write path: the fixed
+    /// 10 ms budget of the synchronous [`append_with_hook`](Self::append_with_hook)
+    /// is replaced by the caller's deadline, so transient scheduling
+    /// jitter or slow activation allocations queue instead of failing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::WriteBackpressureTimeout`] when no slot
+    /// re-activated — or no seal-queue space freed — within `timeout`.
+    /// Returns the underlying append error otherwise.
+    pub async fn append_with_hook_async<F: FnOnce(SegmentId, u64, u32)>(
+        &self,
+        data: &[u8],
+        hook: F,
+        timeout: std::time::Duration,
+    ) -> Result<(SegmentId, u64, u32)> {
+        let mut hook = Some(hook);
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(outcome) = self.try_append_single_pass(data, &mut hook)? {
+                // Guarantee the seal enqueue before returning Ok: the
+                // caller writes the WAL entry right after this, so an
+                // enqueue failure here must reject the write (never
+                // acked) rather than orphan it.
+                self.finish_seal_handoff_async(outcome.sealed, deadline).await?;
+                return Ok((outcome.segment_id, outcome.offset, outcome.length));
+            }
+            // Self-heal stranded slots (same fallback as the sync path).
+            // The `notified()` future is registered BEFORE the self-heal
+            // so a notification from a racing installer cannot be lost;
+            // when this call itself installs a segment, re-scan
+            // immediately instead of waiting on our own notification.
+            let notified = self.slot_activation_notify.notified();
+            tokio::pin!(notified);
+            if self.try_activate_slot() {
+                continue;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::WriteBackpressureTimeout);
+            }
+            // The timeout outcome is intentionally ignored: whether the
+            // wait expired or a re-activation fired, the loop re-scans and
+            // re-checks the deadline at the top.
+            let _ = tokio::time::timeout(remaining, &mut notified).await;
+        }
+    }
+
+    /// One non-waiting scan pass over all slots, starting at the
+    /// round-robin index. Returns `Ok(Some(outcome))` on success (the
+    /// caller performs the seal hand-off), `Ok(None)` when every slot
+    /// was unavailable.
+    fn try_append_single_pass<F: FnOnce(SegmentId, u64, u32)>(
+        &self,
+        data: &[u8],
+        hook: &mut Option<F>,
+    ) -> Result<Option<AppendOutcome>, Error> {
+        // Round-robin start so a busy pool spreads appends across
+        // slots instead of always probing slot 0 first.
+        let start = {
+            let mut current = self.current_index.lock();
+            let idx = *current;
+            *current = (*current + 1) % self.slots.len();
+            idx
+        };
+
+        for offset in 0..self.slots.len() {
+            let slot = &self.slots[(start + offset) % self.slots.len()];
+            match slot.try_append_with_hook(data, hook) {
+                Ok(Some(outcome)) => {
+                    // The hook already ran under the slot lock, so the
+                    // seal worker can never observe the work item
+                    // before the hook recorded its state — regardless
+                    // of when the caller enqueues it.
+                    return Ok(Some(outcome));
+                }
+                Ok(None) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Hands a sealed segment to the seal queue and re-arms its slot —
+    /// synchronous path (`try_send`, drop-on-full safety valve).
+    ///
+    /// Runs with no slot lock held: the slot is already `Sealing` and
+    /// serves reads from its frozen data. Order of operations matters:
+    ///
+    /// 1. **Insert the sealing-data entry FIRST** — the seal worker
+    ///    removes the entry after sealing, and an insert-after-enqueue
+    ///    could race that removal and leak a stale entry that is never
+    ///    cleaned up.
+    /// 2. **Re-arm the slot** — the `Sealing` transit must stay a
+    ///    pointer move; nothing on this path spins or allocates beyond
+    ///    the replacement segment's construction (perf §7.1).
+    /// 3. Enqueue the seal work item last — the hook already ran under
+    ///    the slot lock, so the seal worker can never observe the item
+    ///    before the hook recorded its state.
+    fn finish_seal_handoff(&self, sealed: Option<SealedSegment>) {
+        let Some(payload) = sealed else { return };
+        self.sealing_data.write().insert(payload.segment_id, payload.data.clone());
+        self.try_activate_slot();
+        self.enqueue_seal(payload.segment_id, payload.data, payload.tier);
+    }
+
+    /// Hands a sealed segment to the seal queue and re-arms its slot —
+    /// asynchronous path: the enqueue **awaits queue space** (bounded
+    /// by `deadline`) so a seal work item is never dropped. A dropped
+    /// item would orphan the WAL entry the caller writes after this
+    /// returns: the acknowledged data would be unreadable until a
+    /// restart replays the WAL. On enqueue failure the write is
+    /// rejected (never acked) and the read-window entry is removed —
+    /// no leak, no orphan.
+    ///
+    /// Ordering is identical to [`finish_seal_handoff`]: sealing-data
+    /// insert first, slot re-arm second, enqueue last.
+    async fn finish_seal_handoff_async(
+        &self,
+        sealed: Option<SealedSegment>,
+        deadline: std::time::Instant,
+    ) -> Result<(), Error> {
+        let Some(payload) = sealed else { return Ok(()) };
+        self.sealing_data.write().insert(payload.segment_id, payload.data.clone());
+        self.try_activate_slot();
+
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            self.sealing_data.write().remove(&payload.segment_id);
+            return Err(Error::WriteBackpressureTimeout);
+        }
+
+        let (ec_k, ec_m, strip_size_bytes) = self.ec_params();
+        let work = SealingWork {
+            segment_id: payload.segment_id,
+            segment_data: payload.data,
+            tier: payload.tier,
+            ec_k,
+            ec_m,
+            strip_size_bytes,
+        };
+        match tokio::time::timeout(remaining, self.seal_tx.send(work)).await {
+            Ok(Ok(())) => Ok(()),
+            // The queue is closed (pool shutdown) or no space freed
+            // within the deadline: reject the write — it was never
+            // acked — and drop the read-window entry (the slot was
+            // already re-armed, so nothing else references the data).
+            Ok(Err(_)) | Err(_) => {
+                self.sealing_data.write().remove(&payload.segment_id);
+                tracing::warn!(
+                    segment_id = %payload.segment_id,
+                    "seal enqueue failed within deadline; write rejected (retryable)"
+                );
+                Err(Error::WriteBackpressureTimeout)
+            }
+        }
+    }
+
+    /// Returns the EC parameters carried by seal work items
+    /// `(k, m, strip_size_bytes)`; all zero when EC is not configured.
+    fn ec_params(&self) -> (u8, u8, usize) {
+        self.ec_config
+            .as_ref()
+            .map(|c| (c.data_shards, c.parity_shards, c.strip_size_bytes))
+            .unwrap_or((0, 0, 0))
+    }
+
     /// Enqueues a filled segment for sealing on the bounded work channel.
     ///
     /// Uses `try_send` for non-blocking enqueue. If the channel is full,
     /// the seal is deferred and will be retried later by the pool
     /// rotation logic. This avoids blocking the caller in async contexts.
-    fn enqueue_seal(
-        &self,
-        segment_id: SegmentId,
-        segment_data: Bytes,
-        tier: SizeTier,
-        parity_shards: Option<Vec<Bytes>>,
-    ) {
-        let (ec_k, ec_m) =
-            self.ec_config.as_ref().map(|c| (c.data_shards, c.parity_shards)).unwrap_or((0, 0));
-        let work = SealingWork { segment_id, segment_data, tier, parity_shards, ec_k, ec_m };
+    /// The production (async) path uses [`finish_seal_handoff_async`]
+    /// instead, which never drops an enqueue.
+    fn enqueue_seal(&self, segment_id: SegmentId, segment_data: Bytes, tier: SizeTier) {
+        let (ec_k, ec_m, strip_size_bytes) = self.ec_params();
+        let work = SealingWork { segment_id, segment_data, tier, ec_k, ec_m, strip_size_bytes };
         match self.seal_tx.try_send(work) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -531,49 +772,61 @@ impl SegmentPool {
         }
     }
 
-    /// Attempts to activate a new segment in an idle or sealed slot.
-    fn try_activate_slot(&self) {
-        // Look for a slot in Sealing or Idle state that has no segment.
-        for slot in self.slots.iter() {
-            let mut seg = slot.segment.lock();
-            if seg.is_none() {
-                let state = slot.state();
-                if state == PoolSlotState::Sealing || state == PoolSlotState::Idle {
-                    #[cfg(test)]
-                    if self.fail_activation.load(std::sync::atomic::Ordering::Relaxed) {
-                        // Test seam: pretend activation keeps failing so the
-                        // bounded-wait timeout path is exercisable.
-                        continue;
-                    }
-                    // Try to create a new active segment from the buffer pool.
-                    match SegmentBuffer::new(
-                        self.tier,
-                        &self.size_config,
-                        self.buffer_pool.as_ref(),
-                        self.ec_config.as_ref(),
-                    ) {
-                        Ok(new_segment) => {
-                            *seg = Some(new_segment);
-                            slot.set_state(PoolSlotState::Appending);
-                            tracing::info!(
-                                tier = ?self.tier,
-                                "pool slot re-activated with new active segment"
-                            );
-                            // Wake appenders blocked on slot exhaustion
-                            // (bounded backpressure).
-                            self.slot_activation.1.notify_all();
-                            return;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                tier = ?self.tier,
-                                error = %e,
-                                "failed to create new active segment; slot remains empty"
-                            );
-                        }
-                    }
+    /// Attempts to activate a new segment in a sealing or idle slot.
+    ///
+    /// The replacement segment is built **outside** any slot lock — the
+    /// allocation on miss no longer runs inside a critical section
+    /// (perf §7.1) — and installed with a single pointer swap
+    /// ([`PoolSlot::install_replacement`]). If two threads race, the
+    /// loser's install returns `false` and its freshly built segment is
+    /// dropped (the buffer returns to the allocator; the buffer pool
+    /// recycles only buffers released after a successful seal).
+    ///
+    /// Returns `true` when this call installed a replacement (and thus
+    /// notified waiters), `false` otherwise. Callers that need to react
+    /// to their own install (the async append loop) use the return value
+    /// to re-scan immediately instead of waiting for a notification they
+    /// may have triggered themselves.
+    fn try_activate_slot(&self) -> bool {
+        // Quick peek for a slot that can accept a replacement.
+        let Some(slot) = self.slots.iter().find(|slot| slot.needs_segment()) else {
+            return false;
+        };
+
+        #[cfg(test)]
+        if self.fail_activation.load(std::sync::atomic::Ordering::Relaxed) {
+            // Test seam: pretend activation keeps failing so the
+            // bounded-wait timeout path is exercisable.
+            return false;
+        }
+
+        // Build the replacement outside the slot lock.
+        let replacement =
+            match ActiveSegment::new(self.tier, &self.size_config, self.buffer_pool.as_ref()) {
+                Ok(segment) => segment,
+                Err(e) => {
+                    tracing::warn!(
+                        tier = ?self.tier,
+                        error = %e,
+                        "failed to create new active segment; slot remains sealing"
+                    );
+                    return false;
                 }
-            }
+            };
+
+        if slot.install_replacement(replacement) {
+            tracing::info!(
+                tier = ?self.tier,
+                "pool slot re-activated with new active segment"
+            );
+            // Wake appenders blocked on slot exhaustion: sync waiters on
+            // the condvar, async waiters on the notify (bounded
+            // backpressure).
+            self.slot_activation.1.notify_all();
+            self.slot_activation_notify.notify_waiters();
+            true
+        } else {
+            false
         }
     }
 
@@ -933,14 +1186,156 @@ mod tests {
         assert!(pool.active_count() > 0, "pool must still have active slots");
     }
 
+    // ── State machine tests (segment-pool-slot-state-machine) ──────
+
+    #[test]
+    fn take_for_sealing_freezes_segment_in_slot_and_returns_payload() {
+        let (pool_cfg, size_cfg) = test_config();
+        let buf_pool = test_pool();
+        let pool =
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+
+        let slot = Arc::clone(&pool.slots[0]);
+        let (seg_id, _, _) = pool.append(b"payload-data").unwrap();
+
+        let sealed = slot.take_for_sealing().expect("appending slot seals");
+        assert_eq!(sealed.segment_id, seg_id);
+        assert_eq!(sealed.tier, SizeTier::Standard);
+        assert_eq!(&sealed.data[..], b"payload-data");
+
+        // The slot now holds the frozen data: readable by id while Sealing.
+        let read = pool.try_read(seg_id, 0, 12).expect("sealing slot serves reads");
+        assert_eq!(&read[..], b"payload-data");
+        assert_eq!(pool.active_count(), 3, "one slot moved out of Appending");
+    }
+
+    #[test]
+    fn take_for_sealing_on_parked_or_idle_slot_returns_none() {
+        let (pool_cfg, size_cfg) = test_config();
+        let buf_pool = test_pool();
+        let pool =
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+
+        let slot = Arc::clone(&pool.slots[0]);
+        assert!(slot.take_for_sealing().is_some(), "first seal succeeds");
+        assert!(slot.take_for_sealing().is_none(), "second seal is a no-op");
+        let idle = PoolSlot::new_idle();
+        assert!(idle.take_for_sealing().is_none(), "idle slot has nothing to seal");
+    }
+
+    #[test]
+    fn install_replacement_swaps_sealing_slot_exactly_once() {
+        let (pool_cfg, size_cfg) = test_config();
+        let buf_pool = test_pool();
+        let pool =
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool.clone(), None)
+                .unwrap();
+
+        let slot = Arc::clone(&pool.slots[0]);
+        slot.take_for_sealing().expect("park the slot");
+
+        let first = ActiveSegment::new(SizeTier::Standard, &size_cfg, buf_pool.as_ref()).unwrap();
+        assert!(slot.install_replacement(first), "sealing slot accepts a replacement");
+        assert!(slot.is_appending());
+
+        // A second install loses the race: the replacement is refused.
+        let second = ActiveSegment::new(SizeTier::Standard, &size_cfg, buf_pool.as_ref()).unwrap();
+        assert!(!slot.install_replacement(second), "already-appending slot refuses installs");
+        assert!(slot.is_appending());
+    }
+
+    #[test]
+    fn install_replacement_accepts_idle_slots() {
+        let idle = PoolSlot::new_idle();
+        let (_, size_cfg) = test_config();
+        let buf_pool = test_pool();
+        let replacement =
+            ActiveSegment::new(SizeTier::Standard, &size_cfg, buf_pool.as_ref()).unwrap();
+        assert!(idle.install_replacement(replacement));
+        assert!(idle.is_appending());
+    }
+
+    #[test]
+    fn append_skips_non_appending_slot_without_consuming_hook() {
+        // The hook is FnOnce and must survive a failed slot attempt: park
+        // slot 0, then append — the scan must land on another slot and the
+        // hook must still fire exactly once.
+        let pool_cfg = PoolConfig { active_pool_size: 2, ..PoolConfig::default() };
+        let size_cfg = SegmentSizeConfig::default();
+        let buf_pool = test_pool();
+        let pool =
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+
+        pool.slots[0].take_for_sealing().expect("park slot 0");
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let calls2 = StdArc::clone(&calls);
+        let (seg_id, offset, length) = pool
+            .append_with_hook(b"data", move |_, _, _| {
+                calls2.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "hook fires exactly once");
+        assert_eq!(length, 4);
+        assert_ne!(seg_id, SegmentId::default());
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn fill_append_invokes_hook_before_seal_enqueue() {
+        // A fill-triggering append must record the hook before the seal
+        // work item is observable. The ordering is structural (hook inside
+        // the critical section, enqueue after it); this pins the
+        // observable contract: the work item's segment id matches the one
+        // the hook recorded, and the segment stays readable through the
+        // sealing-data set after the slot has been re-armed.
+        let pool_cfg = PoolConfig { active_pool_size: 2, ..PoolConfig::default() };
+        let size_cfg = SegmentSizeConfig {
+            default_target_size: 10,
+            small_target_size: 10,
+            ..SegmentSizeConfig::default()
+        };
+        let buf_pool = test_pool();
+        let pool = Arc::new(
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap(),
+        );
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let _guard = rt.enter();
+
+        let recorded = StdArc::new(Mutex::new(Vec::<(SegmentId, u64, u32)>::new()));
+        let recorded2 = StdArc::clone(&recorded);
+        let (seg_id, _offset, length) = pool
+            .append_with_hook(b"this fills the segment", move |sid, off, len| {
+                recorded2.lock().push((sid, off, len));
+            })
+            .unwrap();
+        assert_eq!(length, 22);
+
+        let mut rx = pool.take_seal_rx().expect("seal rx");
+        let work = rx.blocking_recv().expect("filled segment enqueued");
+        assert_eq!(work.segment_id, seg_id);
+        let hook_recorded = recorded.lock();
+        assert_eq!(work.segment_id, hook_recorded[0].0, "hook ran before enqueue");
+        assert_eq!(work.tier, SizeTier::Standard);
+        assert_eq!(&work.segment_data[..], b"this fills the segment");
+        drop(hook_recorded);
+
+        // The slot was re-armed by finish_seal_handoff; the segment stays
+        // readable through the sealing-data set while the work item is in
+        // flight (ADR-0021 window).
+        assert!(pool.active_count() >= 1, "slot re-armed after fill");
+        let read = pool.try_read(seg_id, 0, length).expect("readable during seal window");
+        assert_eq!(&read[..], b"this fills the segment");
+    }
+
     // ── Backpressure tests (pool-backpressure-and-buffer-recycling) ──
 
-    /// Parks every slot in `Sealing` with no segment, simulating the
-    /// transit window of a concurrent fill burst.
+    /// Parks every slot in `Sealing` with no appendable segment, simulating
+    /// the transit window of a concurrent fill burst. The frozen data stays
+    /// in the slot (matching the unified state machine: a Sealing slot
+    /// never loses its data — ADR-0021 read window).
     fn park_all_slots(pool: &SegmentPool) {
         for slot in pool.slots.iter() {
-            let _ = slot.segment.lock().take();
-            slot.set_state(PoolSlotState::Sealing);
+            slot.take_for_sealing();
         }
     }
 
@@ -1060,6 +1455,182 @@ mod tests {
         );
         drop(pool); // close the seal sender
         drain.join().unwrap();
+    }
+
+    // ── Async append tests (write-path backpressure propagation) ──
+
+    #[tokio::test]
+    async fn append_async_waits_for_reactivation_then_succeeds() {
+        // The async path must never fail on a transiently exhausted
+        // pool: park every slot, start an async append with a generous
+        // deadline, then re-activate a slot — the append completes.
+        let pool_cfg = PoolConfig { active_pool_size: 4, ..PoolConfig::default() };
+        let size_cfg = SegmentSizeConfig::default();
+        let buf_pool = Arc::new(BufferPool::new(65536, 32));
+        let pool = Arc::new(
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap(),
+        );
+
+        park_all_slots(&pool);
+        assert_eq!(pool.active_count(), 0, "all slots parked");
+
+        let pool2 = Arc::clone(&pool);
+        let handle = tokio::spawn(async move {
+            pool2
+                .append_with_hook_async(b"hello", |_, _, _| {}, std::time::Duration::from_secs(5))
+                .await
+        });
+
+        // Give the appender time to enter the async wait, then re-activate
+        // a slot exactly like the fill path does.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        pool.try_activate_slot();
+
+        let result = handle.await.expect("task must not panic");
+        assert!(result.is_ok(), "async append must complete after re-activation: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn append_async_returns_backpressure_timeout_when_activation_keeps_failing() {
+        // With activation disabled and every slot parked, the async
+        // append must wait out its deadline and return the dedicated
+        // backpressure error — never a hang, never the sync path's
+        // InvalidConfig.
+        let pool_cfg = PoolConfig { active_pool_size: 2, ..PoolConfig::default() };
+        let size_cfg = SegmentSizeConfig::default();
+        let buf_pool = Arc::new(BufferPool::new(65536, 8));
+        let pool =
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+
+        park_all_slots(&pool);
+        pool.fail_activation.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let result = pool
+            .append_with_hook_async(b"hello", |_, _, _| {}, std::time::Duration::from_millis(50))
+            .await;
+        assert!(
+            matches!(result, Err(Error::WriteBackpressureTimeout)),
+            "expected backpressure timeout, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_async_self_heals_when_all_slots_are_parked() {
+        // The async path keeps the self-heal: a pool whose slots are all
+        // in the Sealing transit is re-activated by the waiter itself.
+        let pool_cfg = PoolConfig { active_pool_size: 2, ..PoolConfig::default() };
+        let size_cfg = SegmentSizeConfig::default();
+        let buf_pool = Arc::new(BufferPool::new(65536, 8));
+        let pool =
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+
+        park_all_slots(&pool);
+
+        let result = pool
+            .append_with_hook_async(b"hello", |_, _, _| {}, std::time::Duration::from_secs(5))
+            .await;
+        assert!(result.is_ok(), "async append must self-heal a parked pool: {result:?}");
+        assert_eq!(pool.active_count(), 1, "the appender activated one slot");
+    }
+
+    #[tokio::test]
+    async fn append_async_waits_for_seal_queue_space_instead_of_dropping() {
+        // The production path must never drop a seal work item: with a
+        // capacity-1 queue already full, the second fill's enqueue must
+        // await queue space and succeed once the worker drains.
+        let pool_cfg =
+            PoolConfig { active_pool_size: 1, encode_queue_capacity: 1, ..PoolConfig::default() };
+        let size_cfg = SegmentSizeConfig {
+            default_target_size: 16,
+            small_target_size: 16,
+            ..SegmentSizeConfig::default()
+        };
+        let buf_pool = Arc::new(BufferPool::new(65536, 8));
+        let pool = Arc::new(
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap(),
+        );
+
+        let mut rx = pool.take_seal_rx().expect("seal rx");
+
+        // First fill enqueues into the capacity-1 queue (now full).
+        pool.append_with_hook_async(
+            b"0123456789abcdef",
+            |_, _, _| {},
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("first fill succeeds");
+
+        // Second fill must await queue space instead of dropping.
+        let pool2 = Arc::clone(&pool);
+        let second = tokio::spawn(async move {
+            pool2
+                .append_with_hook_async(
+                    b"0123456789abcdef",
+                    |_, _, _| {},
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+        });
+
+        // Let the second append enter the enqueue wait, then drain. The
+        // recv is timeout-bounded so a regression (e.g. re-introducing
+        // try_send drop-on-full) fails fast instead of hanging.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("first work item must arrive")
+            .expect("channel open");
+        let second_item = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("second work item must arrive after queue space frees")
+            .expect("channel open");
+
+        assert_eq!(&first.segment_data[..], b"0123456789abcdef");
+        assert_eq!(&second_item.segment_data[..], b"0123456789abcdef");
+        let result = second.await.expect("task must not panic");
+        assert!(result.is_ok(), "second append must succeed after queue space frees: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn append_async_rejects_write_when_seal_queue_never_drains() {
+        // With the queue permanently full, the async append's enqueue
+        // must time out and REJECT the write (never acked, retryable) —
+        // never silently drop the item (which would orphan the caller's
+        // WAL entry) and never hang.
+        let pool_cfg =
+            PoolConfig { active_pool_size: 1, encode_queue_capacity: 1, ..PoolConfig::default() };
+        let size_cfg = SegmentSizeConfig {
+            default_target_size: 16,
+            small_target_size: 16,
+            ..SegmentSizeConfig::default()
+        };
+        let buf_pool = Arc::new(BufferPool::new(65536, 8));
+        let pool =
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+
+        // Hold the receiver and never drain — the queue stays full.
+        let _rx = pool.take_seal_rx();
+
+        pool.append_with_hook_async(
+            b"0123456789abcdef",
+            |_, _, _| {},
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("first fill enqueues into the empty queue");
+
+        let result = pool
+            .append_with_hook_async(
+                b"0123456789abcdef",
+                |_, _, _| {},
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(Error::WriteBackpressureTimeout)),
+            "expected backpressure timeout, got {result:?}"
+        );
     }
 
     // ── try_read tests ───────────────────────────────────────────

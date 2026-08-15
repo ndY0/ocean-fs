@@ -4,14 +4,11 @@
 //! When the buffer reaches its target size, the segment is sealed and
 //! a new active segment takes its place.
 //!
-//! ## SegmentBuffer
-//!
-//! `SegmentBuffer` is an enum wrapper that can hold either a plain
-//! `ActiveSegment` or a streaming variant that performs EC encode
-//! as stripes complete. The pool creates the appropriate variant
-//! based on the `ec_streaming_encode` configuration flag.
+//! The pool seals segments directly from [`ActiveSegment`]; EC parity
+//! is computed at seal time by the seal worker (via the parallel
+//! encoder), not during appends.
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use oceanfs_core::{SegmentId, SegmentSizeConfig, SizeTier};
 
 use crate::{
@@ -164,120 +161,43 @@ impl ActiveSegment {
 }
 
 // ---------------------------------------------------------------------------
-// SegmentBuffer — enum dispatch over plain vs streaming-encode segments
+// Seal hand-off
 // ---------------------------------------------------------------------------
 
-/// A segment buffer that can be either plain or streaming-EC-aware.
+/// A segment that has been filled and is ready for the seal hand-off.
 ///
-/// When [`PoolConfig::ec_streaming_encode`] is enabled, the pool creates
-/// [`SegmentBuffer::Streaming`] variants which spread EC encode work across
-/// individual stripe completions instead of waiting until seal time.
-pub(crate) enum SegmentBuffer {
-    /// Standard append-only segment without EC awareness.
-    Plain(ActiveSegment),
-    /// Streaming EC segment that encodes each stripe row as soon as its
-    /// data shards become available.
-    Streaming(super::streaming::StreamingEcSegment),
+/// Produced by [`ActiveSegment::seal`] when a slot's segment fills: the
+/// backing buffer is frozen into a zero-copy `Bytes` and the slot's
+/// `Sealing` state retains a clone for the read window. EC parity is
+/// computed at seal time by the seal worker, not here.
+pub(crate) struct SealedSegment {
+    /// The unique identifier of the segment to seal.
+    pub(crate) segment_id: SegmentId,
+    /// The storage tier of the segment (Small or Standard).
+    pub(crate) tier: SizeTier,
+    /// The frozen segment data.
+    pub(crate) data: Bytes,
 }
 
-impl SegmentBuffer {
-    /// Creates a new segment buffer.
+impl ActiveSegment {
+    /// Consumes the segment for sealing: freezes the backing buffer.
     ///
-    /// When `ec_config` is `Some` and streaming is requested, creates a
-    /// [`SegmentBuffer::Streaming`] variant. Otherwise creates a plain
-    /// [`SegmentBuffer::Plain`].
-    pub fn new(
-        tier: SizeTier,
-        size_config: &SegmentSizeConfig,
-        pool: &BufferPool,
-        ec_config: Option<&oceanfs_core::CodecConfig>,
-    ) -> Result<Self> {
-        match ec_config {
-            Some(codec) => {
-                let inner = ActiveSegment::new(tier, size_config, pool)?;
-                Ok(Self::Streaming(super::streaming::StreamingEcSegment::new(inner, codec)))
-            }
-            None => Ok(Self::Plain(ActiveSegment::new(tier, size_config, pool)?)),
-        }
-    }
-
-    /// Appends data to the segment. Delegates to the inner variant.
-    pub fn append(&mut self, data: &[u8]) -> Result<(u64, usize)> {
-        match self {
-            Self::Plain(s) => s.append(data),
-            Self::Streaming(s) => s.append(data),
-        }
-    }
-
-    /// Returns `true` if the segment has reached or exceeded its target size.
-    pub fn is_full(&self) -> bool {
-        match self {
-            Self::Plain(s) => s.is_full(),
-            Self::Streaming(s) => s.is_full(),
-        }
-    }
-
-    /// Returns the segment's unique identifier.
-    pub fn id(&self) -> SegmentId {
-        match self {
-            Self::Plain(s) => s.id(),
-            Self::Streaming(s) => s.id(),
-        }
-    }
-
-    /// Returns the storage tier of this segment.
-    pub fn tier(&self) -> SizeTier {
-        match self {
-            Self::Plain(s) => s.tier(),
-            Self::Streaming(s) => s.tier(),
-        }
-    }
-
-    /// Returns the current size of the segment in bytes.
-    #[allow(dead_code)]
-    pub fn size(&self) -> u64 {
-        match self {
-            Self::Plain(s) => s.size(),
-            Self::Streaming(s) => s.size(),
-        }
-    }
-
-    /// Returns the target size of the segment in bytes.
-    #[allow(dead_code)]
-    pub fn target_size(&self) -> u64 {
-        match self {
-            Self::Plain(s) => s.target_size(),
-            Self::Streaming(s) => s.target_size(),
-        }
-    }
-
-    /// Returns a reference to the accumulated data.
-    #[allow(dead_code)]
-    pub fn data(&self) -> &[u8] {
-        match self {
-            Self::Plain(s) => s.data(),
-            Self::Streaming(s) => s.data(),
-        }
-    }
-
-    /// Consumes the segment, returning the backing buffer for pool reuse.
-    pub fn into_buffer(self) -> BytesMut {
-        match self {
-            Self::Plain(s) => s.into_buffer(),
-            Self::Streaming(s) => s.into_buffer(),
-        }
-    }
-
-    /// Returns any pre-computed parity shards from streaming EC encode.
+    /// The returned [`SealedSegment`] carries everything the pool needs
+    /// to hand the segment to the seal worker — the frozen data and the
+    /// identity. EC parity is deliberately NOT computed here: the encode
+    /// is CPU-bound and runs at seal time on the blocking pool (single
+    /// scheduler; the write path never touches a second thread pool).
     ///
-    /// Returns `None` for [`SegmentBuffer::Plain`]. For
-    /// [`SegmentBuffer::Streaming`], returns the accumulated parity shards
-    /// from all fully-encoded stripes.
-    pub fn parity_shards(&self) -> Option<Vec<bytes::Bytes>> {
-        match self {
-            Self::Plain(_) => None,
-            Self::Streaming(s) => s.parity_shards(),
-        }
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // ActiveSegment is pub(crate); examples are in unit tests.
+    /// ```
+    pub(crate) fn seal(self) -> SealedSegment {
+        let segment_id = self.id();
+        let tier = self.tier();
+        let data = self.into_buffer().freeze();
+        SealedSegment { segment_id, tier, data }
     }
 }
 

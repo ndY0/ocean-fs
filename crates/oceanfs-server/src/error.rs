@@ -47,6 +47,13 @@ pub enum Error {
     #[error("write failed: {0}")]
     WriteFailed(String),
 
+    /// The write backpressure queue is saturated: the request waited for
+    /// a write permit (or for a segment slot re-activation) past
+    /// `operation_timeouts.write_queue_ms`. Retryable — nothing was
+    /// recorded for this request.
+    #[error("write queue overloaded; retry later")]
+    WriteOverloaded,
+
     /// An operation timed out.
     #[error("operation timed out after {elapsed_ms}ms")]
     Timeout {
@@ -126,6 +133,7 @@ impl Error {
             Self::Timeout { .. } => "RequestTimeout",
             Self::HashMismatch { .. } => "BadDigest",
             Self::QuorumNotMet { .. } | Self::WriteFailed(_) => "InternalError",
+            Self::WriteOverloaded => "SlowDown",
             Self::NoReachableNode
             | Self::Routing(_)
             | Self::ForwardFailed { .. }
@@ -157,6 +165,7 @@ impl Error {
             Self::InvalidKey(_) | Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             Self::Timeout { .. } => StatusCode::REQUEST_TIMEOUT,
             Self::HashMismatch { .. } | Self::WriteFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::WriteOverloaded => StatusCode::SERVICE_UNAVAILABLE,
             Self::QuorumNotMet { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::NoReachableNode
             | Self::Routing(_)

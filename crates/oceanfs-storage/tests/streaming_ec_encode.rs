@@ -1,19 +1,23 @@
-//! Integration test: streaming EC encode through the segment pool.
+//! Integration test: seal-time EC parity through the segment pool and sealer.
 //!
-//! Verifies end-to-end correctness: write data through a `SegmentPool` with
-//! `ec_streaming_encode = true`, extract sealed segments, and confirm that
-//! streaming-computed parity shards match batch (seal-time) encode.
+//! Verifies the single-scheduler parity path end-to-end: a pool configured
+//! with EC parameters seals segments whose work items carry (k, m, strip);
+//! `seal_from_data` computes the parity on the blocking pool (the parallel
+//! encoder — no second scheduler on the write path) and persists a v2
+//! parity section whose shard-hash table verifies against the data.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
 
 use oceanfs_core::{CodecConfig, PoolConfig, SegmentSizeConfig, SizeTier};
-use oceanfs_ec::{CauchyEncoder, Encoder};
-use oceanfs_storage::{BufferPool, SegmentPool};
+use oceanfs_storage::{
+    BufferPool, RocksDbMetadataStore, SealConfig, SegmentHeader, SegmentPool, SegmentSealer,
+    WalWriter,
+};
 
-/// Helper: create a segment pool with streaming EC encode enabled.
-fn make_streaming_pool() -> SegmentPool {
+/// Creates a segment pool with EC parameters configured (k=4, m=2, strip=64).
+fn make_ec_pool() -> SegmentPool {
     let ec_config = CodecConfig {
         data_shards: 4,
         parity_shards: 2,
@@ -35,126 +39,97 @@ fn make_streaming_pool() -> SegmentPool {
         .unwrap()
 }
 
-#[test]
-fn streaming_encode_single_stripe_produces_parity_in_sealing_work() {
-    let pool = make_streaming_pool();
-
-    // Write exactly one stripe: k=4, strip=64 → 256 bytes.
-    let data = vec![0xABu8; 256];
-    let (_seg_id, offset, length) = pool.append(&data).unwrap();
-    assert_eq!(offset, 0);
-    assert_eq!(length, 256);
-
-    // Drain the seal queue — the segment is not full (target=1024 > 256),
-    // so it hasn't been enqueued for sealing. Streaming encode should have
-    // fired for the completed stripe though.
-    //
-    // Fill the rest of the segment to trigger seal.
-    let remaining = 1024usize - 256;
-    let fill = vec![0xCDu8; remaining];
-    let _ = pool.append(&fill).unwrap();
-
-    // Drain the seal queue.
-    let mut rx = pool.take_seal_rx().expect("seal rx should be available");
-    let sem = pool.seal_semaphore();
-
-    // Wait for the seal work to appear.
-    let work = rx.blocking_recv().expect("seal work should be enqueued");
-    drop(sem);
-
-    // Verify the seal work contains parity shards.
-    assert!(work.parity_shards.is_some(), "streaming encode should produce parity shards");
-    let parity = work.parity_shards.unwrap();
-    // 4 complete stripes (1024 / 256 = 4), 2 parity shards per stripe.
-    assert_eq!(parity.len(), 8, "4 stripes × 2 parity = 8 shards");
-
-    // Verify parity shard sizes.
-    for (i, shard) in parity.iter().enumerate() {
-        assert_eq!(shard.len(), 64, "parity shard {i} should be 64 bytes, got {}", shard.len());
-    }
-
-    // Compare streaming parity against batch encode for stripe 0.
-    let k = 4usize;
-    let strip = 64;
-    let data_refs: Vec<&[u8]> = (0..k).map(|i| &data[i * strip..(i + 1) * strip]).collect();
-    let encoder = CauchyEncoder::new(CodecConfig {
-        data_shards: 4,
-        parity_shards: 2,
-        strip_size_bytes: 64,
-        ..Default::default()
-    });
-    let batch_parity = encoder.encode(&data_refs, 2).unwrap();
-
-    // Stripe 0 parity shards are the first 2 entries in the parity list.
-    for i in 0..2 {
-        assert_eq!(
-            &parity[i][..],
-            &batch_parity[i][..],
-            "streaming parity shard {i} must match batch encode"
-        );
-    }
+/// Builds a sealer writing into `dir/segments`.
+async fn make_sealer(dir: &tempfile::TempDir) -> (SegmentSealer, std::path::PathBuf) {
+    let metadata = Arc::new(
+        RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+            data_dir: dir.path().join("meta"),
+            block_cache_size: 1024,
+            memtable_size: 1024,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let wal = Arc::new(
+        WalWriter::open(&oceanfs_core::WalConfig {
+            data_dir: dir.path().join("wal"),
+            max_file_size_bytes: 1024 * 1024,
+            fsync_batch_timeout_ms: 5,
+            ..Default::default()
+        })
+        .await
+        .unwrap(),
+    );
+    let seal_dir = dir.path().join("segments");
+    let sealer = SegmentSealer::new(
+        SealConfig {
+            target_size_bytes: 1024,
+            seal_timeout_ms: 5000,
+            data_dir: seal_dir.clone(),
+            io_mode: oceanfs_storage::io::IoReadMode::Buffered,
+            write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
+        },
+        metadata,
+        wal,
+    );
+    (sealer, seal_dir)
 }
 
 #[test]
-fn streaming_encode_plain_pool_produces_no_parity() {
-    let ec_config = CodecConfig {
-        data_shards: 4,
-        parity_shards: 2,
-        strip_size_bytes: 64,
-        ..Default::default()
-    };
-    let pool_config = PoolConfig {
-        ec_streaming_encode: false,
-        active_pool_size: 1,
-        shard_count: 1,
-        max_inflight_encodes: 1,
-        encode_queue_capacity: 4,
-    };
-    let size_config =
-        SegmentSizeConfig { default_target_size: 256, ..SegmentSizeConfig::default() };
-    let buffer_pool = Arc::new(BufferPool::new(65536, 4));
+fn ec_pool_work_items_carry_ec_params() {
+    let pool = make_ec_pool();
 
-    let pool = SegmentPool::new(
-        pool_config,
-        SizeTier::Standard,
-        &size_config,
-        buffer_pool,
-        Some(ec_config),
-    )
-    .unwrap();
+    // 1024 bytes = 4 complete stripes (k=4, strip=64 → 256 B per stripe).
+    let data = vec![0xABu8; 1024];
+    let (_seg_id, _offset, length) = pool.append(&data).unwrap();
+    assert_eq!(length, 1024);
 
-    // Write exactly one segment worth.
-    let _ = pool.append(&vec![0xEFu8; 256]).unwrap();
+    let mut rx = pool.take_seal_rx().expect("seal rx");
+    let work = rx.blocking_recv().expect("seal work item");
 
-    let mut rx = pool.take_seal_rx().expect("seal rx should be available");
-    let work = rx.blocking_recv().expect("seal work should be enqueued");
-
-    assert!(work.parity_shards.is_none(), "plain pool should not produce parity shards");
+    assert_eq!(&work.segment_data[..], &data[..], "seal data must be intact");
+    assert_eq!(work.ec_k, 4);
+    assert_eq!(work.ec_m, 2);
+    assert_eq!(work.strip_size_bytes, 64);
 }
 
-#[test]
-fn streaming_encode_multiple_stripes_all_encoded() {
-    let pool = make_streaming_pool();
+#[tokio::test]
+async fn seal_from_data_persists_ec_parity_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sealer, seal_dir) = make_sealer(&dir).await;
 
-    // Write 768 bytes = 3 complete stripes (3 × 256).
-    let _ = pool.append(&vec![0x11u8; 768]).unwrap();
+    let segment_id = oceanfs_core::SegmentId::new();
+    let data = bytes::Bytes::from(vec![0xCDu8; 1024]); // 4 complete stripes
 
-    // Wait briefly for rayon workers to complete.
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    let _handle = sealer
+        .seal_from_data(segment_id, SizeTier::Standard, data.clone(), &[], 4, 2, 64, None)
+        .await
+        .unwrap();
 
-    // Fill the rest to trigger seal.
-    let remaining = 1024usize - 768;
-    let _ = pool.append(&vec![0x22u8; remaining]).unwrap();
+    let path = seal_dir.join(format!("{segment_id}.dat"));
+    let file = std::fs::read(&path).unwrap();
+    let hdr = SegmentHeader::from_bytes(&file).expect("valid header");
+    assert!(hdr.parity_offset > 0, "v2 file must carry the parity section");
+    assert!(hdr.parity_size > 0, "parity section must be non-empty for 4 complete stripes");
+    // The section contents (shard order, hash table) are verified at the
+    // sealer unit level; the repair path is covered by the repair tests.
+}
 
-    let mut rx = pool.take_seal_rx().expect("seal rx should be available");
-    let work = rx.blocking_recv().expect("seal work should be enqueued");
+#[tokio::test]
+async fn seal_without_ec_params_has_no_parity_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sealer, seal_dir) = make_sealer(&dir).await;
 
-    let parity = work.parity_shards.expect("streaming encode should produce parity");
-    // 4 stripes × 2 parity = 8 shards.
-    assert_eq!(parity.len(), 8);
+    let segment_id = oceanfs_core::SegmentId::new();
+    let data = bytes::Bytes::from(vec![0xEEu8; 512]);
 
-    // Every parity shard should be non-empty.
-    for shard in &parity {
-        assert!(!shard.is_empty(), "parity shard should not be empty");
-    }
+    let _handle = sealer
+        .seal_from_data(segment_id, SizeTier::Standard, data.clone(), &[], 0, 0, 0, None)
+        .await
+        .unwrap();
+
+    let path = seal_dir.join(format!("{segment_id}.dat"));
+    let file = std::fs::read(&path).unwrap();
+    let hdr = SegmentHeader::from_bytes(&file).expect("valid header");
+    assert_eq!(hdr.parity_offset, 0, "no EC → no parity section");
 }

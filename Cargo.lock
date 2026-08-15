@@ -1833,7 +1833,6 @@ dependencies = [
  "parking_lot",
  "prost",
  "rand 0.8.7",
- "rayon",
  "rocksdb",
  "serde_json",
  "smallvec",

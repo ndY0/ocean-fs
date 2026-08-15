@@ -40,6 +40,11 @@ pub struct OperationTimeouts {
     pub segment_seal_ms: u64,
     /// Timeout for gossip roundtrip (push-pull sync message) (ms). Default: 10_000ms.
     pub gossip_roundtrip_ms: u64,
+    /// Timeout for the write backpressure queue: how long a PUT may wait
+    /// for a write permit (bounded request queue) or for the segment
+    /// pool to re-activate a slot before the request is rejected with
+    /// `503 SlowDown` (ms). Default: 5_000ms (5s).
+    pub write_queue_ms: u64,
 }
 
 impl Default for OperationTimeouts {
@@ -55,6 +60,7 @@ impl Default for OperationTimeouts {
             read_default_ms: 10_000,
             segment_seal_ms: 120_000,
             gossip_roundtrip_ms: 10_000,
+            write_queue_ms: 5_000,
         }
     }
 }
@@ -92,6 +98,7 @@ mod tests {
             read_default_ms: 3_000,
             segment_seal_ms: 60_000,
             gossip_roundtrip_ms: 5_000,
+            write_queue_ms: 5_000,
         };
         assert_eq!(t.wal_write_ms, 100);
     }
@@ -109,6 +116,7 @@ mod tests {
             read_default_ms: 3_000,
             segment_seal_ms: 60_000,
             gossip_roundtrip_ms: 5_000,
+            write_queue_ms: 5_000,
         };
         let toml_str = toml::to_string(&t).unwrap();
         let roundtripped: OperationTimeouts = toml::from_str(&toml_str).unwrap();

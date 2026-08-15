@@ -287,6 +287,15 @@ pub struct NodeConfig {
     #[serde(default)]
     pub operation_timeouts: crate::OperationTimeouts,
 
+    // ── Item 4b: Write backpressure (bounded request queue) ──
+    /// Maximum number of concurrent in-flight S3 PUT requests admitted
+    /// to the write path. Requests beyond this bound wait up to
+    /// `operation_timeouts.write_queue_ms` for a permit, then receive
+    /// `503 SlowDown` (backpressure propagates to the HTTP layer instead
+    /// of failing mid-write). Default: 64.
+    #[serde(default = "default_max_inflight_writes")]
+    pub max_inflight_writes: usize,
+
     // ── Item 5: Buffer pool configuration ──
     /// Buffer pool chunk size in bytes (default 65536 = 64 KB).
     #[serde(default = "default_buffer_pool_chunk_bytes")]
@@ -360,6 +369,10 @@ fn default_metrics_listen_addr() -> String {
 }
 fn default_max_body_size() -> usize {
     2 * 1024 * 1024 // 2 MB
+}
+
+fn default_max_inflight_writes() -> usize {
+    64
 }
 fn default_gc_interval() -> u64 {
     3600
@@ -530,6 +543,7 @@ impl Default for NodeConfig {
             read_cache_segments: false,
             io_uring_enabled: cfg!(target_os = "linux"),
             segment_cache_max_entries: 64,
+            max_inflight_writes: 64,
             background_io_class_idle: cfg!(target_os = "linux"),
             background_cpu_sched_idle: cfg!(target_os = "linux"),
             // Anti-entropy

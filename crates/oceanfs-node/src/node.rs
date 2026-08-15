@@ -582,13 +582,18 @@ impl Node {
         // Created before WAL replay so that replayed entries can be
         // reconstructed into active segments (C4-storage, D6).
         let pool_config = PoolConfig::default();
+        // EC codec for the segment pools: work items carry (k, m, strip)
+        // so the seal worker computes and persists per-segment parity at
+        // seal time (single scheduler — the parallel encode runs on the
+        // blocking pool). Matches the heal codec configuration.
+        let pool_ec_config = oceanfs_core::CodecConfig::default();
         let segment_pool_small = Arc::new(
             SegmentPool::new(
                 pool_config.clone(),
                 SizeTier::Small,
                 &segment_size,
                 shard_buffer_pool.clone(),
-                None,
+                Some(pool_ec_config.clone()),
             )
             .map_err(|e| format!("failed to create small segment pool: {e}"))?,
         );
@@ -598,7 +603,7 @@ impl Node {
                 SizeTier::Standard,
                 &segment_size,
                 shard_buffer_pool.clone(),
-                None,
+                Some(pool_ec_config),
             )
             .map_err(|e| format!("failed to create standard segment pool: {e}"))?,
         );
@@ -914,6 +919,9 @@ impl Node {
             segment_reader.clone(),
         ));
 
+        // Clone for the seal notifier closure (the engine itself is
+        // consumed by the background-task spawn later).
+        let ae_worker_notifier = Arc::clone(&ae_worker);
         let write_coordinator = Arc::new(
             WriteCoordinator::new(
                 ring_cache.clone(),
@@ -931,7 +939,14 @@ impl Node {
                 hinted_handoff_manager.clone(),
                 hint_config,
             )
-            .with_timeouts(op_timeouts.clone()),
+            .with_timeouts(op_timeouts.clone())
+            // Continuous anti-entropy: every successful seal updates the
+            // incremental Merkle tree (with its seal-time root) so
+            // recently-written segments participate in the root exchange
+            // without waiting for the next startup rebuild.
+            .with_segment_sealed_notifier(Arc::new(move |segment_id, merkle_root| {
+                ae_worker_notifier.on_segment_sealed(segment_id, merkle_root);
+            })),
         );
 
         // Start background seal worker — drains filled segments from both
@@ -965,7 +980,14 @@ impl Node {
 
         // ---- 12. Construct handlers ----
         let bucket_store = Arc::new(BucketConfigStore::new());
-        let s3_handler = S3Handler::new_with_caches(
+        // Bounded write queue: at most `max_inflight_writes` concurrent
+        // PUTs; requests beyond the bound wait up to `write_queue_ms`
+        // then receive 503 SlowDown (backpressure propagates to the HTTP
+        // layer instead of failing mid-write).
+        let write_queue = Arc::new(tokio::sync::Semaphore::new(config.max_inflight_writes));
+        let write_queue_timeout =
+            std::time::Duration::from_millis(config.operation_timeouts.write_queue_ms);
+        let s3_handler = S3Handler::new_with_caches_and_backpressure(
             write_coordinator,
             read_coordinator,
             metadata_ops,
@@ -973,6 +995,8 @@ impl Node {
             Some(object_cache.clone()),
             Some(metadata_cache.clone()),
             Some(negative_cache.clone()),
+            Some(write_queue),
+            write_queue_timeout,
         )
         .with_prefetch_engine(prefetch_engine.clone())
         .with_router(router);
