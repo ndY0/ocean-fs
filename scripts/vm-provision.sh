@@ -76,6 +76,8 @@ SSH_KEY_PATH=""
 NAME_PREFIX=""
 IMAGE="${DEFAULT_IMAGE}"
 DRY_RUN=false
+DEBUG=false
+KEEP_ON_FAILURE=false
 SINGLE_VM=false
 CONFIRM=""
 TTL_HOURS="${DEFAULT_TTL_HOURS}"
@@ -323,7 +325,12 @@ wait_for_vm() {
             return 0
         fi
         if [ "$status" = "error" ]; then
-            die "VM '${name}' entered error state."
+            # Surface the server's error details (rescue/info from hcloud).
+            local details
+            details=$(hcloud server describe "$name" --output json 2>/dev/null \
+                | jq -r 'if .error then .error.message // .error.code else "status=error" end' 2>/dev/null \
+                || true)
+            die "VM '${name}' entered error state: ${details:-no details available}"
         fi
         retry=$((retry + 1))
         sleep 5
@@ -353,10 +360,13 @@ create_network() {
     fi
 
     log_info "Creating network '${NETWORK_NAME}' with CIDR ${NETWORK_CIDR}..."
-    hcloud network create \
+    local net_output
+    if ! net_output=$(hcloud network create \
         --name "$NETWORK_NAME" \
         --ip-range "$NETWORK_CIDR" \
-        >/dev/null 2>&1 || die "Failed to create network '${NETWORK_NAME}'."
+        2>&1); then
+        die "Failed to create network '${NETWORK_NAME}': ${net_output}"
+    fi
     log_info "Network '${NETWORK_NAME}' created."
 }
 
@@ -374,13 +384,18 @@ create_vm() {
         return 0
     fi
 
-    hcloud server create \
+    # Capture hcloud's output so a failure reports the REAL reason
+    # (quota, location, image, key, permissions) instead of silence.
+    local create_output
+    if ! create_output=$(hcloud server create \
         --name "$name" \
         --type "$type" \
         --image "$image" \
         --network "$NETWORK_NAME" \
         --ssh-key "$ssh_key" \
-        >/dev/null 2>&1 || die "Failed to create VM '${name}'."
+        2>&1); then
+        die "Failed to create VM '${name}': ${create_output}"
+    fi
 
     CREATED_VM_NAMES+=("$name")
     log_info "VM '${name}' creation initiated."
@@ -580,6 +595,13 @@ TTL_SETUP
 # ---------------------------------------------------------------------------
 
 cleanup() {
+    if [ "$KEEP_ON_FAILURE" = true ]; then
+        log_warn "KEEP_ON_FAILURE set — leaving created VMs in place for inspection:"
+        for vm_name in "${CREATED_VM_NAMES[@]:-}"; do
+            log_warn "  ${vm_name}"
+        done
+        return 0
+    fi
     if [ ${#CREATED_VM_NAMES[@]} -gt 0 ]; then
         log_warn "Cleanup: attempting to delete VMs created during this run..."
         for vm_name in "${CREATED_VM_NAMES[@]}"; do
@@ -870,6 +892,9 @@ OPTIONS:
   --confirm yes        Required for VM types >= CX32 (confirmation gate)
   --ttl HOURS          Auto-shutdown TTL (default: 4, or LOAD_TEST_TTL_HOURS)
   --dry-run            Print actions without executing
+  --debug              Enable shell tracing (set -x) for full visibility
+  --keep-on-failure    Keep already-created VMs when a later step fails
+                       (default: cleanup deletes them)
   --destroy NAME       Tear down both VMs with given name prefix
   --status NAME        Check status of both VMs
   -h, --help           Show this help
@@ -995,6 +1020,14 @@ parse_args() {
                 DRY_RUN=true
                 shift
                 ;;
+            --debug)
+                DEBUG=true
+                shift
+                ;;
+            --keep-on-failure)
+                KEEP_ON_FAILURE=true
+                shift
+                ;;
             --destroy)
                 DESTROY_NAME="${2:-}"
                 shift 2
@@ -1016,6 +1049,13 @@ parse_args() {
 
 main() {
     parse_args "$@"
+
+    # Full shell tracing for debugging: shows every command incl. hcloud
+    # invocations (stderr is no longer suppressed under set -x since the
+    # captured-output paths still report failures with details).
+    if [ "$DEBUG" = true ]; then
+        set -x
+    fi
 
     # Resolve SSH key default
     if [ -z "$SSH_KEY_PATH" ]; then
