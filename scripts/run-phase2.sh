@@ -98,6 +98,15 @@ if [ -n "$HARNESS" ]; then
         "cd /root/ocean-fs && ./scripts/run-phase2.sh --${MODE} ${SUT:+--sut $SUT} ${SSH_TARGET:+--ssh $SSH_TARGET} --service ${SERVICE} --seed ${SEED} --report-dir ${REPORT_DIR}"
     local_exit=$?
 
+    # Push the load-test textfile into the SUT's Prometheus textfile
+    # collector (best-effort: only when observability is installed).
+    if [ -n "$SUT" ]; then
+        local sut_ip="${SUT%%:*}"
+        ssh $SSH_OPTS -o BatchMode=yes "$HARNESS" \
+            "scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${REPORT_DIR}/load_test.prom root@${sut_ip}:/var/lib/prometheus/textfile/ 2>/dev/null || true" \
+            || true
+    fi
+
     mkdir -p "$REPORT_DIR"
     scp $SSH_OPTS "${HARNESS}:${REPORT_DIR}/2_load_sustained_*.json" "$REPORT_DIR/" 2>/dev/null \
         && log_info "Report fetched to ${REPORT_DIR}/" || log_info "No report fetched (check ${HARNESS}:${REPORT_DIR})."

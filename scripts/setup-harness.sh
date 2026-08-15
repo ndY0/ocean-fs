@@ -170,7 +170,21 @@ else
     log_info "[DRY-RUN] on harness: ./scripts/sut-deploy.sh --sut root@${SUT_INTERNAL_IP} --port 9000"
 fi
 
-# 4. Verify SUT health over the internal network (the path the harness
+# 4. Ensure the observability stack on the SUT (idempotent; covers VMs
+# provisioned before the provisioner installed it by default).
+log_info "Ensuring observability stack on the SUT (${SUT_INTERNAL_IP})..."
+if [ "$DRY_RUN" = false ]; then
+    if ! ssh $SSH_OPTS -o BatchMode=yes "root@${HARNESS_PUBLIC_IP}" \
+        "cd /root/ocean-fs && scp scripts/setup-observability.sh root@${SUT_INTERNAL_IP}:/root/ && ssh root@${SUT_INTERNAL_IP} 'bash /root/setup-observability.sh'"; then
+        log_warn "Observability setup failed on the SUT (non-fatal — the harness scrape still covers the run)."
+    else
+        log_info "Observability stack ensured on the SUT."
+    fi
+else
+    log_info "[DRY-RUN] on harness: scp setup-observability.sh -> root@${SUT_INTERNAL_IP} && run it"
+fi
+
+# 5. Verify SUT health over the internal network (the path the harness
 # will actually use for the payload).
 log_info "Verifying SUT health over the internal network..."
 if [ "$DRY_RUN" = false ]; then

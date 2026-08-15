@@ -91,6 +91,7 @@ DRY_RUN=false
 DEBUG=false
 KEEP_ON_FAILURE=false
 FIREWALLS=true
+OBSERVABILITY=true
 SSH_SOURCE_IP="0.0.0.0/0"
 SINGLE_VM=false
 CONFIRM=""
@@ -577,6 +578,31 @@ wait_for_ssh() {
     return 1
 }
 
+# Directory this script lives in (for locating sibling scripts like
+# setup-observability.sh regardless of the invocation cwd).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Installs the Prometheus observability stack on the SUT (scrape job for
+# :9000/admin/metrics + node exporter + textfile collector). Idempotent;
+# run by the provisioner by default and re-ensured by setup-harness.sh.
+install_observability() {
+    local public_ip="$1"
+    log_info "Installing observability stack on ${public_ip}..."
+    if [ "$DRY_RUN" = true ]; then
+        log_info "[DRY-RUN] scp ${SCRIPT_DIR}/setup-observability.sh -> root@${public_ip}:/root/ && run it"
+        return 0
+    fi
+    scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
+        "${SCRIPT_DIR}/setup-observability.sh" "root@${public_ip}:/root/setup-observability.sh" \
+        || { log_error "Failed to copy setup-observability.sh to ${public_ip}"; return 1; }
+    if ! ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${public_ip}" \
+        "bash /root/setup-observability.sh"; then
+        log_error "Observability setup failed on ${public_ip} (Prometheus unavailable; the harness's own scrape still covers the run)."
+        return 1
+    fi
+    log_info "Observability stack installed on ${public_ip} (Prometheus :9090 — tunnel-only)."
+}
+
 # Configure SUT VM (minimal — no Rust toolchain)
 configure_sut_vm() {
     local name="$1"
@@ -598,7 +624,12 @@ set -euo pipefail
 apt-get update -qq
 apt-get install -y -qq curl
 SUT_SETUP
-    log_info "SUT VM '${name}' configured (curl only, no Rust toolchain)."
+    if [ "$OBSERVABILITY" = true ]; then
+        install_observability "$public_ip" || log_warn "Observability install failed (non-fatal)."
+    else
+        log_warn "Observability DISABLED (--no-observability) — Prometheus will not be installed."
+    fi
+    log_info "SUT VM '${name}' configured (curl + observability, no Rust toolchain)."
 }
 
 # Configure Harness VM (Rust toolchain + repo + build)
@@ -1053,6 +1084,9 @@ OPTIONS:
   --keep-on-failure    Keep already-created VMs when a later step fails
                        (default: cleanup deletes them)
   --no-firewall        Do NOT create/apply Hetzner managed firewalls
+  --no-observability   Do NOT install Prometheus on the SUT (default:
+                       installed; scrape :9000 + node exporter, :9090
+                       is tunnel-only)
                        (default: applied — SUT: SSH + internal-net
                        9000/9001 only; Harness: SSH only)
   --ssh-source-ip IP   CIDR allowed to SSH into the VMs (default:
@@ -1197,6 +1231,10 @@ parse_args() {
                 ;;
             --no-firewall)
                 FIREWALLS=false
+                shift
+                ;;
+            --no-observability)
+                OBSERVABILITY=false
                 shift
                 ;;
             --ssh-source-ip)
