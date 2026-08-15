@@ -68,6 +68,7 @@ async fn make_sealer(dir: &tempfile::TempDir) -> (SegmentSealer, std::path::Path
             data_dir: seal_dir.clone(),
             io_mode: oceanfs_storage::io::IoReadMode::Buffered,
             write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
+            ..Default::default()
         },
         metadata,
         wal,

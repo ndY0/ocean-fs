@@ -304,7 +304,7 @@ Node startup:
   size appears in locked memory. Swapping test (manual): under memory
   pressure (e.g., `stress-ng --vm 4`), verify that the block cache
   remains resident while anonymous pages are swapped.
-<!-- REVIEW: mlockall(MCL_CURRENT|MCL_FUTURE) in metadata/store.rs with VmLck verification and WARN logging. Uses mlockall instead of per-allocation mlock (declared deviation). -->
+<!-- REVIEW: mlockall(MCL_CURRENT) ONLY in metadata/store.rs with VmLck verification and WARN logging. Never MCL_FUTURE: it caps every future allocation against RLIMIT_MEMLOCK, and past the ceiling all allocations fail with EAGAIN, aborting the whole node (handle_alloc_error). A getrlimit pre-check runs before locking. Regression test: tests/mlock_no_future_cap.rs (see ADR-0023 §4). Uses mlockall instead of per-allocation mlock (declared deviation). -->
 
 - [x] **Config:** New config fields added to `oceanfs-core` types with
   sensible defaults: `wal_use_sync_file_range = true`,
@@ -368,7 +368,7 @@ for future resolution.
 | 3 | `madvise` page cache eviction integration test | `madvise` hints | Not implemented. DoD requirement for page cache eviction test not satisfied. |
 | 4 | `ioprio_set`/`SCHED_IDLE` capability automated test | `ioprio_set` / `SCHED_IDLE` | Not implemented. Manual verification via `ionice`/`chrt` is documented but no automated test exists. |
 | 5 | Criterion benchmarks not validating DoD metrics | Perf | Benchmarks exist and compile (`--no-run`) but do not validate specific metrics: ≥30% WAL sync latency reduction, no regression from `O_TMPFILE`, page cache pollution reduction. Pending benchmark runs. |
-| 6 | `mlockall` instead of per-allocation `mlock` | `mlock` | Uses `mlockall(MCL_CURRENT\|MCL_FUTURE)` instead of per-allocation `mlock` on the block cache. Declared as deviation. |
+| 6 | `mlockall` instead of per-allocation `mlock` | `mlock` | Uses `mlockall(MCL_CURRENT)` only (never `MCL_FUTURE` — it caps future allocations against `RLIMIT_MEMLOCK` and aborts the whole node) with a `getrlimit` pre-check in `metadata/store.rs`; regression test `tests/mlock_no_future_cap.rs`. Declared as deviation. |
 | 7 | Hinted handoff delivery watcher not covered by `ioprio_set`/`SCHED_IDLE` | `ioprio_set` / `SCHED_IDLE` | Declared as known deviation. |
 | 8 | Parallel test execution SIGABRT | Code / Integration | `oceanfs-node` lib tests crash under parallel execution (RocksDB C++). Serial execution (`--test-threads=1`) passes. See `PIPELINE.md` §4.6. |
 | 9 | No macOS cross-compilation verified | Code | Linux-only verification. All `#[cfg]` gates for Linux-specific code are in place but cross-compilation to macOS not tested. |

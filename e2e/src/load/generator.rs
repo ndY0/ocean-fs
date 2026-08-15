@@ -29,7 +29,7 @@ use rand_chacha::ChaCha12Rng;
 use serde::Serialize;
 
 use super::manifest::Manifest;
-use crate::harness::{random_bytes, Cluster};
+use crate::harness::{random_bytes, LoadTarget};
 
 // ---------------------------------------------------------------------------
 // LoadScenario
@@ -814,13 +814,14 @@ impl AggregateStats {
 /// A single load-generator task.
 ///
 /// Each worker loops for the scenario duration, picks random
-/// operations/blobs/keys, executes them against the cluster, and
-/// records results in its [`WorkerStats`].
-pub struct Worker {
+/// operations/blobs/keys, executes them against the target (a spawned
+/// `Cluster` or a remote `RemoteCluster`), and records results in its
+/// [`WorkerStats`].
+pub struct Worker<C: LoadTarget> {
     /// Unique worker identifier.
     id: usize,
-    /// Reference to the cluster under test.
-    cluster: Arc<Cluster>,
+    /// Reference to the target under test.
+    cluster: Arc<C>,
     /// Shared manifest for tracking PUT/DELETE operations.
     manifest: Arc<Manifest>,
     /// Read-only scenario configuration.
@@ -832,7 +833,7 @@ pub struct Worker {
     activity: Arc<AtomicU64>,
 }
 
-impl Worker {
+impl<C: LoadTarget> Worker<C> {
     /// Creates a new worker.
     ///
     /// `activity` is a shared counter owned by the orchestrator: the
@@ -841,7 +842,7 @@ impl Worker {
     /// from workers that panicked before doing any work.
     pub fn new(
         id: usize,
-        cluster: Arc<Cluster>,
+        cluster: Arc<C>,
         manifest: Arc<Manifest>,
         scenario: Arc<LoadScenario>,
         activity: Arc<AtomicU64>,
@@ -1110,7 +1111,7 @@ impl Worker {
 pub struct Orchestrator;
 
 impl Orchestrator {
-    /// Runs a load scenario against a cluster.
+    /// Runs a load scenario against a load target.
     ///
     /// Spawns `scenario.concurrency` [`Worker`] tasks, sleeps for
     /// `scenario.duration`, joins all workers, and returns
@@ -1146,9 +1147,9 @@ impl Orchestrator {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn run(
+    pub async fn run<C: LoadTarget>(
         scenario: LoadScenario,
-        cluster: Arc<Cluster>,
+        cluster: Arc<C>,
         manifest: Arc<Manifest>,
     ) -> AggregateStats {
         let start = Instant::now();
@@ -1213,6 +1214,7 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::Cluster;
 
     // ── BlobSizeDist tests ─────
 
@@ -1444,7 +1446,7 @@ mod tests {
         let mut get_count = 0usize;
 
         for _ in 0..1000 {
-            match Worker::pick_operation(&ops, &mut rng) {
+            match Worker::<Cluster>::pick_operation(&ops, &mut rng) {
                 Operation::Put => put_count += 1,
                 Operation::Get => get_count += 1,
                 _ => {}
@@ -1480,10 +1482,12 @@ mod tests {
         let mut rng1 = ChaCha12Rng::seed_from_u64(scenario1.seed);
         let mut rng2 = ChaCha12Rng::seed_from_u64(scenario2.seed);
 
-        let ops1: Vec<Operation> =
-            (0..50).map(|_| Worker::pick_operation(&scenario1.operations, &mut rng1)).collect();
-        let ops2: Vec<Operation> =
-            (0..50).map(|_| Worker::pick_operation(&scenario2.operations, &mut rng2)).collect();
+        let ops1: Vec<Operation> = (0..50)
+            .map(|_| Worker::<Cluster>::pick_operation(&scenario1.operations, &mut rng1))
+            .collect();
+        let ops2: Vec<Operation> = (0..50)
+            .map(|_| Worker::<Cluster>::pick_operation(&scenario2.operations, &mut rng2))
+            .collect();
 
         assert_eq!(ops1, ops2, "same seed must produce identical operation sequence");
     }

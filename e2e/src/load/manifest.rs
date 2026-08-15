@@ -28,7 +28,7 @@ use std::{
 use dashmap::DashMap;
 use serde::Serialize;
 
-use crate::harness::Cluster;
+use crate::harness::LoadTarget;
 
 // ---------------------------------------------------------------------------
 // Manifest
@@ -109,7 +109,7 @@ impl Manifest {
         self.entries.iter().filter(|e| !e.1.load(Ordering::Relaxed)).count()
     }
 
-    /// Verifies every non-deleted entry against the cluster.
+    /// Verifies every non-deleted entry against the load target.
     ///
     /// Runs sequentially (single-threaded) after all workers stop.
     /// For each key: GET from a random alive node, compute BLAKE3
@@ -119,9 +119,12 @@ impl Manifest {
     /// On connection errors, retries with exponential backoff
     /// (100ms, 200ms, 400ms, 800ms).
     ///
+    /// The target is generic over [`LoadTarget`] so verification works
+    /// against both spawned `Cluster`s and remote `RemoteCluster`s.
+    ///
     /// Returns a vector of [`Mismatch`] entries for any keys whose
     /// final content matches none of the written versions.
-    pub async fn verify(&self, cluster: &Cluster) -> Vec<Mismatch> {
+    pub async fn verify<C: LoadTarget>(&self, target: &C) -> Vec<Mismatch> {
         let mut mismatches = Vec::new();
 
         for entry in self.entries.iter() {
@@ -131,7 +134,7 @@ impl Manifest {
                 continue;
             }
 
-            if let Some(mismatch) = verify_one(cluster, &key, versions).await {
+            if let Some(mismatch) = verify_one(target, &key, versions).await {
                 mismatches.push(mismatch);
             }
         }
@@ -170,22 +173,22 @@ pub struct Mismatch {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Verifies a single manifest entry against the cluster.
+/// Verifies a single manifest entry against the load target.
 ///
 /// Returns `None` on success (the response hash matched one of the
 /// recorded versions), or `Some(Mismatch)` on failure.
 ///
 /// Retries with exponential backoff on transient errors. Reports the key
 /// as `"unreachable"` if all retries are exhausted.
-async fn verify_one(
-    cluster: &Cluster,
+async fn verify_one<C: LoadTarget>(
+    target: &C,
     composite_key: &str,
     expected: &HashSet<[u8; 32]>,
 ) -> Option<Mismatch> {
     let backoffs = [100u64, 200, 400, 800];
 
     for &backoff_ms in &backoffs {
-        if cluster.is_empty() {
+        if target.is_empty() {
             return Some(Mismatch {
                 key: composite_key.to_string(),
                 expected_hash: format!("one of {} recorded versions", expected.len()),
@@ -194,11 +197,10 @@ async fn verify_one(
             });
         }
 
-        let node_idx = rand::random::<usize>() % cluster.len();
-        let node = cluster.node(node_idx);
-        let node_addr = node.http_addr().to_string();
+        let node_idx = rand::random::<usize>() % target.len();
+        let node_addr = target.node_addr(node_idx).to_string();
 
-        match cluster.get(node_idx, &format!("/{composite_key}")).await {
+        match target.get(node_idx, &format!("/{composite_key}")).await {
             Ok(resp) if resp.status().is_success() => {
                 let body = resp.bytes().await.unwrap_or_default();
                 let actual_hash = blake3::hash(&body);
@@ -214,8 +216,10 @@ async fn verify_one(
             }
             Ok(resp) => {
                 // Non-success status (e.g., 404, 500) — may be transient.
-                if resp.status().as_u16() == 404 {
-                    // Key not found — might not have been replicated yet.
+                if resp.status().as_u16() == 404 || (500..600).contains(&resp.status().as_u16()) {
+                    // Key not found (404) or transient server error (5xx
+                    // — e.g. the node is still settling after a restart)
+                    // — retry with backoff.
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     continue;
                 }
@@ -235,11 +239,8 @@ async fn verify_one(
     }
 
     // All retries exhausted.
-    let node = if cluster.is_empty() {
-        "(no nodes)".to_string()
-    } else {
-        cluster.node(0).http_addr().to_string()
-    };
+    let node =
+        if target.is_empty() { "(no nodes)".to_string() } else { target.node_addr(0).to_string() };
     Some(Mismatch {
         key: composite_key.to_string(),
         expected_hash: format!("one of {} recorded versions", expected.len()),
@@ -271,9 +272,9 @@ impl Manifest {
     /// Runs verification and returns a serializable summary.
     ///
     /// This is a convenience wrapper around [`verify`](Self::verify).
-    pub async fn verify_summary(&self, cluster: &Cluster) -> ManifestSummary {
+    pub async fn verify_summary<C: LoadTarget>(&self, target: &C) -> ManifestSummary {
         let objects_written = self.len();
-        let mismatches = self.verify(cluster).await;
+        let mismatches = self.verify(target).await;
         let objects_verified = objects_written.saturating_sub(mismatches.len());
         ManifestSummary {
             objects_written,

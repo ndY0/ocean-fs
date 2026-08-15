@@ -549,7 +549,10 @@ impl Node {
             WalConfig { data_dir: config.data_dir.join("wal"), ..WalConfig::default() };
         let wal_writer = oceanfs_storage::WalWriter::open(&wal_config)
             .await
-            .map_err(|e| format!("failed to open WAL writer: {e}"))?;
+            .map_err(|e| format!("failed to open WAL writer: {e}"))?
+            // Seal-aware retention: rotation must keep files holding
+            // entries for unsealed segments.
+            .with_metadata(metadata_store.clone());
         let wal_writer = Arc::new(wal_writer);
 
         // Per-core segment shards for write concurrency (perf rule §2.5).
@@ -577,6 +580,10 @@ impl Node {
             SegmentShard::new(shard_count, SizeTier::Standard, &segment_size, &shard_buffer_pool)
                 .map_err(|e| format!("failed to create standard segment shard: {e}"))?,
         );
+        // Keep clones for metric registration — the originals are moved
+        // into the write coordinator below.
+        let shard_small_metrics = Arc::clone(&shard_small);
+        let shard_standard_metrics = Arc::clone(&shard_standard);
 
         // Segment pools for pipeline parallelism (perf rule §2.7).
         // Created before WAL replay so that replayed entries can be
@@ -611,12 +618,38 @@ impl Node {
         // ---- 6a. Replay WAL from any previous unclean shutdown (C4-storage, D6) ----
         // Rebuilds in-memory active segments from unsealed WAL entries left
         // behind by a crash. Occurs before the HTTP server binds.
+        //
+        // Entries for already-sealed segments are skipped: the disk file
+        // is authoritative, and replaying a partial WAL tail (entries
+        // spanning a rotation boundary are truncated) would shadow the
+        // durable file with a corrupt pool copy. Only entries with
+        // `sealed_at` set count as sealed — the write path registers
+        // pre-seal metadata (`sealed_at: None`) for admin visibility,
+        // and those segments' data lives exclusively in the WAL.
+        // Entries for deleted segments are skipped too: GC/orphan-reaper
+        // removed the data intentionally; rebuilding it would resurrect
+        // garbage segments in the pools.
+        let finalized: std::collections::HashSet<_> = metadata_store
+            .list_segments()
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .filter(|meta| meta.sealed_at.is_some())
+            .map(|meta| meta.segment_id)
+            .chain(
+                metadata_store
+                    .list_deleted_segments()
+                    .into_iter()
+                    .filter_map(|r| r.ok())
+                    .map(|(id, _)| id),
+            )
+            .collect();
         let replay_summary = oceanfs_storage::wal::replay_wal(
             &wal_config,
             &wal_writer,
             &segment_pool_small,
             &segment_pool_standard,
             &segment_size,
+            |segment_id| finalized.contains(&segment_id),
         )
         .await
         .map_err(|e| format!("WAL replay failed: {e}"))?;
@@ -631,7 +664,21 @@ impl Node {
             );
             // Best-effort: remove old WAL files that have been fully replayed.
             // Failure is logged but does not prevent startup (H8-storage).
-            oceanfs_storage::wal::cleanup_old_wal_files(&wal_config).await;
+            // keep=1: only the current (truncated) file survives — every
+            // entry was replayed into the pools, so older files are dead
+            // (the seal-aware check may still protect files holding
+            // entries for segments rebuilt-but-not-yet-resealed).
+            oceanfs_storage::wal::cleanup_old_wal_files(&wal_config, 1, Some(&metadata_store))
+                .await;
+            // Markers for segments no longer referenced by any retained
+            // file are garbage — prune them now that the retained-file
+            // scan has effectively been paid for by the replay above.
+            let pruned =
+                oceanfs_storage::wal::prune_deleted_segment_markers(&wal_config, &metadata_store)
+                    .await;
+            if pruned > 0 {
+                info!(pruned, "pruned stale deleted-segment markers after replay");
+            }
         }
 
         // ADR-0001: tiered segment sizing driven by SegmentSizeConfig.
@@ -643,6 +690,10 @@ impl Node {
             write_mode: oceanfs_storage::io::SegmentWriteMode::probe(
                 config.data_dir.join("segments"),
             ),
+            // Seal pipeline batching (userland-configurable): the fsync
+            // group-commit window and the early-flush trigger size.
+            fsync_batch_timeout_ms: config.seal_fsync_batch_timeout_ms,
+            fsync_max_waiters: config.seal_fsync_max_waiters,
         };
         // SegmentSealer is the authoritative persistence path. Sealed
         // segments are written to {data_dir}/segments/ with the configured
@@ -914,6 +965,8 @@ impl Node {
         // closing the read-after-write gap for recently-written data.
         let active_pools: Vec<Arc<SegmentPool>> =
             vec![segment_pool_small.clone(), segment_pool_standard.clone()];
+        // Retained for the live `segment_active_count` metric poller.
+        let active_pools_for_metrics = active_pools.clone();
         let segment_reader = Arc::new(oceanfs_storage::io::PoolFallbackReader::new(
             active_pools,
             segment_reader.clone(),
@@ -1019,6 +1072,10 @@ impl Node {
         ae_worker.register_metrics(&*metrics);
         hinted_handoff.register_metrics(&*metrics);
         pool.register_metrics(&*metrics);
+        // Segment shard gauges (`segment_active_count` — Phase 2
+        // asserts the segment pipeline is producing segments).
+        shard_small_metrics.register_metrics(&*metrics);
+        shard_standard_metrics.register_metrics(&*metrics);
         membership.register_gossip_metrics(&*metrics);
         wal_writer.register_metrics(&*metrics);
         sealer.register_metrics(&*metrics);
@@ -1032,9 +1089,18 @@ impl Node {
         let proc_mem_gauge =
             metrics.gauge("process_resident_memory_bytes", "Resident memory in bytes");
         let proc_fd_gauge = metrics.gauge("process_open_fds", "Open file descriptors");
+        // Storage WAL file count — the Phase 2 `wal_not_unbounded`
+        // invariant (sealed segments must keep the WAL consumed).
+        let wal_count_gauge = metrics.gauge("wal_file_count", "Storage WAL files present");
+        // Live segment-pipeline gauge: the shard registration above sets
+        // the initial value; this poller refreshes it from the pools'
+        // Appending slots, which churn as segments fill and seal.
+        let active_segments_gauge =
+            metrics.gauge("segment_active_count", "Active segment groups in the sharded pool");
 
         // Spawn a background poller for process-level metrics (every 15s).
         // RocksDB metrics are polled separately by metadata_store.start_metrics_task().
+        let wal_dir = wal_config.data_dir.clone();
         let _process_poller = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(15));
             loop {
@@ -1045,6 +1111,10 @@ impl Node {
                 if let Ok(fds) = read_process_open_fds() {
                     proc_fd_gauge.set(fds);
                 }
+                let wal_config = WalConfig { data_dir: wal_dir.clone(), ..WalConfig::default() };
+                wal_count_gauge.set(oceanfs_storage::count_wal_files(&wal_config) as u64);
+                let live = active_pools_for_metrics.iter().map(|p| p.active_count()).sum::<usize>();
+                active_segments_gauge.set(live as u64);
             }
         });
 

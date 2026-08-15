@@ -4,7 +4,7 @@
 //! deletion, and listing. Concrete implementations live in
 //! `oceanfs-storage` and are wired in `oceanfs-node`.
 
-use oceanfs_core::{BucketId, Hlc, ObjectKey, ObjectMetadata, SegmentMetadata};
+use oceanfs_core::{BucketId, Hlc, ObjectKey, ObjectMetadata, SegmentId, SegmentMetadata};
 
 /// Result type for metadata operations.
 pub type Result<T, E = MetadataError> = std::result::Result<T, E>;
@@ -76,6 +76,17 @@ pub trait MetadataOps: Send + Sync + 'static {
     ///
     /// Returns an error if the metadata store is unavailable.
     fn put_segment(&self, meta: SegmentMetadata) -> Result<()>;
+
+    /// Retrieves segment metadata for a given segment ID.
+    ///
+    /// Returns `Ok(None)` if the segment does not exist. Used by the
+    /// write path to avoid clobbering a sealed segment's metadata with
+    /// a pre-seal registration entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata store is unavailable.
+    fn get_segment(&self, id: SegmentId) -> Result<Option<SegmentMetadata>>;
 
     /// Lists objects in a bucket matching the given prefix.
     ///

@@ -33,12 +33,12 @@ pub mod atomic_write;
 pub mod direct;
 pub mod mmap;
 pub mod sched;
+pub mod segment_flush;
 pub mod segment_reader;
 #[cfg(feature = "sendfile")]
 pub mod sendfile;
 pub mod uring;
 
-pub(crate) use atomic_write::write_atomic;
 pub use atomic_write::SegmentWriteMode;
 pub use direct::DirectIoBuf;
 pub use mmap::SegmentFileCache;

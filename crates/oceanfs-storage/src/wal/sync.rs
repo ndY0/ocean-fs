@@ -42,6 +42,30 @@ pub(crate) fn sync_file_range_and_fdatasync(
     offset: u64,
     length: u64,
 ) -> std::io::Result<()> {
+    sync_file_range_write(file, offset, length)?;
+    file.sync_data()
+}
+
+/// Kicks write-back of dirty pages in `[offset, offset+length)` WITHOUT
+/// waiting for the barrier (non-blocking `SYNC_FILE_RANGE_WRITE`).
+///
+/// Used by the segment flush coordinator to start write-back for every
+/// file in a group-commit batch before issuing the per-file barriers,
+/// so the barriers overlap across files. No-op on non-Linux.
+///
+/// # Errors
+///
+/// Returns an I/O error if `sync_file_range` fails.
+///
+/// # Safety
+///
+/// The `fd` must be a valid file descriptor for an open file.
+#[allow(unsafe_code)]
+pub(crate) fn sync_file_range_write(
+    file: &std::fs::File,
+    offset: u64,
+    length: u64,
+) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
@@ -64,14 +88,12 @@ pub(crate) fn sync_file_range_and_fdatasync(
         if ret != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        // fdatasync: flush data pages only — skips inode metadata.
-        file.sync_data()
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (offset, length);
-        file.sync_data()
     }
+    Ok(())
 }
 
 /// Internal group-commit coordinator for batched WAL fsync.

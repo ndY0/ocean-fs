@@ -212,7 +212,10 @@ impl OrphanReaper {
     pub(crate) fn build_referenced_set(&self) -> Result<HashSet<SegmentId>> {
         let mut referenced = HashSet::new();
 
-        let all_objects = self.metadata.list_objects(&oceanfs_core::BucketId::new("default"), "");
+        // Scan EVERY bucket: a per-bucket scan would classify every
+        // segment owned by other buckets as an orphan and delete live
+        // data (e.g. the load-test bucket in Phase 2 runs).
+        let all_objects = self.metadata.list_objects_all();
 
         for obj in all_objects.into_iter().flatten() {
             for chunk in &obj.chunks {
@@ -331,6 +334,30 @@ mod tests {
         let stats = reaper.run_cycle().await.unwrap();
         assert_eq!(stats.segments_scanned, 1);
         assert_eq!(stats.orphans_found, 0);
+    }
+
+    #[tokio::test]
+    async fn object_in_non_default_bucket_keeps_segment_alive() {
+        // Regression: the referenced set must scan ALL buckets. A
+        // per-bucket scan (e.g. "default" only) classifies every segment
+        // owned by other buckets as an orphan and deletes live data —
+        // this is what lost Phase 2 pre-crash objects on restart.
+        let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+
+        let seg_id = SegmentId::new();
+        let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1000000000000);
+        metadata.put_segment(seg_meta).unwrap();
+
+        // Object lives in the "load-test" bucket, not "default".
+        let obj_meta =
+            make_object_meta("hot-1", 500, ChunkRef { segment_id: seg_id, offset: 0, length: 500 });
+        metadata.put_object_in_bucket(&BucketId::new("load-test"), obj_meta).unwrap();
+
+        let store = test_shard_store();
+        let reaper = OrphanReaper::new(metadata, store, GcConfig::default());
+        let stats = reaper.run_cycle().await.unwrap();
+        assert_eq!(stats.segments_scanned, 1);
+        assert_eq!(stats.orphans_found, 0, "referenced segment must not be reaped");
     }
 
     #[tokio::test]

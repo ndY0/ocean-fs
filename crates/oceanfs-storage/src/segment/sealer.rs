@@ -14,7 +14,12 @@ use oceanfs_hash::{Blake3Hasher, Hasher};
 
 use crate::{
     error::{Error, Result},
-    io::{write_atomic, IoReadMode, SegmentWriteMode},
+    io::{
+        atomic_write::{create_temp, temp_path},
+        direct::{DirectIoBuf, OpenOptionsDirectExt},
+        segment_flush::{FinalizeOp, SegmentFlushGroup},
+        IoReadMode, SegmentWriteMode,
+    },
     metadata::RocksDbMetadataStore,
     segment::{
         buffer::ActiveSegment,
@@ -48,6 +53,35 @@ pub struct SealConfig {
     /// rename path. Probe once at startup with
     /// `SegmentWriteMode::probe()`.
     pub write_mode: SegmentWriteMode,
+    /// Group-commit window for sealed-segment fsync, in milliseconds:
+    /// how long the flush coordinator collects seal registrations
+    /// before issuing the batch's per-file sync barriers (mirrors the
+    /// WAL's `fsync_batch_timeout_ms`, perf rule §3.4). Default: 10 ms.
+    ///
+    /// Larger windows batch more concurrent seals per barrier round but
+    /// add up to `fsync_batch_timeout_ms` of latency to each seal
+    /// completion. The seal is asynchronous (nothing user-facing waits
+    /// on it), so this is a drain-rate / burst-amortization trade-off.
+    pub fsync_batch_timeout_ms: u64,
+    /// Early-flush trigger: when this many seal registrations are
+    /// pending, the flush coordinator flushes the batch immediately
+    /// instead of waiting for the window to expire. Default: 8
+    /// (matches `PoolConfig::max_inflight_encodes`).
+    pub fsync_max_waiters: usize,
+}
+
+impl Default for SealConfig {
+    fn default() -> Self {
+        Self {
+            target_size_bytes: 4 * 1024 * 1024,
+            seal_timeout_ms: 5000,
+            data_dir: PathBuf::new(),
+            io_mode: IoReadMode::Buffered,
+            write_mode: SegmentWriteMode::Rename,
+            fsync_batch_timeout_ms: 10,
+            fsync_max_waiters: 8,
+        }
+    }
 }
 
 /// Orchestrates the sealing of active segments.
@@ -55,6 +89,9 @@ pub struct SegmentSealer {
     config: SealConfig,
     metadata: Arc<RocksDbMetadataStore>,
     wal: Arc<WalWriter>,
+    /// Group-commit coordinator for segment fsync + metadata batching.
+    /// Lazily constructed on first seal (needs a tokio runtime).
+    flush: std::sync::OnceLock<std::sync::Arc<SegmentFlushGroup>>,
     /// Segment seal error counter.
     seal_errors: Counter,
 }
@@ -70,12 +107,30 @@ impl SegmentSealer {
             config,
             metadata,
             wal,
+            flush: std::sync::OnceLock::new(),
             seal_errors: Counter::new(
                 "segment_seal_errors_total".into(),
                 "Number of segment sealing failures".into(),
                 LabelSet::empty(),
             ),
         }
+    }
+
+    /// Returns the flush coordinator, constructing it on first use.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a tokio runtime context (all production
+    /// call sites are async seal tasks).
+    fn flush_group(&self) -> &std::sync::Arc<SegmentFlushGroup> {
+        self.flush.get_or_init(|| {
+            std::sync::Arc::new(SegmentFlushGroup::new(
+                Arc::clone(&self.metadata),
+                self.config.data_dir.clone(),
+                self.config.fsync_batch_timeout_ms,
+                self.config.fsync_max_waiters,
+            ))
+        })
     }
 
     /// Sets an optional blob store for unified segment data access.
@@ -248,71 +303,12 @@ impl SegmentSealer {
         let index_bytes = index.to_bytes();
 
         // Write segment file: header + data + [parity] + index.
-        let path = self.config.data_dir.join(format!("{segment_id}.dat"));
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
+        let filename = format!("{segment_id}.dat");
+        let dir = self.config.data_dir.clone();
+        tokio::fs::create_dir_all(&dir).await?;
 
-        let mut file_data = Vec::with_capacity(
-            header_bytes.len()
-                + data.len()
-                + parity_bytes.as_ref().map_or(0, |p| p.len())
-                + index_bytes.len(),
-        );
-        file_data.extend_from_slice(&header_bytes);
-        file_data.extend_from_slice(&data);
-        if let Some(section) = parity_bytes.as_ref() {
-            file_data.extend_from_slice(section);
-        }
-        file_data.extend_from_slice(&index_bytes);
-
-        // Select the I/O path based on the configured read mode.
-        match self.config.io_mode {
-            IoReadMode::Direct => {
-                // O_DIRECT requires the buffer to be 512-byte aligned
-                // AND the I/O size to be a multiple of 512 bytes.
-                const BLOCK_SIZE: usize = 512;
-                let pad = (BLOCK_SIZE - (file_data.len() % BLOCK_SIZE)) % BLOCK_SIZE;
-                file_data.resize(file_data.len() + pad, 0);
-
-                #[cfg(target_os = "linux")]
-                {
-                    use std::io::Write;
-
-                    use crate::io::{direct::OpenOptionsDirectExt, DirectIoBuf};
-                    // Copy into a page-aligned buffer for O_DIRECT.
-                    let mut aligned = DirectIoBuf::new(file_data.len())?;
-                    aligned.copy_from_slice(&file_data);
-
-                    let mut file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(true)
-                        .with_direct()
-                        .open(&path)?;
-                    file.write_all(aligned.as_bytes())?;
-                    file.flush()?;
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    tokio::fs::write(&path, &file_data).await?;
-                }
-            }
-            _ => {
-                // Write atomically when O_TMPFILE is available (Linux 3.11+),
-                // falling back to a plain sync write on other platforms.
-                let filename = format!("{segment_id}.dat");
-                write_atomic(self.config.write_mode, &self.config.data_dir, &filename, &file_data)
-                    .map_err(|e| {
-                        Error::Io(std::io::Error::new(
-                            e.kind(),
-                            format!("segment write failed for {segment_id}: {e}"),
-                        ))
-                    })?;
-            }
-        }
-
-        // Persist segment metadata.
+        // Metadata is built before the flush registration — the flush
+        // coordinator batches it with the file's fsync (Design B).
         let meta = SegmentMetadata {
             segment_id,
             ec_k,
@@ -327,17 +323,67 @@ impl SegmentSealer {
                     .as_millis() as i64,
             ),
         };
-        self.metadata
-            .put_segment(meta)
-            .map_err(|e| Error::Io(std::io::Error::other(format!("metadata write failed: {e}"))))?;
+
+        // Design A — write/flush split: write the data to a temp file
+        // (no fsync yet) on the blocking pool, then register with the
+        // flush coordinator. The coordinator group-commits the per-file
+        // syncs across concurrent seals and persists the metadata in one
+        // RocksDB batch; the completion signal fires only after the file
+        // is durable AND its metadata is written (ADR-0021 ordering —
+        // the seal worker removes the sealing-data entry after
+        // `seal_from_data` returns Ok).
+        //
+        // The file parts travel as (header, data, parity, index) slices —
+        // no concatenation Vec, no data copy on the buffered path.
+        let io_mode = self.config.io_mode;
+        let write_mode = self.config.write_mode;
+        let write_filename = filename.clone();
+        let cleanup_dir = dir.clone();
+        let (file, finalize_op) = tokio::task::spawn_blocking(move || {
+            let parts = SegmentFileParts {
+                header: &header_bytes,
+                data: &data,
+                parity: parity_bytes.as_deref(),
+                index: &index_bytes,
+            };
+            write_segment_temp(&dir, &write_filename, parts, io_mode, write_mode)
+        })
+        .await
+        .map_err(|e| {
+            Error::Io(std::io::Error::other(format!(
+                "segment temp write task failed for {segment_id}: {e}"
+            )))
+        })?
+        .map_err(|e| {
+            // Hygiene: if the temp write failed after creating the file,
+            // remove the leftover `.tmp.{filename}` so failed seals do
+            // not accumulate disk garbage (the unnamed O_TMPFILE is
+            // reclaimed by the kernel on fd close).
+            let _ =
+                std::fs::remove_file(crate::io::atomic_write::temp_path(&cleanup_dir, &filename));
+            Error::Io(std::io::Error::new(
+                e.kind(),
+                format!("segment write failed for {segment_id}: {e}"),
+            ))
+        })?;
+
+        self.flush_group().submit(file, filename, finalize_op, meta).await?;
 
         // WAL entries for sealed segments are cleaned up at file rotation time.
         Ok(SegmentHandle::new(segment_id, vec![]))
     }
 
-    /// Registers the segment sealer counter with a metrics registrar.
+    /// Registers the segment sealer counters with a metrics registrar.
+    ///
+    /// Registers the seal-error counter plus the flush coordinator's
+    /// batching counters (fsyncs, flush batches, metadata batches) so
+    /// group-commit behavior is observable in production.
     pub fn register_metrics(&self, registrar: &dyn oceanfs_core::MetricRegistrar) {
         registrar.register_counter(self.seal_errors.clone());
+        let stats = self.flush_group().stats();
+        registrar.register_counter(stats.fsyncs_total.clone());
+        registrar.register_counter(stats.batches_total.clone());
+        registrar.register_counter(stats.metadata_batches_total.clone());
     }
 
     /// Returns a reference to the WAL writer for crash-recovery
@@ -346,6 +392,121 @@ impl SegmentSealer {
     pub fn wal_writer(&self) -> &Arc<WalWriter> {
         &self.wal
     }
+}
+
+/// The serialized parts of a sealed segment file, in on-disk order:
+/// header, data, [parity], index.
+///
+/// Kept as slices so the write path can emit each part directly from
+/// its source buffer — the segment `Bytes` is written zero-copy (no
+/// per-seal concatenation Vec, perf §1.1).
+struct SegmentFileParts<'a> {
+    /// Serialized segment header.
+    header: &'a [u8],
+    /// Raw segment data (the frozen `Bytes`).
+    data: &'a [u8],
+    /// Optional EC parity section.
+    parity: Option<&'a [u8]>,
+    /// Serialized blob index.
+    index: &'a [u8],
+}
+
+impl SegmentFileParts<'_> {
+    /// Total on-disk length of all parts.
+    fn len(&self) -> usize {
+        self.header.len() + self.data.len() + self.parity.map_or(0, |p| p.len()) + self.index.len()
+    }
+}
+
+/// Writes a sealed segment's file parts to a temp file WITHOUT syncing.
+///
+/// No per-seal concatenation Vec is built: the buffered path writes
+/// each part directly from its source slice — the segment `Bytes` is
+/// written zero-copy (perf §1.1). The O_DIRECT path copies the parts
+/// into ONE page-aligned buffer (alignment is unavoidable for
+/// O_DIRECT), padded in place to a 512-byte multiple.
+///
+/// Returns the open temp file handle and the finalize operation the
+/// flush coordinator must apply after the group-committed fsync:
+///
+/// - `io_mode == Direct` (Linux): `.tmp.{filename}` opened with
+///   `O_DIRECT` (aligned buffer, 512-byte padded), finalized by rename.
+///   The O_DIRECT arm now also gets its fsync via the flush coordinator
+///   (previously the Direct path never synced at all — `File::flush()`
+///   is a no-op).
+/// - `write_mode == Tmpfile`: unnamed `O_TMPFILE`, finalized by `linkat`
+///   (never visible until linked).
+/// - otherwise: `.tmp.{filename}`, finalized by rename.
+///
+/// Runs on the blocking pool (single scheduler — the seal task never
+/// performs blocking I/O on a runtime worker).
+fn write_segment_temp(
+    dir: &std::path::Path,
+    filename: &str,
+    parts: SegmentFileParts<'_>,
+    io_mode: IoReadMode,
+    write_mode: SegmentWriteMode,
+) -> std::io::Result<(std::fs::File, FinalizeOp)> {
+    if io_mode == IoReadMode::Direct {
+        #[cfg(target_os = "linux")]
+        {
+            use std::io::Write;
+
+            // O_DIRECT requires the buffer to be 512-byte aligned AND
+            // the I/O size to be a multiple of 512 bytes. Build ONE
+            // aligned buffer from the parts and pad in place.
+            const BLOCK_SIZE: usize = 512;
+            let total = parts.len();
+            let pad = (BLOCK_SIZE - (total % BLOCK_SIZE)) % BLOCK_SIZE;
+
+            let mut aligned = DirectIoBuf::new(total + pad)?;
+            let buf = aligned.as_bytes_mut();
+            let mut off = 0;
+            buf[off..off + parts.header.len()].copy_from_slice(parts.header);
+            off += parts.header.len();
+            buf[off..off + parts.data.len()].copy_from_slice(parts.data);
+            off += parts.data.len();
+            if let Some(p) = parts.parity {
+                buf[off..off + p.len()].copy_from_slice(p);
+                off += p.len();
+            }
+            buf[off..off + parts.index.len()].copy_from_slice(parts.index);
+            // `pad` bytes remain zero (DirectIoBuf is zero-initialised).
+
+            let tmp = temp_path(dir, filename);
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .with_direct()
+                .open(&tmp)?;
+            file.write_all(aligned.as_bytes())?;
+            return Ok((file, FinalizeOp::Rename));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = write_mode;
+            // O_DIRECT is not available — fall through to the buffered
+            // temp-file path (rename finalize).
+        }
+    }
+
+    let file = create_temp(write_mode, dir, filename)?;
+    {
+        use std::io::Write;
+        // Zero-copy: write each part directly from its source slice.
+        (&file).write_all(parts.header)?;
+        (&file).write_all(parts.data)?;
+        if let Some(p) = parts.parity {
+            (&file).write_all(p)?;
+        }
+        (&file).write_all(parts.index)?;
+    }
+    let op = match write_mode {
+        SegmentWriteMode::Tmpfile => FinalizeOp::Link,
+        SegmentWriteMode::Rename => FinalizeOp::Rename,
+    };
+    Ok((file, op))
 }
 
 #[cfg(test)]
@@ -386,6 +547,7 @@ mod tests {
             data_dir: dir.path().join("segments"),
             io_mode: IoReadMode::Buffered,
             write_mode: SegmentWriteMode::Rename,
+            ..Default::default()
         };
 
         let pool = BufferPool::new(65536, 4);
@@ -457,6 +619,7 @@ mod tests {
             data_dir: dir.path().join("segments"),
             io_mode: IoReadMode::Buffered,
             write_mode: SegmentWriteMode::Rename,
+            ..Default::default()
         };
         let pool = BufferPool::new(65536, 4);
         let size_config =
@@ -495,6 +658,161 @@ mod tests {
         assert!(
             names.contains(&"segment_seal_errors_total".to_string()),
             "seal_errors counter should be registered, got: {names:?}"
+        );
+        // The flush coordinator's batching counters must be registered
+        // too (metrics-counter instrumentation for the group commit).
+        assert!(
+            names.contains(&"segment_fsyncs_total".to_string()),
+            "fsyncs counter should be registered, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"segment_metadata_batches_total".to_string()),
+            "metadata batch counter should be registered, got: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_seals_group_commit_fsyncs_and_batch_metadata() {
+        use oceanfs_core::{SegmentId, SizeTier};
+
+        use crate::io::segment_flush::LAST_FLUSH_THREAD;
+
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = Arc::new(
+            RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: dir.path().join("meta"),
+                block_cache_size: 1024,
+                memtable_size: 1024,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let wal = Arc::new(
+            WalWriter::open(&WalConfig {
+                data_dir: dir.path().join("wal"),
+                max_file_size_bytes: 1024 * 1024,
+                fsync_batch_timeout_ms: 5,
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        // Small window + small max_waiters so the batch trigger is
+        // exercised deterministically: 16 seals → at most 2 flush
+        // batches (max_waiters = 8).
+        let config = SealConfig {
+            target_size_bytes: 4096,
+            seal_timeout_ms: 1000,
+            data_dir: dir.path().join("segments"),
+            io_mode: IoReadMode::Buffered,
+            write_mode: SegmentWriteMode::Rename,
+            fsync_batch_timeout_ms: 100,
+            fsync_max_waiters: 8,
+        };
+        let sealer = Arc::new(SegmentSealer::new(config, metadata.clone(), wal));
+
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::thread::current().id().hash(&mut hasher);
+        let test_thread = hasher.finish();
+
+        // 16 concurrent seals, each 2 KiB of data (one stripe-less
+        // standard segment with a single index entry).
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let sealer = Arc::clone(&sealer);
+            handles.push(tokio::spawn(async move {
+                let id = SegmentId::new();
+                let data = Bytes::from(vec![0x5Au8; 2048]);
+                let entries =
+                    vec![SegmentIndexEntry { offset: 0, length: 2048, blob_key_hash: [0x11; 32] }];
+                sealer
+                    .seal_from_data(id, SizeTier::Standard, data, &entries, 0, 0, 0, None)
+                    .await
+                    .expect("seal must succeed");
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // The fsync count is one per file (syscalls cannot be batched),
+        // but the syncs must run on the flush coordinator's blocking
+        // pool — never on a seal task's runtime worker — and the
+        // metadata writes must be batched: 16 seals with max_waiters=8
+        // → at most 2 RocksDB WriteBatch writes.
+        let flush = sealer.flush_group();
+        let stats = flush.stats();
+        assert_eq!(stats.fsyncs_total.get(), 16);
+        assert!(
+            stats.metadata_batches_total.get() <= 2,
+            "16 seals with max_waiters=8 must write metadata in ≤ 2 batches, got {}",
+            stats.metadata_batches_total.get()
+        );
+        let flush_thread = LAST_FLUSH_THREAD.load(std::sync::atomic::Ordering::Relaxed);
+        assert_ne!(
+            flush_thread, test_thread,
+            "the batch fsync must run on the blocking pool, not a runtime worker"
+        );
+        // Every segment must be readable back from the metadata store.
+        assert_eq!(metadata.list_segments().into_iter().filter_map(Result::ok).count(), 16);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn direct_mode_seal_fsyncs_via_flush_coordinator() {
+        // F5: the O_DIRECT arm previously never synced at all
+        // (`File::flush()` is a no-op). With the write/flush split the
+        // Direct-mode temp file is registered with the flush
+        // coordinator, so the fsync counter must tick for it too.
+        use oceanfs_core::{SegmentId, SizeTier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = Arc::new(
+            RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: dir.path().join("meta"),
+                block_cache_size: 1024,
+                memtable_size: 1024,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let wal = Arc::new(
+            WalWriter::open(&WalConfig {
+                data_dir: dir.path().join("wal"),
+                max_file_size_bytes: 1024 * 1024,
+                fsync_batch_timeout_ms: 5,
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let config = SealConfig {
+            target_size_bytes: 4096,
+            seal_timeout_ms: 1000,
+            data_dir: dir.path().join("segments"),
+            io_mode: IoReadMode::Direct,
+            write_mode: SegmentWriteMode::Rename,
+            fsync_batch_timeout_ms: 100,
+            fsync_max_waiters: 8,
+        };
+        let sealer = Arc::new(SegmentSealer::new(config, metadata.clone(), wal));
+
+        let id = SegmentId::new();
+        let data = Bytes::from(vec![0x7Bu8; 2048]);
+        let entries =
+            vec![SegmentIndexEntry { offset: 0, length: 2048, blob_key_hash: [0x22; 32] }];
+        sealer
+            .seal_from_data(id, SizeTier::Standard, data, &entries, 0, 0, 0, None)
+            .await
+            .expect("direct-mode seal must succeed");
+
+        // The file must exist at its final name AND its sync must have
+        // been issued by the flush coordinator (F5).
+        assert!(dir.path().join("segments").join(format!("{id}.dat")).exists());
+        assert!(
+            sealer.flush_group().stats().fsyncs_total.get() >= 1,
+            "Direct-mode seal must fsync via the flush coordinator"
         );
     }
 

@@ -296,6 +296,22 @@ pub struct NodeConfig {
     #[serde(default = "default_max_inflight_writes")]
     pub max_inflight_writes: usize,
 
+    // ── Item 4c: Seal pipeline batching ──
+    /// Maximum time in milliseconds the seal flush coordinator collects
+    /// pending segment fsync registrations before issuing the batch
+    /// (group commit for segment files, mirroring the WAL's
+    /// `fsync_batch_timeout_ms`). Larger windows batch more concurrent
+    /// seals per barrier round but add up to `seal_fsync_batch_timeout_ms`
+    /// of latency to each seal completion. Default: 10 ms.
+    #[serde(default = "default_seal_fsync_batch_timeout_ms")]
+    pub seal_fsync_batch_timeout_ms: u64,
+    /// Maximum number of seal registrations collected into one flush
+    /// batch (early-flush trigger: when this many seals are pending, the
+    /// batch is flushed without waiting for the window to expire).
+    /// Default: 8 (matches `max_inflight_encodes`).
+    #[serde(default = "default_seal_fsync_max_waiters")]
+    pub seal_fsync_max_waiters: usize,
+
     // ── Item 5: Buffer pool configuration ──
     /// Buffer pool chunk size in bytes (default 65536 = 64 KB).
     #[serde(default = "default_buffer_pool_chunk_bytes")]
@@ -373,6 +389,12 @@ fn default_max_body_size() -> usize {
 
 fn default_max_inflight_writes() -> usize {
     64
+}
+fn default_seal_fsync_batch_timeout_ms() -> u64 {
+    10
+}
+fn default_seal_fsync_max_waiters() -> usize {
+    8
 }
 fn default_gc_interval() -> u64 {
     3600
@@ -577,6 +599,9 @@ impl Default for NodeConfig {
             // Item 5: Buffer pool
             buffer_pool_chunk_bytes: 65536,
             buffer_pool_max_chunks: 1024,
+            // Item 4c: Seal pipeline batching
+            seal_fsync_batch_timeout_ms: 10,
+            seal_fsync_max_waiters: 8,
             // Item 8: Shard count
             segment_shard_count: 0,
             segment_shard_count_max: 16,
@@ -608,6 +633,13 @@ mod tests {
     fn default_config_seed_nodes_is_empty() {
         let config = NodeConfig::default();
         assert!(config.gossip.seed_nodes.is_empty());
+    }
+
+    #[test]
+    fn default_seal_batching_knobs_are_sensible() {
+        let config = NodeConfig::default();
+        assert_eq!(config.seal_fsync_batch_timeout_ms, 10);
+        assert_eq!(config.seal_fsync_max_waiters, 8);
     }
 
     #[test]

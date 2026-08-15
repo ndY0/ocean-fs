@@ -74,6 +74,7 @@ async fn wal_truncation_called_during_seal() {
         data_dir: dir.path().join("segments"),
         io_mode: IoReadMode::Buffered,
         write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
+        ..Default::default()
     };
     let sealer = SegmentSealer::new(seal_config, metadata, wal.clone());
 

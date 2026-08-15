@@ -32,6 +32,32 @@ use crate::{
     metadata::cf,
 };
 
+/// A deleted-segment marker: records that a segment's data was
+/// intentionally removed (GC compaction or orphan reaper).
+///
+/// The WAL retention logic reads these markers to distinguish "deleted
+/// (WAL entries are garbage)" from "not yet sealed (WAL entries are the
+/// only durable copy)". Written atomically with the segment's metadata
+/// deletion, so a crash can never leave a deletion untracked. The value
+/// is the deletion timestamp as little-endian `i64` bytes.
+///
+/// Returns the current time in milliseconds since the UNIX epoch.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn encode_deleted_marker(deleted_at_ms: i64) -> Vec<u8> {
+    deleted_at_ms.to_le_bytes().to_vec()
+}
+
+fn decode_deleted_marker(value: &[u8]) -> Option<i64> {
+    let bytes: [u8; 8] = value.try_into().ok()?;
+    Some(i64::from_le_bytes(bytes))
+}
+
 /// RocksDB property gauges exposed for Prometheus / `/admin/metrics`.
 ///
 /// Updated periodically by a background task polling RocksDB internal
@@ -63,6 +89,12 @@ pub struct RocksDbMetrics {
     pub running_flushes: Gauge,
     /// Estimated number of keys across all CFs.
     pub estimate_num_keys: Gauge,
+    /// Number of SST files at level 0 (the write-stall sentinel).
+    pub num_files_at_level_0: Gauge,
+    /// Total size of all live SST files (bytes).
+    pub live_sst_files_size: Gauge,
+    /// Estimated memory used by table readers (bytes).
+    pub estimate_table_readers_mem: Gauge,
 }
 
 impl RocksDbMetrics {
@@ -100,6 +132,21 @@ impl RocksDbMetrics {
                 "Estimated number of keys across all CFs".into(),
                 empty.clone(),
             ),
+            num_files_at_level_0: Gauge::new(
+                "rocksdb_num_files_at_level_0".into(),
+                "Number of SST files at level 0".into(),
+                empty.clone(),
+            ),
+            live_sst_files_size: Gauge::new(
+                "rocksdb_live_sst_files_size_bytes".into(),
+                "Total size of all live SST files".into(),
+                empty.clone(),
+            ),
+            estimate_table_readers_mem: Gauge::new(
+                "rocksdb_estimate_table_readers_mem_bytes".into(),
+                "Estimated memory used by table readers".into(),
+                empty.clone(),
+            ),
         }
     }
 
@@ -125,6 +172,9 @@ impl RocksDbMetrics {
         registrar.register_gauge(self.running_compactions.clone());
         registrar.register_gauge(self.running_flushes.clone());
         registrar.register_gauge(self.estimate_num_keys.clone());
+        registrar.register_gauge(self.num_files_at_level_0.clone());
+        registrar.register_gauge(self.live_sst_files_size.clone());
+        registrar.register_gauge(self.estimate_table_readers_mem.clone());
     }
 }
 
@@ -214,11 +264,15 @@ impl RocksDbMetadataStore {
             false,
             config.memtable_size,
         );
+        // The deleted-segments marker CF is tiny (one small value per
+        // GC'd segment) — default options suffice.
+        let deleted_segments_opts = build_cf_opts(&block_cache, 1, false, config.memtable_size);
 
         let cf_descriptors = vec![
             ColumnFamilyDescriptor::new(cf::CF_OBJECTS, objects_opts),
             ColumnFamilyDescriptor::new(cf::CF_SEGMENTS, segments_opts),
             ColumnFamilyDescriptor::new(cf::CF_DELETIONS, deletions_opts),
+            ColumnFamilyDescriptor::new(cf::CF_DELETED_SEGMENTS, deleted_segments_opts),
         ];
 
         let db = DB::open_cf_descriptors(&opts, &config.data_dir, cf_descriptors)
@@ -239,69 +293,98 @@ impl RocksDbMetadataStore {
         // the block cache, but it prevents swap of the cache pages that
         // are already resident. New pages allocated by RocksDB after this
         // call are not locked.
+        //
+        // IMPORTANT — `MCL_FUTURE` is deliberately NOT used. With
+        // `MCL_FUTURE`, every subsequent `mmap` of the process counts
+        // against `RLIMIT_MEMLOCK`; once the process's locked total
+        // crosses that ceiling, ALL further allocations fail with
+        // `EAGAIN` ("too much memory has been locked") and Rust aborts
+        // via `handle_alloc_error`. Under sustained load this crashed
+        // the whole node the moment its footprint passed the ceiling
+        // (e.g. a 2 GB `RLIMIT_MEMLOCK` with a multi-GB write working
+        // set). Locking only the currently resident pages gives the
+        // swap defense without capping future growth.
         if config.mlock_block_cache && !cfg!(test) {
             #[cfg(target_os = "linux")]
             {
-                // SAFETY: `mlockall(MCL_CURRENT | MCL_FUTURE)` locks all
-                // currently mapped pages AND all future pages of the
-                // calling process into physical RAM. This prevents the
-                // kernel from swapping any RocksDB-allocated pages
-                // (block cache, memtables, SST index blocks) under
-                // memory pressure. The call requires `CAP_IPC_LOCK`;
-                // if not held, fails with EPERM and we log a warning.
+                // Check the lock ceiling BEFORE calling: if
+                // `RLIMIT_MEMLOCK` is 0 (e.g. systemd's historical
+                // `LimitMEMLOCK=0` default) the call can only fail
+                // uselessly; report it once instead.
+                let mut rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+                // SAFETY: `getrlimit` writes into `rlim`, a valid
+                // `libc::rlimit` whose lifetime covers the call.
                 #[allow(unsafe_code)]
-                let ret = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) };
-                if ret != 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() == Some(libc::EPERM) {
-                        tracing::warn!(
-                            "mlockall(MCL_CURRENT|MCL_FUTURE) failed: CAP_IPC_LOCK not held. \
-                             RocksDB block cache is not pinned in RAM — \
-                             system may swap it under memory pressure. \
-                             See deployment docs for capability requirements."
-                        );
-                    } else {
-                        tracing::warn!(
-                            error = %err,
-                            "mlockall(MCL_CURRENT|MCL_FUTURE) failed — \
-                             RocksDB block cache is not pinned in RAM"
-                        );
-                    }
+                let rlim_ok = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rlim) } == 0;
+                if rlim_ok && rlim.rlim_cur == 0 {
+                    tracing::warn!(
+                        "mlock_block_cache: RLIMIT_MEMLOCK = 0; \
+                         RocksDB block cache is not pinned in RAM. \
+                         Set LimitMEMLOCK (systemd) or the memlock \
+                         rlimit to enable page pinning."
+                    );
                 } else {
-                    // Verify the kernel actually honoured mlockall by
-                    // reading VmLck from /proc/self/status. The syscall
-                    // can return success even when RLIMIT_MEMLOCK silently
-                    // caps the locked amount below the block cache size.
-                    let locked_kb = read_vmlck_kb();
-                    let cache_mb = config.block_cache_size / (1024 * 1024);
-                    let locked_mb = locked_kb / 1024;
-
-                    if locked_kb == 0 {
-                        tracing::warn!(
-                            cache_mb,
-                            "mlockall returned success but VmLck = 0 kB. \
-                             RLIMIT_MEMLOCK is likely too low. \
-                             RocksDB block cache is NOT pinned in RAM. \
-                             Raise RLIMIT_MEMLOCK in systemd unit or \
-                             /etc/security/limits.conf to at least {cache_mb} MB."
-                        );
-                    } else if locked_mb < cache_mb as u64 / 2 {
-                        tracing::warn!(
-                            cache_mb,
-                            locked_mb,
-                            "mlockall locked only {locked_mb} MB but block cache \
-                             is {cache_mb} MB. RLIMIT_MEMLOCK may be insufficient. \
-                             RocksDB block cache is partially pinned — \
-                             some pages may still be swapped."
-                        );
+                    // SAFETY: `mlockall(MCL_CURRENT)` locks all currently
+                    // mapped pages of the calling process into physical
+                    // RAM. The call requires `CAP_IPC_LOCK` or a
+                    // sufficient `RLIMIT_MEMLOCK`; if not held, fails
+                    // with EPERM/ENOMEM and we log a warning. It does NOT
+                    // use `MCL_FUTURE`, so it imposes no cap on future
+                    // allocations (see the note above).
+                    #[allow(unsafe_code)]
+                    let ret = unsafe { libc::mlockall(libc::MCL_CURRENT) };
+                    if ret != 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.raw_os_error() == Some(libc::EPERM) {
+                            tracing::warn!(
+                                "mlockall(MCL_CURRENT) failed: CAP_IPC_LOCK not held. \
+                                 RocksDB block cache is not pinned in RAM — \
+                                 system may swap it under memory pressure. \
+                                 See deployment docs for capability requirements."
+                            );
+                        } else {
+                            tracing::warn!(
+                                error = %err,
+                                "mlockall(MCL_CURRENT) failed — \
+                                 RocksDB block cache is not pinned in RAM"
+                            );
+                        }
                     } else {
-                        tracing::info!(
-                            cache_mb,
-                            locked_mb,
-                            "RocksDB block cache pages pinned in RAM via \
-                             mlockall(MCL_CURRENT|MCL_FUTURE): \
-                             VmLck = {locked_mb} MB (cache = {cache_mb} MB)"
-                        );
+                        // Verify the kernel actually honoured mlockall by
+                        // reading VmLck from /proc/self/status. The syscall
+                        // can return success even when RLIMIT_MEMLOCK silently
+                        // caps the locked amount below the block cache size.
+                        let locked_kb = read_vmlck_kb();
+                        let cache_mb = config.block_cache_size / (1024 * 1024);
+                        let locked_mb = locked_kb / 1024;
+
+                        if locked_kb == 0 {
+                            tracing::warn!(
+                                cache_mb,
+                                "mlockall returned success but VmLck = 0 kB. \
+                                 RLIMIT_MEMLOCK is likely too low. \
+                                 RocksDB block cache is NOT pinned in RAM. \
+                                 Raise RLIMIT_MEMLOCK in systemd unit or \
+                                 /etc/security/limits.conf to at least {cache_mb} MB."
+                            );
+                        } else if locked_mb < cache_mb as u64 / 2 {
+                            tracing::warn!(
+                                cache_mb,
+                                locked_mb,
+                                "mlockall locked only {locked_mb} MB but block cache \
+                                 is {cache_mb} MB. RLIMIT_MEMLOCK may be insufficient. \
+                                 RocksDB block cache is partially pinned — \
+                                 some pages may still be swapped."
+                            );
+                        } else {
+                            tracing::info!(
+                                cache_mb,
+                                locked_mb,
+                                "RocksDB block cache pages pinned in RAM via \
+                                 mlockall(MCL_CURRENT): \
+                                 VmLck = {locked_mb} MB (cache = {cache_mb} MB)"
+                            );
+                        }
                     }
                 }
             }
@@ -465,6 +548,30 @@ impl RocksDbMetadataStore {
         .collect()
     }
 
+    /// Lists object metadata for every object across all buckets.
+    ///
+    /// Scans the whole objects column family. Used by the orphan reaper —
+    /// a per-bucket scan would miss objects in other buckets and mark
+    /// their segments as orphans.
+    pub fn list_objects_all(&self) -> Vec<Result<ObjectMetadata>> {
+        let cf = self.db.cf_handle(cf::CF_OBJECTS);
+        let Some(cf_handle) = cf else {
+            return vec![];
+        };
+        let iter = self.db.iterator_cf(&cf_handle, rocksdb::IteratorMode::Start);
+
+        iter.filter_map(|item| match item {
+            Ok((_key, value)) => match bincode::deserialize::<ObjectMetadata>(&value)
+                .or_else(|_| serde_json::from_slice::<ObjectMetadata>(&value))
+            {
+                Ok(meta) => Some(Ok(meta)),
+                Err(_) => None,
+            },
+            Err(e) => Some(Err(Error::Io(io_err(e)))),
+        })
+        .collect()
+    }
+
     // ------------------------------------------------------------------
     // Segment operations
     // ------------------------------------------------------------------
@@ -549,8 +656,88 @@ impl RocksDbMetadataStore {
             .ok_or_else(|| Error::InvalidConfig("segments CF not found".into()))?;
 
         let key = cf::encode_segment_key(&id);
-        self.db.delete_cf(&cf, key).map_err(|e| Error::Io(io_err(e)))?;
 
+        // A deleted segment's WAL entries become garbage — record the
+        // deletion atomically with the metadata removal so the WAL
+        // retention logic can sweep the entries instead of protecting
+        // them forever. The marker is written ONLY when the deleted
+        // entry was actually sealed: deleting a pre-seal phantom must
+        // never mark its still-live WAL entries as garbage.
+        let was_sealed =
+            self.get_segment(id).ok().flatten().is_some_and(|meta| meta.sealed_at.is_some());
+
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete_cf(&cf, &key);
+        if was_sealed {
+            let marker_cf = self
+                .db
+                .cf_handle(cf::CF_DELETED_SEGMENTS)
+                .ok_or_else(|| Error::InvalidConfig("deleted_segments CF not found".into()))?;
+            let value = encode_deleted_marker(now_ms());
+            batch.put_cf(&marker_cf, &key, value);
+        }
+        self.db.write(batch).map_err(|e| Error::Io(io_err(e)))?;
+
+        Ok(())
+    }
+
+    /// Records a deleted-segment marker.
+    ///
+    /// Idempotent: re-marking an already-marked segment overwrites the
+    /// timestamp. The marker tells the WAL retention logic that the
+    /// segment's WAL entries are garbage and may be swept.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the deleted_segments column family is not
+    /// found or the RocksDB write fails.
+    pub fn put_deleted_segment(&self, id: SegmentId, deleted_at_ms: i64) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(cf::CF_DELETED_SEGMENTS)
+            .ok_or_else(|| Error::InvalidConfig("deleted_segments CF not found".into()))?;
+        let key = cf::encode_segment_key(&id);
+        let value = encode_deleted_marker(deleted_at_ms);
+        self.db.put_cf(&cf, key, value).map_err(|e| Error::Io(io_err(e)))?;
+        Ok(())
+    }
+
+    /// Lists all deleted-segment markers as `(segment_id, deleted_at_ms)`.
+    ///
+    /// Used by the WAL retention logic to exempt deleted segments' WAL
+    /// entries from protection.
+    pub fn list_deleted_segments(&self) -> Vec<Result<(SegmentId, i64)>> {
+        let cf = self.db.cf_handle(cf::CF_DELETED_SEGMENTS);
+        let Some(cf_handle) = cf else {
+            return vec![];
+        };
+        let iter = self.db.iterator_cf(&cf_handle, rocksdb::IteratorMode::Start);
+        iter.filter_map(|item| match item {
+            Ok((key, value)) => {
+                let id = match cf::decode_segment_key(&key) {
+                    Some(id) => id,
+                    None => return None,
+                };
+                decode_deleted_marker(&value).map(|deleted_at_ms| Ok((id, deleted_at_ms)))
+            }
+            Err(e) => Some(Err(Error::Io(io_err(e)))),
+        })
+        .collect()
+    }
+
+    /// Removes a deleted-segment marker (used by the WAL marker prune).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the deleted_segments column family is not
+    /// found or the RocksDB delete fails.
+    pub fn delete_deleted_segment(&self, id: SegmentId) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(cf::CF_DELETED_SEGMENTS)
+            .ok_or_else(|| Error::InvalidConfig("deleted_segments CF not found".into()))?;
+        let key = cf::encode_segment_key(&id);
+        self.db.delete_cf(&cf, key).map_err(|e| Error::Io(io_err(e)))?;
         Ok(())
     }
 
@@ -823,7 +1010,24 @@ impl RocksDbMetadataStore {
                         .cf_handle(cf::CF_SEGMENTS)
                         .ok_or_else(|| Error::InvalidConfig("segments CF not found".into()))?;
                     let k = cf::encode_segment_key(segment_id);
-                    batch.delete_cf(&cf, k);
+                    batch.delete_cf(&cf, &k);
+                    // Record the deletion marker in the SAME batch so it
+                    // is atomic with the metadata removal. Only sealed
+                    // segments' entries become garbage — deleting a
+                    // pre-seal phantom must keep its WAL entries live.
+                    let was_sealed = self
+                        .get_segment(*segment_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|meta| meta.sealed_at.is_some());
+                    if was_sealed {
+                        let marker_cf =
+                            self.db.cf_handle(cf::CF_DELETED_SEGMENTS).ok_or_else(|| {
+                                Error::InvalidConfig("deleted_segments CF not found".into())
+                            })?;
+                        let v = encode_deleted_marker(now_ms());
+                        batch.put_cf(&marker_cf, &k, v);
+                    }
                 }
                 BatchOp::DeleteTombstone(bucket, key) => {
                     let cf = self
@@ -866,6 +1070,13 @@ impl RocksDbMetadataStore {
     /// Call this after opening the store when a Tokio runtime is available
     /// (typically at node startup). Test code may skip this.
     pub fn start_metrics_task(self: &Arc<Self>) {
+        // Property-availability check: a gauge that never resolves stays
+        // pinned at 0, which would silently hide real conditions (e.g.
+        // `rocksdb.num-files-at-level0` masking a write stall) from the
+        // load-test assertions.
+        for unresolved in unresolved_rocksdb_properties(&self.db) {
+            tracing::warn!("rocksdb property unavailable; gauge will stay at 0: {unresolved}");
+        }
         let db = Arc::clone(&self.db);
         let metrics = Arc::clone(&self.metrics);
         tokio::spawn(async move {
@@ -954,7 +1165,7 @@ async fn poll_rocksdb_metrics(db: Arc<DB>, metrics: Arc<RocksDbMetrics>) {
         if let Some(v) = property_u64(&db, "rocksdb.block.cache.miss") {
             metrics.block_cache_miss.set(v);
         }
-        if let Some(v) = property_u64(&db, "rocksdb.cur-size-all-mem-tables") {
+        if let Some(v) = property_u64_cf_sum(&db, "rocksdb.cur-size-all-mem-tables") {
             metrics.memtable_size.set(v);
         }
         if let Some(v) = property_u64(&db, "rocksdb.num-running-compactions") {
@@ -963,14 +1174,86 @@ async fn poll_rocksdb_metrics(db: Arc<DB>, metrics: Arc<RocksDbMetrics>) {
         if let Some(v) = property_u64(&db, "rocksdb.num-running-flushes") {
             metrics.running_flushes.set(v);
         }
-        if let Some(v) = property_u64(&db, "rocksdb.estimate-num-keys") {
+        if let Some(v) = property_u64_cf_sum(&db, "rocksdb.estimate-num-keys") {
             metrics.estimate_num_keys.set(v);
+        }
+        // SST-level properties are PER-COLUMN-FAMILY: the DB-level read
+        // reports the (empty) default CF, which would pin these gauges
+        // at 0 and make the write-stall assertion vacuous. Sum across
+        // the real CFs instead.
+        if let Some(v) = property_u64_cf_sum(&db, "rocksdb.num-files-at-level0") {
+            metrics.num_files_at_level_0.set(v);
+        }
+        if let Some(v) = property_u64_cf_sum(&db, "rocksdb.live-sst-files-size") {
+            metrics.live_sst_files_size.set(v);
+        }
+        if let Some(v) = property_u64_cf_sum(&db, "rocksdb.estimate-table-readers-mem") {
+            metrics.estimate_table_readers_mem.set(v);
         }
     }
 }
 
+/// Returns the RocksDB property value for `name` as a `u64`, or `None`
+/// when the property is unavailable (unknown on this RocksDB version).
 fn property_u64(db: &DB, name: &str) -> Option<u64> {
     db.property_int_value(name).ok().flatten()
+}
+
+/// Sums a RocksDB property across the three real column families.
+///
+/// Some properties (SST file counts, sizes, reader memory) are only
+/// reported per-CF; the DB-level read covers the empty default CF.
+fn property_u64_cf_sum(db: &DB, name: &str) -> Option<u64> {
+    let mut total = 0u64;
+    let mut found = false;
+    for cf_name in [cf::CF_OBJECTS, cf::CF_SEGMENTS, cf::CF_DELETIONS] {
+        if let Some(cf) = db.cf_handle(cf_name) {
+            if let Some(v) = db.property_int_value_cf(&cf, name).ok().flatten() {
+                total = total.saturating_add(v);
+                found = true;
+            }
+        }
+    }
+    found.then_some(total)
+}
+
+/// Verifies that the properties the metrics poller depends on actually
+/// resolve on this RocksDB build.
+///
+/// A property that silently fails to parse would leave its gauge pinned
+/// at 0 — for `rocksdb.num-files-at-level0` that would hide a real
+/// write-stall condition from the load-test assertions. Returns the
+/// names of any unresolvable properties.
+///
+/// Note: `rocksdb.block.cache.hit`/`miss` are intentionally absent from
+/// the required list — they do not resolve via `property_int_value` on
+/// current RocksDB builds (pre-existing; the block-cache gauges polled
+/// from them have always read 0). Phase 2 assertions use the L1 object
+/// cache counters instead.
+pub(crate) fn unresolved_rocksdb_properties(db: &DB) -> Vec<String> {
+    const REQUIRED: &[&str] = &["rocksdb.num-running-compactions", "rocksdb.num-running-flushes"];
+    // SST-level properties are per-CF; require them on at least the
+    // objects CF (the busiest).
+    const REQUIRED_CF: &[&str] = &[
+        "rocksdb.num-files-at-level0",
+        "rocksdb.live-sst-files-size",
+        "rocksdb.estimate-table-readers-mem",
+    ];
+    let mut unresolved: Vec<String> = REQUIRED
+        .iter()
+        .filter(|name| property_u64(db, name).is_none())
+        .map(|name| (*name).to_string())
+        .collect();
+    for name in REQUIRED_CF {
+        let Some(cf) = db.cf_handle(cf::CF_OBJECTS) else {
+            unresolved.push(format!("{name} (objects CF missing)"));
+            continue;
+        };
+        if db.property_int_value_cf(&cf, *name).ok().flatten().is_none() {
+            unresolved.push(format!("{name} (objects CF)"));
+        }
+    }
+    unresolved
 }
 
 // ---------------------------------------------------------------------------
@@ -1040,6 +1323,13 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
             .collect::<std::io::Result<Vec<_>>>()
     }
 
+    fn list_objects_all(&self) -> Vec<std::io::Result<ObjectMetadata>> {
+        self.list_objects_all()
+            .into_iter()
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+            .collect()
+    }
+
     fn get_object_metadata(
         &self,
         bucket: &BucketId,
@@ -1065,6 +1355,13 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
 
     fn list_segments(&self) -> Vec<std::io::Result<SegmentMetadata>> {
         self.list_segments()
+            .into_iter()
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+            .collect()
+    }
+
+    fn list_deleted_segments(&self) -> Vec<std::io::Result<(SegmentId, i64)>> {
+        self.list_deleted_segments()
             .into_iter()
             .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
             .collect()
@@ -1309,6 +1606,98 @@ mod tests {
         assert!(got.is_sealed());
     }
 
+    // ── Deleted-segment markers (WAL retention) ─────
+
+    #[test]
+    fn delete_sealed_segment_writes_marker() {
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        let id = SegmentId::new();
+        store
+            .put_segment(SegmentMetadata {
+                segment_id: id,
+                ec_k: 1,
+                ec_m: 0,
+                size_tier: SizeTier::Small,
+                merkle_root: None,
+                storage_locations: smallvec::SmallVec::new(),
+                sealed_at: Some(1_000_000_000_000),
+            })
+            .unwrap();
+
+        store.delete_segment(id).unwrap();
+
+        // The metadata is gone and the deletion is recorded.
+        assert!(store.get_segment(id).unwrap().is_none());
+        let markers: Vec<_> =
+            store.list_deleted_segments().into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(markers.len(), 1, "sealed deletion must leave a marker");
+        let (marker_id, deleted_at_ms) = markers[0];
+        assert_eq!(marker_id, id);
+        assert!(deleted_at_ms > 0, "marker must carry a timestamp");
+    }
+
+    #[test]
+    fn delete_unsealed_phantom_writes_no_marker() {
+        // Deleting a pre-seal phantom must NOT mark its WAL entries as
+        // garbage — the data is still only in the WAL.
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        let id = SegmentId::new();
+        store
+            .put_segment(SegmentMetadata {
+                segment_id: id,
+                ec_k: 1,
+                ec_m: 0,
+                size_tier: SizeTier::Small,
+                merkle_root: None,
+                storage_locations: smallvec::SmallVec::new(),
+                sealed_at: None,
+            })
+            .unwrap();
+
+        store.delete_segment(id).unwrap();
+        assert!(
+            store.list_deleted_segments().into_iter().all(|r| r.is_err()),
+            "phantom deletion must leave no marker"
+        );
+    }
+
+    #[test]
+    fn batch_delete_segment_writes_marker() {
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        let id = SegmentId::new();
+        store
+            .put_segment(SegmentMetadata {
+                segment_id: id,
+                ec_k: 1,
+                ec_m: 0,
+                size_tier: SizeTier::Small,
+                merkle_root: None,
+                storage_locations: smallvec::SmallVec::new(),
+                sealed_at: Some(1_000_000_000_000),
+            })
+            .unwrap();
+
+        store.batch_write(vec![BatchOp::DeleteSegment(id)]).unwrap();
+
+        let markers: Vec<_> =
+            store.list_deleted_segments().into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(markers.len(), 1, "batched sealed deletion must leave a marker");
+        assert_eq!(markers[0].0, id);
+    }
+
+    #[test]
+    fn marker_roundtrip_via_put_and_delete_deleted_segment() {
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        let id = SegmentId::new();
+        store.put_deleted_segment(id, 42).unwrap();
+        let markers: Vec<_> =
+            store.list_deleted_segments().into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(markers, vec![(id, 42)]);
+
+        store.delete_deleted_segment(id).unwrap();
+        assert!(store.list_deleted_segments().into_iter().all(|r| r.is_err()));
+    }
+
     #[test]
     fn tombstone_roundtrip() {
         let store = RocksDbMetadataStore::open(&test_config()).unwrap();
@@ -1373,6 +1762,9 @@ mod tests {
         assert_eq!(m.running_compactions.get(), 0);
         assert_eq!(m.running_flushes.get(), 0);
         assert_eq!(m.estimate_num_keys.get(), 0);
+        assert_eq!(m.num_files_at_level_0.get(), 0);
+        assert_eq!(m.live_sst_files_size.get(), 0);
+        assert_eq!(m.estimate_table_readers_mem.get(), 0);
     }
 
     #[test]
@@ -1488,9 +1880,31 @@ mod tests {
         let _ = m.running_compactions.get();
         let _ = m.running_flushes.get();
         let _ = m.estimate_num_keys.get();
+        let _ = m.num_files_at_level_0.get();
+        let _ = m.live_sst_files_size.get();
+        let _ = m.estimate_table_readers_mem.get();
 
         // Verify Gauge renders in Prometheus format
         let rendered = m.block_cache_hit.render();
         assert!(rendered.contains("rocksdb_block_cache_hit"), "must contain metric name");
+
+        // The load-test sentinel gauge must render under its documented name.
+        let rendered_l0 = m.num_files_at_level_0.render();
+        assert!(
+            rendered_l0.contains("rocksdb_num_files_at_level_0"),
+            "must contain metric name: {rendered_l0}"
+        );
+    }
+
+    #[test]
+    fn unresolved_rocksdb_properties_empty_on_real_db() {
+        // On a real RocksDB build every polled property must resolve —
+        // otherwise the load-test assertions would silently see zeros.
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        let unresolved = unresolved_rocksdb_properties(&store.db);
+        assert!(
+            unresolved.is_empty(),
+            "unresolvable RocksDB properties (gauges would pin at 0): {unresolved:?}"
+        );
     }
 }

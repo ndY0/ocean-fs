@@ -36,6 +36,11 @@ harness = false
 path = "wal_sync_benchmark.rs"
 
 [[bench]]
+name = "seal_pipeline_benchmark"
+harness = false
+path = "seal_pipeline_benchmark.rs"
+
+[[bench]]
 name = "network_benchmark"
 harness = false
 path = "network_benchmark.rs"

@@ -44,6 +44,11 @@ pub struct SegmentGrpcService {
     /// Optional metadata store for persisting object metadata
     /// replicated alongside segment data.
     metadata_store: Option<Arc<dyn oceanfs_storage_api::MetadataStore>>,
+    /// Optional async adapter over the metadata store: blocking RocksDB
+    /// calls (DELETE replication, read-repair pushes) run on the
+    /// blocking pool, never on a runtime worker
+    /// (metadata-io-off-async-workers).
+    metadata_async: Option<Arc<crate::metadata_async::AsyncMetadataOps>>,
     /// Buffer pool for segment data buffers (perf rule §1.2).
     buffer_pool: Arc<BufferPool>,
     /// HLC clock for receive-merge (hlc-causality-closure G2). Remote
@@ -67,7 +72,10 @@ impl SegmentGrpcService {
         buffer_pool: Arc<BufferPool>,
         hlc_clock: Arc<HlcClock>,
     ) -> Self {
-        Self { data_store, metadata_store, buffer_pool, hlc_clock }
+        let metadata_async = metadata_store
+            .clone()
+            .map(|s| Arc::new(crate::metadata_async::AsyncMetadataOps::from_storage(s)));
+        Self { data_store, metadata_store, metadata_async, buffer_pool, hlc_clock }
     }
 
     /// Returns a reference to the underlying data store (for testing).
@@ -294,16 +302,17 @@ impl SegmentRpc for SegmentGrpcService {
         };
         self.hlc_clock.update(hlc);
 
-        if let Some(ref md_store) = self.metadata_store {
+        if let Some(ref md_store) = self.metadata_async {
             md_store
                 .delete_object(&bucket, &key, hlc)
+                .await
                 .map_err(|e| Status::internal(format!("metadata delete failed: {e}")))?;
         }
 
         tracing::debug!(
             bucket = %bucket,
             key = %key,
-            has_metadata_store = self.metadata_store.is_some(),
+            has_metadata_store = self.metadata_async.is_some(),
             "delete_object: tombstone applied"
         );
 

@@ -100,6 +100,7 @@ async fn sealed_segment_produces_metadata_in_rocksdb() {
         data_dir: dir.path().join("segments"),
         io_mode: oceanfs_storage::io::IoReadMode::Buffered,
         write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
+        ..Default::default()
     };
     let sealer = SegmentSealer::new(seal_config, store.clone(), wal);
 

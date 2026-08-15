@@ -19,5 +19,12 @@ mod writer;
 
 pub use entry::WalEntry;
 pub use reader::WalReader;
-pub use replay::{cleanup_old_wal_files, replay_wal, ReplaySummary};
+pub use replay::{
+    cleanup_old_wal_files, count_wal_files, prune_deleted_segment_markers, replay_wal,
+    ReplaySummary,
+};
+/// Re-exported for the segment flush coordinator (`io/segment_flush.rs`),
+/// which applies the same `sync_file_range` + `fdatasync` optimisation to
+/// sealed segment files during group commit.
+pub(crate) use sync::sync_file_range_write;
 pub use writer::WalWriter;

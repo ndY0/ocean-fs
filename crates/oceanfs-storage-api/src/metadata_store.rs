@@ -104,6 +104,20 @@ pub trait MetadataStore: Send + Sync {
     fn list_objects(&self, bucket: &BucketId, prefix: &str)
         -> Vec<std::io::Result<ObjectMetadata>>;
 
+    /// Lists object metadata for **every** object across all buckets.
+    ///
+    /// Each element is a Result — individual objects may fail to deserialize
+    /// without failing the entire scan. Used by the orphan reaper to build
+    /// the set of referenced segments: restricting the scan to a single
+    /// bucket (as `list_objects` does) would classify every segment owned
+    /// by other buckets as an orphan and delete live data.
+    ///
+    /// The default implementation returns an empty list (no objects
+    /// referenced); stores that support cross-bucket scans override it.
+    fn list_objects_all(&self) -> Vec<std::io::Result<ObjectMetadata>> {
+        Vec::new()
+    }
+
     /// Retrieves segment metadata for a given segment ID.
     ///
     /// Returns `Ok(None)` if the segment does not exist.
@@ -113,6 +127,18 @@ pub trait MetadataStore: Send + Sync {
     ///
     /// Each element is a Result. Used by GC, scrub, anti-entropy, and orphan reaper.
     fn list_segments(&self) -> Vec<std::io::Result<SegmentMetadata>>;
+
+    /// Lists all deleted-segment markers as `(segment_id, deleted_at_ms)`.
+    ///
+    /// A marker records that a segment's data was intentionally removed
+    /// (GC compaction or orphan reaper) — its WAL entries are garbage.
+    /// Used by the WAL retention logic to sweep deleted segments'
+    /// entries instead of protecting them forever. The default
+    /// implementation returns an empty list; stores that track
+    /// deletions override it.
+    fn list_deleted_segments(&self) -> Vec<std::io::Result<(SegmentId, i64)>> {
+        Vec::new()
+    }
 
     /// Lists tombstone entries for a bucket.
     ///

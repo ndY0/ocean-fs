@@ -43,11 +43,9 @@ pub use segment::{
     ActiveSegment, SealConfig, SealingWork, SegmentHandle, SegmentHeader, SegmentIndex,
     SegmentPool, SegmentSealer, SegmentShard, SegmentSplitter, TierRouter,
 };
-pub use wal::{WalEntry, WalReader, WalWriter};
-
-// ---------------------------------------------------------------------------
-// Generated gRPC service stubs
-// ---------------------------------------------------------------------------
+pub use wal::{count_wal_files, prune_deleted_segment_markers, WalEntry, WalReader, WalWriter}; // ---------------------------------------------------------------------------
+                                                                                               // Generated gRPC service stubs
+                                                                                               // ---------------------------------------------------------------------------
 
 /// Generated gRPC client and server stubs for storage services.
 #[allow(missing_docs, clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::all)]

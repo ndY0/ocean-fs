@@ -18,10 +18,10 @@
 //! cached in a `SegmentWriteMode` value.
 
 use std::{
-    fs,
-    io::{self, Write},
+    fs::{self, File},
+    io,
     os::unix::io::AsRawFd,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 /// Strategy for writing sealed segment files to disk.
@@ -69,25 +69,52 @@ impl SegmentWriteMode {
     }
 }
 
-/// Writes data atomically to a segment file.
+/// Returns the temp-file path used by the rename-based fallback
+/// (`.tmp.{filename}` in `dir`).
+pub(crate) fn temp_path(dir: &Path, filename: &str) -> PathBuf {
+    dir.join(format!(".tmp.{filename}"))
+}
+
+/// Creates the temporary file for a segment write, without syncing or
+/// finalizing.
 ///
-/// When `mode` is `Tmpfile` and the platform supports it, the file is
-/// created via `O_TMPFILE` and linked atomically — readers never see
-/// a partial file. Falls back to the rename path otherwise.
+/// `Tmpfile` mode creates an unnamed `O_TMPFILE` (invisible until
+/// [`finalize_temp`] links it). `Rename` mode creates `.tmp.{filename}`
+/// in the segment directory.
 ///
 /// # Errors
 ///
-/// Returns an I/O error if the file cannot be created, written, synced,
-/// or linked.
-pub(crate) fn write_atomic(
+/// Returns an I/O error if the file cannot be created.
+pub(crate) fn create_temp(mode: SegmentWriteMode, dir: &Path, filename: &str) -> io::Result<File> {
+    match mode {
+        SegmentWriteMode::Tmpfile => create_otmpfile(dir),
+        SegmentWriteMode::Rename => File::create(temp_path(dir, filename)),
+    }
+}
+
+/// Finalizes a segment temp file after its data has been synced: makes
+/// the file visible under its final name atomically.
+///
+/// `Tmpfile` mode links the unnamed `O_TMPFILE` into the directory
+/// (`linkat`); `Rename` mode renames `.tmp.{filename}` to `{filename}`.
+/// The caller must have synced the file's data before calling this —
+/// visibility and durability ordering is the flush coordinator's job.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file cannot be linked or renamed.
+pub(crate) fn finalize_temp(
     mode: SegmentWriteMode,
+    file: File,
     dir: &Path,
     filename: &str,
-    data: &[u8],
 ) -> io::Result<()> {
     match mode {
-        SegmentWriteMode::Tmpfile => write_tmpfile(dir, filename, data),
-        SegmentWriteMode::Rename => write_rename(dir, filename, data),
+        SegmentWriteMode::Tmpfile => link_temp(file, dir, filename),
+        SegmentWriteMode::Rename => {
+            drop(file);
+            fs::rename(temp_path(dir, filename), dir.join(filename))
+        }
     }
 }
 
@@ -97,10 +124,8 @@ pub(crate) fn write_atomic(
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn write_tmpfile(dir: &Path, filename: &str, data: &[u8]) -> io::Result<()> {
+fn create_otmpfile(dir: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
-
-    let dir_fd = open_dir_fd(dir)?;
 
     // Create an unnamed, invisible file in the segment directory.
     // O_TMPFILE: creates a temporary file that has no directory entry.
@@ -110,9 +135,14 @@ fn write_tmpfile(dir: &Path, filename: &str, data: &[u8]) -> io::Result<()> {
     opts.write(true);
     opts.custom_flags(libc::O_TMPFILE);
 
-    let mut file = opts.open(dir)?;
-    file.write_all(data)?;
-    file.sync_data()?;
+    let file = opts.open(dir)?;
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn link_temp(file: File, dir: &Path, filename: &str) -> io::Result<()> {
+    let dir_fd = open_dir_fd(dir)?;
 
     // Atomically link the unnamed file into the directory.
     // "/proc/self/fd/{fd}" is a magic path that refers to the open
@@ -220,36 +250,18 @@ fn probe_otmpfile_support(dir: &Path) -> bool {
 
 // Non-Linux: O_TMPFILE is not available — always use rename path.
 #[cfg(not(target_os = "linux"))]
-fn write_tmpfile(_dir: &Path, _filename: &str, _data: &[u8]) -> io::Result<()> {
-    unreachable!("write_tmpfile should not be called on non-Linux")
+fn create_otmpfile(_dir: &Path) -> io::Result<File> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "O_TMPFILE is not supported on this platform"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn link_temp(_file: File, _dir: &Path, _filename: &str) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "O_TMPFILE is not supported on this platform"))
 }
 
 #[cfg(not(target_os = "linux"))]
 fn probe_otmpfile_support(_dir: &Path) -> bool {
     false
-}
-
-// ---------------------------------------------------------------------------
-// Rename-based fallback (portable)
-// ---------------------------------------------------------------------------
-
-/// Writes data via the traditional create→write→fsync→rename path.
-fn write_rename(dir: &Path, filename: &str, data: &[u8]) -> io::Result<()> {
-    // Write to a temporary name first so readers don't see a partial file.
-    let tmp_name = format!(".tmp.{filename}");
-    let tmp_path = dir.join(&tmp_name);
-    let final_path = dir.join(filename);
-
-    {
-        let mut file = fs::File::create(&tmp_path)?;
-        file.write_all(data)?;
-        file.sync_data()?;
-        // File is synced; drop the handle before rename.
-    }
-
-    fs::rename(&tmp_path, &final_path)?;
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +271,8 @@ fn write_rename(dir: &Path, filename: &str, data: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     #[test]
@@ -267,7 +281,10 @@ mod tests {
         let data = b"segment data for atomic write test";
         let filename = "segment-test-001.dat";
 
-        write_rename(dir.path(), filename, data).unwrap();
+        let mut file = create_temp(SegmentWriteMode::Rename, dir.path(), filename).unwrap();
+        file.write_all(data).unwrap();
+        file.sync_data().unwrap();
+        finalize_temp(SegmentWriteMode::Rename, file, dir.path(), filename).unwrap();
 
         let path = dir.path().join(filename);
         let read_back = fs::read(&path).unwrap();
@@ -321,11 +338,14 @@ mod tests {
     }
 
     #[test]
-    fn write_atomic_rename_mode_writes_file() {
+    fn rename_mode_roundtrips_via_split_primitives() {
         let dir = tempfile::tempdir().unwrap();
         let data = b"atomic write via rename mode";
 
-        write_atomic(SegmentWriteMode::Rename, dir.path(), "seg.dat", data).unwrap();
+        let mut file = create_temp(SegmentWriteMode::Rename, dir.path(), "seg.dat").unwrap();
+        file.write_all(data).unwrap();
+        file.sync_data().unwrap();
+        finalize_temp(SegmentWriteMode::Rename, file, dir.path(), "seg.dat").unwrap();
 
         let path = dir.path().join("seg.dat");
         let read_back = fs::read(&path).unwrap();
@@ -334,14 +354,17 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn write_atomic_tmpfile_mode_writes_file() {
+    fn tmpfile_mode_roundtrips_via_split_primitives() {
         let dir = tempfile::tempdir().unwrap();
         let data = b"atomic write via O_TMPFILE";
 
         // First check if TMPFILE is supported on this filesystem.
         let mode = SegmentWriteMode::probe(dir.path());
         // Use whichever mode is supported.
-        write_atomic(mode, dir.path(), "seg-tmpfile.dat", data).unwrap();
+        let mut file = create_temp(mode, dir.path(), "seg-tmpfile.dat").unwrap();
+        file.write_all(data).unwrap();
+        file.sync_data().unwrap();
+        finalize_temp(mode, file, dir.path(), "seg-tmpfile.dat").unwrap();
 
         let path = dir.path().join("seg-tmpfile.dat");
         let read_back = fs::read(&path).unwrap();

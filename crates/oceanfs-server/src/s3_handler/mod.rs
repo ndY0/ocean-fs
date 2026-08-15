@@ -74,8 +74,10 @@ pub(crate) struct AppState {
     pub write: Arc<WriteCoordinator>,
     /// Read coordinator for GET/HEAD operations.
     pub read: Arc<ReadCoordinator>,
-    /// Metadata store for DELETE/LIST operations.
-    pub metadata: Arc<dyn MetadataOps>,
+    /// Metadata store for DELETE/LIST operations, wrapped in the async
+    /// adapter so blocking RocksDB calls run on the blocking pool,
+    /// never on a runtime worker (metadata-io-off-async-workers).
+    pub metadata: Arc<crate::metadata_async::AsyncMetadataOps>,
     /// Bucket configuration store for bucket CRUD.
     pub buckets: Arc<BucketConfigStore>,
     /// MIME type map by file extension.
@@ -206,6 +208,11 @@ impl S3Handler {
         write_queue: Option<Arc<tokio::sync::Semaphore>>,
         write_queue_timeout: std::time::Duration,
     ) -> Self {
+        // Wrap the sync metadata ops in the async adapter: blocking
+        // RocksDB calls run on the blocking pool via spawn_blocking
+        // (bounded by the adapter's semaphore), never on a runtime
+        // worker (metadata-io-off-async-workers).
+        let metadata = Arc::new(crate::metadata_async::AsyncMetadataOps::new(metadata));
         let state = AppState {
             write,
             read,
@@ -465,6 +472,13 @@ mod tests {
             // No-op: mock metadata store doesn't track segments.
             Ok(())
         }
+        fn get_segment(
+            &self,
+            _id: oceanfs_core::SegmentId,
+        ) -> Result<Option<oceanfs_core::SegmentMetadata>, MetadataError> {
+            // No-op: mock metadata store doesn't track segments.
+            Ok(None)
+        }
     }
 
     // --- Test helpers ---
@@ -538,6 +552,7 @@ mod tests {
             data_dir: dir.path().join("segments"),
             io_mode: oceanfs_storage::io::IoReadMode::Buffered,
             write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
+            ..Default::default()
         };
         let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
 
@@ -586,6 +601,7 @@ mod tests {
         );
 
         let metadata: Arc<dyn MetadataOps> = Arc::new(MockMetadata::new());
+        let metadata = Arc::new(crate::metadata_async::AsyncMetadataOps::new(metadata));
         let buckets = Arc::new(BucketConfigStore::new());
 
         AppState {

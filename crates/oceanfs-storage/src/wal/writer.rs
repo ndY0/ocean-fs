@@ -17,6 +17,7 @@ use std::{
 
 use oceanfs_core::{Counter, LabelSet, WalConfig};
 use tokio::sync::Mutex;
+use tracing::info;
 
 use crate::{
     error::{Error, Result},
@@ -28,6 +29,23 @@ use crate::{
 
 /// Default maximum number of waiters per WAL fsync batch.
 const DEFAULT_SYNC_BATCH_MAX_WAITERS: usize = 64;
+
+/// Number of WAL files retained across rotations.
+///
+/// Rotating deletes files outside this window. The window must cover
+/// every segment still unsealed at rotation time: entries for unsealed
+/// segments are the only durable copy of their data (replay reads every
+/// retained file). Segments fill and seal in milliseconds under load, so
+/// a window of a few 64 MiB files is ample; the window also bounds disk
+/// usage (64 MiB × window).
+pub(crate) const WAL_RETENTION_FILES: usize = 4;
+
+/// Rotations between deleted-segment marker prunes.
+///
+/// At ~10 s per rotation under load this runs every ~10 minutes — the
+/// retained-file scan it performs is cheap at that cadence, and the
+/// marker CF stays bounded over arbitrarily long uptimes.
+const MARKER_PRUNE_ROTATIONS: u64 = 60;
 
 /// An append-only sequential WAL writer.
 ///
@@ -49,6 +67,13 @@ const DEFAULT_SYNC_BATCH_MAX_WAITERS: usize = 64;
 pub struct WalWriter {
     /// WAL configuration.
     config: WalConfig,
+    /// Metadata store handle for seal-aware file retention: rotation
+    /// keeps files that still hold entries for unsealed segments. `None`
+    /// (tests, minimal embedding) falls back to the plain retention
+    /// window.
+    metadata: Option<Arc<crate::metadata::RocksDbMetadataStore>>,
+    /// Number of rotations performed (drives the marker-prune throttle).
+    rotations: std::sync::atomic::AtomicU64,
     /// Current WAL file handle (shared with sync group for true fsync).
     file: Arc<Mutex<std::fs::File>>,
     /// Current file sequence number.
@@ -92,6 +117,8 @@ impl WalWriter {
 
         let writer = Self {
             config: config.clone(),
+            metadata: None,
+            rotations: std::sync::atomic::AtomicU64::new(0),
             file,
             file_seq: Mutex::new(file_seq),
             position: Mutex::new(existing_size),
@@ -111,6 +138,17 @@ impl WalWriter {
         };
 
         Ok(writer)
+    }
+
+    /// Attaches the metadata store for seal-aware WAL retention.
+    ///
+    /// With the store attached, rotation keeps WAL files that still
+    /// contain entries for unsealed segments (`sealed_at: None` in the
+    /// segments CF) — the WAL is the only durable copy of their data.
+    /// Without it, retention falls back to the plain file-count window.
+    pub fn with_metadata(mut self, metadata: Arc<crate::metadata::RocksDbMetadataStore>) -> Self {
+        self.metadata = Some(metadata);
+        self
     }
 
     /// Appends an entry to the WAL.
@@ -217,7 +255,8 @@ impl WalWriter {
     }
 
     /// Rotates to a new WAL file.
-    async fn rotate(&self) -> Result<()> {
+    /// Rotates to the next WAL file (internal; `pub(crate)` for tests).
+    pub(crate) async fn rotate(&self) -> Result<()> {
         let mut file = self.file.lock().await;
         let mut seq = self.file_seq.lock().await;
         let mut pos = self.position.lock().await;
@@ -234,8 +273,27 @@ impl WalWriter {
         *file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
         *pos = 0;
 
-        // Best-effort cleanup of old rotated WAL files.
-        super::cleanup_old_wal_files(&self.config).await;
+        // Best-effort cleanup of old rotated WAL files. The retention
+        // window keeps the last few files, and the seal-aware check
+        // additionally protects files holding entries for unsealed
+        // segments (their only durable copy).
+        super::cleanup_old_wal_files(&self.config, WAL_RETENTION_FILES, self.metadata.as_deref())
+            .await;
+
+        // Periodically prune deleted-segment markers: segments removed
+        // by GC/orphan-reaper whose entries have fully rotated out no
+        // longer need their marker. Throttled so the retained-file scan
+        // runs every ~10 minutes, not every rotation.
+        let rotations = self.rotations.fetch_add(1, Ordering::Relaxed) + 1;
+        if rotations % MARKER_PRUNE_ROTATIONS == 0 {
+            if let Some(metadata) = self.metadata.as_ref() {
+                let pruned =
+                    super::prune_deleted_segment_markers(&self.config, metadata.as_ref()).await;
+                if pruned > 0 {
+                    info!(pruned, "pruned deleted-segment WAL markers");
+                }
+            }
+        }
 
         Ok(())
     }

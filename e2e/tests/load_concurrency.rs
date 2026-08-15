@@ -123,7 +123,7 @@ async fn load_concurrency() {
     let accel_fallback = scrape_accel_fallback(&cluster).await;
 
     // ── Verify manifest ────────────────────────────────────────
-    let manifest_summary = manifest.verify_summary(&cluster).await;
+    let manifest_summary = manifest.verify_summary(&*cluster).await;
 
     // ── Health check ───────────────────────────────────────────
     let health_ok =

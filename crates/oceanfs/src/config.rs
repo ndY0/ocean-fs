@@ -384,6 +384,8 @@ mod tests {
             keepalive_sec = 60
             connect_timeout_ms = 10000
             request_timeout_ms = 60000
+            seal_fsync_batch_timeout_ms = 25
+            seal_fsync_max_waiters = 16
 
             [gossip]
             interval_ms = 500
@@ -407,6 +409,8 @@ mod tests {
         assert_eq!(config.gossip.failure_timeout_ms, 30000);
         assert_eq!(config.gossip.indirect_ping_count, 5);
         assert_eq!(config.gossip.seed_nodes, vec!["peer1:9001", "peer2:9001"]);
+        assert_eq!(config.seal_fsync_batch_timeout_ms, 25);
+        assert_eq!(config.seal_fsync_max_waiters, 16);
     }
 
     #[test]

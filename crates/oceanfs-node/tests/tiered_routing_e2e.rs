@@ -91,6 +91,7 @@ async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
         data_dir: dir.path().join("segments"),
         io_mode: oceanfs_storage::io::IoReadMode::Buffered,
         write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
+        ..Default::default()
     };
     let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
 

@@ -84,6 +84,29 @@ impl ActiveSegment {
         Ok(Self { id: SegmentId::new(), tier, buffer, cursor: 0, target_size })
     }
 
+    /// Creates an active segment with an **explicit** segment id.
+    ///
+    /// Used exclusively by WAL replay: replayed entries must rebuild the
+    /// segment under its original identity so object metadata (which
+    /// references that id) stays readable after a crash. All other
+    /// callers use [`new`](Self::new) so ids come from the normal
+    /// generator.
+    pub(crate) fn new_with_id(
+        segment_id: SegmentId,
+        tier: SizeTier,
+        config: &SegmentSizeConfig,
+        pool: &BufferPool,
+    ) -> Result<Self> {
+        let mut segment = Self::new(tier, config, pool)?;
+        segment.id = segment_id;
+        Ok(segment)
+    }
+
+    /// Returns `true` when no data has been appended yet.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.cursor == 0
+    }
+
     /// Appends data to the segment buffer.
     ///
     /// Returns `(offset, length)` indicating where the data was placed

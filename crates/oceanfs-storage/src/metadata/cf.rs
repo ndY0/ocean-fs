@@ -9,9 +9,18 @@ pub(crate) const CF_SEGMENTS: &str = "segments";
 /// Column family name for deletion tombstones.
 pub(crate) const CF_DELETIONS: &str = "deletions";
 
+/// Column family name for deleted-segment markers.
+///
+/// Written atomically with a segment's metadata deletion so the WAL
+/// retention logic can distinguish "segment deleted (entries are
+/// garbage)" from "segment not yet sealed (entries are the only durable
+/// copy)". Keyed by the same segment-id encoding as the segments CF.
+pub(crate) const CF_DELETED_SEGMENTS: &str = "deleted_segments";
+
 /// All column families used by the metadata store.
 #[allow(dead_code)]
-pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[CF_OBJECTS, CF_SEGMENTS, CF_DELETIONS];
+pub(crate) const ALL_COLUMN_FAMILIES: &[&str] =
+    &[CF_OBJECTS, CF_SEGMENTS, CF_DELETIONS, CF_DELETED_SEGMENTS];
 
 /// Encodes a bucket and object key into a RocksDB key.
 ///
@@ -40,6 +49,16 @@ pub(crate) fn encode_segment_key(id: &oceanfs_core::SegmentId) -> Vec<u8> {
     buf.extend_from_slice(b"segment:");
     buf.extend_from_slice(id.as_uuid().as_bytes());
     buf
+}
+
+/// Decodes a segment key back into a segment ID.
+///
+/// Returns `None` for keys that are not `segment:{16 bytes}`.
+pub(crate) fn decode_segment_key(data: &[u8]) -> Option<oceanfs_core::SegmentId> {
+    const PREFIX: &[u8] = b"segment:";
+    let rest = data.strip_prefix(PREFIX)?;
+    let bytes: [u8; 16] = rest.try_into().ok()?;
+    Some(oceanfs_core::SegmentId::from_uuid_bytes(bytes))
 }
 
 /// Encodes a bucket and object key into a deletion tombstone key.

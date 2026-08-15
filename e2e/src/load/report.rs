@@ -79,6 +79,24 @@ pub struct LoadReport {
     /// Detailed failure descriptions (supplements assertions).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub failures: Vec<FailureDetail>,
+    /// Harness process resource usage at report time (metadata only —
+    /// never asserted), per ADR-0019 Decision 4.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness_metrics: Option<HarnessSelfMetrics>,
+}
+
+/// The harness process's own resource usage at the end of a run.
+///
+/// Recorded as metadata so borderline SUT measurements can be attributed
+/// when the harness is co-located with the SUT (`--single-vm` mode).
+/// Mirrors the SUT-side `process_resident_memory_bytes` /
+/// `process_open_fds` gauges.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct HarnessSelfMetrics {
+    /// Resident memory of the harness process (bytes).
+    pub process_resident_memory_bytes: u64,
+    /// Open file descriptors of the harness process.
+    pub process_open_fds: u64,
 }
 
 impl LoadReport {
@@ -98,6 +116,7 @@ impl LoadReport {
             metric_snapshots: Vec::new(),
             assertions: Vec::new(),
             failures: Vec::new(),
+            harness_metrics: None,
         }
     }
 

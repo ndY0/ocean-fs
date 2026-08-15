@@ -79,6 +79,12 @@ impl MetadataOps for TestMetadata {
         // No-op: test store doesn't track segments.
         Ok(())
     }
+    fn get_segment(
+        &self,
+        _id: oceanfs_core::SegmentId,
+    ) -> std::result::Result<Option<oceanfs_core::SegmentMetadata>, MetadataError> {
+        Ok(None)
+    }
 }
 
 /// Creates a minimal test setup with an in-memory segment store
@@ -173,6 +179,7 @@ impl RoundTripEnv {
             data_dir: dir.path().join("segments"),
             io_mode: oceanfs_storage::io::IoReadMode::Buffered,
             write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
+            ..Default::default()
         };
         let sealer = Arc::new(SegmentSealer::new(seal_config, metadata_store.clone(), wal));
 

@@ -29,6 +29,7 @@ pub mod auth;
 mod bucket_config;
 mod error;
 pub mod grpc;
+pub mod metadata_async;
 pub mod metadata_ops;
 pub mod read;
 mod router;

@@ -72,6 +72,15 @@ pub struct MetadataConfig {
     /// (e.g., capability not held, mlock limit reached), the system
     /// logs a warning and continues without pinning.
     /// No-op on non-Linux platforms.
+    ///
+    /// The store uses `mlockall(MCL_CURRENT)` — currently resident
+    /// pages only. It deliberately does NOT use `MCL_FUTURE`: with
+    /// `MCL_FUTURE` every subsequent `mmap` counts against
+    /// `RLIMIT_MEMLOCK`, and once the process's locked total crosses
+    /// that ceiling ALL further allocations fail with `EAGAIN`,
+    /// aborting the whole node (Rust's `handle_alloc_error`). Locking
+    /// current pages gives the swap defense without capping future
+    /// growth.
     pub mlock_block_cache: bool,
 }
 

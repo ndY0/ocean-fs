@@ -16,14 +16,14 @@
 //! ## Usage
 //!
 //! ```no_run
-//! use e2e::harness::{config_standard, NodeProcess};
+//! use e2e::harness::{config_standard, Cluster};
 //! use e2e::load::MetricsSnapshot;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let node = NodeProcess::spawn(&config_standard()).await?;
-//! let snap1 = MetricsSnapshot::scrape(&node).await?;
+//! let cluster = Cluster::spawn(1, &config_standard()).await?;
+//! let snap1 = MetricsSnapshot::scrape(&cluster, 0).await?;
 //! // ... wait, run load ...
-//! let snap2 = MetricsSnapshot::scrape(&node).await?;
+//! let snap2 = MetricsSnapshot::scrape(&cluster, 0).await?;
 //! let diffs = snap2.delta(&snap1);
 //! for (metric, delta) in &diffs {
 //!     println!("{metric}: +{delta}");
@@ -36,7 +36,7 @@ use std::{collections::HashMap, time::Instant};
 
 use serde::Serialize;
 
-use crate::harness::{Error, NodeProcess};
+use crate::harness::{Error, LoadTarget};
 
 // ---------------------------------------------------------------------------
 // MetricsSnapshot
@@ -51,12 +51,12 @@ use crate::harness::{Error, NodeProcess};
 /// # Examples
 ///
 /// ```no_run
-/// use e2e::harness::{config_standard, NodeProcess};
+/// use e2e::harness::{config_standard, Cluster};
 /// use e2e::load::MetricsSnapshot;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// # let node = NodeProcess::spawn(&config_standard()).await?;
-/// let snap = MetricsSnapshot::scrape(&node).await?;
+/// # let cluster = Cluster::spawn(1, &config_standard()).await?;
+/// let snap = MetricsSnapshot::scrape(&cluster, 0).await?;
 /// if let Some(rss) = snap.gauge("process_resident_memory_bytes") {
 ///     println!("RSS: {rss} bytes");
 /// }
@@ -73,16 +73,19 @@ pub struct MetricsSnapshot {
 }
 
 impl MetricsSnapshot {
-    /// Scrapes `GET /admin/metrics` from the given node and parses the
-    /// Prometheus text-format response.
+    /// Scrapes `GET /admin/metrics` from the given load target node and
+    /// parses the Prometheus text-format response.
+    ///
+    /// Works against both spawned local nodes (`Cluster`) and remote
+    /// endpoints (`RemoteCluster`), per the [`LoadTarget`] abstraction.
     ///
     /// # Errors
     ///
     /// Returns an error if the HTTP request fails or the response status
     /// is not 2xx. Malformed metric lines in the response body are
     /// silently skipped.
-    pub async fn scrape(node: &NodeProcess) -> Result<Self, Error> {
-        let resp = node.get("/admin/metrics").await?;
+    pub async fn scrape(target: &impl LoadTarget, node_idx: usize) -> Result<Self, Error> {
+        let resp = target.get(node_idx, "/admin/metrics").await?;
         if !resp.status().is_success() {
             return Err(Error::ClusterError(format!(
                 "metrics endpoint returned {}",

@@ -12,7 +12,10 @@ use std::collections::BTreeSet;
 use oceanfs_core::{SegmentId, SegmentSizeConfig, SizeTier, WalConfig};
 use tracing::{info, warn};
 
-use crate::{error::Result, segment::pool::SegmentPool, wal::reader::WalReader};
+use crate::{
+    error::Result, metadata::RocksDbMetadataStore, segment::pool::SegmentPool,
+    wal::reader::WalReader,
+};
 
 /// Summary of a WAL replay operation.
 ///
@@ -27,7 +30,7 @@ use crate::{error::Result, segment::pool::SegmentPool, wal::reader::WalReader};
 /// use oceanfs_storage::wal::{replay_wal, WalWriter};
 ///
 /// # async fn example(config: &WalConfig, wal_writer: &WalWriter) -> oceanfs_storage::Result<()> {
-/// let summary = replay_wal(config, wal_writer).await?;
+/// let summary = replay_wal(config, wal_writer, &pool_small, &pool_standard, &size_config, |_| false).await?;
 /// assert_eq!(summary.entries_replayed, 0); // empty WAL on first start
 /// # Ok(())
 /// # }
@@ -70,6 +73,7 @@ pub async fn replay_wal(
     segment_pool_small: &SegmentPool,
     segment_pool_standard: &SegmentPool,
     size_config: &SegmentSizeConfig,
+    already_sealed: impl Fn(SegmentId) -> bool,
 ) -> Result<ReplaySummary> {
     let reader = WalReader::open(config)?;
 
@@ -81,6 +85,19 @@ pub async fn replay_wal(
 
     for entry_result in reader.replay() {
         let entry = entry_result?;
+
+        // Skip entries whose segment was already sealed: the sealed
+        // segment's file is durable and its metadata is committed, so
+        // the disk copy is authoritative. Rebuilding it here would
+        // shadow the disk with a potentially PARTIAL pool copy — the
+        // WAL keeps sealed segments' entries until file rotation, and
+        // entries spanning a rotation boundary are truncated, so the
+        // remaining tail would reconstruct the segment at wrong
+        // offsets and corrupt every read of it.
+        if already_sealed(entry.segment_id()) {
+            continue;
+        }
+
         entries_replayed += 1;
         bytes_replayed += entry.length as u64;
         segments_seen.insert(entry.segment_id());
@@ -94,13 +111,20 @@ pub async fn replay_wal(
         }
 
         // Reconstruct the active segment: route by blob size tier.
+        //
+        // The rebuilt segment keeps the entry's **original** segment id
+        // (`append_replayed`): object metadata committed before the
+        // crash references that id, and the pool fallback reader looks
+        // it up on the read path. Appending under a fresh id would leave
+        // every replayed object pointing at a segment that can never be
+        // found (data loss on every crash with unsealed segments).
         let tier = size_config.classify(entry.length as u64);
         match tier {
             SizeTier::Small => {
-                segment_pool_small.append(&entry.data)?;
+                segment_pool_small.append_replayed(entry.segment_id(), &entry.data)?;
             }
             SizeTier::Standard | SizeTier::Multi => {
-                segment_pool_standard.append(&entry.data)?;
+                segment_pool_standard.append_replayed(entry.segment_id(), &entry.data)?;
             }
             SizeTier::Inline => {
                 // Inline blobs are stored directly in RocksDB metadata
@@ -143,7 +167,19 @@ pub async fn replay_wal(
 /// numbers earlier than the current file are no longer needed and
 /// can be safely deleted. Failure to delete a file is logged but
 /// does not cause the replay to fail.
-pub async fn cleanup_old_wal_files(config: &WalConfig) {
+///
+/// `keep` is the number of most recent files to retain (including the
+/// current one). When `metadata` is provided, retention is **seal-aware**
+/// in addition: a file outside the window is still kept when it contains
+/// entries for segments that are not yet sealed (`sealed_at: None`) —
+/// the WAL is the only durable copy of an unsealed segment's data, and
+/// replay reads every retained file. Segments that completed sealing
+/// are durable on disk, so their entries may be swept freely.
+pub async fn cleanup_old_wal_files(
+    config: &WalConfig,
+    keep: usize,
+    metadata: Option<&RocksDbMetadataStore>,
+) {
     let dir_path = &config.data_dir;
 
     // If the WAL directory doesn't exist, there's nothing to clean.
@@ -179,11 +215,50 @@ pub async fn cleanup_old_wal_files(config: &WalConfig) {
             return;
         }
     }
+    // The set of segments whose data IS durable outside the WAL (sealed
+    // files) plus segments whose data was intentionally DELETED (GC
+    // compaction / orphan reaper — their WAL entries are garbage). ANY
+    // file containing entries for a segment in neither set must survive
+    // rotation — including segments whose metadata registration has not
+    // happened yet (the write path registers the phantom after the WAL
+    // append; between the two, the segment's entries exist in the WAL
+    // with no CF entry at all).
+    let durable_or_deleted: std::collections::HashSet<oceanfs_core::SegmentId> = metadata
+        .map(|m| {
+            let mut set: std::collections::HashSet<oceanfs_core::SegmentId> = m
+                .list_segments()
+                .into_iter()
+                .filter_map(|r| r.ok())
+                .filter(|meta| meta.sealed_at.is_some())
+                .map(|meta| meta.segment_id)
+                .collect();
+            set.extend(
+                m.list_deleted_segments().into_iter().filter_map(|r| r.ok()).map(|(id, _)| id),
+            );
+            set
+        })
+        .unwrap_or_default();
 
-    // Delete all files with sequence numbers less than the current one.
+    // Delete all files outside the retention window — unless they hold
+    // entries for segments that are neither sealed nor deleted
+    // (seal-aware mode, active only when a metadata store is provided;
+    // without one the plain window applies).
+    let seal_aware = metadata.is_some();
+    let retention_floor = current_seq.saturating_sub(keep.saturating_sub(1) as u64);
     let mut removed: usize = 0;
+    let mut protected: usize = 0;
     for (seq, path) in &file_paths {
-        if *seq < current_seq {
+        if *seq < retention_floor {
+            // Empty durable-or-deleted set → no segment's data is
+            // finalized yet → protect everything. Otherwise protect
+            // files holding entries for not-yet-finalized segments.
+            if seal_aware
+                && (durable_or_deleted.is_empty()
+                    || file_contains_live_entries(path, &durable_or_deleted))
+            {
+                protected += 1;
+                continue;
+            }
             match tokio::fs::remove_file(path).await {
                 Ok(()) => removed += 1,
                 Err(e) => {
@@ -193,9 +268,96 @@ pub async fn cleanup_old_wal_files(config: &WalConfig) {
         }
     }
 
-    if removed > 0 {
-        info!(removed, kept = current_seq, "cleaned up old WAL files");
+    if removed > 0 || protected > 0 {
+        info!(
+            removed,
+            protected,
+            kept = current_seq,
+            "cleaned up old WAL files (protected files hold not-yet-finalized entries)"
+        );
     }
+}
+
+/// Returns `true` when the WAL file contains an entry for a segment
+/// that is NOT in the given (sealed ∪ deleted) set — i.e. an entry
+/// whose data is still only in the WAL.
+///
+/// Scans the file's entries — this runs only for files that would
+/// otherwise be deleted (one per rotation), so the read cost is bounded
+/// by the rotation window.
+fn file_contains_live_entries(
+    path: &std::path::Path,
+    durable_or_deleted: &std::collections::HashSet<oceanfs_core::SegmentId>,
+) -> bool {
+    for entry in super::reader::WalReader::entries_in_file(path.to_path_buf()).flatten() {
+        if !durable_or_deleted.contains(&entry.segment_id()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Prunes deleted-segment markers whose segment is no longer referenced
+/// by any retained WAL file.
+///
+/// Markers accumulate while their segments' entries sit in retained
+/// files (the entries only become sweepable once the file leaves the
+/// retention window); once no retained file references the segment, the
+/// marker is pure garbage. Runs periodically during operation (the
+/// writer throttles it to every `MARKER_PRUNE_ROTATIONS` rotations) and
+/// once at replay, where the retained-file scan is already paid for.
+///
+/// Returns the number of markers removed.
+pub async fn prune_deleted_segment_markers(
+    config: &WalConfig,
+    metadata: &RocksDbMetadataStore,
+) -> usize {
+    // Collect the segment ids referenced by every retained file.
+    let mut referenced: std::collections::HashSet<oceanfs_core::SegmentId> =
+        std::collections::HashSet::new();
+    let Ok(dir) = std::fs::read_dir(&config.data_dir) else {
+        return 0;
+    };
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("wal_") && name.ends_with(".log") {
+            for wal_entry in super::reader::WalReader::entries_in_file(entry.path()).flatten() {
+                referenced.insert(wal_entry.segment_id());
+            }
+        }
+    }
+
+    // Drop every marker whose segment is not referenced anymore.
+    let mut pruned = 0usize;
+    for result in metadata.list_deleted_segments() {
+        let Ok((id, _)) = result else { continue };
+        if !referenced.contains(&id) && metadata.delete_deleted_segment(id).is_ok() {
+            pruned += 1;
+        }
+    }
+    pruned
+}
+
+/// Counts the number of WAL files present in the configured directory.
+///
+/// Files are named `wal_{seq:08}.log`. Rotation appends new files while
+/// [`cleanup_old_wal_files`] prunes replayed ones, so a bounded count is
+/// the expected steady state. A count that grows without bound signals
+/// that sealing/replay stopped consuming the WAL — this is what the
+/// Phase 2 `wal_not_unbounded` assertion monitors.
+pub fn count_wal_files(config: &WalConfig) -> usize {
+    let dir_path = &config.data_dir;
+    let Ok(dir) = std::fs::read_dir(dir_path) else {
+        return 0;
+    };
+    dir.flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("wal_") && name.ends_with(".log")
+        })
+        .count()
 }
 
 #[cfg(test)]
@@ -203,11 +365,14 @@ pub async fn cleanup_old_wal_files(config: &WalConfig) {
 mod tests {
     use std::sync::Arc;
 
-    use oceanfs_core::{HashOutput, PoolConfig, SegmentSizeConfig, SizeTier};
+    use oceanfs_core::{
+        HashOutput, MetadataConfig, PoolConfig, SegmentMetadata, SegmentSizeConfig, SizeTier,
+    };
 
     use super::*;
     use crate::{
         buffer_pool::BufferPool,
+        metadata::RocksDbMetadataStore,
         segment::pool::SegmentPool,
         wal::{WalEntry, WalWriter},
     };
@@ -275,14 +440,250 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn count_wal_files_counts_rotated_files_only() {
+        let (wal_config, .., dir) = make_test_env().await;
+        assert_eq!(count_wal_files(&wal_config), 0, "empty dir must count zero");
+
+        // The WAL lives in `{temp}/wal` (per make_test_env); rotation
+        // produces `wal_{seq:08}.log` files at seq 1, 2, 3.
+        let wal_dir = dir.path().join("wal");
+        tokio::fs::create_dir_all(&wal_dir).await.unwrap();
+        for seq in 1..=3u64 {
+            let path = wal_dir.join(format!("wal_{seq:08}.log"));
+            tokio::fs::write(path, b"entry").await.unwrap();
+        }
+        // Unrelated files (RocksDB, ports.toml) must not be counted.
+        tokio::fs::write(wal_dir.join("rocksdb.log"), b"x").await.unwrap();
+        tokio::fs::write(wal_dir.join("ports.toml"), b"x").await.unwrap();
+
+        assert_eq!(count_wal_files(&wal_config), 3, "only wal_*.log files count");
+    }
+
+    #[tokio::test]
+    async fn cleanup_old_wal_files_keeps_retention_window() {
+        // Regression: rotation must retain the most recent files — their
+        // entries may belong to still-unsealed segments, the only durable
+        // copy of that data. Deleting them loses the data on crash.
+        let (wal_config, .., dir) = make_test_env().await;
+        let wal_dir = dir.path().join("wal");
+        tokio::fs::create_dir_all(&wal_dir).await.unwrap();
+        for seq in 1..=6u64 {
+            let path = wal_dir.join(format!("wal_{seq:08}.log"));
+            tokio::fs::write(path, b"entry").await.unwrap();
+        }
+
+        // Keep the last 4 files (seq 3..=6); seq 1-2 are deleted.
+        cleanup_old_wal_files(&wal_config, 4, None).await;
+        assert_eq!(count_wal_files(&wal_config), 4, "retention window must survive");
+
+        // keep=1 retains only the current file.
+        for seq in 7..=8u64 {
+            let path = wal_dir.join(format!("wal_{seq:08}.log"));
+            tokio::fs::write(path, b"entry").await.unwrap();
+        }
+        cleanup_old_wal_files(&wal_config, 1, None).await;
+        assert_eq!(count_wal_files(&wal_config), 1, "keep=1 must retain only the current file");
+    }
+
+    #[tokio::test]
+    async fn cleanup_protects_files_with_unsealed_entries() {
+        // Regression: a file outside the retention window must survive
+        // when it holds entries for a segment that is not yet sealed —
+        // the WAL is the only durable copy of that data. Rotation used
+        // to sweep it, losing the segment on crash.
+        let (wal_config, .., dir) = make_test_env().await;
+        let wal_dir = dir.path().join("wal");
+        tokio::fs::create_dir_all(&wal_dir).await.unwrap();
+
+        // A segment written into the OLDEST file (seq 1), still unsealed.
+        let unsealed_id = SegmentId::new();
+        let metadata = Arc::new(
+            RocksDbMetadataStore::open(&MetadataConfig {
+                data_dir: dir.path().join("metadata"),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        // Register the segment as UNSEALED (sealed_at: None — the write
+        // path's phantom registration) BEFORE any rotation, exactly as
+        // the production write path does.
+        metadata
+            .put_segment(SegmentMetadata {
+                segment_id: unsealed_id,
+                ec_k: 1,
+                ec_m: 0,
+                size_tier: oceanfs_core::SizeTier::Small,
+                merkle_root: None,
+                storage_locations: smallvec::SmallVec::new(),
+                sealed_at: None,
+            })
+            .unwrap();
+        {
+            let writer =
+                WalWriter::open(&wal_config).await.unwrap().with_metadata(Arc::clone(&metadata));
+            writer.append(make_entry(unsealed_id, 0, 8192)).await.unwrap();
+            // Rotate 6 times so the entry lands in a file far outside
+            // the retention window (each rotate opens the next seq).
+            // The filler entries' segments are SEALED (registered with
+            // sealed_at: Some), so their files remain sweepable — only
+            // the unsealed segment's file is protected.
+            for i in 0..6 {
+                let filler_id = SegmentId::new();
+                metadata
+                    .put_segment(SegmentMetadata {
+                        segment_id: filler_id,
+                        ec_k: 1,
+                        ec_m: 0,
+                        size_tier: oceanfs_core::SizeTier::Small,
+                        merkle_root: None,
+                        storage_locations: smallvec::SmallVec::new(),
+                        sealed_at: Some(1_000_000_000_000),
+                    })
+                    .unwrap();
+                writer.append(make_entry(filler_id, 0, 8192)).await.unwrap();
+                writer.rotate().await.unwrap();
+            }
+        }
+        // The seal-aware cleanup protects the oldest file: rotations
+        // swept only the intermediate files (their entries' segments are
+        // sealed), while file 0 — holding the unsealed segment's entry —
+        // survived far beyond the 4-file window.
+        let after_rotation = count_wal_files(&wal_config);
+        assert_eq!(
+            after_rotation, 5,
+            "4-file window (seq 3..=6) + protected oldest file (seq 0) = 5"
+        );
+
+        cleanup_old_wal_files(&wal_config, 1, Some(&metadata)).await;
+        // The oldest file (holding the unsealed segment's entry) is
+        // protected; the current file survives via the window.
+        assert_eq!(
+            count_wal_files(&wal_config),
+            2,
+            "oldest file with unsealed entries + current file must survive"
+        );
+
+        // Once the segment is SEALED, the file becomes deletable.
+        metadata
+            .put_segment(SegmentMetadata {
+                segment_id: unsealed_id,
+                ec_k: 1,
+                ec_m: 0,
+                size_tier: oceanfs_core::SizeTier::Small,
+                merkle_root: None,
+                storage_locations: smallvec::SmallVec::new(),
+                sealed_at: Some(1_000_000_000_000),
+            })
+            .unwrap();
+        cleanup_old_wal_files(&wal_config, 1, Some(&metadata)).await;
+        assert_eq!(count_wal_files(&wal_config), 1, "sealed segments' entries may be swept");
+    }
+
+    #[tokio::test]
+    async fn cleanup_sweeps_files_with_only_deleted_entries() {
+        // A file outside the window whose entries all belong to DELETED
+        // segments must be swept — the deleted-segment marker tells the
+        // retention logic the data is garbage, not merely unsealed.
+        let (wal_config, .., dir) = make_test_env().await;
+        let wal_dir = dir.path().join("wal");
+        tokio::fs::create_dir_all(&wal_dir).await.unwrap();
+
+        let metadata = Arc::new(
+            RocksDbMetadataStore::open(&MetadataConfig {
+                data_dir: dir.path().join("metadata"),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let deleted_id = SegmentId::new();
+        // Sealed first (delete_segment only marks SEALED deletions)...
+        metadata
+            .put_segment(SegmentMetadata {
+                segment_id: deleted_id,
+                ec_k: 1,
+                ec_m: 0,
+                size_tier: oceanfs_core::SizeTier::Small,
+                merkle_root: None,
+                storage_locations: smallvec::SmallVec::new(),
+                sealed_at: Some(1_000_000_000_000),
+            })
+            .unwrap();
+        {
+            let writer =
+                WalWriter::open(&wal_config).await.unwrap().with_metadata(Arc::clone(&metadata));
+            writer.append(make_entry(deleted_id, 0, 8192)).await.unwrap();
+            // ...then deleted: file 0 now holds only garbage entries.
+            metadata.delete_segment(deleted_id).unwrap();
+            for i in 0..6 {
+                let filler_id = SegmentId::new();
+                metadata
+                    .put_segment(SegmentMetadata {
+                        segment_id: filler_id,
+                        ec_k: 1,
+                        ec_m: 0,
+                        size_tier: oceanfs_core::SizeTier::Small,
+                        merkle_root: None,
+                        storage_locations: smallvec::SmallVec::new(),
+                        sealed_at: Some(1_000_000_000_000),
+                    })
+                    .unwrap();
+                writer.append(make_entry(filler_id, 0, 8192)).await.unwrap();
+                writer.rotate().await.unwrap();
+            }
+        }
+        // The deleted segment's file was swept with the rest — only the
+        // 4-file window survives (no protected file remains).
+        assert_eq!(
+            count_wal_files(&wal_config),
+            4,
+            "files holding only deleted segments' entries must be swept"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_deleted_segment_markers_removes_only_unreferenced() {
+        let (wal_config, .., dir) = make_test_env().await;
+        let wal_dir = dir.path().join("wal");
+        tokio::fs::create_dir_all(&wal_dir).await.unwrap();
+
+        let metadata = Arc::new(
+            RocksDbMetadataStore::open(&MetadataConfig {
+                data_dir: dir.path().join("metadata"),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let referenced_id = SegmentId::new();
+        let unreferenced_id = SegmentId::new();
+
+        // A retained WAL file referencing `referenced_id`.
+        {
+            let writer = WalWriter::open(&wal_config).await.unwrap();
+            writer.append(make_entry(referenced_id, 0, 8192)).await.unwrap();
+        }
+        // Both segments are marked deleted; only `referenced_id` still
+        // has entries in a retained file.
+        metadata.put_deleted_segment(referenced_id, 100).unwrap();
+        metadata.put_deleted_segment(unreferenced_id, 200).unwrap();
+
+        let pruned = prune_deleted_segment_markers(&wal_config, &metadata).await;
+        assert_eq!(pruned, 1, "only the unreferenced marker is pruned");
+        let remaining: Vec<_> =
+            metadata.list_deleted_segments().into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(remaining, vec![(referenced_id, 100)]);
+    }
+
+    #[tokio::test]
     async fn replay_wal_empty_directory_returns_zero_summary() {
         let (wal_config, size_config, buffer_pool, _dir) = make_test_env().await;
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
         let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
         let summary =
-            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config)
-                .await
-                .unwrap();
+            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| {
+                false
+            })
+            .await
+            .unwrap();
         assert_eq!(summary.entries_replayed, 0);
         assert_eq!(summary.bytes_replayed, 0);
         assert!(summary.segments_seen.is_empty());
@@ -305,9 +706,11 @@ mod tests {
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
         let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
         let summary =
-            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config)
-                .await
-                .unwrap();
+            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| {
+                false
+            })
+            .await
+            .unwrap();
         assert_eq!(summary.entries_replayed, 5);
         assert_eq!(summary.bytes_replayed, 25000);
         assert_eq!(summary.segments_seen.len(), 1);
@@ -330,9 +733,11 @@ mod tests {
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
         let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
         let summary =
-            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config)
-                .await
-                .unwrap();
+            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| {
+                false
+            })
+            .await
+            .unwrap();
         assert_eq!(summary.entries_replayed, 3);
 
         let reader = WalReader::open(&wal_config).unwrap();
@@ -356,9 +761,11 @@ mod tests {
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
         let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
         let summary =
-            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config)
-                .await
-                .unwrap();
+            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| {
+                false
+            })
+            .await
+            .unwrap();
         assert_eq!(summary.entries_replayed, 3);
         assert_eq!(summary.segments_seen.len(), 2);
     }
@@ -378,9 +785,11 @@ mod tests {
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
         let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
         let summary =
-            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config)
-                .await
-                .unwrap();
+            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| {
+                false
+            })
+            .await
+            .unwrap();
         assert_eq!(summary.entries_replayed, 3);
         assert_eq!(summary.max_hlc_wall_time, 2000);
         assert_eq!(summary.max_hlc_logical, 0);
@@ -400,11 +809,52 @@ mod tests {
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
         let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
         let summary =
-            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config)
-                .await
-                .unwrap();
+            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| {
+                false
+            })
+            .await
+            .unwrap();
         assert_eq!(summary.max_hlc_wall_time, 5000);
         assert_eq!(summary.max_hlc_logical, 7);
+    }
+
+    #[tokio::test]
+    async fn replay_wal_skips_entries_for_already_sealed_segments() {
+        // Regression: the WAL keeps sealed segments' entries until file
+        // rotation. Rebuilding a sealed segment from a possibly-partial
+        // WAL tail would shadow the durable disk file with a corrupt
+        // pool copy (BadDigest on every read of that segment).
+        let (wal_config, size_config, buffer_pool, _dir) = make_test_env().await;
+        let sealed_id = SegmentId::new();
+        let unsealed_id = SegmentId::new();
+
+        {
+            let writer = WalWriter::open(&wal_config).await.unwrap();
+            // The sealed segment's entries are present in the WAL...
+            writer.append(make_entry(sealed_id, 0, 8192)).await.unwrap();
+            writer.append(make_entry(sealed_id, 8192, 4096)).await.unwrap();
+            // ...and so are the unsealed segment's. (8192 bytes routes
+            // to the small tier — inline entries are skipped by design.)
+            writer.append(make_entry(unsealed_id, 0, 8192)).await.unwrap();
+        }
+
+        let wal_writer = WalWriter::open(&wal_config).await.unwrap();
+        let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
+        let summary = replay_wal(
+            &wal_config,
+            &wal_writer,
+            &pool_small,
+            &pool_standard,
+            &size_config,
+            |id| id == sealed_id, // the sealed segment is durable on disk
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.entries_replayed, 1, "only the unsealed entry is replayed");
+        assert_eq!(summary.segments_seen, vec![unsealed_id]);
+        // The sealed segment must NOT be rebuilt into the pool.
+        assert!(pool_small.try_read(sealed_id, 0, 8192).is_none());
+        assert!(pool_small.try_read(unsealed_id, 0, 8192).is_some());
     }
 
     #[tokio::test]
@@ -426,9 +876,11 @@ mod tests {
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
         let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
         let summary =
-            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config)
-                .await
-                .unwrap();
+            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| {
+                false
+            })
+            .await
+            .unwrap();
         assert_eq!(summary.entries_replayed, 8);
         assert_eq!(summary.bytes_replayed, 40000);
 

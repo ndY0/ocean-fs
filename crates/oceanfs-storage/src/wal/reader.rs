@@ -69,16 +69,29 @@ impl WalReader {
     /// entries (wrong magic, CRC failure, truncated data) are silently
     /// skipped and logged.
     pub fn replay(&self) -> impl Iterator<Item = Result<WalEntry>> + '_ {
-        WalReplayIter { file_paths: &self.files, current_reader: None }
+        WalReplayIter { file_paths: self.files.clone(), current: 0, current_reader: None }
+    }
+
+    /// Iterates the entries of a single WAL file.
+    ///
+    /// Used by the retention-aware cleanup to decide whether a file can
+    /// be deleted: a file must be kept when it contains entries for
+    /// segments that are still unsealed (the WAL is their only durable
+    /// copy).
+    pub(crate) fn entries_in_file(path: PathBuf) -> impl Iterator<Item = Result<WalEntry>> {
+        WalReplayIter { file_paths: vec![path], current: 0, current_reader: None }
     }
 }
 
-struct WalReplayIter<'a> {
-    file_paths: &'a [PathBuf],
+struct WalReplayIter {
+    /// Remaining files to replay (owned so single-file iteration works).
+    file_paths: Vec<PathBuf>,
+    /// Index of the file currently being read.
+    current: usize,
     current_reader: Option<std::io::BufReader<std::fs::File>>,
 }
 
-impl Iterator for WalReplayIter<'_> {
+impl Iterator for WalReplayIter {
     type Item = Result<WalEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -129,14 +142,14 @@ impl Iterator for WalReplayIter<'_> {
             }
 
             // Advance to the next file.
-            if self.file_paths.is_empty() {
+            if self.current >= self.file_paths.len() {
                 return None;
             }
 
-            let path = &self.file_paths[0];
-            self.file_paths = &self.file_paths[1..];
+            let path = self.file_paths[self.current].clone();
+            self.current += 1;
 
-            match std::fs::File::open(path) {
+            match std::fs::File::open(&path) {
                 Ok(file) => {
                     self.current_reader = Some(std::io::BufReader::new(file));
                 }

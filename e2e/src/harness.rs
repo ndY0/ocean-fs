@@ -200,6 +200,9 @@ pub enum Error {
     /// Failed to read a captured node log file.
     #[error("failed to read captured log {0}: {1}")]
     LogRead(PathBuf, #[source] std::io::Error),
+    /// An SSH command (remote crash control) failed.
+    #[error("ssh command failed: {0}")]
+    Ssh(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,6 +1027,57 @@ ae_interval_sec = 10
     .to_string()
 }
 
+/// Configuration with a shortened scrub interval.
+///
+/// Scrub runs every 60 seconds instead of the multi-hour production
+/// default so that a sustained-load test observes scrub cycles within
+/// its runtime. Uses the configurable `scrub_interval_sec` field.
+pub fn config_short_scrub() -> String {
+    r#"
+node_id = "e2e-scrub"
+listen_addr = "127.0.0.1:{http_port}"
+grpc_listen_addr = "127.0.0.1:{grpc_port}"
+log_level = "error"
+prefetch_enabled = false
+scrub_interval_sec = 60
+"#
+    .to_string()
+}
+
+/// Phase 2 sustained-load configuration: shortened background intervals,
+/// a 16 MiB body limit, and an L1 cache covering every tier.
+///
+/// Combines every interval the Phase 2 test shortens — GC (10s cycle,
+/// 5s tombstone TTL), anti-entropy (10s), scrub (60s) — with the
+/// `max_body_size` raised to 16 MiB so the tiered load generator's
+/// multi-tier blobs (up to `MULTI_MAX`) are accepted. The L1 object
+/// cache's `object_cache_max_blob_size` is raised from the 1 MiB
+/// production default to 16 MiB so **every** tier participates in the
+/// L1 cache: the Phase 2 cache-hit-rate assertion (>50%) measures the
+/// cache pipeline, not the size-threshold tuning (the production
+/// default excludes standard >1 MiB and all multi-tier blobs, which
+/// caps hit rates near 30% under this workload). Gossip is left at its
+/// default with no seed nodes: the single-node Phase 2 topology has no
+/// peers, so the gossip loop is inert.
+pub fn config_sustained() -> String {
+    r#"
+node_id = "e2e-sustained"
+listen_addr = "127.0.0.1:{http_port}"
+grpc_listen_addr = "127.0.0.1:{grpc_port}"
+log_level = "error"
+prefetch_enabled = false
+max_body_size = 16777216   # 16 MiB — matches BlobSizeDist MULTI_MAX
+gc_interval_sec = 10
+tombstone_ttl_sec = 5
+ae_interval_sec = 10
+scrub_interval_sec = 60
+object_cache_size_bytes = 268435456    # 256 MiB — holds the hot-key working set; keeps RSS < 2× baseline
+object_cache_max_blob_size = 16777216   # 16 MiB — every tier is L1-cacheable
+object_cache_ttl_ms = 0                # no TTL expiry — hit-rate invariant measures cache health, not expiry churn
+"#
+    .to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Cluster config templates
 // ---------------------------------------------------------------------------
@@ -1154,6 +1208,45 @@ pub async fn response_bytes(resp: reqwest::Response) -> Vec<u8> {
 /// Reads the body of an HTTP response as a string.
 pub async fn response_text(resp: reqwest::Response) -> String {
     resp.text().await.unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Harness self-monitoring
+// ---------------------------------------------------------------------------
+
+/// Reads the harness process's resident memory from `/proc/self/statm`.
+///
+/// Per ADR-0019 Decision 4 the harness records its own RSS and FD count
+/// into the [`LoadReport`](crate::load::LoadReport) as **metadata** (not
+/// assertions), so borderline results can be attributed when the harness
+/// is co-located with the SUT (`--single-vm` mode).
+///
+/// # Errors
+///
+/// Returns an error if `/proc/self/statm` cannot be read or parsed.
+pub fn read_self_memory_bytes() -> Result<u64, std::io::Error> {
+    let statm = std::fs::read_to_string("/proc/self/statm")?;
+    // Format: size resident shared text lib data dt (in pages).
+    let parts: Vec<&str> = statm.split_whitespace().collect();
+    if parts.len() < 2 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected statm format",
+        ));
+    }
+    let resident_pages: u64 =
+        parts[1].parse().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(resident_pages * 4096)
+}
+
+/// Counts the harness process's open file descriptors from `/proc/self/fd`.
+///
+/// # Errors
+///
+/// Returns an error if the directory cannot be read.
+pub fn read_self_open_fds() -> Result<u64, std::io::Error> {
+    let entries = std::fs::read_dir("/proc/self/fd")?;
+    Ok(entries.count() as u64)
 }
 
 /// Parses an HTTP response body as JSON.
@@ -1532,6 +1625,135 @@ impl Cluster {
     }
 }
 
+// ---------------------------------------------------------------------------
+// LoadTarget
+// ---------------------------------------------------------------------------
+
+/// A target the load harness can issue S3-style HTTP operations against.
+///
+/// Implemented by [`Cluster`] (spawned local processes) and by
+/// `RemoteCluster` (already-running OceanFS processes reached over the
+/// network, per ADR-0019 remote-target mode). The load generator
+/// ([`Worker`](crate::load::Worker), [`Manifest`](crate::load::Manifest))
+/// is generic over this trait, so the same scenario runs against either
+/// topology.
+///
+/// The HTTP methods return explicitly `+ Send` futures so workers can be
+/// spawned on the multi-threaded tokio runtime (stable Rust's `async fn`
+/// in traits does not imply `Send`).
+pub trait LoadTarget: Send + Sync + 'static {
+    /// Returns the number of nodes in the target.
+    fn len(&self) -> usize;
+
+    /// Returns `true` if the target has no nodes.
+    fn is_empty(&self) -> bool;
+
+    /// Returns the HTTP address of node `i`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` is out of bounds or (for `Cluster`) the node has
+    /// been killed without being restarted.
+    fn node_addr(&self, i: usize) -> SocketAddr;
+
+    /// Returns the shared HTTP client used by every request to this target.
+    fn client(&self) -> &reqwest::Client;
+
+    /// HTTP GET to node `i`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails.
+    fn get<'a>(
+        &'a self,
+        i: usize,
+        path: &'a str,
+    ) -> impl std::future::Future<Output = Result<reqwest::Response, Error>> + Send + 'a;
+
+    /// HTTP PUT to node `i`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails.
+    fn put<'a>(
+        &'a self,
+        i: usize,
+        path: &'a str,
+        body: &'a [u8],
+    ) -> impl std::future::Future<Output = Result<reqwest::Response, Error>> + Send + 'a;
+
+    /// HTTP DELETE to node `i`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails.
+    fn delete<'a>(
+        &'a self,
+        i: usize,
+        path: &'a str,
+    ) -> impl std::future::Future<Output = Result<reqwest::Response, Error>> + Send + 'a;
+
+    /// HTTP HEAD to node `i`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails.
+    fn head<'a>(
+        &'a self,
+        i: usize,
+        path: &'a str,
+    ) -> impl std::future::Future<Output = Result<reqwest::Response, Error>> + Send + 'a;
+
+    /// HTTP POST to node `i`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails.
+    fn post<'a>(
+        &'a self,
+        i: usize,
+        path: &'a str,
+    ) -> impl std::future::Future<Output = Result<reqwest::Response, Error>> + Send + 'a;
+}
+
+impl LoadTarget for Cluster {
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+
+    fn node_addr(&self, i: usize) -> SocketAddr {
+        self.node_http_addr(i)
+    }
+
+    fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
+    async fn get(&self, i: usize, path: &str) -> Result<reqwest::Response, Error> {
+        self.get(i, path).await
+    }
+
+    async fn put(&self, i: usize, path: &str, body: &[u8]) -> Result<reqwest::Response, Error> {
+        self.put(i, path, body).await
+    }
+
+    async fn delete(&self, i: usize, path: &str) -> Result<reqwest::Response, Error> {
+        self.delete(i, path).await
+    }
+
+    async fn head(&self, i: usize, path: &str) -> Result<reqwest::Response, Error> {
+        self.head(i, path).await
+    }
+
+    async fn post(&self, i: usize, path: &str) -> Result<reqwest::Response, Error> {
+        self.post(i, path).await
+    }
+}
+
 /// Extract the config name prefix from a config template.
 ///
 /// Looks for patterns like `node_id = "e2e-{name}-0"` and returns `{name}`.
@@ -1603,6 +1825,36 @@ mod tests {
     fn config_prefetch_enabled_has_flag() {
         let cfg = config_prefetch_enabled();
         assert!(cfg.contains("prefetch_enabled = true"));
+    }
+
+    #[test]
+    fn config_short_scrub_sets_60_second_interval() {
+        let cfg = config_short_scrub();
+        assert!(cfg.contains("scrub_interval_sec = 60"));
+    }
+
+    #[test]
+    fn config_sustained_sets_all_short_intervals() {
+        let cfg = config_sustained();
+        assert!(cfg.contains("gc_interval_sec = 10"));
+        assert!(cfg.contains("tombstone_ttl_sec = 5"));
+        assert!(cfg.contains("ae_interval_sec = 10"));
+        assert!(cfg.contains("scrub_interval_sec = 60"));
+    }
+
+    #[test]
+    fn config_sustained_allows_16mib_bodies() {
+        // The tiered load distribution sends multi-tier blobs up to
+        // 16 MiB; the Phase 2 config must accept them.
+        let cfg = config_sustained();
+        assert!(cfg.contains("max_body_size = 16777216"));
+    }
+
+    #[test]
+    fn config_sustained_has_port_placeholders() {
+        let cfg = config_sustained();
+        assert!(cfg.contains("{http_port}"));
+        assert!(cfg.contains("{grpc_port}"));
     }
 
     #[test]

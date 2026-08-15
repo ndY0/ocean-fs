@@ -142,7 +142,7 @@ pub(crate) async fn put_object(
                         .as_millis() as i64,
                     hlc: result.hlc,
                 };
-                if let Err(e) = state.metadata.put_object(&bucket_id, meta) {
+                if let Err(e) = state.metadata.put_object(&bucket_id, meta).await {
                     error!(key = %key, error = %e, "failed to persist object metadata");
                     return s3_error_response(
                         &Error::Internal(format!("metadata write failed: {e}")),
@@ -170,12 +170,38 @@ pub(crate) async fn put_object(
 
             // Register segment metadata for each unique segment so
             // /admin/segments reflects created segments.
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
+            //
+            // `sealed_at` stays None: the segment is NOT sealed yet —
+            // sealing happens asynchronously, and the seal path
+            // overwrites this entry with the real metadata (merkle
+            // root, sealed_at). A phantom entry marked sealed would
+            // make WAL replay skip the segment's entries while the
+            // data is still only in the WAL, losing it on crash.
+            //
+            // The registration must NEVER clobber a sealed entry: a
+            // segment can complete sealing between the write and this
+            // registration, and overwriting `sealed_at: Some` back to
+            // None would (a) make WAL retention protect the segment's
+            // files forever and (b) make replay rebuild the segment
+            // from possibly-partial WAL entries, shadowing the durable
+            // file with corrupt data.
             let size_config = oceanfs_core::SegmentSizeConfig::default();
+            let mut registered: std::collections::HashSet<oceanfs_core::SegmentId> =
+                std::collections::HashSet::new();
             for chunk in &result.chunks {
+                if !registered.insert(chunk.segment_id) {
+                    continue;
+                }
+                let already_sealed = state
+                    .metadata
+                    .get_segment(chunk.segment_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|meta| meta.sealed_at.is_some());
+                if already_sealed {
+                    continue;
+                }
                 let tier = size_config.classify(result.size);
                 let seg_meta = oceanfs_core::SegmentMetadata {
                     segment_id: chunk.segment_id,
@@ -184,9 +210,9 @@ pub(crate) async fn put_object(
                     size_tier: tier,
                     merkle_root: None,
                     storage_locations: smallvec::SmallVec::new(),
-                    sealed_at: Some(now_ms),
+                    sealed_at: None,
                 };
-                if let Err(e) = state.metadata.put_segment(seg_meta) {
+                if let Err(e) = state.metadata.put_segment(seg_meta).await {
                     error!(segment_id = %chunk.segment_id, error = %e, "failed to persist segment metadata");
                 }
             }
@@ -499,7 +525,7 @@ pub(crate) async fn delete_object(
     // converges (hlc-causality-closure G4/G8).
     let hlc = state.write.hlc_clock().now();
 
-    match state.metadata.delete_object(&bucket_id, &object_key, hlc) {
+    match state.metadata.delete_object(&bucket_id, &object_key, hlc).await {
         Ok(()) => {
             // Replicate deletion to other replicas in the ring. The local
             // tombstone counts as one confirmed deletion; `write.delete`
@@ -645,7 +671,7 @@ pub(crate) async fn list_objects(
     let bucket_id = BucketId::new(&bucket);
     let prefix = params.get("prefix").map(|s| s.as_str()).unwrap_or("");
 
-    match state.metadata.list_objects(&bucket_id, prefix) {
+    match state.metadata.list_objects(&bucket_id, prefix).await {
         Ok(objects) => {
             let entries: Vec<(String, u64, String)> = objects
                 .iter()
@@ -695,7 +721,7 @@ pub(crate) async fn delete_bucket(
 
     // Check if bucket is empty by listing with no prefix.
     let bucket_id = BucketId::new(&bucket);
-    match state.metadata.list_objects(&bucket_id, "") {
+    match state.metadata.list_objects(&bucket_id, "").await {
         Ok(objects) if !objects.is_empty() => {
             let err = Error::BucketNotEmpty(bucket.clone());
             s3_error_response(&err, &bucket, "")

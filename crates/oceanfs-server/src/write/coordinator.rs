@@ -87,8 +87,10 @@ pub struct WriteCoordinator {
     node_id: NodeId,
     /// HLC clock for write timestamping.
     hlc_clock: Arc<HlcClock>,
-    /// Metadata store for inline writes and segment metadata.
-    metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore>,
+    /// Metadata store for inline writes, wrapped in the async adapter
+    /// (blocking RocksDB calls run on the blocking pool — see
+    /// metadata-io-off-async-workers).
+    metadata_store: Arc<crate::metadata_async::AsyncMetadataOps>,
     /// Tier router for classifying blob sizes.
     tier_router: TierRouter,
     /// Per-core sharded segment groups (Small tier).
@@ -146,6 +148,12 @@ impl WriteCoordinator {
         hinted_handoff: Arc<HintedHandoffManager>,
         hint_config: HintedHandoffConfig,
     ) -> Self {
+        // Wrap the storage-api metadata store in the async adapter: the
+        // Inline-tier write path's blocking RocksDB put runs on the
+        // blocking pool via spawn_blocking, never on a runtime worker
+        // (metadata-io-off-async-workers).
+        let metadata_store =
+            Arc::new(crate::metadata_async::AsyncMetadataOps::from_storage(metadata_store));
         let tier_router = TierRouter::new(size_config.clone());
         Self {
             ring,
@@ -272,6 +280,7 @@ impl WriteCoordinator {
                 };
                 self.metadata_store
                     .put_object(&req.bucket, meta)
+                    .await
                     .map_err(|e| Error::Storage(format!("inline metadata write: {e}")))?;
                 smallvec::SmallVec::new()
             }
@@ -703,12 +712,6 @@ impl WriteCoordinator {
                         tokio::spawn(async move {
                             let permit = sem.acquire().await;
 
-                            // Collect the streaming parity shards (off the
-                            // request path) and persist them with the
-                            // segment so EC recovery can repair corrupt
-                            // data shards. The collect may wait for
-                            // in-flight rayon stripe encodes — acceptable
-                            // here, never on the fill path.
                             // The seal-time EC parity is computed inside
                             // `seal_from_data` on the blocking pool
                             // (single scheduler — the write path never
@@ -723,11 +726,30 @@ impl WriteCoordinator {
                             // Merkle tree. Without it, every segment is
                             // "missing merkle root" (scrub inert,
                             // anti-entropy flags every segment).
-                            let merkle_root = oceanfs_durability::MerkleTree::build(
-                                &work.segment_data,
-                                0, // 0 selects the shared 64 KiB default
-                            )
-                            .map(|tree| tree.root().hash());
+                            //
+                            // The build is CPU-bound (hashing the full
+                            // segment data) — it runs on the blocking
+                            // pool, never on a runtime worker.
+                            let merkle_data = work.segment_data.clone();
+                            let merkle_root = match tokio::task::spawn_blocking(move || {
+                                oceanfs_durability::MerkleTree::build(
+                                    &merkle_data,
+                                    0, // 0 selects the shared 64 KiB default
+                                )
+                                .map(|tree| tree.root().hash())
+                            })
+                            .await
+                            {
+                                Ok(root) => root,
+                                Err(e) => {
+                                    warn!(
+                                        segment_id = %segment_id,
+                                        error = %e,
+                                        "merkle build task failed; sealing without merkle root"
+                                    );
+                                    None
+                                }
+                            };
 
                             let result = sealer_arc
                                 .seal_from_data(
@@ -1054,6 +1076,7 @@ mod tests {
             data_dir: dir.path().join("segments"),
             io_mode: oceanfs_storage::io::IoReadMode::Buffered,
             write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
+            ..Default::default()
         };
         let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
 
@@ -1919,6 +1942,15 @@ mod tests {
                 .put_segment(meta)
                 .map_err(|e| crate::metadata_ops::MetadataError::Internal(format!("{e}")))
         }
+        fn get_segment(
+            &self,
+            id: SegmentId,
+        ) -> std::result::Result<Option<SegmentMetadata>, crate::metadata_ops::MetadataError>
+        {
+            self.store
+                .get_segment(id)
+                .map_err(|e| crate::metadata_ops::MetadataError::Internal(format!("{e}")))
+        }
 
         fn list_objects(
             &self,
@@ -2038,6 +2070,7 @@ mod tests {
             data_dir: seal_dir.clone(),
             io_mode: oceanfs_storage::io::IoReadMode::Buffered,
             write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
+            ..Default::default()
         };
         let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
 
@@ -2374,6 +2407,15 @@ mod tests {
                 .put_segment(meta)
                 .map_err(|e| crate::metadata_ops::MetadataError::Internal(format!("{e}")))
         }
+        fn get_segment(
+            &self,
+            id: SegmentId,
+        ) -> std::result::Result<Option<SegmentMetadata>, crate::metadata_ops::MetadataError>
+        {
+            self.store
+                .get_segment(id)
+                .map_err(|e| crate::metadata_ops::MetadataError::Internal(format!("{e}")))
+        }
 
         fn list_objects(
             &self,
@@ -2463,6 +2505,7 @@ mod tests {
                 data_dir: seal_dir.clone(),
                 io_mode: oceanfs_storage::io::IoReadMode::Buffered,
                 write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
+                ..Default::default()
             },
             metadata.clone(),
             wal,

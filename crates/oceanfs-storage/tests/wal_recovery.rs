@@ -236,9 +236,10 @@ async fn replay_wal_recovers_and_truncates() {
 
     // On restart: open writer, replay WAL into pools.
     let wal_writer = WalWriter::open(&config).await.unwrap();
-    let summary = replay_wal(&config, &wal_writer, &pool_small, &pool_standard, &size_config)
-        .await
-        .expect("replay_wal should succeed after crash");
+    let summary =
+        replay_wal(&config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| false)
+            .await
+            .expect("replay_wal should succeed after crash");
 
     assert_eq!(summary.entries_replayed, 5);
     assert_eq!(summary.bytes_replayed, 320);
@@ -271,7 +272,9 @@ async fn replay_wal_empty_wal_returns_zero_summary() {
 
     let wal_writer = WalWriter::open(&config).await.unwrap();
     let summary =
-        replay_wal(&config, &wal_writer, &pool_small, &pool_standard, &size_config).await.unwrap();
+        replay_wal(&config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| false)
+            .await
+            .unwrap();
 
     assert_eq!(summary.entries_replayed, 0);
     assert_eq!(summary.bytes_replayed, 0);

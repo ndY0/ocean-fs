@@ -1,7 +1,7 @@
 ---
 feature: "Seal Pipeline Batching — Segment Fsync Group Commit & Metadata Write Batching"
 epic: "performance-optimization"
-status: proposed
+status: done
 priority: medium
 owner: ""
 dependencies:
@@ -14,7 +14,7 @@ perf:
   - "3.1 Sequential-only WAL writes"
   - "2.7 Tokio semaphore for concurrency limits"
 created: 2026-08-13
-updated: 2026-08-13
+updated: 2026-08-15
 ---
 
 # Seal Pipeline Batching — Segment Fsync Group Commit & Metadata Write Batching
@@ -61,79 +61,169 @@ Per-seal cost today (verified):
 
 ## Design & Scope
 
-### Design A — segment fsync group commit
+### Design A — segment fsync group commit (implemented)
 
-1. New flush module in oceanfs-storage (under `io/` or `wal/`): a
-   segment-flush coordinator.
-2. The sealer's write path splits into write (async, no `sync_data`) +
-   flush (batched): after writing the segment file (and before
-   `put_segment`), the seal task registers (file handle, completion
-   signal) with the coordinator.
-3. A dedicated flusher task collects registrations within a short window
-   (e.g. ≤ 5 ms) and performs one `sync_data` per registered file (files
-   still synced individually — the win is amortizing the barrier/queue
-   cost across the burst), then wakes all waiters in the window.
-4. Instrumentation: a test-visible fsync counter in the flush module
-   (cfg(test) seam or metrics counter).
+1. New flush module in oceanfs-storage (`io/segment_flush.rs`): a
+   segment-flush coordinator (`SegmentFlushGroup`), mirroring the WAL's
+   `WalSyncGroup` but per-file: registrations carry the open temp file
+   handle, the final name, the finalize op (`O_TMPFILE` link vs
+   rename), and the segment metadata.
+2. The sealer's write path splits into write (temp file, no fsync, on
+   the blocking pool) + flush (batched): `seal_from_data` writes the
+   temp file via `spawn_blocking`, then registers with the coordinator
+   and awaits the completion signal.
+3. A dedicated flusher collects registrations within a configurable
+   window (`fsync_batch_timeout_ms`, userland-configurable via
+   `NodeConfig`, default 10 ms) or until `fsync_max_waiters` (default
+   8) are pending, then on the blocking pool: kicks write-back for all
+   files (`sync_file_range(WRITE)`), issues one `fdatasync` per file
+   (files still synced individually — the win is amortizing the
+   barrier/queue cost across the burst and moving the fsync off the
+   runtime worker threads), finalizes each file (link/rename — the
+   file is never visible before its sync, preserving the O_TMPFILE
+   atomicity contract), and persists all metadata in ONE RocksDB
+   `WriteBatch`. Then it wakes all waiters.
+4. Instrumentation: `FlushStats` counters (`fsyncs_total`,
+   `batches_total`, `metadata_batches_total`) registered via
+   `SegmentSealer::register_metrics`, plus a cfg(test) thread-pin seam
+   (`LAST_FLUSH_THREAD`) and a cfg(test) sync-failure seam
+   (`FAIL_SYNC`).
 
-### Design B — metadata write batching
+### Design B — metadata write batching (implemented)
 
-1. Accumulate `put_segment` (and the seal worker's other per-seal RocksDB
-   writes) into one `WriteBatch` flushed per drain cycle (or per N seals /
-   T ms) — reusing/extending `batch_write` (store.rs:781).
-2. **Crash-window semantics:** metadata must be durable by the time
-   `remove_seal_buffer` runs. Today `remove_seal_buffer` happens right
-   after `seal_from_data` returns Ok (coordinator.rs:676–684); with
-   batched metadata, decide whether removal waits for the batch flush.
-   ADR-0021 scoping — removal only on success — must be kept: never remove
-   before the segment is durably on disk AND its metadata persisted; a
-   crash before the flush re-seals from WAL replay.
-3. The sealing-data read window (ADR-0021) is unaffected: reads hit the
-   in-memory `sealing_data` set until removal.
+1. `put_segment` for every seal in a flush cycle is accumulated into
+   one RocksDB `WriteBatch` (`batch_write`, store.rs:780) flushed per
+   drain cycle — reusing the existing `batch_write` API unchanged.
+2. **Crash-window semantics (resolved):** removal waits for the batch
+   flush, INSIDE `seal_from_data` — `seal_from_data` returns `Ok` only
+   after the segment file is synced+finalized AND its metadata is in
+   the batch flush. ADR-0021's letter is preserved: the seal worker
+   removes the sealing-data entry only after `seal_from_data` returns
+   `Ok`, and the recycle path (`try_into_mut` + `release_buffer`) is
+   untouched. A crash before the flush loses the metadata entry — the
+   same end-state as the pre-existing ack-before-seal window, and WAL
+   replay re-seals from the WAL entries (unchanged recovery path).
+3. The sealing-data read window (ADR-0021) is unaffected: reads hit
+   the in-memory `sealing_data` set until removal.
 
 ### Out of Scope
 
 - No change to the WAL group commit itself (already batched).
-- No change to seal-queue `try_send` semantics (drop-on-full stays).
+- No change to seal-queue enqueue semantics: the production path is
+  the deadline-bounded async enqueue (`finish_seal_handoff_async`,
+  never drops); the sync `try_send` path remains for tests.
 - No EC/streaming changes.
 
 ## Crate Impact
 
 | Crate | Change |
 |---|---|
-| `oceanfs-storage` | `segment/sealer.rs`: write/flush split, batched metadata call path. New flush module (e.g. `io/segment_flush.rs` or `wal/`-adjacent). `metadata/store.rs`: batch API extension if needed (flush trigger / `batch_write` variant). Tests incl. fsync-count instrumentation. |
-| `oceanfs-server` | `write/coordinator.rs` seal worker: register/batch coordination — completion awaits, and removal waits on the batch flush per the ADR-0021 invariant. |
-| `oceanfs-node` | Verify only (composition root unchanged). |
+| `oceanfs-storage` | New `io/segment_flush.rs` (flush coordinator + stats + seams); `segment/sealer.rs` write/flush split, `spawn_blocking` temp write, Direct-arm fsync (F5 — the O_DIRECT arm previously never synced: `File::flush()` is a no-op) and zero-copy direct write (`write_segment_temp`: in-place padding — no double copy, ONE aligned buffer for O_DIRECT, `SegmentFileParts` header/data/parity/index written directly from source slices; `write_all(&data)` zero-copy on the buffered path), `SealConfig` gains `fsync_batch_timeout_ms`/`fsync_max_waiters` + `Default`; `io/atomic_write.rs` split into `create_temp`/`finalize_temp` primitives; `wal/sync.rs` exposes `sync_file_range_write` kick. |
+| `oceanfs-core` | `NodeConfig` gains `seal_fsync_batch_timeout_ms` (10) + `seal_fsync_max_waiters` (8) — userland-configurable (TOML), not build time. |
+| `oceanfs-server` | Originally verify-only; two review-driven changes landed: `MerkleTree::build` moved to `spawn_blocking` in the coordinator seal worker (`write/coordinator.rs`, graceful fallback) and gRPC `DeleteObject` routed through the `AsyncMetadataOps` adapter (`grpc/segment_service.rs`) so it never blocks a runtime worker. Coordinator contract otherwise unchanged. |
+| `oceanfs-node` | Composition root passes the config knobs into `SealConfig` (defaults only). |
+| `benches/` | New `seal_pipeline_benchmark.rs` (criterion, before/after throughput instructions). |
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets`, `cargo fmt --check`,
+- [x] **Code:** `cargo build --all-targets`, `cargo fmt --check`,
       `cargo clippy --lib -- -D warnings` on touched crates,
       `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` clean
-- [ ] **Tests:** `cargo test -p oceanfs-storage -- --test-threads=1` and
+- [x] **Tests:** `cargo test -p oceanfs-storage -- --test-threads=1` and
       `cargo test -p oceanfs-server --lib -- --test-threads=1` green
       (PIPELINE.md §4.6 RocksDB SIGABRT caveat)
-- [ ] **Tests:** unit test — N concurrent seals produce
-      ≤ ceil(N / window) fsyncs (via the flush module's test counter)
-- [ ] **Tests:** metadata batch test — N seals produce ≤ N / batch
-      RocksDB writes
-- [ ] **Tests:** `wal_truncation_after_seal` and `segment_roundtrip`
-      integration suites still pass (oceanfs-storage/tests/)
-- [ ] **Integration:** seed-42 30 s + 3 random seeds load tests PASS with
+- [x] **Tests:** all N syncs issued by the flusher task (thread-pin via
+      `LAST_FLUSH_THREAD`, mirroring `LAST_ENCODE_THREAD`), waiters
+      woken in ≤ ceil(N / max_waiters) waves (`batches_total`
+      counter), per-seal wait bounded by window + one barrier —
+      `concurrent_seals_group_commit_fsyncs_and_batch_metadata`
+      (sealer.rs) and `group_commit_batches_concurrent_registrations`
+      (segment_flush.rs). N fsync syscalls is the floor (one per file);
+      the count is not batchable, the barrier/queue cost is.
+- [x] **Tests:** metadata batch test — N seals produce ≤ ceil(N /
+      batch_size) RocksDB writes (`metadata_batches_total` ≤ 2 for 16
+      seals with max_waiters=8)
+- [x] **Tests:** `wal_truncation_after_seal` and `segment_roundtrip`
+      integration suites still pass (oceanfs-storage/tests/), plus
+      `streaming_ec_encode` and `disk_segment_reader`
+- [x] **Integration:** seed-42 30 s + 3 random seeds load tests PASS with
       `manifest_integrity` 0 mismatches and the puts_5xx log-gate clean
       (no `no appending segment available in pool`)
-- [ ] **Perf:** 120 s run — RSS stable
-- [ ] **Bench:** a criterion bench of the seal path (throughput
-      before/after) scaffolded under `benches/` (workspace benches/ holds
-      storage_benchmark.rs, wal_sync_benchmark.rs et al.) with
-      instructions in the bench file for a later baseline run
+<!-- REVIEW: independently re-run by reviewer: LOAD_TEST_SEED=42/7/1234/987654 at 30 s each + seed-42 at 120 s, all PASS (e2e/tests/load_concurrency.rs gates: manifest_integrity 0, zero_4xx_puts, logs_clean; node logs captured by the harness contained none of the four gate patterns). -->
+- [x] **Perf:** 120 s run — RSS stable, demonstrated by quantitative
+      before/after comparison (seed-42 120 s, 2 s sampling):
+      baseline (pre-feature HEAD binary via `OCEANFS_BIN`) min=459160
+      p50=957132 p90=1214964 max=1294056 avg=909411 kB vs final build
+      min=204620 p50=861744 p90=1433508 max=1556972 avg=933075 kB —
+      avg +2.6%, p50 −10%, sawtooth with repeated drops, no monotonic
+      growth; the remaining max delta is RocksDB metadata growth
+      (VmData near-identical between builds; see ADR-0023 §2)
+<!-- REVIEW: FAIL (iter 1, HIGH) — reviewer sampled node RSS every 10 s during a 120 s seed-42 load run: 0.98→1.18→1.12→1.12→1.59→1.49→1.38→1.71→1.99→1.97→1.82→1.60 GB; swings ~2× and no before-baseline was recorded. CLOSED: the quantitative before/after comparison above (2 s sampling, OCEANFS_BIN baseline vs final) satisfies the pass condition — bounded band with no monotonic growth; remaining max delta attributable to RocksDB metadata growth (VmData near-identical). No leaks (RSS falls back at run end); swing partly RocksDB block-cache/memtable growth (mlock is MCL_CURRENT-only). -->
+- [x] **Bench:** a criterion bench of the seal path (throughput
+      before/after) scaffolded under `benches/`
+      (`benches/seal_pipeline_benchmark.rs`, registered in
+      `benches/Cargo.toml`) with instructions in the bench file for a
+      later baseline run
+
+## Review & Accepted Deviations
+
+Review history: iteration 1 returned FAIL — one HIGH gap (Perf/RSS DoD item
+not evidenced) plus MEDIUM/LOW gaps; every gap was addressed and verified by
+the implementer. Iteration 2 was accepted by the user directly (the reviewer
+agent stalled); the user accepted on their own confidence after confirming
+all iteration-1 gaps were fixed.
+
+- **DoD fsync-count test revision (user-approved, already reflected in
+  Design A).** N fsync syscalls is the floor (one per file) — the count
+  itself is not batchable; the testable claims are the flusher-thread pin
+  (`LAST_FLUSH_THREAD`), ≤ ceil(N / max_waiters) wake waves
+  (`batches_total` counter), and ≤ ceil(N / 8) metadata batches
+  (`metadata_batches_total` counter). The "one fsync per segment" figure in
+  Evidence/Motivation is the per-seal cost being amortized, not a batchable
+  quantity.
+- **Iteration-1 gaps fixed:**
+  - (a) Direct-mode double copy eliminated — in-place padding plus
+    zero-copy file write via `SegmentFileParts` (header/data/parity/index
+    written directly from source slices; `write_all(&data)` zero-copy on
+    the buffered path; ONE aligned buffer for O_DIRECT) — sealer.rs
+    `write_segment_temp`.
+  - (b) `MerkleTree::build` moved off the runtime thread to
+    `spawn_blocking` in the coordinator seal worker (write/coordinator.rs)
+    with graceful fallback.
+  - (c) Temp-file cleanup on failed seals (sealer error path + flush
+    coordinator sync-failure path + `FAIL_SYNC` test seam).
+  - (d) gRPC `DeleteObject` routed through the `AsyncMetadataOps` adapter
+    (grpc/segment_service.rs) so it never blocks a runtime worker.
+- **mlock fix — accepted cross-cutting bugfix (see the
+  advanced-io-optimizations note; ADR-0023 §4 records the incident).**
+  `mlockall(MCL_CURRENT|MCL_FUTURE)` → `mlockall(MCL_CURRENT)` with a
+  `getrlimit` pre-check in metadata/store.rs: `MCL_FUTURE` made every
+  subsequent allocation count against `RLIMIT_MEMLOCK`, and once the
+  ceiling was crossed all allocations failed with `EAGAIN`, aborting the
+  whole node via `handle_alloc_error`. Regression test:
+  `crates/oceanfs-storage/tests/mlock_no_future_cap.rs`.
+- **Perf/RSS evidence (closes the iteration-1 HIGH gap).** Recorded in the
+  Perf DoD item above: baseline (pre-feature HEAD via `OCEANFS_BIN`,
+  seed-42 120 s, 2 s sampling) vs final build — avg +2.6%, p50 −10%,
+  sawtooth with repeated drops, no monotonic growth; remaining max delta is
+  RocksDB metadata growth (VmData near-identical between builds; ADR-0023
+  §2 attributes the growth to the RocksDB dependency, not the seal path).
+- **Iteration 2 acceptance:** the reviewer agent stalled; the user accepted
+  the iteration on their own confidence after the implementer addressed
+  every iteration-1 gap (verified fixed before acceptance).
 
 ## Open Questions
 
-1. Flush window size — 5 ms default (mirroring WAL `fsync_batch_timeout_ms`)?
-2. Does `remove_seal_buffer` block on the metadata batch flush (durability
-   ordering), or does removal proceed and rely on WAL replay if the batch
-   is lost?
-3. WAL truncation timing: WAL entries are cleaned at file rotation —
-   verify no ordering hazard between the batched metadata flush, removal,
-   and WAL rotation.
+1. **Resolved.** Flush window default = 10 ms (userland-configurable,
+   not build time): `NodeConfig.seal_fsync_batch_timeout_ms` + early
+   flush at `seal_fsync_max_waiters` (default 8, matching
+   `max_inflight_encodes`). At the measured ~16 fills/s a 5 ms window
+   rarely batches; the win concentrates in bursts, and the config knob
+   lets ops tune it per workload.
+2. **Resolved.** `remove_seal_buffer` does NOT proceed independently —
+   removal (and the recycle) waits for the batch flush inside
+   `seal_from_data` (ADR-0021-literal; see Design B §2).
+3. **Resolved.** No ordering hazard with WAL rotation: the metadata
+   flush completes before `seal_from_data` returns, WAL rotation is
+   independent and later, and sealed segments' WAL entries are cleaned
+   at rotation as before (untouched).

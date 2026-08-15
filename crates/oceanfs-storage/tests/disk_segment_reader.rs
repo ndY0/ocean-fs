@@ -292,6 +292,7 @@ mod write_read_roundtrip {
                 data_dir: segments_dir.clone(),
                 io_mode,
                 write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
+                ..Default::default()
             },
             metadata,
             wal,

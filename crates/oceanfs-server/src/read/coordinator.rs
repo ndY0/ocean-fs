@@ -180,8 +180,10 @@ pub struct ReadCoordinator {
     node_id: NodeId,
     /// Conflict resolver for comparing replica versions.
     conflict_resolver: Arc<dyn ConflictResolver>,
-    /// Metadata store for object lookup.
-    metadata: Option<Arc<dyn MetadataOps>>,
+    /// Metadata store for object lookup, wrapped in the async adapter
+    /// so blocking RocksDB reads run on the blocking pool, never on a
+    /// runtime worker (metadata-io-off-async-workers).
+    metadata: Option<Arc<crate::metadata_async::AsyncMetadataOps>>,
     /// Optional segment reader for chunk-based reads.
     segment_reader: Option<Arc<dyn SegmentReader>>,
     /// Connection pool for gRPC shard fetch (multi-node reads).
@@ -239,6 +241,10 @@ impl ReadCoordinator {
     }
 
     /// Creates a new read coordinator with metadata store access.
+    ///
+    /// The sync metadata ops are wrapped in the async adapter
+    /// (`spawn_blocking` + bounded semaphore) so blocking RocksDB reads
+    /// never block a runtime worker.
     pub fn new_with_metadata(
         ring: Arc<RingCache>,
         node_id: NodeId,
@@ -249,7 +255,7 @@ impl ReadCoordinator {
             ring,
             node_id,
             conflict_resolver: conflict_resolver.unwrap_or_else(|| Arc::new(LwwResolver)),
-            metadata: Some(metadata),
+            metadata: Some(Arc::new(crate::metadata_async::AsyncMetadataOps::new(metadata))),
             segment_reader: None,
             pool: None,
             membership: None,
@@ -570,7 +576,7 @@ impl ReadCoordinator {
 
         // If remote won, apply winning metadata locally and return it.
         if let Some(winning) = winning_meta {
-            Self::apply_winning_metadata_locally(metadata_store, bucket, key, &winning);
+            Self::apply_winning_metadata_locally(metadata_store, bucket, key, &winning).await;
 
             info!(
                 bucket = %bucket.as_str(),
@@ -780,7 +786,7 @@ impl ReadCoordinator {
             // authoritative; genuine repair of lost data is the job of
             // anti-entropy/healing, not read repair.
             let local_still_authoritative = match metadata_store.as_ref() {
-                Some(store) => match store.get_object(&bucket_clone, &key_clone) {
+                Some(store) => match store.get_object(&bucket_clone, &key_clone).await {
                     Ok(Some(current)) => current.hlc == local_hlc,
                     Ok(None) | Err(_) => false,
                 },
@@ -819,7 +825,8 @@ impl ReadCoordinator {
                             &bucket_clone,
                             &key_clone,
                             winning,
-                        );
+                        )
+                        .await;
                     }
                 }
             }
@@ -895,8 +902,8 @@ impl ReadCoordinator {
 
     /// Writes corrected metadata from a winning remote into the local
     /// metadata store. Called when the local node is stale.
-    fn apply_winning_metadata_locally(
-        store: &Arc<dyn MetadataOps>,
+    async fn apply_winning_metadata_locally(
+        store: &Arc<crate::metadata_async::AsyncMetadataOps>,
         bucket: &BucketId,
         key: &ObjectKey,
         winning: &GetObjectMetadataResponse,
@@ -946,7 +953,7 @@ impl ReadCoordinator {
             hlc,
         };
 
-        match store.put_object(bucket, meta) {
+        match store.put_object(bucket, meta).await {
             Ok(()) => info!(
                 bucket = %bucket.as_str(),
                 key = %key.as_str(),
@@ -994,6 +1001,7 @@ impl ReadCoordinator {
         if let Some(ref store) = self.metadata {
             store
                 .get_object(&req.bucket, &req.key)
+                .await
                 .map_err(|e| Error::Internal(format!("metadata lookup: {e}")))?
                 .ok_or_else(|| Error::NotFound(format!("{}/{}", req.bucket, req.key)))
         } else {
@@ -1365,7 +1373,7 @@ impl ReadCoordinator {
     }
 
     /// Returns a reference to the metadata store, if any.
-    pub fn metadata_store(&self) -> Option<&Arc<dyn MetadataOps>> {
+    pub fn metadata_store(&self) -> Option<&Arc<crate::metadata_async::AsyncMetadataOps>> {
         self.metadata.as_ref()
     }
 }
@@ -1779,6 +1787,15 @@ mod tests {
             _meta: oceanfs_core::SegmentMetadata,
         ) -> std::result::Result<(), crate::metadata_ops::MetadataError> {
             Ok(())
+        }
+        fn get_segment(
+            &self,
+            _id: oceanfs_core::SegmentId,
+        ) -> std::result::Result<
+            Option<oceanfs_core::SegmentMetadata>,
+            crate::metadata_ops::MetadataError,
+        > {
+            Ok(None)
         }
     }
 
