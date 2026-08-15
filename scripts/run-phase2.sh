@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# run-phase2.sh — Run the Phase 2 sustained-load test from the Harness VM.
+# run-phase2.sh — Run the Phase 2 sustained-load test.
 #
-# Targets an already-running OceanFS SUT (deployed via sut-deploy.sh) in
-# remote-target mode (ADR-0019 two-VM topology) or spawns a local node
-# when no --sut is given. Builds the release e2e harness, runs
-# load_sustained, and reports the LoadReport path.
+# Two modes:
+#   --harness HOST   Run the payload ON the harness VM (the load must be
+#                    generated there: the SUT firewall only accepts :9000
+#                    from the internal network). SSHes to the harness,
+#                    executes the local-spawn flow there, then fetches the
+#                    LoadReport back to $REPORT_DIR.
+#   (no --harness)   Run locally (on the harness itself, or in CI quick
+#                    mode with a locally spawned node).
+#
+# Targets an already-running OceanFS SUT (deployed via sut-deploy.sh /
+# setup-harness.sh) in remote-target mode (ADR-0019 two-VM topology), or
+# spawns a local node when no --sut is given.
 #
 # Usage:
 #   ./scripts/run-phase2.sh [--quick|--full] [OPTIONS]
@@ -13,14 +21,18 @@
 # Options:
 #   --quick            Quick mode: 300s sustained load (default).
 #   --full             Full mode: 3600s sustained load.
-#   --sut HOST:PORT    Remote SUT endpoint (e.g. 10.0.0.5:9000). When
-#                      unset, the test spawns a local node (CI quick mode).
-#   --ssh TARGET       SSH target for crash control (e.g. root@10.0.0.5 or
-#                      an alias like oceanfs-sut). Required with --sut;
-#                      without it the crash-recovery phase is skipped.
+#   --harness HOST     Harness VM to run the payload on (user@host or an
+#                      alias like oceanfs-harness).
+#   --sut HOST:PORT    Remote SUT endpoint as seen from the harness
+#                      (e.g. 10.0.0.2:9000). When unset, the test spawns
+#                      a local node (CI quick mode).
+#   --ssh TARGET       SSH target for crash control from the harness
+#                      (e.g. root@10.0.0.2). Required with --sut; without
+#                      it the crash-recovery phase is skipped.
 #   --service NAME     systemd unit name on the SUT (default: oceanfs).
 #   --seed N           Deterministic seed (default: 42).
-#   --report-dir DIR   Report output dir on the harness (default:
+#   --report-dir DIR   Report output dir (on the harness in --harness
+#                      mode, fetched back here afterwards; default:
 #                      /tmp/oceanfs-reports — tmpfs per ADR-0019).
 #   -h, --help         Show this help.
 #
@@ -29,24 +41,27 @@
 # LOAD_TEST_REPORT_DIR.
 #
 # Examples:
-#   ./scripts/run-phase2.sh --quick --sut 10.0.0.5:9000 --ssh oceanfs-sut
-#   ./scripts/run-phase2.sh --full --sut 10.0.0.5:9000 --ssh oceanfs-sut --seed 7
+#   ./scripts/run-phase2.sh --harness oceanfs-harness --quick --sut 10.0.0.2:9000 --ssh root@10.0.0.2
+#   ./scripts/run-phase2.sh --harness oceanfs-harness --full --seed 7
 #   ./scripts/run-phase2.sh --quick                      # local spawn
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
 MODE="quick"
+HARNESS=""
 SUT=""
 SSH_TARGET=""
 SERVICE="${TARGET_SERVICE:-oceanfs}"
 SEED="${LOAD_TEST_SEED:-42}"
 REPORT_DIR="${LOAD_TEST_REPORT_DIR:-/tmp/oceanfs-reports}"
 
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+
 log_info() { echo "[INFO]  $(date '+%H:%M:%S') $*" >&2; }
 log_error() { echo "[ERROR] $(date '+%H:%M:%S') $*" >&2; }
 
 usage() {
-    sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 }
 
@@ -54,6 +69,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --quick) MODE="quick"; shift ;;
         --full) MODE="full"; shift ;;
+        --harness) HARNESS="${2:-}"; shift 2 ;;
         --sut) SUT="${2:-}"; shift 2 ;;
         --ssh) SSH_TARGET="${2:-}"; shift 2 ;;
         --service) SERVICE="${2:-}"; shift 2 ;;
@@ -70,6 +86,27 @@ else
     DURATION="${LOAD_TEST_DURATION_SECS:-300}"
 fi
 
+# ---------------------------------------------------------------------------
+# Harness mode: run the payload on the harness VM (load must originate on
+# the internal network), then fetch the report back.
+# ---------------------------------------------------------------------------
+if [ -n "$HARNESS" ]; then
+    log_info "Phase 2 $MODE mode on harness ${HARNESS} (sut=${SUT:-local}, seed=${SEED})..."
+
+    # The remote invocation drops --harness and runs the local flow.
+    ssh $SSH_OPTS -o BatchMode=yes "$HARNESS" \
+        "cd /root/ocean-fs && ./scripts/run-phase2.sh --${MODE} ${SUT:+--sut $SUT} ${SSH_TARGET:+--ssh $SSH_TARGET} --service ${SERVICE} --seed ${SEED} --report-dir ${REPORT_DIR}"
+    local_exit=$?
+
+    mkdir -p "$REPORT_DIR"
+    scp $SSH_OPTS "${HARNESS}:${REPORT_DIR}/2_load_sustained_*.json" "$REPORT_DIR/" 2>/dev/null \
+        && log_info "Report fetched to ${REPORT_DIR}/" || log_info "No report fetched (check ${HARNESS}:${REPORT_DIR})."
+    exit $local_exit
+fi
+
+# ---------------------------------------------------------------------------
+# Local flow (runs on the harness itself, or in CI with local spawn).
+# ---------------------------------------------------------------------------
 if [ -n "$SUT" ]; then
     [ -n "$SSH_TARGET" ] || log_error "--ssh is required with --sut (crash control needs it)."
     log_info "Phase 2 $MODE mode: remote SUT ${SUT} (crash control via ${SSH_TARGET})"

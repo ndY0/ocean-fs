@@ -155,7 +155,23 @@ else
     log_info "[DRY-RUN] clone/pull ${REPO} on the harness + cargo build --release -p oceanfs -p e2e"
 fi
 
-# 3. Verify SUT health over the internal network.
+# 3. Deploy to the SUT from the harness (the harness is the build machine,
+# per ADR-0019: build on the Harness VM, scp to the SUT VM). Reuses
+# sut-deploy.sh over the internal network.
+log_info "Deploying oceanfs to the SUT (${SUT_INTERNAL_IP}) from the harness..."
+if [ "$DRY_RUN" = false ]; then
+    if ! ssh $SSH_OPTS -o BatchMode=yes "root@${HARNESS_PUBLIC_IP}" \
+        "cd /root/ocean-fs && ./scripts/sut-deploy.sh --sut root@${SUT_INTERNAL_IP} --port 9000 --binary target/release/oceanfs"; then
+        log_error "SUT deploy failed. Check: ssh root@${SUT_PUBLIC_IP} 'systemctl status oceanfs'"
+        exit 1
+    fi
+    log_info "SUT deployed from the harness."
+else
+    log_info "[DRY-RUN] on harness: ./scripts/sut-deploy.sh --sut root@${SUT_INTERNAL_IP} --port 9000"
+fi
+
+# 4. Verify SUT health over the internal network (the path the harness
+# will actually use for the payload).
 log_info "Verifying SUT health over the internal network..."
 if [ "$DRY_RUN" = false ]; then
     if ! ssh $SSH_OPTS -o BatchMode=yes "root@${HARNESS_PUBLIC_IP}" \
@@ -170,9 +186,7 @@ fi
 
 cat <<READY
 
-Setup complete. Run the Phase 2 payload from the harness:
-  ssh root@${HARNESS_PUBLIC_IP}
-  cd /root/ocean-fs
-  ./scripts/run-phase2.sh --quick --sut ${SUT_INTERNAL_IP}:9000 --ssh root@${SUT_INTERNAL_IP} --seed 42
-  ./scripts/run-phase2.sh --full  --sut ${SUT_INTERNAL_IP}:9000 --ssh root@${SUT_INTERNAL_IP} --seed 7
+Setup complete. Run the Phase 2 payload from your laptop:
+  ./scripts/run-phase2.sh --harness root@${HARNESS_PUBLIC_IP} --quick --sut ${SUT_INTERNAL_IP}:9000 --ssh root@${SUT_INTERNAL_IP} --seed 42
+  ./scripts/run-phase2.sh --harness root@${HARNESS_PUBLIC_IP} --full  --sut ${SUT_INTERNAL_IP}:9000 --ssh root@${SUT_INTERNAL_IP} --seed 7
 READY
