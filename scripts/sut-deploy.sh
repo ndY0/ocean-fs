@@ -79,9 +79,9 @@ log_info "Deploying OceanFS to $SUT (port $PORT, service $SERVICE)"
 
 # 1. Binary.
 if [ "$DRY_RUN" = false ]; then
-    scp -o StrictHostKeyChecking=accept-new "$BINARY" "${SUT}:/usr/local/bin/oceanfs" \
+    scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "$BINARY" "${SUT}:/usr/local/bin/oceanfs" \
         || { log_error "scp failed to ${SUT}:/usr/local/bin/oceanfs"; exit 1; }
-    ssh -o StrictHostKeyChecking=accept-new "$SUT" "chmod +x /usr/local/bin/oceanfs"
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "$SUT" "chmod +x /usr/local/bin/oceanfs"
 else
     log_info "[DRY-RUN] scp $BINARY ${SUT}:/usr/local/bin/oceanfs && chmod +x"
 fi
@@ -92,7 +92,7 @@ if [ "$DRY_RUN" = true ]; then
     exit 0
 fi
 
-ssh -o StrictHostKeyChecking=accept-new "$SUT" bash -s -- "$PORT" "$DATA_DIR" "$CONFIG_DIR" "$SERVICE" <<'SUT_SETUP'
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "$SUT" bash -s -- "$PORT" "$DATA_DIR" "$CONFIG_DIR" "$SERVICE" <<'SUT_SETUP'
 set -euo pipefail
 PORT="$1"; DATA_DIR="$2"; CONFIG_DIR="$3"; SERVICE="$4"
 
@@ -139,7 +139,7 @@ SUT_SETUP
 # 3. Health check.
 log_info "Waiting for ${SERVICE} health on ${SUT}:${PORT}..."
 for _ in $(seq 1 30); do
-    if ssh -o StrictHostKeyChecking=accept-new "$SUT" \
+    if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "$SUT" \
         "curl -sf http://localhost:${PORT}/admin/health >/dev/null 2>&1"; then
         log_info "SUT healthy: http://${SUT}:${PORT}/admin/health"
         exit 0

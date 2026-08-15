@@ -558,7 +558,7 @@ wait_for_ssh() {
     local ssh_retries=90
     local ssh_retry=0
     while [ "$ssh_retry" -lt "$ssh_retries" ]; do
-        if ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=5 \
+        if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes \
                "root@${public_ip}" "echo ok" >/dev/null 2>&1; then
             log_info "SSH to ${public_ip} is up (attempt $((ssh_retry + 1)))."
             return 0
@@ -591,7 +591,7 @@ configure_sut_vm() {
     wait_for_ssh "$public_ip" || return 1
 
     # Install minimal dependencies (curl for Prometheus setup script)
-    ssh -o StrictHostKeyChecking=accept-new "root@${public_ip}" <<'SUT_SETUP'
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${public_ip}" <<'SUT_SETUP'
 set -euo pipefail
 apt-get update -qq
 apt-get install -y -qq curl
@@ -620,7 +620,7 @@ configure_harness_vm() {
     wait_for_ssh "$public_ip" || return 1
 
     # Install system dependencies
-    ssh -o StrictHostKeyChecking=accept-new "root@${public_ip}" <<HARNESS_SETUP
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${public_ip}" <<HARNESS_SETUP
 set -euo pipefail
 apt-get update -qq
 apt-get install -y -qq build-essential pkg-config libssl-dev curl git
@@ -628,25 +628,25 @@ HARNESS_SETUP
 
     # Install Rust
     log_info "Installing Rust toolchain on Harness VM..."
-    ssh -o StrictHostKeyChecking=accept-new "root@${public_ip}" \
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${public_ip}" \
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y" \
         || log_error "Rust installation failed on Harness VM."
 
     # Clone repo
     log_info "Cloning repository (branch=${BRANCH}) on Harness VM..."
     if [ -n "$COMMIT" ]; then
-        ssh -o StrictHostKeyChecking=accept-new "root@${public_ip}" \
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${public_ip}" \
             "git clone https://github.com/ocean-fs/ocean-fs.git --branch ${BRANCH} /root/ocean-fs && cd /root/ocean-fs && git checkout ${COMMIT}" \
             || log_error "Git clone/checkout failed on Harness VM."
     else
-        ssh -o StrictHostKeyChecking=accept-new "root@${public_ip}" \
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${public_ip}" \
             "git clone https://github.com/ocean-fs/ocean-fs.git --branch ${BRANCH} /root/ocean-fs" \
             || log_error "Git clone failed on Harness VM."
     fi
 
     # Build
     log_info "Building oceanfs + e2e on Harness VM... (this may take several minutes)"
-    ssh -o StrictHostKeyChecking=accept-new "root@${public_ip}" \
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${public_ip}" \
         "source /root/.cargo/env && cd /root/ocean-fs && cargo build --release -p oceanfs -p e2e" \
         || log_error "Build failed on Harness VM."
 
@@ -664,7 +664,7 @@ setup_ttl_timer() {
         return 0
     fi
 
-    ssh -o StrictHostKeyChecking=accept-new "root@${public_ip}" <<TTL_SETUP
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${public_ip}" <<TTL_SETUP
 set -euo pipefail
 
 # Create the auto-shutdown service
@@ -715,7 +715,7 @@ TTL_SETUP
 
     # Verify timer is active
     local timer_status
-    timer_status=$(ssh -o StrictHostKeyChecking=accept-new "root@${public_ip}" \
+    timer_status=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${public_ip}" \
         "systemctl is-active oceanfs-ttl.timer" 2>/dev/null || echo "inactive")
     if [ "$timer_status" = "active" ]; then
         log_info "TTL timer active on '${name}'."
