@@ -426,84 +426,75 @@ create_network() {
 # after each VM is created, BEFORE the config steps (SSH must stay open).
 # ---------------------------------------------------------------------------
 
-# YAML rule file for the SUT firewall (rules-file format of
-# `hcloud firewall create/update`).
-sut_rules_yaml() {
+# JSON rule file for the SUT firewall. The current hcloud CLI requires
+# JSON matching the API structure ({"rules": [...]}); older CLIs
+# accepted YAML — the create/replace fallbacks in ensure_firewall cover
+# the old command syntax, and the JSON wrapper is the documented format
+# since the CLI rewrite.
+sut_rules_json() {
     cat <<EOF
-rules:
-  - direction: in
-    protocol: tcp
-    port: "22"
-    source_ips:
-      - ${SSH_SOURCE_IP}
-      - ${NETWORK_CIDR}
-      - "::/0"
-  - direction: in
-    protocol: tcp
-    port: "9000"
-    source_ips:
-      - ${NETWORK_CIDR}
-  - direction: in
-    protocol: tcp
-    port: "9001"
-    source_ips:
-      - ${NETWORK_CIDR}
-  - direction: in
-    protocol: icmp
-    source_ips:
-      - 0.0.0.0/0
-      - "::/0"
+{"rules": [
+  {"direction": "in", "protocol": "tcp", "port": "22", "source_ips": ["${SSH_SOURCE_IP}", "${NETWORK_CIDR}", "::/0"]},
+  {"direction": "in", "protocol": "tcp", "port": "9000", "source_ips": ["${NETWORK_CIDR}"]},
+  {"direction": "in", "protocol": "tcp", "port": "9001", "source_ips": ["${NETWORK_CIDR}"]},
+  {"direction": "in", "protocol": "icmp", "source_ips": ["0.0.0.0/0", "::/0"]}
+]}
 EOF
 }
 
-# YAML rule file for the Harness firewall: SSH only.
-harness_rules_yaml() {
+# JSON rule file for the Harness firewall: SSH only.
+harness_rules_json() {
     cat <<EOF
-rules:
-  - direction: in
-    protocol: tcp
-    port: "22"
-    source_ips:
-      - ${SSH_SOURCE_IP}
-      - "::/0"
-  - direction: in
-    protocol: icmp
-    source_ips:
-      - 0.0.0.0/0
-      - "::/0"
+{"rules": [
+  {"direction": "in", "protocol": "tcp", "port": "22", "source_ips": ["${SSH_SOURCE_IP}", "::/0"]},
+  {"direction": "in", "protocol": "icmp", "source_ips": ["0.0.0.0/0", "::/0"]}
+]}
 EOF
 }
 
-# Creates (or updates) a managed firewall with the given rules and
-# applies it to the server. Idempotent: re-running with the same name
-# prefix updates the rules in place.
+# Creates (or replaces the rules of) a managed firewall and applies it
+# to the server. Idempotent: re-running with the same name prefix
+# replaces the rules in place.
+#
+# The hcloud CLI was rewritten and changed three contracts: the rules
+# file is JSON (not YAML), rule updates go through `replace-rules`
+# (positional firewall), and applying uses `apply-to-resource`
+# (singular, positional). Each step tries the current syntax first and
+# falls back to the legacy one, reporting both errors on failure so CLI
+# drift stays diagnosable.
 ensure_firewall() {
     local fw_name="$1"
     local server_name="$2"
-    local rules_yaml="$3"
+    local rules_json="$3"
 
     log_info "Ensuring firewall '${fw_name}' on server '${server_name}'..."
 
     local rules_file
     rules_file=$(mktemp)
-    printf '%s' "$rules_yaml" > "$rules_file"
-    trap 'rm -f "$rules_file"' RETURN
+    printf '%s' "$rules_json" > "$rules_file"
 
-    local fw_output
+    local out1 out2
     if hcloud firewall describe "$fw_name" >/dev/null 2>&1; then
-        if ! fw_output=$(hcloud firewall update "$fw_name" --rules-file "$rules_file" 2>&1); then
-            die "Failed to update firewall '${fw_name}': ${fw_output}"
+        if ! out1=$(hcloud firewall replace-rules --rules-file "$rules_file" "$fw_name" 2>&1); then
+            if ! out2=$(hcloud firewall update "$fw_name" --rules-file "$rules_file" 2>&1); then
+                rm -f "$rules_file"
+                die "Failed to update firewall '${fw_name}': replace-rules: ${out1} | update: ${out2}"
+            fi
         fi
         log_info "Firewall '${fw_name}' rules updated."
     else
-        if ! fw_output=$(hcloud firewall create --name "$fw_name" --rules-file "$rules_file" 2>&1); then
-            die "Failed to create firewall '${fw_name}': ${fw_output}"
+        if ! out1=$(hcloud firewall create --name "$fw_name" --rules-file "$rules_file" 2>&1); then
+            rm -f "$rules_file"
+            die "Failed to create firewall '${fw_name}': ${out1}"
         fi
         log_info "Firewall '${fw_name}' created."
     fi
+    rm -f "$rules_file"
 
-    if ! fw_output=$(hcloud firewall apply-to-resources --firewall "$fw_name" --server "$server_name" 2>&1); then
-        die "Failed to apply firewall '${fw_name}' to '${server_name}': ${fw_output}"
+    if ! out1=$(hcloud firewall apply-to-resource --type server --server "$server_name" "$fw_name" 2>&1); then
+        if ! out2=$(hcloud firewall apply-to-resources --firewall "$fw_name" --server "$server_name" 2>&1); then
+            die "Failed to apply firewall '${fw_name}' to '${server_name}': apply-to-resource: ${out1} | apply-to-resources: ${out2}"
+        fi
     fi
     log_info "Firewall '${fw_name}' applied to '${server_name}'."
 }
@@ -917,7 +908,7 @@ WARNING
             # Firewall BEFORE configuration: SSH stays open (rule above),
             # everything else is denied from the internet by default.
             if [ "$FIREWALLS" = true ]; then
-                ensure_firewall "${NAME_PREFIX}-sut-fw" "$sut_name" "$(sut_rules_yaml)"
+                ensure_firewall "${NAME_PREFIX}-sut-fw" "$sut_name" "$(sut_rules_json)"
             else
                 log_warn "Firewalls DISABLED (--no-firewall) — ${sut_name} is exposed to the internet."
             fi
@@ -949,7 +940,7 @@ WARNING
 
         if [ "$DRY_RUN" = false ]; then
             if [ "$FIREWALLS" = true ]; then
-                ensure_firewall "${NAME_PREFIX}-harness-fw" "$harness_name" "$(harness_rules_yaml)"
+                ensure_firewall "${NAME_PREFIX}-harness-fw" "$harness_name" "$(harness_rules_json)"
             else
                 log_warn "Firewalls DISABLED (--no-firewall) — ${harness_name} is exposed to the internet."
             fi
