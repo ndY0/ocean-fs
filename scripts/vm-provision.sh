@@ -547,6 +547,34 @@ create_vm() {
     echo "${private_ip} ${public_ip}"
 }
 
+# Waits for SSH to become available on a freshly created VM.
+#
+# 90 retries x 5s = 7.5 min budget: first boot (cloud-init, sshd
+# startup) is the slowest provisioning step and varies per VM/location
+# (observed: the second VM can exceed the old 150s budget). BatchMode
+# makes key problems fail fast instead of hanging on a password prompt.
+wait_for_ssh() {
+    local public_ip="$1"
+    local ssh_retries=90
+    local ssh_retry=0
+    while [ "$ssh_retry" -lt "$ssh_retries" ]; do
+        if ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=5 \
+               "root@${public_ip}" "echo ok" >/dev/null 2>&1; then
+            log_info "SSH to ${public_ip} is up (attempt $((ssh_retry + 1)))."
+            return 0
+        fi
+        ssh_retry=$((ssh_retry + 1))
+        if [ $((ssh_retry % 15)) -eq 0 ]; then
+            log_info "Still waiting for SSH on ${public_ip} (${ssh_retry}/${ssh_retries})..."
+        fi
+        sleep 5
+    done
+    log_error "SSH connection to ${public_ip} timed out after ${ssh_retries} attempts."
+    log_error "Check the VM state: hcloud server describe --output json <name> | jq '.status'"
+    log_error "Check the firewall allows tcp/22 from your IP: hcloud firewall describe <name>-fw"
+    return 1
+}
+
 # Configure SUT VM (minimal — no Rust toolchain)
 configure_sut_vm() {
     local name="$1"
@@ -560,22 +588,7 @@ configure_sut_vm() {
         return 0
     fi
 
-    # Wait for SSH to be available
-    local ssh_retries=30
-    local ssh_retry=0
-    while [ "$ssh_retry" -lt "$ssh_retries" ]; do
-        if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
-               "root@${public_ip}" "echo ok" >/dev/null 2>&1; then
-            break
-        fi
-        ssh_retry=$((ssh_retry + 1))
-        sleep 5
-    done
-
-    if [ "$ssh_retry" -ge "$ssh_retries" ]; then
-        log_error "SSH connection to ${public_ip} timed out."
-        return 1
-    fi
+    wait_for_ssh "$public_ip" || return 1
 
     # Install minimal dependencies (curl for Prometheus setup script)
     ssh -o StrictHostKeyChecking=accept-new "root@${public_ip}" <<'SUT_SETUP'
@@ -604,22 +617,7 @@ configure_harness_vm() {
         return 0
     fi
 
-    # Wait for SSH to be available
-    local ssh_retries=30
-    local ssh_retry=0
-    while [ "$ssh_retry" -lt "$ssh_retries" ]; do
-        if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
-               "root@${public_ip}" "echo ok" >/dev/null 2>&1; then
-            break
-        fi
-        ssh_retry=$((ssh_retry + 1))
-        sleep 5
-    done
-
-    if [ "$ssh_retry" -ge "$ssh_retries" ]; then
-        log_error "SSH connection to ${public_ip} timed out."
-        return 1
-    fi
+    wait_for_ssh "$public_ip" || return 1
 
     # Install system dependencies
     ssh -o StrictHostKeyChecking=accept-new "root@${public_ip}" <<HARNESS_SETUP
