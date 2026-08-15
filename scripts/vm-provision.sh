@@ -360,9 +360,29 @@ get_vm_ips() {
 }
 
 create_network() {
-    # Check if network exists; create if not
+    # If the network exists, it must have at least one subnetwork —
+    # Hetzner rejects server attachment to networks without one
+    # ("networks must have at least one subnetwork"). Networks created
+    # by this script always have one; manually created ones may not.
     if hcloud network describe "$NETWORK_NAME" --output json >/dev/null 2>&1; then
-        log_info "Network '${NETWORK_NAME}' already exists."
+        local subnet_count
+        subnet_count=$(hcloud network describe "$NETWORK_NAME" --output json 2>/dev/null \
+            | jq '[.subnets[]?] | length' 2>/dev/null || echo 0)
+        if [ "${subnet_count:-0}" -gt 0 ]; then
+            log_info "Network '${NETWORK_NAME}' already exists with ${subnet_count} subnetwork(s)."
+            return 0
+        fi
+        log_warn "Network '${NETWORK_NAME}' exists but has NO subnetwork — adding ${NETWORK_CIDR}..."
+        local subnet_output
+        if ! subnet_output=$(hcloud network add-subnet \
+            --network "$NETWORK_NAME" \
+            --type cloud \
+            --network-zone eu-central \
+            --ip-range "$NETWORK_CIDR" \
+            2>&1); then
+            die "Failed to add subnetwork to '${NETWORK_NAME}': ${subnet_output}"
+        fi
+        log_info "Subnetwork ${NETWORK_CIDR} added to '${NETWORK_NAME}'."
         return 0
     fi
 
@@ -389,6 +409,13 @@ create_vm() {
         log_info "[DRY-RUN] hcloud server create --name '${name}' --type '${type}' --image '${image}' --network '${NETWORK_NAME}' --ssh-key '${ssh_key}'"
         DRY_RUN_VMS+=("${name} ${type} ${image}")
         return 0
+    fi
+
+    # Fail fast with a clear message when the name is already taken
+    # (e.g. a leftover from a manual attempt) instead of an opaque
+    # hcloud "name already exists" error mid-provisioning.
+    if hcloud server describe "$name" >/dev/null 2>&1; then
+        die "VM '${name}' already exists. Re-run with a different --name prefix, or remove it: hcloud server delete ${name}"
     fi
 
     # Capture hcloud's output so a failure reports the REAL reason
