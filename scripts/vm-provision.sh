@@ -47,6 +47,7 @@ set -euo pipefail
 readonly MAX_AGENT_VM_TYPE="cx33"
 readonly DEFAULT_PROVIDER="hetzner"
 readonly DEFAULT_BRANCH="main"
+readonly DEFAULT_REPO="https://github.com/ndY0/ocean-fs.git"
 readonly DEFAULT_IMAGE="ubuntu-24.04"
 readonly DEFAULT_TTL_HOURS="${LOAD_TEST_TTL_HOURS:-4}"
 readonly NETWORK_NAME="oceanfs-testnet"
@@ -81,6 +82,7 @@ VM_TYPE_RANK[cpx62]=5
 PHASE=""
 PROVIDER="${DEFAULT_PROVIDER}"
 BRANCH="${DEFAULT_BRANCH}"
+REPO_URL="${DEFAULT_REPO}"
 COMMIT=""
 SSH_KEY_PATH=""
 NAME_PREFIX=""
@@ -636,11 +638,11 @@ HARNESS_SETUP
     log_info "Cloning repository (branch=${BRANCH}) on Harness VM..."
     if [ -n "$COMMIT" ]; then
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${public_ip}" \
-            "git clone https://github.com/ocean-fs/ocean-fs.git --branch ${BRANCH} /root/ocean-fs && cd /root/ocean-fs && git checkout ${COMMIT}" \
+            "git clone ${REPO_URL} --branch ${BRANCH} /root/ocean-fs && cd /root/ocean-fs && git checkout ${COMMIT}" \
             || log_error "Git clone/checkout failed on Harness VM."
     else
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${public_ip}" \
-            "git clone https://github.com/ocean-fs/ocean-fs.git --branch ${BRANCH} /root/ocean-fs" \
+            "git clone ${REPO_URL} --branch ${BRANCH} /root/ocean-fs" \
             || log_error "Git clone failed on Harness VM."
     fi
 
@@ -1037,6 +1039,7 @@ OPTIONS:
                        Phase 5+: N/A (separate provisioning model)
   --provider NAME      Cloud provider: hetzner (default), gcp, aws
   --branch BRANCH      Git branch to clone on Harness VM (default: main)
+  --repo URL           Git repo to clone on Harness VM (default: github.com/ndY0/ocean-fs)
   --commit SHA         Specific commit to check out on Harness VM
   --ssh-key PATH       SSH public key path (default: ~/.ssh/id_rsa.pub)
   --name NAME          VM name prefix (default: oceanfs-loadtest-{phase})
@@ -1146,6 +1149,10 @@ parse_args() {
                 ;;
             --branch)
                 BRANCH="${2:-main}"
+                shift 2
+                ;;
+            --repo)
+                REPO_URL="${2:-}"
                 shift 2
                 ;;
             --commit)
@@ -1303,8 +1310,20 @@ main() {
     # Output
     if [ "$DRY_RUN" = false ]; then
         log_info "Provisioning complete. Outputting JSON..."
+        # Persist the record so follow-up tooling (setup-harness.sh) can
+        # derive IPs, repo/branch, and the SSH key without re-querying.
+        local record
+        record=$(output_json)
+        printf '%s\n' "$record"
+        mkdir -p .hetzner
+        printf '%s\n' "$record" | jq --arg repo "$REPO_URL" --arg branch "$BRANCH" \
+            --arg commit "$COMMIT" --arg ssh_key "$SSH_KEY_PATH" \
+            '. + {repo: $repo, branch: $branch, commit: $commit, ssh_key: $ssh_key}' \
+            > ".hetzner/provision-${NAME_PREFIX}.json"
+        log_info "Provisioning record written to .hetzner/provision-${NAME_PREFIX}.json"
+    else
+        output_json
     fi
-    output_json
 }
 
 # ---------------------------------------------------------------------------
