@@ -1179,19 +1179,39 @@ pub fn random_bytes(len: usize) -> Vec<u8> {
     buf
 }
 
-/// Deterministic, highly-compressible payload (repeating block).
+/// Realistically-compressible payload (~2x): half incompressible
+/// random data, half compressible text.
 ///
 /// The default load uses [`random_bytes`] — incompressible, so the
 /// node's don't-shrink guard stores everything raw and the
-/// decompression path is never exercised. Compression runs set
-/// `LOAD_TEST_COMPRESSIBLE=1` to make the compression counters and the
-/// decompress path observable.
+/// decompression path is never exercised. A pure repeated block would
+/// compress ~12,000x (a 4-16 MiB object becomes ~341 bytes stored), so
+/// standard segments need ~12,000 chunks to fill and the seal-time EC
+/// encode fires about once every three minutes — the dashboards look
+/// dead and the phase-2 CPU-bound premise evaporates. Mixing random
+/// data with text gives zstd a realistic 2x ratio: segments fill at
+/// the designed rate and the encode/decompress paths are observable.
 pub fn compressible_bytes(len: usize) -> Vec<u8> {
+    use rand::RngCore;
     const BLOCK: &[u8] = b"The quick brown fox jumps over the lazy dog. 0123456789 ";
+    const SECTION: usize = 2048;
     let mut buf = Vec::with_capacity(len);
+    let mut rng = rand::thread_rng();
+    let mut section = 0usize;
     while buf.len() < len {
-        let take = (len - buf.len()).min(BLOCK.len());
-        buf.extend_from_slice(&BLOCK[..take]);
+        if section % 2 == 0 {
+            // Compressible text section (repeated sentence).
+            while buf.len() < len && buf.len() % SECTION < SECTION - BLOCK.len() {
+                buf.extend_from_slice(BLOCK);
+            }
+        } else {
+            // Incompressible random section.
+            let take = (len - buf.len()).min(SECTION);
+            let mut r = vec![0u8; take];
+            rng.fill_bytes(&mut r);
+            buf.extend_from_slice(&r);
+        }
+        section += 1;
     }
     buf
 }
