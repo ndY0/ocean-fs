@@ -211,6 +211,7 @@ async fn write_coordinator_handoff_on_replica_failure() {
             &size_config,
             buffer_pool.clone(),
             None,
+            None,
         )
         .unwrap(),
     );
@@ -220,6 +221,7 @@ async fn write_coordinator_handoff_on_replica_failure() {
             oceanfs_core::SizeTier::Standard,
             &size_config,
             buffer_pool,
+            None,
             None,
         )
         .unwrap(),

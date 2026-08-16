@@ -364,23 +364,38 @@ impl Default for GpuConfig {
 /// use oceanfs_core::{CompressConfig, CompressionTier};
 ///
 /// let config = CompressConfig::default();
-/// assert_eq!(config.tier, CompressionTier::Auto);
-/// assert_eq!(config.level, 3);
+/// // Default is OFF — buckets must opt in via `tier`.
+/// assert_eq!(config.tier, CompressionTier::None);
 /// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompressConfig {
-    /// Compression tier to use: Auto, CpuZstd, CpuIgzip, or GpuNvcomp.
+    /// Compression tier to use: None (off), Auto, CpuZstd, CpuIgzip, or
+    /// GpuNvcomp. `None` disables compression for the bucket.
     pub tier: CompressionTier,
     /// Compression level (0-22 for zstd, 0-3 for igzip).
     /// Higher levels produce smaller output at the cost of more CPU/GPU time.
     pub level: u32,
     /// nvCOMP-specific configuration (only used when `tier` is GpuNvcomp).
     pub nvcomp: Option<NvcompConfig>,
+    /// Chunks smaller than this many bytes are stored uncompressed
+    /// (small payloads compress poorly and cost CPU for nothing).
+    #[serde(default = "default_min_chunk_bytes")]
+    pub min_chunk_bytes: usize,
+}
+
+/// Default compression skip threshold: 1 KiB.
+pub fn default_min_chunk_bytes() -> usize {
+    1024
 }
 
 impl Default for CompressConfig {
     fn default() -> Self {
-        Self { tier: CompressionTier::Auto, level: 3, nvcomp: None }
+        Self {
+            tier: CompressionTier::None,
+            level: 3,
+            nvcomp: None,
+            min_chunk_bytes: default_min_chunk_bytes(),
+        }
     }
 }
 

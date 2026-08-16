@@ -84,7 +84,16 @@ async fn reaper_referenced_segment_not_orphan() {
     metadata.put_segment(seg_meta).expect("put segment");
 
     // Create an object referencing this segment
-    let obj = make_object("alive.txt", ChunkRef { segment_id: seg_id, offset: 0, length: 500 });
+    let obj = make_object(
+        "alive.txt",
+        ChunkRef {
+            segment_id: seg_id,
+            offset: 0,
+            length: 500,
+            compressed: false,
+            logical_length: 500,
+        },
+    );
     metadata.put_object(obj).expect("put object");
 
     let shard_store = make_shard_store();

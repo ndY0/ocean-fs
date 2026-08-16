@@ -29,7 +29,7 @@ use crate::{types::hash_output::HashOutput, Hlc};
 /// let chunk = ChunkRef {
 ///     segment_id: SegmentId::new(),
 ///     offset: 0,
-///     length: 1024,
+///     length: 1024, compressed: false, logical_length: 1024,
 /// };
 /// assert_eq!(chunk.length, 1024);
 /// ```
@@ -39,8 +39,18 @@ pub struct ChunkRef {
     pub segment_id: SegmentId,
     /// Byte offset of the chunk within the segment.
     pub offset: u64,
-    /// Length of the chunk in bytes.
+    /// Length of the chunk as stored in the segment file (compressed
+    /// when `compressed` is true, logical otherwise).
     pub length: u32,
+    /// Whether the stored bytes are compressed (zstd via the accel
+    /// dispatcher). When `true`, `logical_length` holds the original
+    /// uncompressed size and readers must decompress before use.
+    #[serde(default)]
+    pub compressed: bool,
+    /// Original uncompressed length of the chunk. Meaningful only when
+    /// `compressed` is true; ignored otherwise.
+    #[serde(default)]
+    pub logical_length: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +222,13 @@ mod tests {
     #[test]
     fn chunk_ref_construction_and_access() {
         let seg = SegmentId::new();
-        let chunk = ChunkRef { segment_id: seg, offset: 4096, length: 1024 };
+        let chunk = ChunkRef {
+            segment_id: seg,
+            offset: 4096,
+            length: 1024,
+            compressed: false,
+            logical_length: 1024,
+        };
         assert_eq!(chunk.offset, 4096);
         assert_eq!(chunk.length, 1024);
         assert_eq!(chunk.segment_id, seg);
@@ -221,7 +237,13 @@ mod tests {
     #[test]
     fn chunk_ref_copy_and_eq() {
         let seg = SegmentId::new();
-        let a = ChunkRef { segment_id: seg, offset: 0, length: 100 };
+        let a = ChunkRef {
+            segment_id: seg,
+            offset: 0,
+            length: 100,
+            compressed: false,
+            logical_length: 100,
+        };
         let b = a; // Copy
         assert_eq!(a, b);
     }
@@ -246,7 +268,13 @@ mod tests {
     #[test]
     fn object_metadata_is_segment_stored_when_chunks_present() {
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id: SegmentId::new(), offset: 0, length: 200 });
+        chunks.push(ChunkRef {
+            segment_id: SegmentId::new(),
+            offset: 0,
+            length: 200,
+            compressed: false,
+            logical_length: 200,
+        });
         let meta = ObjectMetadata {
             object_key: ObjectKey::new("y"),
             size: 200,

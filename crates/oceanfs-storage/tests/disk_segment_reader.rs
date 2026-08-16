@@ -48,6 +48,8 @@ async fn disk_reader_buffered_read_write_roundtrip() {
         Arc::new(DiskIo::TokioFs),
         None,
         dir.path().to_path_buf(),
+        None,
+        None,
     );
 
     // Read a chunk and verify data matches.
@@ -78,6 +80,8 @@ async fn disk_reader_mmap_read_write_roundtrip() {
         Arc::new(DiskIo::TokioFs),
         Some(cache.clone()),
         dir.path().to_path_buf(),
+        None,
+        None,
     );
 
     // First read: cache miss, maps the file.
@@ -109,6 +113,8 @@ async fn disk_reader_multiple_segments() {
         Arc::new(DiskIo::TokioFs),
         Some(cache),
         dir.path().to_path_buf(),
+        None,
+        None,
     );
 
     // Write and read 3 different segments.
@@ -149,6 +155,8 @@ async fn disk_reader_error_on_missing_file() {
         Arc::new(DiskIo::TokioFs),
         None,
         dir.path().to_path_buf(),
+        None,
+        None,
     );
 
     let result = reader.read_chunk(&SegmentId::new(), 0, 100).await;
@@ -171,6 +179,8 @@ async fn disk_reader_respects_io_mode_buffered() {
         Arc::new(DiskIo::TokioFs),
         None,
         dir.path().to_path_buf(),
+        None,
+        None,
     );
 
     let chunk = reader.read_chunk(&id, 9, 4).await.unwrap();
@@ -198,6 +208,8 @@ async fn segment_cache_eviction_preserves_mmap_data() {
         Arc::new(DiskIo::TokioFs),
         Some(cache.clone()),
         dir.path().to_path_buf(),
+        None,
+        None,
     );
 
     // Read id1 → maps and caches it.
@@ -228,6 +240,8 @@ async fn segment_cache_invalidation_allows_re_read() {
         Arc::new(DiskIo::TokioFs),
         Some(cache.clone()),
         dir.path().to_path_buf(),
+        None,
+        None,
     );
 
     // Read → cache hit.
@@ -303,6 +317,8 @@ mod write_read_roundtrip {
             Arc::new(DiskIo::TokioFs),
             None,
             segments_dir,
+            None,
+            None,
         ));
 
         (sealer, reader)
@@ -329,6 +345,7 @@ mod write_read_roundtrip {
                 0,
                 0,
                 0,
+                None,
                 None,
             )
             .await
@@ -360,6 +377,7 @@ mod write_read_roundtrip {
                 0,
                 0,
                 0,
+                None,
                 None,
             )
             .await

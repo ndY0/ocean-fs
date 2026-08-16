@@ -333,12 +333,8 @@ async fn run_ssh(args: &[&str]) -> Result<(), Error> {
     // Disposable test VMs: never track host keys (the SUT's key is not in
     // the harness's known_hosts — the SUT is reached over the internal
     // network and the harness may be re-provisioned at any time).
-    let mut full_args: Vec<&str> = vec![
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-    ];
+    let mut full_args: Vec<&str> =
+        vec!["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"];
     full_args.extend_from_slice(args);
     // Own the arguments so the blocking closure is `'static`.
     let args: Vec<String> = full_args.iter().map(|s| (*s).to_string()).collect();

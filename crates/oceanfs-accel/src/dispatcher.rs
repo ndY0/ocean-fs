@@ -25,6 +25,7 @@ use std::{
     },
 };
 
+use bytes::Bytes;
 #[cfg(all(feature = "cuda", not(no_cuda_toolkit)))]
 use oceanfs_core::GpuConfig;
 use oceanfs_core::{
@@ -37,6 +38,7 @@ use crate::{
     compressor::{Compressor, ZstdCompressor},
     metrics::AccelMetrics,
     tier0::{self, CpuEncoder},
+    Result,
 };
 
 /// Acceleration tier levels for EC operations.
@@ -1100,6 +1102,44 @@ impl Decoder for AccelDispatcher {
             self.metrics.record_decode(byte_count);
         }
         result
+    }
+}
+
+impl Compressor for AccelDispatcher {
+    fn compress(&self, data: &[u8], level: u32) -> Result<Bytes> {
+        let start = std::time::Instant::now();
+        let compressor = self.resolve_compressor(CompressionTier::Auto);
+        let result = compressor.compress(data, level);
+        self.compress_duration_us.observe(start.elapsed().as_micros() as u64);
+        result
+    }
+
+    fn compress_into(&self, data: &[u8], level: u32, out: &mut [u8]) -> Result<usize> {
+        let start = std::time::Instant::now();
+        let compressor = self.resolve_compressor(CompressionTier::Auto);
+        let result = compressor.compress_into(data, level, out);
+        self.compress_duration_us.observe(start.elapsed().as_micros() as u64);
+        result
+    }
+
+    fn decompress(&self, data: &[u8]) -> Result<Bytes> {
+        let start = std::time::Instant::now();
+        let compressor = self.resolve_compressor(CompressionTier::Auto);
+        let result = compressor.decompress(data);
+        self.decompress_duration_us.observe(start.elapsed().as_micros() as u64);
+        result
+    }
+
+    fn decompress_exact(&self, data: &[u8], expected_len: usize) -> Result<Bytes> {
+        let start = std::time::Instant::now();
+        let compressor = self.resolve_compressor(CompressionTier::Auto);
+        let result = compressor.decompress_exact(data, expected_len);
+        self.decompress_duration_us.observe(start.elapsed().as_micros() as u64);
+        result
+    }
+
+    fn compression_tier(&self) -> CompressionTier {
+        CompressionTier::Auto
     }
 }
 

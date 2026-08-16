@@ -65,7 +65,13 @@ async fn gc_cycle_with_only_live_objects() {
         .put_object(make_object_meta(
             "live.txt",
             500,
-            ChunkRef { segment_id: seg_id, offset: 0, length: 500 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 500,
+                compressed: false,
+                logical_length: 500,
+            },
         ))
         .unwrap();
 
@@ -89,7 +95,13 @@ async fn gc_cycle_detects_dead_space() {
         .put_object(make_object_meta(
             "live.txt",
             600,
-            ChunkRef { segment_id: seg_id, offset: 0, length: 600 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 600,
+                compressed: false,
+                logical_length: 600,
+            },
         ))
         .unwrap();
 
@@ -147,7 +159,13 @@ async fn full_gc_cycle_compacts_segment() {
             .put_object(make_object_meta(
                 &format!("obj{i}.txt"),
                 200,
-                ChunkRef { segment_id: seg_id, offset: i * 200, length: 200 },
+                ChunkRef {
+                    segment_id: seg_id,
+                    offset: i * 200,
+                    length: 200,
+                    compressed: false,
+                    logical_length: 200,
+                },
             ))
             .unwrap();
     }
@@ -216,7 +234,13 @@ async fn gc_cycle_respects_tombstone_ttl() {
             .put_object(make_object_meta(
                 &format!("ttl_obj{i}.txt"),
                 200,
-                ChunkRef { segment_id: seg_id, offset: i * 200, length: 200 },
+                ChunkRef {
+                    segment_id: seg_id,
+                    offset: i * 200,
+                    length: 200,
+                    compressed: false,
+                    logical_length: 200,
+                },
             ))
             .unwrap();
     }

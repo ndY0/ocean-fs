@@ -100,6 +100,8 @@ impl SegmentCompactor {
                         segment_id: new_segment_id,
                         offset: new_offset,
                         length: chunk.length,
+                        compressed: false,
+                        logical_length: chunk.length,
                     };
                     let key = (chunk.segment_id, chunk.offset, chunk.length);
                     chunk_remap.insert(key, new_chunk);
@@ -251,7 +253,13 @@ mod tests {
         let obj_meta = make_object_meta(
             "ref.txt",
             500,
-            ChunkRef { segment_id: seg_id, offset: 0, length: 500 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 500,
+                compressed: false,
+                logical_length: 500,
+            },
         );
         metadata.put_object(obj_meta).unwrap();
 
@@ -260,7 +268,13 @@ mod tests {
         let obj_meta2 = make_object_meta(
             "other.txt",
             200,
-            ChunkRef { segment_id: other_seg_id, offset: 0, length: 200 },
+            ChunkRef {
+                segment_id: other_seg_id,
+                offset: 0,
+                length: 200,
+                compressed: false,
+                logical_length: 200,
+            },
         );
         metadata.put_object(obj_meta2).unwrap();
 
@@ -324,7 +338,13 @@ mod tests {
         let obj_meta = make_object_meta(
             "old_deleted.txt",
             300,
-            ChunkRef { segment_id: seg_id, offset: 0, length: 300 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 300,
+                compressed: false,
+                logical_length: 300,
+            },
         );
         metadata.put_object(obj_meta).unwrap();
 
@@ -370,7 +390,13 @@ mod tests {
         let obj_meta = make_object_meta(
             "moved.txt",
             400,
-            ChunkRef { segment_id: old_seg_id, offset: 0, length: 400 },
+            ChunkRef {
+                segment_id: old_seg_id,
+                offset: 0,
+                length: 400,
+                compressed: false,
+                logical_length: 400,
+            },
         );
         metadata.put_object(obj_meta).unwrap();
 
@@ -420,7 +446,13 @@ mod tests {
             let obj_meta = make_object_meta(
                 &format!("keep{i}.txt"),
                 200,
-                ChunkRef { segment_id: seg_id, offset: i * 200, length: 200 },
+                ChunkRef {
+                    segment_id: seg_id,
+                    offset: i * 200,
+                    length: 200,
+                    compressed: false,
+                    logical_length: 200,
+                },
             );
             metadata.put_object(obj_meta).unwrap();
         }
@@ -475,7 +507,13 @@ mod tests {
         let obj_meta_live = make_object_meta(
             "live.txt",
             300,
-            ChunkRef { segment_id: seg_id, offset: 0, length: 300 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 300,
+                compressed: false,
+                logical_length: 300,
+            },
         );
         metadata.put_object(obj_meta_live).unwrap();
 
@@ -484,7 +522,13 @@ mod tests {
         let obj_meta_dead = make_object_meta(
             "dead.txt",
             200,
-            ChunkRef { segment_id: seg_id, offset: 300, length: 200 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 300,
+                length: 200,
+                compressed: false,
+                logical_length: 200,
+            },
         );
         metadata.put_object(obj_meta_dead).unwrap();
 

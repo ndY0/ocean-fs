@@ -598,8 +598,7 @@ impl Node {
         // encode is observable (accel_encode_ops_total, duration
         // histograms, fallbacks) — the accel tier is exercised on the
         // write path, not just in isolation.
-        let pool_ec_encoder: Option<std::sync::Arc<dyn oceanfs_ec::Encoder>> =
-            Some(accel.clone());
+        let pool_ec_encoder: Option<std::sync::Arc<dyn oceanfs_ec::Encoder>> = Some(accel.clone());
         let segment_pool_small = Arc::new(
             SegmentPool::new(
                 pool_config.clone(),
@@ -1005,6 +1004,10 @@ impl Node {
                 hint_config,
             )
             .with_timeouts(op_timeouts.clone())
+            // Per-bucket compression: buckets opting in via
+            // `compression.tier != None` compress chunks on the write
+            // path through the accel dispatcher (blocking pool).
+            .with_compressor(Some(accel.clone()))
             // Continuous anti-entropy: every successful seal updates the
             // incremental Merkle tree (with its seal-time root) so
             // recently-written segments participate in the root exchange
@@ -1030,6 +1033,9 @@ impl Node {
             .with_membership(membership.clone())
             .with_decoder(ec_decoder.clone())
             .with_ec_codec(heal_codec_config.data_shards, heal_codec_config.parity_shards)
+            // Read-path decompression for compressed chunks (paired
+            // with the write path's per-bucket compression).
+            .with_compressor(Some(accel.clone()))
             .with_timeouts(op_timeouts.clone())
             .with_default_fetch_strategy(config.default_fetch_strategy)
             .with_hlc_clock(hlc_clock.clone()),

@@ -231,6 +231,14 @@ impl NegativeCache {
             .clone();
 
         bucket_cache.filter.write().insert(bucket, key);
+        // The key is now DEFINITELY absent: drop any "recently written"
+        // overlay entry so `contains` can serve the negative answer.
+        // Without this, a key written then deleted could never produce
+        // a negative-cache hit — the write path's `invalidate` recorded
+        // it in the overlay, which suppresses negative answers.
+        if let Some(recent) = self.recent_writes.get_mut(bucket) {
+            recent.remove(key);
+        }
         self.stats.entry_count.inc();
     }
 
@@ -365,6 +373,33 @@ mod tests {
         });
         cache.insert(&BucketId::new("b"), &ObjectKey::new("k"));
         assert!(cache.contains(&BucketId::new("b"), &ObjectKey::new("k")));
+    }
+
+    #[test]
+    fn delete_after_write_serves_negative_hit() {
+        // Regression: the write path's `invalidate` records the key in
+        // the recent-writes overlay, which suppresses negative answers.
+        // A key written THEN deleted must still produce a negative-cache
+        // hit — the DELETE's `insert` has to drop the overlay entry.
+        let cache = NegativeCache::new(NegativeCacheConfig {
+            enabled: true,
+            size_bytes: 1024,
+            fp_rate: 0.01,
+            rebuild_interval_sec: 3600,
+            ..Default::default()
+        });
+        let bucket = BucketId::new("b");
+        let key = ObjectKey::new("k");
+        // Write path: key written → overlay records it.
+        cache.invalidate(&bucket, &key);
+        // Delete path: key removed → negative set populated.
+        cache.insert(&bucket, &key);
+        // The overlay must NOT suppress the negative answer anymore.
+        assert!(
+            cache.contains(&bucket, &key),
+            "deleted key must be served from the negative cache"
+        );
+        assert_eq!(cache.stats().hits.get(), 1, "negative hit must be counted");
     }
 
     #[test]

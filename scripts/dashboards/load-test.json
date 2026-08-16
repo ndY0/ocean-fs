@@ -2447,6 +2447,11 @@
           "expr": "rate(gc_bytes_reclaimed_total{job=\"oceanfs\"}[1m])",
           "legendFormat": "bytes",
           "refId": "B"
+        },
+        {
+          "expr": "rate(gc_dead_bytes_total{job=\"oceanfs\"}[1m])",
+          "legendFormat": "dead bytes found",
+          "refId": "C"
         }
       ],
       "options": {

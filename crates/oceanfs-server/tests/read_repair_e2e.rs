@@ -126,6 +126,8 @@ async fn put_get_metadata_roundtrip() {
         chunk_segment_ids: vec![],
         chunk_offsets: vec![],
         chunk_lengths: vec![],
+        chunk_logical_lengths: vec![],
+        chunk_compressed: vec![],
     });
     let push_resp = client.put_object_metadata(push_req).await.unwrap();
     assert!(push_resp.into_inner().written);
@@ -167,6 +169,8 @@ async fn put_overwrites_stale_version() {
             chunk_segment_ids: vec![],
             chunk_offsets: vec![],
             chunk_lengths: vec![],
+            chunk_logical_lengths: vec![],
+            chunk_compressed: vec![],
         }))
         .await
         .unwrap();
@@ -184,6 +188,8 @@ async fn put_overwrites_stale_version() {
             chunk_segment_ids: vec![],
             chunk_offsets: vec![],
             chunk_lengths: vec![],
+            chunk_logical_lengths: vec![],
+            chunk_compressed: vec![],
         }))
         .await
         .unwrap();
@@ -239,6 +245,8 @@ async fn put_object_with_chunks_roundtrip() {
             chunk_segment_ids: vec![proto_sid],
             chunk_offsets: vec![100],
             chunk_lengths: vec![200],
+            chunk_logical_lengths: vec![],
+            chunk_compressed: vec![],
         }))
         .await
         .unwrap();

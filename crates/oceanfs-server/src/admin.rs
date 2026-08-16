@@ -9,10 +9,10 @@
 use std::{collections::HashMap, sync::Arc};
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use dashmap::DashMap;
@@ -443,6 +443,7 @@ impl AdminHandler {
             .route("/admin/scrub", post(trigger_scrub))
             .route("/admin/metrics", get(metrics_endpoint))
             .route("/admin/acceleration", get(acceleration_status))
+            .route("/admin/buckets/{bucket}/policy", put(set_bucket_policy))
             .with_state(state)
     }
 }
@@ -455,6 +456,31 @@ async fn health_check() -> impl IntoResponse {
         "version": env!("CARGO_PKG_VERSION"),
     });
     (StatusCode::OK, Json(body)).into_response()
+}
+
+/// PUT /admin/buckets/{bucket}/policy — replace a bucket's policy.
+///
+/// Accepts a full [`BucketPolicy`] JSON body (serde defaults fill
+/// omitted fields; content-type agnostic). Used by the load harness to
+/// opt buckets into per-bucket features such as compression
+/// (`{"compression": {"tier": "Auto", "level": 3}}`).
+async fn set_bucket_policy(
+    State(state): State<AdminState>,
+    Path(bucket): Path<String>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let policy: crate::BucketPolicy = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid policy JSON: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    state.buckets.put(bucket.clone(), policy);
+    (StatusCode::OK, Json(serde_json::json!({ "bucket": bucket, "updated": true }))).into_response()
 }
 
 /// GET /admin/cluster — returns cluster membership view as JSON.

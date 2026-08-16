@@ -35,8 +35,15 @@ fn make_ec_pool() -> SegmentPool {
         SegmentSizeConfig { default_target_size: 1024, ..SegmentSizeConfig::default() };
     let buffer_pool = Arc::new(BufferPool::new(65536, 4));
 
-    SegmentPool::new(pool_config, SizeTier::Standard, &size_config, buffer_pool, Some(ec_config))
-        .unwrap()
+    SegmentPool::new(
+        pool_config,
+        SizeTier::Standard,
+        &size_config,
+        buffer_pool,
+        Some(ec_config),
+        None,
+    )
+    .unwrap()
 }
 
 /// Builds a sealer writing into `dir/segments`.
@@ -103,7 +110,7 @@ async fn seal_from_data_persists_ec_parity_section() {
     let data = bytes::Bytes::from(vec![0xCDu8; 1024]); // 4 complete stripes
 
     let _handle = sealer
-        .seal_from_data(segment_id, SizeTier::Standard, data.clone(), &[], 4, 2, 64, None)
+        .seal_from_data(segment_id, SizeTier::Standard, data.clone(), &[], 4, 2, 64, None, None)
         .await
         .unwrap();
 
@@ -125,7 +132,7 @@ async fn seal_without_ec_params_has_no_parity_section() {
     let data = bytes::Bytes::from(vec![0xEEu8; 512]);
 
     let _handle = sealer
-        .seal_from_data(segment_id, SizeTier::Standard, data.clone(), &[], 0, 0, 0, None)
+        .seal_from_data(segment_id, SizeTier::Standard, data.clone(), &[], 0, 0, 0, None, None)
         .await
         .unwrap();
 

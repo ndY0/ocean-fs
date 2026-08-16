@@ -120,6 +120,8 @@ fn make_meta(key: &str, inline: Option<&[u8]>) -> ObjectMetadata {
                 segment_id: oceanfs_core::SegmentId::new(),
                 offset: 0,
                 length: 1024,
+                compressed: false,
+                logical_length: 1024,
             });
             chunks
         },

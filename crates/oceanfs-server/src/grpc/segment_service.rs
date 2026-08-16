@@ -233,6 +233,8 @@ impl SegmentRpc for SegmentGrpcService {
                     segment_id: SegmentId::from_uuid_bytes(seg_bytes),
                     offset: chunk_offsets[i],
                     length: chunk_lengths[i],
+                    compressed: false,
+                    logical_length: chunk_lengths[i],
                 });
             }
             let meta = ObjectMetadata {
@@ -439,10 +441,18 @@ impl SegmentRpc for SegmentGrpcService {
                     Vec::with_capacity(meta.chunks.len());
                 let mut chunk_offsets: Vec<u64> = Vec::with_capacity(meta.chunks.len());
                 let mut chunk_lengths: Vec<u32> = Vec::with_capacity(meta.chunks.len());
+                let mut chunk_logical_lengths: Vec<u32> = Vec::with_capacity(meta.chunks.len());
+                let mut chunk_compressed: Vec<bool> = Vec::with_capacity(meta.chunks.len());
                 for chunk in &meta.chunks {
                     chunk_segment_ids.push(chunk.segment_id.into());
                     chunk_offsets.push(chunk.offset);
                     chunk_lengths.push(chunk.length);
+                    chunk_logical_lengths.push(if chunk.compressed {
+                        chunk.logical_length
+                    } else {
+                        chunk.length
+                    });
+                    chunk_compressed.push(chunk.compressed);
                 }
 
                 let hlc_proto = oceanfs_core::proto::common::HlcTimestamp {
@@ -462,6 +472,8 @@ impl SegmentRpc for SegmentGrpcService {
                     chunk_segment_ids,
                     chunk_offsets,
                     chunk_lengths,
+                    chunk_logical_lengths,
+                    chunk_compressed,
                 }))
             }
             None => Ok(Response::new(GetObjectMetadataResponse {
@@ -473,6 +485,8 @@ impl SegmentRpc for SegmentGrpcService {
                 chunk_segment_ids: vec![],
                 chunk_offsets: vec![],
                 chunk_lengths: vec![],
+                chunk_logical_lengths: vec![],
+                chunk_compressed: vec![],
             })),
         }
     }
@@ -557,6 +571,8 @@ impl SegmentRpc for SegmentGrpcService {
                 segment_id: seg_id,
                 offset: req.chunk_offsets[i],
                 length: req.chunk_lengths[i],
+                compressed: false,
+                logical_length: req.chunk_lengths[i],
             });
         }
 
@@ -960,6 +976,8 @@ mod tests {
             chunk_segment_ids: vec![],
             chunk_offsets: vec![],
             chunk_lengths: vec![],
+            chunk_logical_lengths: vec![],
+            chunk_compressed: vec![],
         }
     }
 

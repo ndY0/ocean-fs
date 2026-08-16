@@ -83,11 +83,55 @@ impl EcRecoveryParams {
 ///
 /// Returns an error if no replica can serve a chunk, or if the
 /// operation exceeds the timeout.
+/// Read-path decompression context (accel feature): the compressor
+/// (accel dispatcher) plus the semaphore bounding concurrent
+/// decompression on the blocking pool. The non-accel build defines an
+/// empty alias so signatures stay uniform.
+#[cfg(feature = "accel")]
+pub(crate) type DecompressCtx<'a> =
+    (&'a Arc<dyn oceanfs_accel::Compressor>, &'a Arc<tokio::sync::Semaphore>);
+#[cfg(not(feature = "accel"))]
+pub(crate) type DecompressCtx<'a> = ();
+
+/// Decompresses a stored chunk when its metadata says it is compressed.
+/// Runs on the blocking pool (mirrors the seal path's EC encode),
+/// bounded by the same semaphore pattern; `expected_len` is the exact
+/// logical size, so the backend allocates exactly once.
+pub(crate) async fn maybe_decompress(
+    ctx: Option<DecompressCtx<'_>>,
+    chunk: &ChunkRef,
+    data: Bytes,
+) -> Result<Bytes> {
+    #[cfg(feature = "accel")]
+    {
+        if !chunk.compressed {
+            return Ok(data);
+        }
+        let (compressor, semaphore) = ctx.ok_or_else(|| {
+            Error::Storage("compressed chunk read without a decompression backend".into())
+        })?;
+        let _permit = semaphore.acquire().await;
+        let compressor = Arc::clone(compressor);
+        let data = data.clone();
+        let expected = chunk.logical_length as usize;
+        tokio::task::spawn_blocking(move || compressor.decompress_exact(&data, expected))
+            .await
+            .map_err(|e| Error::Storage(format!("decompression task failed: {e}")))?
+            .map_err(|e| Error::Storage(format!("decompress failed: {e}")))
+    }
+    #[cfg(not(feature = "accel"))]
+    {
+        let _ = (ctx, chunk);
+        Ok(data)
+    }
+}
+
 pub(crate) async fn fetch_chunks(
     ring: &Arc<RingCache>,
     metadata: &ObjectMetadata,
     timeout_ms: u64,
     segment_reader: Option<&Arc<dyn SegmentReader>>,
+    decompress_ctx: Option<DecompressCtx<'_>>,
 ) -> Result<Vec<Bytes>> {
     fetch_chunks_inner(
         ring,
@@ -100,6 +144,7 @@ pub(crate) async fn fetch_chunks(
         true,
         true,
         None,
+        decompress_ctx,
     )
     .await
 }
@@ -120,6 +165,7 @@ pub(crate) async fn fetch_chunks_with_grpc(
     parallel_fetch: bool,
     use_fastest_k: bool,
     stripe_semaphore: Option<&Arc<Semaphore>>,
+    decompress_ctx: Option<DecompressCtx<'_>>,
 ) -> Result<Vec<Bytes>> {
     fetch_chunks_inner(
         ring,
@@ -132,6 +178,7 @@ pub(crate) async fn fetch_chunks_with_grpc(
         parallel_fetch,
         use_fastest_k,
         stripe_semaphore,
+        decompress_ctx,
     )
     .await
 }
@@ -154,6 +201,7 @@ pub(crate) async fn fetch_chunks_with_ec(
     parallel_fetch: bool,
     use_fastest_k: bool,
     stripe_semaphore: Option<&Arc<Semaphore>>,
+    decompress_ctx: Option<DecompressCtx<'_>>,
 ) -> Result<Vec<Bytes>> {
     fetch_chunks_inner(
         ring,
@@ -166,6 +214,7 @@ pub(crate) async fn fetch_chunks_with_ec(
         parallel_fetch,
         use_fastest_k,
         stripe_semaphore,
+        decompress_ctx,
     )
     .await
 }
@@ -191,6 +240,7 @@ async fn fetch_chunks_inner(
     parallel_fetch: bool,
     #[cfg_attr(not(feature = "ec"), allow(unused_variables))] use_fastest_k: bool,
     stripe_semaphore: Option<&Arc<Semaphore>>,
+    decompress_ctx: Option<DecompressCtx<'_>>,
 ) -> Result<Vec<Bytes>> {
     if metadata.is_inline() {
         if let Some(ref data) = metadata.inline_data {
@@ -214,6 +264,7 @@ async fn fetch_chunks_inner(
             ec_params,
             use_fastest_k,
             stripe_semaphore,
+            decompress_ctx,
         )
         .await
     } else {
@@ -227,6 +278,7 @@ async fn fetch_chunks_inner(
             ec_params,
             use_fastest_k,
             stripe_semaphore,
+            decompress_ctx,
         )
         .await
     }
@@ -253,6 +305,7 @@ async fn fetch_all_chunks_parallel(
     ec_params: Option<&EcRecoveryParams>,
     use_fastest_k: bool,
     stripe_semaphore: Option<&Arc<Semaphore>>,
+    decompress_ctx: Option<DecompressCtx<'_>>,
 ) -> Result<Vec<Bytes>> {
     let chunk_count = chunks.len();
 
@@ -288,6 +341,7 @@ async fn fetch_all_chunks_parallel(
             let sem = sem.clone();
             async move {
                 let result = fetch_single_chunk(
+                    decompress_ctx,
                     &ring,
                     &chunk,
                     timeout_ms,
@@ -360,6 +414,7 @@ async fn fetch_all_chunks_serial(
     ec_params: Option<&EcRecoveryParams>,
     #[allow(unused_variables)] use_fastest_k: bool,
     stripe_semaphore: Option<&Arc<Semaphore>>,
+    decompress_ctx: Option<DecompressCtx<'_>>,
 ) -> Result<Vec<Bytes>> {
     let ec_params_arc = ec_params.map(|p| {
         Arc::new(EcRecoveryParams {
@@ -373,6 +428,7 @@ async fn fetch_all_chunks_serial(
     let mut results = Vec::with_capacity(chunks.len());
     for chunk in chunks {
         let result = fetch_single_chunk(
+            decompress_ctx,
             ring,
             chunk,
             timeout_ms,
@@ -394,6 +450,37 @@ async fn fetch_all_chunks_serial(
 /// EC-based shard reconstruction if the normal fetch path fails.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_single_chunk(
+    decompress_ctx: Option<DecompressCtx<'_>>,
+    ring: &Arc<RingCache>,
+    chunk: &ChunkRef,
+    timeout_ms: u64,
+    segment_reader: Option<&Arc<dyn SegmentReader>>,
+    pool: Option<&Arc<ConnectionPool>>,
+    membership: Option<&Arc<Membership>>,
+    #[cfg_attr(not(feature = "ec"), allow(unused_variables))] ec_params: Option<
+        &Arc<EcRecoveryParams>,
+    >,
+    stripe_semaphore: Option<&Arc<Semaphore>>,
+) -> Result<Bytes> {
+    let data = fetch_single_chunk_raw(
+        ring,
+        chunk,
+        timeout_ms,
+        segment_reader,
+        pool,
+        membership,
+        ec_params,
+        stripe_semaphore,
+    )
+    .await?;
+    maybe_decompress(decompress_ctx, chunk, data).await
+}
+
+/// Raw stored-byte fetch: local segment reader, gRPC replicas, or EC
+/// recovery — no decompression. Callers use [`fetch_single_chunk`] so
+/// compressed chunks are transparently expanded.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_single_chunk_raw(
     ring: &Arc<RingCache>,
     chunk: &ChunkRef,
     timeout_ms: u64,
@@ -900,7 +987,7 @@ mod tests {
         };
 
         let ring = make_ring();
-        let result = fetch_chunks(&ring, &meta, 1000, None).await.unwrap();
+        let result = fetch_chunks(&ring, &meta, 1000, None, None).await.unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(&result[0][..], b"hello");
     }
@@ -918,7 +1005,7 @@ mod tests {
         };
 
         let ring = make_ring();
-        let result = fetch_chunks(&ring, &meta, 1000, None).await.unwrap();
+        let result = fetch_chunks(&ring, &meta, 1000, None, None).await.unwrap();
         assert!(result.is_empty());
     }
 
@@ -927,7 +1014,13 @@ mod tests {
         let seg_id = SegmentId::new();
         let test_data = b"real segment data for fetch test";
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id: seg_id, offset: 0, length: test_data.len() as u32 });
+        chunks.push(ChunkRef {
+            segment_id: seg_id,
+            offset: 0,
+            length: test_data.len() as u32,
+            compressed: false,
+            logical_length: test_data.len() as u32,
+        });
 
         let meta = ObjectMetadata {
             object_key: oceanfs_core::ObjectKey::new("fetch-test"),
@@ -944,7 +1037,7 @@ mod tests {
         let reader: Arc<dyn SegmentReader> = reader;
 
         let ring = make_ring();
-        let result = fetch_chunks(&ring, &meta, 1000, Some(&reader)).await.unwrap();
+        let result = fetch_chunks(&ring, &meta, 1000, Some(&reader), None).await.unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(&result[0][..], test_data);
     }
@@ -953,7 +1046,13 @@ mod tests {
     async fn fetch_chunks_without_reader_returns_error() {
         let seg_id = SegmentId::new();
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id: seg_id, offset: 0, length: 100 });
+        chunks.push(ChunkRef {
+            segment_id: seg_id,
+            offset: 0,
+            length: 100,
+            compressed: false,
+            logical_length: 100,
+        });
 
         let meta = ObjectMetadata {
             object_key: oceanfs_core::ObjectKey::new("no-reader"),
@@ -966,7 +1065,7 @@ mod tests {
         };
 
         let ring = make_ring();
-        let result = fetch_chunks(&ring, &meta, 5000, None).await;
+        let result = fetch_chunks(&ring, &meta, 5000, None, None).await;
         assert!(result.is_err(), "should fail without segment reader");
     }
 
@@ -1085,7 +1184,13 @@ mod tests {
             let params = make_ec_params();
 
             // Chunk is the first 8 bytes of shard 0 (offset 0, length 8).
-            let chunk = ChunkRef { segment_id: seg_id, offset: 0, length: 8 };
+            let chunk = ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 8,
+                compressed: false,
+                logical_length: 8,
+            };
 
             let recovered =
                 try_ec_recovery_for_chunk(&reader, &chunk, &params, &ring, None, None, 5000, None)
@@ -1116,7 +1221,13 @@ mod tests {
             let params = make_ec_params();
 
             // Chunk at offset 0, length 8 (normal, no corruption).
-            let chunk = ChunkRef { segment_id: seg_id, offset: 0, length: 8 };
+            let chunk = ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 8,
+                compressed: false,
+                logical_length: 8,
+            };
 
             let recovered =
                 try_ec_recovery_for_chunk(&reader, &chunk, &params, &ring, None, None, 5000, None)
@@ -1135,7 +1246,13 @@ mod tests {
             let reader: Arc<dyn SegmentReader> = reader;
             let ring = make_ring_for_ec();
             let params = make_ec_params();
-            let chunk = ChunkRef { segment_id: seg_id, offset: 0, length: 8 };
+            let chunk = ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 8,
+                compressed: false,
+                logical_length: 8,
+            };
 
             let result =
                 try_ec_recovery_for_chunk(&reader, &chunk, &params, &ring, None, None, 5000, None)

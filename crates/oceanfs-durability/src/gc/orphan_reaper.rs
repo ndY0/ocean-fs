@@ -325,7 +325,13 @@ mod tests {
         let obj_meta = make_object_meta(
             "alive.txt",
             500,
-            ChunkRef { segment_id: seg_id, offset: 0, length: 500 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 500,
+                compressed: false,
+                logical_length: 500,
+            },
         );
         metadata.put_object(obj_meta).unwrap();
 
@@ -349,8 +355,17 @@ mod tests {
         metadata.put_segment(seg_meta).unwrap();
 
         // Object lives in the "load-test" bucket, not "default".
-        let obj_meta =
-            make_object_meta("hot-1", 500, ChunkRef { segment_id: seg_id, offset: 0, length: 500 });
+        let obj_meta = make_object_meta(
+            "hot-1",
+            500,
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 500,
+                compressed: false,
+                logical_length: 500,
+            },
+        );
         metadata.put_object_in_bucket(&BucketId::new("load-test"), obj_meta).unwrap();
 
         let store = test_shard_store();
@@ -481,7 +496,13 @@ mod tests {
         let obj_meta = make_object_meta(
             "deleted_obj.txt",
             500,
-            ChunkRef { segment_id: seg_id, offset: 0, length: 500 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 500,
+                compressed: false,
+                logical_length: 500,
+            },
         );
         metadata.put_object(obj_meta).unwrap();
 
@@ -535,7 +556,13 @@ mod tests {
         let obj_meta = make_object_meta(
             "concurrent.txt",
             100,
-            ChunkRef { segment_id: seg_id, offset: 0, length: 100 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 100,
+                compressed: false,
+                logical_length: 100,
+            },
         );
         metadata.put_object(obj_meta).unwrap();
 
@@ -591,7 +618,13 @@ mod tests {
         let obj_meta = make_object_meta(
             "wholly_deleted.txt",
             300,
-            ChunkRef { segment_id: seg_id, offset: 0, length: 300 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 300,
+                compressed: false,
+                logical_length: 300,
+            },
         );
         metadata.put_object(obj_meta).unwrap();
 
@@ -646,7 +679,13 @@ mod tests {
         let obj_meta = make_object_meta(
             "recently_deleted.txt",
             100,
-            ChunkRef { segment_id: seg_id, offset: 0, length: 100 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 100,
+                compressed: false,
+                logical_length: 100,
+            },
         );
         metadata.put_object(obj_meta).unwrap();
         metadata
@@ -694,7 +733,13 @@ mod tests {
         let obj_meta = make_object_meta(
             "included.txt",
             100,
-            ChunkRef { segment_id: seg_id, offset: 0, length: 100 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 100,
+                compressed: false,
+                logical_length: 100,
+            },
         );
         metadata.put_object(obj_meta).unwrap();
 
@@ -737,7 +782,13 @@ mod tests {
         let obj_meta = make_object_meta(
             "recently_deleted.txt",
             500,
-            ChunkRef { segment_id: seg_id, offset: 0, length: 500 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 500,
+                compressed: false,
+                logical_length: 500,
+            },
         );
         metadata.put_object(obj_meta).unwrap();
 

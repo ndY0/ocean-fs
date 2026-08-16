@@ -68,6 +68,54 @@ pub trait Compressor: Send + Sync {
     /// (e.g., corrupt data, unsupported format).
     fn decompress(&self, data: &[u8]) -> Result<Bytes>;
 
+    /// Decompresses data whose uncompressed size is known in advance.
+    ///
+    /// Backends that support exact-size decompression allocate exactly
+    /// `expected_len` bytes — a single allocation, no reallocations on
+    /// the read path. The default implementation falls back to
+    /// [`Self::decompress`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccelError::CompressionError`] if decompression fails.
+    fn decompress_exact(&self, data: &[u8], _expected_len: usize) -> Result<Bytes> {
+        self.decompress(data)
+    }
+
+    /// Compresses data into a caller-provided output buffer.
+    ///
+    /// `out` must be large enough for the compressed output; backends
+    /// that expose worst-case bounds (zstd, DEFLATE) write directly and
+    /// return the number of bytes written — enabling buffer reuse across
+    /// chunks (the write path compresses whole objects chunk by chunk
+    /// into a single per-put scratch buffer). The default implementation
+    /// falls back to [`Self::compress`] and copies into `out` when it
+    /// fits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccelError::CompressionError`] if compression fails or
+    /// `out` is too small.
+    fn compress_into(&self, data: &[u8], level: u32, out: &mut [u8]) -> Result<usize> {
+        let compressed = self.compress(data, level)?;
+        if compressed.len() > out.len() {
+            return Err(AccelError::CompressionError {
+                reason: "output buffer too small for compressed data".into(),
+            });
+        }
+        out[..compressed.len()].copy_from_slice(&compressed);
+        Ok(compressed.len())
+    }
+
+    /// Worst-case compressed output size for `input_len` input bytes.
+    ///
+    /// Used to size reusable scratch buffers (the write path allocates
+    /// one per PUT and reuses it across chunks). The default is a
+    /// conservative over-estimate; zstd overrides with its exact bound.
+    fn worst_case_bound(&self, input_len: usize) -> usize {
+        input_len + input_len / 16 + 64
+    }
+
     /// Returns the compression tier this backend implements.
     fn compression_tier(&self) -> CompressionTier;
 
@@ -132,15 +180,46 @@ impl Default for ZstdCompressor {
 impl Compressor for ZstdCompressor {
     fn compress(&self, data: &[u8], level: u32) -> Result<Bytes> {
         let effective_level = if level == 0 { self.level } else { level };
-        zstd::encode_all(data, effective_level as i32).map(Bytes::from).map_err(|e| {
+        // Precompute zstd's worst-case bound and compress into a single
+        // allocation (encode_all would grow the buffer dynamically).
+        let bound = zstd::zstd_safe::compress_bound(data.len());
+        let mut buf = vec![0u8; bound];
+        let written = zstd::bulk::compress_to_buffer(data, &mut buf, effective_level as i32)
+            .map_err(|e| AccelError::CompressionError {
+                reason: format!("zstd compress failed: {e}"),
+            })?;
+        let mut out = Bytes::from(buf);
+        out.truncate(written);
+        Ok(out)
+    }
+
+    fn compress_into(&self, data: &[u8], level: u32, out: &mut [u8]) -> Result<usize> {
+        let effective_level = if level == 0 { self.level } else { level };
+        zstd::bulk::compress_to_buffer(data, out, effective_level as i32).map_err(|e| {
             AccelError::CompressionError { reason: format!("zstd compress failed: {e}") }
         })
+    }
+
+    fn worst_case_bound(&self, input_len: usize) -> usize {
+        zstd::zstd_safe::compress_bound(input_len)
     }
 
     fn decompress(&self, data: &[u8]) -> Result<Bytes> {
         zstd::decode_all(data).map(Bytes::from).map_err(|e| AccelError::CompressionError {
             reason: format!("zstd decompress failed: {e}"),
         })
+    }
+
+    fn decompress_exact(&self, data: &[u8], expected_len: usize) -> Result<Bytes> {
+        // Exact-size destination: one allocation, no reallocations.
+        let mut buf = vec![0u8; expected_len];
+        let written = zstd::bulk::decompress_to_buffer(data, &mut buf).map_err(|e| {
+            AccelError::CompressionError { reason: format!("zstd decompress failed: {e}") }
+        })?;
+        debug_assert!(written == expected_len, "zstd output size mismatch");
+        let mut out = Bytes::from(buf);
+        out.truncate(written);
+        Ok(out)
     }
 
     fn compression_tier(&self) -> CompressionTier {

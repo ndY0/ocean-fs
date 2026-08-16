@@ -111,6 +111,16 @@ pub struct WriteCoordinator {
     size_config: SegmentSizeConfig,
     /// Hinted handoff buffer for writes to temporarily unreachable replicas.
     hinted_handoff: Arc<HintedHandoffManager>,
+    /// Compression backend (accel dispatcher), injected by the
+    /// composition root. `None` (default) disables per-bucket
+    /// compression.
+    #[cfg(feature = "accel")]
+    compressor: Option<Arc<dyn oceanfs_accel::Compressor>>,
+    /// Bounds concurrent compress calls on the blocking pool — mirrors
+    /// the seal semaphore so CPU-bound compression never floods the
+    /// spawn_blocking threads (perf §2.7).
+    #[cfg(feature = "accel")]
+    compress_semaphore: Arc<tokio::sync::Semaphore>,
     /// Hinted handoff configuration (inline threshold, etc.).
     hint_config: HintedHandoffConfig,
     /// Accumulated blob index entries per segment, keyed by segment ID.
@@ -124,6 +134,85 @@ pub struct WriteCoordinator {
     /// Merkle tree covers segments sealed after startup (continuous
     /// anti-entropy).
     segment_sealed_notifier: Option<Arc<dyn Fn(SegmentId, HashOutput) + Send + Sync>>,
+}
+
+/// Per-PUT compression context: backend + bucket config + semaphore +
+/// a single worst-case-sized scratch buffer reused across all of the
+/// PUT's chunks (Multi-tier objects compress chunk by chunk).
+#[cfg(feature = "accel")]
+struct WriteCompression {
+    compressor: Arc<dyn oceanfs_accel::Compressor>,
+    config: oceanfs_core::CompressConfig,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    /// Worst-case-sized scratch buffer (bound of the largest chunk in
+    /// the PUT). One allocation per PUT instead of one per chunk.
+    scratch: Arc<tokio::sync::Mutex<Vec<u8>>>,
+}
+
+#[cfg(feature = "accel")]
+impl WriteCompression {
+    fn new(
+        compressor: Arc<dyn oceanfs_accel::Compressor>,
+        config: oceanfs_core::CompressConfig,
+        semaphore: Arc<tokio::sync::Semaphore>,
+        bound: usize,
+    ) -> Self {
+        Self {
+            compressor,
+            config,
+            semaphore,
+            scratch: Arc::new(tokio::sync::Mutex::new(vec![0u8; bound])),
+        }
+    }
+
+    /// Compresses one chunk on the blocking pool (mirrors the seal
+    /// path's EC encode). Returns `(stored_bytes, logical_len,
+    /// compressed)`; chunks below `min_chunk_bytes` and incompressible
+    /// payloads are stored as-is with `compressed = false`.
+    async fn compress(&self, data: &Bytes) -> crate::Result<(Bytes, u32, bool)> {
+        let logical = data.len() as u32;
+        if data.len() < self.config.min_chunk_bytes {
+            return Ok((data.clone(), logical, false));
+        }
+        let _permit = self.semaphore.acquire().await;
+        let compressor = Arc::clone(&self.compressor);
+        let data_for_encode = data.clone();
+        let level = self.config.level;
+        let scratch = Arc::clone(&self.scratch);
+        let written = tokio::task::spawn_blocking(move || {
+            let mut buf = scratch.blocking_lock();
+            compressor.compress_into(&data_for_encode, level, &mut buf)
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("compression task failed: {e}")))?
+        .map_err(|e| Error::Storage(format!("compress failed: {e}")))?;
+        if written >= data.len() {
+            // Incompressible payload — store the original, unmarked.
+            return Ok((data.clone(), logical, false));
+        }
+        let stored = Bytes::copy_from_slice(&self.scratch.lock().await[..written]);
+        Ok((stored, logical, true))
+    }
+}
+
+/// Compresses `data` when the PUT's compression context is active.
+/// The non-accel build compiles to a plain pass-through.
+async fn compress_chunk(
+    #[cfg(feature = "accel")] ctx: &Option<WriteCompression>,
+    #[cfg(not(feature = "accel"))] _ctx: &Option<()>,
+    data: &Bytes,
+) -> crate::Result<(Bytes, u32, bool)> {
+    #[cfg(feature = "accel")]
+    {
+        match ctx {
+            Some(c) => c.compress(data).await,
+            None => Ok((data.clone(), data.len() as u32, false)),
+        }
+    }
+    #[cfg(not(feature = "accel"))]
+    {
+        Ok((data.clone(), data.len() as u32, false))
+    }
 }
 
 impl WriteCoordinator {
@@ -171,6 +260,12 @@ impl WriteCoordinator {
             size_config,
             hinted_handoff,
             hint_config,
+            #[cfg(feature = "accel")]
+            compressor: None,
+            #[cfg(feature = "accel")]
+            compress_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                std::thread::available_parallelism().map_or(4, |n| n.get().saturating_mul(2)),
+            )),
             segment_entries: DashMap::new(),
             timeouts: Arc::new(OperationTimeouts::default()),
             segment_sealed_notifier: None,
@@ -183,6 +278,17 @@ impl WriteCoordinator {
     #[must_use]
     pub fn with_timeouts(mut self, timeouts: Arc<OperationTimeouts>) -> Self {
         self.timeouts = timeouts;
+        self
+    }
+
+    /// Injects the compression backend (accel dispatcher) used when a
+    /// bucket policy opts in via `compression.tier != None`.
+    #[cfg(feature = "accel")]
+    pub fn with_compressor(
+        mut self,
+        compressor: Option<Arc<dyn oceanfs_accel::Compressor>>,
+    ) -> Self {
+        self.compressor = compressor;
         self
     }
 
@@ -259,6 +365,37 @@ impl WriteCoordinator {
         // (Bytes clone is a ref-count bump, not a copy.)
         let wal_data = req.data.clone();
 
+        // Per-bucket compression context (accel feature). Built once per
+        // PUT: resolves the bucket's compression config against the
+        // injected backend and sizes a single scratch buffer (worst-case
+        // bound of the largest chunk in this PUT) reused across chunks.
+        #[cfg(feature = "accel")]
+        let compression_ctx = {
+            let enabled = req
+                .policy
+                .as_ref()
+                .map(|p| p.compression.tier != oceanfs_core::CompressionTier::None)
+                .unwrap_or(false);
+            match (enabled, self.compressor.as_ref()) {
+                (true, Some(compressor)) => req.policy.as_ref().map(|p| {
+                    let max_chunk = if tier == SizeTier::Multi {
+                        self.size_config.default_target_size as usize
+                    } else {
+                        wal_data.len()
+                    };
+                    WriteCompression::new(
+                        Arc::clone(compressor),
+                        p.compression.clone(),
+                        Arc::clone(&self.compress_semaphore),
+                        compressor.worst_case_bound(max_chunk),
+                    )
+                }),
+                _ => None,
+            }
+        };
+        #[cfg(not(feature = "accel"))]
+        let compression_ctx: Option<()> = None;
+
         // Compute BLAKE3 hash of the data.
         let hash = blake3::hash(&req.data);
         let blake3_hash = HashOutput::from_bytes(*hash.as_bytes());
@@ -285,10 +422,12 @@ impl WriteCoordinator {
                 smallvec::SmallVec::new()
             }
             SizeTier::Small => {
+                let (stored, logical_len, compressed) =
+                    compress_chunk(&compression_ctx, &wal_data).await?;
                 let (segment_id, offset, length) = self
                     .segment_pool_small
                     .append_with_hook_async(
-                        &wal_data[..],
+                        &stored[..],
                         |seg_id, off, len| {
                             // Recorded under the slot lock, before any
                             // fill-triggered seal enqueue: the seal worker
@@ -301,16 +440,24 @@ impl WriteCoordinator {
                     .await
                     .map_err(map_append_error("small".into()))?;
                 // Write WAL entry for crash-recovery durability (C4-storage, D6).
-                self.write_wal_entry(segment_id, offset, wal_data.clone(), length, hlc).await?;
+                self.write_wal_entry(segment_id, offset, stored, length, hlc).await?;
                 let mut chunks = smallvec::SmallVec::new();
-                chunks.push(ChunkRef { segment_id, offset, length });
+                chunks.push(ChunkRef {
+                    segment_id,
+                    offset,
+                    length,
+                    compressed,
+                    logical_length: logical_len,
+                });
                 chunks
             }
             SizeTier::Standard => {
+                let (stored, logical_len, compressed) =
+                    compress_chunk(&compression_ctx, &wal_data).await?;
                 let (segment_id, offset, length) = self
                     .segment_pool_standard
                     .append_with_hook_async(
-                        &wal_data[..],
+                        &stored[..],
                         |seg_id, off, len| {
                             // Same airtight ordering as the Small tier above.
                             self.record_blob_entry(seg_id, off, len, blake3_hash);
@@ -320,9 +467,15 @@ impl WriteCoordinator {
                     .await
                     .map_err(map_append_error("standard".into()))?;
                 // Write WAL entry for crash-recovery durability (C4-storage, D6).
-                self.write_wal_entry(segment_id, offset, wal_data.clone(), length, hlc).await?;
+                self.write_wal_entry(segment_id, offset, stored, length, hlc).await?;
                 let mut chunks = smallvec::SmallVec::new();
-                chunks.push(ChunkRef { segment_id, offset, length });
+                chunks.push(ChunkRef {
+                    segment_id,
+                    offset,
+                    length,
+                    compressed,
+                    logical_length: logical_len,
+                });
                 chunks
             }
             SizeTier::Multi => {
@@ -330,10 +483,13 @@ impl WriteCoordinator {
                 let split_chunks = splitter.split(&wal_data[..]);
                 let mut chunks = smallvec::SmallVec::new();
                 for (_, chunk_data) in &split_chunks {
+                    let (stored, logical_len, compressed) =
+                        compress_chunk(&compression_ctx, &Bytes::copy_from_slice(chunk_data))
+                            .await?;
                     let (seg_id, seg_offset, length) = self
                         .segment_pool_standard
                         .append_with_hook_async(
-                            chunk_data,
+                            &stored[..],
                             |seg_id, off, len| {
                                 // Record the blob index entry BEFORE any
                                 // fill-triggered seal enqueue (Defect 2).
@@ -348,19 +504,18 @@ impl WriteCoordinator {
                         .await
                         .map_err(map_append_error("multi".into()))?;
                     // Write WAL entry for each chunk (C4-storage, D6).
-                    self.write_wal_entry(
-                        seg_id,
-                        seg_offset,
-                        Bytes::copy_from_slice(chunk_data),
-                        length,
-                        hlc,
-                    )
-                    .await?;
+                    self.write_wal_entry(seg_id, seg_offset, stored, length, hlc).await?;
                     // The chunk ref must carry the segment-relative offset
                     // returned by `append()`, not the splitter's
                     // blob-relative `chunk_offset` — readers slice the
                     // segment, not the blob (Defect 1).
-                    chunks.push(ChunkRef { segment_id: seg_id, offset: seg_offset, length });
+                    chunks.push(ChunkRef {
+                        segment_id: seg_id,
+                        offset: seg_offset,
+                        length,
+                        compressed,
+                        logical_length: logical_len,
+                    });
                 }
                 chunks
             }
@@ -619,7 +774,13 @@ impl WriteCoordinator {
         let blake3_hash = HashOutput::from_bytes(*hash.as_bytes());
 
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id, offset: 0, length: req.data.len() as u32 });
+        chunks.push(ChunkRef {
+            segment_id,
+            offset: 0,
+            length: req.data.len() as u32,
+            compressed: false,
+            logical_length: req.data.len() as u32,
+        });
 
         Ok(WriteResult {
             object_key: req.key.clone(),
@@ -2493,7 +2654,8 @@ mod tests {
             .unwrap(),
         );
         let standard_pool = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, size_config, buffer_pool, None, None).unwrap(),
+            SegmentPool::new(pool_cfg, SizeTier::Standard, size_config, buffer_pool, None, None)
+                .unwrap(),
         );
         let wal = Arc::new(
             WalWriter::open(&WalConfig {

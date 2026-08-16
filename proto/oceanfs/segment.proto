@@ -114,6 +114,9 @@ message GetObjectMetadataResponse {
   repeated oceanfs.common.SegmentId chunk_segment_ids = 6;
   repeated uint64 chunk_offsets = 7;
   repeated uint32 chunk_lengths = 8;
+  // Compression metadata per chunk (empty = all uncompressed).
+  repeated uint32 chunk_logical_lengths = 9;
+  repeated bool chunk_compressed = 10;
 }
 
 // Request to push corrected object metadata + data to a stale replica (4.2).
@@ -127,6 +130,9 @@ message PutObjectMetadataRequest {
   repeated oceanfs.common.SegmentId chunk_segment_ids = 7;
   repeated uint64 chunk_offsets = 8;
   repeated uint32 chunk_lengths = 9;
+  // Compression metadata per chunk (empty = all uncompressed).
+  repeated uint32 chunk_logical_lengths = 10;
+  repeated bool chunk_compressed = 11;
 }
 
 // Response acknowledging the metadata write.

@@ -290,6 +290,8 @@ mod tests {
             segment_id: super::super::id::SegmentId::new(),
             offset: 0,
             length: 100,
+            compressed: false,
+            logical_length: 100,
         });
         let result = WriteResult {
             object_key: key.clone(),

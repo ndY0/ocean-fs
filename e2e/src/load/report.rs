@@ -289,12 +289,7 @@ impl LoadReport {
                 secs(stats.head_p99_us),
                 Some(&self.test),
             );
-            write_metric(
-                &mut buf,
-                "load_test_ops_total",
-                stats.ops_total as f64,
-                Some(&self.test),
-            );
+            write_metric(&mut buf, "load_test_ops_total", stats.ops_total as f64, Some(&self.test));
             write_metric(
                 &mut buf,
                 "load_test_errors_total",

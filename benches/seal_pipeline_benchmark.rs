@@ -97,7 +97,7 @@ async fn concurrent_seals(
                 blob_key_hash: [0xAB; 32],
             }];
             sealer
-                .seal_from_data(id, SizeTier::Standard, data, &entries, 0, 0, 0, None)
+                .seal_from_data(id, SizeTier::Standard, data, &entries, 0, 0, 0, None, None)
                 .await
                 .expect("seal");
         }));

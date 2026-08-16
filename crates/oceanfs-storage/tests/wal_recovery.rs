@@ -218,10 +218,12 @@ async fn replay_wal_recovers_and_truncates() {
         &size_config,
         buffer_pool.clone(),
         None,
+        None,
     )
     .unwrap();
     let pool_standard =
-        SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None).unwrap();
+        SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None, None)
+            .unwrap();
 
     let seg_id = SegmentId::new();
 
@@ -265,10 +267,12 @@ async fn replay_wal_empty_wal_returns_zero_summary() {
         &size_config,
         buffer_pool.clone(),
         None,
+        None,
     )
     .unwrap();
     let pool_standard =
-        SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None).unwrap();
+        SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None, None)
+            .unwrap();
 
     let wal_writer = WalWriter::open(&config).await.unwrap();
     let summary =

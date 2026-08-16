@@ -140,7 +140,11 @@ impl WalEntry {
     ///
     /// Used for round-trip testing and debugging.
     pub fn to_bytes(&self) -> Vec<u8> {
+        // Reserve the exact serialized size up front: the header Vec is
+        // capacity-exact, so extending it with the payload would
+        // otherwise reallocate and copy the full data twice.
         let mut buf = self.to_header_bytes();
+        buf.reserve(self.data.len());
         buf.extend_from_slice(&self.data);
         buf
     }

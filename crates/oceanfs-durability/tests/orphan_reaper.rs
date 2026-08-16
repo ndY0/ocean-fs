@@ -43,7 +43,13 @@ async fn segment_with_live_object_not_reclaimed() {
 
     // Object references this segment
     let mut chunks = smallvec::SmallVec::new();
-    chunks.push(ChunkRef { segment_id: seg_id, offset: 0, length: 500 });
+    chunks.push(ChunkRef {
+        segment_id: seg_id,
+        offset: 0,
+        length: 500,
+        compressed: false,
+        logical_length: 500,
+    });
     let obj = ObjectMetadata {
         object_key: ObjectKey::new("alive.txt"),
         size: 500,

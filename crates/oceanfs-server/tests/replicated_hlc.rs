@@ -160,11 +160,13 @@ async fn make_coordinator(
             &size_config,
             buffer_pool.clone(),
             None,
+            None,
         )
         .unwrap(),
     );
     let segment_pool_standard = Arc::new(
-        SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None).unwrap(),
+        SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None, None)
+            .unwrap(),
     );
     let wal = Arc::new(
         WalWriter::open(&WalConfig {

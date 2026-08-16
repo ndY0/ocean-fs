@@ -1159,6 +1159,30 @@ impl Orchestrator {
         // Workers PUT to /load-test/{key}; this ensures the bucket exists.
         let _ = cluster.put(0, "/load-test", &[]).await;
 
+        // Optional: opt the load-test bucket into per-bucket compression
+        // (LOAD_TEST_COMPRESSION=1). The policy is set through the admin
+        // endpoint before workers start; writes then compress chunks via
+        // the accel dispatcher and reads decompress them transparently.
+        if std::env::var("LOAD_TEST_COMPRESSION").as_deref() == Ok("1") {
+            let body = br#"{"compression": {"tier": "Auto", "level": 3}}"#;
+            match cluster.put(0, "/admin/buckets/load-test/policy", body).await {
+                Ok(resp) if resp.status().is_success() => {
+                    eprintln!("load_sustained: compression policy enabled on /load-test");
+                }
+                Ok(resp) => {
+                    eprintln!(
+                        "load_sustained: compression policy rejected ({}); continuing uncompressed",
+                        resp.status()
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "load_sustained: compression policy failed: {e}; continuing uncompressed"
+                    );
+                }
+            }
+        }
+
         // Shared activity counter: each worker increments it once on its
         // first completed operation, so the orchestrator can assert that
         // every worker actually ran.

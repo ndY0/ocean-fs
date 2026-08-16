@@ -232,12 +232,11 @@ impl DiskSegmentReader {
         // 76-92 byte header — on first touches under load that was a
         // second full-file buffer per segment read (multi-GB anon bursts).
         use std::io::Read;
-        let mut file = std::fs::File::open(&path)
-            .map_err(|e| format!("open {}: {e}", path.display()))?;
+        let mut file =
+            std::fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let mut header_buf = [0u8; 128];
-        let got = file
-            .read(&mut header_buf)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let got =
+            file.read(&mut header_buf).map_err(|e| format!("read {}: {e}", path.display()))?;
         if got < crate::segment::header::SegmentHeader::header_size(1) {
             return Err(format!("segment file {segment_id} too short for header"));
         }
@@ -774,7 +773,10 @@ mod tests {
         let pool_cfg = PoolConfig::default();
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = Arc::new(BufferPool::new(65536, 32));
-        Arc::new(SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap())
+        Arc::new(
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
+                .unwrap(),
+        )
     }
 
     #[tokio::test]

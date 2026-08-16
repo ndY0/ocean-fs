@@ -23,7 +23,7 @@ use crate::types::CompressionTier;
 /// assert!(config.enabled);
 /// assert_eq!(config.tier, CompressionTier::Auto);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompressionConfig {
     /// Whether segment compression is enabled at all.
     /// When `false`, no compression is applied regardless of bucket settings.

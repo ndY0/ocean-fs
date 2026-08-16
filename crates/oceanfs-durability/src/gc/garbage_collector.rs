@@ -35,6 +35,7 @@ pub struct GarbageCollector {
     segments_compacted_total: Counter,
     bytes_reclaimed_total: Counter,
     compaction_bytes_total: Counter,
+    dead_bytes_total: Counter,
 }
 
 type TombstoneResult = Result<(HashSet<String>, HashMap<SegmentId, Vec<(BucketId, ObjectKey)>>)>;
@@ -66,6 +67,11 @@ impl GarbageCollector {
                 "Bytes processed during segment compaction".into(),
                 LabelSet::empty(),
             ),
+            dead_bytes_total: Counter::new(
+                "gc_dead_bytes_total".into(),
+                "Bytes found dead by GC (reclaimable, before compaction)".into(),
+                LabelSet::empty(),
+            ),
         }
     }
 
@@ -75,6 +81,7 @@ impl GarbageCollector {
         registrar.register_counter(self.segments_compacted_total.clone());
         registrar.register_counter(self.bytes_reclaimed_total.clone());
         registrar.register_counter(self.compaction_bytes_total.clone());
+        registrar.register_counter(self.dead_bytes_total.clone());
     }
 
     /// Returns a reference to the configuration.
@@ -98,6 +105,12 @@ impl GarbageCollector {
         &self,
         metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
     ) -> Result<GcStats> {
+        // A pass is a pass — count every cycle, including ones that find
+        // nothing to compact, so the "GC running" signal is visible in
+        // metrics (previously the counter only moved after a compaction,
+        // making a healthy idle GC look dead).
+        self.cycles_total.inc();
+
         let mut stats = GcStats::default();
         let mut tracker = LivenessTracker::new();
 
@@ -106,6 +119,16 @@ impl GarbageCollector {
         // so compaction can skip them when re-packing.
         let (dead_keys, tombstone_keys_by_segment) =
             self.process_tombstones(&*metadata, &mut tracker, &mut stats)?;
+
+        // Report what the pass observed even when nothing compacts, so
+        // metrics show the scanner is alive and how much dead data it is
+        // accumulating toward the compaction threshold.
+        stats.segments_scanned = tracker.known_segments.len() as u64;
+        stats.dead_bytes = tracker.dead_bytes.values().sum();
+        stats.live_bytes = tracker.live_bytes.values().sum();
+        if stats.dead_bytes > 0 {
+            self.dead_bytes_total.add(stats.dead_bytes);
+        }
 
         // Phase 2: Identify compaction candidates
         let candidates = tracker.compaction_candidates(self.config.compact_threshold);
@@ -208,7 +231,6 @@ impl GarbageCollector {
             let _ = handle.await;
         }
 
-        self.cycles_total.inc();
         self.segments_compacted_total.add(stats.segments_compacted);
         self.bytes_reclaimed_total.add(stats.bytes_reclaimed);
         self.compaction_bytes_total.add(stats.dead_bytes + stats.live_bytes);
@@ -490,7 +512,13 @@ mod tests {
         let obj_meta = make_object_meta(
             "test.txt",
             1024,
-            ChunkRef { segment_id: seg_id, offset: 0, length: 1024 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 1024,
+                compressed: false,
+                logical_length: 1024,
+            },
         );
         metadata.put_object(obj_meta).unwrap();
 
@@ -511,7 +539,13 @@ mod tests {
         let obj_meta = make_object_meta(
             "deleted.txt",
             100,
-            ChunkRef { segment_id: seg_id, offset: 0, length: 100 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 100,
+                compressed: false,
+                logical_length: 100,
+            },
         );
         metadata.put_object(obj_meta).unwrap();
 
@@ -555,7 +589,13 @@ mod tests {
             let obj_meta = make_object_meta(
                 &format!("obj{i}.txt"),
                 300,
-                ChunkRef { segment_id: seg_id, offset: i * 300, length: 300 },
+                ChunkRef {
+                    segment_id: seg_id,
+                    offset: i * 300,
+                    length: 300,
+                    compressed: false,
+                    logical_length: 300,
+                },
             );
             metadata.put_object(obj_meta).unwrap();
         }
@@ -592,7 +632,13 @@ mod tests {
         let obj_meta = make_object_meta(
             "alive.txt",
             900,
-            ChunkRef { segment_id: seg_id, offset: 0, length: 900 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 900,
+                compressed: false,
+                logical_length: 900,
+            },
         );
         metadata.put_object(obj_meta).unwrap();
 
@@ -610,7 +656,13 @@ mod tests {
         let dead_obj = make_object_meta(
             "dead.txt",
             100,
-            ChunkRef { segment_id: seg_id, offset: 900, length: 100 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 900,
+                length: 100,
+                compressed: false,
+                logical_length: 100,
+            },
         );
         metadata.put_object(dead_obj).unwrap();
 
@@ -638,7 +690,13 @@ mod tests {
         let obj_meta = make_object_meta(
             "live.txt",
             100,
-            ChunkRef { segment_id: seg_id, offset: 0, length: 100 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 100,
+                compressed: false,
+                logical_length: 100,
+            },
         );
         metadata.put_object(obj_meta).unwrap();
 
@@ -672,7 +730,13 @@ mod tests {
             let obj_meta = make_object_meta(
                 &format!("obj_seg{i}.txt"),
                 200,
-                ChunkRef { segment_id: seg_id, offset: 0, length: 200 },
+                ChunkRef {
+                    segment_id: seg_id,
+                    offset: 0,
+                    length: 200,
+                    compressed: false,
+                    logical_length: 200,
+                },
             );
             metadata.put_object(obj_meta).unwrap();
         }

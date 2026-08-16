@@ -56,6 +56,8 @@ async fn read_classify_multi_chunk_blob() {
             segment_id: oceanfs_core::SegmentId::new(),
             offset: i * 1024,
             length: 1024,
+            compressed: false,
+            logical_length: 1024,
         });
     }
     let meta = oceanfs_core::ObjectMetadata {
@@ -134,6 +136,8 @@ async fn test_fetch_batched_reads_single_rpc_per_node() {
             segment_id: oceanfs_core::SegmentId::new(),
             offset: i * 100,
             length: 100,
+            compressed: false,
+            logical_length: 100,
         });
     }
     let meta = oceanfs_core::ObjectMetadata {

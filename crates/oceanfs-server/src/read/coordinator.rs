@@ -208,6 +208,14 @@ pub struct ReadCoordinator {
     /// repair are merged via [`HlcClock::update`] so the local clock
     /// never lags the replicas this node talks to.
     hlc_clock: Option<Arc<HlcClock>>,
+    /// Compression backend (accel dispatcher) for decompressing stored
+    /// chunks on the read path. `None` (default) serves stored bytes
+    /// as-is.
+    #[cfg(feature = "accel")]
+    compressor: Option<Arc<dyn oceanfs_accel::Compressor>>,
+    /// Bounds concurrent decompression on the blocking pool (perf §2.7).
+    #[cfg(feature = "accel")]
+    decompress_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl ReadCoordinator {
@@ -237,6 +245,12 @@ impl ReadCoordinator {
             timeouts: Arc::new(OperationTimeouts::default()),
             default_fetch_strategy: FetchStrategy::default(),
             hlc_clock: None,
+            #[cfg(feature = "accel")]
+            compressor: None,
+            #[cfg(feature = "accel")]
+            decompress_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                std::thread::available_parallelism().map_or(4, |n| n.get().saturating_mul(2)),
+            )),
         }
     }
 
@@ -268,6 +282,12 @@ impl ReadCoordinator {
             timeouts: Arc::new(OperationTimeouts::default()),
             default_fetch_strategy: FetchStrategy::default(),
             hlc_clock: None,
+            #[cfg(feature = "accel")]
+            compressor: None,
+            #[cfg(feature = "accel")]
+            decompress_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                std::thread::available_parallelism().map_or(4, |n| n.get().saturating_mul(2)),
+            )),
         }
     }
 
@@ -308,6 +328,17 @@ impl ReadCoordinator {
     #[cfg(feature = "ec")]
     pub fn with_decoder(mut self, decoder: Arc<dyn oceanfs_ec::Decoder>) -> Self {
         self.decoder = Some(decoder);
+        self
+    }
+
+    /// Injects the compression backend (accel dispatcher) used to
+    /// decompress stored chunks whose metadata marks them compressed.
+    #[cfg(feature = "accel")]
+    pub fn with_compressor(
+        mut self,
+        compressor: Option<Arc<dyn oceanfs_accel::Compressor>>,
+    ) -> Self {
+        self.compressor = compressor;
         self
     }
 
@@ -599,6 +630,8 @@ impl ReadCoordinator {
                     segment_id: seg_id,
                     offset: winning.chunk_offsets[i],
                     length: winning.chunk_lengths[i],
+                    compressed: false,
+                    logical_length: winning.chunk_lengths[i],
                 });
             }
             let blake3_hash = if winning.blake3_hash.len() == 32 {
@@ -926,6 +959,8 @@ impl ReadCoordinator {
                 segment_id: seg_id,
                 offset: winning.chunk_offsets[i],
                 length: winning.chunk_lengths[i],
+                compressed: false,
+                logical_length: winning.chunk_lengths[i],
             });
         }
 
@@ -1069,6 +1104,15 @@ impl ReadCoordinator {
             None
         };
 
+        // Read-path decompression context: decompress stored chunks whose
+        // metadata marks them compressed. Built from the injected accel
+        // compressor (write path always pairs compress with the flag).
+        #[cfg(feature = "accel")]
+        let decompress_ctx: Option<crate::read::fetch::DecompressCtx<'_>> =
+            self.compressor.as_ref().map(|c| (c, &self.decompress_semaphore));
+        #[cfg(not(feature = "accel"))]
+        let decompress_ctx: Option<crate::read::fetch::DecompressCtx<'_>> = None;
+
         // Build EC recovery params if decoder and codec are configured.
         #[cfg(feature = "ec")]
         let ec_params = if let (Some(ref decoder), true) = (&self.decoder, self.ec_data_shards > 0)
@@ -1097,6 +1141,7 @@ impl ReadCoordinator {
                     parallel_fetch,
                     use_fastest_k,
                     sem_ref,
+                    decompress_ctx,
                 )
                 .await?
             } else {
@@ -1110,6 +1155,7 @@ impl ReadCoordinator {
                     parallel_fetch,
                     use_fastest_k,
                     sem_ref,
+                    decompress_ctx,
                 )
                 .await?
             }
@@ -1124,6 +1170,7 @@ impl ReadCoordinator {
                 parallel_fetch,
                 use_fastest_k,
                 sem_ref,
+                decompress_ctx,
             )
             .await?
         } else {
@@ -1141,6 +1188,7 @@ impl ReadCoordinator {
                     parallel_fetch,
                     use_fastest_k,
                     sem_ref,
+                    decompress_ctx,
                 )
                 .await?
             } else {
@@ -1149,6 +1197,7 @@ impl ReadCoordinator {
                     meta,
                     timeout_ms,
                     self.segment_reader.as_ref(),
+                    decompress_ctx,
                 )
                 .await?
             }
@@ -1158,6 +1207,7 @@ impl ReadCoordinator {
                 meta,
                 timeout_ms,
                 self.segment_reader.as_ref(),
+                decompress_ctx,
             )
             .await?
         };
@@ -1399,6 +1449,12 @@ impl Default for ReadCoordinator {
             timeouts: Arc::new(OperationTimeouts::default()),
             default_fetch_strategy: FetchStrategy::default(),
             hlc_clock: None,
+            #[cfg(feature = "accel")]
+            compressor: None,
+            #[cfg(feature = "accel")]
+            decompress_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                std::thread::available_parallelism().map_or(4, |n| n.get().saturating_mul(2)),
+            )),
         }
     }
 }
@@ -1415,10 +1471,18 @@ fn build_put_metadata_request(
         Vec::with_capacity(meta.chunks.len());
     let mut chunk_offsets: Vec<u64> = Vec::with_capacity(meta.chunks.len());
     let mut chunk_lengths: Vec<u32> = Vec::with_capacity(meta.chunks.len());
+    let mut chunk_logical_lengths: Vec<u32> = Vec::with_capacity(meta.chunks.len());
+    let mut chunk_compressed: Vec<bool> = Vec::with_capacity(meta.chunks.len());
     for chunk in &meta.chunks {
         chunk_segment_ids.push(chunk.segment_id.into());
         chunk_offsets.push(chunk.offset);
         chunk_lengths.push(chunk.length);
+        chunk_logical_lengths.push(if chunk.compressed {
+            chunk.logical_length
+        } else {
+            chunk.length
+        });
+        chunk_compressed.push(chunk.compressed);
     }
 
     let hlc_proto = oceanfs_core::proto::common::HlcTimestamp {
@@ -1439,6 +1503,8 @@ fn build_put_metadata_request(
         chunk_segment_ids,
         chunk_offsets,
         chunk_lengths,
+        chunk_logical_lengths,
+        chunk_compressed,
     })
 }
 
@@ -1509,7 +1575,13 @@ mod tests {
         let coordinator = make_coordinator_with_segments(&[(segment_id, data)]);
 
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id, offset: 0, length: data.len() as u32 });
+        chunks.push(ChunkRef {
+            segment_id,
+            offset: 0,
+            length: data.len() as u32,
+            compressed: false,
+            logical_length: data.len() as u32,
+        });
 
         // Build metadata with the single chunk and the stored hash.
         let meta = ObjectMetadata {
@@ -1540,8 +1612,20 @@ mod tests {
         let coordinator = make_coordinator_with_segments(&[(seg1, part1), (seg2, part2)]);
 
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id: seg1, offset: 0, length: part1.len() as u32 });
-        chunks.push(ChunkRef { segment_id: seg2, offset: 0, length: part2.len() as u32 });
+        chunks.push(ChunkRef {
+            segment_id: seg1,
+            offset: 0,
+            length: part1.len() as u32,
+            compressed: false,
+            logical_length: part1.len() as u32,
+        });
+        chunks.push(ChunkRef {
+            segment_id: seg2,
+            offset: 0,
+            length: part2.len() as u32,
+            compressed: false,
+            logical_length: part2.len() as u32,
+        });
 
         let meta = ObjectMetadata {
             object_key: ObjectKey::new("multi-chunk"),
@@ -1567,7 +1651,13 @@ mod tests {
         let coordinator = make_coordinator_with_segments(&[(seg_id, data)]);
 
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id: seg_id, offset: 0, length: data.len() as u32 });
+        chunks.push(ChunkRef {
+            segment_id: seg_id,
+            offset: 0,
+            length: data.len() as u32,
+            compressed: false,
+            logical_length: data.len() as u32,
+        });
 
         let meta = ObjectMetadata {
             object_key: ObjectKey::new("mismatch"),
@@ -1597,7 +1687,13 @@ mod tests {
         let coordinator = make_coordinator_with_segments(&[(SegmentId::new(), b"other")]);
 
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id: missing_id, offset: 0, length: data.len() as u32 });
+        chunks.push(ChunkRef {
+            segment_id: missing_id,
+            offset: 0,
+            length: data.len() as u32,
+            compressed: false,
+            logical_length: data.len() as u32,
+        });
 
         let meta = ObjectMetadata {
             object_key: ObjectKey::new("missing"),
@@ -1649,7 +1745,13 @@ mod tests {
     fn classify_single_chunk_returns_single_chunk() {
         let coord = make_coordinator();
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id: SegmentId::new(), offset: 0, length: 100 });
+        chunks.push(ChunkRef {
+            segment_id: SegmentId::new(),
+            offset: 0,
+            length: 100,
+            compressed: false,
+            logical_length: 100,
+        });
         let meta = ObjectMetadata {
             object_key: ObjectKey::new("single"),
             size: 100,
@@ -1668,7 +1770,13 @@ mod tests {
         let coord = make_coordinator();
         let mut chunks = smallvec::SmallVec::new();
         for i in 0..3 {
-            chunks.push(ChunkRef { segment_id: SegmentId::new(), offset: i * 1024, length: 1024 });
+            chunks.push(ChunkRef {
+                segment_id: SegmentId::new(),
+                offset: i * 1024,
+                length: 1024,
+                compressed: false,
+                logical_length: 1024,
+            });
         }
         let meta = ObjectMetadata {
             object_key: ObjectKey::new("multi"),
@@ -1824,7 +1932,13 @@ mod tests {
         // Set up metadata store.
         let store = Arc::new(MockMetadataStore::new());
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id, offset: 0, length: data.len() as u32 });
+        chunks.push(ChunkRef {
+            segment_id,
+            offset: 0,
+            length: data.len() as u32,
+            compressed: false,
+            logical_length: data.len() as u32,
+        });
         let meta = ObjectMetadata {
             object_key: ObjectKey::new("full-pipe"),
             size: data.len() as u64,
@@ -1869,8 +1983,20 @@ mod tests {
 
         let store = Arc::new(MockMetadataStore::new());
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id: seg1, offset: 0, length: part1.len() as u32 });
-        chunks.push(ChunkRef { segment_id: seg2, offset: 0, length: part2.len() as u32 });
+        chunks.push(ChunkRef {
+            segment_id: seg1,
+            offset: 0,
+            length: part1.len() as u32,
+            compressed: false,
+            logical_length: part1.len() as u32,
+        });
+        chunks.push(ChunkRef {
+            segment_id: seg2,
+            offset: 0,
+            length: part2.len() as u32,
+            compressed: false,
+            logical_length: part2.len() as u32,
+        });
         let meta = ObjectMetadata {
             object_key: ObjectKey::new("multi-full"),
             size: combined.len() as u64,
@@ -1909,7 +2035,13 @@ mod tests {
 
         let store = Arc::new(MockMetadataStore::new());
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id: seg_id, offset: 0, length: data.len() as u32 });
+        chunks.push(ChunkRef {
+            segment_id: seg_id,
+            offset: 0,
+            length: data.len() as u32,
+            compressed: false,
+            logical_length: data.len() as u32,
+        });
         let meta = ObjectMetadata {
             object_key: ObjectKey::new("mismatch-full"),
             size: data.len() as u64,
@@ -2002,7 +2134,13 @@ mod tests {
 
         let store = Arc::new(MockMetadataStore::new());
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id: seg_id, offset: 0, length: data.len() as u32 });
+        chunks.push(ChunkRef {
+            segment_id: seg_id,
+            offset: 0,
+            length: data.len() as u32,
+            compressed: false,
+            logical_length: data.len() as u32,
+        });
         let hash = blake3::hash(data);
         let meta = ObjectMetadata {
             object_key: ObjectKey::new("concurrent"),
@@ -2661,7 +2799,13 @@ mod tests {
 
         // Metadata: single chunk covering all 4 data shards at offset 0.
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id: seg_id, offset: 0, length: (4 * shard_size) as u32 });
+        chunks.push(ChunkRef {
+            segment_id: seg_id,
+            offset: 0,
+            length: (4 * shard_size) as u32,
+            compressed: false,
+            logical_length: (4 * shard_size) as u32,
+        });
         let meta = ObjectMetadata {
             object_key: ObjectKey::new("ec-pipe"),
             size: expected.len() as u64,
@@ -2694,8 +2838,20 @@ mod tests {
         let coordinator = make_coordinator_with_segments(&[(seg1, part1), (seg2, part2)]);
 
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id: seg1, offset: 0, length: part1.len() as u32 });
-        chunks.push(ChunkRef { segment_id: seg2, offset: 0, length: part2.len() as u32 });
+        chunks.push(ChunkRef {
+            segment_id: seg1,
+            offset: 0,
+            length: part1.len() as u32,
+            compressed: false,
+            logical_length: part1.len() as u32,
+        });
+        chunks.push(ChunkRef {
+            segment_id: seg2,
+            offset: 0,
+            length: part2.len() as u32,
+            compressed: false,
+            logical_length: part2.len() as u32,
+        });
 
         let meta = ObjectMetadata {
             object_key: ObjectKey::new("fastest-k"),
@@ -2724,7 +2880,13 @@ mod tests {
         let coordinator = make_coordinator_with_segments(&[(seg, data)]);
 
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id: seg, offset: 0, length: data.len() as u32 });
+        chunks.push(ChunkRef {
+            segment_id: seg,
+            offset: 0,
+            length: data.len() as u32,
+            compressed: false,
+            logical_length: data.len() as u32,
+        });
 
         let meta = ObjectMetadata {
             object_key: ObjectKey::new("local-first"),
@@ -2759,11 +2921,19 @@ mod tests {
         let coordinator = make_coordinator_with_segments(&[(seg1, part1)]);
 
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id: seg1, offset: 0, length: part1.len() as u32 });
+        chunks.push(ChunkRef {
+            segment_id: seg1,
+            offset: 0,
+            length: part1.len() as u32,
+            compressed: false,
+            logical_length: part1.len() as u32,
+        });
         chunks.push(ChunkRef {
             segment_id: seg2,
             offset: 0,
             length: (data.len() - part1.len()) as u32,
+            compressed: false,
+            logical_length: (data.len() - part1.len()) as u32,
         });
 
         let meta = ObjectMetadata {
@@ -2794,9 +2964,27 @@ mod tests {
             make_coordinator_with_segments(&[(seg1, &data[0..100]), (seg2, &data[100..200])]);
 
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id: seg1, offset: 0, length: 100 });
-        chunks.push(ChunkRef { segment_id: seg2, offset: 0, length: 100 });
-        chunks.push(ChunkRef { segment_id: seg3, offset: 0, length: 100 });
+        chunks.push(ChunkRef {
+            segment_id: seg1,
+            offset: 0,
+            length: 100,
+            compressed: false,
+            logical_length: 100,
+        });
+        chunks.push(ChunkRef {
+            segment_id: seg2,
+            offset: 0,
+            length: 100,
+            compressed: false,
+            logical_length: 100,
+        });
+        chunks.push(ChunkRef {
+            segment_id: seg3,
+            offset: 0,
+            length: 100,
+            compressed: false,
+            logical_length: 100,
+        });
 
         let hash = blake3::hash(&data);
         let meta = ObjectMetadata {
@@ -2822,7 +3010,13 @@ mod tests {
         let coordinator = make_coordinator_with_segments(&[(seg, data)]);
 
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id: seg, offset: 0, length: data.len() as u32 });
+        chunks.push(ChunkRef {
+            segment_id: seg,
+            offset: 0,
+            length: data.len() as u32,
+            compressed: false,
+            logical_length: data.len() as u32,
+        });
 
         let meta = ObjectMetadata {
             object_key: ObjectKey::new("bw-opt"),
@@ -2858,8 +3052,20 @@ mod tests {
         let coordinator = make_coordinator_with_segments(&[(seg1, part1), (seg2, part2)]);
 
         let mut chunks = smallvec::SmallVec::new();
-        chunks.push(ChunkRef { segment_id: seg1, offset: 0, length: part1.len() as u32 });
-        chunks.push(ChunkRef { segment_id: seg2, offset: 0, length: part2.len() as u32 });
+        chunks.push(ChunkRef {
+            segment_id: seg1,
+            offset: 0,
+            length: part1.len() as u32,
+            compressed: false,
+            logical_length: part1.len() as u32,
+        });
+        chunks.push(ChunkRef {
+            segment_id: seg2,
+            offset: 0,
+            length: part2.len() as u32,
+            compressed: false,
+            logical_length: part2.len() as u32,
+        });
 
         let meta = ObjectMetadata {
             object_key: ObjectKey::new("cpu-opt"),

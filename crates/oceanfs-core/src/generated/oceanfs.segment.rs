@@ -146,6 +146,11 @@ pub struct GetObjectMetadataResponse {
     pub chunk_offsets: ::prost::alloc::vec::Vec<u64>,
     #[prost(uint32, repeated, tag = "8")]
     pub chunk_lengths: ::prost::alloc::vec::Vec<u32>,
+    /// Compression metadata per chunk (empty = all uncompressed).
+    #[prost(uint32, repeated, tag = "9")]
+    pub chunk_logical_lengths: ::prost::alloc::vec::Vec<u32>,
+    #[prost(bool, repeated, tag = "10")]
+    pub chunk_compressed: ::prost::alloc::vec::Vec<bool>,
 }
 /// Request to push corrected object metadata + data to a stale replica (4.2).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -168,6 +173,11 @@ pub struct PutObjectMetadataRequest {
     pub chunk_offsets: ::prost::alloc::vec::Vec<u64>,
     #[prost(uint32, repeated, tag = "9")]
     pub chunk_lengths: ::prost::alloc::vec::Vec<u32>,
+    /// Compression metadata per chunk (empty = all uncompressed).
+    #[prost(uint32, repeated, tag = "10")]
+    pub chunk_logical_lengths: ::prost::alloc::vec::Vec<u32>,
+    #[prost(bool, repeated, tag = "11")]
+    pub chunk_compressed: ::prost::alloc::vec::Vec<bool>,
 }
 /// Response acknowledging the metadata write.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]

@@ -98,7 +98,13 @@ mod tests {
         let mut tracker = LivenessTracker::new();
         let id = SegmentId::new();
         tracker.register_segment(id, 1000);
-        let chunk = ChunkRef { segment_id: id, offset: 0, length: 1000 };
+        let chunk = ChunkRef {
+            segment_id: id,
+            offset: 0,
+            length: 1000,
+            compressed: false,
+            logical_length: 1000,
+        };
         tracker.mark_dead(&chunk);
         let ratio = tracker.liveness_ratio(&id).unwrap();
         assert!((ratio - 0.0).abs() < f64::EPSILON);
@@ -109,7 +115,13 @@ mod tests {
         let mut tracker = LivenessTracker::new();
         let id = SegmentId::new();
         tracker.register_segment(id, 1000);
-        let dead_chunk = ChunkRef { segment_id: id, offset: 0, length: 500 };
+        let dead_chunk = ChunkRef {
+            segment_id: id,
+            offset: 0,
+            length: 500,
+            compressed: false,
+            logical_length: 500,
+        };
         tracker.mark_dead(&dead_chunk);
         let ratio = tracker.liveness_ratio(&id).unwrap();
         assert!((ratio - 0.5).abs() < f64::EPSILON);
@@ -124,7 +136,13 @@ mod tests {
         tracker.register_segment(id2, 1000);
 
         // Mark 800 bytes dead on id1 (20% liveness)
-        let chunk = ChunkRef { segment_id: id1, offset: 0, length: 800 };
+        let chunk = ChunkRef {
+            segment_id: id1,
+            offset: 0,
+            length: 800,
+            compressed: false,
+            logical_length: 800,
+        };
         tracker.mark_dead(&chunk);
 
         let candidates = tracker.compaction_candidates(0.5);
@@ -164,7 +182,13 @@ mod tests {
         let mut tracker = LivenessTracker::new();
         let id = SegmentId::new();
         tracker.register_segment(id, 100);
-        let chunk = ChunkRef { segment_id: id, offset: 0, length: 200 };
+        let chunk = ChunkRef {
+            segment_id: id,
+            offset: 0,
+            length: 200,
+            compressed: false,
+            logical_length: 200,
+        };
         tracker.mark_dead(&chunk);
         // Live bytes should not go below 0
         let ratio = tracker.liveness_ratio(&id).unwrap();
@@ -186,7 +210,13 @@ mod tests {
         assert!((tracker.liveness_ratio(&id2).unwrap() - 1.0).abs() < f64::EPSILON);
 
         // Mark some dead on id1
-        let chunk = ChunkRef { segment_id: id1, offset: 0, length: 500 };
+        let chunk = ChunkRef {
+            segment_id: id1,
+            offset: 0,
+            length: 500,
+            compressed: false,
+            logical_length: 500,
+        };
         tracker.mark_dead(&chunk);
         // id1 should now be at 50% liveness, id2 still at 100%
         assert!((tracker.liveness_ratio(&id1).unwrap() - 0.5).abs() < f64::EPSILON);

@@ -78,8 +78,17 @@ async fn gc_with_segments_no_deletions_no_compaction() {
         .put_segment(make_segment(seg_id, SizeTier::Standard, 1700000000000))
         .expect("put segment");
 
-    let obj =
-        make_object("alive.txt", 1024, ChunkRef { segment_id: seg_id, offset: 0, length: 1024 });
+    let obj = make_object(
+        "alive.txt",
+        1024,
+        ChunkRef {
+            segment_id: seg_id,
+            offset: 0,
+            length: 1024,
+            compressed: false,
+            logical_length: 1024,
+        },
+    );
     metadata.put_object(obj).expect("put object");
 
     let gc = GarbageCollector::new(GcConfig::default());
@@ -100,7 +109,13 @@ async fn gc_tombstone_within_ttl_not_expired() {
     let obj = make_object(
         "recently_deleted.txt",
         100,
-        ChunkRef { segment_id: seg_id, offset: 0, length: 100 },
+        ChunkRef {
+            segment_id: seg_id,
+            offset: 0,
+            length: 100,
+            compressed: false,
+            logical_length: 100,
+        },
     );
     metadata.put_object(obj).expect("put object");
 
@@ -138,7 +153,13 @@ async fn gc_write_delete_verify_stats() {
         let obj = make_object(
             &format!("obj_{i}"),
             200 * i as u64 + 100,
-            ChunkRef { segment_id: seg_id, offset: 0, length: 200 * i + 100 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 200 * i + 100,
+                compressed: false,
+                logical_length: 200 * i + 100,
+            },
         );
         metadata.put_object(obj).expect("put object");
     }
@@ -185,7 +206,13 @@ async fn gc_run_cycle_returns_meaningful_stats() {
         let obj = make_object(
             &format!("seg_{seg_idx}_obj"),
             5000,
-            ChunkRef { segment_id: seg_id, offset: 0, length: 5000 },
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 5000,
+                compressed: false,
+                logical_length: 5000,
+            },
         );
         metadata.put_object(obj).expect("put object");
     }
@@ -205,8 +232,17 @@ async fn gc_multiple_cycles_dont_panic() {
         .put_segment(make_segment(seg_id, SizeTier::Standard, 1700000000000))
         .expect("put segment");
 
-    let obj =
-        make_object("stable.txt", 4096, ChunkRef { segment_id: seg_id, offset: 0, length: 4096 });
+    let obj = make_object(
+        "stable.txt",
+        4096,
+        ChunkRef {
+            segment_id: seg_id,
+            offset: 0,
+            length: 4096,
+            compressed: false,
+            logical_length: 4096,
+        },
+    );
     metadata.put_object(obj).expect("put object");
 
     let gc = GarbageCollector::new(GcConfig::default());

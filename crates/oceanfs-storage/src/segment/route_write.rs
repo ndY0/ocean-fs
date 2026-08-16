@@ -71,7 +71,13 @@ pub(crate) fn route_write(
             let segment_id = active.id();
             let (offset, length) = active.append(&data)?;
             let mut chunks = smallvec::SmallVec::new();
-            chunks.push(ChunkRef { segment_id, offset, length: length as u32 });
+            chunks.push(ChunkRef {
+                segment_id,
+                offset,
+                length: length as u32,
+                compressed: false,
+                logical_length: length as u32,
+            });
             Ok(chunks)
         }
         SizeTier::Multi => {
@@ -85,6 +91,8 @@ pub(crate) fn route_write(
                     segment_id,
                     offset: *chunk_offset,
                     length: chunk_data.len() as u32,
+                    compressed: false,
+                    logical_length: chunk_data.len() as u32,
                 });
             }
             Ok(chunk_refs)
