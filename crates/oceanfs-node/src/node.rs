@@ -622,72 +622,6 @@ impl Node {
             .map_err(|e| format!("failed to create standard segment pool: {e}"))?,
         );
 
-        // ---- 6a. Replay WAL from any previous unclean shutdown (C4-storage, D6) ----
-        // Rebuilds in-memory active segments from unsealed WAL entries left
-        // behind by a crash. Occurs before the HTTP server binds.
-        //
-        // Entries for already-sealed segments are skipped: the disk file
-        // is authoritative, and replaying a partial WAL tail (entries
-        // spanning a rotation boundary are truncated) would shadow the
-        // durable file with a corrupt pool copy. Only entries with
-        // `sealed_at` set count as sealed — the write path registers
-        // pre-seal metadata (`sealed_at: None`) for admin visibility,
-        // and those segments' data lives exclusively in the WAL.
-        // Entries for deleted segments are skipped too: GC/orphan-reaper
-        // removed the data intentionally; rebuilding it would resurrect
-        // garbage segments in the pools.
-        let finalized: std::collections::HashSet<_> = metadata_store
-            .list_segments()
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .filter(|meta| meta.sealed_at.is_some())
-            .map(|meta| meta.segment_id)
-            .chain(
-                metadata_store
-                    .list_deleted_segments()
-                    .into_iter()
-                    .filter_map(|r| r.ok())
-                    .map(|(id, _)| id),
-            )
-            .collect();
-        let replay_summary = oceanfs_storage::wal::replay_wal(
-            &wal_config,
-            &wal_writer,
-            &segment_pool_small,
-            &segment_pool_standard,
-            &segment_size,
-            |segment_id| finalized.contains(&segment_id),
-        )
-        .await
-        .map_err(|e| format!("WAL replay failed: {e}"))?;
-        if replay_summary.entries_replayed > 0 {
-            info!(
-                entries = replay_summary.entries_replayed,
-                bytes = replay_summary.bytes_replayed,
-                segments = replay_summary.segments_seen.len(),
-                hlc_wall = replay_summary.max_hlc_wall_time,
-                hlc_logical = replay_summary.max_hlc_logical,
-                "replayed unsealed WAL entries from prior crash; active segments rebuilt"
-            );
-            // Best-effort: remove old WAL files that have been fully replayed.
-            // Failure is logged but does not prevent startup (H8-storage).
-            // keep=1: only the current (truncated) file survives — every
-            // entry was replayed into the pools, so older files are dead
-            // (the seal-aware check may still protect files holding
-            // entries for segments rebuilt-but-not-yet-resealed).
-            oceanfs_storage::wal::cleanup_old_wal_files(&wal_config, 1, Some(&metadata_store))
-                .await;
-            // Markers for segments no longer referenced by any retained
-            // file are garbage — prune them now that the retained-file
-            // scan has effectively been paid for by the replay above.
-            let pruned =
-                oceanfs_storage::wal::prune_deleted_segment_markers(&wal_config, &metadata_store)
-                    .await;
-            if pruned > 0 {
-                info!(pruned, "pruned stale deleted-segment markers after replay");
-            }
-        }
-
         // ADR-0001: tiered segment sizing driven by SegmentSizeConfig.
         let seal_config = oceanfs_storage::SealConfig {
             target_size_bytes: segment_size.default_target_size,
@@ -707,6 +641,16 @@ impl Node {
         // I/O mode (O_DIRECT or buffered). The shared segment data store
         // is used by anti-entropy and healing below.
         let segment_dir = config.data_dir.join("segments");
+        // The seal worker runs BEFORE the WAL replay (replayed segments
+        // seal during replay), so the segment directory must already
+        // exist when the first replay seal fires.
+        if let Err(e) = std::fs::create_dir_all(&segment_dir) {
+            return Err(std::io::Error::other(format!(
+                "cannot create segments directory {:?}: {e}",
+                segment_dir
+            ))
+            .into());
+        }
 
         let sealer = Arc::new(oceanfs_storage::SegmentSealer::new(
             seal_config,
@@ -997,8 +941,8 @@ impl Node {
                 segment_size.clone(),
                 shard_small,
                 shard_standard,
-                segment_pool_small,
-                segment_pool_standard,
+                segment_pool_small.clone(),
+                segment_pool_standard.clone(),
                 sealer.clone(),
                 hinted_handoff_manager.clone(),
                 hint_config,
@@ -1020,6 +964,72 @@ impl Node {
         // Start background seal worker — drains filled segments from both
         // pools and writes them to disk via the segment sealer (Epic 3).
         let _seal_handle = write_coordinator.start_seal_worker();
+
+        // ---- 6a. Replay WAL from any previous unclean shutdown (C4-storage, D6) ----
+        // Rebuilds in-memory active segments from unsealed WAL entries left
+        // behind by a crash. Occurs before the HTTP server binds.
+        //
+        // Entries for already-sealed segments are skipped: the disk file
+        // is authoritative, and replaying a partial WAL tail (entries
+        // spanning a rotation boundary are truncated) would shadow the
+        // durable file with a corrupt pool copy. Only entries with
+        // `sealed_at` set count as sealed — the write path registers
+        // pre-seal metadata (`sealed_at: None`) for admin visibility,
+        // and those segments' data lives exclusively in the WAL.
+        // Entries for deleted segments are skipped too: GC/orphan-reaper
+        // removed the data intentionally; rebuilding it would resurrect
+        // garbage segments in the pools.
+        let finalized: std::collections::HashSet<_> = metadata_store
+            .list_segments()
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .filter(|meta| meta.sealed_at.is_some())
+            .map(|meta| meta.segment_id)
+            .chain(
+                metadata_store
+                    .list_deleted_segments()
+                    .into_iter()
+                    .filter_map(|r| r.ok())
+                    .map(|(id, _)| id),
+            )
+            .collect();
+        let replay_summary = oceanfs_storage::wal::replay_wal(
+            &wal_config,
+            &wal_writer,
+            &segment_pool_small,
+            &segment_pool_standard,
+            &segment_size,
+            |segment_id| finalized.contains(&segment_id),
+        )
+        .await
+        .map_err(|e| format!("WAL replay failed: {e}"))?;
+        if replay_summary.entries_replayed > 0 {
+            info!(
+                entries = replay_summary.entries_replayed,
+                bytes = replay_summary.bytes_replayed,
+                segments = replay_summary.segments_seen.len(),
+                hlc_wall = replay_summary.max_hlc_wall_time,
+                hlc_logical = replay_summary.max_hlc_logical,
+                "replayed unsealed WAL entries from prior crash; active segments rebuilt"
+            );
+            // Best-effort: remove old WAL files that have been fully replayed.
+            // Failure is logged but does not prevent startup (H8-storage).
+            // keep=1: only the current (truncated) file survives — every
+            // entry was replayed into the pools, so older files are dead
+            // (the seal-aware check may still protect files holding
+            // entries for segments rebuilt-but-not-yet-resealed).
+            oceanfs_storage::wal::cleanup_old_wal_files(&wal_config, 1, Some(&metadata_store))
+                .await;
+            // Markers for segments no longer referenced by any retained
+            // file are garbage — prune them now that the retained-file
+            // scan has effectively been paid for by the replay above.
+            let pruned =
+                oceanfs_storage::wal::prune_deleted_segment_markers(&wal_config, &metadata_store)
+                    .await;
+            if pruned > 0 {
+                info!(pruned, "pruned stale deleted-segment markers after replay");
+            }
+        }
 
         let read_coordinator = Arc::new(
             ReadCoordinator::new_with_metadata(

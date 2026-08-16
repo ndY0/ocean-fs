@@ -440,7 +440,10 @@ impl WriteCoordinator {
                     .await
                     .map_err(map_append_error("small".into()))?;
                 // Write WAL entry for crash-recovery durability (C4-storage, D6).
-                self.write_wal_entry(segment_id, offset, stored, length, hlc).await?;
+                // `logical_length` lets crash replay classify compressed
+                // chunks by their original size.
+                self.write_wal_entry(segment_id, offset, stored, length, logical_len, 0, hlc)
+                    .await?;
                 let mut chunks = smallvec::SmallVec::new();
                 chunks.push(ChunkRef {
                     segment_id,
@@ -467,7 +470,10 @@ impl WriteCoordinator {
                     .await
                     .map_err(map_append_error("standard".into()))?;
                 // Write WAL entry for crash-recovery durability (C4-storage, D6).
-                self.write_wal_entry(segment_id, offset, stored, length, hlc).await?;
+                // `logical_length` lets crash replay classify compressed
+                // chunks by their original size.
+                self.write_wal_entry(segment_id, offset, stored, length, logical_len, 0, hlc)
+                    .await?;
                 let mut chunks = smallvec::SmallVec::new();
                 chunks.push(ChunkRef {
                     segment_id,
@@ -504,7 +510,8 @@ impl WriteCoordinator {
                         .await
                         .map_err(map_append_error("multi".into()))?;
                     // Write WAL entry for each chunk (C4-storage, D6).
-                    self.write_wal_entry(seg_id, seg_offset, stored, length, hlc).await?;
+                    self.write_wal_entry(seg_id, seg_offset, stored, length, logical_len, 1, hlc)
+                        .await?;
                     // The chunk ref must carry the segment-relative offset
                     // returned by `append()`, not the splitter's
                     // blob-relative `chunk_offset` — readers slice the
@@ -635,18 +642,30 @@ impl WriteCoordinator {
     ///
     /// Records the segment append in the write-ahead log so that unsealed
     /// segment data can be replayed on crash recovery (C4-storage, D6).
+    #[allow(clippy::too_many_arguments)]
     async fn write_wal_entry(
         &self,
         segment_id: SegmentId,
         offset: u64,
         data: Bytes,
         length: u32,
+        logical_length: u32,
+        tier: u8,
         hlc: Hlc,
     ) -> std::result::Result<(), Error> {
         let chunk_hash = blake3::hash(&data);
         let checksum = HashOutput::from_bytes(*chunk_hash.as_bytes());
-        let entry =
-            WalEntry::new(segment_id, offset, length, hlc.wall_time, hlc.logical, checksum, data);
+        let entry = WalEntry::new(
+            segment_id,
+            offset,
+            length,
+            logical_length,
+            tier,
+            hlc.wall_time,
+            hlc.logical,
+            checksum,
+            data,
+        );
         self.sealer
             .wal_writer()
             .append(entry)
@@ -1703,7 +1722,7 @@ mod tests {
         // the same id (pass-2 claim), so bound the loop explicitly:
         // 512 × 64 KiB = 32 MiB, enough to fill several 4 MiB segments.
         for _ in 0..512 {
-            match coord.segment_pool_small.append_replayed(replayed_id, &chunk) {
+            match coord.segment_pool_small.append_replayed(replayed_id, &chunk).await {
                 Ok(()) => appended += chunk.len() as u64,
                 Err(_) => break, // pool saturated — all slots sealing/used
             }

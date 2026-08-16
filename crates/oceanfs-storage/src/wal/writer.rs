@@ -60,7 +60,7 @@ const MARKER_PRUNE_ROTATIONS: u64 = 60;
 /// # async fn main() {
 /// let config = WalConfig::default();
 /// let writer = WalWriter::open(&config).await.unwrap();
-/// let entry = WalEntry::new(SegmentId::new(), 0, 3, 0, 0, HashOutput::from_bytes([0u8; 32]), vec![1,2,3]);
+/// let entry = WalEntry::new(SegmentId::new(), 0, 3, 3, ,0, 0, HashOutput::from_bytes([0u8; 32]), vec![1,2,3]);
 /// let _position = writer.append(entry).await.unwrap();
 /// # }
 /// ```
@@ -494,6 +494,8 @@ mod tests {
             SegmentId::new(),
             offset,
             length,
+            length,
+            0,
             0,
             0,
             HashOutput::from_bytes([0u8; 32]),

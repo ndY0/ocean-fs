@@ -32,6 +32,8 @@ fn make_entry(segment_id: SegmentId, offset: u64, length: u32) -> WalEntry {
         segment_id,
         offset,
         length,
+        length,
+        0,
         0,
         0,
         HashOutput::from_bytes([0u8; 32]),
@@ -191,7 +193,8 @@ async fn replay_empty_directory_returns_no_entries() {
 fn entry_roundtrip() {
     let seg_id = SegmentId::new();
     let data: Bytes = vec![0xBBu8; 256].into();
-    let entry = WalEntry::new(seg_id, 42, 256, 0, 0, HashOutput::from_bytes([0xAA; 32]), data);
+    let entry =
+        WalEntry::new(seg_id, 42, 256, 256, 0, 0, 0, HashOutput::from_bytes([0xAA; 32]), data);
 
     let bytes = entry.to_bytes();
     let restored = WalEntry::from_bytes(&bytes).expect("failed to deserialize entry");

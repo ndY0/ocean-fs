@@ -7,8 +7,14 @@
 use bytes::Bytes;
 use oceanfs_core::{HashOutput, SegmentId};
 
-/// Magic bytes at the start of every WAL entry header (4 bytes: "WAL\0").
-pub(crate) const WAL_ENTRY_MAGIC: [u8; 4] = [b'W', b'A', b'L', 0];
+/// Magic bytes at the start of every WAL entry header (4 bytes: "WAL\1").
+///
+/// The header is 88 bytes: the append fields plus `logical_length` and
+/// `tier` so crash replay can rebuild compressed chunks into the correct
+/// segment pool (stored length alone would misroute them). No format
+/// versioning: nothing has ever shipped, stale data is wiped, not
+/// migrated.
+pub(crate) const WAL_ENTRY_MAGIC: [u8; 4] = [b'W', b'A', b'L', 1];
 
 /// A single entry in the Write-Ahead Log.
 ///
@@ -22,17 +28,26 @@ pub(crate) const WAL_ENTRY_MAGIC: [u8; 4] = [b'W', b'A', b'L', 0];
 /// The on-disk format is a fixed 80-byte header followed by `length` bytes
 /// of inline data:
 ///
-/// | Field         | Offset | Size |
-/// |--------------|--------|------|
-/// | magic        | 0      | 4    |
-/// | segment_id   | 4      | 16   |
-/// | offset       | 20     | 8    |
-/// | length       | 28     | 4    |
-/// | hlc_wall_time| 32     | 8    |
-/// | hlc_logical  | 40     | 4    |
-/// | checksum     | 44     | 32   |
-/// | crc          | 76     | 4    |
-/// | data         | 80     | N    |
+/// | Field          | Offset (v1) | Size |
+/// |---------------|------------|------|
+/// | magic         | 0          | 4    |
+/// | segment_id    | 4          | 16   |
+/// | offset        | 20         | 8    |
+/// | length        | 28         | 4    |
+/// | logical_length| 32         | 4    |
+/// | tier          | 36         | 1    |
+/// | reserved      | 37         | 3    |
+/// | hlc_wall_time | 40         | 8    |
+/// | hlc_logical   | 48         | 4    |
+/// | checksum      | 52         | 32   |
+/// | crc           | 84         | 4    |
+/// | data          | 88         | N    |
+///
+/// `tier` is the destination segment pool (0 = small, 1 = standard):
+/// crash replay routes by it because size classification is ambiguous
+/// for compressed chunks (a 4 MiB chunk is a Small-tier object OR a
+/// Multi-tier piece — the write path sends the latter to the standard
+/// pool).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalEntry {
     /// Magic bytes identifying this as a WAL entry.
@@ -41,8 +56,15 @@ pub struct WalEntry {
     pub segment_id: [u8; 16],
     /// Byte offset within the segment where the blob starts.
     pub offset: u64,
-    /// Length of the blob data in bytes.
+    /// Length of the blob data in bytes (the STORED length — for
+    /// compressed chunks this is the compressed size).
     pub length: u32,
+    /// Original (logical) length of the blob before compression.
+    pub logical_length: u32,
+    /// Destination segment pool (0 = small, 1 = standard). Crash replay
+    /// routes by this (authoritative — size classification is ambiguous
+    /// for compressed chunks).
+    pub tier: u8,
     /// HLC wall-clock component (milliseconds since epoch) for clock reconstruction.
     pub hlc_wall_time: u64,
     /// HLC logical counter for events at the same wall time.
@@ -62,10 +84,13 @@ impl WalEntry {
     /// All fields are set; `crc` is computed from the header fields.
     /// The `data` is stored inline so that crash recovery can replay
     /// the entry without external storage.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         segment_id: SegmentId,
         offset: u64,
         length: u32,
+        logical_length: u32,
+        tier: u8,
         hlc_wall_time: u64,
         hlc_logical: u32,
         checksum: HashOutput,
@@ -77,6 +102,8 @@ impl WalEntry {
             segment_id: *segment_id.as_uuid().as_bytes(),
             offset,
             length,
+            logical_length,
+            tier,
             hlc_wall_time,
             hlc_logical,
             checksum: *checksum.as_bytes(),
@@ -114,8 +141,8 @@ impl WalEntry {
 
     /// Size of the serialized WAL entry header in bytes.
     pub fn header_size() -> usize {
-        // 4 + 16 + 8 + 4 + 8 + 4 + 32 + 4 = 80
-        80
+        // 4 + 16 + 8 + 4 + 4 + 1 + 3 + 8 + 4 + 32 + 4 = 88
+        88
     }
 
     /// Serializes the header to bytes (80 bytes, excluding inline data).
@@ -128,6 +155,9 @@ impl WalEntry {
         buf.extend_from_slice(&self.segment_id);
         buf.extend_from_slice(&self.offset.to_le_bytes());
         buf.extend_from_slice(&self.length.to_le_bytes());
+        buf.extend_from_slice(&self.logical_length.to_le_bytes());
+        buf.push(self.tier);
+        buf.extend_from_slice(&[0u8; 3]); // reserved
         buf.extend_from_slice(&self.hlc_wall_time.to_le_bytes());
         buf.extend_from_slice(&self.hlc_logical.to_le_bytes());
         buf.extend_from_slice(&self.checksum);
@@ -169,16 +199,20 @@ impl WalEntry {
         let segment_id: [u8; 16] = header[4..20].try_into().ok()?;
         let offset = u64::from_le_bytes(header[20..28].try_into().ok()?);
         let length = u32::from_le_bytes(header[28..32].try_into().ok()?);
-        let hlc_wall_time = u64::from_le_bytes(header[32..40].try_into().ok()?);
-        let hlc_logical = u32::from_le_bytes(header[40..44].try_into().ok()?);
-        let checksum: [u8; 32] = header[44..76].try_into().ok()?;
-        let crc = u32::from_le_bytes(header[76..80].try_into().ok()?);
+        let logical_length = u32::from_le_bytes(header[32..36].try_into().ok()?);
+        let tier = header[36];
+        let hlc_wall_time = u64::from_le_bytes(header[40..48].try_into().ok()?);
+        let hlc_logical = u32::from_le_bytes(header[48..52].try_into().ok()?);
+        let checksum: [u8; 32] = header[52..84].try_into().ok()?;
+        let crc = u32::from_le_bytes(header[84..88].try_into().ok()?);
 
         let entry = Self {
             magic,
             segment_id,
             offset,
             length,
+            logical_length,
+            tier,
             hlc_wall_time,
             hlc_logical,
             checksum,
@@ -208,18 +242,21 @@ impl WalEntry {
     }
 
     fn compute_crc(&self) -> u32 {
-        // CRC32 over all header fields preceding crc (76 bytes):
+        // CRC32 over all header fields preceding crc (84 bytes):
         // magic(4) + segment_id(16) + offset(8) + length(4) +
-        // hlc_wall_time(8) + hlc_logical(4) + checksum(32) = 76
+        // logical_length(4) + tier(1) + reserved(3) + hlc_wall_time(8) +
+        // hlc_logical(4) + checksum(32) = 84
         let header_bytes = {
-            let mut buf = [0u8; 76];
+            let mut buf = [0u8; 84];
             buf[0..4].copy_from_slice(&self.magic);
             buf[4..20].copy_from_slice(&self.segment_id);
             buf[20..28].copy_from_slice(&self.offset.to_le_bytes());
             buf[28..32].copy_from_slice(&self.length.to_le_bytes());
-            buf[32..40].copy_from_slice(&self.hlc_wall_time.to_le_bytes());
-            buf[40..44].copy_from_slice(&self.hlc_logical.to_le_bytes());
-            buf[44..76].copy_from_slice(&self.checksum);
+            buf[32..36].copy_from_slice(&self.logical_length.to_le_bytes());
+            buf[36] = self.tier;
+            buf[40..48].copy_from_slice(&self.hlc_wall_time.to_le_bytes());
+            buf[48..52].copy_from_slice(&self.hlc_logical.to_le_bytes());
+            buf[52..84].copy_from_slice(&self.checksum);
             buf
         };
         crc32fast::hash(&header_bytes)
@@ -232,11 +269,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn entries_roundtrip_logical_length_and_tier() {
+        // Compressed chunks: stored length (3) differs from the logical
+        // length (1000) — the replay classifies by logical_length.
+        let entry = WalEntry::new(
+            SegmentId::new(),
+            0,
+            3,
+            1000,
+            0,
+            1000,
+            1,
+            HashOutput::from_bytes([0u8; 32]),
+            vec![1, 2, 3].into(),
+        );
+        assert_eq!(entry.magic, WAL_ENTRY_MAGIC);
+        let header = entry.to_header_bytes();
+        assert_eq!(header.len(), WalEntry::header_size(), "header must be 88 bytes");
+        let parsed = WalEntry::from_header_bytes(&header).expect("header parses");
+        assert_eq!(parsed.logical_length, 1000);
+        assert_eq!(parsed.tier, 0);
+        assert_eq!(parsed.length, 3);
+        assert!(parsed.verify_crc());
+    }
+
+    #[test]
     fn new_entry_has_correct_magic() {
         let entry = WalEntry::new(
             SegmentId::new(),
             0,
             3,
+            3,
+            0,
             1000,
             1,
             HashOutput::from_bytes([0u8; 32]),
@@ -251,7 +315,7 @@ mod tests {
         let data = Bytes::from_static(b"hello world");
         let len = data.len() as u32;
         let checksum = HashOutput::from_bytes([0xABu8; 32]);
-        let entry = WalEntry::new(id, 1024, len, 5000, 3, checksum, data.clone());
+        let entry = WalEntry::new(id, 1024, len, len, 0, 5000, 3, checksum, data.clone());
         assert_eq!(entry.segment_id(), id);
         assert_eq!(entry.offset, 1024);
         assert_eq!(entry.length, len);
@@ -269,6 +333,8 @@ mod tests {
             SegmentId::new(),
             2048,
             len,
+            len,
+            0,
             7000,
             2,
             HashOutput::from_bytes([0xCDu8; 32]),
@@ -293,6 +359,8 @@ mod tests {
             SegmentId::new(),
             0,
             3,
+            3,
+            0,
             100,
             0,
             HashOutput::from_bytes([1u8; 32]),
@@ -307,6 +375,8 @@ mod tests {
             SegmentId::new(),
             0,
             3,
+            3,
+            0,
             100,
             0,
             HashOutput::from_bytes([1u8; 32]),
@@ -322,6 +392,8 @@ mod tests {
             SegmentId::new(),
             0,
             3,
+            3,
+            0,
             0,
             0,
             HashOutput::from_bytes([0u8; 32]),
@@ -343,6 +415,8 @@ mod tests {
             SegmentId::new(),
             0,
             100,
+            100,
+            0,
             0,
             0,
             HashOutput::from_bytes([0u8; 32]),
@@ -357,13 +431,15 @@ mod tests {
     #[test]
     fn header_size_is_constant() {
         let size = WalEntry::header_size();
-        assert_eq!(size, 80);
+        assert_eq!(size, 88, "v1 (current) header: 4+16+8+4+4+1+3+8+4+32+4");
     }
 
     #[test]
     fn empty_data_entry_roundtrip() {
         let entry = WalEntry::new(
             SegmentId::new(),
+            0,
+            0,
             0,
             0,
             0,

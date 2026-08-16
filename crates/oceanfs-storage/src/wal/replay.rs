@@ -79,6 +79,7 @@ pub async fn replay_wal(
 
     let mut entries_replayed: usize = 0;
     let mut bytes_replayed: u64 = 0;
+    let mut entries_skipped_sealed: usize = 0;
     let mut segments_seen: BTreeSet<SegmentId> = BTreeSet::new();
     let mut max_hlc_wall_time: u64 = 0;
     let mut max_hlc_logical: u32 = 0;
@@ -95,6 +96,7 @@ pub async fn replay_wal(
         // remaining tail would reconstruct the segment at wrong
         // offsets and corrupt every read of it.
         if already_sealed(entry.segment_id()) {
+            entries_skipped_sealed += 1;
             continue;
         }
 
@@ -118,13 +120,30 @@ pub async fn replay_wal(
         // it up on the read path. Appending under a fresh id would leave
         // every replayed object pointing at a segment that can never be
         // found (data loss on every crash with unsealed segments).
-        let tier = size_config.classify(entry.length as u64);
+        // Route by the entry's POOL TIER when available (v1): the write
+        // path records the destination pool (0 = small, 1 = standard)
+        // because size classification is ambiguous for compressed
+        // chunks — a 4 MiB logical chunk is a Small-tier object OR a
+        // Multi-tier piece, and the latter lives in the STANDARD pool.
+        // v0 entries (tier = 0) fall back to size classification, which
+        // is exact for their uncompressed data.
+        let tier = match entry.tier {
+            0 => SizeTier::Small,
+            1 => SizeTier::Standard,
+            other => {
+                warn!(
+                    tier = other,
+                    "unknown WAL entry tier during replay; using size classification"
+                );
+                size_config.classify(entry.length as u64)
+            }
+        };
         match tier {
             SizeTier::Small => {
-                segment_pool_small.append_replayed(entry.segment_id(), &entry.data)?;
+                segment_pool_small.append_replayed(entry.segment_id(), &entry.data).await?;
             }
             SizeTier::Standard | SizeTier::Multi => {
-                segment_pool_standard.append_replayed(entry.segment_id(), &entry.data)?;
+                segment_pool_standard.append_replayed(entry.segment_id(), &entry.data).await?;
             }
             SizeTier::Inline => {
                 // Inline blobs are stored directly in RocksDB metadata
@@ -136,6 +155,12 @@ pub async fn replay_wal(
         }
     }
 
+    tracing::info!(
+        entries_replayed,
+        entries_skipped_sealed,
+        distinct_segments = segments_seen.len(),
+        "WAL replay scan complete"
+    );
     if entries_replayed > 0 {
         // Truncate the current WAL file to its start — all entries
         // have been replayed and rebuilt into in-memory active segments.
@@ -458,6 +483,8 @@ mod tests {
             segment_id,
             offset,
             length,
+            length,
+            0,
             0,
             0,
             HashOutput::from_bytes([0u8; 32]),
@@ -476,6 +503,8 @@ mod tests {
             segment_id,
             offset,
             length,
+            length,
+            0,
             wall,
             logical,
             HashOutput::from_bytes([0u8; 32]),

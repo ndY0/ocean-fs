@@ -97,7 +97,7 @@ impl Iterator for WalReplayIter {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(ref mut reader) = self.current_reader {
-                // Read the 80-byte header.
+                // Read the fixed-size header.
                 let header_size = WalEntry::header_size();
                 let mut header_buf = vec![0u8; header_size];
 
@@ -172,6 +172,8 @@ mod tests {
             segment_id,
             offset,
             length,
+            length,
+            0,
             0,
             0,
             HashOutput::from_bytes([i; 32]),

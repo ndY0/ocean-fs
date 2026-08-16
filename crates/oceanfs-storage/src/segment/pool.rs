@@ -353,6 +353,11 @@ pub struct SegmentPool {
     fail_activation: std::sync::atomic::AtomicBool,
 }
 
+/// How long a replay enqueue may wait for seal-queue space before
+/// failing startup. Generous: the seal worker drains concurrently
+/// during replay (started before the WAL replay in the node).
+const REPLAY_SEAL_ENQUEUE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl SegmentPool {
     /// Creates a new segment pool.
     ///
@@ -429,50 +434,61 @@ impl SegmentPool {
     /// # Errors
     ///
     /// Returns [`Error::InvalidConfig`] when no slot can host the
-    /// segment (more live segments than pool slots — impossible for a
-    /// replay of a pool with the same slot count).
-    pub fn append_replayed(&self, segment_id: SegmentId, data: &[u8]) -> Result<()> {
+    /// segment (more live segments than pool slots) and
+    /// [`Error::WriteBackpressureTimeout`] when the seal queue cannot
+    /// accept the filled segment within the deadline.
+    pub async fn append_replayed(&self, segment_id: SegmentId, data: &[u8]) -> Result<()> {
         // Pass 1: append to a slot already rebuilding this segment. WAL
         // entries for one segment are contiguous, so appending in replay
         // order reconstructs the original offsets.
         for slot in &self.slots {
-            let mut guard = slot.state.lock();
-            let SlotState::Appending(segment) = &mut *guard else {
-                continue;
-            };
-            if segment.id() != segment_id {
-                continue;
-            }
-            let full = {
-                let (_offset, _length) = match segment.append(data) {
-                    Ok(placed) => placed,
-                    Err(Error::SegmentFull { .. }) => {
-                        // The fill→Sealing transition happens in the same
-                        // critical section as the appending append, so a
-                        // full Appending segment is unreachable here.
-                        return Err(Error::InvalidConfig(
-                            "replayed append hit a full appending segment".into(),
-                        ));
-                    }
-                    Err(e) => return Err(e),
+            // The slot lock is scoped to this block: the async seal
+            // handoff below must never run while holding it.
+            let sealed = {
+                let mut guard = slot.state.lock();
+                let SlotState::Appending(segment) = &mut *guard else {
+                    continue;
                 };
-                segment.is_full()
-            };
-            let sealed = if full {
-                // `seal` consumes the segment, so take it out of the
-                // slot first (mirrors `transition_to_sealing`).
-                let current = std::mem::replace(&mut *guard, SlotState::Idle);
-                let SlotState::Appending(segment) = current else {
-                    unreachable!("state checked Appending above and the lock is held")
+                if segment.id() != segment_id {
+                    continue;
+                }
+                let full = {
+                    let (_offset, _length) = match segment.append(data) {
+                        Ok(placed) => placed,
+                        Err(Error::SegmentFull { .. }) => {
+                            // The fill→Sealing transition happens in the
+                            // same critical section as the appending
+                            // append, so a full Appending segment is
+                            // unreachable here.
+                            return Err(Error::InvalidConfig(
+                                "replayed append hit a full appending segment".into(),
+                            ));
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    segment.is_full()
                 };
-                let sealed = segment.seal();
-                *guard = SlotState::Sealing(sealed.segment_id, sealed.data.clone());
-                Some(sealed)
-            } else {
-                None
+                if full {
+                    // `seal` consumes the segment, so take it out of the
+                    // slot first (mirrors `transition_to_sealing`).
+                    let current = std::mem::replace(&mut *guard, SlotState::Idle);
+                    let SlotState::Appending(segment) = current else {
+                        unreachable!("state checked Appending above and the lock is held")
+                    };
+                    let sealed = segment.seal();
+                    *guard = SlotState::Sealing(sealed.segment_id, sealed.data.clone());
+                    Some(sealed)
+                } else {
+                    None
+                }
             };
-            drop(guard);
-            self.finish_seal_handoff(sealed);
+            // Await queue space — a dropped seal work item would orphan
+            // the segment's data (the WAL is truncated after replay).
+            self.finish_seal_handoff_async(
+                sealed,
+                std::time::Instant::now() + REPLAY_SEAL_ENQUEUE_DEADLINE,
+            )
+            .await?;
             return Ok(());
         }
 
@@ -481,32 +497,44 @@ impl SegmentPool {
         // replace it with a segment carrying the original id. Replay runs
         // single-threaded at startup before the server accepts writes, so
         // the plain critical section below cannot race other appenders.
+        //
+        // Self-heal first: a crash can leave MORE in-flight segments than
+        // the pool has slots (16 workers × 16 MiB bodies fills many
+        // segments per interval). Sealing slots hold frozen data that has
+        // already been handed off; installing their replacement recycles
+        // them, so replay of arbitrarily many segments always progresses.
+        self.try_activate_slot();
         for slot in &self.slots {
-            let mut guard = slot.state.lock();
-            let SlotState::Appending(segment) = &mut *guard else {
-                continue;
+            let sealed = {
+                let mut guard = slot.state.lock();
+                let SlotState::Appending(segment) = &mut *guard else {
+                    continue;
+                };
+                if !segment.is_empty() {
+                    continue;
+                }
+                let mut replacement = ActiveSegment::new_with_id(
+                    segment_id,
+                    self.tier,
+                    &self.size_config,
+                    self.buffer_pool.as_ref(),
+                )?;
+                let (_offset, _length) = replacement.append(data)?;
+                let full = replacement.is_full();
+                if full {
+                    let sealed = replacement.seal();
+                    *guard = SlotState::Sealing(sealed.segment_id, sealed.data.clone());
+                    Some(sealed)
+                } else {
+                    *guard = SlotState::Appending(replacement);
+                    None
+                }
             };
-            if !segment.is_empty() {
-                continue;
-            }
-            let mut replacement = ActiveSegment::new_with_id(
-                segment_id,
-                self.tier,
-                &self.size_config,
-                self.buffer_pool.as_ref(),
-            )?;
-            let (_offset, _length) = replacement.append(data)?;
-            let full = replacement.is_full();
-            let sealed = if full {
-                let sealed = replacement.seal();
-                *guard = SlotState::Sealing(sealed.segment_id, sealed.data.clone());
-                Some(sealed)
-            } else {
-                *guard = SlotState::Appending(replacement);
-                None
-            };
-            drop(guard);
-            self.finish_seal_handoff(sealed);
+            self.finish_seal_handoff_async(
+                sealed,
+                std::time::Instant::now() + REPLAY_SEAL_ENQUEUE_DEADLINE,
+            )
+            .await?;
             return Ok(());
         }
 
@@ -514,7 +542,31 @@ impl SegmentPool {
         // WAL holds more live segments than the pool has slots. This is
         // impossible for a crash-recovery replay of a pool with the same
         // slot count — each slot held at most one unsealed segment.
-        Err(Error::InvalidConfig("no pool slot available to rebuild replayed segment".into()))
+        {
+            let states: Vec<String> = self
+                .slots
+                .iter()
+                .map(|s| {
+                    let g = s.state.lock();
+                    match &*g {
+                        SlotState::Appending(seg) => {
+                            format!("Appending({}B)", seg.data().len())
+                        }
+                        SlotState::Sealing(id, d) => {
+                            format!("Sealing({}, {}B)", id, d.len())
+                        }
+                        SlotState::Idle => "Idle".into(),
+                    }
+                })
+                .collect();
+            tracing::error!(
+                tier = ?self.tier,
+                slot_count = self.slots.len(),
+                states = ?states,
+                "no pool slot available to rebuild replayed segment"
+            );
+            Err(Error::InvalidConfig("no pool slot available to rebuild replayed segment".into()))
+        }
     }
 
     /// Appends data to the current active segment.
@@ -1056,18 +1108,27 @@ mod tests {
 
     // ── Replay reconstruction (crash recovery) ─────
 
-    #[test]
-    fn append_replayed_rebuilds_segment_under_original_id() {
+    /// Drains the pool's seal queue so replay handoffs (which await
+    /// queue space) never block in tests without a real seal worker.
+    fn drain_seal_queue(pool: &SegmentPool) {
+        if let Some(mut rx) = pool.take_seal_rx() {
+            std::thread::spawn(move || while rx.blocking_recv().is_some() {});
+        }
+    }
+
+    #[tokio::test]
+    async fn append_replayed_rebuilds_segment_under_original_id() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
             .unwrap();
+        drain_seal_queue(&pool);
 
         let original_id = SegmentId::new();
-        pool.append_replayed(original_id, b"alpha").unwrap();
+        pool.append_replayed(original_id, b"alpha").await.unwrap();
         // A second entry for the SAME segment must append to the same
         // rebuilt segment (contiguous offsets).
-        pool.append_replayed(original_id, b"beta").unwrap();
+        pool.append_replayed(original_id, b"beta").await.unwrap();
 
         let read = pool.try_read(original_id, 0, 5).expect("original id must resolve");
         assert_eq!(&read[..], b"alpha");
@@ -1075,17 +1136,18 @@ mod tests {
         assert_eq!(&read2[..], b"beta");
     }
 
-    #[test]
-    fn append_replayed_keeps_distinct_segments_distinct() {
+    #[tokio::test]
+    async fn append_replayed_keeps_distinct_segments_distinct() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
             .unwrap();
+        drain_seal_queue(&pool);
 
         let id_a = SegmentId::new();
         let id_b = SegmentId::new();
-        pool.append_replayed(id_a, b"aaaa").unwrap();
-        pool.append_replayed(id_b, b"bbbb").unwrap();
+        pool.append_replayed(id_a, b"aaaa").await.unwrap();
+        pool.append_replayed(id_b, b"bbbb").await.unwrap();
 
         assert_eq!(&pool.try_read(id_a, 0, 4).expect("id_a")[..], b"aaaa");
         assert_eq!(&pool.try_read(id_b, 0, 4).expect("id_b")[..], b"bbbb");
@@ -1093,25 +1155,26 @@ mod tests {
         assert!(pool.try_read(id_a, 4, 4).is_none(), "id_a must not contain id_b's data");
     }
 
-    #[test]
-    fn append_replayed_errors_when_all_slots_occupied() {
+    #[tokio::test]
+    async fn append_replayed_errors_when_all_slots_occupied() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
             .unwrap();
+        drain_seal_queue(&pool);
 
         // Fill every slot with a distinct replayed segment.
         for i in 0..pool.slot_count() {
             let id = SegmentId::new();
-            pool.append_replayed(id, format!("segment-{i}").as_bytes()).unwrap();
+            pool.append_replayed(id, format!("segment-{i}").as_bytes()).await.unwrap();
         }
         // One more distinct segment than slots → error.
-        let err = pool.append_replayed(SegmentId::new(), b"overflow").expect_err("must fail");
+        let err = pool.append_replayed(SegmentId::new(), b"overflow").await.expect_err("must fail");
         assert!(matches!(err, Error::InvalidConfig(_)));
     }
 
-    #[test]
-    fn append_replayed_filled_segment_hands_to_seal_queue() {
+    #[tokio::test]
+    async fn append_replayed_filled_segment_hands_to_seal_queue() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool =
@@ -1123,7 +1186,7 @@ mod tests {
         let original_id = SegmentId::new();
         let target = size_cfg.small_target_size;
         let mut payload = vec![0xabu8; target as usize];
-        pool.append_replayed(original_id, &payload).unwrap();
+        pool.append_replayed(original_id, &payload).await.unwrap();
         let mut rx = pool.take_seal_rx().expect("seal receiver");
         let work = rx.try_recv().expect("filled rebuilt segment must be enqueued for sealing");
         assert_eq!(work.segment_id, original_id, "seal work must carry the original id");

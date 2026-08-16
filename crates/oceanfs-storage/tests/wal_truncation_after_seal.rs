@@ -22,6 +22,8 @@ fn make_test_entry(segment_id: SegmentId, offset: u64, length: u32) -> WalEntry 
         segment_id,
         offset,
         length,
+        length,
+        0,
         0,
         0,
         HashOutput::from_bytes([0u8; 32]),
