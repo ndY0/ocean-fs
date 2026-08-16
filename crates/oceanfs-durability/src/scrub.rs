@@ -630,6 +630,24 @@ impl ScrubCoordinator {
         partitions
     }
 
+    /// Computes the number of concurrent segment verifications for a
+    /// scrub cycle.
+    ///
+    /// `parallel_nodes == 0` selects the bounded default (never "all
+    /// segments at once" — each concurrent verification holds one fd and
+    /// one full ~10 MB segment buffer, so an unbounded batch is a
+    /// multi-GB anonymous-memory spike). An explicit `parallel_nodes`
+    /// value is honored as an upper bound.
+    fn scrub_concurrency(segment_count: usize, parallel_nodes: usize) -> usize {
+        const DEFAULT_SCRUB_CONCURRENCY: usize = 4;
+        if parallel_nodes == 0 {
+            segment_count.min(DEFAULT_SCRUB_CONCURRENCY)
+        } else {
+            parallel_nodes.min(segment_count)
+        }
+        .max(1)
+    }
+
     /// Runs a single scrub cycle.
     ///
     /// # Workflow
@@ -668,12 +686,13 @@ impl ScrubCoordinator {
             return Ok(report);
         }
 
-        // Determine concurrency: use configured parallel_nodes, or all segments
-        let max_concurrent = if self.config.parallel_nodes == 0 {
-            segment_ids.len().max(1)
-        } else {
-            self.config.parallel_nodes.min(segment_ids.len()).max(1)
-        };
+        // Determine concurrency: use configured parallel_nodes, or a sane
+        // bounded default. NOTE: 0 previously meant "all segments at
+        // once" — with ~10 MB per full-segment read, that turned a scrub
+        // cycle into a multi-GB anonymous-memory burst (hundreds of
+        // concurrent file reads, one fd + one full buffer each), which
+        // OOM-killed 4 GB SUT VMs mid-run. The default is now capped.
+        let max_concurrent = Self::scrub_concurrency(segment_ids.len(), self.config.parallel_nodes);
 
         // Phase 2: Partition segments into batches for parallel verification.
         // Each batch is assigned to a spawned task bounded by the semaphore.
@@ -889,9 +908,28 @@ mod tests {
     }
 
     #[test]
-    fn default_parallel_nodes_is_zero_meaning_all() {
+    fn default_parallel_nodes_is_zero() {
         let config = ScrubConfig::default();
         assert_eq!(config.parallel_nodes(), 0);
+        // 0 selects the bounded default (see scrub_concurrency) — it no
+        // longer means "all segments at once" (multi-GB memory bursts).
+        assert_eq!(ScrubCoordinator::scrub_concurrency(80, 0), 4);
+    }
+
+    #[test]
+    fn scrub_concurrency_default_bounds_all_segments() {
+        // 0 (default): capped at the bounded default, never "all".
+        assert_eq!(ScrubCoordinator::scrub_concurrency(1, 0), 1);
+        assert_eq!(ScrubCoordinator::scrub_concurrency(4, 0), 4);
+        assert_eq!(ScrubCoordinator::scrub_concurrency(80, 0), 4);
+        assert_eq!(ScrubCoordinator::scrub_concurrency(500, 0), 4);
+    }
+
+    #[test]
+    fn scrub_concurrency_explicit_parallel_nodes_is_honored() {
+        assert_eq!(ScrubCoordinator::scrub_concurrency(80, 3), 3);
+        assert_eq!(ScrubCoordinator::scrub_concurrency(2, 8), 2); // capped by segment count
+        assert_eq!(ScrubCoordinator::scrub_concurrency(80, 64), 64);
     }
 
     #[test]
