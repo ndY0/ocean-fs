@@ -235,6 +235,74 @@ impl LoadReport {
             }
         }
 
+        // Client-observed latency percentiles (the product does not emit
+        // request-latency histograms; the harness measures the real
+        // end-to-end latency per op). Microseconds -> seconds.
+        // Also the run's op/error totals for per-run comparison.
+        if let Some(stats) = &self.worker_stats {
+            let secs = |us: u64| us as f64 / 1_000_000.0;
+            write_metric(
+                &mut buf,
+                "load_test_put_latency_p50_seconds",
+                secs(stats.put_p50_us),
+                Some(&self.test),
+            );
+            write_metric(
+                &mut buf,
+                "load_test_put_latency_p99_seconds",
+                secs(stats.put_p99_us),
+                Some(&self.test),
+            );
+            write_metric(
+                &mut buf,
+                "load_test_get_latency_p50_seconds",
+                secs(stats.get_p50_us),
+                Some(&self.test),
+            );
+            write_metric(
+                &mut buf,
+                "load_test_get_latency_p99_seconds",
+                secs(stats.get_p99_us),
+                Some(&self.test),
+            );
+            write_metric(
+                &mut buf,
+                "load_test_delete_latency_p50_seconds",
+                secs(stats.delete_p50_us),
+                Some(&self.test),
+            );
+            write_metric(
+                &mut buf,
+                "load_test_delete_latency_p99_seconds",
+                secs(stats.delete_p99_us),
+                Some(&self.test),
+            );
+            write_metric(
+                &mut buf,
+                "load_test_head_latency_p50_seconds",
+                secs(stats.head_p50_us),
+                Some(&self.test),
+            );
+            write_metric(
+                &mut buf,
+                "load_test_head_latency_p99_seconds",
+                secs(stats.head_p99_us),
+                Some(&self.test),
+            );
+            write_metric(
+                &mut buf,
+                "load_test_ops_total",
+                stats.ops_total as f64,
+                Some(&self.test),
+            );
+            write_metric(
+                &mut buf,
+                "load_test_errors_total",
+                stats.errors_total as f64,
+                Some(&self.test),
+            );
+        }
+
         fs::write(&tmp_path, &buf)?;
         fs::rename(&tmp_path, &final_path)?;
 

@@ -452,7 +452,6 @@ ExecStart=
 ExecStart=/usr/bin/prometheus-node-exporter \\
     --collector.textfile.directory=${TEXTFILE_DIR} \\
     --web.listen-address=0.0.0.0:${NODE_EXPORTER_PORT} \\
-    --collector.disable-defaults \\
     --collector.textfile
 NODE_EXPORTER_OVERRIDE
 
