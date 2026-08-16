@@ -24,6 +24,12 @@ reflect the two-VM design.
 
 **Two-VM Topology (Phase 2-4, per ADR-0019):**
 
+> **Corrigendum (2026-08-16):** the laptop additionally runs a persistent
+> Prometheus (mcps/docker-compose.yml, :9091) that federates the SUT
+> Prometheus through the tunnel (365-day retention); Grafana reads from it.
+> See ADR-0019 Decision 5 corrigendum. The diagram below shows the original
+> design.
+
 ```
 ┌─ Developer Laptop ─────────────────────────────────────┐
 │                                                         │

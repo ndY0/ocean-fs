@@ -4,6 +4,13 @@
 **Date:** 2026-08-10
 **Deciders:** Brainstorm Agent (Architect)
 
+> **Corrigendum (2026-08-16):** Hetzner retired the cx22/cx32 VM line. The
+> provisioning scripts (`scripts/vm-provision.sh`) use **cx23** (2 vCPU / 4 GB)
+> and **cx33** (4 vCPU / 8 GB) instead — `MAX_AGENT_VM_TYPE="cx33"`. The VM
+> sizes cited throughout this ADR keep the original cx22/cx32 names; treat the
+> script as the authoritative mapping. The ADR's decisions (two-VM topology,
+> four-layer cost guardrails, network analysis) are unchanged.
+
 ---
 
 ## Context
@@ -92,11 +99,15 @@ free, uncapped, and sub-millisecond latency.
 ```
 ┌─ Developer Laptop ─────────────────────────────────────┐
 │                                                         │
-│  Grafana :3000  (datasource → tunneled :9090)           │
+│  Grafana :3000  (datasource → laptop Prometheus :9091)  │
+│  laptop Prometheus :9091  (federates tunneled :9090,    │
+│                            365-day retention,           │
+│                            mcps/docker-compose.yml)     │
 │  ssh oceanfs-sut     (SUT VM)                           │
 │  ssh oceanfs-harness (Harness VM, optionally)           │
 │                                                         │
-│  (Zero load generation. SSH + browser only.)            │
+│  (Zero load generation. SSH + browser + 2 small         │
+│   containers; see the Decision 5 corrigendum below.)    │
 └──────────┬──────────────────────────┬───────────────────┘
            │ SSH                      │ SSH
            ▼                          ▼
@@ -341,9 +352,21 @@ fills the SSD to 95% will not prevent the harness from saving results.
 
 ### Decision 5: Developer Laptop — Zero Load Generation
 
+> **Corrigendum (2026-08-16):** the laptop additionally runs a small
+> **persistent Prometheus container** (mcps/docker-compose.yml, host
+> port 9091, `network_mode: host`) that federates the SUT Prometheus
+> through the observe.sh tunnel (365-day retention). This is the same
+> class of local service as the already-permitted laptop Grafana
+> (negligible CPU, no load generation — the ADR's actual concern), and it
+> preserves run metrics across VM teardown. The sentence below ("The
+> laptop never runs: … Prometheus") refers to a full Prometheus *server
+> workload* for the SUT; the persistent container is a thin federation
+> sink.
+
 The developer laptop is responsible for:
 1. **SSH to both VMs** — negligible CPU (<1%)
-2. **Grafana** (browser, rendering dashboards from tunneled Prometheus) — moderate
+2. **Grafana** (browser, rendering dashboards from the persistent laptop
+   Prometheus at :9091) — moderate
    RAM when dashboards are visible, near-zero CPU when idle
 3. **SSH tunnel** (`ssh -L 9090:localhost:9090 -N oceanfs-sut`) — kernel-level
    port forwarding, negligible CPU

@@ -2,3 +2,5 @@ target
 src/generated/
 tarpaulin-report.*
 .hetzner
+# Local archive: vm-down --preserve-data + backup-observability.sh output
+local-results/

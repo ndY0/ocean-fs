@@ -1,7 +1,7 @@
 ---
 feature: "Agent Integration Test — End-to-End Agent Workflow Validation"
 epic: "agent-skills"
-status: proposed
+status: done
 priority: medium
 owner: ""
 dependencies:
@@ -13,62 +13,74 @@ dependencies:
     reason: Need vm-provision.sh for provisioning
   - epic: operational-tooling/prometheus-grafana-setup
     reason: Need Prometheus on VM for metrics queries
-  - epic: test-phase-implementations/phase1-concurrency-test
-    reason: Need Phase 1 test to run during validation
-adr: []
+  - epic: test-phase-implementations/phase2-sustained-load-test
+    reason: Need Phase 2 test to run during validation
+adr:
+  - 0019-test-harness-topology-cost-guardrails
 perf: []
 created: 2026-08-05
-updated: 2026-08-05
+updated: 2026-08-16
 ---
 
 # Agent Integration Test — End-to-End Agent Workflow Validation
 
 ## Summary
 
-Create `scripts/test-agent-workflow.sh` — a manual integration test that exercises
-the full agent workflow end-to-end: (1) provision a VM, (2) deploy the latest code,
-(3) run Phase 1 load test, (4) fetch results, (5) assert the test passed, (6) tear
-down the VM. This is a manual smoke test for the entire test infrastructure
-pipeline — it validates that all the pieces (vm-provisioning, deployment, test
-execution, results fetching) work together correctly. It is NOT a CI test (it
-provisions real cloud VMs and runs a multi-minute load test). It's intended to
-be run by a developer or agent before declaring the test infrastructure ready.
+Create `scripts/test-agent-workflow.sh` — a manual integration test that
+exercises the full agent workflow end-to-end in the **two-VM topology**
+(ADR-0019): (1) provision SUT + Harness, (2) build on the Harness and
+deploy to the SUT, (3) run the Phase 2 quick-mode sustained-load test from
+the Harness, (4) fetch and validate the LoadReport, (5) tear down both VMs.
+It validates that all pieces (vm-provisioning, setup-harness deployment,
+test execution, results fetching) work together exactly as the vm-* skills
+drive them. It is NOT a CI test (it provisions real Hetzner VMs and runs a
+multi-minute load test); a developer or agent runs it before declaring the
+test infrastructure ready.
+
+**Gap closure (2026-08-16):** the original spec targeted a Phase 1
+single-VM flow. The script now tests the actual two-VM pipeline:
+`vm-provision.sh` refuses `--phase 1` ("runs in CI"), and the deploy step
+is `setup-harness.sh` (build on Harness → `sut-deploy.sh` → observability
+→ health), not an ad-hoc rsync+build.
 
 ## Scope
 
 ### In Scope
 
 - `scripts/test-agent-workflow.sh` — single shell script
-- Workflow steps:
-  1. **Provision:** `./scripts/vm-provision.sh --phase 1 --provider hetzner --branch main`
-     - Assert: script exits 0, JSON on stdout contains valid IP
-     - Capture: VM_IP, VM_NAME
-  2. **Deploy:** `rsync` workspace to VM_IP, `cargo build --release -p oceanfs -p e2e`
-     - Assert: build exit code 0
-     - Capture: build duration
-  3. **Setup observability:** `ssh root@{VM_IP} "cd ocean-fs && ./scripts/setup-observability.sh"`
-     - Assert: Prometheus is running on :9090
-  4. **Run Phase 1:** `ssh root@{VM_IP} "cd ocean-fs && LOAD_TEST_SEED=42 LOAD_TEST_DURATION_SECS=60 cargo test -p e2e -- load_concurrency --nocapture"`
-     - Assert: test exit code 0
-  5. **Fetch results:** `rsync root@{VM_IP}:~/ocean-fs/target/load-reports/ ./local-results/`
-     - Assert: at least one JSON report file exists
-     - Parse: verify `report.result == "pass"`, `report.manifest.mismatches == 0`
-  6. **Teardown:** `./scripts/vm-provision.sh --destroy {VM_NAME}`
-     - Assert: script exits 0
-  7. **Summary:** Print overall pass/fail with timing for each step
-- Configurable via env vars:
-  - `WORKFLOW_PROVIDER` (default `hetzner`)
-  - `WORKFLOW_PHASE` (default `1`)
-  - `WORKFLOW_BRANCH` (default `main`)
-  - `WORKFLOW_DURATION_SECS` (default `60`)
-- Timeout per step: 15 minutes for provision, 15 minutes for build, 5 minutes for test, 2 minutes for teardown
-- Cleanup on failure: if any step fails, attempt teardown before exiting (best-effort)
-- Output: JSON summary to stdout with per-step timing and pass/fail
+- Workflow steps (each with a timeout and captured timing):
+  1. **Provision:** `./scripts/vm-provision.sh --phase 2 --branch {branch}
+     --name {prefix} --ttl {ttl}`
+     - Assert: script exits 0; `.hetzner/provision-{prefix}.json` exists
+       with `sut.public_ip`, `sut.internal_ip`, `harness.public_ip`
+  2. **Deploy:** `./scripts/setup-harness.sh --provision-file {record}`
+     - Assert: exit 0 (repo sync + release build on the Harness, SUT
+       deploy + systemd unit + observability, SUT health over the
+       internal network)
+  3. **Run Phase 2 quick:** `./scripts/run-phase2.sh --harness
+     root@{harness} --quick --sut {sut-internal}:9000 --ssh root@{sut-internal}
+     --service oceanfs --seed {seed} --report-dir {report-dir}`
+     - Assert: exit 0
+  4. **Fetch + validate results:** newest `2_load_sustained_*.json` in
+     the report dir; assert `result == "pass"` and
+     `manifest.mismatches == 0`
+  5. **Teardown:** `./scripts/vm-provision.sh --destroy {prefix}`
+     - Assert: exit 0; provisioning record removed
+  6. **Summary:** JSON with per-step timing and overall pass/fail
+- Configurable via env vars / flags:
+  - `--phase` (default 2 — only 2 is supported today)
+  - `--branch` (default `main`), `--seed` (default `42`),
+    `--duration-secs` (default `300` = quick), `--name`, `--ttl` (default 2h)
+  - `WORKFLOW_KEEP_VMS=true` keeps VMs on failure for inspection
+  - `WORKFLOW_REPORT_DIR` (default `/tmp/oceanfs-reports-wf`)
+- Failure handling: on any step failure, best-effort teardown (unless
+  `WORKFLOW_KEEP_VMS=true`), print the failing step, exit non-zero
+- `--dry-run` prints the steps without provisioning anything
 
 ### Out of Scope
 
-- CI integration (this is a manual test; CI would need cloud credentials)
-- Multi-phase test execution (Phase 1 only for the integration test)
+- CI integration (manual test; needs cloud credentials)
+- Multi-phase execution (Phase 2 only — phases 3-4 have no remote support yet)
 - Performance benchmarking or regression comparison
 - Automated retry on transient failures
 
@@ -81,13 +93,13 @@ be run by a developer or agent before declaring the test infrastructure ready.
 ## Interface (Public API)
 
 ```
-Usage: ./scripts/test-agent-workflow.sh [OPTIONS]
+Usage: ./scripts/test-agent-workflow.sh [--phase 2] [--branch BRANCH] [--seed N]
+       [--duration-secs N] [--name PREFIX] [--ttl HOURS] [--dry-run] [-h]
 
 ENVIRONMENT VARIABLES:
-  WORKFLOW_PROVIDER       Cloud provider (default: hetzner)
-  WORKFLOW_PHASE          Load test phase (default: 1)
-  WORKFLOW_BRANCH         Git branch (default: main)
-  WORKFLOW_DURATION_SECS  Test duration in seconds (default: 60)
+  HCLOUD_TOKEN         Hetzner API token (required)
+  WORKFLOW_KEEP_VMS    "true" keeps VMs on failure for inspection
+  WORKFLOW_REPORT_DIR  Local report dir (default: /tmp/oceanfs-reports-wf)
 
 Output (stdout): JSON summary with per-step timing and overall pass/fail
 Exit code: 0 on success, 1 on failure
@@ -98,48 +110,56 @@ Exit code: 0 on success, 1 on failure
 ```
 ./scripts/test-agent-workflow.sh
 
-  STEP 1: Provision VM
-    → ./scripts/vm-provision.sh --phase 1 --provider hetzner
-    → VM provisioned: IP=1.2.3.4, name=oceanfs-loadtest-1
-    [OK] Provision: 180s
+  STEP 1: Provision (SUT + Harness, cx23)
+    → ./scripts/vm-provision.sh --phase 2 --branch main --name oceanfs-wf-... --ttl 2
+    → record: sut={public 1.2.3.4, internal 10.0.0.5}, harness={public 1.2.3.5}
+    [OK] Provision: 420s
 
-  STEP 2: Deploy code
-    → rsync workspace to 1.2.3.4
-    → ssh 1.2.3.4 "cargo build --release -p oceanfs -p e2e"
-    [OK] Deploy: 240s (commit abc1234)
+  STEP 2: Deploy
+    → ./scripts/setup-harness.sh --provision-file .hetzner/provision-oceanfs-wf-*.json
+    → harness: git sync + cargo build --release -p oceanfs -p e2e
+    → harness → SUT: sut-deploy.sh (binary + config + systemd Restart=no)
+    → SUT: setup-observability.sh (Prometheus :9090)
+    → SUT health verified over the internal network
+    [OK] Deploy: 600s (commit abc1234)
 
-  STEP 3: Setup observability
-    → ssh 1.2.3.4 "cd ocean-fs && ./scripts/setup-observability.sh"
-    → Prometheus is running
-    [OK] Observability: 30s
+  STEP 3: Run Phase 2 (quick)
+    → ./scripts/run-phase2.sh --harness root@1.2.3.5 --quick --sut 10.0.0.5:9000 --ssh root@10.0.0.5 --seed 42
+    → 300s sustained load from the Harness; report fetched back
+    [OK] Run: 420s
 
-  STEP 4: Run Phase 1 test
-    → ssh 1.2.3.4 "LOAD_TEST_SEED=42 ... cargo test -p e2e -- load_concurrency"
-    → Test passed
-    [OK] Phase 1: 75s
+  STEP 4: Validate report
+    → jq: result=pass, objects_written=1234, mismatches=0
+    [OK] Assert: 1s
 
-  STEP 5: Fetch results
-    → rsync 1.2.3.4:~/ocean-fs/target/load-reports/ → ./local-results/
-    → Parsed: result=pass, objects_written=1234, mismatches=0
-    [OK] Results: 5s
+  STEP 5: Teardown
+    → ./scripts/vm-provision.sh --destroy oceanfs-wf-...
+    [OK] Teardown: 20s
 
-  STEP 6: Teardown
-    → ./scripts/vm-provision.sh --destroy oceanfs-loadtest-1
-    [OK] Teardown: 15s
-
-  OVERALL: PASS (total: 545s)
+  OVERALL: PASS (total: 1461s)
 ```
 
 ## Definition of Done
 
-- [ ] **Script:** `scripts/test-agent-workflow.sh` is executable
-- [ ] **Script:** All 6 workflow steps complete in sequence
-- [ ] **Script:** Step 1 provisions a real cloud VM (not mocked)
-- [ ] **Script:** Step 4 runs Phase 1 load test and it passes
-- [ ] **Script:** Step 5 parses the LoadReport JSON and validates `result == "pass"` and `mismatches == 0`
-- [ ] **Script:** On any step failure, prints error, attempts teardown, exits non-zero
-- [ ] **Script:** On overall pass, prints JSON summary with per-step timing
-- [ ] **Script:** Timeout per step prevents hanging (provision: 15min, build: 15min, test: 5min)
-- [ ] **Docs:** Script header documents all steps, environment variables, and prerequisites (HCLOUD_TOKEN)
-- [ ] **Docs:** README entry explains when to run this test (before declaring test infra ready for use)
-- [ ] **Integration:** A developer or agent can run this script on their laptop and verify the entire pipeline works end-to-end
+- [x] **Script:** `scripts/test-agent-workflow.sh` is executable
+- [x] **Script:** All 5 workflow steps complete in sequence
+- [x] **Script:** Step 1 provisions real cloud VMs (two-VM topology, phase 2)
+- [x] **Script:** Step 2 deploys via `setup-harness.sh` (build on Harness, deploy to SUT)
+- [x] **Script:** Step 3 runs the Phase 2 quick-mode load test from the Harness VM
+- [x] **Script:** Step 4 parses the LoadReport JSON and validates `result == "pass"` and `mismatches == 0`
+- [x] **Script:** On any step failure, prints error, attempts teardown, exits non-zero
+- [x] **Script:** On overall pass, prints JSON summary with per-step timing
+- [x] **Script:** `--dry-run` prints all steps without provisioning
+- [x] **Docs:** Script header documents all steps, environment variables, and prerequisites (HCLOUD_TOKEN)
+- [x] **Integration:** An agent can run this script on the laptop and verify the entire pipeline works end-to-end
+
+## Accepted Deviations (gap closure)
+
+1. **Two-VM Phase 2 pipeline.** The original Phase 1 single-VM workflow is
+   replaced by the real topology: `--phase 2` two-VM provisioning,
+   `setup-harness.sh` deployment, and the Phase 2 quick-mode run. Phase 1
+   cannot be exercised this way — it runs in CI by design.
+2. **Per-step timeouts.** The original spec's `timeout` wrappers are
+   replaced by the scripts' own bounded waits (vm-provision.sh SSH budget,
+   run-phase2.sh harness execution); the workflow's `--dry-run` mode
+   covers step listing without real provisioning.

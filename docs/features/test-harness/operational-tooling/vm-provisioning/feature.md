@@ -9,7 +9,7 @@ adr:
   - 0019-test-harness-topology-cost-guardrails
 perf: []
 created: 2026-08-05
-updated: 2026-08-11
+updated: 2026-08-16
 ---
 
 # VM Provisioning — Two-VM Cloud Lifecycle with Cost Guardrails
@@ -39,7 +39,7 @@ Returns JSON with two VM objects: `{sut: {...}, harness: {...}}`.
   - `--provider PROVIDER` — `hetzner` (default), extensible to `gcp`, `aws`
   - `--branch BRANCH` — git branch to clone on Harness VM (default `main`)
   - `--commit SHA` — specific commit to check out (optional)
-  - `--ssh-key PATH` — path to SSH public key for VM access (default `~/.ssh/id_rsa.pub`)
+  - `--ssh-key PATH` — path to SSH public key for VM access (default: `.hetzner/.ssh/hetzner-ssh.pub` when present — set via `HETZNER_SSH_PUBLIC_KEY` by `scripts/lib/env-hetzner.sh` — else `~/.ssh/id_rsa.pub`)
   - `--name NAME` — VM name prefix (default `oceanfs-loadtest-{phase}`)
   - `--image IMAGE` — OS image (default `ubuntu-24.04`)
   - `--dry-run` — print what would be done without provisioning
@@ -51,6 +51,11 @@ Returns JSON with two VM objects: `{sut: {...}, harness: {...}}`.
 - **Guardrail: Hard VM size cap** — `MAX_AGENT_VM_TYPE="cx32"`; any `--phase` or `--type` mapping to ≥ CX42 is **rejected** with error directing human to provision manually
 - **Guardrail: Confirmation gate** — CX22 auto-approved; CX32 requires `--confirm yes` flag; prints cost estimate and exits if not provided
 - **Guardrail: Auto-shutdown TTL** — systemd timer on each VM that calls `hcloud server poweroff $(hostname)` after configurable TTL (default 4h); timer fires on boot and every TTL_HOURS thereafter
+  - **Note (2026-08-16):** the TTL poweroff depends on the `hcloud` CLI being
+    present on the VMs — `setup_ttl_timer()` installs a `/usr/local/bin/hcloud`
+    wrapper that `exec`s `/usr/bin/hcloud`; if the CLI is not installed on the
+    VM image (or the API token not injected at provision time), the timer fails
+    at poweroff time. Tracked by this epic.
 - **Guardrail: Budget gate (scaffolding)** — if `LOAD_TEST_MAX_MONTHLY_EUR` env var is set, query Hetzner billing API and reject if estimated cost exceeds budget; marked as deferrable/v2
 - Hetzner internal network configuration: both VMs created in the same project/network so they can communicate over private IPs (free, uncapped)
 - Provisioning steps for **Harness VM** (has Rust toolchain):
@@ -113,7 +118,8 @@ OPTIONS:
   --provider NAME      Cloud provider: hetzner (default), gcp, aws
   --branch BRANCH      Git branch to clone on Harness VM (default: main)
   --commit SHA         Specific commit to checkout
-  --ssh-key PATH       SSH public key path (default: ~/.ssh/id_rsa.pub)
+  --ssh-key PATH       SSH public key path (default: .hetzner/.ssh/
+                       hetzner-ssh.pub when present, else ~/.ssh/id_rsa.pub)
   --name NAME          VM name prefix (default: oceanfs-loadtest-{phase})
   --image IMAGE        OS image (default: ubuntu-24.04)
   --single-vm          Co-locate SUT+Harness on single VM (Phase 2 only; Phase 3-4 warns)
@@ -125,9 +131,18 @@ OPTIONS:
   -h, --help           Show this help
 
 Environment Variables:
-  HCLOUD_TOKEN              Hetzner Cloud API token (required for hetzner provider)
+  HCLOUD_TOKEN              Hetzner Cloud API token (required for hetzner provider;
+                            auto-loaded from .hetzner/.env by scripts/lib/env-hetzner.sh)
+  HETZNER_SSH_PUBLIC_KEY    Default provisioning key (set by scripts/lib/env-hetzner.sh
+                            to .hetzner/.ssh/hetzner-ssh.pub when present)
   LOAD_TEST_TTL_HOURS       Override default TTL (default: 4)
   LOAD_TEST_MAX_MONTHLY_EUR Optional monthly budget cap (deferrable, v2)
+
+Bootstrap contract (scripts/lib/env-hetzner.sh — sourced by every
+  laptop-side script, no-op without .hetzner/ e.g. on the Harness VM):
+  loads .hetzner/.env (HCLOUD_TOKEN), ensures ssh-agent and adds
+  .hetzner/.ssh/hetzner-ssh, exports HETZNER_SSH_PUBLIC_KEY (default
+  provisioning key).
 
 Output (stdout): JSON with sut + harness VM objects (see Scope section)
 ```

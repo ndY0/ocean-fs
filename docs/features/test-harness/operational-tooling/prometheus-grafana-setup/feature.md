@@ -8,7 +8,7 @@ dependencies: []
 adr: []
 perf: []
 created: 2026-08-05
-updated: 2026-08-11
+updated: 2026-08-16
 ---
 
 # Prometheus & Grafana Setup — Observability Stack for Load Test VM
@@ -45,11 +45,15 @@ marker. Documents the SSH tunnel for laptop Grafana access.
     4. **Cache Hit Rates** (stat/gauge): `cache_hits_total / (cache_hits_total + cache_misses_total)` per tier
     5. **Gossip Message Rate** (line chart): `rate(gossip_messages_sent_total[1m])`
     6. **Heal Request Rate** (line chart): `rate(heal_requests_total[1m])`
-    7. **Accel Fallback Count** (stat): `accel_fallback_total`
+    7. **Accel Fallback Count** (stat): `accel_ec_fallback_total`
     8. **Test Phase Marker** (state timeline): `load_test_phase` from textfile
     9. **S3 Request Latency p50/p99** (line chart): histogram quantiles
     10. **WAL Bytes Written** (line chart): `wal_bytes_written_total`
   - Variables: `$phase` (from `load_test_phase`), `$test` (from textfile label)
+    - **Caveat:** `load_test_phase` carries only a `test` label — the phase is
+      the metric **value** (emitted by `e2e/src/load/report.rs`), so the
+      `$phase` dropdown variable renders empty until a phase label is emitted;
+      panels are unaffected.
   - Datasource: Prometheus (configured by user, variable `$datasource`)
 - README documentation in script header or `docs/observability-setup.md`:
   - How to SSH tunnel: `ssh -L 9090:localhost:9090 -N vm`
@@ -91,8 +95,9 @@ Setup (run once):
 
 During test:
   Harness writes → /var/lib/prometheus/textfile/load_test.prom (atomic)
-  Prometheus scrapes → :9090 (API)
-  Laptop Grafana → SSH tunnel → localhost:9090 → dashboards
+  SUT Prometheus scrapes → :9090 (API)
+  Laptop Prometheus federates ← SSH tunnel (observe.sh) ← SUT :9090
+  Laptop Grafana → 127.0.0.1:9091 (persistent store) → dashboards
 ```
 
 ## Definition of Done
@@ -115,6 +120,24 @@ During test:
 
 The following deviations from the original feature spec were accepted during
 review:
+
+0. **Addendum (2026-08-16) — persistent laptop Prometheus (Solution B).**
+   The SUT's Prometheus is ephemeral (destroyed with the VM, 7-day
+   retention), which lost all run history at teardown. A persistent
+   laptop-side Prometheus now runs in `mcps/docker-compose.yml` (service
+   `prometheus`, host port `localhost:9091`, 365-day retention in the
+   `prometheus-storage` volume) and **federates** the SUT Prometheus
+   through the observe.sh tunnel (`/federate`, 15s, `honor_labels: true`).
+   Both it and Grafana run with `network_mode: host` (the tunnel binds
+   loopback only). Grafana's datasource points at this persistent store
+   (`http://127.0.0.1:9091`, host loopback), so dashboards keep showing
+   historical runs after the SUT is gone. Agents query it via the
+   `vm-metrics` skill; `run-phase2.sh` ensures the tunnel automatically
+   before each remote run so archiving is the default. No SUT-side changes
+   were needed (federation is pull-based through the existing tunnel).
+   Caveat: metrics are archived only while the tunnel is up during a run —
+   `vm-down --preserve-data` (SUT TSDB snapshot) and the LoadReport JSONs
+   remain the backstops for tunnel-less runs.
 
 1. **Live integration test (`curl localhost:9090/api/v1/query?query=up`)** — This
    test requires a live Prometheus instance on a VM. The setup script's

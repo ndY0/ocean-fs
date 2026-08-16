@@ -1,6 +1,6 @@
 # Test Harness — Master Index
 
-**Date:** 2026-08-10
+**Date:** 2026-08-16
 **Context:** Implementation plan for the OceanFS load test harness, test phases,
 and operational tooling. Derived from three brainstorm design documents and
 cross-referenced with the gap-closure plan. Updated per
@@ -8,6 +8,12 @@ cross-referenced with the gap-closure plan. Updated per
 **two-VM topology** for cloud-based phases (Phase 2–4): a dedicated **SUT VM**
 (running OceanFS + Prometheus) and a dedicated **Harness VM** (running the e2e
 harness + Rust toolchain) communicating over Hetzner's internal network.
+
+> **Corrigendum (2026-08-16):** Hetzner retired the cx22/cx32 VM line. The
+> provisioning scripts use **cx23** (2 vCPU / 4 GB) and **cx33** (4 vCPU / 8 GB)
+> — see `scripts/vm-provision.sh` for the authoritative size mapping. The
+> tables below keep the ADR's original names; treat the script as the source
+> of truth.
 
 **Source Documents:**
 
@@ -27,15 +33,17 @@ Phase 1 runs entirely in CI with local process spawning. Phases 2–4 use a
 two-VM cloud topology:
 
 ```
-┌─ Developer Laptop ─────────────────────────────────────┐
-│  Grafana :3000  (datasource → tunneled :9090)          │
-│  ssh oceanfs-sut     (SUT VM)                          │
-│  ssh oceanfs-harness (Harness VM, optionally)          │
-│  (Zero load generation. SSH + browser only.)           │
-└──────────┬──────────────────────────┬──────────────────┘
+┌─ Developer Laptop ────────────────────────────────────────────┐
+│  Grafana :3000  (datasource → laptop Prometheus :9091)         │
+│  laptop Prometheus :9091  (federates tunneled :9090, 365d)     │
+│  ssh -L tunnel 9090 → SUT Prometheus (observe.sh)              │
+│  ssh oceanfs-sut     (SUT VM)                                  │
+│  ssh oceanfs-harness (Harness VM, optionally)                  │
+│  (Zero load generation. SSH + browser + 2 small containers.)   │
+└──────────┬──────────────────────────┬──────────────────────────┘
            │ SSH                      │ SSH
            ▼                          ▼
-┌─ SUT VM ──────────────────┐  ┌─ Harness VM (CX22) ─────┐
+┌─ SUT VM ──────────────────┐  ┌─ Harness VM (CX23) ─────┐
 │  oceanfs (1-5 processes)   │  │  e2e harness             │
 │  prometheus :9090          │  │  Rust toolchain          │
 │  No harness.               │  │  Targets SUT via         │
@@ -50,8 +58,8 @@ two-VM cloud topology:
 | Phase | SUT VM | Harness VM | Mode |
 |---|---|---|---|
 | Phase 1 | None (CI runner) | None (CI runner) | Local spawn in CI |
-| Phase 2 | CX22 (2 vCPU, 4 GB) | CX22 (2 vCPU, 4 GB) | Remote target (`TARGET_HOST`) |
-| Phase 3-4 | CX32 (4 vCPU, 8 GB) | CX22 (2 vCPU, 4 GB) | Remote target (`TARGET_HOSTS`) |
+| Phase 2 | CX23 (2 vCPU, 4 GB) | CX23 (2 vCPU, 4 GB) | Remote target (`TARGET_HOST`) |
+| Phase 3-4 | CX33 (4 vCPU, 8 GB) | CX23 (2 vCPU, 4 GB) | Remote target (`TARGET_HOSTS`) |
 
 ---
 
@@ -64,6 +72,42 @@ two-VM cloud topology:
 | 3 | [operational-tooling](#epic-3-operational-tooling) | **high** | 3 | Epic 4 | Epic 1 (shared types), ADR-0019 (guardrails design) |
 | 4 | [agent-skills](#epic-4-agent-skills) | **high** | 3 | — | Epics 1, 2, 3, ADR-0019 (two-VM topology design) |
 
+---
+
+## Script Inventory (current state, 2026-08-16)
+
+The agent skills and the workflow script drive these `scripts/` files.
+They are the source of truth for the operational interfaces:
+
+| Script | Purpose | Consumed by |
+|---|---|---|
+| `lib/env-hetzner.sh` | Shared bootstrap sourced by every laptop-side script: loads `.hetzner/.env` (HCLOUD_TOKEN), ensures ssh-agent + adds `.hetzner/.ssh/hetzner-ssh`, exports `HETZNER_SSH_PUBLIC_KEY` (default provisioning key). No-op without `.hetzner/` (Harness VM) | vm-provision, observe, setup-harness, sut-deploy, run-phase2, test-agent-workflow |
+| `vm-provision.sh` | Two-VM provisioning (cx23/cx33), firewalls, TTL timer, observability default, provisioning record `.hetzner/provision-*.json`, `--status`/`--destroy` | vm-up, vm-down, vm-status |
+| `setup-harness.sh` | Full deploy pipeline: seed harness→SUT SSH key, repo sync + release build on the Harness, `sut-deploy.sh` to the SUT, observability ensure, health verify | vm-deploy |
+| `sut-deploy.sh` | SUT install: binary, `/etc/oceanfs/oceanfs.toml`, systemd unit `oceanfs` (`Restart=no` for crash control) | setup-harness.sh |
+| `setup-observability.sh` | SUT-side Prometheus :9090 + Node Exporter textfile collector (systemd) | vm-provision.sh (default), setup-harness.sh |
+| `observe.sh` | Idempotent SSH tunnel `localhost:9090 → SUT:9090` (feeds the laptop Prometheus federation) | prometheus (federation), vm-metrics, vm-status |
+| `backup-observability.sh` | Backs up the persistent laptop stack: Prometheus TSDB snapshot (admin API) + Grafana state, with rotation (default keep 7). Auto-invoked (best-effort) by `run-phase2.sh` after every remote run; run manually any time. **Use before any `docker compose ... down --volumes`** | run-phase2.sh (auto), agents/humans |
+| `run-phase2.sh` | Phase 2 runner: `--harness` mode (payload on the Harness VM) + local mode; env wiring, textfile push, report fetch | vm-test-phase |
+| `test-agent-workflow.sh` | End-to-end pipeline validation (provision → deploy → run → assert → teardown) | agent-integration-test |
+| `dashboards/load-test.json` | Grafana dashboard (mounted into the laptop Grafana service) | Grafana (`mcps/docker-compose.yml`) |
+
+Grafana itself runs on the **laptop** via `mcps/docker-compose.yml`:
+
+- `grafana` service — UI at `http://localhost:3000`, dashboard auto-provisioned
+  from `scripts/dashboards/load-test.json`.
+- `prometheus` service — **persistent laptop Prometheus** (host port
+  `localhost:9091`, 365-day retention in the `prometheus-storage` volume).
+  It federates the SUT's Prometheus through the observe.sh tunnel
+  (`/federate`, 15s), so every run's metrics survive VM teardown. Grafana
+  reads from it (both use `network_mode: host`; datasource is the host
+  loopback `127.0.0.1:9091`), and agents query it via the
+  `vm-metrics` skill. `run-phase2.sh` ensures the tunnel automatically
+  before each remote run, so archiving is the default.
+
+The SUT-side Prometheus (`setup-observability.sh`) keeps a 7-day local
+buffer; the laptop store is the durable copy. `vm-down --preserve-data`
+additionally snapshots the SUT TSDB for full-fidelity archives.
 ---
 
 ## Dependency Graph
@@ -201,9 +245,9 @@ Harness VM (e2e harness + Rust toolchain), connected over Hetzner internal netwo
 
 | # | Feature | Summary |
 |---|---|---|
-| 4.1 | [vm-skills](agent-skills/vm-skills/feature.md) | `vm-status`, `vm-up`, `vm-down`, `vm-deploy` — two-VM lifecycle management |
-| 4.2 | [test-execution-skills](agent-skills/test-execution-skills/feature.md) | `vm-test-phase`, `vm-results`, `vm-metrics`, `vm-logs` — remote-target test execution |
-| 4.3 | [agent-integration-test](agent-skills/agent-integration-test/feature.md) | End-to-end agent workflow test script (two-VM topology) |
+| 4.1 | [vm-skills](agent-skills/vm-skills/feature.md) | `vm-status`, `vm-up`, `vm-down`, `vm-deploy` — two-VM lifecycle management (`.opencode/skills/`, **done 2026-08-16**) |
+| 4.2 | [test-execution-skills](agent-skills/test-execution-skills/feature.md) | `vm-test-phase`, `vm-results`, `vm-metrics`, `vm-logs` — remote-target test execution (`.opencode/skills/`, **done 2026-08-16**) |
+| 4.3 | [agent-integration-test](agent-skills/agent-integration-test/feature.md) | `scripts/test-agent-workflow.sh` — end-to-end workflow validation (two-VM topology, **done 2026-08-16**) |
 
 ---
 

@@ -1,7 +1,7 @@
 ---
 feature: "VM Skills — Agent Commands for Two-VM Lifecycle Management"
 epic: "agent-skills"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies:
@@ -11,153 +11,174 @@ adr:
   - 0019-test-harness-topology-cost-guardrails
 perf: []
 created: 2026-08-05
-updated: 2026-08-10
+updated: 2026-08-16
 ---
 
 # VM Skills — Agent Commands for Two-VM Lifecycle Management
 
 ## Summary
 
-Create four OpenCode skill files under `.opencode/skills/` that agents use to
+Create four OpenCode skills under `.opencode/skills/` that agents use to
 manage the two-VM test topology (SUT VM + Harness VM, per ADR-0019):
-`vm-status`, `vm-up`, `vm-down`, and `vm-deploy`. Each skill is a concise
-instruction file that tells the agent what command to execute via SSH and what
+`vm-status`, `vm-up`, `vm-down`, and `vm-deploy`. Each skill is an OpenCode
+`SKILL.md` instruction file (`name` + `description` frontmatter, body =
+exact commands + return schema) telling the agent what to execute and what
 to return. These skills abstract away the two-VM complexity, providing a
 consistent interface for all agents (Architect, Reviewer, Implementer) to
 interact with the load test infrastructure.
+
+**Gap closure (2026-08-16):** The skills are built against the **actual**
+script interfaces after the 2026-08-15/16 script refactor, not the original
+design. Source of truth per skill:
+
+| Skill | Backing script(s) | Notes vs. original design |
+|---|---|---|
+| `vm-status` | `vm-provision.sh --status`, provisioning record `.hetzner/provision-*.json`, SSH `systemctl is-active` checks | Reads the record for IPs/type instead of assuming `~/.ssh/config` aliases (aliases are created by vm-up but the record is the source of truth) |
+| `vm-up` | `vm-provision.sh --phase N` | VM types are **cx23/cx33** (Hetzner retired cx22/cx32); writes the provisioning record; the skill (not the script) maintains `~/.ssh/config` aliases; idempotency via `--status` check before provisioning |
+| `vm-down` | `vm-provision.sh --destroy NAME` | `--preserve-data` implemented in the skill: fetch harness reports + Prometheus TSDB **before** destroy, then clean the record + ssh aliases |
+| `vm-deploy` | `setup-harness.sh` → `sut-deploy.sh` + `setup-observability.sh` | Replaces the hand-rolled "build on harness + scp to SUT" recipe: seeds harness→SUT SSH key, syncs repo, builds `oceanfs`+`e2e` on the harness, deploys binary + config + systemd unit (`Restart=no`) to the SUT, ensures Prometheus, verifies health |
 
 ## Scope
 
 ### In Scope
 
-#### `vm-status.md`
-- SSH to **both** VMs (hostnames from `~/.ssh/config` aliases `oceanfs-sut` and `oceanfs-harness`)
-- Check if OceanFS process is running on SUT VM: `systemctl is-active oceanfs`
-- Check if Prometheus is running on SUT VM: `systemctl is-active prometheus`
-- Check if TTL timer is active on both VMs: `systemctl is-active oceanfs-ttl.timer`
-- Return structured two-VM status:
-  ```json
-  {
-    "sut": {
-      "status": "running",
-      "ip": "10.0.0.5",
-      "public_ip": "1.2.3.4",
-      "type": "cx32",
-      "oceanfs": "active",
-      "prometheus": "active",
-      "ttl_timer": "active",
-      "uptime": "2026-08-10T10:00:00Z"
-    },
-    "harness": {
-      "status": "running",
-      "ip": "10.0.0.6",
-      "public_ip": "1.2.3.5",
-      "type": "cx22",
-      "ttl_timer": "active",
-      "uptime": "2026-08-10T10:00:00Z"
-    }
-  }
-  ```
-- If either VM doesn't exist or is unreachable, set `status: "not_found"` with error details
+#### `vm-status` (`.opencode/skills/vm-status/SKILL.md`)
+- Locate the newest `.hetzner/provision-*.json` (or by prefix)
+- SSH to both VMs with `BatchMode=yes` and check services:
+  - SUT: `systemctl is-active oceanfs`, `systemctl is-active prometheus`, `systemctl is-active oceanfs-ttl.timer`, boot time
+  - Harness: `systemctl is-active oceanfs-ttl.timer`, boot time
+- Check the observe.sh tunnel to the SUT Prometheus (`curl localhost:9090/-/healthy`)
+- Return structured two-VM status (see Interface); unreachable/not_found
+  states reported explicitly
 
-#### `vm-up.md`
-- Determine phase → VM types via `scripts/vm-provision.sh --phase {phase} --dry-run` for sizing info
-- Invoke `scripts/vm-provision.sh --phase {phase} --branch {branch} [--confirm yes] [--single-vm] [--ttl N]`
-- Accepts: `phase` (required, 1-6), `branch` (optional, default main), `provider` (optional), `confirm` (auto-passes `--confirm yes` for phases 3-4), `single-vm` (optional, for Phase 2 budget mode), `ttl` (optional, default 4h)
-- Return: two-VM JSON object (see vm-provisioning output format)
-- If VMs already running, return existing IPs (idempotent)
-- Updates `~/.ssh/config` with two entries:
-  - `Host oceanfs-sut` → `HostName <sut-public-ip>`
-  - `Host oceanfs-harness` → `HostName <harness-public-ip>`
-- For Phase 3-4, skill file instructs agent to always pass `--confirm yes` (since agent intends to provision)
-- For Phase 1, prints "Phase 1 runs in CI, no VMs needed" (no provisioning)
+#### `vm-up` (`.opencode/skills/vm-up/SKILL.md`)
+- Idempotency: `vm-provision.sh --status <prefix>` first; if both VMs are
+  running, return the existing record instead of re-provisioning
+- Invoke `scripts/vm-provision.sh --phase {phase} --branch {branch} [--name PREFIX] [--commit SHA] [--ssh-key PATH] [--single-vm] [--ttl N] [--confirm yes]`
+- Accepts: `phase` (required, 2-4; Phase 1 → "runs in CI" message; 5+ →
+  separate-model guidance), `branch` (default main), `commit`, `name`
+  (default `oceanfs-loadtest-{phase}`), `ssh-key` (default
+  `~/.ssh/id_rsa.pub`), `single-vm`, `ttl` (default 4h),
+  `confirm` (auto-passed for phases 3-4, since the agent intends to
+  provision)
+- The script writes the provisioning record
+  `.hetzner/provision-<prefix>.json` (gitignored) — the source of truth
+  for every later skill
+- The skill then ensures `~/.ssh/config` aliases
+  (`oceanfs-sut` → sut public IP, `oceanfs-harness` → harness public IP),
+  idempotent
+- Return: the provisioning record (two-VM JSON)
 
-#### `vm-down.md`
-- Invoke `scripts/vm-provision.sh --destroy {name}` (tears down both VMs)
-- Before teardown: rsync Prometheus TSDB snapshot and load reports from both VMs to persistent storage (controlled by `--preserve-data` flag)
-- Return: `{destroyed: true, sut: {name: "...", destroyed: true}, harness: {name: "...", destroyed: true}, preserved_data: true|false}`
-- If VMs don't exist, return success (idempotent)
+#### `vm-down` (`.opencode/skills/vm-down/SKILL.md`)
+- Optional `--preserve-data`: before teardown, rsync load reports from the
+  Harness (`/tmp/oceanfs-reports/` → `local-results/`) and snapshot the SUT
+  Prometheus TSDB (tar over ssh)
+- Invoke `scripts/vm-provision.sh --destroy {prefix}` (idempotent)
+- Clean local state: remove ssh aliases + the provisioning record
+- Return: `{destroyed: true, sut: {...}, harness: {...}, preserved_data, preserved_paths}`
 
-#### `vm-deploy.md`
-- **Build on Harness VM** (has Rust toolchain): `cd ~/ocean-fs && cargo build --release -p oceanfs -p e2e`
-- **Deploy binary to SUT VM**: `scp ~/ocean-fs/target/release/oceanfs oceanfs-sut:~/oceanfs`
-- SUT VM does NOT have Rust installed — binary is cross-deployed via `scp` over internal network
-- Accepts: `branch` (optional — if provided, `git checkout {branch} && git pull` on Harness VM before build)
-- Return: `{commit: "...", build_duration_secs: N, build_success: true|false, deploy_success: true|false}`
-- On build failure, return stderr output
-- On deploy failure (scp error), return error details
-- Also syncs workspace to Harness VM via rsync if needed: `rsync -avz --exclude target . oceanfs-harness:~/ocean-fs/`
+#### `vm-deploy` (`.opencode/skills/vm-deploy/SKILL.md`)
+- Invoke `scripts/setup-harness.sh [--provision-file] [--branch] [--commit] [--repo]`
+  — the full deploy pipeline:
+  1. seed the harness's SSH identity (harness → SUT over internal net)
+  2. sync repo on the harness; `cargo build --release -p oceanfs -p e2e`
+  3. `sut-deploy.sh`: scp binary to SUT, write `/etc/oceanfs/oceanfs.toml`
+     + systemd unit `oceanfs` with **`Restart=no`** (crash-control contract)
+  4. `setup-observability.sh` on the SUT (Prometheus :9090 + textfile
+     collector; non-fatal on failure)
+  5. verify SUT health over the internal network
+- Accepts: `branch`, `commit`, `repo` (defaults from the provisioning record)
+- Return: `{commit, build: ok, deploy: ok, observability: ok, sut_health}`
+- On failure: relay the failing step's stderr
 
 ### Out of Scope
 
-- Agent authentication or SSH key management (assumes `~/.ssh/config` is pre-configured with both aliases)
-- Automated cost reporting beyond `hcloud server describe` (vm-status shows VM type, not cost-to-date in MVP)
+- Agent authentication or SSH key management (uses the key recorded at
+  provisioning time)
+- Automated cost reporting beyond `hcloud server describe` (vm-status shows
+  VM type, not cost-to-date in MVP)
 - VM performance tuning (kernel params, ulimits) — handled by vm-provision.sh
-- `vm-deploy` does NOT install Prometheus on SUT VM (that's feature 3.1: prometheus-grafana-setup)
+- `vm-deploy` does not install Prometheus on the SUT separately —
+  `setup-harness.sh` ensures it (feature 3.1 stack, idempotent)
 
 ## Crate Impact
 
 | Crate | Change |
 |---|---|
-| (none) | Skill files under `.opencode/skills/`. |
+| (none) | Skill files under `.opencode/skills/<name>/SKILL.md`. |
 
 ## Interface (Public API)
 
-Each skill is a Markdown file with a YAML-like structure that an agent can parse:
+Each skill is an OpenCode skill: `.opencode/skills/<name>/SKILL.md` with
+frontmatter (`name`, `description`) and a markdown body of exact commands,
+return schema, error conditions, and examples. The four skills expose:
 
-```markdown
-# vm-status
-
-Check the status of both OceanFS load test VMs (SUT + Harness).
-
-## Command
-ssh oceanfs-sut "systemctl is-active oceanfs; systemctl is-active prometheus; systemctl is-active oceanfs-ttl.timer; uptime -s"
-ssh oceanfs-harness "systemctl is-active oceanfs-ttl.timer; uptime -s"
-
-## Returns
-{ sut: { status, ip, public_ip, type, oceanfs, prometheus, ttl_timer, uptime },
-  harness: { status, ip, public_ip, type, ttl_timer, uptime } }
+```
+vm-status  → { prefix, record, sut: {name, status, public_ip, internal_ip, type, oceanfs, prometheus, ttl_timer, booted}, harness: {...}, tunnel: {up, url} }
+vm-up      → { phase, prefix, record, sut: {name, public_ip, internal_ip, type}, harness: {...}, ttl_hours, ssh_config }
+vm-down    → { destroyed, prefix, sut: {name, destroyed}, harness: {name, destroyed}, preserved_data, preserved_paths, record_deleted }
+vm-deploy  → { commit, branch, sut: {internal_ip, service, port}, build: {...}, deploy: {...}, observability: {...}, sut_health }
 ```
 
 ## Data Flow
 
 ```
 Agent: vm-up phase=2
+  → vm-provision.sh --status oceanfs-loadtest-2      (idempotency check)
   → ./scripts/vm-provision.sh --phase 2 --branch main
-  → Script: creates SUT CX22 + Harness CX22 in same Hetzner network
-  → Script: installs Rust + builds oceanfs/e2e on Harness VM only
-  → returns { sut: { ip: "10.0.0.5", ... }, harness: { ip: "10.0.0.6", ... } }
-  → Agent updates ~/.ssh/config:
-      Host oceanfs-sut → HostName <sut-public-ip>
-      Host oceanfs-harness → HostName <harness-public-ip>
+  → Script: creates SUT CX23 + Harness CX23 in the same Hetzner network,
+            firewalls, TTL timer, observability on SUT, provisioning record
+  → returns record { sut: { public_ip, internal_ip, type: cx23 }, ... }
+  → Agent ensures ~/.ssh/config: oceanfs-sut / oceanfs-harness
 
 Agent: vm-deploy
-  → ssh oceanfs-harness "cd ~/ocean-fs && git pull && cargo build --release -p oceanfs -p e2e"
-  → scp oceanfs-harness:~/ocean-fs/target/release/oceanfs oceanfs-sut:~/oceanfs
-  → returns { commit: "abc1234", build_duration_secs: 120, build_success: true, deploy_success: true }
+  → ./scripts/setup-harness.sh --provision-file .hetzner/provision-oceanfs-loadtest-2.json
+  → harness: git sync + cargo build --release -p oceanfs -p e2e
+  → harness → SUT: sut-deploy.sh (binary + config + systemd Restart=no)
+  → SUT: setup-observability.sh (Prometheus, idempotent)
+  → returns { commit: "abc1234", build: ok, deploy: ok, sut_health: 200 }
 
 Agent: vm-status
-  → ssh oceanfs-sut "systemctl is-active oceanfs && systemctl is-active prometheus && uptime -s"
-  → ssh oceanfs-harness "uptime -s"
-  → returns { sut: { status: "running", oceanfs: "active", ... }, harness: { status: "running", ... } }
+  → jq .sut/.harness from the record; ssh systemctl is-active checks
+  → returns { sut: { status: "running", oceanfs: "active", ... }, ... }
 
-Agent: vm-down
-  → rsync oceanfs-sut:~/ocean-fs/target/load-reports/ ./local-results/
+Agent: vm-down --preserve-data
+  → rsync harness:/tmp/oceanfs-reports/ → local-results/
+  → ssh sut tar czf - /var/lib/prometheus/data > local-results/prometheus-*.tar.gz
   → ./scripts/vm-provision.sh --destroy oceanfs-loadtest-2
-  → returns { destroyed: true, preserved_data: true }
+  → remove ssh aliases + record
+  → returns { destroyed: true, preserved_data: true, ... }
 ```
 
 ## Definition of Done
 
-- [ ] **Files:** `.opencode/skills/vm-status.md` exists with two-VM return schema
-- [ ] **Files:** `.opencode/skills/vm-up.md` exists with parameters (phase, branch, confirm, single-vm, ttl) and two-VM return schema
-- [ ] **Files:** `.opencode/skills/vm-down.md` exists with `--preserve-data` parameter and two-VM teardown schema
-- [ ] **Files:** `.opencode/skills/vm-deploy.md` exists with build-on-harness + scp-to-sut workflow
-- [ ] **Validation:** Each skill file is syntactically valid (can be parsed by an agent)
-- [ ] **Validation:** `vm-up` skill correctly passes `--confirm yes` for Phase 3-4
-- [ ] **Validation:** `vm-up` skill correctly handles Phase 1 (prints "runs in CI" and exits)
-- [ ] **Validation:** `vm-deploy` skill includes both `cargo build` on Harness VM and `scp` to SUT VM
-- [ ] **Validation:** `vm-down` skill tears down both VMs and supports `--preserve-data`
-- [ ] **Docs:** Each skill file documents its purpose, inputs, outputs, and error conditions
-- [ ] **Integration:** An agent can execute the full two-VM lifecycle: vm-up → vm-deploy → vm-status → vm-down using only these skill files
-- [ ] **Integration:** SSH config correctly configured with two aliases (`oceanfs-sut`, `oceanfs-harness`)
+- [x] **Files:** `.opencode/skills/vm-status/SKILL.md` exists with two-VM return schema
+- [x] **Files:** `.opencode/skills/vm-up/SKILL.md` exists with parameters (phase, branch, commit, name, single-vm, ttl, confirm) and two-VM return schema
+- [x] **Files:** `.opencode/skills/vm-down/SKILL.md` exists with `--preserve-data` parameter and two-VM teardown schema
+- [x] **Files:** `.opencode/skills/vm-deploy/SKILL.md` exists with the setup-harness build-on-harness + deploy-to-sut workflow
+- [x] **Validation:** Each skill file is a valid OpenCode SKILL.md (name + description frontmatter, folder matches name)
+- [x] **Validation:** `vm-up` skill correctly passes `--confirm yes` for Phase 3-4
+- [x] **Validation:** `vm-up` skill correctly handles Phase 1 (prints "runs in CI" and exits)
+- [x] **Validation:** `vm-deploy` skill delegates to `setup-harness.sh` (build on Harness VM + deploy to SUT VM + observability + health)
+- [x] **Validation:** `vm-down` skill tears down both VMs and supports `--preserve-data`
+- [x] **Docs:** Each skill file documents its purpose, inputs, outputs, and error conditions
+- [x] **Integration:** An agent can execute the full two-VM lifecycle: vm-up → vm-deploy → vm-status → vm-down using only these skill files
+- [x] **Integration:** Provisioning record (`.hetzner/provision-*.json`) is the source of truth; `~/.ssh/config` aliases (`oceanfs-sut`, `oceanfs-harness`) maintained by vm-up
+
+## Accepted Deviations (gap closure)
+
+1. **Skill file format.** The original spec's flat `.opencode/skills/vm-*.md`
+   "YAML-like structure" is replaced by the real OpenCode skill format
+   (`.opencode/skills/<name>/SKILL.md` with `name`/`description`
+   frontmatter) so the skills are discoverable by the agent runtime.
+2. **VM types.** cx22/cx32 → **cx23/cx33** — Hetzner retired the 22/32
+   line; `vm-provision.sh` (2026-08-15) is the authoritative mapping.
+3. **`vm-deploy` implementation.** The hand-rolled build+scp recipe is
+   replaced by `setup-harness.sh` (which also seeds the harness→SUT SSH
+   identity, writes the SUT systemd unit with `Restart=no`, ensures
+   observability, and verifies health).
+4. **`~/.ssh/config` maintenance moved to the skill.** vm-provision.sh does
+   not write ssh config; `vm-up`/`vm-down` maintain the aliases.
+5. **`--preserve-data` lives in the skill.** The destroy script has no such
+   flag; vm-down fetches reports + Prometheus TSDB before invoking
+   `--destroy`, then cleans the record and aliases.
