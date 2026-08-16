@@ -853,12 +853,22 @@ impl WriteCoordinator {
                         let entries =
                             entries_map.remove(&segment_id).map(|(_, v)| v).unwrap_or_default();
 
+                        // NOTE: an empty entry list is LEGITIMATE — a
+                        // segment rebuilt by WAL replay carries data that
+                        // was never appended through this coordinator (no
+                        // blob entries were recorded for it). Sealing it
+                        // with an empty index is correct: the data bytes
+                        // are the drained buffer, readers locate chunks
+                        // via the object metadata's ChunkRefs, and the
+                        // seal makes the segment durable (and its WAL
+                        // files sweepable). Skipping the seal left such
+                        // segments registered-unsealed forever, pinning
+                        // their WAL files indefinitely (2.5 GB leak).
                         if entries.is_empty() {
                             tracing::debug!(
                                 segment_id = %segment_id,
-                                "no index entries for sealed segment; skipping seal"
+                                "sealing segment with empty blob index (WAL-replayed data)"
                             );
-                            continue;
                         }
 
                         // Acquire a permit to enforce bounded concurrency
@@ -1153,7 +1163,24 @@ mod tests {
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
             Arc::new(GrpcHintDeliveryClient::new(pool.clone()));
-        make_write_coordinator_with_delivery(node_id, ring_nodes, dir, pool, delivery_client).await
+        make_write_coordinator_with_delivery(node_id, ring_nodes, dir, pool, delivery_client)
+            .await
+            .0
+    }
+
+    /// Creates a test coordinator, discarding the temp dir (callers that
+    /// need the on-disk state use `make_write_coordinator_with_delivery`).
+    #[allow(clippy::too_many_arguments)]
+    async fn make_write_coordinator_discard_dir(
+        node_id: &str,
+        ring_nodes: &[&str],
+        dir: tempfile::TempDir,
+        pool: Arc<ConnectionPool>,
+        delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient>,
+    ) -> WriteCoordinator {
+        make_write_coordinator_with_delivery(node_id, ring_nodes, dir, pool, delivery_client)
+            .await
+            .0
     }
 
     /// Creates a test coordinator with a caller-provided hint delivery client.
@@ -1163,7 +1190,7 @@ mod tests {
         dir: tempfile::TempDir,
         pool: Arc<ConnectionPool>,
         delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient>,
-    ) -> WriteCoordinator {
+    ) -> (WriteCoordinator, tempfile::TempDir) {
         let mut ring = Ring::new(RingConfig { vnodes_per_node: 8, replication_factor: 3 });
         for node in ring_nodes {
             ring.add_node(NodeId::new(*node));
@@ -1251,21 +1278,24 @@ mod tests {
         let hinted_handoff =
             Arc::new(HintedHandoffManager::new(hints_dir, delivery_client, hint_config.clone()));
 
-        WriteCoordinator::new(
-            ring_cache,
-            membership,
-            pool,
-            NodeId::new(node_id),
-            hlc_clock,
-            metadata,
-            size_config,
-            shard_small,
-            shard_standard,
-            segment_pool_small,
-            segment_pool_standard,
-            sealer,
-            hinted_handoff,
-            hint_config,
+        (
+            WriteCoordinator::new(
+                ring_cache,
+                membership,
+                pool,
+                NodeId::new(node_id),
+                hlc_clock,
+                metadata,
+                size_config,
+                shard_small,
+                shard_standard,
+                segment_pool_small,
+                segment_pool_standard,
+                sealer,
+                hinted_handoff,
+                hint_config,
+            ),
+            dir,
         )
     }
 
@@ -1315,7 +1345,8 @@ mod tests {
             pool,
             delivery_client,
         )
-        .await;
+        .await
+        .0;
 
         // The write is routed to n2/n3 (dead addresses) → replication
         // fails → hints are enqueued with the write's stamped HLC.
@@ -1619,9 +1650,8 @@ mod tests {
 
     #[tokio::test]
     async fn seal_worker_handles_empty_entries_gracefully() {
-        // When a SealingWork item arrives with no accumulated index entries
-        // (all entries were removed or never added), the seal worker should
-        // skip sealing gracefully without error.
+        // Inline writes produce no segment work; the seal worker must
+        // drain without error.
         let coord = Arc::new(make_write_coordinator("n1", &["n1"]).await);
         let _seal_handle = coord.start_seal_worker();
 
@@ -1641,6 +1671,56 @@ mod tests {
         let result = coord.put(req).await.unwrap();
         // Inline writes produce no chunks — nothing to seal.
         assert!(result.chunks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn seal_worker_seals_replayed_segment_with_empty_entries() {
+        // Regression (WAL leak on the phase-2 SUT): a segment rebuilt by
+        // WAL replay fills with data that never passed through the
+        // coordinator's append hooks, so its blob-index entry list is
+        // EMPTY at seal time. The seal worker used to skip such
+        // segments, leaving them registered-unsealed forever — and the
+        // seal-aware WAL retention correctly protected their files
+        // forever (the WAL was their only durable copy), leaking ~50
+        // files / 2.5 GB. The worker must SEAL them with an empty index
+        // (readers locate chunks via object-metadata ChunkRefs).
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
+        let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
+            Arc::new(oceanfs_durability::GrpcHintDeliveryClient::new(pool.clone()));
+        let (coord, dir) =
+            make_write_coordinator_with_delivery("n1", &["n1"], dir, pool, delivery_client).await;
+        let coord = Arc::new(coord);
+        let _seal_handle = coord.start_seal_worker();
+
+        // Rebuild a segment through the replay path: 64 KiB chunks until
+        // the pool has no empty slot left (each fill enqueues a seal
+        // with zero recorded entries).
+        let replayed_id = SegmentId::new();
+        let chunk = vec![0xCDu8; 64 * 1024];
+        let mut appended: u64 = 0;
+        // Replay keeps recycling sealed slots into fresh segments under
+        // the same id (pass-2 claim), so bound the loop explicitly:
+        // 512 × 64 KiB = 32 MiB, enough to fill several 4 MiB segments.
+        for _ in 0..512 {
+            match coord.segment_pool_small.append_replayed(replayed_id, &chunk) {
+                Ok(()) => appended += chunk.len() as u64,
+                Err(_) => break, // pool saturated — all slots sealing/used
+            }
+        }
+        assert!(appended > 0, "replay append must make progress");
+
+        // The seal worker must persist the segment (empty index) — poll
+        // for the on-disk segment file.
+        let seg_path = dir.path().join("segments").join(format!("{replayed_id}.dat"));
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        while !seg_path.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "replayed segment was never sealed (WAL leak regression)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     // ── Replication fan-out test ──────────────────────────────────

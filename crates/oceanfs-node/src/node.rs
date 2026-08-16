@@ -1678,6 +1678,14 @@ impl Node {
         let ae_cancel = CancellationToken::new();
         let ae_token = ae_cancel.clone();
         let ae_interval_secs = config.ae_interval_sec;
+        // Continuous mode exchanges Merkle ROOTS with peers via the
+        // incremental tree — it never reads segment data, so per-cycle
+        // cost is O(sealed segments) metadata calls instead of reading
+        // every segment file (GBs per cycle on the phase-2 SUT, which
+        // stalled cycles for 90s+ under load and spiked RSS). The full
+        // cycle (reads all data + rebuilds trees) stays available for
+        // `continuous_enabled = false`.
+        let ae_continuous = config.anti_entropy.continuous_enabled;
         let io_idle = config.background_io_class_idle;
         let cpu_idle = config.background_cpu_sched_idle;
         let ae = tokio::spawn(async move {
@@ -1695,7 +1703,12 @@ impl Node {
                         break;
                     }
                     _ = interval.tick() => {
-                        if let Err(e) = ae_worker.run_cycle().await {
+                        let result = if ae_continuous {
+                            ae_worker.run_continuous_cycle().await
+                        } else {
+                            ae_worker.run_cycle().await
+                        };
+                        if let Err(e) = result {
                             warn!("Anti-entropy cycle error: {e}");
                         }
                     }
