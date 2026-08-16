@@ -74,9 +74,10 @@ for i in $(seq 1 "$N"); do
     echo "$(date -u +%H:%M:%S),${ROLLUP},$FDS,$PID"
     # During a burst, snapshot what the fds point to (once per event).
     if [ "$FDS" -gt 250 ]; then
-        echo "FD_TARGETS $(date -u +%H:%M:%S):"
+        echo "FD_TARGETS $(date -u +%H:%M:%S) total=$FDS:"
         ls -l /proc/$PID/fd 2>/dev/null | awk '{print $11}' \
-            | sort | uniq -c | sort -rn | head -12
+            | sed -E 's#/var/lib/oceanfs/segments/##; s#/var/lib/oceanfs/##; s#[0-9a-f-]{36}#<id>#g; s#wal_[0-9]+\.log#wal_N.log#; s#\.tmp\..*#.tmp#' \
+            | sort | uniq -c | sort -rn
     fi
     sleep 1
 done
