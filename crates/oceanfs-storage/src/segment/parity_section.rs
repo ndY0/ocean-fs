@@ -173,7 +173,13 @@ pub(crate) fn build_parity_section(
 pub(crate) static LAST_ENCODE_THREAD: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-pub(crate) fn encode_segment_parity(data: &[u8], k: u8, m: u8, strip: usize) -> Option<Vec<Bytes>> {
+pub(crate) fn encode_segment_parity(
+    data: &[u8],
+    k: u8,
+    m: u8,
+    strip: usize,
+    encoder: Option<std::sync::Arc<dyn oceanfs_ec::Encoder>>,
+) -> Option<Vec<Bytes>> {
     // Test seam: record the thread this encode ran on, so the sealer
     // test can pin the spawn_blocking boundary (the CPU-bound encode
     // must never run on a tokio worker).
@@ -195,15 +201,19 @@ pub(crate) fn encode_segment_parity(data: &[u8], k: u8, m: u8, strip: usize) -> 
     }
     let plan =
         oceanfs_ec::StripeLayout::compute((complete * stripe_byte_len) as u64, k, m, strip).ok()?;
-    let encoder = oceanfs_ec::ParallelEncoder::new(
+    // The injected encoder (the node wires the AccelDispatcher) makes the
+    // seal-time encode observable through the accel metrics (encode ops,
+    // duration histograms, fallbacks) — the EC panels depend on it. When
+    // None, fall back to the plain Cauchy encoder.
+    let inner: std::sync::Arc<dyn oceanfs_ec::Encoder> = encoder.unwrap_or_else(|| {
         std::sync::Arc::new(oceanfs_ec::CauchyEncoder::new(oceanfs_core::CodecConfig {
             data_shards: k,
             parity_shards: m,
             strip_size_bytes: strip,
             ..Default::default()
-        })),
-        0, // the seal worker bounds concurrency via its own semaphore
-    );
+        }))
+    });
+    let encoder = oceanfs_ec::ParallelEncoder::new(inner, 0);
     let batch = encoder.encode(&data[..complete * stripe_byte_len], &plan).ok()?;
 
     // SoA (m buffers x complete x strip) → AoS ([stripe][parity] shards).

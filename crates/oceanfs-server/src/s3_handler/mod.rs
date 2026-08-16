@@ -528,11 +528,12 @@ mod tests {
                 &size_config,
                 buffer_pool.clone(),
                 None,
+                None,
             )
             .unwrap(),
         );
         let segment_pool_standard = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None)
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None, None)
                 .unwrap(),
         );
 

@@ -65,7 +65,6 @@ const SLOT_ACTIVATION_WAIT_SLICE: std::time::Duration = std::time::Duration::fro
 /// seal completes), the storage tier, and the EC parameters the seal
 /// worker uses to compute and persist per-segment parity at seal time
 /// (so EC recovery can repair corrupt data shards).
-#[derive(Debug)]
 pub struct SealingWork {
     /// The unique identifier of the segment to seal.
     pub segment_id: SegmentId,
@@ -82,6 +81,23 @@ pub struct SealingWork {
     /// The seal worker uses (k, m, strip) to compute and persist the
     /// segment's parity at seal time on the blocking pool.
     pub strip_size_bytes: usize,
+    /// The encoder used for the seal-time EC parity encode. The node
+    /// wires the AccelDispatcher so seal encodes are observable through
+    /// the accel metrics; `None` falls back to the plain Cauchy encoder.
+    pub ec_encoder: Option<std::sync::Arc<dyn oceanfs_ec::Encoder>>,
+}
+
+impl std::fmt::Debug for SealingWork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealingWork")
+            .field("segment_id", &self.segment_id)
+            .field("tier", &self.tier)
+            .field("ec_k", &self.ec_k)
+            .field("ec_m", &self.ec_m)
+            .field("strip_size_bytes", &self.strip_size_bytes)
+            .field("ec_encoder", &self.ec_encoder.as_ref().map(|_| "<encoder>"))
+            .finish_non_exhaustive()
+    }
 }
 
 /// The state of a pool slot throughout its lifecycle.
@@ -297,6 +313,9 @@ pub struct SegmentPool {
     /// EC codec configuration; when set, the seal worker computes and
     /// persists per-segment parity at seal time.
     ec_config: Option<CodecConfig>,
+    /// Encoder for seal-time EC parity (the node wires the
+    /// AccelDispatcher; None falls back to the plain Cauchy encoder).
+    ec_encoder: Option<std::sync::Arc<dyn oceanfs_ec::Encoder>>,
     /// Index of the current appending slot (round-robin).
     current_index: Mutex<usize>,
     /// Sender for the seal work queue.
@@ -352,6 +371,7 @@ impl SegmentPool {
         size_config: &oceanfs_core::SegmentSizeConfig,
         buffer_pool: Arc<BufferPool>,
         ec_config: Option<CodecConfig>,
+        ec_encoder: Option<std::sync::Arc<dyn oceanfs_ec::Encoder>>,
     ) -> Result<Self> {
         let (seal_tx, seal_rx) = mpsc::channel(config.encode_queue_capacity);
 
@@ -373,6 +393,7 @@ impl SegmentPool {
             tier,
             size_config: size_config.clone(),
             ec_config: actual_ec,
+            ec_encoder,
             current_index: Mutex::new(0),
             seal_tx,
             seal_rx: Mutex::new(Some(seal_rx)),
@@ -826,6 +847,7 @@ impl SegmentPool {
             ec_k,
             ec_m,
             strip_size_bytes,
+            ec_encoder: self.ec_encoder.clone(),
         };
         match tokio::time::timeout(remaining, self.seal_tx.send(work)).await {
             Ok(Ok(())) => Ok(()),
@@ -862,7 +884,15 @@ impl SegmentPool {
     /// instead, which never drops an enqueue.
     fn enqueue_seal(&self, segment_id: SegmentId, segment_data: Bytes, tier: SizeTier) {
         let (ec_k, ec_m, strip_size_bytes) = self.ec_params();
-        let work = SealingWork { segment_id, segment_data, tier, ec_k, ec_m, strip_size_bytes };
+        let work = SealingWork {
+            segment_id,
+            segment_data,
+            tier,
+            ec_k,
+            ec_m,
+            strip_size_bytes,
+            ec_encoder: self.ec_encoder.clone(),
+        };
         match self.seal_tx.try_send(work) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -1007,7 +1037,7 @@ mod tests {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
         assert_eq!(pool.slot_count(), 4);
         assert_eq!(pool.active_count(), 4, "all slots start in Appending state");
     }
@@ -1017,7 +1047,7 @@ mod tests {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
         let (seg_id, offset, length) = pool.append(b"hello world").unwrap();
         assert_eq!(offset, 0);
         assert_eq!(length, 11);
@@ -1031,7 +1061,7 @@ mod tests {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
 
         let original_id = SegmentId::new();
         pool.append_replayed(original_id, b"alpha").unwrap();
@@ -1050,7 +1080,7 @@ mod tests {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
 
         let id_a = SegmentId::new();
         let id_b = SegmentId::new();
@@ -1068,7 +1098,7 @@ mod tests {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
 
         // Fill every slot with a distinct replayed segment.
         for i in 0..pool.slot_count() {
@@ -1084,7 +1114,7 @@ mod tests {
     fn append_replayed_filled_segment_hands_to_seal_queue() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Small, &size_cfg, buf_pool, None).unwrap();
+        let pool = SegmentPool::new(pool_cfg, SizeTier::Small, &size_cfg, buf_pool, None, None).unwrap();
 
         // Fill the segment past its target with one replay append — the
         // fill→Sealing transition must enqueue seal work (same contract
@@ -1107,7 +1137,7 @@ mod tests {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool = StdArc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool.clone(), None)
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool.clone(), None, None)
                 .unwrap(),
         );
 
@@ -1141,7 +1171,7 @@ mod tests {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
 
         let rx = pool.take_seal_rx();
         assert!(rx.is_some(), "seal receiver must exist");
@@ -1156,6 +1186,7 @@ mod tests {
             SizeTier::Standard,
             &size_cfg,
             buf_pool.clone(),
+            None,
             None,
         )
         .unwrap();
@@ -1179,7 +1210,7 @@ mod tests {
         let pool_cfg = PoolConfig { active_pool_size: 8, ..PoolConfig::default() };
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = Arc::new(BufferPool::new(65536, 32));
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Small, &size_cfg, buf_pool, None).unwrap();
+        let pool = SegmentPool::new(pool_cfg, SizeTier::Small, &size_cfg, buf_pool, None, None).unwrap();
         assert_eq!(pool.slot_count(), 8);
     }
 
@@ -1189,7 +1220,7 @@ mod tests {
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = test_pool();
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
 
         let (id1, _, _) = pool.append(b"a").unwrap();
         // The second append may go to a different slot (round-robin).
@@ -1218,7 +1249,7 @@ mod tests {
         let _guard = rt.enter();
 
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
         assert_eq!(pool.active_count(), 4, "all 4 slots start appending");
 
         // Append data larger than target_size (10 bytes).
@@ -1258,7 +1289,7 @@ mod tests {
         let _guard = rt.enter();
 
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
         assert_eq!(pool.active_count(), 2);
 
         // Fill both slots multiple times. Each 20-byte append overflows
@@ -1286,7 +1317,7 @@ mod tests {
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = test_pool();
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
 
         // The seal queue should exist with the configured capacity.
         let rx = pool.take_seal_rx();
@@ -1317,7 +1348,7 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
 
         let pool = StdArc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap(),
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap(),
         );
 
         // Take the receiver but don't drain — the channel will fill.
@@ -1355,7 +1386,7 @@ mod tests {
         let _guard = rt.enter();
 
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
 
         // Before writes: all slots in Appending.
         assert_eq!(pool.active_count(), 4);
@@ -1383,7 +1414,7 @@ mod tests {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
 
         let slot = Arc::clone(&pool.slots[0]);
         let (seg_id, _, _) = pool.append(b"payload-data").unwrap();
@@ -1404,7 +1435,7 @@ mod tests {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
 
         let slot = Arc::clone(&pool.slots[0]);
         assert!(slot.take_for_sealing().is_some(), "first seal succeeds");
@@ -1418,7 +1449,7 @@ mod tests {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool.clone(), None)
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool.clone(), None, None)
                 .unwrap();
 
         let slot = Arc::clone(&pool.slots[0]);
@@ -1454,7 +1485,7 @@ mod tests {
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = test_pool();
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
 
         pool.slots[0].take_for_sealing().expect("park slot 0");
         let calls = StdArc::new(AtomicUsize::new(0));
@@ -1486,7 +1517,7 @@ mod tests {
         };
         let buf_pool = test_pool();
         let pool = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap(),
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap(),
         );
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         let _guard = rt.enter();
@@ -1535,7 +1566,7 @@ mod tests {
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = Arc::new(BufferPool::new(65536, 32));
         let pool = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap(),
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap(),
         );
 
         park_all_slots(&pool);
@@ -1563,7 +1594,7 @@ mod tests {
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = Arc::new(BufferPool::new(65536, 8));
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
 
         park_all_slots(&pool);
         pool.fail_activation.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1584,7 +1615,7 @@ mod tests {
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = Arc::new(BufferPool::new(65536, 8));
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
 
         park_all_slots(&pool);
 
@@ -1608,7 +1639,7 @@ mod tests {
         };
         let buf_pool = Arc::new(BufferPool::new(65536, 64));
         let pool = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap(),
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap(),
         );
 
         // Drain the seal queue so the fillers never back up on it.
@@ -1658,7 +1689,7 @@ mod tests {
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = Arc::new(BufferPool::new(65536, 32));
         let pool = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap(),
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap(),
         );
 
         park_all_slots(&pool);
@@ -1690,7 +1721,7 @@ mod tests {
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = Arc::new(BufferPool::new(65536, 8));
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
 
         park_all_slots(&pool);
         pool.fail_activation.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1712,7 +1743,7 @@ mod tests {
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = Arc::new(BufferPool::new(65536, 8));
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
 
         park_all_slots(&pool);
 
@@ -1737,7 +1768,7 @@ mod tests {
         };
         let buf_pool = Arc::new(BufferPool::new(65536, 8));
         let pool = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap(),
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap(),
         );
 
         let mut rx = pool.take_seal_rx().expect("seal rx");
@@ -1797,7 +1828,7 @@ mod tests {
         };
         let buf_pool = Arc::new(BufferPool::new(65536, 8));
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
 
         // Hold the receiver and never drain — the queue stays full.
         let _rx = pool.take_seal_rx();
@@ -1829,7 +1860,7 @@ mod tests {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
 
         let data = b"hello world, this is a test segment read";
         let (seg_id, offset, length) = pool.append(data).unwrap();
@@ -1845,7 +1876,7 @@ mod tests {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
 
         // A segment id that was never appended.
         let unknown_id = SegmentId::new();
@@ -1858,7 +1889,7 @@ mod tests {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
 
         let data = b"abcdefghijklmnopqrstuvwxyz";
         let (seg_id, offset, length) = pool.append(data).unwrap();
@@ -1879,7 +1910,7 @@ mod tests {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap();
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap();
 
         let data = b"short";
         let (seg_id, offset, _length) = pool.append(data).unwrap();

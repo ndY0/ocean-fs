@@ -38,7 +38,11 @@ use crate::{
 /// stripes. Errors with [`Error::SegmentCorrupt`] when corruption is
 /// detected but cannot be repaired (more than `m` corrupt shards, or a
 /// corrupt un-encoded tail).
-pub(crate) fn verify_and_repair_segment(path: &Path) -> Result<usize> {
+pub(crate) fn verify_and_repair_segment(
+    path: &Path,
+    ec_decoder: Option<&dyn Decoder>,
+    ec_encoder: Option<&dyn Encoder>,
+) -> Result<usize> {
     // Streamed verification: the previous implementation loaded the whole
     // file with std::fs::read just to hash it — the read path calls this
     // on every segment's first touch, so under sustained load the
@@ -168,12 +172,23 @@ pub(crate) fn verify_and_repair_segment(path: &Path) -> Result<usize> {
                 available.push(Some(section.parity_shard(stripe, idx - section.k)));
             }
         }
-        let codec = CauchyEncoder::new(CodecConfig {
+        // The injected decoder/encoder (the node wires the
+        // AccelDispatcher) keep corruption repair observable through the
+        // accel metrics; fall back to the plain Cauchy codec when unset.
+        let fallback_decoder = CauchyEncoder::new(CodecConfig {
             data_shards: section.k as u8,
             parity_shards: section.m as u8,
             strip_size_bytes: section.strip,
             ..Default::default()
         });
+        let fallback_encoder = CauchyEncoder::new(CodecConfig {
+            data_shards: section.k as u8,
+            parity_shards: section.m as u8,
+            strip_size_bytes: section.strip,
+            ..Default::default()
+        });
+        let codec: &dyn Decoder = ec_decoder.unwrap_or(&fallback_decoder);
+        let codec_enc: &dyn Encoder = ec_encoder.unwrap_or(&fallback_encoder);
         let recovered =
             codec.decode(&available, section.k as u8, section.m as u8).map_err(|e| {
                 Error::Io(std::io::Error::other(format!(
@@ -200,7 +215,7 @@ pub(crate) fn verify_and_repair_segment(path: &Path) -> Result<usize> {
         // If any parity shard was corrupt, re-encode and rewrite it.
         if corrupt.iter().any(|&i| i >= section.k) {
             let data_shards: Vec<&[u8]> = recovered.iter().map(|s| s.as_ref()).collect();
-            let parity = codec.encode(&data_shards, section.m as u8).map_err(|e| {
+            let parity = codec_enc.encode(&data_shards, section.m as u8).map_err(|e| {
                 Error::Io(std::io::Error::other(format!(
                     "EC re-encode failed for stripe {stripe} of {}: {e}",
                     header.segment_id
@@ -311,7 +326,7 @@ mod tests {
     fn repair_healthy_v2_file_returns_zero() {
         let dir = tempfile::tempdir().unwrap();
         let (path, _) = make_v2_file(&dir, SegmentId::new(), None);
-        assert_eq!(verify_and_repair_segment(&path).unwrap(), 0);
+        assert_eq!(verify_and_repair_segment(&path, None, None).unwrap(), 0);
     }
 
     #[test]
@@ -322,11 +337,11 @@ mod tests {
         let data_offset = crate::segment::header::SEGMENT_HEADER_SIZE;
         let (path, original) = make_v2_file(&dir, id, Some((data_offset + 2 * 64 + 10, 0xFF)));
 
-        let repaired = verify_and_repair_segment(&path).unwrap();
+        let repaired = verify_and_repair_segment(&path, None, None).unwrap();
         assert_eq!(repaired, 1, "one stripe must be repaired");
 
         // The file is now healed: re-verification is a fast-path pass.
-        assert_eq!(verify_and_repair_segment(&path).unwrap(), 0);
+        assert_eq!(verify_and_repair_segment(&path, None, None).unwrap(), 0);
 
         let file = std::fs::read(&path).unwrap();
         assert_eq!(
@@ -350,7 +365,7 @@ mod tests {
         file[corrupt_offset] ^= 0x5A;
         std::fs::write(&path, &file).unwrap();
 
-        let repaired = verify_and_repair_segment(&path).unwrap();
+        let repaired = verify_and_repair_segment(&path, None, None).unwrap();
         assert_eq!(repaired, 1);
         let file = std::fs::read(&path).unwrap();
         assert_eq!(
@@ -391,7 +406,7 @@ mod tests {
         }
         std::fs::write(&path, &file).unwrap();
 
-        let result = verify_and_repair_segment(&path);
+        let result = verify_and_repair_segment(&path, None, None);
         assert!(matches!(result, Err(Error::SegmentCorrupt(_))));
     }
 
@@ -410,7 +425,7 @@ mod tests {
         file.extend_from_slice(&data);
         std::fs::write(&path, &file).unwrap();
 
-        let result = verify_and_repair_segment(&path);
+        let result = verify_and_repair_segment(&path, None, None);
         assert!(
             matches!(result, Err(Error::SegmentCorrupt(_))),
             "v1 corruption without parity must be unrepairable"

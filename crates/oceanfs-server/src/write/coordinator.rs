@@ -760,6 +760,7 @@ impl WriteCoordinator {
                                     work.ec_k,
                                     work.ec_m,
                                     work.strip_size_bytes,
+                                    work.ec_encoder.clone(),
                                     merkle_root,
                                 )
                                 .await;
@@ -1051,11 +1052,12 @@ mod tests {
                 &size_config,
                 buffer_pool.clone(),
                 None,
+                None,
             )
             .unwrap(),
         );
         let segment_pool_standard = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None)
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None, None)
                 .unwrap(),
         );
 
@@ -2044,11 +2046,12 @@ mod tests {
                 &size_config,
                 buffer_pool.clone(),
                 None,
+                None,
             )
             .unwrap(),
         );
         let standard_pool = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None)
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None, None)
                 .unwrap(),
         );
 
@@ -2224,6 +2227,8 @@ mod tests {
             Arc::new(oceanfs_storage::io::DiskIo::TokioFs),
             None,
             fx.seal_dir.clone(),
+            None,
+            None,
         ));
         let reader: Arc<dyn oceanfs_storage::io::SegmentReader> = Arc::new(
             oceanfs_storage::io::PoolFallbackReader::new(vec![fx.standard_pool.clone()], disk),
@@ -2347,6 +2352,8 @@ mod tests {
             Arc::new(oceanfs_storage::io::DiskIo::TokioFs),
             None,
             fx.seal_dir.clone(),
+            None,
+            None,
         ));
         let read = fx.read.with_segment_reader(disk);
 
@@ -2481,11 +2488,12 @@ mod tests {
                 size_config,
                 buffer_pool.clone(),
                 None,
+                None,
             )
             .unwrap(),
         );
         let standard_pool = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, size_config, buffer_pool, None).unwrap(),
+            SegmentPool::new(pool_cfg, SizeTier::Standard, size_config, buffer_pool, None, None).unwrap(),
         );
         let wal = Arc::new(
             WalWriter::open(&WalConfig {
@@ -2546,6 +2554,8 @@ mod tests {
             Arc::new(oceanfs_storage::io::DiskIo::TokioFs),
             None,
             seal_dir.clone(),
+            None,
+            None,
         ));
         let reader: Arc<dyn oceanfs_storage::io::SegmentReader> =
             Arc::new(oceanfs_storage::io::PoolFallbackReader::new(

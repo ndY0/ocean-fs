@@ -151,6 +151,11 @@ pub struct DiskSegmentReader {
     /// process by [`verify_and_repair_segment`]; corrupt-but-repairable
     /// files are repaired on first touch.
     verified_headers: Mutex<HashMap<SegmentId, usize>>,
+    /// Injected EC decoder for corruption repair (the node wires the
+    /// AccelDispatcher; None falls back to the plain Cauchy codec).
+    ec_decoder: Option<std::sync::Arc<dyn oceanfs_ec::Decoder>>,
+    /// Injected EC encoder for parity re-encode during repair.
+    ec_encoder: Option<std::sync::Arc<dyn oceanfs_ec::Encoder>>,
     /// When `true`, call `madvise(MADV_DONTNEED)` after reading from mmap
     /// to eagerly evict segment data from the page cache. Set to `true`
     /// when `read_cache_segments = false` (write-optimised profile) so
@@ -169,12 +174,16 @@ impl DiskSegmentReader {
         disk_io: Arc<DiskIo>,
         mmap_cache: Option<Arc<SegmentFileCache>>,
         segment_dir: PathBuf,
+        ec_decoder: Option<std::sync::Arc<dyn oceanfs_ec::Decoder>>,
+        ec_encoder: Option<std::sync::Arc<dyn oceanfs_ec::Encoder>>,
     ) -> Self {
         Self {
             read_mode,
             disk_io,
             mmap_cache,
             segment_dir,
+            ec_decoder,
+            ec_encoder,
             last_source: Mutex::new(HashMap::new()),
             verified_headers: Mutex::new(HashMap::new()),
             evict_after_read: false,
@@ -204,8 +213,12 @@ impl DiskSegmentReader {
             return Ok(hdr_size);
         }
         let path = self.segment_path(&segment_id);
-        let repaired = crate::segment::repair::verify_and_repair_segment(&path)
-            .map_err(|e| format!("integrity check failed for {segment_id}: {e}"))?;
+        let repaired = crate::segment::repair::verify_and_repair_segment(
+            &path,
+            self.ec_decoder.as_deref(),
+            self.ec_encoder.as_deref(),
+        )
+        .map_err(|e| format!("integrity check failed for {segment_id}: {e}"))?;
         if repaired > 0 {
             // The mmap cache (if any) may hold the pre-repair mapping;
             // invalidate it so subsequent reads see the repaired bytes.
@@ -608,6 +621,8 @@ mod tests {
             Arc::new(DiskIo::TokioFs),
             None,
             dir.path().to_path_buf(),
+            None,
+            None,
         );
 
         let data = reader.read_chunk(&id, 0, 100).await.unwrap();
@@ -627,6 +642,8 @@ mod tests {
             Arc::new(DiskIo::TokioFs),
             Some(cache),
             dir.path().to_path_buf(),
+            None,
+            None,
         );
 
         let data = reader.read_chunk(&id, 0, 512).await.unwrap();
@@ -650,6 +667,8 @@ mod tests {
             Arc::new(DiskIo::TokioFs),
             Some(cache.clone()),
             dir.path().to_path_buf(),
+            None,
+            None,
         );
 
         let _data1 = reader.read_chunk(&id, 0, 100).await.unwrap();
@@ -667,6 +686,8 @@ mod tests {
             Arc::new(DiskIo::TokioFs),
             None,
             dir.path().to_path_buf(),
+            None,
+            None,
         );
 
         let result = reader.read_chunk(&SegmentId::new(), 0, 100).await;
@@ -684,6 +705,8 @@ mod tests {
             Arc::new(DiskIo::TokioFs),
             None,
             dir.path().to_path_buf(),
+            None,
+            None,
         );
 
         let data = reader.read_chunk(&id, 0, 256).await.unwrap();
@@ -709,6 +732,8 @@ mod tests {
                 Arc::new(DiskIo::TokioFs),
                 None,
                 dir.path().to_path_buf(),
+                None,
+                None,
             );
 
             let data = reader.read_chunk(&id, 1024, 8192).await.unwrap();
@@ -734,6 +759,8 @@ mod tests {
             Arc::new(DiskIo::TokioFs),
             None,
             dir.path().to_path_buf(),
+            None,
+            None,
         );
 
         let data = reader.read_chunk(&id, 0, payload.len() as u32).await.unwrap();
@@ -747,7 +774,7 @@ mod tests {
         let pool_cfg = PoolConfig::default();
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = Arc::new(BufferPool::new(65536, 32));
-        Arc::new(SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None).unwrap())
+        Arc::new(SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None).unwrap())
     }
 
     #[tokio::test]

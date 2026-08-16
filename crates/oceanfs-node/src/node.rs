@@ -594,6 +594,12 @@ impl Node {
         // seal time (single scheduler — the parallel encode runs on the
         // blocking pool). Matches the heal codec configuration.
         let pool_ec_config = oceanfs_core::CodecConfig::default();
+        // Seal-time EC parity routes through the accel dispatcher so the
+        // encode is observable (accel_encode_ops_total, duration
+        // histograms, fallbacks) — the accel tier is exercised on the
+        // write path, not just in isolation.
+        let pool_ec_encoder: Option<std::sync::Arc<dyn oceanfs_ec::Encoder>> =
+            Some(accel.clone());
         let segment_pool_small = Arc::new(
             SegmentPool::new(
                 pool_config.clone(),
@@ -601,6 +607,7 @@ impl Node {
                 &segment_size,
                 shard_buffer_pool.clone(),
                 Some(pool_ec_config.clone()),
+                pool_ec_encoder.clone(),
             )
             .map_err(|e| format!("failed to create small segment pool: {e}"))?,
         );
@@ -611,6 +618,7 @@ impl Node {
                 &segment_size,
                 shard_buffer_pool.clone(),
                 Some(pool_ec_config),
+                pool_ec_encoder,
             )
             .map_err(|e| format!("failed to create standard segment pool: {e}"))?,
         );
@@ -781,8 +789,10 @@ impl Node {
         // call enqueue_heal() without direct queue access.
         oceanfs_durability::heal::init_global_queue(heal_queue.sender());
         let heal_codec_config = oceanfs_core::CodecConfig::default();
-        let heal_decoder: Arc<dyn oceanfs_ec::Decoder> =
-            Arc::new(oceanfs_ec::CauchyEncoder::new(heal_codec_config.clone()));
+        // The heal decoder routes through the accel dispatcher so decode
+        // repair work is observable (accel_decode_ops_total, duration
+        // histograms) and the tier is consistent across sites.
+        let heal_decoder: Arc<dyn oceanfs_ec::Decoder> = accel.clone();
         // Clone before move into HealWorker — used by ReadCoordinator as well.
         let ec_decoder = heal_decoder.clone();
 
@@ -929,6 +939,8 @@ impl Node {
                 disk_io.clone(),
                 mmap_cache,
                 config.data_dir.join("segments"),
+                Some(accel.clone()),
+                Some(accel.clone()),
             )
             .with_evict_after_read(!config.read_cache_segments),
         );

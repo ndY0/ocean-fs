@@ -401,10 +401,11 @@ mod tests {
             size_config,
             buffer_pool.clone(),
             None,
+            None,
         )
         .unwrap();
         let standard =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, size_config, buffer_pool.clone(), None)
+            SegmentPool::new(pool_cfg, SizeTier::Standard, size_config, buffer_pool.clone(), None, None)
                 .unwrap();
         (small, standard)
     }

@@ -125,23 +125,23 @@ listen_addr = "0.0.0.0:${PORT}"
 grpc_listen_addr = "0.0.0.0:$((${PORT} + 1))"
 data_dir = "${DATA_DIR}"
 log_level = "info"
-# ── CX23 (4 GB RAM) memory calibration ────────────────────────────────────
-# The Phase 2 sustained-load crest exceeds 3.5 GB RSS with the spec's
-# original tuning (16 MiB blobs, 256 MiB L1, 128 MiB block cache, 336 MiB
-# write buffers + 512 MiB segment pool) and the kernel OOM-kills the SUT
-# mid-run. Shrink the per-op buffers and caches so the crest fits:
-max_body_size = 4194304
-object_cache_size_bytes = 100663296
-object_cache_max_blob_size = 4194304
-metadata_cache_size_bytes = 134217728
-block_cache_size = 67108864
-objects_write_buffer_mb = 32
-segments_write_buffer_mb = 64
-deletions_write_buffer_mb = 8
+# ── CX33 (8 GB RAM) — generous memory profile ──────────────────────────────
+# The earlier CX23 calibration (4 MiB bodies, 96-128 MiB caches) made
+# memory the constraint. On the 8 GB SUT, restore production-like values
+# so CPU (hashing, EC encode) is the bottleneck; the streaming read-path
+# fix removed the multi-GB burst behavior that forced the small profile.
+max_body_size = 16777216
+object_cache_size_bytes = 268435456
+object_cache_max_blob_size = 16777216
+metadata_cache_size_bytes = 1073741824
+block_cache_size = 134217728
+objects_write_buffer_mb = 64
+segments_write_buffer_mb = 256
+deletions_write_buffer_mb = 16
 # Bound fd-per-SST spikes (RocksDB default max_open_files=-1 opens one fd
 # per SST during compaction bursts — the fds_stable root cause).
 max_open_files = 256
-# ── End of memory calibration ─────────────────────────────────────────────
+# ── End of memory profile ──────────────────────────────────────────────────
 gc_interval_sec = 10
 tombstone_ttl_sec = 5
 ae_interval_sec = 10

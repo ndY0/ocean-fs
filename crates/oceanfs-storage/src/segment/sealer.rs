@@ -180,7 +180,7 @@ impl SegmentSealer {
         let segment_id = active.id();
         let tier = active.tier();
         let data = Bytes::copy_from_slice(active.data());
-        self.seal_from_data(segment_id, tier, data, entries, 0, 0, 0, None).await
+        self.seal_from_data(segment_id, tier, data, entries, 0, 0, 0, None, None).await
     }
 
     /// Seals a segment from raw data bytes, without requiring an `ActiveSegment`.
@@ -216,6 +216,7 @@ impl SegmentSealer {
         ec_k: u8,
         ec_m: u8,
         strip_size_bytes: usize,
+        ec_encoder: Option<std::sync::Arc<dyn oceanfs_ec::Encoder>>,
         merkle_root: Option<oceanfs_core::HashOutput>,
     ) -> Result<SegmentHandle> {
         let size = data.len() as u64;
@@ -234,7 +235,7 @@ impl SegmentSealer {
         let parity_bytes = if ec_k > 0 && ec_m > 0 && strip_size_bytes > 0 {
             let data_for_encode = data.clone();
             let encoded = tokio::task::spawn_blocking(move || {
-                encode_segment_parity(&data_for_encode, ec_k, ec_m, strip_size_bytes)
+                encode_segment_parity(&data_for_encode, ec_k, ec_m, strip_size_bytes, ec_encoder)
             })
             .await
             .map_err(|e| {
@@ -727,7 +728,7 @@ mod tests {
                 let entries =
                     vec![SegmentIndexEntry { offset: 0, length: 2048, blob_key_hash: [0x11; 32] }];
                 sealer
-                    .seal_from_data(id, SizeTier::Standard, data, &entries, 0, 0, 0, None)
+                    .seal_from_data(id, SizeTier::Standard, data, &entries, 0, 0, 0, None, None)
                     .await
                     .expect("seal must succeed");
             }));
@@ -803,7 +804,7 @@ mod tests {
         let entries =
             vec![SegmentIndexEntry { offset: 0, length: 2048, blob_key_hash: [0x22; 32] }];
         sealer
-            .seal_from_data(id, SizeTier::Standard, data, &entries, 0, 0, 0, None)
+            .seal_from_data(id, SizeTier::Standard, data, &entries, 0, 0, 0, None, None)
             .await
             .expect("direct-mode seal must succeed");
 
@@ -836,7 +837,7 @@ mod tests {
         const M: u8 = 2;
 
         let _handle = sealer
-            .seal_from_data(id, SizeTier::Standard, data.clone(), &[], K, M, 64, None)
+            .seal_from_data(id, SizeTier::Standard, data.clone(), &[], K, M, 64, None, None)
             .await
             .unwrap();
 
@@ -901,7 +902,7 @@ mod tests {
         let data = bytes::Bytes::from(vec![0x77u8; 256 * 1024]);
 
         let _handle = sealer
-            .seal_from_data(id, SizeTier::Standard, data, &[], 4, 2, 65536, None)
+            .seal_from_data(id, SizeTier::Standard, data, &[], 4, 2, 65536, None, None)
             .await
             .unwrap();
 
