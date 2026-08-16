@@ -47,6 +47,13 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
+# Load .hetzner/.env, ensure ssh-agent + the Hetzner key (no-op without
+# .hetzner/, e.g. when this script runs on the Harness VM).
+# shellcheck source=lib/env-hetzner.sh
+_ENV_HETZNER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/env-hetzner.sh"
+[ -f "$_ENV_HETZNER" ] && . "$_ENV_HETZNER"
+unset _ENV_HETZNER
+
 MODE="quick"
 HARNESS=""
 SUT=""
@@ -93,9 +100,23 @@ fi
 if [ -n "$HARNESS" ]; then
     log_info "Phase 2 $MODE mode on harness ${HARNESS} (sut=${SUT:-local}, seed=${SEED})..."
 
+    # Ensure the observe.sh tunnel so the persistent laptop Prometheus
+    # (mcps/docker-compose.yml, service "prometheus") can federate this
+    # run's metrics — the durable copy that survives VM teardown.
+    # Best-effort: needs a provisioning record; a missing tunnel only
+    # means the run is not archived to the laptop store.
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if ! "${SCRIPT_DIR}/observe.sh" >/dev/null 2>&1; then
+        log_info "observe.sh tunnel not up — this run's metrics will not be archived to the laptop Prometheus (start it with: ./scripts/observe.sh)"
+    else
+        log_info "observe.sh tunnel up — run metrics will be federated to the persistent laptop Prometheus (localhost:9091)."
+    fi
+
     # The remote invocation drops --harness and runs the local flow.
+    # Forward LOAD_TEST_DURATION_SECS so a duration override (e.g. from
+    # test-agent-workflow.sh --duration-secs) reaches the harness-side run.
     ssh $SSH_OPTS -o BatchMode=yes "$HARNESS" \
-        "cd /root/ocean-fs && ./scripts/run-phase2.sh --${MODE} ${SUT:+--sut $SUT} ${SSH_TARGET:+--ssh $SSH_TARGET} --service ${SERVICE} --seed ${SEED} --report-dir ${REPORT_DIR}"
+        "cd /root/ocean-fs && ${LOAD_TEST_DURATION_SECS:+LOAD_TEST_DURATION_SECS=$LOAD_TEST_DURATION_SECS }./scripts/run-phase2.sh --${MODE} ${SUT:+--sut $SUT} ${SSH_TARGET:+--ssh $SSH_TARGET} --service ${SERVICE} --seed ${SEED} --report-dir ${REPORT_DIR}"
     local_exit=$?
 
     # Push the load-test textfile into the SUT's Prometheus textfile
@@ -110,6 +131,15 @@ if [ -n "$HARNESS" ]; then
     mkdir -p "$REPORT_DIR"
     scp $SSH_OPTS "${HARNESS}:${REPORT_DIR}/2_load_sustained_*.json" "$REPORT_DIR/" 2>/dev/null \
         && log_info "Report fetched to ${REPORT_DIR}/" || log_info "No report fetched (check ${HARNESS}:${REPORT_DIR})."
+
+    # Archive the just-finished run's metrics into the observability
+    # backup (best-effort: the persistent laptop Prometheus must be
+    # running). Guards against a later destructive volume command wiping
+    # the archived run history.
+    "${SCRIPT_DIR}/backup-observability.sh" --quiet >/dev/null 2>&1 \
+        && log_info "Observability backup taken (scripts/backup-observability.sh)" \
+        || log_info "Observability backup skipped (start the laptop stack: docker compose -f mcps/docker-compose.yml up -d prometheus)"
+
     exit $local_exit
 fi
 
@@ -124,6 +154,13 @@ else
 fi
 
 log_info "Building release e2e harness..."
+# The Harness VM installs Rust via rustup; non-interactive ssh shells do
+# not source ~/.cargo/env, so make cargo available explicitly. No-op when
+# cargo is already on PATH (laptop / CI).
+if ! command -v cargo >/dev/null 2>&1 && [ -f /root/.cargo/env ]; then
+    # shellcheck disable=SC1091
+    . /root/.cargo/env
+fi
 cargo build --release -p e2e
 
 log_info "Running load_sustained (${DURATION}s, seed ${SEED})..."

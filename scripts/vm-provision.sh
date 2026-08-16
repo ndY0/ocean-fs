@@ -26,9 +26,11 @@
 #   Harness: SSH only). Disable with --no-firewall (not recommended).
 #
 # Requirements:
-#   - hcloud CLI installed and authenticated (HCLOUD_TOKEN env var or config)
+#   - hcloud CLI installed and authenticated. HCLOUD_TOKEN is auto-loaded
+#     from .hetzner/.env by lib/env-hetzner.sh (or set it in the environment)
 #   - jq for JSON parsing
-#   - SSH key at ~/.ssh/id_rsa.pub (or --ssh-key PATH)
+#   - SSH key at .hetzner/.ssh/hetzner-ssh.pub (loaded into ssh-agent by
+#     lib/env-hetzner.sh), or --ssh-key PATH / ~/.ssh/id_rsa.pub
 #
 # Environment Variables:
 #   HCLOUD_TOKEN              Hetzner Cloud API token (required)
@@ -40,6 +42,14 @@
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
+
+# Load .hetzner/.env (HCLOUD_TOKEN), ensure ssh-agent + the Hetzner key, and
+# set the default provisioning key (HETZNER_SSH_PUBLIC_KEY). No-op without
+# .hetzner/ (e.g. on the Harness VM).
+# shellcheck source=lib/env-hetzner.sh
+_ENV_HETZNER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/env-hetzner.sh"
+[ -f "$_ENV_HETZNER" ] && . "$_ENV_HETZNER"
+unset _ENV_HETZNER
 
 # ---------------------------------------------------------------------------
 # Constants & defaults
@@ -656,7 +666,13 @@ configure_harness_vm() {
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${public_ip}" <<HARNESS_SETUP
 set -euo pipefail
 apt-get update -qq
-apt-get install -y -qq build-essential pkg-config libssl-dev curl git
+# protobuf-compiler:   required by oceanfs-core's prost-build (protoc)
+# libclang-dev:        required by bindgen (zstd-sys etc.)
+# librocksdb-dev:      required by the workspace .cargo/config.toml — the
+#                      crate links the SYSTEM rocksdb instead of compiling
+#                      ~500 KLoC of C++ (PIPELINE.md §4.5); without it the
+#                      build fails on a 2-vCPU/4GB CX23
+apt-get install -y -qq build-essential pkg-config libssl-dev curl git protobuf-compiler libclang-dev librocksdb-dev
 HARNESS_SETUP
 
     # Install Rust
@@ -1072,7 +1088,8 @@ OPTIONS:
   --branch BRANCH      Git branch to clone on Harness VM (default: main)
   --repo URL           Git repo to clone on Harness VM (default: github.com/ndY0/ocean-fs)
   --commit SHA         Specific commit to check out on Harness VM
-  --ssh-key PATH       SSH public key path (default: ~/.ssh/id_rsa.pub)
+  --ssh-key PATH       SSH public key path (default: .hetzner/.ssh/
+                       hetzner-ssh.pub when present, else ~/.ssh/id_rsa.pub)
   --name NAME          VM name prefix (default: oceanfs-loadtest-{phase})
   --image IMAGE        OS image (default: ubuntu-24.04)
   --single-vm          Co-locate SUT+Harness on single VM
@@ -1097,7 +1114,9 @@ OPTIONS:
   -h, --help           Show this help
 
 Environment Variables:
-  HCLOUD_TOKEN              Hetzner Cloud API token (required for hetzner)
+  HCLOUD_TOKEN              Hetzner Cloud API token (required for hetzner;
+                            auto-loaded from .hetzner/.env by
+                            lib/env-hetzner.sh)
   LOAD_TEST_TTL_HOURS       Override default TTL (default: 4)
   LOAD_TEST_MAX_MONTHLY_EUR Optional monthly budget cap (deferrable, v2)
 
@@ -1270,9 +1289,10 @@ main() {
         set -x
     fi
 
-    # Resolve SSH key default
+    # Resolve SSH key default: .hetzner/.ssh/<key>.pub (set by
+    # lib/env-hetzner.sh), else the conventional ~/.ssh/id_rsa.pub.
     if [ -z "$SSH_KEY_PATH" ]; then
-        SSH_KEY_PATH="${HOME}/.ssh/id_rsa.pub"
+        SSH_KEY_PATH="${HETZNER_SSH_PUBLIC_KEY:-${HOME}/.ssh/id_rsa.pub}"
     fi
 
     # Handle --destroy

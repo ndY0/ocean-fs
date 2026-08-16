@@ -34,6 +34,13 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
+# Load .hetzner/.env, ensure ssh-agent + the Hetzner key (no-op without
+# .hetzner/, e.g. on the Harness VM).
+# shellcheck source=lib/env-hetzner.sh
+_ENV_HETZNER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/env-hetzner.sh"
+[ -f "$_ENV_HETZNER" ] && . "$_ENV_HETZNER"
+unset _ENV_HETZNER
+
 SUT=""
 BINARY="${OCEANFS_BIN:-./target/release/oceanfs}"
 PORT=9000
@@ -77,13 +84,18 @@ run() {
 
 log_info "Deploying OceanFS to $SUT (port $PORT, service $SERVICE)"
 
-# 1. Binary.
+# 1. Binary — staged via a temp name + atomic rename: the running service
+#    holds the old inode, and Linux refuses to open an executing file for
+#    writing (ETXTBSY / "Text file busy"), which makes direct overwrite
+#    fail on every redeploy while the service is up.
 if [ "$DRY_RUN" = false ]; then
-    scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "$BINARY" "${SUT}:/usr/local/bin/oceanfs" \
-        || { log_error "scp failed to ${SUT}:/usr/local/bin/oceanfs"; exit 1; }
-    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "$SUT" "chmod +x /usr/local/bin/oceanfs"
+    scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "$BINARY" "${SUT}:/usr/local/bin/oceanfs.new" \
+        || { log_error "scp failed to ${SUT}:/usr/local/bin/oceanfs.new"; exit 1; }
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "$SUT" \
+        "mv -f /usr/local/bin/oceanfs.new /usr/local/bin/oceanfs && chmod +x /usr/local/bin/oceanfs" \
+        || { log_error "install (rename) failed on $SUT"; exit 1; }
 else
-    log_info "[DRY-RUN] scp $BINARY ${SUT}:/usr/local/bin/oceanfs && chmod +x"
+    log_info "[DRY-RUN] scp $BINARY ${SUT}:/usr/local/bin/oceanfs.new && mv + chmod +x"
 fi
 
 # 2. Config + systemd unit (written via a single SSH heredoc).
@@ -98,19 +110,42 @@ PORT="$1"; DATA_DIR="$2"; CONFIG_DIR="$3"; SERVICE="$4"
 
 mkdir -p "$DATA_DIR" "$CONFIG_DIR"
 
+# OOM safety net for the 4 GB CX23: a 2 GiB swapfile so memory crests
+# (known open item: phase-2 RSS can spike ~1.7 GB within seconds) degrade
+# latency instead of letting the kernel OOM-kill the SUT mid-run. The
+# harness crash-control (SIGKILL/restart) is unaffected.
+if [ ! -f /swapfile ]; then
+    fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+    grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
 cat > "${CONFIG_DIR}/oceanfs.toml" <<CONFIG
 node_id = "sut"
 listen_addr = "0.0.0.0:${PORT}"
 grpc_listen_addr = "0.0.0.0:$((${PORT} + 1))"
 data_dir = "${DATA_DIR}"
 log_level = "info"
-max_body_size = 16777216
+# ── CX23 (4 GB RAM) memory calibration ────────────────────────────────────
+# The Phase 2 sustained-load crest exceeds 3.5 GB RSS with the spec's
+# original tuning (16 MiB blobs, 256 MiB L1, 128 MiB block cache, 336 MiB
+# write buffers + 512 MiB segment pool) and the kernel OOM-kills the SUT
+# mid-run. Shrink the per-op buffers and caches so the crest fits:
+max_body_size = 4194304
+object_cache_size_bytes = 100663296
+object_cache_max_blob_size = 4194304
+metadata_cache_size_bytes = 134217728
+block_cache_size = 67108864
+objects_write_buffer_mb = 32
+segments_write_buffer_mb = 64
+deletions_write_buffer_mb = 8
+# Bound fd-per-SST spikes (RocksDB default max_open_files=-1 opens one fd
+# per SST during compaction bursts — the fds_stable root cause).
+max_open_files = 256
+# ── End of memory calibration ─────────────────────────────────────────────
 gc_interval_sec = 10
 tombstone_ttl_sec = 5
 ae_interval_sec = 10
 scrub_interval_sec = 60
-object_cache_size_bytes = 268435456
-object_cache_max_blob_size = 16777216
 object_cache_ttl_ms = 0
 CONFIG
 
@@ -133,7 +168,10 @@ WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
-systemctl enable --now "$SERVICE"
+systemctl enable "$SERVICE"
+# restart (not enable --now): a redeploy must apply the new config even
+# when the service is already running.
+systemctl restart "$SERVICE"
 SUT_SETUP
 
 # 3. Health check.

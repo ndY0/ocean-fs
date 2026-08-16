@@ -30,8 +30,12 @@
 # SSH Tunnel (for laptop Grafana):
 #   ssh -L 9090:localhost:9090 -N <vm-ip>
 #
-# Then point Grafana datasource to http://localhost:9090 and import the
-# dashboard from scripts/dashboards/load-test.json.
+# Note: the recommended laptop flow is the persistent Prometheus + Grafana
+# stack in mcps/docker-compose.yml (Solution B): run ./scripts/observe.sh,
+# then `docker compose -f mcps/docker-compose.yml up -d prometheus grafana`.
+# The laptop Prometheus federates THIS SUT Prometheus through the tunnel
+# (365-day retention) and Grafana reads from it at http://127.0.0.1:9091.
+# Importing the dashboard manually is only needed for a direct-tunnel setup.
 #
 # Author: OceanFS
 # Date: 2026-08-11
@@ -48,6 +52,9 @@ SCRAPE_INTERVAL=15
 PROMETHEUS_VERSION="2.52.0"
 PROMETHEUS_PORT=9090
 NODE_EXPORTER_PORT=9100
+# Set by create_prometheus_config when it (re)writes prometheus.yml; consumed
+# by create_systemd_unit to decide whether a running service must restart.
+CONFIG_WRITTEN=false
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -199,9 +206,11 @@ create_prometheus_config() {
         log_info "Updating existing Prometheus config..."
         # Back up the old config
         cp "$config_file" "${config_file}.bak.$(date +%s)"
+        CONFIG_WRITTEN=true
     fi
 
     log_info "Writing Prometheus configuration to ${config_file}..."
+    CONFIG_WRITTEN=true
 
     cat > "$config_file" <<PROMETHEUS_CONFIG
 # ---------------------------------------------------------------------------
@@ -308,7 +317,16 @@ create_systemd_unit() {
         log_info "systemd unit ${unit_file} already exists. Checking if active..."
         systemctl daemon-reload
         if systemctl is-active --quiet prometheus 2>/dev/null; then
-            log_ok "Prometheus service is already running."
+            if [ "${CONFIG_WRITTEN:-false}" = "true" ]; then
+                # The scrape config was (re)written during THIS run but the
+                # running process still uses the pre-existing config loaded
+                # at startup (apt installs start prometheus with the stock
+                # config; our oceanfs/load_test jobs would never load).
+                log_info "Config changed this run — restarting prometheus to load it."
+                systemctl restart prometheus
+            else
+                log_ok "Prometheus service is already running."
+            fi
             return 0
         fi
         log_info "Unit exists but service is not running. Restarting..."
@@ -517,23 +535,21 @@ print_ssh_tunnel_instructions() {
 ║                         SSH TUNNEL INSTRUCTIONS                          ║
 ╠══════════════════════════════════════════════════════════════════════════╣
 ║                                                                          ║
-║  From your laptop, create an SSH tunnel to access Prometheus:            ║
+║  From your laptop, open the tunnel (see scripts/observe.sh — idempotent, ║
+║  reads the provisioning record):                                         ║
 ║                                                                          ║
-║    ssh -L 9090:localhost:9090 -N ${hostname}                                   ║
+║    ./scripts/observe.sh                                                  ║
+║    # or manually: ssh -L 9090:localhost:9090 -N ${hostname}              ║
 ║                                                                          ║
-║  Then configure Grafana with a Prometheus datasource:                    ║
-║    URL: http://localhost:9090                                            ║
+║  Recommended (Solution B — persistent history): start the laptop stack:  ║
 ║                                                                          ║
-║  Import the dashboard:                                                   ║
-║    1. Open Grafana at http://localhost:3000                              ║
-║    2. Go to Dashboards → Import                                         ║
-║    3. Upload scripts/dashboards/load-test.json                          ║
-║    4. Select the Prometheus datasource                                   ║
+║    docker compose -f mcps/docker-compose.yml up -d prometheus grafana    ║
 ║                                                                          ║
-║  Dashboard shortcut after import:                                        ║
-║    http://localhost:3000/d/load-test                                     ║
+║  The laptop Prometheus federates this SUT (365-day retention) and        ║
+║  Grafana reads from it at http://127.0.0.1:9091 — no manual datasource   ║
+║  setup or dashboard import needed (auto-provisioned).                    ║
 ║                                                                          ║
-║  Direct Prometheus queries (no Grafana):                                 ║
+║  Direct Prometheus queries on this SUT (no laptop stack):                ║
 ║    curl 'http://localhost:9090/api/v1/query?query=up'                    ║
 ║                                                                          ║
 ╚══════════════════════════════════════════════════════════════════════════╝

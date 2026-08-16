@@ -34,6 +34,13 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
+# Load .hetzner/.env, ensure ssh-agent + the Hetzner key (no-op without
+# .hetzner/, e.g. on the Harness VM).
+# shellcheck source=lib/env-hetzner.sh
+_ENV_HETZNER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/env-hetzner.sh"
+[ -f "$_ENV_HETZNER" ] && . "$_ENV_HETZNER"
+unset _ENV_HETZNER
+
 PROVISION_FILE=""
 SSH_KEY=""
 SSH_PRIVATE_KEY=""
@@ -45,6 +52,7 @@ DRY_RUN=false
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
 
 log_info() { echo "[INFO]  $(date '+%H:%M:%S') $*" >&2; }
+log_warn() { echo "[WARN]  $(date '+%H:%M:%S') $*" >&2; }
 log_error() { echo "[ERROR] $(date '+%H:%M:%S') $*" >&2; }
 
 usage() {
@@ -133,7 +141,9 @@ log_info "Ensuring repo ${REPO} (branch=${BRANCH}${COMMIT:+, commit=${COMMIT}}) 
 if [ "$DRY_RUN" = false ]; then
     ssh $SSH_OPTS "root@${HARNESS_PUBLIC_IP}" bash -s -- "$REPO" "$BRANCH" "$COMMIT" <<'HARNESS_REPO'
 set -euo pipefail
-REPO="$1"; BRANCH="$2"; COMMIT="$3"
+REPO="$1"; BRANCH="$2"; COMMIT="${3:-}"
+# Note: ${3:-} — ssh joins remote-command arguments with spaces, so an
+# empty $COMMIT is DROPPED and the remote bash only sees $1 and $2.
 
 if [ -d /root/ocean-fs/.git ]; then
     git -C /root/ocean-fs fetch origin "$BRANCH" || true
@@ -175,7 +185,7 @@ fi
 log_info "Ensuring observability stack on the SUT (${SUT_INTERNAL_IP})..."
 if [ "$DRY_RUN" = false ]; then
     if ! ssh $SSH_OPTS -o BatchMode=yes "root@${HARNESS_PUBLIC_IP}" \
-        "cd /root/ocean-fs && scp scripts/setup-observability.sh root@${SUT_INTERNAL_IP}:/root/ && ssh root@${SUT_INTERNAL_IP} 'bash /root/setup-observability.sh'"; then
+        "cd /root/ocean-fs && scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null scripts/setup-observability.sh root@${SUT_INTERNAL_IP}:/root/ && ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@${SUT_INTERNAL_IP} 'bash /root/setup-observability.sh'"; then
         log_warn "Observability setup failed on the SUT (non-fatal — the harness scrape still covers the run)."
     else
         log_info "Observability stack ensured on the SUT."

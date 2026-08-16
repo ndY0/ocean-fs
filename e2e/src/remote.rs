@@ -229,7 +229,12 @@ impl RemoteCluster {
         ssh_target: &str,
         service: &str,
     ) -> Result<(), Error> {
-        // 1. SIGKILL the service's main process.
+        // 1. SIGKILL the service's main process. `--kill-who=main` is
+        // required: plain `systemctl kill` also signals the unit's
+        // auxiliary/control processes, which do not exist for our
+        // Type=simple unit and make systemd fail with "Failed to send
+        // signal SIGKILL to auxiliary processes: Invalid argument" even
+        // though the main process was killed.
         run_ssh(&[
             "-o",
             "BatchMode=yes",
@@ -240,6 +245,7 @@ impl RemoteCluster {
             "kill",
             "-s",
             "KILL",
+            "--kill-who=main",
             service,
         ])
         .await?;
@@ -324,8 +330,18 @@ impl LoadTarget for RemoteCluster {
 /// Returns [`Error::Ssh`] when ssh cannot be spawned, exits non-zero, or
 /// the blocking task panics.
 async fn run_ssh(args: &[&str]) -> Result<(), Error> {
+    // Disposable test VMs: never track host keys (the SUT's key is not in
+    // the harness's known_hosts — the SUT is reached over the internal
+    // network and the harness may be re-provisioned at any time).
+    let mut full_args: Vec<&str> = vec![
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+    ];
+    full_args.extend_from_slice(args);
     // Own the arguments so the blocking closure is `'static`.
-    let args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+    let args: Vec<String> = full_args.iter().map(|s| (*s).to_string()).collect();
     let args_display = format!("{args:?}");
     let status = tokio::task::spawn_blocking(move || {
         std::process::Command::new("ssh")

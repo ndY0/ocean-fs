@@ -24,6 +24,13 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
+# Load .hetzner/.env, ensure ssh-agent + the Hetzner key (no-op without
+# .hetzner/, e.g. on the Harness VM).
+# shellcheck source=lib/env-hetzner.sh
+_ENV_HETZNER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/env-hetzner.sh"
+[ -f "$_ENV_HETZNER" ] && . "$_ENV_HETZNER"
+unset _ENV_HETZNER
+
 SUT=""
 PORT=9090
 KILL=false
