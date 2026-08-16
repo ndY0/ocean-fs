@@ -29,7 +29,7 @@ use rand_chacha::ChaCha12Rng;
 use serde::Serialize;
 
 use super::manifest::Manifest;
-use crate::harness::{random_bytes, LoadTarget};
+use crate::harness::{compressible_bytes, random_bytes, LoadTarget};
 
 // ---------------------------------------------------------------------------
 // LoadScenario
@@ -83,6 +83,13 @@ pub struct LoadScenario {
 // ---------------------------------------------------------------------------
 // OpWeight
 // ---------------------------------------------------------------------------
+
+/// Whether the load should use compressible payloads
+/// (`LOAD_TEST_COMPRESSIBLE=1`) so per-bucket compression actually
+/// shrinks stored data and exercises the read-path decompression.
+fn compressible_payloads() -> bool {
+    std::env::var("LOAD_TEST_COMPRESSIBLE").as_deref() == Ok("1")
+}
 
 /// A weighted entry in the operation mix.
 ///
@@ -906,7 +913,11 @@ impl<C: LoadTarget> Worker<C> {
                     // the HTTP boundary so the histogram measures
                     // server round-trips, not client-side generation.
                     let gen_start = Instant::now();
-                    let body = random_bytes(size);
+                    let body = if compressible_payloads() {
+                        compressible_bytes(size)
+                    } else {
+                        random_bytes(size)
+                    };
                     let gen_elapsed = gen_start.elapsed(); // kept for debug trace
                     let start = Instant::now(); // HTTP-only latency
                     match self.cluster.put(node_idx, &path, &body).await {

@@ -1179,6 +1179,23 @@ pub fn random_bytes(len: usize) -> Vec<u8> {
     buf
 }
 
+/// Deterministic, highly-compressible payload (repeating block).
+///
+/// The default load uses [`random_bytes`] — incompressible, so the
+/// node's don't-shrink guard stores everything raw and the
+/// decompression path is never exercised. Compression runs set
+/// `LOAD_TEST_COMPRESSIBLE=1` to make the compression counters and the
+/// decompress path observable.
+pub fn compressible_bytes(len: usize) -> Vec<u8> {
+    const BLOCK: &[u8] = b"The quick brown fox jumps over the lazy dog. 0123456789 ";
+    let mut buf = Vec::with_capacity(len);
+    while buf.len() < len {
+        let take = (len - buf.len()).min(BLOCK.len());
+        buf.extend_from_slice(&BLOCK[..take]);
+    }
+    buf
+}
+
 /// Polls a condition function every `interval` until it returns `true`
 /// or `timeout` elapses.
 ///

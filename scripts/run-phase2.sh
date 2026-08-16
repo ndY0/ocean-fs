@@ -39,7 +39,8 @@
 # Environment: all options can also be passed via LOAD_TEST_SEED /
 # LOAD_TEST_DURATION_SECS / TARGET_HOST / TARGET_HOST_SSH / TARGET_SERVICE /
 # LOAD_TEST_REPORT_DIR / LOAD_TEST_COMPRESSION (1 = opt the load-test
-# bucket into per-bucket zstd compression).
+# bucket into per-bucket zstd compression) / LOAD_TEST_COMPRESSIBLE
+# (1 = compressible payloads so compression actually shrinks data).
 #
 # Examples:
 #   ./scripts/run-phase2.sh --harness oceanfs-harness --quick --sut 10.0.0.2:9000 --ssh root@10.0.0.2
@@ -63,6 +64,7 @@ SERVICE="${TARGET_SERVICE:-oceanfs}"
 SEED="${LOAD_TEST_SEED:-42}"
 REPORT_DIR="${LOAD_TEST_REPORT_DIR:-/tmp/oceanfs-reports}"
 COMPRESSION="${LOAD_TEST_COMPRESSION:-0}"
+COMPRESSIBLE="${LOAD_TEST_COMPRESSIBLE:-0}"
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
 
@@ -171,6 +173,7 @@ env \
     LOAD_TEST_DURATION_SECS="$DURATION" \
     LOAD_TEST_REPORT_DIR="$REPORT_DIR" \
     LOAD_TEST_COMPRESSION="$COMPRESSION" \
+    LOAD_TEST_COMPRESSIBLE="$COMPRESSIBLE" \
     TARGET_HOST="${SUT:-}" \
     TARGET_HOST_SSH="${SSH_TARGET:-}" \
     TARGET_SERVICE="$SERVICE" \
