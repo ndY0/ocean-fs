@@ -39,32 +39,71 @@ use crate::{
 /// detected but cannot be repaired (more than `m` corrupt shards, or a
 /// corrupt un-encoded tail).
 pub(crate) fn verify_and_repair_segment(path: &Path) -> Result<usize> {
-    let file = std::fs::read(path)
+    // Streamed verification: the previous implementation loaded the whole
+    // file with std::fs::read just to hash it — the read path calls this
+    // on every segment's first touch, so under sustained load the
+    // concurrent full-file buffers (segments ~10 MB each) formed
+    // multi-GB anonymous-memory bursts (hundreds of fds + anon==RSS,
+    // OOM-killing 4 GB SUT VMs). Header-only + chunked BLAKE3 keeps the
+    // same integrity guarantee in constant memory.
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| Error::Io(std::io::Error::other(format!("open {}: {e}", path.display()))))?;
+
+    // The on-disk header is 76 (v1) or 92 (v2) bytes; read a fixed
+    // 128-byte prefix so the version is known before the data offset.
+    let mut header_buf = [0u8; 128];
+    let got = file
+        .read(&mut header_buf)
         .map_err(|e| Error::Io(std::io::Error::other(format!("read {}: {e}", path.display()))))?;
-    let header = SegmentHeader::from_bytes(&file)
+    if got < SegmentHeader::header_size(1) {
+        return Err(Error::SegmentCorrupt(SegmentId::default()));
+    }
+    let header = SegmentHeader::from_bytes(&header_buf)
         .ok_or_else(|| Error::SegmentCorrupt(SegmentId::default()))?;
     let hdr_size = header.serialized_size();
     let data_end = header.data_end() as usize;
-    if data_end > file.len() {
+    let file_len = file
+        .metadata()
+        .map_err(|e| Error::Io(std::io::Error::other(format!("stat {}: {e}", path.display()))))?
+        .len() as usize;
+    if data_end > file_len {
         return Err(Error::SegmentCorrupt(header.segment_id));
     }
-    let data = &file[hdr_size..data_end];
 
     // Fast path: the checksum matches — healthy file. For v2 files the
-    // checksum covers data + parity section.
-    let computed = if header.parity_size > 0 {
+    // checksum covers data + parity section. Stream both sections in
+    // 1 MiB chunks (perf rule 5.2: never buffer the full blob).
+    let mut hasher = Blake3Hasher::new();
+    let mut chunk = vec![0u8; 1024 * 1024];
+    let mut read_range = |mut f: &std::fs::File, start: usize, end: usize| -> Result<()> {
+        f.seek(SeekFrom::Start(start as u64))
+            .map_err(|e| Error::Io(std::io::Error::other(format!("seek: {e}"))))?;
+        let mut remaining = end.saturating_sub(start);
+        while remaining > 0 {
+            let want = remaining.min(chunk.len());
+            let n = f
+                .read(&mut chunk[..want])
+                .map_err(|e| Error::Io(std::io::Error::other(format!("read: {e}"))))?;
+            if n == 0 {
+                return Err(Error::SegmentCorrupt(header.segment_id));
+            }
+            hasher.update(&chunk[..n]);
+            remaining -= n;
+        }
+        Ok(())
+    };
+    read_range(&file, hdr_size, data_end)?;
+    if header.parity_size > 0 {
         let section_start = header.parity_offset as usize;
         let section_end = section_start + header.parity_size as usize;
-        if section_end > file.len() {
+        if section_end > file_len {
             return Err(Error::SegmentCorrupt(header.segment_id));
         }
-        let mut hasher = Blake3Hasher::new();
-        hasher.update(data);
-        hasher.update(&file[section_start..section_end]);
-        hasher.finalize()
-    } else {
-        Blake3Hasher::hash(data)
-    };
+        read_range(&file, section_start, section_end)?;
+    }
+    let computed = hasher.finalize();
     if computed.as_bytes() == &header.checksum {
         return Ok(0);
     }
@@ -78,6 +117,11 @@ pub(crate) fn verify_and_repair_segment(path: &Path) -> Result<usize> {
     if header.parity_offset == 0 || header.parity_size == 0 {
         return Err(Error::SegmentCorrupt(header.segment_id));
     }
+    // Repair path: corruption is rare, so load the file fully here (the
+    // streaming fast path above keeps the healthy case in O(1) memory).
+    let file = std::fs::read(path)
+        .map_err(|e| Error::Io(std::io::Error::other(format!("read {}: {e}", path.display()))))?;
+    let data = &file[hdr_size..data_end];
     let section_start = header.parity_offset as usize;
     let section_end = section_start + header.parity_size as usize;
     if section_end > file.len() {

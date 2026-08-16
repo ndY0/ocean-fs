@@ -214,9 +214,21 @@ impl DiskSegmentReader {
             }
         }
         // Parse the header (the repair already validated the file) to
-        // learn the format version's data offset.
-        let file = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let header = crate::segment::header::SegmentHeader::from_bytes(&file)
+        // learn the format version's data offset. Header-only read: the
+        // previous std::fs::read loaded the whole segment just for the
+        // 76-92 byte header — on first touches under load that was a
+        // second full-file buffer per segment read (multi-GB anon bursts).
+        use std::io::Read;
+        let mut file = std::fs::File::open(&path)
+            .map_err(|e| format!("open {}: {e}", path.display()))?;
+        let mut header_buf = [0u8; 128];
+        let got = file
+            .read(&mut header_buf)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        if got < crate::segment::header::SegmentHeader::header_size(1) {
+            return Err(format!("segment file {segment_id} too short for header"));
+        }
+        let header = crate::segment::header::SegmentHeader::from_bytes(&header_buf)
             .ok_or_else(|| format!("bad segment header for {segment_id}"))?;
         let hdr_size = header.serialized_size();
         self.verified_headers.lock().insert(segment_id, hdr_size);
