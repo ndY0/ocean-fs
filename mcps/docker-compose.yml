@@ -106,10 +106,101 @@ services:
     depends_on:
       dgraph-alpha:
         condition: service_healthy
+  prometheus:
+    # Persistent laptop-side Prometheus ("Solution B"): the SUT's Prometheus
+    # is ephemeral (destroyed with the VM), so this service federates every
+    # run's metrics through the observe.sh tunnel and keeps them for
+    # 365 days. Grafana and the agents (vm-metrics skill) read from HERE,
+    # not from the tunnel — history survives VM teardown.
+    #
+    # Data flow:
+    #   SUT Prometheus :9090  --observe.sh tunnel-->  localhost:9090 (host)
+    #     -> this container scrapes /federate (15s)  ->  prometheus-storage volume
+    #     -> Grafana datasource http://127.0.0.1:9091
+    #
+    # network_mode: host is REQUIRED (Linux): the observe.sh tunnel binds
+    # 127.0.0.1 only (loopback termination by design), and a bridge-mode
+    # container reaching host.docker.internal (the Docker bridge gateway)
+    # CANNOT reach a loopback-bound listener. With host networking the
+    # container shares the host network stack: it targets localhost:9090
+    # (the tunnel) directly and listens on 127.0.0.1:9091 — no LAN
+    # exposure. Docker Desktop (macOS/Windows) does not support host
+    # networking reliably; on those platforms run this service in bridge
+    # mode and bind the tunnel on the gateway instead.
+    #
+    # Bring-up order:
+    #   1. ./scripts/observe.sh                    (tunnel SUT:9090 -> localhost:9090)
+    #   2. docker compose -f mcps/docker-compose.yml up -d prometheus grafana
+    #   3. open http://localhost:3000  -> dashboard "OceanFS Load Test"
+    #
+    # Host port is 9091, NOT 9090 — localhost:9090 belongs to the tunnel.
+    # Pin to the same version the SUT setup script installs.
+    image: prom/prometheus:v2.52.0
+    container_name: oceanfs-prometheus
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - prometheus-storage:/prometheus
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=365d
+      - --web.listen-address=127.0.0.1:9091
+      # Admin API (loopback-only): enables the TSDB snapshot endpoint used
+      # by scripts/backup-observability.sh.
+      - --web.enable-admin-api
+  grafana:
+    # Laptop-side Grafana for the OceanFS load-test observability stack
+    # (ADR-0019 Decision 5). The datasource is the persistent laptop
+    # Prometheus (host networking: http://127.0.0.1:9091), NOT the SUT
+    # tunnel directly — so dashboards keep showing historical runs even
+    # after the SUT VM is destroyed.
+    #
+    # network_mode: host for the same reason as prometheus above (the
+    # datasource is loopback-bound on the host network stack).
+    #
+    # Bring-up order:
+    #   1. ./scripts/observe.sh                    (tunnel SUT:9090 -> localhost:9090)
+    #   2. docker compose -f mcps/docker-compose.yml up -d prometheus grafana
+    #   3. open http://localhost:3000  -> dashboard "OceanFS Load Test"
+    #
+    # Pin to a specific version for reproducibility; bump deliberately.
+    image: grafana/grafana:11.4.0
+    container_name: oceanfs-grafana
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # Local-only credentials (default admin/admin). Override in .env:
+      #   GRAFANA_ADMIN_USER / GRAFANA_ADMIN_PASSWORD
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SERVER_HTTP_ADDR: "127.0.0.1"
+    volumes:
+      - grafana-storage:/var/lib/grafana
+      # Datasource (persistent Prometheus service) + dashboard providers —
+      # auto-provisioned on first start.
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      # Single source of truth for the dashboard JSON lives in the repo
+      # (scripts/dashboards/load-test.json); mount it read-only instead of
+      # copying, so dashboard edits never drift from the provisioning input.
+      - ../scripts/dashboards:/var/lib/grafana/dashboards:ro
 volumes:
   qdrant_storage:
   dgraph-zero-data:
   dgraph-alpha-data:
+  # ⚠ DESTRUCTIVE COMMAND WARNING ⚠
+  # `docker compose down --volumes` (or `-v`) DELETES the volumes below.
+  # grafana-storage and prometheus-storage hold precious data (every
+  # archived load-test run, 365 days of metrics). To reset ONE service's
+  # data safely, stop the service and remove only its volume, e.g.:
+  #   docker compose -f mcps/docker-compose.yml stop grafana
+  #   docker volume rm mcps_grafana-storage
+  # And back up first: ./scripts/backup-observability.sh
+  grafana-storage:
+  prometheus-storage:
 
 networks:
   cgraph-net:

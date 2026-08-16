@@ -1,0 +1,32 @@
+# ---------------------------------------------------------------------------
+# OceanFS — Grafana datasource provisioning
+#
+# Points Grafana at the PERSISTENT laptop Prometheus (Solution B) at
+# http://127.0.0.1:9091 — the long-lived store that federates the SUT VM's
+# Prometheus through the observe.sh tunnel. Both services run with
+# network_mode: host (see docker-compose.yml), so the datasource is the
+# host loopback. Grafana therefore keeps showing historical runs even
+# after the SUT VM is destroyed — the tunnel is only needed by the
+# prometheus service's /federate scrape, not by Grafana.
+#
+# The datasource is named "Prometheus" so the dashboard's `$datasource`
+# template variable (default value "Prometheus") resolves to it without any
+# manual mapping after import.
+#
+# Bring-up order:
+#   1. ./scripts/observe.sh                    (tunnel SUT:9090 -> localhost:9090)
+#   2. docker compose -f mcps/docker-compose.yml up -d prometheus grafana
+# ---------------------------------------------------------------------------
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: oceanfs-prom
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:9091
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 15s      # matches the federation scrape_interval
+      httpMethod: POST

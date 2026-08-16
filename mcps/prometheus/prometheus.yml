@@ -1,0 +1,50 @@
+# ---------------------------------------------------------------------------
+# OceanFS — Persistent laptop Prometheus (Solution B)
+#
+# This is the LONG-LIVED metrics store. It federates the SUT VM's
+# Prometheus through the observe.sh SSH tunnel (localhost:9090), so every
+# test run's metrics accumulate here and survive VM teardown. Grafana
+# (http://127.0.0.1:9091) and the agents (vm-metrics skill,
+# http://localhost:9091) read from this instance.
+#
+# Data flow:
+#   SUT Prometheus :9090  --observe.sh tunnel-->  localhost:9090 (host)
+#     -> /federate scrape (15s)  ->  prometheus-storage volume (365d)
+#
+# Notes:
+#   - The service runs with network_mode: host (see docker-compose.yml):
+#     the tunnel binds 127.0.0.1 only, which a bridge-mode container could
+#     not reach (host.docker.internal is the bridge gateway, not loopback).
+#   - The tunnel must be up for data to flow. run-phase2.sh ensures it
+#     (best-effort) before every remote run; vm-test-phase documents it.
+#   - The SUT's own Prometheus keeps its 7-day local retention as a
+#     buffer; the laptop store is the durable copy.
+#   - honor_labels: true is required for federation — the scraped series
+#     keep their original labels (job="oceanfs", instance="oceanfs-sut",
+#     job="load_test" with the textfile markers).
+# ---------------------------------------------------------------------------
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # ── SUT federation (through the observe.sh tunnel) ────────────────────
+  - job_name: 'sut-federate'
+    scrape_interval: 15s
+    metrics_path: '/federate'
+    honor_labels: true
+    params:
+      'match[]':
+        - '{job="oceanfs"}'     # SUT application metrics (:9000/admin/metrics)
+        - '{job="load_test"}'   # harness textfile markers (load_test_phase, ...)
+    static_configs:
+      - targets: ['localhost:9090']
+    # If the tunnel is down (no SUT provisioned), the target is simply
+    # DOWN — the previously federated history remains queryable.
+
+  # ── Self-monitoring (hygiene only) ────────────────────────────────────
+  # With host networking, localhost:9090 is the observe.sh tunnel, so the
+  # self-scrape must target the service's own listen address (127.0.0.1:9091).
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['127.0.0.1:9091']

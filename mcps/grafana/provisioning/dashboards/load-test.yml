@@ -1,0 +1,21 @@
+# ---------------------------------------------------------------------------
+# OceanFS — Grafana dashboard provider provisioning
+#
+# Loads scripts/dashboards/load-test.json (mounted read-only at
+# /var/lib/grafana/dashboards in docker-compose.yml) into the "OceanFS"
+# folder. The dashboard uses the `$datasource` template variable, which
+# resolves to the provisioned "Prometheus" datasource (see
+# ../datasources/prometheus.yml).
+# ---------------------------------------------------------------------------
+apiVersion: 1
+
+providers:
+  - name: oceanfs-load-test
+    orgId: 1
+    folder: OceanFS
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

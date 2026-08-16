@@ -328,7 +328,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "accel_fallback_total{job=\"oceanfs\"}",
+          "expr": "accel_ec_fallback_total{job=\"oceanfs\"}",
           "legendFormat": "Fallbacks",
           "range": true,
           "refId": "A"
