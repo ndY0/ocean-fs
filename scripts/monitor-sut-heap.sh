@@ -72,6 +72,12 @@ for i in $(seq 1 "$N"); do
     ' "/proc/$PID/smaps_rollup" 2>/dev/null || true)
     FDS=$(ls /proc/$PID/fd 2>/dev/null | wc -l)
     echo "$(date -u +%H:%M:%S),${ROLLUP},$FDS,$PID"
+    # During a burst, snapshot what the fds point to (once per event).
+    if [ "$FDS" -gt 250 ]; then
+        echo "FD_TARGETS $(date -u +%H:%M:%S):"
+        ls -l /proc/$PID/fd 2>/dev/null | awk '{print $11}' \
+            | sort | uniq -c | sort -rn | head -12
+    fi
     sleep 1
 done
 REMOTE
