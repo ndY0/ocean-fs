@@ -630,8 +630,12 @@ impl ReadCoordinator {
                     segment_id: seg_id,
                     offset: winning.chunk_offsets[i],
                     length: winning.chunk_lengths[i],
-                    compressed: false,
-                    logical_length: winning.chunk_lengths[i],
+                    compressed: winning.chunk_compressed.get(i).copied().unwrap_or(false),
+                    logical_length: winning
+                        .chunk_logical_lengths
+                        .get(i)
+                        .copied()
+                        .unwrap_or(winning.chunk_lengths[i]),
                 });
             }
             let blake3_hash = if winning.blake3_hash.len() == 32 {
@@ -959,8 +963,12 @@ impl ReadCoordinator {
                 segment_id: seg_id,
                 offset: winning.chunk_offsets[i],
                 length: winning.chunk_lengths[i],
-                compressed: false,
-                logical_length: winning.chunk_lengths[i],
+                compressed: winning.chunk_compressed.get(i).copied().unwrap_or(false),
+                logical_length: winning
+                    .chunk_logical_lengths
+                    .get(i)
+                    .copied()
+                    .unwrap_or(winning.chunk_lengths[i]),
             });
         }
 

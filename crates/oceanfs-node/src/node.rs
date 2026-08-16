@@ -594,6 +594,11 @@ impl Node {
         // seal time (single scheduler — the parallel encode runs on the
         // blocking pool). Matches the heal codec configuration.
         let pool_ec_config = oceanfs_core::CodecConfig::default();
+        // The pools consume `pool_ec_config` below; capture the codec
+        // params now — interrupted seal commits are re-registered at
+        // startup with the same codec the pools used.
+        let pool_ec_k = pool_ec_config.data_shards;
+        let pool_ec_m = pool_ec_config.parity_shards;
         // Seal-time EC parity routes through the accel dispatcher so the
         // encode is observable (accel_encode_ops_total, duration
         // histograms, fallbacks) — the accel tier is exercised on the
@@ -979,7 +984,7 @@ impl Node {
         // Entries for deleted segments are skipped too: GC/orphan-reaper
         // removed the data intentionally; rebuilding it would resurrect
         // garbage segments in the pools.
-        let finalized: std::collections::HashSet<_> = metadata_store
+        let mut finalized: std::collections::HashSet<_> = metadata_store
             .list_segments()
             .into_iter()
             .filter_map(|r| r.ok())
@@ -993,6 +998,73 @@ impl Node {
                     .map(|(id, _)| id),
             )
             .collect();
+        // Complete interrupted seal commits: a seal can be SIGKILLed
+        // between linking the .dat file and committing its metadata —
+        // the file is durable but the CF has no sealed entry. Recompute
+        // the merkle root over the data section (identical to the
+        // seal's 64 KiB-leaf tree) and register the full sealed
+        // metadata, so the WAL-bridged commit completes at startup.
+        // The replay (CF-driven) then skips these segments; nothing is
+        // traded — adopted segments are root-bearing and verifiable,
+        // exactly as if the seal had finished. Only crash-window
+        // orphans are hashed (a handful per crash), never the whole
+        // directory.
+        if let Ok(entries) = std::fs::read_dir(&segment_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let Some(stem) = name.strip_suffix(".dat") else { continue };
+                let Ok(uuid) = uuid::Uuid::parse_str(stem) else { continue };
+                let segment_id = oceanfs_core::SegmentId::from_uuid_bytes(*uuid.as_bytes());
+                if finalized.contains(&segment_id) {
+                    continue; // already sealed or deleted
+                }
+                let Ok(raw) = std::fs::read(entry.path()) else { continue };
+                let Some(header) = oceanfs_storage::SegmentHeader::from_bytes(&raw) else {
+                    continue; // not a segment file
+                };
+                let hdr_size = oceanfs_storage::SegmentHeader::header_size(header.version);
+                let data_end = (hdr_size as u64 + header.size) as usize;
+                if data_end > raw.len() {
+                    continue; // truncated tail — leave to WAL replay
+                }
+                // Merkle root over the DATA section (the seal's exact
+                // construction). CPU-bound but bounded to orphans.
+                let merkle_root =
+                    oceanfs_durability::MerkleTree::build(&raw[hdr_size..data_end], 0)
+                        .map(|tree| tree.root().hash());
+                let meta = oceanfs_core::SegmentMetadata {
+                    segment_id,
+                    ec_k: pool_ec_k,
+                    ec_m: pool_ec_m,
+                    size_tier: segment_size.classify(header.size),
+                    merkle_root,
+                    storage_locations: smallvec::SmallVec::new(),
+                    sealed_at: Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64,
+                    ),
+                };
+                match metadata_store.put_segment(meta) {
+                    Ok(()) => {
+                        finalized.insert(segment_id);
+                        info!(
+                            segment_id = %segment_id,
+                            "adopted interrupted seal commit: durable .dat registered with recomputed merkle root"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            segment_id = %segment_id,
+                            error = %e,
+                            "failed to adopt interrupted seal commit; WAL replay will rebuild it"
+                        );
+                    }
+                }
+            }
+        }
         let replay_summary = oceanfs_storage::wal::replay_wal(
             &wal_config,
             &wal_writer,
@@ -1003,6 +1075,32 @@ impl Node {
         )
         .await
         .map_err(|e| format!("WAL replay failed: {e}"))?;
+        // The replayed segments' seals complete asynchronously on the
+        // seal worker (the .dat files appear via the flush's atomic
+        // rename). Reads must NEVER race a partially-written segment
+        // file, so the node waits for every replayed segment's .dat to
+        // be persisted before the server binds.
+        if replay_summary.entries_replayed > 0 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            for id in &replay_summary.segments_seen {
+                let path = segment_dir.join(format!("{id}.dat"));
+                while !path.exists() {
+                    if std::time::Instant::now() > deadline {
+                        warn!(
+                            segment_id = %id,
+                            "replayed segment seal did not persist within 30s; reads may race"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+            info!(
+                replayed = replay_summary.segments_seen.len(),
+                "replayed segment seals persisted; server may bind"
+            );
+        }
+
         if replay_summary.entries_replayed > 0 {
             info!(
                 entries = replay_summary.entries_replayed,

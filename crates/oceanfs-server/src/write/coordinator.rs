@@ -401,6 +401,9 @@ impl WriteCoordinator {
         let blake3_hash = HashOutput::from_bytes(*hash.as_bytes());
 
         // Step 4: Store data through the segment pipeline.
+        // Phantom registrations performed in this request (one per
+        // unique segment), BEFORE each segment's WAL entry.
+        let mut registered: std::collections::HashSet<SegmentId> = std::collections::HashSet::new();
         let chunks = match tier {
             SizeTier::Inline => {
                 let meta = ObjectMetadata {
@@ -439,6 +442,10 @@ impl WriteCoordinator {
                     )
                     .await
                     .map_err(map_append_error("small".into()))?;
+                // Register the phantom BEFORE the WAL entry so the WAL
+                // cleanup can never mistake this segment for garbage.
+                self.register_phantom_before_wal(segment_id, SizeTier::Small, &mut registered)
+                    .await?;
                 // Write WAL entry for crash-recovery durability (C4-storage, D6).
                 // `logical_length` lets crash replay classify compressed
                 // chunks by their original size.
@@ -469,10 +476,16 @@ impl WriteCoordinator {
                     )
                     .await
                     .map_err(map_append_error("standard".into()))?;
+                // Register the phantom BEFORE the WAL entry so the WAL
+                // cleanup can never mistake this segment for garbage.
+                self.register_phantom_before_wal(segment_id, SizeTier::Standard, &mut registered)
+                    .await?;
                 // Write WAL entry for crash-recovery durability (C4-storage, D6).
                 // `logical_length` lets crash replay classify compressed
-                // chunks by their original size.
-                self.write_wal_entry(segment_id, offset, stored, length, logical_len, 0, hlc)
+                // chunks by their original size. Tier byte 1 = standard
+                // pool (the replay routes by it — a 0 here sends the
+                // segment's rebuild to the small pool).
+                self.write_wal_entry(segment_id, offset, stored, length, logical_len, 1, hlc)
                     .await?;
                 let mut chunks = smallvec::SmallVec::new();
                 chunks.push(ChunkRef {
@@ -509,6 +522,9 @@ impl WriteCoordinator {
                         )
                         .await
                         .map_err(map_append_error("multi".into()))?;
+                    // Register the phantom BEFORE the WAL entry (see Small arm).
+                    self.register_phantom_before_wal(seg_id, SizeTier::Standard, &mut registered)
+                        .await?;
                     // Write WAL entry for each chunk (C4-storage, D6).
                     self.write_wal_entry(seg_id, seg_offset, stored, length, logical_len, 1, hlc)
                         .await?;
@@ -642,6 +658,40 @@ impl WriteCoordinator {
     ///
     /// Records the segment append in the write-ahead log so that unsealed
     /// segment data can be replayed on crash recovery (C4-storage, D6).
+    /// Registers the segment's phantom metadata (sealed_at: None)
+    /// BEFORE its WAL entry is written. The WAL cleanup treats
+    /// unregistered ids as sweepable garbage, so an entry whose
+    /// registration lags would let the cleanup delete the file holding
+    /// the segment's early entries — corrupting crash recovery. With
+    /// the registration first, the cleanup can only ever see TRUE crash
+    /// phantoms (requests killed before any entry was written).
+    async fn register_phantom_before_wal(
+        &self,
+        segment_id: SegmentId,
+        tier: SizeTier,
+        registered: &mut std::collections::HashSet<SegmentId>,
+    ) -> Result<()> {
+        if !registered.insert(segment_id) {
+            return Ok(()); // already registered in this request
+        }
+        let (ec_k, ec_m, _strip) = match tier {
+            SizeTier::Small => self.segment_pool_small.ec_params(),
+            _ => self.segment_pool_standard.ec_params(),
+        };
+        self.metadata_store
+            .put_segment(oceanfs_core::SegmentMetadata {
+                segment_id,
+                ec_k,
+                ec_m,
+                size_tier: tier,
+                merkle_root: None,
+                storage_locations: smallvec::SmallVec::new(),
+                sealed_at: None,
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("phantom registration failed: {e}")))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn write_wal_entry(
         &self,

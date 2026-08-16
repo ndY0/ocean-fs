@@ -918,9 +918,55 @@ impl SegmentPool {
         }
     }
 
+    /// Seals a rebuilt segment that did not fill during replay (a
+    /// partial segment whose WAL entries ended with the crash). The
+    /// replay drains queued segments one at a time, sealing each to
+    /// free its slot — the pool's configured slot count never bounds
+    /// the replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfig`] when no slot holds the segment
+    /// (already sealed — a no-op success for filled segments) and
+    /// [`Error::WriteBackpressureTimeout`] when the seal queue cannot
+    /// accept the work within the deadline.
+    pub async fn seal_replayed_partial(&self, segment_id: SegmentId) -> Result<()> {
+        for slot in &self.slots {
+            let sealed = {
+                let mut guard = slot.state.lock();
+                let SlotState::Appending(segment) = &mut *guard else {
+                    continue;
+                };
+                if segment.id() != segment_id {
+                    continue;
+                }
+                // `seal` consumes the segment; take it out of the slot
+                // first (mirrors `transition_to_sealing`).
+                let current = std::mem::replace(&mut *guard, SlotState::Idle);
+                let SlotState::Appending(segment) = current else {
+                    unreachable!("state checked Appending above and the lock is held")
+                };
+                let sealed = segment.seal();
+                *guard = SlotState::Sealing(sealed.segment_id, sealed.data.clone());
+                Some(sealed)
+            };
+            if let Some(sealed) = sealed {
+                self.finish_seal_handoff_async(
+                    Some(sealed),
+                    std::time::Instant::now() + REPLAY_SEAL_ENQUEUE_DEADLINE,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+        // No slot holds the segment — it already filled and sealed
+        // during the rebuild (or is unknown). A no-op is correct.
+        Ok(())
+    }
+
     /// Returns the EC parameters carried by seal work items
     /// `(k, m, strip_size_bytes)`; all zero when EC is not configured.
-    fn ec_params(&self) -> (u8, u8, usize) {
+    pub fn ec_params(&self) -> (u8, u8, usize) {
         self.ec_config
             .as_ref()
             .map(|c| (c.data_shards, c.parity_shards, c.strip_size_bytes))
@@ -947,14 +993,20 @@ impl SegmentPool {
         };
         match self.seal_tx.try_send(work) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                // The segment was not enqueued for sealing; remove
-                // the sealing-data entry to avoid leaking the Bytes.
-                self.sealing_data.write().remove(&segment_id);
-                tracing::warn!(
-                    segment_id = %segment_id,
-                    "seal queue full; seal deferred, sealing-data entry removed"
-                );
+            Err(mpsc::error::TrySendError::Full(work)) => {
+                // NEVER drop a seal work item: a dropped seal leaves the
+                // segment registered-unsealed forever (its data only in
+                // the WAL) and pins the WAL files indefinitely. The
+                // sync path runs on blocking contexts (never a runtime
+                // worker), so blocking_send applies backpressure to the
+                // caller instead of losing the segment.
+                if let Err(e) = self.seal_tx.blocking_send(work) {
+                    tracing::warn!(
+                        segment_id = %segment_id,
+                        error = %e,
+                        "seal queue closed; seal work dropped on shutdown"
+                    );
+                }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.sealing_data.write().remove(&segment_id);

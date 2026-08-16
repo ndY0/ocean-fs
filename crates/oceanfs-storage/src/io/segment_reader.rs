@@ -150,7 +150,7 @@ pub struct DiskSegmentReader {
     /// size (the data section offset). Populated once per segment per
     /// process by [`verify_and_repair_segment`]; corrupt-but-repairable
     /// files are repaired on first touch.
-    verified_headers: Mutex<HashMap<SegmentId, usize>>,
+    verified_headers: Mutex<HashMap<SegmentId, (usize, u64)>>,
     /// Injected EC decoder for corruption repair (the node wires the
     /// AccelDispatcher; None falls back to the plain Cauchy codec).
     ec_decoder: Option<std::sync::Arc<dyn oceanfs_ec::Decoder>>,
@@ -208,9 +208,9 @@ impl DiskSegmentReader {
     /// corrupt stripes are repaired from the stored EC parity
     /// ([`verify_and_repair_segment`]). Subsequent reads skip the
     /// verification.
-    fn ensure_verified(&self, segment_id: SegmentId) -> std::result::Result<usize, String> {
-        if let Some(hdr_size) = self.verified_headers.lock().get(&segment_id).copied() {
-            return Ok(hdr_size);
+    fn ensure_verified(&self, segment_id: SegmentId) -> std::result::Result<(usize, u64), String> {
+        if let Some(cached) = self.verified_headers.lock().get(&segment_id).copied() {
+            return Ok(cached);
         }
         let path = self.segment_path(&segment_id);
         let repaired = crate::segment::repair::verify_and_repair_segment(
@@ -243,8 +243,9 @@ impl DiskSegmentReader {
         let header = crate::segment::header::SegmentHeader::from_bytes(&header_buf)
             .ok_or_else(|| format!("bad segment header for {segment_id}"))?;
         let hdr_size = header.serialized_size();
-        self.verified_headers.lock().insert(segment_id, hdr_size);
-        Ok(hdr_size)
+        let data_size = header.size;
+        self.verified_headers.lock().insert(segment_id, (hdr_size, data_size));
+        Ok((hdr_size, data_size))
     }
 
     /// Returns the filesystem path for a segment file.
@@ -265,7 +266,11 @@ impl SegmentReader for DiskSegmentReader {
         // First touch: verify integrity and learn the format version's
         // data offset (v1 = 76 bytes, v2 = 92 bytes). Blob offsets are
         // relative to the data region, AFTER the segment header.
-        let hdr_size = self.ensure_verified(*segment_id).map_err(|e| e.to_string())?;
+        let (hdr_size, data_size) = self.ensure_verified(*segment_id).map_err(|e| e.to_string())?;
+        // u32::MAX is the EC recovery's "whole segment" sentinel — the
+        // reader resolves it to the file's actual data size. Treating
+        // it literally would allocate/read 4 GiB from a small file.
+        let length = if length == u32::MAX { data_size as u32 } else { length };
         let file_offset = offset + hdr_size as u64;
 
         let (data, source) = match self.read_mode {

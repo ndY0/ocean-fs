@@ -9,6 +9,7 @@
 
 use std::collections::BTreeSet;
 
+use bytes::Bytes;
 use oceanfs_core::{SegmentId, SegmentSizeConfig, SizeTier, WalConfig};
 use tracing::{info, warn};
 
@@ -52,13 +53,68 @@ pub struct ReplaySummary {
     /// Maximum HLC logical counter observed across all replayed entries.
     pub max_hlc_logical: u32,
 }
+/// Byte bound for the replay queue's COMPLETE (filled) groups. The
+/// reader drains them through the pools once the bound is hit
+/// (backpressure), so the buffered transient stays bounded. Partial
+/// groups (below the fill target — their entries only end with the
+/// crash) are inherently bounded by the crash window and stay queued
+/// until the WAL is consumed.
+const REPLAY_QUEUE_BOUND: u64 = 64 * 1024 * 1024;
+
+/// One unsealed segment's WAL entries, grouped for sequential rebuild.
+struct QueuedSegment {
+    segment_id: SegmentId,
+    tier: SizeTier,
+    entries: Vec<Bytes>,
+    bytes: u64,
+    /// True when the stored bytes reached the tier's fill target — the
+    /// write path would have sealed it, so its entries are complete.
+    complete: bool,
+}
+
+/// The fill target for a tier (the write path seals at this size).
+fn fill_target(size_config: &SegmentSizeConfig, tier: SizeTier) -> u64 {
+    match tier {
+        SizeTier::Small => size_config.small_target_size,
+        SizeTier::Standard | SizeTier::Multi => size_config.default_target_size,
+        _ => size_config.default_target_size,
+    }
+}
+
+/// Rebuilds one queued segment into its pool and seals it: appends the
+/// grouped entries in WAL order (exact offset reconstruction), lets the
+/// fill-triggered seal fire for filled segments, and force-seals
+/// partial ones so the slot frees — the pool's configured slot count
+/// never bounds the replay.
+async fn replay_queued_segment(
+    group: QueuedSegment,
+    segment_pool_small: &SegmentPool,
+    segment_pool_standard: &SegmentPool,
+) -> Result<()> {
+    let (pool, tier) = match group.tier {
+        SizeTier::Small => (segment_pool_small, SizeTier::Small),
+        SizeTier::Standard | SizeTier::Multi => (segment_pool_standard, SizeTier::Standard),
+        _ => return Ok(()), // inline tier never reaches the pools
+    };
+    for data in &group.entries {
+        pool.append_replayed(group.segment_id, data).await?;
+    }
+    // If the segment did not fill, seal it now to free the slot. Filled
+    // segments already left the slot via the fill-triggered seal — this
+    // is a no-op for them.
+    pool.seal_replayed_partial(group.segment_id).await?;
+    let _ = tier;
+    Ok(())
+}
+
 /// Replays all WAL entries into active segments and truncates the WAL afterward.
 ///
 /// This function is called during node startup before the HTTP server
-/// binds. It reads every WAL file, deserializes each entry, appends the
-/// inline data into the appropriate tier's [`crate::segment::SegmentPool`], tracks the
-/// maximum HLC timestamp, and truncates the WAL to prevent double-replay
-/// on a subsequent restart.
+/// binds. It reads every WAL file, deserializes each entry, groups the
+/// unsealed entries by segment, rebuilds each segment sequentially
+/// (sealing it on completion — the pool's configured slot count never
+/// bounds recovery), tracks the maximum HLC timestamp, and truncates
+/// the WAL to prevent double-replay on a subsequent restart.
 ///
 /// Inline-tier entries (≤4 KB) are skipped during replay — they are
 /// stored directly in RocksDB metadata, not in active segments.
@@ -83,6 +139,16 @@ pub async fn replay_wal(
     let mut segments_seen: BTreeSet<SegmentId> = BTreeSet::new();
     let mut max_hlc_wall_time: u64 = 0;
     let mut max_hlc_logical: u32 = 0;
+
+    // The replay queue: unsealed entries grouped by segment, rebuilt
+    // sequentially with one pool slot. The pool's configured slot count
+    // is a WRITE-PATH tuning knob and must never bound recovery — the
+    // WAL can describe more distinct unsealed segments than slots
+    // (seal-transit recycling, compression, crash timing), and the old
+    // "same slot count" assumption failed startup under load.
+    let mut queue: Vec<QueuedSegment> = Vec::new();
+    let mut index: std::collections::HashMap<SegmentId, usize> = std::collections::HashMap::new();
+    let mut queued_complete_bytes: u64 = 0;
 
     for entry_result in reader.replay() {
         let entry = entry_result?;
@@ -112,21 +178,11 @@ pub async fn replay_wal(
             max_hlc_logical = entry.hlc_logical;
         }
 
-        // Reconstruct the active segment: route by blob size tier.
-        //
-        // The rebuilt segment keeps the entry's **original** segment id
-        // (`append_replayed`): object metadata committed before the
-        // crash references that id, and the pool fallback reader looks
-        // it up on the read path. Appending under a fresh id would leave
-        // every replayed object pointing at a segment that can never be
-        // found (data loss on every crash with unsealed segments).
-        // Route by the entry's POOL TIER when available (v1): the write
-        // path records the destination pool (0 = small, 1 = standard)
+        // Route by the entry's POOL TIER when available: the write path
+        // records the destination pool (0 = small, 1 = standard)
         // because size classification is ambiguous for compressed
         // chunks — a 4 MiB logical chunk is a Small-tier object OR a
         // Multi-tier piece, and the latter lives in the STANDARD pool.
-        // v0 entries (tier = 0) fall back to size classification, which
-        // is exact for their uncompressed data.
         let tier = match entry.tier {
             0 => SizeTier::Small,
             1 => SizeTier::Standard,
@@ -138,21 +194,65 @@ pub async fn replay_wal(
                 size_config.classify(entry.length as u64)
             }
         };
-        match tier {
-            SizeTier::Small => {
-                segment_pool_small.append_replayed(entry.segment_id(), &entry.data).await?;
-            }
-            SizeTier::Standard | SizeTier::Multi => {
-                segment_pool_standard.append_replayed(entry.segment_id(), &entry.data).await?;
-            }
-            SizeTier::Inline => {
-                // Inline blobs are stored directly in RocksDB metadata
-                // and do not go through the segment pipeline.
-            }
-            _ => {
-                warn!(tier = ?tier, "unexpected tier during WAL replay; skipping entry");
-            }
+        if tier == SizeTier::Inline {
+            // Inline blobs are stored directly in RocksDB metadata and
+            // do not go through the segment pipeline.
+            continue;
         }
+
+        // Append the entry to its segment's group.
+        let id = entry.segment_id();
+        let idx = match index.get(&id) {
+            Some(&i) => i,
+            None => {
+                index.insert(id, queue.len());
+                queue.push(QueuedSegment {
+                    segment_id: id,
+                    tier,
+                    entries: Vec::new(),
+                    bytes: 0,
+                    complete: false,
+                });
+                queue.len() - 1
+            }
+        };
+        let group = &mut queue[idx];
+        group.entries.push(entry.data);
+        group.bytes += entry.length as u64;
+        if !group.complete && group.bytes >= fill_target(size_config, group.tier) {
+            // The segment filled — the write path would have sealed it,
+            // so no more entries for it exist in the WAL. Sealable.
+            group.complete = true;
+            queued_complete_bytes += group.bytes;
+        }
+
+        // Backpressure: once the buffered COMPLETE groups exceed the
+        // bound, drain them through the pools (one slot at a time) and
+        // resume reading. Partial groups stay queued — they are the
+        // crash window's residue and are inherently small.
+        if queued_complete_bytes >= REPLAY_QUEUE_BOUND {
+            let mut remaining = Vec::with_capacity(queue.len());
+            for group in queue.drain(..) {
+                if group.complete {
+                    replay_queued_segment(group, segment_pool_small, segment_pool_standard).await?;
+                } else {
+                    remaining.push(group);
+                }
+            }
+            queue = remaining;
+            index.clear();
+            for (i, group) in queue.iter().enumerate() {
+                index.insert(group.segment_id, i);
+            }
+            queued_complete_bytes = 0;
+        }
+    }
+
+    // Finalize: rebuild + seal every queued segment (complete and
+    // partial), sequentially — one slot, then the WAL is fully
+    // consumed and every rebuilt segment is durable.
+    for group in queue.drain(..) {
+        replay_queued_segment(group, segment_pool_small, segment_pool_standard).await?;
     }
 
     tracing::info!(
@@ -203,7 +303,9 @@ pub async fn replay_wal(
 /// freely. Entries for segments that are **not registered in the
 /// metadata store at all** are unreachable garbage (a phantom whose
 /// `put_segment` never landed — crash window — or a segment deleted
-/// without a marker); they do not protect their file.
+/// without a marker); they do not protect their file. The write path
+/// registers the phantom BEFORE the WAL entry, so the unregistered case
+/// can only be a true crash phantom — no timing heuristic needed.
 pub async fn cleanup_old_wal_files(
     config: &WalConfig,
     keep: usize,
@@ -344,7 +446,10 @@ fn file_contains_live_entries(
                     // No CF entry: either the registration never landed
                     // (crash-window phantom) or the segment was deleted
                     // without a marker (unsealed deletion). Either way
-                    // the entries are unreachable — sweepable.
+                    // the entries are unreachable — sweepable. (The
+                    // write path registers the phantom BEFORE the WAL
+                    // entry, so no in-flight segment can look
+                    // unregistered.)
                 }
                 Err(e) => {
                     // DB read failure: we cannot prove the segment is
@@ -1005,12 +1110,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_wal_reconstructed_data_is_readable_via_pool() {
+    async fn replay_wal_seals_rebuilt_segments_and_enqueues_seal_work() {
         let (wal_config, size_config, buffer_pool, _dir) = make_test_env().await;
         let seg_id = SegmentId::new();
         let blob_len: u32 = 5000; // 5 KB → Small tier, not inline
 
-        // Write 8 entries to the WAL (2× the pool size so round-robin wraps).
+        // Write 8 entries to the WAL (one segment, partial — below the
+        // small fill target).
         {
             let writer = WalWriter::open(&wal_config).await.unwrap();
             for i in 0..8 {
@@ -1031,17 +1137,70 @@ mod tests {
         assert_eq!(summary.entries_replayed, 8);
         assert_eq!(summary.bytes_replayed, 40000);
 
-        // With 8 entries and 4 pool slots (round-robin), each slot
-        // received 2 entries = 10000 bytes. Append one more blob —
-        // it lands in the same slot as entry 0/4/8. The offset should
-        // be ≥ 10000 (the cumulative size of the first 2 entries in
-        // that slot).
-        let new_data = vec![0xCCu8; 200];
-        let (_seg_id, offset, _len) = pool_small.append(&new_data).unwrap();
+        // The rebuilt (partial) segment is SEALED by the replay — the
+        // seal work item is enqueued with the full rebuilt data (the
+        // WAL-bridged commit completes at startup; the data is durable,
+        // not merely resident in a pool slot).
+        let mut rx = pool_small.take_seal_rx().expect("seal receiver");
+        let work = rx.try_recv().expect("rebuilt segment must be enqueued for sealing");
+        assert_eq!(work.segment_id, seg_id, "seal work must carry the rebuilt segment id");
+        assert_eq!(work.segment_data.len(), 40000, "seal work carries the full rebuilt data");
+        // The segment's data remains readable through the Sealing
+        // read window until the seal worker persists it to disk
+        // (ADR-0021) — the replay did not discard it.
         assert!(
-            offset >= 10000,
-            "after replay of 8×5000 bytes (2 per slot), next append offset {offset} \
-             should be ≥ 10000 (replayed data not present in active segment)"
+            pool_small.try_read(seg_id, 0, 5000).is_some(),
+            "sealed segment's data must remain readable via the read window"
         );
+    }
+
+    #[tokio::test]
+    async fn replay_wal_handles_more_distinct_segments_than_slots() {
+        // Regression (phase-2 SUT startup failure): a crash can leave
+        // MORE distinct unsealed segments than the pool has slots
+        // (seal-transit recycling + crash timing). The old replay bound
+        // recovery to the pool's WRITE-PATH slot count and failed
+        // startup with "no pool slot available". The queued replay must
+        // rebuild and seal every segment sequentially, one slot at a
+        // time.
+        let (wal_config, size_config, buffer_pool, _dir) = make_test_env().await;
+        let blob_len: u32 = 5000;
+        let mut ids = Vec::new();
+        {
+            let writer = WalWriter::open(&wal_config).await.unwrap();
+            // 8 distinct small segments (the pool has 4 slots) with
+            // interleaved entries, each below the fill target.
+            for i in 0..8 {
+                let id = SegmentId::new();
+                ids.push(id);
+                for j in 0..3 {
+                    let entry = make_entry(id, j as u64 * blob_len as u64, blob_len);
+                    writer.append(entry).await.unwrap();
+                }
+            }
+        }
+
+        let wal_writer = WalWriter::open(&wal_config).await.unwrap();
+        let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
+        let summary =
+            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| {
+                false
+            })
+            .await
+            .unwrap();
+        assert_eq!(summary.entries_replayed, 24);
+        assert_eq!(summary.segments_seen.len(), 8, "all 8 distinct segments must be rebuilt");
+
+        // Every rebuilt segment's seal work is enqueued (the replay
+        // sealed each one to free its slot).
+        let mut rx = pool_small.take_seal_rx().expect("seal receiver");
+        let mut sealed: std::collections::HashSet<SegmentId> = std::collections::HashSet::new();
+        while let Ok(work) = rx.try_recv() {
+            sealed.insert(work.segment_id);
+        }
+        for id in &ids {
+            assert!(sealed.contains(id), "segment {id} must be sealed by the replay");
+        }
+        assert_eq!(sealed.len(), 8, "every distinct segment must be sealed exactly once");
     }
 }
