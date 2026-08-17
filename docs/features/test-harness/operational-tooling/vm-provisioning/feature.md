@@ -14,6 +14,14 @@ updated: 2026-08-16
 
 # VM Provisioning — Two-VM Cloud Lifecycle with Cost Guardrails
 
+> **Deviation (2026-08-17):** The VM size mapping and confirmation gate in
+> this feature doc are superseded. Phase 2 now provisions **SUT=CX33**
+> (8 GB) + Harness=CX23 — the deploy profile targets the 8 GB CX33 and the
+> CX23 OOM-kills mid-run (see ADR-0019 Corrigendum 2). The size-based
+> **confirmation gate is removed** (CX33 is the standard sizing for phases
+> 2-4; `--confirm yes` is accepted but is a no-op). The script is the
+> authoritative mapping.
+
 ## Summary
 
 Create `scripts/vm-provision.sh` to provision **two VMs** (SUT + Harness) sized

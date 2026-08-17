@@ -58,7 +58,7 @@ two-VM cloud topology:
 | Phase | SUT VM | Harness VM | Mode |
 |---|---|---|---|
 | Phase 1 | None (CI runner) | None (CI runner) | Local spawn in CI |
-| Phase 2 | CX23 (2 vCPU, 4 GB) | CX23 (2 vCPU, 4 GB) | Remote target (`TARGET_HOST`) |
+| Phase 2 | CX33 (4 vCPU, 8 GB) — per ADR-0019 Corrigendum 2 | CX23 (2 vCPU, 4 GB) | Remote target (`TARGET_HOST`) |
 | Phase 3-4 | CX33 (4 vCPU, 8 GB) | CX23 (2 vCPU, 4 GB) | Remote target (`TARGET_HOSTS`) |
 
 ---

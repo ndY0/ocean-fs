@@ -12,13 +12,21 @@
 #
 # VM Size Mapping (per phase):
 #   Phase 1: N/A (runs in CI, no cloud VMs needed)
-#   Phase 2: SUT=CX23 (2 vCPU, 4 GB, 40 GB), Harness=CX23 (2 vCPU, 4 GB, 40 GB)
+#   Phase 2: SUT=CX33 (4 vCPU, 8 GB, 80 GB), Harness=CX23 (2 vCPU, 4 GB, 40 GB)
+#            (SUT is CX33, not CX23: the load-test deploy profile in
+#            sut-deploy.sh targets the 8 GB CX33 — generous caches, 16 MiB
+#            bodies — so CPU (hashing, EC encode) is the bottleneck; on a
+#            4 GB CX23 that profile OOM-kills the SUT mid-run. See commits
+#            7e4c3b4 and 5e7aa70.)
 #   Phase 3-4: SUT=CX33 (4 vCPU, 8 GB, 80 GB), Harness=CX23 (2 vCPU, 4 GB, 40 GB)
 #   Phase 5+: N/A (separate provisioning model)
 #
 # Guardrails (four-layer defense per ADR-0019):
 #   Layer 1 — Hard VM size cap: MAX_AGENT_VM_TYPE="cx33"
-#   Layer 2 — Confirmation gate: CX23 auto-approved; CX33 requires --confirm yes
+#   Layer 2 — Confirmation gate: REMOVED (2026-08-17) — CX33 is the standard
+#             sizing for phases 2-4, so no size-based confirmation is required.
+#             The --confirm flag is still accepted for compatibility but is a
+#             no-op (see check_confirmation_gate).
 #   Layer 3 — Auto-shutdown TTL: systemd timer on each VM (default 4h)
 #   Layer 4 — Budget gate: scaffolding (deferrable/v2)
 # Security: Hetzner VMs ship with NO firewall — managed firewalls are
@@ -152,15 +160,6 @@ vm_type_lte() {
     [ "$rank_a" -le "$rank_b" ]
 }
 
-# Check if VM type requires confirmation (>= CX33)
-vm_type_needs_confirm() {
-    local type="${1,,}"
-    if vm_type_lte "$type" "cx23"; then
-        return 1  # CX23 or smaller: no confirm
-    fi
-    return 0  # CX33 or larger: needs confirm
-}
-
 # Get VM type cost per hour
 vm_hourly_cost() {
     local type="${1,,}"
@@ -180,7 +179,8 @@ resolve_phase() {
             HARNESS_TYPE=""
             ;;
         2)
-            SUT_TYPE="cx23"
+            # SUT is CX33 (8 GB) — the deploy profile targets it; CX23 OOMs.
+            SUT_TYPE="cx33"
             HARNESS_TYPE="cx23"
             ;;
         3|4)
@@ -229,7 +229,9 @@ check_hard_cap() {
     fi
 }
 
-# Layer 2: Size-based confirmation gate
+# Layer 2: Size-based confirmation gate (REMOVED — CX33 is the standard
+# sizing for phases 2-4, so no confirmation is required. Kept as a no-op
+# so `--confirm yes` in existing invocations keeps working.)
 check_confirmation_gate() {
     local type="${1,,}"
     local phase="${2:-}"
@@ -238,30 +240,8 @@ check_confirmation_gate() {
         return 0
     fi
 
-    if vm_type_needs_confirm "$type"; then
-        local hourly
-        hourly=$(vm_hourly_cost "$type")
-        local daily
-        daily=$(echo "scale=2; $hourly * 24" | bc 2>/dev/null || echo "unknown")
-        # Ensure leading zero for values like ".72"
-        if [[ "$daily" =~ ^\. ]]; then
-            daily="0${daily}"
-        fi
-
-        if [ "$CONFIRM" != "yes" ]; then
-            cat >&2 <<MSG
-
-This phase (${phase}) provisions a ${type} VM (~€${hourly}/hour, ~€${daily}/day).
-Re-run with --confirm yes to proceed.
-MSG
-            exit 1
-        fi
-        log_info "Confirmation gate: CX33 confirmed with --confirm yes."
-    fi
-
-    # CX23 with --confirm yes: accepted but note it wasn't required
-    if [ "$CONFIRM" == "yes" ] && ! vm_type_needs_confirm "$type"; then
-        log_info "Note: --confirm yes provided but not required for ${type} (CX23 is auto-approved)."
+    if [ "$CONFIRM" == "yes" ]; then
+        log_info "Note: --confirm yes is no longer required (confirmation gate removed — CX33 is the standard sizing)."
     fi
 }
 
@@ -914,7 +894,7 @@ provision_vms() {
     # Single-VM mode: warn for Phase 3-4
     if [ "$SINGLE_VM" = true ]; then
         if [ "$PHASE" = "2" ]; then
-            log_info "Single-VM mode: co-locating SUT + Harness on one CX23."
+            log_info "Single-VM mode: co-locating SUT + Harness on one CX33."
             log_info "Reports will be written to /tmp (tmpfs) to avoid disk I/O contention."
         elif [ "$PHASE" = "3" ] || [ "$PHASE" = "4" ]; then
             cat >&2 <<'WARNING'
@@ -1081,7 +1061,7 @@ Provision two VMs (SUT + Harness) for OceanFS load testing per ADR-0019.
 OPTIONS:
   --phase N            Load test phase (1-6). Determines VM sizes. [required]
                        Phase 1: N/A (runs in CI, no cloud VMs)
-                       Phase 2: SUT=CX23, Harness=CX23
+                       Phase 2: SUT=CX33, Harness=CX23
                        Phase 3-4: SUT=CX33, Harness=CX23
                        Phase 5+: N/A (separate provisioning model)
   --provider NAME      Cloud provider: hetzner (default), gcp, aws
@@ -1094,7 +1074,7 @@ OPTIONS:
   --image IMAGE        OS image (default: ubuntu-24.04)
   --single-vm          Co-locate SUT+Harness on single VM
                        (Phase 2 only; Phase 3-4 prints warning per ADR-0019)
-  --confirm yes        Required for VM types >= CX33 (confirmation gate)
+  --confirm yes        Accepted for compatibility; no-op (confirmation gate removed)
   --ttl HOURS          Auto-shutdown TTL (default: 4, or LOAD_TEST_TTL_HOURS)
   --dry-run            Print actions without executing
   --debug              Enable shell tracing (set -x) for full visibility
@@ -1122,7 +1102,7 @@ Environment Variables:
 
 Guardrails:
   - Hard VM size cap: VMs >= CX43 require manual provisioning
-  - Confirmation gate: CX33 requires --confirm yes (CX23 auto-approved)
+  - Confirmation gate: removed (CX33 is the standard sizing for phases 2-4)
   - Auto-shutdown TTL: systemd timer powers off VMs after TTL expires
   - Budget gate: optional LOAD_TEST_MAX_MONTHLY_EUR scaffolding
 
@@ -1130,7 +1110,7 @@ Output: JSON with sut + harness VM objects on stdout.
 
 Examples:
   vm-provision.sh --phase 2 --branch feature/test
-  vm-provision.sh --phase 3 --confirm yes
+  vm-provision.sh --phase 3
   vm-provision.sh --phase 1
   vm-provision.sh --destroy oceanfs-loadtest-2
   vm-provision.sh --status oceanfs-loadtest-2
@@ -1334,7 +1314,7 @@ main() {
             "Extensibility for gcp/aws is planned but not implemented."
     fi
 
-    # Guardrails (must run before provisioning prerequisites — confirmation gate
+    # Guardrails (must run before provisioning prerequisites; hard size cap
     # should fire even if SSH keys aren't set up yet)
     run_guardrails
 

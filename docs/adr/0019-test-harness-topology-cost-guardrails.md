@@ -11,6 +11,18 @@
 > script as the authoritative mapping. The ADR's decisions (two-VM topology,
 > four-layer cost guardrails, network analysis) are unchanged.
 
+> **Corrigendum 2 (2026-08-17): Phase 2 SUT sizing is CX33 (8 GB), not the
+> original ADR table's CX23.** The load-test deploy profile
+> (`scripts/sut-deploy.sh`) targets the 8 GB CX33 (generous caches, 16 MiB
+> bodies — restored in commit `5e7aa70`) so CPU (hashing, EC encode) is the
+> intended bottleneck; on a 4 GB CX23 that profile OOM-kills the SUT mid-run
+> (see commit `7e4c3b4`). `scripts/vm-provision.sh` therefore maps phase 2 to
+> **SUT=CX33 + Harness=CX23** (same as phases 3-4). Because CX33 is now the
+> standard sizing for phases 2-4, the size-based **confirmation gate is
+> removed** — `--confirm yes` is accepted for compatibility but is a no-op.
+> This is a deliberate sizing deviation from the original ADR table; the
+> remaining guardrails (hard size cap, TTL, budget gate) are unchanged.
+
 ---
 
 ## Context
@@ -137,7 +149,7 @@ free, uncapped, and sub-millisecond latency.
 | Phase | SUT VM | Harness VM | Rationale |
 |---|---|---|---|
 | **Phase 1** | None (CI runner) | None (CI runner) | Phase 1 runs entirely in CI. TSAN + concurrency test fits in <2 minutes on a single CI runner. No cloud VMs needed. |
-| **Phase 2** | CX22 (2 vCPU, 4 GB) | CX22 (2 vCPU, 4 GB) | Single OceanFS node + Prometheus. Sustained 30-60 min. Harness on separate VM for clean resource measurements. |
+| **Phase 2** | CX33 (4 vCPU, 8 GB) — see Corrigendum 2 | CX23 (2 vCPU, 4 GB) | Single OceanFS node + Prometheus. Sustained 30-60 min. Harness on separate VM for clean resource measurements. SUT is the 8 GB CX33: the deploy profile targets it (CPU — hashing, EC encode — is the bottleneck); the 4 GB CX23 OOM-kills mid-run. |
 | **Phase 3** | CX32 (4 vCPU, 8 GB) | CX22 (2 vCPU, 4 GB) | 3-5 OceanFS processes + Prometheus need 4 vCPU. Harness stays on CX22 (load generation is not the bottleneck). |
 | **Phase 4** | CX32 (4 vCPU, 8 GB) | CX22 (2 vCPU, 4 GB) | Same as Phase 3 plus failure injection overhead. SUT VM needs headroom for `tc netem`, disk fill, node kill/restart. |
 | **Phase 5** | Fleet (TBD) | CX32+ (dedicated loadgen) | Separate operational model; not covered by this ADR. Phase 5 was already scoped as a remote-targeting loadgen binary in the brainstorm documents. |
@@ -178,7 +190,12 @@ Any `--phase` or explicit `--type` that maps to a VM larger than CX32 is
 Currently all phases 1-4 max out at CX32, so this is a safety net for future
 VM type additions. Phase 5 and beyond use a separate provisioning model.
 
-#### Layer 2: Size-Based Confirmation Gate
+#### Layer 2: Size-Based Confirmation Gate (removed 2026-08-17)
+
+> **Removed:** CX33 is now the standard sizing for phases 2-4 (see
+> Corrigendum 2), so the size-based confirmation gate no longer applies.
+> `--confirm yes` is still accepted by the script for compatibility but is a
+> no-op. The original table is retained below for history.
 
 | VM Type | Phase(s) | Agent Can Provision? | Rule |
 |---|---|---|---|

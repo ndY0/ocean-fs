@@ -16,6 +16,11 @@ updated: 2026-08-16
 
 # VM Skills — Agent Commands for Two-VM Lifecycle Management
 
+> **Deviation (2026-08-17):** the `confirm` gate described below is removed —
+> CX33 is the standard sizing for phases 2-4 and `--confirm yes` is a no-op
+> (see ADR-0019 Corrigendum 2). DoD items referencing the gate reflect the
+> state at implementation time.
+
 ## Summary
 
 Create four OpenCode skills under `.opencode/skills/` that agents use to
@@ -54,13 +59,13 @@ design. Source of truth per skill:
 #### `vm-up` (`.opencode/skills/vm-up/SKILL.md`)
 - Idempotency: `vm-provision.sh --status <prefix>` first; if both VMs are
   running, return the existing record instead of re-provisioning
-- Invoke `scripts/vm-provision.sh --phase {phase} --branch {branch} [--name PREFIX] [--commit SHA] [--ssh-key PATH] [--single-vm] [--ttl N] [--confirm yes]`
+- Invoke `scripts/vm-provision.sh --phase {phase} --branch {branch} [--name PREFIX] [--commit SHA] [--ssh-key PATH] [--single-vm] [--ttl N]`
 - Accepts: `phase` (required, 2-4; Phase 1 → "runs in CI" message; 5+ →
   separate-model guidance), `branch` (default main), `commit`, `name`
   (default `oceanfs-loadtest-{phase}`), `ssh-key` (default
   `~/.ssh/id_rsa.pub`), `single-vm`, `ttl` (default 4h),
-  `confirm` (auto-passed for phases 3-4, since the agent intends to
-  provision)
+  `confirm` (accepted for compatibility; no-op — gate removed 2026-08-17,
+  CX33 is the standard sizing for phases 2-4)
 - The script writes the provisioning record
   `.hetzner/provision-<prefix>.json` (gitignored) — the source of truth
   for every later skill

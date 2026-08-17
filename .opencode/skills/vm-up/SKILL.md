@@ -16,18 +16,27 @@ never bypasses them.
 
 | Parameter | Meaning | Default |
 |---|---|---|
-| `phase` | Load-test phase: 2 (CX23+CX23), 3-4 (CX33+CX23) | required |
+| `phase` | Load-test phase: 2 (SUT=CX33, Harness=CX23), 3-4 (SUT=CX33, Harness=CX23) | required |
 | `branch` | Git branch cloned on the Harness | `main` |
 | `commit` | Optional exact commit to check out | none |
 | `name` | VM name prefix | `oceanfs-loadtest-{phase}` |
-| `single-vm` | Budget mode: co-locate harness+SUT on one VM (Phase 2 only) | off |
+| `single-vm` | Budget mode: co-locate harness+SUT on one VM (Phase 2 only; SUT size CX33) | off |
 | `ttl` | Auto-shutdown TTL in hours | 4 (`LOAD_TEST_TTL_HOURS`) |
-| `confirm` | Confirmation for CX33+ | auto-pass `yes` for phases 3-4 |
+| `confirm` | Accepted for compatibility; no-op (gate removed 2026-08-17) | — |
 | `ssh-key` | SSH public key path for the VMs | `.hetzner/.ssh/hetzner-ssh.pub` (loaded into the agent by `scripts/lib/env-hetzner.sh`); fallback `~/.ssh/id_rsa.pub` |
 
 Phase 1 runs in CI — no VMs: `vm-provision.sh --phase 1` prints
 "Phase 1 runs in CI, no cloud VMs needed". Phases 5+ use a separate
 provisioning model (the script prints guidance).
+
+**Phase 2 sizing — SUT is CX33 (8 GB), not CX23.** The load-test deploy
+profile (`scripts/sut-deploy.sh`) targets the 8 GB CX33 (generous caches,
+16 MiB bodies — restored in commit `5e7aa70`) so CPU (hashing, EC encode)
+is the intended bottleneck; on a 4 GB CX23 that profile OOM-kills the SUT
+mid-run (see commit `7e4c3b4`). `vm-provision.sh` maps phase 2 to
+SUT=CX33 + Harness=CX23 (same as phases 3-4), so a plain `--phase 2`
+provisions the correct sizes. No confirmation gate applies (removed
+2026-08-17, ADR-0019 Corrigendum 2).
 
 ## Prerequisites
 
@@ -52,25 +61,17 @@ provisioning model (the script prints guidance).
 2. **Provision:**
 
    ```bash
-   # Phases 3-4 require the confirmation gate: set CONFIRM=yes so the
-   # script receives --confirm yes (the agent intends to provision).
-   CONFIRM=""
-   if [ "$PHASE" = "3" ] || [ "$PHASE" = "4" ]; then
-       CONFIRM="yes"
-   fi
-
    ./scripts/vm-provision.sh --phase "${PHASE}" \
      --branch "${BRANCH:-main}" \
      ${COMMIT:+--commit "$COMMIT"} \
      ${NAME:+--name "$NAME"} \
      ${SSH_KEY:+--ssh-key "$SSH_KEY"} \
      ${SINGLE_VM:+--single-vm} \
-     ${TTL:+--ttl "$TTL"} \
-     ${CONFIRM:+--confirm yes}
+     ${TTL:+--ttl "$TTL"}
    ```
 
-   - Always pass `--confirm yes` for phases 3-4 (the agent intends to
-     provision; the script prints the cost estimate with the confirmation).
+   - No confirmation gate: CX33 is the standard sizing for phases 2-4
+     (ADR-0019 Corrigendum 2); `--confirm yes` is accepted but not needed.
    - The script installs the TTL timer on both VMs, applies managed
      firewalls (SUT: SSH + internal-net :9000/:9001; Harness: SSH only),
      configures the Harness (Rust toolchain, repo clone at `branch`/
