@@ -121,7 +121,14 @@ impl oceanfs_storage_api::MetadataStore for PrefetchStoreAdapter {
             match op {
                 oceanfs_storage_api::BatchOp::PutSegment(meta) => self.put_segment(meta)?,
                 oceanfs_storage_api::BatchOp::DeleteSegment(id) => self.delete_segment(id)?,
-                oceanfs_storage_api::BatchOp::PutObject(_, _) => {}
+                oceanfs_storage_api::BatchOp::PutObject(bucket, key, meta) => {
+                    // The adapter's put_object writes with the caller's
+                    // bucket; replicate that here for the rewritten object.
+                    self.store
+                        .put_object_in_bucket(&bucket, meta)
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    let _ = key;
+                }
                 oceanfs_storage_api::BatchOp::DeleteObject(_, _) => {}
                 oceanfs_storage_api::BatchOp::PutTombstone(_, _, _) => {}
                 oceanfs_storage_api::BatchOp::DeleteTombstone(bucket, key) => {

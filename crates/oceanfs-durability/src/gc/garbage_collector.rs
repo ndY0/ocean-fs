@@ -38,7 +38,8 @@ pub struct GarbageCollector {
     dead_bytes_total: Counter,
 }
 
-type TombstoneResult = Result<(HashSet<String>, HashMap<SegmentId, Vec<(BucketId, ObjectKey)>>)>;
+type TombstoneResult =
+    Result<(HashSet<(String, String)>, HashMap<SegmentId, Vec<(BucketId, ObjectKey)>>)>;
 
 impl GarbageCollector {
     /// Creates a new garbage collector with unregistered counters.
@@ -297,16 +298,20 @@ impl GarbageCollector {
         }
 
         // Phase 1: Collect eligible tombstone keys (past TTL).
-        // Build a set of object keys whose tombstones have expired.
-        let bucket = oceanfs_core::BucketId::new("default");
-        let tombstones = metadata.list_tombstones(&bucket);
-        let mut eligible_keys: HashSet<String> = HashSet::new();
+        // Build a set of (bucket, object key) pairs whose tombstones have
+        // expired. Tombstones are scanned across ALL buckets — restricting
+        // the scan to "default" (the historical behaviour) hid every
+        // deletion in other buckets, so GC never detected dead bytes for
+        // those buckets' segments and compaction never ran for them.
+        let tombstones = metadata.list_tombstones_all();
+        let mut eligible_keys: HashSet<(String, String)> = HashSet::new();
 
         for tomb_result in tombstones {
             match tomb_result {
-                Ok((key, tombstone)) => {
+                Ok((bucket, key, tombstone)) => {
                     if now_ms - tombstone.deletion_time > ttl_ms {
-                        eligible_keys.insert(key.as_str().to_string());
+                        eligible_keys
+                            .insert((bucket.as_str().to_string(), key.as_str().to_string()));
                     }
                 }
                 Err(e) => {
@@ -320,16 +325,22 @@ impl GarbageCollector {
         }
 
         // Phase 2: Scan objects to accumulate live/dead bytes per segment.
-        // Objects whose key is in the eligible set → mark their chunks as dead.
-        // All other objects → add their chunks as live bytes.
-        // Also track which (bucket, object_key) pairs belong to which segment
-        // so that tombstones can be deleted after compaction.
-        let all_objects = metadata.list_objects(&bucket, "");
+        // Objects whose (bucket, key) is in the eligible set → mark their
+        // chunks as dead. All other objects → add their chunks as live
+        // bytes. Objects are scanned across ALL buckets (the bucket is
+        // decoded from the store key) so tombstones in any bucket match
+        // their owning objects.
+        // Also track which (bucket, object_key) pairs belong to which
+        // segment so that tombstones can be deleted after compaction.
+        let all_objects = metadata.list_objects_all_with_bucket();
         let mut tombstone_keys_by_segment: HashMap<SegmentId, Vec<(BucketId, ObjectKey)>> =
             HashMap::new();
 
-        for obj in all_objects.into_iter().flatten() {
-            if eligible_keys.contains(obj.object_key.as_str()) {
+        for obj_result in all_objects {
+            let Ok((bucket, obj)) = obj_result else { continue };
+            if eligible_keys
+                .contains(&(bucket.as_str().to_string(), obj.object_key.as_str().to_string()))
+            {
                 for chunk in &obj.chunks {
                     tracker.mark_dead(chunk);
                     tombstone_keys_by_segment

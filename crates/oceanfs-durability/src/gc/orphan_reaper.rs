@@ -812,7 +812,7 @@ mod tests {
         let (dead_keys, _) = gc.process_tombstones(&metadata, &mut tracker, &mut stats).unwrap();
 
         // The tombstone is within TTL, so it should NOT be in the dead set
-        assert!(!dead_keys.contains("recently_deleted.txt"));
+        assert!(!dead_keys.contains(&("default".to_string(), "recently_deleted.txt".to_string())));
         // And the chunk should NOT be marked dead
         assert_eq!(tracker.dead_bytes_for(&seg_id), 0);
     }

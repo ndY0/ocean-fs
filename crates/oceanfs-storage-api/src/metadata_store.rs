@@ -19,7 +19,13 @@ use oceanfs_core::{
 #[derive(Debug, Clone)]
 pub enum BatchOp {
     /// Put an object metadata entry.
-    PutObject(ObjectKey, ObjectMetadata),
+    ///
+    /// The bucket is carried explicitly: object keys are only unique
+    /// within a bucket, and the store encodes the bucket into the key.
+    /// (Previously the bucket was implicit "default", which silently
+    /// moved every non-default-bucket object to the default bucket on
+    /// rewrite — e.g. during GC compaction repacking.)
+    PutObject(BucketId, ObjectKey, ObjectMetadata),
     /// Delete an object.
     DeleteObject(BucketId, ObjectKey),
     /// Put a tombstone.
@@ -118,6 +124,20 @@ pub trait MetadataStore: Send + Sync {
         Vec::new()
     }
 
+    /// Lists object metadata for **every** object across all buckets,
+    /// carrying each object's owning bucket.
+    ///
+    /// The bucket is not part of [`ObjectMetadata`] — it lives in the
+    /// store's key. GC liveness tracking needs it to match tombstones
+    /// against objects per-bucket (the same object key may exist in
+    /// multiple buckets), so this method decodes it from the key.
+    ///
+    /// The default implementation returns an empty list; stores that
+    /// support cross-bucket scans override it.
+    fn list_objects_all_with_bucket(&self) -> Vec<std::io::Result<(BucketId, ObjectMetadata)>> {
+        Vec::new()
+    }
+
     /// Retrieves segment metadata for a given segment ID.
     ///
     /// Returns `Ok(None)` if the segment does not exist.
@@ -144,6 +164,21 @@ pub trait MetadataStore: Send + Sync {
     ///
     /// Each element is a Result. Used by GC to find expired deletion markers.
     fn list_tombstones(&self, bucket: &BucketId) -> Vec<std::io::Result<(ObjectKey, Tombstone)>>;
+
+    /// Lists tombstone entries for **every** bucket.
+    ///
+    /// Each element is a Result carrying the tombstone's owning bucket.
+    /// Used by GC liveness tracking: restricting the scan to a single
+    /// bucket (as `list_tombstones` does) would hide every deletion in
+    /// other buckets and stall compaction for those buckets' segments
+    /// (observed with the load-test bucket — GC only scanned "default",
+    /// so no dead bytes were ever detected for load-test data).
+    ///
+    /// The default implementation returns an empty list; stores that
+    /// support cross-bucket scans override it.
+    fn list_tombstones_all(&self) -> Vec<std::io::Result<(BucketId, ObjectKey, Tombstone)>> {
+        Vec::new()
+    }
 
     /// Deletes a tombstone entry for the given object key.
     ///

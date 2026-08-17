@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use oceanfs_core::{ChunkRef, ObjectMetadata, SegmentId, SegmentMetadata};
+use oceanfs_core::{BucketId, ChunkRef, ObjectMetadata, SegmentId, SegmentMetadata};
 use oceanfs_storage::{segment::TierRouter, Result};
 
 use super::config::tier_target_size;
@@ -45,9 +45,9 @@ impl SegmentCompactor {
     /// Compacts a single segment: re-packs live blobs, updates metadata,
     /// and returns the number of bytes reclaimed.
     ///
-    /// Objects whose keys are in `dead_object_keys` (i.e., have an expired
-    /// tombstone) are NOT repacked — their space is reclaimed. Only live
-    /// (non-deleted) objects are moved to the new segment.
+    /// Objects whose (bucket, key) is in `dead_object_keys` (i.e., have an
+    /// expired tombstone) are NOT repacked — their space is reclaimed.
+    /// Only live (non-deleted) objects are moved to the new segment.
     ///
     /// Steps:
     /// 1. Find objects referencing this segment
@@ -59,15 +59,18 @@ impl SegmentCompactor {
         &self,
         segment_id: SegmentId,
         segment_meta: &SegmentMetadata,
-        dead_object_keys: &HashSet<String>,
+        dead_object_keys: &HashSet<(String, String)>,
     ) -> Result<u64> {
         // Find all objects that reference this segment
         let objects = self.find_objects_in_segment(segment_id)?;
 
         // Filter: only repack live (non-deleted) objects
-        let live_objects: Vec<&ObjectMetadata> = objects
+        let live_objects: Vec<&(BucketId, ObjectMetadata)> = objects
             .iter()
-            .filter(|obj| !dead_object_keys.contains(obj.object_key.as_str()))
+            .filter(|(bucket, obj)| {
+                !dead_object_keys
+                    .contains(&(bucket.as_str().to_string(), obj.object_key.as_str().to_string()))
+            })
             .collect();
 
         // Total segment size for reclaimed bytes tracking
@@ -93,7 +96,7 @@ impl SegmentCompactor {
         let mut chunk_remap: HashMap<(SegmentId, u64, u32), ChunkRef> =
             HashMap::with_capacity(live_objects.len());
 
-        for obj in &live_objects {
+        for (_bucket, obj) in &live_objects {
             for chunk in &obj.chunks {
                 if chunk.segment_id == segment_id {
                     let new_chunk = ChunkRef {
@@ -126,7 +129,7 @@ impl SegmentCompactor {
         // Write all mutations atomically via batch.
         let ops: Vec<oceanfs_storage_api::BatchOp> = {
             let mut ops = Vec::with_capacity(live_objects.len() + 2);
-            for obj in &live_objects {
+            for (bucket, obj) in &live_objects {
                 let mut new_chunks = smallvec::SmallVec::<[ChunkRef; 4]>::new();
                 for chunk in &obj.chunks {
                     if chunk.segment_id == segment_id {
@@ -140,6 +143,7 @@ impl SegmentCompactor {
                 }
                 let updated_meta = ObjectMetadata { chunks: new_chunks, ..(*obj).clone() };
                 ops.push(oceanfs_storage_api::BatchOp::PutObject(
+                    bucket.clone(),
                     obj.object_key.clone(),
                     updated_meta,
                 ));
@@ -170,15 +174,21 @@ impl SegmentCompactor {
     /// index (segment → objects) would accelerate this. The RocksDB
     /// `objects` CF could be augmented with an index column family
     /// mapping `segment_id → [object_key]` to avoid the full scan.
-    fn find_objects_in_segment(&self, segment_id: SegmentId) -> Result<Vec<ObjectMetadata>> {
+    fn find_objects_in_segment(
+        &self,
+        segment_id: SegmentId,
+    ) -> Result<Vec<(BucketId, ObjectMetadata)>> {
         let mut result = Vec::new();
 
-        // Use list_objects with empty prefix to scan all; filter in-memory.
-        let all_objects = self.metadata.list_objects(&oceanfs_core::BucketId::new("default"), "");
+        // Scan ALL buckets (the bucket is decoded from the store key):
+        // restricting the scan to "default" would miss every object in
+        // other buckets, so compaction would never repack their segments.
+        let all_objects = self.metadata.list_objects_all_with_bucket();
 
-        for obj in all_objects.into_iter().flatten() {
+        for obj_result in all_objects {
+            let Ok((bucket, obj)) = obj_result else { continue };
             if obj.chunks.iter().any(|c| c.segment_id == segment_id) {
-                result.push(obj);
+                result.push((bucket, obj));
             }
         }
 
@@ -369,7 +379,7 @@ mod tests {
         let (dead_keys, _) = gc.process_tombstones(&metadata, &mut tracker, &mut stats).unwrap();
 
         // The tombstone is past TTL, so it should be in the dead set
-        assert!(dead_keys.contains("old_deleted.txt"));
+        assert!(dead_keys.contains(&("default".to_string(), "old_deleted.txt".to_string())));
         assert_eq!(tracker.dead_bytes_for(&seg_id), 300);
     }
 
@@ -539,7 +549,7 @@ mod tests {
 
         // Mark "dead.txt" as a dead object
         let mut dead_keys = HashSet::new();
-        dead_keys.insert("dead.txt".to_string());
+        dead_keys.insert(("default".to_string(), "dead.txt".to_string()));
 
         let result = compactor
             .compact_segment(

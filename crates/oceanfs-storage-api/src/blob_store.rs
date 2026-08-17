@@ -13,6 +13,7 @@ use crate::error::Error;
 /// # Examples
 ///
 /// ```
+/// use bytes::Bytes;
 /// use oceanfs_core::SegmentId;
 /// use oceanfs_storage_api::BlobStore;
 /// use oceanfs_storage_api::error::Error;

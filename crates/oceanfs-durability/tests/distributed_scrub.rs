@@ -121,7 +121,7 @@ async fn manual_scrub_trigger_does_not_error() {
 }
 
 #[tokio::test]
-async fn run_cycle_with_missing_data_detects_corruption() {
+async fn run_cycle_with_missing_data_skips_not_corrupt() {
     let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
 
     let seg_id = SegmentId::new();
@@ -140,13 +140,17 @@ async fn run_cycle_with_missing_data_detects_corruption() {
     };
     metadata.put_segment(seg).unwrap();
 
-    // Empty data store — data is missing (simulates shard loss)
+    // Empty data store — data is missing (simulates a seal/GC race where
+    // the shard is not yet on disk, or was reclaimed between the metadata
+    // scan and the read). Missing shards are SKIPPED, not counted corrupt:
+    // counting them corrupt produced false corruption alarms + spurious
+    // heal requests for segments that were never corrupt.
     let data_store = segment_store_with_data(vec![]);
 
     let coord = ScrubCoordinator::new(ScrubConfig::default());
     let report = coord.run_cycle(metadata, data_store).await.unwrap();
 
     assert_eq!(report.segments_total(), 1);
-    assert_eq!(report.segments_healthy(), 0);
-    assert_eq!(report.segments_corrupt(), 1);
+    assert_eq!(report.segments_healthy(), 0, "skipped segments are excluded from healthy");
+    assert_eq!(report.segments_corrupt(), 0, "missing shard is not corruption");
 }

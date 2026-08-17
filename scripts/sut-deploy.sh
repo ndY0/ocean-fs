@@ -146,6 +146,12 @@ gc_interval_sec = 10
 tombstone_ttl_sec = 5
 ae_interval_sec = 10
 scrub_interval_sec = 60
+# Orphan reaper must match the GC cadence: with the default 3600s the
+# reaper never fires during a load-test run, so orphaned segments (from
+# the delete-heavy workload) accumulate until the disk fills and the SUT
+# OOM-kills (observed: ~31 GB of orphans swept only at crash-recovery
+# restart). A 10s interval reclaims them continuously.
+orphan_reaper_interval_sec = 10
 object_cache_ttl_ms = 0
 CONFIG
 

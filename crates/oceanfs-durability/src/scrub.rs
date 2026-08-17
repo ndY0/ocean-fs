@@ -260,6 +260,10 @@ pub(crate) struct ScrubResult {
     pub bytes_scanned: u64,
     /// Whether this segment was enqueued for EC-based healing.
     pub enqueued_heal: bool,
+    /// Whether this segment was skipped (shard not found — seal/GC race).
+    /// Skipped segments are neither healthy-reads nor corruption; they are
+    /// excluded from both the corrupt count and the heal path.
+    pub skipped: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +329,35 @@ impl ScrubWorker {
         let data = match self.data_store.read_segment_data(&segment_meta.segment_id) {
             Ok(data) => data,
             Err(e) => {
+                // A NotFound read is NOT corruption: the segment may have
+                // been sealed concurrently with this scrub cycle and the
+                // .dat finalized after the metadata scan, or (single-node
+                // crash recovery) the orphan reaper may have deleted the
+                // shard between the metadata scan and this read. Report it
+                // as skipped so the cycle does not emit false corruption
+                // alarms (the previous behaviour counted every read error
+                // as a Merkle mismatch and enqueued heal requests for
+                // segments that were never corrupt).
+                let not_found = matches!(
+                    &e,
+                    oceanfs_storage::Error::Io(io_err)
+                        if io_err.kind() == std::io::ErrorKind::NotFound
+                ) || matches!(&e, oceanfs_storage::Error::SegmentNotFound(_));
+                if not_found {
+                    tracing::debug!(
+                        segment_id = %segment_meta.segment_id,
+                        "segment shard not found during scrub; skipping (seal/GC race)"
+                    );
+                    return ScrubResult {
+                        segment_id: segment_meta.segment_id,
+                        healthy: true,
+                        corrupt_shard_indices: Vec::new(),
+                        merkle_mismatch: false,
+                        bytes_scanned: 0,
+                        enqueued_heal: false,
+                        skipped: true,
+                    };
+                }
                 tracing::warn!(
                     error = %e,
                     segment_id = %segment_meta.segment_id,
@@ -337,6 +370,7 @@ impl ScrubWorker {
                     merkle_mismatch: true,
                     bytes_scanned: 0,
                     enqueued_heal: false,
+                    skipped: false,
                 };
             }
         };
@@ -352,6 +386,7 @@ impl ScrubWorker {
                 merkle_mismatch: false,
                 bytes_scanned: 0,
                 enqueued_heal: false,
+                skipped: false,
             };
         }
 
@@ -368,6 +403,7 @@ impl ScrubWorker {
                     merkle_mismatch: false,
                     bytes_scanned: total_bytes,
                     enqueued_heal: false,
+                    skipped: false,
                 };
             }
         };
@@ -449,6 +485,7 @@ impl ScrubWorker {
             merkle_mismatch,
             bytes_scanned: total_bytes,
             enqueued_heal,
+            skipped: false,
         }
     }
 
@@ -675,10 +712,20 @@ impl ScrubCoordinator {
         let start_time = Instant::now();
         let mut report = ScrubReport::default();
 
-        // Phase 1: Gather all segment IDs
+        // Phase 1: Gather all segment IDs.
+        // Only SEALED segments are scrubbed: unsealed segments (phantom
+        // registrations made before their WAL entry, or in-flight active
+        // segments) have no `.dat` file on disk yet — attempting to read
+        // them would produce false "corrupt" results (the read fails with
+        // NotFound, which the worker classifies as a Merkle mismatch).
+        // Sealed segments carry a stored Merkle root to verify against.
         let segments = metadata.list_segments();
-        let segment_ids: Vec<SegmentId> =
-            segments.into_iter().filter_map(|r| r.ok().map(|s| s.segment_id)).collect();
+        let segment_ids: Vec<SegmentId> = segments
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .filter(|s| s.is_sealed())
+            .map(|s| s.segment_id)
+            .collect();
 
         report.segments_total = segment_ids.len() as u64;
 
@@ -740,6 +787,10 @@ impl ScrubCoordinator {
                 Ok(Ok(results)) => {
                     for result in &results {
                         report.bytes_scanned += result.bytes_scanned;
+                        if result.skipped {
+                            // Shard missing (seal/GC race) — not corruption.
+                            continue;
+                        }
                         if result.healthy {
                             report.segments_healthy += 1;
                         } else {
@@ -1181,7 +1232,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn scrub_worker_missing_data_marks_unhealthy() {
+    fn scrub_worker_missing_data_skips_not_corrupt() {
         let seg_id = SegmentId::new();
         let test_data = b"data that exists in metadata but not in store".to_vec();
         let merkle_root = MerkleTree::build(&test_data, 0).unwrap().root().hash();
@@ -1202,8 +1253,13 @@ mod tests {
         };
 
         let result = worker.scrub_segment(&seg_meta);
-        assert!(!result.healthy, "missing data should be flagged as unhealthy");
-        assert!(result.merkle_mismatch);
+        assert!(
+            result.skipped,
+            "missing shard is a seal/GC race, not corruption — must be skipped"
+        );
+        assert!(result.healthy, "skipped segments count as healthy (not corrupt)");
+        assert!(!result.merkle_mismatch, "missing shard must not be a Merkle mismatch");
+        assert!(!result.enqueued_heal, "missing shard must not trigger a heal request");
     }
 
     #[test]
@@ -1265,6 +1321,55 @@ mod tests {
         let report = coord.run_cycle(metadata, data_store).await.unwrap();
         assert_eq!(report.segments_total, 0);
         assert_eq!(report.segments_healthy, 0);
+    }
+
+    #[tokio::test]
+    async fn run_cycle_skips_unsealed_phantom_segments() {
+        let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let mut stored_data = Vec::new();
+
+        // One sealed segment with data on disk.
+        let sealed_id = SegmentId::new();
+        let sealed_data = vec![0xEF; 1024];
+        let merkle_root = MerkleTree::build(&sealed_data, 0).unwrap().root().hash();
+        stored_data.push((sealed_id, sealed_data.clone()));
+        metadata
+            .put_segment(SegmentMetadata {
+                segment_id: sealed_id,
+                ec_k: 4,
+                ec_m: 2,
+                size_tier: SizeTier::Standard,
+                merkle_root: Some(merkle_root),
+                storage_locations: smallvec::SmallVec::new(),
+                sealed_at: Some(1700000000000),
+            })
+            .unwrap();
+
+        // One PHANTOM segment: registered (sealed_at: None) but its .dat
+        // does not exist yet — the write path registers it before the WAL
+        // entry. Scrub must NOT read it (no file) nor count it corrupt.
+        let phantom_id = SegmentId::new();
+        metadata
+            .put_segment(SegmentMetadata {
+                segment_id: phantom_id,
+                ec_k: 4,
+                ec_m: 2,
+                size_tier: SizeTier::Standard,
+                merkle_root: None,
+                storage_locations: smallvec::SmallVec::new(),
+                sealed_at: None,
+            })
+            .unwrap();
+
+        let data_store = segment_store_with_data(stored_data);
+        let coord = ScrubCoordinator::new(ScrubConfig::default());
+        let report = coord.run_cycle(metadata, data_store).await.unwrap();
+
+        // Only the sealed segment is scrubbed; the phantom is skipped.
+        assert_eq!(report.segments_total, 1, "unsealed phantom must not be scrubbed");
+        assert_eq!(report.segments_healthy, 1);
+        assert_eq!(report.segments_corrupt, 0, "phantom must not count as corrupt");
+        assert!(report.bytes_scanned > 0);
     }
 
     #[tokio::test]

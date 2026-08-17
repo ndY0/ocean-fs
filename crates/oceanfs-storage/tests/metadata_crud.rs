@@ -302,7 +302,7 @@ fn batch_write_atomicity() {
     let tombstone = Tombstone { deletion_time: 1_700_000_001_000, hlc: Hlc::zero() };
 
     let ops = vec![
-        BatchOp::PutObject(test_key("batch-obj"), meta),
+        BatchOp::PutObject(test_bucket(), test_key("batch-obj"), meta),
         BatchOp::PutTombstone(test_bucket(), test_key("batch-obj"), tombstone),
     ];
 

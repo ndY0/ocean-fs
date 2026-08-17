@@ -572,6 +572,34 @@ impl RocksDbMetadataStore {
         .collect()
     }
 
+    /// Lists object metadata for every object across all buckets,
+    /// decoding the owning bucket from each RocksDB key.
+    ///
+    /// [`ObjectMetadata`] does not carry its bucket (the bucket lives in
+    /// the encoded key `{bucket}\0{key}`), so GC liveness tracking — which
+    /// must match tombstones against objects per-bucket — uses this method.
+    pub fn list_objects_all_with_bucket(&self) -> Vec<Result<(BucketId, ObjectMetadata)>> {
+        let cf = self.db.cf_handle(cf::CF_OBJECTS);
+        let Some(cf_handle) = cf else {
+            return vec![];
+        };
+        let iter = self.db.iterator_cf(&cf_handle, rocksdb::IteratorMode::Start);
+
+        iter.filter_map(|item| match item {
+            Ok((key, value)) => {
+                let (bucket_str, _) = cf::decode_object_key(&key)?;
+                match bincode::deserialize::<ObjectMetadata>(&value)
+                    .or_else(|_| serde_json::from_slice::<ObjectMetadata>(&value))
+                {
+                    Ok(meta) => Some(Ok((BucketId::new(bucket_str), meta))),
+                    Err(_) => None,
+                }
+            }
+            Err(e) => Some(Err(Error::Io(io_err(e)))),
+        })
+        .collect()
+    }
+
     // ------------------------------------------------------------------
     // Segment operations
     // ------------------------------------------------------------------
@@ -877,6 +905,36 @@ impl RocksDbMetadataStore {
         .collect()
     }
 
+    /// Lists all deletion tombstones across every bucket.
+    ///
+    /// Scans the deletions CF from the start, decoding each key into its
+    /// owning bucket + object key. Used by GC liveness tracking so that
+    /// tombstones in ANY bucket (not just "default") drive compaction.
+    pub fn list_tombstones_all(&self) -> Vec<Result<(BucketId, ObjectKey, Tombstone)>> {
+        let cf = self.db.cf_handle(cf::CF_DELETIONS);
+        let Some(cf_handle) = cf else {
+            return vec![];
+        };
+
+        let iter = self.db.iterator_cf(&cf_handle, rocksdb::IteratorMode::Start);
+
+        iter.filter_map(|item| match item {
+            Ok((key, value)) => {
+                let (bucket_str, key_str) = cf::decode_object_key(&key)?;
+                match bincode::deserialize::<Tombstone>(&value)
+                    .or_else(|_| serde_json::from_slice::<Tombstone>(&value))
+                {
+                    Ok(tombstone) => {
+                        Some(Ok((BucketId::new(bucket_str), ObjectKey::new(key_str), tombstone)))
+                    }
+                    Err(_) => None,
+                }
+            }
+            Err(e) => Some(Err(Error::Io(io_err(e)))),
+        })
+        .collect()
+    }
+
     // ------------------------------------------------------------------
     // Async wrappers
     // ------------------------------------------------------------------
@@ -969,12 +1027,12 @@ impl RocksDbMetadataStore {
 
         for op in &ops {
             match op {
-                BatchOp::PutObject(key, value) => {
+                BatchOp::PutObject(bucket, key, value) => {
                     let cf = self
                         .db
                         .cf_handle(cf::CF_OBJECTS)
                         .ok_or_else(|| Error::InvalidConfig("objects CF not found".into()))?;
-                    let k = cf::encode_object_key("default", key.as_str());
+                    let k = cf::encode_object_key(bucket.as_str(), key.as_str());
                     let v = bincode::serialize(value).map_err(|e| Error::Io(io_err(e)))?;
                     batch.put_cf(&cf, k, v);
                 }
@@ -1263,8 +1321,9 @@ pub(crate) fn unresolved_rocksdb_properties(db: &DB) -> Vec<String> {
 /// An operation in a batch write.
 #[derive(Debug, Clone)]
 pub enum BatchOp {
-    /// Put an object metadata entry.
-    PutObject(ObjectKey, ObjectMetadata),
+    /// Put an object metadata entry (bucket-carried, mirroring
+    /// `oceanfs_storage_api::BatchOp::PutObject`).
+    PutObject(BucketId, ObjectKey, ObjectMetadata),
     /// Delete an object.
     DeleteObject(BucketId, ObjectKey),
     /// Put a tombstone.
@@ -1330,6 +1389,13 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
             .collect()
     }
 
+    fn list_objects_all_with_bucket(&self) -> Vec<std::io::Result<(BucketId, ObjectMetadata)>> {
+        self.list_objects_all_with_bucket()
+            .into_iter()
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+            .collect()
+    }
+
     fn get_object_metadata(
         &self,
         bucket: &BucketId,
@@ -1374,6 +1440,13 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
             .collect()
     }
 
+    fn list_tombstones_all(&self) -> Vec<std::io::Result<(BucketId, ObjectKey, Tombstone)>> {
+        self.list_tombstones_all()
+            .into_iter()
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+            .collect()
+    }
+
     fn delete_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<()> {
         self.delete_tombstone(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
     }
@@ -1410,8 +1483,8 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
         let rocks_ops: Vec<crate::metadata::store::BatchOp> = ops
             .into_iter()
             .map(|op| match op {
-                oceanfs_storage_api::BatchOp::PutObject(key, meta) => {
-                    crate::metadata::store::BatchOp::PutObject(key, meta)
+                oceanfs_storage_api::BatchOp::PutObject(bucket, key, meta) => {
+                    crate::metadata::store::BatchOp::PutObject(bucket, key, meta)
                 }
                 oceanfs_storage_api::BatchOp::DeleteObject(bucket, key) => {
                     crate::metadata::store::BatchOp::DeleteObject(bucket, key)
