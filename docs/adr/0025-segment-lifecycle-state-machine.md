@@ -65,9 +65,45 @@ worker, compactor, reaper, GC, and recovery.
 
 ### Decision 1: A single in-memory `SegmentLifecycle` registry, owned by a single coordinator
 
-A new module — `crates/oceanfs-storage/src/segment/lifecycle.rs` (or a
-dedicated `oceanfs-lifecycle` crate if crate boundaries demand it; see
-ADR-0009) — defines:
+A new module — `crates/oceanfs-storage/src/segment/lifecycle.rs` —
+defines the machine. It lives **in the storage domain**
+(`oceanfs-storage`), not in a dedicated crate:
+
+- The machine's primary writers — the segment pool, the seal worker's
+  persistence path, and the WAL writer — are all in `oceanfs-storage`;
+  the coordinator must sit beside them, not across a crate boundary.
+- `oceanfs-durability` consumers (GC, scrub, AE, orphan reaper) call
+  into it read-only through the existing `MetadataStore`-style boundary;
+  ADR-0009's direction (trait-in-consuming-crate) is preserved — the
+  consumers keep their trait, the machine is the implementation.
+- A dedicated `oceanfs-lifecycle` crate would add a boundary with no
+  counterpart on the other side: nothing outside storage owns segment
+  lifecycle, so there is no second consumer class to justify the split.
+
+**Domain placement (storage vs durability).** The machine is durability
+*state* owned by the storage *domain* — the same relationship the data
+WAL already has (durability machinery owned by storage,
+`crates/oceanfs-storage/src/wal/`). Considered placing it in
+`oceanfs-durability` and rejected:
+
+- **Semantic pull.** Lifecycle transitions, crash recovery, and the
+  event log are durability-flavored; the `oceanfs-durability` name
+  points at them. But that crate is the *background-maintenance* home
+  (GC, scrub, AE, reaper — ADR-0017's "look up a column family + act"
+  tasks), not the WAL home. ADR-0009 already assigned **segment
+  lifecycle ownership to `oceanfs-storage`** (recorded in ADR-0021
+  §References).
+- **Dependency direction is decisive.** `oceanfs-durability` depends on
+  `oceanfs-storage`; storage cannot call into durability without a
+  cycle. The machine's primary writers — the pool's fill→Sealing
+  transition and the sealer's seal-complete — happen in storage's
+  critical sections and must record the event exactly there; and the
+  read path consults the machine on every GET via `try_read` (storage).
+  Keeping it in-crate avoids a hot-path trait boundary into another
+  crate.
+- **Consumers are unaffected.** GC, scrub, AE, and the reaper read the
+  machine through the existing trait boundary — they already depend on
+  storage today. Nothing new crosses a crate edge on a hot path.
 
 ```rust
 enum SegmentState {
@@ -270,6 +306,7 @@ Each phase lands green (build, tests, clippy, fmt) before the next.
 | **Keep the CF as a derived mirror (dual-write)** | Smaller first step; consumers unchanged | Every transition written twice with a reconciliation rule — the disease being cured; doubles the migration's eventual removal work | Rejected — the ADR lands the CF removal as phase 3 of the migration, not as a permanent dual-write |
 | **Full native store now (ADR-0023 Phase 2 entire)** | One rewrite, no intermediate states | Objects + inline payloads + tombstones are a much larger correctness surface; conflicts with "consolidate current work first" | Rejected — this ADR is deliberately the segment-state slice only |
 | **Machine in `oceanfs-durability`** | Near the consumers (GC, scrub, AE) | The pool + seal worker (the machine's core writers) are in `oceanfs-storage`; ownership would cross the crate boundary in the wrong direction | Rejected — the machine lives with its primary writers in `oceanfs-storage`, exposed read-only to `oceanfs-durability` consumers |
+| **Dedicated `oceanfs-lifecycle` crate** | Clean ownership boundary; machine is a first-class crate | Adds a crate boundary with no counterpart on the other side: nothing outside storage owns segment lifecycle, so no second consumer class justifies the split; the coordinator would sit far from the pool and seal worker it coordinates | Rejected — Decision 1 places the machine in `oceanfs-storage/src/segment/lifecycle.rs`; consumers keep their trait boundary (ADR-0009), the machine is the implementation |
 | **Keep six owners, add tests** | Zero refactor risk | Tests prove the folklore; they do not enforce it; the campaign showed the folklore fails under load | Rejected — enforcement by design is the requirement |
 
 ---
