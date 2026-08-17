@@ -14,7 +14,7 @@ use oceanfs_core::{
     BucketId, ChunkRef, HashOutput, Hlc, MetadataConfig, ObjectKey, ObjectMetadata, SegmentId,
     SegmentMetadata, SizeTier, Tombstone,
 };
-use oceanfs_durability::{GarbageCollector, GcConfig};
+use oceanfs_durability::{GarbageCollector, GcConfig, InMemorySegmentStore, SegmentDataStore};
 use oceanfs_storage::RocksDbMetadataStore;
 
 fn test_config() -> MetadataConfig {
@@ -190,7 +190,9 @@ async fn full_gc_cycle_compacts_segment() {
     }
 
     // Run GC with threshold that will trigger (liveness 0.4 < 0.5)
-    let gc = GarbageCollector::new(GcConfig::new(3600, 0, 0.5, 2, 16));
+    let store = Arc::new(oceanfs_durability::InMemorySegmentStore::new());
+    store.write_segment_data(&seg_id, &vec![0x55; 1000]).unwrap();
+    let gc = GarbageCollector::new(GcConfig::new(3600, 0, 0.5, 2, 16)).with_data_store(store);
 
     let stats = gc.run_cycle(metadata.clone()).await.unwrap();
 

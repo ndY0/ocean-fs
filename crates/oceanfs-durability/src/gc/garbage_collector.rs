@@ -36,6 +36,13 @@ pub struct GarbageCollector {
     bytes_reclaimed_total: Counter,
     compaction_bytes_total: Counter,
     dead_bytes_total: Counter,
+    /// Segment data store used by compaction to persist repacked data.
+    ///
+    /// `None` (tests / minimal embeddings) means compaction candidates are
+    /// identified but NOT compacted — repacking requires reading the old
+    /// segment's bytes and writing the new segment's `.dat`, which needs a
+    /// data store. See [`Self::with_data_store`].
+    data_store: Option<Arc<dyn crate::anti_entropy::SegmentDataStore>>,
 }
 
 type TombstoneResult =
@@ -65,15 +72,31 @@ impl GarbageCollector {
             ),
             compaction_bytes_total: Counter::new(
                 "gc_compaction_bytes_total".into(),
-                "Bytes processed during segment compaction".into(),
+                "Bytes processed by GC compaction".into(),
                 LabelSet::empty(),
             ),
             dead_bytes_total: Counter::new(
                 "gc_dead_bytes_total".into(),
-                "Bytes found dead by GC (reclaimable, before compaction)".into(),
+                "Dead bytes detected by GC".into(),
                 LabelSet::empty(),
             ),
+            data_store: None,
         }
+    }
+
+    /// Attaches the segment data store used to persist repacked data
+    /// during compaction.
+    ///
+    /// Without it, compaction candidates are identified and reported but
+    /// not compacted (repacking must read the old segment's bytes and
+    /// write the new segment's `.dat`; a metadata-only remap would point
+    /// objects at a segment with no on-disk data).
+    pub fn with_data_store(
+        mut self,
+        data_store: Arc<dyn crate::anti_entropy::SegmentDataStore>,
+    ) -> Self {
+        self.data_store = Some(data_store);
+        self
     }
 
     /// Registers all GC counters with a metrics registrar.
@@ -138,10 +161,22 @@ impl GarbageCollector {
             return Ok(stats);
         }
 
+        // Compaction needs a data store: repacking reads the old segment's
+        // bytes and writes the new segment's `.dat` BEFORE the metadata
+        // swap (a metadata-only remap would point objects at a segment
+        // with no on-disk data — reads would fail after restart).
+        let Some(data_store) = self.data_store.clone() else {
+            tracing::warn!(
+                candidates = candidates.len(),
+                "GC identified compaction candidates but no segment data store is attached; skipping compaction (use with_data_store)"
+            );
+            return Ok(stats);
+        };
+
         // Phase 3: Compact candidate segments concurrency-limited
         let semaphore = Arc::new(Semaphore::new(self.config.max_concurrent_compactions));
         let tier_router = TierRouter::new(oceanfs_core::SegmentSizeConfig::default());
-        let compactor = Arc::new(SegmentCompactor::new(metadata.clone(), tier_router));
+        let compactor = Arc::new(SegmentCompactor::new(metadata.clone(), tier_router, data_store));
 
         tracing::debug!(
             "GC compaction phase: tier router configured for repacking, {} segment(s) candidate",
@@ -469,6 +504,7 @@ mod tests {
     use oceanfs_storage::metadata::RocksDbMetadataStore;
 
     use super::super::*;
+    use crate::anti_entropy::SegmentDataStore;
     fn test_config() -> MetadataConfig {
         let dir = tempfile::tempdir().unwrap();
         MetadataConfig {
@@ -865,7 +901,12 @@ mod tests {
 
         // Liveness: 100 live / 1000 total = 0.1 < 0.5 threshold → compaction
         // must trigger purely from the tombstone-carried chunks.
-        let gc = GarbageCollector::new(GcConfig { compact_threshold: 0.5, ..GcConfig::default() });
+        let store = Arc::new(crate::anti_entropy::InMemorySegmentStore::new());
+        // 1000 bytes of old segment data; the live object's 100 bytes sit at
+        // offset 0, the tombstoned 900 at offset 100.
+        store.write_segment_data(&seg_id, &vec![0xAA; 1000]).unwrap();
+        let gc = GarbageCollector::new(GcConfig { compact_threshold: 0.5, ..GcConfig::default() })
+            .with_data_store(store);
         let stats = gc.run_cycle(metadata.clone()).await.unwrap();
 
         assert_eq!(stats.dead_bytes, 900, "dead bytes must come from the tombstone chunks");

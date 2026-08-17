@@ -10,6 +10,7 @@ use oceanfs_core::{BucketId, ChunkRef, ObjectMetadata, SegmentId, SegmentMetadat
 use oceanfs_storage::{segment::TierRouter, Result};
 
 use super::config::tier_target_size;
+use crate::anti_entropy::SegmentDataStore;
 
 // ---------------------------------------------------------------------------
 // SegmentCompactor
@@ -26,6 +27,13 @@ pub(crate) struct SegmentCompactor {
     /// The tier router for classifying blobs by size.
     /// Wired for future tier-specific segment pool routing during repacking.
     tier_router: TierRouter,
+    /// The segment data store: reads the old segment's bytes and writes
+    /// the repacked new segment's `.dat` file. Without this the compactor
+    /// only remapped metadata to a segment ID with no on-disk data —
+    /// reads of repacked objects failed after restart (dormant bug: GC
+    /// never compacted before tombstone-carried chunks made dead bytes
+    /// detectable).
+    data_store: Arc<dyn SegmentDataStore>,
 }
 
 impl SegmentCompactor {
@@ -33,8 +41,9 @@ impl SegmentCompactor {
     pub(crate) fn new(
         metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
         tier_router: TierRouter,
+        data_store: Arc<dyn SegmentDataStore>,
     ) -> Self {
-        Self { metadata, tier_router }
+        Self { metadata, tier_router, data_store }
     }
 
     /// Returns the tier router used for blob classification during repacking.
@@ -52,9 +61,14 @@ impl SegmentCompactor {
     /// Steps:
     /// 1. Find objects referencing this segment
     /// 2. Filter out dead objects (those with expired tombstones)
-    /// 3. Create a new segment and repack live chunks
-    /// 4. Batch-update object metadata with new chunk refs
-    /// 5. Delete old segment metadata
+    /// 3. Read the old segment's data and build the repacked byte buffer
+    ///    (live chunks copied to their new offsets)
+    /// 4. Persist the new segment's `.dat` via the data store — MUST
+    ///    happen before metadata swap: without the on-disk data the new
+    ///    segment ID would be metadata-only and reads of repacked objects
+    ///    would fail after restart
+    /// 5. Batch-update object metadata with new chunk refs
+    /// 6. Delete old segment metadata
     pub(crate) async fn compact_segment(
         &self,
         segment_id: SegmentId,
@@ -87,6 +101,13 @@ impl SegmentCompactor {
             return Ok(segment_size);
         }
 
+        // Read the old segment's data section (header already stripped by
+        // the store; chunk offsets are relative to the data region).
+        let old_data = self
+            .data_store
+            .read_segment_data(&segment_id)
+            .map_err(|e| oceanfs_storage::Error::Io(std::io::Error::other(e.to_string())))?;
+
         // Create a new segment for repacking the live blobs.
         let new_segment_id = SegmentId::new();
         let mut new_offset: u64 = 0;
@@ -95,6 +116,9 @@ impl SegmentCompactor {
         // Key: (old_segment_id, old_offset, length) → new ChunkRef
         let mut chunk_remap: HashMap<(SegmentId, u64, u32), ChunkRef> =
             HashMap::with_capacity(live_objects.len());
+
+        // Repacked byte buffer: live chunks copied to their new offsets.
+        let mut repacked: Vec<u8> = Vec::new();
 
         for (_bucket, obj) in &live_objects {
             for chunk in &obj.chunks {
@@ -108,10 +132,25 @@ impl SegmentCompactor {
                     };
                     let key = (chunk.segment_id, chunk.offset, chunk.length);
                     chunk_remap.insert(key, new_chunk);
+
+                    // Copy the live bytes into the repacked buffer at the
+                    // new offset. Chunk data is contiguous in the source
+                    // segment (data section), so a direct slice copy is
+                    // exact.
+                    let start = chunk.offset as usize;
+                    let end = start.saturating_add(chunk.length as usize).min(old_data.len());
+                    repacked.extend_from_slice(&old_data[start..end]);
                     new_offset += chunk.length as u64;
                 }
             }
         }
+
+        // Persist the new segment's data BEFORE the metadata swap. The
+        // store writes a v1 segment file (header + checksum + data) so
+        // the read path's first-touch verification passes.
+        self.data_store
+            .write_segment_data(&new_segment_id, &repacked)
+            .map_err(|e| oceanfs_storage::Error::Io(std::io::Error::other(e.to_string())))?;
 
         // Create new segment metadata entry.
         let now_ms =
@@ -211,6 +250,7 @@ mod tests {
         garbage_collector::GarbageCollector, liveness_tracker::LivenessTracker,
         segment_compactor::SegmentCompactor, *,
     };
+    use crate::anti_entropy::SegmentDataStore;
 
     fn test_config() -> MetadataConfig {
         let dir = tempfile::tempdir().unwrap();
@@ -246,6 +286,24 @@ mod tests {
             storage_locations: smallvec::SmallVec::new(),
             sealed_at: Some(sealed_at),
         }
+    }
+
+    /// Builds a compactor with an in-memory data store preloaded with the
+    /// given segment's data bytes (the data-section content the store's
+    /// `read_segment_data` would return).
+    fn make_compactor(
+        metadata: Arc<RocksDbMetadataStore>,
+        entries: Vec<(SegmentId, Vec<u8>)>,
+    ) -> SegmentCompactor {
+        let store = Arc::new(crate::anti_entropy::InMemorySegmentStore::new());
+        for (id, data) in entries {
+            store.write_segment_data(&id, &data).unwrap();
+        }
+        SegmentCompactor::new(
+            metadata,
+            TierRouter::new(oceanfs_core::SegmentSizeConfig::default()),
+            store,
+        )
     }
 
     // SegmentCompactor
@@ -288,10 +346,7 @@ mod tests {
         );
         metadata.put_object(obj_meta2).unwrap();
 
-        let compactor = SegmentCompactor::new(
-            metadata.clone(),
-            TierRouter::new(oceanfs_core::SegmentSizeConfig::default()),
-        );
+        let compactor = make_compactor(metadata.clone(), vec![(seg_id, vec![0xAB; 500])]);
 
         let empty_dead_keys = HashSet::new();
         let result = compactor
@@ -317,10 +372,7 @@ mod tests {
         let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
         metadata.put_segment(seg_meta).unwrap();
 
-        let compactor = SegmentCompactor::new(
-            metadata.clone(),
-            TierRouter::new(oceanfs_core::SegmentSizeConfig::default()),
-        );
+        let compactor = make_compactor(metadata.clone(), vec![(seg_id, vec![0xCD; 300])]);
 
         let empty_dead_keys2 = HashSet::new();
         let result = compactor
@@ -411,10 +463,7 @@ mod tests {
         );
         metadata.put_object(obj_meta).unwrap();
 
-        let compactor = SegmentCompactor::new(
-            metadata.clone(),
-            TierRouter::new(oceanfs_core::SegmentSizeConfig::default()),
-        );
+        let compactor = make_compactor(metadata.clone(), vec![(old_seg_id, vec![0xEF; 400])]);
 
         let empty_dead = HashSet::new();
         let result = compactor
@@ -485,13 +534,16 @@ mod tests {
         }
 
         // Use a threshold that will trigger (liveness 0.25 < 0.5)
+        let store = Arc::new(crate::anti_entropy::InMemorySegmentStore::new());
+        store.write_segment_data(&seg_id, &vec![0x11; 800]).unwrap();
         let gc_trigger = GarbageCollector::new(GcConfig {
             tombstone_ttl_sec: 0,
             compact_threshold: 0.5,
             max_concurrent_compactions: 1,
             compaction_queue_capacity: 8,
             ..GcConfig::default()
-        });
+        })
+        .with_data_store(store);
         let stats = gc_trigger.run_cycle(metadata.clone()).await.unwrap();
 
         assert!(stats.segments_scanned >= 1);
@@ -544,10 +596,7 @@ mod tests {
         );
         metadata.put_object(obj_meta_dead).unwrap();
 
-        let compactor = SegmentCompactor::new(
-            metadata.clone(),
-            TierRouter::new(oceanfs_core::SegmentSizeConfig::default()),
-        );
+        let compactor = make_compactor(metadata.clone(), vec![(seg_id, vec![0x42; 500])]);
 
         // Mark "dead.txt" as a dead object
         let mut dead_keys = HashSet::new();

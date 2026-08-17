@@ -677,7 +677,16 @@ impl Node {
             config.gc_max_concurrent_compactions,
             config.gc_compaction_queue_capacity,
         );
-        let gc_worker = Arc::new(oceanfs_durability::GarbageCollector::new(gc_config.clone()));
+        // GC compaction repacks live blobs into new segments — it must
+        // persist the repacked data through the segment data store (the
+        // compactor reads the old segment's bytes and writes the new
+        // segment's .dat before the metadata swap; without the store, a
+        // metadata-only remap would leave objects pointing at a segment
+        // with no on-disk data).
+        let gc_worker =
+            Arc::new(oceanfs_durability::GarbageCollector::new(gc_config.clone()).with_data_store(
+                Arc::new(oceanfs_durability::DiskSegmentStore::new(segment_dir.clone())),
+            ));
 
         // Construct IncrementalMerkleTree for anti-entropy by scanning
         // the segments column family (ADR-0018 Decision 1).
