@@ -168,8 +168,8 @@ load ≈ tens of MB/day — bounded per-day but unbounded over weeks).
 day one:
 
 - A **checkpoint** is an atomic snapshot of the folded registry
-  (temp file + rename + fsync) written on a schedule (on rotation, or on
-  a byte threshold).
+  (temp file + rename + fsync), triggered by a **byte threshold** on
+  the event log (see Decision 4 — the threshold is the *only* trigger).
 - On checkpoint: events older than the snapshot are truncated;
   `DeleteEvent`s make their segment's entire history garbage.
 - Startup: load latest checkpoint (ms) → append-fold any events after
@@ -178,10 +178,54 @@ day one:
 The checkpoint file is the on-disk state snapshot **in our own format** —
 it is what replaces the `segments` CF, without RocksDB (see ADR-0025).
 
+### Decision 4: The event log has its own fsync group
+
+The event log does **not** share the data WAL's `WalSyncGroup`. Each
+log owns a private group-commit fsync domain:
+
+- **Isolation of durability points.** The data WAL's group commit is
+  sized and tuned for the write path (140 MB/s, sub-ms batches). Event
+  appends are ~50 B and sparse (seal/delete/compaction cadence); mixing
+  them into the data group would either delay data fsyncs (waiting on
+  the event batch window) or force the events to ride an unrelated
+  durability point.
+- **Independent batch windows.** The event group's `fsync_batch_timeout`
+  is tuned for *event* latency (a seal is already paying a `.dat` fsync;
+  its `SealEvent` must be durable promptly, but the batch window can be
+  wider than the data path's).
+- **Independent backpressure.** A stall or overload on one log cannot
+  block the other. The data path's write latency never depends on event
+  log availability, and vice versa.
+- **Reuse, not reinvention.** The event group is the same
+  `WalSyncGroup` machinery (`crates/oceanfs-storage/src/wal/sync.rs`)
+  instantiated per log — one more instance of a proven component, not a
+  new fsync discipline.
+
+The group-commit batch window for the event log is a configuration knob
+(`event_wal_fsync_batch_timeout_ms`), defaulting to a wider window than
+the data WAL's since events are sparse and a seal's `.dat` fsync already
+precedes its `SealEvent`.
+
+**Why a byte threshold, not rotation, for checkpointing.** Rotation is a
+time/volume proxy that fits the data WAL (whose files are written at a
+steady rate and whose retention is cadence-shaped). The event log's
+write rate is *bursty and workload-shaped* — a quiet cluster generates
+almost no events, a delete-heavy or compaction-heavy one generates
+thousands. A byte threshold makes checkpoint cost a direct function of
+*replay cost*: the event log is checkpointed before it can grow past
+`event_wal_checkpoint_bytes` (default e.g. 64 MB, configurable), so
+startup replay after checkpoint is bounded by the threshold regardless
+of how the workload arrived there. At TB scale this matters: rotation
+would checkpoint on wall-clock cadence even when the log is tiny (wasted
+I/O) or, worse, defer checkpointing past the bounded-replay guarantee
+when events spike. The threshold is the only trigger; there is no
+time-based fallback.
+
 ### Scope
 
 - **In:** event WAL format, position references, retention rules,
-  checkpoint mechanism, recovery algorithm (see ADR-0025 for the
+  checkpoint mechanism (byte-threshold trigger), event log's own
+  fsync group (Decision 4), recovery algorithm (see ADR-0025 for the
   machine + recovery fold).
 - **Out:** object metadata (stays in RocksDB — confirmed),
   inline-payload replay (ADR-0023's store concern, not this ADR's),
