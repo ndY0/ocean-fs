@@ -126,7 +126,11 @@ async fn gc_tombstone_within_ttl_not_expired() {
         .put_tombstone(
             &bucket,
             &key,
-            Tombstone { deletion_time: 1700000000000, hlc: Hlc::new(1700000000000, 1) },
+            Tombstone {
+                deletion_time: 1700000000000,
+                hlc: Hlc::new(1700000000000, 1),
+                chunks: smallvec::SmallVec::new(),
+            },
         )
         .expect("put tombstone");
 
@@ -174,6 +178,7 @@ async fn gc_write_delete_verify_stats() {
                 Tombstone {
                     deletion_time: 1, // very old — definitely past TTL
                     hlc: Hlc::new(1, i),
+                    chunks: smallvec::SmallVec::new(),
                 },
             )
             .expect("put tombstone");

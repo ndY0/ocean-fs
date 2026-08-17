@@ -521,7 +521,11 @@ mod tests {
             .put_tombstone(
                 &BucketId::new("default"),
                 &ObjectKey::new("deleted_obj.txt"),
-                Tombstone { deletion_time: 1000000000000, hlc: Hlc::new(1000000000000, 1) },
+                Tombstone {
+                    deletion_time: 1000000000000,
+                    hlc: Hlc::new(1000000000000, 1),
+                    chunks: smallvec::SmallVec::new(),
+                },
             )
             .unwrap();
 
@@ -644,7 +648,11 @@ mod tests {
             .put_tombstone(
                 &BucketId::new("default"),
                 &obj_key,
-                Tombstone { deletion_time: 1000000000000, hlc: Hlc::new(1000000000000, 1) },
+                Tombstone {
+                    deletion_time: 1000000000000,
+                    hlc: Hlc::new(1000000000000, 1),
+                    chunks: smallvec::SmallVec::new(),
+                },
             )
             .unwrap();
 
@@ -799,7 +807,11 @@ mod tests {
             .put_tombstone(
                 &bucket,
                 &ObjectKey::new("recently_deleted.txt"),
-                Tombstone { deletion_time: now_ms, hlc: Hlc::new(now_ms as u64, 1) },
+                Tombstone {
+                    deletion_time: now_ms,
+                    hlc: Hlc::new(now_ms as u64, 1),
+                    chunks: smallvec::SmallVec::new(),
+                },
             )
             .unwrap();
 

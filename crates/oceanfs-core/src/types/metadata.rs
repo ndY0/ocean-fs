@@ -169,12 +169,27 @@ impl SegmentMetadata {
 /// Stored in the `deletions` RocksDB column family. Objects with a
 /// tombstone are considered deleted even if their data still exists
 /// in segments (until GC compaction reclaims the space).
+///
+/// The tombstone carries the deleted object's chunk references: the
+/// object row is removed from `CF_OBJECTS` at delete time (S3 GET/LIST
+/// semantics), so the tombstone is the ONLY surviving record of which
+/// segments hold the dead bytes. GC marks those chunks dead directly
+/// from the tombstone — without this, GC could never detect dead bytes
+/// for deleted objects (`gc_dead_bytes_total` stayed 0 forever).
+///
+/// `chunks` is empty for legacy tombstones written before this field
+/// existed (defaulted on deserialize); their dead bytes are unreachable
+/// and rely on the orphan reaper instead.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Tombstone {
     /// When the deletion occurred (milliseconds since epoch).
     pub deletion_time: i64,
     /// HLC timestamp for conflict resolution.
     pub hlc: Hlc,
+    /// Chunk references of the deleted object, captured before the
+    /// object row was removed. GC marks these chunks dead.
+    #[serde(default)]
+    pub chunks: smallvec::SmallVec<[ChunkRef; 4]>,
 }
 
 // ---------------------------------------------------------------------------
@@ -310,7 +325,11 @@ mod tests {
 
     #[test]
     fn tombstone_hlc_integration() {
-        let ts = Tombstone { deletion_time: 1700000000000, hlc: Hlc::new(1700000000000, 0) };
+        let ts = Tombstone {
+            deletion_time: 1700000000000,
+            hlc: Hlc::new(1700000000000, 0),
+            chunks: smallvec::SmallVec::new(),
+        };
         assert_eq!(ts.deletion_time, 1700000000000);
         assert_eq!(ts.hlc.wall_time(), 1700000000000);
     }

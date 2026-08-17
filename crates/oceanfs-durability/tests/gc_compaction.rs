@@ -111,7 +111,11 @@ async fn gc_cycle_detects_dead_space() {
         .put_tombstone(
             &bucket,
             &ObjectKey::new("live.txt"),
-            Tombstone { deletion_time: 1700000000000, hlc: Hlc::new(1700000000000, 1) },
+            Tombstone {
+                deletion_time: 1700000000000,
+                hlc: Hlc::new(1700000000000, 1),
+                chunks: smallvec::SmallVec::new(),
+            },
         )
         .unwrap();
 
@@ -179,6 +183,7 @@ async fn full_gc_cycle_compacts_segment() {
                 Tombstone {
                     deletion_time: 1000000000000, // ancient
                     hlc: Hlc::new(1000000000000, 1),
+                    chunks: smallvec::SmallVec::new(),
                 },
             )
             .unwrap();
@@ -254,7 +259,11 @@ async fn gc_cycle_respects_tombstone_ttl() {
         .put_tombstone(
             &bucket,
             &ObjectKey::new("ttl_obj0.txt"),
-            Tombstone { deletion_time: now_ms, hlc: Hlc::new(now_ms as u64, 1) },
+            Tombstone {
+                deletion_time: now_ms,
+                hlc: Hlc::new(now_ms as u64, 1),
+                chunks: smallvec::SmallVec::new(),
+            },
         )
         .unwrap();
 

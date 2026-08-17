@@ -297,14 +297,25 @@ impl GarbageCollector {
             }
         }
 
-        // Phase 1: Collect eligible tombstone keys (past TTL).
-        // Build a set of (bucket, object key) pairs whose tombstones have
-        // expired. Tombstones are scanned across ALL buckets — restricting
-        // the scan to "default" (the historical behaviour) hid every
-        // deletion in other buckets, so GC never detected dead bytes for
-        // those buckets' segments and compaction never ran for them.
+        // Phase 1: Collect eligible tombstone keys (past TTL) and the dead
+        // chunks they carry. Tombstones are scanned across ALL buckets —
+        // restricting the scan to "default" (the historical behaviour) hid
+        // every deletion in other buckets, so GC never detected dead bytes
+        // for those buckets' segments and compaction never ran for them.
+        //
+        // The tombstone carries the deleted object's chunk refs (captured
+        // before the object row was removed — see
+        // RocksDbMetadataStore::delete_object). Marking them dead directly
+        // is the ONLY way GC can attribute dead bytes to segments: the
+        // object row no longer exists, so matching tombstone keys against
+        // surviving object rows (the pre-fix approach) could never fire.
+        // Legacy tombstones (written before chunks were captured) have an
+        // empty chunk list — their dead bytes are unreachable and fall to
+        // the orphan reaper.
         let tombstones = metadata.list_tombstones_all();
         let mut eligible_keys: HashSet<(String, String)> = HashSet::new();
+        let mut tombstone_keys_by_segment: HashMap<SegmentId, Vec<(BucketId, ObjectKey)>> =
+            HashMap::new();
 
         for tomb_result in tombstones {
             match tomb_result {
@@ -312,6 +323,13 @@ impl GarbageCollector {
                     if now_ms - tombstone.deletion_time > ttl_ms {
                         eligible_keys
                             .insert((bucket.as_str().to_string(), key.as_str().to_string()));
+                        for chunk in &tombstone.chunks {
+                            tracker.mark_dead(chunk);
+                            tombstone_keys_by_segment
+                                .entry(chunk.segment_id)
+                                .or_default()
+                                .push((bucket.clone(), key.clone()));
+                        }
                     }
                 }
                 Err(e) => {
@@ -321,20 +339,15 @@ impl GarbageCollector {
         }
 
         if eligible_keys.is_empty() {
-            return Ok((eligible_keys, HashMap::new()));
+            return Ok((eligible_keys, tombstone_keys_by_segment));
         }
 
-        // Phase 2: Scan objects to accumulate live/dead bytes per segment.
-        // Objects whose (bucket, key) is in the eligible set → mark their
-        // chunks as dead. All other objects → add their chunks as live
-        // bytes. Objects are scanned across ALL buckets (the bucket is
-        // decoded from the store key) so tombstones in any bucket match
-        // their owning objects.
-        // Also track which (bucket, object_key) pairs belong to which
-        // segment so that tombstones can be deleted after compaction.
+        // Phase 2: Scan surviving objects to accumulate live bytes per
+        // segment. Deleted objects are already gone from the store — their
+        // chunks were marked dead in Phase 1 via the tombstone. Objects
+        // whose (bucket, key) is in the eligible set are skipped (they
+        // should not exist, but a re-PUT racing a tombstone would).
         let all_objects = metadata.list_objects_all_with_bucket();
-        let mut tombstone_keys_by_segment: HashMap<SegmentId, Vec<(BucketId, ObjectKey)>> =
-            HashMap::new();
 
         for obj_result in all_objects {
             let Ok((bucket, obj)) = obj_result else { continue };
@@ -567,7 +580,11 @@ mod tests {
             .put_tombstone(
                 &bucket,
                 &key,
-                Tombstone { deletion_time: 1700000000000, hlc: Hlc::new(1700000000000, 1) },
+                Tombstone {
+                    deletion_time: 1700000000000,
+                    hlc: Hlc::new(1700000000000, 1),
+                    chunks: smallvec::SmallVec::new(),
+                },
             )
             .unwrap();
 
@@ -618,7 +635,11 @@ mod tests {
                 .put_tombstone(
                     &bucket,
                     &ObjectKey::new(format!("obj{i}.txt")),
-                    Tombstone { deletion_time: 1700000000000, hlc: Hlc::new(1700000000000, 1) },
+                    Tombstone {
+                        deletion_time: 1700000000000,
+                        hlc: Hlc::new(1700000000000, 1),
+                        chunks: smallvec::SmallVec::new(),
+                    },
                 )
                 .unwrap();
         }
@@ -659,7 +680,11 @@ mod tests {
             .put_tombstone(
                 &bucket,
                 &ObjectKey::new("dead.txt"),
-                Tombstone { deletion_time: 1700000000000, hlc: Hlc::new(1700000000000, 1) },
+                Tombstone {
+                    deletion_time: 1700000000000,
+                    hlc: Hlc::new(1700000000000, 1),
+                    chunks: smallvec::SmallVec::new(),
+                },
             )
             .unwrap();
 
@@ -781,6 +806,80 @@ mod tests {
         assert_eq!(gc.segments_compacted_total.get(), 3);
         assert_eq!(gc.bytes_reclaimed_total.get(), 1024);
         assert_eq!(gc.compaction_bytes_total.get(), 2048);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tombstone-carried chunks: GC marks dead bytes from the tombstone even
+    // when the object row is already gone (the historical broken case).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn tombstone_chunks_drive_compaction_after_row_removed() {
+        let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+
+        let seg_id = SegmentId::new();
+        let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
+        metadata.put_segment(seg_meta).unwrap();
+
+        // One LIVE object (100 bytes) still referencing the segment.
+        let live_obj = make_object_meta(
+            "live.txt",
+            100,
+            ChunkRef {
+                segment_id: seg_id,
+                offset: 0,
+                length: 100,
+                compressed: false,
+                logical_length: 100,
+            },
+        );
+        metadata.put_object(live_obj).unwrap();
+
+        // The DELETED object's row is GONE (delete_object removes it) —
+        // only the tombstone survives, and it carries the deleted chunks.
+        // This is the exact scenario that was broken: the old code matched
+        // tombstone keys against surviving object rows, which can never
+        // fire once the row is removed, so gc_dead_bytes_total stayed 0
+        // and compaction never ran.
+        let bucket = BucketId::new("default");
+        let dead_chunk = ChunkRef {
+            segment_id: seg_id,
+            offset: 100,
+            length: 900,
+            compressed: false,
+            logical_length: 900,
+        };
+        let mut chunks = smallvec::SmallVec::<[ChunkRef; 4]>::new();
+        chunks.push(dead_chunk);
+        metadata
+            .put_tombstone(
+                &bucket,
+                &ObjectKey::new("deleted.txt"),
+                Tombstone {
+                    deletion_time: 1700000000000, // ancient, past TTL
+                    hlc: Hlc::new(1700000000000, 1),
+                    chunks,
+                },
+            )
+            .unwrap();
+
+        // Liveness: 100 live / 1000 total = 0.1 < 0.5 threshold → compaction
+        // must trigger purely from the tombstone-carried chunks.
+        let gc = GarbageCollector::new(GcConfig { compact_threshold: 0.5, ..GcConfig::default() });
+        let stats = gc.run_cycle(metadata.clone()).await.unwrap();
+
+        assert_eq!(stats.dead_bytes, 900, "dead bytes must come from the tombstone chunks");
+        assert_eq!(stats.segments_compacted, 1, "segment must be compacted");
+        assert!(stats.bytes_reclaimed > 0);
+
+        // The deleted object's data must be gone from the new segment:
+        // the live object survives with a NEW chunk ref.
+        let live_after = metadata
+            .get_object(&bucket, &ObjectKey::new("live.txt"))
+            .unwrap()
+            .expect("live object must survive compaction");
+        assert!(!live_after.chunks.is_empty());
+        assert_ne!(live_after.chunks[0].segment_id, seg_id, "live chunks repacked to new segment");
     }
 
     // -----------------------------------------------------------------------

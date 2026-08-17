@@ -22,8 +22,8 @@
 use std::{sync::Arc, time::Duration};
 
 use oceanfs_core::{
-    BucketId, Gauge, Hlc, LabelSet, MetadataConfig, MetricRegistrar, ObjectKey, ObjectMetadata,
-    SegmentId, SegmentMetadata, Tombstone,
+    BucketId, ChunkRef, Gauge, Hlc, LabelSet, MetadataConfig, MetricRegistrar, ObjectKey,
+    ObjectMetadata, SegmentId, SegmentMetadata, Tombstone,
 };
 use rocksdb::{ColumnFamilyDescriptor, Options, DB};
 
@@ -497,6 +497,15 @@ impl RocksDbMetadataStore {
 
         let db_key = cf::encode_object_key(bucket.as_str(), key.as_str());
 
+        // Capture the object's chunk references BEFORE removing the row:
+        // the tombstone is the only surviving record of which segments
+        // hold this object's bytes, and GC marks them dead from the
+        // tombstone. Without this, GC could never detect dead bytes for
+        // deleted objects (the row is gone, so the old object-scan
+        // matching could never fire).
+        let chunks: smallvec::SmallVec<[ChunkRef; 4]> =
+            self.get_object(bucket, key).ok().flatten().map(|meta| meta.chunks).unwrap_or_default();
+
         self.db.delete_cf(&cf, &db_key).map_err(|e| Error::Io(io_err(e)))?;
 
         // Write a deletion tombstone so that GC can compact this key
@@ -508,6 +517,7 @@ impl RocksDbMetadataStore {
                 .unwrap_or_default()
                 .as_millis() as i64,
             hlc,
+            chunks,
         };
         self.put_tombstone(bucket, key, tombstone)?;
 
@@ -1781,7 +1791,11 @@ mod tests {
             .put_tombstone(
                 &bucket,
                 &key,
-                Tombstone { deletion_time: 1700000000000, hlc: Hlc::new(1700000000000, 1) },
+                Tombstone {
+                    deletion_time: 1700000000000,
+                    hlc: Hlc::new(1700000000000, 1),
+                    chunks: smallvec::SmallVec::new(),
+                },
             )
             .unwrap();
 

@@ -947,6 +947,7 @@ mod tests {
                         .unwrap_or_default()
                         .as_millis() as i64,
                     hlc,
+                    chunks: smallvec::SmallVec::new(),
                 },
             );
             Ok(())

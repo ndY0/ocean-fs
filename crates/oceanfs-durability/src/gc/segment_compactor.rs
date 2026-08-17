@@ -367,6 +367,7 @@ mod tests {
                 Tombstone {
                     deletion_time: 1000000000000, // very old
                     hlc: Hlc::new(1000000000000, 1),
+                    chunks: smallvec::SmallVec::new(),
                 },
             )
             .unwrap();
@@ -477,6 +478,7 @@ mod tests {
                     Tombstone {
                         deletion_time: 1000000000000, // ancient, past any TTL
                         hlc: Hlc::new(1000000000000, 1),
+                        chunks: smallvec::SmallVec::new(),
                     },
                 )
                 .unwrap();

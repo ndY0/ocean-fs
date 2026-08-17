@@ -152,7 +152,11 @@ fn tombstone_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let store = make_store(&dir);
 
-    let tombstone = Tombstone { deletion_time: 1_700_000_000_000, hlc: Hlc::zero() };
+    let tombstone = Tombstone {
+        deletion_time: 1_700_000_000_000,
+        hlc: Hlc::zero(),
+        chunks: smallvec::SmallVec::new(),
+    };
 
     store.put_tombstone(&test_bucket(), &test_key("deleted-key"), tombstone).unwrap();
 
@@ -299,7 +303,11 @@ fn batch_write_atomicity() {
         hlc: Hlc::zero(),
     };
 
-    let tombstone = Tombstone { deletion_time: 1_700_000_001_000, hlc: Hlc::zero() };
+    let tombstone = Tombstone {
+        deletion_time: 1_700_000_001_000,
+        hlc: Hlc::zero(),
+        chunks: smallvec::SmallVec::new(),
+    };
 
     let ops = vec![
         BatchOp::PutObject(test_bucket(), test_key("batch-obj"), meta),
