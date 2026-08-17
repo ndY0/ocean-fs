@@ -191,6 +191,12 @@ done until its rows are automated fault-injection tests.
   behaviors as the regression suite, not regress them.
 - **Next action:** begin EPIC 1, feature 1 (`lifecycle-registry-
   coordinator`).
+- **Known remaining CF writers during phases 1–2** (accepted phase-1
+  deviation, recorded in `segments-cf-removal.md`): the GC compactor's
+  `PutSegment`/`DeleteSegment` writes, the startup interrupted-seal
+  adoption `put_segment`, and the heal worker's post-repair metadata
+  refresh stay outside the coordinator until phase 3
+  (`compaction-state-machine`, `startup-rebuild-from-machine`).
 
 ## References
 

@@ -2,13 +2,15 @@
 //!
 //! Mirrors the WAL's group commit (`crate::wal::sync` — internal) for
 //! the seal pipeline (perf rule §3.4): concurrent seal tasks register
-//! their temp files and segment metadata with the coordinator, a
-//! dedicated flusher collects registrations within a short window,
-//! then performs one sync barrier round per file (files are synced
-//! individually — the win is amortizing the barrier/queue cost across
-//! the burst and moving the fsync off the runtime worker threads) and
-//! persists all segment metadata for the batch in ONE RocksDB
-//! `WriteBatch`.
+//! their temp files with the coordinator, a dedicated flusher collects
+//! registrations within a short window, then performs one sync barrier
+//! round per file (files are synced individually — the win is
+//! amortizing the barrier/queue cost across the burst and moving the
+//! fsync off the runtime worker threads). The batch's segment metadata
+//! is then persisted through the **lifecycle coordinator** — the only
+//! writer of segment state — in ONE RocksDB `WriteBatch`
+//! (`SegmentLifecycleCoordinator::seal_finalized_batch`; ADR-0025
+//! phase 1: the coordinator validates, writes durably, and folds).
 //!
 //! ## Ordering guarantees
 //!
@@ -19,8 +21,9 @@
 //!    rename atomicity contract), AND
 //! 2. the file is finalized under its final name (`linkat` or
 //!    `rename`), AND
-//! 3. the segment's metadata write has been submitted to RocksDB in
-//!    the batch flush.
+//! 3. the segment's seal transition has been validated against the
+//!    lifecycle registry, its metadata written durably (the batch
+//!    write), and the registry folded (validate → durable → fold).
 //!
 //! This keeps ADR-0021's invariant intact: the seal worker removes the
 //! sealing-data entry only after `seal_from_data` returns `Ok`, which
@@ -41,7 +44,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::{
     error::{Error, Result},
     io::atomic_write::{finalize_temp, SegmentWriteMode},
-    metadata::{BatchOp, RocksDbMetadataStore},
+    segment::lifecycle::SegmentLifecycleCoordinator,
 };
 
 /// How a registered temp file is made visible under its final name.
@@ -61,10 +64,11 @@ struct FlushRegistration {
     filename: String,
     /// How to make the file visible.
     op: FinalizeOp,
-    /// Segment metadata persisted in the batch after the file is durable.
+    /// Segment metadata persisted by the lifecycle coordinator in the
+    /// batch after the file is durable.
     meta: SegmentMetadata,
     /// Completion signal: `Ok` = file synced + finalized + metadata
-    /// submitted in the batch.
+    /// committed through the lifecycle coordinator.
     done: oneshot::Sender<Result<()>>,
 }
 
@@ -132,9 +136,15 @@ impl SegmentFlushGroup {
     /// window). `max_waiters` is an early-flush trigger: when this
     /// many registrations are pending, the batch flushes immediately.
     ///
+    /// `lifecycle` is the single writer of segment lifecycle state: the
+    /// flusher hands the batch's sealed metadata to
+    /// [`SegmentLifecycleCoordinator::seal_finalized_batch`], which
+    /// validates, writes it durably (one RocksDB batch), and folds it
+    /// into the registry (ADR-0025 phase 1).
+    ///
     /// Must be called from within a tokio runtime context.
     pub(crate) fn new(
-        metadata: Arc<RocksDbMetadataStore>,
+        lifecycle: Arc<SegmentLifecycleCoordinator>,
         data_dir: PathBuf,
         batch_timeout_ms: u64,
         max_waiters: usize,
@@ -168,15 +178,15 @@ impl SegmentFlushGroup {
                     }
                 }
 
-                // Run the blocking I/O (sync + finalize + RocksDB batch)
-                // on the blocking pool — never on a runtime worker
-                // (single-scheduler discipline, same as the seal-time
-                // EC encode).
-                let metadata = Arc::clone(&metadata);
+                // Run the blocking I/O (sync + finalize + the lifecycle
+                // seal batch) on the blocking pool — never on a runtime
+                // worker (single-scheduler discipline, same as the
+                // seal-time EC encode).
+                let lifecycle = Arc::clone(&lifecycle);
                 let data_dir = data_dir.clone();
                 let stats = Arc::clone(&stats_task);
                 let _ = tokio::task::spawn_blocking(move || {
-                    flush_batch(batch, &metadata, &data_dir, &stats);
+                    flush_batch(batch, &lifecycle, &data_dir, &stats);
                 })
                 .await;
             }
@@ -221,13 +231,14 @@ impl SegmentFlushGroup {
 }
 
 /// Syncs + finalizes every registration in the batch, then persists all
-/// segment metadata in ONE RocksDB `WriteBatch`.
+/// segment metadata through the lifecycle coordinator in ONE RocksDB
+/// `WriteBatch` (validate → durable → fold).
 ///
 /// Runs on the blocking pool (spawn_blocking) — every call here is a
 /// blocking syscall or a synchronous RocksDB write.
 fn flush_batch(
     batch: Vec<FlushRegistration>,
-    metadata: &RocksDbMetadataStore,
+    lifecycle: &SegmentLifecycleCoordinator,
     data_dir: &Path,
     stats: &FlushStats,
 ) {
@@ -251,7 +262,7 @@ fn flush_batch(
 
     // Phase 2: per-file barrier + finalize. Collect metadata only for
     // files whose sync AND finalize succeeded.
-    let mut ops: Vec<BatchOp> = Vec::with_capacity(batch.len());
+    let mut metas: Vec<SegmentMetadata> = Vec::with_capacity(batch.len());
     let mut ok_waiters: Vec<oneshot::Sender<Result<()>>> = Vec::with_capacity(batch.len());
 
     for reg in batch {
@@ -278,7 +289,7 @@ fn flush_batch(
 
         match finalize_result {
             Ok(()) => {
-                ops.push(BatchOp::PutSegment(meta));
+                metas.push(meta);
                 ok_waiters.push(done);
             }
             Err(e) => {
@@ -299,21 +310,16 @@ fn flush_batch(
         }
     }
 
-    // Phase 3: one metadata batch for all successfully finalized files.
-    if !ops.is_empty() {
+    // Phase 3: one lifecycle seal batch for all successfully finalized
+    // files. The coordinator validates every id against the registry
+    // (Reserved-only), writes the accepted metadata in ONE RocksDB
+    // batch, then folds each entry — the single-writer invariant
+    // (ADR-0025 Decision 1) is preserved end to end.
+    if !metas.is_empty() {
         stats.metadata_batches_total.inc();
-        let result = metadata.batch_write(ops).map_err(|e| {
-            Error::Io(io::Error::other(format!("segment metadata batch write failed: {e}")))
-        });
-        for done in ok_waiters {
-            match &result {
-                Ok(()) => {
-                    let _ = done.send(Ok(()));
-                }
-                Err(e) => {
-                    let _ = done.send(Err(Error::Io(io::Error::other(e.to_string()))));
-                }
-            }
+        let results = lifecycle.seal_finalized_batch(metas);
+        for (done, result) in ok_waiters.into_iter().zip(results) {
+            let _ = done.send(result.map_err(|e| Error::Io(io::Error::other(e.to_string()))));
         }
     }
 }
@@ -321,12 +327,13 @@ fn flush_batch(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use oceanfs_core::{MetadataConfig, SegmentId, SizeTier};
+    use oceanfs_core::{LifecycleConfig, MetadataConfig, SegmentId, SizeTier};
 
     use super::*;
-    use crate::metadata::RocksDbMetadataStore;
+    use crate::{metadata::RocksDbMetadataStore, segment::lifecycle::SegmentLifecycleCoordinator};
 
-    async fn test_metadata() -> (Arc<RocksDbMetadataStore>, tempfile::TempDir) {
+    async fn test_metadata_and_lifecycle(
+    ) -> (Arc<RocksDbMetadataStore>, Arc<SegmentLifecycleCoordinator>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(
             RocksDbMetadataStore::open(&MetadataConfig {
@@ -337,7 +344,9 @@ mod tests {
             })
             .unwrap(),
         );
-        (store, dir)
+        let lifecycle =
+            Arc::new(SegmentLifecycleCoordinator::new(store.clone(), &LifecycleConfig::default()));
+        (store, lifecycle, dir)
     }
 
     fn make_meta(segment_id: SegmentId) -> SegmentMetadata {
@@ -354,11 +363,11 @@ mod tests {
 
     #[tokio::test]
     async fn group_commit_batches_concurrent_registrations() {
-        let (store, dir) = test_metadata().await;
+        let (store, lifecycle, dir) = test_metadata_and_lifecycle().await;
         let seg_dir = dir.path().join("segments");
         std::fs::create_dir_all(&seg_dir).unwrap();
 
-        let group = Arc::new(SegmentFlushGroup::new(store.clone(), seg_dir.clone(), 100, 8));
+        let group = Arc::new(SegmentFlushGroup::new(lifecycle.clone(), seg_dir.clone(), 100, 8));
 
         // 16 concurrent registrations with max_waiters=8 → at most 2 batches.
         let mut handles = Vec::new();
@@ -366,6 +375,10 @@ mod tests {
             let group = Arc::clone(&group);
             let seg_dir = seg_dir.clone();
             let id = SegmentId::new();
+            // Every registered segment must be Reserved in the
+            // registry first — the coordinator validates Reserved-only
+            // before the durable seal write.
+            lifecycle.request_reserve(id, SizeTier::Standard, 0, 0).await.unwrap();
             let meta = make_meta(id);
             handles.push(tokio::spawn(async move {
                 // Write a temp file (the seal task's job before registering).
@@ -404,18 +417,21 @@ mod tests {
             .filter_map(|r| r.ok().map(|m| m.segment_id))
             .collect();
         assert_eq!(ids.len(), 16, "all 16 segment metadata entries persisted");
+        // The lifecycle registry folded every seal.
+        assert_eq!(lifecycle.registry().len(), 16);
     }
 
     #[tokio::test]
     async fn sync_failure_reports_error_and_skips_metadata() {
-        let (store, dir) = test_metadata().await;
+        let (store, lifecycle, dir) = test_metadata_and_lifecycle().await;
         let seg_dir = dir.path().join("segments");
         std::fs::create_dir_all(&seg_dir).unwrap();
 
-        let group = Arc::new(SegmentFlushGroup::new(store.clone(), seg_dir.clone(), 100, 8));
+        let group = Arc::new(SegmentFlushGroup::new(lifecycle.clone(), seg_dir.clone(), 100, 8));
 
         FAIL_SYNC.store(true, Ordering::Relaxed);
         let id = SegmentId::new();
+        lifecycle.request_reserve(id, SizeTier::Standard, 0, 0).await.unwrap();
         let meta = make_meta(id);
         let tmp = seg_dir.join(".tmp.fail");
         std::fs::write(&tmp, vec![0xCD; 512]).unwrap();
@@ -425,9 +441,14 @@ mod tests {
 
         assert!(result.is_err(), "sync failure must propagate to the waiter");
         assert!(!seg_dir.join("fail.dat").exists(), "finalize must not run after a failed sync");
-        assert!(
-            store.get_segment(id).unwrap().is_none(),
-            "metadata must not be persisted for a file that failed sync"
+        // The reserve entry survives (it predates the seal); the SEAL
+        // metadata must not have been written.
+        let cf = store.get_segment(id).unwrap().expect("reserve entry still present");
+        assert!(cf.sealed_at.is_none(), "seal metadata must not be persisted after a failed sync");
+        assert_eq!(
+            lifecycle.registry().get(id).unwrap().state,
+            crate::segment::lifecycle::SegmentState::Reserved,
+            "registry fold must not happen for a file that failed sync"
         );
     }
 
@@ -435,7 +456,7 @@ mod tests {
     async fn fsync_runs_on_the_blocking_pool_not_the_runtime_worker() {
         use std::hash::{Hash, Hasher};
 
-        let (store, dir) = test_metadata().await;
+        let (_store, lifecycle, dir) = test_metadata_and_lifecycle().await;
         let seg_dir = dir.path().join("segments");
         std::fs::create_dir_all(&seg_dir).unwrap();
 
@@ -443,14 +464,13 @@ mod tests {
         std::thread::current().id().hash(&mut hasher);
         let test_thread = hasher.finish();
 
-        let group = Arc::new(SegmentFlushGroup::new(store, seg_dir.clone(), 100, 8));
+        let group = Arc::new(SegmentFlushGroup::new(lifecycle.clone(), seg_dir.clone(), 100, 8));
         let tmp = seg_dir.join(".tmp.pin.dat");
         std::fs::write(&tmp, vec![0xEE; 512]).unwrap();
         let file = std::fs::File::open(&tmp).unwrap();
-        group
-            .submit(file, "pin.dat".into(), FinalizeOp::Rename, make_meta(SegmentId::new()))
-            .await
-            .unwrap();
+        let id = SegmentId::new();
+        lifecycle.request_reserve(id, SizeTier::Standard, 0, 0).await.unwrap();
+        group.submit(file, "pin.dat".into(), FinalizeOp::Rename, make_meta(id)).await.unwrap();
 
         let flush_thread = LAST_FLUSH_THREAD.load(Ordering::Relaxed);
         assert_ne!(

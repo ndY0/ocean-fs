@@ -40,8 +40,9 @@ pub use buffer_pool::BufferPool;
 pub use error::{Error, Result};
 pub use metadata::{BatchOp, RocksDbMetadataStore, RocksDbMetrics};
 pub use segment::{
-    ActiveSegment, SealConfig, SealingWork, SegmentHandle, SegmentHeader, SegmentIndex,
-    SegmentPool, SegmentSealer, SegmentShard, SegmentSplitter, TierRouter,
+    ActiveSegment, LifecycleEntry, SealConfig, SealingWork, SegmentHandle, SegmentHeader,
+    SegmentIndex, SegmentLifecycleCoordinator, SegmentLifecycleRegistry, SegmentPool,
+    SegmentSealer, SegmentShard, SegmentSplitter, SegmentState, TierRouter, TransitionError,
 };
 pub use wal::{count_wal_files, prune_deleted_segment_markers, WalEntry, WalReader, WalWriter}; // ---------------------------------------------------------------------------
                                                                                                // Generated gRPC service stubs

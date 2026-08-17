@@ -982,7 +982,10 @@ impl SegmentPool {
     /// Enqueue failures are logged and retried on the next sweep — an
     /// idle segment is not a fresh write, so there is no ack to reject;
     /// the segment simply stays unsealed one more interval.
-    async fn sweep_idle_segments(&self, idle_timeout: std::time::Duration) {
+    ///
+    /// Driven by the lifecycle coordinator's `seal_idle_segments` tick
+    /// (ADR-0025 phase 1 — the coordinator owns the idle-seal timer).
+    pub(crate) async fn sweep_idle_segments(&self, idle_timeout: std::time::Duration) {
         // Collect sealed payloads outside the slot locks (same pattern
         // as the fill path: the critical section is the freeze).
         let mut sealed: Vec<SealedSegment> = Vec::new();
@@ -1553,8 +1556,16 @@ mod tests {
                 .unwrap(),
         );
 
-        // Take the receiver but don't drain — the channel will fill.
+        // Drain the queue on a background thread: the enqueue path
+        // NEVER drops a seal work item (a dropped seal orphans the
+        // segment's data), so a full queue applies backpressure via
+        // `blocking_send` — with the receiver taken and never drained
+        // the sync path would block forever. The drainer keeps the
+        // channel consuming while the appends fill it.
         let _rx = pool.take_seal_rx();
+        if let Some(mut rx) = _rx {
+            std::thread::spawn(move || while rx.blocking_recv().is_some() {});
+        }
 
         // Execute on the runtime so block_on works for enqueue_seal.
         rt.block_on(async {

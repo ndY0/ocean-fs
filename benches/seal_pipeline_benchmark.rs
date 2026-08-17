@@ -69,6 +69,11 @@ async fn concurrent_seals(
         .await
         .expect("open wal"),
     );
+    let lifecycle =
+        std::sync::Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+            metadata,
+            &oceanfs_core::LifecycleConfig::default(),
+        ));
     let sealer = Arc::new(SegmentSealer::new(
         oceanfs_storage::SealConfig {
             target_size_bytes: data_size as u64,
@@ -80,8 +85,8 @@ async fn concurrent_seals(
             fsync_batch_timeout_ms: 10,
             fsync_max_waiters: 8,
         },
-        metadata,
         wal,
+        lifecycle,
     ));
 
     let start = Instant::now();

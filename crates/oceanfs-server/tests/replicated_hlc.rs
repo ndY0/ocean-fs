@@ -186,7 +186,12 @@ async fn make_coordinator(
         write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
         ..Default::default()
     };
-    let sealer = Arc::new(SegmentSealer::new(seal_config, local_store.clone(), wal));
+    let lifecycle =
+        Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+            local_store.clone(),
+            &oceanfs_core::LifecycleConfig::default(),
+        ));
+    let sealer = Arc::new(SegmentSealer::new(seal_config, wal, Arc::clone(&lifecycle)));
 
     let hints_dir = dir.path().join("hints");
     let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
@@ -214,6 +219,7 @@ async fn make_coordinator(
         segment_pool_small,
         segment_pool_standard,
         sealer,
+        lifecycle,
         hinted_handoff,
         hint_config,
     );

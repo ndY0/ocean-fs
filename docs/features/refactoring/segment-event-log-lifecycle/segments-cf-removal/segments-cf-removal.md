@@ -125,6 +125,49 @@ machine scan (ADR-0025 §References).
 - Any dual-write reconciliation layer — the event log is the source of
   truth; the CF is gone, not synced.
 
+## Known remaining CF writers (phases 1–2; absorbed by this phase)
+
+Phase 1 (`lifecycle-registry-coordinator`) routes the write path's
+phantom registration, the seal-complete metadata write, and the orphan
+reaper's deleted-marker write through the coordinator — the only writer
+of segment lifecycle state. **Two CF writers intentionally remain
+outside the coordinator during phases 1–2** and must be absorbed (or
+deleted) by this phase:
+
+1. **GC compactor** (`crates/oceanfs-durability/src/gc/segment_compactor.rs`):
+   `delete_segment` for fully-dead segments and
+   `batch_write(PutSegment(new) + DeleteSegment(old))` for repacks. This
+   is the `compaction-state-machine` feature's migration surface; until
+   then the compactor's new segments have **no registry entry** — the
+   orphan reaper's `request_delete` on them returns `Missing`, which the
+   reaper treats as "durable deletion already happened" (unlink proceeds
+   without a marker; the CF entry lingers). The reaper's
+   `Missing`-handling must be revisited when the compactor moves onto
+   the machine.
+2. **Startup interrupted-seal adoption**
+   (`crates/oceanfs-node/src/node.rs`, the `.dat`-orphan scan):
+   `put_segment` with recomputed Merkle root. This is deleted by
+   `startup-rebuild-from-machine` (fold-based recovery replaces the
+   heuristic). Until then the adopted segments are also registry-less;
+   the node's phase-1 startup **seed** (`seed_from_metadata_store`)
+   covers pre-existing entries at boot, but adoption runs after the
+   seed, so adopted segments stay registry-less until this phase.
+3. **Heal worker's post-repair metadata refresh**
+   (`crates/oceanfs-durability/src/heal/worker.rs`): re-saves a sealed
+   segment's metadata with `merkle_root: None` (invalidate the anchor
+   until rebuilt). This is a metadata refresh, **not** a lifecycle
+   transition — `sealed_at` is preserved, no state change, no
+   downgrade — and no phase-1 coordinator transition exists for it
+   (`seal` is Reserved-only, the segment is already Sealed). Absorbed
+   here by routing the refresh through the machine (the machine's
+   entry metadata is the scrub/AE anchor in this phase).
+
+Mutation/grep note: the phase-1 DoD's "every `put_segment` /
+deleted-marker CF write outside `segment/lifecycle.rs` is gone" applies
+to the three in-scope writers; the three remaining writers above are
+the documented exceptions and each must be **gone** by the end of
+this phase's "CF gone (grep-verifiable)" DoD item.
+
 ## Crate Impact
 
 | Crate | Change |

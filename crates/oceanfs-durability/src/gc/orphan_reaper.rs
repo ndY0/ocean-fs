@@ -7,7 +7,7 @@ use std::{
 };
 
 use oceanfs_core::{Counter, LabelSet, MetricRegistrar, SegmentId};
-use oceanfs_storage::Result;
+use oceanfs_storage::{Result, SegmentLifecycleCoordinator, TransitionError};
 
 use super::{config::GcConfig, garbage_collector::SegmentShardStore};
 
@@ -39,6 +39,12 @@ pub struct OrphanStats {
 /// The reaper periodically scans the `segments` CF, cross-references
 /// against `objects` CF, and deletes unreferenced segments.
 ///
+/// Deletion is routed through the lifecycle coordinator (ADR-0025
+/// phase 1) — the ONLY writer of segment lifecycle state: the reaper
+/// *requests* the delete, and the coordinator makes the deleted-marker
+/// CF write durable BEFORE the reaper unlinks the `.dat` files
+/// (ADR-0024 invariant 3: delete before unlink).
+///
 /// # Examples
 ///
 /// ```ignore
@@ -47,6 +53,10 @@ pub struct OrphanStats {
 /// ```
 pub struct OrphanReaper {
     metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
+    /// Lifecycle coordinator — the single writer of segment lifecycle
+    /// state; the reaper requests `delete` through it before unlinking
+    /// shards.
+    lifecycle: Arc<SegmentLifecycleCoordinator>,
     store: Arc<dyn SegmentShardStore>,
     config: GcConfig,
     orphans_deleted_total: Counter,
@@ -63,11 +73,13 @@ impl OrphanReaper {
     /// ```
     pub fn new(
         metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
+        lifecycle: Arc<SegmentLifecycleCoordinator>,
         store: Arc<dyn SegmentShardStore>,
         config: GcConfig,
     ) -> Self {
         Self {
             metadata,
+            lifecycle,
             store,
             config,
             orphans_deleted_total: Counter::new(
@@ -140,11 +152,33 @@ impl OrphanReaper {
             let still_orphan = !self.is_segment_referenced(*segment_id)?;
 
             if still_orphan {
-                // Delete shard data from disk first, then remove metadata.
-                // Shard deletion happens before metadata deletion so that
-                // a crash between the two leaves metadata pointing to
-                // already-deleted shards (safe: the segment will be detected
-                // as orphan again and retried).
+                // Delete-before-unlink (ADR-0024 invariant 3): the
+                // lifecycle coordinator makes the deleted-marker write
+                // durable BEFORE the .dat files are unlinked. A crash
+                // between the two leaves a Deleted marker + an orphan
+                // `.dat`, which the reaper sweeps on the next cycle
+                // (ADR-0025 crash-window row 6 is unrepresentable).
+                match self.lifecycle.request_delete(*segment_id).await {
+                    Ok(()) => {}
+                    // The durable deletion already happened (this
+                    // segment was deleted by an earlier run whose
+                    // unlink never completed) — safe to unlink.
+                    Err(TransitionError::AlreadyDeleted) | Err(TransitionError::Missing) => {}
+                    Err(e) => {
+                        // The deletion is NOT durable: unlinking the
+                        // shards would violate delete-before-unlink.
+                        // Retry on the next cycle.
+                        tracing::warn!(
+                            segment_id = %segment_id,
+                            error = %e,
+                            "failed to persist orphan deletion; shard unlink deferred"
+                        );
+                        continue;
+                    }
+                }
+
+                // Delete shard data from disk after the deletion is
+                // durable.
                 match self.store.delete_shards(*segment_id) {
                     Ok(bytes) => {
                         tracing::info!(
@@ -155,18 +189,18 @@ impl OrphanReaper {
                         stats.bytes_reclaimed += bytes;
                     }
                     Err(e) => {
-                        // Log but continue — metadata deletion should still happen.
-                        // The orphan segment's shards may already be gone.
+                        // Log but continue — metadata deletion already
+                        // happened. The orphan segment's shards may
+                        // already be gone, or the leftover `.dat` is
+                        // swept by the next cycle.
                         tracing::warn!(
                             error = %e,
                             segment_id = %segment_id,
-                            "failed to delete orphan segment shards, continuing with metadata deletion"
+                            "failed to delete orphan segment shards, continuing"
                         );
                     }
                 }
 
-                // Delete segment metadata from RocksDB
-                self.metadata.delete_segment(*segment_id)?;
                 stats.orphans_deleted += 1;
 
                 tracing::info!(segment_id = %segment_id, "reclaimed orphan segment");
@@ -244,10 +278,12 @@ mod tests {
     };
 
     use oceanfs_core::{
-        BucketId, ChunkRef, Hlc, MetadataConfig, ObjectKey, ObjectMetadata, SegmentId,
-        SegmentMetadata, SizeTier, Tombstone,
+        BucketId, ChunkRef, Hlc, LifecycleConfig, MetadataConfig, ObjectKey, ObjectMetadata,
+        SegmentId, SegmentMetadata, SizeTier, Tombstone,
     };
-    use oceanfs_storage::metadata::RocksDbMetadataStore;
+    use oceanfs_storage::{
+        metadata::RocksDbMetadataStore, segment::lifecycle::SegmentLifecycleCoordinator,
+    };
 
     use super::super::{
         config::tier_target_size, garbage_collector::InMemorySegmentShardStore,
@@ -266,6 +302,23 @@ mod tests {
 
     fn test_shard_store() -> Arc<InMemorySegmentShardStore> {
         Arc::new(InMemorySegmentShardStore::new(tier_target_size(SizeTier::Standard)))
+    }
+
+    /// Constructs a reaper whose coordinator is seeded from the store
+    /// (mirroring the node's startup seed): orphan candidates written
+    /// directly to the CF must be visible to the coordinator's
+    /// `request_delete` validation.
+    fn make_reaper(
+        metadata: Arc<RocksDbMetadataStore>,
+        store: Arc<InMemorySegmentShardStore>,
+        config: GcConfig,
+    ) -> OrphanReaper {
+        let lifecycle = Arc::new(SegmentLifecycleCoordinator::new(
+            metadata.clone(),
+            &LifecycleConfig::default(),
+        ));
+        lifecycle.seed_from_metadata_store().unwrap();
+        OrphanReaper::new(metadata, lifecycle, store, config)
     }
 
     fn make_object_meta(key: &str, size: u64, chunk: ChunkRef) -> ObjectMetadata {
@@ -301,14 +354,14 @@ mod tests {
     fn orphan_reaper_constructor() {
         let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
         let store = test_shard_store();
-        let _reaper = OrphanReaper::new(metadata, store, GcConfig::default());
+        let _reaper = make_reaper(metadata, store, GcConfig::default());
     }
 
     #[tokio::test]
     async fn orphan_reaper_empty_store() {
         let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
         let store = test_shard_store();
-        let reaper = OrphanReaper::new(metadata, store, GcConfig::default());
+        let reaper = make_reaper(metadata, store, GcConfig::default());
         let stats = reaper.run_cycle().await.unwrap();
         assert_eq!(stats.segments_scanned, 0);
         assert_eq!(stats.orphans_found, 0);
@@ -336,7 +389,7 @@ mod tests {
         metadata.put_object(obj_meta).unwrap();
 
         let store = test_shard_store();
-        let reaper = OrphanReaper::new(metadata, store, GcConfig::default());
+        let reaper = make_reaper(metadata, store, GcConfig::default());
         let stats = reaper.run_cycle().await.unwrap();
         assert_eq!(stats.segments_scanned, 1);
         assert_eq!(stats.orphans_found, 0);
@@ -369,7 +422,7 @@ mod tests {
         metadata.put_object_in_bucket(&BucketId::new("load-test"), obj_meta).unwrap();
 
         let store = test_shard_store();
-        let reaper = OrphanReaper::new(metadata, store, GcConfig::default());
+        let reaper = make_reaper(metadata, store, GcConfig::default());
         let stats = reaper.run_cycle().await.unwrap();
         assert_eq!(stats.segments_scanned, 1);
         assert_eq!(stats.orphans_found, 0, "referenced segment must not be reaped");
@@ -386,7 +439,7 @@ mod tests {
         // No object references this segment
 
         let store = test_shard_store();
-        let reaper = OrphanReaper::new(metadata, store, GcConfig::default());
+        let reaper = make_reaper(metadata, store, GcConfig::default());
         let stats = reaper.run_cycle().await.unwrap();
         assert_eq!(stats.segments_scanned, 1);
         assert_eq!(stats.orphans_found, 1);
@@ -406,7 +459,7 @@ mod tests {
         // No object references this segment
 
         let store = test_shard_store();
-        let reaper = OrphanReaper::new(metadata, store, GcConfig::default());
+        let reaper = make_reaper(metadata, store, GcConfig::default());
         let stats = reaper.run_cycle().await.unwrap();
         assert_eq!(stats.segments_scanned, 1);
         // Should not be considered orphan because it's too young
@@ -417,7 +470,7 @@ mod tests {
     async fn empty_segments_cf_yields_no_orphans() {
         let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
         let store = test_shard_store();
-        let reaper = OrphanReaper::new(metadata, store, GcConfig::default());
+        let reaper = make_reaper(metadata, store, GcConfig::default());
         let stats = reaper.run_cycle().await.unwrap();
         assert_eq!(stats.orphans_found, 0);
     }
@@ -434,7 +487,7 @@ mod tests {
         assert!(metadata.get_segment(seg_id).unwrap().is_some());
 
         let store = test_shard_store();
-        let reaper = OrphanReaper::new(metadata.clone(), store, GcConfig::default());
+        let reaper = make_reaper(metadata.clone(), store, GcConfig::default());
         let stats = reaper.run_cycle().await.unwrap();
         assert_eq!(stats.orphans_found, 1);
         assert_eq!(stats.orphans_deleted, 1);
@@ -452,7 +505,7 @@ mod tests {
         metadata.put_segment(seg_meta).unwrap();
 
         let store = Arc::new(InMemorySegmentShardStore::new(4194304));
-        let reaper = OrphanReaper::new(metadata, store.clone(), GcConfig::default());
+        let reaper = make_reaper(metadata, store.clone(), GcConfig::default());
         let stats = reaper.run_cycle().await.unwrap();
         assert_eq!(stats.orphans_found, 1);
         assert_eq!(stats.orphans_deleted, 1);
@@ -477,7 +530,7 @@ mod tests {
 
         let store = test_shard_store();
         let standard_size = tier_target_size(SizeTier::Standard);
-        let reaper = OrphanReaper::new(metadata, store, GcConfig::default());
+        let reaper = make_reaper(metadata, store, GcConfig::default());
         let stats = reaper.run_cycle().await.unwrap();
         assert_eq!(stats.orphans_found, 3);
         assert_eq!(stats.orphans_deleted, 3);
@@ -530,7 +583,7 @@ mod tests {
             .unwrap();
 
         let store = test_shard_store();
-        let reaper = OrphanReaper::new(metadata.clone(), store, GcConfig::default());
+        let reaper = make_reaper(metadata.clone(), store, GcConfig::default());
         let stats = reaper.run_cycle().await.unwrap();
         // The object was deleted so no chunks reference the segment → orphan
         assert_eq!(stats.orphans_found, 1);
@@ -550,7 +603,7 @@ mod tests {
         metadata.put_segment(seg_meta).unwrap();
 
         let store = test_shard_store();
-        let reaper = OrphanReaper::new(metadata.clone(), store, GcConfig::default());
+        let reaper = make_reaper(metadata.clone(), store, GcConfig::default());
 
         // Initially unreferenced — would be an orphan candidate
         assert!(!reaper.is_segment_referenced(seg_id).unwrap());
@@ -587,7 +640,7 @@ mod tests {
     async fn start_background_spawns_and_can_be_cancelled() {
         let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
         let store = test_shard_store();
-        let reaper = Arc::new(OrphanReaper::new(
+        let reaper = Arc::new(make_reaper(
             metadata,
             store,
             GcConfig { interval_sec: 3600, ..GcConfig::default() },
@@ -635,7 +688,7 @@ mod tests {
         // Verify the segment is referenced (not orphan yet)
         let store = test_shard_store();
         {
-            let reaper = OrphanReaper::new(metadata.clone(), store.clone(), GcConfig::default());
+            let reaper = make_reaper(metadata.clone(), store.clone(), GcConfig::default());
             let stats = reaper.run_cycle().await.unwrap();
             assert_eq!(stats.orphans_found, 0, "segment should NOT be orphan while object exists");
         }
@@ -657,7 +710,7 @@ mod tests {
             .unwrap();
 
         // After object deletion, the segment is no longer referenced → orphan
-        let reaper = OrphanReaper::new(metadata.clone(), store, GcConfig::default());
+        let reaper = make_reaper(metadata.clone(), store, GcConfig::default());
         let stats = reaper.run_cycle().await.unwrap();
         assert_eq!(stats.orphans_found, 1, "segment should be orphan after all objects deleted");
         assert_eq!(stats.orphans_deleted, 1);
@@ -705,7 +758,7 @@ mod tests {
             .unwrap();
 
         let store = test_shard_store();
-        let reaper = OrphanReaper::new(metadata, store, GcConfig::default());
+        let reaper = make_reaper(metadata, store, GcConfig::default());
         let stats = reaper.run_cycle().await.unwrap();
         // Segment is unreferenced but sealed too recently → not orphan
         assert_eq!(stats.orphans_found, 0);
@@ -752,7 +805,7 @@ mod tests {
         metadata.put_object(obj_meta).unwrap();
 
         let store = test_shard_store();
-        let reaper = OrphanReaper::new(Arc::new(metadata), store, GcConfig::default());
+        let reaper = make_reaper(Arc::new(metadata), store, GcConfig::default());
         let referenced = reaper.build_referenced_set().unwrap();
         assert!(referenced.contains(&seg_id));
     }
@@ -766,7 +819,7 @@ mod tests {
     async fn is_segment_referenced_returns_false_for_nonexistent() {
         let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
         let store = test_shard_store();
-        let reaper = OrphanReaper::new(metadata, store, GcConfig::default());
+        let reaper = make_reaper(metadata, store, GcConfig::default());
         assert!(!reaper.is_segment_referenced(SegmentId::new()).unwrap());
     }
 
@@ -835,7 +888,7 @@ mod tests {
     fn orphan_reaper_metrics_created_and_increment() {
         let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
         let store = test_shard_store();
-        let reaper = OrphanReaper::new(metadata, store, GcConfig::default());
+        let reaper = make_reaper(metadata, store, GcConfig::default());
         assert_eq!(reaper.orphans_deleted_total.get(), 0);
         assert_eq!(reaper.bytes_reclaimed_total.get(), 0);
 

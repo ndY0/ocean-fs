@@ -78,7 +78,12 @@ async fn wal_truncation_called_during_seal() {
         write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
         ..Default::default()
     };
-    let sealer = SegmentSealer::new(seal_config, metadata, wal.clone());
+    let lifecycle =
+        std::sync::Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+            metadata,
+            &oceanfs_core::LifecycleConfig::default(),
+        ));
+    let sealer = SegmentSealer::new(seal_config, wal.clone(), lifecycle.clone());
 
     // Create and fill an active segment.
     let size_config = SegmentSizeConfig {
@@ -91,7 +96,9 @@ async fn wal_truncation_called_during_seal() {
     active.append(&[0xAAu8; 120]).unwrap();
     assert!(active.is_full());
 
-    // Seal it — the sealer internally calls wal.truncate().
+    // Seal it — the sealer internally calls wal.truncate(). The flush
+    // path seals Reserved-only — reserve first.
+    lifecycle.request_reserve(active.id(), SizeTier::Standard, 0, 0).await.unwrap();
     let entries =
         vec![oceanfs_core::SegmentIndexEntry { offset: 0, length: 120, blob_key_hash: [0xBB; 32] }];
     let handle = sealer.try_seal(&mut active, 0, &entries).await.unwrap();

@@ -244,7 +244,12 @@ async fn write_coordinator_handoff_on_replica_failure() {
         write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
         ..Default::default()
     };
-    let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
+    let lifecycle =
+        Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+            metadata.clone(),
+            &oceanfs_core::LifecycleConfig::default(),
+        ));
+    let sealer = Arc::new(SegmentSealer::new(seal_config, wal, Arc::clone(&lifecycle)));
 
     let coordinator = WriteCoordinator::new(
         ring_cache,
@@ -259,6 +264,7 @@ async fn write_coordinator_handoff_on_replica_failure() {
         segment_pool_small,
         segment_pool_standard,
         sealer,
+        lifecycle,
         hinted_handoff.clone(),
         hint_config,
     );

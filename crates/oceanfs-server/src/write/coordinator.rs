@@ -26,8 +26,8 @@ use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::RingCache;
 use oceanfs_storage::{
-    SegmentPool, SegmentRpcClient, SegmentSealer, SegmentShard, SegmentSplitter, TierRouter,
-    WalEntry,
+    SegmentLifecycleCoordinator, SegmentPool, SegmentRpcClient, SegmentSealer, SegmentShard,
+    SegmentSplitter, TierRouter, TransitionError, WalEntry,
 };
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -107,6 +107,13 @@ pub struct WriteCoordinator {
     segment_pool_standard: Arc<SegmentPool>,
     /// Segment sealer for finalizing full segments.
     sealer: Arc<SegmentSealer>,
+    /// The single writer of segment lifecycle state (ADR-0025 phase 1):
+    /// the write path requests `reserve` through it BEFORE the first
+    /// WAL entry of each segment; the seal worker's persistence path
+    /// requests `seal` through it (via the flush coordinator); the
+    /// orphan reaper requests `delete` through it. No other code writes
+    /// segment state.
+    lifecycle: Arc<SegmentLifecycleCoordinator>,
     /// Segment size configuration.
     size_config: SegmentSizeConfig,
     /// Hinted handoff buffer for writes to temporarily unreachable replicas.
@@ -234,6 +241,7 @@ impl WriteCoordinator {
         segment_pool_small: Arc<SegmentPool>,
         segment_pool_standard: Arc<SegmentPool>,
         sealer: Arc<SegmentSealer>,
+        lifecycle: Arc<SegmentLifecycleCoordinator>,
         hinted_handoff: Arc<HintedHandoffManager>,
         hint_config: HintedHandoffConfig,
     ) -> Self {
@@ -257,6 +265,7 @@ impl WriteCoordinator {
             segment_pool_small,
             segment_pool_standard,
             sealer,
+            lifecycle,
             size_config,
             hinted_handoff,
             hint_config,
@@ -442,9 +451,11 @@ impl WriteCoordinator {
                     )
                     .await
                     .map_err(map_append_error("small".into()))?;
-                // Register the phantom BEFORE the WAL entry so the WAL
-                // cleanup can never mistake this segment for garbage.
-                self.register_phantom_before_wal(segment_id, SizeTier::Small, &mut registered)
+                // Reserve the segment BEFORE the WAL entry so the WAL
+                // cleanup can never mistake this segment for garbage
+                // (ADR-0024 invariant: reserve precedes the first
+                // DataEntry).
+                self.request_reserve_before_wal(segment_id, SizeTier::Small, &mut registered)
                     .await?;
                 // Write WAL entry for crash-recovery durability (C4-storage, D6).
                 // `logical_length` lets crash replay classify compressed
@@ -476,9 +487,11 @@ impl WriteCoordinator {
                     )
                     .await
                     .map_err(map_append_error("standard".into()))?;
-                // Register the phantom BEFORE the WAL entry so the WAL
-                // cleanup can never mistake this segment for garbage.
-                self.register_phantom_before_wal(segment_id, SizeTier::Standard, &mut registered)
+                // Reserve the segment BEFORE the WAL entry so the WAL
+                // cleanup can never mistake this segment for garbage
+                // (ADR-0024 invariant: reserve precedes the first
+                // DataEntry).
+                self.request_reserve_before_wal(segment_id, SizeTier::Standard, &mut registered)
                     .await?;
                 // Write WAL entry for crash-recovery durability (C4-storage, D6).
                 // `logical_length` lets crash replay classify compressed
@@ -522,8 +535,9 @@ impl WriteCoordinator {
                         )
                         .await
                         .map_err(map_append_error("multi".into()))?;
-                    // Register the phantom BEFORE the WAL entry (see Small arm).
-                    self.register_phantom_before_wal(seg_id, SizeTier::Standard, &mut registered)
+                    // Reserve the segment BEFORE the WAL entry (see
+                    // Small arm — ADR-0024 invariant).
+                    self.request_reserve_before_wal(seg_id, SizeTier::Standard, &mut registered)
                         .await?;
                     // Write WAL entry for each chunk (C4-storage, D6).
                     self.write_wal_entry(seg_id, seg_offset, stored, length, logical_len, 1, hlc)
@@ -658,53 +672,38 @@ impl WriteCoordinator {
     ///
     /// Records the segment append in the write-ahead log so that unsealed
     /// segment data can be replayed on crash recovery (C4-storage, D6).
-    /// Registers the segment's phantom metadata (sealed_at: None)
-    /// BEFORE its WAL entry is written. The WAL cleanup treats
-    /// unregistered ids as sweepable garbage, so an entry whose
-    /// registration lags would let the cleanup delete the file holding
-    /// the segment's early entries — corrupting crash recovery. With
-    /// the registration first, the cleanup can only ever see TRUE crash
-    /// phantoms (requests killed before any entry was written).
-    async fn register_phantom_before_wal(
+    /// The segment is reserved through the lifecycle coordinator
+    /// BEFORE its WAL entry is written (see
+    /// [`request_reserve_before_wal`](Self::request_reserve_before_wal));
+    /// the WAL cleanup treats unregistered ids as sweepable garbage, so
+    /// an entry whose registration lags would let the cleanup delete
+    /// the file holding the segment's early entries — corrupting crash
+    /// recovery. With the registration first, the cleanup can only ever
+    /// see TRUE crash phantoms (requests killed before any entry was
+    /// written).
+    async fn request_reserve_before_wal(
         &self,
         segment_id: SegmentId,
         tier: SizeTier,
         registered: &mut std::collections::HashSet<SegmentId>,
     ) -> Result<()> {
         if !registered.insert(segment_id) {
-            return Ok(()); // already registered in this request
-        }
-        // Do NOT downgrade an already-sealed segment. The append that
-        // precedes this call may have FILLED the segment, enqueueing its
-        // seal; the seal worker (a separate task) can persist the sealed
-        // metadata (sealed_at: Some) before this phantom write lands.
-        // Unconditionally writing sealed_at: None would then downgrade
-        // the entry back to unsealed — and nothing ever re-seals it, so
-        // the WAL cleanup protects every file holding its entries
-        // forever (the wal_not_unbounded leak: ~1 protected file/min).
-        // A sealed segment's data is durable on disk; its WAL entries are
-        // sweepable, so no phantom is needed.
-        if let Ok(Some(existing)) = self.metadata_store.get_segment(segment_id).await {
-            if existing.sealed_at.is_some() {
-                return Ok(());
-            }
+            return Ok(()); // already reserved in this request
         }
         let (ec_k, ec_m, _strip) = match tier {
             SizeTier::Small => self.segment_pool_small.ec_params(),
             _ => self.segment_pool_standard.ec_params(),
         };
-        self.metadata_store
-            .put_segment(oceanfs_core::SegmentMetadata {
-                segment_id,
-                ec_k,
-                ec_m,
-                size_tier: tier,
-                merkle_root: None,
-                storage_locations: smallvec::SmallVec::new(),
-                sealed_at: None,
-            })
-            .await
-            .map_err(|e| Error::Storage(format!("phantom registration failed: {e}")))
+        // The typed transition API rejects a reserve on a Sealed or
+        // Deleted id (AlreadySealed / AlreadyDeleted) — the
+        // phantom-downgrade race is unrepresentable here, not patched.
+        // Both outcomes mean the segment is already durable (or gone),
+        // so no phantom is needed and the write proceeds.
+        match self.lifecycle.request_reserve(segment_id, tier, ec_k, ec_m).await {
+            Ok(()) => Ok(()),
+            Err(TransitionError::AlreadySealed) | Err(TransitionError::AlreadyDeleted) => Ok(()),
+            Err(e) => Err(Error::Storage(format!("phantom registration failed: {e}"))),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -899,23 +898,26 @@ impl WriteCoordinator {
         let self_small = Arc::clone(self);
         let self_standard = Arc::clone(self);
 
-        // Idle-seal sweep: seal partially-filled segments that stopped
-        // receiving writes (fill-only sealing would leave them
-        // registered-unsealed forever, pinning their WAL files — the
-        // wal_not_unbounded leak). The sweep runs at a fraction of the
-        // seal timeout so a segment is sealed within ~timeout of going
-        // idle.
+        // Idle-seal driver: the lifecycle coordinator owns the
+        // idle-seal timer (ADR-0025 phase 1). The tick runs at a
+        // fraction of the seal timeout so a partially-filled segment
+        // that stopped receiving writes is sealed within ~timeout of
+        // going idle — fill-only sealing would leave it
+        // registered-unsealed forever, pinning its WAL files (the
+        // wal_not_unbounded leak).
         let idle_interval =
             std::time::Duration::from_millis((self.sealer.seal_timeout_ms() / 4).max(100));
-        let idle_timeout = std::time::Duration::from_millis(self.sealer.seal_timeout_ms());
-        let _idle_handle_small =
-            self.segment_pool_small.start_idle_seal_worker(idle_interval, idle_timeout);
-        let _idle_handle_standard =
-            self.segment_pool_standard.start_idle_seal_worker(idle_interval, idle_timeout);
-        let _idle_handle_small =
-            self.segment_pool_small.start_idle_seal_worker(idle_interval, idle_timeout);
-        let _idle_handle_standard =
-            self.segment_pool_standard.start_idle_seal_worker(idle_interval, idle_timeout);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(idle_interval);
+            // Skip the immediate first tick — a freshly started pool
+            // has nothing idle yet.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                lifecycle.seal_idle_segments().await;
+            }
+        });
 
         // Take seal receivers from both pools.
         let rx_small = self.segment_pool_small.take_seal_rx();
@@ -984,6 +986,45 @@ impl WriteCoordinator {
                         let self_standard = Arc::clone(&self_standard);
                         tokio::spawn(async move {
                             let permit = sem.acquire().await;
+
+                            // Race-closing reserve: the write path
+                            // reserves the segment BEFORE its first WAL
+                            // entry, but the fill-triggered seal work
+                            // item is enqueued DURING the append — a
+                            // seal can drain before that reserve lands,
+                            // and the flush path's Reserved-only
+                            // validation would reject it as Missing.
+                            // Reserving here (idempotent, through the
+                            // coordinator — still the only writer) only
+                            // when the registry has no entry yet closes
+                            // the race; the common case (the write
+                            // path's reserve already folded) skips the
+                            // extra durable write.
+                            if self_small.lifecycle.registry().get(segment_id).is_none() {
+                                match self_small
+                                    .lifecycle
+                                    .request_reserve(segment_id, tier, work.ec_k, work.ec_m)
+                                    .await
+                                {
+                                    Ok(())
+                                    | Err(TransitionError::AlreadySealed)
+                                    | Err(TransitionError::AlreadyDeleted) => {}
+                                    Err(e) => {
+                                        warn!(
+                                            segment_id = %segment_id,
+                                            error = %e,
+                                            "seal-time reserve failed; seal deferred to replay"
+                                        );
+                                        // The segment's data remains
+                                        // readable via the sealing-data
+                                        // set and the WAL still holds its
+                                        // entries — crash recovery
+                                        // replays it. Do not seal: the
+                                        // flush path would reject it.
+                                        return;
+                                    }
+                                }
+                            }
 
                             // The seal-time EC parity is computed inside
                             // `seal_from_data` on the blocking pool
@@ -1370,7 +1411,11 @@ mod tests {
             write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
             ..Default::default()
         };
-        let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
+        let lifecycle = Arc::new(SegmentLifecycleCoordinator::new(
+            metadata.clone(),
+            &oceanfs_core::LifecycleConfig::default(),
+        ));
+        let sealer = Arc::new(SegmentSealer::new(seal_config, wal, Arc::clone(&lifecycle)));
 
         use oceanfs_durability::{HintedHandoffConfig, HintedHandoffManager};
 
@@ -1394,6 +1439,7 @@ mod tests {
                 segment_pool_small,
                 segment_pool_standard,
                 sealer,
+                lifecycle,
                 hinted_handoff,
                 hint_config,
             ),
@@ -2317,6 +2363,9 @@ mod tests {
         read: crate::ReadCoordinator,
         metadata: Arc<RocksDbMetadataStore>,
         standard_pool: Arc<SegmentPool>,
+        /// The lifecycle coordinator — the single writer of segment
+        /// lifecycle state (the tests probe its registry).
+        lifecycle: Arc<SegmentLifecycleCoordinator>,
         seal_dir: std::path::PathBuf,
         /// (segment_id, merkle_root) pairs recorded by the seal notifier.
         sealed_events: Arc<Mutex<Vec<(SegmentId, oceanfs_core::HashOutput)>>>,
@@ -2418,7 +2467,16 @@ mod tests {
             write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
             ..Default::default()
         };
-        let sealer = Arc::new(SegmentSealer::new(seal_config, metadata.clone(), wal));
+        let lifecycle = Arc::new(
+            SegmentLifecycleCoordinator::new(
+                metadata.clone(),
+                &oceanfs_core::LifecycleConfig::default(),
+            )
+            // Idle-seal driver: the coordinator owns the idle-seal
+            // timer (ADR-0025 phase 1) and sweeps the standard pool.
+            .with_idle_seal(vec![standard_pool.clone()], seal_config.seal_timeout_ms),
+        );
+        let sealer = Arc::new(SegmentSealer::new(seal_config, wal, Arc::clone(&lifecycle)));
 
         let hints_dir = dir.path().join("hints");
         let hint_config =
@@ -2446,6 +2504,7 @@ mod tests {
                 segment_pool_small,
                 standard_pool.clone(),
                 sealer,
+                lifecycle.clone(),
                 hinted_handoff,
                 hint_config,
             )
@@ -2468,6 +2527,7 @@ mod tests {
             read,
             metadata,
             standard_pool,
+            lifecycle,
             seal_dir,
             sealed_events,
             _dir: dir,
@@ -2618,6 +2678,7 @@ mod tests {
                 .list_segments()
                 .into_iter()
                 .filter_map(std::result::Result::ok)
+                .filter(|m| m.sealed_at.is_some())
                 .map(|m| m.segment_id)
                 .collect();
             if sealed_ids.iter().all(|id| ids.contains(id)) {
@@ -2701,6 +2762,192 @@ mod tests {
         let read = fx.read.with_segment_reader(disk);
 
         get_and_verify(&read, "test", "multi-obj", &payload).await;
+    }
+
+    // ── Lifecycle integration (ADR-0025 phase 1) ────────────────────
+    // The coordinator is the only writer of segment lifecycle state:
+    // a PUT reserves before the first WAL entry, the seal worker's
+    // persistence path seals (via the flush coordinator), and the
+    // registry + CF must agree at every step.
+
+    #[tokio::test]
+    async fn lifecycle_write_seal_read_roundtrip_through_coordinator() {
+        // A full write → seal → read round trip through the lifecycle
+        // coordinator at the server crate boundary: the registry entry
+        // exists (Reserved) with the CF phantom as soon as the PUT
+        // returns; after the seal worker drains, both registry and CF
+        // show Sealed with a Merkle root; the data reads back from disk.
+        let fx = make_multi_tier_fixture().await;
+        let payload = vec![0x5Au8; 3000]; // Standard tier, one chunk
+        let put = put_and_persist(
+            &fx.coord,
+            &fx.metadata,
+            "test",
+            "lifecycle-rt",
+            Bytes::from(payload.clone()),
+        )
+        .await;
+        let segment_id = put.chunks[0].segment_id;
+
+        // Reserve-before-data, observable: the PUT has returned, so the
+        // registry entry exists (Reserved — the seal worker may not have
+        // run yet) and the CF holds the unsealed phantom.
+        let entry = fx.lifecycle.registry().get(segment_id).expect("registry entry after PUT");
+        match entry.state {
+            oceanfs_storage::SegmentState::Reserved => {
+                let cf = fx.metadata.get_segment(segment_id).unwrap().expect("CF phantom");
+                assert!(cf.sealed_at.is_none(), "phantom is unsealed");
+            }
+            // The seal may complete before the assert runs (the PUT
+            // returns before the seal worker drains) — Sealed is also
+            // correct; Reserved is the common case.
+            oceanfs_storage::SegmentState::Sealed => {}
+            other => panic!("unexpected registry state after PUT: {other:?}"),
+        }
+
+        // Start the seal worker and wait for the Sealed state in BOTH
+        // the registry and the CF. The PUT's segment is below the fill
+        // target, so it seals via the coordinator's idle-seal driver.
+        let _seal_handle = fx.coord.start_seal_worker();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let registry_sealed = fx
+                .lifecycle
+                .registry()
+                .get(segment_id)
+                .map(|e| e.state == oceanfs_storage::SegmentState::Sealed)
+                .unwrap_or(false);
+            let cf_sealed = fx
+                .metadata
+                .get_segment(segment_id)
+                .unwrap()
+                .map(|m| m.sealed_at.is_some())
+                .unwrap_or(false);
+            if registry_sealed && cf_sealed {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "seal did not complete in time");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let entry = fx.lifecycle.registry().get(segment_id).unwrap();
+        assert_eq!(entry.state, oceanfs_storage::SegmentState::Sealed);
+        let cf = fx.metadata.get_segment(segment_id).unwrap().unwrap();
+        assert!(cf.sealed_at.is_some());
+        assert!(cf.merkle_root.is_some(), "seal-time Merkle root persisted");
+
+        // Read back from disk (no pool fallback): the data reached the
+        // .dat through the seal path.
+        let disk = Arc::new(oceanfs_storage::io::DiskSegmentReader::new(
+            oceanfs_storage::io::IoReadMode::Direct,
+            Arc::new(oceanfs_storage::io::DiskIo::TokioFs),
+            None,
+            fx.seal_dir.clone(),
+            None,
+            None,
+        ));
+        let read = fx.read.with_segment_reader(disk);
+        get_and_verify(&read, "test", "lifecycle-rt", &payload).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_put_seal_stress_never_downgrades_registry() {
+        // Concurrent PUTs + the seal worker churn segments through the
+        // coordinator. The poisoned-registry probe then verifies ZERO
+        // Sealed→Reserved downgrades: every registry entry is Sealed
+        // exactly when its CF entry is sealed, and a poison reserve
+        // attempt on a Sealed id is rejected without mutating either
+        // store.
+        let fx = make_multi_tier_fixture().await;
+        let _seal_handle = fx.coord.start_seal_worker();
+
+        let coord = Arc::clone(&fx.coord);
+        let metadata = Arc::clone(&fx.metadata);
+        let mut handles = Vec::new();
+        let mut put_ids: Vec<SegmentId> = Vec::new();
+        for i in 0..16 {
+            let coord = Arc::clone(&coord);
+            let metadata = Arc::clone(&metadata);
+            handles.push(tokio::spawn(async move {
+                let payload = vec![(i as u8).wrapping_mul(17); 2000 + i * 37];
+                let result = put_and_persist(
+                    &coord,
+                    &metadata,
+                    "test",
+                    &format!("stress-{i}"),
+                    Bytes::from(payload.clone()),
+                )
+                .await;
+                assert!(!result.chunks.is_empty(), "stress put must land in a segment");
+                result.chunks.iter().map(|c| c.segment_id).collect::<Vec<_>>()
+            }));
+        }
+        for h in handles {
+            let mut ids = h.await.unwrap();
+            put_ids.append(&mut ids);
+        }
+
+        // Wait for EVERY stress segment to reach Sealed (fill-triggered
+        // for full segments, the coordinator's idle driver for partials).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let all_sealed = put_ids.iter().all(|id| {
+                fx.lifecycle
+                    .registry()
+                    .get(*id)
+                    .map(|e| e.state == oceanfs_storage::SegmentState::Sealed)
+                    .unwrap_or(false)
+            });
+            if all_sealed {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "stress seals did not complete");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Poisoned-registry probe: for every CF segment, the registry
+        // entry must agree (Sealed ↔ sealed_at Some) and a downgrade
+        // attempt must be rejected with the registry + CF unchanged.
+        // The probe must exercise at least every distinct stress segment.
+        let distinct_put_segments: std::collections::HashSet<SegmentId> =
+            put_ids.iter().copied().collect();
+        let mut probed = 0usize;
+        let cf_ids: Vec<SegmentId> = fx
+            .metadata
+            .list_segments()
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+            .map(|m| m.segment_id)
+            .collect();
+        for id in cf_ids {
+            let cf = fx.metadata.get_segment(id).unwrap().expect("CF entry");
+            let entry = fx.lifecycle.registry().get(id).unwrap_or_else(|| {
+                panic!("CF segment {id} must have a registry entry (seeded/reserved)")
+            });
+            assert_eq!(
+                entry.state == oceanfs_storage::SegmentState::Sealed,
+                cf.sealed_at.is_some(),
+                "registry and CF must agree on segment {id}"
+            );
+            if cf.sealed_at.is_some() {
+                // Poison probe: the phantom-downgrade write.
+                let err =
+                    fx.lifecycle.request_reserve(id, SizeTier::Standard, 0, 0).await.unwrap_err();
+                assert_eq!(err, TransitionError::AlreadySealed, "no downgrade for {id}");
+                let after = fx.metadata.get_segment(id).unwrap().unwrap();
+                assert!(after.sealed_at.is_some(), "CF must stay sealed for {id}");
+                assert_eq!(
+                    fx.lifecycle.registry().get(id).unwrap().state,
+                    oceanfs_storage::SegmentState::Sealed,
+                    "registry must stay sealed for {id}"
+                );
+                probed += 1;
+            }
+        }
+        assert!(
+            probed >= distinct_put_segments.len(),
+            "the probe must exercise every stress segment ({} distinct, probed {probed})",
+            distinct_put_segments.len()
+        );
     }
 
     // ── Concurrency regression (read-path-integrity-under-load) ─────
@@ -2850,6 +3097,13 @@ mod tests {
             .unwrap(),
         );
         let seal_dir = dir.path().join("segments");
+        let lifecycle = Arc::new(
+            SegmentLifecycleCoordinator::new(
+                metadata.clone(),
+                &oceanfs_core::LifecycleConfig::default(),
+            )
+            .with_idle_seal(vec![standard_pool.clone()], 5000),
+        );
         let sealer = Arc::new(SegmentSealer::new(
             SealConfig {
                 target_size_bytes: size_config.default_target_size,
@@ -2859,8 +3113,8 @@ mod tests {
                 write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
                 ..Default::default()
             },
-            metadata.clone(),
             wal,
+            lifecycle.clone(),
         ));
 
         use oceanfs_durability::GrpcHintDeliveryClient;
@@ -2886,6 +3140,7 @@ mod tests {
             small_pool.clone(),
             standard_pool.clone(),
             sealer,
+            lifecycle,
             hinted_handoff,
             hint_config,
         ));

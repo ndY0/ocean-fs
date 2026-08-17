@@ -12,8 +12,13 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use oceanfs_core::{HashOutput, PoolConfig, SegmentId, SegmentSizeConfig, SizeTier, WalConfig};
+use oceanfs_core::{
+    HashOutput, LifecycleConfig, MetadataConfig, PoolConfig, SegmentId, SegmentSizeConfig,
+    SizeTier, WalConfig,
+};
 use oceanfs_storage::{
+    metadata::RocksDbMetadataStore,
+    segment::lifecycle::SegmentLifecycleCoordinator,
     wal::{replay_wal, WalEntry, WalReader, WalWriter},
     BufferPool, SegmentPool,
 };
@@ -25,6 +30,22 @@ fn make_config(dir: &tempfile::TempDir) -> WalConfig {
         fsync_batch_timeout_ms: 5,
         ..Default::default()
     }
+}
+
+async fn make_lifecycle() -> (Arc<RocksDbMetadataStore>, Arc<SegmentLifecycleCoordinator>) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        RocksDbMetadataStore::open(&MetadataConfig {
+            data_dir: dir.path().join("meta"),
+            block_cache_size: 1024,
+            memtable_size: 1024,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let lifecycle =
+        Arc::new(SegmentLifecycleCoordinator::new(store.clone(), &LifecycleConfig::default()));
+    (store, lifecycle)
 }
 
 fn make_entry(segment_id: SegmentId, offset: u64, length: u32) -> WalEntry {
@@ -241,10 +262,18 @@ async fn replay_wal_recovers_and_truncates() {
 
     // On restart: open writer, replay WAL into pools.
     let wal_writer = WalWriter::open(&config).await.unwrap();
-    let summary =
-        replay_wal(&config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| false)
-            .await
-            .expect("replay_wal should succeed after crash");
+    let (_store, lifecycle) = make_lifecycle().await;
+    let summary = replay_wal(
+        &config,
+        &wal_writer,
+        &pool_small,
+        &pool_standard,
+        &size_config,
+        |_| false,
+        &lifecycle,
+    )
+    .await
+    .expect("replay_wal should succeed after crash");
 
     assert_eq!(summary.entries_replayed, 5);
     assert_eq!(summary.bytes_replayed, 320);
@@ -278,12 +307,85 @@ async fn replay_wal_empty_wal_returns_zero_summary() {
             .unwrap();
 
     let wal_writer = WalWriter::open(&config).await.unwrap();
-    let summary =
-        replay_wal(&config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| false)
-            .await
-            .unwrap();
+    let (_store, lifecycle) = make_lifecycle().await;
+    let summary = replay_wal(
+        &config,
+        &wal_writer,
+        &pool_small,
+        &pool_standard,
+        &size_config,
+        |_| false,
+        &lifecycle,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.entries_replayed, 0);
     assert_eq!(summary.bytes_replayed, 0);
     assert!(summary.segments_seen.is_empty());
+}
+
+#[tokio::test]
+async fn replay_recovers_segment_reserved_before_crash() {
+    // The feature DoD's reserve-before-data mutation check ("kill after
+    // first entry → segment present"): a segment whose durable reserve
+    // landed BEFORE its first WAL entry survives a kill+replay with its
+    // data present. The write path's order is reserve → WAL entry; this
+    // test drops the writer right after the first entry (no truncate —
+    // a simulated kill), then replays on a fresh writer and asserts the
+    // segment is rebuilt and readable.
+    let dir = tempfile::tempdir().unwrap();
+    let config = make_config(&dir);
+    let size_config = SegmentSizeConfig::default();
+    let buffer_pool = Arc::new(BufferPool::new(65536, 8));
+    let pool_cfg = PoolConfig::default();
+    let pool_small = Arc::new(
+        SegmentPool::new(
+            pool_cfg.clone(),
+            SizeTier::Small,
+            &size_config,
+            buffer_pool.clone(),
+            None,
+            None,
+        )
+        .unwrap(),
+    );
+    let pool_standard =
+        SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None, None)
+            .unwrap();
+
+    let (store, lifecycle) = make_lifecycle().await;
+    let seg_id = SegmentId::new();
+
+    // The write path contract: reserve BEFORE the first DataEntry.
+    lifecycle.request_reserve(seg_id, SizeTier::Small, 2, 1).await.unwrap();
+    {
+        let writer = WalWriter::open(&config).await.unwrap();
+        writer.append(make_entry(seg_id, 0, 64)).await.unwrap();
+        // drop(writer): simulated kill — no truncate, no cleanup.
+    }
+
+    // Restart: replay with the same coordinator (the registry entry is
+    // still Reserved; replay's own reserve is an idempotent no-op).
+    let wal_writer = WalWriter::open(&config).await.unwrap();
+    let summary = replay_wal(
+        &config,
+        &wal_writer,
+        &pool_small,
+        &pool_standard,
+        &size_config,
+        |_| false,
+        &lifecycle,
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.entries_replayed, 1, "the entry survives the kill");
+    assert_eq!(summary.segments_seen, vec![seg_id]);
+
+    // "Segment present": the rebuilt segment is readable from the pool
+    // (the write path's reserve is durable in the CF too).
+    let chunk = pool_small.try_read(seg_id, 0, 64).expect("recovered segment must be present");
+    assert_eq!(&chunk[..], &[0u8; 64], "recovered data must match the WAL entry");
+    let cf = store.get_segment(seg_id).unwrap().expect("reserve phantom durable in the CF");
+    assert!(cf.sealed_at.is_none(), "reserve is the unsealed phantom");
 }

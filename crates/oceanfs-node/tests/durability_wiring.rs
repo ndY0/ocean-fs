@@ -85,9 +85,17 @@ async fn durability_components_are_wireable_and_spawnable() {
         }
     });
 
-    // Orphan reaper
+    // Orphan reaper (lifecycle coordinator seeded at startup, as the
+    // composition root does)
+    let lifecycle =
+        Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+            metadata_store.clone(),
+            &oceanfs_core::LifecycleConfig::default(),
+        ));
+    lifecycle.seed_from_metadata_store().expect("seed lifecycle registry");
     let _reaper = Arc::new(OrphanReaper::new(
         metadata_store.clone(),
+        lifecycle,
         Arc::new(InMemorySegmentShardStore::new(4194304)),
         GcConfig::new(3600, 86400, 0.5, 4, 64),
     ));

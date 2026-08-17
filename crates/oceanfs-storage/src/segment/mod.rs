@@ -7,6 +7,7 @@ pub mod buffer;
 pub mod handle;
 pub mod header;
 pub mod index;
+pub mod lifecycle;
 pub(crate) mod parity_section;
 pub(crate) mod pool;
 pub(crate) mod repair;
@@ -20,6 +21,10 @@ pub use buffer::ActiveSegment;
 pub use handle::SegmentHandle;
 pub use header::SegmentHeader;
 pub use index::SegmentIndex;
+pub use lifecycle::{
+    LifecycleEntry, SegmentLifecycleCoordinator, SegmentLifecycleRegistry, SegmentState,
+    TransitionError,
+};
 pub use pool::{SealingWork, SegmentPool};
 pub use sealer::{SealConfig, SegmentSealer};
 pub use shard::SegmentShard;

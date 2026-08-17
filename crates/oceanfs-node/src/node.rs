@@ -664,10 +664,36 @@ impl Node {
             .into());
         }
 
+        // ---- 6b. Segment lifecycle coordinator (ADR-0025 phase 1) ----
+        // The ONLY writer of segment lifecycle state. The write path
+        // reserves through it before the first WAL entry of each
+        // segment; the seal path (via the flush coordinator) seals
+        // through it; the orphan reaper deletes through it. The
+        // registry is seeded from the segments CF so the coordinator
+        // is the complete single writer over EXISTING data too (the
+        // reaper's request_delete validates against it) — a pure
+        // registry fold, no CF writes.
+        let lifecycle = Arc::new(
+            oceanfs_storage::SegmentLifecycleCoordinator::new(
+                metadata_store.clone(),
+                &config.lifecycle,
+            )
+            // Idle-seal driver: the coordinator owns the idle-seal
+            // timer and sweeps both pools (ADR-0025 phase 1). The
+            // timeout honors the sealer's seal_timeout_ms.
+            .with_idle_seal(
+                vec![segment_pool_small.clone(), segment_pool_standard.clone()],
+                seal_config.seal_timeout_ms,
+            ),
+        );
+        lifecycle
+            .seed_from_metadata_store()
+            .map_err(|e| format!("failed to seed lifecycle registry from segments CF: {e}"))?;
+
         let sealer = Arc::new(oceanfs_storage::SegmentSealer::new(
             seal_config,
-            metadata_store.clone(),
             wal_writer.clone(),
+            lifecycle.clone(),
         ));
         // ---- 7. Construct durability workers ----
         let gc_config = oceanfs_durability::GcConfig::new(
@@ -735,6 +761,7 @@ impl Node {
         );
         let reaper = Arc::new(oceanfs_durability::OrphanReaper::new(
             metadata_store.clone(),
+            lifecycle.clone(),
             reaper_shard_store,
             gc_config,
         ));
@@ -965,6 +992,7 @@ impl Node {
                 segment_pool_small.clone(),
                 segment_pool_standard.clone(),
                 sealer.clone(),
+                lifecycle.clone(),
                 hinted_handoff_manager.clone(),
                 hint_config,
             )
@@ -1088,6 +1116,7 @@ impl Node {
             &segment_pool_standard,
             &segment_size,
             |segment_id| finalized.contains(&segment_id),
+            &lifecycle,
         )
         .await
         .map_err(|e| format!("WAL replay failed: {e}"))?;
@@ -1221,6 +1250,9 @@ impl Node {
         membership.register_gossip_metrics(&*metrics);
         wal_writer.register_metrics(&*metrics);
         sealer.register_metrics(&*metrics);
+        // Lifecycle registry-size gauges (ADR-0025 Decision 5 — the
+        // registry's O(live segments) memory cost is metric-visible).
+        lifecycle.register_metrics(&*metrics);
 
         // Register RocksDB property gauges into the central metrics registry.
         metadata_store.metrics().register(&*metrics);
@@ -2205,8 +2237,14 @@ mod tests {
         let scrub_worker = Arc::new(oceanfs_durability::ScrubCoordinator::new(scrub_config));
         let reaper_shard_store: Arc<dyn oceanfs_durability::SegmentShardStore> =
             Arc::new(oceanfs_durability::InMemorySegmentShardStore::new(4194304));
+        let lifecycle = Arc::new(oceanfs_storage::SegmentLifecycleCoordinator::new(
+            metadata_store.clone(),
+            &oceanfs_core::LifecycleConfig::default(),
+        ));
+        lifecycle.seed_from_metadata_store().expect("seed lifecycle registry");
         let reaper = Arc::new(oceanfs_durability::OrphanReaper::new(
             metadata_store.clone(),
+            lifecycle,
             reaper_shard_store,
             gc_config,
         ));

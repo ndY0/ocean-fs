@@ -14,8 +14,10 @@ use oceanfs_core::{
     ChunkRef, HashOutput, Hlc, MetadataConfig, ObjectKey, ObjectMetadata, SegmentId,
     SegmentMetadata, SizeTier,
 };
-use oceanfs_durability::{GcConfig, InMemorySegmentShardStore, OrphanReaper};
-use oceanfs_storage::RocksDbMetadataStore;
+use oceanfs_durability::{GcConfig, InMemorySegmentShardStore, OrphanReaper, SegmentShardStore};
+use oceanfs_storage::{
+    metadata::RocksDbMetadataStore, segment::lifecycle::SegmentLifecycleCoordinator,
+};
 
 /// Helper: create a temporary metadata store.
 fn open_temp_metadata() -> Arc<RocksDbMetadataStore> {
@@ -28,6 +30,21 @@ fn open_temp_metadata() -> Arc<RocksDbMetadataStore> {
     };
     let _dir_leaked = Box::leak(Box::new(dir));
     Arc::new(RocksDbMetadataStore::open(&config).expect("open metadata store"))
+}
+
+/// Constructs a reaper whose coordinator is seeded from the store
+/// (mirroring the node's startup seed).
+fn make_reaper(
+    metadata: Arc<RocksDbMetadataStore>,
+    shard_store: Arc<dyn SegmentShardStore>,
+    config: GcConfig,
+) -> OrphanReaper {
+    let lifecycle = Arc::new(SegmentLifecycleCoordinator::new(
+        metadata.clone(),
+        &oceanfs_core::LifecycleConfig::default(),
+    ));
+    lifecycle.seed_from_metadata_store().expect("seed registry");
+    OrphanReaper::new(metadata, lifecycle, shard_store, config)
 }
 
 /// Helper: create a test shard store.
@@ -67,7 +84,7 @@ fn make_object(key: &str, chunk: ChunkRef) -> ObjectMetadata {
 async fn reaper_empty_store_produces_zero_stats() {
     let metadata = open_temp_metadata();
     let shard_store = make_shard_store();
-    let reaper = OrphanReaper::new(metadata, shard_store, GcConfig::default());
+    let reaper = make_reaper(metadata, shard_store, GcConfig::default());
 
     let stats = reaper.run_cycle().await.expect("reaper cycle");
     assert_eq!(stats.segments_scanned, 0);
@@ -97,7 +114,7 @@ async fn reaper_referenced_segment_not_orphan() {
     metadata.put_object(obj).expect("put object");
 
     let shard_store = make_shard_store();
-    let reaper = OrphanReaper::new(metadata, shard_store, GcConfig::default());
+    let reaper = make_reaper(metadata, shard_store, GcConfig::default());
 
     let stats = reaper.run_cycle().await.expect("reaper cycle");
     assert_eq!(stats.segments_scanned, 1);
@@ -115,7 +132,7 @@ async fn reaper_unreferenced_segment_beyond_ttl_is_orphan() {
     // No object references this segment
 
     let shard_store = make_shard_store();
-    let reaper = OrphanReaper::new(metadata, shard_store, GcConfig::default());
+    let reaper = make_reaper(metadata, shard_store, GcConfig::default());
 
     let stats = reaper.run_cycle().await.expect("reaper cycle");
     assert_eq!(stats.segments_scanned, 1);
@@ -137,7 +154,7 @@ async fn reaper_unreferenced_segment_within_ttl_not_orphan() {
     // No object references this segment, but it's too young
 
     let shard_store = make_shard_store();
-    let reaper = OrphanReaper::new(metadata, shard_store, GcConfig::default());
+    let reaper = make_reaper(metadata, shard_store, GcConfig::default());
 
     let stats = reaper.run_cycle().await.expect("reaper cycle");
     assert_eq!(stats.segments_scanned, 1);
@@ -156,7 +173,7 @@ async fn reaper_deletes_shard_data_and_metadata() {
     assert!(metadata.get_segment(seg_id).expect("get segment").is_some());
 
     let shard_store = make_shard_store();
-    let reaper = OrphanReaper::new(metadata.clone(), shard_store.clone(), GcConfig::default());
+    let reaper = make_reaper(metadata.clone(), shard_store.clone(), GcConfig::default());
 
     let stats = reaper.run_cycle().await.expect("reaper cycle");
     assert_eq!(stats.orphans_found, 1);
@@ -181,7 +198,7 @@ async fn reaper_multiple_orphans_all_reaped() {
     }
 
     let shard_store = make_shard_store();
-    let reaper = OrphanReaper::new(metadata, shard_store, GcConfig::default());
+    let reaper = make_reaper(metadata, shard_store, GcConfig::default());
 
     let stats = reaper.run_cycle().await.expect("reaper cycle");
     assert_eq!(stats.segments_scanned, 5);
@@ -200,7 +217,7 @@ async fn reaper_double_check_prevents_race_condition() {
     metadata.put_segment(seg_meta).expect("put segment");
 
     let shard_store = make_shard_store();
-    let reaper = OrphanReaper::new(metadata.clone(), shard_store, GcConfig::default());
+    let reaper = make_reaper(metadata.clone(), shard_store, GcConfig::default());
 
     // Simulate a race: an object referencing the segment is created
     // AFTER the scan phase but BEFORE the delete phase.
@@ -232,7 +249,7 @@ async fn reaper_reports_bytes_reclaimed_correctly() {
 
     let shard_size = 4194304u64;
     let shard_store = Arc::new(InMemorySegmentShardStore::new(shard_size));
-    let reaper = OrphanReaper::new(metadata, shard_store, GcConfig::default());
+    let reaper = make_reaper(metadata, shard_store, GcConfig::default());
 
     let stats = reaper.run_cycle().await.expect("reaper cycle");
     assert_eq!(stats.orphans_found, 3);

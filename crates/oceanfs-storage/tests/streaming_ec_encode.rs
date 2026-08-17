@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use oceanfs_core::{CodecConfig, PoolConfig, SegmentSizeConfig, SizeTier};
 use oceanfs_storage::{
-    BufferPool, RocksDbMetadataStore, SealConfig, SegmentHeader, SegmentPool, SegmentSealer,
-    WalWriter,
+    segment::lifecycle::SegmentLifecycleCoordinator, BufferPool, RocksDbMetadataStore, SealConfig,
+    SegmentHeader, SegmentPool, SegmentSealer, WalWriter,
 };
 
 /// Creates a segment pool with EC parameters configured (k=4, m=2, strip=64).
@@ -47,7 +47,9 @@ fn make_ec_pool() -> SegmentPool {
 }
 
 /// Builds a sealer writing into `dir/segments`.
-async fn make_sealer(dir: &tempfile::TempDir) -> (SegmentSealer, std::path::PathBuf) {
+async fn make_sealer(
+    dir: &tempfile::TempDir,
+) -> (SegmentSealer, std::sync::Arc<SegmentLifecycleCoordinator>, std::path::PathBuf) {
     let metadata = Arc::new(
         RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
             data_dir: dir.path().join("meta"),
@@ -68,6 +70,11 @@ async fn make_sealer(dir: &tempfile::TempDir) -> (SegmentSealer, std::path::Path
         .unwrap(),
     );
     let seal_dir = dir.path().join("segments");
+    let lifecycle =
+        std::sync::Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+            metadata,
+            &oceanfs_core::LifecycleConfig::default(),
+        ));
     let sealer = SegmentSealer::new(
         SealConfig {
             target_size_bytes: 1024,
@@ -77,10 +84,10 @@ async fn make_sealer(dir: &tempfile::TempDir) -> (SegmentSealer, std::path::Path
             write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
             ..Default::default()
         },
-        metadata,
         wal,
+        lifecycle.clone(),
     );
-    (sealer, seal_dir)
+    (sealer, lifecycle, seal_dir)
 }
 
 #[test]
@@ -104,9 +111,11 @@ fn ec_pool_work_items_carry_ec_params() {
 #[tokio::test]
 async fn seal_from_data_persists_ec_parity_section() {
     let dir = tempfile::tempdir().unwrap();
-    let (sealer, seal_dir) = make_sealer(&dir).await;
+    let (sealer, lifecycle, seal_dir) = make_sealer(&dir).await;
 
     let segment_id = oceanfs_core::SegmentId::new();
+    // The flush path seals Reserved-only — reserve first.
+    lifecycle.request_reserve(segment_id, SizeTier::Standard, 0, 0).await.unwrap();
     let data = bytes::Bytes::from(vec![0xCDu8; 1024]); // 4 complete stripes
 
     let _handle = sealer
@@ -126,9 +135,11 @@ async fn seal_from_data_persists_ec_parity_section() {
 #[tokio::test]
 async fn seal_without_ec_params_has_no_parity_section() {
     let dir = tempfile::tempdir().unwrap();
-    let (sealer, seal_dir) = make_sealer(&dir).await;
+    let (sealer, lifecycle, seal_dir) = make_sealer(&dir).await;
 
     let segment_id = oceanfs_core::SegmentId::new();
+    // The flush path seals Reserved-only — reserve first.
+    lifecycle.request_reserve(segment_id, SizeTier::Standard, 0, 0).await.unwrap();
     let data = bytes::Bytes::from(vec![0xEEu8; 512]);
 
     let _handle = sealer

@@ -312,6 +312,13 @@ pub struct NodeConfig {
     #[serde(default = "default_seal_fsync_max_waiters")]
     pub seal_fsync_max_waiters: usize,
 
+    // ── Item 4d: Segment lifecycle machine (ADR-0025) ──
+    /// Segment lifecycle registry + coordinator configuration: the shard
+    /// count of the in-memory registry and the delete-eviction grace.
+    /// Default: 64 shards, immediate eviction.
+    #[serde(default)]
+    pub lifecycle: crate::LifecycleConfig,
+
     // ── Item 5: Buffer pool configuration ──
     /// Buffer pool chunk size in bytes (default 65536 = 64 KB).
     #[serde(default = "default_buffer_pool_chunk_bytes")]
@@ -602,6 +609,8 @@ impl Default for NodeConfig {
             // Item 4c: Seal pipeline batching
             seal_fsync_batch_timeout_ms: 10,
             seal_fsync_max_waiters: 8,
+            // Item 4d: Segment lifecycle machine (ADR-0025)
+            lifecycle: crate::LifecycleConfig::default(),
             // Item 8: Shard count
             segment_shard_count: 0,
             segment_shard_count_max: 16,

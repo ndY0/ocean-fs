@@ -20,12 +20,12 @@ use crate::{
         segment_flush::{FinalizeOp, SegmentFlushGroup},
         IoReadMode, SegmentWriteMode,
     },
-    metadata::RocksDbMetadataStore,
     segment::{
         buffer::ActiveSegment,
         handle::SegmentHandle,
         header::SegmentHeader,
         index::{SegmentIndex, SegmentIndexEntry},
+        lifecycle::SegmentLifecycleCoordinator,
         parity_section::{build_parity_section, encode_segment_parity},
     },
     wal::WalWriter,
@@ -85,10 +85,18 @@ impl Default for SealConfig {
 }
 
 /// Orchestrates the sealing of active segments.
+///
+/// The seal-complete persistence path runs through the lifecycle
+/// coordinator (ADR-0025 phase 1): the flush group syncs + finalizes
+/// the `.dat`, then the coordinator validates the `Reserved` entry,
+/// writes the sealed metadata durably, and folds the `Sealed` state —
+/// the coordinator is the only writer of segment lifecycle state.
 pub struct SegmentSealer {
     config: SealConfig,
-    metadata: Arc<RocksDbMetadataStore>,
     wal: Arc<WalWriter>,
+    /// Lifecycle coordinator — the single writer of segment lifecycle
+    /// state (the flush group's seal batch target).
+    lifecycle: Arc<SegmentLifecycleCoordinator>,
     /// Group-commit coordinator for segment fsync + metadata batching.
     /// Lazily constructed on first seal (needs a tokio runtime).
     flush: std::sync::OnceLock<std::sync::Arc<SegmentFlushGroup>>,
@@ -98,15 +106,21 @@ pub struct SegmentSealer {
 
 impl SegmentSealer {
     /// Creates a new segment sealer.
+    ///
+    /// `lifecycle` is the single writer of segment lifecycle state: the
+    /// flush coordinator hands every batch's sealed metadata to
+    /// `SegmentLifecycleCoordinator::seal_finalized_batch`, so the
+    /// CF write and the registry fold stay inside
+    /// `segment/lifecycle.rs`.
     pub fn new(
         config: SealConfig,
-        metadata: Arc<RocksDbMetadataStore>,
         wal: Arc<WalWriter>,
+        lifecycle: Arc<SegmentLifecycleCoordinator>,
     ) -> Self {
         Self {
             config,
-            metadata,
             wal,
+            lifecycle,
             flush: std::sync::OnceLock::new(),
             seal_errors: Counter::new(
                 "segment_seal_errors_total".into(),
@@ -125,7 +139,7 @@ impl SegmentSealer {
     fn flush_group(&self) -> &std::sync::Arc<SegmentFlushGroup> {
         self.flush.get_or_init(|| {
             std::sync::Arc::new(SegmentFlushGroup::new(
-                Arc::clone(&self.metadata),
+                Arc::clone(&self.lifecycle),
                 self.config.data_dir.clone(),
                 self.config.fsync_batch_timeout_ms,
                 self.config.fsync_max_waiters,
@@ -317,7 +331,10 @@ impl SegmentSealer {
         tokio::fs::create_dir_all(&dir).await?;
 
         // Metadata is built before the flush registration — the flush
-        // coordinator batches it with the file's fsync (Design B).
+        // coordinator batches it with the file's fsync (Design B), and
+        // persists it through the lifecycle coordinator (validate →
+        // durable → fold — the coordinator is the only writer of
+        // segment lifecycle state; ADR-0025 phase 1).
         let meta = SegmentMetadata {
             segment_id,
             ec_k,
@@ -521,12 +538,25 @@ fn write_segment_temp(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use oceanfs_core::WalConfig;
+    use oceanfs_core::{LifecycleConfig, WalConfig};
 
     use super::*;
-    use crate::buffer_pool::BufferPool;
+    use crate::{
+        buffer_pool::BufferPool, metadata::RocksDbMetadataStore,
+        segment::lifecycle::SegmentLifecycleCoordinator,
+    };
 
-    async fn setup() -> (SegmentSealer, ActiveSegment, Vec<SegmentIndexEntry>, tempfile::TempDir) {
+    /// Creates the sealer plus its lifecycle coordinator. Every seal in
+    /// these tests reserves its segment FIRST — the flush path
+    /// validates `Reserved`-only (ADR-0025: seal is Reserved-only), so
+    /// an unreserved seal is rejected by construction.
+    async fn setup() -> (
+        SegmentSealer,
+        Arc<SegmentLifecycleCoordinator>,
+        ActiveSegment,
+        Vec<SegmentIndexEntry>,
+        tempfile::TempDir,
+    ) {
         let dir = tempfile::tempdir().unwrap();
 
         let metadata = Arc::new(
@@ -538,6 +568,8 @@ mod tests {
             })
             .unwrap(),
         );
+        let lifecycle =
+            Arc::new(SegmentLifecycleCoordinator::new(metadata, &LifecycleConfig::default()));
 
         let wal = Arc::new(
             WalWriter::open(&WalConfig {
@@ -570,23 +602,25 @@ mod tests {
         // Build an index entry covering the appended data.
         let entries = vec![SegmentIndexEntry { offset: 0, length: 50, blob_key_hash: [0xAB; 32] }];
 
-        let sealer = SegmentSealer::new(config, metadata, wal);
-        (sealer, active, entries, dir)
+        let sealer = SegmentSealer::new(config, wal, Arc::clone(&lifecycle));
+        (sealer, lifecycle, active, entries, dir)
     }
 
     #[tokio::test]
     async fn try_seal_returns_none_when_not_full_and_not_timed_out() {
-        let (sealer, mut active, entries, _dir) = setup().await;
+        let (sealer, _lifecycle, mut active, entries, _dir) = setup().await;
         let result = sealer.try_seal(&mut active, 0, &entries).await.unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn try_seal_returns_handle_when_full() {
-        let (sealer, mut active, entries, _dir) = setup().await;
+        let (sealer, lifecycle, mut active, entries, _dir) = setup().await;
         // Fill it up.
         active.append(&[0u8; 60]).unwrap();
         assert!(active.is_full());
+        // The seal path validates Reserved-only — reserve first.
+        lifecycle.request_reserve(active.id(), SizeTier::Standard, 0, 0).await.unwrap();
 
         let result = sealer.try_seal(&mut active, 0, &entries).await.unwrap();
         assert!(result.is_some());
@@ -594,8 +628,9 @@ mod tests {
 
     #[tokio::test]
     async fn try_seal_returns_handle_when_timed_out() {
-        let (sealer, mut active, entries, _dir) = setup().await;
+        let (sealer, lifecycle, mut active, entries, _dir) = setup().await;
         // Not full, but timed out.
+        lifecycle.request_reserve(active.id(), SizeTier::Standard, 0, 0).await.unwrap();
         let result = sealer.try_seal(&mut active, 2000, &entries).await.unwrap();
         assert!(result.is_some());
     }
@@ -612,6 +647,8 @@ mod tests {
             })
             .unwrap(),
         );
+        let lifecycle =
+            Arc::new(SegmentLifecycleCoordinator::new(metadata, &LifecycleConfig::default()));
         let wal = Arc::new(
             WalWriter::open(&WalConfig {
                 data_dir: dir.path().join("wal"),
@@ -634,7 +671,7 @@ mod tests {
         let size_config =
             SegmentSizeConfig { default_target_size: 100, ..SegmentSizeConfig::default() };
         let mut active = ActiveSegment::new(SizeTier::Standard, &size_config, &pool).unwrap();
-        let sealer = SegmentSealer::new(config, metadata, wal);
+        let sealer = SegmentSealer::new(config, wal, lifecycle);
 
         // Empty segment should not seal.
         let result = sealer.try_seal(&mut active, 2000, &[]).await.unwrap();
@@ -658,7 +695,7 @@ mod tests {
             fn register_histogram(&self, _: std::sync::Arc<oceanfs_core::Histogram>) {}
         }
 
-        let (sealer, _active, _entries, _dir) = setup().await;
+        let (sealer, _lifecycle, _active, _entries, _dir) = setup().await;
         let reg = TestRegistrar { counter_names: parking_lot::Mutex::new(Vec::new()) };
 
         sealer.register_metrics(&reg);
@@ -696,6 +733,10 @@ mod tests {
             })
             .unwrap(),
         );
+        let lifecycle = Arc::new(SegmentLifecycleCoordinator::new(
+            metadata.clone(),
+            &LifecycleConfig::default(),
+        ));
         let wal = Arc::new(
             WalWriter::open(&WalConfig {
                 data_dir: dir.path().join("wal"),
@@ -718,7 +759,7 @@ mod tests {
             fsync_batch_timeout_ms: 100,
             fsync_max_waiters: 8,
         };
-        let sealer = Arc::new(SegmentSealer::new(config, metadata.clone(), wal));
+        let sealer = Arc::new(SegmentSealer::new(config, wal, Arc::clone(&lifecycle)));
 
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -730,8 +771,11 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..16 {
             let sealer = Arc::clone(&sealer);
+            let lifecycle = Arc::clone(&lifecycle);
             handles.push(tokio::spawn(async move {
                 let id = SegmentId::new();
+                // Reserve first — the flush path seals Reserved-only.
+                lifecycle.request_reserve(id, SizeTier::Standard, 0, 0).await.unwrap();
                 let data = Bytes::from(vec![0x5Au8; 2048]);
                 let entries =
                     vec![SegmentIndexEntry { offset: 0, length: 2048, blob_key_hash: [0x11; 32] }];
@@ -765,6 +809,8 @@ mod tests {
         );
         // Every segment must be readable back from the metadata store.
         assert_eq!(metadata.list_segments().into_iter().filter_map(Result::ok).count(), 16);
+        // ... and folded Sealed in the lifecycle registry.
+        assert_eq!(lifecycle.registry().len(), 16);
     }
 
     #[cfg(target_os = "linux")]
@@ -786,6 +832,10 @@ mod tests {
             })
             .unwrap(),
         );
+        let lifecycle = Arc::new(SegmentLifecycleCoordinator::new(
+            metadata.clone(),
+            &LifecycleConfig::default(),
+        ));
         let wal = Arc::new(
             WalWriter::open(&WalConfig {
                 data_dir: dir.path().join("wal"),
@@ -805,9 +855,10 @@ mod tests {
             fsync_batch_timeout_ms: 100,
             fsync_max_waiters: 8,
         };
-        let sealer = Arc::new(SegmentSealer::new(config, metadata.clone(), wal));
+        let sealer = Arc::new(SegmentSealer::new(config, wal, Arc::clone(&lifecycle)));
 
         let id = SegmentId::new();
+        lifecycle.request_reserve(id, SizeTier::Standard, 0, 0).await.unwrap();
         let data = Bytes::from(vec![0x7Bu8; 2048]);
         let entries =
             vec![SegmentIndexEntry { offset: 0, length: 2048, blob_key_hash: [0x22; 32] }];
@@ -835,8 +886,9 @@ mod tests {
             parity_section::{verify_section_hashes, ParitySection},
         };
 
-        let (sealer, _seg, _entries, dir) = setup().await;
+        let (sealer, lifecycle, _seg, _entries, dir) = setup().await;
         let id = SegmentId::new();
+        lifecycle.request_reserve(id, SizeTier::Standard, 0, 0).await.unwrap();
         let data = Bytes::from(vec![0x42u8; 512]);
 
         // k=4, m=2, strip=64 → 2 full stripes → 4 parity shards,
@@ -904,8 +956,9 @@ mod tests {
         std::thread::current().id().hash(&mut hasher);
         let test_thread = hasher.finish();
 
-        let (sealer, _seg, _entries, _dir) = setup().await;
+        let (sealer, lifecycle, _seg, _entries, _dir) = setup().await;
         let id = SegmentId::new();
+        lifecycle.request_reserve(id, SizeTier::Standard, 0, 0).await.unwrap();
         // 256 KiB → exactly one complete stripe (k=4, strip=64 KiB).
         let data = bytes::Bytes::from(vec![0x77u8; 256 * 1024]);
 

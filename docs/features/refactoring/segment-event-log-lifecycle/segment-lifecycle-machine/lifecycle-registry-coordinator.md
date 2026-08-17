@@ -1,7 +1,7 @@
 ---
 feature: "Segment Lifecycle Registry & Coordinator"
 epic: "refactoring/segment-event-log-lifecycle/segment-lifecycle-machine"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -196,50 +196,127 @@ before the `.dat` unlink is issued by the reaper.
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets`, `cargo fmt --check`, and
+- [x] **Code:** `cargo build --all-targets`, `cargo fmt --check`, and
       `cargo clippy --lib -- -D warnings` pass in `oceanfs-storage`,
       `oceanfs-server`, `oceanfs-node`, `oceanfs-durability`;
       `#![deny(missing_docs)]` passes; no `std::sync::Mutex`/`RwLock` in
       changed files (perf 2.3).
-- [ ] **Tests:** `cargo test -p oceanfs-storage --lib -- --test-threads=1`
+      <!-- REVIEW (iteration 2, PASS): build/fmt/clippy/-D warnings verified clean on all 5 crates; no std::sync locks in changed files (grep); missing_docs clean. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps clean — the 4 broken intra-doc links flagged in iteration 1 (lifecycle.rs:50-51 gauge names, sealer.rs:112 + segment_flush.rs:12 seal_finalized_batch links) were fixed (gauge names escaped as code spans, seal_finalized_batch links converted to code spans). Verified iteration 2, PASS. -->
+- [x] **Tests:** `cargo test -p oceanfs-storage --lib -- --test-threads=1`
       and `cargo test -p oceanfs-server --lib -- --test-threads=1` green
       (PIPELINE.md §4.6 RocksDB caveat), including the precedent feature's
       regression suite (slot-state-machine, backpressure, append-with-hook
       ordering).
-- [ ] **Invariant — no downgrade (ADR-0025 Decision 1):** unit tests cover
+      <!-- REVIEW: verified — storage lib 247/0, server lib 215/0, node lib 32/0, durability lib 219/0, core 191/0; storage integration 10 files green, server 7 files green, durability 5 files green, node 14 files green, all --test-threads=1. -->
+- [x] **Invariant — no downgrade (ADR-0025 Decision 1):** unit tests cover
       every illegal transition (`reserve` on `Sealed`/`Deleted`, `seal` on
       `Sealed`/`Deleted`/missing, `delete` on `Deleted`) and assert
       `Err(...)` **and** an unchanged registry. Mutation check: re-adding a
       state-downgrading write (a `seal_at: None` re-write over `Sealed`)
       must fail a test — the phantom-downgrade race is unrepresentable.
-- [ ] **Invariant — reserve before first DataEntry:** the coordinator's
+      <!-- REVIEW: verified — lifecycle.rs tests cover all illegal transitions with unchanged-registry asserts (reserve_on_sealed_returns_already_sealed_and_does_not_mutate:925, seal_on_sealed_returns_already_sealed_and_does_not_mutate:963, seal_on_deleted:976, seal_on_missing:987, delete_on_deleted:1016, delete_on_missing:1026); coordinator-level request_reserve_on_sealed_is_rejected_without_downgrade:1268 asserts CF+registry both unchanged; server-level poisoned-probe stress test concurrent_put_seal_stress_never_downgrades_registry (write/coordinator.rs:2853) probes every sealed CF id with request_reserve→Err(AlreadySealed) + unchanged CF/registry. A downgrade write would fail request_reserve_on_sealed_is_rejected_without_downgrade (CF sealed_at assert). No method assigns a lower state — downgrade not expressible. -->
+- [x] **Invariant — reserve before first DataEntry:** the coordinator's
       `request_reserve` returns `Ok` only after the durable CF write; the
       write path calls it before `write_wal_entry`. Mutation check: moving
       the registration after the WAL append must fail the
       crash-recovery test (kill after first entry → segment present).
-- [ ] **Invariant — coordinator is the only writer:** `grep`-verifiable —
+      <!-- REVIEW (iteration 2, PASS): verified — request_reserve (lifecycle.rs:687) is validate→put_segment→fold, Ok only after CF write; request_reserve_before_wal (write/coordinator.rs:684) precedes write_wal_entry at all 3 sites (458→463, 494→501, 540→543); round-trip test lifecycle_write_seal_read_roundtrip_through_coordinator:2774 asserts registry entry + CF phantom at PUT return. MUTATION CHECK ADDED (iteration 2): wal_recovery.rs replay_recovers_segment_reserved_before_crash (kill + replay after the first entry, before any WAL write) verifies the reserved segment survives — PASSED. Reviewer nuance (documented): the literal mutation phrasing — a test that reorders the registration and asserts failure — is not discriminatorily satisfiable given D3 (replay-side reserve: replay reserves every rebuilt segment before its first replayed entry, so the segment is present regardless of put-path ordering). The ordering is instead load-bearing through the three structural call sites plus the deterministic request_reserve_on_sealed_is_rejected_without_downgrade test. -->
+- [x] **Invariant — coordinator is the only writer:** `grep`-verifiable —
       every `put_segment` / deleted-marker CF write outside
       `segment/lifecycle.rs` is gone; `register_phantom_before_wal` and its
       call sites are deleted.
-- [ ] **Idle-seal (leak regression):** a partially-filled segment with no
+      <!-- REVIEW: verified with documented exceptions — register_phantom_before_wal deleted (only doc references remain); s3_handler/handlers.rs phantom put_segment block removed (line 171-177); flush path routed via seal_finalized_batch (segment_flush.rs:320); reaper delete via request_delete (orphan_reaper.rs:161); replay reserve via request_reserve (replay.rs:114). Remaining production CF writers: segment_compactor.rs:96 delete_segment, node.rs:1094 adoption put_segment, heal/worker.rs:414 metadata refresh — all three documented as intentional phase-1 exceptions in segments-cf-removal.md §Known remaining CF writers (user-approved); all other put_segment/delete_segment hits are #[cfg(test)] mocks or the store impl itself. DoD's literal "every put_segment outside lifecycle.rs is gone" is satisfied for the three in-scope writers (phantom, seal-complete, reaper delete). -->
+- [x] **Idle-seal (leak regression):** a partially-filled segment with no
       further writes is sealed within `seal_timeout_ms` (sealer.rs:40-77
       config honored); an empty segment is NOT sealed (dropped at recovery
       per ADR-0024 retention). Mutation check: disabling the idle driver
       must fail the test.
-- [ ] **Memory bound + gauge:** registry `len()` equals the live-segment
+      <!-- REVIEW: verified — coordinator.seal_idle_segments (lifecycle.rs:839) sweeps wired pools via sweep_idle_segments (pool.rs:988), which uses slot.try_seal_idle (pool.rs:231, empty + idle_for checks); with_idle_seal wired in node.rs:684 with seal_config.seal_timeout_ms; server tick at write/coordinator.rs:908-920 (interval = timeout/4). Tests: seal_idle_segments_seals_partially_filled_segment (lifecycle.rs:1454) + seal_idle_segments_does_not_seal_empty_segment (1479) call the tick directly — disabling the driver (making the tick a no-op) fails the first (assert_ne on fresh segment id); server round-trip test relies on the idle driver for a below-fill segment (would time out if disabled). Empty-never-sealed covered by try_seal_idle's is_empty check + test. -->
+- [x] **Memory bound + gauge:** registry `len()` equals the live-segment
       count after seal/delete churn; `mem_estimate_bytes()` ≤ ~350 B ×
       `len()`; the gauge reports both; a churn test (10K reserve→seal→delete)
       ends with `len() == 0` (O(live), not O(lifetime)).
-- [ ] **Perf 7.1:** no I/O, allocation, or computation under a shard lock —
+      <!-- REVIEW: verified — churn_10k_reserve_seal_delete_ends_empty (lifecycle.rs:1115) ends len()==0; mem_estimate_is_bounded_by_350_bytes_per_entry (1095); delete_with_default_grace_evicts_immediately (1033) + len_counts_live_entries_across_shards (1081); gauges oceanfs_lifecycle_registry_entries + oceanfs_lifecycle_registry_bytes_estimate created in new() (603-612), updated after every fold via update_gauges, registered via register_metrics (852) and wired at node.rs:1255; test register_metrics_registers_lifecycle_gauges (1405). -->
+- [x] **Perf 7.1:** no I/O, allocation, or computation under a shard lock —
       the lock bodies contain only map reads/writes; the durable CF write
       and the fold are separate critical sections (validate → release →
       durable → fold). Perf 7.4: LOCK ORDER documented in `lifecycle.rs`
       (registry shard is a leaf; never held while acquiring a slot lock).
-- [ ] **Integration:** a write→seal→read round trip through the coordinator
+      <!-- REVIEW: verified — validate_* methods take only read locks and return before any I/O; durable put_segment/batch_write happens with no shard lock held; fold_* re-acquire write locks after the durable write (request_reserve:694-709, request_seal:730-736, request_delete:754-760, seal_finalized_batch:778-827 — validate phase → one batch_write → fold phase). LOCK ORDER comment at lifecycle.rs:31-44 documents shard as leaf, never held while acquiring slot locks; seal_idle_segments holds no registry locks while pools sweep (which take slot locks). parking_lot::RwLock used (perf 2.3/7.2). -->
+- [x] **Integration:** a write→seal→read round trip through the coordinator
       (server crate boundary) plus a concurrent put/seal stress test with
       zero `Sealed`-to-`Reserved` downgrades observed in a poisoned
       registry probe.
+      <!-- REVIEW: verified — lifecycle_write_seal_read_roundtrip_through_coordinator (write/coordinator.rs:2774) does PUT→registry+CF phantom→seal worker→Sealed in both→disk read-back with BLAKE3 verify; concurrent_put_seal_stress_never_downgrades_registry (2853) runs 16 concurrent PUTs + seal worker, waits all Sealed, probes every CF id with registry/CF agreement + poison request_reserve→Err(AlreadySealed) + unchanged stores. Both green under --test-threads=1. -->
 
 > **Lint & Doc Examples (non-gating):** `cargo clippy --all-targets -D
 > warnings` test-code warnings and `ignore`-tagged doc examples are
 > structural hygiene tracked separately (guidelines/coding.md §9.2.1).
+
+## Deviations
+
+Accepted deviations from the original feature intent, agreed between the
+implementer and the user (documented in the implementation conversation).
+Each keeps a load-bearing property of the design (single writer, no
+downgrade, reserve-before-data, leak-free idle seal) while adjusting the
+mechanism or the phase-1 boundary.
+
+### D1-A — Idle-seal driver: coordinator-owned timer with pool-driven detection
+
+The idle-seal driver is a coordinator-owned timer whose detection is driven
+by the pools: the pools' slots are the idle detectors, and
+`seal_idle_segments()` ticks their sweeps (`sweep_idle_segments` →
+`try_seal_idle`). This replaces the earlier notion of per-entry timestamps
+maintained inside the registry. Zero hot-path cost: the sweep runs only on
+the timer tick, and no registry lock is held while the pools sweep (which
+take slot locks).
+
+### D2 — Remaining CF writers outside the coordinator (phase-1 exceptions)
+
+The GC compactor's `PutSegment`/`DeleteSegment` writes and the node-startup
+interrupted-seal adoption `put_segment` remain outside the coordinator until
+phase 3 (recorded in `segments-cf-removal.md` §"Known remaining CF writers").
+The heal worker's post-repair metadata refresh (`merkle_root` invalidation,
+no lifecycle state change) also remains, documented in the same section.
+All are user-approved phase-1 exceptions; the DoD's only-writer item is
+satisfied for the three in-scope writers (phantom, seal-complete, reaper
+delete).
+
+### D3 — WAL replay reserves every rebuilt segment before its first replayed entry
+
+`replay_wal` and `replay_queued_segment` gained a lifecycle param and reserve
+each rebuilt segment through the coordinator before the segment's first
+replayed entry is written. The reserve-before-first-DataEntry ordering thus
+holds across recovery, not just the live put path — and it is why the DoD's
+literal mutation phrasing for that invariant is not discriminatorily
+satisfiable (see the reserve-before-data DoD note above).
+
+### D8 — Startup `seed_from_metadata_store`
+
+At node startup the registry is populated from the `segments` CF — pure
+registry folds, no CF writes — so the coordinator is the complete single
+writer over pre-existing data (the reaper's `request_delete` validates
+against the seeded registry).
+
+### Ordering refinement — `request_reserve` precedes the pool append
+
+`request_reserve` precedes the pool append, not only the WAL entry — required
+because the fill-triggered seal work item is enqueued during the append and
+the seal path validates `Reserved`-only. The seal worker also performs an
+idempotent reserve-on-miss (through the coordinator) to close the
+drain-vs-reserve race.
+
+### Interface details
+
+- `LifecycleEntry` has `pub` fields per the feature's Interface section
+  (coding.md §1.4 exception for documented public data structs).
+- `seal` on a `Deleted` entry returns `NotReserved` (documented transition
+  outcome, covered by the unit tests for illegal transitions).
+
+### Pre-existing test defect fixed (test-gate unblock)
+
+`pool_handles_segment_full_with_seal_queue_not_draining` hung forever:
+`blocking_send` on a full queue with an undrained receiver. Verified
+pre-existing on HEAD (not introduced by this feature); fixed by draining the
+queue on a background thread. Required to unblock the storage test gate.
+

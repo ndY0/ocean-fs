@@ -102,7 +102,12 @@ async fn sealed_segment_produces_metadata_in_rocksdb() {
         write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
         ..Default::default()
     };
-    let sealer = SegmentSealer::new(seal_config, store.clone(), wal);
+    let lifecycle =
+        Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+            store.clone(),
+            &oceanfs_core::LifecycleConfig::default(),
+        ));
+    let sealer = SegmentSealer::new(seal_config, wal, lifecycle.clone());
 
     // Create an active segment and fill it.
     let mut active =
@@ -117,6 +122,11 @@ async fn sealed_segment_produces_metadata_in_rocksdb() {
     let segment_id = active.id();
     let entries =
         vec![oceanfs_core::SegmentIndexEntry { offset: 0, length: 120, blob_key_hash: [0xBB; 32] }];
+    // The flush path seals Reserved-only — reserve before sealing.
+    lifecycle
+        .request_reserve(segment_id, SizeTier::Standard, 0, 0)
+        .await
+        .expect("reserve should succeed");
     let handle = sealer.try_seal(&mut active, 0, &entries).await.expect("seal should succeed");
     assert!(handle.is_some(), "seal should return a handle for full segment");
 

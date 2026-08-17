@@ -168,54 +168,13 @@ pub(crate) async fn put_object(
             }
             state.write.invalidate_cache_on_replicas(&bucket_id, &object_key, &hk).await;
 
-            // Register segment metadata for each unique segment so
-            // /admin/segments reflects created segments.
-            //
-            // `sealed_at` stays None: the segment is NOT sealed yet —
-            // sealing happens asynchronously, and the seal path
-            // overwrites this entry with the real metadata (merkle
-            // root, sealed_at). A phantom entry marked sealed would
-            // make WAL replay skip the segment's entries while the
-            // data is still only in the WAL, losing it on crash.
-            //
-            // The registration must NEVER clobber a sealed entry: a
-            // segment can complete sealing between the write and this
-            // registration, and overwriting `sealed_at: Some` back to
-            // None would (a) make WAL retention protect the segment's
-            // files forever and (b) make replay rebuild the segment
-            // from possibly-partial WAL entries, shadowing the durable
-            // file with corrupt data.
-            let size_config = oceanfs_core::SegmentSizeConfig::default();
-            let mut registered: std::collections::HashSet<oceanfs_core::SegmentId> =
-                std::collections::HashSet::new();
-            for chunk in &result.chunks {
-                if !registered.insert(chunk.segment_id) {
-                    continue;
-                }
-                let already_sealed = state
-                    .metadata
-                    .get_segment(chunk.segment_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some_and(|meta| meta.sealed_at.is_some());
-                if already_sealed {
-                    continue;
-                }
-                let tier = size_config.classify(result.size);
-                let seg_meta = oceanfs_core::SegmentMetadata {
-                    segment_id: chunk.segment_id,
-                    ec_k: 1,
-                    ec_m: 0,
-                    size_tier: tier,
-                    merkle_root: None,
-                    storage_locations: smallvec::SmallVec::new(),
-                    sealed_at: None,
-                };
-                if let Err(e) = state.metadata.put_segment(seg_meta).await {
-                    error!(segment_id = %chunk.segment_id, error = %e, "failed to persist segment metadata");
-                }
-            }
+            // Segment metadata registration is REMOVED: the lifecycle
+            // coordinator (ADR-0025 phase 1) already reserved every
+            // segment durably inside `WriteCoordinator::put` — before
+            // its first WAL entry — so /admin/segments reflects the
+            // segments and this handler's phantom `put_segment` would
+            // be a second, non-coordinator CF writer (the
+            // phantom-downgrade class the coordinator eliminates).
 
             info!(key = %key, size = result.size, etag = %etag, "PUT object success");
 

@@ -14,7 +14,9 @@ use oceanfs_storage::{
         DiskIo, DiskSegmentReader, InMemorySegmentReader, IoReadMode, SegmentFileCache,
         SegmentReadSource, SegmentReader,
     },
-    segment::header::SEGMENT_HEADER_SIZE_V1 as V1_HEADER_SIZE,
+    segment::{
+        header::SEGMENT_HEADER_SIZE_V1 as V1_HEADER_SIZE, lifecycle::SegmentLifecycleCoordinator,
+    },
 };
 
 /// Writes a segment file with a 76-byte zeroed header followed by `data`.
@@ -269,14 +271,17 @@ mod write_read_roundtrip {
     use oceanfs_storage::{
         io::{DiskIo, DiskSegmentReader, IoReadMode, SegmentReader},
         metadata::RocksDbMetadataStore,
-        segment::sealer::{SealConfig, SegmentSealer},
+        segment::{
+            lifecycle::SegmentLifecycleCoordinator,
+            sealer::{SealConfig, SegmentSealer},
+        },
         wal::WalWriter,
     };
 
     async fn setup(
         dir: &tempfile::TempDir,
         io_mode: IoReadMode,
-    ) -> (Arc<SegmentSealer>, Arc<DiskSegmentReader>) {
+    ) -> (Arc<SegmentSealer>, Arc<SegmentLifecycleCoordinator>, Arc<DiskSegmentReader>) {
         let metadata = Arc::new(
             RocksDbMetadataStore::open(&MetadataConfig {
                 data_dir: dir.path().join("meta"),
@@ -299,6 +304,11 @@ mod write_read_roundtrip {
         );
 
         let segments_dir = dir.path().join("segments");
+        let lifecycle =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+                metadata,
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         let sealer = Arc::new(SegmentSealer::new(
             SealConfig {
                 target_size_bytes: 65536,
@@ -308,8 +318,8 @@ mod write_read_roundtrip {
                 write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
                 ..Default::default()
             },
-            metadata,
             wal,
+            lifecycle.clone(),
         ));
 
         let reader = Arc::new(DiskSegmentReader::new(
@@ -321,17 +331,19 @@ mod write_read_roundtrip {
             None,
         ));
 
-        (sealer, reader)
+        (sealer, lifecycle.clone(), reader)
     }
 
     #[tokio::test]
     async fn seal_buffered_then_read_back() {
         let dir = tempfile::tempdir().unwrap();
-        let (sealer, reader) = setup(&dir, IoReadMode::Buffered).await;
+        let (sealer, lifecycle, reader) = setup(&dir, IoReadMode::Buffered).await;
 
         let segment_id = SegmentId::new();
         let data = b"write path integration test data payload";
 
+        // The flush path seals Reserved-only — reserve first.
+        lifecycle.request_reserve(segment_id, SizeTier::Standard, 0, 0).await.unwrap();
         sealer
             .seal_from_data(
                 segment_id,
@@ -359,11 +371,13 @@ mod write_read_roundtrip {
     #[tokio::test]
     async fn seal_direct_then_read_back() {
         let dir = tempfile::tempdir().unwrap();
-        let (sealer, reader) = setup(&dir, IoReadMode::Direct).await;
+        let (sealer, lifecycle, reader) = setup(&dir, IoReadMode::Direct).await;
 
         let segment_id = SegmentId::new();
         let data = b"O_DIRECT write then read from disk";
 
+        // The flush path seals Reserved-only — reserve first.
+        lifecycle.request_reserve(segment_id, SizeTier::Standard, 0, 0).await.unwrap();
         sealer
             .seal_from_data(
                 segment_id,

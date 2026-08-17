@@ -14,7 +14,9 @@ use oceanfs_core::{SegmentId, SegmentSizeConfig, SizeTier, WalConfig};
 use tracing::{info, warn};
 
 use crate::{
-    error::Result, metadata::RocksDbMetadataStore, segment::pool::SegmentPool,
+    error::Result,
+    metadata::RocksDbMetadataStore,
+    segment::{lifecycle::SegmentLifecycleCoordinator, pool::SegmentPool},
     wal::reader::WalReader,
 };
 
@@ -30,8 +32,9 @@ use crate::{
 /// use oceanfs_core::WalConfig;
 /// use oceanfs_storage::wal::{replay_wal, WalWriter};
 ///
-/// # async fn example(config: &WalConfig, wal_writer: &WalWriter) -> oceanfs_storage::Result<()> {
-/// let summary = replay_wal(config, wal_writer, &pool_small, &pool_standard, &size_config, |_| false).await?;
+/// # async fn example(config: &WalConfig, wal_writer: &WalWriter, lifecycle: &oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator) -> oceanfs_storage::Result<()> {
+/// let summary =
+///     replay_wal(config, wal_writer, &pool_small, &pool_standard, &size_config, |_| false, lifecycle).await?;
 /// assert_eq!(summary.entries_replayed, 0); // empty WAL on first start
 /// # Ok(())
 /// # }
@@ -86,16 +89,34 @@ fn fill_target(size_config: &SegmentSizeConfig, tier: SizeTier) -> u64 {
 /// fill-triggered seal fire for filled segments, and force-seals
 /// partial ones so the slot frees — the pool's configured slot count
 /// never bounds the replay.
+///
+/// The rebuilt segment is **reserved** through the lifecycle
+/// coordinator before its first replayed entry is appended: the seal
+/// path validates `Reserved`-only (ADR-0025 Decision 1), and the WAL
+/// cleanup protects registered-but-unsealed entries — a rebuilt
+/// segment must never be sealed without its reserve.
 async fn replay_queued_segment(
     group: QueuedSegment,
     segment_pool_small: &SegmentPool,
     segment_pool_standard: &SegmentPool,
+    lifecycle: &SegmentLifecycleCoordinator,
 ) -> Result<()> {
     let (pool, tier) = match group.tier {
         SizeTier::Small => (segment_pool_small, SizeTier::Small),
         SizeTier::Standard | SizeTier::Multi => (segment_pool_standard, SizeTier::Standard),
         _ => return Ok(()), // inline tier never reaches the pools
     };
+    // Reserve BEFORE the first replayed DataEntry: a fill-triggered
+    // seal can fire during `append_replayed` below, and the seal's
+    // Reserved-only validation must pass (the reserve is also the
+    // durable registration the WAL cleanup relies on).
+    let (ec_k, ec_m, _strip) = pool.ec_params();
+    lifecycle.request_reserve(group.segment_id, tier, ec_k, ec_m).await.map_err(|e| {
+        crate::error::Error::Io(std::io::Error::other(format!(
+            "failed to reserve rebuilt segment {} during WAL replay: {e}",
+            group.segment_id
+        )))
+    })?;
     for data in &group.entries {
         pool.append_replayed(group.segment_id, data).await?;
     }
@@ -116,13 +137,18 @@ async fn replay_queued_segment(
 /// bounds recovery), tracks the maximum HLC timestamp, and truncates
 /// the WAL to prevent double-replay on a subsequent restart.
 ///
+/// Every rebuilt segment is reserved through `lifecycle` before its
+/// first replayed entry is appended (the seal path validates
+/// `Reserved`-only — ADR-0025 phase 1).
+///
 /// Inline-tier entries (≤4 KB) are skipped during replay — they are
 /// stored directly in RocksDB metadata, not in active segments.
 ///
 /// # Errors
 ///
 /// Returns an error if the WAL directory cannot be read, a segment pool
-/// append fails, or truncation fails.
+/// append fails, the rebuilt segment's reserve fails, or truncation
+/// fails.
 pub async fn replay_wal(
     config: &WalConfig,
     wal_writer: &super::WalWriter,
@@ -130,6 +156,7 @@ pub async fn replay_wal(
     segment_pool_standard: &SegmentPool,
     size_config: &SegmentSizeConfig,
     already_sealed: impl Fn(SegmentId) -> bool,
+    lifecycle: &SegmentLifecycleCoordinator,
 ) -> Result<ReplaySummary> {
     let reader = WalReader::open(config)?;
 
@@ -234,7 +261,13 @@ pub async fn replay_wal(
             let mut remaining = Vec::with_capacity(queue.len());
             for group in queue.drain(..) {
                 if group.complete {
-                    replay_queued_segment(group, segment_pool_small, segment_pool_standard).await?;
+                    replay_queued_segment(
+                        group,
+                        segment_pool_small,
+                        segment_pool_standard,
+                        lifecycle,
+                    )
+                    .await?;
                 } else {
                     remaining.push(group);
                 }
@@ -252,7 +285,7 @@ pub async fn replay_wal(
     // partial), sequentially — one slot, then the WAL is fully
     // consumed and every rebuilt segment is durable.
     for group in queue.drain(..) {
-        replay_queued_segment(group, segment_pool_small, segment_pool_standard).await?;
+        replay_queued_segment(group, segment_pool_small, segment_pool_standard, lifecycle).await?;
     }
 
     tracing::info!(
@@ -533,16 +566,35 @@ mod tests {
     use std::sync::Arc;
 
     use oceanfs_core::{
-        HashOutput, MetadataConfig, PoolConfig, SegmentMetadata, SegmentSizeConfig, SizeTier,
+        HashOutput, LifecycleConfig, MetadataConfig, PoolConfig, SegmentMetadata,
+        SegmentSizeConfig, SizeTier,
     };
 
     use super::*;
     use crate::{
         buffer_pool::BufferPool,
         metadata::RocksDbMetadataStore,
-        segment::pool::SegmentPool,
+        segment::{lifecycle::SegmentLifecycleCoordinator, pool::SegmentPool},
         wal::{WalEntry, WalWriter},
     };
+
+    /// Creates a lifecycle coordinator over a fresh metadata store (the
+    /// replay reserves every rebuilt segment through it).
+    async fn make_lifecycle() -> (Arc<RocksDbMetadataStore>, Arc<SegmentLifecycleCoordinator>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            RocksDbMetadataStore::open(&MetadataConfig {
+                data_dir: dir.path().join("meta"),
+                block_cache_size: 1024,
+                memtable_size: 1024,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let lifecycle =
+            Arc::new(SegmentLifecycleCoordinator::new(store.clone(), &LifecycleConfig::default()));
+        (store, lifecycle)
+    }
 
     async fn make_test_env() -> (WalConfig, SegmentSizeConfig, Arc<BufferPool>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -930,12 +982,18 @@ mod tests {
         let (wal_config, size_config, buffer_pool, _dir) = make_test_env().await;
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
         let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
-        let summary =
-            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| {
-                false
-            })
-            .await
-            .unwrap();
+        let (_store, lifecycle) = make_lifecycle().await;
+        let summary = replay_wal(
+            &wal_config,
+            &wal_writer,
+            &pool_small,
+            &pool_standard,
+            &size_config,
+            |_| false,
+            &lifecycle,
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.entries_replayed, 0);
         assert_eq!(summary.bytes_replayed, 0);
         assert!(summary.segments_seen.is_empty());
@@ -957,12 +1015,18 @@ mod tests {
 
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
         let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
-        let summary =
-            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| {
-                false
-            })
-            .await
-            .unwrap();
+        let (_store, lifecycle) = make_lifecycle().await;
+        let summary = replay_wal(
+            &wal_config,
+            &wal_writer,
+            &pool_small,
+            &pool_standard,
+            &size_config,
+            |_| false,
+            &lifecycle,
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.entries_replayed, 5);
         assert_eq!(summary.bytes_replayed, 25000);
         assert_eq!(summary.segments_seen.len(), 1);
@@ -984,12 +1048,18 @@ mod tests {
 
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
         let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
-        let summary =
-            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| {
-                false
-            })
-            .await
-            .unwrap();
+        let (_store, lifecycle) = make_lifecycle().await;
+        let summary = replay_wal(
+            &wal_config,
+            &wal_writer,
+            &pool_small,
+            &pool_standard,
+            &size_config,
+            |_| false,
+            &lifecycle,
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.entries_replayed, 3);
 
         let reader = WalReader::open(&wal_config).unwrap();
@@ -1012,12 +1082,18 @@ mod tests {
 
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
         let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
-        let summary =
-            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| {
-                false
-            })
-            .await
-            .unwrap();
+        let (_store, lifecycle) = make_lifecycle().await;
+        let summary = replay_wal(
+            &wal_config,
+            &wal_writer,
+            &pool_small,
+            &pool_standard,
+            &size_config,
+            |_| false,
+            &lifecycle,
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.entries_replayed, 3);
         assert_eq!(summary.segments_seen.len(), 2);
     }
@@ -1036,12 +1112,18 @@ mod tests {
 
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
         let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
-        let summary =
-            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| {
-                false
-            })
-            .await
-            .unwrap();
+        let (_store, lifecycle) = make_lifecycle().await;
+        let summary = replay_wal(
+            &wal_config,
+            &wal_writer,
+            &pool_small,
+            &pool_standard,
+            &size_config,
+            |_| false,
+            &lifecycle,
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.entries_replayed, 3);
         assert_eq!(summary.max_hlc_wall_time, 2000);
         assert_eq!(summary.max_hlc_logical, 0);
@@ -1060,12 +1142,18 @@ mod tests {
 
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
         let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
-        let summary =
-            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| {
-                false
-            })
-            .await
-            .unwrap();
+        let (_store, lifecycle) = make_lifecycle().await;
+        let summary = replay_wal(
+            &wal_config,
+            &wal_writer,
+            &pool_small,
+            &pool_standard,
+            &size_config,
+            |_| false,
+            &lifecycle,
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.max_hlc_wall_time, 5000);
         assert_eq!(summary.max_hlc_logical, 7);
     }
@@ -1092,6 +1180,7 @@ mod tests {
 
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
         let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
+        let (_store, lifecycle) = make_lifecycle().await;
         let summary = replay_wal(
             &wal_config,
             &wal_writer,
@@ -1099,6 +1188,7 @@ mod tests {
             &pool_standard,
             &size_config,
             |id| id == sealed_id, // the sealed segment is durable on disk
+            &lifecycle,
         )
         .await
         .unwrap();
@@ -1128,12 +1218,18 @@ mod tests {
         // Replay into pools — the entries land in pool_small.
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
         let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
-        let summary =
-            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| {
-                false
-            })
-            .await
-            .unwrap();
+        let (_store, lifecycle) = make_lifecycle().await;
+        let summary = replay_wal(
+            &wal_config,
+            &wal_writer,
+            &pool_small,
+            &pool_standard,
+            &size_config,
+            |_| false,
+            &lifecycle,
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.entries_replayed, 8);
         assert_eq!(summary.bytes_replayed, 40000);
 
@@ -1170,7 +1266,7 @@ mod tests {
             let writer = WalWriter::open(&wal_config).await.unwrap();
             // 8 distinct small segments (the pool has 4 slots) with
             // interleaved entries, each below the fill target.
-            for i in 0..8 {
+            for _i in 0..8 {
                 let id = SegmentId::new();
                 ids.push(id);
                 for j in 0..3 {
@@ -1182,12 +1278,18 @@ mod tests {
 
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
         let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
-        let summary =
-            replay_wal(&wal_config, &wal_writer, &pool_small, &pool_standard, &size_config, |_| {
-                false
-            })
-            .await
-            .unwrap();
+        let (_store, lifecycle) = make_lifecycle().await;
+        let summary = replay_wal(
+            &wal_config,
+            &wal_writer,
+            &pool_small,
+            &pool_standard,
+            &size_config,
+            |_| false,
+            &lifecycle,
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.entries_replayed, 24);
         assert_eq!(summary.segments_seen.len(), 8, "all 8 distinct segments must be rebuilt");
 
