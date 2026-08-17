@@ -31,8 +31,12 @@ impl DiskSegmentStore {
 impl SegmentDataStore for DiskSegmentStore {
     fn read_segment_data(&self, segment_id: &SegmentId) -> std::result::Result<Bytes, Error> {
         let path = self.segment_dir.join(format!("{segment_id}.dat"));
-        let data =
-            std::fs::read(&path).map_err(|e| Error::Io(std::io::Error::other(format!("{e}"))))?;
+        // Preserve the original io::Error (including its ErrorKind): scrub
+        // distinguishes NotFound (shard not yet sealed / already reclaimed —
+        // NOT corruption) from genuine I/O failures by matching the kind.
+        // Wrapping with `Error::other(format!(...))` would collapse every
+        // error into ErrorKind::Other and hide the NotFound signal.
+        let data = std::fs::read(&path).map_err(Error::Io)?;
 
         // The on-disk header size depends on the format version (v1 = 76
         // bytes, v2 = 92 bytes); the returned data is the DATA section
