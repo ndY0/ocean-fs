@@ -674,6 +674,21 @@ impl WriteCoordinator {
         if !registered.insert(segment_id) {
             return Ok(()); // already registered in this request
         }
+        // Do NOT downgrade an already-sealed segment. The append that
+        // precedes this call may have FILLED the segment, enqueueing its
+        // seal; the seal worker (a separate task) can persist the sealed
+        // metadata (sealed_at: Some) before this phantom write lands.
+        // Unconditionally writing sealed_at: None would then downgrade
+        // the entry back to unsealed — and nothing ever re-seals it, so
+        // the WAL cleanup protects every file holding its entries
+        // forever (the wal_not_unbounded leak: ~1 protected file/min).
+        // A sealed segment's data is durable on disk; its WAL entries are
+        // sweepable, so no phantom is needed.
+        if let Ok(Some(existing)) = self.metadata_store.get_segment(segment_id).await {
+            if existing.sealed_at.is_some() {
+                return Ok(());
+            }
+        }
         let (ec_k, ec_m, _strip) = match tier {
             SizeTier::Small => self.segment_pool_small.ec_params(),
             _ => self.segment_pool_standard.ec_params(),
