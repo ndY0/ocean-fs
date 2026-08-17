@@ -216,6 +216,27 @@ impl PoolSlot {
         }
     }
 
+    /// Seals the slot's segment if it has been idle (no appends) for at
+    /// least `timeout` and holds data.
+    ///
+    /// Returns the sealed payload for the caller to hand to the seal
+    /// queue (the same path as a fill-triggered seal). This is what
+    /// bounds the WAL: a partially-filled segment that never receives
+    /// another append would otherwise stay registered-unsealed forever,
+    /// and every WAL file holding its entries would be protected from
+    /// cleanup — the `wal_not_unbounded` leak (the count grew ~1.5
+    /// files/min under sustained load).
+    ///
+    /// Runs under the slot lock (same critical section as fill).
+    fn try_seal_idle(&self, timeout: std::time::Duration) -> Option<SealedSegment> {
+        let mut guard = self.state.lock();
+        let SlotState::Appending(segment) = &*guard else { return None };
+        if segment.is_empty() || segment.idle_for() < timeout {
+            return None;
+        }
+        Self::transition_to_sealing(&mut guard)
+    }
+
     /// Installs a replacement segment into a slot that is sealing or idle
     /// — a single pointer swap under one lock acquisition.
     ///
@@ -914,6 +935,69 @@ impl SegmentPool {
                     "seal enqueue failed within deadline; write rejected (retryable)"
                 );
                 Err(Error::WriteBackpressureTimeout)
+            }
+        }
+    }
+
+    /// Runs a periodic sweep that seals **idle** (partially-filled)
+    /// segments.
+    ///
+    /// The fill path seals a segment only when an append makes it full.
+    /// A segment that receives its last write short of the target size
+    /// would otherwise stay `Appending` (registered-unsealed) forever:
+    /// the WAL cleanup protects every file holding its entries (they are
+    /// the segment's only durable copy), so the WAL file count grows
+    /// without bound — the `wal_not_unbounded` leak observed under
+    /// sustained load (~1.5 protected files/min).
+    ///
+    /// Every `interval`, each slot's segment is sealed if it has been
+    /// idle for at least `idle_timeout` and holds data. The seal goes
+    /// through the same queue as a fill-triggered seal, so the seal
+    /// worker persists the `.dat`, registers the sealed metadata (making
+    /// the WAL entries sweepable), and the slot re-arms for new writes.
+    ///
+    /// The returned handle can be aborted to stop the sweep.
+    pub fn start_idle_seal_worker(
+        self: &Arc<Self>,
+        interval: std::time::Duration,
+        idle_timeout: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // Skip the immediate first tick — a freshly started pool has
+            // nothing idle yet.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                this.sweep_idle_segments(idle_timeout).await;
+            }
+        })
+    }
+
+    /// One idle-seal sweep across all slots.
+    ///
+    /// Seals every `Appending` segment idle past `idle_timeout` (with
+    /// data), enqueueing the sealed payload through the async hand-off.
+    /// Enqueue failures are logged and retried on the next sweep — an
+    /// idle segment is not a fresh write, so there is no ack to reject;
+    /// the segment simply stays unsealed one more interval.
+    async fn sweep_idle_segments(&self, idle_timeout: std::time::Duration) {
+        // Collect sealed payloads outside the slot locks (same pattern
+        // as the fill path: the critical section is the freeze).
+        let mut sealed: Vec<SealedSegment> = Vec::new();
+        for slot in &self.slots {
+            if let Some(payload) = slot.try_seal_idle(idle_timeout) {
+                sealed.push(payload);
+            }
+        }
+        for payload in sealed {
+            // Re-arm the slot and enqueue. Bounded wait: if the queue is
+            // full the segment waits for the next sweep (one interval),
+            // which is acceptable for idle data.
+            let deadline = std::time::Instant::now() + SLOT_ACTIVATION_WAIT;
+            if let Err(e) = self.finish_seal_handoff_async(Some(payload), deadline).await {
+                tracing::warn!(error = %e, "idle-seal enqueue failed; retrying next sweep");
             }
         }
     }
@@ -2043,5 +2127,42 @@ mod tests {
         let chunk = pool.try_read(seg_id, 0, 100).expect("clamped read");
         assert_eq!(chunk.len(), 5);
         assert_eq!(&chunk[..], b"short");
+    }
+
+    #[tokio::test]
+    async fn idle_seal_sweep_seals_partially_filled_segment() {
+        let (pool_cfg, size_cfg) = test_config();
+        let buf_pool = test_pool();
+        let pool = Arc::new(
+            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
+                .unwrap(),
+        );
+        // Drain the seal queue so the async hand-off never blocks.
+        drain_seal_queue(&pool);
+
+        // Append a small blob — the segment is far from full.
+        let (seg_id, offset, length) = pool.append(b"partial").unwrap();
+        assert_eq!(offset, 0);
+        assert_eq!(length, 7);
+
+        // A zero idle timeout forces the sweep to seal it immediately.
+        let handle = pool.start_idle_seal_worker(
+            std::time::Duration::from_millis(10),
+            std::time::Duration::ZERO,
+        );
+        // Give the worker a few ticks.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        handle.abort();
+
+        // The sealed segment's data remains readable during the seal
+        // window (read-after-write gap preserved)...
+        assert_eq!(&pool.try_read(seg_id, 0, 7).expect("read during seal window")[..], b"partial");
+
+        // ...but the segment itself is no longer active: the slot was
+        // re-armed with a FRESH segment, so the next append must land in
+        // a different segment id (the old one is sealed + enqueued).
+        let (new_seg_id, new_offset, _) = pool.append(b"more").unwrap();
+        assert_eq!(new_offset, 0, "fresh segment starts at offset 0");
+        assert_ne!(new_seg_id, seg_id, "old segment must be sealed, new append uses a new one");
     }
 }

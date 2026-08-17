@@ -884,6 +884,24 @@ impl WriteCoordinator {
         let self_small = Arc::clone(self);
         let self_standard = Arc::clone(self);
 
+        // Idle-seal sweep: seal partially-filled segments that stopped
+        // receiving writes (fill-only sealing would leave them
+        // registered-unsealed forever, pinning their WAL files — the
+        // wal_not_unbounded leak). The sweep runs at a fraction of the
+        // seal timeout so a segment is sealed within ~timeout of going
+        // idle.
+        let idle_interval =
+            std::time::Duration::from_millis((self.sealer.seal_timeout_ms() / 4).max(100));
+        let idle_timeout = std::time::Duration::from_millis(self.sealer.seal_timeout_ms());
+        let _idle_handle_small =
+            self.segment_pool_small.start_idle_seal_worker(idle_interval, idle_timeout);
+        let _idle_handle_standard =
+            self.segment_pool_standard.start_idle_seal_worker(idle_interval, idle_timeout);
+        let _idle_handle_small =
+            self.segment_pool_small.start_idle_seal_worker(idle_interval, idle_timeout);
+        let _idle_handle_standard =
+            self.segment_pool_standard.start_idle_seal_worker(idle_interval, idle_timeout);
+
         // Take seal receivers from both pools.
         let rx_small = self.segment_pool_small.take_seal_rx();
         let rx_standard = self.segment_pool_standard.take_seal_rx();

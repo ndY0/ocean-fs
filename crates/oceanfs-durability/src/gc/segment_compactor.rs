@@ -126,9 +126,17 @@ impl SegmentCompactor {
                     let new_chunk = ChunkRef {
                         segment_id: new_segment_id,
                         offset: new_offset,
+                        // Preserve the compression contract: a compressed
+                        // chunk's length is the COMPRESSED size on disk,
+                        // and the read path decompresses only when
+                        // `compressed` is true, yielding `logical_length`
+                        // bytes. Hardcoding false/equal here (as the
+                        // original compactor did) made reads return raw
+                        // compressed bytes — hash verification failed
+                        // (BadDigest) for repacked compressed objects.
                         length: chunk.length,
-                        compressed: false,
-                        logical_length: chunk.length,
+                        compressed: chunk.compressed,
+                        logical_length: chunk.logical_length,
                     };
                     let key = (chunk.segment_id, chunk.offset, chunk.length);
                     chunk_remap.insert(key, new_chunk);
