@@ -12,8 +12,9 @@ use std::sync::Arc;
 
 use oceanfs_core::{CodecConfig, PoolConfig, SegmentSizeConfig, SizeTier};
 use oceanfs_storage::{
-    segment::lifecycle::SegmentLifecycleCoordinator, BufferPool, RocksDbMetadataStore, SealConfig,
-    SegmentHeader, SegmentPool, SegmentSealer, WalWriter,
+    segment::lifecycle::{SegmentLifecycleCoordinator, SegmentLifecycleRegistry},
+    BufferPool, RocksDbMetadataStore, SealConfig, SegmentHeader, SegmentPool, SegmentSealer,
+    WalWriter,
 };
 
 /// Creates a segment pool with EC parameters configured (k=4, m=2, strip=64).
@@ -42,6 +43,9 @@ fn make_ec_pool() -> SegmentPool {
         buffer_pool,
         Some(ec_config),
         None,
+        std::sync::Arc::new(SegmentLifecycleRegistry::new(
+            &oceanfs_core::LifecycleConfig::default(),
+        )),
     )
     .unwrap()
 }

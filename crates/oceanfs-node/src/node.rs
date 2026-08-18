@@ -611,6 +611,12 @@ impl Node {
         // histograms, fallbacks) — the accel tier is exercised on the
         // write path, not just in isolation.
         let pool_ec_encoder: Option<std::sync::Arc<dyn oceanfs_ec::Encoder>> = Some(accel.clone());
+        // The lifecycle registry is constructed FIRST (ADR-0025
+        // Decision 2): the pools hold it for the read path and the
+        // in-flight attach, and the coordinator wraps the same instance
+        // (construction order: registry → pools → coordinator).
+        let lifecycle_registry =
+            Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(&config.lifecycle));
         let segment_pool_small = Arc::new(
             SegmentPool::new(
                 pool_config.clone(),
@@ -619,6 +625,7 @@ impl Node {
                 shard_buffer_pool.clone(),
                 Some(pool_ec_config.clone()),
                 pool_ec_encoder.clone(),
+                Arc::clone(&lifecycle_registry),
             )
             .map_err(|e| format!("failed to create small segment pool: {e}"))?,
         );
@@ -630,6 +637,7 @@ impl Node {
                 shard_buffer_pool.clone(),
                 Some(pool_ec_config),
                 pool_ec_encoder,
+                Arc::clone(&lifecycle_registry),
             )
             .map_err(|e| format!("failed to create standard segment pool: {e}"))?,
         );
@@ -674,9 +682,9 @@ impl Node {
         // reaper's request_delete validates against it) — a pure
         // registry fold, no CF writes.
         let lifecycle = Arc::new(
-            oceanfs_storage::SegmentLifecycleCoordinator::new(
+            oceanfs_storage::SegmentLifecycleCoordinator::with_registry(
                 metadata_store.clone(),
-                &config.lifecycle,
+                lifecycle_registry,
             )
             // Idle-seal driver: the coordinator owns the idle-seal
             // timer and sweeps both pools (ADR-0025 phase 1). The

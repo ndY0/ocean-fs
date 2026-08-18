@@ -483,6 +483,11 @@ mod tests {
 
     // --- Test helpers ---
 
+    fn test_registry() -> Arc<oceanfs_storage::SegmentLifecycleRegistry> {
+        Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(
+            &oceanfs_core::LifecycleConfig::default(),
+        ))
+    }
     async fn make_app_state() -> AppState {
         let mut ring = Ring::new(RingConfig { vnodes_per_node: 8, replication_factor: 3 });
         ring.add_node(NodeId::new("n1"));
@@ -529,12 +534,21 @@ mod tests {
                 buffer_pool.clone(),
                 None,
                 None,
+                test_registry(),
             )
             .unwrap(),
         );
         let segment_pool_standard = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None, None)
-                .unwrap(),
+            SegmentPool::new(
+                pool_cfg,
+                SizeTier::Standard,
+                &size_config,
+                buffer_pool,
+                None,
+                None,
+                test_registry(),
+            )
+            .unwrap(),
         );
 
         let wal = Arc::new(

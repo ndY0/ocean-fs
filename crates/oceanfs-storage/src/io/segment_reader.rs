@@ -554,10 +554,13 @@ fn madvise_dontneed(addr: *const u8, len: usize) -> std::io::Result<()> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use oceanfs_core::{PoolConfig, SegmentSizeConfig, SizeTier};
+    use oceanfs_core::{LifecycleConfig, PoolConfig, SegmentSizeConfig, SizeTier};
 
     use super::*;
-    use crate::{buffer_pool::BufferPool, segment::SegmentPool};
+    use crate::{
+        buffer_pool::BufferPool,
+        segment::{SegmentLifecycleRegistry, SegmentPool},
+    };
 
     fn temp_segment_file(dir: &tempfile::TempDir, id: SegmentId) -> PathBuf {
         temp_segment_file_with_data(dir, id, &vec![0xABu8; 4096])
@@ -778,9 +781,18 @@ mod tests {
         let pool_cfg = PoolConfig::default();
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = Arc::new(BufferPool::new(65536, 32));
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
         Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-                .unwrap(),
+            SegmentPool::new(
+                pool_cfg,
+                SizeTier::Standard,
+                &size_cfg,
+                buf_pool,
+                None,
+                None,
+                registry,
+            )
+            .unwrap(),
         )
     }
 
@@ -789,9 +801,25 @@ mod tests {
         let pool = test_pool();
         let fallback = Arc::new(InMemorySegmentReader::new());
 
-        // Write data into the active pool.
+        // Write data into the active pool. The machine entry must
+        // exist for the read resolution (the write path reserves before
+        // any readable state) — mirror that contract here.
         let data = b"active segment test data";
         let (seg_id, offset, length) = pool.append(data).unwrap();
+        pool.lifecycle_registry()
+            .reserve(
+                seg_id,
+                oceanfs_core::SegmentMetadata {
+                    segment_id: seg_id,
+                    ec_k: 0,
+                    ec_m: 0,
+                    size_tier: SizeTier::Standard,
+                    merkle_root: None,
+                    storage_locations: smallvec::SmallVec::new(),
+                    sealed_at: None,
+                },
+            )
+            .unwrap();
 
         let reader = PoolFallbackReader::new(vec![pool], fallback);
 

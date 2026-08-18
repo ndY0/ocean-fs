@@ -157,6 +157,7 @@ mod helpers {
                     buffer_pool.clone(),
                     None,
                     None,
+                    crate::test_registry(),
                 )
                 .unwrap(),
             );
@@ -168,6 +169,7 @@ mod helpers {
                     buffer_pool,
                     None,
                     None,
+                    crate::test_registry(),
                 )
                 .unwrap(),
             );
@@ -350,4 +352,10 @@ async fn e2e_hash_verification_passes() {
     let actual = blake3::hash(&retrieved);
     assert_eq!(expected, actual);
     assert_eq!(&retrieved[..], data);
+}
+
+fn test_registry() -> std::sync::Arc<oceanfs_storage::SegmentLifecycleRegistry> {
+    std::sync::Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ))
 }

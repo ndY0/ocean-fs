@@ -25,22 +25,27 @@
 //!
 //! # LOCK ORDER
 //!
-//! `current_index → slot_state`. `sealing_data` is never acquired while a
-//! slot lock is held — every caller drops all slot guards before touching
-//! the map — so the only ordering constraint is that the round-robin
-//! counter is taken before any slot lock.
+//! `current_index → slot_state → registry shard` (fill path): the frozen
+//! buffer is attached to the lifecycle registry entry in the same
+//! critical section as the slot freeze, so the read window is continuous
+//! (lifecycle-read-path). The registry shard is never held while
+//! acquiring a slot lock — `read_source` releases before the caller's
+//! slot scan, and the coordinator's transitions never touch slots.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use oceanfs_core::{CodecConfig, PoolConfig, SegmentId, SizeTier};
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Condvar, Mutex};
 use tokio::sync::{mpsc, Semaphore};
 
 use crate::{
     buffer_pool::BufferPool,
     error::{Error, Result},
-    segment::buffer::{ActiveSegment, SealedSegment},
+    segment::{
+        buffer::{ActiveSegment, SealedSegment},
+        lifecycle::{SegmentLifecycleRegistry, SegmentReadSource},
+    },
 };
 
 /// Upper bound on how long an append may wait while the pool is silent.
@@ -57,6 +62,15 @@ const SLOT_ACTIVATION_WAIT: std::time::Duration = std::time::Duration::from_mill
 /// deadline — which under continuous churn often lands in another transit
 /// window. Short slices give the re-scan many chances within the budget.
 const SLOT_ACTIVATION_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Upper bound on the seal pipeline's in-flight set (frozen segments
+/// between fill and durable seal) — ADR-0021's bound:
+/// `active_pool_size × shard_count × num_tiers ≤ 16` segments ≈ 1 GB
+/// worst case. While the registry holds this many frozen buffers, slots
+/// are not re-armed: appends wait on slot re-activation (backpressure),
+/// the frozen data stays readable via the registry entry, and the seal
+/// queue drains. Seals completing below the cap re-open the slots.
+const IN_FLIGHT_CAP: usize = 16;
 
 /// A work item sent to the seal worker when a segment is filled.
 ///
@@ -192,21 +206,73 @@ impl PoolSlot {
     // Non-test builds exercise this transition inline under the append
     // critical section; the standalone method is used by the tests.
     #[allow(dead_code)]
-    fn take_for_sealing(&self) -> Option<SealedSegment> {
+    fn take_for_sealing(
+        &self,
+        registry: &SegmentLifecycleRegistry,
+        tier: SizeTier,
+        ec_k: u8,
+        ec_m: u8,
+    ) -> Option<SealedSegment> {
         let mut guard = self.state.lock();
-        Self::transition_to_sealing(&mut guard)
+        Self::transition_to_sealing(&mut guard, registry, tier, ec_k, ec_m, false)
     }
 
     /// The `Appending` → `Sealing` transition, given that the slot lock is
     /// already held (single critical section with the appending append).
+    ///
+    /// The frozen buffer is attached to the lifecycle registry entry in
+    /// THIS critical section (slot lock → registry shard write — the
+    /// documented fill-path order): the read window is continuous, with
+    /// no freeze→attach gap a concurrent GET could fall into.
     fn transition_to_sealing(
         guard: &mut parking_lot::MutexGuard<'_, SlotState>,
+        registry: &SegmentLifecycleRegistry,
+        tier: SizeTier,
+        ec_k: u8,
+        ec_m: u8,
+        ignore_cap: bool,
     ) -> Option<SealedSegment> {
+        // In-flight cap gate (ADR-0021's bound: ≤ 16 frozen segments
+        // ≈ 1 GB worst case — the memory-bound DoD test pins this):
+        // while the registry holds the cap's worth of frozen buffers,
+        // NO new FILL freeze happens — the slot stays `Appending` with
+        // its full segment (still readable via the slot scan; the write
+        // that filled it is acked, its WAL entry written, and the
+        // recovery re-freezes it once the seal queue can accept it).
+        // Appends beyond the cap therefore backpressure on full slots
+        // instead of growing the in-flight set. The recovery path
+        // (`ignore_cap`) bypasses the gate — its frozen segments'
+        // data is already ACKED and the queue capacity check guarantees
+        // the work is accepted immediately, breaking the count=16 +
+        // empty-queue deadlock.
+        if !ignore_cap && registry.in_flight_count() >= IN_FLIGHT_CAP {
+            return None;
+        }
         let current = std::mem::replace(&mut **guard, SlotState::Idle);
         match current {
             SlotState::Appending(segment) => {
                 let sealed = segment.seal();
                 **guard = SlotState::Sealing(sealed.segment_id, sealed.data.clone());
+                // Attach before returning: the registry entry now owns
+                // the read window (was `sealing_data`). The slot keeps
+                // its own refcounted copy until the replacement is
+                // installed (unchanged transit). The attach inserts a
+                // registry-only entry when the write path's durable
+                // reserve has not landed yet (fill-before-reserve
+                // window — the segment id is only known after the
+                // append that filled it).
+                if !registry.attach_in_flight(
+                    sealed.segment_id,
+                    tier,
+                    ec_k,
+                    ec_m,
+                    sealed.data.clone(),
+                ) {
+                    tracing::warn!(
+                        segment_id = %sealed.segment_id,
+                        "frozen segment holds a higher lifecycle state; in-flight window unavailable"
+                    );
+                }
                 Some(sealed)
             }
             other => {
@@ -228,13 +294,20 @@ impl PoolSlot {
     /// files/min under sustained load).
     ///
     /// Runs under the slot lock (same critical section as fill).
-    fn try_seal_idle(&self, timeout: std::time::Duration) -> Option<SealedSegment> {
+    fn try_seal_idle(
+        &self,
+        timeout: std::time::Duration,
+        registry: &SegmentLifecycleRegistry,
+        tier: SizeTier,
+        ec_k: u8,
+        ec_m: u8,
+    ) -> Option<SealedSegment> {
         let mut guard = self.state.lock();
         let SlotState::Appending(segment) = &*guard else { return None };
         if segment.is_empty() || segment.idle_for() < timeout {
             return None;
         }
-        Self::transition_to_sealing(&mut guard)
+        Self::transition_to_sealing(&mut guard, registry, tier, ec_k, ec_m, false)
     }
 
     /// Installs a replacement segment into a slot that is sealing or idle
@@ -271,6 +344,10 @@ impl PoolSlot {
         &self,
         data: &[u8],
         hook: &mut Option<F>,
+        registry: &SegmentLifecycleRegistry,
+        tier: SizeTier,
+        ec_k: u8,
+        ec_m: u8,
     ) -> Result<Option<AppendOutcome>, Error> {
         let mut guard = self.state.lock();
         let SlotState::Appending(_) = &mut *guard else {
@@ -306,7 +383,11 @@ impl PoolSlot {
             (segment_id, offset, length_u32, segment.is_full())
         };
 
-        let sealed = if full { Self::transition_to_sealing(&mut guard) } else { None };
+        let sealed = if full {
+            Self::transition_to_sealing(&mut guard, registry, tier, ec_k, ec_m, false)
+        } else {
+            None
+        };
 
         Ok(Some(AppendOutcome { segment_id, offset, length, sealed }))
     }
@@ -350,14 +431,11 @@ pub struct SegmentPool {
     config: PoolConfig,
     /// Reference to the buffer pool for creating new active segments.
     buffer_pool: Arc<BufferPool>,
-    /// Segment data for segments that have been dequeued from active slots
-    /// but not yet written to disk by the seal worker. Serves reads during
-    /// the seal window (read-after-write gap).
-    ///
-    /// `RwLock<HashMap>` is appropriate here because writes (insert, remove)
-    /// happen once per segment lifecycle (every ~64 MB of data), while reads
-    /// are much more frequent (every GET request via `try_read`).
-    sealing_data: RwLock<HashMap<SegmentId, Bytes>>,
+    /// The lifecycle registry — the machine that owns the read path
+    /// resolution and the in-flight read window (ADR-0025 Decision 2).
+    /// The fill transition attaches the frozen buffer to the registry
+    /// entry; `try_read` resolves through it.
+    registry: Arc<SegmentLifecycleRegistry>,
     /// Wake-up signal for appenders waiting on slot re-activation
     /// (bounded backpressure when a concurrent burst fills every slot).
     /// The mutex guards nothing; it only serves as the wait primitive
@@ -379,6 +457,38 @@ pub struct SegmentPool {
 /// during replay (started before the WAL replay in the node).
 const REPLAY_SEAL_ENQUEUE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long the idle-seal driver's in-flight retry waits for seal-queue
+/// space before deferring to the next tick (10 ms — a draining queue
+/// accepts the work in microseconds; a stalled one is retried next
+/// tick, the in-flight window stays readable throughout).
+const INFLIGHT_RETRY_ENQUEUE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Copies `[offset, offset+length)` from a byte buffer (the append-mode
+/// buffer is `BytesMut`-backed and cannot be shared without freezing);
+/// clamped to the buffer end; `None` when the offset is past the end.
+fn slice_range(data: &[u8], offset: u64, length: u32) -> Option<Bytes> {
+    let start = offset as usize;
+    let end = start.saturating_add(length as usize).min(data.len());
+    if start < data.len() {
+        Some(Bytes::copy_from_slice(&data[start..end]))
+    } else {
+        None
+    }
+}
+
+/// Slices `[offset, offset+length)` from a frozen `Bytes` — zero-copy
+/// (refcount only); clamped to the buffer end; `None` when the offset
+/// is past the end.
+fn slice_bytes(data: &Bytes, offset: u64, length: u32) -> Option<Bytes> {
+    let start = offset as usize;
+    let end = start.saturating_add(length as usize).min(data.len());
+    if start < data.len() {
+        Some(data.slice(start..end))
+    } else {
+        None
+    }
+}
+
 impl SegmentPool {
     /// Creates a new segment pool.
     ///
@@ -398,6 +508,7 @@ impl SegmentPool {
         buffer_pool: Arc<BufferPool>,
         ec_config: Option<CodecConfig>,
         ec_encoder: Option<std::sync::Arc<dyn oceanfs_ec::Encoder>>,
+        registry: Arc<SegmentLifecycleRegistry>,
     ) -> Result<Self> {
         let (seal_tx, seal_rx) = mpsc::channel(config.encode_queue_capacity);
 
@@ -424,9 +535,9 @@ impl SegmentPool {
             seal_tx,
             seal_rx: Mutex::new(Some(seal_rx)),
             seal_semaphore,
+            registry,
             config,
             buffer_pool: Arc::clone(&buffer_pool),
-            sealing_data: RwLock::new(HashMap::new()),
             slot_activation: (Mutex::new(()), Condvar::new()),
             slot_activation_notify: tokio::sync::Notify::new(),
             #[cfg(test)]
@@ -490,15 +601,20 @@ impl SegmentPool {
                     segment.is_full()
                 };
                 if full {
-                    // `seal` consumes the segment, so take it out of the
-                    // slot first (mirrors `transition_to_sealing`).
-                    let current = std::mem::replace(&mut *guard, SlotState::Idle);
-                    let SlotState::Appending(segment) = current else {
-                        unreachable!("state checked Appending above and the lock is held")
-                    };
-                    let sealed = segment.seal();
-                    *guard = SlotState::Sealing(sealed.segment_id, sealed.data.clone());
-                    Some(sealed)
+                    // The segment filled — freeze it through the shared
+                    // transition (which attaches the frozen buffer to
+                    // the lifecycle registry entry under this lock).
+                    // `seal` consumes the segment, so the id check above
+                    // guarantees `Appending` here.
+                    let (ec_k, ec_m, _strip) = self.ec_params();
+                    PoolSlot::transition_to_sealing(
+                        &mut guard,
+                        &self.registry,
+                        self.tier,
+                        ec_k,
+                        ec_m,
+                        false,
+                    )
                 } else {
                     None
                 }
@@ -545,6 +661,22 @@ impl SegmentPool {
                 if full {
                     let sealed = replacement.seal();
                     *guard = SlotState::Sealing(sealed.segment_id, sealed.data.clone());
+                    // Attach the frozen buffer to the machine entry in
+                    // this critical section (same discipline as the
+                    // write-path fill — the window is continuous).
+                    let (ec_k, ec_m, _strip) = self.ec_params();
+                    if !self.registry.attach_in_flight(
+                        sealed.segment_id,
+                        self.tier,
+                        ec_k,
+                        ec_m,
+                        sealed.data.clone(),
+                    ) {
+                        tracing::warn!(
+                            segment_id = %sealed.segment_id,
+                            "replayed frozen segment holds a higher state; window unavailable"
+                        );
+                    }
                     Some(sealed)
                 } else {
                     *guard = SlotState::Appending(replacement);
@@ -656,49 +788,48 @@ impl SegmentPool {
 
     /// Reads a chunk from an active (unsealed) segment in this pool.
     ///
-    /// Searches all slots for a segment matching `segment_id`: appending
-    /// segments serve from the live buffer, `Sealing` slots serve from
-    /// the frozen data retained in the slot (ADR-0021 read window), and
-    /// after the replacement is installed the sealing-data set covers the
-    /// rest of the seal-to-disk window.
+    /// Resolves "where do I read this segment?" through the lifecycle
+    /// registry in one lookup (ADR-0025 Decision 2): the registry's
+    /// in-flight buffer (`InFlight` — was the `sealing_data` side-map)
+    /// or an active slot buffer (`ActiveSlot` — the slot scan, bounded
+    /// by `active_pool_size × num_tiers`). `Sealed`/`Missing` → `None`,
+    /// the caller's fall-through (`DiskSegmentReader` / replica).
+    ///
+    /// The slot scan serves only append-mode slots — `Sealing` slots
+    /// no longer hold the read window (the registry entry does,
+    /// attached in the same critical section as the freeze). A segment
+    /// that froze between the resolution and the scan is re-resolved
+    /// once: the registry now carries its in-flight data.
     ///
     /// Returns `None` if no segment in this pool matches the id.
     /// This is a fast, synchronous operation — only a memcpy under the
     /// slot mutex, same lock used by `append`.
     pub fn try_read(&self, segment_id: SegmentId, offset: u64, length: u32) -> Option<Bytes> {
-        for slot in self.slots.iter() {
-            let guard = slot.state.lock();
-            match &*guard {
-                SlotState::Appending(segment) if segment.id() == segment_id => {
-                    let data = segment.data();
-                    let start = offset as usize;
-                    let end = start.saturating_add(length as usize).min(data.len());
-                    if start < data.len() {
-                        return Some(Bytes::copy_from_slice(&data[start..end]));
+        match self.registry.read_source(segment_id) {
+            // The registry's in-flight buffer is immutable frozen data —
+            // serve it as a zero-copy `Bytes` slice (no copy, perf §1.1).
+            SegmentReadSource::InFlight(data) => slice_bytes(&data, offset, length),
+            SegmentReadSource::ActiveSlot => {
+                for slot in self.slots.iter() {
+                    let guard = slot.state.lock();
+                    if let SlotState::Appending(segment) = &*guard {
+                        if segment.id() == segment_id {
+                            let data = segment.data();
+                            return slice_range(data, offset, length);
+                        }
                     }
                 }
-                // A slot in the Sealing transit still holds its frozen
-                // data: reads hit it here until the replacement is
-                // installed, then fall through to `sealing_data` below.
-                SlotState::Sealing(id, data) if *id == segment_id => {
-                    let start = offset as usize;
-                    let end = start.saturating_add(length as usize).min(data.len());
-                    if start < data.len() {
-                        return Some(data.slice(start..end));
-                    }
+                // The segment froze between the resolution and the scan
+                // (a concurrent fill attached its buffer to the registry
+                // entry): re-resolve once — the in-flight window is
+                // continuous.
+                match self.registry.read_source(segment_id) {
+                    SegmentReadSource::InFlight(data) => slice_bytes(&data, offset, length),
+                    _ => None,
                 }
-                _ => {}
             }
+            SegmentReadSource::Sealed | SegmentReadSource::Missing => None,
         }
-        // Check segments currently being sealed (fill→disk window).
-        if let Some(seg_data) = self.sealing_data.read().get(&segment_id) {
-            let start = offset as usize;
-            let end = start.saturating_add(length as usize).min(seg_data.len());
-            if start < seg_data.len() {
-                return Some(seg_data.slice(start..end));
-            }
-        }
-        None
     }
 
     // ------------------------------------------------------------------
@@ -733,12 +864,16 @@ impl SegmentPool {
                 return Ok((outcome.segment_id, outcome.offset, outcome.length));
             }
 
-            // Every slot is unavailable. Before waiting, self-heal: if a
+            // Every slot is unavailable. Recover full-but-unfrozen slots
+            // first (their fill was gated by the in-flight cap — the cap
+            // may have dropped since, and the full segments must resume
+            // the seal pipeline or the pool stalls), then self-heal: if a
             // concurrent filler was descheduled between freezing its
             // segment and installing the replacement, a waiter installs it
             // — a Sealing slot (whose frozen data is already in the slot
-            // and the sealing-data set) can never block the pool
+            // and the registry entry) can never block the pool
             // indefinitely.
+            self.recover_full_slots_sync();
             self.try_activate_slot();
 
             // Wait for a re-activation signal in short slices, re-scanning
@@ -807,11 +942,15 @@ impl SegmentPool {
                 self.finish_seal_handoff_async(outcome.sealed, deadline).await?;
                 return Ok((outcome.segment_id, outcome.offset, outcome.length));
             }
-            // Self-heal stranded slots (same fallback as the sync path).
-            // The `notified()` future is registered BEFORE the self-heal
-            // so a notification from a racing installer cannot be lost;
-            // when this call itself installs a segment, re-scan
-            // immediately instead of waiting on our own notification.
+            // Recover full-but-unfrozen slots (their fill was gated by
+            // the in-flight cap — freeze + hand off now that the cap may
+            // have dropped), then self-heal stranded slots (same
+            // fallback as the sync path). The `notified()` future is
+            // registered BEFORE the self-heal so a notification from a
+            // racing installer cannot be lost; when this call itself
+            // installs a segment, re-scan immediately instead of waiting
+            // on our own notification.
+            self.recover_full_slots_async(deadline).await?;
             let notified = self.slot_activation_notify.notified();
             tokio::pin!(notified);
             if self.try_activate_slot() {
@@ -848,7 +987,8 @@ impl SegmentPool {
 
         for offset in 0..self.slots.len() {
             let slot = &self.slots[(start + offset) % self.slots.len()];
-            match slot.try_append_with_hook(data, hook) {
+            let (ec_k, ec_m, _strip) = self.ec_params();
+            match slot.try_append_with_hook(data, hook, &self.registry, self.tier, ec_k, ec_m) {
                 Ok(Some(outcome)) => {
                     // The hook already ran under the slot lock, so the
                     // seal worker can never observe the work item
@@ -861,6 +1001,104 @@ impl SegmentPool {
             }
         }
         Ok(None)
+    }
+
+    /// Freezes `Appending` slots holding FULL segments (their fill was
+    /// gated by the in-flight cap) and hands the sealed payloads off —
+    /// synchronous variant. Called when a pass found no appendable
+    /// slot: the cap may have dropped since the fills, and the full
+    /// segments must resume the seal pipeline or the pool stalls on
+    /// full-but-unfrozen slots.
+    fn recover_full_slots_sync(&self) {
+        // The recovery is the seal pipeline's continuation for
+        // cap-gated fills (their data is ACKED — the WAL entry exists):
+        // it must proceed whenever the seal queue can accept the work.
+        // A stalled queue (no capacity) defers the freeze — the entries
+        // stay readable and the count stays at the cap; a draining
+        // queue accepts the recovered seals immediately, breaking the
+        // count=16 + empty-queue deadlock. The freeze bypasses the
+        // in-flight cap gate (`ignore_cap`).
+        if self.seal_tx.capacity() == 0 {
+            return;
+        }
+        let mut sealed: Vec<SealedSegment> = Vec::new();
+        let (ec_k, ec_m, _strip) = self.ec_params();
+        for slot in &self.slots {
+            let payload = {
+                let mut guard = slot.state.lock();
+                let SlotState::Appending(segment) = &*guard else { continue };
+                if !segment.is_full() {
+                    continue;
+                }
+                PoolSlot::transition_to_sealing(
+                    &mut guard,
+                    &self.registry,
+                    self.tier,
+                    ec_k,
+                    ec_m,
+                    true,
+                )
+            };
+            if let Some(payload) = payload {
+                sealed.push(payload);
+            }
+        }
+        for payload in sealed {
+            self.finish_seal_handoff(Some(payload));
+        }
+    }
+
+    /// Asynchronous variant of [`recover_full_slots_sync`] — fully
+    /// NON-BLOCKING: a `try_send` enqueue that never waits for queue
+    /// space, so the recovery cannot consume the caller's write budget.
+    /// A full queue defers the seal to the idle driver (the entry stays
+    /// readable, `seal_queued` is reset, and the seal is retried, not
+    /// skipped).
+    async fn recover_full_slots_async(&self, _deadline: std::time::Instant) -> Result<(), Error> {
+        // See [`recover_full_slots_sync`]: freeze + re-enqueue only
+        // when the seal queue can accept the work (a stalled queue
+        // defers — the entries stay readable and the count stays at
+        // the cap; a draining queue breaks the cap-deadlock). The
+        // freeze bypasses the in-flight cap gate (`ignore_cap`).
+        if self.seal_tx.capacity() == 0 {
+            return Ok(());
+        }
+        let mut sealed: Vec<SealedSegment> = Vec::new();
+        let (ec_k, ec_m, _strip) = self.ec_params();
+        for slot in &self.slots {
+            let payload = {
+                let mut guard = slot.state.lock();
+                let SlotState::Appending(segment) = &*guard else { continue };
+                if !segment.is_full() {
+                    continue;
+                }
+                PoolSlot::transition_to_sealing(
+                    &mut guard,
+                    &self.registry,
+                    self.tier,
+                    ec_k,
+                    ec_m,
+                    true,
+                )
+            };
+            if let Some(payload) = payload {
+                sealed.push(payload);
+            }
+        }
+        for payload in sealed {
+            // The bounded handoff RE-ARMS the frozen slot (the critical
+            // part — without it the Sealing slots accumulate and starve
+            // the pool) and enqueues the work with a short wait; a full
+            // queue defers the seal to the idle driver (the entry stays
+            // readable; the seal is retried, not skipped). The wait is
+            // capped at [`INFLIGHT_RETRY_ENQUEUE_DEADLINE`] so the
+            // recovery cannot consume the caller's write budget.
+            let segment_id = payload.segment_id;
+            let retry_deadline = std::time::Instant::now() + INFLIGHT_RETRY_ENQUEUE_DEADLINE;
+            let _ = self.finish_seal_handoff_async(Some(payload), retry_deadline).await;
+            let _ = segment_id;
+        }
+        Ok(())
     }
 
     /// Hands a sealed segment to the seal queue and re-arms its slot —
@@ -881,9 +1119,10 @@ impl SegmentPool {
     ///    before the hook recorded its state.
     fn finish_seal_handoff(&self, sealed: Option<SealedSegment>) {
         let Some(payload) = sealed else { return };
-        self.sealing_data.write().insert(payload.segment_id, payload.data.clone());
         self.try_activate_slot();
-        self.enqueue_seal(payload.segment_id, payload.data, payload.tier);
+        if self.enqueue_seal(payload.segment_id, payload.data, payload.tier) {
+            self.registry.mark_seal_queued(payload.segment_id);
+        }
     }
 
     /// Hands a sealed segment to the seal queue and re-arms its slot —
@@ -892,29 +1131,34 @@ impl SegmentPool {
     /// item would orphan the WAL entry the caller writes after this
     /// returns: the acknowledged data would be unreadable until a
     /// restart replays the WAL. On enqueue failure the write is
-    /// rejected (never acked) and the read-window entry is removed —
-    /// no leak, no orphan.
+    /// rejected (never acked) — but the in-flight read window is owned
+    /// by the lifecycle registry entry and stays readable; the
+    /// idle-seal driver retries the seal (lifecycle-read-path).
     ///
-    /// Ordering is identical to [`finish_seal_handoff`]: sealing-data
-    /// insert first, slot re-arm second, enqueue last.
+    /// Ordering: re-arm second (the frozen data was attached to the
+    /// registry entry at the freeze, under the slot lock), enqueue
+    /// last.
     async fn finish_seal_handoff_async(
         &self,
         sealed: Option<SealedSegment>,
         deadline: std::time::Instant,
     ) -> Result<(), Error> {
         let Some(payload) = sealed else { return Ok(()) };
-        self.sealing_data.write().insert(payload.segment_id, payload.data.clone());
+        let segment_id = payload.segment_id;
         self.try_activate_slot();
 
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            self.sealing_data.write().remove(&payload.segment_id);
+            // The write is rejected (never acked). The registry entry
+            // keeps the in-flight window; the idle driver retries the
+            // seal (the seal is delayed, not skipped).
+            self.registry.mark_seal_unqueued(segment_id);
             return Err(Error::WriteBackpressureTimeout);
         }
 
         let (ec_k, ec_m, strip_size_bytes) = self.ec_params();
         let work = SealingWork {
-            segment_id: payload.segment_id,
+            segment_id,
             segment_data: payload.data,
             tier: payload.tier,
             ec_k,
@@ -923,15 +1167,19 @@ impl SegmentPool {
             ec_encoder: self.ec_encoder.clone(),
         };
         match tokio::time::timeout(remaining, self.seal_tx.send(work)).await {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                self.registry.mark_seal_queued(segment_id);
+                Ok(())
+            }
             // The queue is closed (pool shutdown) or no space freed
             // within the deadline: reject the write — it was never
-            // acked — and drop the read-window entry (the slot was
-            // already re-armed, so nothing else references the data).
+            // acked — and leave the in-flight window for the idle
+            // driver's retry (a full seal queue delays the seal but
+            // never removes the read window).
             Ok(Err(_)) | Err(_) => {
-                self.sealing_data.write().remove(&payload.segment_id);
+                self.registry.mark_seal_unqueued(segment_id);
                 tracing::warn!(
-                    segment_id = %payload.segment_id,
+                    segment_id = %segment_id,
                     "seal enqueue failed within deadline; write rejected (retryable)"
                 );
                 Err(Error::WriteBackpressureTimeout)
@@ -989,8 +1237,11 @@ impl SegmentPool {
         // Collect sealed payloads outside the slot locks (same pattern
         // as the fill path: the critical section is the freeze).
         let mut sealed: Vec<SealedSegment> = Vec::new();
+        let (ec_k, ec_m, _strip) = self.ec_params();
         for slot in &self.slots {
-            if let Some(payload) = slot.try_seal_idle(idle_timeout) {
+            if let Some(payload) =
+                slot.try_seal_idle(idle_timeout, &self.registry, self.tier, ec_k, ec_m)
+            {
                 sealed.push(payload);
             }
         }
@@ -1027,15 +1278,18 @@ impl SegmentPool {
                 if segment.id() != segment_id {
                     continue;
                 }
-                // `seal` consumes the segment; take it out of the slot
-                // first (mirrors `transition_to_sealing`).
-                let current = std::mem::replace(&mut *guard, SlotState::Idle);
-                let SlotState::Appending(segment) = current else {
-                    unreachable!("state checked Appending above and the lock is held")
-                };
-                let sealed = segment.seal();
-                *guard = SlotState::Sealing(sealed.segment_id, sealed.data.clone());
-                Some(sealed)
+                // `seal` consumes the segment; freeze it through the
+                // shared transition (which attaches the frozen buffer
+                // to the lifecycle registry entry under this lock).
+                let (ec_k, ec_m, _strip) = self.ec_params();
+                PoolSlot::transition_to_sealing(
+                    &mut guard,
+                    &self.registry,
+                    self.tier,
+                    ec_k,
+                    ec_m,
+                    false,
+                )
             };
             if let Some(sealed) = sealed {
                 self.finish_seal_handoff_async(
@@ -1067,7 +1321,17 @@ impl SegmentPool {
     /// rotation logic. This avoids blocking the caller in async contexts.
     /// The production (async) path uses [`finish_seal_handoff_async`]
     /// instead, which never drops an enqueue.
-    fn enqueue_seal(&self, segment_id: SegmentId, segment_data: Bytes, tier: SizeTier) {
+    /// Enqueues a filled segment for sealing on the bounded work
+    /// channel. Returns whether the work item was accepted.
+    ///
+    /// Uses `try_send` for non-blocking enqueue; when the channel is
+    /// full, `blocking_send` applies backpressure to the caller instead
+    /// of losing the segment (a dropped seal leaves the segment
+    /// registered-unsealed forever). The production (async) path uses
+    /// [`finish_seal_handoff_async`] instead, which never drops an
+    /// enqueue. A `Closed` queue (shutdown) returns `false` — the
+    /// registry entry keeps the in-flight window.
+    fn enqueue_seal(&self, segment_id: SegmentId, segment_data: Bytes, tier: SizeTier) -> bool {
         let (ec_k, ec_m, strip_size_bytes) = self.ec_params();
         let work = SealingWork {
             segment_id,
@@ -1079,30 +1343,71 @@ impl SegmentPool {
             ec_encoder: self.ec_encoder.clone(),
         };
         match self.seal_tx.try_send(work) {
-            Ok(()) => {}
+            Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(work)) => {
-                // NEVER drop a seal work item: a dropped seal leaves the
-                // segment registered-unsealed forever (its data only in
-                // the WAL) and pins the WAL files indefinitely. The
-                // sync path runs on blocking contexts (never a runtime
-                // worker), so blocking_send applies backpressure to the
-                // caller instead of losing the segment.
-                if let Err(e) = self.seal_tx.blocking_send(work) {
-                    tracing::warn!(
-                        segment_id = %segment_id,
-                        error = %e,
-                        "seal queue closed; seal work dropped on shutdown"
-                    );
+                // The sync path runs on blocking contexts (never a
+                // runtime worker), so blocking_send applies
+                // backpressure to the caller instead of losing the
+                // segment.
+                match self.seal_tx.blocking_send(work) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(
+                            segment_id = %segment_id,
+                            error = %e,
+                            "seal queue closed; seal work dropped on shutdown"
+                        );
+                        false
+                    }
                 }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.sealing_data.write().remove(&segment_id);
                 tracing::error!(
                     segment_id = %segment_id,
                     "seal queue closed; segment will not be sealed"
                 );
+                false
             }
         }
+    }
+
+    /// Re-enqueues a frozen segment's seal work on behalf of the
+    /// idle-seal driver (lifecycle-read-path): the seal queue was at
+    /// capacity when the segment froze, so its enqueue was deferred;
+    /// the registry entry owns the read window throughout.
+    ///
+    /// Bounded wait ([`INFLIGHT_RETRY_ENQUEUE_DEADLINE`]) — a draining
+    /// queue accepts the work in microseconds; a stalled one defers to
+    /// the next tick. Returns whether the work was accepted.
+    pub(crate) async fn enqueue_inflight_work(
+        &self,
+        segment_id: SegmentId,
+        tier: SizeTier,
+        data: Bytes,
+    ) -> bool {
+        let (ec_k, ec_m, strip_size_bytes) = self.ec_params();
+        let work = SealingWork {
+            segment_id,
+            segment_data: data,
+            tier,
+            ec_k,
+            ec_m,
+            strip_size_bytes,
+            ec_encoder: self.ec_encoder.clone(),
+        };
+        tokio::time::timeout(INFLIGHT_RETRY_ENQUEUE_DEADLINE, self.seal_tx.send(work)).await.is_ok()
+    }
+
+    /// Returns the storage tier this pool serves.
+    pub(crate) fn storage_tier(&self) -> SizeTier {
+        self.tier
+    }
+
+    /// Returns the lifecycle registry this pool resolves reads through
+    /// (the machine — ADR-0025 Decision 2). Test-only.
+    #[cfg(test)]
+    pub(crate) fn lifecycle_registry(&self) -> &SegmentLifecycleRegistry {
+        &self.registry
     }
 
     /// Attempts to activate a new segment in a sealing or idle slot.
@@ -1120,7 +1425,7 @@ impl SegmentPool {
     /// to their own install (the async append loop) use the return value
     /// to re-scan immediately instead of waiting for a notification they
     /// may have triggered themselves.
-    fn try_activate_slot(&self) -> bool {
+    pub(crate) fn try_activate_slot(&self) -> bool {
         // Quick peek for a slot that can accept a replacement.
         let Some(slot) = self.slots.iter().find(|slot| slot.needs_segment()) else {
             return false;
@@ -1177,16 +1482,6 @@ impl SegmentPool {
         Arc::clone(&self.seal_semaphore)
     }
 
-    /// Removes a segment from the sealing-data set after it has been
-    /// successfully written to disk.
-    ///
-    /// Called by the seal worker after `seal_from_data()` returns `Ok`.
-    /// This frees the held `Bytes` reference, allowing the buffer memory
-    /// to be reclaimed.
-    pub fn remove_seal_buffer(&self, segment_id: SegmentId) {
-        self.sealing_data.write().remove(&segment_id);
-    }
-
     /// Returns a segment backing buffer to the shared buffer pool after
     /// a seal completes.
     ///
@@ -1211,12 +1506,36 @@ mod tests {
         thread,
     };
 
-    use oceanfs_core::SegmentSizeConfig;
+    use oceanfs_core::{SegmentMetadata, SegmentSizeConfig};
 
     use super::*;
 
     fn test_config() -> (PoolConfig, SegmentSizeConfig) {
         (PoolConfig::default(), SegmentSizeConfig::default())
+    }
+
+    fn test_registry() -> Arc<SegmentLifecycleRegistry> {
+        Arc::new(SegmentLifecycleRegistry::new(&oceanfs_core::LifecycleConfig::default()))
+    }
+
+    /// Reserves a segment in the pool's registry (the write path's
+    /// contract: the machine entry must exist before the first append —
+    /// the fill attach and the read resolution both require it).
+    fn reserve_segment(pool: &SegmentPool, id: SegmentId) {
+        pool.registry
+            .reserve(
+                id,
+                SegmentMetadata {
+                    segment_id: id,
+                    ec_k: 0,
+                    ec_m: 0,
+                    size_tier: pool.tier,
+                    merkle_root: None,
+                    storage_locations: smallvec::SmallVec::new(),
+                    sealed_at: None,
+                },
+            )
+            .unwrap();
     }
 
     fn test_pool() -> Arc<BufferPool> {
@@ -1227,8 +1546,16 @@ mod tests {
     fn pool_creation_has_correct_slot_count() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
         assert_eq!(pool.slot_count(), 4);
         assert_eq!(pool.active_count(), 4, "all slots start in Appending state");
     }
@@ -1237,8 +1564,16 @@ mod tests {
     fn pool_append_returns_valid_offset_and_length() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
         let (seg_id, offset, length) = pool.append(b"hello world").unwrap();
         assert_eq!(offset, 0);
         assert_eq!(length, 11);
@@ -1259,11 +1594,21 @@ mod tests {
     async fn append_replayed_rebuilds_segment_under_original_id() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
         drain_seal_queue(&pool);
 
         let original_id = SegmentId::new();
+        // Replay reserves before appending (the write-path contract).
+        reserve_segment(&pool, original_id);
         pool.append_replayed(original_id, b"alpha").await.unwrap();
         // A second entry for the SAME segment must append to the same
         // rebuilt segment (contiguous offsets).
@@ -1279,12 +1624,23 @@ mod tests {
     async fn append_replayed_keeps_distinct_segments_distinct() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
         drain_seal_queue(&pool);
 
         let id_a = SegmentId::new();
         let id_b = SegmentId::new();
+        // Replay reserves before appending (the write-path contract).
+        reserve_segment(&pool, id_a);
+        reserve_segment(&pool, id_b);
         pool.append_replayed(id_a, b"aaaa").await.unwrap();
         pool.append_replayed(id_b, b"bbbb").await.unwrap();
 
@@ -1298,8 +1654,16 @@ mod tests {
     async fn append_replayed_errors_when_all_slots_occupied() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
         drain_seal_queue(&pool);
 
         // Fill every slot with a distinct replayed segment.
@@ -1316,8 +1680,16 @@ mod tests {
     async fn append_replayed_filled_segment_hands_to_seal_queue() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
-        let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Small, &size_cfg, buf_pool, None, None).unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Small,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
 
         // Fill the segment past its target with one replay append — the
         // fill→Sealing transition must enqueue seal work (same contract
@@ -1325,6 +1697,8 @@ mod tests {
         let original_id = SegmentId::new();
         let target = size_cfg.small_target_size;
         let mut payload = vec![0xabu8; target as usize];
+        // Replay reserves before appending (the fill attach requires it).
+        reserve_segment(&pool, original_id);
         pool.append_replayed(original_id, &payload).await.unwrap();
         let mut rx = pool.take_seal_rx().expect("seal receiver");
         let work = rx.try_recv().expect("filled rebuilt segment must be enqueued for sealing");
@@ -1340,8 +1714,16 @@ mod tests {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool = StdArc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool.clone(), None, None)
-                .unwrap(),
+            SegmentPool::new(
+                pool_cfg,
+                SizeTier::Standard,
+                &size_cfg,
+                buf_pool.clone(),
+                None,
+                None,
+                test_registry(),
+            )
+            .unwrap(),
         );
 
         let write_count = StdArc::new(AtomicUsize::new(0));
@@ -1373,8 +1755,16 @@ mod tests {
     fn encode_queue_is_created() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
 
         let rx = pool.take_seal_rx();
         assert!(rx.is_some(), "seal receiver must exist");
@@ -1391,6 +1781,7 @@ mod tests {
             buf_pool.clone(),
             None,
             None,
+            test_registry(),
         )
         .unwrap();
 
@@ -1413,8 +1804,16 @@ mod tests {
         let pool_cfg = PoolConfig { active_pool_size: 8, ..PoolConfig::default() };
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = Arc::new(BufferPool::new(65536, 32));
-        let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Small, &size_cfg, buf_pool, None, None).unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Small,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
         assert_eq!(pool.slot_count(), 8);
     }
 
@@ -1423,8 +1822,16 @@ mod tests {
         let pool_cfg = PoolConfig { active_pool_size: 2, ..PoolConfig::default() };
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = test_pool();
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
 
         let (id1, _, _) = pool.append(b"a").unwrap();
         // The second append may go to a different slot (round-robin).
@@ -1452,8 +1859,16 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         let _guard = rt.enter();
 
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
         assert_eq!(pool.active_count(), 4, "all 4 slots start appending");
 
         // Append data larger than target_size (10 bytes).
@@ -1492,8 +1907,16 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         let _guard = rt.enter();
 
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
         assert_eq!(pool.active_count(), 2);
 
         // Fill both slots multiple times. Each 20-byte append overflows
@@ -1520,8 +1943,16 @@ mod tests {
             PoolConfig { active_pool_size: 4, encode_queue_capacity: 2, ..PoolConfig::default() };
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = test_pool();
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
 
         // The seal queue should exist with the configured capacity.
         let rx = pool.take_seal_rx();
@@ -1552,8 +1983,16 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
 
         let pool = StdArc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-                .unwrap(),
+            SegmentPool::new(
+                pool_cfg,
+                SizeTier::Standard,
+                &size_cfg,
+                buf_pool,
+                None,
+                None,
+                test_registry(),
+            )
+            .unwrap(),
         );
 
         // Drain the queue on a background thread: the enqueue path
@@ -1598,8 +2037,16 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         let _guard = rt.enter();
 
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
 
         // Before writes: all slots in Appending.
         assert_eq!(pool.active_count(), 4);
@@ -1626,19 +2073,31 @@ mod tests {
     fn take_for_sealing_freezes_segment_in_slot_and_returns_payload() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
 
         let slot = Arc::clone(&pool.slots[0]);
         let (seg_id, _, _) = pool.append(b"payload-data").unwrap();
+        reserve_segment(&pool, seg_id);
 
-        let sealed = slot.take_for_sealing().expect("appending slot seals");
+        let sealed =
+            slot.take_for_sealing(&pool.registry, pool.tier, 0, 0).expect("appending slot seals");
         assert_eq!(sealed.segment_id, seg_id);
         assert_eq!(sealed.tier, SizeTier::Standard);
         assert_eq!(&sealed.data[..], b"payload-data");
 
-        // The slot now holds the frozen data: readable by id while Sealing.
-        let read = pool.try_read(seg_id, 0, 12).expect("sealing slot serves reads");
+        // The frozen data was attached to the lifecycle registry entry
+        // in the freeze critical section: readable by id while Sealing
+        // (the in-flight window; the slot scan serves append-mode only).
+        let read = pool.try_read(seg_id, 0, 12).expect("in-flight registry entry serves reads");
         assert_eq!(&read[..], b"payload-data");
         assert_eq!(pool.active_count(), 3, "one slot moved out of Appending");
     }
@@ -1647,26 +2106,50 @@ mod tests {
     fn take_for_sealing_on_parked_or_idle_slot_returns_none() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
 
         let slot = Arc::clone(&pool.slots[0]);
-        assert!(slot.take_for_sealing().is_some(), "first seal succeeds");
-        assert!(slot.take_for_sealing().is_none(), "second seal is a no-op");
+        assert!(
+            slot.take_for_sealing(&pool.registry, pool.tier, 0, 0).is_some(),
+            "first seal succeeds"
+        );
+        assert!(
+            slot.take_for_sealing(&pool.registry, pool.tier, 0, 0).is_none(),
+            "second seal is a no-op"
+        );
         let idle = PoolSlot::new_idle();
-        assert!(idle.take_for_sealing().is_none(), "idle slot has nothing to seal");
+        assert!(
+            idle.take_for_sealing(&pool.registry, pool.tier, 0, 0).is_none(),
+            "idle slot has nothing to seal"
+        );
     }
 
     #[test]
     fn install_replacement_swaps_sealing_slot_exactly_once() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
-        let pool =
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool.clone(), None, None)
-                .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool.clone(),
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
 
         let slot = Arc::clone(&pool.slots[0]);
-        slot.take_for_sealing().expect("park the slot");
+        slot.take_for_sealing(&pool.registry, pool.tier, 0, 0).expect("park the slot");
 
         let first = ActiveSegment::new(SizeTier::Standard, &size_cfg, buf_pool.as_ref()).unwrap();
         assert!(slot.install_replacement(first), "sealing slot accepts a replacement");
@@ -1697,10 +2180,18 @@ mod tests {
         let pool_cfg = PoolConfig { active_pool_size: 2, ..PoolConfig::default() };
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = test_pool();
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
 
-        pool.slots[0].take_for_sealing().expect("park slot 0");
+        pool.slots[0].take_for_sealing(&pool.registry, pool.tier, 0, 0).expect("park slot 0");
         let calls = StdArc::new(AtomicUsize::new(0));
         let calls2 = StdArc::clone(&calls);
         let (seg_id, offset, length) = pool
@@ -1730,14 +2221,26 @@ mod tests {
         };
         let buf_pool = test_pool();
         let pool = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-                .unwrap(),
+            SegmentPool::new(
+                pool_cfg,
+                SizeTier::Standard,
+                &size_cfg,
+                buf_pool,
+                None,
+                None,
+                test_registry(),
+            )
+            .unwrap(),
         );
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         let _guard = rt.enter();
 
         let recorded = StdArc::new(Mutex::new(Vec::<(SegmentId, u64, u32)>::new()));
         let recorded2 = StdArc::clone(&recorded);
+        // The fill's freeze attaches the frozen buffer to the machine
+        // entry (inserting a registry-only entry when the write path's
+        // durable reserve has not landed yet — the fill-before-reserve
+        // window), so the segment stays readable through the seal.
         let (seg_id, _offset, length) = pool
             .append_with_hook(b"this fills the segment", move |sid, off, len| {
                 recorded2.lock().push((sid, off, len));
@@ -1762,6 +2265,132 @@ mod tests {
         assert_eq!(&read[..], b"this fills the segment");
     }
 
+    // ── Read-path windows + in-flight cap (lifecycle-read-path) ──
+
+    #[tokio::test]
+    async fn try_read_serves_append_inflight_and_after_freeze_windows() {
+        // The read-after-write window matrix at the pool level: a
+        // freshly appended segment resolves via the slot scan
+        // (ActiveSlot); once it freezes, the registry's in-flight
+        // buffer serves (InFlight), attached in the freeze critical
+        // section — the window is continuous across the fill.
+        let pool_cfg = PoolConfig { active_pool_size: 1, ..PoolConfig::default() };
+        let size_cfg = SegmentSizeConfig {
+            default_target_size: 1024,
+            small_target_size: 1024,
+            ..SegmentSizeConfig::default()
+        };
+        let buf_pool = test_pool();
+        let pool = Arc::new(
+            SegmentPool::new(
+                pool_cfg,
+                SizeTier::Standard,
+                &size_cfg,
+                buf_pool,
+                None,
+                None,
+                test_registry(),
+            )
+            .unwrap(),
+        );
+        drain_seal_queue(&pool);
+
+        // (a) Append-mode: the data is readable from the active slot.
+        let data = b"window matrix payload";
+        let (seg_id, offset, length) = pool.append(data).unwrap();
+        reserve_segment(&pool, seg_id);
+        let chunk = pool.try_read(seg_id, offset, length).expect("append-mode read");
+        assert_eq!(&chunk[..], &data[..]);
+
+        // (b) In-flight: the fill freezes the segment and attaches the
+        // buffer to the machine entry (the attach self-heals the entry
+        // even before the write path's durable reserve lands). The
+        // single-slot pool guarantees the second append hits the same
+        // segment (round-robin over one slot).
+        let fill_data = vec![0xABu8; 2048];
+        let (fill_id, fill_offset, _) = pool.append(&fill_data).unwrap();
+        assert_eq!(fill_id, seg_id, "same segment until it fills");
+        assert_eq!(fill_offset, data.len() as u64, "fill lands right after the first append");
+        let chunk = pool.try_read(seg_id, fill_offset, 2048).expect("in-flight read after freeze");
+        assert_eq!(&chunk[..], &fill_data[..]);
+    }
+
+    #[tokio::test]
+    async fn in_flight_set_bounded_and_readable_under_stalled_seal_queue() {
+        // The DoD memory-bound test: with the seal queue stalled, the
+        // in-flight set never exceeds the ADR-0021 cap (16) and every
+        // frozen entry stays readable. A full seal queue delays the
+        // seal but never removes the read window.
+        let pool_cfg = PoolConfig {
+            active_pool_size: 4,
+            encode_queue_capacity: 2, // tiny queue → stalls fast
+            ..PoolConfig::default()
+        };
+        let size_cfg = SegmentSizeConfig {
+            default_target_size: 1024,
+            small_target_size: 1024,
+            ..SegmentSizeConfig::default()
+        };
+        let buf_pool = Arc::new(BufferPool::new(65536, 64));
+        let registry =
+            Arc::new(SegmentLifecycleRegistry::new(&oceanfs_core::LifecycleConfig::default()));
+        let pool = Arc::new(
+            SegmentPool::new(
+                pool_cfg,
+                SizeTier::Standard,
+                &size_cfg,
+                buf_pool,
+                None,
+                None,
+                Arc::clone(&registry),
+            )
+            .unwrap(),
+        );
+        // Take the receiver WITHOUT draining — the seal queue stalls.
+        let _rx = pool.take_seal_rx().expect("seal rx");
+
+        // Fill segments until the deferred-seal cap closes the slots.
+        // Each fill's enqueue waits for queue space within a short
+        // deadline; once the queue is full the writes are rejected
+        // (never acked) and the frozen entries stay in the registry.
+        let mut written_ids: Vec<SegmentId> = Vec::new();
+        let mut backpressured = 0usize;
+        for _ in 0..200 {
+            let data = vec![0xCDu8; 2048]; // fills (target 1024)
+            match pool
+                .append_with_hook_async(&data, |_, _, _| {}, std::time::Duration::from_millis(20))
+                .await
+            {
+                Ok((id, _, _)) => {
+                    // The write path's contract: the durable reserve
+                    // lands right after the append (the cap-gated fills
+                    // stay Appending-full and resolve via ActiveSlot).
+                    reserve_segment(&pool, id);
+                    written_ids.push(id);
+                }
+                Err(Error::WriteBackpressureTimeout) => backpressured += 1,
+                Err(e) => panic!("unexpected append error: {e}"),
+            }
+        }
+        assert!(backpressured > 0, "the stalled queue must backpressure appends");
+        assert!(
+            registry.in_flight_count() <= IN_FLIGHT_CAP,
+            "in-flight set must never exceed the cap: {}",
+            registry.in_flight_count()
+        );
+
+        // Every acked entry is still readable (the window is owned by
+        // the machine, not the channel): the frozen ones resolve via the
+        // registry's in-flight buffer, the cap-gated full ones via the
+        // slot scan.
+        for id in &written_ids {
+            let chunk = pool.try_read(*id, 0, 2048).unwrap_or_else(|| {
+                panic!("acked segment {id} must stay readable under backpressure")
+            });
+            assert_eq!(&chunk[..], &[0xCDu8; 2048]);
+        }
+    }
+
     // ── Backpressure tests (pool-backpressure-and-buffer-recycling) ──
 
     /// Parks every slot in `Sealing` with no appendable segment, simulating
@@ -1770,7 +2399,7 @@ mod tests {
     /// never loses its data — ADR-0021 read window).
     fn park_all_slots(pool: &SegmentPool) {
         for slot in pool.slots.iter() {
-            slot.take_for_sealing();
+            slot.take_for_sealing(&pool.registry, pool.tier, 0, 0);
         }
     }
 
@@ -1780,8 +2409,16 @@ mod tests {
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = Arc::new(BufferPool::new(65536, 32));
         let pool = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-                .unwrap(),
+            SegmentPool::new(
+                pool_cfg,
+                SizeTier::Standard,
+                &size_cfg,
+                buf_pool,
+                None,
+                None,
+                test_registry(),
+            )
+            .unwrap(),
         );
 
         park_all_slots(&pool);
@@ -1808,8 +2445,16 @@ mod tests {
         let pool_cfg = PoolConfig { active_pool_size: 2, ..PoolConfig::default() };
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = Arc::new(BufferPool::new(65536, 8));
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
 
         park_all_slots(&pool);
         pool.fail_activation.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1829,8 +2474,16 @@ mod tests {
         let pool_cfg = PoolConfig { active_pool_size: 2, ..PoolConfig::default() };
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = Arc::new(BufferPool::new(65536, 8));
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
 
         park_all_slots(&pool);
 
@@ -1854,13 +2507,42 @@ mod tests {
         };
         let buf_pool = Arc::new(BufferPool::new(65536, 64));
         let pool = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-                .unwrap(),
+            SegmentPool::new(
+                pool_cfg,
+                SizeTier::Standard,
+                &size_cfg,
+                buf_pool,
+                None,
+                None,
+                test_registry(),
+            )
+            .unwrap(),
         );
 
-        // Drain the seal queue so the fillers never back up on it.
+        // Drain the seal queue so the fillers never back up on it,
+        // simulating the seal worker's fold: each drained item is
+        // registry-sealed, clearing its in-flight entry (the seal
+        // transition's job) so the deferred-seal gate re-opens the
+        // slots — exactly what the real seal worker does. The drain
+        // holds ONLY the registry (not the pool): `drop(pool)` below
+        // must close the seal sender so the drain's `blocking_recv`
+        // terminates.
+        let drain_registry = Arc::clone(&pool.registry);
         let mut rx = pool.take_seal_rx().expect("seal rx available");
-        let drain = std::thread::spawn(move || while rx.blocking_recv().is_some() {});
+        let drain = std::thread::spawn(move || {
+            while let Some(work) = rx.blocking_recv() {
+                let meta = SegmentMetadata {
+                    segment_id: work.segment_id,
+                    ec_k: work.ec_k,
+                    ec_m: work.ec_m,
+                    size_tier: work.tier,
+                    merkle_root: None,
+                    storage_locations: smallvec::SmallVec::new(),
+                    sealed_at: Some(1),
+                };
+                let _ = drain_registry.seal(work.segment_id, meta);
+            }
+        });
 
         let mut handles = Vec::new();
         for _ in 0..16 {
@@ -1882,11 +2564,14 @@ mod tests {
         }
         // The bounded wait may legitimately expire under OS-scheduling
         // turbulence in this 8×-adversarial configuration (16 threads ×
-        // 4 slots, every append fills). Regression mutations (removing
-        // the self-heal or the budget refresh) fail essentially every
-        // append; scheduling noise stays far below this 0.125% bound.
+        // 4 slots, every append fills) — the in-flight cap's recovery
+        // windows add a few expiries (~0.3%: the freeze gate + the
+        // full-slot recovery defer re-arms while the seal pipeline
+        // catches up). Regression mutations (removing the self-heal,
+        // the budget refresh, or the recovery) fail essentially every
+        // append; scheduling noise stays far below this 1% bound.
         assert!(
-            failures <= 4,
+            failures <= 32,
             "slot exhaustion too frequent: {failures} of {} appends failed",
             16 * 200
         );
@@ -1905,8 +2590,16 @@ mod tests {
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = Arc::new(BufferPool::new(65536, 32));
         let pool = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-                .unwrap(),
+            SegmentPool::new(
+                pool_cfg,
+                SizeTier::Standard,
+                &size_cfg,
+                buf_pool,
+                None,
+                None,
+                test_registry(),
+            )
+            .unwrap(),
         );
 
         park_all_slots(&pool);
@@ -1937,8 +2630,16 @@ mod tests {
         let pool_cfg = PoolConfig { active_pool_size: 2, ..PoolConfig::default() };
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = Arc::new(BufferPool::new(65536, 8));
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
 
         park_all_slots(&pool);
         pool.fail_activation.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1959,8 +2660,16 @@ mod tests {
         let pool_cfg = PoolConfig { active_pool_size: 2, ..PoolConfig::default() };
         let size_cfg = SegmentSizeConfig::default();
         let buf_pool = Arc::new(BufferPool::new(65536, 8));
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
 
         park_all_slots(&pool);
 
@@ -1985,8 +2694,16 @@ mod tests {
         };
         let buf_pool = Arc::new(BufferPool::new(65536, 8));
         let pool = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-                .unwrap(),
+            SegmentPool::new(
+                pool_cfg,
+                SizeTier::Standard,
+                &size_cfg,
+                buf_pool,
+                None,
+                None,
+                test_registry(),
+            )
+            .unwrap(),
         );
 
         let mut rx = pool.take_seal_rx().expect("seal rx");
@@ -2045,8 +2762,16 @@ mod tests {
             ..SegmentSizeConfig::default()
         };
         let buf_pool = Arc::new(BufferPool::new(65536, 8));
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
 
         // Hold the receiver and never drain — the queue stays full.
         let _rx = pool.take_seal_rx();
@@ -2077,11 +2802,22 @@ mod tests {
     fn try_read_returns_data_after_append() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
 
         let data = b"hello world, this is a test segment read";
         let (seg_id, offset, length) = pool.append(data).unwrap();
+        // The read resolution goes through the machine — reserve the
+        // entry (the write path's contract) before reading.
+        reserve_segment(&pool, seg_id);
 
         // Data should be readable immediately from the active segment.
         let chunk = pool.try_read(seg_id, offset, length).expect("try_read should find segment");
@@ -2093,8 +2829,16 @@ mod tests {
     fn try_read_returns_none_for_unknown_segment() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
 
         // A segment id that was never appended.
         let unknown_id = SegmentId::new();
@@ -2106,13 +2850,23 @@ mod tests {
     fn try_read_respects_offset_and_length() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
 
         let data = b"abcdefghijklmnopqrstuvwxyz";
         let (seg_id, offset, length) = pool.append(data).unwrap();
         assert_eq!(offset, 0);
         assert_eq!(length, 26);
+        // The read resolution goes through the machine.
+        reserve_segment(&pool, seg_id);
 
         // Read a sub-range: bytes 5..10 = "fghij"
         let chunk = pool.try_read(seg_id, 5, 5).expect("sub-range read");
@@ -2127,12 +2881,22 @@ mod tests {
     fn try_read_clamped_at_buffer_end() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
-        let pool = SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-            .unwrap();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            buf_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap();
 
         let data = b"short";
         let (seg_id, offset, _length) = pool.append(data).unwrap();
         assert_eq!(offset, 0);
+        // The read resolution goes through the machine.
+        reserve_segment(&pool, seg_id);
 
         // Request more bytes than written — should be clamped.
         let chunk = pool.try_read(seg_id, 0, 100).expect("clamped read");
@@ -2145,16 +2909,26 @@ mod tests {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_cfg, buf_pool, None, None)
-                .unwrap(),
+            SegmentPool::new(
+                pool_cfg,
+                SizeTier::Standard,
+                &size_cfg,
+                buf_pool,
+                None,
+                None,
+                test_registry(),
+            )
+            .unwrap(),
         );
         // Drain the seal queue so the async hand-off never blocks.
         drain_seal_queue(&pool);
 
-        // Append a small blob — the segment is far from full.
+        // Append a small blob — the segment is far from full. Reserve
+        // first (the machine entry must exist for the read resolution).
         let (seg_id, offset, length) = pool.append(b"partial").unwrap();
         assert_eq!(offset, 0);
         assert_eq!(length, 7);
+        reserve_segment(&pool, seg_id);
 
         // A zero idle timeout forces the sweep to seal it immediately.
         let handle = pool.start_idle_seal_worker(

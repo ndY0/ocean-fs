@@ -157,12 +157,21 @@ impl RoundTripEnv {
                 buffer_pool.clone(),
                 None,
                 None,
+                test_registry(),
             )
             .unwrap(),
         );
         let segment_pool_standard = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None, None)
-                .unwrap(),
+            SegmentPool::new(
+                pool_cfg,
+                SizeTier::Standard,
+                &size_config,
+                buffer_pool,
+                None,
+                None,
+                test_registry(),
+            )
+            .unwrap(),
         );
         let wal = Arc::new(
             WalWriter::open(&WalConfig {
@@ -413,4 +422,10 @@ async fn roundtrip_overwrite_preserves_latest() {
     let retrieved = env.get("test", "overwrite").await;
     assert_eq!(&retrieved[..], v2);
     assert_ne!(&retrieved[..], v1);
+}
+
+fn test_registry() -> Arc<oceanfs_storage::SegmentLifecycleRegistry> {
+    Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ))
 }

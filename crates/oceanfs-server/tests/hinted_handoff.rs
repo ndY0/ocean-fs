@@ -7,6 +7,12 @@
 use oceanfs_core::{Hlc, NodeId, SegmentId};
 use oceanfs_durability::{HintRecord, HintedHandoff};
 
+fn test_registry() -> std::sync::Arc<oceanfs_storage::SegmentLifecycleRegistry> {
+    std::sync::Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ))
+}
+
 #[tokio::test]
 async fn handoff_create_deliver_cleanup() {
     let hh = HintedHandoff::new();
@@ -212,6 +218,7 @@ async fn write_coordinator_handoff_on_replica_failure() {
             buffer_pool.clone(),
             None,
             None,
+            test_registry(),
         )
         .unwrap(),
     );
@@ -223,6 +230,7 @@ async fn write_coordinator_handoff_on_replica_failure() {
             buffer_pool,
             None,
             None,
+            test_registry(),
         )
         .unwrap(),
     );

@@ -26,6 +26,11 @@ use oceanfs_storage::{
     WalWriter,
 };
 
+fn test_registry() -> Arc<oceanfs_storage::SegmentLifecycleRegistry> {
+    Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ))
+}
 async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
     let mut ring = Ring::new(RingConfig { vnodes_per_node: 8, replication_factor: 3 });
     for n in nodes {
@@ -70,12 +75,21 @@ async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
             buffer_pool.clone(),
             None,
             None,
+            test_registry(),
         )
         .unwrap(),
     );
     let segment_pool_standard = Arc::new(
-        SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None, None)
-            .unwrap(),
+        SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_config,
+            buffer_pool,
+            None,
+            None,
+            test_registry(),
+        )
+        .unwrap(),
     );
     let wal = Arc::new(
         WalWriter::open(&WalConfig {

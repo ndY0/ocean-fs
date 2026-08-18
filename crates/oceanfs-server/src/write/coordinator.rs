@@ -1081,18 +1081,13 @@ impl WriteCoordinator {
 
                             match result {
                                 Ok(_handle) => {
-                                    // Segment is now on disk — remove from
-                                    // the sealing-data set so reads no
-                                    // longer hit the in-memory buffer.
-                                    if tier == SizeTier::Small {
-                                        self_small
-                                            .segment_pool_small
-                                            .remove_seal_buffer(segment_id);
-                                    } else {
-                                        self_standard
-                                            .segment_pool_standard
-                                            .remove_seal_buffer(segment_id);
-                                    }
+                                    // The in-flight read window is closed
+                                    // by the seal transition itself (the
+                                    // coordinator's fold cleared the
+                                    // entry's in_flight — the `.dat` is
+                                    // durable), so no cross-crate
+                                    // remove_seal_buffer call exists any
+                                    // more (lifecycle-read-path).
                                     // Notify the anti-entropy engine so the
                                     // incremental Merkle tree covers this
                                     // segment without waiting for the next
@@ -1326,6 +1321,13 @@ mod tests {
             .0
     }
 
+    /// A fresh lifecycle registry for pool construction (the pools hold
+    /// it for the read path and the in-flight attach).
+    fn test_registry() -> Arc<oceanfs_storage::SegmentLifecycleRegistry> {
+        Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(
+            &oceanfs_core::LifecycleConfig::default(),
+        ))
+    }
     /// Creates a test coordinator with a caller-provided hint delivery client.
     async fn make_write_coordinator_with_delivery(
         node_id: &str,
@@ -1384,12 +1386,21 @@ mod tests {
                 buffer_pool.clone(),
                 None,
                 None,
+                test_registry(),
             )
             .unwrap(),
         );
         let segment_pool_standard = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None, None)
-                .unwrap(),
+            SegmentPool::new(
+                pool_cfg,
+                SizeTier::Standard,
+                &size_config,
+                buffer_pool,
+                None,
+                None,
+                test_registry(),
+            )
+            .unwrap(),
         );
 
         let wal = Arc::new(
@@ -2431,6 +2442,13 @@ mod tests {
         // accumulate at sequential offsets within one segment.
         let pool_cfg =
             PoolConfig { active_pool_size: 1, encode_queue_capacity: 64, ..PoolConfig::default() };
+        // The registry is SHARED by the pools and the coordinator (the
+        // machine's entry is the one the pools attach to and resolve
+        // reads through — construction order: registry → pools →
+        // coordinator).
+        let fixture_registry = Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(
+            &oceanfs_core::LifecycleConfig::default(),
+        ));
         let segment_pool_small = Arc::new(
             SegmentPool::new(
                 pool_cfg.clone(),
@@ -2439,12 +2457,21 @@ mod tests {
                 buffer_pool.clone(),
                 None,
                 None,
+                Arc::clone(&fixture_registry),
             )
             .unwrap(),
         );
         let standard_pool = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None, None)
-                .unwrap(),
+            SegmentPool::new(
+                pool_cfg,
+                SizeTier::Standard,
+                &size_config,
+                buffer_pool,
+                None,
+                None,
+                Arc::clone(&fixture_registry),
+            )
+            .unwrap(),
         );
 
         let wal = Arc::new(
@@ -2468,13 +2495,10 @@ mod tests {
             ..Default::default()
         };
         let lifecycle = Arc::new(
-            SegmentLifecycleCoordinator::new(
-                metadata.clone(),
-                &oceanfs_core::LifecycleConfig::default(),
-            )
-            // Idle-seal driver: the coordinator owns the idle-seal
-            // timer (ADR-0025 phase 1) and sweeps the standard pool.
-            .with_idle_seal(vec![standard_pool.clone()], seal_config.seal_timeout_ms),
+            SegmentLifecycleCoordinator::with_registry(metadata.clone(), fixture_registry)
+                // Idle-seal driver: the coordinator owns the idle-seal
+                // timer (ADR-0025 phase 1) and sweeps the standard pool.
+                .with_idle_seal(vec![standard_pool.clone()], seal_config.seal_timeout_ms),
         );
         let sealer = Arc::new(SegmentSealer::new(seal_config, wal, Arc::clone(&lifecycle)));
 
@@ -2950,6 +2974,140 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn lifecycle_read_windows_append_inflight_sealed() {
+        // The DoD's parameterized read-after-write window matrix at the
+        // server boundary: GET after an acked PUT during (a) append-mode
+        // (active slot), (b) in-flight between fill and seal (the
+        // registry entry's frozen buffer), (c) sealed (disk) — all
+        // return the exact bytes.
+        let fx = make_multi_tier_fixture().await;
+        let disk = Arc::new(oceanfs_storage::io::DiskSegmentReader::new(
+            oceanfs_storage::io::IoReadMode::Buffered,
+            Arc::new(oceanfs_storage::io::DiskIo::TokioFs),
+            None,
+            fx.seal_dir.clone(),
+            None,
+            None,
+        ));
+        // The composite reader: active pools first, disk fallback — the
+        // production wiring (ADR-0020 Decision 2, unchanged).
+        let composite: Arc<dyn oceanfs_storage::io::SegmentReader> = Arc::new(
+            oceanfs_storage::io::PoolFallbackReader::new(vec![fx.standard_pool.clone()], disk),
+        );
+        let read = fx.read.with_segment_reader(composite);
+
+        // (a) Append-mode: a small object (below the 4 KiB target) stays
+        // in an active slot; the GET resolves via the slot scan.
+        let small = vec![0x11u8; 2000];
+        put_and_persist(&fx.coord, &fx.metadata, "test", "win-append", Bytes::from(small.clone()))
+            .await;
+        get_and_verify(&read, "test", "win-append", &small).await;
+
+        // (b) In-flight: an object larger than the target fills its
+        // segment on the FIRST append — the frozen buffer is attached to
+        // the machine entry (the fill-before-reserve window self-heals
+        // the entry; the write path's reserve follows). The seal worker
+        // is NOT running, so the segment stays in-flight and the GET is
+        // served from the registry entry.
+        let big = vec![0x22u8; 5000];
+        put_and_persist(&fx.coord, &fx.metadata, "test", "win-inflight", Bytes::from(big.clone()))
+            .await;
+        let in_flight_id = fx
+            .metadata
+            .get_object(&BucketId::new("test"), &ObjectKey::new("win-inflight"))
+            .unwrap()
+            .expect("object metadata present")
+            .chunks[0]
+            .segment_id;
+        assert!(matches!(
+            fx.lifecycle.registry().read_source(in_flight_id),
+            oceanfs_storage::SegmentReadSource::InFlight(_)
+        ));
+        get_and_verify(&read, "test", "win-inflight", &big).await;
+
+        // (c) Sealed: start the seal worker, wait for the Sealed state,
+        // and GET from disk through the composite's fallback.
+        let _seal_handle = fx.coord.start_seal_worker();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let sealed = fx
+                .lifecycle
+                .registry()
+                .get(in_flight_id)
+                .map(|e| e.state == oceanfs_storage::SegmentState::Sealed)
+                .unwrap_or(false);
+            if sealed {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "seal did not complete");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        get_and_verify(&read, "test", "win-inflight", &big).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_put_get_never_fails_any_read_window() {
+        // Concurrent puts + the seal worker churn segments through every
+        // read window (append-mode, in-flight, sealed); every GET must
+        // return the exact bytes with ZERO read failures. The stress
+        // fixture wires the composite reader (pools + disk fallback) and
+        // starts the seal worker, mirroring production.
+        let size_config = SegmentSizeConfig {
+            inline_threshold_bytes: 4096,
+            small_threshold_bytes: 262_144,
+            small_target_size: 65_536,
+            default_target_size: 4_194_304, // 4 MiB
+        };
+        let fx = make_stress_fixture(&size_config).await;
+
+        let coord = Arc::clone(&fx.coord);
+        let metadata = Arc::clone(&fx.metadata);
+        let read = Arc::new(fx.read);
+        let mut handles = Vec::new();
+        for worker in 0..4usize {
+            let coord = Arc::clone(&coord);
+            let metadata = Arc::clone(&metadata);
+            let read = Arc::clone(&read);
+            handles.push(tokio::spawn(async move {
+                for i in 0..15usize {
+                    // Sizes straddle the 4 MiB target so append-mode,
+                    // in-flight (fill), and sealed windows are all hit.
+                    let len = 3_000_000 + (worker * 151 + i * 97) % 4_000_000;
+                    let payload: Vec<u8> = (0..len)
+                        .map(|b| {
+                            ((b as u64).wrapping_mul(31).wrapping_add((worker * 17 + i) as u64)
+                                % 251) as u8
+                        })
+                        .collect();
+                    let key = format!("rw-{worker}-{i}");
+                    put_and_persist(&coord, &metadata, "test", &key, Bytes::from(payload.clone()))
+                        .await;
+                    // GET immediately — must succeed in ANY window.
+                    let req = crate::ReadRequest {
+                        bucket: BucketId::new("test"),
+                        key: ObjectKey::new(&key),
+                        hash_key: HashKey::from_bytes(hash_key(key.as_bytes())),
+                        metadata_only: false,
+                        policy: None,
+                    };
+                    let result = read
+                        .get_object(req)
+                        .await
+                        .unwrap_or_else(|e| panic!("GET {key} failed: {e}"));
+                    assert_eq!(
+                        &result.data[..],
+                        &payload[..],
+                        "GET {key} must return the exact PUT bytes"
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
     // ── Concurrency regression (read-path-integrity-under-load) ─────
     // Under concurrent multi-tier load the seal worker runs on another
     // thread than the PUT tasks; entry recording, seal draining, and
@@ -3071,6 +3229,11 @@ mod tests {
             Arc::new(SegmentShard::new(4, SizeTier::Standard, size_config, &buffer_pool).unwrap());
         let pool_cfg =
             PoolConfig { active_pool_size: 4, encode_queue_capacity: 64, ..PoolConfig::default() };
+        // Shared registry: the pools and the coordinator must see the
+        // same machine (registry → pools → coordinator).
+        let stress_registry = Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(
+            &oceanfs_core::LifecycleConfig::default(),
+        ));
         let small_pool = Arc::new(
             SegmentPool::new(
                 pool_cfg.clone(),
@@ -3079,12 +3242,21 @@ mod tests {
                 buffer_pool.clone(),
                 None,
                 None,
+                Arc::clone(&stress_registry),
             )
             .unwrap(),
         );
         let standard_pool = Arc::new(
-            SegmentPool::new(pool_cfg, SizeTier::Standard, size_config, buffer_pool, None, None)
-                .unwrap(),
+            SegmentPool::new(
+                pool_cfg,
+                SizeTier::Standard,
+                size_config,
+                buffer_pool,
+                None,
+                None,
+                Arc::clone(&stress_registry),
+            )
+            .unwrap(),
         );
         let wal = Arc::new(
             WalWriter::open(&WalConfig {
@@ -3098,11 +3270,8 @@ mod tests {
         );
         let seal_dir = dir.path().join("segments");
         let lifecycle = Arc::new(
-            SegmentLifecycleCoordinator::new(
-                metadata.clone(),
-                &oceanfs_core::LifecycleConfig::default(),
-            )
-            .with_idle_seal(vec![standard_pool.clone()], 5000),
+            SegmentLifecycleCoordinator::with_registry(metadata.clone(), stress_registry)
+                .with_idle_seal(vec![standard_pool.clone()], 5000),
         );
         let sealer = Arc::new(SegmentSealer::new(
             SealConfig {

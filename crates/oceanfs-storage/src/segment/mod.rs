@@ -22,8 +22,8 @@ pub use handle::SegmentHandle;
 pub use header::SegmentHeader;
 pub use index::SegmentIndex;
 pub use lifecycle::{
-    LifecycleEntry, SegmentLifecycleCoordinator, SegmentLifecycleRegistry, SegmentState,
-    TransitionError,
+    LifecycleEntry, SegmentLifecycleCoordinator, SegmentLifecycleRegistry, SegmentReadSource,
+    SegmentState, TransitionError,
 };
 pub use pool::{SealingWork, SegmentPool};
 pub use sealer::{SealConfig, SegmentSealer};

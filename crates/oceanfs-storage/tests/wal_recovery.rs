@@ -18,7 +18,7 @@ use oceanfs_core::{
 };
 use oceanfs_storage::{
     metadata::RocksDbMetadataStore,
-    segment::lifecycle::SegmentLifecycleCoordinator,
+    segment::lifecycle::{SegmentLifecycleCoordinator, SegmentLifecycleRegistry},
     wal::{replay_wal, WalEntry, WalReader, WalWriter},
     BufferPool, SegmentPool,
 };
@@ -236,6 +236,7 @@ async fn replay_wal_recovers_and_truncates() {
     let size_config = SegmentSizeConfig::default();
     let buffer_pool = Arc::new(BufferPool::new(65536, 8));
     let pool_cfg = PoolConfig::default();
+    let registry = std::sync::Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
     let pool_small = SegmentPool::new(
         pool_cfg.clone(),
         SizeTier::Small,
@@ -243,11 +244,19 @@ async fn replay_wal_recovers_and_truncates() {
         buffer_pool.clone(),
         None,
         None,
+        std::sync::Arc::clone(&registry),
     )
     .unwrap();
-    let pool_standard =
-        SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None, None)
-            .unwrap();
+    let pool_standard = SegmentPool::new(
+        pool_cfg,
+        SizeTier::Standard,
+        &size_config,
+        buffer_pool,
+        None,
+        None,
+        registry,
+    )
+    .unwrap();
 
     let seg_id = SegmentId::new();
 
@@ -293,6 +302,7 @@ async fn replay_wal_empty_wal_returns_zero_summary() {
     let size_config = SegmentSizeConfig::default();
     let buffer_pool = Arc::new(BufferPool::new(65536, 8));
     let pool_cfg = PoolConfig::default();
+    let registry = std::sync::Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
     let pool_small = SegmentPool::new(
         pool_cfg.clone(),
         SizeTier::Small,
@@ -300,11 +310,19 @@ async fn replay_wal_empty_wal_returns_zero_summary() {
         buffer_pool.clone(),
         None,
         None,
+        std::sync::Arc::clone(&registry),
     )
     .unwrap();
-    let pool_standard =
-        SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None, None)
-            .unwrap();
+    let pool_standard = SegmentPool::new(
+        pool_cfg,
+        SizeTier::Standard,
+        &size_config,
+        buffer_pool,
+        None,
+        None,
+        registry,
+    )
+    .unwrap();
 
     let wal_writer = WalWriter::open(&config).await.unwrap();
     let (_store, lifecycle) = make_lifecycle().await;
@@ -339,6 +357,7 @@ async fn replay_recovers_segment_reserved_before_crash() {
     let size_config = SegmentSizeConfig::default();
     let buffer_pool = Arc::new(BufferPool::new(65536, 8));
     let pool_cfg = PoolConfig::default();
+    let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
     let pool_small = Arc::new(
         SegmentPool::new(
             pool_cfg.clone(),
@@ -347,12 +366,20 @@ async fn replay_recovers_segment_reserved_before_crash() {
             buffer_pool.clone(),
             None,
             None,
+            Arc::clone(&registry),
         )
         .unwrap(),
     );
-    let pool_standard =
-        SegmentPool::new(pool_cfg, SizeTier::Standard, &size_config, buffer_pool, None, None)
-            .unwrap();
+    let pool_standard = SegmentPool::new(
+        pool_cfg,
+        SizeTier::Standard,
+        &size_config,
+        buffer_pool,
+        None,
+        None,
+        registry,
+    )
+    .unwrap();
 
     let (store, lifecycle) = make_lifecycle().await;
     let seg_id = SegmentId::new();

@@ -574,13 +574,18 @@ mod tests {
     use crate::{
         buffer_pool::BufferPool,
         metadata::RocksDbMetadataStore,
-        segment::{lifecycle::SegmentLifecycleCoordinator, pool::SegmentPool},
+        segment::{
+            lifecycle::{SegmentLifecycleCoordinator, SegmentLifecycleRegistry},
+            pool::SegmentPool,
+        },
         wal::{WalEntry, WalWriter},
     };
 
     /// Creates a lifecycle coordinator over a fresh metadata store (the
     /// replay reserves every rebuilt segment through it).
-    async fn make_lifecycle() -> (Arc<RocksDbMetadataStore>, Arc<SegmentLifecycleCoordinator>) {
+    async fn make_lifecycle(
+        registry: Arc<SegmentLifecycleRegistry>,
+    ) -> (Arc<RocksDbMetadataStore>, Arc<SegmentLifecycleCoordinator>) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(
             RocksDbMetadataStore::open(&MetadataConfig {
@@ -592,7 +597,7 @@ mod tests {
             .unwrap(),
         );
         let lifecycle =
-            Arc::new(SegmentLifecycleCoordinator::new(store.clone(), &LifecycleConfig::default()));
+            Arc::new(SegmentLifecycleCoordinator::with_registry(store.clone(), registry));
         (store, lifecycle)
     }
 
@@ -612,6 +617,7 @@ mod tests {
     fn make_pools(
         buffer_pool: &Arc<BufferPool>,
         size_config: &SegmentSizeConfig,
+        registry: Arc<SegmentLifecycleRegistry>,
     ) -> (SegmentPool, SegmentPool) {
         let pool_cfg = PoolConfig::default();
         let small = SegmentPool::new(
@@ -621,6 +627,7 @@ mod tests {
             buffer_pool.clone(),
             None,
             None,
+            Arc::clone(&registry),
         )
         .unwrap();
         let standard = SegmentPool::new(
@@ -630,6 +637,7 @@ mod tests {
             buffer_pool.clone(),
             None,
             None,
+            registry,
         )
         .unwrap();
         (small, standard)
@@ -981,8 +989,10 @@ mod tests {
     async fn replay_wal_empty_directory_returns_zero_summary() {
         let (wal_config, size_config, buffer_pool, _dir) = make_test_env().await;
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
-        let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
-        let (_store, lifecycle) = make_lifecycle().await;
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        let (pool_small, pool_standard) =
+            make_pools(&buffer_pool, &size_config, Arc::clone(&registry));
+        let (_store, lifecycle) = make_lifecycle(registry).await;
         let summary = replay_wal(
             &wal_config,
             &wal_writer,
@@ -1014,8 +1024,10 @@ mod tests {
         }
 
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
-        let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
-        let (_store, lifecycle) = make_lifecycle().await;
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        let (pool_small, pool_standard) =
+            make_pools(&buffer_pool, &size_config, Arc::clone(&registry));
+        let (_store, lifecycle) = make_lifecycle(registry).await;
         let summary = replay_wal(
             &wal_config,
             &wal_writer,
@@ -1047,8 +1059,10 @@ mod tests {
         }
 
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
-        let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
-        let (_store, lifecycle) = make_lifecycle().await;
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        let (pool_small, pool_standard) =
+            make_pools(&buffer_pool, &size_config, Arc::clone(&registry));
+        let (_store, lifecycle) = make_lifecycle(registry).await;
         let summary = replay_wal(
             &wal_config,
             &wal_writer,
@@ -1081,8 +1095,10 @@ mod tests {
         }
 
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
-        let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
-        let (_store, lifecycle) = make_lifecycle().await;
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        let (pool_small, pool_standard) =
+            make_pools(&buffer_pool, &size_config, Arc::clone(&registry));
+        let (_store, lifecycle) = make_lifecycle(registry).await;
         let summary = replay_wal(
             &wal_config,
             &wal_writer,
@@ -1111,8 +1127,10 @@ mod tests {
         }
 
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
-        let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
-        let (_store, lifecycle) = make_lifecycle().await;
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        let (pool_small, pool_standard) =
+            make_pools(&buffer_pool, &size_config, Arc::clone(&registry));
+        let (_store, lifecycle) = make_lifecycle(registry).await;
         let summary = replay_wal(
             &wal_config,
             &wal_writer,
@@ -1141,8 +1159,10 @@ mod tests {
         }
 
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
-        let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
-        let (_store, lifecycle) = make_lifecycle().await;
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        let (pool_small, pool_standard) =
+            make_pools(&buffer_pool, &size_config, Arc::clone(&registry));
+        let (_store, lifecycle) = make_lifecycle(registry).await;
         let summary = replay_wal(
             &wal_config,
             &wal_writer,
@@ -1179,8 +1199,10 @@ mod tests {
         }
 
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
-        let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
-        let (_store, lifecycle) = make_lifecycle().await;
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        let (pool_small, pool_standard) =
+            make_pools(&buffer_pool, &size_config, Arc::clone(&registry));
+        let (_store, lifecycle) = make_lifecycle(registry).await;
         let summary = replay_wal(
             &wal_config,
             &wal_writer,
@@ -1217,8 +1239,10 @@ mod tests {
 
         // Replay into pools — the entries land in pool_small.
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
-        let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
-        let (_store, lifecycle) = make_lifecycle().await;
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        let (pool_small, pool_standard) =
+            make_pools(&buffer_pool, &size_config, Arc::clone(&registry));
+        let (_store, lifecycle) = make_lifecycle(registry).await;
         let summary = replay_wal(
             &wal_config,
             &wal_writer,
@@ -1277,8 +1301,10 @@ mod tests {
         }
 
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
-        let (pool_small, pool_standard) = make_pools(&buffer_pool, &size_config);
-        let (_store, lifecycle) = make_lifecycle().await;
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        let (pool_small, pool_standard) =
+            make_pools(&buffer_pool, &size_config, Arc::clone(&registry));
+        let (_store, lifecycle) = make_lifecycle(registry).await;
         let summary = replay_wal(
             &wal_config,
             &wal_writer,

@@ -30,18 +30,23 @@
 //!
 //! # LOCK ORDER
 //!
-//! A registry shard is a **leaf** lock: it is never held while
-//! acquiring any other lock (a pool slot lock, `sealing_data`,
-//! `segment_entries`, the flush coordinator's channel, ...). Every
-//! coordinator transition is structured as
-//! `validate (shard read, released) → durable I/O (no locks) → fold
-//! (shard write)` — the durable CF write and the fold are separate
-//! critical sections, so no I/O ever runs under a shard lock
-//! (performance §7.1). `seal_idle_segments` holds no registry locks
-//! while the pools' sweeps acquire slot locks. Reverse-order
-//! acquisition (slot lock → shard lock) does not occur anywhere in
-//! this crate; if a future feature introduces it, this comment must
-//! document the full order.
+//! A registry shard is a **leaf** lock in the coordinator's own
+//! transitions: `validate (shard read, released) → durable I/O (no
+//! locks) → fold (shard write)` — the durable CF write and the fold
+//! are separate critical sections, so no I/O ever runs under a shard
+//! lock (performance §7.1), and the coordinator never acquires a slot
+//! lock while holding a shard.
+//!
+//! The one legal multi-lock order in the crate is **slot lock →
+//! registry shard write**, on the pool's fill path: the frozen buffer
+//! is attached to the entry in the same critical section as the slot
+//! freeze (the read window is continuous — `lifecycle-read-path`). It
+//! is safe because no code path acquires a shard and then a slot lock:
+//! `read_source` releases the shard before returning (the caller's
+//! slot scan happens after), `request_*` never touch slots, and
+//! `seal_idle_segments` sweeps slots and retries in-flight seals in
+//! separate steps. If a future feature introduces another order, this
+//! comment must document the full ordering.
 //!
 //! Memory bound (ADR-0025 Decision 5 — stated at TB scale, not
 //! load-test scale): ~300 B/entry × ~170K live segments/TB → **~50 MB
@@ -58,7 +63,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use oceanfs_core::{Gauge, LabelSet, LifecycleConfig, MetricRegistrar, SegmentId, SegmentMetadata};
+use bytes::Bytes;
+use oceanfs_core::{
+    Gauge, LabelSet, LifecycleConfig, MetricRegistrar, SegmentId, SegmentMetadata, SizeTier,
+};
 use oceanfs_storage_api::MetadataStore;
 use parking_lot::RwLock;
 
@@ -102,13 +110,49 @@ pub struct LifecycleEntry {
     /// When a `Deleted` entry's grace expires (entry eviction time).
     /// Meaningful only for `Deleted` entries; set at construction.
     evict_at: Instant,
+    /// The frozen buffer between fill and durable seal (was the
+    /// `sealing_data` side-map; ADR-0025 Decision 2 — the read window
+    /// is owned by the machine's entry). Attached by the pool's fill
+    /// transition in the same critical section as the freeze; cleared
+    /// by the seal transition's fold. `Bytes::clone` — refcount only.
+    in_flight: Option<Bytes>,
+    /// Whether the seal enqueue is taken care of: `true` from the
+    /// freeze (the fill path owns the enqueue) until the seal
+    /// completes; reset to `false` when an enqueue attempt fails so
+    /// the idle-seal driver retries the seal (a full seal queue delays
+    /// the seal but never removes the read window).
+    seal_queued: bool,
 }
 
 impl LifecycleEntry {
     /// Creates a new lifecycle entry in the given state.
     pub(crate) fn new(state: SegmentState, metadata: SegmentMetadata) -> Self {
-        Self { state, metadata, evict_at: Instant::now() }
+        Self { state, metadata, evict_at: Instant::now(), in_flight: None, seal_queued: false }
     }
+}
+
+/// Where a segment's data can be read from — the answer to "where do I
+/// read this segment?" in one registry lookup (ADR-0025 Decision 2).
+///
+/// NOTE: this type is distinct from
+/// `oceanfs_storage::io::SegmentReadSource` (the HTTP handler's
+/// memory-vs-file source tracking). The two live in different modules
+/// and serve different purposes; this one is the machine's resolution.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum SegmentReadSource {
+    /// `Reserved` entry with no in-flight data: the data lives in an
+    /// active pool slot buffer (append-mode, mutable). The caller
+    /// performs the slot scan for this case only.
+    ActiveSlot,
+    /// `Reserved`/`Sealed` entry carrying the frozen buffer between
+    /// fill and durable seal (was `sealing_data`). The `Bytes` is a
+    /// refcounted handle — serving is a slice, no copy.
+    InFlight(Bytes),
+    /// Durable `.dat` — the read falls through to the disk reader.
+    Sealed,
+    /// Not this node's segment (replica fallback) or gone (404 path).
+    Missing,
 }
 
 /// A lifecycle transition that could not be applied.
@@ -285,6 +329,11 @@ impl SegmentLifecycleRegistry {
             Some(entry) if entry.state == SegmentState::Reserved => {
                 entry.state = SegmentState::Sealed;
                 entry.metadata = metadata;
+                // The seal transition closes the read window: the `.dat`
+                // is authoritative once sealed (the in-flight buffer is
+                // released — the memory-bound test pins this).
+                entry.in_flight = None;
+                entry.seal_queued = false;
                 Ok(())
             }
             Some(entry) if entry.state == SegmentState::Sealed => {
@@ -341,8 +390,181 @@ impl SegmentLifecycleRegistry {
                 state: entry.state,
                 metadata: entry.metadata.clone(),
                 evict_at: entry.evict_at,
+                in_flight: entry.in_flight.clone(),
+                seal_queued: entry.seal_queued,
             }
         })
+    }
+
+    /// Resolves where a segment's data can be read from — one registry
+    /// lookup (ADR-0025 Decision 2).
+    ///
+    /// The resolution: an entry carrying the frozen in-flight buffer
+    /// (`Reserved`/`Sealed`) → [`SegmentReadSource::InFlight`]; a
+    /// `Reserved` entry without one → [`SegmentReadSource::ActiveSlot`]
+    /// (the caller's slot scan serves it); `Sealed` → the durable
+    /// `.dat` (the caller falls through to the disk reader);
+    /// `Missing`/`Deleted` → not resolvable here (replica fallback or
+    /// 404). Holds a shard read lock only — no I/O, no allocation
+    /// (performance §7.1).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::{LifecycleConfig, SegmentId, SegmentMetadata, SizeTier};
+    /// use oceanfs_storage::segment::lifecycle::{
+    ///     SegmentLifecycleRegistry, SegmentReadSource,
+    /// };
+    ///
+    /// let registry = SegmentLifecycleRegistry::new(&LifecycleConfig::default());
+    /// let id = SegmentId::new();
+    /// assert!(matches!(registry.read_source(id), SegmentReadSource::Missing));
+    /// let meta = SegmentMetadata {
+    ///     segment_id: id,
+    ///     ec_k: 4,
+    ///     ec_m: 2,
+    ///     size_tier: SizeTier::Standard,
+    ///     merkle_root: None,
+    ///     storage_locations: smallvec::SmallVec::new(),
+    ///     sealed_at: None,
+    /// };
+    /// registry.reserve(id, meta).unwrap();
+    /// assert!(matches!(registry.read_source(id), SegmentReadSource::ActiveSlot));
+    /// ```
+    pub fn read_source(&self, id: SegmentId) -> SegmentReadSource {
+        let shard = &self.shards[self.shard_for(id)];
+        let guard = shard.read();
+        match guard.get(&id) {
+            None => SegmentReadSource::Missing,
+            Some(entry) if Self::deleted_expired(entry, Instant::now()) => {
+                SegmentReadSource::Missing
+            }
+            Some(entry) if entry.state == SegmentState::Deleted => SegmentReadSource::Missing,
+            Some(entry) => {
+                if let Some(data) = &entry.in_flight {
+                    SegmentReadSource::InFlight(data.clone())
+                } else if entry.state == SegmentState::Sealed {
+                    SegmentReadSource::Sealed
+                } else {
+                    SegmentReadSource::ActiveSlot
+                }
+            }
+        }
+    }
+
+    /// Attaches a frozen buffer to a `Reserved` entry — the pool's fill
+    /// transition calls this in the SAME critical section as the slot
+    /// freeze, so the read window is continuous (ADR-0025 Decision 2).
+    ///
+    /// Also marks the seal as queued: the fill path owns the enqueue
+    /// from the freeze on; only an enqueue failure resets that flag so
+    /// the idle-seal driver retries (a full seal queue delays the seal
+    /// but never removes the read window).
+    ///
+    /// When the entry does not exist yet — the **fill-before-reserve
+    /// window**: the write path's durable reserve lands AFTER the append
+    /// that filled the segment (the segment id is only known once the
+    /// append returns) — a registry-only `Reserved` entry is inserted
+    /// with the pool's tier/EC metadata. This is a pure in-memory fold:
+    /// the coordinator remains the only DURABLE writer, and its
+    /// `request_reserve` lands µs later as an idempotent no-op.
+    ///
+    /// Returns `false` only when the entry holds a higher state
+    /// (`Sealed`/`Deleted` — impossible by construction; the caller
+    /// logs).
+    pub(crate) fn attach_in_flight(
+        &self,
+        id: SegmentId,
+        tier: SizeTier,
+        ec_k: u8,
+        ec_m: u8,
+        data: Bytes,
+    ) -> bool {
+        let shard = &self.shards[self.shard_for(id)];
+        let mut guard = shard.write();
+        match guard.get_mut(&id) {
+            Some(entry) if entry.state == SegmentState::Reserved => {
+                entry.in_flight = Some(data);
+                entry.seal_queued = true;
+                true
+            }
+            None => {
+                let meta = SegmentMetadata {
+                    segment_id: id,
+                    ec_k,
+                    ec_m,
+                    size_tier: tier,
+                    merkle_root: None,
+                    storage_locations: smallvec::SmallVec::new(),
+                    sealed_at: None,
+                };
+                guard.insert(
+                    id,
+                    LifecycleEntry {
+                        state: SegmentState::Reserved,
+                        metadata: meta,
+                        evict_at: Instant::now(),
+                        in_flight: Some(data),
+                        seal_queued: true,
+                    },
+                );
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    /// Marks an entry's seal as queued (the idle-seal driver's retry
+    /// succeeded). No-op when the entry is gone or already sealed.
+    pub(crate) fn mark_seal_queued(&self, id: SegmentId) {
+        let shard = &self.shards[self.shard_for(id)];
+        let mut guard = shard.write();
+        if let Some(entry) = guard.get_mut(&id) {
+            if entry.in_flight.is_some() {
+                entry.seal_queued = true;
+            }
+        }
+    }
+
+    /// Marks an entry's seal as NOT queued: an enqueue attempt failed
+    /// (seal queue at capacity or closed), so the idle-seal driver must
+    /// retry the seal. The in-flight window stays readable.
+    pub(crate) fn mark_seal_unqueued(&self, id: SegmentId) {
+        let shard = &self.shards[self.shard_for(id)];
+        let mut guard = shard.write();
+        if let Some(entry) = guard.get_mut(&id) {
+            entry.seal_queued = false;
+        }
+    }
+
+    /// Returns the number of entries currently carrying a frozen
+    /// in-flight buffer (the seal pipeline's in-flight set).
+    pub(crate) fn in_flight_count(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| {
+                let guard = shard.read();
+                guard.values().filter(|entry| entry.in_flight.is_some()).count()
+            })
+            .sum()
+    }
+
+    /// Returns the number of frozen entries whose seal enqueue FAILED
+    /// (`seal_queued == false`) — the set the idle-seal driver must
+    /// retry. Test-only: the production gate bounds the TOTAL
+    /// in-flight set (`in_flight_count`) at `IN_FLIGHT_CAP`.
+    #[cfg(test)]
+    pub(crate) fn in_flight_unqueued_count(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| {
+                let guard = shard.read();
+                guard
+                    .values()
+                    .filter(|entry| entry.in_flight.is_some() && !entry.seal_queued)
+                    .count()
+            })
+            .sum()
     }
 
     /// Enumerates a snapshot of the **live** entries (`Reserved` /
@@ -490,6 +712,13 @@ impl SegmentLifecycleRegistry {
             Some(entry) if entry.state == SegmentState::Reserved => {
                 entry.state = SegmentState::Sealed;
                 entry.metadata = metadata;
+                // The seal transition closes the read window: once the
+                // `.dat` is durable, the in-flight buffer is released —
+                // the memory-bound test pins this, and failing to clear
+                // it would leak the frozen buffer forever and keep the
+                // in-flight cap permanently engaged (lifecycle-read-path).
+                entry.in_flight = None;
+                entry.seal_queued = false;
                 Ok(())
             }
             Some(entry) if entry.state == SegmentState::Sealed => {
@@ -559,7 +788,7 @@ impl SegmentLifecycleRegistry {
 /// last-append — and the coordinator's `seal_idle_segments` tick drives
 /// the sweep; empty segments are never sealed).
 pub struct SegmentLifecycleCoordinator {
-    registry: SegmentLifecycleRegistry,
+    registry: Arc<SegmentLifecycleRegistry>,
     metadata: Arc<dyn MetadataStore>,
     /// Pools swept by the idle-seal driver (empty until
     /// [`with_idle_seal`](Self::with_idle_seal) is called).
@@ -599,7 +828,23 @@ impl SegmentLifecycleCoordinator {
     /// # }
     /// ```
     pub fn new(metadata: Arc<dyn MetadataStore>, config: &LifecycleConfig) -> Self {
-        let registry = SegmentLifecycleRegistry::new(config);
+        Self::with_registry(metadata, Arc::new(SegmentLifecycleRegistry::new(config)))
+    }
+
+    /// Creates a new lifecycle coordinator over the given metadata
+    /// store (the phase-1 durable side-effect target), sharing a
+    /// caller-provided registry.
+    ///
+    /// The composition root uses this when the registry must exist
+    /// BEFORE the coordinator — the segment pools hold
+    /// `Arc<SegmentLifecycleRegistry>` for the read path and the
+    /// in-flight attach, and the node constructs the registry first
+    /// and hands it to both (construction order: registry → pools →
+    /// coordinator).
+    pub fn with_registry(
+        metadata: Arc<dyn MetadataStore>,
+        registry: Arc<SegmentLifecycleRegistry>,
+    ) -> Self {
         let entries_gauge = Gauge::new(
             "oceanfs_lifecycle_registry_entries".into(),
             "Live segment lifecycle registry entries (Reserved + Sealed, not Deleted)".into(),
@@ -833,13 +1078,52 @@ impl SegmentLifecycleCoordinator {
     /// pinning their WAL files — the `wal_not_unbounded` leak).
     ///
     /// Empty segments are never sealed (recovery drops empty
-    /// reserves). Enqueue failures are logged by the pools and retried
-    /// on the next tick. A timeout of zero means "idle immediately"
-    /// (used by tests; production wires the sealer's `seal_timeout_ms`).
+    /// reserves). The tick also **retries deferred seals**: frozen
+    /// segments whose enqueue failed while the seal queue was at
+    /// capacity stay readable through the registry's in-flight window
+    /// and are re-enqueued here — a full seal queue delays the seal
+    /// but never removes the read window (lifecycle-read-path). Once
+    /// the in-flight count drops below the cap, slots re-arm.
+    ///
+    /// A timeout of zero means "idle immediately" (used by tests;
+    /// production wires the sealer's `seal_timeout_ms`).
     pub async fn seal_idle_segments(&self) {
         let timeout = Duration::from_millis(self.idle_seal_timeout_ms);
         for pool in &self.idle_pools {
             pool.sweep_idle_segments(timeout).await;
+        }
+        self.retry_deferred_seals().await;
+        // Re-arm slots whose in-flight count dropped below the cap
+        // (seals completed during the sweep/retry).
+        for pool in &self.idle_pools {
+            pool.try_activate_slot();
+        }
+    }
+
+    /// Re-enqueues seal work for frozen segments whose enqueue failed
+    /// while the seal queue was at capacity (their `seal_queued` flag
+    /// was reset). The in-flight window stays readable throughout.
+    async fn retry_deferred_seals(&self) {
+        // Collect under the registry's read locks (the closure must not
+        // call back into the registry).
+        let mut pending: Vec<(SegmentId, SizeTier, Bytes)> = Vec::new();
+        self.registry.for_each(|id, entry| {
+            if entry.state == SegmentState::Reserved
+                && entry.in_flight.is_some()
+                && !entry.seal_queued
+            {
+                if let Some(data) = &entry.in_flight {
+                    pending.push((id, entry.metadata.size_tier, data.clone()));
+                }
+            }
+        });
+        for (id, tier, data) in pending {
+            let Some(pool) = self.idle_pools.iter().find(|p| p.storage_tier() == tier) else {
+                continue;
+            };
+            if pool.enqueue_inflight_work(id, tier, data).await {
+                self.registry.mark_seal_queued(id);
+            }
         }
     }
 
@@ -1235,6 +1519,103 @@ mod tests {
         assert!(deleted.contains(&sealed_id), "deleted-marker written for seeded sealed segment");
     }
 
+    // ------------------------------------------------------------------
+    // Read source resolution + in-flight window (lifecycle-read-path)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn read_source_missing_for_absent_and_deleted_entries() {
+        let registry = SegmentLifecycleRegistry::new(&grace_config(10_000));
+        let id = SegmentId::new();
+        assert!(matches!(registry.read_source(id), SegmentReadSource::Missing));
+        registry.reserve(id, test_metadata(id, false)).unwrap();
+        registry.delete(id).unwrap();
+        assert!(matches!(registry.read_source(id), SegmentReadSource::Missing));
+    }
+
+    #[test]
+    fn read_source_active_slot_for_reserved_without_in_flight() {
+        let registry = SegmentLifecycleRegistry::new(&LifecycleConfig::default());
+        let id = SegmentId::new();
+        registry.reserve(id, test_metadata(id, false)).unwrap();
+        assert!(matches!(registry.read_source(id), SegmentReadSource::ActiveSlot));
+    }
+
+    #[test]
+    fn read_source_in_flight_after_attach_and_sealed_after_seal() {
+        let registry = SegmentLifecycleRegistry::new(&LifecycleConfig::default());
+        let id = SegmentId::new();
+        registry.reserve(id, test_metadata(id, false)).unwrap();
+        // Attach the frozen buffer (the pool fill's job).
+        assert!(registry.attach_in_flight(
+            id,
+            SizeTier::Standard,
+            4,
+            2,
+            Bytes::from_static(b"frozen")
+        ));
+        match registry.read_source(id) {
+            SegmentReadSource::InFlight(data) => assert_eq!(&data[..], b"frozen"),
+            other => panic!("expected InFlight, got {other:?}"),
+        }
+        assert_eq!(registry.in_flight_count(), 1);
+        // The seal transition closes the window: after request_seal the
+        // entry resolves as Sealed and the in-flight count drops.
+        registry.seal(id, test_metadata(id, true)).unwrap();
+        assert!(matches!(registry.read_source(id), SegmentReadSource::Sealed));
+        assert_eq!(registry.in_flight_count(), 0, "seal must clear the in-flight window");
+    }
+
+    #[test]
+    fn attach_on_missing_entry_inserts_registry_only_reserve() {
+        // The fill-before-reserve window: the write path's durable
+        // reserve lands AFTER the append that filled the segment, so
+        // the freeze's attach may find no entry. It inserts a
+        // registry-only Reserved entry (pure in-memory fold — the
+        // coordinator's later request_reserve is an idempotent no-op).
+        let registry = SegmentLifecycleRegistry::new(&LifecycleConfig::default());
+        let id = SegmentId::new();
+        assert!(
+            registry.attach_in_flight(id, SizeTier::Small, 2, 1, Bytes::from_static(b"data")),
+            "attach must self-heal the missing entry"
+        );
+        let entry = registry.get(id).unwrap();
+        assert_eq!(entry.state, SegmentState::Reserved);
+        assert!(matches!(registry.read_source(id), SegmentReadSource::InFlight(_)));
+        // The coordinator's durable reserve afterwards: idempotent.
+        assert!(registry.reserve(id, test_metadata(id, false)).is_ok());
+        assert!(registry.get(id).unwrap().metadata.sealed_at.is_none());
+    }
+
+    #[test]
+    fn attach_on_sealed_entry_is_rejected() {
+        let registry = SegmentLifecycleRegistry::new(&LifecycleConfig::default());
+        let id = SegmentId::new();
+        registry.reserve(id, test_metadata(id, false)).unwrap();
+        registry.seal(id, test_metadata(id, true)).unwrap();
+        assert!(
+            !registry.attach_in_flight(id, SizeTier::Standard, 4, 2, Bytes::from_static(b"x")),
+            "a sealed entry must never accept an in-flight attach"
+        );
+    }
+
+    #[test]
+    fn seal_queued_flag_roundtrip() {
+        let registry = SegmentLifecycleRegistry::new(&LifecycleConfig::default());
+        let id = SegmentId::new();
+        registry.reserve(id, test_metadata(id, false)).unwrap();
+        assert!(registry.attach_in_flight(id, SizeTier::Standard, 4, 2, Bytes::from_static(b"d")));
+        assert_eq!(registry.in_flight_unqueued_count(), 0, "attach marks the seal queued");
+        registry.mark_seal_unqueued(id);
+        assert_eq!(registry.in_flight_unqueued_count(), 1, "failed enqueue → retry set");
+        registry.mark_seal_queued(id);
+        assert_eq!(registry.in_flight_unqueued_count(), 0);
+        // The seal clears everything.
+        registry.seal(id, test_metadata(id, true)).unwrap();
+        assert_eq!(registry.in_flight_count(), 0);
+        assert_eq!(registry.in_flight_unqueued_count(), 0);
+    }
+
     #[tokio::test]
     async fn request_reserve_writes_cf_then_folds() {
         let (store, _dir) = test_store().await;
@@ -1283,6 +1664,54 @@ mod tests {
         assert!(cf.sealed_at.is_some(), "CF must not be downgraded to unsealed");
         let entry = coordinator.registry().get(id).unwrap();
         assert_eq!(entry.state, SegmentState::Sealed, "registry must not be downgraded");
+    }
+
+    #[tokio::test]
+    async fn coordinator_seal_clears_in_flight_via_the_fold() {
+        // The production seal-complete paths (request_seal and
+        // seal_finalized_batch) fold through `fold_seal` — the seal
+        // transition must clear the in-flight window there, not only in
+        // the direct registry `seal()` used by tests. A mutation that
+        // drops the clear leaks the frozen buffer and keeps the
+        // in-flight cap permanently engaged.
+        let (store, _dir) = test_store().await;
+        let coordinator =
+            SegmentLifecycleCoordinator::new(store.clone(), &LifecycleConfig::default());
+        let id = SegmentId::new();
+        coordinator.request_reserve(id, SizeTier::Standard, 4, 2).await.unwrap();
+        // Attach a frozen buffer (the pool fill's job).
+        assert!(coordinator.registry().attach_in_flight(
+            id,
+            SizeTier::Standard,
+            4,
+            2,
+            Bytes::from_static(b"frozen-payload"),
+        ));
+        assert_eq!(coordinator.registry().in_flight_count(), 1);
+
+        // request_seal → fold_seal: the window must close.
+        coordinator.request_seal(id, test_metadata(id, true)).await.unwrap();
+        assert_eq!(
+            coordinator.registry().in_flight_count(),
+            0,
+            "request_seal must clear the in-flight window"
+        );
+        assert!(matches!(coordinator.registry().read_source(id), SegmentReadSource::Sealed));
+
+        // seal_finalized_batch → fold_seal: the same clearing.
+        let id2 = SegmentId::new();
+        coordinator.request_reserve(id2, SizeTier::Standard, 4, 2).await.unwrap();
+        assert!(coordinator.registry().attach_in_flight(
+            id2,
+            SizeTier::Standard,
+            4,
+            2,
+            Bytes::from_static(b"frozen-payload-2"),
+        ));
+        let results = coordinator.seal_finalized_batch(vec![test_metadata(id2, true)]);
+        assert!(results[0].is_ok());
+        assert_eq!(coordinator.registry().in_flight_count(), 0, "batch seal must clear the window");
+        assert!(matches!(coordinator.registry().read_source(id2), SegmentReadSource::Sealed));
     }
 
     #[tokio::test]
@@ -1453,14 +1882,23 @@ mod tests {
     #[tokio::test]
     async fn seal_idle_segments_seals_partially_filled_segment() {
         let (pool_config, size_config, buf_pool) = test_pool_config();
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
         let pool = Arc::new(
-            SegmentPool::new(pool_config, SizeTier::Standard, &size_config, buf_pool, None, None)
-                .unwrap(),
+            SegmentPool::new(
+                pool_config,
+                SizeTier::Standard,
+                &size_config,
+                buf_pool,
+                None,
+                None,
+                Arc::clone(&registry),
+            )
+            .unwrap(),
         );
         drain_seal_queue(&pool).await;
 
         let (store, _dir) = test_store().await;
-        let coordinator = SegmentLifecycleCoordinator::new(store, &LifecycleConfig::default())
+        let coordinator = SegmentLifecycleCoordinator::with_registry(store, registry)
             .with_idle_seal(vec![pool.clone()], 0); // 0 ms timeout = idle immediately
 
         let (seg_id, offset, length) = pool.append(b"partial").unwrap();
@@ -1476,16 +1914,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_driver_retries_deferred_seals_under_queue_backpressure() {
+        // A full seal queue delays the seal but never removes the read
+        // window: when an enqueue fails, the entry stays in flight and
+        // the idle driver's tick re-enqueues it once the queue drains.
+        let pool_config = PoolConfig {
+            active_pool_size: 2,
+            shard_count: 1,
+            max_inflight_encodes: 4,
+            encode_queue_capacity: 1, // stalls after one item
+            ec_streaming_encode: false,
+        };
+        let size_config = SegmentSizeConfig {
+            default_target_size: 1024,
+            small_target_size: 1024,
+            ..Default::default()
+        };
+        let buf_pool = Arc::new(BufferPool::new(65536, 16));
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        let pool = Arc::new(
+            SegmentPool::new(
+                pool_config,
+                SizeTier::Standard,
+                &size_config,
+                buf_pool,
+                None,
+                None,
+                Arc::clone(&registry),
+            )
+            .unwrap(),
+        );
+        let (store, _dir) = test_store().await;
+        let coordinator = SegmentLifecycleCoordinator::with_registry(store, Arc::clone(&registry))
+            .with_idle_seal(vec![pool.clone()], 0);
+
+        // Stall the queue: take the receiver without draining.
+        let mut rx = pool.take_seal_rx().expect("seal rx");
+
+        // Fill the first segment — the enqueue fills the one-slot queue.
+        let data = vec![0xEEu8; 2048]; // fills (target 1024)
+        let (seg_id, _, _) = pool.append(&data).unwrap();
+
+        // Fill the second segment — its enqueue stalls (queue at
+        // capacity) and times out: the write is REJECTED (never acked)
+        // but the frozen entry stays in flight (readable) and is marked
+        // for retry.
+        let data2 = vec![0xFFu8; 2048];
+        let err = pool
+            .append_with_hook_async(&data2, |_, _, _| {}, std::time::Duration::from_millis(20))
+            .await
+            .expect_err("the stalled queue must reject the write");
+        assert!(matches!(err, crate::error::Error::WriteBackpressureTimeout));
+
+        // Both frozen entries are in the registry; the second is NOT
+        // queued (its enqueue failed) and both stay readable.
+        let mut in_flight_ids: Vec<SegmentId> = Vec::new();
+        registry.for_each(|id, entry| {
+            if entry.in_flight.is_some() {
+                in_flight_ids.push(id);
+            }
+        });
+        assert_eq!(in_flight_ids.len(), 2, "both fills' entries are in flight");
+        let seg2_id =
+            in_flight_ids.iter().copied().find(|id| *id != seg_id).expect("second segment id");
+        assert!(matches!(registry.read_source(seg2_id), SegmentReadSource::InFlight(_)));
+        assert_eq!(registry.in_flight_unqueued_count(), 1, "enqueue failed → retry set");
+        // ... and it stays readable under the backpressure.
+        let chunk = pool.try_read(seg2_id, 0, 2048).expect("readable during the stall");
+        assert_eq!(&chunk[..], &data2[..]);
+
+        // Drain the queue (the seal worker's job), then tick the idle
+        // driver: the deferred seal must be re-enqueued.
+        let _first = rx.try_recv().expect("first seal queued");
+        drop(rx);
+        let drain_pool = Arc::clone(&pool);
+        let drain = std::thread::spawn(move || {
+            while let Some(_w) = drain_pool.take_seal_rx().and_then(|mut r| r.blocking_recv()) {}
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        coordinator.seal_idle_segments().await;
+        assert!(
+            registry.in_flight_unqueued_count() == 0,
+            "the idle driver must retry the deferred seal"
+        );
+        drain.join().unwrap();
+        let _ = seg_id;
+    }
+
+    #[tokio::test]
     async fn seal_idle_segments_does_not_seal_empty_segment() {
         let (pool_config, size_config, buf_pool) = test_pool_config();
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
         let pool = Arc::new(
-            SegmentPool::new(pool_config, SizeTier::Standard, &size_config, buf_pool, None, None)
-                .unwrap(),
+            SegmentPool::new(
+                pool_config,
+                SizeTier::Standard,
+                &size_config,
+                buf_pool,
+                None,
+                None,
+                Arc::clone(&registry),
+            )
+            .unwrap(),
         );
         drain_seal_queue(&pool).await;
 
         let (store, _dir) = test_store().await;
-        let coordinator = SegmentLifecycleCoordinator::new(store, &LifecycleConfig::default())
+        let coordinator = SegmentLifecycleCoordinator::with_registry(store, Arc::clone(&registry))
             .with_idle_seal(vec![pool.clone()], 0);
 
         // No appends: the slot's segment is empty and must NOT be
