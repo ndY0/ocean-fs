@@ -175,6 +175,7 @@ impl SegmentSealer {
         active: &mut ActiveSegment,
         elapsed_ms: u64,
         entries: &[SegmentIndexEntry],
+        merkle_root: Option<oceanfs_core::HashOutput>,
     ) -> Result<Option<SegmentHandle>> {
         // Don't seal empty segments.
         if active.size() == 0 {
@@ -187,7 +188,7 @@ impl SegmentSealer {
             return Ok(None);
         }
 
-        let result = self.seal(active, entries).await;
+        let result = self.seal(active, entries, merkle_root).await;
         if result.is_err() {
             self.seal_errors.inc();
         }
@@ -199,11 +200,12 @@ impl SegmentSealer {
         &self,
         active: &mut ActiveSegment,
         entries: &[SegmentIndexEntry],
+        merkle_root: Option<oceanfs_core::HashOutput>,
     ) -> Result<SegmentHandle> {
         let segment_id = active.id();
         let tier = active.tier();
         let data = Bytes::copy_from_slice(active.data());
-        self.seal_from_data(segment_id, tier, data, entries, 0, 0, 0, None, None).await
+        self.seal_from_data(segment_id, tier, data, entries, 0, 0, 0, None, merkle_root).await
     }
 
     /// Seals a segment from raw data bytes, without requiring an `ActiveSegment`.
@@ -570,13 +572,10 @@ fn write_segment_temp(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use oceanfs_core::{LifecycleConfig, WalConfig};
+    use oceanfs_core::{HashOutput, LifecycleConfig, WalConfig};
 
     use super::*;
-    use crate::{
-        buffer_pool::BufferPool, metadata::RocksDbMetadataStore,
-        segment::lifecycle::SegmentLifecycleCoordinator,
-    };
+    use crate::{buffer_pool::BufferPool, segment::lifecycle::SegmentLifecycleCoordinator};
 
     /// Creates the sealer plus its lifecycle coordinator. Every seal in
     /// these tests reserves its segment FIRST — the flush path
@@ -591,17 +590,21 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
 
-        let metadata = Arc::new(
-            RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
-                data_dir: dir.path().join("meta"),
-                block_cache_size: 1024,
-                memtable_size: 1024,
-                ..Default::default()
-            })
-            .unwrap(),
+        let lifecycle = Arc::new(
+            SegmentLifecycleCoordinator::new(&LifecycleConfig::default()).with_event_wal(Arc::new(
+                crate::segment::event_wal::EventWal::open(
+                    dir.path().join("event-wal"),
+                    &oceanfs_core::EventWalConfig {
+                        event_wal_dir: dir.path().join("event-wal"),
+                        event_wal_file_size_bytes: 1024 * 1024,
+                        event_wal_fsync_batch_timeout_ms: 10,
+                        event_wal_checkpoint_bytes: 1024 * 1024,
+                    },
+                )
+                .await
+                .unwrap(),
+            )),
         );
-        let lifecycle =
-            Arc::new(SegmentLifecycleCoordinator::new(metadata, &LifecycleConfig::default()));
 
         let wal = Arc::new(
             WalWriter::open(&WalConfig {
@@ -641,7 +644,10 @@ mod tests {
     #[tokio::test]
     async fn try_seal_returns_none_when_not_full_and_not_timed_out() {
         let (sealer, _lifecycle, mut active, entries, _dir) = setup().await;
-        let result = sealer.try_seal(&mut active, 0, &entries).await.unwrap();
+        let result = sealer
+            .try_seal(&mut active, 0, &entries, Some(HashOutput::from_bytes([0xAB; 32])))
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -654,7 +660,10 @@ mod tests {
         // The seal path validates Reserved-only — reserve first.
         lifecycle.request_reserve(active.id(), SizeTier::Standard, 0, 0).await.unwrap();
 
-        let result = sealer.try_seal(&mut active, 0, &entries).await.unwrap();
+        let result = sealer
+            .try_seal(&mut active, 0, &entries, Some(HashOutput::from_bytes([0xAB; 32])))
+            .await
+            .unwrap();
         assert!(result.is_some());
     }
 
@@ -663,24 +672,31 @@ mod tests {
         let (sealer, lifecycle, mut active, entries, _dir) = setup().await;
         // Not full, but timed out.
         lifecycle.request_reserve(active.id(), SizeTier::Standard, 0, 0).await.unwrap();
-        let result = sealer.try_seal(&mut active, 2000, &entries).await.unwrap();
+        let result = sealer
+            .try_seal(&mut active, 2000, &entries, Some(HashOutput::from_bytes([0xAB; 32])))
+            .await
+            .unwrap();
         assert!(result.is_some());
     }
 
     #[tokio::test]
     async fn try_seal_returns_none_for_empty_segment() {
         let dir = tempfile::tempdir().unwrap();
-        let metadata = Arc::new(
-            RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
-                data_dir: dir.path().join("meta"),
-                block_cache_size: 1024,
-                memtable_size: 1024,
-                ..Default::default()
-            })
-            .unwrap(),
+        let lifecycle = Arc::new(
+            SegmentLifecycleCoordinator::new(&LifecycleConfig::default()).with_event_wal(Arc::new(
+                crate::segment::event_wal::EventWal::open(
+                    dir.path().join("event-wal"),
+                    &oceanfs_core::EventWalConfig {
+                        event_wal_dir: dir.path().join("event-wal"),
+                        event_wal_file_size_bytes: 1024 * 1024,
+                        event_wal_fsync_batch_timeout_ms: 10,
+                        event_wal_checkpoint_bytes: 1024 * 1024,
+                    },
+                )
+                .await
+                .unwrap(),
+            )),
         );
-        let lifecycle =
-            Arc::new(SegmentLifecycleCoordinator::new(metadata, &LifecycleConfig::default()));
         let wal = Arc::new(
             WalWriter::open(&WalConfig {
                 data_dir: dir.path().join("wal"),
@@ -706,7 +722,10 @@ mod tests {
         let sealer = SegmentSealer::new(config, wal, lifecycle);
 
         // Empty segment should not seal.
-        let result = sealer.try_seal(&mut active, 2000, &[]).await.unwrap();
+        let result = sealer
+            .try_seal(&mut active, 2000, &[], Some(HashOutput::from_bytes([0xAB; 32])))
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -756,19 +775,21 @@ mod tests {
         use crate::io::segment_flush::LAST_FLUSH_THREAD;
 
         let dir = tempfile::tempdir().unwrap();
-        let metadata = Arc::new(
-            RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
-                data_dir: dir.path().join("meta"),
-                block_cache_size: 1024,
-                memtable_size: 1024,
-                ..Default::default()
-            })
-            .unwrap(),
+        let lifecycle = Arc::new(
+            SegmentLifecycleCoordinator::new(&LifecycleConfig::default()).with_event_wal(Arc::new(
+                crate::segment::event_wal::EventWal::open(
+                    dir.path().join("event-wal"),
+                    &oceanfs_core::EventWalConfig {
+                        event_wal_dir: dir.path().join("event-wal"),
+                        event_wal_file_size_bytes: 1024 * 1024,
+                        event_wal_fsync_batch_timeout_ms: 10,
+                        event_wal_checkpoint_bytes: 1024 * 1024,
+                    },
+                )
+                .await
+                .unwrap(),
+            )),
         );
-        let lifecycle = Arc::new(SegmentLifecycleCoordinator::new(
-            metadata.clone(),
-            &LifecycleConfig::default(),
-        ));
         let wal = Arc::new(
             WalWriter::open(&WalConfig {
                 data_dir: dir.path().join("wal"),
@@ -812,7 +833,17 @@ mod tests {
                 let entries =
                     vec![SegmentIndexEntry { offset: 0, length: 2048, blob_key_hash: [0x11; 32] }];
                 sealer
-                    .seal_from_data(id, SizeTier::Standard, data, &entries, 0, 0, 0, None, None)
+                    .seal_from_data(
+                        id,
+                        SizeTier::Standard,
+                        data,
+                        &entries,
+                        0,
+                        0,
+                        0,
+                        None,
+                        Some(HashOutput::from_bytes([0xAB; 32])),
+                    )
                     .await
                     .expect("seal must succeed");
             }));
@@ -839,9 +870,8 @@ mod tests {
             flush_thread, test_thread,
             "the batch fsync must run on the blocking pool, not a runtime worker"
         );
-        // Every segment must be readable back from the metadata store.
-        assert_eq!(metadata.list_segments().into_iter().filter_map(Result::ok).count(), 16);
-        // ... and folded Sealed in the lifecycle registry.
+        // Every segment is folded Sealed in the lifecycle registry (the
+        // event log is the only durable segment-state store).
         assert_eq!(lifecycle.registry().len(), 16);
     }
 
@@ -855,19 +885,21 @@ mod tests {
         use oceanfs_core::{SegmentId, SizeTier};
 
         let dir = tempfile::tempdir().unwrap();
-        let metadata = Arc::new(
-            RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
-                data_dir: dir.path().join("meta"),
-                block_cache_size: 1024,
-                memtable_size: 1024,
-                ..Default::default()
-            })
-            .unwrap(),
+        let lifecycle = Arc::new(
+            SegmentLifecycleCoordinator::new(&LifecycleConfig::default()).with_event_wal(Arc::new(
+                crate::segment::event_wal::EventWal::open(
+                    dir.path().join("event-wal"),
+                    &oceanfs_core::EventWalConfig {
+                        event_wal_dir: dir.path().join("event-wal"),
+                        event_wal_file_size_bytes: 1024 * 1024,
+                        event_wal_fsync_batch_timeout_ms: 10,
+                        event_wal_checkpoint_bytes: 1024 * 1024,
+                    },
+                )
+                .await
+                .unwrap(),
+            )),
         );
-        let lifecycle = Arc::new(SegmentLifecycleCoordinator::new(
-            metadata.clone(),
-            &LifecycleConfig::default(),
-        ));
         let wal = Arc::new(
             WalWriter::open(&WalConfig {
                 data_dir: dir.path().join("wal"),
@@ -895,7 +927,17 @@ mod tests {
         let entries =
             vec![SegmentIndexEntry { offset: 0, length: 2048, blob_key_hash: [0x22; 32] }];
         sealer
-            .seal_from_data(id, SizeTier::Standard, data, &entries, 0, 0, 0, None, None)
+            .seal_from_data(
+                id,
+                SizeTier::Standard,
+                data,
+                &entries,
+                0,
+                0,
+                0,
+                None,
+                Some(HashOutput::from_bytes([0xAB; 32])),
+            )
             .await
             .expect("direct-mode seal must succeed");
 
@@ -929,7 +971,17 @@ mod tests {
         const M: u8 = 2;
 
         let _handle = sealer
-            .seal_from_data(id, SizeTier::Standard, data.clone(), &[], K, M, 64, None, None)
+            .seal_from_data(
+                id,
+                SizeTier::Standard,
+                data.clone(),
+                &[],
+                K,
+                M,
+                64,
+                None,
+                Some(HashOutput::from_bytes([0xAB; 32])),
+            )
             .await
             .unwrap();
 
@@ -995,7 +1047,17 @@ mod tests {
         let data = bytes::Bytes::from(vec![0x77u8; 256 * 1024]);
 
         let _handle = sealer
-            .seal_from_data(id, SizeTier::Standard, data, &[], 4, 2, 65536, None, None)
+            .seal_from_data(
+                id,
+                SizeTier::Standard,
+                data,
+                &[],
+                4,
+                2,
+                65536,
+                None,
+                Some(HashOutput::from_bytes([0xAB; 32])),
+            )
             .await
             .unwrap();
 

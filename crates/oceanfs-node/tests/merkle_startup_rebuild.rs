@@ -1,17 +1,18 @@
-//! Integration test: Merkle tree rebuilt from segments CF on startup.
+//! Integration test: Merkle tree rebuilt from the machine on startup.
 //!
-//! Verifies ADR-0018 Decision 1: when a node starts, the incremental Merkle
-//! tree is rebuilt from the authoritative `segments` column family in RocksDB.
-//! No MerkleWal is involved — the tree is pure in-memory, derived state.
+//! Verifies ADR-0025 Decision 3 (superseding ADR-0018 Decision 1): when a
+//! node starts, the incremental Merkle tree is rebuilt from the lifecycle
+//! registry's Sealed entries — the `segments` CF is removed. No MerkleWal
+//! is involved — the tree is pure in-memory, derived state.
 //!
 //! This test exercises the exact code path that `Node::start()` uses:
-//! `IncrementalMerkleTree::rebuild_from_segment_scan(metadata_store, config)`.
+//! `IncrementalMerkleTree::rebuild_from_segment_scan(&lifecycle_registry, config)`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use oceanfs_core::{HashOutput, MetadataConfig, SegmentId, SegmentMetadata, SizeTier};
+use oceanfs_core::{HashOutput, SegmentId, SegmentMetadata, SizeTier};
 use oceanfs_durability::merkle::{IncrementalMerkleTree, MerkleTreeConfig};
-use oceanfs_storage::RocksDbMetadataStore;
+use oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry;
 
 fn make_hash(byte: u8) -> HashOutput {
     let mut bytes = [0u8; 32];
@@ -31,30 +32,31 @@ fn make_sealed_segment(id: SegmentId, merkle_root: HashOutput) -> SegmentMetadat
     }
 }
 
-#[test]
-fn rebuild_tree_from_existing_segments_cf() {
-    let dir = tempfile::tempdir().unwrap();
-    let metadata = RocksDbMetadataStore::open(&MetadataConfig {
-        data_dir: dir.path().join("meta"),
-        block_cache_size: 1024,
-        memtable_size: 1024,
-        ..Default::default()
-    })
-    .unwrap();
+fn make_registry() -> SegmentLifecycleRegistry {
+    SegmentLifecycleRegistry::new(&oceanfs_core::LifecycleConfig::default())
+}
 
-    // Populate the segments CF with 5 sealed segments, each with a unique
-    // Populate with 3 sealed segments with non-zero merkle roots.
+fn seed_sealed(registry: &SegmentLifecycleRegistry, seg: SegmentMetadata) {
+    registry.reserve(seg.segment_id, seg.clone()).unwrap();
+    registry.seal(seg.segment_id, seg).unwrap();
+}
+
+#[test]
+fn rebuild_tree_from_existing_segments() {
+    let registry = make_registry();
+
+    // Populate the machine with 3 sealed segments with non-zero merkle roots.
     let mut expected_segments: Vec<(SegmentId, [u8; 32])> = Vec::new();
     for b in 1..=3u8 {
         let seg_id = SegmentId::new();
         let root = make_hash(b);
-        metadata.put_segment(make_sealed_segment(seg_id, root)).unwrap();
+        seed_sealed(&registry, make_sealed_segment(seg_id, root));
         expected_segments.push((seg_id, *root.as_bytes()));
     }
 
     // Rebuild the tree — this is the same call Node::start() makes.
     let tree =
-        IncrementalMerkleTree::rebuild_from_segment_scan(&metadata, &MerkleTreeConfig::default())
+        IncrementalMerkleTree::rebuild_from_segment_scan(&registry, &MerkleTreeConfig::default())
             .unwrap();
 
     // Every sealed segment with a merkle root must appear in the tree.
@@ -79,14 +81,7 @@ fn rebuild_tree_from_existing_segments_cf() {
 
 #[test]
 fn rebuild_tree_skips_unsealed_segments() {
-    let dir = tempfile::tempdir().unwrap();
-    let metadata = RocksDbMetadataStore::open(&MetadataConfig {
-        data_dir: dir.path().join("meta"),
-        block_cache_size: 1024,
-        memtable_size: 1024,
-        ..Default::default()
-    })
-    .unwrap();
+    let registry = make_registry();
 
     // Unsealed segment — should not appear in the tree.
     let unsealed = SegmentMetadata {
@@ -98,7 +93,7 @@ fn rebuild_tree_skips_unsealed_segments() {
         storage_locations: smallvec::SmallVec::new(),
         sealed_at: None,
     };
-    metadata.put_segment(unsealed).unwrap();
+    registry.reserve(unsealed.segment_id, unsealed).unwrap();
 
     // Sealed but no merkle root — should not appear.
     let sealed_no_root = SegmentMetadata {
@@ -110,10 +105,10 @@ fn rebuild_tree_skips_unsealed_segments() {
         storage_locations: smallvec::SmallVec::new(),
         sealed_at: Some(1700000000000),
     };
-    metadata.put_segment(sealed_no_root).unwrap();
+    seed_sealed(&registry, sealed_no_root);
 
     let tree =
-        IncrementalMerkleTree::rebuild_from_segment_scan(&metadata, &MerkleTreeConfig::default())
+        IncrementalMerkleTree::rebuild_from_segment_scan(&registry, &MerkleTreeConfig::default())
             .unwrap();
 
     assert_eq!(
@@ -125,50 +120,49 @@ fn rebuild_tree_skips_unsealed_segments() {
 
 #[test]
 fn rebuild_tree_with_mixed_segments() {
-    let dir = tempfile::tempdir().unwrap();
-    let metadata = RocksDbMetadataStore::open(&MetadataConfig {
-        data_dir: dir.path().join("meta"),
-        block_cache_size: 1024,
-        memtable_size: 1024,
-        ..Default::default()
-    })
-    .unwrap();
+    let registry = make_registry();
 
     // Mix of sealed + merkle root, sealed + no root, unsealed.
     let good1 = SegmentId::new();
-    metadata.put_segment(make_sealed_segment(good1, make_hash(0x11))).unwrap();
+    seed_sealed(&registry, make_sealed_segment(good1, make_hash(0x11)));
 
     // Sealed with no merkle root (skipped).
-    metadata
-        .put_segment(SegmentMetadata {
-            segment_id: SegmentId::new(),
+    let no_root_id = SegmentId::new();
+    seed_sealed(
+        &registry,
+        SegmentMetadata {
+            segment_id: no_root_id,
             ec_k: 4,
             ec_m: 2,
             size_tier: SizeTier::Standard,
             merkle_root: None,
             storage_locations: smallvec::SmallVec::new(),
             sealed_at: Some(1700000000000),
-        })
-        .unwrap();
+        },
+    );
 
     let good2 = SegmentId::new();
-    metadata.put_segment(make_sealed_segment(good2, make_hash(0x22))).unwrap();
+    seed_sealed(&registry, make_sealed_segment(good2, make_hash(0x22)));
 
     // Unsealed (skipped).
-    metadata
-        .put_segment(SegmentMetadata {
-            segment_id: SegmentId::new(),
-            ec_k: 4,
-            ec_m: 2,
-            size_tier: SizeTier::Standard,
-            merkle_root: Some(make_hash(0x99)),
-            storage_locations: smallvec::SmallVec::new(),
-            sealed_at: None,
-        })
+    let unsealed_id = SegmentId::new();
+    registry
+        .reserve(
+            unsealed_id,
+            SegmentMetadata {
+                segment_id: unsealed_id,
+                ec_k: 4,
+                ec_m: 2,
+                size_tier: SizeTier::Standard,
+                merkle_root: Some(make_hash(0x99)),
+                storage_locations: smallvec::SmallVec::new(),
+                sealed_at: None,
+            },
+        )
         .unwrap();
 
     let tree =
-        IncrementalMerkleTree::rebuild_from_segment_scan(&metadata, &MerkleTreeConfig::default())
+        IncrementalMerkleTree::rebuild_from_segment_scan(&registry, &MerkleTreeConfig::default())
             .unwrap();
 
     // Only the two valid sealed + rooted segments should appear.

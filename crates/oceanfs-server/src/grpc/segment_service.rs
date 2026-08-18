@@ -611,9 +611,7 @@ impl SegmentRpc for SegmentGrpcService {
 mod tests {
     use std::{collections::HashMap, net::SocketAddr};
 
-    use oceanfs_core::{
-        proto::common::SegmentId as ProtoSegmentId, SegmentId, SegmentMetadata, Tombstone,
-    };
+    use oceanfs_core::{proto::common::SegmentId as ProtoSegmentId, SegmentId, Tombstone};
     use oceanfs_durability::SegmentDataStore;
     use oceanfs_storage::{SegmentRpcClient, SegmentRpcServer};
     use oceanfs_storage_api::MetadataStore;
@@ -886,14 +884,6 @@ mod tests {
             Vec::new()
         }
 
-        fn get_segment(&self, _id: SegmentId) -> std::io::Result<Option<SegmentMetadata>> {
-            Ok(None)
-        }
-
-        fn list_segments(&self) -> Vec<std::io::Result<SegmentMetadata>> {
-            Vec::new()
-        }
-
         fn list_tombstones(
             &self,
             _bucket: &BucketId,
@@ -916,14 +906,6 @@ mod tests {
             key: &ObjectKey,
         ) -> std::io::Result<Option<Tombstone>> {
             Ok(self.tombstoned.lock().get(&(bucket.as_str().into(), key.as_str().into())).cloned())
-        }
-
-        fn put_segment(&self, _meta: SegmentMetadata) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn delete_segment(&self, _id: SegmentId) -> std::io::Result<()> {
-            Ok(())
         }
 
         fn put_object(&self, bucket: &BucketId, meta: ObjectMetadata) -> std::io::Result<()> {
@@ -1160,14 +1142,6 @@ mod tests {
             Vec::new()
         }
 
-        fn get_segment(&self, _id: SegmentId) -> std::io::Result<Option<SegmentMetadata>> {
-            Ok(None)
-        }
-
-        fn list_segments(&self) -> Vec<std::io::Result<SegmentMetadata>> {
-            Vec::new()
-        }
-
         fn list_tombstones(
             &self,
             _bucket: &BucketId,
@@ -1181,14 +1155,6 @@ mod tests {
 
         fn has_tombstone(&self, _bucket: &BucketId, _key: &ObjectKey) -> std::io::Result<bool> {
             Ok(false)
-        }
-
-        fn put_segment(&self, _meta: SegmentMetadata) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn delete_segment(&self, _id: SegmentId) -> std::io::Result<()> {
-            Ok(())
         }
 
         fn put_object(&self, _bucket: &BucketId, meta: ObjectMetadata) -> std::io::Result<()> {

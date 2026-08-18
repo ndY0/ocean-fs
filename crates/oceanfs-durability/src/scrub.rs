@@ -290,7 +290,9 @@ pub(crate) struct SegmentPartition {
 /// builds a [`MerkleTree`] over the data, and compares the computed
 /// Merkle root against the stored root in [`SegmentMetadata`].
 pub(crate) struct ScrubWorker {
-    metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
+    /// The lifecycle registry — the machine's `Sealed` entries are the
+    /// scrub set and its metadata carries the anchor (ADR-0025 Decision 3).
+    registry: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry>,
     data_store: Arc<dyn SegmentDataStore>,
     /// Throughput limit in bytes per second (reserved for future rate-limiting).
     #[allow(dead_code)]
@@ -300,11 +302,11 @@ pub(crate) struct ScrubWorker {
 impl ScrubWorker {
     /// Creates a new scrub worker.
     pub(crate) fn new(
-        metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
+        registry: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry>,
         data_store: Arc<dyn SegmentDataStore>,
         throttle_bytes_sec: u64,
     ) -> Self {
-        Self { metadata, data_store, throttle_bytes_sec }
+        Self { registry, data_store, throttle_bytes_sec }
     }
 
     /// Scrubs a single segment: verifies BLAKE3 hashes and Merkle root.
@@ -502,16 +504,13 @@ impl ScrubWorker {
         let mut results = Vec::with_capacity(partition.segment_ids.len());
 
         for seg_id in &partition.segment_ids {
-            match self.metadata.get_segment(*seg_id) {
-                Ok(Some(meta)) => {
-                    let result = self.scrub_segment(&meta);
+            match self.registry.get(*seg_id) {
+                Some(entry) => {
+                    let result = self.scrub_segment(&entry.metadata);
                     results.push(result);
                 }
-                Ok(None) => {
+                None => {
                     tracing::warn!(segment_id = %seg_id, "segment not found during scrub");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, segment_id = %seg_id, "failed to read segment during scrub");
                 }
             }
         }
@@ -704,7 +703,7 @@ impl ScrubCoordinator {
     /// cannot be acquired.
     pub async fn run_cycle(
         &self,
-        metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
+        registry: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry>,
         data_store: Arc<dyn SegmentDataStore>,
     ) -> Result<ScrubReport> {
         use std::time::Instant;
@@ -712,20 +711,20 @@ impl ScrubCoordinator {
         let start_time = Instant::now();
         let mut report = ScrubReport::default();
 
-        // Phase 1: Gather all segment IDs.
+        // Phase 1: Gather all segment IDs from the machine (ADR-0025
+        // Decision 3).
         // Only SEALED segments are scrubbed: unsealed segments (phantom
         // registrations made before their WAL entry, or in-flight active
         // segments) have no `.dat` file on disk yet — attempting to read
         // them would produce false "corrupt" results (the read fails with
         // NotFound, which the worker classifies as a Merkle mismatch).
         // Sealed segments carry a stored Merkle root to verify against.
-        let segments = metadata.list_segments();
-        let segment_ids: Vec<SegmentId> = segments
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .filter(|s| s.is_sealed())
-            .map(|s| s.segment_id)
-            .collect();
+        let mut segment_ids: Vec<SegmentId> = Vec::new();
+        registry.for_each(|id, entry| {
+            if entry.state == oceanfs_storage::segment::lifecycle::SegmentState::Sealed {
+                segment_ids.push(id);
+            }
+        });
 
         report.segments_total = segment_ids.len() as u64;
 
@@ -749,7 +748,7 @@ impl ScrubCoordinator {
 
         let semaphore = Arc::new(Semaphore::new(max_concurrent));
         let worker = Arc::new(ScrubWorker::new(
-            metadata.clone(),
+            registry.clone(),
             data_store,
             self.config.throttle_bytes_sec,
         ));
@@ -848,13 +847,13 @@ impl ScrubCoordinator {
     /// Returns an error if the background task cannot be spawned.
     pub async fn trigger_manual(
         &self,
-        metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
+        registry: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry>,
         data_store: Arc<dyn SegmentDataStore>,
     ) -> Result<()> {
         let config = self.config.clone();
         tokio::spawn(async move {
             let coord = ScrubCoordinator::new(config);
-            match coord.run_cycle(metadata, data_store).await {
+            match coord.run_cycle(registry, data_store).await {
                 Ok(report) => {
                     tracing::info!(
                         total = report.segments_total,
@@ -883,7 +882,7 @@ impl ScrubCoordinator {
     /// graceful shutdown coordination.
     pub async fn start_background(
         self: Arc<Self>,
-        metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
+        registry: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry>,
         data_store: Arc<dyn SegmentDataStore>,
         mut shutdown: tokio::sync::watch::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
@@ -895,7 +894,7 @@ impl ScrubCoordinator {
                         break;
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(self.config.interval_sec)) => {
-                        match self.run_cycle(metadata.clone(), data_store.clone()).await {
+                        match self.run_cycle(registry.clone(), data_store.clone()).await {
                             Ok(report) => {
                                 if report.segments_corrupt > 0 {
                                     tracing::warn!(
@@ -922,21 +921,10 @@ impl ScrubCoordinator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use oceanfs_core::{MetadataConfig, NodeId, SegmentId, SegmentMetadata, SizeTier};
-    use oceanfs_storage::metadata::RocksDbMetadataStore;
+    use oceanfs_core::{NodeId, SegmentId, SegmentMetadata, SizeTier};
 
     use super::*;
     use crate::anti_entropy::InMemorySegmentStore;
-
-    fn test_config() -> MetadataConfig {
-        let dir = tempfile::tempdir().unwrap();
-        MetadataConfig {
-            data_dir: dir.path().to_path_buf(),
-            block_cache_size: 8 * 1024 * 1024,
-            memtable_size: 8 * 1024 * 1024,
-            ..Default::default()
-        }
-    }
 
     /// Creates an in-memory segment data store pre-populated with the given
     /// segment ID → data mapping.
@@ -1074,9 +1062,12 @@ mod tests {
         let seg_id = SegmentId::new();
         let test_data = b"data present but no merkle root stored".to_vec();
 
-        let metadata_store = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         let data_store = segment_store_with_data(vec![(seg_id, test_data.clone())]);
-        let worker = ScrubWorker::new(metadata_store, data_store, 0);
+        let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
             segment_id: seg_id,
@@ -1102,9 +1093,12 @@ mod tests {
         let test_data = b"hello world this is test segment data for scrub verification".to_vec();
         let merkle_root = MerkleTree::build(&test_data, 0).unwrap().root().hash();
 
-        let metadata_store = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         let data_store = segment_store_with_data(vec![(seg_id, test_data.clone())]);
-        let worker = ScrubWorker::new(metadata_store, data_store, 0);
+        let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
             segment_id: seg_id,
@@ -1124,9 +1118,12 @@ mod tests {
 
     #[test]
     fn scrub_worker_empty_partition() {
-        let metadata_store = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         let data_store = segment_store_with_data(vec![]);
-        let worker = ScrubWorker::new(metadata_store, data_store, 0);
+        let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let partition = SegmentPartition { node_id: NodeId::new("test"), segment_ids: Vec::new() };
 
@@ -1151,10 +1148,13 @@ mod tests {
         let correct_root = MerkleTree::build(&original_data, 0).unwrap().root().hash();
         let corrupted_len = corrupted_data.len() as u64;
 
-        let metadata_store = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         // Store the CORRUPTED data (simulating disk corruption)
         let data_store = segment_store_with_data(vec![(seg_id, corrupted_data)]);
-        let worker = ScrubWorker::new(metadata_store, data_store, 0);
+        let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
             segment_id: seg_id,
@@ -1181,10 +1181,13 @@ mod tests {
         // Root from the original data
         let correct_root = MerkleTree::build(&original_data, 0).unwrap().root().hash();
 
-        let metadata_store = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         // Store DIFFERENT data (simulating accidental overwrite)
         let data_store = segment_store_with_data(vec![(seg_id, different_data)]);
-        let worker = ScrubWorker::new(metadata_store, data_store, 0);
+        let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
             segment_id: seg_id,
@@ -1207,9 +1210,12 @@ mod tests {
         let test_data = b"this segment data is correct and verified by scrubbing".to_vec();
         let merkle_root = MerkleTree::build(&test_data, 0).unwrap().root().hash();
 
-        let metadata_store = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         let data_store = segment_store_with_data(vec![(seg_id, test_data.clone())]);
-        let worker = ScrubWorker::new(metadata_store, data_store, 0);
+        let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
             segment_id: seg_id,
@@ -1237,10 +1243,13 @@ mod tests {
         let test_data = b"data that exists in metadata but not in store".to_vec();
         let merkle_root = MerkleTree::build(&test_data, 0).unwrap().root().hash();
 
-        let metadata_store = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         // Empty store — the segment data is NOT present
         let data_store = segment_store_with_data(vec![]);
-        let worker = ScrubWorker::new(metadata_store, data_store, 0);
+        let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
             segment_id: seg_id,
@@ -1264,9 +1273,12 @@ mod tests {
 
     #[test]
     fn scrub_worker_reports_segment_id() {
-        let metadata_store = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         let data_store = segment_store_with_data(vec![]);
-        let worker = ScrubWorker::new(metadata_store, data_store, 0);
+        let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_id = SegmentId::new();
         let seg_meta = SegmentMetadata {
@@ -1290,9 +1302,12 @@ mod tests {
         let large_data = vec![0xCD; 131072];
         let merkle_root = MerkleTree::build(&large_data, 0).unwrap().root().hash();
 
-        let metadata_store = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         let data_store = segment_store_with_data(vec![(seg_id, large_data.clone())]);
-        let worker = ScrubWorker::new(metadata_store, data_store, 0);
+        let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
             segment_id: seg_id,
@@ -1315,17 +1330,23 @@ mod tests {
 
     #[tokio::test]
     async fn run_cycle_empty_store() {
-        let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         let data_store = segment_store_with_data(vec![]);
         let coord = ScrubCoordinator::new(ScrubConfig::default());
-        let report = coord.run_cycle(metadata, data_store).await.unwrap();
+        let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
         assert_eq!(report.segments_total, 0);
         assert_eq!(report.segments_healthy, 0);
     }
 
     #[tokio::test]
     async fn run_cycle_skips_unsealed_phantom_segments() {
-        let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         let mut stored_data = Vec::new();
 
         // One sealed segment with data on disk.
@@ -1333,37 +1354,57 @@ mod tests {
         let sealed_data = vec![0xEF; 1024];
         let merkle_root = MerkleTree::build(&sealed_data, 0).unwrap().root().hash();
         stored_data.push((sealed_id, sealed_data.clone()));
-        metadata
-            .put_segment(SegmentMetadata {
-                segment_id: sealed_id,
-                ec_k: 4,
-                ec_m: 2,
-                size_tier: SizeTier::Standard,
-                merkle_root: Some(merkle_root),
-                storage_locations: smallvec::SmallVec::new(),
-                sealed_at: Some(1700000000000),
-            })
+        registry
+            .reserve(
+                sealed_id,
+                SegmentMetadata {
+                    segment_id: sealed_id,
+                    ec_k: 4,
+                    ec_m: 2,
+                    size_tier: SizeTier::Standard,
+                    merkle_root: Some(merkle_root),
+                    storage_locations: smallvec::SmallVec::new(),
+                    sealed_at: Some(1700000000000),
+                },
+            )
+            .unwrap();
+        registry
+            .seal(
+                sealed_id,
+                SegmentMetadata {
+                    segment_id: sealed_id,
+                    ec_k: 4,
+                    ec_m: 2,
+                    size_tier: SizeTier::Standard,
+                    merkle_root: Some(merkle_root),
+                    storage_locations: smallvec::SmallVec::new(),
+                    sealed_at: Some(1700000000000),
+                },
+            )
             .unwrap();
 
         // One PHANTOM segment: registered (sealed_at: None) but its .dat
         // does not exist yet — the write path registers it before the WAL
         // entry. Scrub must NOT read it (no file) nor count it corrupt.
         let phantom_id = SegmentId::new();
-        metadata
-            .put_segment(SegmentMetadata {
-                segment_id: phantom_id,
-                ec_k: 4,
-                ec_m: 2,
-                size_tier: SizeTier::Standard,
-                merkle_root: None,
-                storage_locations: smallvec::SmallVec::new(),
-                sealed_at: None,
-            })
+        registry
+            .reserve(
+                phantom_id,
+                SegmentMetadata {
+                    segment_id: phantom_id,
+                    ec_k: 4,
+                    ec_m: 2,
+                    size_tier: SizeTier::Standard,
+                    merkle_root: None,
+                    storage_locations: smallvec::SmallVec::new(),
+                    sealed_at: None,
+                },
+            )
             .unwrap();
 
         let data_store = segment_store_with_data(stored_data);
         let coord = ScrubCoordinator::new(ScrubConfig::default());
-        let report = coord.run_cycle(metadata, data_store).await.unwrap();
+        let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
 
         // Only the sealed segment is scrubbed; the phantom is skipped.
         assert_eq!(report.segments_total, 1, "unsealed phantom must not be scrubbed");
@@ -1374,7 +1415,10 @@ mod tests {
 
     #[tokio::test]
     async fn run_cycle_with_healthy_segments() {
-        let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         let mut stored_data = Vec::new();
 
         // Create 3 segments with known data
@@ -1394,12 +1438,13 @@ mod tests {
                 storage_locations: smallvec::SmallVec::new(),
                 sealed_at: Some(1700000000000),
             };
-            metadata.put_segment(seg_meta).unwrap();
+            registry.reserve(seg_id, seg_meta.clone()).unwrap();
+            registry.seal(seg_id, seg_meta).unwrap();
         }
 
         let data_store = segment_store_with_data(stored_data);
         let coord = ScrubCoordinator::new(ScrubConfig::default());
-        let report = coord.run_cycle(metadata, data_store).await.unwrap();
+        let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
 
         assert_eq!(report.segments_total, 3);
         assert_eq!(report.segments_healthy, 3);
@@ -1409,7 +1454,10 @@ mod tests {
 
     #[tokio::test]
     async fn run_cycle_detects_corrupt_segment() {
-        let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
 
         let seg_id = SegmentId::new();
         let correct_data = vec![0xAA; 4096];
@@ -1428,13 +1476,14 @@ mod tests {
             storage_locations: smallvec::SmallVec::new(),
             sealed_at: Some(1700000000000),
         };
-        metadata.put_segment(seg_meta).unwrap();
+        registry.reserve(seg_id, seg_meta.clone()).unwrap();
+        registry.seal(seg_id, seg_meta).unwrap();
 
         // Data store has the CORRUPTED data
         let data_store = segment_store_with_data(vec![(seg_id, corrupted_data)]);
 
         let coord = ScrubCoordinator::new(ScrubConfig::default());
-        let report = coord.run_cycle(metadata, data_store).await.unwrap();
+        let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
 
         assert_eq!(report.segments_total, 1);
         assert_eq!(report.segments_healthy, 0);
@@ -1443,10 +1492,13 @@ mod tests {
 
     #[tokio::test]
     async fn trigger_manual_spawns_and_completes() {
-        let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         let data_store = segment_store_with_data(vec![]);
         let coord = ScrubCoordinator::new(ScrubConfig::default());
-        let result = coord.trigger_manual(metadata, data_store).await;
+        let result = coord.trigger_manual(Arc::clone(&registry), data_store).await;
         assert!(result.is_ok());
         // Give the spawned task a moment to start
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1454,7 +1506,10 @@ mod tests {
 
     #[tokio::test]
     async fn start_background_with_shutdown_signal() {
-        let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         let data_store = segment_store_with_data(vec![]);
         let mut config = ScrubConfig::default();
         config.set_interval_sec(3600); // Long interval so it doesn't fire in test
@@ -1462,7 +1517,7 @@ mod tests {
         let coord = Arc::new(ScrubCoordinator::new(config));
         let (tx, rx) = tokio::sync::watch::channel(());
 
-        let handle = coord.start_background(metadata, data_store, rx).await;
+        let handle = coord.start_background(Arc::clone(&registry), data_store, rx).await;
 
         // Send shutdown signal
         drop(tx);
@@ -1518,9 +1573,12 @@ mod tests {
     fn scrub_segment_empty_data_is_healthy() {
         let seg_id = SegmentId::new();
 
-        let metadata_store = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         let data_store = segment_store_with_data(vec![(seg_id, vec![])]);
-        let worker = ScrubWorker::new(metadata_store, data_store, 0);
+        let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
             segment_id: seg_id,
@@ -1542,9 +1600,12 @@ mod tests {
     // which triggers the Ok(None) branch.
     #[test]
     fn scrub_partition_handles_missing_segment() {
-        let metadata_store = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         let data_store = segment_store_with_data(vec![]);
-        let worker = ScrubWorker::new(metadata_store, data_store, 0);
+        let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         // Create a segment ID that was never stored in metadata
         let missing_id = SegmentId::new();
@@ -1558,7 +1619,10 @@ mod tests {
 
     #[tokio::test]
     async fn start_background_runs_cycle_on_expiry() {
-        let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         let data_store = segment_store_with_data(vec![]);
         let mut config = ScrubConfig::default();
         // Use a very short interval so the cycle fires quickly
@@ -1567,7 +1631,7 @@ mod tests {
         let coord = Arc::new(ScrubCoordinator::new(config));
         let (tx, rx) = tokio::sync::watch::channel(());
 
-        let handle = coord.start_background(metadata, data_store, rx).await;
+        let handle = coord.start_background(Arc::clone(&registry), data_store, rx).await;
 
         // Wait a tiny bit for the cycle to run, then shut down
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1620,7 +1684,10 @@ mod tests {
 
     #[tokio::test]
     async fn run_cycle_with_parallel_nodes_limit() {
-        let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         let mut stored_data = Vec::new();
 
         // Create 4 segments
@@ -1640,7 +1707,8 @@ mod tests {
                 storage_locations: smallvec::SmallVec::new(),
                 sealed_at: Some(1700000000000),
             };
-            metadata.put_segment(seg_meta).unwrap();
+            registry.reserve(seg_id, seg_meta.clone()).unwrap();
+            registry.seal(seg_id, seg_meta).unwrap();
         }
 
         let data_store = segment_store_with_data(stored_data);
@@ -1648,7 +1716,7 @@ mod tests {
         let mut config = ScrubConfig::default();
         config.set_parallel_nodes(2);
         let coord = ScrubCoordinator::new(config);
-        let report = coord.run_cycle(metadata, data_store).await.unwrap();
+        let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
 
         assert_eq!(report.segments_total(), 4);
         assert_eq!(report.segments_healthy(), 4);

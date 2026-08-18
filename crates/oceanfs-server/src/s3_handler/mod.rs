@@ -467,18 +467,6 @@ mod tests {
                 .collect();
             Ok(objs)
         }
-
-        fn put_segment(&self, _meta: oceanfs_core::SegmentMetadata) -> Result<(), MetadataError> {
-            // No-op: mock metadata store doesn't track segments.
-            Ok(())
-        }
-        fn get_segment(
-            &self,
-            _id: oceanfs_core::SegmentId,
-        ) -> Result<Option<oceanfs_core::SegmentMetadata>, MetadataError> {
-            // No-op: mock metadata store doesn't track segments.
-            Ok(None)
-        }
     }
 
     // --- Test helpers ---
@@ -571,7 +559,6 @@ mod tests {
         };
         let lifecycle =
             Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
-                metadata.clone(),
                 &oceanfs_core::LifecycleConfig::default(),
             ));
         let sealer = Arc::new(SegmentSealer::new(seal_config, wal, Arc::clone(&lifecycle)));

@@ -298,6 +298,11 @@ pub(crate) struct AdminState {
     /// Metadata store for scrub verification (storage feature only).
     #[cfg(feature = "storage")]
     pub metadata_store: Option<Arc<dyn oceanfs_storage_api::MetadataStore>>,
+    /// The lifecycle registry — the admin segments report enumerates
+    /// the machine's live entries (ADR-0025 Decision 3).
+    #[cfg(feature = "storage")]
+    pub lifecycle_registry:
+        Option<Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry>>,
     /// Segment data store for scrub (storage feature only).
     #[cfg(feature = "storage")]
     pub data_store: Option<Arc<dyn oceanfs_durability::SegmentDataStore>>,
@@ -341,6 +346,8 @@ impl AdminHandler {
                 #[cfg(feature = "storage")]
                 metadata_store: None,
                 #[cfg(feature = "storage")]
+                lifecycle_registry: None,
+                #[cfg(feature = "storage")]
                 data_store: None,
                 #[cfg(feature = "cache")]
                 object_cache: None,
@@ -372,6 +379,8 @@ impl AdminHandler {
                 #[cfg(feature = "storage")]
                 metadata_store: None,
                 #[cfg(feature = "storage")]
+                lifecycle_registry: None,
+                #[cfg(feature = "storage")]
                 data_store: None,
                 #[cfg(feature = "cache")]
                 object_cache: None,
@@ -400,6 +409,21 @@ impl AdminHandler {
         self.state.scrub_coordinator = Some(coordinator);
         self.state.metadata_store = Some(metadata);
         self.state.data_store = Some(data_store);
+        self
+    }
+
+    /// Wires the segment lifecycle registry for the admin segments
+    /// report.
+    ///
+    /// When configured, `GET /admin/segments` enumerates the machine's
+    /// live entries (ADR-0025 Decision 3 — the `segments` CF is
+    /// removed; the registry is the only segment-state source).
+    #[cfg(feature = "storage")]
+    pub fn with_lifecycle_registry(
+        mut self,
+        registry: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry>,
+    ) -> Self {
+        self.state.lifecycle_registry = Some(registry);
         self
     }
 
@@ -519,22 +543,23 @@ async fn cluster_view(State(state): State<AdminState>) -> impl IntoResponse {
 async fn segment_report(State(state): State<AdminState>) -> impl IntoResponse {
     #[cfg(feature = "storage")]
     {
-        if let Some(ref metadata) = state.metadata_store {
+        if let Some(ref registry) = state.lifecycle_registry {
             let mut total: u64 = 0;
             let mut sealed: u64 = 0;
             let mut unsealed: u64 = 0;
             let mut by_tier: HashMap<SizeTier, u64> = HashMap::new();
 
-            let segments = metadata.list_segments();
-            for seg in segments.into_iter().flatten() {
+            // The machine's live entries are the segment set (ADR-0025
+            // Decision 3 — the `segments` CF is removed).
+            registry.for_each(|_id, entry| {
                 total += 1;
-                if seg.is_sealed() {
+                if entry.state == oceanfs_storage::segment::lifecycle::SegmentState::Sealed {
                     sealed += 1;
                 } else {
                     unsealed += 1;
                 }
-                *by_tier.entry(seg.size_tier).or_insert(0) += 1;
-            }
+                *by_tier.entry(entry.metadata.size_tier).or_insert(0) += 1;
+            });
 
             let report = SegmentReport {
                 total,
@@ -604,9 +629,13 @@ async fn trigger_scrub(State(state): State<AdminState>) -> impl IntoResponse {
             (&state.scrub_coordinator, &state.metadata_store, &state.data_store)
         {
             let coordinator = coordinator.clone();
-            let metadata = metadata.clone();
+            let _metadata = metadata.clone();
             let data_store = data_store.clone();
-            match coordinator.trigger_manual(metadata, data_store).await {
+            let registry = state
+                .lifecycle_registry
+                .clone()
+                .expect("lifecycle registry wired with the scrub trigger");
+            match coordinator.trigger_manual(registry, data_store).await {
                 Ok(()) => {
                     tracing::info!("scrub triggered via admin API");
                     return (StatusCode::ACCEPTED, "Scrub triggered").into_response();

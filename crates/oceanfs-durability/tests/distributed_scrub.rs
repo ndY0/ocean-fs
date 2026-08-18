@@ -7,20 +7,14 @@
 
 use std::sync::Arc;
 
-use oceanfs_core::{MetadataConfig, SegmentId, SegmentMetadata, SizeTier};
+use oceanfs_core::{SegmentId, SegmentMetadata, SizeTier};
 use oceanfs_durability::{
     InMemorySegmentStore, MerkleTree, ScrubConfig, ScrubCoordinator, SegmentDataStore,
 };
-use oceanfs_storage::RocksDbMetadataStore;
+use oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry;
 
-fn test_config() -> MetadataConfig {
-    let dir = tempfile::tempdir().unwrap();
-    MetadataConfig {
-        data_dir: dir.path().to_path_buf(),
-        block_cache_size: 8 * 1024 * 1024,
-        memtable_size: 8 * 1024 * 1024,
-        ..Default::default()
-    }
+fn make_registry() -> Arc<SegmentLifecycleRegistry> {
+    Arc::new(SegmentLifecycleRegistry::new(&oceanfs_core::LifecycleConfig::default()))
 }
 
 fn segment_store_with_data(entries: Vec<(SegmentId, Vec<u8>)>) -> Arc<InMemorySegmentStore> {
@@ -31,19 +25,24 @@ fn segment_store_with_data(entries: Vec<(SegmentId, Vec<u8>)>) -> Arc<InMemorySe
     store
 }
 
+fn seed_sealed(registry: &SegmentLifecycleRegistry, seg: SegmentMetadata) {
+    registry.reserve(seg.segment_id, seg.clone()).unwrap();
+    registry.seal(seg.segment_id, seg).unwrap();
+}
+
 #[tokio::test]
 async fn scrub_cycle_on_empty_store() {
-    let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+    let registry = make_registry();
     let data_store = segment_store_with_data(vec![]);
     let coord = ScrubCoordinator::new(ScrubConfig::default());
-    let report = coord.run_cycle(metadata, data_store).await.unwrap();
+    let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
     assert_eq!(report.segments_total(), 0);
     assert_eq!(report.segments_healthy(), 0);
 }
 
 #[tokio::test]
 async fn scrub_cycle_verifies_healthy_segments() {
-    let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+    let registry = make_registry();
     let mut stored_data = Vec::new();
 
     // Put 3 segments with known data and correct Merkle roots
@@ -63,12 +62,12 @@ async fn scrub_cycle_verifies_healthy_segments() {
             storage_locations: smallvec::SmallVec::new(),
             sealed_at: Some(1700000000000),
         };
-        metadata.put_segment(seg).unwrap();
+        seed_sealed(&registry, seg);
     }
 
     let data_store = segment_store_with_data(stored_data);
     let coord = ScrubCoordinator::new(ScrubConfig::default());
-    let report = coord.run_cycle(metadata, data_store).await.unwrap();
+    let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
     assert_eq!(report.segments_total(), 3);
     assert_eq!(report.segments_healthy(), 3);
     assert_eq!(report.segments_corrupt(), 0);
@@ -78,7 +77,7 @@ async fn scrub_cycle_verifies_healthy_segments() {
 
 #[tokio::test]
 async fn scrub_cycle_detects_corruption() {
-    let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+    let registry = make_registry();
 
     let seg_id = SegmentId::new();
     let correct_data = vec![0x55; 4096];
@@ -96,13 +95,13 @@ async fn scrub_cycle_detects_corruption() {
         storage_locations: smallvec::SmallVec::new(),
         sealed_at: Some(1700000000000),
     };
-    metadata.put_segment(seg).unwrap();
+    seed_sealed(&registry, seg);
 
     // Store the corrupt data
     let data_store = segment_store_with_data(vec![(seg_id, bad_data)]);
 
     let coord = ScrubCoordinator::new(ScrubConfig::default());
-    let report = coord.run_cycle(metadata, data_store).await.unwrap();
+    let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
 
     assert_eq!(report.segments_total(), 1);
     assert_eq!(report.segments_healthy(), 0);
@@ -111,10 +110,10 @@ async fn scrub_cycle_detects_corruption() {
 
 #[tokio::test]
 async fn manual_scrub_trigger_does_not_error() {
-    let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+    let registry = make_registry();
     let data_store = segment_store_with_data(vec![]);
     let coord = ScrubCoordinator::new(ScrubConfig::default());
-    let result = coord.trigger_manual(metadata, data_store).await;
+    let result = coord.trigger_manual(Arc::clone(&registry), data_store).await;
     assert!(result.is_ok());
     // Give the spawned task a moment
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -122,7 +121,7 @@ async fn manual_scrub_trigger_does_not_error() {
 
 #[tokio::test]
 async fn run_cycle_with_missing_data_skips_not_corrupt() {
-    let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+    let registry = make_registry();
 
     let seg_id = SegmentId::new();
     let data = vec![0xBE; 1024];
@@ -138,7 +137,7 @@ async fn run_cycle_with_missing_data_skips_not_corrupt() {
         storage_locations: smallvec::SmallVec::new(),
         sealed_at: Some(1700000000000),
     };
-    metadata.put_segment(seg).unwrap();
+    seed_sealed(&registry, seg);
 
     // Empty data store — data is missing (simulates a seal/GC race where
     // the shard is not yet on disk, or was reclaimed between the metadata
@@ -148,7 +147,7 @@ async fn run_cycle_with_missing_data_skips_not_corrupt() {
     let data_store = segment_store_with_data(vec![]);
 
     let coord = ScrubCoordinator::new(ScrubConfig::default());
-    let report = coord.run_cycle(metadata, data_store).await.unwrap();
+    let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
 
     assert_eq!(report.segments_total(), 1);
     assert_eq!(report.segments_healthy(), 0, "skipped segments are excluded from healthy");

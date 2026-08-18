@@ -10,8 +10,8 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use bytes::Bytes;
 use oceanfs_core::{
     shard, AccelConfig, BucketId, Hlc, HlcClock, Incarnation, MetadataConfig, NodeConfig, NodeId,
-    ObjectKey, ObjectMetadata, PoolConfig, RingConfig, RpcConfig, SegmentId, SegmentMetadata,
-    SegmentSizeConfig, SizeTier, Tombstone, WalConfig,
+    ObjectKey, ObjectMetadata, PoolConfig, RingConfig, RpcConfig, SegmentSizeConfig, SizeTier,
+    Tombstone, WalConfig,
 };
 use oceanfs_durability::{
     GrpcHintDeliveryClient, HintedHandoff, HintedHandoffConfig, HintedHandoffManager,
@@ -73,18 +73,6 @@ impl oceanfs_storage_api::MetadataStore for PrefetchStoreAdapter {
             .collect()
     }
 
-    fn get_segment(&self, id: SegmentId) -> std::io::Result<Option<SegmentMetadata>> {
-        self.store.get_segment(id).map_err(|e| std::io::Error::other(e.to_string()))
-    }
-
-    fn list_segments(&self) -> Vec<std::io::Result<SegmentMetadata>> {
-        self.store
-            .list_segments()
-            .into_iter()
-            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
-            .collect()
-    }
-
     fn list_tombstones(&self, bucket: &BucketId) -> Vec<std::io::Result<(ObjectKey, Tombstone)>> {
         self.store
             .list_tombstones(bucket)
@@ -101,14 +89,6 @@ impl oceanfs_storage_api::MetadataStore for PrefetchStoreAdapter {
         self.store.has_tombstone(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
     }
 
-    fn put_segment(&self, meta: SegmentMetadata) -> std::io::Result<()> {
-        self.store.put_segment(meta).map_err(|e| std::io::Error::other(e.to_string()))
-    }
-
-    fn delete_segment(&self, id: SegmentId) -> std::io::Result<()> {
-        self.store.delete_segment(id).map_err(|e| std::io::Error::other(e.to_string()))
-    }
-
     fn put_object(&self, bucket: &BucketId, meta: ObjectMetadata) -> std::io::Result<()> {
         self.store
             .put_object_in_bucket(bucket, meta)
@@ -119,8 +99,6 @@ impl oceanfs_storage_api::MetadataStore for PrefetchStoreAdapter {
         // Fall back to sequential writes for the adapter.
         for op in ops {
             match op {
-                oceanfs_storage_api::BatchOp::PutSegment(meta) => self.put_segment(meta)?,
-                oceanfs_storage_api::BatchOp::DeleteSegment(id) => self.delete_segment(id)?,
                 oceanfs_storage_api::BatchOp::PutObject(bucket, key, meta) => {
                     // The adapter's put_object writes with the caller's
                     // bucket; replicate that here for the rewritten object.
@@ -447,201 +425,6 @@ pub struct Node {
     wal_writer: Arc<oceanfs_storage::WalWriter>,
 }
 
-/// Legacy CF-driven startup recovery (pre-event-fold): seeds the
-/// registry from the `segments` CF, adopts interrupted seal commits
-/// (`.dat`-without-CF), and replays the data WAL.
-///
-/// Superseded by the machine path (`rebuild_with_data_wal` — the
-/// event fold, ADR-0025 phase 2); kept for unwired-event-WAL
-/// configurations and removed by `startup-rebuild-from-machine`.
-/// The `#[allow(dead_code)]` covers the wired-always production
-/// shape.
-#[allow(dead_code, clippy::too_many_arguments)]
-async fn legacy_cf_driven_recovery(
-    metadata_store: Arc<oceanfs_storage::RocksDbMetadataStore>,
-    wal_config: oceanfs_core::WalConfig,
-    wal_writer: Arc<oceanfs_storage::WalWriter>,
-    segment_pool_small: Arc<oceanfs_storage::SegmentPool>,
-    segment_pool_standard: Arc<oceanfs_storage::SegmentPool>,
-    segment_size: oceanfs_core::SegmentSizeConfig,
-    segment_dir: std::path::PathBuf,
-    lifecycle: Arc<oceanfs_storage::SegmentLifecycleCoordinator>,
-    pool_ec_k: u8,
-    pool_ec_m: u8,
-) -> std::result::Result<(), String> {
-    lifecycle
-        .seed_from_metadata_store()
-        .map_err(|e| format!("failed to seed lifecycle registry from segments CF: {e}"))?;
-    // ---- 6a. Replay WAL from any previous unclean shutdown (C4-storage, D6) ----
-    // Rebuilds in-memory active segments from unsealed WAL entries left
-    // behind by a crash. Occurs before the HTTP server binds.
-    //
-    // Entries for already-sealed segments are skipped: the disk file
-    // is authoritative, and replaying a partial WAL tail (entries
-    // spanning a rotation boundary are truncated) would shadow the
-    // durable file with a corrupt pool copy. Only entries with
-    // `sealed_at` set count as sealed — the write path registers
-    // pre-seal metadata (`sealed_at: None`) for admin visibility,
-    // and those segments' data lives exclusively in the WAL.
-    // Entries for deleted segments are skipped too: GC/orphan-reaper
-    // removed the data intentionally; rebuilding it would resurrect
-    // garbage segments in the pools.
-    let mut finalized: std::collections::HashSet<_> = metadata_store
-        .list_segments()
-        .into_iter()
-        .filter_map(|r| r.ok())
-        .filter(|meta| meta.sealed_at.is_some())
-        .map(|meta| meta.segment_id)
-        .chain(
-            metadata_store
-                .list_deleted_segments()
-                .into_iter()
-                .filter_map(|r| r.ok())
-                .map(|(id, _)| id),
-        )
-        .collect();
-    // Complete interrupted seal commits: a seal can be SIGKILLed
-    // between linking the .dat file and committing its metadata —
-    // the file is durable but the CF has no sealed entry. Recompute
-    // the merkle root over the data section (identical to the
-    // seal's 64 KiB-leaf tree) and register the full sealed
-    // metadata, so the WAL-bridged commit completes at startup.
-    // The replay (CF-driven) then skips these segments; nothing is
-    // traded — adopted segments are root-bearing and verifiable,
-    // exactly as if the seal had finished. Only crash-window
-    // orphans are hashed (a handful per crash), never the whole
-    // directory.
-    if let Ok(entries) = std::fs::read_dir(&segment_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let Some(stem) = name.strip_suffix(".dat") else { continue };
-            let Ok(uuid) = uuid::Uuid::parse_str(stem) else { continue };
-            let segment_id = oceanfs_core::SegmentId::from_uuid_bytes(*uuid.as_bytes());
-            if finalized.contains(&segment_id) {
-                continue; // already sealed or deleted
-            }
-            let Ok(raw) = std::fs::read(entry.path()) else { continue };
-            let Some(header) = oceanfs_storage::SegmentHeader::from_bytes(&raw) else {
-                continue; // not a segment file
-            };
-            let hdr_size = oceanfs_storage::SegmentHeader::header_size(header.version);
-            let data_end = (hdr_size as u64 + header.size) as usize;
-            if data_end > raw.len() {
-                continue; // truncated tail — leave to WAL replay
-            }
-            // Merkle root over the DATA section (the seal's exact
-            // construction). CPU-bound but bounded to orphans.
-            let merkle_root = oceanfs_durability::MerkleTree::build(&raw[hdr_size..data_end], 0)
-                .map(|tree| tree.root().hash());
-            let meta = oceanfs_core::SegmentMetadata {
-                segment_id,
-                ec_k: pool_ec_k,
-                ec_m: pool_ec_m,
-                size_tier: segment_size.classify(header.size),
-                merkle_root,
-                storage_locations: smallvec::SmallVec::new(),
-                sealed_at: Some(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as i64,
-                ),
-            };
-            match metadata_store.put_segment(meta) {
-                Ok(()) => {
-                    finalized.insert(segment_id);
-                    info!(
-                        segment_id = %segment_id,
-                        "adopted interrupted seal commit: durable .dat registered with recomputed merkle root"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        segment_id = %segment_id,
-                        error = %e,
-                        "failed to adopt interrupted seal commit; WAL replay will rebuild it"
-                    );
-                }
-            }
-        }
-    }
-    let replay_summary = oceanfs_storage::wal::replay_wal(
-        &wal_config,
-        &wal_writer,
-        &segment_pool_small,
-        &segment_pool_standard,
-        &segment_size,
-        |segment_id| finalized.contains(&segment_id),
-        &lifecycle,
-    )
-    .await
-    .map_err(|e| format!("WAL replay failed: {e}"))?;
-    // The replayed segments' seals complete asynchronously on the
-    // seal worker (the .dat files appear via the flush's atomic
-    // rename). Reads must NEVER race a partially-written segment
-    // file, so the node waits for every replayed segment's .dat to
-    // be persisted before the server binds.
-    if replay_summary.entries_replayed > 0 {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        for id in &replay_summary.segments_seen {
-            let path = segment_dir.join(format!("{id}.dat"));
-            while !path.exists() {
-                if std::time::Instant::now() > deadline {
-                    warn!(
-                        segment_id = %id,
-                        "replayed segment seal did not persist within 30s; reads may race"
-                    );
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        }
-        info!(
-            replayed = replay_summary.segments_seen.len(),
-            "replayed segment seals persisted; server may bind"
-        );
-    }
-
-    if replay_summary.entries_replayed > 0 {
-        info!(
-            entries = replay_summary.entries_replayed,
-            bytes = replay_summary.bytes_replayed,
-            segments = replay_summary.segments_seen.len(),
-            hlc_wall = replay_summary.max_hlc_wall_time,
-            hlc_logical = replay_summary.max_hlc_logical,
-            "replayed unsealed WAL entries from prior crash; active segments rebuilt"
-        );
-        // Best-effort: remove old WAL files that have been fully replayed.
-        // Failure is logged but does not prevent startup (H8-storage).
-        // keep=1: only the current (truncated) file survives — every
-        // entry was replayed into the pools, so older files are dead
-        // (the seal-aware check may still protect files holding
-        // entries for segments rebuilt-but-not-yet-resealed).
-        // The legacy retention semantics through the closure-based
-        // cleanup API: garbage iff sealed, deleted (entry gone), or
-        // absent; DB errors protect conservatively.
-        let cf_liveness =
-            |id: oceanfs_core::SegmentId, _pos: oceanfs_storage::DataWalPos| match metadata_store
-                .get_segment(id)
-            {
-                Ok(Some(meta)) => meta.sealed_at.is_some(),
-                Ok(None) => true,
-                Err(_) => false,
-            };
-        oceanfs_storage::wal::cleanup_old_wal_files(&wal_config, 1, Some(&cf_liveness)).await;
-        // Markers for segments no longer referenced by any retained
-        // file are garbage — prune them now that the retained-file
-        // scan has effectively been paid for by the replay above.
-        let pruned =
-            oceanfs_storage::wal::prune_deleted_segment_markers(&wal_config, &metadata_store).await;
-        if pruned > 0 {
-            info!(pruned, "pruned stale deleted-segment markers after replay");
-        }
-    }
-    Ok(())
-}
-
 impl Node {
     /// Starts an OceanFS node: wires all subsystems, binds servers,
     /// spawns background tasks, and returns a running [`Node`].
@@ -749,13 +532,11 @@ impl Node {
         let segment_size = SegmentSizeConfig::default();
         let wal_config =
             WalConfig { data_dir: config.data_dir.join("wal"), ..WalConfig::default() };
-        let wal_writer = oceanfs_storage::WalWriter::open(&wal_config)
-            .await
-            .map_err(|e| format!("failed to open WAL writer: {e}"))?
-            // Seal-aware retention: rotation must keep files holding
-            // entries for unsealed segments.
-            .with_metadata(metadata_store.clone());
-        let wal_writer = Arc::new(wal_writer);
+        let wal_writer = Arc::new(
+            oceanfs_storage::WalWriter::open(&wal_config)
+                .await
+                .map_err(|e| format!("failed to open WAL writer: {e}"))?,
+        );
 
         // Per-core segment shards for write concurrency (perf rule §2.5).
         let shard_count =
@@ -880,10 +661,22 @@ impl Node {
         // write becomes a derived mirror performed after the event
         // (dual-read verification surface — the event log is the source
         // of truth for segment lifecycle).
+        // The event WAL dir is composed from `{data_dir}/event-wal`
+        // exactly like every other data path (data WAL at
+        // `{data_dir}/wal`, metadata at `{data_dir}/metadata`): the
+        // crate-level default (`/var/lib/oceanfs/event-wal`) is the
+        // system-layout default, and the node always overrides it with
+        // its own data dir — the same pattern applied to `WalConfig`
+        // above. Without this, any non-root run (dev, e2e, tests)
+        // fails to open the event WAL with permission denied.
+        let event_wal_config = oceanfs_core::EventWalConfig {
+            event_wal_dir: config.data_dir.join("event-wal"),
+            ..config.event_wal.clone()
+        };
         let event_wal = Arc::new(
             oceanfs_storage::EventWal::open(
-                config.event_wal.event_wal_dir.clone(),
-                &config.event_wal,
+                event_wal_config.event_wal_dir.clone(),
+                &event_wal_config,
             )
             .await
             .map_err(|e| format!("failed to open segment event WAL: {e}"))?,
@@ -893,21 +686,20 @@ impl Node {
         // events. Checkpoint files live beside the event WAL files.
         let event_checkpoint = Arc::new(
             oceanfs_storage::EventCheckpoint::open(
-                config.event_wal.event_wal_dir.clone(),
+                event_wal_config.event_wal_dir.clone(),
                 event_wal.clone(),
             )
             .map_err(|e| format!("failed to open event WAL checkpoint manager: {e}"))?,
         );
         let lifecycle = Arc::new(
-            oceanfs_storage::SegmentLifecycleCoordinator::with_registry(
-                metadata_store.clone(),
-                Arc::clone(&lifecycle_registry),
-            )
+            oceanfs_storage::SegmentLifecycleCoordinator::with_registry(Arc::clone(
+                &lifecycle_registry,
+            ))
             // Phase 2: event appends become the durable side-effect;
             // the CF write is demoted to a derived mirror.
             .with_event_wal(event_wal.clone())
             // Checkpoint trigger: threshold-only, off the append path.
-            .with_checkpoint(event_checkpoint.clone(), config.event_wal.clone())
+            .with_checkpoint(event_checkpoint.clone(), event_wal_config.clone())
             // Idle-seal driver: the coordinator owns the idle-seal
             // timer and sweeps both pools (ADR-0025 phase 1). The
             // timeout honors the sealer's seal_timeout_ms.
@@ -951,18 +743,19 @@ impl Node {
         );
 
         // Construct IncrementalMerkleTree for anti-entropy by scanning
-        // the segments column family (ADR-0018 Decision 1).
+        // the machine's Sealed entries — supersedes ADR-0018 Decision
+        // 1's segments-CF scan (ADR-0025 Decision 3).
         let merkle_tree_config = oceanfs_durability::merkle::MerkleTreeConfig::default();
 
         let merkle_tree = {
             Arc::new(
                 oceanfs_durability::merkle::IncrementalMerkleTree::rebuild_from_segment_scan(
-                    metadata_store.as_ref(),
+                    &lifecycle_registry,
                     &merkle_tree_config,
                 )
                 .map_err(|e| {
                     std::io::Error::other(format!(
-                        "failed to rebuild Merkle tree from segment scan: {e}"
+                        "failed to rebuild Merkle tree from the machine scan: {e}"
                     ))
                 })?,
             )
@@ -981,7 +774,7 @@ impl Node {
                 sampling_fraction: config.anti_entropy.sampling_fraction,
             }),
             membership.clone(),
-            metadata_store.clone(),
+            Arc::clone(&lifecycle_registry),
             pool.clone(),
             Arc::new(oceanfs_durability::DiskSegmentStore::new(segment_dir.clone())),
             merkle_tree.clone(),
@@ -1032,7 +825,7 @@ impl Node {
             heal_config,
             heal_queue.clone(),
             heal_decoder,
-            metadata_store.clone(),
+            lifecycle.clone(),
             heal_data_store.clone(),
         )
         .with_timeouts(op_timeouts.clone());
@@ -1438,6 +1231,7 @@ impl Node {
             ring_cache.clone(),
         )
         .with_scrub(scrub_worker.clone(), metadata_store.clone(), heal_data_store.clone())
+        .with_lifecycle_registry(Arc::clone(&lifecycle_registry))
         .with_caches(
             Some(object_cache.clone()),
             Some(metadata_cache.clone()),
@@ -1540,6 +1334,7 @@ impl Node {
         let healing_service = oceanfs_durability::healing_service::HealingGrpcService::new(
             hinted_handoff.clone(),
             metadata_store.clone(),
+            Arc::clone(&lifecycle_registry),
             heal_data_store.clone(),
             hlc_clock.clone(),
         )
@@ -1627,6 +1422,7 @@ impl Node {
         let mut background = Self::spawn_background_tasks(
             gc_worker,
             metadata_store.clone(),
+            Arc::clone(&lifecycle_registry),
             ae_worker,
             scrub_worker,
             reaper,
@@ -1920,6 +1716,7 @@ impl Node {
     fn spawn_background_tasks(
         gc_worker: Arc<oceanfs_durability::GarbageCollector>,
         metadata_store: Arc<oceanfs_storage::RocksDbMetadataStore>,
+        lifecycle_registry: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry>,
         ae_worker: Arc<oceanfs_durability::AntiEntropy>,
         scrub_worker: Arc<oceanfs_durability::ScrubCoordinator>,
         reaper: Arc<oceanfs_durability::OrphanReaper>,
@@ -1929,6 +1726,10 @@ impl Node {
         hinted_handoff_manager: Arc<HintedHandoffManager>,
         config: &oceanfs_core::NodeConfig,
     ) -> BackgroundTasks {
+        // The background tasks hold the registry across 'static spawns.
+        let gc_registry = Arc::clone(&lifecycle_registry);
+        let scrub_registry = Arc::clone(&lifecycle_registry);
+
         // Gossip: Membership drives the gossip protocol internally via
         // Membership::start(). This task holds a cancellation-aware standby
         // so the shutdown sequence can await it cleanly.
@@ -1961,7 +1762,8 @@ impl Node {
                         break;
                     }
                     _ = interval.tick() => {
-                        if let Err(e) = gc_worker.run_cycle(gc_store.clone()).await {
+                        if let Err(e) = gc_worker.run_cycle(gc_store.clone(), &gc_registry).await
+                        {
                             warn!("GC cycle error: {e}");
                         }
                     }
@@ -2014,7 +1816,7 @@ impl Node {
         // Scrub: runs every scrub_interval_sec from config.
         let scrub_cancel = CancellationToken::new();
         let scrub_token = scrub_cancel.clone();
-        let scrub_store = metadata_store.clone();
+        let _scrub_store = metadata_store.clone();
         let scrub_data = data_store;
         let scrub_interval_secs = config.scrub_interval_sec;
         let io_idle = config.background_io_class_idle;
@@ -2034,10 +1836,10 @@ impl Node {
                         break;
                     }
                     _ = interval.tick() => {
-                        match scrub_worker.run_cycle(
-                            scrub_store.clone(),
-                            scrub_data.clone(),
-                        ).await {
+                        match scrub_worker
+                            .run_cycle(Arc::clone(&scrub_registry), scrub_data.clone())
+                            .await
+                        {
                             Ok(report) => {
                                 if report.segments_corrupt() > 0 {
                                     warn!(
@@ -2368,10 +2170,14 @@ mod tests {
         let pool =
             Arc::new(oceanfs_network::ConnectionPool::new(oceanfs_core::RpcConfig::default()));
 
+        let lifecycle_registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         let ae_worker = Arc::new(oceanfs_durability::AntiEntropy::new(
             oceanfs_durability::AntiEntropyConfig::default(),
             membership,
-            metadata_store.clone(),
+            Arc::clone(&lifecycle_registry),
             pool,
             Arc::new(oceanfs_durability::InMemorySegmentStore::new()),
             Arc::new(oceanfs_durability::merkle::IncrementalMerkleTree::new(
@@ -2382,11 +2188,9 @@ mod tests {
         let scrub_worker = Arc::new(oceanfs_durability::ScrubCoordinator::new(scrub_config));
         let reaper_shard_store: Arc<dyn oceanfs_durability::SegmentShardStore> =
             Arc::new(oceanfs_durability::InMemorySegmentShardStore::new(4194304));
-        let lifecycle = Arc::new(oceanfs_storage::SegmentLifecycleCoordinator::new(
-            metadata_store.clone(),
-            &oceanfs_core::LifecycleConfig::default(),
+        let lifecycle = Arc::new(oceanfs_storage::SegmentLifecycleCoordinator::with_registry(
+            Arc::clone(&lifecycle_registry),
         ));
-        lifecycle.seed_from_metadata_store().expect("seed lifecycle registry");
         let reaper = Arc::new(oceanfs_durability::OrphanReaper::new(
             metadata_store.clone(),
             lifecycle,
@@ -2419,11 +2223,14 @@ mod tests {
             Arc::new(oceanfs_durability::InMemorySegmentStore::new());
         let heal_data_store: Arc<dyn oceanfs_durability::SegmentDataStore> =
             Arc::new(oceanfs_durability::InMemorySegmentStore::new());
+        let heal_lifecycle = Arc::new(oceanfs_storage::SegmentLifecycleCoordinator::new(
+            &oceanfs_core::LifecycleConfig::default(),
+        ));
         let heal_worker = oceanfs_durability::HealWorker::new(
             heal_config,
             heal_queue,
             heal_decoder,
-            metadata_store.clone(),
+            heal_lifecycle,
             heal_data_store,
         );
 
@@ -2440,6 +2247,7 @@ mod tests {
         let bg = Node::spawn_background_tasks(
             gc_worker,
             metadata_store.clone(),
+            Arc::clone(&lifecycle_registry),
             ae_worker,
             scrub_worker,
             reaper,
@@ -2989,6 +2797,9 @@ mod tests {
         let healing_svc = HealingGrpcService::new(
             server_handoff.clone(),
             server_meta.clone(),
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            )),
             server_store,
             Arc::new(HlcClock::new()),
         );

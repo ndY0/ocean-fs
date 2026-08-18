@@ -61,15 +61,6 @@ async fn wal_truncation_called_during_seal() {
     assert!(pos_before_seal > 0, "WAL should have data before seal");
 
     // Create a sealer that uses this WAL.
-    let metadata = Arc::new(
-        oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
-            data_dir: dir.path().join("meta"),
-            block_cache_size: 1024,
-            memtable_size: 1024,
-            ..Default::default()
-        })
-        .unwrap(),
-    );
     let seal_config = SealConfig {
         target_size_bytes: 100,
         seal_timeout_ms: 5000,
@@ -78,11 +69,24 @@ async fn wal_truncation_called_during_seal() {
         write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
         ..Default::default()
     };
-    let lifecycle =
-        std::sync::Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
-            metadata,
+    let lifecycle = std::sync::Arc::new(
+        oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
             &oceanfs_core::LifecycleConfig::default(),
-        ));
+        )
+        .with_event_wal(std::sync::Arc::new(
+            oceanfs_storage::segment::event_wal::EventWal::open(
+                dir.path().join("event-wal"),
+                &oceanfs_core::EventWalConfig {
+                    event_wal_dir: dir.path().join("event-wal"),
+                    event_wal_file_size_bytes: 1024 * 1024,
+                    event_wal_fsync_batch_timeout_ms: 10,
+                    event_wal_checkpoint_bytes: 1024 * 1024,
+                },
+            )
+            .await
+            .unwrap(),
+        )),
+    );
     let sealer = SegmentSealer::new(seal_config, wal.clone(), lifecycle.clone());
 
     // Create and fill an active segment.
@@ -101,7 +105,10 @@ async fn wal_truncation_called_during_seal() {
     lifecycle.request_reserve(active.id(), SizeTier::Standard, 0, 0).await.unwrap();
     let entries =
         vec![oceanfs_core::SegmentIndexEntry { offset: 0, length: 120, blob_key_hash: [0xBB; 32] }];
-    let handle = sealer.try_seal(&mut active, 0, &entries).await.unwrap();
+    let handle = sealer
+        .try_seal(&mut active, 0, &entries, Some(oceanfs_core::HashOutput::from_bytes([0xAB; 32])))
+        .await
+        .unwrap();
     assert!(handle.is_some(), "seal should succeed for full segment");
 
     // After seal, the WAL should have been truncated (global_position

@@ -265,10 +265,9 @@ async fn segment_cache_invalidation_allows_re_read() {
 mod write_read_roundtrip {
     use std::sync::Arc;
 
-    use oceanfs_core::{MetadataConfig, SegmentId, SegmentIndexEntry, SizeTier, WalConfig};
+    use oceanfs_core::{SegmentId, SegmentIndexEntry, SizeTier, WalConfig};
     use oceanfs_storage::{
         io::{DiskIo, DiskSegmentReader, IoReadMode, SegmentReader},
-        metadata::RocksDbMetadataStore,
         segment::{
             lifecycle::SegmentLifecycleCoordinator,
             sealer::{SealConfig, SegmentSealer},
@@ -280,16 +279,6 @@ mod write_read_roundtrip {
         dir: &tempfile::TempDir,
         io_mode: IoReadMode,
     ) -> (Arc<SegmentSealer>, Arc<SegmentLifecycleCoordinator>, Arc<DiskSegmentReader>) {
-        let metadata = Arc::new(
-            RocksDbMetadataStore::open(&MetadataConfig {
-                data_dir: dir.path().join("meta"),
-                block_cache_size: 1024,
-                memtable_size: 1024,
-                ..Default::default()
-            })
-            .unwrap(),
-        );
-
         let wal = Arc::new(
             WalWriter::open(&WalConfig {
                 data_dir: dir.path().join("wal"),
@@ -302,11 +291,24 @@ mod write_read_roundtrip {
         );
 
         let segments_dir = dir.path().join("segments");
-        let lifecycle =
-            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
-                metadata,
+        let lifecycle = Arc::new(
+            oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
                 &oceanfs_core::LifecycleConfig::default(),
-            ));
+            )
+            .with_event_wal(Arc::new(
+                oceanfs_storage::segment::event_wal::EventWal::open(
+                    dir.path().join("event-wal"),
+                    &oceanfs_core::EventWalConfig {
+                        event_wal_dir: dir.path().join("event-wal"),
+                        event_wal_file_size_bytes: 1024 * 1024,
+                        event_wal_fsync_batch_timeout_ms: 10,
+                        event_wal_checkpoint_bytes: 1024 * 1024,
+                    },
+                )
+                .await
+                .unwrap(),
+            )),
+        );
         let sealer = Arc::new(SegmentSealer::new(
             SealConfig {
                 target_size_bytes: 65536,
@@ -356,7 +358,7 @@ mod write_read_roundtrip {
                 0,
                 0,
                 None,
-                None,
+                Some(oceanfs_core::HashOutput::from_bytes([0xAB; 32])),
             )
             .await
             .unwrap();
@@ -390,7 +392,7 @@ mod write_read_roundtrip {
                 0,
                 0,
                 None,
-                None,
+                Some(oceanfs_core::HashOutput::from_bytes([0xAB; 32])),
             )
             .await
             .unwrap();

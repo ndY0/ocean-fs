@@ -7,8 +7,11 @@
 //! | CF | Pattern | Bloom Filter | Write Buffer | Compression |
 //! |---|---|---|---|---|
 //! | objects | point lookups (GET/HEAD) | 10 bits/key (~1% FP) | 64 MB | Snappy L0-L1, Zstd L2+ |
-//! | segments | batch writes (seal) | none | 256 MB | Snappy L0-L1, Zstd L2+ |
 //! | deletions | append-mostly | none | 16 MB | Snappy L0-L1, Zstd L2+ |
+//!
+//! The `segments` + `deleted_segments` column families are removed
+//! (ADR-0025 Decision 3): segment lifecycle state lives in the event
+//! log + checkpoint + registry, never in RocksDB.
 //!
 //! The bloom filter on `objects` eliminates ~99% of unnecessary SST probes
 //! for key-not-found queries — the single highest-impact RocksDB tuning for
@@ -23,7 +26,7 @@ use std::{sync::Arc, time::Duration};
 
 use oceanfs_core::{
     BucketId, ChunkRef, Gauge, Hlc, LabelSet, MetadataConfig, MetricRegistrar, ObjectKey,
-    ObjectMetadata, SegmentId, SegmentMetadata, Tombstone,
+    ObjectMetadata, Tombstone,
 };
 use rocksdb::{ColumnFamilyDescriptor, Options, DB};
 
@@ -31,32 +34,6 @@ use crate::{
     error::{Error, Result},
     metadata::cf,
 };
-
-/// A deleted-segment marker: records that a segment's data was
-/// intentionally removed (GC compaction or orphan reaper).
-///
-/// The WAL retention logic reads these markers to distinguish "deleted
-/// (WAL entries are garbage)" from "not yet sealed (WAL entries are the
-/// only durable copy)". Written atomically with the segment's metadata
-/// deletion, so a crash can never leave a deletion untracked. The value
-/// is the deletion timestamp as little-endian `i64` bytes.
-///
-/// Returns the current time in milliseconds since the UNIX epoch.
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
-
-fn encode_deleted_marker(deleted_at_ms: i64) -> Vec<u8> {
-    deleted_at_ms.to_le_bytes().to_vec()
-}
-
-fn decode_deleted_marker(value: &[u8]) -> Option<i64> {
-    let bytes: [u8; 8] = value.try_into().ok()?;
-    Some(i64::from_le_bytes(bytes))
-}
 
 /// RocksDB property gauges exposed for Prometheus / `/admin/metrics`.
 ///
@@ -249,14 +226,6 @@ impl RocksDbMetadataStore {
             config.memtable_size,
         );
 
-        // Segments CF: batch-write pattern → larger write buffer, no bloom needed.
-        let segments_opts = build_cf_opts(
-            &block_cache,
-            config.segments_write_buffer_mb,
-            false,
-            config.memtable_size,
-        );
-
         // Deletions CF: append-mostly, low volume → small write buffer.
         let deletions_opts = build_cf_opts(
             &block_cache,
@@ -264,15 +233,14 @@ impl RocksDbMetadataStore {
             false,
             config.memtable_size,
         );
-        // The deleted-segments marker CF is tiny (one small value per
-        // GC'd segment) — default options suffice.
-        let deleted_segments_opts = build_cf_opts(&block_cache, 1, false, config.memtable_size);
 
+        // RocksDB opens `objects` + `deletions` ONLY (ADR-0025 Decision
+        // 3): the `segments` and `deleted_segments` CFs are removed —
+        // segment lifecycle state lives in the event log + checkpoint +
+        // registry.
         let cf_descriptors = vec![
             ColumnFamilyDescriptor::new(cf::CF_OBJECTS, objects_opts),
-            ColumnFamilyDescriptor::new(cf::CF_SEGMENTS, segments_opts),
             ColumnFamilyDescriptor::new(cf::CF_DELETIONS, deletions_opts),
-            ColumnFamilyDescriptor::new(cf::CF_DELETED_SEGMENTS, deleted_segments_opts),
         ];
 
         let db = DB::open_cf_descriptors(&opts, &config.data_dir, cf_descriptors)
@@ -611,175 +579,6 @@ impl RocksDbMetadataStore {
     }
 
     // ------------------------------------------------------------------
-    // Segment operations
-    // ------------------------------------------------------------------
-
-    /// Stores segment metadata.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the segments column family is not found, serialization
-    /// fails, or the RocksDB write fails.
-    pub fn put_segment(&self, meta: SegmentMetadata) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle(cf::CF_SEGMENTS)
-            .ok_or_else(|| Error::InvalidConfig("segments CF not found".into()))?;
-
-        let key = cf::encode_segment_key(&meta.segment_id);
-        let value = bincode::serialize(&meta).map_err(|e| Error::Io(io_err(e)))?;
-
-        self.db.put_cf(&cf, key, value).map_err(|e| Error::Io(io_err(e)))?;
-
-        Ok(())
-    }
-
-    /// Retrieves segment metadata.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the segments column family is not found,
-    /// deserialization fails, or the RocksDB read fails.
-    pub fn get_segment(&self, id: SegmentId) -> Result<Option<SegmentMetadata>> {
-        let cf = self
-            .db
-            .cf_handle(cf::CF_SEGMENTS)
-            .ok_or_else(|| Error::InvalidConfig("segments CF not found".into()))?;
-
-        let key = cf::encode_segment_key(&id);
-
-        match self.db.get_cf(&cf, key) {
-            Ok(Some(value)) => {
-                let meta: SegmentMetadata = bincode::deserialize(&value)
-                    .or_else(|_| serde_json::from_slice(&value))
-                    .map_err(|e| Error::Io(io_err(e)))?;
-                Ok(Some(meta))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(Error::Io(io_err(e))),
-        }
-    }
-
-    /// Lists all segment metadata entries.
-    pub fn list_segments(&self) -> Vec<Result<SegmentMetadata>> {
-        let cf = self.db.cf_handle(cf::CF_SEGMENTS);
-        let Some(cf_handle) = cf else {
-            return vec![];
-        };
-
-        let iter = self.db.iterator_cf(&cf_handle, rocksdb::IteratorMode::Start);
-
-        iter.filter_map(|item| match item {
-            Ok((_key, value)) => match bincode::deserialize::<SegmentMetadata>(&value)
-                .or_else(|_| serde_json::from_slice::<SegmentMetadata>(&value))
-            {
-                Ok(meta) => Some(Ok(meta)),
-                Err(_) => None,
-            },
-            Err(e) => Some(Err(Error::Io(io_err(e)))),
-        })
-        .collect()
-    }
-
-    /// Deletes a segment metadata entry.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the segments column family is not found or
-    /// the RocksDB delete fails.
-    pub fn delete_segment(&self, id: SegmentId) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle(cf::CF_SEGMENTS)
-            .ok_or_else(|| Error::InvalidConfig("segments CF not found".into()))?;
-
-        let key = cf::encode_segment_key(&id);
-
-        // A deleted segment's WAL entries become garbage — record the
-        // deletion atomically with the metadata removal so the WAL
-        // retention logic can sweep the entries instead of protecting
-        // them forever. The marker is written ONLY when the deleted
-        // entry was actually sealed: deleting a pre-seal phantom must
-        // never mark its still-live WAL entries as garbage.
-        let was_sealed =
-            self.get_segment(id).ok().flatten().is_some_and(|meta| meta.sealed_at.is_some());
-
-        let mut batch = rocksdb::WriteBatch::default();
-        batch.delete_cf(&cf, &key);
-        if was_sealed {
-            let marker_cf = self
-                .db
-                .cf_handle(cf::CF_DELETED_SEGMENTS)
-                .ok_or_else(|| Error::InvalidConfig("deleted_segments CF not found".into()))?;
-            let value = encode_deleted_marker(now_ms());
-            batch.put_cf(&marker_cf, &key, value);
-        }
-        self.db.write(batch).map_err(|e| Error::Io(io_err(e)))?;
-
-        Ok(())
-    }
-
-    /// Records a deleted-segment marker.
-    ///
-    /// Idempotent: re-marking an already-marked segment overwrites the
-    /// timestamp. The marker tells the WAL retention logic that the
-    /// segment's WAL entries are garbage and may be swept.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the deleted_segments column family is not
-    /// found or the RocksDB write fails.
-    pub fn put_deleted_segment(&self, id: SegmentId, deleted_at_ms: i64) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle(cf::CF_DELETED_SEGMENTS)
-            .ok_or_else(|| Error::InvalidConfig("deleted_segments CF not found".into()))?;
-        let key = cf::encode_segment_key(&id);
-        let value = encode_deleted_marker(deleted_at_ms);
-        self.db.put_cf(&cf, key, value).map_err(|e| Error::Io(io_err(e)))?;
-        Ok(())
-    }
-
-    /// Lists all deleted-segment markers as `(segment_id, deleted_at_ms)`.
-    ///
-    /// Used by the WAL retention logic to exempt deleted segments' WAL
-    /// entries from protection.
-    pub fn list_deleted_segments(&self) -> Vec<Result<(SegmentId, i64)>> {
-        let cf = self.db.cf_handle(cf::CF_DELETED_SEGMENTS);
-        let Some(cf_handle) = cf else {
-            return vec![];
-        };
-        let iter = self.db.iterator_cf(&cf_handle, rocksdb::IteratorMode::Start);
-        iter.filter_map(|item| match item {
-            Ok((key, value)) => {
-                let id = match cf::decode_segment_key(&key) {
-                    Some(id) => id,
-                    None => return None,
-                };
-                decode_deleted_marker(&value).map(|deleted_at_ms| Ok((id, deleted_at_ms)))
-            }
-            Err(e) => Some(Err(Error::Io(io_err(e)))),
-        })
-        .collect()
-    }
-
-    /// Removes a deleted-segment marker (used by the WAL marker prune).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the deleted_segments column family is not
-    /// found or the RocksDB delete fails.
-    pub fn delete_deleted_segment(&self, id: SegmentId) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle(cf::CF_DELETED_SEGMENTS)
-            .ok_or_else(|| Error::InvalidConfig("deleted_segments CF not found".into()))?;
-        let key = cf::encode_segment_key(&id);
-        self.db.delete_cf(&cf, key).map_err(|e| Error::Io(io_err(e)))?;
-        Ok(())
-    }
-
-    // ------------------------------------------------------------------
     // Tombstone operations
     // ------------------------------------------------------------------
 
@@ -1063,40 +862,6 @@ impl RocksDbMetadataStore {
                     let v = bincode::serialize(tombstone).map_err(|e| Error::Io(io_err(e)))?;
                     batch.put_cf(&cf, k, v);
                 }
-                BatchOp::PutSegment(meta) => {
-                    let cf = self
-                        .db
-                        .cf_handle(cf::CF_SEGMENTS)
-                        .ok_or_else(|| Error::InvalidConfig("segments CF not found".into()))?;
-                    let k = cf::encode_segment_key(&meta.segment_id);
-                    let v = bincode::serialize(meta).map_err(|e| Error::Io(io_err(e)))?;
-                    batch.put_cf(&cf, k, v);
-                }
-                BatchOp::DeleteSegment(segment_id) => {
-                    let cf = self
-                        .db
-                        .cf_handle(cf::CF_SEGMENTS)
-                        .ok_or_else(|| Error::InvalidConfig("segments CF not found".into()))?;
-                    let k = cf::encode_segment_key(segment_id);
-                    batch.delete_cf(&cf, &k);
-                    // Record the deletion marker in the SAME batch so it
-                    // is atomic with the metadata removal. Only sealed
-                    // segments' entries become garbage — deleting a
-                    // pre-seal phantom must keep its WAL entries live.
-                    let was_sealed = self
-                        .get_segment(*segment_id)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|meta| meta.sealed_at.is_some());
-                    if was_sealed {
-                        let marker_cf =
-                            self.db.cf_handle(cf::CF_DELETED_SEGMENTS).ok_or_else(|| {
-                                Error::InvalidConfig("deleted_segments CF not found".into())
-                            })?;
-                        let v = encode_deleted_marker(now_ms());
-                        batch.put_cf(&marker_cf, &k, v);
-                    }
-                }
                 BatchOp::DeleteTombstone(bucket, key) => {
                     let cf = self
                         .db
@@ -1274,7 +1039,7 @@ fn property_u64(db: &DB, name: &str) -> Option<u64> {
 fn property_u64_cf_sum(db: &DB, name: &str) -> Option<u64> {
     let mut total = 0u64;
     let mut found = false;
-    for cf_name in [cf::CF_OBJECTS, cf::CF_SEGMENTS, cf::CF_DELETIONS] {
+    for cf_name in [cf::CF_OBJECTS, cf::CF_DELETIONS] {
         if let Some(cf) = db.cf_handle(cf_name) {
             if let Some(v) = db.property_int_value_cf(&cf, name).ok().flatten() {
                 total = total.saturating_add(v);
@@ -1338,10 +1103,6 @@ pub enum BatchOp {
     DeleteObject(BucketId, ObjectKey),
     /// Put a tombstone.
     PutTombstone(BucketId, ObjectKey, Tombstone),
-    /// Put a segment metadata entry.
-    PutSegment(SegmentMetadata),
-    /// Delete a segment metadata entry.
-    DeleteSegment(SegmentId),
     /// Delete a tombstone entry.
     DeleteTombstone(BucketId, ObjectKey),
 }
@@ -1425,24 +1186,6 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
             .collect()
     }
 
-    fn get_segment(&self, id: SegmentId) -> std::io::Result<Option<SegmentMetadata>> {
-        self.get_segment(id).map_err(|e| std::io::Error::other(e.to_string()))
-    }
-
-    fn list_segments(&self) -> Vec<std::io::Result<SegmentMetadata>> {
-        self.list_segments()
-            .into_iter()
-            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
-            .collect()
-    }
-
-    fn list_deleted_segments(&self) -> Vec<std::io::Result<(SegmentId, i64)>> {
-        self.list_deleted_segments()
-            .into_iter()
-            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
-            .collect()
-    }
-
     fn list_tombstones(&self, bucket: &BucketId) -> Vec<std::io::Result<(ObjectKey, Tombstone)>> {
         self.list_tombstones(bucket)
             .into_iter()
@@ -1473,14 +1216,6 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
         self.get_tombstone(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
     }
 
-    fn put_segment(&self, meta: SegmentMetadata) -> std::io::Result<()> {
-        self.put_segment(meta).map_err(|e| std::io::Error::other(e.to_string()))
-    }
-
-    fn delete_segment(&self, id: SegmentId) -> std::io::Result<()> {
-        self.delete_segment(id).map_err(|e| std::io::Error::other(e.to_string()))
-    }
-
     fn put_object(&self, bucket: &BucketId, meta: ObjectMetadata) -> std::io::Result<()> {
         self.put_object_in_bucket(bucket, meta).map_err(|e| std::io::Error::other(e.to_string()))
     }
@@ -1502,12 +1237,6 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
                 oceanfs_storage_api::BatchOp::PutTombstone(bucket, key, tombstone) => {
                     crate::metadata::store::BatchOp::PutTombstone(bucket, key, tombstone)
                 }
-                oceanfs_storage_api::BatchOp::PutSegment(meta) => {
-                    crate::metadata::store::BatchOp::PutSegment(meta)
-                }
-                oceanfs_storage_api::BatchOp::DeleteSegment(id) => {
-                    crate::metadata::store::BatchOp::DeleteSegment(id)
-                }
                 oceanfs_storage_api::BatchOp::DeleteTombstone(bucket, key) => {
                     crate::metadata::store::BatchOp::DeleteTombstone(bucket, key)
                 }
@@ -1520,7 +1249,7 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use oceanfs_core::{HashOutput, Hlc, SizeTier};
+    use oceanfs_core::{HashOutput, Hlc};
 
     use super::*;
 
@@ -1667,118 +1396,6 @@ mod tests {
         let results = store.list_objects(&BucketId::new("default"), "a/");
         let results: Vec<_> = results.into_iter().collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(results.len(), 2);
-    }
-
-    #[test]
-    fn put_and_get_segment_roundtrip() {
-        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
-        let meta = SegmentMetadata {
-            segment_id: SegmentId::new(),
-            ec_k: 4,
-            ec_m: 2,
-            size_tier: SizeTier::Standard,
-            merkle_root: None,
-            storage_locations: smallvec::SmallVec::new(),
-            sealed_at: Some(1700000000000),
-        };
-        store.put_segment(meta.clone()).unwrap();
-
-        let got = store.get_segment(meta.segment_id).unwrap().unwrap();
-        assert_eq!(got.ec_k, 4);
-        assert_eq!(got.ec_m, 2);
-        assert!(got.is_sealed());
-    }
-
-    // ── Deleted-segment markers (WAL retention) ─────
-
-    #[test]
-    fn delete_sealed_segment_writes_marker() {
-        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
-        let id = SegmentId::new();
-        store
-            .put_segment(SegmentMetadata {
-                segment_id: id,
-                ec_k: 1,
-                ec_m: 0,
-                size_tier: SizeTier::Small,
-                merkle_root: None,
-                storage_locations: smallvec::SmallVec::new(),
-                sealed_at: Some(1_000_000_000_000),
-            })
-            .unwrap();
-
-        store.delete_segment(id).unwrap();
-
-        // The metadata is gone and the deletion is recorded.
-        assert!(store.get_segment(id).unwrap().is_none());
-        let markers: Vec<_> =
-            store.list_deleted_segments().into_iter().map(|r| r.unwrap()).collect();
-        assert_eq!(markers.len(), 1, "sealed deletion must leave a marker");
-        let (marker_id, deleted_at_ms) = markers[0];
-        assert_eq!(marker_id, id);
-        assert!(deleted_at_ms > 0, "marker must carry a timestamp");
-    }
-
-    #[test]
-    fn delete_unsealed_phantom_writes_no_marker() {
-        // Deleting a pre-seal phantom must NOT mark its WAL entries as
-        // garbage — the data is still only in the WAL.
-        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
-        let id = SegmentId::new();
-        store
-            .put_segment(SegmentMetadata {
-                segment_id: id,
-                ec_k: 1,
-                ec_m: 0,
-                size_tier: SizeTier::Small,
-                merkle_root: None,
-                storage_locations: smallvec::SmallVec::new(),
-                sealed_at: None,
-            })
-            .unwrap();
-
-        store.delete_segment(id).unwrap();
-        assert!(
-            store.list_deleted_segments().into_iter().all(|r| r.is_err()),
-            "phantom deletion must leave no marker"
-        );
-    }
-
-    #[test]
-    fn batch_delete_segment_writes_marker() {
-        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
-        let id = SegmentId::new();
-        store
-            .put_segment(SegmentMetadata {
-                segment_id: id,
-                ec_k: 1,
-                ec_m: 0,
-                size_tier: SizeTier::Small,
-                merkle_root: None,
-                storage_locations: smallvec::SmallVec::new(),
-                sealed_at: Some(1_000_000_000_000),
-            })
-            .unwrap();
-
-        store.batch_write(vec![BatchOp::DeleteSegment(id)]).unwrap();
-
-        let markers: Vec<_> =
-            store.list_deleted_segments().into_iter().map(|r| r.unwrap()).collect();
-        assert_eq!(markers.len(), 1, "batched sealed deletion must leave a marker");
-        assert_eq!(markers[0].0, id);
-    }
-
-    #[test]
-    fn marker_roundtrip_via_put_and_delete_deleted_segment() {
-        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
-        let id = SegmentId::new();
-        store.put_deleted_segment(id, 42).unwrap();
-        let markers: Vec<_> =
-            store.list_deleted_segments().into_iter().map(|r| r.unwrap()).collect();
-        assert_eq!(markers, vec![(id, 42)]);
-
-        store.delete_deleted_segment(id).unwrap();
-        assert!(store.list_deleted_segments().into_iter().all(|r| r.is_err()));
     }
 
     #[test]

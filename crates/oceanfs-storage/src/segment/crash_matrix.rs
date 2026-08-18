@@ -21,13 +21,12 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use oceanfs_core::{
-    EventWalConfig, HashOutput, LifecycleConfig, MetadataConfig, PoolConfig, SegmentId,
-    SegmentMetadata, SegmentSizeConfig, SizeTier, WalConfig,
+    EventWalConfig, HashOutput, LifecycleConfig, PoolConfig, SegmentId, SegmentMetadata,
+    SegmentSizeConfig, SizeTier, WalConfig,
 };
 
 use crate::{
     buffer_pool::BufferPool,
-    metadata::RocksDbMetadataStore,
     segment::{
         event_checkpoint::EventCheckpoint,
         event_wal::{EventWal, EventWalPos, SegmentEvent},
@@ -93,7 +92,6 @@ fn spawn_seal_worker(
 /// wal, data wal, pools, coordinator (event-wal arm + idle-seal pools),
 /// sealer, and the mini seal worker.
 struct Harness {
-    store: Arc<RocksDbMetadataStore>,
     event_wal: Arc<EventWal>,
     checkpoint: Option<Arc<EventCheckpoint>>,
     data_wal: Arc<WalWriter>,
@@ -121,15 +119,6 @@ impl Harness {
     /// checkpoint), data wal, pools, coordinator (event-wal arm +
     /// idle-seal pools), sealer, and the mini seal worker.
     async fn boot_with(dir: &std::path::Path, checkpoint_threshold: Option<u64>) -> Harness {
-        let store = Arc::new(
-            RocksDbMetadataStore::open(&MetadataConfig {
-                data_dir: dir.join("meta"),
-                block_cache_size: 1024,
-                memtable_size: 1024,
-                ..Default::default()
-            })
-            .unwrap(),
-        );
         let event_wal_config = EventWalConfig {
             event_wal_dir: dir.join("event-wal"),
             event_wal_file_size_bytes: 1024 * 1024,
@@ -183,8 +172,8 @@ impl Harness {
             )
             .unwrap(),
         );
-        let mut builder = SegmentLifecycleCoordinator::with_registry(store.clone(), registry)
-            .with_event_wal(event_wal.clone());
+        let mut builder =
+            SegmentLifecycleCoordinator::with_registry(registry).with_event_wal(event_wal.clone());
         if let Some(checkpoint) = &checkpoint {
             builder = builder.with_checkpoint(checkpoint.clone(), event_wal_config);
         }
@@ -198,7 +187,6 @@ impl Harness {
         let worker = spawn_seal_worker(pool_small, pool_standard, sealer.clone(), root_fn);
 
         Harness {
-            store,
             event_wal,
             checkpoint,
             data_wal,
@@ -690,9 +678,8 @@ async fn checkpoint_full_cycle_threshold_trigger_and_restart() {
     // inside the recovery pass, using data_wal_pos from the snapshot).
     assert_eq!(outcome.swept_entries, 1, "the sealed segment's entry is swept post-checkpoint");
     assert!(h.event_wal.bytes_since(covered) <= 128, "replay bound holds after restart");
-    // Dual-read: the CF mirror matches (verify_and_repair ran inside).
-    let cf = h.store.get_segment(sealed_id).unwrap().expect("mirror entry present");
-    assert!(cf.sealed_at.is_some(), "CF mirror reflects the sealed fold");
+    // The event log is the only durable writer (ADR-0025 Decision 3
+    // final form — no CF mirror exists to compare).
 }
 
 #[tokio::test]
@@ -913,9 +900,7 @@ async fn fold_is_deterministic_and_reproduces_the_mirror() {
     assert_eq!(a.metadata.merkle_root, b.metadata.merkle_root);
     assert_eq!(a.data_wal_pos, b.data_wal_pos);
 
-    // Dual-read: after recovery the CF mirror matches the fold.
-    let cf = h2.store.get_segment(id).unwrap().expect("mirror entry present");
-    assert!(cf.sealed_at.is_some(), "CF mirror reflects the sealed fold");
+    // The event log is the only durable writer (no CF mirror).
 }
 
 // ---------------------------------------------------------------------------

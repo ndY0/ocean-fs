@@ -68,6 +68,7 @@ struct Harness {
     store: Arc<RocksDbMetadataStore>,
     event_wal: Arc<EventWal>,
     data_wal: Arc<WalWriter>,
+    registry: Arc<SegmentLifecycleRegistry>,
     lifecycle: Arc<SegmentLifecycleCoordinator>,
     sealer: Arc<SegmentSealer>,
     data_store: Arc<DiskSegmentStore>,
@@ -110,7 +111,7 @@ impl Harness {
 
         let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
         let lifecycle = Arc::new(
-            SegmentLifecycleCoordinator::with_registry(store.clone(), registry)
+            SegmentLifecycleCoordinator::with_registry(Arc::clone(&registry))
                 .with_event_wal(event_wal.clone()),
         );
         let segments_dir = dir.join("segments");
@@ -133,6 +134,7 @@ impl Harness {
             store,
             event_wal,
             data_wal,
+            registry,
             lifecycle,
             sealer,
             data_store,
@@ -648,22 +650,15 @@ async fn repacked_compressed_chunk_reads_back_with_matching_digest() {
     let start = chunk.offset as usize;
     let end = start + chunk.length as usize;
     assert!(end <= new_data.len(), "chunk fits in the new segment's data section");
-    // The AE anchor: the machine's Sealed entry carries the same root
-    // the (phase-2) CF mirror holds — scrub/AE read the machine's root
-    // and it equals the repacked seal-time root.
+    // The AE anchor: the machine's Sealed entry carries the repacked
+    // seal-time root — scrub/AE read the machine's root (ADR-0025
+    // Decision 3; there is no CF mirror anymore).
     let entry = h2.entry(chunk.segment_id);
     assert_eq!(
         entry.metadata.merkle_root,
         root_fn(new_data.as_ref()),
         "the machine's Sealed entry carries the seal-time root"
     );
-    let cf_root = h2
-        .store
-        .get_segment(chunk.segment_id)
-        .unwrap()
-        .expect("phase-2 mirror entry present")
-        .merkle_root;
-    assert_eq!(cf_root, entry.metadata.merkle_root, "mirror root matches the machine's");
     let stored = &new_data[start..end];
     assert_eq!(stored, on_disk.as_slice(), "the compressed bytes are copied verbatim");
     let recovered: Vec<u8> = stored.iter().map(|b| b ^ 0xFF).collect();
@@ -717,7 +712,8 @@ async fn post_compaction_segment_scrubs_healthy_against_the_machine_root() {
     assert_ne!(new_id, old_id);
     let entry = h2.entry(new_id);
     assert_eq!(entry.state, oceanfs_storage::segment::lifecycle::SegmentState::Sealed);
-    let scrubber = crate::scrub::ScrubWorker::new(h2.store.clone(), h2.data_store.clone(), 0);
+    let scrubber =
+        crate::scrub::ScrubWorker::new(Arc::clone(&h2.registry), h2.data_store.clone(), 0);
     let result = scrubber.scrub_segment(&entry.metadata);
     assert!(
         result.healthy && !result.merkle_mismatch && !result.skipped,

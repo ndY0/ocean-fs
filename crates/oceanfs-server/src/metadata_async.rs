@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use oceanfs_core::{BucketId, Hlc, ObjectKey, ObjectMetadata, SegmentId, SegmentMetadata};
+use oceanfs_core::{BucketId, Hlc, ObjectKey, ObjectMetadata};
 use tokio::sync::Semaphore;
 
 use crate::metadata_ops::{MetadataError, MetadataOps, Result};
@@ -153,50 +153,6 @@ impl AsyncMetadataOps {
         .map_err(|e| MetadataError::Internal(format!("metadata task failed: {e}")))?
     }
 
-    /// Stores segment metadata.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the metadata store is unavailable.
-    pub async fn put_segment(&self, meta: SegmentMetadata) -> Result<()> {
-        let permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| MetadataError::Internal("metadata semaphore closed".into()))?;
-        let inner = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            inner.put_segment(meta)
-        })
-        .await
-        .map_err(|e| MetadataError::Internal(format!("metadata task failed: {e}")))?
-    }
-
-    /// Retrieves segment metadata for a given segment ID.
-    ///
-    /// Returns `Ok(None)` if the segment does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the metadata store is unavailable.
-    pub async fn get_segment(&self, id: SegmentId) -> Result<Option<SegmentMetadata>> {
-        let permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| MetadataError::Internal("metadata semaphore closed".into()))?;
-        let inner = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            inner.get_segment(id)
-        })
-        .await
-        .map_err(|e| MetadataError::Internal(format!("metadata task failed: {e}")))?
-    }
-
     /// Lists objects in a bucket matching the given prefix.
     ///
     /// # Errors
@@ -255,14 +211,6 @@ impl MetadataOps for StorageOpsAdapter {
         self.store.put_object(bucket, meta).map_err(|e| MetadataError::Internal(format!("{e}")))
     }
 
-    fn put_segment(&self, meta: SegmentMetadata) -> Result<()> {
-        self.store.put_segment(meta).map_err(|e| MetadataError::Internal(format!("{e}")))
-    }
-
-    fn get_segment(&self, id: SegmentId) -> Result<Option<SegmentMetadata>> {
-        self.store.get_segment(id).map_err(|e| MetadataError::Internal(format!("{e}")))
-    }
-
     fn list_objects(&self, bucket: &BucketId, prefix: &str) -> Result<Vec<ObjectMetadata>> {
         self.store
             .list_objects(bucket, prefix)
@@ -312,14 +260,6 @@ mod tests {
         fn put_object(&self, _b: &BucketId, _m: ObjectMetadata) -> Result<()> {
             self.record();
             Ok(())
-        }
-        fn put_segment(&self, _m: SegmentMetadata) -> Result<()> {
-            self.record();
-            Ok(())
-        }
-        fn get_segment(&self, _id: SegmentId) -> Result<Option<SegmentMetadata>> {
-            self.record();
-            Ok(None)
         }
         fn list_objects(&self, _b: &BucketId, _p: &str) -> Result<Vec<ObjectMetadata>> {
             self.record();
@@ -437,12 +377,6 @@ mod tests {
             }
             fn put_object(&self, _b: &BucketId, _m: ObjectMetadata) -> Result<()> {
                 Ok(())
-            }
-            fn put_segment(&self, _m: SegmentMetadata) -> Result<()> {
-                Ok(())
-            }
-            fn get_segment(&self, _id: SegmentId) -> Result<Option<SegmentMetadata>> {
-                Ok(None)
             }
             fn list_objects(&self, _b: &BucketId, _p: &str) -> Result<Vec<ObjectMetadata>> {
                 Ok(vec![])

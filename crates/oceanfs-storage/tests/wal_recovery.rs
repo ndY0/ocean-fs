@@ -13,14 +13,13 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use oceanfs_core::{
-    HashOutput, LifecycleConfig, MetadataConfig, PoolConfig, SegmentId, SegmentSizeConfig,
+    HashOutput, LifecycleConfig, PoolConfig, SegmentId, SegmentMetadata, SegmentSizeConfig,
     SizeTier, WalConfig,
 };
 use oceanfs_storage::{
-    metadata::RocksDbMetadataStore,
     segment::lifecycle::{SegmentLifecycleCoordinator, SegmentLifecycleRegistry},
-    wal::{replay_wal, WalEntry, WalReader, WalWriter},
-    BufferPool, SegmentPool,
+    wal::{cleanup_old_wal_files, count_wal_files, replay_wal, WalEntry, WalReader, WalWriter},
+    BufferPool, SealConfig, SegmentPool, SegmentSealer,
 };
 
 fn make_config(dir: &tempfile::TempDir) -> WalConfig {
@@ -32,20 +31,24 @@ fn make_config(dir: &tempfile::TempDir) -> WalConfig {
     }
 }
 
-async fn make_lifecycle() -> (Arc<RocksDbMetadataStore>, Arc<SegmentLifecycleCoordinator>) {
+async fn make_lifecycle() -> Arc<SegmentLifecycleCoordinator> {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(
-        RocksDbMetadataStore::open(&MetadataConfig {
-            data_dir: dir.path().join("meta"),
-            block_cache_size: 1024,
-            memtable_size: 1024,
-            ..Default::default()
-        })
+    let event_wal = Arc::new(
+        oceanfs_storage::segment::event_wal::EventWal::open(
+            dir.path().join("event-wal"),
+            &oceanfs_core::EventWalConfig {
+                event_wal_dir: dir.path().join("event-wal"),
+                event_wal_file_size_bytes: 1024 * 1024,
+                event_wal_fsync_batch_timeout_ms: 10,
+                event_wal_checkpoint_bytes: 1024 * 1024,
+            },
+        )
+        .await
         .unwrap(),
     );
-    let lifecycle =
-        Arc::new(SegmentLifecycleCoordinator::new(store.clone(), &LifecycleConfig::default()));
-    (store, lifecycle)
+    Arc::new(
+        SegmentLifecycleCoordinator::new(&LifecycleConfig::default()).with_event_wal(event_wal),
+    )
 }
 
 fn make_entry(segment_id: SegmentId, offset: u64, length: u32) -> WalEntry {
@@ -271,7 +274,7 @@ async fn replay_wal_recovers_and_truncates() {
 
     // On restart: open writer, replay WAL into pools.
     let wal_writer = WalWriter::open(&config).await.unwrap();
-    let (_store, lifecycle) = make_lifecycle().await;
+    let lifecycle = make_lifecycle().await;
     let summary = replay_wal(
         &config,
         &wal_writer,
@@ -325,7 +328,7 @@ async fn replay_wal_empty_wal_returns_zero_summary() {
     .unwrap();
 
     let wal_writer = WalWriter::open(&config).await.unwrap();
-    let (_store, lifecycle) = make_lifecycle().await;
+    let lifecycle = make_lifecycle().await;
     let summary = replay_wal(
         &config,
         &wal_writer,
@@ -381,7 +384,7 @@ async fn replay_recovers_segment_reserved_before_crash() {
     )
     .unwrap();
 
-    let (store, lifecycle) = make_lifecycle().await;
+    let lifecycle = make_lifecycle().await;
     let seg_id = SegmentId::new();
 
     // The write path contract: reserve BEFORE the first DataEntry.
@@ -410,9 +413,95 @@ async fn replay_recovers_segment_reserved_before_crash() {
     assert_eq!(summary.segments_seen, vec![seg_id]);
 
     // "Segment present": the rebuilt segment is readable from the pool
-    // (the write path's reserve is durable in the CF too).
+    // (the write path's reserve is durable in the event log + registry).
     let chunk = pool_small.try_read(seg_id, 0, 64).expect("recovered segment must be present");
     assert_eq!(&chunk[..], &[0u8; 64], "recovered data must match the WAL entry");
-    let cf = store.get_segment(seg_id).unwrap().expect("reserve phantom durable in the CF");
-    assert!(cf.sealed_at.is_none(), "reserve is the unsealed phantom");
+    let entry = lifecycle.registry().get(seg_id).expect("reserve durable in the registry");
+    assert_eq!(entry.state, oceanfs_storage::segment::lifecycle::SegmentState::Reserved);
+}
+
+// ---------------------------------------------------------------------------
+// Retention: the production write → seal → rotate → sweep loop
+// ---------------------------------------------------------------------------
+
+/// Mirrors the production write path end to end: reserve → data-WAL
+/// append (position recorded) → seal through the coordinator → WAL
+/// rotation → machine-backed sweep. The seal is requested only after
+/// the position record (ADR-0024 §Retention — the write path's caller-
+/// side seal hand-off), so the sweep must prune every file older than
+/// the retention window.
+#[tokio::test]
+async fn retention_sweeps_sealed_segments_with_machine_liveness() {
+    let dir = tempfile::tempdir().unwrap();
+    // Tiny files so a handful of segments forces several rotations.
+    let config = WalConfig {
+        data_dir: dir.path().join("wal"),
+        max_file_size_bytes: 4096,
+        fsync_batch_timeout_ms: 2,
+        ..Default::default()
+    };
+    // The registry is shared: the coordinator folds into it and the
+    // liveness closure reads it (the production wiring).
+    let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+    let event_wal = Arc::new(
+        oceanfs_storage::segment::event_wal::EventWal::open(
+            dir.path().join("event-wal"),
+            &oceanfs_core::EventWalConfig {
+                event_wal_dir: dir.path().join("event-wal"),
+                event_wal_file_size_bytes: 1024 * 1024,
+                event_wal_fsync_batch_timeout_ms: 10,
+                event_wal_checkpoint_bytes: 1024 * 1024,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let lifecycle = Arc::new(
+        SegmentLifecycleCoordinator::with_registry(Arc::clone(&registry)).with_event_wal(event_wal),
+    );
+    let wal_writer = Arc::new(WalWriter::open(&config).await.unwrap());
+    let sealer = Arc::new(SegmentSealer::new(
+        SealConfig {
+            data_dir: dir.path().join("segments"),
+            io_mode: oceanfs_storage::io::IoReadMode::Buffered,
+            write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
+            ..Default::default()
+        },
+        Arc::clone(&wal_writer),
+        Arc::clone(&lifecycle),
+    ));
+
+    // The production liveness closure (node.rs): absent → garbage.
+    let liveness: Arc<dyn Fn(SegmentId, oceanfs_storage::DataWalPos) -> bool + Send + Sync> =
+        Arc::new(move |id, pos| match registry.get(id) {
+            Some(entry) => oceanfs_storage::entry_is_garbage(&entry, &pos),
+            None => true,
+        });
+    wal_writer.set_liveness(Arc::clone(&liveness));
+
+    // The production write path: reserve → WAL append (the position is
+    // recorded by `append_wal_entry`) → seal.
+    for i in 0..60u32 {
+        let seg_id = SegmentId::new();
+        lifecycle.request_reserve(seg_id, SizeTier::Small, 2, 1).await.unwrap();
+        for chunk in 0..3 {
+            sealer.append_wal_entry(make_entry(seg_id, chunk * 64, 64)).await.unwrap();
+        }
+        let meta = SegmentMetadata {
+            segment_id: seg_id,
+            ec_k: 2,
+            ec_m: 1,
+            size_tier: SizeTier::Small,
+            merkle_root: Some(HashOutput::from_bytes([i as u8; 32])),
+            storage_locations: smallvec::SmallVec::new(),
+            sealed_at: Some(1_700_000_000_000),
+        };
+        lifecycle.request_seal(seg_id, meta, None).await.expect("seal must succeed");
+    }
+
+    // Every segment is sealed with a recorded data-WAL position; the
+    // machine-backed sweep must prune all files older than the window.
+    cleanup_old_wal_files(&config, 2, Some(liveness.as_ref())).await;
+    let files = count_wal_files(&config);
+    assert!(files <= 3, "old WAL files must be pruned after sealing; {files} remain");
 }

@@ -59,10 +59,14 @@ async fn durability_components_are_wireable_and_spawnable() {
     });
 
     // Anti-entropy
+    let wiring_registry =
+        Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+            &oceanfs_core::LifecycleConfig::default(),
+        ));
     let _ae_worker = Arc::new(AntiEntropy::new(
         AntiEntropyConfig::default(),
         membership.clone(),
-        metadata_store.clone(),
+        Arc::clone(&wiring_registry),
         pool.clone(),
         Arc::new(InMemorySegmentStore::new()),
         make_test_tree(),
@@ -88,11 +92,9 @@ async fn durability_components_are_wireable_and_spawnable() {
     // Orphan reaper (lifecycle coordinator seeded at startup, as the
     // composition root does)
     let lifecycle =
-        Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
-            metadata_store.clone(),
-            &oceanfs_core::LifecycleConfig::default(),
+        Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::with_registry(
+            Arc::clone(&wiring_registry),
         ));
-    lifecycle.seed_from_metadata_store().expect("seed lifecycle registry");
     let _reaper = Arc::new(OrphanReaper::new(
         metadata_store.clone(),
         lifecycle,
@@ -134,9 +136,13 @@ async fn test_gc_accepts_trait_object() {
     let store: Arc<dyn MetadataStore> =
         Arc::new(RocksDbMetadataStore::open(&metadata_config).expect("open metadata store"));
 
-    // GC accepts Arc<dyn MetadataStore> via coercion.
+    // GC accepts Arc<dyn MetadataStore> via coercion; the machine's
+    // registry is the segment set (ADR-0025 Decision 3).
     let gc = GarbageCollector::new(GcConfig::default());
-    let stats = gc.run_cycle(store).await.expect("GC cycle with trait object");
+    let gc_registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    );
+    let stats = gc.run_cycle(store, &gc_registry).await.expect("GC cycle with trait object");
     assert_eq!(stats.segments_scanned, 0);
     assert_eq!(stats.segments_compacted, 0);
 }
@@ -147,13 +153,18 @@ async fn test_scrub_accepts_trait_object() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let metadata_config =
         MetadataConfig { data_dir: tmp.path().join("metadata"), ..Default::default() };
-    let store: Arc<dyn MetadataStore> =
+    let _store: Arc<dyn MetadataStore> =
         Arc::new(RocksDbMetadataStore::open(&metadata_config).expect("open metadata store"));
 
     let data_store: Arc<dyn oceanfs_durability::SegmentDataStore> =
         Arc::new(InMemorySegmentStore::new());
     let coord = ScrubCoordinator::new(ScrubConfig::default());
-    let report = coord.run_cycle(store, data_store).await.expect("scrub with trait object");
+    let scrub_registry =
+        Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+            &oceanfs_core::LifecycleConfig::default(),
+        ));
+    let report =
+        coord.run_cycle(Arc::clone(&scrub_registry), data_store).await.expect("scrub cycle");
     assert_eq!(report.segments_total(), 0);
 }
 
@@ -163,7 +174,7 @@ async fn test_anti_entropy_accepts_trait_object() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let metadata_config =
         MetadataConfig { data_dir: tmp.path().join("metadata"), ..Default::default() };
-    let store: Arc<dyn MetadataStore> =
+    let _store: Arc<dyn MetadataStore> =
         Arc::new(RocksDbMetadataStore::open(&metadata_config).expect("open metadata store"));
 
     let ring = Ring::new(oceanfs_core::RingConfig::default());
@@ -178,11 +189,13 @@ async fn test_anti_entropy_accepts_trait_object() {
     let data_store: Arc<dyn oceanfs_durability::SegmentDataStore> =
         Arc::new(InMemorySegmentStore::new());
 
-    // AntiEntropy::new accepts Arc<dyn MetadataStore>.
+    // AntiEntropy::new accepts the machine's registry.
     let ae = AntiEntropy::new(
         AntiEntropyConfig::default(),
         membership,
-        store,
+        Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+            &oceanfs_core::LifecycleConfig::default(),
+        )),
         pool,
         data_store,
         make_test_tree(),

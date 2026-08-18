@@ -12,9 +12,7 @@ use oceanfs_cache::{
     MetadataCache, MetadataCacheConfig, NegativeCache, NegativeCacheConfig, ObjectCache,
     ObjectCacheConfig, PrefetchConfig, PrefetchEngine,
 };
-use oceanfs_core::{
-    BucketId, Hlc, ObjectKey, ObjectMetadata, SegmentId, SegmentMetadata, Tombstone,
-};
+use oceanfs_core::{BucketId, Hlc, ObjectKey, ObjectMetadata, Tombstone};
 use oceanfs_storage_api::MetadataStore;
 
 /// A mock metadata store for integration testing.
@@ -54,27 +52,11 @@ impl MetadataStore for MockStore {
         self.entries.iter().map(|(_, _, m)| Ok(m.clone())).collect()
     }
 
-    fn get_segment(&self, _id: SegmentId) -> std::io::Result<Option<SegmentMetadata>> {
-        Ok(None)
-    }
-
-    fn list_segments(&self) -> Vec<std::io::Result<SegmentMetadata>> {
-        vec![]
-    }
-
     fn list_tombstones(&self, _bucket: &BucketId) -> Vec<std::io::Result<(ObjectKey, Tombstone)>> {
         vec![]
     }
 
     fn delete_tombstone(&self, _bucket: &BucketId, _key: &ObjectKey) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn put_segment(&self, _meta: SegmentMetadata) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn delete_segment(&self, _id: SegmentId) -> std::io::Result<()> {
         Ok(())
     }
 

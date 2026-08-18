@@ -109,11 +109,24 @@ async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
         write_mode: oceanfs_storage::io::SegmentWriteMode::Rename,
         ..Default::default()
     };
-    let lifecycle =
-        Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
-            metadata.clone(),
+    let lifecycle = Arc::new(
+        oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
             &oceanfs_core::LifecycleConfig::default(),
-        ));
+        )
+        .with_event_wal(Arc::new(
+            oceanfs_storage::segment::event_wal::EventWal::open(
+                dir.path().join("event-wal"),
+                &oceanfs_core::EventWalConfig {
+                    event_wal_dir: dir.path().join("event-wal"),
+                    event_wal_file_size_bytes: 1024 * 1024,
+                    event_wal_fsync_batch_timeout_ms: 10,
+                    event_wal_checkpoint_bytes: 1024 * 1024,
+                },
+            )
+            .await
+            .unwrap(),
+        )),
+    );
     let sealer = Arc::new(SegmentSealer::new(seal_config, wal, Arc::clone(&lifecycle)));
 
     let (hinted_handoff, hint_config) = {

@@ -11,8 +11,7 @@
 //! - batch atomic writes
 
 use oceanfs_core::{
-    BucketId, ChunkRef, Hlc, MetadataConfig, ObjectKey, ObjectMetadata, SegmentId, SegmentMetadata,
-    SizeTier, Tombstone,
+    BucketId, ChunkRef, Hlc, MetadataConfig, ObjectKey, ObjectMetadata, SegmentId, Tombstone,
 };
 use oceanfs_storage::{BatchOp, RocksDbMetadataStore};
 
@@ -101,46 +100,6 @@ fn delete_object_removes_it() {
 
     // Confirm it is gone.
     assert!(store.get_object(&test_bucket(), &test_key("tmp.dat")).unwrap().is_none());
-}
-
-// ---------------------------------------------------------------------------
-// Segment metadata CRUD
-// ---------------------------------------------------------------------------
-
-#[test]
-fn put_and_get_segment_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = make_store(&dir);
-
-    let seg_id = SegmentId::new();
-    let meta = SegmentMetadata {
-        segment_id: seg_id,
-        ec_k: 4,
-        ec_m: 2,
-        size_tier: SizeTier::Standard,
-        merkle_root: None,
-        storage_locations: smallvec::SmallVec::new(),
-        sealed_at: Some(1_700_000_000_000),
-    };
-
-    store.put_segment(meta).expect("put_segment failed");
-
-    let fetched =
-        store.get_segment(seg_id).expect("get_segment failed").expect("segment not found");
-
-    assert_eq!(fetched.segment_id.as_uuid(), seg_id.as_uuid());
-    assert_eq!(fetched.ec_k, 4);
-    assert_eq!(fetched.ec_m, 2);
-    assert!(fetched.is_sealed());
-}
-
-#[test]
-fn get_nonexistent_segment_returns_none() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = make_store(&dir);
-
-    let result = store.get_segment(SegmentId::new()).unwrap();
-    assert!(result.is_none());
 }
 
 // ---------------------------------------------------------------------------

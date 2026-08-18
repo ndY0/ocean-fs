@@ -1,14 +1,17 @@
-//! Metadata store trait — CRUD operations for object and segment metadata.
+//! Metadata store trait — CRUD operations for object metadata.
 //!
 //! Each crate that provides metadata storage implements this trait so
 //! that caches can rebuild filters and warm entries without depending
 //! on the concrete storage implementation. Durability components (GC,
 //! scrub, heal, anti-entropy) consume this trait to avoid coupling to
 //! RocksDB.
+//!
+//! Segment lifecycle state is NOT part of this trait (ADR-0025
+//! Decision 3): the `segments` CF is removed, and consumers read the
+//! machine (`SegmentLifecycleRegistry`) through the consuming crate's
+//! own boundary.
 
-use oceanfs_core::{
-    BucketId, Hlc, ObjectKey, ObjectMetadata, SegmentId, SegmentMetadata, Tombstone,
-};
+use oceanfs_core::{BucketId, Hlc, ObjectKey, ObjectMetadata, Tombstone};
 
 /// A single batch operation for atomic metadata writes.
 ///
@@ -30,10 +33,6 @@ pub enum BatchOp {
     DeleteObject(BucketId, ObjectKey),
     /// Put a tombstone.
     PutTombstone(BucketId, ObjectKey, Tombstone),
-    /// Put a segment metadata entry.
-    PutSegment(SegmentMetadata),
-    /// Delete a segment metadata entry.
-    DeleteSegment(SegmentId),
     /// Delete a tombstone entry for the given object key.
     DeleteTombstone(BucketId, ObjectKey),
 }
@@ -43,7 +42,7 @@ pub enum BatchOp {
 /// # Examples
 ///
 /// ```
-/// use oceanfs_core::{BucketId, ObjectKey, SegmentId, SegmentMetadata, ObjectMetadata, Tombstone};
+/// use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata, Tombstone};
 /// use oceanfs_storage_api::{MetadataStore, BatchOp};
 /// use std::io;
 ///
@@ -59,22 +58,10 @@ pub enum BatchOp {
 ///     fn list_objects(&self, _bucket: &BucketId, _prefix: &str) -> Vec<io::Result<ObjectMetadata>> {
 ///         vec![]
 ///     }
-///     fn get_segment(&self, _id: SegmentId) -> io::Result<Option<SegmentMetadata>> {
-///         Ok(None)
-///     }
-///     fn list_segments(&self) -> Vec<io::Result<SegmentMetadata>> {
-///         vec![]
-///     }
 ///     fn list_tombstones(&self, _bucket: &BucketId) -> Vec<io::Result<(ObjectKey, Tombstone)>> {
 ///         vec![]
 ///     }
 ///     fn delete_tombstone(&self, _bucket: &BucketId, _key: &ObjectKey) -> io::Result<()> {
-///         Ok(())
-///     }
-///     fn put_segment(&self, _meta: SegmentMetadata) -> io::Result<()> {
-///         Ok(())
-///     }
-///     fn delete_segment(&self, _id: SegmentId) -> io::Result<()> {
 ///         Ok(())
 ///     }
 ///     fn put_object(&self, _bucket: &BucketId, _meta: ObjectMetadata) -> io::Result<()> {
@@ -135,28 +122,6 @@ pub trait MetadataStore: Send + Sync {
     /// The default implementation returns an empty list; stores that
     /// support cross-bucket scans override it.
     fn list_objects_all_with_bucket(&self) -> Vec<std::io::Result<(BucketId, ObjectMetadata)>> {
-        Vec::new()
-    }
-
-    /// Retrieves segment metadata for a given segment ID.
-    ///
-    /// Returns `Ok(None)` if the segment does not exist.
-    fn get_segment(&self, id: SegmentId) -> std::io::Result<Option<SegmentMetadata>>;
-
-    /// Lists all sealed segment metadata.
-    ///
-    /// Each element is a Result. Used by GC, scrub, anti-entropy, and orphan reaper.
-    fn list_segments(&self) -> Vec<std::io::Result<SegmentMetadata>>;
-
-    /// Lists all deleted-segment markers as `(segment_id, deleted_at_ms)`.
-    ///
-    /// A marker records that a segment's data was intentionally removed
-    /// (GC compaction or orphan reaper) — its WAL entries are garbage.
-    /// Used by the WAL retention logic to sweep deleted segments'
-    /// entries instead of protecting them forever. The default
-    /// implementation returns an empty list; stores that track
-    /// deletions override it.
-    fn list_deleted_segments(&self) -> Vec<std::io::Result<(SegmentId, i64)>> {
         Vec::new()
     }
 
@@ -233,16 +198,6 @@ pub trait MetadataStore: Send + Sync {
             .find(|(k, _)| k == key)
             .map(|(_, t)| t))
     }
-
-    /// Stores (or updates) segment metadata.
-    ///
-    /// Used by heal worker to update metadata after repairing a segment.
-    fn put_segment(&self, meta: SegmentMetadata) -> std::io::Result<()>;
-
-    /// Deletes segment metadata for a given segment ID.
-    ///
-    /// Used by orphan reaper and segment compactor.
-    fn delete_segment(&self, id: SegmentId) -> std::io::Result<()>;
 
     /// Stores (or updates) object metadata.
     ///

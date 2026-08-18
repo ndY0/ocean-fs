@@ -28,20 +28,23 @@
 //! EventRecord:
 //!   magic        [4]   = b"EVL\1"
 //!   version      [1]   = 1
-//!   kind         [1]   0=Reserve, 1=Seal, 2=Delete
+//!   kind         [1]   0=Reserve, 1=Seal, 2=Delete, 3=MetadataRefresh
 //!   reserved     [2]   = 0
 //!   payload_len  [4]   LE, payload size
 //!   segment_id   [16]
 //!   payload      [payload_len]   tier(1) + ec_k(1) + ec_m(1) + flags(1)
 //!                                | + merkle_root(32) + data_wal_pos(12)
 //!                                | + [repacked_from(16)] for Seal
+//!                                | merkle_flag(1) + [merkle_root(32)]
+//!                                |   for MetadataRefresh
 //!   crc32        [4]   over all preceding bytes
 //! ```
 //!
 //! Header is 28 bytes (4+1+1+2+4+16); Reserve payload is 4 bytes, Seal
 //! payload 48 bytes (4+32+12) or 64 bytes with the compaction
-//! `repacked_from` marker, Delete payload 0 bytes. `data_wal_pos` is
-//! `file_seq(4, LE) + offset(8, LE)`.
+//! `repacked_from` marker, Delete payload 0 bytes, MetadataRefresh
+//! payload 1 or 33 bytes. `data_wal_pos` is `file_seq(4, LE) +
+//! offset(8, LE)`.
 //!
 //! The Seal payload's flags byte (payload\[3\], was reserved): bit 0 set
 //! means the compaction `repacked_from` segment id follows the position
@@ -94,6 +97,14 @@ pub(crate) const SEAL_FLAG_REPACKED_FROM: u8 = 1;
 /// Payload size of a `DeleteEvent`.
 pub(crate) const DELETE_PAYLOAD_SIZE: usize = 0;
 
+/// Payload size of a `MetadataRefreshEvent` without a root
+/// (merkle_flag(1)).
+pub(crate) const REFRESH_PAYLOAD_SIZE: usize = 1;
+
+/// Extra payload bytes of a `MetadataRefreshEvent` carrying a root
+/// (merkle_root(32)).
+pub(crate) const REFRESH_ROOT_SIZE: usize = 32;
+
 /// Largest possible payload size (the Seal payload with the compaction
 /// marker) — bounds the reader's allocation so a corrupt `payload_len`
 /// can never allocate arbitrarily.
@@ -103,6 +114,7 @@ pub(crate) const MAX_PAYLOAD_SIZE: usize = SEAL_PAYLOAD_SIZE + SEAL_REPACKED_FRO
 pub(crate) const KIND_RESERVE: u8 = 0;
 pub(crate) const KIND_SEAL: u8 = 1;
 pub(crate) const KIND_DELETE: u8 = 2;
+pub(crate) const KIND_METADATA_REFRESH: u8 = 3;
 
 /// Maximum number of waiters per event fsync batch.
 const DEFAULT_EVENT_SYNC_MAX_WAITERS: usize = 64;
@@ -196,6 +208,23 @@ pub struct DeleteEvent {
     pub segment_id: SegmentId,
 }
 
+/// A segment **metadata refresh** — the machine's post-repair anchor
+/// update (ADR-0025 Decision 3: the machine's entry metadata is the
+/// scrub/AE anchor).
+///
+/// Not a lifecycle transition: the state is unchanged (the segment stays
+/// `Sealed`). The refresh replaces the heal worker's post-repair
+/// `put_segment(merkle_root: None)` CF write (the `segments` CF is
+/// removed); the fold swaps the entry's `merkle_root` so the stale
+/// anchor never survives a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataRefreshEvent {
+    /// The segment whose anchor is refreshed.
+    pub segment_id: SegmentId,
+    /// The new anchor: `None` invalidates the root until rebuilt.
+    pub merkle_root: Option<HashOutput>,
+}
+
 /// A segment lifecycle transition — the only record family of the event
 /// log (ADR-0024 Decision 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +236,9 @@ pub enum SegmentEvent {
     Seal(SealEvent),
     /// Segment deleted (replaces the deleted-marker CF write).
     Delete(DeleteEvent),
+    /// Metadata refresh (the post-repair anchor invalidation; no state
+    /// change).
+    MetadataRefresh(MetadataRefreshEvent),
 }
 
 impl SegmentEvent {
@@ -216,6 +248,7 @@ impl SegmentEvent {
             SegmentEvent::Reserve(evt) => evt.segment_id,
             SegmentEvent::Seal(evt) => evt.segment_id,
             SegmentEvent::Delete(evt) => evt.segment_id,
+            SegmentEvent::MetadataRefresh(evt) => evt.segment_id,
         }
     }
 
@@ -251,6 +284,17 @@ impl SegmentEvent {
                 (KIND_SEAL, payload)
             }
             SegmentEvent::Delete(_) => (KIND_DELETE, Vec::new()),
+            SegmentEvent::MetadataRefresh(evt) => {
+                let mut payload = Vec::with_capacity(REFRESH_PAYLOAD_SIZE);
+                match evt.merkle_root {
+                    Some(root) => {
+                        payload.push(1);
+                        payload.extend_from_slice(root.as_bytes());
+                    }
+                    None => payload.push(0),
+                }
+                (KIND_METADATA_REFRESH, payload)
+            }
         };
 
         let segment_id = self.segment_id();
@@ -371,6 +415,20 @@ fn decode_payload(kind: u8, segment_id: SegmentId, payload: &[u8]) -> Option<Seg
         }
         KIND_DELETE if payload.len() == DELETE_PAYLOAD_SIZE => {
             Some(SegmentEvent::Delete(DeleteEvent { segment_id }))
+        }
+        KIND_METADATA_REFRESH if payload.len() == REFRESH_PAYLOAD_SIZE && payload[0] == 0 => {
+            Some(SegmentEvent::MetadataRefresh(MetadataRefreshEvent {
+                segment_id,
+                merkle_root: None,
+            }))
+        }
+        KIND_METADATA_REFRESH
+            if payload.len() == REFRESH_PAYLOAD_SIZE + REFRESH_ROOT_SIZE && payload[0] == 1 =>
+        {
+            Some(SegmentEvent::MetadataRefresh(MetadataRefreshEvent {
+                segment_id,
+                merkle_root: Some(HashOutput::from_bytes(payload[1..33].try_into().ok()?)),
+            }))
         }
         _ => None,
     }
@@ -1292,6 +1350,13 @@ mod tests {
         SegmentEvent::Delete(DeleteEvent { segment_id: id })
     }
 
+    fn refresh_event(id: SegmentId) -> SegmentEvent {
+        SegmentEvent::MetadataRefresh(MetadataRefreshEvent {
+            segment_id: id,
+            merkle_root: Some(HashOutput::from_bytes([0xCD; 32])),
+        })
+    }
+
     async fn open_wal(dir: &Path) -> EventWal {
         EventWal::open(dir.to_path_buf(), &test_config(dir)).await.unwrap()
     }
@@ -1303,7 +1368,7 @@ mod tests {
     #[test]
     fn record_roundtrip_is_byte_exact() {
         let id = SegmentId::new();
-        for evt in [reserve_event(id), seal_event(id), delete_event(id)] {
+        for evt in [reserve_event(id), seal_event(id), delete_event(id), refresh_event(id)] {
             let bytes = evt.to_record_bytes();
             let decoded = SegmentEvent::from_record_bytes(&bytes).expect("record decodes");
             assert_eq!(decoded, evt, "record must round-trip byte-exact");
@@ -1321,6 +1386,28 @@ mod tests {
             delete_event(SegmentId::new()).to_record_bytes().len() as u64,
             DELETE_RECORD_SIZE
         );
+        // MetadataRefresh with a root: 28 header + 1 + 32 + 4 crc = 65.
+        assert_eq!(
+            refresh_event(SegmentId::new()).to_record_bytes().len(),
+            EVENT_RECORD_HEADER_SIZE + REFRESH_PAYLOAD_SIZE + REFRESH_ROOT_SIZE + 4
+        );
+    }
+
+    #[test]
+    fn metadata_refresh_roundtrip_preserves_the_anchor() {
+        let id = SegmentId::new();
+        let with_root = refresh_event(id);
+        let decoded =
+            SegmentEvent::from_record_bytes(&with_root.to_record_bytes()).expect("record decodes");
+        assert_eq!(decoded, with_root);
+        // The invalidating form (merkle_root: None) round-trips too.
+        let invalidate = SegmentEvent::MetadataRefresh(MetadataRefreshEvent {
+            segment_id: id,
+            merkle_root: None,
+        });
+        let decoded =
+            SegmentEvent::from_record_bytes(&invalidate.to_record_bytes()).expect("record decodes");
+        assert_eq!(decoded, invalidate);
     }
 
     #[test]

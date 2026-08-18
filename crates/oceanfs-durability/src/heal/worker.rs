@@ -73,8 +73,10 @@ pub struct HealWorker {
     queue: Arc<HealQueue>,
     /// EC decoder for reconstructing corrupt shards.
     decoder: Arc<dyn Decoder>,
-    /// Metadata store for segment lookups and updates.
-    metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
+    /// The lifecycle coordinator — the machine is the heal worker's
+    /// segment-metadata source and the post-repair anchor refresh
+    /// (ADR-0025 Decision 3).
+    lifecycle: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
     /// Data store for reading/writing segment shard data.
     data_store: Arc<dyn SegmentDataStore>,
     /// Optional membership for distributed shard fetch (H3).
@@ -105,7 +107,7 @@ impl HealWorker {
         config: HealConfig,
         queue: Arc<HealQueue>,
         decoder: Arc<dyn Decoder>,
-        metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
+        lifecycle: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
         data_store: Arc<dyn SegmentDataStore>,
     ) -> Self {
         let max_concurrent = config.max_concurrent_heals();
@@ -117,7 +119,7 @@ impl HealWorker {
             config,
             queue,
             decoder,
-            metadata,
+            lifecycle,
             data_store,
             membership: None,
             pool: None,
@@ -204,7 +206,7 @@ impl HealWorker {
     /// Process a single heal request with concurrency control.
     async fn process_request(&self, request: HealRequest, shutdown: &CancellationToken) {
         let stats = self.stats.clone();
-        let metadata = self.metadata.clone();
+        let lifecycle = self.lifecycle.clone();
         let data_store = self.data_store.clone();
         let decoder = self.decoder.clone();
         let semaphore = self.semaphore.clone();
@@ -224,7 +226,7 @@ impl HealWorker {
             match Self::execute_heal(
                 &request,
                 &*decoder,
-                Arc::as_ref(&metadata),
+                Arc::as_ref(&lifecycle),
                 Arc::as_ref(&data_store),
                 membership.as_deref(),
                 pool.as_deref(),
@@ -292,7 +294,7 @@ impl HealWorker {
     async fn execute_heal(
         request: &HealRequest,
         decoder: &dyn Decoder,
-        metadata: &dyn oceanfs_storage_api::MetadataStore,
+        lifecycle: &oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator,
         data_store: &dyn SegmentDataStore,
         membership: Option<&Membership>,
         pool: Option<&ConnectionPool>,
@@ -300,10 +302,12 @@ impl HealWorker {
     ) -> Result<u64> {
         let segment_id = &request.segment_id;
 
-        // Step 1: Look up segment metadata.
-        let segment_meta = metadata
-            .get_segment(*segment_id)
-            .map_err(|e| Error::Storage(format!("metadata lookup failed: {e}")))?
+        // Step 1: Look up segment metadata from the machine (ADR-0025
+        // Decision 3 — the `segments` CF is removed).
+        let segment_meta = lifecycle
+            .registry()
+            .get(*segment_id)
+            .map(|entry| entry.metadata.clone())
             .ok_or(Error::SegmentNotFound(*segment_id))?;
 
         let ec_k = segment_meta.ec_k;
@@ -405,14 +409,15 @@ impl HealWorker {
             }
         }
 
-        // Step 5: Update segment metadata (bump version by re-saving).
-        // In a full implementation, this would update the merkle root
-        // and storage_locations.
-        let mut updated_meta = segment_meta;
-        updated_meta.merkle_root = None; // Invalidate old Merkle root until rebuilt.
-        metadata
-            .put_segment(updated_meta)
-            .map_err(|e| Error::Storage(format!("metadata update failed: {e}")))?;
+        // Step 5: Invalidate the segment's anchor through the machine
+        // (ADR-0025 Decision 3): the entry metadata is the scrub/AE
+        // anchor, and the stale root must not survive a restart. The
+        // `MetadataRefresh` event is durable (the event log is the only
+        // durable writer) — no state change, no downgrade.
+        lifecycle
+            .request_refresh_metadata(*segment_id, None)
+            .await
+            .map_err(|e| Error::Storage(format!("anchor refresh failed: {e}")))?;
 
         Ok(total_repaired)
     }
@@ -526,9 +531,8 @@ impl HealWorker {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use oceanfs_core::{SegmentId, SegmentMetadata};
+    use oceanfs_core::{SegmentId, SegmentMetadata, SizeTier};
     use oceanfs_ec::Encoder;
-    use oceanfs_storage::metadata::RocksDbMetadataStore;
 
     use super::*;
     use crate::anti_entropy::InMemorySegmentStore;
@@ -600,15 +604,13 @@ mod tests {
         let config = HealConfig::default().with_max_concurrent_heals(2);
         let queue = Arc::new(HealQueue::new(4));
         let decoder = Arc::new(StubDecoder);
-        let tmp = tempfile::TempDir::new().unwrap();
-        let metadata_config = oceanfs_core::MetadataConfig {
-            data_dir: tmp.path().join("meta"),
-            ..Default::default()
-        };
-        let metadata = Arc::new(RocksDbMetadataStore::open(&metadata_config).unwrap());
         let data_store = Arc::new(InMemorySegmentStore::new());
 
-        let worker = HealWorker::new(config, queue, decoder, metadata, data_store);
+        let lifecycle =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
+        let worker = HealWorker::new(config, queue, decoder, lifecycle, data_store);
         assert_eq!(worker.stats().heals_attempted(), 0);
     }
 
@@ -624,12 +626,6 @@ mod tests {
         let config = HealConfig::default();
         let queue = Arc::new(HealQueue::new(4));
         let decoder = Arc::new(StubDecoder);
-        let tmp = tempfile::TempDir::new().unwrap();
-        let metadata_config = oceanfs_core::MetadataConfig {
-            data_dir: tmp.path().join("meta"),
-            ..Default::default()
-        };
-        let metadata = Arc::new(RocksDbMetadataStore::open(&metadata_config).unwrap());
         let data_store: Arc<dyn SegmentDataStore> = Arc::new(InMemorySegmentStore::new());
 
         let ring = {
@@ -646,7 +642,11 @@ mod tests {
         ));
         let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
 
-        let worker = HealWorker::new(config, queue, decoder, metadata, data_store)
+        let lifecycle =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
+        let worker = HealWorker::new(config, queue, decoder, lifecycle, data_store)
             .with_distributed_fetch(membership, pool);
 
         // Stats should still work.
@@ -671,31 +671,47 @@ mod tests {
         let config = HealConfig::default().with_max_concurrent_heals(0);
         let queue = Arc::new(HealQueue::new(4));
         let decoder = Arc::new(StubDecoder);
-        let tmp = tempfile::TempDir::new().unwrap();
-        let metadata_config = oceanfs_core::MetadataConfig {
-            data_dir: tmp.path().join("meta"),
-            ..Default::default()
-        };
-        let metadata = Arc::new(RocksDbMetadataStore::open(&metadata_config).unwrap());
         let data_store = Arc::new(InMemorySegmentStore::new());
 
-        HealWorker::new(config, queue, decoder, metadata, data_store);
+        let lifecycle =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
+        HealWorker::new(config, queue, decoder, lifecycle, data_store);
     }
 
-    fn setup_test_env() -> (Arc<RocksDbMetadataStore>, Arc<InMemorySegmentStore>) {
+    async fn make_lifecycle(
+    ) -> Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator> {
         let tmp = tempfile::TempDir::new().unwrap();
-        let metadata_config = oceanfs_core::MetadataConfig {
-            data_dir: tmp.path().join("meta"),
-            ..Default::default()
-        };
-        let metadata = Arc::new(RocksDbMetadataStore::open(&metadata_config).unwrap());
-        let data_store = Arc::new(InMemorySegmentStore::new());
-        (metadata, data_store)
+        let event_wal = Arc::new(
+            oceanfs_storage::segment::event_wal::EventWal::open(
+                tmp.path().join("event-wal"),
+                &oceanfs_core::EventWalConfig {
+                    event_wal_dir: tmp.path().join("event-wal"),
+                    event_wal_file_size_bytes: 1024 * 1024,
+                    event_wal_fsync_batch_timeout_ms: 10,
+                    event_wal_checkpoint_bytes: 1024 * 1024,
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        Arc::new(
+            oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            )
+            .with_event_wal(event_wal),
+        )
+    }
+
+    fn setup_test_env() -> Arc<InMemorySegmentStore> {
+        Arc::new(InMemorySegmentStore::new())
     }
 
     #[tokio::test]
     async fn execute_heal_successful_single_shard_repair() {
-        let (metadata, data_store) = setup_test_env();
+        let data_store = setup_test_env();
+        let lifecycle = make_lifecycle().await;
 
         let segment_id = SegmentId::new();
         let data: Vec<u8> = (0..40).collect();
@@ -710,15 +726,23 @@ mod tests {
             storage_locations: smallvec::smallvec![],
             sealed_at: Some(1),
         };
-        metadata.put_segment(segment_meta).unwrap();
-
+        lifecycle
+            .request_reserve(
+                segment_id,
+                segment_meta.size_tier,
+                segment_meta.ec_k,
+                segment_meta.ec_m,
+            )
+            .await
+            .unwrap();
+        lifecycle.request_seal(segment_id, segment_meta, None).await.unwrap();
         let decoder = StubDecoder;
         let request = HealRequest { segment_id, corrupt_shard_indices: vec![2], retry_count: 0 };
 
         let result = HealWorker::execute_heal(
             &request,
             &decoder,
-            &*metadata,
+            &*lifecycle,
             &*data_store,
             None,
             None,
@@ -729,8 +753,11 @@ mod tests {
         let bytes_repaired = result.unwrap();
         assert!(bytes_repaired > 0, "should have repaired some bytes");
 
-        let updated = metadata.get_segment(segment_id).unwrap().unwrap();
-        assert!(updated.merkle_root.is_none(), "merkle root should be invalidated after repair");
+        let updated = lifecycle.registry().get(segment_id).unwrap();
+        assert!(
+            updated.metadata.merkle_root.is_none(),
+            "merkle root should be invalidated after repair"
+        );
 
         let repaired_data = data_store.read_segment_data(&segment_id).unwrap();
         assert!(!repaired_data.is_empty(), "repaired data should exist");
@@ -738,7 +765,8 @@ mod tests {
 
     #[tokio::test]
     async fn execute_heal_fails_for_ec_k_zero_segment() {
-        let (metadata, data_store) = setup_test_env();
+        let data_store = setup_test_env();
+        let lifecycle = make_lifecycle().await;
 
         let segment_id = SegmentId::new();
         data_store.write_segment_data(&segment_id, &[1, 2, 3]).unwrap();
@@ -752,15 +780,24 @@ mod tests {
             storage_locations: smallvec::smallvec![],
             sealed_at: Some(1),
         };
-        metadata.put_segment(segment_meta).unwrap();
-
+        // The heal fails at the ec_k=0 check before any anchor refresh —
+        // a machine reserve is enough (the entry's metadata is the read).
+        lifecycle
+            .request_reserve(
+                segment_id,
+                segment_meta.size_tier,
+                segment_meta.ec_k,
+                segment_meta.ec_m,
+            )
+            .await
+            .unwrap();
         let decoder = StubDecoder;
         let request = HealRequest { segment_id, corrupt_shard_indices: vec![0], retry_count: 0 };
 
         let result = HealWorker::execute_heal(
             &request,
             &decoder,
-            &*metadata,
+            &*lifecycle,
             &*data_store,
             None,
             None,
@@ -772,7 +809,8 @@ mod tests {
 
     #[tokio::test]
     async fn execute_heal_segment_not_found_returns_error() {
-        let (metadata, data_store) = setup_test_env();
+        let data_store = setup_test_env();
+        let lifecycle = make_lifecycle().await;
 
         let decoder = StubDecoder;
         let request = HealRequest {
@@ -784,7 +822,7 @@ mod tests {
         let result = HealWorker::execute_heal(
             &request,
             &decoder,
-            &*metadata,
+            &*lifecycle,
             &*data_store,
             None,
             None,
@@ -796,7 +834,8 @@ mod tests {
 
     #[tokio::test]
     async fn execute_heal_multi_shard_repair() {
-        let (metadata, data_store) = setup_test_env();
+        let data_store = setup_test_env();
+        let lifecycle = make_lifecycle().await;
 
         let segment_id = SegmentId::new();
         let data: Vec<u8> = (0..40).collect();
@@ -811,15 +850,23 @@ mod tests {
             storage_locations: smallvec::smallvec![],
             sealed_at: Some(1),
         };
-        metadata.put_segment(segment_meta).unwrap();
-
+        lifecycle
+            .request_reserve(
+                segment_id,
+                segment_meta.size_tier,
+                segment_meta.ec_k,
+                segment_meta.ec_m,
+            )
+            .await
+            .unwrap();
+        lifecycle.request_seal(segment_id, segment_meta, None).await.unwrap();
         let decoder = StubDecoder;
         let request = HealRequest { segment_id, corrupt_shard_indices: vec![0, 3], retry_count: 0 };
 
         let result = HealWorker::execute_heal(
             &request,
             &decoder,
-            &*metadata,
+            &*lifecycle,
             &*data_store,
             None,
             None,
@@ -831,12 +878,13 @@ mod tests {
 
     #[tokio::test]
     async fn run_worker_with_empty_queue_exits_on_shutdown() {
-        let (metadata, data_store) = setup_test_env();
+        let data_store = setup_test_env();
+        let lifecycle = make_lifecycle().await;
         let config = HealConfig::default().with_max_concurrent_heals(2);
         let queue = Arc::new(HealQueue::new(4));
         let decoder: Arc<dyn Decoder> = Arc::new(StubDecoder);
 
-        let worker = HealWorker::new(config, queue.clone(), decoder, metadata.clone(), data_store);
+        let worker = HealWorker::new(config, queue.clone(), decoder, lifecycle.clone(), data_store);
         let shutdown = CancellationToken::new();
 
         let cancel = shutdown.clone();
@@ -850,7 +898,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_worker_processes_queued_request() {
-        let (metadata, data_store) = setup_test_env();
+        let data_store = setup_test_env();
+        let lifecycle = make_lifecycle().await;
 
         let segment_id = SegmentId::new();
         let data: Vec<u8> = (0..40).collect();
@@ -865,8 +914,16 @@ mod tests {
             storage_locations: smallvec::smallvec![],
             sealed_at: Some(1),
         };
-        metadata.put_segment(segment_meta).unwrap();
-
+        lifecycle
+            .request_reserve(
+                segment_id,
+                segment_meta.size_tier,
+                segment_meta.ec_k,
+                segment_meta.ec_m,
+            )
+            .await
+            .unwrap();
+        lifecycle.request_seal(segment_id, segment_meta, None).await.unwrap();
         let config = HealConfig::default().with_max_concurrent_heals(2);
         let queue = Arc::new(HealQueue::new(4));
         let decoder: Arc<dyn Decoder> = Arc::new(StubDecoder);
@@ -880,7 +937,7 @@ mod tests {
             })
             .unwrap();
 
-        let worker = HealWorker::new(config, queue.clone(), decoder, metadata.clone(), data_store);
+        let worker = HealWorker::new(config, queue.clone(), decoder, lifecycle.clone(), data_store);
         let shutdown = CancellationToken::new();
 
         let cancel = shutdown.clone();
@@ -895,13 +952,17 @@ mod tests {
 
     #[tokio::test]
     async fn run_worker_no_queue_receiver_exits_early() {
-        let (metadata, data_store) = setup_test_env();
+        let data_store = setup_test_env();
         let config = HealConfig::default();
         let queue = Arc::new(HealQueue::new(4));
         let decoder: Arc<dyn Decoder> = Arc::new(StubDecoder);
 
         let _rx = queue.take_receiver();
-        let worker = HealWorker::new(config, queue, decoder, metadata, data_store);
+        let lifecycle =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
+        let worker = HealWorker::new(config, queue, decoder, lifecycle, data_store);
         let shutdown = CancellationToken::new();
         worker.run(shutdown).await;
     }
@@ -910,7 +971,8 @@ mod tests {
     /// worker drains queue, executes EC repair, verifies data recovery.
     #[tokio::test]
     async fn integration_full_heal_lifecycle_corrupt_to_repaired() {
-        let (metadata, data_store) = setup_test_env();
+        let data_store = setup_test_env();
+        let lifecycle = make_lifecycle().await;
 
         // Create a segment with k=3, m=1 → 4 shards, 40 bytes
         let segment_id = SegmentId::new();
@@ -926,8 +988,16 @@ mod tests {
             storage_locations: smallvec::smallvec![],
             sealed_at: Some(1),
         };
-        metadata.put_segment(segment_meta).unwrap();
-
+        lifecycle
+            .request_reserve(
+                segment_id,
+                segment_meta.size_tier,
+                segment_meta.ec_k,
+                segment_meta.ec_m,
+            )
+            .await
+            .unwrap();
+        lifecycle.request_seal(segment_id, segment_meta, None).await.unwrap();
         // Corrupt shard 1 (bytes 10..20) by zeroing it.
         let mut corrupted = data.clone();
         for b in corrupted.iter_mut().take(20).skip(10) {
@@ -952,7 +1022,7 @@ mod tests {
 
         let decoder: Arc<dyn Decoder> = Arc::new(StubDecoder);
         let worker =
-            HealWorker::new(config, queue.clone(), decoder, metadata.clone(), data_store.clone());
+            HealWorker::new(config, queue.clone(), decoder, lifecycle.clone(), data_store.clone());
         let shutdown = CancellationToken::new();
 
         let cancel = shutdown.clone();
@@ -974,13 +1044,14 @@ mod tests {
         assert_eq!(repaired_data.len(), data.len(), "repaired data length should match original");
 
         // Verify metadata was touched.
-        let updated = metadata.get_segment(segment_id).unwrap().unwrap();
-        assert!(updated.merkle_root.is_none(), "merkle root should be invalidated");
+        let updated = lifecycle.registry().get(segment_id).unwrap();
+        assert!(updated.metadata.merkle_root.is_none(), "merkle root should be invalidated");
     }
 
     #[tokio::test]
     async fn execute_heal_decode_failure_triggers_retry() {
-        let (metadata, data_store) = setup_test_env();
+        let data_store = setup_test_env();
+        let lifecycle = make_lifecycle().await;
 
         let segment_id = SegmentId::new();
         let data: Vec<u8> = (0..40).collect();
@@ -995,8 +1066,16 @@ mod tests {
             storage_locations: smallvec::smallvec![],
             sealed_at: Some(1),
         };
-        metadata.put_segment(segment_meta).unwrap();
-
+        lifecycle
+            .request_reserve(
+                segment_id,
+                segment_meta.size_tier,
+                segment_meta.ec_k,
+                segment_meta.ec_m,
+            )
+            .await
+            .unwrap();
+        lifecycle.request_seal(segment_id, segment_meta, None).await.unwrap();
         let decoder = FailingDecoder;
         let request = HealRequest { segment_id, corrupt_shard_indices: vec![0], retry_count: 0 };
 
@@ -1004,7 +1083,7 @@ mod tests {
         let result = HealWorker::execute_heal(
             &request,
             &decoder,
-            &*metadata,
+            &*lifecycle,
             &*data_store,
             None,
             None,
@@ -1016,7 +1095,8 @@ mod tests {
 
     #[tokio::test]
     async fn process_request_retry_exhaustion_permanently_fails() {
-        let (metadata, data_store) = setup_test_env();
+        let data_store = setup_test_env();
+        let lifecycle = make_lifecycle().await;
 
         let segment_id = SegmentId::new();
         let data: Vec<u8> = (0..40).collect();
@@ -1031,8 +1111,16 @@ mod tests {
             storage_locations: smallvec::smallvec![],
             sealed_at: Some(1),
         };
-        metadata.put_segment(segment_meta).unwrap();
-
+        lifecycle
+            .request_reserve(
+                segment_id,
+                segment_meta.size_tier,
+                segment_meta.ec_k,
+                segment_meta.ec_m,
+            )
+            .await
+            .unwrap();
+        lifecycle.request_seal(segment_id, segment_meta, None).await.unwrap();
         // Use HealConfig with retry limit 0 → no retries allowed.
         let config = HealConfig::default().with_max_concurrent_heals(2).with_heal_retry_limit(0);
         let queue = Arc::new(HealQueue::new(4));
@@ -1041,21 +1129,11 @@ mod tests {
         // Actually, use a failing decoder for a clearer test.
         let segment_fail_id = SegmentId::new();
         data_store.write_segment_data(&segment_fail_id, &data).unwrap();
-        metadata
-            .put_segment(SegmentMetadata {
-                segment_id: segment_fail_id,
-                ec_k: 3,
-                ec_m: 1,
-                size_tier: oceanfs_core::SizeTier::Standard,
-                merkle_root: None,
-                storage_locations: smallvec::smallvec![],
-                sealed_at: None,
-            })
-            .unwrap();
+        lifecycle.request_reserve(segment_fail_id, SizeTier::Standard, 3, 1).await.unwrap();
 
         let decoder: Arc<dyn Decoder> = Arc::new(FailingDecoder);
         let worker =
-            HealWorker::new(config, queue.clone(), decoder, metadata.clone(), data_store.clone());
+            HealWorker::new(config, queue.clone(), decoder, lifecycle.clone(), data_store.clone());
 
         // Enqueue a request with retry_count already at limit.
         queue

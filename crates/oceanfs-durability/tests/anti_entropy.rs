@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use oceanfs_core::{
-    GossipConfig, HashOutput, Incarnation, MetadataConfig, NodeId, NodeState, RingConfig,
-    RpcConfig, SegmentId, SegmentMetadata, SizeTier,
+    GossipConfig, HashOutput, Incarnation, NodeId, NodeState, RingConfig, RpcConfig, SegmentId,
+    SegmentMetadata, SizeTier,
 };
 use oceanfs_durability::{
     merkle::{IncrementalMerkleTree, MerkleTreeConfig},
@@ -19,7 +19,6 @@ use oceanfs_durability::{
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::{Ring, RingCache};
-use oceanfs_storage::RocksDbMetadataStore;
 
 /// Creates a test IncrementalMerkleTree.
 fn make_test_tree() -> Arc<IncrementalMerkleTree> {
@@ -45,23 +44,13 @@ fn make_membership(node_id_str: &str) -> (Arc<Membership>, Arc<RingCache>) {
 /// Builds a test AntiEntropy instance with all dependencies wired.
 fn make_anti_entropy(
     membership: Arc<Membership>,
-    metadata: Arc<RocksDbMetadataStore>,
+    registry: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry>,
 ) -> AntiEntropy {
     let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
     let segment_store = Arc::new(InMemorySegmentStore::new());
     let config = AntiEntropyConfig::default();
 
-    AntiEntropy::new(config, membership, metadata, pool, segment_store, make_test_tree())
-}
-
-fn make_metadata_config() -> MetadataConfig {
-    let dir = tempfile::tempdir().unwrap();
-    MetadataConfig {
-        data_dir: dir.path().to_path_buf(),
-        block_cache_size: 8 * 1024 * 1024,
-        memtable_size: 8 * 1024 * 1024,
-        ..Default::default()
-    }
+    AntiEntropy::new(config, membership, registry, pool, segment_store, make_test_tree())
 }
 
 fn make_segment_metadata(
@@ -134,9 +123,10 @@ fn empty_segment_returns_valid_single_leaf_tree() {
 #[tokio::test]
 async fn anti_entropy_cycle_with_empty_metadata_store() {
     let (membership, _ring) = make_membership("test-node");
-    let config = make_metadata_config();
-    let metadata = Arc::new(RocksDbMetadataStore::open(&config).unwrap());
-    let ae = make_anti_entropy(membership, metadata);
+    let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ));
+    let ae = make_anti_entropy(membership, Arc::clone(&registry));
 
     let stats = ae.run_cycle().await.unwrap();
     assert_eq!(stats.segments_compared, 0);
@@ -145,13 +135,15 @@ async fn anti_entropy_cycle_with_empty_metadata_store() {
 #[tokio::test]
 async fn anti_entropy_cycle_detects_missing_merkle_roots() {
     let (membership, _ring) = make_membership("test-node");
-    let config = make_metadata_config();
-    let metadata = Arc::new(RocksDbMetadataStore::open(&config).unwrap());
+    let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ));
 
     let seg = make_segment_metadata(SegmentId::new(), true, None);
-    metadata.put_segment(seg).unwrap();
+    registry.reserve(seg.segment_id, seg.clone()).unwrap();
+    registry.seal(seg.segment_id, seg).unwrap();
 
-    let ae = make_anti_entropy(membership, metadata);
+    let ae = make_anti_entropy(membership, Arc::clone(&registry));
     let stats = ae.run_cycle().await.unwrap();
     assert_eq!(stats.segments_compared, 1);
     assert_eq!(stats.mismatches_found, 1);
@@ -160,16 +152,18 @@ async fn anti_entropy_cycle_detects_missing_merkle_roots() {
 #[tokio::test]
 async fn anti_entropy_cycle_with_valid_segments() {
     let (membership, _ring) = make_membership("test-node");
-    let config = make_metadata_config();
-    let metadata = Arc::new(RocksDbMetadataStore::open(&config).unwrap());
+    let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ));
 
     for _ in 0..3 {
         let seg =
             make_segment_metadata(SegmentId::new(), true, Some(HashOutput::from_bytes([0u8; 32])));
-        metadata.put_segment(seg).unwrap();
+        registry.reserve(seg.segment_id, seg.clone()).unwrap();
+        registry.seal(seg.segment_id, seg).unwrap();
     }
 
-    let ae = make_anti_entropy(membership, metadata);
+    let ae = make_anti_entropy(membership, Arc::clone(&registry));
     let stats = ae.run_cycle().await.unwrap();
     assert_eq!(stats.segments_compared, 3);
     assert_eq!(stats.mismatches_found, 0);
@@ -216,15 +210,16 @@ fn merkle_exchange_protocol_roundtrip() {
 #[tokio::test]
 async fn anti_entropy_start_background_and_shutdown() {
     let (membership, _ring) = make_membership("test-node");
-    let config = make_metadata_config();
-    let metadata = Arc::new(RocksDbMetadataStore::open(&config).unwrap());
+    let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ));
 
     let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
     let segment_store = Arc::new(InMemorySegmentStore::new());
     let ae = Arc::new(AntiEntropy::new(
         AntiEntropyConfig::default(),
         membership,
-        metadata,
+        Arc::clone(&registry),
         pool,
         segment_store,
         make_test_tree(),
@@ -333,10 +328,11 @@ async fn real_two_node_anti_entropy_cycle() {
         ring_cache_a.clone(),
     ));
 
-    let metadata_config_a = make_metadata_config();
-    let metadata_a = Arc::new(RocksDbMetadataStore::open(&metadata_config_a).unwrap());
     let pool_a = Arc::new(ConnectionPool::new(RpcConfig::default()));
     let segment_store_a = Arc::new(InMemorySegmentStore::new());
+    let registry_a = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ));
 
     // --- Node B setup ---
     let ring_b = Ring::new(RingConfig::default());
@@ -349,9 +345,10 @@ async fn real_two_node_anti_entropy_cycle() {
         ring_cache_b.clone(),
     ));
 
-    let metadata_config_b = make_metadata_config();
-    let metadata_b = Arc::new(RocksDbMetadataStore::open(&metadata_config_b).unwrap());
     let segment_store_b = Arc::new(InMemorySegmentStore::new());
+    let registry_b = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ));
 
     // --- Cross-register each node in the other's membership ---
     membership_a.upsert_node(
@@ -384,8 +381,8 @@ async fn real_two_node_anti_entropy_cycle() {
         storage_locations: smallvec::SmallVec::new(),
         sealed_at: Some(1700000000000),
     };
-    metadata_a.put_segment(seg_meta_a).unwrap();
-
+    registry_a.reserve(seg_id, seg_meta_a.clone()).unwrap();
+    registry_a.seal(seg_id, seg_meta_a).unwrap();
     // Node B: store data and metadata
     segment_store_b.write_segment_data(&seg_id, &segment_data).unwrap();
     let tree_b = MerkleTree::build(&segment_data, 65536).unwrap();
@@ -399,7 +396,8 @@ async fn real_two_node_anti_entropy_cycle() {
         storage_locations: smallvec::SmallVec::new(),
         sealed_at: Some(1700000000000),
     };
-    metadata_b.put_segment(seg_meta_b).unwrap();
+    registry_b.reserve(seg_id, seg_meta_b.clone()).unwrap();
+    registry_b.seal(seg_id, seg_meta_b).unwrap();
 
     // Verify both nodes have the same root at seal time
     assert_eq!(root_a, root_b);
@@ -418,7 +416,7 @@ async fn real_two_node_anti_entropy_cycle() {
     let ae = AntiEntropy::new(
         AntiEntropyConfig::new(300, 1),
         membership_a.clone(),
-        metadata_a.clone(),
+        Arc::clone(&registry_a),
         pool_a,
         segment_store_a.clone(),
         make_test_tree(),
@@ -459,8 +457,9 @@ async fn real_two_node_anti_entropy_cycle() {
 #[tokio::test]
 async fn anti_entropy_handles_unreachable_peer() {
     let (membership_a, _ring_a) = make_membership("node-a");
-    let metadata_config = make_metadata_config();
-    let metadata = Arc::new(RocksDbMetadataStore::open(&metadata_config).unwrap());
+    let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ));
 
     // Register a peer with an unreachable address
     membership_a.upsert_node(
@@ -491,12 +490,13 @@ async fn anti_entropy_handles_unreachable_peer() {
         storage_locations: smallvec::SmallVec::new(),
         sealed_at: Some(1700000000000),
     };
-    metadata.put_segment(seg).unwrap();
+    registry.reserve(seg_id, seg.clone()).unwrap();
+    registry.seal(seg_id, seg).unwrap();
 
     let ae = AntiEntropy::new(
         AntiEntropyConfig::default(),
         membership_a,
-        metadata,
+        Arc::clone(&registry),
         pool,
         segment_store,
         make_test_tree(),
@@ -511,8 +511,9 @@ async fn anti_entropy_handles_unreachable_peer() {
 #[tokio::test]
 async fn anti_entropy_with_no_alive_peers() {
     let (membership, _ring) = make_membership("solo-node");
-    let metadata_config = make_metadata_config();
-    let metadata = Arc::new(RocksDbMetadataStore::open(&metadata_config).unwrap());
+    let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ));
 
     // Add a segment
     let seg_id = SegmentId::new();
@@ -531,12 +532,13 @@ async fn anti_entropy_with_no_alive_peers() {
         storage_locations: smallvec::SmallVec::new(),
         sealed_at: Some(1700000000000),
     };
-    metadata.put_segment(seg).unwrap();
+    registry.reserve(seg_id, seg.clone()).unwrap();
+    registry.seal(seg_id, seg).unwrap();
 
     let ae = AntiEntropy::new(
         AntiEntropyConfig::default(),
         membership,
-        metadata,
+        Arc::clone(&registry),
         pool,
         segment_store,
         make_test_tree(),

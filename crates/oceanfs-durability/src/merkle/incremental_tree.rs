@@ -396,32 +396,32 @@ impl IncrementalMerkleTree {
     // Rebuild from segment scan
     // ------------------------------------------------------------------
 
-    /// Rebuilds the incremental tree from a full scan of all sealed segments.
+    /// Rebuilds the incremental tree from the machine's sealed segments.
     ///
-    /// Scans all segments from the metadata store and reconstructs the trees
-    /// from scratch. Called at node startup (ADR-0018 Decision 1).
+    /// Scans the lifecycle registry's `Sealed` entries and reconstructs
+    /// the trees from scratch. Called at node startup — supersedes
+    /// ADR-0018 Decision 1's segments-CF scan (ADR-0025 Decision 3: the
+    /// CF is removed; the machine's entry metadata is the root source).
     ///
     /// # Errors
     ///
-    /// Returns an error if the segment scan or tree construction fails.
+    /// Returns an error if the tree construction fails.
     pub fn rebuild_from_segment_scan(
-        metadata: &dyn oceanfs_storage_api::MetadataStore,
+        registry: &oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry,
         config: &MerkleTreeConfig,
     ) -> Result<Self> {
         let tree = Self::new(config.clone());
 
-        let segments = metadata.list_segments();
-        for segment_result in segments {
-            let segment =
-                segment_result.map_err(|e| Error::Storage(format!("metadata scan error: {e}")))?;
-            if segment.is_sealed() {
-                // Use the segment's stored BLAKE3 checksum as the leaf hash.
-                if let Some(merkle_root) = segment.merkle_root {
+        registry.for_each(|segment_id, entry| {
+            if entry.state == oceanfs_storage::segment::lifecycle::SegmentState::Sealed {
+                // Use the segment's stored BLAKE3 checksum as the leaf
+                // hash (the machine's entry is the anchor).
+                if let Some(merkle_root) = entry.metadata.merkle_root {
                     let hash_bytes = *merkle_root.as_bytes();
-                    tree.insert_leaf(segment.segment_id, hash_bytes)?;
+                    let _ = tree.insert_leaf(segment_id, hash_bytes);
                 }
             }
-        }
+        });
 
         Ok(tree)
     }

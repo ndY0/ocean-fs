@@ -31,10 +31,9 @@ use std::{
 
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, Criterion};
-use oceanfs_core::{MetadataConfig, SegmentId, SizeTier, WalConfig};
+use oceanfs_core::{SegmentId, SizeTier, WalConfig};
 use oceanfs_storage::{
     io::{IoReadMode, SegmentWriteMode},
-    metadata::RocksDbMetadataStore,
     segment::index::SegmentIndexEntry,
     SegmentSealer, WalWriter,
 };
@@ -50,15 +49,6 @@ async fn concurrent_seals(
     data_size: usize,
     tmpdir: &std::path::Path,
 ) -> Duration {
-    let metadata = Arc::new(
-        RocksDbMetadataStore::open(&MetadataConfig {
-            data_dir: tmpdir.join("meta"),
-            block_cache_size: 1024,
-            memtable_size: 1024,
-            ..Default::default()
-        })
-        .expect("open metadata store"),
-    );
     let wal = Arc::new(
         WalWriter::open(&WalConfig {
             data_dir: tmpdir.join("wal"),
@@ -71,7 +61,6 @@ async fn concurrent_seals(
     );
     let lifecycle =
         std::sync::Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
-            metadata,
             &oceanfs_core::LifecycleConfig::default(),
         ));
     let sealer = Arc::new(SegmentSealer::new(

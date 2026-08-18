@@ -799,17 +799,6 @@ mod tests {
             Vec::new()
         }
 
-        fn get_segment(
-            &self,
-            _id: oceanfs_core::SegmentId,
-        ) -> std::io::Result<Option<oceanfs_core::SegmentMetadata>> {
-            Ok(None)
-        }
-
-        fn list_segments(&self) -> Vec<std::io::Result<oceanfs_core::SegmentMetadata>> {
-            Vec::new()
-        }
-
         fn list_tombstones(
             &self,
             _bucket: &oceanfs_core::BucketId,
@@ -822,14 +811,6 @@ mod tests {
             _bucket: &oceanfs_core::BucketId,
             _key: &oceanfs_core::ObjectKey,
         ) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn put_segment(&self, _meta: oceanfs_core::SegmentMetadata) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn delete_segment(&self, _id: oceanfs_core::SegmentId) -> std::io::Result<()> {
             Ok(())
         }
 
@@ -877,6 +858,9 @@ mod tests {
         let healing_service = crate::healing_service::HealingGrpcService::new(
             server_handoff,
             server_meta,
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            )),
             server_store,
             Arc::new(oceanfs_core::HlcClock::new()),
         );

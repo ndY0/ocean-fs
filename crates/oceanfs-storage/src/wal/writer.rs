@@ -17,7 +17,6 @@ use std::{
 
 use oceanfs_core::{Counter, LabelSet, WalConfig};
 use tokio::sync::Mutex;
-use tracing::info;
 
 use crate::{
     error::{Error, Result},
@@ -46,8 +45,6 @@ pub(crate) const WAL_RETENTION_FILES: usize = 4;
 /// At ~10 s per rotation under load this runs every ~10 minutes — the
 /// retained-file scan it performs is cheap at that cadence, and the
 /// marker CF stays bounded over arbitrarily long uptimes.
-const MARKER_PRUNE_ROTATIONS: u64 = 60;
-
 /// An append-only sequential WAL writer.
 ///
 /// # Examples
@@ -71,7 +68,6 @@ pub struct WalWriter {
     /// Metadata store handle for the deleted-segment marker pruning
     /// (the markers CF is removed in phase 3). `None` (tests, minimal
     /// embedding) skips pruning.
-    metadata: Option<Arc<crate::metadata::RocksDbMetadataStore>>,
     /// Machine-backed retention liveness (ADR-0024 §Retention, phase 2):
     /// an entry at position `p` of segment `S` is garbage iff `S`'s
     /// `SealEvent.data_wal_pos ≥ p` (or `S` is `Deleted`). The closure is
@@ -80,8 +76,6 @@ pub struct WalWriter {
     /// `None` falls back to the plain retention window.
     liveness:
         std::sync::OnceLock<Arc<dyn Fn(oceanfs_core::SegmentId, DataWalPos) -> bool + Send + Sync>>,
-    /// Number of rotations performed (drives the marker-prune throttle).
-    rotations: std::sync::atomic::AtomicU64,
     /// Current WAL file handle (shared with sync group for true fsync).
     file: Arc<Mutex<std::fs::File>>,
     /// Current file sequence number.
@@ -125,9 +119,7 @@ impl WalWriter {
 
         let writer = Self {
             config: config.clone(),
-            metadata: None,
             liveness: std::sync::OnceLock::new(),
-            rotations: std::sync::atomic::AtomicU64::new(0),
             file,
             file_seq: Mutex::new(file_seq),
             position: Mutex::new(existing_size),
@@ -147,16 +139,6 @@ impl WalWriter {
         };
 
         Ok(writer)
-    }
-
-    /// Attaches the metadata store for deleted-segment marker pruning.
-    ///
-    /// With the store attached, rotation periodically prunes
-    /// deleted-segment markers whose entries have fully rotated out.
-    /// Without it, pruning is skipped.
-    pub fn with_metadata(mut self, metadata: Arc<crate::metadata::RocksDbMetadataStore>) -> Self {
-        self.metadata = Some(metadata);
-        self
     }
 
     /// Sets the machine-backed retention liveness predicate (ADR-0024
@@ -323,21 +305,6 @@ impl WalWriter {
             self.liveness.get().map(|liveness| liveness.as_ref()),
         )
         .await;
-
-        // Periodically prune deleted-segment markers: segments removed
-        // by GC/orphan-reaper whose entries have fully rotated out no
-        // longer need their marker. Throttled so the retained-file scan
-        // runs every ~10 minutes, not every rotation.
-        let rotations = self.rotations.fetch_add(1, Ordering::Relaxed) + 1;
-        if rotations % MARKER_PRUNE_ROTATIONS == 0 {
-            if let Some(metadata) = self.metadata.as_ref() {
-                let pruned =
-                    super::prune_deleted_segment_markers(&self.config, metadata.as_ref()).await;
-                if pruned > 0 {
-                    info!(pruned, "pruned deleted-segment WAL markers");
-                }
-            }
-        }
 
         Ok(())
     }

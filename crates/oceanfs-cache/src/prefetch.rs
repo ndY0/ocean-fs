@@ -250,7 +250,7 @@ impl PrefetchWorker {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use oceanfs_core::{Hlc, ObjectMetadata, SegmentId, SegmentMetadata, Tombstone};
+    use oceanfs_core::{Hlc, ObjectMetadata, Tombstone};
 
     use super::*;
 
@@ -296,14 +296,6 @@ mod tests {
             self.entries.iter().map(|(_, _, m)| Ok(m.clone())).collect()
         }
 
-        fn get_segment(&self, _id: SegmentId) -> std::io::Result<Option<SegmentMetadata>> {
-            Ok(None)
-        }
-
-        fn list_segments(&self) -> Vec<std::io::Result<SegmentMetadata>> {
-            vec![]
-        }
-
         fn list_tombstones(
             &self,
             _bucket: &BucketId,
@@ -312,14 +304,6 @@ mod tests {
         }
 
         fn delete_tombstone(&self, _bucket: &BucketId, _key: &ObjectKey) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn put_segment(&self, _meta: SegmentMetadata) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn delete_segment(&self, _id: SegmentId) -> std::io::Result<()> {
             Ok(())
         }
 

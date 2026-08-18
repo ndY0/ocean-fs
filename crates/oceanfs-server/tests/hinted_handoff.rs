@@ -254,7 +254,6 @@ async fn write_coordinator_handoff_on_replica_failure() {
     };
     let lifecycle =
         Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
-            metadata.clone(),
             &oceanfs_core::LifecycleConfig::default(),
         ));
     let sealer = Arc::new(SegmentSealer::new(seal_config, wal, Arc::clone(&lifecycle)));

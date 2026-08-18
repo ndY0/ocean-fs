@@ -63,7 +63,10 @@ fn make_segment(id: SegmentId, tier: SizeTier, sealed_at: i64) -> SegmentMetadat
 async fn gc_empty_store_produces_zero_stats() {
     let metadata = open_temp_metadata();
     let gc = GarbageCollector::new(GcConfig::default());
-    let stats = gc.run_cycle(metadata).await.expect("GC cycle");
+    let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    );
+    let stats = gc.run_cycle(metadata, &registry).await.expect("GC cycle");
     assert_eq!(stats.segments_scanned, 0);
     assert_eq!(stats.segments_compacted, 0);
     assert_eq!(stats.bytes_reclaimed, 0);
@@ -74,9 +77,13 @@ async fn gc_with_segments_no_deletions_no_compaction() {
     let metadata = open_temp_metadata();
 
     let seg_id = SegmentId::new();
-    metadata
-        .put_segment(make_segment(seg_id, SizeTier::Standard, 1700000000000))
-        .expect("put segment");
+    let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    );
+    registry
+        .reserve(seg_id, make_segment(seg_id, SizeTier::Standard, 1700000000000).clone())
+        .unwrap();
+    registry.seal(seg_id, make_segment(seg_id, SizeTier::Standard, 1700000000000)).unwrap();
 
     let obj = make_object(
         "alive.txt",
@@ -92,9 +99,9 @@ async fn gc_with_segments_no_deletions_no_compaction() {
     metadata.put_object(obj).expect("put object");
 
     let gc = GarbageCollector::new(GcConfig::default());
-    let stats = gc.run_cycle(metadata).await.expect("GC cycle");
+    let stats = gc.run_cycle(metadata, &registry).await.expect("GC cycle");
     assert!(stats.segments_scanned >= 1);
-    assert_eq!(stats.segments_compacted, 0);
+    assert_eq!(stats.segments_compacted, 0); // no deletions → no compaction
 }
 
 #[tokio::test]
@@ -102,9 +109,13 @@ async fn gc_tombstone_within_ttl_not_expired() {
     let metadata = open_temp_metadata();
 
     let seg_id = SegmentId::new();
-    metadata
-        .put_segment(make_segment(seg_id, SizeTier::Standard, 1700000000000))
-        .expect("put segment");
+    let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    );
+    registry
+        .reserve(seg_id, make_segment(seg_id, SizeTier::Standard, 1700000000000).clone())
+        .unwrap();
+    registry.seal(seg_id, make_segment(seg_id, SizeTier::Standard, 1700000000000)).unwrap();
 
     let obj = make_object(
         "recently_deleted.txt",
@@ -137,7 +148,7 @@ async fn gc_tombstone_within_ttl_not_expired() {
     // Very long TTL: tombstone should NOT be expired
     let config = GcConfig::new(3600, 315360000, 0.5, 4, 64); // 10 year TTL
     let gc = GarbageCollector::new(config);
-    let stats = gc.run_cycle(metadata).await.expect("GC cycle");
+    let stats = gc.run_cycle(metadata, &registry).await.expect("GC cycle");
     assert!(stats.segments_scanned >= 1);
     // Should NOT compact — tombstone is not expired
     assert_eq!(stats.segments_compacted, 0);
@@ -149,9 +160,13 @@ async fn gc_write_delete_verify_stats() {
 
     // Write 5 objects into a single segment
     let seg_id = SegmentId::new();
-    metadata
-        .put_segment(make_segment(seg_id, SizeTier::Standard, 1000000000000))
-        .expect("put segment");
+    let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    );
+    registry
+        .reserve(seg_id, make_segment(seg_id, SizeTier::Standard, 1000000000000).clone())
+        .unwrap();
+    registry.seal(seg_id, make_segment(seg_id, SizeTier::Standard, 1000000000000)).unwrap();
 
     for i in 0..5u32 {
         let obj = make_object(
@@ -185,7 +200,10 @@ async fn gc_write_delete_verify_stats() {
     }
 
     let gc = GarbageCollector::new(GcConfig::default());
-    let stats = gc.run_cycle(metadata).await.expect("GC cycle");
+    let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    );
+    let stats = gc.run_cycle(metadata, &registry).await.expect("GC cycle");
 
     // At least one segment scanned; the segment has ~60% dead bytes (3/5)
     // which is above the default 50% threshold → should be a compaction candidate
@@ -202,11 +220,15 @@ async fn gc_run_cycle_returns_meaningful_stats() {
     let metadata = open_temp_metadata();
 
     // Create 3 segments, each with objects
+    let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    );
     for seg_idx in 0..3u32 {
         let seg_id = SegmentId::new();
-        metadata
-            .put_segment(make_segment(seg_id, SizeTier::Standard, 1000000000000))
-            .expect("put segment");
+        registry
+            .reserve(seg_id, make_segment(seg_id, SizeTier::Standard, 1000000000000).clone())
+            .unwrap();
+        registry.seal(seg_id, make_segment(seg_id, SizeTier::Standard, 1000000000000)).unwrap();
 
         let obj = make_object(
             &format!("seg_{seg_idx}_obj"),
@@ -223,7 +245,7 @@ async fn gc_run_cycle_returns_meaningful_stats() {
     }
 
     let gc = GarbageCollector::new(GcConfig::default());
-    let stats = gc.run_cycle(metadata).await.expect("GC cycle");
+    let stats = gc.run_cycle(metadata, &registry).await.expect("GC cycle");
     assert_eq!(stats.segments_scanned, 3);
     assert_eq!(stats.segments_compacted, 0); // all alive
 }
@@ -233,9 +255,13 @@ async fn gc_multiple_cycles_dont_panic() {
     let metadata = open_temp_metadata();
 
     let seg_id = SegmentId::new();
-    metadata
-        .put_segment(make_segment(seg_id, SizeTier::Standard, 1700000000000))
-        .expect("put segment");
+    let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    );
+    registry
+        .reserve(seg_id, make_segment(seg_id, SizeTier::Standard, 1700000000000).clone())
+        .unwrap();
+    registry.seal(seg_id, make_segment(seg_id, SizeTier::Standard, 1700000000000)).unwrap();
 
     let obj = make_object(
         "stable.txt",
@@ -254,7 +280,7 @@ async fn gc_multiple_cycles_dont_panic() {
 
     // Run multiple cycles — should not panic or error
     for _ in 0..3 {
-        let stats = gc.run_cycle(metadata.clone()).await.expect("GC cycle");
+        let stats = gc.run_cycle(metadata.clone(), &registry).await.expect("GC cycle");
         assert!(stats.segments_scanned >= 1);
         assert_eq!(stats.segments_compacted, 0);
     }
@@ -289,7 +315,10 @@ async fn test_gc_config_flow_from_node_config() {
 
     // Config accepts trait object (Item 6 verification).
     let gc = GarbageCollector::new(config);
-    let stats = gc.run_cycle(metadata).await.expect("GC cycle");
+    let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    );
+    let stats = gc.run_cycle(metadata, &registry).await.expect("GC cycle");
     assert_eq!(stats.segments_scanned, 0, "empty store produces zero scanned");
     assert_eq!(stats.segments_compacted, 0);
 }

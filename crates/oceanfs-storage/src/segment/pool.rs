@@ -930,17 +930,25 @@ impl SegmentPool {
         data: &[u8],
         hook: F,
         timeout: std::time::Duration,
-    ) -> Result<(SegmentId, u64, u32)> {
+    ) -> Result<(SegmentId, u64, u32, Option<SealedSegment>)> {
         let mut hook = Some(hook);
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if let Some(outcome) = self.try_append_single_pass(data, &mut hook)? {
-                // Guarantee the seal enqueue before returning Ok: the
-                // caller writes the WAL entry right after this, so an
-                // enqueue failure here must reject the write (never
-                // acked) rather than orphan it.
-                self.finish_seal_handoff_async(outcome.sealed, deadline).await?;
-                return Ok((outcome.segment_id, outcome.offset, outcome.length));
+                // The seal hand-off is DELIBERATELY not enqueued here:
+                // the caller (the write path) appends the segment's data
+                // WAL entry and records its position AFTER this returns,
+                // and enqueues the payload via
+                // [`Self::enqueue_seal_handoff`]. That ordering is the
+                // retention contract (ADR-0024 §Retention): the seal
+                // worker must never observe the work item before the
+                // position record, or the `SealEvent` would capture a
+                // stale `(0, 0)` and pin the segment's WAL files forever.
+                // An enqueue failure is surfaced by the caller's enqueue
+                // call — the write is rejected (never acked), the
+                // in-flight read window stays owned by the registry
+                // entry, and the idle driver retries the seal.
+                return Ok((outcome.segment_id, outcome.offset, outcome.length, outcome.sealed));
             }
             // Recover full-but-unfrozen slots (their fill was gated by
             // the in-flight cap — freeze + hand off now that the cap may
@@ -965,6 +973,37 @@ impl SegmentPool {
             // re-checks the deadline at the top.
             let _ = tokio::time::timeout(remaining, &mut notified).await;
         }
+    }
+
+    /// Enqueues a sealed payload returned by
+    /// [`append_with_hook_async`] — the caller-side half of the seal
+    /// hand-off.
+    ///
+    /// The write path calls this AFTER its data-WAL append and position
+    /// record (the record precedes the enqueue, in the same task), so
+    /// the seal worker can never observe the work item before the
+    /// segment's final data-WAL position is recorded — the
+    /// `SealEvent`'s `data_wal_pos` is then always the final one
+    /// (ADR-0024 §Retention; a seal can never capture a stale `(0, 0)`
+    /// that would pin the segment's WAL files).
+    ///
+    /// Mirrors the internal [`finish_seal_handoff_async`] semantics:
+    /// the frozen slot is re-armed and the work item enqueued within
+    /// `deadline`; on failure the write is rejected (never acked), the
+    /// registry entry keeps the in-flight read window, and the
+    /// idle-seal driver retries the seal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::WriteBackpressureTimeout`] when the seal queue
+    /// cannot accept the work within `deadline` (or the pool is shut
+    /// down).
+    pub async fn enqueue_seal_handoff(
+        &self,
+        sealed: Option<SealedSegment>,
+        deadline: std::time::Instant,
+    ) -> Result<(), Error> {
+        self.finish_seal_handoff_async(sealed, deadline).await
     }
 
     /// One non-waiting scan pass over all slots, starting at the
@@ -993,7 +1032,12 @@ impl SegmentPool {
                     // The hook already ran under the slot lock, so the
                     // seal worker can never observe the work item
                     // before the hook recorded its state — regardless
-                    // of when the caller enqueues it.
+                    // of when the caller enqueues it. The caller (write
+                    // path) additionally enqueues only AFTER its
+                    // data-WAL append + position record, so the seal
+                    // worker also can never observe the work item
+                    // before the segment's final `data_wal_pos` exists
+                    // (ADR-0024 §Retention — no stale `(0, 0)` seals).
                     return Ok(Some(outcome));
                 }
                 Ok(None) => continue,
@@ -2350,9 +2394,11 @@ mod tests {
         let _rx = pool.take_seal_rx().expect("seal rx");
 
         // Fill segments until the deferred-seal cap closes the slots.
-        // Each fill's enqueue waits for queue space within a short
-        // deadline; once the queue is full the writes are rejected
-        // (never acked) and the frozen entries stay in the registry.
+        // The append never waits on the queue (the hand-off is
+        // caller-side); the ENQUEUE waits for queue space within a
+        // short deadline — once the queue is full the enqueue fails
+        // (write rejected, never acked) and the frozen entries stay in
+        // the registry.
         let mut written_ids: Vec<SegmentId> = Vec::new();
         let mut backpressured = 0usize;
         for _ in 0..200 {
@@ -2361,12 +2407,28 @@ mod tests {
                 .append_with_hook_async(&data, |_, _, _| {}, std::time::Duration::from_millis(20))
                 .await
             {
-                Ok((id, _, _)) => {
+                Ok((id, _, _, sealed)) => {
                     // The write path's contract: the durable reserve
-                    // lands right after the append (the cap-gated fills
-                    // stay Appending-full and resolve via ActiveSlot).
+                    // lands right after the append, then the caller
+                    // enqueues the seal hand-off.
                     reserve_segment(&pool, id);
                     written_ids.push(id);
+                    // The stalled queue backpressures the ENQUEUE (the
+                    // caller-side half of the hand-off). Note the append
+                    // can also time out when the queue is full AND the
+                    // in-flight cap gates a fill — both are the same
+                    // backpressure signal.
+                    match pool
+                        .enqueue_seal_handoff(
+                            sealed,
+                            std::time::Instant::now() + std::time::Duration::from_millis(20),
+                        )
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(Error::WriteBackpressureTimeout) => backpressured += 1,
+                        Err(e) => panic!("unexpected enqueue error: {e}"),
+                    }
                 }
                 Err(Error::WriteBackpressureTimeout) => backpressured += 1,
                 Err(e) => panic!("unexpected append error: {e}"),
@@ -2707,29 +2769,36 @@ mod tests {
         );
 
         let mut rx = pool.take_seal_rx().expect("seal rx");
+        let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(5);
 
-        // First fill enqueues into the capacity-1 queue (now full).
-        pool.append_with_hook_async(
-            b"0123456789abcdef",
-            |_, _, _| {},
-            std::time::Duration::from_secs(5),
-        )
-        .await
-        .expect("first fill succeeds");
+        // First fill; the caller-side enqueue fills the capacity-1 queue
+        // (now full).
+        let (_, _, _, sealed) = pool
+            .append_with_hook_async(
+                b"0123456789abcdef",
+                |_, _, _| {},
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("first fill succeeds");
+        pool.enqueue_seal_handoff(sealed, deadline()).await.expect("first enqueue succeeds");
 
-        // Second fill must await queue space instead of dropping.
+        // Second fill's enqueue must await queue space instead of
+        // dropping.
         let pool2 = Arc::clone(&pool);
         let second = tokio::spawn(async move {
-            pool2
+            let (_, _, _, sealed) = pool2
                 .append_with_hook_async(
                     b"0123456789abcdef",
                     |_, _, _| {},
                     std::time::Duration::from_secs(5),
                 )
                 .await
+                .expect("second fill succeeds");
+            pool2.enqueue_seal_handoff(sealed, deadline()).await
         });
 
-        // Let the second append enter the enqueue wait, then drain. The
+        // Let the second enqueue enter the wait, then drain. The
         // recv is timeout-bounded so a regression (e.g. re-introducing
         // try_send drop-on-full) fails fast instead of hanging.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -2745,7 +2814,7 @@ mod tests {
         assert_eq!(&first.segment_data[..], b"0123456789abcdef");
         assert_eq!(&second_item.segment_data[..], b"0123456789abcdef");
         let result = second.await.expect("task must not panic");
-        assert!(result.is_ok(), "second append must succeed after queue space frees: {result:?}");
+        assert!(result.is_ok(), "second enqueue must succeed after queue space frees: {result:?}");
     }
 
     #[tokio::test]
@@ -2776,19 +2845,33 @@ mod tests {
         // Hold the receiver and never drain — the queue stays full.
         let _rx = pool.take_seal_rx();
 
-        pool.append_with_hook_async(
-            b"0123456789abcdef",
-            |_, _, _| {},
-            std::time::Duration::from_secs(5),
-        )
-        .await
-        .expect("first fill enqueues into the empty queue");
-
-        let result = pool
+        let (_, _, _, sealed) = pool
             .append_with_hook_async(
                 b"0123456789abcdef",
                 |_, _, _| {},
-                std::time::Duration::from_millis(50),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("first fill succeeds");
+        pool.enqueue_seal_handoff(
+            sealed,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("first enqueue fills the queue");
+
+        let (_, _, _, sealed) = pool
+            .append_with_hook_async(
+                b"0123456789abcdef",
+                |_, _, _| {},
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("second fill succeeds");
+        let result = pool
+            .enqueue_seal_handoff(
+                sealed,
+                std::time::Instant::now() + std::time::Duration::from_millis(50),
             )
             .await;
         assert!(

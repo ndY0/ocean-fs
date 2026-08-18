@@ -25,6 +25,9 @@ pub struct HealingGrpcService {
     handoff: Arc<crate::HintedHandoff>,
     /// Metadata store for Merkle root lookups during anti-entropy.
     metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore>,
+    /// The lifecycle registry — the machine's `Sealed` entries carry
+    /// the Merkle-root fallback (ADR-0025 Decision 3).
+    registry: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry>,
     /// Segment data store for shard fetch and repair.
     data_store: Arc<dyn SegmentDataStore>,
     /// This node's identifier. When set, hints whose `intended_for`
@@ -42,10 +45,11 @@ impl HealingGrpcService {
     pub fn new(
         handoff: Arc<crate::HintedHandoff>,
         metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore>,
+        registry: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry>,
         data_store: Arc<dyn SegmentDataStore>,
         hlc_clock: Arc<HlcClock>,
     ) -> Self {
-        Self { handoff, metadata_store, data_store, local_node_id: None, hlc_clock }
+        Self { handoff, metadata_store, registry, data_store, local_node_id: None, hlc_clock }
     }
 
     /// Sets this node's identifier so that self-intended hints are
@@ -366,14 +370,12 @@ impl HealingRpc for HealingGrpcService {
             let proto_sid = req.segment_ids.first().cloned().unwrap_or_default();
             let sid = SegmentId::try_from(proto_sid).unwrap_or_default();
 
-            // Look up the segment's Merkle root from the metadata store.
+            // Look up the segment's Merkle root from the machine
+            // (ADR-0025 Decision 3).
             best_root_hash = self
-                .metadata_store
-                .list_segments()
-                .into_iter()
-                .filter_map(|r| r.ok())
-                .find(|s| s.segment_id == sid)
-                .and_then(|seg| seg.merkle_root)
+                .registry
+                .get(sid)
+                .and_then(|entry| entry.metadata.merkle_root)
                 .map(|h| Bytes::copy_from_slice(h.as_bytes()))
                 .unwrap_or_else(|| Bytes::from(vec![0u8; 32]));
 
@@ -527,7 +529,15 @@ mod tests {
             .unwrap(),
         );
         let data_store: Arc<dyn SegmentDataStore> = Arc::new(TestHealStore::new());
-        HealingGrpcService::new(handoff, metadata_store, data_store, Arc::new(HlcClock::new()))
+        HealingGrpcService::new(
+            handoff,
+            metadata_store,
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            )),
+            data_store,
+            Arc::new(HlcClock::new()),
+        )
     }
 
     /// G5: a batched inline hint intended for this node applies with the
@@ -547,6 +557,9 @@ mod tests {
         let service = HealingGrpcService::new(
             handoff,
             metadata_store.clone(),
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            )),
             data_store,
             Arc::new(HlcClock::new()),
         )
@@ -619,8 +632,15 @@ mod tests {
         test_store.write_segment_data(&seg_id, &data).unwrap();
 
         let data_store: Arc<dyn SegmentDataStore> = test_store;
-        let service =
-            HealingGrpcService::new(handoff, metadata_store, data_store, Arc::new(HlcClock::new()));
+        let service = HealingGrpcService::new(
+            handoff,
+            metadata_store,
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            )),
+            data_store,
+            Arc::new(HlcClock::new()),
+        );
 
         let proto_sid: ProtoSegmentId = seg_id.into();
         let request = tonic::Request::new(MerkleRequest {

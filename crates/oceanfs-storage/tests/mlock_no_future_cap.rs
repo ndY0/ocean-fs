@@ -87,7 +87,7 @@ fn mlock_block_cache_never_caps_future_allocations() {
     // ── 2. Open the metadata store with mlock enabled. On Linux this
     //       runs `mlockall(MCL_CURRENT)` — the real production path. ──
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = Arc::new(
+    let _store = Arc::new(
         RocksDbMetadataStore::open(&MetadataConfig {
             data_dir: dir.path().join("meta"),
             block_cache_size: 4 * 1024 * 1024,
@@ -119,11 +119,13 @@ fn mlock_block_cache_never_caps_future_allocations() {
         storage_locations: smallvec::SmallVec::new(),
         sealed_at: Some(0),
     };
-    store.put_segment(meta.clone()).expect("put segment");
-    assert!(
-        store.get_segment(id).expect("get segment").is_some(),
-        "segment must be readable after store open"
+    // Segment state lives in the machine (the segments CF is removed) —
+    // the store's objects side is exercised by the tombstone below.
+    let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
     );
+    registry.reserve(id, meta).expect("reserve segment");
+    assert!(registry.get(id).is_some(), "segment must be readable after store open");
 
     // ── 4. THE REGRESSION: allocate 1 GB. With `MCL_FUTURE` this
     //       mmap counts against the 1.5 GB `RLIMIT_MEMLOCK` ceiling

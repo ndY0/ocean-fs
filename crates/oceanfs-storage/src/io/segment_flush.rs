@@ -358,8 +358,22 @@ mod tests {
             })
             .unwrap(),
         );
-        let lifecycle =
-            Arc::new(SegmentLifecycleCoordinator::new(store.clone(), &LifecycleConfig::default()));
+        let event_wal = Arc::new(
+            crate::segment::event_wal::EventWal::open(
+                dir.path().join("event-wal"),
+                &oceanfs_core::EventWalConfig {
+                    event_wal_dir: dir.path().join("event-wal"),
+                    event_wal_file_size_bytes: 1024 * 1024,
+                    event_wal_fsync_batch_timeout_ms: 10,
+                    event_wal_checkpoint_bytes: 1024 * 1024,
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let lifecycle = Arc::new(
+            SegmentLifecycleCoordinator::new(&LifecycleConfig::default()).with_event_wal(event_wal),
+        );
         (store, lifecycle, dir)
     }
 
@@ -369,7 +383,7 @@ mod tests {
             ec_k: 0,
             ec_m: 0,
             size_tier: SizeTier::Standard,
-            merkle_root: None,
+            merkle_root: Some(oceanfs_core::HashOutput::from_bytes([0xAB; 32])),
             storage_locations: smallvec::SmallVec::new(),
             sealed_at: Some(0),
         }
@@ -377,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn group_commit_batches_concurrent_registrations() {
-        let (store, lifecycle, dir) = test_metadata_and_lifecycle().await;
+        let (_store, lifecycle, dir) = test_metadata_and_lifecycle().await;
         let seg_dir = dir.path().join("segments");
         std::fs::create_dir_all(&seg_dir).unwrap();
 
@@ -425,19 +439,14 @@ mod tests {
         for i in 0..16u64 {
             assert!(seg_dir.join(format!("{i}.dat")).exists());
         }
-        let ids: Vec<_> = store
-            .list_segments()
-            .into_iter()
-            .filter_map(|r| r.ok().map(|m| m.segment_id))
-            .collect();
-        assert_eq!(ids.len(), 16, "all 16 segment metadata entries persisted");
-        // The lifecycle registry folded every seal.
+        // The lifecycle registry folded every seal (the event log is
+        // the only durable segment-state store — ADR-0025 Decision 3).
         assert_eq!(lifecycle.registry().len(), 16);
     }
 
     #[tokio::test]
     async fn sync_failure_reports_error_and_skips_metadata() {
-        let (store, lifecycle, dir) = test_metadata_and_lifecycle().await;
+        let (_store, lifecycle, dir) = test_metadata_and_lifecycle().await;
         let seg_dir = dir.path().join("segments");
         std::fs::create_dir_all(&seg_dir).unwrap();
 
@@ -455,10 +464,8 @@ mod tests {
 
         assert!(result.is_err(), "sync failure must propagate to the waiter");
         assert!(!seg_dir.join("fail.dat").exists(), "finalize must not run after a failed sync");
-        // The reserve entry survives (it predates the seal); the SEAL
-        // metadata must not have been written.
-        let cf = store.get_segment(id).unwrap().expect("reserve entry still present");
-        assert!(cf.sealed_at.is_none(), "seal metadata must not be persisted after a failed sync");
+        // The reserve entry survives (it predates the seal); no seal
+        // event may be durable for the failed file.
         assert_eq!(
             lifecycle.registry().get(id).unwrap().state,
             crate::segment::lifecycle::SegmentState::Reserved,

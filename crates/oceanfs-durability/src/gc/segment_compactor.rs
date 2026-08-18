@@ -499,7 +499,9 @@ mod tests {
             ec_k: 4,
             ec_m: 2,
             size_tier: tier,
-            merkle_root: None,
+            // A sealed entry carries its seal-time anchor (the event log
+            // requires the root at seal time).
+            merkle_root: Some(oceanfs_core::HashOutput::from_bytes([0xAB; 32])),
             storage_locations: smallvec::SmallVec::new(),
             sealed_at: Some(sealed_at),
         }
@@ -512,7 +514,7 @@ mod tests {
     /// side-effects — the milestone ORDER is what these tests pin), and
     /// an in-memory shard store. Returns the coordinator too so tests can
     /// seed segments through the machine.
-    fn make_compactor(
+    async fn make_compactor(
         metadata: Arc<RocksDbMetadataStore>,
         entries: Vec<(SegmentId, Vec<u8>)>,
     ) -> (SegmentCompactor, Arc<SegmentLifecycleCoordinator>) {
@@ -520,9 +522,25 @@ mod tests {
         for (id, data) in entries {
             store.write_segment_data(&id, &data).unwrap();
         }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let event_wal = Arc::new(
+            oceanfs_storage::segment::event_wal::EventWal::open(
+                tmp.path().join("event-wal"),
+                &oceanfs_core::EventWalConfig {
+                    event_wal_dir: tmp.path().join("event-wal"),
+                    event_wal_file_size_bytes: 1024 * 1024,
+                    event_wal_fsync_batch_timeout_ms: 10,
+                    event_wal_checkpoint_bytes: 1024 * 1024,
+                },
+            )
+            .await
+            .unwrap(),
+        );
         let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
-        let lifecycle =
-            Arc::new(SegmentLifecycleCoordinator::with_registry(metadata.clone(), registry));
+        let lifecycle = Arc::new(
+            SegmentLifecycleCoordinator::with_registry(Arc::clone(&registry))
+                .with_event_wal(event_wal),
+        );
         let compactor = SegmentCompactor::new(
             metadata,
             TierRouter::new(oceanfs_core::SegmentSizeConfig::default()),
@@ -552,8 +570,9 @@ mod tests {
 
         let seg_id = SegmentId::new();
         let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
-        metadata.put_segment(seg_meta).unwrap();
-
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
+        registry.seal(seg_meta.segment_id, seg_meta).unwrap();
         // Put object referencing this segment
         let obj_meta = make_object_meta(
             "ref.txt",
@@ -584,7 +603,7 @@ mod tests {
         metadata.put_object(obj_meta2).unwrap();
 
         let (compactor, _lifecycle) =
-            make_compactor(metadata.clone(), vec![(seg_id, vec![0xAB; 500])]);
+            make_compactor(metadata.clone(), vec![(seg_id, vec![0xAB; 500])]).await;
 
         let empty_dead_keys = HashSet::new();
         let result = compactor
@@ -608,10 +627,11 @@ mod tests {
 
         let seg_id = SegmentId::new();
         let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
-        metadata.put_segment(seg_meta).unwrap();
-
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
+        registry.seal(seg_meta.segment_id, seg_meta).unwrap();
         let (compactor, _lifecycle) =
-            make_compactor(metadata.clone(), vec![(seg_id, vec![0xCD; 300])]);
+            make_compactor(metadata.clone(), vec![(seg_id, vec![0xCD; 300])]).await;
 
         let empty_dead_keys2 = HashSet::new();
         let result = compactor
@@ -634,8 +654,9 @@ mod tests {
 
         let seg_id = SegmentId::new();
         let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
-        metadata.put_segment(seg_meta).unwrap();
-
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
+        registry.seal(seg_meta.segment_id, seg_meta).unwrap();
         let obj_meta = make_object_meta(
             "old_deleted.txt",
             300,
@@ -668,7 +689,8 @@ mod tests {
 
         let mut tracker = LivenessTracker::new();
         let mut stats = GcStats::default();
-        let (dead_keys, _) = gc.process_tombstones(&metadata, &mut tracker, &mut stats).unwrap();
+        let (dead_keys, _) =
+            gc.process_tombstones(&metadata, &registry, &mut tracker, &mut stats).unwrap();
 
         // The tombstone is past TTL, so it should be in the dead set
         assert!(dead_keys.contains(&("default".to_string(), "old_deleted.txt".to_string())));
@@ -686,7 +708,7 @@ mod tests {
         let old_seg_id = SegmentId::new();
         let old_seg_meta = make_segment_meta(old_seg_id, SizeTier::Standard, 1700000000000);
         let (compactor, lifecycle) =
-            make_compactor(metadata.clone(), vec![(old_seg_id, vec![0xEF; 400])]);
+            make_compactor(metadata.clone(), vec![(old_seg_id, vec![0xEF; 400])]).await;
         // Seed the old segment through the machine (the only writer of
         // lifecycle state) so the compactor's request_delete validates.
         seed_sealed(&lifecycle, old_seg_meta.clone()).await;
@@ -712,8 +734,7 @@ mod tests {
         assert!(result.unwrap() > 0);
 
         // The old segment should be deleted (durably, via the
-        // coordinator) — the CF mirror no longer holds it.
-        assert!(metadata.get_segment(old_seg_id).unwrap().is_none());
+        // coordinator) — the machine's entry is evicted.
         assert!(
             lifecycle.registry().get(old_seg_id).is_none(),
             "the delete folds and evicts (grace 0)"
@@ -739,7 +760,9 @@ mod tests {
 
         let seg_id = SegmentId::new();
         let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
-        metadata.put_segment(seg_meta.clone()).unwrap();
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        registry.reserve(seg_id, seg_meta.clone()).unwrap();
+        registry.seal(seg_id, seg_meta.clone()).unwrap();
 
         // Put 4 objects (200 bytes each = 800 total)
         for i in 0..4 {
@@ -777,11 +800,27 @@ mod tests {
         let store = Arc::new(crate::anti_entropy::InMemorySegmentStore::new());
         store.write_segment_data(&seg_id, &vec![0x11; 800]).unwrap();
         let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
-        let lifecycle =
-            Arc::new(SegmentLifecycleCoordinator::with_registry(metadata.clone(), registry));
         // Seed the candidate through the machine (the only writer of
         // lifecycle state) so the compactor's transitions validate.
-        seed_sealed(&lifecycle, seg_meta).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let event_wal = Arc::new(
+            oceanfs_storage::segment::event_wal::EventWal::open(
+                tmp.path().join("event-wal"),
+                &oceanfs_core::EventWalConfig {
+                    event_wal_dir: tmp.path().join("event-wal"),
+                    event_wal_file_size_bytes: 1024 * 1024,
+                    event_wal_fsync_batch_timeout_ms: 10,
+                    event_wal_checkpoint_bytes: 1024 * 1024,
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let lifecycle = Arc::new(
+            SegmentLifecycleCoordinator::with_registry(Arc::clone(&registry))
+                .with_event_wal(event_wal),
+        );
+        seed_sealed(&lifecycle, seg_meta.clone()).await;
         let gc_trigger = GarbageCollector::new(GcConfig {
             tombstone_ttl_sec: 0,
             compact_threshold: 0.5,
@@ -792,14 +831,14 @@ mod tests {
         .with_data_store(store)
         .with_lifecycle(lifecycle)
         .with_shard_store(Arc::new(InMemorySegmentShardStore::new(0)));
-        let stats = gc_trigger.run_cycle(metadata.clone()).await.unwrap();
+        let stats = gc_trigger.run_cycle(metadata.clone(), &registry).await.unwrap();
 
         assert!(stats.segments_scanned >= 1);
         // With 75% dead and threshold 0.5, the segment should be compacted
         assert_eq!(stats.segments_compacted, 1);
         assert!(stats.bytes_reclaimed > 0);
         // Old segment should be gone (durably deleted via the machine)
-        assert!(metadata.get_segment(seg_id).unwrap().is_none());
+        assert!(registry.get(seg_id).is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -812,8 +851,9 @@ mod tests {
 
         let seg_id = SegmentId::new();
         let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
-        metadata.put_segment(seg_meta).unwrap();
-
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
+        registry.seal(seg_meta.segment_id, seg_meta).unwrap();
         // Live object
         let obj_key_live = ObjectKey::new("live.txt");
         let obj_meta_live = make_object_meta(
@@ -845,7 +885,7 @@ mod tests {
         metadata.put_object(obj_meta_dead).unwrap();
 
         let (compactor, _lifecycle) =
-            make_compactor(metadata.clone(), vec![(seg_id, vec![0x42; 500])]);
+            make_compactor(metadata.clone(), vec![(seg_id, vec![0x42; 500])]).await;
 
         // Mark "dead.txt" as a dead object
         let mut dead_keys = HashSet::new();

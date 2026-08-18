@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use oceanfs_core::{HashOutput, MetadataConfig, NodeId, SegmentId, SegmentMetadata, SizeTier};
+use oceanfs_core::{HashOutput, NodeId, SegmentId, SegmentMetadata, SizeTier};
 use oceanfs_durability::{
     merkle::{IncrementalMerkleTree, MerkleTreeConfig},
     AntiEntropy, AntiEntropyConfig, InMemorySegmentStore, MerkleTree, SegmentDataStore,
@@ -19,24 +19,10 @@ use oceanfs_durability::{
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::{Ring, RingCache};
-use oceanfs_storage::RocksDbMetadataStore;
 
 /// Creates a test IncrementalMerkleTree.
 fn make_test_tree() -> Arc<IncrementalMerkleTree> {
     Arc::new(IncrementalMerkleTree::new(MerkleTreeConfig::default()))
-}
-
-/// Helper: create a temporary metadata store.
-fn open_temp_metadata() -> Arc<RocksDbMetadataStore> {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let config = MetadataConfig {
-        data_dir: dir.path().to_path_buf(),
-        block_cache_size: 8 * 1024 * 1024,
-        memtable_size: 8 * 1024 * 1024,
-        ..Default::default()
-    };
-    let _dir_leaked = Box::leak(Box::new(dir));
-    Arc::new(RocksDbMetadataStore::open(&config).expect("open metadata store"))
 }
 
 /// Helper: create a membership + ring cache for a single node.
@@ -77,7 +63,9 @@ fn make_test_data(size: usize) -> Vec<u8> {
 
 #[tokio::test]
 async fn ae_empty_segments_produces_zero_stats() {
-    let metadata = open_temp_metadata();
+    let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ));
     let (membership, _ring_cache) = make_membership("test-node");
     let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
     let data_store: Arc<dyn SegmentDataStore> = Arc::new(InMemorySegmentStore::new());
@@ -85,7 +73,7 @@ async fn ae_empty_segments_produces_zero_stats() {
     let ae = AntiEntropy::new(
         AntiEntropyConfig::default(),
         membership,
-        metadata,
+        Arc::clone(&registry),
         pool,
         data_store,
         make_test_tree(),
@@ -98,7 +86,9 @@ async fn ae_empty_segments_produces_zero_stats() {
 
 #[tokio::test]
 async fn ae_sealed_segment_with_matching_root_no_mismatch() {
-    let metadata = open_temp_metadata();
+    let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ));
     let data_store: Arc<dyn SegmentDataStore> = Arc::new(InMemorySegmentStore::new());
 
     // Create test data and write it to the in-memory store
@@ -106,11 +96,12 @@ async fn ae_sealed_segment_with_matching_root_no_mismatch() {
     let seg_id = SegmentId::new();
     data_store.write_segment_data(&seg_id, &data).expect("write segment data");
 
-    // Compute the Merkle root and store it in metadata
+    // Compute the Merkle root and seed the machine with it
     let tree = MerkleTree::build(&data, 0).expect("build Merkle tree");
     let root_hash = tree.root().hash();
     let seg_meta = make_sealed_segment(seg_id, Some(root_hash));
-    metadata.put_segment(seg_meta).expect("put segment");
+    registry.reserve(seg_id, seg_meta.clone()).expect("reserve segment");
+    registry.seal(seg_id, seg_meta).expect("seal segment");
 
     let (membership, _ring_cache) = make_membership("test-node");
     let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
@@ -118,7 +109,7 @@ async fn ae_sealed_segment_with_matching_root_no_mismatch() {
     let ae = AntiEntropy::new(
         AntiEntropyConfig::default(),
         membership,
-        metadata,
+        Arc::clone(&registry),
         pool,
         data_store,
         make_test_tree(),
@@ -132,7 +123,9 @@ async fn ae_sealed_segment_with_matching_root_no_mismatch() {
 
 #[tokio::test]
 async fn ae_sealed_segment_with_mismatched_root_detected() {
-    let metadata = open_temp_metadata();
+    let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ));
     let data_store: Arc<dyn SegmentDataStore> = Arc::new(InMemorySegmentStore::new());
 
     // Create test data
@@ -143,7 +136,8 @@ async fn ae_sealed_segment_with_mismatched_root_detected() {
     // Store a deliberately WRONG merkle root
     let wrong_hash = HashOutput::from_bytes([0xAAu8; 32]);
     let seg_meta = make_sealed_segment(seg_id, Some(wrong_hash));
-    metadata.put_segment(seg_meta).expect("put segment");
+    registry.reserve(seg_id, seg_meta.clone()).expect("reserve segment");
+    registry.seal(seg_id, seg_meta).expect("seal segment");
 
     let (membership, _ring_cache) = make_membership("test-node");
     let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
@@ -151,7 +145,7 @@ async fn ae_sealed_segment_with_mismatched_root_detected() {
     let ae = AntiEntropy::new(
         AntiEntropyConfig::default(),
         membership,
-        metadata,
+        Arc::clone(&registry),
         pool,
         data_store,
         make_test_tree(),
@@ -165,7 +159,9 @@ async fn ae_sealed_segment_with_mismatched_root_detected() {
 
 #[tokio::test]
 async fn ae_sealed_segment_without_merkle_root_is_flagged() {
-    let metadata = open_temp_metadata();
+    let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ));
     let data_store: Arc<dyn SegmentDataStore> = Arc::new(InMemorySegmentStore::new());
 
     let data = make_test_data(4096);
@@ -174,7 +170,8 @@ async fn ae_sealed_segment_without_merkle_root_is_flagged() {
 
     // Segment with no stored Merkle root
     let seg_meta = make_sealed_segment(seg_id, None);
-    metadata.put_segment(seg_meta).expect("put segment");
+    registry.reserve(seg_id, seg_meta.clone()).expect("reserve segment");
+    registry.seal(seg_id, seg_meta).expect("seal segment");
 
     let (membership, _ring_cache) = make_membership("test-node");
     let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
@@ -182,7 +179,7 @@ async fn ae_sealed_segment_without_merkle_root_is_flagged() {
     let ae = AntiEntropy::new(
         AntiEntropyConfig::default(),
         membership,
-        metadata,
+        Arc::clone(&registry),
         pool,
         data_store,
         make_test_tree(),
@@ -196,7 +193,9 @@ async fn ae_sealed_segment_without_merkle_root_is_flagged() {
 
 #[tokio::test]
 async fn ae_multiple_segments_all_compared() {
-    let metadata = open_temp_metadata();
+    let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ));
     let data_store: Arc<dyn SegmentDataStore> = Arc::new(InMemorySegmentStore::new());
 
     for i in 0..5u32 {
@@ -207,7 +206,8 @@ async fn ae_multiple_segments_all_compared() {
         let tree = MerkleTree::build(&data, 0).expect("build Merkle tree");
         let root_hash = tree.root().hash();
         let seg_meta = make_sealed_segment(seg_id, Some(root_hash));
-        metadata.put_segment(seg_meta).expect("put segment");
+        registry.reserve(seg_id, seg_meta.clone()).expect("reserve segment");
+        registry.seal(seg_id, seg_meta).expect("seal segment");
     }
 
     let (membership, _ring_cache) = make_membership("test-node");
@@ -216,7 +216,7 @@ async fn ae_multiple_segments_all_compared() {
     let ae = AntiEntropy::new(
         AntiEntropyConfig::default(),
         membership,
-        metadata,
+        Arc::clone(&registry),
         pool,
         data_store,
         make_test_tree(),
@@ -254,14 +254,23 @@ async fn ae_merkle_tree_build_and_compare() {
 /// exist, so the returned vec is always empty — but the config is wired.
 #[tokio::test]
 async fn test_ae_config_peer_count_respected() {
-    let metadata = open_temp_metadata();
+    let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ));
     let (membership, _ring_cache) = make_membership("test-node");
     let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
     let data_store: Arc<dyn SegmentDataStore> = Arc::new(InMemorySegmentStore::new());
 
     // Custom peer_count = 3 (vs default 1).
     let config = AntiEntropyConfig::new(300, 3);
-    let ae = AntiEntropy::new(config, membership, metadata, pool, data_store, make_test_tree());
+    let ae = AntiEntropy::new(
+        config,
+        membership,
+        Arc::clone(&registry),
+        pool,
+        data_store,
+        make_test_tree(),
+    );
 
     // select_alive_peers should not panic; with only self node, returns empty.
     let peers = ae.select_alive_peers();

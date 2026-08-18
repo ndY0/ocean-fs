@@ -203,7 +203,6 @@ async fn make_coordinator(
     };
     let lifecycle =
         Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
-            local_store.clone(),
             &oceanfs_core::LifecycleConfig::default(),
         ));
     let sealer = Arc::new(SegmentSealer::new(seal_config, wal, Arc::clone(&lifecycle)));

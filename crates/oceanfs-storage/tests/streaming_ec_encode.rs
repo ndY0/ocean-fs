@@ -13,8 +13,7 @@ use std::sync::Arc;
 use oceanfs_core::{CodecConfig, PoolConfig, SegmentSizeConfig, SizeTier};
 use oceanfs_storage::{
     segment::lifecycle::{SegmentLifecycleCoordinator, SegmentLifecycleRegistry},
-    BufferPool, RocksDbMetadataStore, SealConfig, SegmentHeader, SegmentPool, SegmentSealer,
-    WalWriter,
+    BufferPool, SealConfig, SegmentHeader, SegmentPool, SegmentSealer, WalWriter,
 };
 
 /// Creates a segment pool with EC parameters configured (k=4, m=2, strip=64).
@@ -54,15 +53,6 @@ fn make_ec_pool() -> SegmentPool {
 async fn make_sealer(
     dir: &tempfile::TempDir,
 ) -> (SegmentSealer, std::sync::Arc<SegmentLifecycleCoordinator>, std::path::PathBuf) {
-    let metadata = Arc::new(
-        RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
-            data_dir: dir.path().join("meta"),
-            block_cache_size: 1024,
-            memtable_size: 1024,
-            ..Default::default()
-        })
-        .unwrap(),
-    );
     let wal = Arc::new(
         WalWriter::open(&oceanfs_core::WalConfig {
             data_dir: dir.path().join("wal"),
@@ -74,11 +64,24 @@ async fn make_sealer(
         .unwrap(),
     );
     let seal_dir = dir.path().join("segments");
-    let lifecycle =
-        std::sync::Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
-            metadata,
+    let lifecycle = std::sync::Arc::new(
+        oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
             &oceanfs_core::LifecycleConfig::default(),
-        ));
+        )
+        .with_event_wal(std::sync::Arc::new(
+            oceanfs_storage::segment::event_wal::EventWal::open(
+                dir.path().join("event-wal"),
+                &oceanfs_core::EventWalConfig {
+                    event_wal_dir: dir.path().join("event-wal"),
+                    event_wal_file_size_bytes: 1024 * 1024,
+                    event_wal_fsync_batch_timeout_ms: 10,
+                    event_wal_checkpoint_bytes: 1024 * 1024,
+                },
+            )
+            .await
+            .unwrap(),
+        )),
+    );
     let sealer = SegmentSealer::new(
         SealConfig {
             target_size_bytes: 1024,
@@ -123,7 +126,17 @@ async fn seal_from_data_persists_ec_parity_section() {
     let data = bytes::Bytes::from(vec![0xCDu8; 1024]); // 4 complete stripes
 
     let _handle = sealer
-        .seal_from_data(segment_id, SizeTier::Standard, data.clone(), &[], 4, 2, 64, None, None)
+        .seal_from_data(
+            segment_id,
+            SizeTier::Standard,
+            data.clone(),
+            &[],
+            4,
+            2,
+            64,
+            None,
+            Some(oceanfs_core::HashOutput::from_bytes([0xAB; 32])),
+        )
         .await
         .unwrap();
 
@@ -147,7 +160,17 @@ async fn seal_without_ec_params_has_no_parity_section() {
     let data = bytes::Bytes::from(vec![0xEEu8; 512]);
 
     let _handle = sealer
-        .seal_from_data(segment_id, SizeTier::Standard, data.clone(), &[], 0, 0, 0, None, None)
+        .seal_from_data(
+            segment_id,
+            SizeTier::Standard,
+            data.clone(),
+            &[],
+            0,
+            0,
+            0,
+            None,
+            Some(oceanfs_core::HashOutput::from_bytes([0xAB; 32])),
+        )
         .await
         .unwrap();
 

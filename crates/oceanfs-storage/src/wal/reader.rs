@@ -91,18 +91,8 @@ impl WalReader {
         }
     }
 
-    /// Iterates the entries of a single WAL file.
-    ///
-    /// Used by the retention-aware cleanup to decide whether a file can
-    /// be deleted: a file must be kept when it contains entries for
-    /// segments that are still unsealed (the WAL is their only durable
-    /// copy).
-    pub(crate) fn entries_in_file(path: PathBuf) -> impl Iterator<Item = Result<WalEntry>> {
-        WalReplayIter { file_paths: vec![path], current: 0, current_reader: None }
-    }
-
-    /// Position-yielding variant of [`entries_in_file`](Self::entries_in_file)
-    /// — the cleanup's exact sweep boundary (an entry at position `p` is
+    /// Position-yielding iteration over a single WAL file — the
+    /// retention sweep's exact boundary (an entry at position `p` is
     /// garbage iff its segment's `SealEvent.data_wal_pos ≥ p`).
     pub(crate) fn entries_in_file_positions(
         path: PathBuf,

@@ -15,7 +15,6 @@ use tracing::{info, warn};
 
 use crate::{
     error::Result,
-    metadata::RocksDbMetadataStore,
     segment::{event_wal::DataWalPos, lifecycle::SegmentLifecycleCoordinator, pool::SegmentPool},
     wal::reader::WalReader,
 };
@@ -327,18 +326,13 @@ pub async fn replay_wal(
 /// does not cause the replay to fail.
 ///
 /// `keep` is the number of most recent files to retain (including the
-/// current one). When `metadata` is provided, retention is **seal-aware**
-/// in addition: a file outside the window is still kept when it contains
-/// entries for segments that are registered but not yet sealed
-/// (`sealed_at: None`) — the WAL is the only durable copy of an unsealed
-/// segment's data, and replay reads every retained file. Segments that
-/// completed sealing are durable on disk, so their entries may be swept
-/// freely. Entries for segments that are **not registered in the
-/// metadata store at all** are unreachable garbage (a phantom whose
-/// `put_segment` never landed — crash window — or a segment deleted
-/// without a marker); they do not protect their file. The write path
-/// registers the phantom BEFORE the WAL entry, so the unregistered case
-/// can only be a true crash phantom — no timing heuristic needed.
+/// current one). When `is_entry_garbage` is provided, retention is
+/// **machine-aware** in addition: a file outside the window is still
+/// kept when it contains live entries (ADR-0024 §Retention — an entry
+/// at position `p` of segment `S` is garbage iff `S` is Sealed with
+/// `data_wal_pos ≥ p`, or Deleted). No metadata-store lookup happens
+/// here — liveness is the caller's closure (the lifecycle registry +
+/// event positions; the CF-derived `durable_or_deleted` scan is gone).
 pub async fn cleanup_old_wal_files(
     config: &WalConfig,
     keep: usize,
@@ -440,48 +434,6 @@ fn file_contains_live_entries(
     false
 }
 
-/// Prunes deleted-segment markers whose segment is no longer referenced
-/// by any retained WAL file.
-///
-/// Markers accumulate while their segments' entries sit in retained
-/// files (the entries only become sweepable once the file leaves the
-/// retention window); once no retained file references the segment, the
-/// marker is pure garbage. Runs periodically during operation (the
-/// writer throttles it to every `MARKER_PRUNE_ROTATIONS` rotations) and
-/// once at replay, where the retained-file scan is already paid for.
-///
-/// Returns the number of markers removed.
-pub async fn prune_deleted_segment_markers(
-    config: &WalConfig,
-    metadata: &RocksDbMetadataStore,
-) -> usize {
-    // Collect the segment ids referenced by every retained file.
-    let mut referenced: std::collections::HashSet<oceanfs_core::SegmentId> =
-        std::collections::HashSet::new();
-    let Ok(dir) = std::fs::read_dir(&config.data_dir) else {
-        return 0;
-    };
-    for entry in dir.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with("wal_") && name.ends_with(".log") {
-            for wal_entry in super::reader::WalReader::entries_in_file(entry.path()).flatten() {
-                referenced.insert(wal_entry.segment_id());
-            }
-        }
-    }
-
-    // Drop every marker whose segment is not referenced anymore.
-    let mut pruned = 0usize;
-    for result in metadata.list_deleted_segments() {
-        let Ok((id, _)) = result else { continue };
-        if !referenced.contains(&id) && metadata.delete_deleted_segment(id).is_ok() {
-            pruned += 1;
-        }
-    }
-    pruned
-}
-
 /// Counts the number of WAL files present in the configured directory.
 ///
 /// Files are named `wal_{seq:08}.log`. Rotation appends new files while
@@ -509,14 +461,12 @@ mod tests {
     use std::sync::Arc;
 
     use oceanfs_core::{
-        HashOutput, LifecycleConfig, MetadataConfig, PoolConfig, SegmentMetadata,
-        SegmentSizeConfig, SizeTier,
+        HashOutput, LifecycleConfig, PoolConfig, SegmentMetadata, SegmentSizeConfig, SizeTier,
     };
 
     use super::*;
     use crate::{
         buffer_pool::BufferPool,
-        metadata::RocksDbMetadataStore,
         segment::{
             lifecycle::{SegmentLifecycleCoordinator, SegmentLifecycleRegistry},
             pool::SegmentPool,
@@ -528,20 +478,22 @@ mod tests {
     /// replay reserves every rebuilt segment through it).
     async fn make_lifecycle(
         registry: Arc<SegmentLifecycleRegistry>,
-    ) -> (Arc<RocksDbMetadataStore>, Arc<SegmentLifecycleCoordinator>) {
+    ) -> Arc<SegmentLifecycleCoordinator> {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            RocksDbMetadataStore::open(&MetadataConfig {
-                data_dir: dir.path().join("meta"),
-                block_cache_size: 1024,
-                memtable_size: 1024,
-                ..Default::default()
-            })
+        let event_wal = Arc::new(
+            crate::segment::event_wal::EventWal::open(
+                dir.path().join("event-wal"),
+                &oceanfs_core::EventWalConfig {
+                    event_wal_dir: dir.path().join("event-wal"),
+                    event_wal_file_size_bytes: 1024 * 1024,
+                    event_wal_fsync_batch_timeout_ms: 10,
+                    event_wal_checkpoint_bytes: 1024 * 1024,
+                },
+            )
+            .await
             .unwrap(),
         );
-        let lifecycle =
-            Arc::new(SegmentLifecycleCoordinator::with_registry(store.clone(), registry));
-        (store, lifecycle)
+        Arc::new(SegmentLifecycleCoordinator::with_registry(registry).with_event_wal(event_wal))
     }
 
     async fn make_test_env() -> (WalConfig, SegmentSizeConfig, Arc<BufferPool>, tempfile::TempDir) {
@@ -600,21 +552,39 @@ mod tests {
         )
     }
 
-    /// Builds a liveness closure from the CF (the pre-machine retention
-    /// semantics), exercising the closure-based cleanup API: garbage iff
-    /// sealed, deleted-marker'd, or absent from the CF; DB errors
-    /// protect conservatively.
-    fn cf_liveness(
-        metadata: &Arc<RocksDbMetadataStore>,
+    /// Builds the machine-backed liveness closure (ADR-0024 §Retention
+    /// final form): an entry at `pos` of segment `S` is garbage iff the
+    /// registry entry is Sealed with `data_wal_pos ≥ pos`, or Deleted;
+    /// an absent entry (phantom or deleted-and-evicted) is unreachable
+    /// garbage — sweepable.
+    fn machine_liveness(
+        registry: &Arc<SegmentLifecycleRegistry>,
     ) -> impl Fn(oceanfs_core::SegmentId, DataWalPos) -> bool + Send + Sync + 'static {
-        let metadata = Arc::clone(metadata);
-        move |id, _pos| match metadata.get_segment(id) {
-            Ok(Some(meta)) => meta.sealed_at.is_some(),
-            // No CF entry: deleted (marker removed the entry) or never
-            // registered — both unreachable, sweepable.
-            Ok(None) => true,
-            Err(_) => false, // conservative: protect on DB error
+        let registry = Arc::clone(registry);
+        move |id, pos| {
+            registry
+                .get(id)
+                .map(|entry| crate::segment::lifecycle::entry_is_garbage(&entry, &pos))
+                .unwrap_or(true)
         }
+    }
+
+    /// Sealed-metadata helper for the retention tests.
+    fn sealed_meta(id: SegmentId) -> SegmentMetadata {
+        SegmentMetadata {
+            segment_id: id,
+            ec_k: 1,
+            ec_m: 0,
+            size_tier: oceanfs_core::SizeTier::Small,
+            merkle_root: Some(HashOutput::from_bytes([0u8; 32])),
+            storage_locations: smallvec::SmallVec::new(),
+            sealed_at: Some(1_000_000_000_000),
+        }
+    }
+
+    /// Unsealed-metadata helper for the retention tests.
+    fn unsealed_meta(id: SegmentId) -> SegmentMetadata {
+        SegmentMetadata { merkle_root: None, sealed_at: None, ..sealed_meta(id) }
     }
 
     fn make_entry_with_hlc(
@@ -695,53 +665,28 @@ mod tests {
 
         // A segment written into the OLDEST file (seq 1), still unsealed.
         let unsealed_id = SegmentId::new();
-        let metadata = Arc::new(
-            RocksDbMetadataStore::open(&MetadataConfig {
-                data_dir: dir.path().join("metadata"),
-                ..Default::default()
-            })
-            .unwrap(),
-        );
-        // Register the segment as UNSEALED (sealed_at: None — the write
-        // path's phantom registration) BEFORE any rotation, exactly as
-        // the production write path does.
-        metadata
-            .put_segment(SegmentMetadata {
-                segment_id: unsealed_id,
-                ec_k: 1,
-                ec_m: 0,
-                size_tier: oceanfs_core::SizeTier::Small,
-                merkle_root: None,
-                storage_locations: smallvec::SmallVec::new(),
-                sealed_at: None,
-            })
-            .unwrap();
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        let lifecycle = make_lifecycle(Arc::clone(&registry)).await;
+        // Register the segment as UNSEALED (the write path's phantom
+        // registration) BEFORE any rotation, exactly as production does.
+        registry.reserve(unsealed_id, unsealed_meta(unsealed_id)).unwrap();
+        let unsealed_pos;
         {
             let writer = WalWriter::open(&wal_config).await.unwrap();
-            // Retention liveness (machine-backed in production; the
-            // CF-derived closure here exercises the same contract).
-            writer.set_liveness(Arc::new(cf_liveness(&metadata)));
-            let writer = writer.with_metadata(Arc::clone(&metadata));
-            writer.append(make_entry(unsealed_id, 0, 8192)).await.unwrap();
+            // Retention liveness: the machine-backed closure.
+            writer.set_liveness(Arc::new(machine_liveness(&registry)));
+            unsealed_pos = writer.append(make_entry(unsealed_id, 0, 8192)).await.unwrap();
             // Rotate 6 times so the entry lands in a file far outside
             // the retention window (each rotate opens the next seq).
-            // The filler entries' segments are SEALED (registered with
-            // sealed_at: Some), so their files remain sweepable — only
-            // the unsealed segment's file is protected.
+            // The filler entries' segments are SEALED (with their entry
+            // positions recorded), so their files remain sweepable —
+            // only the unsealed segment's file is protected.
             for _i in 0..6 {
                 let filler_id = SegmentId::new();
-                metadata
-                    .put_segment(SegmentMetadata {
-                        segment_id: filler_id,
-                        ec_k: 1,
-                        ec_m: 0,
-                        size_tier: oceanfs_core::SizeTier::Small,
-                        merkle_root: None,
-                        storage_locations: smallvec::SmallVec::new(),
-                        sealed_at: Some(1_000_000_000_000),
-                    })
-                    .unwrap();
-                writer.append(make_entry(filler_id, 0, 8192)).await.unwrap();
+                registry.reserve(filler_id, unsealed_meta(filler_id)).unwrap();
+                let pos = writer.append(make_entry(filler_id, 0, 8192)).await.unwrap();
+                lifecycle.record_data_wal_pos(filler_id, pos);
+                registry.seal(filler_id, sealed_meta(filler_id)).unwrap();
                 writer.rotate().await.unwrap();
             }
         }
@@ -755,7 +700,7 @@ mod tests {
             "4-file window (seq 3..=6) + protected oldest file (seq 0) = 5"
         );
 
-        cleanup_old_wal_files(&wal_config, 1, Some(&cf_liveness(&metadata))).await;
+        cleanup_old_wal_files(&wal_config, 1, Some(&machine_liveness(&registry))).await;
         // The oldest file (holding the unsealed segment's entry) is
         // protected; the current file survives via the window.
         assert_eq!(
@@ -764,19 +709,12 @@ mod tests {
             "oldest file with unsealed entries + current file must survive"
         );
 
-        // Once the segment is SEALED, the file becomes deletable.
-        metadata
-            .put_segment(SegmentMetadata {
-                segment_id: unsealed_id,
-                ec_k: 1,
-                ec_m: 0,
-                size_tier: oceanfs_core::SizeTier::Small,
-                merkle_root: None,
-                storage_locations: smallvec::SmallVec::new(),
-                sealed_at: Some(1_000_000_000_000),
-            })
-            .unwrap();
-        cleanup_old_wal_files(&wal_config, 1, Some(&cf_liveness(&metadata))).await;
+        // Once the segment is SEALED (with its entry position recorded),
+        // the file becomes deletable.
+        let _ = lifecycle; // the coordinator's record_data_wal_pos path is exercised above
+        registry.record_data_wal_pos(unsealed_id, unsealed_pos);
+        registry.seal(unsealed_id, sealed_meta(unsealed_id)).unwrap();
+        cleanup_old_wal_files(&wal_config, 1, Some(&machine_liveness(&registry))).await;
         assert_eq!(count_wal_files(&wal_config), 1, "sealed segments' entries may be swept");
     }
 
@@ -789,49 +727,27 @@ mod tests {
         let wal_dir = dir.path().join("wal");
         tokio::fs::create_dir_all(&wal_dir).await.unwrap();
 
-        let metadata = Arc::new(
-            RocksDbMetadataStore::open(&MetadataConfig {
-                data_dir: dir.path().join("metadata"),
-                ..Default::default()
-            })
-            .unwrap(),
-        );
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        let lifecycle = make_lifecycle(Arc::clone(&registry)).await;
         let deleted_id = SegmentId::new();
-        // Sealed first (delete_segment only marks SEALED deletions)...
-        metadata
-            .put_segment(SegmentMetadata {
-                segment_id: deleted_id,
-                ec_k: 1,
-                ec_m: 0,
-                size_tier: oceanfs_core::SizeTier::Small,
-                merkle_root: None,
-                storage_locations: smallvec::SmallVec::new(),
-                sealed_at: Some(1_000_000_000_000),
-            })
-            .unwrap();
+        // Sealed first (the DeleteEvent's garbage rule applies to the
+        // sealed state), then deleted.
+        registry.reserve(deleted_id, unsealed_meta(deleted_id)).unwrap();
+        registry.seal(deleted_id, sealed_meta(deleted_id)).unwrap();
         {
             let writer = WalWriter::open(&wal_config).await.unwrap();
-            // Retention liveness (machine-backed in production; the
-            // CF-derived closure here exercises the same contract).
-            writer.set_liveness(Arc::new(cf_liveness(&metadata)));
-            let writer = writer.with_metadata(Arc::clone(&metadata));
+            // Retention liveness: the machine-backed closure.
+            writer.set_liveness(Arc::new(machine_liveness(&registry)));
             writer.append(make_entry(deleted_id, 0, 8192)).await.unwrap();
-            // ...then deleted: file 0 now holds only garbage entries.
-            metadata.delete_segment(deleted_id).unwrap();
+            // ...then deleted (the fold evicts with grace 0): file 0 now
+            // holds only garbage entries.
+            registry.delete(deleted_id).unwrap();
             for _i in 0..6 {
                 let filler_id = SegmentId::new();
-                metadata
-                    .put_segment(SegmentMetadata {
-                        segment_id: filler_id,
-                        ec_k: 1,
-                        ec_m: 0,
-                        size_tier: oceanfs_core::SizeTier::Small,
-                        merkle_root: None,
-                        storage_locations: smallvec::SmallVec::new(),
-                        sealed_at: Some(1_000_000_000_000),
-                    })
-                    .unwrap();
-                writer.append(make_entry(filler_id, 0, 8192)).await.unwrap();
+                registry.reserve(filler_id, unsealed_meta(filler_id)).unwrap();
+                let pos = writer.append(make_entry(filler_id, 0, 8192)).await.unwrap();
+                lifecycle.record_data_wal_pos(filler_id, pos);
+                registry.seal(filler_id, sealed_meta(filler_id)).unwrap();
                 writer.rotate().await.unwrap();
             }
         }
@@ -860,55 +776,30 @@ mod tests {
         let wal_dir = dir.path().join("wal");
         tokio::fs::create_dir_all(&wal_dir).await.unwrap();
 
-        let metadata = Arc::new(
-            RocksDbMetadataStore::open(&MetadataConfig {
-                data_dir: dir.path().join("metadata"),
-                ..Default::default()
-            })
-            .unwrap(),
-        );
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        let lifecycle = make_lifecycle(Arc::clone(&registry)).await;
         let phantom_id = SegmentId::new();
         let unsealed_deleted_id = SegmentId::new();
         {
             let writer = WalWriter::open(&wal_config).await.unwrap();
-            // Retention liveness (machine-backed in production; the
-            // CF-derived closure here exercises the same contract).
-            writer.set_liveness(Arc::new(cf_liveness(&metadata)));
-            let writer = writer.with_metadata(Arc::clone(&metadata));
+            // Retention liveness: the machine-backed closure.
+            writer.set_liveness(Arc::new(machine_liveness(&registry)));
             // Phantom: append WITHOUT registering the segment — the
             // crash-window shape from the production write path.
             writer.append(make_entry(phantom_id, 0, 8192)).await.unwrap();
-            // Unsealed-deleted: register, delete while unsealed (no
-            // marker is written — was_sealed is false).
-            metadata
-                .put_segment(SegmentMetadata {
-                    segment_id: unsealed_deleted_id,
-                    ec_k: 1,
-                    ec_m: 0,
-                    size_tier: oceanfs_core::SizeTier::Small,
-                    merkle_root: None,
-                    storage_locations: smallvec::SmallVec::new(),
-                    sealed_at: None,
-                })
-                .unwrap();
+            // Unsealed-deleted: register, delete while unsealed (the
+            // fold evicts; no entry remains to protect anything).
+            registry.reserve(unsealed_deleted_id, unsealed_meta(unsealed_deleted_id)).unwrap();
             writer.append(make_entry(unsealed_deleted_id, 0, 8192)).await.unwrap();
-            metadata.delete_segment(unsealed_deleted_id).unwrap();
+            registry.delete(unsealed_deleted_id).unwrap();
             // Rotate 6 times with sealed filler segments so file 0 falls
             // far outside the 4-file window.
             for _i in 0..6 {
                 let filler_id = SegmentId::new();
-                metadata
-                    .put_segment(SegmentMetadata {
-                        segment_id: filler_id,
-                        ec_k: 1,
-                        ec_m: 0,
-                        size_tier: oceanfs_core::SizeTier::Small,
-                        merkle_root: None,
-                        storage_locations: smallvec::SmallVec::new(),
-                        sealed_at: Some(1_000_000_000_000),
-                    })
-                    .unwrap();
-                writer.append(make_entry(filler_id, 0, 8192)).await.unwrap();
+                registry.reserve(filler_id, unsealed_meta(filler_id)).unwrap();
+                let pos = writer.append(make_entry(filler_id, 0, 8192)).await.unwrap();
+                lifecycle.record_data_wal_pos(filler_id, pos);
+                registry.seal(filler_id, sealed_meta(filler_id)).unwrap();
                 writer.rotate().await.unwrap();
             }
         }
@@ -922,46 +813,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prune_deleted_segment_markers_removes_only_unreferenced() {
-        let (wal_config, .., dir) = make_test_env().await;
-        let wal_dir = dir.path().join("wal");
-        tokio::fs::create_dir_all(&wal_dir).await.unwrap();
-
-        let metadata = Arc::new(
-            RocksDbMetadataStore::open(&MetadataConfig {
-                data_dir: dir.path().join("metadata"),
-                ..Default::default()
-            })
-            .unwrap(),
-        );
-        let referenced_id = SegmentId::new();
-        let unreferenced_id = SegmentId::new();
-
-        // A retained WAL file referencing `referenced_id`.
-        {
-            let writer = WalWriter::open(&wal_config).await.unwrap();
-            writer.append(make_entry(referenced_id, 0, 8192)).await.unwrap();
-        }
-        // Both segments are marked deleted; only `referenced_id` still
-        // has entries in a retained file.
-        metadata.put_deleted_segment(referenced_id, 100).unwrap();
-        metadata.put_deleted_segment(unreferenced_id, 200).unwrap();
-
-        let pruned = prune_deleted_segment_markers(&wal_config, &metadata).await;
-        assert_eq!(pruned, 1, "only the unreferenced marker is pruned");
-        let remaining: Vec<_> =
-            metadata.list_deleted_segments().into_iter().map(|r| r.unwrap()).collect();
-        assert_eq!(remaining, vec![(referenced_id, 100)]);
-    }
-
-    #[tokio::test]
     async fn replay_wal_empty_directory_returns_zero_summary() {
         let (wal_config, size_config, buffer_pool, _dir) = make_test_env().await;
         let wal_writer = WalWriter::open(&wal_config).await.unwrap();
         let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
         let (pool_small, pool_standard) =
             make_pools(&buffer_pool, &size_config, Arc::clone(&registry));
-        let (_store, lifecycle) = make_lifecycle(registry).await;
+        let lifecycle = make_lifecycle(registry).await;
         let summary = replay_wal(
             &wal_config,
             &wal_writer,
@@ -996,7 +854,7 @@ mod tests {
         let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
         let (pool_small, pool_standard) =
             make_pools(&buffer_pool, &size_config, Arc::clone(&registry));
-        let (_store, lifecycle) = make_lifecycle(registry).await;
+        let lifecycle = make_lifecycle(registry).await;
         let summary = replay_wal(
             &wal_config,
             &wal_writer,
@@ -1031,7 +889,7 @@ mod tests {
         let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
         let (pool_small, pool_standard) =
             make_pools(&buffer_pool, &size_config, Arc::clone(&registry));
-        let (_store, lifecycle) = make_lifecycle(registry).await;
+        let lifecycle = make_lifecycle(registry).await;
         let summary = replay_wal(
             &wal_config,
             &wal_writer,
@@ -1067,7 +925,7 @@ mod tests {
         let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
         let (pool_small, pool_standard) =
             make_pools(&buffer_pool, &size_config, Arc::clone(&registry));
-        let (_store, lifecycle) = make_lifecycle(registry).await;
+        let lifecycle = make_lifecycle(registry).await;
         let summary = replay_wal(
             &wal_config,
             &wal_writer,
@@ -1099,7 +957,7 @@ mod tests {
         let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
         let (pool_small, pool_standard) =
             make_pools(&buffer_pool, &size_config, Arc::clone(&registry));
-        let (_store, lifecycle) = make_lifecycle(registry).await;
+        let lifecycle = make_lifecycle(registry).await;
         let summary = replay_wal(
             &wal_config,
             &wal_writer,
@@ -1131,7 +989,7 @@ mod tests {
         let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
         let (pool_small, pool_standard) =
             make_pools(&buffer_pool, &size_config, Arc::clone(&registry));
-        let (_store, lifecycle) = make_lifecycle(registry).await;
+        let lifecycle = make_lifecycle(registry).await;
         let summary = replay_wal(
             &wal_config,
             &wal_writer,
@@ -1171,7 +1029,7 @@ mod tests {
         let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
         let (pool_small, pool_standard) =
             make_pools(&buffer_pool, &size_config, Arc::clone(&registry));
-        let (_store, lifecycle) = make_lifecycle(registry).await;
+        let lifecycle = make_lifecycle(registry).await;
         let summary = replay_wal(
             &wal_config,
             &wal_writer,
@@ -1211,7 +1069,7 @@ mod tests {
         let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
         let (pool_small, pool_standard) =
             make_pools(&buffer_pool, &size_config, Arc::clone(&registry));
-        let (_store, lifecycle) = make_lifecycle(registry).await;
+        let lifecycle = make_lifecycle(registry).await;
         let summary = replay_wal(
             &wal_config,
             &wal_writer,
@@ -1273,7 +1131,7 @@ mod tests {
         let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
         let (pool_small, pool_standard) =
             make_pools(&buffer_pool, &size_config, Arc::clone(&registry));
-        let (_store, lifecycle) = make_lifecycle(registry).await;
+        let lifecycle = make_lifecycle(registry).await;
         let summary = replay_wal(
             &wal_config,
             &wal_writer,

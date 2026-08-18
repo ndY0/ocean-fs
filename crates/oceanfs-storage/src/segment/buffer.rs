@@ -216,7 +216,13 @@ impl ActiveSegment {
 /// backing buffer is frozen into a zero-copy `Bytes` and the slot's
 /// `Sealing` state retains a clone for the read window. EC parity is
 /// computed at seal time by the seal worker, not here.
-pub(crate) struct SealedSegment {
+///
+/// The struct is `pub` because the pool's `append_with_hook_async`
+/// returns it to the write path (which passes it back to
+/// `SegmentPool::enqueue_seal_handoff`); the fields stay `pub(crate)` —
+/// only the pool constructs and reads them.
+#[derive(Debug)]
+pub struct SealedSegment {
     /// The unique identifier of the segment to seal.
     pub(crate) segment_id: SegmentId,
     /// The storage tier of the segment (Small or Standard).

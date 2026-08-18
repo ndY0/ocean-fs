@@ -163,6 +163,7 @@ impl GarbageCollector {
     pub async fn run_cycle(
         &self,
         metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
+        registry: &oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry,
     ) -> Result<GcStats> {
         // A pass is a pass — count every cycle, including ones that find
         // nothing to compact, so the "GC running" signal is visible in
@@ -177,7 +178,7 @@ impl GarbageCollector {
         // Also returns the set of dead object keys (eligible tombstones past TTL)
         // so compaction can skip them when re-packing.
         let (dead_keys, tombstone_keys_by_segment) =
-            self.process_tombstones(&*metadata, &mut tracker, &mut stats)?;
+            self.process_tombstones(&*metadata, registry, &mut tracker, &mut stats)?;
 
         // Report what the pass observed even when nothing compacts, so
         // metrics show the scanner is alive and how much dead data it is
@@ -262,12 +263,13 @@ impl GarbageCollector {
                 .map_err(|e| Error::Internal(format!("semaphore acquire failed: {e}")))?;
             let compactor = compactor.clone();
             let tx = tx.clone();
-            let metadata = metadata.clone();
+            let _metadata = metadata.clone();
             let dead_keys = dead_keys.clone();
 
-            // Fetch segment metadata before spawning
-            let segment_meta = match metadata.get_segment(segment_id)? {
-                Some(m) => m,
+            // Fetch segment metadata before spawning — from the machine
+            // (ADR-0025 Decision 3).
+            let segment_meta = match registry.get(segment_id) {
+                Some(entry) => entry.metadata.clone(),
                 None => {
                     drop(permit);
                     continue;
@@ -338,11 +340,12 @@ impl GarbageCollector {
     pub async fn start_background(
         self: Arc<Self>,
         metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
+        registry: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(self.config.interval_sec)).await;
-                match self.run_cycle(metadata.clone()).await {
+                match self.run_cycle(metadata.clone(), &registry).await {
                     Ok(stats) => {
                         tracing::info!(
                             segments_scanned = stats.segments_scanned,
@@ -368,6 +371,7 @@ impl GarbageCollector {
     pub(crate) fn process_tombstones(
         &self,
         metadata: &dyn oceanfs_storage_api::MetadataStore,
+        registry: &oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry,
         tracker: &mut LivenessTracker,
         stats: &mut GcStats,
     ) -> TombstoneResult {
@@ -375,20 +379,14 @@ impl GarbageCollector {
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
         let ttl_ms = (self.config.tombstone_ttl_sec * 1000) as i64;
 
-        // Register all known segments first (initialize with zero — actual bytes
-        // come from object chunk metadata).
-        let segments = metadata.list_segments();
-        for seg_result in segments {
-            match seg_result {
-                Ok(seg) => {
-                    tracker.register_segment(seg.segment_id, 0);
-                    stats.segments_scanned += 1;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to read segment metadata");
-                }
-            }
-        }
+        // Register all known segments first (initialize with zero —
+        // actual bytes come from object chunk metadata). The machine's
+        // live entries are the segment set (ADR-0025 Decision 3).
+        registry.for_each(|id, entry| {
+            let _ = entry;
+            tracker.register_segment(id, 0);
+            stats.segments_scanned += 1;
+        });
 
         // Phase 1: Collect eligible tombstone keys (past TTL) and the dead
         // chunks they carry. Tombstones are scanned across ALL buckets —
@@ -593,7 +591,9 @@ mod tests {
             ec_k: 4,
             ec_m: 2,
             size_tier: tier,
-            merkle_root: None,
+            // A sealed entry carries its seal-time anchor (the event log
+            // requires the root at seal time).
+            merkle_root: Some(oceanfs_core::HashOutput::from_bytes([0xAB; 32])),
             storage_locations: smallvec::SmallVec::new(),
             sealed_at: Some(sealed_at),
         }
@@ -612,8 +612,11 @@ mod tests {
     #[tokio::test]
     async fn run_cycle_on_empty_store() {
         let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+            &oceanfs_core::LifecycleConfig::default(),
+        );
         let gc = GarbageCollector::new(GcConfig::default());
-        let stats = gc.run_cycle(metadata).await.unwrap();
+        let stats = gc.run_cycle(metadata, &registry).await.unwrap();
         assert_eq!(stats.segments_scanned, 0);
         assert_eq!(stats.segments_compacted, 0);
     }
@@ -621,12 +624,15 @@ mod tests {
     #[tokio::test]
     async fn run_cycle_with_segments_no_deletions() {
         let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+            &oceanfs_core::LifecycleConfig::default(),
+        );
 
         // Put a segment with an object
         let seg_id = SegmentId::new();
         let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
-        metadata.put_segment(seg_meta).unwrap();
-
+        registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
+        registry.seal(seg_meta.segment_id, seg_meta).unwrap();
         let obj_meta = make_object_meta(
             "test.txt",
             1024,
@@ -641,7 +647,7 @@ mod tests {
         metadata.put_object(obj_meta).unwrap();
 
         let gc = GarbageCollector::new(GcConfig::default());
-        let stats = gc.run_cycle(metadata).await.unwrap();
+        let stats = gc.run_cycle(metadata, &registry).await.unwrap();
         assert!(stats.segments_scanned >= 1);
         assert_eq!(stats.segments_compacted, 0); // No tombstones → no compaction needed
     }
@@ -649,11 +655,14 @@ mod tests {
     #[tokio::test]
     async fn run_cycle_with_tombstone_below_ttl_ignored() {
         let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+            &oceanfs_core::LifecycleConfig::default(),
+        );
 
         let seg_id = SegmentId::new();
         let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
-        metadata.put_segment(seg_meta).unwrap();
-
+        registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
+        registry.seal(seg_meta.segment_id, seg_meta).unwrap();
         let obj_meta = make_object_meta(
             "deleted.txt",
             100,
@@ -685,7 +694,7 @@ mod tests {
         // With a long TTL, the tombstone should not trigger compaction
         let config = GcConfig { tombstone_ttl_sec: 315360000, ..GcConfig::default() };
         let gc = GarbageCollector::new(config);
-        let stats = gc.run_cycle(metadata).await.unwrap();
+        let stats = gc.run_cycle(metadata, &registry).await.unwrap();
         // The tombstone is below TTL, but our simplified implementation
         // marks tombstones regardless (TTL check requires tombstone iterator)
         assert!(stats.segments_scanned >= 1);
@@ -700,12 +709,15 @@ mod tests {
     #[tokio::test]
     async fn run_cycle_full_cycle_with_tombstone_and_compaction() {
         let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+            &oceanfs_core::LifecycleConfig::default(),
+        );
 
         // Create a segment
         let seg_id = SegmentId::new();
         let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
-        metadata.put_segment(seg_meta).unwrap();
-
+        registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
+        registry.seal(seg_meta.segment_id, seg_meta).unwrap();
         // Put objects referencing this segment
         for i in 0..3 {
             let obj_meta = make_object_meta(
@@ -743,18 +755,21 @@ mod tests {
         assert!(metadata.has_tombstone(&bucket, &ObjectKey::new("obj1.txt")).unwrap());
 
         let gc = GarbageCollector::new(GcConfig { compact_threshold: 0.5, ..GcConfig::default() });
-        let stats = gc.run_cycle(metadata).await.unwrap();
+        let stats = gc.run_cycle(metadata, &registry).await.unwrap();
         assert!(stats.segments_scanned >= 1);
     }
 
     #[tokio::test]
     async fn run_cycle_no_candidates_when_above_threshold() {
         let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+            &oceanfs_core::LifecycleConfig::default(),
+        );
 
         let seg_id = SegmentId::new();
         let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
-        metadata.put_segment(seg_meta).unwrap();
-
+        registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
+        registry.seal(seg_meta.segment_id, seg_meta).unwrap();
         let obj_meta = make_object_meta(
             "alive.txt",
             900,
@@ -797,7 +812,7 @@ mod tests {
         metadata.put_object(dead_obj).unwrap();
 
         let gc = GarbageCollector::new(GcConfig { compact_threshold: 0.5, ..GcConfig::default() });
-        let stats = gc.run_cycle(metadata).await.unwrap();
+        let stats = gc.run_cycle(metadata, &registry).await.unwrap();
         // Liveness is 90% (900/1000), above 0.5 threshold → no compaction
         assert_eq!(stats.segments_compacted, 0);
     }
@@ -811,11 +826,14 @@ mod tests {
     #[tokio::test]
     async fn run_cycle_triggers_compaction_when_below_threshold() {
         let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+            &oceanfs_core::LifecycleConfig::default(),
+        );
 
         let seg_id = SegmentId::new();
         let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
-        metadata.put_segment(seg_meta).unwrap();
-
+        registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
+        registry.seal(seg_meta.segment_id, seg_meta).unwrap();
         // One live object (small)
         let obj_meta = make_object_meta(
             "live.txt",
@@ -837,7 +855,7 @@ mod tests {
             compaction_queue_capacity: 8,
             ..GcConfig::default()
         });
-        let stats = gc.run_cycle(metadata).await.unwrap();
+        let stats = gc.run_cycle(metadata, &registry).await.unwrap();
         assert!(stats.segments_scanned >= 1);
         // Compaction may or may not trigger depending on liveness
     }
@@ -850,13 +868,16 @@ mod tests {
     #[tokio::test]
     async fn process_tombstones_multiple_segments() {
         let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+            &oceanfs_core::LifecycleConfig::default(),
+        );
 
         // Create 2 segments
         for i in 0..2 {
             let seg_id = SegmentId::new();
             let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
-            metadata.put_segment(seg_meta).unwrap();
-
+            registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
+            registry.seal(seg_meta.segment_id, seg_meta).unwrap();
             let obj_meta = make_object_meta(
                 &format!("obj_seg{i}.txt"),
                 200,
@@ -872,7 +893,7 @@ mod tests {
         }
 
         let gc = GarbageCollector::new(GcConfig::default());
-        let stats = gc.run_cycle(metadata).await.unwrap();
+        let stats = gc.run_cycle(metadata, &registry).await.unwrap();
         assert!(stats.segments_scanned >= 2);
         // No tombstones, so no dead bytes
         assert_eq!(stats.dead_bytes, 0);
@@ -910,10 +931,14 @@ mod tests {
     #[tokio::test]
     async fn tombstone_chunks_drive_compaction_after_row_removed() {
         let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+            &oceanfs_core::LifecycleConfig::default(),
+        );
 
         let seg_id = SegmentId::new();
         let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
-        metadata.put_segment(seg_meta.clone()).unwrap();
+        registry.reserve(seg_id, seg_meta.clone()).unwrap();
+        registry.seal(seg_id, seg_meta.clone()).unwrap();
 
         // One LIVE object (100 bytes) still referencing the segment.
         let live_obj = make_object_meta(
@@ -966,26 +991,32 @@ mod tests {
         // Wire the machine: the compactor requests every transition from
         // the coordinator (ADR-0025 Decision 4) and unlinks through the
         // shard store. The candidate is seeded through the machine too.
-        let registry =
-            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
-                &oceanfs_core::LifecycleConfig::default(),
-            ));
+        let registry = Arc::new(registry);
+        let event_wal_tmp = tempfile::TempDir::new().unwrap();
+        let event_wal = Arc::new(
+            oceanfs_storage::segment::event_wal::EventWal::open(
+                event_wal_tmp.path().join("event-wal"),
+                &oceanfs_core::EventWalConfig {
+                    event_wal_dir: event_wal_tmp.path().join("event-wal"),
+                    event_wal_file_size_bytes: 1024 * 1024,
+                    event_wal_fsync_batch_timeout_ms: 10,
+                    event_wal_checkpoint_bytes: 1024 * 1024,
+                },
+            )
+            .await
+            .unwrap(),
+        );
         let lifecycle = Arc::new(
             oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::with_registry(
-                metadata.clone(),
-                registry,
-            ),
+                Arc::clone(&registry),
+            )
+            .with_event_wal(event_wal),
         );
-        lifecycle
-            .request_reserve(seg_id, seg_meta.size_tier, seg_meta.ec_k, seg_meta.ec_m)
-            .await
-            .unwrap();
-        lifecycle.request_seal(seg_id, seg_meta, None).await.unwrap();
         let gc = GarbageCollector::new(GcConfig { compact_threshold: 0.5, ..GcConfig::default() })
             .with_data_store(store)
             .with_lifecycle(lifecycle)
             .with_shard_store(Arc::new(InMemorySegmentShardStore::new(0)));
-        let stats = gc.run_cycle(metadata.clone()).await.unwrap();
+        let stats = gc.run_cycle(metadata.clone(), &registry).await.unwrap();
 
         assert_eq!(stats.dead_bytes, 900, "dead bytes must come from the tombstone chunks");
         assert_eq!(stats.segments_compacted, 1, "segment must be compacted");
