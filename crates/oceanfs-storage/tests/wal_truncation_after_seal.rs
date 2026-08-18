@@ -116,7 +116,7 @@ async fn wal_truncation_called_during_seal() {
     // Verify we can still write to the WAL after truncation (idempotency).
     let new_entry = make_test_entry(SegmentId::new(), 0, 50);
     let post_trunc_pos = wal.append(new_entry).await.unwrap();
-    assert!(post_trunc_pos > 0, "WAL should still accept writes after truncation");
+    assert!(post_trunc_pos.offset > 0, "WAL should still accept writes after truncation");
 }
 
 // ---------------------------------------------------------------------------
@@ -142,12 +142,15 @@ async fn wal_writer_truncation_is_idempotent() {
     // Write an entry, then truncate back.
     let entry = make_test_entry(SegmentId::new(), 0, 100);
     let pos = wal.append(entry).await.unwrap();
-    assert!(pos < 1024, "first entry should be at a small position, got {pos}");
+    assert!(pos.offset < 1024, "first entry should be at a small position, got {pos:?}");
 
     wal.truncate(0).await.unwrap();
 
     // After truncation, the next append returns a small position
     // (truncation resets the file cursor).
     let pos2 = wal.append(make_test_entry(SegmentId::new(), 0, 50)).await.unwrap();
-    assert!(pos2 < 1024, "after truncation, next write should be at a small position, got {pos2}");
+    assert!(
+        pos2.offset < 1024,
+        "after truncation, next write should be at a small position, got {pos2:?}"
+    );
 }

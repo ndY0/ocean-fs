@@ -21,6 +21,7 @@ use tracing::info;
 
 use crate::{
     error::{Error, Result},
+    segment::event_wal::DataWalPos,
     wal::{
         entry::WalEntry,
         sync::{sync_file_range_and_fdatasync, WalSyncGroup},
@@ -67,11 +68,18 @@ const MARKER_PRUNE_ROTATIONS: u64 = 60;
 pub struct WalWriter {
     /// WAL configuration.
     config: WalConfig,
-    /// Metadata store handle for seal-aware file retention: rotation
-    /// keeps files that still hold entries for unsealed segments. `None`
-    /// (tests, minimal embedding) falls back to the plain retention
-    /// window.
+    /// Metadata store handle for the deleted-segment marker pruning
+    /// (the markers CF is removed in phase 3). `None` (tests, minimal
+    /// embedding) skips pruning.
     metadata: Option<Arc<crate::metadata::RocksDbMetadataStore>>,
+    /// Machine-backed retention liveness (ADR-0024 §Retention, phase 2):
+    /// an entry at position `p` of segment `S` is garbage iff `S`'s
+    /// `SealEvent.data_wal_pos ≥ p` (or `S` is `Deleted`). The closure is
+    /// backed by the folded lifecycle registry + event positions and is
+    /// set once at startup (the registry exists after the event fold).
+    /// `None` falls back to the plain retention window.
+    liveness:
+        std::sync::OnceLock<Arc<dyn Fn(oceanfs_core::SegmentId, DataWalPos) -> bool + Send + Sync>>,
     /// Number of rotations performed (drives the marker-prune throttle).
     rotations: std::sync::atomic::AtomicU64,
     /// Current WAL file handle (shared with sync group for true fsync).
@@ -118,6 +126,7 @@ impl WalWriter {
         let writer = Self {
             config: config.clone(),
             metadata: None,
+            liveness: std::sync::OnceLock::new(),
             rotations: std::sync::atomic::AtomicU64::new(0),
             file,
             file_seq: Mutex::new(file_seq),
@@ -140,25 +149,46 @@ impl WalWriter {
         Ok(writer)
     }
 
-    /// Attaches the metadata store for seal-aware WAL retention.
+    /// Attaches the metadata store for deleted-segment marker pruning.
     ///
-    /// With the store attached, rotation keeps WAL files that still
-    /// contain entries for unsealed segments (`sealed_at: None` in the
-    /// segments CF) — the WAL is the only durable copy of their data.
-    /// Without it, retention falls back to the plain file-count window.
+    /// With the store attached, rotation periodically prunes
+    /// deleted-segment markers whose entries have fully rotated out.
+    /// Without it, pruning is skipped.
     pub fn with_metadata(mut self, metadata: Arc<crate::metadata::RocksDbMetadataStore>) -> Self {
         self.metadata = Some(metadata);
         self
     }
 
+    /// Sets the machine-backed retention liveness predicate (ADR-0024
+    /// §Retention, phase 2): `true` means the entry at `pos` of the
+    /// segment is garbage and does not protect its file.
+    ///
+    /// Called once at startup after the event fold populated the
+    /// lifecycle registry (the registry does not exist when the writer
+    /// is constructed). The closure is backed by the registry + event
+    /// positions; the CF-derived `durable_or_deleted` scan is gone.
+    /// Without it, retention falls back to the plain file-count window.
+    pub fn set_liveness(
+        &self,
+        liveness: Arc<dyn Fn(oceanfs_core::SegmentId, DataWalPos) -> bool + Send + Sync>,
+    ) {
+        if self.liveness.set(liveness).is_err() {
+            tracing::warn!("WAL retention liveness already set; ignoring second set");
+        }
+    }
+
     /// Appends an entry to the WAL.
     ///
-    /// Returns the global WAL position of the entry.
+    /// Returns the entry's `DataWalPos` — the (file sequence, in-file
+    /// offset) pair that makes the WAL seekable (ADR-0024 Decision 2).
+    /// The write path records it per segment so the lifecycle
+    /// coordinator can embed the last entry's position in the
+    /// `SealEvent`.
     ///
     /// # Errors
     ///
     /// Returns an I/O error if the write fails or the sync group shuts down.
-    pub async fn append(&self, entry: WalEntry) -> Result<u64> {
+    pub async fn append(&self, entry: WalEntry) -> Result<DataWalPos> {
         let data = entry.to_bytes();
         let entry_size = data.len() as u64;
 
@@ -170,10 +200,13 @@ impl WalWriter {
             }
         }
 
-        // Write the entry.
-        let global_pos = {
+        // Write the entry. The file sequence is read under the file lock
+        // (rotation — the only writer of the sequence — needs that lock),
+        // so the returned position is the entry's exact location.
+        let data_wal_pos = {
             let mut file = self.file.lock().await;
             let mut pos = self.position.lock().await;
+            let seq = self.file_seq.lock().await;
 
             file.write_all(&data)?;
             // Sync data but NOT metadata (the directory sync happens in group commit).
@@ -186,7 +219,14 @@ impl WalWriter {
             // compute the byte range to flush with sync_file_range.
             self.sync_position.store(*pos, Ordering::Release);
 
-            written_pos
+            DataWalPos {
+                file_seq: u32::try_from(*seq).map_err(|_| {
+                    Error::Io(std::io::Error::other(
+                        "WAL file sequence exceeded u32 (2^32 rotations)",
+                    ))
+                })?,
+                offset: written_pos,
+            }
         };
 
         // Update global position.
@@ -204,7 +244,7 @@ impl WalWriter {
         })?;
 
         self.bytes_written_total.add(entry_size);
-        Ok(global_pos)
+        Ok(data_wal_pos)
     }
 
     /// Truncates the WAL at the given position.
@@ -277,8 +317,12 @@ impl WalWriter {
         // window keeps the last few files, and the seal-aware check
         // additionally protects files holding entries for unsealed
         // segments (their only durable copy).
-        super::cleanup_old_wal_files(&self.config, WAL_RETENTION_FILES, self.metadata.as_deref())
-            .await;
+        super::cleanup_old_wal_files(
+            &self.config,
+            WAL_RETENTION_FILES,
+            self.liveness.get().map(|liveness| liveness.as_ref()),
+        )
+        .await;
 
         // Periodically prune deleted-segment markers: segments removed
         // by GC/orphan-reaper whose entries have fully rotated out no
@@ -520,11 +564,12 @@ mod tests {
         let writer = WalWriter::open(&config).await.unwrap();
 
         let pos1 = writer.append(make_entry(0, 100)).await.unwrap();
-        writer.truncate(pos1).await.unwrap();
+        writer.truncate(pos1.offset).await.unwrap();
 
         // Position should be back at pos1.
         let pos2 = writer.append(make_entry(0, 50)).await.unwrap();
-        assert_eq!(pos1, pos2); // Re-writing at same position
+        assert_eq!(pos1.offset, pos2.offset); // Re-writing at same position
+        assert_eq!(pos1.file_seq, pos2.file_seq);
     }
 
     #[tokio::test]

@@ -23,7 +23,10 @@ impl oceanfs_storage_api::WalWriter for WalWriter {
     async fn append(&self, entry_data: &[u8]) -> Result<u64, ApiError> {
         let entry = WalEntry::from_bytes(entry_data)
             .ok_or_else(|| ApiError::InvalidArgument("invalid WAL entry bytes".into()))?;
-        self.append(entry).await.map_err(map_error)
+        // The API contract's position is the in-file offset (truncate's
+        // unit); the file sequence is carried only by the crate-level
+        // DataWalPos (ADR-0024 Decision 2).
+        self.append(entry).await.map_err(map_error).map(|pos| pos.offset)
     }
 
     async fn truncate(&self, position: u64) -> Result<(), ApiError> {

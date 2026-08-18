@@ -730,9 +730,12 @@ impl WriteCoordinator {
             checksum,
             data,
         );
+        // Append through the sealer so the entry's data-WAL position is
+        // recorded per segment (ADR-0024 Decision 2): the coordinator
+        // embeds the LAST entry's position in the SealEvent, making the
+        // data WAL seekable for recovery and retention.
         self.sealer
-            .wal_writer()
-            .append(entry)
+            .append_wal_entry(entry)
             .await
             .map_err(|e| Error::Storage(format!("WAL append failed: {e}")))?;
         Ok(())

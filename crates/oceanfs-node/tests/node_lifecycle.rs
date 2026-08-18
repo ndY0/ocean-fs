@@ -23,6 +23,10 @@ async fn node_lifecycle_startup_health_shutdown() {
         data_dir: tmp.path().to_path_buf(),
         listen_addr: "127.0.0.1:0".into(),      // ephemeral port
         grpc_listen_addr: "127.0.0.1:0".into(), // ephemeral port
+        event_wal: oceanfs_core::EventWalConfig {
+            event_wal_dir: tmp.path().join("event-wal"),
+            ..Default::default()
+        },
         ..NodeConfig::default()
     };
 

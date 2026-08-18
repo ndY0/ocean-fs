@@ -14,9 +14,7 @@ use oceanfs_storage::{
         DiskIo, DiskSegmentReader, InMemorySegmentReader, IoReadMode, SegmentFileCache,
         SegmentReadSource, SegmentReader,
     },
-    segment::{
-        header::SEGMENT_HEADER_SIZE_V1 as V1_HEADER_SIZE, lifecycle::SegmentLifecycleCoordinator,
-    },
+    segment::header::SEGMENT_HEADER_SIZE_V1 as V1_HEADER_SIZE,
 };
 
 /// Writes a segment file with a 76-byte zeroed header followed by `data`.

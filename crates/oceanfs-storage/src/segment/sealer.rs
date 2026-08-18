@@ -22,13 +22,14 @@ use crate::{
     },
     segment::{
         buffer::ActiveSegment,
+        event_wal::DataWalPos,
         handle::SegmentHandle,
         header::SegmentHeader,
         index::{SegmentIndex, SegmentIndexEntry},
         lifecycle::SegmentLifecycleCoordinator,
         parity_section::{build_parity_section, encode_segment_parity},
     },
-    wal::WalWriter,
+    wal::{WalEntry, WalWriter},
 };
 
 /// Configuration for the segment sealer.
@@ -417,6 +418,37 @@ impl SegmentSealer {
     /// active segment writes.
     pub fn wal_writer(&self) -> &Arc<WalWriter> {
         &self.wal
+    }
+
+    /// Returns the directory holding sealed `.dat` files — the recovery
+    /// pass's adopt probe (a durable `.dat` for a `Reserved` segment is
+    /// an interrupted seal commit, crash-window row 3).
+    pub(crate) fn segment_data_dir(&self) -> &std::path::Path {
+        &self.config.data_dir
+    }
+
+    /// Appends a data-WAL entry and records its position with the
+    /// lifecycle coordinator.
+    ///
+    /// This is the write path's single entry point for data-WAL appends
+    /// in phase 2 (ADR-0024 Decision 2): the returned `DataWalPos` is
+    /// recorded per segment so the coordinator can embed the LAST entry's
+    /// position in the `SealEvent` (`data_wal_pos` correctness — the
+    /// recovery fold seeks by it). The server's write path calls this
+    /// instead of `wal_writer().append()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the WAL append fails (the position is not
+    /// recorded — the entry was not written).
+    pub async fn append_wal_entry(&self, entry: WalEntry) -> Result<DataWalPos> {
+        let segment_id = entry.segment_id();
+        let pos = self.wal.append(entry).await?;
+        // The coordinator is the only writer of per-segment lifecycle
+        // state; the position is recorded through it, never directly on
+        // the registry.
+        self.lifecycle.record_data_wal_pos(segment_id, pos);
+        Ok(pos)
     }
 }
 

@@ -151,7 +151,7 @@ async fn truncate_removes_entries_after_position() {
             let entry_size = entry.serialized_size() as u64;
             let pos = writer.append(entry).await.unwrap();
             if i == 2 {
-                truncation_point = pos + entry_size;
+                truncation_point = pos.offset + entry_size;
             }
         }
 

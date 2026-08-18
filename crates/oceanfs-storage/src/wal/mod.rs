@@ -27,4 +27,7 @@ pub use replay::{
 /// which applies the same `sync_file_range` + `fdatasync` optimisation to
 /// sealed segment files during group commit.
 pub(crate) use sync::sync_file_range_write;
+/// Re-exported for the segment event WAL (`segment/event_wal.rs`), which
+/// instantiates its own group-commit fsync domain (ADR-0024 Decision 4).
+pub(crate) use sync::WalSyncGroup;
 pub use writer::WalWriter;

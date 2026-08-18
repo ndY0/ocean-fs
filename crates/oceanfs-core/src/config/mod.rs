@@ -7,6 +7,7 @@
 mod accel;
 mod auth;
 mod compression;
+mod event_wal;
 mod lifecycle;
 mod metadata;
 mod node;
@@ -17,6 +18,7 @@ mod wal;
 pub use accel::AccelConfig;
 pub use auth::AuthConfig;
 pub use compression::CompressionConfig;
+pub use event_wal::EventWalConfig;
 pub use lifecycle::LifecycleConfig;
 pub use metadata::MetadataConfig;
 pub use node::{AntiEntropyConfig, NodeConfig};

@@ -9,7 +9,7 @@ use std::{io::Read, path::PathBuf};
 use bytes::Bytes;
 use oceanfs_core::WalConfig;
 
-use crate::{error::Result, wal::entry::WalEntry};
+use crate::{error::Result, segment::event_wal::DataWalPos, wal::entry::WalEntry};
 
 /// Reads WAL files and replays entries in order.
 ///
@@ -72,6 +72,25 @@ impl WalReader {
         WalReplayIter { file_paths: self.files.clone(), current: 0, current_reader: None }
     }
 
+    /// Replays all WAL entries from all files with their exact
+    /// `DataWalPos` (file sequence + in-file offset) — the recovery
+    /// fold's seek/sweep input (ADR-0024 Decision 2).
+    ///
+    /// Invalid entries are skipped and logged exactly like [`replay`](
+    /// Self::replay), with the position still advancing past them so
+    /// the returned positions stay exact.
+    pub(crate) fn replay_positions(
+        &self,
+    ) -> impl Iterator<Item = Result<(DataWalPos, WalEntry)>> + '_ {
+        WalReplayPosIter {
+            file_paths: self.files.clone(),
+            current: 0,
+            current_reader: None,
+            current_seq: 0,
+            current_offset: 0,
+        }
+    }
+
     /// Iterates the entries of a single WAL file.
     ///
     /// Used by the retention-aware cleanup to decide whether a file can
@@ -80,6 +99,21 @@ impl WalReader {
     /// copy).
     pub(crate) fn entries_in_file(path: PathBuf) -> impl Iterator<Item = Result<WalEntry>> {
         WalReplayIter { file_paths: vec![path], current: 0, current_reader: None }
+    }
+
+    /// Position-yielding variant of [`entries_in_file`](Self::entries_in_file)
+    /// — the cleanup's exact sweep boundary (an entry at position `p` is
+    /// garbage iff its segment's `SealEvent.data_wal_pos ≥ p`).
+    pub(crate) fn entries_in_file_positions(
+        path: PathBuf,
+    ) -> impl Iterator<Item = Result<(DataWalPos, WalEntry)>> {
+        WalReplayPosIter {
+            file_paths: vec![path],
+            current: 0,
+            current_reader: None,
+            current_seq: 0,
+            current_offset: 0,
+        }
     }
 }
 
@@ -149,7 +183,114 @@ impl Iterator for WalReplayIter {
             let path = self.file_paths[self.current].clone();
             self.current += 1;
 
-            match std::fs::File::open(&path) {
+            match std::fs::File::open(path) {
+                Ok(file) => {
+                    self.current_reader = Some(std::io::BufReader::new(file));
+                }
+                Err(e) => return Some(Err(e.into())),
+            }
+        }
+    }
+}
+
+/// Position-yielding WAL replay iterator (the recovery fold's input).
+///
+/// Same skip-invalid semantics as [`WalReplayIter`], plus the exact
+/// `DataWalPos` of every yielded entry: the file sequence is parsed
+/// from the `wal_{seq:08}.log` file name and the offset is the
+/// cumulative in-file byte position (header + data advance it).
+struct WalReplayPosIter {
+    /// Remaining files to replay (owned so single-file iteration works).
+    file_paths: Vec<PathBuf>,
+    /// Index of the file currently being read.
+    current: usize,
+    /// Open file being read.
+    current_reader: Option<std::io::BufReader<std::fs::File>>,
+    /// File sequence of the open file (parsed from its name).
+    current_seq: u32,
+    /// In-file byte position of the next entry (advanced past every
+    /// entry read, valid or skipped — positions stay exact).
+    current_offset: u64,
+}
+
+impl WalReplayPosIter {
+    /// Parses the file sequence from a `wal_{seq:08}.log` name.
+    fn file_seq_of(path: &std::path::Path) -> u32 {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("wal_"))
+            .and_then(|n| n.strip_suffix(".log"))
+            .and_then(|n| n.parse::<u32>().ok())
+            .unwrap_or(0)
+    }
+}
+
+impl Iterator for WalReplayPosIter {
+    type Item = Result<(DataWalPos, WalEntry)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(ref mut reader) = self.current_reader {
+                // Read the fixed-size header.
+                let header_size = WalEntry::header_size();
+                let mut header_buf = vec![0u8; header_size];
+
+                match reader.read_exact(&mut header_buf) {
+                    Ok(()) => {
+                        // Parse the header.
+                        let parsed = match WalEntry::from_header_bytes(&header_buf) {
+                            Some(e) => e,
+                            None => {
+                                tracing::warn!("corrupted WAL entry header skipped");
+                                self.current_offset += header_size as u64;
+                                continue;
+                            }
+                        };
+
+                        // Read the inline data.
+                        let data_len = parsed.length as usize;
+                        let mut data_buf = vec![0u8; data_len];
+                        if let Err(e) = reader.read_exact(&mut data_buf) {
+                            tracing::warn!("truncated WAL entry data: {e}");
+                            return Some(Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                e,
+                            )
+                            .into()));
+                        }
+
+                        // Assemble full entry.
+                        let mut entry = parsed;
+                        entry.data = Bytes::from(data_buf);
+
+                        if !entry.verify_crc() {
+                            tracing::warn!("WAL entry CRC mismatch skipped");
+                            self.current_offset += (header_size + data_len) as u64;
+                            continue;
+                        }
+
+                        let pos =
+                            DataWalPos { file_seq: self.current_seq, offset: self.current_offset };
+                        self.current_offset += (header_size + data_len) as u64;
+                        return Some(Ok((pos, entry)));
+                    }
+                    Err(_) => {
+                        // End of file or read error — advance to next file.
+                    }
+                }
+            }
+
+            // Advance to the next file.
+            if self.current >= self.file_paths.len() {
+                return None;
+            }
+
+            let path = &self.file_paths[self.current];
+            self.current_seq = Self::file_seq_of(path);
+            self.current_offset = 0;
+            self.current += 1;
+
+            match std::fs::File::open(path) {
                 Ok(file) => {
                     self.current_reader = Some(std::io::BufReader::new(file));
                 }

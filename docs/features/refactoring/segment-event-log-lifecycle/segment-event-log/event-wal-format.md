@@ -1,7 +1,7 @@
 ---
 feature: "Segment Event WAL — Format, Checksums, Rotation, Own Fsync Group"
 epic: "refactoring/segment-event-log-lifecycle/segment-event-log"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -19,7 +19,7 @@ perf:
   - "6.3 #[repr(C)] for all on-disk / on-wire structures"
   - "7.1 Minimize lock hold duration"
 created: 2026-08-17
-updated: 2026-08-17
+updated: 2026-08-18
 ---
 
 # Segment Event WAL — Format, Checksums, Rotation, Own Fsync Group
@@ -187,46 +187,135 @@ WAL cleanup (phase 2, dual-read)
   → cleanup_old_wal_files consults registry/event log (not the CF scan)
 ```
 
+## Deviations
+
+Accepted deviations agreed between implementer and independent reviewer
+(one review iteration, PASS; no blocking gaps). The reviewer's only
+regression-class note — `latest_pos` transient regression across rotation —
+was fixed by the implementer with a packed-atomic publish plus a regression
+test; the remaining notes below are recorded as accepted, no fix.
+
+### D1 — Server touch beyond "Verify only"
+
+`WalWriter::append` return type changed `u64` → `DataWalPos`
+(`oceanfs-storage`); `SegmentSealer::append_wal_entry` added;
+`oceanfs-server`'s `write_wal_entry` switched exactly one line to it
+(`coordinator.rs`: `wal_writer().append` → `sealer.append_wal_entry`).
+The Crate Impact row "oceanfs-server: Verify only" is interpreted as
+"lifecycle coordinator `request_*` API unchanged" — the `request_*`
+signatures are untouched.
+
+### D2 — `SealEvent` built inside the coordinator
+
+`request_reserve` / `request_seal` / `request_delete` signatures are
+unchanged; the `SealEvent` is built inside the coordinator from the
+metadata plus the registry entry's recorded `data_wal_pos`
+(`registry.last_data_wal_pos` at seal).
+
+### D3 — Failure semantics
+
+- Event append failure → `TransitionError::DurableWriteFailed`, no fold.
+- CF mirror write failure after a successful event append → warn + still
+  fold (the event log is authoritative; the CF is a derived mirror).
+- Absent `data_wal_pos` at seal → `(0,0)` sentinel (documented).
+- Absent `merkle_root` at seal when the event WAL is wired →
+  `DurableWriteFailed` (a fabricated root would corrupt recovery).
+
+### D4 — `with_event_wal(Arc<EventWal>)` builder
+
+New builder on the coordinator; existing constructors keep phase-1
+behavior (CF-only) so all pre-existing tests compile unchanged; the
+production node (`oceanfs-node` composition root) wires the EventWal.
+
+### Perf 6.3 — Hand-laid explicit byte layout
+
+A `#[repr(C)]` struct was not used for the on-disk event record; instead
+the record is laid out explicitly by hand, following the `WalEntry`
+discipline (documented at `event_wal.rs:24-42`; precedent
+`wal/entry.rs`) — the crate's accepted precedent, fully deterministic
+layout with no repr-padding surprises.
+
+### Accepted LOW note (no fix) — `bytes_since` transient over-count
+
+`bytes_since` can transiently over-count across rotation by the last
+record. Safe direction for a byte-threshold checkpoint trigger (fires
+early, never late); under-count is impossible.
+
+### Accepted LOW note (no fix) — `wal/writer.rs` import placement
+
+`wal/writer.rs` imports `DataWalPos` from `segment/event_wal.rs` —
+intentional placement per the feature's Interface section; no module
+cycle.
+
+### Pre-existing test-only fix — `FAIL_SYNC` seam scoping
+
+`io/segment_flush`'s `FAIL_SYNC` test seam was scoped to the failure
+test's filename (the shared static leaked across tests on clean main
+under `--test-threads=1`). Test-only; no production behavior change.
+
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets`, `cargo fmt --check`,
+- [x] **Code:** `cargo build --all-targets`, `cargo fmt --check`,
       `cargo clippy --lib -- -D warnings` pass in `oceanfs-storage`,
       `oceanfs-node`; `#![deny(missing_docs)]` passes; `event_wal.rs`
       contains no RocksDB dependency (grep-verifiable — the event log is
       plain files, ADR-0023 direction).
-- [ ] **Tests:** `cargo test -p oceanfs-storage --lib -- --test-threads=1`
+<!-- REVIEW: verified 2026-08-18 — build (--all-targets, incl. oceanfs-server + oceanfs-core), fmt --check, fresh clippy -D warnings (storage/node/core), RUSTDOCFLAGS="-D warnings" cargo doc all pass. event_wal.rs contains "RocksDB" only in doc comments (lines 12, 19) — zero imports/code dependency. -->
+- [x] **Tests:** `cargo test -p oceanfs-storage --lib -- --test-threads=1`
       green; new unit tests cover every `pub` item (append/read round trip,
       torn tail, checksum, rotation, position monotonicity).
-- [ ] **Invariant — checksummed records:** every record round-trips
+<!-- REVIEW: verified 2026-08-18 — 286 lib tests pass (29 event_wal + phase-2 sequence test). Coverage: round trip, mid-log read, concurrent monotonic positions, latest_pos, durable-on-return reopen, rotation at threshold + reopen-resume + keep-old-files, 3 torn-tail variants (header/payload/checksum), clean-boundary EOF, bytes_since incl. rotation span, 4 own-fsync-group fault-injection tests, metrics registration. -->
+- [x] **Invariant — checksummed records:** every record round-trips
       byte-exact; a single flipped byte anywhere in a record fails CRC and
       `read_from` surfaces `TornRecord` (stop-at-first-bad-tail semantics,
       consumed by recovery); records are never silently skipped or
       truncated mid-file.
-- [ ] **Invariant — `data_wal_pos` correctness:** unit test — N appends to
+<!-- REVIEW: verified 2026-08-18 — framing matches the spec exactly (magic b"EVL\1", version 1, kinds 0/1/2, 2 reserved, payload_len LE, 16-byte segment_id, tier/ec_k/ec_m/reserved (+merkle_root 32 + file_seq 4 + offset 8 for Seal), crc32 over header+payload; header 28 B, record sizes 36/80/32 asserted by test). Flipped-byte/header, bad magic, unknown kind, unknown tier, truncation at 3 cut points all rejected. -->
+- [x] **Invariant — `data_wal_pos` correctness:** unit test — N appends to
       a segment, then seal; `SealEvent.data_wal_pos` equals the position of
       the N-th (last) data entry. Mutation check: off-by-one corruption of
       `data_wal_pos` must fail the sweep-boundary test (recovery feature).
-- [ ] **Invariant — own fsync group (ADR-0024 Decision 4):** the event
+<!-- REVIEW: verified 2026-08-18 — event_wal_phase2_full_sequence_folds_and_mirrors (lifecycle.rs tests) appends 3 WalEntries via sealer.append_wal_entry and asserts evt.data_wal_pos == last_pos returned by the writer. Mutation check belongs to event-wal-recovery (out of scope here). -->
+- [x] **Invariant — own fsync group (ADR-0024 Decision 4):** the event
       group is a separate `WalSyncGroup` instance; tests with injected
       blocking fsync functions prove (a) a stalled data group does not
       delay event fsyncs, (b) a stalled event group does not delay data
       fsyncs, (c) the event batch window is governed by
       `event_wal_fsync_batch_timeout_ms` only. The data group's waiter list
       never contains an event append.
-- [ ] **Invariant — append-only (perf 3.1):** no seek or rewrite on the
+<!-- REVIEW: verified 2026-08-18 — EventWal::create_sync_group instantiates its own WalSyncGroup (event_wal.rs:690-734); stalled_data_group_does_not_delay_event_appends, stalled_event_group_does_not_delay_data_group, event_batch_window_governs_fsync_cadence (asserts 1 fsync round for 8 concurrent appends @ 200 ms window), independent_sync_groups_have_independent_waiter_lists all pass. -->
+- [x] **Invariant — append-only (perf 3.1):** no seek or rewrite on the
       event WAL files; rotation opens a new file at `event_wal_file_size_bytes`;
       `read_from` is the only read path.
-- [ ] **ADR-0018 compliance note:** every reference to ADR-0018 states the
+<!-- REVIEW: verified 2026-08-18 — append path is write_all at position under the write mutex (event_wal.rs:530-566); rotate() opens a new file and never deletes (retention = checkpoint feature); read_from is the only reader. -->
+- [x] **ADR-0018 compliance note:** every reference to ADR-0018 states the
       replacement rationale — the event log replaces a RocksDB CF (net
       external durability domains −1) and is the single ordering authority,
       not a parallel data path (ADR-0024 §Consequences).
-- [ ] **ADR-0024 Decision 2:** there is no sequence counter shared with the
+<!-- REVIEW: verified 2026-08-18 — the only ADR-0018 reference in the new code is the module-doc compliance note at event_wal.rs:17-22, which states the full rationale. -->
+- [x] **ADR-0024 Decision 2:** there is no sequence counter shared with the
       data WAL anywhere in the code (grep-verifiable); all cross-log
       ordering is via `DataWalPos`.
-- [ ] **Integration:** a reserve→data→seal→delete sequence through the
+<!-- REVIEW: verified 2026-08-18 — grep for global_seq/shared_seq/sequence_counter/global_sequence: no matches; cross-log ordering is only DataWalPos carried in SealEvent (recorded per append via sealer.append_wal_entry → coordinator.record_data_wal_pos → registry.last_data_wal_pos at seal). -->
+- [x] **Integration:** a reserve→data→seal→delete sequence through the
       coordinator produces exactly three events whose replay fold
       reproduces the registry exactly (dual-read: CF mirror matches); the
       seal's `data_wal_pos` matches the WAL writer's returned position.
+<!-- REVIEW: verified 2026-08-18 — event_wal_phase2_full_sequence_folds_and_mirrors passes: 3 events in order, folded registry equals live registry (state + len), CF mirror reflects the delete, data_wal_pos == writer position. Node-level wiring verified: node.rs opens EventWal, with_event_wal, register_metrics; node_lifecycle integration test passes. -->
+- [x] **D1–D4 declared deviations:** D1 — WalWriter::append returns
+      DataWalPos; server switch is exactly one line (coordinator.rs
+      write_wal_entry: wal_writer().append → sealer.append_wal_entry); the
+      oceanfs-storage-api WalWriter trait keeps u64 offset (maps
+      pos.offset). D2 — request_* signatures unchanged; SealEvent built in
+      coordinator from metadata + registry.last_data_wal_pos. D3 — event
+      append failure → DurableWriteFailed (no fold); CF mirror failure →
+      warn + still fold; absent data_wal_pos → (0,0) sentinel; absent
+      merkle_root with event wal wired → DurableWriteFailed. D4 —
+      with_event_wal builder; phase-1 constructors keep CF-only behavior
+      (all pre-existing lifecycle tests pass). Perf 6.3 — hand-laid byte
+      layout documented at event_wal.rs:24-42, consistent with the
+      WalEntry precedent (wal/entry.rs). All accepted. Full record in the
+      Deviations section above.
 
 > **Lint & Doc Examples (non-gating):** `cargo clippy --all-targets -D
 > warnings` test-code warnings and `ignore`-tagged doc examples are

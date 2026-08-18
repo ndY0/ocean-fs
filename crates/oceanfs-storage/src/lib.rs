@@ -40,8 +40,10 @@ pub use buffer_pool::BufferPool;
 pub use error::{Error, Result};
 pub use metadata::{BatchOp, RocksDbMetadataStore, RocksDbMetrics};
 pub use segment::{
-    ActiveSegment, LifecycleEntry, SealConfig, SealingWork, SegmentHandle, SegmentHeader,
-    SegmentIndex, SegmentLifecycleCoordinator, SegmentLifecycleRegistry, SegmentPool,
+    entry_is_garbage, ActiveSegment, CheckpointInfo, DataWalPos, DeleteEvent, EventCheckpoint,
+    EventWal, EventWalPos, EventWalReader, LifecycleEntry, RebuildOutcome, ReserveEvent,
+    SealConfig, SealEvent, SealingWork, SegmentEvent, SegmentHandle, SegmentHeader, SegmentIndex,
+    SegmentLifecycle, SegmentLifecycleCoordinator, SegmentLifecycleRegistry, SegmentPool,
     SegmentReadSource, SegmentSealer, SegmentShard, SegmentSplitter, SegmentState, TierRouter,
     TransitionError,
 };

@@ -1,18 +1,21 @@
 //! Segment lifecycle machine — in-memory registry + single coordinator.
 //!
-//! ADR-0025 Decision 1, migration phase 1. This module is the runtime
-//! half of the segment-lifecycle redesign: a sharded in-memory
+//! ADR-0025 Decision 1. This module is the runtime half of the
+//! segment-lifecycle redesign: a sharded in-memory
 //! [`SegmentLifecycleRegistry`] holding exactly one entry per **live**
 //! segment, and a single [`SegmentLifecycleCoordinator`] that is the
 //! **only writer** of segment lifecycle state.
 //!
-//! In phase 1 the RocksDB `segments` CF write remains as the
-//! coordinator's durable side-effect (no behavior change), but every
-//! CF writer is routed through the coordinator — the pool, the seal
-//! worker's persistence path, the orphan reaper, and WAL replay stop
-//! touching state directly; they *request* transitions. The
-//! phantom-downgrade race and the idle-seal gap die here, by
-//! construction, before any event log exists:
+//! In phase 1 the RocksDB `segments` CF write is the coordinator's
+//! durable side-effect (no behavior change), but every CF writer is
+//! routed through the coordinator — the pool, the seal worker's
+//! persistence path, the orphan reaper, and WAL replay stop touching
+//! state directly; they *request* transitions. In phase 2 (the event
+//! WAL wired via [`SegmentLifecycleCoordinator::with_event_wal`], ADR-
+//! 0024) the durable side-effect becomes the event append and the CF
+//! write is demoted to a **derived mirror** performed after the event
+//! (dual-read verification surface). The phantom-downgrade race and
+//! the idle-seal gap die here, by construction:
 //!
 //! - **No downgrade.** The transition API is typed: `reserve` accepts
 //!   absent/`Reserved`, `seal` accepts `Reserved` only, `delete`
@@ -20,7 +23,7 @@
 //!   lower state**, so a `sealed_at: None` re-write over a `Sealed`
 //!   entry (the phantom-downgrade race) is not expressible.
 //! - **Reserve before data.** `request_reserve` returns `Ok` only
-//!   after its durable CF write; the write path calls it before the
+//!   after its durable side-effect; the write path calls it before the
 //!   first `DataEntry` (WAL entry) of its segment.
 //! - **Idle-seal.** The coordinator owns the idle-seal timer:
 //!   [`SegmentLifecycleCoordinator::seal_idle_segments`] sweeps the
@@ -65,12 +68,24 @@ use std::{
 
 use bytes::Bytes;
 use oceanfs_core::{
-    Gauge, LabelSet, LifecycleConfig, MetricRegistrar, SegmentId, SegmentMetadata, SizeTier,
+    EventWalConfig, Gauge, HashOutput, LabelSet, LifecycleConfig, MetricRegistrar, SegmentId,
+    SegmentMetadata, SizeTier,
 };
 use oceanfs_storage_api::MetadataStore;
 use parking_lot::RwLock;
 
-use crate::{error::Result, segment::pool::SegmentPool};
+use crate::{
+    error::{Error, Result},
+    segment::{
+        event_checkpoint::EventCheckpoint,
+        event_wal::{
+            DataWalPos, DeleteEvent, EventWal, EventWalPos, ReserveEvent, SealEvent, SegmentEvent,
+        },
+        pool::SegmentPool,
+    },
+    wal::{WalReader, WalWriter},
+    SegmentHeader, SegmentSealer,
+};
 
 /// Estimated in-memory cost of one live registry entry, in bytes
 /// (ADR-0025 Decision 5: ~300 B/entry including `HashMap` overhead).
@@ -99,14 +114,19 @@ pub enum SegmentState {
 /// One live segment's lifecycle entry: its state and full metadata.
 ///
 /// The full `SegmentMetadata` lives with the state (tier, ec_k/ec_m,
-/// `merkle_root` filled at seal). `data_wal_pos` is added by the
-/// `event-wal-format` feature (epic 2), not here.
+/// `merkle_root` filled at seal).
 #[derive(Debug)]
 pub struct LifecycleEntry {
     /// The segment's current lifecycle state.
     pub state: SegmentState,
     /// The segment's full metadata as last committed by a transition.
     pub metadata: SegmentMetadata,
+    /// The data-WAL position (file sequence + offset) of the segment's
+    /// LAST data entry, recorded by the write path on every append
+    /// (ADR-0024 Decision 2). Consumed at seal time to build the
+    /// `SealEvent`; `None` until the first data entry is appended (and
+    /// always for replayed segments whose WAL entries were truncated).
+    pub data_wal_pos: Option<DataWalPos>,
     /// When a `Deleted` entry's grace expires (entry eviction time).
     /// Meaningful only for `Deleted` entries; set at construction.
     evict_at: Instant,
@@ -127,7 +147,14 @@ pub struct LifecycleEntry {
 impl LifecycleEntry {
     /// Creates a new lifecycle entry in the given state.
     pub(crate) fn new(state: SegmentState, metadata: SegmentMetadata) -> Self {
-        Self { state, metadata, evict_at: Instant::now(), in_flight: None, seal_queued: false }
+        Self {
+            state,
+            metadata,
+            data_wal_pos: None,
+            evict_at: Instant::now(),
+            in_flight: None,
+            seal_queued: false,
+        }
     }
 }
 
@@ -184,6 +211,115 @@ pub enum TransitionError {
     /// registry fold was skipped.
     #[error("durable lifecycle write failed: {0}")]
     DurableWriteFailed(String),
+}
+
+/// The machine as a single type — the spec's `SegmentLifecycle` name.
+///
+/// The lifecycle machine is the [`SegmentLifecycleCoordinator`]: the
+/// only writer of segment lifecycle state (ADR-0025 Decision 1). The
+/// alias keeps the spec's `SegmentLifecycle::rebuild_from_events` /
+/// `rebuild_with_data_wal` API resolvable for downstream features
+/// (`event-wal-checkpoint`, `startup-rebuild-from-machine`) — the
+/// methods exist exactly once, on the coordinator.
+pub type SegmentLifecycle = SegmentLifecycleCoordinator;
+
+/// The observable result of a startup rebuild (ADR-0025 Decision 3 —
+/// `state = fold(events)`).
+///
+/// Every crash-window row asserts a specific outcome vector; the fold
+/// and the data-WAL pass are observable through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RebuildOutcome {
+    /// Number of distinct segments whose state was established by the
+    /// event fold.
+    pub folded_segments: usize,
+    /// Number of `Reserved` segments with zero data entries, dropped by
+    /// the data-WAL pass (idle-seal never seals empty — crash-window
+    /// row 1).
+    pub dropped_empty_reserves: usize,
+    /// Number of `Reserved`-unsealed segments rebuilt from the data WAL
+    /// and re-sealed (crash-window row 2).
+    pub re_sealed_segments: usize,
+    /// Number of `Reserved`-unsealed segments whose durable `.dat` was
+    /// adopted: root recomputed, `SealEvent` appended, no re-seal I/O
+    /// (crash-window row 3).
+    pub adopted_segments: usize,
+    /// Number of data-WAL entries skipped during the pass: entries for
+    /// sealed/deleted segments and orphan entries whose segment has no
+    /// `ReserveEvent` (the reserve-before-entry invariant — they are
+    /// logged and swept, never replayed).
+    pub swept_entries: u64,
+}
+
+/// The machine's retention rule (ADR-0024 §Retention, phase 2): an
+/// entry at position `p` of segment `S` is garbage iff `S` is `Sealed`
+/// with `data_wal_pos ≥ p`, or `S` is `Deleted`.
+///
+/// `Reserved` entries are always live (the WAL is their only durable
+/// copy); a `Sealed` entry without a recorded `data_wal_pos` is
+/// conservatively live (nothing to sweep — replayed segments whose WAL
+/// entries were truncated have no entries left).
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::{LifecycleConfig, SegmentId, SegmentMetadata, SizeTier};
+/// use oceanfs_storage::segment::lifecycle::{
+///     entry_is_garbage, SegmentLifecycleRegistry, SegmentState,
+/// };
+///
+/// let registry = SegmentLifecycleRegistry::new(&LifecycleConfig::default());
+/// let id = SegmentId::new();
+/// let meta = SegmentMetadata {
+///     segment_id: id,
+///     ec_k: 4,
+///     ec_m: 2,
+///     size_tier: SizeTier::Standard,
+///     merkle_root: None,
+///     storage_locations: smallvec::SmallVec::new(),
+///     sealed_at: None,
+/// };
+/// registry.reserve(id, meta).unwrap();
+/// let entry = registry.get(id).unwrap();
+/// let pos = oceanfs_storage::DataWalPos { file_seq: 0, offset: 100 };
+/// assert!(!entry_is_garbage(&entry, &pos), "Reserved entries are always live");
+/// ```
+pub fn entry_is_garbage(entry: &LifecycleEntry, pos: &DataWalPos) -> bool {
+    match entry.state {
+        SegmentState::Deleted => true,
+        SegmentState::Sealed => matches!(entry.data_wal_pos, Some(p) if p >= *pos),
+        SegmentState::Reserved => false,
+    }
+}
+
+// The recovery pass buffers only the `Reserved`-unsealed residue —
+// bounded by the data WAL's retention window by construction (the WAL
+// cannot grow unbounded: rotation + sweep keep ~4 × 64 MB files). No
+// mid-stream drain: a group sealed before the stream ends could miss
+// later entries (a segment's final `data_wal_pos` must be recorded
+// before its re-seal reads it).
+
+/// Reads a segment's data section from its durable `.dat` and computes
+/// the recovery merkle root via the caller's root builder — the same
+/// construction the seal worker uses, so adopted segments carry
+/// matching roots (crash-window row 3).
+///
+/// `None` when the file is missing or unparsable (the segment falls
+/// back to WAL replay).
+fn read_segment_data_root(
+    segments_dir: &std::path::Path,
+    id: SegmentId,
+    merkle_root_fn: &(dyn Fn(&[u8]) -> Option<HashOutput> + Send + Sync),
+) -> Option<HashOutput> {
+    let path = segments_dir.join(format!("{id}.dat"));
+    let raw = std::fs::read(path).ok()?;
+    let header = SegmentHeader::from_bytes(&raw)?;
+    let hdr_size = SegmentHeader::header_size(header.version);
+    let data_end = (hdr_size as u64 + header.size) as usize;
+    if data_end > raw.len() {
+        return None; // truncated tail — leave to WAL replay
+    }
+    merkle_root_fn(&raw[hdr_size..data_end])
 }
 
 /// Returns the number of registry shards for the given configuration.
@@ -389,6 +525,7 @@ impl SegmentLifecycleRegistry {
             LifecycleEntry {
                 state: entry.state,
                 metadata: entry.metadata.clone(),
+                data_wal_pos: entry.data_wal_pos,
                 evict_at: entry.evict_at,
                 in_flight: entry.in_flight.clone(),
                 seal_queued: entry.seal_queued,
@@ -503,6 +640,7 @@ impl SegmentLifecycleRegistry {
                     LifecycleEntry {
                         state: SegmentState::Reserved,
                         metadata: meta,
+                        data_wal_pos: None,
                         evict_at: Instant::now(),
                         in_flight: Some(data),
                         seal_queued: true,
@@ -618,12 +756,52 @@ impl SegmentLifecycleRegistry {
     /// the entry; this is a pure registry fold so the coordinator is the
     /// complete single writer over EXISTING data too (the reaper's
     /// `request_delete` validates against the registry).
-    pub(crate) fn seed_entry(&self, id: SegmentId, state: SegmentState, metadata: SegmentMetadata) {
+    ///
+    /// `data_wal_pos` restores the entry's recorded position (checkpoint
+    /// snapshots carry it — retention needs it to survive
+    /// checkpointing).
+    pub(crate) fn seed_entry(
+        &self,
+        id: SegmentId,
+        state: SegmentState,
+        metadata: SegmentMetadata,
+        data_wal_pos: Option<DataWalPos>,
+    ) {
         let shard = &self.shards[self.shard_for(id)];
         let mut guard = shard.write();
         let now = Instant::now();
         Self::evict_expired_locked(&mut guard, now);
-        guard.entry(id).or_insert_with(|| LifecycleEntry::new(state, metadata));
+        guard.entry(id).or_insert_with(|| {
+            let mut entry = LifecycleEntry::new(state, metadata);
+            entry.data_wal_pos = data_wal_pos;
+            entry
+        });
+    }
+
+    /// Hints every shard's map at the expected live-entry count
+    /// (perf 1.3 — the recovery fold pre-sizes from the CF mirror /
+    /// checkpoint estimate, avoiding reallocation cascades).
+    pub(crate) fn reserve_hint(&self, entries: usize) {
+        let per_shard = entries / self.shards.len() + 1;
+        for shard in self.shards.iter() {
+            shard.write().reserve(per_shard);
+        }
+    }
+
+    /// Removes a `Reserved` entry without any durable side-effect — the
+    /// recovery pass's drop of an empty reserve (crash-window row 1:
+    /// idle-seal never seals empty).
+    ///
+    /// No `DeleteEvent` is appended: the `ReserveEvent` stays in the
+    /// event log and a restart re-folds it and re-drops it (idempotent).
+    pub(crate) fn drop_reserve(&self, id: SegmentId) {
+        let shard = &self.shards[self.shard_for(id)];
+        let mut guard = shard.write();
+        if let Some(entry) = guard.get(&id) {
+            if entry.state == SegmentState::Reserved {
+                guard.remove(&id);
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -635,6 +813,35 @@ impl SegmentLifecycleRegistry {
     // I/O out of the lock bodies (performance §7.1) while preserving
     // "no mutation on illegal transitions".
     // ------------------------------------------------------------------
+
+    /// Records the data-WAL position of a segment's latest data entry.
+    ///
+    /// Called by the write path after every data-WAL append (through
+    /// the coordinator — the registry's only writer). Only `Reserved`
+    /// entries are updated: the position feeds the `SealEvent` built at
+    /// seal time (ADR-0024 Decision 2 — the recovery fold seeks by it).
+    /// No-op when the entry is absent or no longer `Reserved` (the
+    /// reserve always precedes the first data entry, so in the write
+    /// path the entry exists — this guard only covers races with a
+    /// concurrent delete).
+    pub(crate) fn record_data_wal_pos(&self, id: SegmentId, pos: DataWalPos) {
+        let shard = &self.shards[self.shard_for(id)];
+        let mut guard = shard.write();
+        if let Some(entry) = guard.get_mut(&id) {
+            if entry.state == SegmentState::Reserved {
+                entry.data_wal_pos = Some(pos);
+            }
+        }
+    }
+
+    /// Returns the recorded data-WAL position of a segment's last data
+    /// entry, or `None` when nothing was recorded (no appends, or the
+    /// entry is absent).
+    pub(crate) fn last_data_wal_pos(&self, id: SegmentId) -> Option<DataWalPos> {
+        let shard = &self.shards[self.shard_for(id)];
+        let guard = shard.read();
+        guard.get(&id).and_then(|entry| entry.data_wal_pos)
+    }
 
     /// Validates a `reserve` without mutating: `Ok` when absent or
     /// `Reserved`; `Err(AlreadySealed)` / `Err(AlreadyDeleted)`
@@ -790,6 +997,21 @@ impl SegmentLifecycleRegistry {
 pub struct SegmentLifecycleCoordinator {
     registry: Arc<SegmentLifecycleRegistry>,
     metadata: Arc<dyn MetadataStore>,
+    /// The event WAL (ADR-0024, migration phase 2): when wired, every
+    /// `request_*` appends its event as the durable side-effect and the
+    /// CF write becomes a derived mirror performed AFTER the event
+    /// (dual-read verification surface). `None` keeps the phase-1
+    /// behavior (CF write only) — tests and minimal embeddings.
+    event_wal: Option<Arc<EventWal>>,
+    /// The event log's checkpoint manager (ADR-0024 Decision 3): when
+    /// wired, `maybe_checkpoint` runs after every event append, triggered
+    /// only by the byte threshold. `None` disables checkpointing.
+    checkpoint: Option<Arc<EventCheckpoint>>,
+    /// The checkpoint trigger's configuration (the byte threshold).
+    checkpoint_config: Option<EventWalConfig>,
+    /// Latch: exactly one checkpoint task in flight (a burst past the
+    /// threshold produces exactly one checkpoint — DoD).
+    checkpoint_latch: Arc<std::sync::atomic::AtomicBool>,
     /// Pools swept by the idle-seal driver (empty until
     /// [`with_idle_seal`](Self::with_idle_seal) is called).
     idle_pools: Vec<Arc<SegmentPool>>,
@@ -858,6 +1080,10 @@ impl SegmentLifecycleCoordinator {
         let coordinator = Self {
             registry,
             metadata,
+            event_wal: None,
+            checkpoint: None,
+            checkpoint_config: None,
+            checkpoint_latch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idle_pools: Vec::new(),
             idle_seal_timeout_ms: 0,
             entries_gauge,
@@ -865,6 +1091,75 @@ impl SegmentLifecycleCoordinator {
         };
         coordinator.update_gauges();
         coordinator
+    }
+
+    /// Arms the event-appender arm (ADR-0025 migration phase 2): the
+    /// coordinator appends Reserve/Seal/Delete events to the event WAL
+    /// as its durable side-effect, and the CF write becomes a
+    /// **derived-mirror** write performed AFTER the event append
+    /// (dual-read verification surface — the event log is the source of
+    /// truth, ADR-0024 Decision 1).
+    ///
+    /// Without this (phase 1 — tests, minimal embeddings), the
+    /// coordinator keeps the CF write as the durable side-effect.
+    #[must_use]
+    pub fn with_event_wal(mut self, event_wal: Arc<EventWal>) -> Self {
+        self.event_wal = Some(event_wal);
+        self
+    }
+
+    /// Arms the checkpoint trigger (ADR-0024 Decision 3): after every
+    /// event append, `maybe_checkpoint` runs — triggered **only** by the
+    /// byte threshold (`event_wal_checkpoint_bytes`; no time-based
+    /// fallback), spawning the snapshot + truncate off the append path.
+    #[must_use]
+    pub fn with_checkpoint(
+        mut self,
+        checkpoint: Arc<EventCheckpoint>,
+        config: EventWalConfig,
+    ) -> Self {
+        self.checkpoint = Some(checkpoint);
+        self.checkpoint_config = Some(config);
+        self
+    }
+
+    /// The threshold-only checkpoint trigger (ADR-0024 Decision 3):
+    /// when the event log has grown past the byte threshold since the
+    /// last checkpoint and no checkpoint is in flight, spawn the
+    /// snapshot + truncate off the append path.
+    ///
+    /// The latch guarantees a burst past the threshold produces exactly
+    /// one checkpoint (the DoD invariant); `up_to` is the position
+    /// captured at spawn time — appends landing during the checkpoint
+    /// are folded on top at startup (exactly-once by position coverage).
+    async fn maybe_checkpoint(&self) {
+        let (Some(checkpoint), Some(event_wal), Some(config)) =
+            (&self.checkpoint, &self.event_wal, &self.checkpoint_config)
+        else {
+            return;
+        };
+        if !checkpoint.needs_checkpoint(config) {
+            return;
+        }
+        if self.checkpoint_latch.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return; // a checkpoint is already in flight
+        }
+        let checkpoint = Arc::clone(checkpoint);
+        let event_wal = Arc::clone(event_wal);
+        let registry = Arc::clone(&self.registry);
+        let latch = Arc::clone(&self.checkpoint_latch);
+        tokio::spawn(async move {
+            let up_to = event_wal.latest_pos();
+            match checkpoint.write_checkpoint(&registry, up_to) {
+                Ok(info) => {
+                    if let Err(e) = checkpoint.truncate_before(info.covered_pos).await {
+                        tracing::warn!(error = %e, "event WAL checkpoint truncation failed");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "event WAL checkpoint failed"),
+            }
+            latch.store(false, std::sync::atomic::Ordering::Release);
+        });
     }
 
     /// Wires the idle-seal driver: the pools whose slots
@@ -881,6 +1176,17 @@ impl SegmentLifecycleCoordinator {
     /// consumers; all writes go through this coordinator).
     pub fn registry(&self) -> &SegmentLifecycleRegistry {
         &self.registry
+    }
+
+    /// Records the data-WAL position of a segment's latest data entry
+    /// (ADR-0024 Decision 2).
+    ///
+    /// Called by the write path after every data-WAL append (through the
+    /// sealer's `append_wal_entry`); the coordinator is the registry's
+    /// only writer. The last recorded position per segment is embedded
+    /// in the `SealEvent` at seal time.
+    pub(crate) fn record_data_wal_pos(&self, id: SegmentId, pos: DataWalPos) {
+        self.registry.record_data_wal_pos(id, pos);
     }
 
     /// Seeds the registry from the durable store (phase 1: the
@@ -908,16 +1214,486 @@ impl SegmentLifecycleCoordinator {
             } else {
                 SegmentState::Reserved
             };
-            self.registry.seed_entry(meta.segment_id, state, meta);
+            self.registry.seed_entry(meta.segment_id, state, meta, None);
         }
         self.update_gauges();
         Ok(())
     }
 
-    /// Reserves a segment durably: validate (absent | `Reserved`) →
-    /// CF `put_segment` (`sealed_at: None`) → fold into the registry.
+    /// Seeds the registry from a checkpoint snapshot (ADR-0024
+    /// Decision 3): every live entry's state, full metadata, and
+    /// recorded `data_wal_pos` (retention needs it to survive
+    /// checkpointing) is restored. The fold then runs from the
+    /// checkpoint's covered position.
+    pub fn seed_from_checkpoint(&self, snapshot: &SegmentLifecycleRegistry) {
+        snapshot.for_each(|id, entry| {
+            self.registry.seed_entry(id, entry.state, entry.metadata.clone(), entry.data_wal_pos);
+        });
+    }
+
+    /// Folds the event log into the registry — the deterministic
+    /// recovery core (`state = fold(events)`, ADR-0025 Decision 3).
     ///
-    /// Returns `Ok` **only after** the durable CF write — the write
+    /// Applies every event in the iterator's order through the typed
+    /// transition API (`reserve` / `seal` / `delete` — the registry's
+    /// pure transitions; no event is re-appended during recovery). The
+    /// fold is deterministic: the same event sequence folded twice
+    /// yields identical registries (the `SealEvent` carries no
+    /// timestamp, so the folded `sealed_at` is the deterministic
+    /// sentinel `Some(0)`).
+    ///
+    /// The registry is pre-sized from the CF mirror estimate
+    /// (perf 1.3); the lock bodies contain only map ops (perf 7.1).
+    ///
+    /// A torn tail ([`Error::TornEventRecord`]) ends the fold at the
+    /// last good record — the crash window's residue, folded state is
+    /// authoritative. A mid-log corruption ([`Error::CorruptEventLog`])
+    /// or a rejected transition ([`Error::EventFoldError`]) aborts with
+    /// the record position — never a silent partial fold.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CorruptEventLog`] for a corrupt mid-log record,
+    /// [`Error::EventFoldError`] for a rejected transition (with the
+    /// record position), or an I/O error from the iterator.
+    pub fn rebuild_from_events(
+        &self,
+        events: impl Iterator<Item = Result<(EventWalPos, SegmentEvent)>>,
+    ) -> Result<RebuildOutcome> {
+        let mut outcome = RebuildOutcome::default();
+        // Pre-size the registry and the folded-id set (perf 1.3): the CF
+        // mirror holds the same live set as the fold, modulo the
+        // event→mirror lag.
+        let mirror_estimate = self.metadata.list_segments().len();
+        let mut folded: std::collections::HashSet<SegmentId> =
+            std::collections::HashSet::with_capacity(mirror_estimate);
+        self.registry.reserve_hint(mirror_estimate);
+
+        for item in events {
+            let (pos, evt) = match item {
+                Ok(item) => item,
+                // A torn tail ends the fold at the last good record —
+                // the crash window's residue, folded state is
+                // authoritative (the open-time truncation normally
+                // removes it before the fold runs; this is the
+                // defensive path).
+                Err(Error::TornEventRecord { .. }) => break,
+                Err(e) => return Err(e),
+            };
+            let segment_id = evt.segment_id();
+            let fold_result = match evt {
+                SegmentEvent::Reserve(evt) => {
+                    let meta = SegmentMetadata {
+                        segment_id: evt.segment_id,
+                        ec_k: evt.ec_k,
+                        ec_m: evt.ec_m,
+                        size_tier: evt.tier,
+                        merkle_root: None,
+                        storage_locations: smallvec::SmallVec::new(),
+                        sealed_at: None,
+                    };
+                    self.registry.reserve(evt.segment_id, meta)
+                }
+                SegmentEvent::Seal(evt) => {
+                    // Record the SealEvent's data_wal_pos BEFORE the seal
+                    // transition (record_data_wal_pos updates Reserved
+                    // entries only; the seal keeps the position).
+                    self.registry.record_data_wal_pos(evt.segment_id, evt.data_wal_pos);
+                    let meta = SegmentMetadata {
+                        segment_id: evt.segment_id,
+                        ec_k: evt.ec_k,
+                        ec_m: evt.ec_m,
+                        size_tier: evt.tier,
+                        merkle_root: Some(evt.merkle_root),
+                        storage_locations: smallvec::SmallVec::new(),
+                        sealed_at: Some(0), // deterministic sentinel — the event carries no timestamp
+                    };
+                    self.registry.seal(evt.segment_id, meta)
+                }
+                SegmentEvent::Delete(evt) => self.registry.delete(evt.segment_id),
+            };
+            fold_result.map_err(|e| Error::EventFoldError {
+                pos,
+                detail: format!("{e} (segment {segment_id})"),
+            })?;
+            folded.insert(segment_id);
+        }
+        outcome.folded_segments = folded.len();
+        Ok(outcome)
+    }
+
+    /// Full startup recovery: fold the events, verify the CF mirror
+    /// (phase 2 dual-read), then run the data-WAL pass for
+    /// `Reserved`-unsealed segments (ADR-0024 Decision 1).
+    ///
+    /// The pass, per crash-window row:
+    /// - **row 1** — `Reserved` with zero data entries: the reserve is
+    ///   dropped (idle-seal never seals empty);
+    /// - **row 2** — `Reserved`-unsealed with data entries: entries are
+    ///   replayed into the pools in position order, the last entry's
+    ///   position is recorded, and the segment is re-sealed through the
+    ///   seal worker (the `SealEvent` carries the recomputed
+    ///   `merkle_root` and the recorded `data_wal_pos`);
+    /// - **row 3** — `Reserved`-unsealed with a durable `.dat` (the
+    ///   crash happened after the `.dat` fsync, before the `SealEvent`):
+    ///   the root is recomputed from the `.dat` and a `SealEvent` is
+    ///   appended via `request_seal` — no re-seal I/O;
+    /// - a data entry whose segment has **no** `ReserveEvent` is a
+    ///   corruption signal (the reserve-before-entry invariant): logged
+    ///   with its position and swept, never replayed.
+    ///
+    /// The spec's `seed` (checkpoint snapshot) is realized by pre-seeding
+    /// the coordinator's registry (`seed_entry`) and starting the event
+    /// iterator at the checkpoint position — the checkpoint feature
+    /// composes that; `None` here means fold from the earliest retained
+    /// event.
+    ///
+    /// The data WAL is consumed and truncated after the pass. The pass
+    /// requires the pools wired via
+    /// [`with_idle_seal`](Self::with_idle_seal) and the sealer's `.dat`
+    /// directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns the fold's corruption errors, a
+    /// [`Error::MirrorDivergence`] when the CF mirror contradicts the
+    /// fold in the impossible direction, or an I/O error from the data
+    /// WAL / sealer.
+    pub async fn rebuild_with_data_wal(
+        &self,
+        events: impl Iterator<Item = Result<(EventWalPos, SegmentEvent)>>,
+        data_wal: &WalReader,
+        sealer: &SegmentSealer,
+        merkle_root_fn: impl Fn(&[u8]) -> Option<HashOutput> + Send + Sync + 'static,
+        data_wal_writer: &WalWriter,
+    ) -> Result<RebuildOutcome> {
+        let mut outcome = self.rebuild_from_events(events)?;
+        self.verify_and_repair_mirror()?;
+        self.recover_reserved_unsealed(
+            data_wal,
+            sealer,
+            &merkle_root_fn,
+            &mut outcome,
+            data_wal_writer,
+        )
+        .await?;
+        Ok(outcome)
+    }
+
+    /// Phase-2 dual-read verification: the folded registry must agree
+    /// with the CF mirror, and the mirror must not hold anything the
+    /// fold cannot produce.
+    ///
+    /// The mirror write always follows its event append, so a crash
+    /// between the two leaves the mirror **lagging** the fold — a normal
+    /// crash window, repaired from the fold (the event log is
+    /// authoritative; phase-2 consumers such as GC still read the CF,
+    /// so the mirror must be consistent after rebuild). The impossible
+    /// direction — the mirror holding an entry or a sealed state the
+    /// fold lacks — fails startup with a structured error
+    /// ([`Error::MirrorDivergence`]); a stale reserve mirror for a
+    /// dropped empty reserve is removed.
+    fn verify_and_repair_mirror(&self) -> Result<()> {
+        // Snapshot the live entries under the shard read locks (the
+        // closure must not call back into the registry).
+        let mut live: Vec<(SegmentId, SegmentState, SegmentMetadata)> = Vec::new();
+        self.registry.for_each(|id, entry| {
+            live.push((id, entry.state, entry.metadata.clone()));
+        });
+
+        for (id, state, meta) in live {
+            match state {
+                SegmentState::Deleted => {
+                    // The delete mirror must eventually remove the entry;
+                    // a lagging mirror (crash between DeleteEvent and the
+                    // mirror write) is repaired.
+                    if self.metadata.get_segment(id)?.is_some() {
+                        self.metadata.delete_segment(id).map_err(|e| Error::MirrorDivergence {
+                            segment_id: id,
+                            detail: format!("failed to repair lagging delete mirror: {e}"),
+                        })?;
+                    }
+                }
+                SegmentState::Reserved | SegmentState::Sealed => {
+                    match self.metadata.get_segment(id)? {
+                        Some(cf_meta) => {
+                            let cf_sealed = cf_meta.sealed_at.is_some();
+                            let fold_sealed = state == SegmentState::Sealed;
+                            if cf_sealed != fold_sealed {
+                                return Err(Error::MirrorDivergence {
+                                    segment_id: id,
+                                    detail: format!(
+                                        "mirror sealed_at={cf_sealed} but the fold says {state:?}"
+                                    ),
+                                });
+                            }
+                        }
+                        None => {
+                            // Mirror lag (crash between the event append
+                            // and the mirror write) — repair from the
+                            // fold.
+                            self.metadata.put_segment(meta).map_err(|e| {
+                                Error::MirrorDivergence {
+                                    segment_id: id,
+                                    detail: format!("failed to repair lagging mirror: {e}"),
+                                }
+                            })?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // The impossible direction: mirror entries the fold lacks.
+        for cf_meta in self.metadata.list_segments() {
+            let cf_meta = cf_meta.map_err(|e| {
+                Error::Io(std::io::Error::other(format!("CF mirror scan failed: {e}")))
+            })?;
+            let id = cf_meta.segment_id;
+            if self.registry.get(id).is_some() {
+                continue;
+            }
+            if cf_meta.sealed_at.is_some() {
+                // A sealed mirror entry requires a durable SealEvent,
+                // which the fold must have seen (the mirror write
+                // follows the event append).
+                return Err(Error::MirrorDivergence {
+                    segment_id: id,
+                    detail: "mirror holds a sealed entry the fold lacks".into(),
+                });
+            }
+            // Stale reserve mirror for a dropped empty reserve — remove
+            // it (the fold is authoritative).
+            self.metadata.delete_segment(id).map_err(|e| Error::MirrorDivergence {
+                segment_id: id,
+                detail: format!("failed to remove stale reserve mirror: {e}"),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The data-WAL pass: rebuild every `Reserved`-unsealed segment
+    /// (adopt the durable `.dat` or replay the entries), drop empty
+    /// reserves, sweep orphan entries (ADR-0024 Decision 1).
+    async fn recover_reserved_unsealed(
+        &self,
+        data_wal: &WalReader,
+        sealer: &SegmentSealer,
+        merkle_root_fn: &(dyn Fn(&[u8]) -> Option<HashOutput> + Send + Sync),
+        outcome: &mut RebuildOutcome,
+        data_wal_writer: &WalWriter,
+    ) -> Result<()> {
+        // 1. Collect the Reserved-unsealed set (the fold's residue) with
+        //    the registry's authoritative tier.
+        let mut reserved: Vec<(SegmentId, SizeTier)> = Vec::new();
+        self.registry.for_each(|id, entry| {
+            if entry.state == SegmentState::Reserved {
+                reserved.push((id, entry.metadata.size_tier));
+            }
+        });
+        let reserved_ids: std::collections::HashSet<SegmentId> =
+            reserved.iter().map(|(id, _)| *id).collect();
+        let segments_dir = sealer.segment_data_dir().to_path_buf();
+
+        // 2. Split adopt vs replay by the durable `.dat` presence. The
+        //    probe validates the FULL data section (header + data_end
+        //    within the file), mirroring `read_segment_data_root`: a
+        //    `.dat` with a valid header but a truncated data section
+        //    falls back to replay — its entries must be buffered during
+        //    the stream (silently adopting it would orphan the segment
+        //    and then truncate its only durable copy).
+        let mut adopt: std::collections::HashSet<SegmentId> = std::collections::HashSet::new();
+        for (id, _) in &reserved {
+            let path = segments_dir.join(format!("{id}.dat"));
+            if let Ok(raw) = std::fs::read(&path) {
+                if let Some(header) = SegmentHeader::from_bytes(&raw) {
+                    let hdr_size = SegmentHeader::header_size(header.version);
+                    let data_end = (hdr_size as u64 + header.size) as usize;
+                    if data_end <= raw.len() {
+                        adopt.insert(*id);
+                        continue;
+                    }
+                }
+                tracing::warn!(
+                    segment_id = %id,
+                    "interrupted-seal .dat unparsable or truncated; removing it and falling back to WAL replay"
+                );
+                // The file is untrustworthy (an interrupted seal's
+                // artifact is only valid if fully written). Remove it
+                // so the re-seal's readiness wait actually waits for
+                // the fresh .dat instead of seeing the corrupt one.
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+
+        // 3. Stream the data WAL ONCE in position order (perf 3.1 — no
+        //    per-entry seeks): buffer replay data per segment (bounded
+        //    by the WAL retention window — see the module note), record
+        //    the last entry position per reserved segment, count swept
+        //    entries (sealed/deleted/orphan).
+        let mut groups: std::collections::HashMap<SegmentId, Vec<Bytes>> =
+            std::collections::HashMap::with_capacity(reserved.len());
+        let mut last_pos: std::collections::HashMap<SegmentId, DataWalPos> =
+            std::collections::HashMap::with_capacity(reserved.len());
+        for item in data_wal.replay_positions() {
+            let (pos, entry) = item?;
+            let id = entry.segment_id();
+            if reserved_ids.contains(&id) {
+                last_pos.insert(id, pos);
+                if adopt.contains(&id) {
+                    // The entry is garbage once the .dat is adopted.
+                    outcome.swept_entries += 1;
+                } else {
+                    groups.entry(id).or_default().push(entry.data);
+                }
+            } else {
+                if self.registry.get(id).is_none() {
+                    // A data entry without any ReserveEvent: the
+                    // reserve-before-entry invariant (ADR-0024
+                    // Decision 1) is by construction — its violation is
+                    // a corruption signal. Logged and swept, never
+                    // replayed.
+                    tracing::warn!(
+                        segment_id = %id,
+                        pos = ?pos,
+                        "data WAL entry without a ReserveEvent; swept (reserve-before-entry invariant)"
+                    );
+                }
+                outcome.swept_entries += 1;
+            }
+        }
+
+        // 4. Record every segment's LAST entry position FIRST (the
+        //    re-seal's SealEvent reads it at seal time), then drain all
+        //    replay groups sequentially (the pool's slot model bounds
+        //    concurrency).
+        for (id, pos) in &last_pos {
+            self.record_data_wal_pos(*id, *pos);
+        }
+        for id in groups.keys().cloned().collect::<Vec<_>>() {
+            self.drain_replay_group(id, &mut groups, &reserved).await?;
+        }
+
+        // 5. Adopt the durable `.dat` segments (row 3): recompute the
+        //    root and append the SealEvent via request_seal — no re-seal
+        //    I/O.
+        for &id in &adopt {
+            let Some(entry) = self.registry.get(id) else { continue };
+            let Some(root) = read_segment_data_root(&segments_dir, id, merkle_root_fn) else {
+                tracing::warn!(segment_id = %id, "adopt failed to read .dat; leaving Reserved");
+                continue;
+            };
+            let meta = SegmentMetadata {
+                segment_id: id,
+                ec_k: entry.metadata.ec_k,
+                ec_m: entry.metadata.ec_m,
+                size_tier: entry.metadata.size_tier,
+                merkle_root: Some(root),
+                storage_locations: smallvec::SmallVec::new(),
+                sealed_at: Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64,
+                ),
+            };
+            self.request_seal(id, meta)
+                .await
+                .map_err(|e| Error::Io(std::io::Error::other(format!("adopt seal failed: {e}"))))?;
+            outcome.adopted_segments += 1;
+        }
+
+        // 6. Drop empty reserves (row 1): Reserved with no data entries
+        //    and no `.dat`.
+        let mut remaining_reserved: Vec<SegmentId> = Vec::new();
+        self.registry.for_each(|id, entry| {
+            if entry.state == SegmentState::Reserved {
+                remaining_reserved.push(id);
+            }
+        });
+        for id in remaining_reserved {
+            if !last_pos.contains_key(&id) && !adopt.contains(&id) {
+                self.registry.drop_reserve(id);
+                outcome.dropped_empty_reserves += 1;
+            }
+        }
+
+        // 7. The replayed seals complete asynchronously on the seal
+        //    worker; wait for their .dat files (reads must never race a
+        //    partially-written segment — the node's pre-bind readiness).
+        let replayed_ids: Vec<SegmentId> =
+            last_pos.keys().filter(|id| !adopt.contains(id)).copied().collect();
+        if !replayed_ids.is_empty() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            for id in &replayed_ids {
+                let path = segments_dir.join(format!("{id}.dat"));
+                while !path.exists() {
+                    if std::time::Instant::now() > deadline {
+                        tracing::warn!(
+                            segment_id = %id,
+                            "re-sealed segment .dat not durable within 30s; startup continues"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+            outcome.re_sealed_segments = replayed_ids.len();
+        }
+
+        // 8. The data WAL is fully consumed (replayed or swept) —
+        //    truncate it, exactly like the WAL replay path.
+        data_wal_writer.truncate(0).await?;
+        Ok(())
+    }
+
+    /// Drains one replay group through its pool: appends every buffered
+    /// entry in position order (append order == offset order), then
+    /// seals the segment through the pool's replay-seal path (the seal
+    /// worker computes the root and `request_seal` embeds the recorded
+    /// `data_wal_pos`).
+    async fn drain_replay_group(
+        &self,
+        id: SegmentId,
+        groups: &mut std::collections::HashMap<SegmentId, Vec<Bytes>>,
+        reserved: &[(SegmentId, SizeTier)],
+    ) -> Result<()> {
+        let Some(data) = groups.remove(&id) else { return Ok(()) };
+        let tier = reserved
+            .iter()
+            .find(|(rid, _)| *rid == id)
+            .map(|(_, tier)| *tier)
+            .unwrap_or(SizeTier::Standard);
+        let Some(pool) = self.idle_pools.iter().find(|p| p.storage_tier() == tier) else {
+            return Err(Error::Io(std::io::Error::other(format!(
+                "recovery: no pool wired for tier {tier:?} of segment {id}"
+            ))));
+        };
+        for chunk in &data {
+            pool.append_replayed(id, chunk).await.map_err(|e| {
+                Error::Io(std::io::Error::other(format!("replay append for {id} failed: {e}")))
+            })?;
+        }
+        pool.seal_replayed_partial(id).await.map_err(|e| {
+            Error::Io(std::io::Error::other(format!("replay seal for {id} failed: {e}")))
+        })?;
+        Ok(())
+    }
+
+    /// Reserves a segment durably: validate (absent | `Reserved`) →
+    /// durable side-effect → fold into the registry.
+    ///
+    /// **Phase 1** (no event WAL wired): the CF `put_segment`
+    /// (`sealed_at: None`) is the durable side-effect.
+    ///
+    /// **Phase 2** (event WAL wired): the `ReserveEvent` is appended
+    /// first (durable via the event group — ADR-0024 Decision 1), then
+    /// the fold; the CF write becomes a **derived mirror** performed
+    /// AFTER the event append (dual-read verification surface). A
+    /// mirror-write failure is logged, not fatal — the event log is
+    /// authoritative.
+    ///
+    /// Returns `Ok` **only after** the durable side-effect — the write
     /// path calls this before the first `DataEntry` (WAL entry) of its
     /// segment, so the WAL cleanup can never mistake an in-flight
     /// segment for garbage.
@@ -927,8 +1703,9 @@ impl SegmentLifecycleCoordinator {
     /// Returns [`TransitionError::AlreadySealed`] /
     /// [`TransitionError::AlreadyDeleted`] when the segment already
     /// holds a higher state (the phantom-downgrade write is rejected —
-    /// no CF write and no fold happen), or
-    /// [`TransitionError::DurableWriteFailed`] when the CF write fails.
+    /// no durable write and no fold happen), or
+    /// [`TransitionError::DurableWriteFailed`] when the durable
+    /// side-effect (event append in phase 2, CF write in phase 1) fails.
     pub async fn request_reserve(
         &self,
         id: SegmentId,
@@ -946,17 +1723,45 @@ impl SegmentLifecycleCoordinator {
             storage_locations: smallvec::SmallVec::new(),
             sealed_at: None,
         };
-        self.metadata
-            .put_segment(meta.clone())
-            .map_err(|e| TransitionError::DurableWriteFailed(e.to_string()))?;
-        self.registry.fold_reserve(id, meta)?;
+        if let Some(event_wal) = &self.event_wal {
+            // Phase 2: the event append is the durable side-effect.
+            let evt = SegmentEvent::Reserve(ReserveEvent { segment_id: id, tier, ec_k, ec_m });
+            event_wal
+                .append(evt)
+                .await
+                .map_err(|e| TransitionError::DurableWriteFailed(e.to_string()))?;
+            self.registry.fold_reserve(id, meta.clone())?;
+            if let Err(e) = self.metadata.put_segment(meta) {
+                tracing::warn!(
+                    segment_id = %id,
+                    error = %e,
+                    "lifecycle CF mirror write failed after reserve event; event log is authoritative"
+                );
+            }
+        } else {
+            // Phase 1: the CF write is the durable side-effect.
+            self.metadata
+                .put_segment(meta.clone())
+                .map_err(|e| TransitionError::DurableWriteFailed(e.to_string()))?;
+            self.registry.fold_reserve(id, meta)?;
+        }
+        self.maybe_checkpoint().await;
         self.update_gauges();
         Ok(())
     }
 
-    /// Seals a segment durably: validate (`Reserved` only) → CF
-    /// `put_segment` with the full sealed metadata (incl. the seal-time
-    /// `merkle_root`) → fold into the registry.
+    /// Seals a segment durably: validate (`Reserved` only) → durable
+    /// side-effect → fold into the registry.
+    ///
+    /// **Phase 1** (no event WAL wired): the CF `put_segment` with the
+    /// full sealed metadata (incl. the seal-time `merkle_root`) is the
+    /// durable side-effect.
+    ///
+    /// **Phase 2** (event WAL wired): the `SealEvent` — carrying the
+    /// full repacked metadata: `merkle_root` is a seal input (the
+    /// BadDigest defect is impossible) and `data_wal_pos` is the LAST
+    /// data entry's position (ADR-0024 Decision 2) — is appended first,
+    /// then the fold, then the CF mirror write.
     ///
     /// Callers invoke this only after the `.dat` fsync returns (the
     /// seal worker's operation sequence); the durable write and the
@@ -965,25 +1770,70 @@ impl SegmentLifecycleCoordinator {
     /// # Errors
     ///
     /// Returns a [`TransitionError`] when the entry is not `Reserved`
-    /// (no CF write, no fold), or
-    /// [`TransitionError::DurableWriteFailed`] when the CF write fails.
+    /// (no durable write, no fold), or
+    /// [`TransitionError::DurableWriteFailed`] when the durable
+    /// side-effect fails. In phase 2 a missing `merkle_root` is a
+    /// durable-write failure: a `SealEvent` without the seal-time root
+    /// would fabricate the anchor recovery trusts.
     pub async fn request_seal(
         &self,
         id: SegmentId,
         metadata: SegmentMetadata,
     ) -> Result<(), TransitionError> {
         self.registry.validate_seal(id)?;
-        self.metadata
-            .put_segment(metadata.clone())
-            .map_err(|e| TransitionError::DurableWriteFailed(e.to_string()))?;
-        self.registry.fold_seal(id, metadata)?;
+        if let Some(event_wal) = &self.event_wal {
+            // Phase 2: the event append is the durable side-effect.
+            let merkle_root = metadata.merkle_root.ok_or_else(|| {
+                TransitionError::DurableWriteFailed(
+                    "seal without merkle_root (the event log requires the seal-time root)".into(),
+                )
+            })?;
+            let data_wal_pos = self
+                .registry
+                .last_data_wal_pos(id)
+                .unwrap_or(DataWalPos { file_seq: 0, offset: 0 });
+            let evt = SegmentEvent::Seal(SealEvent {
+                segment_id: id,
+                tier: metadata.size_tier,
+                ec_k: metadata.ec_k,
+                ec_m: metadata.ec_m,
+                merkle_root,
+                data_wal_pos,
+            });
+            event_wal
+                .append(evt)
+                .await
+                .map_err(|e| TransitionError::DurableWriteFailed(e.to_string()))?;
+            self.registry.fold_seal(id, metadata.clone())?;
+            if let Err(e) = self.metadata.put_segment(metadata) {
+                tracing::warn!(
+                    segment_id = %id,
+                    error = %e,
+                    "lifecycle CF mirror write failed after seal event; event log is authoritative"
+                );
+            }
+        } else {
+            // Phase 1: the CF write is the durable side-effect.
+            self.metadata
+                .put_segment(metadata.clone())
+                .map_err(|e| TransitionError::DurableWriteFailed(e.to_string()))?;
+            self.registry.fold_seal(id, metadata)?;
+        }
+        self.maybe_checkpoint().await;
         self.update_gauges();
         Ok(())
     }
 
     /// Deletes a segment durably: validate (`Reserved` | `Sealed`) →
-    /// CF deleted-marker write → fold into the registry (the entry is
+    /// durable side-effect → fold into the registry (the entry is
     /// evicted after the delete grace).
+    ///
+    /// **Phase 1** (no event WAL wired): the CF deleted-marker write is
+    /// the durable side-effect.
+    ///
+    /// **Phase 2** (event WAL wired): the `DeleteEvent` is appended
+    /// first (durable via the event group), then the fold, then the CF
+    /// mirror `delete_segment`.
     ///
     /// The caller (the orphan reaper) invokes this **before** the
     /// `.dat` unlink — the durable deletion precedes the data removal
@@ -992,15 +1842,35 @@ impl SegmentLifecycleCoordinator {
     /// # Errors
     ///
     /// Returns [`TransitionError::AlreadyDeleted`] /
-    /// [`TransitionError::Missing`] when no live entry exists (no CF
-    /// write, no fold), or
-    /// [`TransitionError::DurableWriteFailed`] when the CF write fails.
+    /// [`TransitionError::Missing`] when no live entry exists (no
+    /// durable write, no fold), or
+    /// [`TransitionError::DurableWriteFailed`] when the durable
+    /// side-effect fails.
     pub async fn request_delete(&self, id: SegmentId) -> Result<(), TransitionError> {
         self.registry.validate_delete(id)?;
-        self.metadata
-            .delete_segment(id)
-            .map_err(|e| TransitionError::DurableWriteFailed(e.to_string()))?;
-        self.registry.fold_delete(id)?;
+        if let Some(event_wal) = &self.event_wal {
+            // Phase 2: the event append is the durable side-effect.
+            let evt = SegmentEvent::Delete(DeleteEvent { segment_id: id });
+            event_wal
+                .append(evt)
+                .await
+                .map_err(|e| TransitionError::DurableWriteFailed(e.to_string()))?;
+            self.registry.fold_delete(id)?;
+            if let Err(e) = self.metadata.delete_segment(id) {
+                tracing::warn!(
+                    segment_id = %id,
+                    error = %e,
+                    "lifecycle CF mirror write failed after delete event; event log is authoritative"
+                );
+            }
+        } else {
+            // Phase 1: the CF write is the durable side-effect.
+            self.metadata
+                .delete_segment(id)
+                .map_err(|e| TransitionError::DurableWriteFailed(e.to_string()))?;
+            self.registry.fold_delete(id)?;
+        }
+        self.maybe_checkpoint().await;
         self.update_gauges();
         Ok(())
     }
@@ -1010,17 +1880,19 @@ impl SegmentLifecycleCoordinator {
     ///
     /// Preserves the flush coordinator's one-RocksDB-batch-per-cycle
     /// property: every accepted id is validated first (read-only, no
-    /// locks held across I/O — performance §7.1), the accepted
-    /// metadata is written in **one** `batch_write`, then each accepted
-    /// entry is folded. Returns one result per input, aligned by
-    /// index: a validation failure for one segment does not fail the
-    /// others.
+    /// locks held across I/O — performance §7.1), the accepted metadata
+    /// is committed (phase 1: one `batch_write`; phase 2: one
+    /// `SealEvent` append per id — the event group's group commit
+    /// batches the fsyncs — then the folds, then one mirror
+    /// `batch_write`), and each accepted entry is folded. Returns one
+    /// result per input, aligned by index: a validation failure for one
+    /// segment does not fail the others.
     ///
     /// # Errors
     ///
     /// Each element is `Ok` on success, or a [`TransitionError`] for
     /// that segment.
-    pub(crate) fn seal_finalized_batch(
+    pub(crate) async fn seal_finalized_batch(
         &self,
         metas: Vec<SegmentMetadata>,
     ) -> Vec<std::result::Result<(), TransitionError>> {
@@ -1028,45 +1900,105 @@ impl SegmentLifecycleCoordinator {
         // shard locks are released before any durable I/O).
         let mut out: Vec<std::result::Result<(), TransitionError>> =
             std::iter::repeat_with(|| Ok(())).take(metas.len()).collect();
-        let mut accepted: Vec<SegmentMetadata> = Vec::with_capacity(metas.len());
+        let mut accepted: Vec<(usize, SegmentMetadata)> = Vec::with_capacity(metas.len());
         for (i, meta) in metas.into_iter().enumerate() {
             match self.registry.validate_seal(meta.segment_id) {
-                Ok(()) => accepted.push(meta),
+                Ok(()) => accepted.push((i, meta)),
                 Err(e) => out[i] = Err(e),
             }
         }
         if accepted.is_empty() {
             return out;
         }
-        // Phase 2 — one durable batch write for the accepted entries.
-        let ops: Vec<oceanfs_storage_api::BatchOp> =
-            accepted.iter().cloned().map(oceanfs_storage_api::BatchOp::PutSegment).collect();
-        if let Err(e) = self.metadata.batch_write(ops) {
-            for slot in &mut out {
-                if slot.is_ok() {
-                    *slot = Err(TransitionError::DurableWriteFailed(e.to_string()));
+
+        if let Some(event_wal) = &self.event_wal {
+            // Phase 2 — per-id event append (durable via the event
+            // group; the group commit batches the fsyncs), then fold,
+            // then ONE mirror batch write for the folded entries. A
+            // single event failure fails only that id; mirror failures
+            // are logged (the event log is authoritative).
+            let mut mirror_ops: Vec<oceanfs_storage_api::BatchOp> =
+                Vec::with_capacity(accepted.len());
+            for (i, meta) in accepted {
+                let id = meta.segment_id;
+                let Some(merkle_root) = meta.merkle_root else {
+                    out[i] = Err(TransitionError::DurableWriteFailed(
+                        "seal without merkle_root (the event log requires the seal-time root)"
+                            .into(),
+                    ));
+                    continue;
+                };
+                let data_wal_pos = self
+                    .registry
+                    .last_data_wal_pos(id)
+                    .unwrap_or(DataWalPos { file_seq: 0, offset: 0 });
+                let evt = SegmentEvent::Seal(SealEvent {
+                    segment_id: id,
+                    tier: meta.size_tier,
+                    ec_k: meta.ec_k,
+                    ec_m: meta.ec_m,
+                    merkle_root,
+                    data_wal_pos,
+                });
+                let mirror_meta = meta.clone();
+                match event_wal.append(evt).await {
+                    Ok(_) => match self.registry.fold_seal(id, meta) {
+                        Ok(()) => {
+                            mirror_ops.push(oceanfs_storage_api::BatchOp::PutSegment(mirror_meta));
+                        }
+                        Err(e) => {
+                            // A fold can lose a race only to a concurrent
+                            // delete of the same segment (unreachable in
+                            // phase 1: the reaper deletes only
+                            // unreferenced segments, and a segment being
+                            // sealed is referenced). The event is
+                            // durable; the registry converged elsewhere;
+                            // no mirror write for this id.
+                            tracing::warn!(
+                                segment_id = %id,
+                                error = ?e,
+                                "seal fold lost a transition race; event durable, registry entry unchanged"
+                            );
+                        }
+                    },
+                    Err(e) => out[i] = Err(TransitionError::DurableWriteFailed(e.to_string())),
                 }
             }
-            return out;
-        }
-        // Phase 3 — fold each accepted entry (write locks, once per
-        // segment, strictly after the durable write returned).
-        for meta in accepted {
-            let id = meta.segment_id;
-            if let Err(e) = self.registry.fold_seal(id, meta) {
-                // A fold can lose a race only to a concurrent delete of
-                // the same segment (unreachable in phase 1: the reaper
-                // deletes only unreferenced segments, and a segment
-                // being sealed is referenced). The durable write already
-                // happened; the registry converges on the next
-                // transition.
-                tracing::warn!(
-                    segment_id = %id,
-                    error = ?e,
-                    "seal fold lost a transition race; registry entry unchanged"
-                );
+            if !mirror_ops.is_empty() {
+                if let Err(e) = self.metadata.batch_write(mirror_ops) {
+                    tracing::warn!(
+                        error = %e,
+                        "lifecycle CF mirror batch write failed after seal events; event log is authoritative"
+                    );
+                }
+            }
+        } else {
+            // Phase 1 — one durable batch write for the accepted entries.
+            let ops: Vec<oceanfs_storage_api::BatchOp> = accepted
+                .iter()
+                .cloned()
+                .map(|(_, meta)| oceanfs_storage_api::BatchOp::PutSegment(meta))
+                .collect();
+            if let Err(e) = self.metadata.batch_write(ops) {
+                for (i, _) in accepted {
+                    out[i] = Err(TransitionError::DurableWriteFailed(e.to_string()));
+                }
+                return out;
+            }
+            // Phase 3 — fold each accepted entry (write locks, once per
+            // segment, strictly after the durable write returned).
+            for (_, meta) in accepted {
+                let id = meta.segment_id;
+                if let Err(e) = self.registry.fold_seal(id, meta) {
+                    tracing::warn!(
+                        segment_id = %id,
+                        error = ?e,
+                        "seal fold lost a transition race; registry entry unchanged"
+                    );
+                }
             }
         }
+        self.maybe_checkpoint().await;
         self.update_gauges();
         out
     }
@@ -1150,12 +2082,21 @@ impl SegmentLifecycleCoordinator {
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use oceanfs_core::{MetadataConfig, PoolConfig, SegmentSizeConfig, SizeTier};
+    use oceanfs_core::{
+        EventWalConfig, HashOutput, MetadataConfig, PoolConfig, SegmentSizeConfig, SizeTier,
+        WalConfig,
+    };
     use oceanfs_storage_api::MetadataStore;
     use tempfile::TempDir;
 
     use super::*;
-    use crate::{buffer_pool::BufferPool, metadata::RocksDbMetadataStore};
+    use crate::{
+        buffer_pool::BufferPool,
+        metadata::RocksDbMetadataStore,
+        segment::event_wal::{EventWal, EventWalPos},
+        wal::{WalEntry, WalWriter},
+        SegmentSealer,
+    };
 
     /// A registry config with a non-zero delete grace, so the
     /// `Deleted` state is observable (with the default immediate
@@ -1708,7 +2649,7 @@ mod tests {
             2,
             Bytes::from_static(b"frozen-payload-2"),
         ));
-        let results = coordinator.seal_finalized_batch(vec![test_metadata(id2, true)]);
+        let results = coordinator.seal_finalized_batch(vec![test_metadata(id2, true)]).await;
         assert!(results[0].is_ok());
         assert_eq!(coordinator.registry().in_flight_count(), 0, "batch seal must clear the window");
         assert!(matches!(coordinator.registry().read_source(id2), SegmentReadSource::Sealed));
@@ -1793,7 +2734,7 @@ mod tests {
             coordinator.request_reserve(*id, SizeTier::Standard, 4, 2).await.unwrap();
         }
         let metas: Vec<SegmentMetadata> = ids.iter().map(|id| test_metadata(*id, true)).collect();
-        let results = coordinator.seal_finalized_batch(metas);
+        let results = coordinator.seal_finalized_batch(metas).await;
         assert!(results.iter().all(|r| r.is_ok()), "all 16 must seal: {results:?}");
         assert_eq!(coordinator.registry().len(), 16);
         for id in &ids {
@@ -1820,7 +2761,7 @@ mod tests {
             test_metadata(missing_id, true),
             test_metadata(sealed_id, true),
         ];
-        let results = coordinator.seal_finalized_batch(metas);
+        let results = coordinator.seal_finalized_batch(metas).await;
         assert_eq!(results[0], Ok(()));
         assert_eq!(results[1], Err(TransitionError::Missing));
         assert_eq!(results[2], Err(TransitionError::AlreadySealed));
@@ -2120,5 +3061,190 @@ mod tests {
         fn batch_write(&self, ops: Vec<oceanfs_storage_api::BatchOp>) -> std::io::Result<()> {
             MetadataStore::batch_write(&*self.inner, ops)
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Event WAL phase 2 — full coordinator sequence (ADR-0024, DoD)
+    // ------------------------------------------------------------------
+
+    /// The DoD integration test: a reserve→data→seal→delete sequence
+    /// through the coordinator produces exactly three events whose
+    /// replay fold reproduces the registry exactly; the CF mirror
+    /// matches (dual-read); the seal's `data_wal_pos` equals the data
+    /// WAL writer's returned position of the LAST data entry.
+    #[tokio::test]
+    async fn event_wal_phase2_full_sequence_folds_and_mirrors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            RocksDbMetadataStore::open(&MetadataConfig {
+                data_dir: dir.path().join("meta"),
+                block_cache_size: 1024,
+                memtable_size: 1024,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let event_wal_config = EventWalConfig {
+            event_wal_dir: dir.path().join("event-wal"),
+            event_wal_file_size_bytes: 1024 * 1024,
+            event_wal_fsync_batch_timeout_ms: 10,
+            event_wal_checkpoint_bytes: 1024 * 1024,
+        };
+        let event_wal = Arc::new(
+            EventWal::open(event_wal_config.event_wal_dir.clone(), &event_wal_config)
+                .await
+                .unwrap(),
+        );
+
+        // The coordinator registry uses a non-zero delete grace so the
+        // `Deleted` state is observable in both the live and the folded
+        // registries (the DoD's "replay fold reproduces the registry
+        // exactly").
+        let lifecycle_config = grace_config(1_000);
+        let lifecycle = Arc::new(
+            SegmentLifecycleCoordinator::with_registry(
+                store.clone(),
+                Arc::new(SegmentLifecycleRegistry::new(&lifecycle_config)),
+            )
+            .with_event_wal(event_wal.clone()),
+        );
+
+        // The data WAL writer + sealer — the write path's position
+        // source (`append_wal_entry` records each entry's position with
+        // the coordinator).
+        let data_config = WalConfig {
+            data_dir: dir.path().join("wal"),
+            max_file_size_bytes: 1024 * 1024,
+            fsync_batch_timeout_ms: 5,
+            wal_use_sync_file_range: false,
+        };
+        let data_wal = Arc::new(WalWriter::open(&data_config).await.unwrap());
+        let sealer = Arc::new(SegmentSealer::new(
+            crate::SealConfig { data_dir: dir.path().join("segments"), ..Default::default() },
+            data_wal.clone(),
+            lifecycle.clone(),
+        ));
+
+        // reserve → N data appends → seal → delete
+        let id = SegmentId::new();
+        lifecycle.request_reserve(id, SizeTier::Standard, 4, 2).await.unwrap();
+
+        let mut last_pos: Option<DataWalPos> = None;
+        for i in 0..3u32 {
+            let entry = WalEntry::new(
+                id,
+                (i * 100) as u64,
+                3,
+                3,
+                1, // standard pool tier byte
+                0,
+                0,
+                HashOutput::from_bytes([0u8; 32]),
+                vec![1, 2, 3].into(),
+            );
+            last_pos = Some(sealer.append_wal_entry(entry).await.unwrap());
+        }
+        let last_pos = last_pos.expect("three data entries appended");
+        // Each data entry is the 88-byte header + 3 payload bytes.
+        assert_eq!(
+            data_wal.global_position().await,
+            3 * (WalEntry::header_size() as u64 + 3),
+            "data WAL holds the three entries"
+        );
+
+        let sealed_meta = SegmentMetadata {
+            segment_id: id,
+            ec_k: 4,
+            ec_m: 2,
+            size_tier: SizeTier::Standard,
+            merkle_root: Some(HashOutput::from_bytes([0xAB; 32])),
+            storage_locations: smallvec::SmallVec::new(),
+            sealed_at: Some(1_700_000_000_000),
+        };
+        lifecycle.request_seal(id, sealed_meta.clone()).await.unwrap();
+        lifecycle.request_delete(id).await.unwrap();
+
+        // --- Exactly three events, in order: Reserve, Seal, Delete ---
+        let events: Vec<(EventWalPos, SegmentEvent)> = event_wal
+            .read_from(EventWalPos { file_seq: 0, offset: 0 })
+            .collect::<crate::Result<_>>()
+            .unwrap();
+        assert_eq!(events.len(), 3, "the sequence must produce exactly three events");
+
+        match &events[0].1 {
+            SegmentEvent::Reserve(evt) => {
+                assert_eq!(evt.segment_id, id);
+                assert_eq!(evt.tier, SizeTier::Standard);
+                assert_eq!(evt.ec_k, 4);
+                assert_eq!(evt.ec_m, 2);
+            }
+            other => panic!("first event must be Reserve, got {other:?}"),
+        }
+        match &events[1].1 {
+            SegmentEvent::Seal(evt) => {
+                assert_eq!(evt.segment_id, id);
+                assert_eq!(evt.tier, SizeTier::Standard);
+                assert_eq!(evt.ec_k, 4);
+                assert_eq!(evt.ec_m, 2);
+                assert_eq!(evt.merkle_root, HashOutput::from_bytes([0xAB; 32]));
+                assert_eq!(
+                    evt.data_wal_pos, last_pos,
+                    "SealEvent.data_wal_pos must equal the LAST data entry's position"
+                );
+            }
+            other => panic!("second event must be Seal, got {other:?}"),
+        }
+        match &events[2].1 {
+            SegmentEvent::Delete(evt) => assert_eq!(evt.segment_id, id),
+            other => panic!("third event must be Delete, got {other:?}"),
+        }
+
+        // --- Replay fold reproduces the registry exactly ---
+        let folded = SegmentLifecycleRegistry::new(&lifecycle_config);
+        for (_, evt) in &events {
+            match evt {
+                SegmentEvent::Reserve(evt) => {
+                    let meta = SegmentMetadata {
+                        segment_id: evt.segment_id,
+                        ec_k: evt.ec_k,
+                        ec_m: evt.ec_m,
+                        size_tier: evt.tier,
+                        merkle_root: None,
+                        storage_locations: smallvec::SmallVec::new(),
+                        sealed_at: None,
+                    };
+                    folded.reserve(evt.segment_id, meta).unwrap();
+                }
+                SegmentEvent::Seal(evt) => {
+                    let meta = SegmentMetadata {
+                        segment_id: evt.segment_id,
+                        ec_k: evt.ec_k,
+                        ec_m: evt.ec_m,
+                        size_tier: evt.tier,
+                        merkle_root: Some(evt.merkle_root),
+                        storage_locations: smallvec::SmallVec::new(),
+                        sealed_at: Some(1_700_000_000_000),
+                    };
+                    folded.seal(evt.segment_id, meta).unwrap();
+                }
+                SegmentEvent::Delete(evt) => {
+                    folded.delete(evt.segment_id).unwrap();
+                }
+            }
+        }
+        // Both registries hold the same Deleted entry (grace not yet
+        // expired in either).
+        let live = lifecycle.registry().get(id).expect("live registry entry present");
+        let folded_entry = folded.get(id).expect("folded registry entry present");
+        assert_eq!(live.state, SegmentState::Deleted);
+        assert_eq!(folded_entry.state, SegmentState::Deleted);
+        assert_eq!(folded.len(), lifecycle.registry().len(), "fold reproduces the live registry");
+
+        // --- Dual-read: the CF mirror matches the event fold ---
+        // reserve put sealed_at:None; seal updated it; delete removed it.
+        assert!(
+            store.get_segment(id).unwrap().is_none(),
+            "CF mirror must reflect the delete (event log authoritative)"
+        );
     }
 }

@@ -269,7 +269,11 @@ fn flush_batch(
         stats.fsyncs_total.inc();
 
         #[cfg(test)]
-        if FAIL_SYNC.load(Ordering::Relaxed) {
+        // Scoped to the failure test's filename: the static flag may be
+        // observed by a concurrently-running test's batch (shared
+        // process), so the seam must only fail the registration it was
+        // armed for.
+        if FAIL_SYNC.load(Ordering::Relaxed) && reg.filename == "fail.dat" {
             // Hygiene: same cleanup as the real error path.
             let _ =
                 std::fs::remove_file(crate::io::atomic_write::temp_path(data_dir, &reg.filename));
@@ -312,12 +316,22 @@ fn flush_batch(
 
     // Phase 3: one lifecycle seal batch for all successfully finalized
     // files. The coordinator validates every id against the registry
-    // (Reserved-only), writes the accepted metadata in ONE RocksDB
-    // batch, then folds each entry — the single-writer invariant
-    // (ADR-0025 Decision 1) is preserved end to end.
+    // (Reserved-only), commits the accepted metadata (phase 1: one
+    // RocksDB batch; phase 2: one SealEvent append per id — the event
+    // group's group commit batches the fsyncs — then the folds, then
+    // one mirror RocksDB batch), then folds each entry — the
+    // single-writer invariant (ADR-0025 Decision 1) is preserved end
+    // to end.
+    //
+    // The seal batch is async (the event appends await the event
+    // group's group commit). flush_batch runs on the blocking pool
+    // (spawn_blocking); the future is driven on the runtime handle —
+    // the blocking thread is not an async context, so block_on is
+    // legal here.
     if !metas.is_empty() {
         stats.metadata_batches_total.inc();
-        let results = lifecycle.seal_finalized_batch(metas);
+        let handle = tokio::runtime::Handle::current();
+        let results = handle.block_on(lifecycle.seal_finalized_batch(metas));
         for (done, result) in ok_waiters.into_iter().zip(results) {
             let _ = done.send(result.map_err(|e| Error::Io(io::Error::other(e.to_string()))));
         }

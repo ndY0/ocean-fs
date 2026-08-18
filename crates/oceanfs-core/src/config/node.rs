@@ -319,6 +319,15 @@ pub struct NodeConfig {
     #[serde(default)]
     pub lifecycle: crate::LifecycleConfig,
 
+    // ── Item 4e: Segment event WAL (ADR-0024) ──
+    /// Dedicated segment-lifecycle event log configuration: directory,
+    /// rotation size, its own fsync-group batch window, and the byte
+    /// threshold driving the checkpoint feature. Default: `{data_dir}/
+    /// event-wal`, 64 MB files, 50 ms batch window, 64 MB checkpoint
+    /// threshold.
+    #[serde(default)]
+    pub event_wal: crate::EventWalConfig,
+
     // ── Item 5: Buffer pool configuration ──
     /// Buffer pool chunk size in bytes (default 65536 = 64 KB).
     #[serde(default = "default_buffer_pool_chunk_bytes")]
@@ -611,6 +620,8 @@ impl Default for NodeConfig {
             seal_fsync_max_waiters: 8,
             // Item 4d: Segment lifecycle machine (ADR-0025)
             lifecycle: crate::LifecycleConfig::default(),
+            // Item 4e: Segment event WAL (ADR-0024)
+            event_wal: crate::EventWalConfig::default(),
             // Item 8: Shard count
             segment_shard_count: 0,
             segment_shard_count_max: 16,

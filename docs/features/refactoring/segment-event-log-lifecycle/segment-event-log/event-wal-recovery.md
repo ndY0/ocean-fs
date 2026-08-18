@@ -1,7 +1,7 @@
 ---
 feature: "Event WAL Recovery — Fold, data_wal_pos Seek, Crash-Window Fault-Injection Matrix"
 epic: "refactoring/segment-event-log-lifecycle/segment-event-log"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -20,7 +20,7 @@ perf:
   - "1.3 Pre-size collections with known capacity"
   - "7.1 Minimize lock hold duration"
 created: 2026-08-17
-updated: 2026-08-17
+updated: 2026-08-18
 ---
 
 # Event WAL Recovery — Fold, data_wal_pos Seek, Crash-Window Fault-Injection Matrix
@@ -171,12 +171,14 @@ crash → restart
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets`, `cargo fmt --check`,
+- [x] **Code:** `cargo build --all-targets`, `cargo fmt --check`,
       `cargo clippy --lib -- -D warnings` pass in `oceanfs-storage`,
       `oceanfs-node`; `#![deny(missing_docs)]` passes.
-- [ ] **Tests:** `cargo test -p oceanfs-storage --lib -- --test-threads=1`
+<!-- REVIEW: verified 2026-08-18 — cargo build --all-targets -p oceanfs-storage and -p oceanfs-node pass; cargo fmt --check clean; cargo clippy -p oceanfs-storage --lib -- -D warnings and -p oceanfs-node --lib -- -D warnings clean; RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p oceanfs-storage -p oceanfs-node passes; both crates carry #![deny(missing_docs)] in lib.rs. -->
+- [x] **Tests:** `cargo test -p oceanfs-storage --lib -- --test-threads=1`
       green plus the new crash-matrix suite (rows 1–6, below).
-- [ ] **Invariant — crash-window rows 1–6 are fault-injection tests:**
+<!-- REVIEW: verified 2026-08-18 — 303 lib tests pass under --test-threads=1, including the 13-test crash-matrix module (src/segment/crash_matrix.rs), 33 event_wal tests, 44 lifecycle tests. Node lib (32), node_lifecycle integration, and storage integration tests (wal_recovery, wal_truncation_after_seal, disk_segment_reader) all pass. Note: the matrix lives in a #[cfg(test)] lib module rather than tests/ (declared deviation — the mini seal worker needs pub(crate) take_seal_rx; matches the spec's "or the node-level suite" intent). -->
+- [x] **Invariant — crash-window rows 1–6 are fault-injection tests:**
       each row drives the coordinator to its milestone, kills the process
       (or replays the on-disk state), rebuilds, and asserts (a) the folded
       state exactly matches the table's "Folded state" column, (b) the
@@ -184,28 +186,104 @@ crash → restart
       matches. Row 6 is asserted unrepresentable: the unlink-before-delete
       sequence cannot be expressed through the API (compile-level) and an
       attempted test fails.
-- [ ] **Invariant — fold is deterministic and order-exact:** the same event
+<!-- REVIEW: verified 2026-08-18 — crash_matrix.rs rows 1-5 each kill (abort+join worker, drop instances) and assert all three: row1 (dropped_empty_reserves=1, registry empty, no .dat), row2 (re_sealed=1, Sealed, data_wal_pos==last entry pos, root matches worker's, .dat durable), row3 (adopted=1, re_sealed=0, root matches, .dat mtime unchanged = no re-seal I/O), row4 (swept=1, Sealed, entry_is_garbage at data_wal_pos, live beyond it), row5 (swept=1, entry evicted, .dat orphan survives). Row 6 asserts the fold stays Sealed with a missing .dat and request_delete of an unknown id fails (TransitionError::Missing) — no API path expresses unlink-before-delete. -->
+- [x] **Invariant — fold is deterministic and order-exact:** the same event
       sequence folded twice yields identical registries; fold of the
       reserve→data→seal→delete sequence reproduces the CF mirror
       (dual-read); a mid-log corruption aborts with the record position
       (never silent partial fold).
-- [ ] **Invariant — reserve-before-entry (ADR-0024 Decision 1):** recovery
+<!-- REVIEW: verified 2026-08-18 — fold_is_deterministic_and_reproduces_the_mirror (two folds over the on-disk state, identical state/root/data_wal_pos + mirror sealed); event_wal_phase2_full_sequence_folds_and_mirrors (3 events, folded registry == live registry); mid_log_corruption_aborts_the_fold_with_the_position (CorruptEventLog with pos.offset==36); determinism of sealed_at via Some(0) sentinel (lifecycle.rs:1215). Torn tail ends the fold at the last good record (torn_tail_truncates_the_fold_at_the_last_good_record). -->
+- [x] **Invariant — reserve-before-entry (ADR-0024 Decision 1):** recovery
       of row 1 proves no data entry exists without its reserve; a mutation
       that lets a data entry precede its reserve in the WAL must fail the
       fold (corruption path) or the coordinator-order test.
-- [ ] **Invariant — `data_wal_pos` seek & sweep:** after row 4, the sweep
+<!-- REVIEW: verified 2026-08-18 — data_entry_without_reserve_is_swept_never_replayed (orphan entry: folded_segments=0, swept_entries=1, no .dat, position logged, never replayed — lifecycle.rs:1440-1453); the fold path also rejects a seal-on-missing as EventFoldError with position (rebuild_from_events maps every transition error to EventFoldError{pos}). -->
+- [x] **Invariant — `data_wal_pos` seek & sweep:** after row 4, the sweep
       removes exactly the sealed segment's entries ≤ `data_wal_pos` and
       keeps every other entry; mutation check: an off-by-one `data_wal_pos`
       (too small) leaves live entries protected (bounded-protection test
       fails), too large sweeps a live entry (recovery test fails).
-- [ ] **Perf 1.3/7.1:** the fold pre-sizes the registry (live-segment
+<!-- REVIEW: verified 2026-08-18 — entry_is_garbage_sealed_position_rule_and_mutation_checks covers p==pos, p<pos, p>pos plus both off-by-one mutations (too-small protects a swept entry; too-large sweeps a live entry); row4 asserts the boundary live (entry at data_wal_pos garbage, beyond it live). Sweep applied through cleanup_old_wal_files(file_contains_live_entries, wal/replay.rs:430-441) with the machine-backed liveness closure set via WalWriter::set_liveness; the CF-derived durable_or_deleted scan is deleted (only doc references remain). -->
+- [x] **Perf 1.3/7.1:** the fold pre-sizes the registry (live-segment
       estimate from the CF mirror/checkpoint seed); the fold's lock bodies
       contain only map ops; the data-WAL pass streams sequentially
       (perf 3.1) — no per-entry seeks.
-- [ ] **Integration:** the reserved-unsealed re-seal path end-to-end —
+<!-- REVIEW: verified 2026-08-18 — rebuild_from_events pre-sizes via registry.reserve_hint(list_segments().len()) (lifecycle.rs:1175-1176); validate→durable→fold split keeps I/O out of shard locks (lock bodies are map ops only); the data-WAL pass is a single sequential replay_positions() stream (perf 3.1) with groups/last_pos pre-sized with_capacity(reserved.len()) (lifecycle.rs:1427-1430). Event WAL is append-only (append(true), no seeks) with its own WalSyncGroup (ADR-0024 D4). -->
+- [x] **Integration:** the reserved-unsealed re-seal path end-to-end —
       crash mid-window, restart, the affected objects are readable and
       their segments `Sealed` with matching `merkle_root` (node-level test
       here or in `startup-rebuild-from-machine`).
+<!-- REVIEW: verified 2026-08-18 — rows 2/3 assert crash → restart → Sealed with matching merkle_root and durable .dat (storage-level end-to-end through pool replay + seal worker). The node-level "objects readable" assertion is explicitly deferrable to startup-rebuild-from-machine per this item's own text; node startup itself is wired (node.rs calls rebuild_with_data_wal with the same MerkleTree construction the seal worker uses) and node_lifecycle integration passes. NON-BLOCKING NOTE: rebuild_with_data_wal drops the spec's seed parameter (pre-seed registry + start iterator at checkpoint position instead, documented at lifecycle.rs:1251-1255) — this interface change is NOT listed in the declared deviations D1-D4 and should be recorded for event-wal-checkpoint. -->
+> **Non-blocking review notes (2026-08-18, PASS):** (1) MEDIUM — adopt
+> probe classifies a `.dat` by header parseability only (lifecycle.rs:
+> 1408-1420); a header-valid but data-truncated `.dat` is not replayed
+> (entries skipped at 1434-1438) and read_segment_data_root's None leaves
+> the segment Reserved forever while step-8 truncate(0) destroys its WAL
+> entries (lifecycle.rs:1470-1475). Unreachable via crash windows (.dat
+> writes are atomic O_TMPFILE/rename) but a silent data loss on disk
+> corruption — contradicts the code's own "falls back to WAL replay"
+> comments (1405-1406, 319). Fix: align the adopt probe with
+> read_segment_data_root's full data-section check, or abort loudly.
+> (2) LOW — adopted segments' entries are neither replayed nor counted in
+> swept_entries (1434-1438); consider counting them. (3) LOW — the
+> folded_segments HashSet is not pre-sized (perf 1.3 applies to the
+> registry reserve_hint, which is done).
+
+## Deviations
+
+Accepted deviations from the interface and behavior specified in this
+document. D1–D6 were validated with the user before implementation; D7 and
+the test-location note are post-review fixes applied by the implementer
+after the reviewer's MEDIUM/LOW gaps and re-verified (review evidence is in
+the Definition of Done section above).
+
+- **D1 (API placement):** `rebuild_from_events` / `rebuild_with_data_wal`
+  live on `SegmentLifecycleCoordinator`; a documented
+  `pub type SegmentLifecycle = SegmentLifecycleCoordinator;` alias
+  (`segment/lifecycle.rs:223`) keeps the spec's `SegmentLifecycle::*` names
+  resolvable for downstream features (`event-wal-checkpoint`,
+  `startup-rebuild-from-machine`).
+- **D2 (WalStore mapping):** `rebuild_with_data_wal(events, data_wal:
+  &WalReader, sealer: &SegmentSealer, merkle_root_fn: impl Fn(&[u8]) ->
+  Option<HashOutput>, data_wal_writer: &WalWriter)` — the spec's `WalStore`
+  is the data WAL reader + the sealer + the writer; the pass does not invent
+  a store type. The merkle root must be computed by the caller because
+  oceanfs-storage cannot depend on oceanfs-durability's MerkleTree — the
+  node passes the same construction the seal worker uses, so adopted/
+  replayed roots match.
+- **D3 (seed mapping):** the spec's `seed: Option<(Registry, EventWalPos)>`
+  is realized by pre-seeding the coordinator's registry (`seed_entry`,
+  `lifecycle.rs:758`) and starting the event iterator at the checkpoint
+  position — `event-wal-checkpoint` composes that; this feature folds from
+  the earliest retained event.
+- **D4 (replay reuse):** `replay_wal`'s machinery (pool `append_replayed` /
+  `seal_replayed_partial`) is the replay arm; the standalone node call site
+  is superseded; the legacy CF-driven startup (seed + interrupted-seal
+  adoption + `replay_wal`) is extracted to `legacy_cf_driven_recovery`
+  (`node.rs:460`, dead-code-allowed, removed by
+  `startup-rebuild-from-machine`).
+- **D5 (dual-read interpretation):** the feature doc's "any divergence
+  fails" is implemented as FAIL on the impossible direction (mirror holds an
+  entry/state the fold lacks — corruption, `Error::MirrorDivergence`) +
+  REPAIR of the lagging mirror (crash between event append and mirror write
+  is a normal crash window; phase-2 consumers still read the CF, so the
+  mirror must be consistent after rebuild).
+- **D6 (fold determinism):** the fold uses the deterministic
+  `sealed_at: Some(0)` sentinel (`lifecycle.rs:1217`) — the SealEvent
+  carries no timestamp, and fold determinism is a DoD requirement.
+- **D7 (post-review fix — adopt probe):** the adopt probe validates the
+  FULL data section (`data_end <= file len`, `lifecycle.rs:1419-1420`), not
+  just the header; an invalid `.dat` is removed and the segment falls back
+  to WAL replay (never silently adopted-then-truncated); adopt-classified
+  entries count as swept. Closes the review's MEDIUM gap (1) and the LOW
+  counting gap (2); the remaining LOW (3) — `folded_segments` set
+  pre-sizing — is addressed (`HashSet::with_capacity(mirror_estimate)`,
+  `lifecycle.rs:1177`).
+- **Test location:** the crash-matrix tests live in
+  `src/segment/crash_matrix.rs` (`#[cfg(test)]` lib module, declared in
+  `segment/mod.rs`) instead of `tests/` because the mini seal worker needs
+  `pub(crate)` access (`take_seal_rx`, `pool.rs:1476`) — within the scope
+  text's "or the node-level suite" latitude.
 
 > **Lint & Doc Examples (non-gating):** `cargo clippy --all-targets -D
 > warnings` test-code warnings and `ignore`-tagged doc examples are

@@ -85,6 +85,65 @@ pub enum Error {
         /// The actual hash computed.
         actual: oceanfs_core::HashOutput,
     },
+
+    /// A torn (partial, checksum-failed, or corrupt) record at the tail of
+    /// the segment event WAL.
+    ///
+    /// [`crate::segment::event_wal::EventWalReader`] stops at the first
+    /// such record (stop-at-first-bad-tail semantics — the recovery fold
+    /// consumes the error and ignores everything after it). Records are
+    /// never silently skipped or truncated mid-file.
+    #[error("torn event WAL record at {pos:?}: {detail}")]
+    TornEventRecord {
+        /// The position where the bad record starts.
+        pos: crate::segment::event_wal::EventWalPos,
+        /// Why the record failed framing or checksum.
+        detail: &'static str,
+    },
+
+    /// A corrupt record **in the middle** of the segment event log —
+    /// valid bytes follow the bad record, so this is disk corruption, not
+    /// a crash window.
+    ///
+    /// The recovery fold aborts startup with the record position (a torn
+    /// tail is a clean stop; a mid-log corruption is not). The event log
+    /// is never silently truncated past a mid-log corruption.
+    #[error("corrupt event WAL record at {pos:?}: {detail} (valid data follows)")]
+    CorruptEventLog {
+        /// The position where the corrupt record starts.
+        pos: crate::segment::event_wal::EventWalPos,
+        /// Why the record failed framing or checksum.
+        detail: &'static str,
+    },
+
+    /// A lifecycle transition rejected during the event fold — the event
+    /// sequence is out of order, which the typed transition API cannot
+    /// express (corruption). Startup aborts with the record position;
+    /// the fold is never silently partial.
+    #[error("event fold rejected at {pos:?}: {detail}")]
+    EventFoldError {
+        /// The position of the event that failed to fold.
+        pos: crate::segment::event_wal::EventWalPos,
+        /// The transition rejection reason.
+        detail: String,
+    },
+
+    /// The CF mirror contradicts the folded event log (phase 2
+    /// dual-read verification): the mirror holds an entry or a state the
+    /// fold cannot produce.
+    ///
+    /// The mirror write always follows its event append, so "mirror has
+    /// it, fold lacks it" is impossible by construction — its presence
+    /// means corruption (or a bug), and startup fails loudly. The
+    /// opposite direction (fold has it, mirror lacks it) is a normal
+    /// crash window and is repaired, not failed.
+    #[error("CF mirror contradicts the folded event log for segment {segment_id}: {detail}")]
+    MirrorDivergence {
+        /// The segment whose mirror entry diverges.
+        segment_id: oceanfs_core::SegmentId,
+        /// Why the divergence is impossible.
+        detail: String,
+    },
 }
 
 /// Convenience alias for `std::result::Result<T, Error>`.

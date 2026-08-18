@@ -16,7 +16,7 @@ use tracing::{info, warn};
 use crate::{
     error::Result,
     metadata::RocksDbMetadataStore,
-    segment::{lifecycle::SegmentLifecycleCoordinator, pool::SegmentPool},
+    segment::{event_wal::DataWalPos, lifecycle::SegmentLifecycleCoordinator, pool::SegmentPool},
     wal::reader::WalReader,
 };
 
@@ -342,7 +342,7 @@ pub async fn replay_wal(
 pub async fn cleanup_old_wal_files(
     config: &WalConfig,
     keep: usize,
-    metadata: Option<&RocksDbMetadataStore>,
+    is_entry_garbage: Option<&(dyn Fn(oceanfs_core::SegmentId, DataWalPos) -> bool + Send + Sync)>,
 ) {
     let dir_path = &config.data_dir;
 
@@ -379,50 +379,24 @@ pub async fn cleanup_old_wal_files(
             return;
         }
     }
-    // The set of segments whose data IS durable outside the WAL (sealed
-    // files) plus segments whose data was intentionally DELETED (GC
-    // compaction / orphan reaper — their WAL entries are garbage). For
-    // any entry referencing a segment in neither set, the cleanup
-    // resolves the id against the metadata store: a segment that is
-    // REGISTERED but unsealed is still in flight and must protect its
-    // file (the WAL is its only durable copy); a segment with no CF
-    // entry at all is unreachable garbage — either a phantom whose
-    // registration never landed (the write path registers after the WAL
-    // append; a crash in between leaves entries with no CF entry) or a
-    // segment deleted without a marker (unsealed deletion) — and its
-    // entries may be swept.
-    let durable_or_deleted: std::collections::HashSet<oceanfs_core::SegmentId> = metadata
-        .map(|m| {
-            let mut set: std::collections::HashSet<oceanfs_core::SegmentId> = m
-                .list_segments()
-                .into_iter()
-                .filter_map(|r| r.ok())
-                .filter(|meta| meta.sealed_at.is_some())
-                .map(|meta| meta.segment_id)
-                .collect();
-            set.extend(
-                m.list_deleted_segments().into_iter().filter_map(|r| r.ok()).map(|(id, _)| id),
-            );
-            set
-        })
-        .unwrap_or_default();
-
-    // Delete all files outside the retention window — unless they hold
-    // entries for segments that are neither durable nor deleted, where
-    // "live" is decided by CF resolution (seal-aware mode, active only
-    // when a metadata store is provided; without one the plain window
-    // applies).
-    let seal_aware = metadata.is_some();
+    // Liveness is decided by the machine (ADR-0024 §Retention — phase 2):
+    // an entry at position `p` of segment `S` is garbage iff `S`'s
+    // `SealEvent.data_wal_pos ≥ p` (or `S` is `Deleted`). The closure is
+    // backed by the folded lifecycle registry + event positions; the
+    // CF-derived `durable_or_deleted` scan is gone. Without a closure
+    // (minimal embeddings, tests) the plain retention window applies.
     let retention_floor = current_seq.saturating_sub(keep.saturating_sub(1) as u64);
     let mut removed: usize = 0;
     let mut protected: usize = 0;
     for (seq, path) in &file_paths {
         if *seq < retention_floor {
-            // Protect files holding entries for registered-but-unsealed
-            // segments; entries for unregistered ids are sweepable.
-            if seal_aware && file_contains_live_entries(path, &durable_or_deleted, metadata) {
-                protected += 1;
-                continue;
+            // Protect files holding live entries (their only durable
+            // copy); sweepable entries are not protected.
+            if let Some(is_entry_garbage) = is_entry_garbage {
+                if file_contains_live_entries(path, is_entry_garbage) {
+                    protected += 1;
+                    continue;
+                }
             }
             match tokio::fs::remove_file(path).await {
                 Ok(()) => removed += 1,
@@ -443,55 +417,24 @@ pub async fn cleanup_old_wal_files(
     }
 }
 
-/// Returns `true` when the WAL file contains an entry for a segment
-/// that is still **live**: registered in the metadata store but not
-/// sealed — the file is the only durable copy of that data.
-///
-/// Entries for sealed or deleted segments (the `durable_or_deleted`
-/// set) and entries for segments with **no CF entry at all** (never
-/// registered, or deleted without a marker) are sweepable: sealed data
-/// lives on disk, deleted data is garbage, and unregistered ids are
-/// unreachable (their writes were never visible).
+/// Returns `true` when the WAL file contains an entry that is still
+/// **live** per the machine's position rule: an entry at position `p`
+/// of segment `S` is garbage iff `S` is `Sealed` with
+/// `data_wal_pos ≥ p`, or `S` is `Deleted` (ADR-0024 §Retention). Any
+/// entry the closure does NOT classify as garbage is live — the file is
+/// the only durable copy of that data and must be protected.
 ///
 /// Scans the file's entries — this runs only for files that would
 /// otherwise be deleted (one per rotation), so the read cost is bounded
 /// by the rotation window.
 fn file_contains_live_entries(
     path: &std::path::Path,
-    durable_or_deleted: &std::collections::HashSet<oceanfs_core::SegmentId>,
-    metadata: Option<&RocksDbMetadataStore>,
+    is_entry_garbage: &(dyn Fn(oceanfs_core::SegmentId, DataWalPos) -> bool + Send + Sync),
 ) -> bool {
-    for entry in super::reader::WalReader::entries_in_file(path.to_path_buf()).flatten() {
-        let id = entry.segment_id();
-        if durable_or_deleted.contains(&id) {
-            continue;
-        }
-        // Not durable and not deleted — decide by CF resolution.
-        match metadata {
-            Some(m) => match m.get_segment(id) {
-                Ok(Some(meta)) if meta.sealed_at.is_none() => {
-                    // Registered but unsealed: in-flight segment whose
-                    // only durable copy is this file → protect.
-                    return true;
-                }
-                Ok(Some(_)) => {} // sealed (already in the set; harmless double-check)
-                Ok(None) => {
-                    // No CF entry: either the registration never landed
-                    // (crash-window phantom) or the segment was deleted
-                    // without a marker (unsealed deletion). Either way
-                    // the entries are unreachable — sweepable. (The
-                    // write path registers the phantom BEFORE the WAL
-                    // entry, so no in-flight segment can look
-                    // unregistered.)
-                }
-                Err(e) => {
-                    // DB read failure: we cannot prove the segment is
-                    // unreachable — protect the file (conservative).
-                    warn!(segment = %id, error = %e, "failed to resolve segment during WAL cleanup; protecting file");
-                    return true;
-                }
-            },
-            None => return true, // unreachable (seal-aware callers only); protect
+    for entry in super::reader::WalReader::entries_in_file_positions(path.to_path_buf()).flatten() {
+        let (pos, wal_entry) = entry;
+        if !is_entry_garbage(wal_entry.segment_id(), pos) {
+            return true;
         }
     }
     false
@@ -657,6 +600,23 @@ mod tests {
         )
     }
 
+    /// Builds a liveness closure from the CF (the pre-machine retention
+    /// semantics), exercising the closure-based cleanup API: garbage iff
+    /// sealed, deleted-marker'd, or absent from the CF; DB errors
+    /// protect conservatively.
+    fn cf_liveness(
+        metadata: &Arc<RocksDbMetadataStore>,
+    ) -> impl Fn(oceanfs_core::SegmentId, DataWalPos) -> bool + Send + Sync + 'static {
+        let metadata = Arc::clone(metadata);
+        move |id, _pos| match metadata.get_segment(id) {
+            Ok(Some(meta)) => meta.sealed_at.is_some(),
+            // No CF entry: deleted (marker removed the entry) or never
+            // registered — both unreachable, sweepable.
+            Ok(None) => true,
+            Err(_) => false, // conservative: protect on DB error
+        }
+    }
+
     fn make_entry_with_hlc(
         segment_id: SegmentId,
         offset: u64,
@@ -757,8 +717,11 @@ mod tests {
             })
             .unwrap();
         {
-            let writer =
-                WalWriter::open(&wal_config).await.unwrap().with_metadata(Arc::clone(&metadata));
+            let writer = WalWriter::open(&wal_config).await.unwrap();
+            // Retention liveness (machine-backed in production; the
+            // CF-derived closure here exercises the same contract).
+            writer.set_liveness(Arc::new(cf_liveness(&metadata)));
+            let writer = writer.with_metadata(Arc::clone(&metadata));
             writer.append(make_entry(unsealed_id, 0, 8192)).await.unwrap();
             // Rotate 6 times so the entry lands in a file far outside
             // the retention window (each rotate opens the next seq).
@@ -792,7 +755,7 @@ mod tests {
             "4-file window (seq 3..=6) + protected oldest file (seq 0) = 5"
         );
 
-        cleanup_old_wal_files(&wal_config, 1, Some(&metadata)).await;
+        cleanup_old_wal_files(&wal_config, 1, Some(&cf_liveness(&metadata))).await;
         // The oldest file (holding the unsealed segment's entry) is
         // protected; the current file survives via the window.
         assert_eq!(
@@ -813,7 +776,7 @@ mod tests {
                 sealed_at: Some(1_000_000_000_000),
             })
             .unwrap();
-        cleanup_old_wal_files(&wal_config, 1, Some(&metadata)).await;
+        cleanup_old_wal_files(&wal_config, 1, Some(&cf_liveness(&metadata))).await;
         assert_eq!(count_wal_files(&wal_config), 1, "sealed segments' entries may be swept");
     }
 
@@ -847,8 +810,11 @@ mod tests {
             })
             .unwrap();
         {
-            let writer =
-                WalWriter::open(&wal_config).await.unwrap().with_metadata(Arc::clone(&metadata));
+            let writer = WalWriter::open(&wal_config).await.unwrap();
+            // Retention liveness (machine-backed in production; the
+            // CF-derived closure here exercises the same contract).
+            writer.set_liveness(Arc::new(cf_liveness(&metadata)));
+            let writer = writer.with_metadata(Arc::clone(&metadata));
             writer.append(make_entry(deleted_id, 0, 8192)).await.unwrap();
             // ...then deleted: file 0 now holds only garbage entries.
             metadata.delete_segment(deleted_id).unwrap();
@@ -904,8 +870,11 @@ mod tests {
         let phantom_id = SegmentId::new();
         let unsealed_deleted_id = SegmentId::new();
         {
-            let writer =
-                WalWriter::open(&wal_config).await.unwrap().with_metadata(Arc::clone(&metadata));
+            let writer = WalWriter::open(&wal_config).await.unwrap();
+            // Retention liveness (machine-backed in production; the
+            // CF-derived closure here exercises the same contract).
+            writer.set_liveness(Arc::new(cf_liveness(&metadata)));
+            let writer = writer.with_metadata(Arc::clone(&metadata));
             // Phantom: append WITHOUT registering the segment — the
             // crash-window shape from the production write path.
             writer.append(make_entry(phantom_id, 0, 8192)).await.unwrap();
