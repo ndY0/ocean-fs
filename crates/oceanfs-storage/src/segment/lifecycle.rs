@@ -127,6 +127,12 @@ pub struct LifecycleEntry {
     /// `SealEvent`; `None` until the first data entry is appended (and
     /// always for replayed segments whose WAL entries were truncated).
     pub data_wal_pos: Option<DataWalPos>,
+    /// The compaction marker (ADR-0025 Decision 4): when the segment is a
+    /// GC-repacked replacement, the id of the source segment it was
+    /// repacked from. Set by the seal transition from the `SealEvent`'s
+    /// `repacked_from`; survives checkpointing so startup recovery can
+    /// identify incomplete compaction units (crash-window rows 7–9).
+    pub repacked_from: Option<SegmentId>,
     /// When a `Deleted` entry's grace expires (entry eviction time).
     /// Meaningful only for `Deleted` entries; set at construction.
     evict_at: Instant,
@@ -151,6 +157,7 @@ impl LifecycleEntry {
             state,
             metadata,
             data_wal_pos: None,
+            repacked_from: None,
             evict_at: Instant::now(),
             in_flight: None,
             seal_queued: false,
@@ -454,10 +461,31 @@ impl SegmentLifecycleRegistry {
     /// `Err(AlreadySealed)` / `Err(NotReserved)` / `Err(Missing)`
     /// otherwise — no mutation.
     ///
+    /// No compaction marker is set (the segment is not a repacked
+    /// replacement); see [`seal_with`](Self::seal_with).
+    ///
     /// # Errors
     ///
     /// Returns a [`TransitionError`] when the entry is not `Reserved`.
     pub fn seal(&self, id: SegmentId, metadata: SegmentMetadata) -> Result<(), TransitionError> {
+        self.seal_with(id, metadata, None)
+    }
+
+    /// Seals a segment with the compaction marker (ADR-0025
+    /// Decision 4): `repacked_from` records the source segment this one
+    /// was repacked from, so startup recovery can identify incomplete
+    /// compaction units (crash-window rows 7–9). Same transition rules
+    /// and error contract as [`seal`](Self::seal).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TransitionError`] when the entry is not `Reserved`.
+    pub fn seal_with(
+        &self,
+        id: SegmentId,
+        metadata: SegmentMetadata,
+        repacked_from: Option<SegmentId>,
+    ) -> Result<(), TransitionError> {
         let shard = &self.shards[self.shard_for(id)];
         let mut guard = shard.write();
         Self::evict_expired_locked(&mut guard, Instant::now());
@@ -465,6 +493,7 @@ impl SegmentLifecycleRegistry {
             Some(entry) if entry.state == SegmentState::Reserved => {
                 entry.state = SegmentState::Sealed;
                 entry.metadata = metadata;
+                entry.repacked_from = repacked_from;
                 // The seal transition closes the read window: the `.dat`
                 // is authoritative once sealed (the in-flight buffer is
                 // released — the memory-bound test pins this).
@@ -526,6 +555,7 @@ impl SegmentLifecycleRegistry {
                 state: entry.state,
                 metadata: entry.metadata.clone(),
                 data_wal_pos: entry.data_wal_pos,
+                repacked_from: entry.repacked_from,
                 evict_at: entry.evict_at,
                 in_flight: entry.in_flight.clone(),
                 seal_queued: entry.seal_queued,
@@ -641,6 +671,7 @@ impl SegmentLifecycleRegistry {
                         state: SegmentState::Reserved,
                         metadata: meta,
                         data_wal_pos: None,
+                        repacked_from: None,
                         evict_at: Instant::now(),
                         in_flight: Some(data),
                         seal_queued: true,
@@ -757,15 +788,17 @@ impl SegmentLifecycleRegistry {
     /// complete single writer over EXISTING data too (the reaper's
     /// `request_delete` validates against the registry).
     ///
-    /// `data_wal_pos` restores the entry's recorded position (checkpoint
-    /// snapshots carry it — retention needs it to survive
-    /// checkpointing).
+    /// `data_wal_pos` restores the entry's recorded position and
+    /// `repacked_from` restores the compaction marker (checkpoint
+    /// snapshots carry both — retention needs the position and recovery
+    /// needs the marker to survive checkpointing).
     pub(crate) fn seed_entry(
         &self,
         id: SegmentId,
         state: SegmentState,
         metadata: SegmentMetadata,
         data_wal_pos: Option<DataWalPos>,
+        repacked_from: Option<SegmentId>,
     ) {
         let shard = &self.shards[self.shard_for(id)];
         let mut guard = shard.write();
@@ -774,6 +807,7 @@ impl SegmentLifecycleRegistry {
         guard.entry(id).or_insert_with(|| {
             let mut entry = LifecycleEntry::new(state, metadata);
             entry.data_wal_pos = data_wal_pos;
+            entry.repacked_from = repacked_from;
             entry
         });
     }
@@ -905,11 +939,13 @@ impl SegmentLifecycleRegistry {
     }
 
     /// Folds a validated `seal` into the registry: `Reserved` → `Sealed`
-    /// with the full sealed metadata.
+    /// with the full sealed metadata and the compaction marker (the
+    /// `SealEvent`'s `repacked_from`, `None` for ordinary seals).
     pub(crate) fn fold_seal(
         &self,
         id: SegmentId,
         metadata: SegmentMetadata,
+        repacked_from: Option<SegmentId>,
     ) -> Result<(), TransitionError> {
         let shard = &self.shards[self.shard_for(id)];
         let mut guard = shard.write();
@@ -919,6 +955,7 @@ impl SegmentLifecycleRegistry {
             Some(entry) if entry.state == SegmentState::Reserved => {
                 entry.state = SegmentState::Sealed;
                 entry.metadata = metadata;
+                entry.repacked_from = repacked_from;
                 // The seal transition closes the read window: once the
                 // `.dat` is durable, the in-flight buffer is released —
                 // the memory-bound test pins this, and failing to clear
@@ -1214,20 +1251,27 @@ impl SegmentLifecycleCoordinator {
             } else {
                 SegmentState::Reserved
             };
-            self.registry.seed_entry(meta.segment_id, state, meta, None);
+            self.registry.seed_entry(meta.segment_id, state, meta, None, None);
         }
         self.update_gauges();
         Ok(())
     }
 
     /// Seeds the registry from a checkpoint snapshot (ADR-0024
-    /// Decision 3): every live entry's state, full metadata, and
-    /// recorded `data_wal_pos` (retention needs it to survive
-    /// checkpointing) is restored. The fold then runs from the
-    /// checkpoint's covered position.
+    /// Decision 3): every live entry's state, full metadata, recorded
+    /// `data_wal_pos` (retention needs it to survive checkpointing), and
+    /// the compaction `repacked_from` marker (recovery needs it to find
+    /// incomplete compaction units) is restored. The fold then runs from
+    /// the checkpoint's covered position.
     pub fn seed_from_checkpoint(&self, snapshot: &SegmentLifecycleRegistry) {
         snapshot.for_each(|id, entry| {
-            self.registry.seed_entry(id, entry.state, entry.metadata.clone(), entry.data_wal_pos);
+            self.registry.seed_entry(
+                id,
+                entry.state,
+                entry.metadata.clone(),
+                entry.data_wal_pos,
+                entry.repacked_from,
+            );
         });
     }
 
@@ -1308,7 +1352,7 @@ impl SegmentLifecycleCoordinator {
                         storage_locations: smallvec::SmallVec::new(),
                         sealed_at: Some(0), // deterministic sentinel — the event carries no timestamp
                     };
-                    self.registry.seal(evt.segment_id, meta)
+                    self.registry.seal_with(evt.segment_id, meta, evt.repacked_from)
                 }
                 SegmentEvent::Delete(evt) => self.registry.delete(evt.segment_id),
             };
@@ -1597,7 +1641,7 @@ impl SegmentLifecycleCoordinator {
                         .as_millis() as i64,
                 ),
             };
-            self.request_seal(id, meta)
+            self.request_seal(id, meta, None)
                 .await
                 .map_err(|e| Error::Io(std::io::Error::other(format!("adopt seal failed: {e}"))))?;
             outcome.adopted_segments += 1;
@@ -1763,6 +1807,16 @@ impl SegmentLifecycleCoordinator {
     /// data entry's position (ADR-0024 Decision 2) — is appended first,
     /// then the fold, then the CF mirror write.
     ///
+    /// `repacked_from` is the compaction marker (ADR-0025 Decision 4):
+    /// `Some(old_id)` for a GC-repacked replacement segment, `None`
+    /// otherwise. When set, the tier/EC parameters must match the source
+    /// segment's (a repack never changes the storage shape — a mismatch
+    /// is rejected before any durable write). The caller's
+    /// `SegmentMetadata` is the repacked metadata carried through the
+    /// seal; the ChunkRef compression fields are preserved verbatim by
+    /// the repack, and the read-back regression test pins the BadDigest
+    /// defect.
+    ///
     /// Callers invoke this only after the `.dat` fsync returns (the
     /// seal worker's operation sequence); the durable write and the
     /// fold are strictly ordered after validation.
@@ -1772,15 +1826,34 @@ impl SegmentLifecycleCoordinator {
     /// Returns a [`TransitionError`] when the entry is not `Reserved`
     /// (no durable write, no fold), or
     /// [`TransitionError::DurableWriteFailed`] when the durable
-    /// side-effect fails. In phase 2 a missing `merkle_root` is a
+    /// side-effect fails or the repacked shape contradicts the source
+    /// segment. In phase 2 a missing `merkle_root` is a
     /// durable-write failure: a `SealEvent` without the seal-time root
     /// would fabricate the anchor recovery trusts.
     pub async fn request_seal(
         &self,
         id: SegmentId,
         metadata: SegmentMetadata,
+        repacked_from: Option<SegmentId>,
     ) -> Result<(), TransitionError> {
         self.registry.validate_seal(id)?;
+        // A repack never changes the storage shape: when the seal
+        // carries the compaction marker, the tier/EC parameters must
+        // match the source segment's (the registry holds it — the
+        // compactor deletes the old segment only after this seal).
+        if let Some(old) = repacked_from {
+            if let Some(old_entry) = self.registry.get(old) {
+                let shape_mismatch = old_entry.metadata.size_tier != metadata.size_tier
+                    || old_entry.metadata.ec_k != metadata.ec_k
+                    || old_entry.metadata.ec_m != metadata.ec_m;
+                if shape_mismatch {
+                    return Err(TransitionError::DurableWriteFailed(format!(
+                        "repacked seal rejected: the storage shape (tier/ec) of segment {id} \
+                         differs from its source segment {old}"
+                    )));
+                }
+            }
+        }
         if let Some(event_wal) = &self.event_wal {
             // Phase 2: the event append is the durable side-effect.
             let merkle_root = metadata.merkle_root.ok_or_else(|| {
@@ -1799,12 +1872,13 @@ impl SegmentLifecycleCoordinator {
                 ec_m: metadata.ec_m,
                 merkle_root,
                 data_wal_pos,
+                repacked_from,
             });
             event_wal
                 .append(evt)
                 .await
                 .map_err(|e| TransitionError::DurableWriteFailed(e.to_string()))?;
-            self.registry.fold_seal(id, metadata.clone())?;
+            self.registry.fold_seal(id, metadata.clone(), repacked_from)?;
             if let Err(e) = self.metadata.put_segment(metadata) {
                 tracing::warn!(
                     segment_id = %id,
@@ -1817,7 +1891,7 @@ impl SegmentLifecycleCoordinator {
             self.metadata
                 .put_segment(metadata.clone())
                 .map_err(|e| TransitionError::DurableWriteFailed(e.to_string()))?;
-            self.registry.fold_seal(id, metadata)?;
+            self.registry.fold_seal(id, metadata, None)?;
         }
         self.maybe_checkpoint().await;
         self.update_gauges();
@@ -1939,10 +2013,11 @@ impl SegmentLifecycleCoordinator {
                     ec_m: meta.ec_m,
                     merkle_root,
                     data_wal_pos,
+                    repacked_from: None,
                 });
                 let mirror_meta = meta.clone();
                 match event_wal.append(evt).await {
-                    Ok(_) => match self.registry.fold_seal(id, meta) {
+                    Ok(_) => match self.registry.fold_seal(id, meta, None) {
                         Ok(()) => {
                             mirror_ops.push(oceanfs_storage_api::BatchOp::PutSegment(mirror_meta));
                         }
@@ -1989,7 +2064,7 @@ impl SegmentLifecycleCoordinator {
             // segment, strictly after the durable write returned).
             for (_, meta) in accepted {
                 let id = meta.segment_id;
-                if let Err(e) = self.registry.fold_seal(id, meta) {
+                if let Err(e) = self.registry.fold_seal(id, meta, None) {
                     tracing::warn!(
                         segment_id = %id,
                         error = ?e,
@@ -2596,7 +2671,7 @@ mod tests {
             SegmentLifecycleCoordinator::new(store.clone(), &LifecycleConfig::default());
         let id = SegmentId::new();
         coordinator.request_reserve(id, SizeTier::Standard, 4, 2).await.unwrap();
-        coordinator.request_seal(id, test_metadata(id, true)).await.unwrap();
+        coordinator.request_seal(id, test_metadata(id, true), None).await.unwrap();
         // Poison probe: the old register_phantom_before_wal would have
         // re-written sealed_at: None here.
         let err = coordinator.request_reserve(id, SizeTier::Standard, 4, 2).await.unwrap_err();
@@ -2605,6 +2680,47 @@ mod tests {
         assert!(cf.sealed_at.is_some(), "CF must not be downgraded to unsealed");
         let entry = coordinator.registry().get(id).unwrap();
         assert_eq!(entry.state, SegmentState::Sealed, "registry must not be downgraded");
+    }
+
+    #[tokio::test]
+    async fn request_seal_rejects_a_repacked_shape_mismatch_with_no_durable_write() {
+        // ADR-0025 Decision 4: a repack never changes the storage shape.
+        // A compaction seal whose tier/EC differs from the source
+        // segment is rejected BEFORE any durable write — the CF must not
+        // regress and the registry must stay Reserved.
+        let (store, _dir) = test_store().await;
+        let coordinator =
+            SegmentLifecycleCoordinator::new(store.clone(), &LifecycleConfig::default());
+        let old = SegmentId::new();
+        coordinator.request_reserve(old, SizeTier::Standard, 4, 2).await.unwrap();
+        coordinator.request_seal(old, test_metadata(old, true), None).await.unwrap();
+
+        // The repacked replacement with a DIFFERENT shape (tier/ec).
+        let new = SegmentId::new();
+        coordinator.request_reserve(new, SizeTier::Small, 2, 1).await.unwrap();
+        let mut mismatched = test_metadata(new, true);
+        mismatched.size_tier = SizeTier::Small;
+        mismatched.ec_k = 2;
+        mismatched.ec_m = 1;
+        let err = coordinator.request_seal(new, mismatched, Some(old)).await.unwrap_err();
+        assert!(
+            matches!(err, TransitionError::DurableWriteFailed(_)),
+            "shape mismatch is rejected before any durable write"
+        );
+        // No durable side-effect, no fold: the registry stays Reserved
+        // and the CF holds the unsealed reserve.
+        let entry = coordinator.registry().get(new).unwrap();
+        assert_eq!(entry.state, SegmentState::Reserved, "no fold on rejection");
+        let cf = store.get_segment(new).unwrap().expect("the reserve's CF entry");
+        assert!(cf.sealed_at.is_none(), "no durable seal write on rejection");
+        assert_eq!(cf.size_tier, SizeTier::Small, "the CF still holds the reserve shape");
+
+        // The matching shape seals fine — the repack carries the
+        // SOURCE's shape (the compactor never changes tier/ec).
+        coordinator.request_seal(new, test_metadata(new, true), Some(old)).await.unwrap();
+        assert_eq!(coordinator.registry().get(new).unwrap().state, SegmentState::Sealed);
+        let cf = store.get_segment(new).unwrap().expect("the sealed CF entry");
+        assert!(cf.sealed_at.is_some(), "the matching repacked seal lands durably");
     }
 
     #[tokio::test]
@@ -2631,7 +2747,7 @@ mod tests {
         assert_eq!(coordinator.registry().in_flight_count(), 1);
 
         // request_seal → fold_seal: the window must close.
-        coordinator.request_seal(id, test_metadata(id, true)).await.unwrap();
+        coordinator.request_seal(id, test_metadata(id, true), None).await.unwrap();
         assert_eq!(
             coordinator.registry().in_flight_count(),
             0,
@@ -2662,7 +2778,7 @@ mod tests {
             SegmentLifecycleCoordinator::new(store.clone(), &LifecycleConfig::default());
         let id = SegmentId::new();
         coordinator.request_reserve(id, SizeTier::Standard, 4, 2).await.unwrap();
-        coordinator.request_seal(id, test_metadata(id, true)).await.unwrap();
+        coordinator.request_seal(id, test_metadata(id, true), None).await.unwrap();
         let cf = store.get_segment(id).unwrap().expect("CF sealed entry");
         assert!(cf.sealed_at.is_some());
         let entry = coordinator.registry().get(id).unwrap();
@@ -2675,7 +2791,7 @@ mod tests {
         let coordinator =
             SegmentLifecycleCoordinator::new(store.clone(), &LifecycleConfig::default());
         let id = SegmentId::new();
-        let err = coordinator.request_seal(id, test_metadata(id, true)).await.unwrap_err();
+        let err = coordinator.request_seal(id, test_metadata(id, true), None).await.unwrap_err();
         assert_eq!(err, TransitionError::Missing);
         assert!(store.get_segment(id).unwrap().is_none(), "no CF write for an illegal seal");
         assert!(coordinator.registry().is_empty());
@@ -2688,7 +2804,7 @@ mod tests {
             SegmentLifecycleCoordinator::new(store.clone(), &LifecycleConfig::default());
         let id = SegmentId::new();
         coordinator.request_reserve(id, SizeTier::Standard, 4, 2).await.unwrap();
-        coordinator.request_seal(id, test_metadata(id, true)).await.unwrap();
+        coordinator.request_seal(id, test_metadata(id, true), None).await.unwrap();
         coordinator.request_delete(id).await.unwrap();
         // Durable: CF entry gone, deleted-marker present (the segment
         // was sealed, so the marker must exist for WAL retention).
@@ -2754,7 +2870,7 @@ mod tests {
         let missing_id = SegmentId::new();
         let sealed_id = SegmentId::new();
         coordinator.request_reserve(sealed_id, SizeTier::Standard, 4, 2).await.unwrap();
-        coordinator.request_seal(sealed_id, test_metadata(sealed_id, true)).await.unwrap();
+        coordinator.request_seal(sealed_id, test_metadata(sealed_id, true), None).await.unwrap();
 
         let metas = vec![
             test_metadata(reserved_id, true),
@@ -3161,7 +3277,7 @@ mod tests {
             storage_locations: smallvec::SmallVec::new(),
             sealed_at: Some(1_700_000_000_000),
         };
-        lifecycle.request_seal(id, sealed_meta.clone()).await.unwrap();
+        lifecycle.request_seal(id, sealed_meta.clone(), None).await.unwrap();
         lifecycle.request_delete(id).await.unwrap();
 
         // --- Exactly three events, in order: Reserve, Seal, Delete ---

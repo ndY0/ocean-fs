@@ -32,14 +32,22 @@
 //!   reserved     [2]   = 0
 //!   payload_len  [4]   LE, payload size
 //!   segment_id   [16]
-//!   payload      [payload_len]   tier(1) + ec_k(1) + ec_m(1) + reserved(1)
-//!                                | + merkle_root(32) + data_wal_pos(12) for Seal
+//!   payload      [payload_len]   tier(1) + ec_k(1) + ec_m(1) + flags(1)
+//!                                | + merkle_root(32) + data_wal_pos(12)
+//!                                | + [repacked_from(16)] for Seal
 //!   crc32        [4]   over all preceding bytes
 //! ```
 //!
 //! Header is 28 bytes (4+1+1+2+4+16); Reserve payload is 4 bytes, Seal
-//! payload 48 bytes (4+32+12), Delete payload 0 bytes. `data_wal_pos` is
+//! payload 48 bytes (4+32+12) or 64 bytes with the compaction
+//! `repacked_from` marker, Delete payload 0 bytes. `data_wal_pos` is
 //! `file_seq(4, LE) + offset(8, LE)`.
+//!
+//! The Seal payload's flags byte (payload\[3\], was reserved): bit 0 set
+//! means the compaction `repacked_from` segment id follows the position
+//! (`+16` bytes) — ADR-0025 Decision 4's compaction marker. Records
+//! written before the marker existed (flags = 0, 48-byte payload) decode
+//! unchanged to `repacked_from: None`.
 
 use std::{
     io::{Read, Seek, SeekFrom, Write},
@@ -76,12 +84,20 @@ pub(crate) const RESERVE_PAYLOAD_SIZE: usize = 4;
 /// Payload size of a `SealEvent`: 4 + merkle_root(32) + data_wal_pos(12).
 pub(crate) const SEAL_PAYLOAD_SIZE: usize = 48;
 
+/// Extra payload bytes of a `SealEvent` carrying the compaction
+/// `repacked_from` marker (16 — a segment id).
+pub(crate) const SEAL_REPACKED_FROM_SIZE: usize = 16;
+
+/// Flags byte of the Seal payload: bit 0 set → `repacked_from` present.
+pub(crate) const SEAL_FLAG_REPACKED_FROM: u8 = 1;
+
 /// Payload size of a `DeleteEvent`.
 pub(crate) const DELETE_PAYLOAD_SIZE: usize = 0;
 
-/// Largest possible payload size (the Seal payload) — bounds the reader's
-/// allocation so a corrupt `payload_len` can never allocate arbitrarily.
-pub(crate) const MAX_PAYLOAD_SIZE: usize = SEAL_PAYLOAD_SIZE;
+/// Largest possible payload size (the Seal payload with the compaction
+/// marker) — bounds the reader's allocation so a corrupt `payload_len`
+/// can never allocate arbitrarily.
+pub(crate) const MAX_PAYLOAD_SIZE: usize = SEAL_PAYLOAD_SIZE + SEAL_REPACKED_FROM_SIZE;
 
 /// Record kind bytes on disk.
 pub(crate) const KIND_RESERVE: u8 = 0;
@@ -161,6 +177,12 @@ pub struct SealEvent {
     /// data entries (replayed segments whose WAL entries were truncated
     /// away — nothing to seek or sweep).
     pub data_wal_pos: DataWalPos,
+    /// The compaction marker (ADR-0025 Decision 4): when this segment is
+    /// a GC-repacked replacement, the id of the source segment it was
+    /// repacked from. `None` for ordinary sealed segments. Recovery uses
+    /// the marker to identify incomplete compaction units (crash-window
+    /// rows 7–9) with a single objects-CF read per unit.
+    pub repacked_from: Option<SegmentId>,
 }
 
 /// A segment **Delete** event — replaces the deleted-marker CF write
@@ -214,14 +236,18 @@ impl SegmentEvent {
                 (KIND_RESERVE, payload)
             }
             SegmentEvent::Seal(evt) => {
-                let mut payload = Vec::with_capacity(SEAL_PAYLOAD_SIZE);
+                let extra = if evt.repacked_from.is_some() { SEAL_REPACKED_FROM_SIZE } else { 0 };
+                let mut payload = Vec::with_capacity(SEAL_PAYLOAD_SIZE + extra);
                 payload.push(tier_to_u8(evt.tier));
                 payload.push(evt.ec_k);
                 payload.push(evt.ec_m);
-                payload.push(0); // reserved
+                payload.push(if evt.repacked_from.is_some() { SEAL_FLAG_REPACKED_FROM } else { 0 });
                 payload.extend_from_slice(evt.merkle_root.as_bytes());
                 payload.extend_from_slice(&evt.data_wal_pos.file_seq.to_le_bytes());
                 payload.extend_from_slice(&evt.data_wal_pos.offset.to_le_bytes());
+                if let Some(old) = evt.repacked_from {
+                    payload.extend_from_slice(old.as_uuid().as_bytes());
+                }
                 (KIND_SEAL, payload)
             }
             SegmentEvent::Delete(_) => (KIND_DELETE, Vec::new()),
@@ -310,17 +336,39 @@ fn decode_payload(kind: u8, segment_id: SegmentId, payload: &[u8]) -> Option<Seg
                 ec_m: payload[2],
             }))
         }
-        KIND_SEAL if payload.len() == SEAL_PAYLOAD_SIZE => Some(SegmentEvent::Seal(SealEvent {
-            segment_id,
-            tier: tier_from_u8(payload[0])?,
-            ec_k: payload[1],
-            ec_m: payload[2],
-            merkle_root: HashOutput::from_bytes(payload[4..36].try_into().ok()?),
-            data_wal_pos: DataWalPos {
-                file_seq: u32::from_le_bytes(payload[36..40].try_into().ok()?),
-                offset: u64::from_le_bytes(payload[40..48].try_into().ok()?),
-            },
-        })),
+        KIND_SEAL
+            if payload.len() == SEAL_PAYLOAD_SIZE && payload[3] & !SEAL_FLAG_REPACKED_FROM == 0 =>
+        {
+            Some(SegmentEvent::Seal(SealEvent {
+                segment_id,
+                tier: tier_from_u8(payload[0])?,
+                ec_k: payload[1],
+                ec_m: payload[2],
+                merkle_root: HashOutput::from_bytes(payload[4..36].try_into().ok()?),
+                data_wal_pos: DataWalPos {
+                    file_seq: u32::from_le_bytes(payload[36..40].try_into().ok()?),
+                    offset: u64::from_le_bytes(payload[40..48].try_into().ok()?),
+                },
+                repacked_from: None,
+            }))
+        }
+        KIND_SEAL
+            if payload.len() == SEAL_PAYLOAD_SIZE + SEAL_REPACKED_FROM_SIZE
+                && payload[3] & SEAL_FLAG_REPACKED_FROM != 0 =>
+        {
+            Some(SegmentEvent::Seal(SealEvent {
+                segment_id,
+                tier: tier_from_u8(payload[0])?,
+                ec_k: payload[1],
+                ec_m: payload[2],
+                merkle_root: HashOutput::from_bytes(payload[4..36].try_into().ok()?),
+                data_wal_pos: DataWalPos {
+                    file_seq: u32::from_le_bytes(payload[36..40].try_into().ok()?),
+                    offset: u64::from_le_bytes(payload[40..48].try_into().ok()?),
+                },
+                repacked_from: Some(SegmentId::from_uuid_bytes(payload[48..64].try_into().ok()?)),
+            }))
+        }
         KIND_DELETE if payload.len() == DELETE_PAYLOAD_SIZE => {
             Some(SegmentEvent::Delete(DeleteEvent { segment_id }))
         }
@@ -1224,6 +1272,19 @@ mod tests {
             ec_m: 2,
             merkle_root: HashOutput::from_bytes([0xAB; 32]),
             data_wal_pos: DataWalPos { file_seq: 3, offset: 4096 },
+            repacked_from: None,
+        })
+    }
+
+    fn seal_event_with_repacked(id: SegmentId, old: SegmentId) -> SegmentEvent {
+        SegmentEvent::Seal(SealEvent {
+            segment_id: id,
+            tier: SizeTier::Standard,
+            ec_k: 4,
+            ec_m: 2,
+            merkle_root: HashOutput::from_bytes([0xAB; 32]),
+            data_wal_pos: DataWalPos { file_seq: 3, offset: 4096 },
+            repacked_from: Some(old),
         })
     }
 
@@ -1274,7 +1335,59 @@ mod tests {
                 assert_eq!(seal.tier, SizeTier::Standard);
                 assert_eq!(seal.ec_k, 4);
                 assert_eq!(seal.ec_m, 2);
+                assert_eq!(seal.repacked_from, None);
             }
+            other => panic!("expected seal event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seal_roundtrip_preserves_the_compaction_repacked_from_marker() {
+        let id = SegmentId::new();
+        let old = SegmentId::new();
+        let evt = seal_event_with_repacked(id, old);
+        let bytes = evt.to_record_bytes();
+        // The marked payload is exactly SEAL_REPACKED_FROM_SIZE longer.
+        assert_eq!(
+            bytes.len(),
+            EVENT_RECORD_HEADER_SIZE + SEAL_PAYLOAD_SIZE + SEAL_REPACKED_FROM_SIZE + 4,
+            "the repacked_from marker must extend the record by 16 bytes"
+        );
+        let decoded = SegmentEvent::from_record_bytes(&bytes).expect("record decodes");
+        assert_eq!(decoded, evt, "the marker must round-trip byte-exact");
+        match decoded {
+            SegmentEvent::Seal(seal) => assert_eq!(seal.repacked_from, Some(old)),
+            other => panic!("expected seal event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unmarked_seal_records_still_decode_with_the_marker_absent() {
+        // The payload layout before the compaction marker existed
+        // (flags byte = 0, 48-byte payload) must decode unchanged — old
+        // records in an existing event log are readable.
+        let id = SegmentId::new();
+        let mut payload = Vec::with_capacity(SEAL_PAYLOAD_SIZE);
+        payload.push(tier_to_u8(SizeTier::Standard));
+        payload.push(4);
+        payload.push(2);
+        payload.push(0); // flags — no repacked_from
+        payload.extend_from_slice(&[0xAB; 32]);
+        payload.extend_from_slice(&3u32.to_le_bytes());
+        payload.extend_from_slice(&4096u64.to_le_bytes());
+        let mut buf = Vec::with_capacity(EVENT_RECORD_HEADER_SIZE + payload.len() + 4);
+        buf.extend_from_slice(&EVENT_RECORD_MAGIC);
+        buf.push(EVENT_RECORD_VERSION);
+        buf.push(KIND_SEAL);
+        buf.extend_from_slice(&[0u8; 2]);
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(id.as_uuid().as_bytes());
+        buf.extend_from_slice(&payload);
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        let decoded = SegmentEvent::from_record_bytes(&buf).expect("legacy record decodes");
+        match decoded {
+            SegmentEvent::Seal(seal) => assert_eq!(seal.repacked_from, None),
             other => panic!("expected seal event, got {other:?}"),
         }
     }

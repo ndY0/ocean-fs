@@ -14,7 +14,7 @@ use oceanfs_core::{
     BucketId, ChunkRef, HashOutput, Hlc, MetadataConfig, ObjectKey, ObjectMetadata, SegmentId,
     SegmentMetadata, SizeTier, Tombstone,
 };
-use oceanfs_durability::{GarbageCollector, GcConfig, InMemorySegmentStore, SegmentDataStore};
+use oceanfs_durability::{GarbageCollector, GcConfig, SegmentDataStore};
 use oceanfs_storage::RocksDbMetadataStore;
 
 fn test_config() -> MetadataConfig {
@@ -154,7 +154,7 @@ async fn full_gc_cycle_compacts_segment() {
 
     let seg_id = SegmentId::new();
     let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
-    metadata.put_segment(seg_meta).unwrap();
+    metadata.put_segment(seg_meta.clone()).unwrap();
 
     // Write 5 objects
     let live_keys = vec!["obj3.txt", "obj4.txt"];
@@ -189,10 +189,29 @@ async fn full_gc_cycle_compacts_segment() {
             .unwrap();
     }
 
-    // Run GC with threshold that will trigger (liveness 0.4 < 0.5)
+    // Run GC with threshold that will trigger (liveness 0.4 < 0.5). The
+    // compactor is a machine (ADR-0025 Decision 4): wire the lifecycle
+    // coordinator + shard store, and seed the candidate through the
+    // machine (the only writer of lifecycle state).
     let store = Arc::new(oceanfs_durability::InMemorySegmentStore::new());
     store.write_segment_data(&seg_id, &vec![0x55; 1000]).unwrap();
-    let gc = GarbageCollector::new(GcConfig::new(3600, 0, 0.5, 2, 16)).with_data_store(store);
+    let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ));
+    let lifecycle =
+        Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::with_registry(
+            metadata.clone(),
+            registry,
+        ));
+    lifecycle
+        .request_reserve(seg_id, seg_meta.size_tier, seg_meta.ec_k, seg_meta.ec_m)
+        .await
+        .unwrap();
+    lifecycle.request_seal(seg_id, seg_meta, None).await.unwrap();
+    let gc = GarbageCollector::new(GcConfig::new(3600, 0, 0.5, 2, 16))
+        .with_data_store(store)
+        .with_lifecycle(lifecycle)
+        .with_shard_store(Arc::new(oceanfs_durability::InMemorySegmentShardStore::new(0)));
 
     let stats = gc.run_cycle(metadata.clone()).await.unwrap();
 

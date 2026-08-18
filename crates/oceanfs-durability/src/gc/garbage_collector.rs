@@ -43,6 +43,15 @@ pub struct GarbageCollector {
     /// segment's bytes and writing the new segment's `.dat`, which needs a
     /// data store. See [`Self::with_data_store`].
     data_store: Option<Arc<dyn crate::anti_entropy::SegmentDataStore>>,
+    /// The lifecycle coordinator — the compactor's only writer of
+    /// segment lifecycle state (ADR-0025 Decision 4). `None` (tests /
+    /// minimal embeddings) means compaction candidates are identified but
+    /// NOT compacted. See [`Self::with_lifecycle`].
+    lifecycle: Option<Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>>,
+    /// The shard store: the compactor unlinks the old `.dat` only after
+    /// the durable delete. `None` means compaction is not wired. See
+    /// [`Self::with_shard_store`].
+    shard_store: Option<Arc<dyn SegmentShardStore>>,
 }
 
 type TombstoneResult =
@@ -81,6 +90,8 @@ impl GarbageCollector {
                 LabelSet::empty(),
             ),
             data_store: None,
+            lifecycle: None,
+            shard_store: None,
         }
     }
 
@@ -96,6 +107,30 @@ impl GarbageCollector {
         data_store: Arc<dyn crate::anti_entropy::SegmentDataStore>,
     ) -> Self {
         self.data_store = Some(data_store);
+        self
+    }
+
+    /// Attaches the lifecycle coordinator (ADR-0025 Decision 4): the
+    /// compactor requests every transition (reserve/seal/delete) from
+    /// the coordinator and never writes lifecycle state itself.
+    ///
+    /// Without it, compaction candidates are identified and reported but
+    /// not compacted.
+    pub fn with_lifecycle(
+        mut self,
+        lifecycle: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
+    ) -> Self {
+        self.lifecycle = Some(lifecycle);
+        self
+    }
+
+    /// Attaches the shard store used to unlink the old segment's `.dat`
+    /// after its durable deletion (`OldRemoved` — delete before unlink).
+    ///
+    /// Without it, compaction candidates are identified and reported but
+    /// not compacted.
+    pub fn with_shard_store(mut self, shard_store: Arc<dyn SegmentShardStore>) -> Self {
+        self.shard_store = Some(shard_store);
         self
     }
 
@@ -172,11 +207,34 @@ impl GarbageCollector {
             );
             return Ok(stats);
         };
+        // ... and the machine: the compactor requests every transition
+        // from the coordinator (ADR-0025 Decision 4) and unlinks the old
+        // `.dat` through the shard store after the durable delete.
+        let Some(lifecycle) = self.lifecycle.clone() else {
+            tracing::warn!(
+                candidates = candidates.len(),
+                "GC identified compaction candidates but no lifecycle coordinator is attached; skipping compaction (use with_lifecycle)"
+            );
+            return Ok(stats);
+        };
+        let Some(shard_store) = self.shard_store.clone() else {
+            tracing::warn!(
+                candidates = candidates.len(),
+                "GC identified compaction candidates but no shard store is attached; skipping compaction (use with_shard_store)"
+            );
+            return Ok(stats);
+        };
 
         // Phase 3: Compact candidate segments concurrency-limited
         let semaphore = Arc::new(Semaphore::new(self.config.max_concurrent_compactions));
         let tier_router = TierRouter::new(oceanfs_core::SegmentSizeConfig::default());
-        let compactor = Arc::new(SegmentCompactor::new(metadata.clone(), tier_router, data_store));
+        let compactor = Arc::new(SegmentCompactor::new(
+            metadata.clone(),
+            tier_router,
+            data_store,
+            lifecycle,
+            shard_store,
+        ));
 
         tracing::debug!(
             "GC compaction phase: tier router configured for repacking, {} segment(s) candidate",
@@ -855,7 +913,7 @@ mod tests {
 
         let seg_id = SegmentId::new();
         let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
-        metadata.put_segment(seg_meta).unwrap();
+        metadata.put_segment(seg_meta.clone()).unwrap();
 
         // One LIVE object (100 bytes) still referencing the segment.
         let live_obj = make_object_meta(
@@ -905,8 +963,28 @@ mod tests {
         // 1000 bytes of old segment data; the live object's 100 bytes sit at
         // offset 0, the tombstoned 900 at offset 100.
         store.write_segment_data(&seg_id, &vec![0xAA; 1000]).unwrap();
+        // Wire the machine: the compactor requests every transition from
+        // the coordinator (ADR-0025 Decision 4) and unlinks through the
+        // shard store. The candidate is seeded through the machine too.
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
+        let lifecycle = Arc::new(
+            oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::with_registry(
+                metadata.clone(),
+                registry,
+            ),
+        );
+        lifecycle
+            .request_reserve(seg_id, seg_meta.size_tier, seg_meta.ec_k, seg_meta.ec_m)
+            .await
+            .unwrap();
+        lifecycle.request_seal(seg_id, seg_meta, None).await.unwrap();
         let gc = GarbageCollector::new(GcConfig { compact_threshold: 0.5, ..GcConfig::default() })
-            .with_data_store(store);
+            .with_data_store(store)
+            .with_lifecycle(lifecycle)
+            .with_shard_store(Arc::new(InMemorySegmentShardStore::new(0)));
         let stats = gc.run_cycle(metadata.clone()).await.unwrap();
 
         assert_eq!(stats.dead_bytes, 900, "dead bytes must come from the tombstone chunks");

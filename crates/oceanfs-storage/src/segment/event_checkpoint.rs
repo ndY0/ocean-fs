@@ -20,7 +20,7 @@
 //! ```text
 //! checkpoint-{file_seq:08}-{offset}:
 //!   magic        [4]   = b"CHK\\1"
-//!   version      [1]   = 1
+//!   version      [1]   = 2
 //!   covered_pos  [12]  file_seq(4 LE) + offset(8 LE) — the EventWalPos
 //!                      covered by this snapshot (the fold starts after it)
 //!   entry_count  [4]   LE
@@ -35,8 +35,17 @@
 //!                      incl. merkle_root for Sealed entries
 //!     data_wal_pos [12]  file_seq(4 LE) + offset(8 LE) — Sealed entries
 //!                      only (retention needs it to survive checkpointing)
+//!     repacked_flag [1]  0/1 — Sealed entries only (version 2: the
+//!                      compaction marker, ADR-0025 Decision 4 — recovery
+//!                      needs it to identify incomplete compaction units)
+//!     repacked_from [16]  segment id — present iff repacked_flag = 1
 //!   crc32        [4]   over all preceding bytes
 //! ```
+//!
+//! Version 2 adds the compaction marker to Sealed entries; version 1
+//! snapshots (without the flag byte) are rejected — no deployed
+//! checkpoints exist (the format landed with EPIC 2), so no legacy
+//! files need reading.
 
 use std::{
     io::Write,
@@ -63,16 +72,19 @@ use crate::{
 pub(crate) const CHECKPOINT_MAGIC: [u8; 4] = [b'C', b'H', b'K', 1];
 
 /// On-disk format version of checkpoint files.
-pub(crate) const CHECKPOINT_VERSION: u8 = 1;
+pub(crate) const CHECKPOINT_VERSION: u8 = 2;
 
 /// Fixed header size of a checkpoint file: magic(4) + version(1) +
 /// covered_pos(12) + entry_count(4) = 21.
 pub(crate) const CHECKPOINT_HEADER_SIZE: usize = 21;
 
 /// Entry envelope sizes: segment_id(16) + state(1) + meta_len(4) = 21,
-/// plus data_wal_pos(12) for Sealed entries.
+/// plus data_wal_pos(12) + repacked_flag(1) [+ repacked_from(16)] for
+/// Sealed entries.
 const ENTRY_FIXED_SIZE: usize = 21;
 const SEALED_EXTRA_SIZE: usize = 12;
+const REPACKED_FLAG_SIZE: usize = 1;
+const REPACKED_FROM_SIZE: usize = 16;
 
 /// State bytes on disk.
 const STATE_RESERVED: u8 = 0;
@@ -344,10 +356,17 @@ fn checkpoint_file_path(dir: &Path, pos: EventWalPos) -> PathBuf {
 fn encode_snapshot(registry: &SegmentLifecycleRegistry, up_to: EventWalPos) -> Result<Vec<u8>> {
     // Collect live entries under the shard read guards (perf 7.1: the
     // copies are cheap; the serialization below is lock-free).
-    let mut entries: Vec<(SegmentId, SegmentState, SegmentMetadata, Option<DataWalPos>)> =
-        Vec::new();
+    type SnapshotEntry =
+        (SegmentId, SegmentState, SegmentMetadata, Option<DataWalPos>, Option<SegmentId>);
+    let mut entries: Vec<SnapshotEntry> = Vec::new();
     registry.for_each(|id, entry| {
-        entries.push((id, entry.state, entry.metadata.clone(), entry.data_wal_pos));
+        entries.push((
+            id,
+            entry.state,
+            entry.metadata.clone(),
+            entry.data_wal_pos,
+            entry.repacked_from,
+        ));
     });
 
     let mut buf =
@@ -358,7 +377,7 @@ fn encode_snapshot(registry: &SegmentLifecycleRegistry, up_to: EventWalPos) -> R
     buf.extend_from_slice(&up_to.offset.to_le_bytes());
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
 
-    for (id, state, meta, data_wal_pos) in entries {
+    for (id, state, meta, data_wal_pos, repacked_from) in entries {
         buf.extend_from_slice(id.as_uuid().as_bytes());
         let state_byte = match state {
             SegmentState::Reserved => STATE_RESERVED,
@@ -384,6 +403,16 @@ fn encode_snapshot(registry: &SegmentLifecycleRegistry, up_to: EventWalPos) -> R
             let pos = data_wal_pos.unwrap_or(DataWalPos { file_seq: 0, offset: 0 });
             buf.extend_from_slice(&pos.file_seq.to_le_bytes());
             buf.extend_from_slice(&pos.offset.to_le_bytes());
+            // The compaction marker (ADR-0025 Decision 4): recovery
+            // needs it to identify incomplete compaction units (rows
+            // 7–9) after a checkpoint-covered restart.
+            match repacked_from {
+                Some(old) => {
+                    buf.push(1);
+                    buf.extend_from_slice(old.as_uuid().as_bytes());
+                }
+                None => buf.push(0),
+            }
         }
     }
 
@@ -442,7 +471,7 @@ fn decode_snapshot(bytes: &[u8]) -> Option<(EventWalPos, SegmentLifecycleRegistr
                 registry.reserve(segment_id, meta).ok()?;
             }
             STATE_SEALED => {
-                if cursor + SEALED_EXTRA_SIZE > bytes.len() - 4 {
+                if cursor + SEALED_EXTRA_SIZE + REPACKED_FLAG_SIZE > bytes.len() - 4 {
                     return None;
                 }
                 let data_wal_pos = DataWalPos {
@@ -450,6 +479,21 @@ fn decode_snapshot(bytes: &[u8]) -> Option<(EventWalPos, SegmentLifecycleRegistr
                     offset: u64::from_le_bytes(bytes[cursor + 4..cursor + 12].try_into().ok()?),
                 };
                 cursor += SEALED_EXTRA_SIZE;
+                let repacked_flag = bytes[cursor];
+                cursor += REPACKED_FLAG_SIZE;
+                let repacked_from = match repacked_flag {
+                    0 => None,
+                    1 => {
+                        if cursor + REPACKED_FROM_SIZE > bytes.len() - 4 {
+                            return None;
+                        }
+                        let old =
+                            SegmentId::from_uuid_bytes(bytes[cursor..cursor + 16].try_into().ok()?);
+                        cursor += REPACKED_FROM_SIZE;
+                        Some(old)
+                    }
+                    _ => return None, // unknown repacked flag
+                };
                 // The seal transition requires a Reserved entry: reserve
                 // with the pre-seal metadata shape first (like the
                 // fold's Reserve arm), then record the position BEFORE
@@ -466,7 +510,7 @@ fn decode_snapshot(bytes: &[u8]) -> Option<(EventWalPos, SegmentLifecycleRegistr
                 };
                 registry.reserve(segment_id, reserved_meta).ok()?;
                 registry.record_data_wal_pos(segment_id, data_wal_pos);
-                registry.seal(segment_id, meta).ok()?;
+                registry.seal_with(segment_id, meta, repacked_from).ok()?;
             }
             _ => return None, // unknown state
         }
@@ -555,6 +599,38 @@ mod tests {
             assert_eq!(other.metadata.sealed_at, entry.metadata.sealed_at);
             assert_eq!(other.data_wal_pos, entry.data_wal_pos);
         });
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_the_compaction_repacked_from_marker() {
+        let registry = SegmentLifecycleRegistry::new(&LifecycleConfig::default());
+        let id = SegmentId::new();
+        let old = SegmentId::new();
+        let meta = SegmentMetadata {
+            segment_id: id,
+            ec_k: 4,
+            ec_m: 2,
+            size_tier: SizeTier::Standard,
+            merkle_root: Some(HashOutput::from_bytes([0xAB; 32])),
+            storage_locations: smallvec::SmallVec::new(),
+            sealed_at: Some(1_700_000_000_000),
+        };
+        registry
+            .reserve(id, SegmentMetadata { merkle_root: None, sealed_at: None, ..meta.clone() })
+            .unwrap();
+        registry.record_data_wal_pos(id, DataWalPos { file_seq: 1, offset: 100 });
+        registry.seal_with(id, meta, Some(old)).unwrap();
+
+        let bytes = encode_snapshot(&registry, EventWalPos { file_seq: 3, offset: 4096 }).unwrap();
+        let (_, loaded) = decode_snapshot(&bytes).expect("snapshot decodes");
+        let entry = loaded.get(id).expect("entry present after round trip");
+        assert_eq!(entry.state, SegmentState::Sealed);
+        assert_eq!(entry.data_wal_pos, Some(DataWalPos { file_seq: 1, offset: 100 }));
+        assert_eq!(
+            entry.repacked_from,
+            Some(old),
+            "the compaction marker must survive checkpointing (rows 7-9 recovery)"
+        );
     }
 
     #[test]
@@ -761,6 +837,7 @@ mod tests {
                 ec_m: 2,
                 merkle_root: HashOutput::from_bytes([0xAB; 32]),
                 data_wal_pos: DataWalPos { file_seq: 0, offset: 0 },
+                repacked_from: None,
             },
         ))
         .await
@@ -778,6 +855,7 @@ mod tests {
                 ec_m: 2,
                 merkle_root: HashOutput::from_bytes([0xCD; 32]),
                 data_wal_pos: DataWalPos { file_seq: 0, offset: 0 },
+                repacked_from: None,
             },
         ))
         .await
@@ -845,6 +923,7 @@ mod tests {
                 ec_m: 2,
                 merkle_root: HashOutput::from_bytes([0xAB; 32]),
                 data_wal_pos: DataWalPos { file_seq: 0, offset: 0 },
+                repacked_from: None,
             },
         ))
         .await
@@ -866,6 +945,7 @@ mod tests {
                 ec_m: 2,
                 merkle_root: HashOutput::from_bytes([0xEF; 32]),
                 data_wal_pos: DataWalPos { file_seq: 0, offset: 0 },
+                repacked_from: None,
             },
         ))
         .await

@@ -935,10 +935,20 @@ impl Node {
         // segment's .dat before the metadata swap; without the store, a
         // metadata-only remap would leave objects pointing at a segment
         // with no on-disk data).
-        let gc_worker =
-            Arc::new(oceanfs_durability::GarbageCollector::new(gc_config.clone()).with_data_store(
-                Arc::new(oceanfs_durability::DiskSegmentStore::new(segment_dir.clone())),
-            ));
+        // GC compaction is a state machine (ADR-0025 Decision 4): the
+        // compactor requests every transition from the lifecycle
+        // coordinator and unlinks the old .dat through the shard store
+        // only after the durable delete.
+        let gc_worker = Arc::new(
+            oceanfs_durability::GarbageCollector::new(gc_config.clone())
+                .with_data_store(Arc::new(oceanfs_durability::DiskSegmentStore::new(
+                    segment_dir.clone(),
+                )))
+                .with_lifecycle(lifecycle.clone())
+                .with_shard_store(Arc::new(oceanfs_durability::DiskSegmentShardStore::new(
+                    segment_dir.clone(),
+                ))),
+        );
 
         // Construct IncrementalMerkleTree for anti-entropy by scanning
         // the segments column family (ADR-0018 Decision 1).

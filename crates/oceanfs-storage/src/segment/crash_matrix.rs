@@ -303,7 +303,7 @@ impl Harness {
             storage_locations: smallvec::SmallVec::new(),
             sealed_at: Some(1_700_000_000_000),
         };
-        self.lifecycle.request_seal(id, meta).await.unwrap();
+        self.lifecycle.request_seal(id, meta, None).await.unwrap();
     }
 
     async fn delete(&self, id: SegmentId) {
@@ -939,6 +939,7 @@ async fn mid_log_corruption_aborts_the_fold_with_the_position() {
                 ec_m: 2,
                 merkle_root: HashOutput::from_bytes([0xAB; 32]),
                 data_wal_pos: DataWalPos { file_seq: 0, offset: 0 },
+                repacked_from: None,
             }))
             .await
             .unwrap();
