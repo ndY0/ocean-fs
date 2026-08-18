@@ -181,14 +181,25 @@ impl SegmentFlushGroup {
                 // Run the blocking I/O (sync + finalize + the lifecycle
                 // seal batch) on the blocking pool — never on a runtime
                 // worker (single-scheduler discipline, same as the
-                // seal-time EC encode).
+                // seal-time EC encode). The flush is deliberately NOT
+                // awaited: awaiting it serializes every batch behind the
+                // seal step's event-log group commit (~50 ms per batch),
+                // capping the seal rate below the fill rate under
+                // sustained load — the unsealed set grows and its WAL
+                // entries pin the recent files (the wal_not_unbounded
+                // regression). Fire-and-forget lets the cores-sized
+                // blocking pool parallelize the batches, and the event
+                // group's commit latency is then amortized across
+                // concurrent seals instead of paid once per batch.
+                // Backpressure is unchanged: the channel capacity (the
+                // caller's submit awaits) plus the seal worker's
+                // semaphore.
                 let lifecycle = Arc::clone(&lifecycle);
                 let data_dir = data_dir.clone();
                 let stats = Arc::clone(&stats_task);
-                let _ = tokio::task::spawn_blocking(move || {
+                tokio::task::spawn_blocking(move || {
                     flush_batch(batch, &lifecycle, &data_dir, &stats);
-                })
-                .await;
+                });
             }
         });
 

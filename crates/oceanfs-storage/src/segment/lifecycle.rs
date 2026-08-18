@@ -851,20 +851,34 @@ impl SegmentLifecycleRegistry {
     /// Records the data-WAL position of a segment's latest data entry.
     ///
     /// Called by the write path after every data-WAL append (through
-    /// the coordinator — the registry's only writer). Only `Reserved`
-    /// entries are updated: the position feeds the `SealEvent` built at
-    /// seal time (ADR-0024 Decision 2 — the recovery fold seeks by it).
-    /// No-op when the entry is absent or no longer `Reserved` (the
-    /// reserve always precedes the first data entry, so in the write
-    /// path the entry exists — this guard only covers races with a
-    /// concurrent delete).
+    /// the coordinator — the registry's only writer). The position is
+    /// **max-monotonic**: a later record can only raise it (entries of
+    /// one segment can be appended out of order by concurrent writers
+    /// sharing a slot, so the last record is not necessarily the last
+    /// entry).
+    ///
+    /// Both `Reserved` and `Sealed` entries are updated. The `Reserved`
+    /// update feeds the `SealEvent` built at seal time (ADR-0024
+    /// Decision 2 — the recovery fold seeks by it). The `Sealed` update
+    /// is the retention self-heal: under concurrent writers, a segment's
+    /// last data entry can land in the WAL AFTER the fill-triggered seal
+    /// captured its position (the other request is still inside its
+    /// reserve's event-group commit). Recording it late keeps the
+    /// retention closure correct — the entry becomes garbage and the
+    /// next rotation sweeps its file instead of pinning it forever.
+    /// (The `SealEvent`'s embedded position may stay stale; the recovery
+    /// pass's position overlay fixes it after a restart.)
     pub(crate) fn record_data_wal_pos(&self, id: SegmentId, pos: DataWalPos) {
         let shard = &self.shards[self.shard_for(id)];
         let mut guard = shard.write();
         if let Some(entry) = guard.get_mut(&id) {
-            if entry.state == SegmentState::Reserved {
-                entry.data_wal_pos = Some(pos);
+            if entry.state == SegmentState::Deleted {
+                return;
             }
+            entry.data_wal_pos = Some(match entry.data_wal_pos {
+                Some(p) => p.max(pos),
+                None => pos,
+            });
         }
     }
 
@@ -1473,17 +1487,28 @@ impl SegmentLifecycleCoordinator {
         // 3. Stream the data WAL ONCE in position order (perf 3.1 — no
         //    per-entry seeks): buffer replay data per segment (bounded
         //    by the WAL retention window — see the module note), record
-        //    the last entry position per reserved segment, count swept
-        //    entries (sealed/deleted/orphan).
+        //    the last entry position per segment, count swept entries
+        //    (sealed/deleted/orphan).
         let mut groups: std::collections::HashMap<SegmentId, Vec<Bytes>> =
             std::collections::HashMap::with_capacity(reserved.len());
+        // Last entry position per segment — for Reserved segments it
+        // feeds the re-seal below; for Sealed segments it is the
+        // retention overlay (see the record loop).
         let mut last_pos: std::collections::HashMap<SegmentId, DataWalPos> =
             std::collections::HashMap::with_capacity(reserved.len());
         for item in data_wal.replay_positions() {
             let (pos, entry) = item?;
             let id = entry.segment_id();
+            // Record the last entry position for EVERY segment the WAL
+            // holds. The folded `SealEvent` positions can be stale: a
+            // concurrent writer's entry can land in the WAL after the
+            // fill-triggered seal captured its position, and the event
+            // log never sees the late record. Overlaying the true last
+            // position here keeps the retention closure correct after a
+            // restart — otherwise the late entry's file stays pinned
+            // forever.
+            last_pos.insert(id, pos);
             if reserved_ids.contains(&id) {
-                last_pos.insert(id, pos);
                 if adopt.contains(&id) {
                     // The entry is garbage once the .dat is adopted.
                     outcome.swept_entries += 1;
@@ -1508,14 +1533,17 @@ impl SegmentLifecycleCoordinator {
         }
 
         // 4. Record every segment's LAST entry position FIRST (the
-        //    re-seal's SealEvent reads it at seal time), then drain all
-        //    replay groups sequentially (the pool's slot model bounds
-        //    concurrency).
+        //    re-seal's SealEvent reads it at seal time; the Sealed
+        //    entries' overlay corrects stale event positions), then
+        //    drain all replay groups sequentially (the pool's slot
+        //    model bounds concurrency). The replayed ids are collected
+        //    before the drain (the groups are consumed by it).
+        let replayed_ids: Vec<SegmentId> = groups.keys().cloned().collect();
         for (id, pos) in &last_pos {
             self.record_data_wal_pos(*id, *pos);
         }
-        for id in groups.keys().cloned().collect::<Vec<_>>() {
-            self.drain_replay_group(id, &mut groups, &reserved).await?;
+        for id in &replayed_ids {
+            self.drain_replay_group(*id, &mut groups, &reserved).await?;
         }
 
         // 5. Adopt the durable `.dat` segments (row 3): recompute the
@@ -1565,8 +1593,9 @@ impl SegmentLifecycleCoordinator {
         // 7. The replayed seals complete asynchronously on the seal
         //    worker; wait for their .dat files (reads must never race a
         //    partially-written segment — the node's pre-bind readiness).
-        let replayed_ids: Vec<SegmentId> =
-            last_pos.keys().filter(|id| !adopt.contains(id)).copied().collect();
+        //    Only the REPLAYED ids are waited on — the overlay's
+        //    position records cover sealed segments too, but those never
+        //    produce re-seal work.
         if !replayed_ids.is_empty() {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             for id in &replayed_ids {
@@ -2883,6 +2912,41 @@ mod tests {
         cleanup_old_wal_files(&wal_config, 2, Some(liveness.as_ref())).await;
         let files = count_wal_files(&wal_config);
         assert!(files <= 3, "concurrent write/seal churn must not pin WAL files; {files} remain");
+    }
+
+    #[test]
+    fn record_data_wal_pos_updates_sealed_entries_max_monotonic() {
+        // The retention self-heal: under concurrent writers, a segment's
+        // last data entry can land in the WAL AFTER the fill-triggered
+        // seal captured its position (the other request is still inside
+        // its reserve). The late record must update the SEALED entry
+        // (max-monotonic), so the retention closure classifies the late
+        // entry as garbage and the next rotation sweeps its file.
+        let registry = SegmentLifecycleRegistry::new(&LifecycleConfig::default());
+        let id = SegmentId::new();
+        registry.reserve(id, test_metadata(id, false)).unwrap();
+        // The seal captures the position before the last entry lands.
+        registry.record_data_wal_pos(id, DataWalPos { file_seq: 1, offset: 100 });
+        registry.seal(id, test_metadata(id, true)).unwrap();
+        assert_eq!(
+            registry.get(id).unwrap().data_wal_pos,
+            Some(DataWalPos { file_seq: 1, offset: 100 }),
+            "the sealed entry keeps the seal-time position"
+        );
+
+        // The late record lands on the SEALED entry.
+        let late = DataWalPos { file_seq: 1, offset: 900 };
+        registry.record_data_wal_pos(id, late);
+        let entry = registry.get(id).unwrap();
+        assert_eq!(entry.data_wal_pos, Some(late), "late record must land on the Sealed entry");
+        assert!(
+            entry_is_garbage(&entry, &late),
+            "the late entry must be garbage once its position is recorded"
+        );
+
+        // Max-monotonic: an older record must not regress the position.
+        registry.record_data_wal_pos(id, DataWalPos { file_seq: 1, offset: 50 });
+        assert_eq!(registry.get(id).unwrap().data_wal_pos, Some(late));
     }
 
     #[tokio::test]
