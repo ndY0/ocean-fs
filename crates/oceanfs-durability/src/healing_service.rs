@@ -246,9 +246,18 @@ impl HealingRpc for HealingGrpcService {
         &self,
         request: Request<HintedHandoffRequest>,
     ) -> Result<Response<HintedHandoffResponse>, Status> {
-        // The sender's address — the origin for segment-ref hint data
-        // fetches (the hint sender holds the referenced segment).
-        let origin = request.remote_addr();
+        // The sender's gRPC LISTENER address, carried as a request
+        // metadata header by the delivery client. `request.remote_addr()`
+        // is the sender's ephemeral SOURCE port (the client side of this
+        // very connection) — dialing it back fails. The header is the
+        // address that actually accepts connections; remote_addr remains
+        // the fallback for legacy senders.
+        let sender_grpc_addr = request
+            .metadata()
+            .get("oceanfs-sender-grpc")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<SocketAddr>().ok())
+            .or_else(|| request.remote_addr());
         let req = request.into_inner();
         let hint_count = req.hints.len() as u32;
         let mut accepted_count = 0u32;
@@ -351,7 +360,9 @@ impl HealingRpc for HealingGrpcService {
                     // reach multipart/GB sizes.
                     if self.is_local_hint(&intended_for) {
                         let mut applied = false;
-                        if let (Some(origin), Some(fetcher)) = (origin, &self.hint_data_fetcher) {
+                        if let (Some(origin), Some(fetcher)) =
+                            (sender_grpc_addr, &self.hint_data_fetcher)
+                        {
                             match fetcher
                                 .fetch_range(origin, &segment_id, seg_ref.offset, seg_ref.length)
                                 .await
@@ -366,7 +377,8 @@ impl HealingRpc for HealingGrpcService {
                                         intended_for = %intended_for,
                                         segment_id = %segment_id,
                                         error = %e,
-                                        "failed to fetch segment-ref hint data from origin; buffering"
+                                        "failed to fetch segment-ref hint data from origin; \
+                                         NOT accepted — the sender will retry"
                                     );
                                 }
                             }
@@ -374,12 +386,19 @@ impl HealingRpc for HealingGrpcService {
                             tracing::warn!(
                                 intended_for = %intended_for,
                                 "segment-ref hint intended for self but no origin/fetcher \
-                                 available; buffering"
+                                 available; NOT accepted — the sender will retry"
                             );
                         }
                         if applied {
                             continue;
                         }
+                        // Fetch failed or unavailable: do NOT fall through
+                        // to the legacy relay buffer (which nothing drains
+                        // — accepting would make the sender truncate its
+                        // WAL and lose the hint). Leave the hint
+                        // unaccepted so the batch returns accepted=false
+                        // and the sender re-enqueues + retries.
+                        continue;
                     }
 
                     // For segment refs, store as a legacy hint with empty data.

@@ -633,6 +633,34 @@ async fn load_cluster_churn() {
         .verify_read_quorum(&*target, &alive_indices, READ_QUORUM, Some(READ_QUORUM_SAMPLE))
         .await;
     eprintln!("load_cluster_churn: read-quorum failures = {}", quorum_failed.len());
+    if !quorum_failed.is_empty() {
+        eprintln!("load_cluster_churn: quorum-failed keys: {quorum_failed:?}");
+        // Per-node diagnostics: what does each node serve for the failed
+        // keys (status + body hash prefix)?
+        for key in quorum_failed.iter().take(5) {
+            for i in 0..target.len() {
+                match target.get(i, &format!("/{key}")).await {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let hash = resp.bytes().await.ok().map(|b| {
+                            let h = blake3::hash(&b);
+                            format!(
+                                "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                                h.as_bytes()[0],
+                                h.as_bytes()[1],
+                                h.as_bytes()[2],
+                                h.as_bytes()[3],
+                                h.as_bytes()[4],
+                                h.as_bytes()[5]
+                            )
+                        });
+                        eprintln!("  {key}: node {i} -> HTTP {status} hash={hash:?}");
+                    }
+                    Err(e) => eprintln!("  {key}: node {i} -> ERR {e}"),
+                }
+            }
+        }
+    }
 
     // ── Assertions 4-5: hinted handoff ─────────────────────────
     let mut stored = 0.0;

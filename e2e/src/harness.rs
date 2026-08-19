@@ -1582,10 +1582,23 @@ impl Cluster {
             if i == 0 {
                 String::new()
             } else {
-                nodes[0]
-                    .as_ref()
-                    .map(|n| format!("127.0.0.1:{}", n.grpc_addr().port()))
-                    .unwrap_or_default()
+                // Prefer the live node-0 gRPC port; fall back to node 0's
+                // PRESERVED port from its ports.toml. The churn scheduler
+                // can kill node 0 in the same tick as this restart (kill
+                // phase runs before the restart phase) — an empty seed
+                // would make the restarted node seedless, and with a
+                // failed fallback pull it would start as a permanently
+                // isolated singleton (observed as churn-run
+                // convergence=false).
+                match nodes[0].as_ref() {
+                    Some(node0) => format!("127.0.0.1:{}", node0.grpc_addr().port()),
+                    None => {
+                        let ports_file = self._temp_dir.path().join("node-0").join(PORTS_FILE_NAME);
+                        restore_ports(&ports_file)
+                            .map(|(_, grpc_port)| format!("127.0.0.1:{grpc_port}"))
+                            .unwrap_or_default()
+                    }
+                }
             }
         };
 

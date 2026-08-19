@@ -103,12 +103,26 @@ pub trait HintDeliveryClient: Send + Sync {
 /// to perform the hinted handoff RPC.
 pub struct GrpcHintDeliveryClient {
     pool: Arc<ConnectionPool>,
+    /// This node's gRPC LISTENER address, sent as a request metadata
+    /// header so the hint receiver can fetch segment-ref hint data back
+    /// from the LISTENER. `request.remote_addr()` on the receiver is
+    /// the sender's ephemeral SOURCE port (the client side of the
+    /// delivery connection) — dialing it fails; the header carries the
+    /// address that actually accepts connections.
+    self_grpc_addr: Option<SocketAddr>,
 }
 
 impl GrpcHintDeliveryClient {
     /// Creates a new gRPC hint delivery client.
     pub fn new(pool: Arc<ConnectionPool>) -> Self {
-        Self { pool }
+        Self { pool, self_grpc_addr: None }
+    }
+
+    /// Sets this node's gRPC listener address (composition root).
+    #[must_use]
+    pub fn with_self_grpc_addr(mut self, addr: SocketAddr) -> Self {
+        self.self_grpc_addr = Some(addr);
+        self
     }
 }
 
@@ -132,6 +146,18 @@ impl HintDeliveryClient for GrpcHintDeliveryClient {
         let mut client = HealingRpcClient::new(channel);
 
         let delivery = async {
+            let mut request = tonic::Request::new(request);
+            // Carry the sender's LISTENER address (see the struct docs).
+            if let Some(addr) = self.self_grpc_addr {
+                let value =
+                    tonic::metadata::MetadataValue::try_from(addr.to_string()).map_err(|e| {
+                        Error::ForwardFailed {
+                            target: target_addr.to_string(),
+                            reason: format!("invalid sender grpc addr header: {e}"),
+                        }
+                    })?;
+                request.metadata_mut().insert("oceanfs-sender-grpc", value);
+            }
             let response =
                 client.hinted_handoff(request).await.map_err(|status| Error::ForwardFailed {
                     target: target_addr.to_string(),

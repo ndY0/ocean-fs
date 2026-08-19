@@ -971,8 +971,19 @@ impl Node {
         // HintedHandoffManager for durable hinted handoff (ADR-0018 Decision 2).
         let hints_dir =
             config.hint_wal_dir.clone().unwrap_or_else(|| config.data_dir.join("hints"));
-        let hint_delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
-            Arc::new(GrpcHintDeliveryClient::new(pool.clone()));
+        let hint_delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> = Arc::new(
+            GrpcHintDeliveryClient::new(pool.clone())
+                // The hint receiver fetches segment-ref data back
+                // from THIS node's gRPC listener (remote_addr on the
+                // receiver is the ephemeral source port — dead by
+                // fetch time).
+                .with_self_grpc_addr(
+                    config
+                        .grpc_listen_addr
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 9001))),
+                ),
+        );
         let hint_config = HintedHandoffConfig {
             wal_dir: hints_dir.clone(),
             inline_threshold_bytes: config.hint_inline_threshold_bytes,
@@ -1496,10 +1507,41 @@ impl Node {
         // that precedes the bind produces join-time false Suspects and
         // refused hint deliveries (t5/t21).
         membership.start().map_err(|e| format!("failed to start membership: {e}"))?;
-        membership
-            .join(Incarnation::new(announce_incarnation), &durable_state.fallback_seeds)
-            .await
-            .map_err(|e| format!("failed to join cluster: {e}"))?;
+        let join_incarnation = Incarnation::new(announce_incarnation);
+        let join_fallback_seeds = durable_state.fallback_seeds.clone();
+        if let Err(e) = membership.join(join_incarnation, &join_fallback_seeds).await {
+            // A transient seed outage at boot must not isolate the node:
+            // with configured seeds the old behavior ABORTED the process
+            // (and the unit is Restart=no, so the node stayed down); with
+            // empty configured seeds (restart path) it started as a
+            // singleton with no retry. Instead, warn and rejoin in the
+            // background — the cluster-readiness gate keeps writes
+            // refused until the ring converges.
+            warn!(error = %e, "initial cluster join failed; retrying in the background");
+        }
+
+        // Background rejoin: retry the (idempotent) join every 3s until
+        // the ring reaches 2 nodes. Covers the seedless-restart path
+        // (fallback seeds) and fleet nodes that boot before their seed
+        // comes up. Exits once joined.
+        if is_cluster_node {
+            let retry_membership = membership.clone();
+            let retry_incarnation = join_incarnation;
+            let retry_fallback = join_fallback_seeds.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+                loop {
+                    interval.tick().await;
+                    if retry_membership.ring().snapshot().node_count() >= 2 {
+                        return;
+                    }
+                    if let Err(e) = retry_membership.join(retry_incarnation, &retry_fallback).await
+                    {
+                        tracing::debug!(error = %e, "rejoin retry failed");
+                    }
+                }
+            });
+        }
 
         // After a successful join, snapshot the known member addresses as
         // fallback seeds. Events emitted during join are missed by the
