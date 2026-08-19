@@ -657,6 +657,7 @@ async fn checkpoint_full_cycle_threshold_trigger_and_restart() {
     let h = Harness::boot_ckpt(dir.path(), 128).await;
     let (snapshot, covered) =
         h.checkpoint.as_ref().unwrap().load_checkpoint().unwrap().expect("checkpoint loads");
+
     h.lifecycle.seed_from_checkpoint(&snapshot);
     let outcome = h.recover_from(covered).await;
 
@@ -670,9 +671,17 @@ async fn checkpoint_full_cycle_threshold_trigger_and_restart() {
     // The empty reserve (Reserved, no data entries) is dropped by the
     // data-WAL pass.
     assert!(h.lifecycle.registry().get(reserved_id).is_none(), "empty reserve dropped");
-    // The fold after the covered position reads nothing (the covered
-    // events are folded from the snapshot, not re-folded).
-    assert_eq!(outcome.folded_segments, 0, "post-covered fold finds no events");
+    // The fold after the covered position reads only events whose
+    // folds had NOT landed when the checkpoint fired: the checkpoint
+    // covers the last FOLDED position (never the raw WAL tail — a
+    // tail-covering checkpoint would seed a snapshot missing
+    // appended-but-unfolded segments and abort restart). The final
+    // reserve was appended after the trigger; it re-folds idempotently
+    // (Reserve on the snapshot's Reserved entry).
+    assert_eq!(
+        outcome.folded_segments, 1,
+        "the post-covered reserve re-folds idempotently (the checkpoint covers folded events only)"
+    );
     // Retention stays correct after the checkpoint: the sealed segment's
     // data-WAL entries are swept by the position rule (the sweep ran
     // inside the recovery pass, using data_wal_pos from the snapshot).

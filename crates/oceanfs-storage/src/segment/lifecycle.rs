@@ -1150,6 +1150,14 @@ pub struct SegmentLifecycleCoordinator {
     /// Latch: exactly one checkpoint task in flight (a burst past the
     /// threshold produces exactly one checkpoint — DoD).
     checkpoint_latch: Arc<std::sync::atomic::AtomicBool>,
+    /// The event-log position of the last FOLDED event. The checkpoint
+    /// must cover this, never the WAL's raw tail: `request_*` appends
+    /// its event before folding it, so `latest_pos()` can point past an
+    /// unfolded event — a checkpoint covering it would seed a snapshot
+    /// lacking the segment, and the restart fold would hit its Seal on
+    /// a missing entry and abort (the SUT's 30-min run). Updated after
+    /// every successful fold; packed EventWalPos.
+    last_folded_pos: AtomicU64,
     /// Pools the pending-seal drain freezes/enqueues through (empty
     /// until [`with_seal_pools`](Self::with_seal_pools) is called).
     /// The pools are the deterministic seal trigger's executors — no
@@ -1216,6 +1224,7 @@ impl SegmentLifecycleCoordinator {
             checkpoint: None,
             checkpoint_config: None,
             checkpoint_latch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_folded_pos: AtomicU64::new(0),
             seal_pools: Vec::new(),
             pending_seals: parking_lot::Mutex::new(Vec::new()),
             entries_gauge,
@@ -1278,9 +1287,15 @@ impl SegmentLifecycleCoordinator {
         let checkpoint = Arc::clone(checkpoint);
         let event_wal = Arc::clone(event_wal);
         let registry = Arc::clone(&self.registry);
+        let self_last_folded =
+            Arc::new(self.last_folded_pos.load(std::sync::atomic::Ordering::Acquire));
         let latch = Arc::clone(&self.checkpoint_latch);
         tokio::spawn(async move {
-            let up_to = event_wal.latest_pos();
+            // Cover only events whose folds have landed: the raw WAL
+            // tail can point past an appended-but-unfolded event, and a
+            // checkpoint covering it would seed a snapshot missing the
+            // segment (its restart fold then aborts on the Seal).
+            let up_to = EventWalPos::from_packed(*self_last_folded);
             match checkpoint.write_checkpoint(&registry, up_to) {
                 Ok(info) => {
                     if let Err(e) = checkpoint.truncate_before(info.covered_pos).await {
@@ -1446,7 +1461,12 @@ impl SegmentLifecycleCoordinator {
             // A `Seal` on a segment that was NEVER deleted stays an
             // abort — a seal without a reserve IS corruption.
             let tolerated = match &fold_result {
-                Err(TransitionError::Missing) | Err(TransitionError::AlreadyDeleted) => {
+                // The snapshot-ahead re-fold: a covered event whose
+                // fold landed after the snapshot was encoded — the
+                // entry already holds the outcome (Seal on Sealed,
+                // Delete on Deleted) — idempotent, never corruption.
+                Err(TransitionError::AlreadySealed) | Err(TransitionError::AlreadyDeleted) => true,
+                Err(TransitionError::Missing) => {
                     deleted.contains(&segment_id) || matches!(evt, SegmentEvent::Delete(_))
                 }
                 _ => false,
@@ -1801,11 +1821,12 @@ impl SegmentLifecycleCoordinator {
             ));
         };
         let evt = SegmentEvent::Reserve(ReserveEvent { segment_id: id, tier, ec_k, ec_m });
-        event_wal
+        let pos = event_wal
             .append(evt)
             .await
             .map_err(|e| TransitionError::DurableWriteFailed(e.to_string()))?;
         self.registry.fold_reserve(id, meta)?;
+        self.last_folded_pos.store(pos.packed(), std::sync::atomic::Ordering::Release);
         self.maybe_checkpoint().await;
         self.update_gauges();
         Ok(())
@@ -1896,11 +1917,12 @@ impl SegmentLifecycleCoordinator {
             data_wal_pos,
             repacked_from,
         });
-        event_wal
+        let pos = event_wal
             .append(evt)
             .await
             .map_err(|e| TransitionError::DurableWriteFailed(e.to_string()))?;
         self.registry.fold_seal(id, metadata, repacked_from)?;
+        self.last_folded_pos.store(pos.packed(), std::sync::atomic::Ordering::Release);
         self.maybe_checkpoint().await;
         self.update_gauges();
         Ok(())
@@ -1940,11 +1962,12 @@ impl SegmentLifecycleCoordinator {
             ));
         };
         let evt = SegmentEvent::Delete(DeleteEvent { segment_id: id });
-        event_wal
+        let pos = event_wal
             .append(evt)
             .await
             .map_err(|e| TransitionError::DurableWriteFailed(e.to_string()))?;
         self.registry.fold_delete(id)?;
+        self.last_folded_pos.store(pos.packed(), std::sync::atomic::Ordering::Release);
         self.maybe_checkpoint().await;
         self.update_gauges();
         Ok(())
@@ -1988,11 +2011,12 @@ impl SegmentLifecycleCoordinator {
         }
         let evt =
             SegmentEvent::MetadataRefresh(MetadataRefreshEvent { segment_id: id, merkle_root });
-        event_wal
+        let pos = event_wal
             .append(evt)
             .await
             .map_err(|e| TransitionError::DurableWriteFailed(e.to_string()))?;
         self.registry.fold_refresh(id, merkle_root)?;
+        self.last_folded_pos.store(pos.packed(), std::sync::atomic::Ordering::Release);
         self.maybe_checkpoint().await;
         self.update_gauges();
         Ok(())
@@ -2069,7 +2093,7 @@ impl SegmentLifecycleCoordinator {
                 repacked_from: None,
             });
             match event_wal.append(evt).await {
-                Ok(_) => {
+                Ok(pos) => {
                     if let Err(e) = self.registry.fold_seal(id, meta, None) {
                         // A fold can lose a race only to a concurrent
                         // delete of the same segment (unreachable: the
@@ -2082,6 +2106,9 @@ impl SegmentLifecycleCoordinator {
                             error = ?e,
                             "seal fold lost a transition race; event durable, registry entry unchanged"
                         );
+                    } else {
+                        self.last_folded_pos
+                            .store(pos.packed(), std::sync::atomic::Ordering::Release);
                     }
                 }
                 Err(e) => out[i] = Err(TransitionError::DurableWriteFailed(e.to_string())),
