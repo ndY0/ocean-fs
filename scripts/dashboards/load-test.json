@@ -2996,6 +2996,65 @@
         "x": 16,
         "y": 128
       },
+      "id": 99,
+      "title": "Startup Rebuild Duration",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "oceanfs_startup_rebuild_ms{job=\"oceanfs\"}",
+          "legendFormat": "rebuild_ms",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "drawStyle": "line",
+            "stacking": {
+              "mode": "none"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": ""
+          },
+          "unit": "short",
+          "min": null,
+          "max": null
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 128
+      },
       "id": 51,
       "title": "Active Segments",
       "type": "timeseries",
