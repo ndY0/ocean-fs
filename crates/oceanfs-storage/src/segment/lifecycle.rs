@@ -1389,14 +1389,6 @@ impl SegmentLifecycleCoordinator {
         // set is bounded by live segments).
         let mut folded: std::collections::HashSet<SegmentId> =
             std::collections::HashSet::with_capacity(64);
-        // Segments whose `DeleteEvent` was folded: a later `Seal` for
-        // them is residue of a race (e.g., the compactor's seal append
-        // failed after partial durability and its cleanup deleted the
-        // Reserved replacement — the seal record then lands after the
-        // delete), never corruption. The delete wins.
-        let mut deleted: std::collections::HashSet<SegmentId> =
-            std::collections::HashSet::with_capacity(16);
-
         for item in events {
             let (pos, evt) = match item {
                 Ok(item) => item,
@@ -1438,10 +1430,7 @@ impl SegmentLifecycleCoordinator {
                     };
                     self.registry.seal_with(evt.segment_id, meta, evt.repacked_from)
                 }
-                SegmentEvent::Delete(evt) => {
-                    deleted.insert(evt.segment_id);
-                    self.registry.delete(evt.segment_id)
-                }
+                SegmentEvent::Delete(evt) => self.registry.delete(evt.segment_id),
                 SegmentEvent::MetadataRefresh(evt) => {
                     self.registry.fold_refresh(evt.segment_id, evt.merkle_root)
                 }
@@ -1450,33 +1439,40 @@ impl SegmentLifecycleCoordinator {
             // corruption:
             // - a duplicate `DeleteEvent` (two concurrent deletes both
             //   validated and appended; the first fold evicted);
-            // - a `Seal` or `MetadataRefresh` for a segment whose
-            //   `DeleteEvent` was already folded (the compactor's seal
-            //   append can fail after partial durability, its cleanup
-            //   deletes the Reserved replacement, and the seal record
-            //   lands after the delete — the delete wins; the SUT's
-            //   Reserve→Delete→Seal sequence bricked restart with
-            //   EventFoldError before this tolerance);
-            // - `MetadataRefresh` racing a delete.
-            // A `Seal` on a segment that was NEVER deleted stays an
-            // abort — a seal without a reserve IS corruption.
+            // - `Seal`/`MetadataRefresh` for an absent segment: the
+            //   delete won a race (the compactor's seal append can fail
+            //   after partial durability, its cleanup deletes the
+            //   Reserved replacement, and the seal record lands after),
+            //   or a legacy checkpoint covered the segment's Reserve
+            //   without snapshotting it (the pre-last_folded_pos
+            //   trigger). The segment is gone either way — the seal
+            //   cannot resurrect it; ignoring it is recovery, not
+            //   corruption. The WARN level keeps the event visible.
+            // - AlreadySealed/AlreadyDeleted: the snapshot-ahead
+            //   re-fold of a covered event whose fold landed after the
+            //   snapshot encode — idempotent.
             let tolerated = match &fold_result {
-                // The snapshot-ahead re-fold: a covered event whose
-                // fold landed after the snapshot was encoded — the
-                // entry already holds the outcome (Seal on Sealed,
-                // Delete on Deleted) — idempotent, never corruption.
                 Err(TransitionError::AlreadySealed) | Err(TransitionError::AlreadyDeleted) => true,
-                Err(TransitionError::Missing) => {
-                    deleted.contains(&segment_id) || matches!(evt, SegmentEvent::Delete(_))
-                }
+                Err(TransitionError::Missing) => true,
                 _ => false,
             };
             if tolerated {
-                tracing::debug!(
-                    segment_id = %segment_id,
-                    pos = ?pos,
-                    "fold no-op: event for an already-removed segment"
-                );
+                if matches!(fold_result, Err(TransitionError::Missing))
+                    && !matches!(evt, SegmentEvent::Delete(_))
+                {
+                    tracing::warn!(
+                        segment_id = %segment_id,
+                        pos = ?pos,
+                        "fold no-op: Seal/Refresh for an absent segment (race residue or legacy \
+                         checkpoint coverage); the segment stays absent"
+                    );
+                } else {
+                    tracing::debug!(
+                        segment_id = %segment_id,
+                        pos = ?pos,
+                        "fold no-op: event for an already-removed segment"
+                    );
+                }
                 continue;
             }
             fold_result.map_err(|e| Error::EventFoldError {
