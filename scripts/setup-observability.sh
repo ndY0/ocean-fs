@@ -21,6 +21,10 @@
 #                         pass all node endpoints, e.g.
 #                         10.0.0.2:9000,10.0.0.3:9000,10.0.0.4:9000 —
 #                         instances are labeled oceanfs-node-0..N-1.
+#   --node-exporter-only  Install ONLY the node exporter (no Prometheus).
+#                         Used on fleet nodes 1..N-1 (ADR-0026): node 0's
+#                         Prometheus scrapes every node's :9100 so Grafana
+#                         can follow each VM's system stats individually.
 #   -h, --help            Show this help
 #
 # Components:
@@ -58,6 +62,7 @@ SCRAPE_INTERVAL=15
 PROMETHEUS_VERSION="2.52.0"
 PROMETHEUS_PORT=9090
 NODE_EXPORTER_PORT=9100
+NODE_EXPORTER_ONLY=false
 # Set by create_prometheus_config when it (re)writes prometheus.yml; consumed
 # by create_systemd_unit to decide whether a running service must restart.
 CONFIG_WRITTEN=false
@@ -262,6 +267,39 @@ PROMETHEUS_CONFIG
             if [ -n "$target" ]; then
                 cat >> "$config_file" <<PROMETHEUS_CONFIG
       - targets: ['${target}']
+        labels:
+          instance: 'oceanfs-node-${node_idx}'
+          role: 'sut'
+PROMETHEUS_CONFIG
+                node_idx=$((node_idx + 1))
+            fi
+        done
+    fi
+
+    cat >> "$config_file" <<'PROMETHEUS_CONFIG'
+
+  # ── Fleet node exporters (per-VM system stats, ADR-0026) ────────────────
+PROMETHEUS_CONFIG
+    if [ -z "${SCRAPE_TARGETS:-}" ]; then
+        cat >> "$config_file" <<'PROMETHEUS_CONFIG'
+  # Single-SUT mode: system stats come from the local node exporter under
+  # the load_test job below (instance 'harness').
+
+PROMETHEUS_CONFIG
+    else
+        node_idx=0
+        IFS=',' read -ra TARGET_LIST <<< "$SCRAPE_TARGETS"
+        cat >> "$config_file" <<PROMETHEUS_CONFIG
+  - job_name: 'node'
+    scrape_interval: 15s
+    static_configs:
+PROMETHEUS_CONFIG
+        for target in "${TARGET_LIST[@]}"; do
+            target="$(echo "$target" | tr -d '[:space:]')"
+            if [ -n "$target" ]; then
+                node_host="${target%%:*}"
+                cat >> "$config_file" <<PROMETHEUS_CONFIG
+      - targets: ['${node_host}:9100']
         labels:
           instance: 'oceanfs-node-${node_idx}'
           role: 'sut'
@@ -637,6 +675,10 @@ parse_args() {
                 SCRAPE_TARGETS="${2:-}"
                 shift 2
                 ;;
+            --node-exporter-only)
+                NODE_EXPORTER_ONLY=true
+                shift
+                ;;
             -h|--help)
                 usage
                 exit 0
@@ -657,6 +699,22 @@ main() {
     if [ "$(id -u)" -ne 0 ]; then
         log_error "This script must be run as root (sudo)."
         exit 1
+    fi
+
+    # Fleet member mode (ADR-0026): nodes 1..N-1 run ONLY the node exporter
+    # so node 0's Prometheus can scrape their system stats per VM. No
+    # Prometheus, no config on these nodes.
+    if [ "$NODE_EXPORTER_ONLY" = true ]; then
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+        echo "  OceanFS — Node Exporter only (fleet member, ADR-0026)"
+        echo "  Node Exporter: port ${NODE_EXPORTER_PORT}"
+        echo "═══════════════════════════════════════════════════════════════"
+        install_node_exporter
+        setup_textfile_dir
+        create_node_exporter_unit
+        log_ok "Node Exporter ready on this fleet node (scraped by node 0's Prometheus)."
+        exit 0
     fi
 
     echo ""

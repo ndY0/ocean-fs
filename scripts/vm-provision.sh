@@ -618,7 +618,11 @@ install_observability() {
     # job (ADR-0026 fleet mode — node 0 scrapes every node). Unset/empty
     # keeps the historical single-SUT localhost:9000 scrape.
     local scrape_targets="${2:-}"
-    log_info "Installing observability stack on ${public_ip}..."
+    # Optional third arg: mode. "node-exporter-only" installs just the node
+    # exporter on fleet members 1..N-1 (their :9100 feeds node 0's
+    # Prometheus per-VM system stats).
+    local mode="${3:-full}"
+    log_info "Installing observability stack on ${public_ip} (mode=${mode})..."
     if [ "$DRY_RUN" = true ]; then
         log_info "[DRY-RUN] scp ${SCRIPT_DIR}/setup-observability.sh -> root@${public_ip}:/root/ && run it"
         return 0
@@ -628,7 +632,10 @@ install_observability() {
         || { log_error "Failed to copy setup-observability.sh to ${public_ip}"; return 1; }
     local obs_args=()
     if [ -n "$scrape_targets" ]; then
-        obs_args=(--scrape-targets "$scrape_targets")
+        obs_args+=(--scrape-targets "$scrape_targets")
+    fi
+    if [ "$mode" = "node-exporter-only" ]; then
+        obs_args+=(--node-exporter-only)
     fi
     if ! ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${public_ip}" \
         "bash /root/setup-observability.sh ${obs_args[*]+"${obs_args[*]}"}"; then
@@ -641,10 +648,13 @@ install_observability() {
 # Configure SUT VM (minimal — no Rust toolchain)
 # Optional second arg: comma-separated OceanFS scrape targets for node 0's
 # Prometheus (fleet mode, ADR-0026).
+# Optional third arg: observability mode — "full" (Prometheus + node
+# exporter, default) or "node-exporter-only" (fleet members 1..N-1).
 configure_sut_vm() {
     local name="$1"
     local public_ip="$2"
     local scrape_targets="${3:-}"
+    local obs_mode="${4:-full}"
 
     log_info "Configuring SUT VM '${name}' (${public_ip})..."
 
@@ -663,7 +673,7 @@ apt-get update -qq
 apt-get install -y -qq curl
 SUT_SETUP
     if [ "$OBSERVABILITY" = true ]; then
-        install_observability "$public_ip" "$scrape_targets" || log_warn "Observability install failed (non-fatal)."
+        install_observability "$public_ip" "$scrape_targets" "$obs_mode" || log_warn "Observability install failed (non-fatal)."
     else
         log_warn "Observability DISABLED (--no-observability) — Prometheus will not be installed."
     fi
@@ -1056,23 +1066,27 @@ provision_vms() {
             done
 
             # 2. Configure each node. Node 0's Prometheus scrapes the whole
-            #    fleet (localhost + peers over the internal network).
+            #    fleet (localhost + peers over the internal network) for
+            #    both oceanfs (:9000) and node-exporter (:9100) metrics;
+            #    nodes 1..N-1 get node-exporter only (ADR-0026).
             local scrape_targets=""
             for ((i = 0; i < CLUSTER_NODES; i++)); do
                 scrape_targets=""
+                local obs_mode="node-exporter-only"
                 if [ "$OBSERVABILITY" = true ] && [ "$i" -eq 0 ]; then
+                    obs_mode="full"
                     scrape_targets="localhost:9000"
                     for ((j = 1; j < CLUSTER_NODES; j++)); do
                         scrape_targets="${scrape_targets},${SUT_NODE_IPS[$j]}:9000"
                     done
                 fi
                 if [ "$DRY_RUN" = false ]; then
-                    configure_sut_vm "${SUT_NODE_NAMES[$i]}" "${SUT_NODE_PUBLIC_IPS[$i]}" "$scrape_targets" \
+                    configure_sut_vm "${SUT_NODE_NAMES[$i]}" "${SUT_NODE_PUBLIC_IPS[$i]}" "$scrape_targets" "$obs_mode" \
                         || die "SUT node ${i} configuration failed."
                     setup_ttl_timer "${SUT_NODE_NAMES[$i]}" "${SUT_NODE_PUBLIC_IPS[$i]}" \
                         || log_warn "TTL timer setup failed on ${SUT_NODE_NAMES[$i]}. Manual TTL enforcement may be needed."
                 else
-                    log_info "[DRY-RUN] Configure ${SUT_NODE_NAMES[$i]}${scrape_targets:+ (scrape: $scrape_targets)} + TTL"
+                    log_info "[DRY-RUN] Configure ${SUT_NODE_NAMES[$i]} (obs=${obs_mode}${scrape_targets:+ scrape=$scrape_targets}) + TTL"
                 fi
             done
 
