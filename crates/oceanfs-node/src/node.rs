@@ -578,9 +578,8 @@ impl Node {
         // seal time (single scheduler — the parallel encode runs on the
         // blocking pool). Matches the heal codec configuration.
         let pool_ec_config = oceanfs_core::CodecConfig::default();
-        // The pools consume `pool_ec_config` below (the legacy CF-driven
-        // recovery helper re-registers interrupted seal commits with the
-        // same codec the pools used).
+        // The pools consume `pool_ec_config` below (the machine's
+        // seal-on-zero freeze uses the same codec).
         // Seal-time EC parity routes through the accel dispatcher so the
         // encode is observable (accel_encode_ops_total, duration
         // histograms, fallbacks) — the accel tier is exercised on the

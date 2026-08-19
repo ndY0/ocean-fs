@@ -828,8 +828,8 @@ impl SegmentLifecycleRegistry {
     }
 
     /// Hints every shard's map at the expected live-entry count
-    /// (perf 1.3 — the recovery fold pre-sizes from the CF mirror /
-    /// checkpoint estimate, avoiding reallocation cascades).
+    /// (perf 1.3 — the recovery fold pre-sizes from the checkpoint
+    /// estimate, avoiding reallocation cascades).
     pub(crate) fn reserve_hint(&self, entries: usize) {
         let per_shard = entries / self.shards.len() + 1;
         for shard in self.shards.iter() {
@@ -1349,7 +1349,7 @@ impl SegmentLifecycleCoordinator {
     /// timestamp, so the folded `sealed_at` is the deterministic
     /// sentinel `Some(0)`).
     ///
-    /// The registry is pre-sized from the CF mirror estimate
+    /// The registry is pre-sized from the checkpoint estimate
     /// (perf 1.3); the lock bodies contain only map ops (perf 7.1).
     ///
     /// A torn tail ([`Error::TornEventRecord`]) ends the fold at the
@@ -1784,7 +1784,7 @@ impl SegmentLifecycleCoordinator {
     /// full repacked metadata: `merkle_root` is a seal input (the
     /// BadDigest defect is impossible) and `data_wal_pos` is the LAST
     /// data entry's position (ADR-0024 Decision 2) — is appended first,
-    /// then the fold, then the CF mirror write.
+    /// then the fold.
     ///
     /// `repacked_from` is the compaction marker (ADR-0025 Decision 4):
     /// `Some(old_id)` for a GC-repacked replacement segment, `None`
