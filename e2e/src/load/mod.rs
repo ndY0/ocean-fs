@@ -29,5 +29,6 @@ pub use generator::{
 pub use manifest::{Manifest, ManifestSummary, Mismatch};
 pub use metrics::{parse_prometheus_text, MetricsSnapshot};
 pub use report::{
-    assert_that, AssertionResult, FailureDetail, HarnessSelfMetrics, LoadReport, ReportResult,
+    assert_that, AssertionResult, ClusterViewSnapshot, FailureDetail, HarnessSelfMetrics,
+    LoadReport, ReportResult,
 };

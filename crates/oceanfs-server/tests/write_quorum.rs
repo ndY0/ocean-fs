@@ -129,6 +129,7 @@ async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
     };
 
     let (hinted_handoff, hint_config) = (hinted_handoff.0, hinted_handoff.1);
+    let _ = hint_config;
     WriteCoordinator::new(
         ring_cache,
         membership,
@@ -144,7 +145,6 @@ async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
         sealer,
         lifecycle,
         hinted_handoff,
-        hint_config,
     )
 }
 

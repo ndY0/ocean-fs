@@ -977,6 +977,7 @@ impl Node {
             wal_dir: hints_dir.clone(),
             inline_threshold_bytes: config.hint_inline_threshold_bytes,
             max_batch_size: config.hint_max_batch_size,
+            max_batch_bytes: 32 * 1024 * 1024,
         };
         let hinted_handoff_manager = Arc::new(
             HintedHandoffManager::new(hints_dir.clone(), hint_delivery_client, hint_config.clone())
@@ -1003,6 +1004,42 @@ impl Node {
         // Clone for the seal notifier closure (the engine itself is
         // consumed by the background-task spawn later).
         let ae_worker_notifier = Arc::clone(&ae_worker);
+        // Cluster-readiness gate (phase-3 churn fix): a node that just
+        // (re)joined a cluster has a ring containing only itself until
+        // its membership pull converges; with the adaptive quorum such a
+        // window ACKs writes with a single durable copy (silent
+        // under-replication). While the gate is closed the write path
+        // returns 503 instead. Single-node deployments (no seeds, no
+        // fallback seeds) never close the gate.
+        let ready_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_cluster_node = !config.gossip.seed_nodes.is_empty()
+            || membership_state_store
+                .load()
+                .map(|state| !state.fallback_seeds.is_empty())
+                .unwrap_or(false);
+        if is_cluster_node {
+            let gate_membership = membership.clone();
+            let gate = ready_gate.clone();
+            tokio::spawn(async move {
+                // Open the gate when the ring reaches 2 nodes (enough
+                // for w=2 semantics) or after a 30s bound — the rejoin
+                // pull takes seconds; the bound keeps a node whose seeds
+                // are unreachable from stalling writes forever (it
+                // would serve stale data anyway — the 503s it emits
+                // while gated are the safer failure mode).
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    let ring_nodes = gate_membership.ring().snapshot().node_count();
+                    if ring_nodes >= 2 || tokio::time::Instant::now() >= deadline {
+                        gate.store(true, std::sync::atomic::Ordering::Release);
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            });
+        } else {
+            ready_gate.store(true, std::sync::atomic::Ordering::Release);
+        }
         let write_coordinator = Arc::new(
             WriteCoordinator::new(
                 ring_cache.clone(),
@@ -1019,13 +1056,16 @@ impl Node {
                 sealer.clone(),
                 lifecycle.clone(),
                 hinted_handoff_manager.clone(),
-                hint_config,
             )
             .with_timeouts(op_timeouts.clone())
             // Per-bucket compression: buckets opting in via
             // `compression.tier != None` compress chunks on the write
             // path through the accel dispatcher (blocking pool).
             .with_compressor(Some(accel.clone()))
+            // Cluster-readiness gate: while the ring is still converging
+            // after (re)join, writes fail with 503 instead of
+            // under-replicating (see the gate task above).
+            .with_ready_gate(ready_gate)
             // Continuous anti-entropy: every successful seal updates the
             // incremental Merkle tree (with its seal-time root) so
             // recently-written segments participate in the root exchange
@@ -1206,7 +1246,12 @@ impl Node {
         reaper.register_metrics(&*metrics);
         scrub_worker.register_metrics(&*metrics);
         ae_worker.register_metrics(&*metrics);
-        hinted_handoff.register_metrics(&*metrics);
+        // The manager is the component that actually stores and delivers
+        // hints; its counters are the authoritative
+        // hinted_handoff_hints_{stored,delivered,expired}_total series.
+        // (The legacy HintedHandoff — the gRPC *receiver* — is not
+        // registered: its counters had inverted semantics and stayed 0.)
+        hinted_handoff_manager.register_metrics(&*metrics);
         pool.register_metrics(&*metrics);
         // Segment shard gauges (`segment_active_count` — Phase 2
         // asserts the segment pipeline is producing segments).
@@ -1385,11 +1430,19 @@ impl Node {
             heal_data_store.clone(),
         );
 
-        // Build tonic Server with all services registered.
+        // Build tonic Server with all services registered. The default
+        // gRPC message limit (4 MiB) rejects hinted-handoff batches:
+        // hints carry the blob data inline (the phase-3 churn fix), and
+        // batches can reach tens of MiB. The healing service (hint
+        // receiver) gets a 64 MiB decode limit — the client-side
+        // max_batch_bytes cap (32 MiB) keeps batches comfortably inside.
         let grpc_router = tonic::transport::Server::builder()
             .add_service(oceanfs_storage::SegmentRpcServer::new(segment_service))
             .add_service(oceanfs_network::GossipRpcServer::new(gossip_service))
-            .add_service(oceanfs_durability::HealingRpcServer::new(healing_service))
+            .add_service(
+                oceanfs_durability::HealingRpcServer::new(healing_service)
+                    .max_decoding_message_size(64 * 1024 * 1024),
+            )
             .add_service(oceanfs_cache::CacheRpcServer::new(cache_service))
             .add_service(oceanfs_durability::ScrubRpcServer::new(scrub_service));
 
@@ -1486,12 +1539,60 @@ impl Node {
         let self_node_id = NodeId::new(&config.node_id);
         let mut events = membership.subscribe();
         let delivery_token = background.delivery_cancel.clone();
+        let mut sweep_interval = tokio::time::interval(std::time::Duration::from_secs(
+            config.hint_delivery_sweep_sec.max(1),
+        ));
         let delivery_handle = tokio::spawn(async move {
+            // Bounded retry helper shared by the event path and the sweep
+            // path. The returning node's gRPC listener may still be
+            // binding when the Alive event lands; a failed batch is
+            // re-enqueued, so retries are safe (duplicates are
+            // overwritten on the receiving side).
+            async fn drain_hints(hh: &HintedHandoffManager, node_id: NodeId) {
+                for attempt in 1..=5 {
+                    match hh.deliver_pending(node_id.clone()).await {
+                        Ok(delivered) => {
+                            info!(
+                                node = %node_id,
+                                delivered,
+                                attempt,
+                                "hinted handoff delivery"
+                            );
+                            if delivered > 0 {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                node = %node_id,
+                                attempt,
+                                error = %e,
+                                "hinted handoff delivery failed"
+                            );
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+
             loop {
                 tokio::select! {
                     _ = delivery_token.cancelled() => {
                         info!("Hinted handoff delivery watcher cancelled");
                         break;
+                    }
+                    _ = sweep_interval.tick() => {
+                        // Periodic delivery sweep. Event-driven delivery
+                        // is missed when THIS node is down during the
+                        // recipient's Alive event, or when the event
+                        // lands before the recipient's gRPC listener is
+                        // ready. The sweep re-resolves addresses at sweep
+                        // time, so pending hints drain as soon as the
+                        // recipient is actually reachable — delivery is
+                        // eventually-convergent under churn.
+                        for node_id in hh.nodes_with_pending() {
+                            drain_hints(&hh, node_id).await;
+                        }
                     }
                     event = events.recv() => {
                         match event {
@@ -1501,37 +1602,9 @@ impl Node {
                                     "node returned to cluster; delivering pending hinted handoffs"
                                 );
                                 // Only spend retries when hints are actually
-                                // buffered: the returning node's gRPC listener
-                                // may still be binding when the Alive event
-                                // lands. A failed batch is re-enqueued, so
-                                // bounded retries are safe (duplicates are
-                                // overwritten on the receiving side).
+                                // buffered.
                                 if hh.pending_count(&ev.node_id) > 0 {
-                                    for attempt in 1..=5 {
-                                        match hh.deliver_pending(ev.node_id.clone()).await {
-                                            Ok(delivered) => {
-                                                info!(
-                                                    node = %ev.node_id,
-                                                    delivered,
-                                                    attempt,
-                                                    "hinted handoff delivery"
-                                                );
-                                                if delivered > 0 {
-                                                    break;
-                                                }
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    node = %ev.node_id,
-                                                    attempt,
-                                                    error = %e,
-                                                    "hinted handoff delivery failed on rejoin"
-                                                );
-                                            }
-                                        }
-                                        tokio::time::sleep(std::time::Duration::from_millis(500))
-                                            .await;
-                                    }
+                                    drain_hints(&hh, ev.node_id.clone()).await;
                                 }
                                 // Record the member address as a fallback
                                 // seed (ADR-0022 D3). Self is skipped: the

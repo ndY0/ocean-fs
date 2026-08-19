@@ -1158,6 +1158,38 @@ ae_interval_sec = 10
     .to_string()
 }
 
+/// Configuration for the Phase 3 cluster-churn test (local-spawn mode).
+///
+/// Mirrors the fleet profile that `sut-deploy.sh --cluster` writes on
+/// the SUT VMs (ADR-0026): 3-node quorum semantics (write_quorum=2,
+/// read_quorum=2, replication_factor=3), fast gossip (500ms), fast SWIM
+/// (3s suspicion / 8s failure — the two-VM profile of the Phase 3
+/// feature doc), shortened AE/GC/scrub intervals, and zero L1 cache TTL
+/// (so cross-node cache invalidation is observable within the run).
+pub fn config_cluster_churn() -> String {
+    r#"
+node_id = "e2e-churn-0"
+listen_addr = "127.0.0.1:{http_port}"
+grpc_listen_addr = "127.0.0.1:{grpc_port}"
+log_level = "error"
+prefetch_enabled = false
+write_quorum = 2
+read_quorum = 2
+replication_factor = 3
+object_cache_ttl_ms = 0
+gc_interval_sec = 10
+tombstone_ttl_sec = 5
+ae_interval_sec = 10
+scrub_interval_sec = 60
+
+[gossip]
+interval_ms = 500
+suspicion_timeout_ms = 3000
+failure_timeout_ms = 8000
+"#
+    .to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Helper functions for tests
 // ---------------------------------------------------------------------------
@@ -1443,6 +1475,18 @@ impl Cluster {
         nodes[i].as_ref().expect("node killed").http_addr()
     }
 
+    /// Checked variant of [`node_http_addr`](Self::node_http_addr): an
+    /// error instead of a panic when node `i` is currently killed (churn
+    /// tests address nodes that the scheduler has SIGKILLed mid-run —
+    /// workers must observe a transport error, not abort the test).
+    fn checked_http_addr(&self, i: usize) -> Result<SocketAddr, Error> {
+        let nodes = self.nodes.read();
+        match nodes.get(i) {
+            Some(Some(node)) => Ok(node.http_addr()),
+            _ => Err(Error::ClusterError(format!("node {i} is killed or out of bounds"))),
+        }
+    }
+
     /// Returns the number of nodes in the cluster (including killed ones).
     pub fn len(&self) -> usize {
         self.nodes.read().len()
@@ -1455,51 +1499,57 @@ impl Cluster {
 
     /// HTTP GET from node `i`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `i` is out of bounds or the node is killed.
+    /// Returns an error if `i` is out of bounds or the node is currently
+    /// killed (churn tests) — the request fails like a transport error
+    /// instead of panicking.
     pub async fn get(&self, i: usize, path: &str) -> Result<reqwest::Response, Error> {
-        let url = format!("http://{}{}", self.node_http_addr(i), path);
+        let url = format!("http://{}{}", self.checked_http_addr(i)?, path);
         Ok(self.client.get(&url).send().await?)
     }
 
     /// HTTP PUT to node `i`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `i` is out of bounds or the node is killed.
+    /// Returns an error if `i` is out of bounds or the node is currently
+    /// killed (churn tests).
     pub async fn put(&self, i: usize, path: &str, body: &[u8]) -> Result<reqwest::Response, Error> {
-        let url = format!("http://{}{}", self.node_http_addr(i), path);
+        let url = format!("http://{}{}", self.checked_http_addr(i)?, path);
         Ok(self.client.put(&url).body(body.to_vec()).send().await?)
     }
 
     /// HTTP DELETE from node `i`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `i` is out of bounds or the node is killed.
+    /// Returns an error if `i` is out of bounds or the node is currently
+    /// killed (churn tests).
     pub async fn delete(&self, i: usize, path: &str) -> Result<reqwest::Response, Error> {
-        let url = format!("http://{}{}", self.node_http_addr(i), path);
+        let url = format!("http://{}{}", self.checked_http_addr(i)?, path);
         Ok(self.client.delete(&url).send().await?)
     }
 
     /// HTTP HEAD from node `i`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `i` is out of bounds or the node is killed.
+    /// Returns an error if `i` is out of bounds or the node is currently
+    /// killed (churn tests).
     pub async fn head(&self, i: usize, path: &str) -> Result<reqwest::Response, Error> {
-        let url = format!("http://{}{}", self.node_http_addr(i), path);
+        let url = format!("http://{}{}", self.checked_http_addr(i)?, path);
         Ok(self.client.head(&url).send().await?)
     }
 
     /// HTTP POST to node `i`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `i` is out of bounds or the node is killed.
+    /// Returns an error if `i` is out of bounds or the node is currently
+    /// killed (churn tests).
     pub async fn post(&self, i: usize, path: &str) -> Result<reqwest::Response, Error> {
-        let url = format!("http://{}{}", self.node_http_addr(i), path);
+        let url = format!("http://{}{}", self.checked_http_addr(i)?, path);
         Ok(self.client.post(&url).send().await?)
     }
 

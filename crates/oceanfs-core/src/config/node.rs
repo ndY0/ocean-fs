@@ -376,6 +376,17 @@ pub struct NodeConfig {
     /// (default 3600 = 1 hour).
     #[serde(default = "default_hint_prune_interval")]
     pub hint_prune_interval_sec: u64,
+
+    /// Interval in seconds between hinted handoff delivery sweeps
+    /// (default 5).
+    ///
+    /// Event-driven delivery (Alive event → drain) can be missed when
+    /// this node is down during the recipient's Alive event, or when the
+    /// event lands before the recipient's gRPC listener is ready. The
+    /// sweep retries pending hints periodically, resolving addresses at
+    /// sweep time — delivery becomes eventually-convergent under churn.
+    #[serde(default = "default_hint_delivery_sweep_sec")]
+    pub hint_delivery_sweep_sec: u64,
 }
 
 fn default_node_id() -> String {
@@ -552,6 +563,9 @@ fn default_hint_ttl_sec() -> u64 {
 fn default_hint_prune_interval() -> u64 {
     3600
 }
+fn default_hint_delivery_sweep_sec() -> u64 {
+    5
+}
 
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -633,6 +647,7 @@ impl Default for NodeConfig {
             hint_max_batch_size: 256,
             hint_ttl_sec: 604800,
             hint_prune_interval_sec: 3600,
+            hint_delivery_sweep_sec: 5,
         }
     }
 }

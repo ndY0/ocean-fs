@@ -1273,7 +1273,7 @@ impl SegmentLifecycleCoordinator {
     /// captured at spawn time — appends landing during the checkpoint
     /// are folded on top at startup (exactly-once by position coverage).
     async fn maybe_checkpoint(&self) {
-        let (Some(checkpoint), Some(event_wal), Some(config)) =
+        let (Some(checkpoint), Some(_event_wal), Some(config)) =
             (&self.checkpoint, &self.event_wal, &self.checkpoint_config)
         else {
             return;
@@ -1285,7 +1285,6 @@ impl SegmentLifecycleCoordinator {
             return; // a checkpoint is already in flight
         }
         let checkpoint = Arc::clone(checkpoint);
-        let event_wal = Arc::clone(event_wal);
         let registry = Arc::clone(&self.registry);
         let self_last_folded =
             Arc::new(self.last_folded_pos.load(std::sync::atomic::Ordering::Acquire));
@@ -1451,11 +1450,12 @@ impl SegmentLifecycleCoordinator {
             // - AlreadySealed/AlreadyDeleted: the snapshot-ahead
             //   re-fold of a covered event whose fold landed after the
             //   snapshot encode — idempotent.
-            let tolerated = match &fold_result {
-                Err(TransitionError::AlreadySealed) | Err(TransitionError::AlreadyDeleted) => true,
-                Err(TransitionError::Missing) => true,
-                _ => false,
-            };
+            let tolerated = matches!(
+                &fold_result,
+                Err(TransitionError::AlreadySealed)
+                    | Err(TransitionError::AlreadyDeleted)
+                    | Err(TransitionError::Missing)
+            );
             if tolerated {
                 if matches!(fold_result, Err(TransitionError::Missing))
                     && !matches!(evt, SegmentEvent::Delete(_))

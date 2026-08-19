@@ -563,7 +563,7 @@ mod tests {
             ));
         let sealer = Arc::new(SegmentSealer::new(seal_config, wal, Arc::clone(&lifecycle)));
 
-        let (hinted_handoff, hint_config) = {
+        let hinted_handoff = {
             let hints_dir = dir.path().join("hints");
             let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
                 Arc::new(oceanfs_durability::GrpcHintDeliveryClient::new(pool.clone()));
@@ -571,14 +571,11 @@ mod tests {
                 wal_dir: hints_dir.clone(),
                 ..Default::default()
             };
-            (
-                Arc::new(oceanfs_durability::HintedHandoffManager::new(
-                    hints_dir,
-                    delivery_client,
-                    hint_config.clone(),
-                )),
+            Arc::new(oceanfs_durability::HintedHandoffManager::new(
+                hints_dir,
+                delivery_client,
                 hint_config,
-            )
+            ))
         };
 
         let write = Arc::new(WriteCoordinator::new(
@@ -596,7 +593,6 @@ mod tests {
             sealer,
             lifecycle,
             hinted_handoff,
-            hint_config,
         ));
 
         // Create in-memory segment store shared by write and read paths.

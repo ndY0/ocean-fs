@@ -199,6 +199,13 @@ scrub_interval_sec = 60
 # restart). A 10s interval reclaims them continuously.
 orphan_reaper_interval_sec = 10
 object_cache_ttl_ms = 0
+# ── Cluster semantics (phase 3+, ADR-0026) ──────────────────────────────────
+# 3-node quorum: every write must reach 2 nodes, reads must consult 2.
+# Matches the local-spawn profile (config_cluster_churn in the e2e
+# harness) so remote runs exercise the same durability semantics.
+write_quorum = 2
+read_quorum = 2
+replication_factor = 3
 [gossip]
 interval_ms = 1000
 suspicion_timeout_ms = 3000

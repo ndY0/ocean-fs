@@ -72,6 +72,14 @@ pub struct MetricsSnapshot {
     pub metrics: HashMap<String, f64>,
 }
 
+impl Default for MetricsSnapshot {
+    /// An empty snapshot — used as a missing-scrape placeholder so
+    /// counter-delta computations degrade to zero instead of panicking.
+    fn default() -> Self {
+        Self { timestamp: Instant::now(), metrics: HashMap::new() }
+    }
+}
+
 impl MetricsSnapshot {
     /// Scrapes `GET /admin/metrics` from the given load target node and
     /// parses the Prometheus text-format response.

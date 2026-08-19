@@ -176,19 +176,11 @@ async fn write_coordinator_handoff_on_replica_failure() {
             wal_dir: hints_dir.clone(),
             ..Default::default()
         };
-        (
-            Arc::new(
-                oceanfs_durability::HintedHandoffManager::new(
-                    hints_dir,
-                    delivery_client,
-                    hint_config.clone(),
-                )
+        Arc::new(
+            oceanfs_durability::HintedHandoffManager::new(hints_dir, delivery_client, hint_config)
                 .with_membership(membership.clone()),
-            ),
-            hint_config,
         )
     };
-    let (hinted_handoff, hint_config) = (hinted_handoff.0, hinted_handoff.1);
     let hlc_clock = Arc::new(HlcClock::new());
 
     // Segment pipeline.
@@ -273,7 +265,6 @@ async fn write_coordinator_handoff_on_replica_failure() {
         sealer,
         lifecycle,
         hinted_handoff.clone(),
-        hint_config,
     );
 
     // Write with quorum=1: local ack is sufficient, but we still

@@ -28,7 +28,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use oceanfs_core::{NodeId, OperationTimeouts};
+use oceanfs_core::{Counter, LabelSet, MetricRegistrar, NodeId, OperationTimeouts};
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use tracing::{debug, info, warn};
@@ -36,7 +36,7 @@ use tracing::{debug, info, warn};
 use crate::{
     error::{Error, Result},
     healing_rpc::healing_rpc_client::HealingRpcClient,
-    hinted_handoff_rpc::{HintRecord, HintedHandoffRequest, HintedHandoffResponse},
+    hinted_handoff_rpc::{self, HintRecord, HintedHandoffRequest, HintedHandoffResponse},
     HintWal,
 };
 
@@ -56,6 +56,15 @@ pub struct HintedHandoffConfig {
     /// Maximum hints per batched gRPC delivery call.
     /// Default: 256.
     pub max_batch_size: usize,
+    /// Maximum total payload bytes per batched gRPC delivery call.
+    /// Default: 32 MiB.
+    ///
+    /// Hints carry the blob data inline (the phase-3 churn fix), so a
+    /// batch's byte size is the sum of its blobs. This cap keeps a batch
+    /// well under the server's gRPC message limit (64 MiB) — without it,
+    /// 256 hints of multi-MiB blobs would build a multi-GiB RPC and be
+    /// rejected (or OOM the decoder).
+    pub max_batch_bytes: usize,
 }
 
 impl Default for HintedHandoffConfig {
@@ -64,6 +73,7 @@ impl Default for HintedHandoffConfig {
             wal_dir: std::path::PathBuf::from("/var/lib/oceanfs/hints"),
             inline_threshold_bytes: 4096,
             max_batch_size: 256,
+            max_batch_bytes: 32 * 1024 * 1024,
         }
     }
 }
@@ -190,6 +200,12 @@ pub struct HintedHandoffManager {
     timeouts: Arc<OperationTimeouts>,
     /// Membership for address resolution.
     membership: Option<Arc<Membership>>,
+    /// Hints enqueued for delivery (sender-side semantics).
+    hints_stored_total: Counter,
+    /// Hints successfully delivered to their target node.
+    hints_delivered_total: Counter,
+    /// Hints pruned from the WAL after TTL expiry.
+    hints_expired_total: Counter,
 }
 
 impl HintedHandoffManager {
@@ -213,7 +229,34 @@ impl HintedHandoffManager {
             config,
             timeouts: Arc::new(OperationTimeouts::default()),
             membership: None,
+            hints_stored_total: Counter::new(
+                "hinted_handoff_hints_stored_total".into(),
+                "Hints stored for unreachable nodes".into(),
+                LabelSet::empty(),
+            ),
+            hints_delivered_total: Counter::new(
+                "hinted_handoff_hints_delivered_total".into(),
+                "Hints delivered to returning nodes".into(),
+                LabelSet::empty(),
+            ),
+            hints_expired_total: Counter::new(
+                "hinted_handoff_hints_expired_total".into(),
+                "Hints expired before delivery".into(),
+                LabelSet::empty(),
+            ),
         }
+    }
+
+    /// Registers the sender-side handoff counters with the metrics
+    /// registry.
+    ///
+    /// The manager is the component that actually stores and delivers
+    /// hints; its counters are the authoritative
+    /// `hinted_handoff_hints_{stored,delivered,expired}_total` series.
+    pub fn register_metrics(&self, registrar: &dyn MetricRegistrar) {
+        registrar.register_counter(self.hints_stored_total.clone());
+        registrar.register_counter(self.hints_delivered_total.clone());
+        registrar.register_counter(self.hints_expired_total.clone());
     }
 
     /// Sets the membership reference for address resolution.
@@ -322,6 +365,7 @@ impl HintedHandoffManager {
         // Then add to in-memory queue.
         let mut queue = self.queues.entry(target.clone()).or_default();
         queue.push_back((position, end_position, record));
+        self.hints_stored_total.add(1);
 
         debug!(
             target = %target,
@@ -350,12 +394,34 @@ impl HintedHandoffManager {
     ///
     /// Returns an error if delivery fails.
     pub async fn drain_and_deliver(&self, target: NodeId) -> Result<usize> {
-        // Drain the queue for this target.
+        // Drain the queue for this target, bounded by BOTH the hint count
+        // and the total payload bytes (hints carry blob data inline; the
+        // byte cap keeps the RPC under the gRPC message-size limit).
         let drained: Vec<(u64, u64, HintRecord)> = {
             let mut queue = self.queues.entry(target.clone()).or_default();
-            let batch_size = queue.len().min(self.config.max_batch_size);
-            let items: Vec<_> = queue.drain(..batch_size).collect();
-            items
+            let mut batch_size = 0usize;
+            let mut batch_bytes: usize = 0;
+            for item in queue.iter() {
+                if batch_size >= self.config.max_batch_size {
+                    break;
+                }
+                // Payload estimate for the proto record: the inline blob
+                // (or the fixed-size segment ref), plus proto overhead
+                // slack.
+                let payload = match &item.2.record {
+                    Some(hinted_handoff_rpc::hint_record::Record::Inline(inline)) => {
+                        inline.data.len() + 128
+                    }
+                    Some(hinted_handoff_rpc::hint_record::Record::SegmentRef(_)) => 256,
+                    None => 128,
+                };
+                if batch_bytes + payload > self.config.max_batch_bytes {
+                    break;
+                }
+                batch_size += 1;
+                batch_bytes += payload;
+            }
+            queue.drain(..batch_size).collect()
         };
 
         if drained.is_empty() {
@@ -370,17 +436,30 @@ impl HintedHandoffManager {
         );
 
         // Resolve the target's address.
+        //
+        // NOTE: on resolution failure the drained batch MUST be
+        // re-enqueued. A bare `?` here would return before the failure
+        // path below and silently DROP every hint in the batch — the
+        // churn regression where "node address not found in membership"
+        // (the target's entry briefly disappears while it restarts)
+        // destroyed batches of up to `max_batch_size` hints with
+        // `hints_delivered_total` stuck at 0.
         let addr = match &self.membership {
-            Some(membership) => {
-                membership.address_of(&target).ok_or_else(|| Error::ForwardFailed {
-                    target: target.to_string(),
-                    reason: "node address not found in membership".into(),
-                })?
-            }
+            Some(membership) => match membership.address_of(&target) {
+                Some(addr) => addr,
+                None => {
+                    self.reenqueue_front(&target, drained);
+                    return Err(Error::ForwardFailed {
+                        target: target.to_string(),
+                        reason: "node address not found in membership".into(),
+                    });
+                }
+            },
             None => {
-                // No membership configured — use a dummy address for testing.
-                // Real delivery via gRPC requires membership for address resolution;
-                // mock clients used in tests accept any address.
+                // No membership configured — use a dummy address for
+                // testing. Real delivery via gRPC requires membership
+                // for address resolution; mock clients used in tests
+                // accept any address.
                 "127.0.0.1:0"
                     .parse::<SocketAddr>()
                     .map_err(|e| Error::Internal(format!("failed to parse dummy address: {e}")))?
@@ -418,6 +497,7 @@ impl HintedHandoffManager {
                 self.last_access.remove(&target);
 
                 let delivered = drained.len();
+                self.hints_delivered_total.add(delivered as u64);
                 info!(
                     target = %target,
                     delivered,
@@ -444,6 +524,24 @@ impl HintedHandoffManager {
     /// Returns the number of pending hints for a given node.
     pub fn pending_count(&self, target: &NodeId) -> usize {
         self.queues.get(target).map(|q| q.len()).unwrap_or(0)
+    }
+
+    /// Returns the node ids with at least one pending hint, sorted for a
+    /// deterministic sweep order.
+    ///
+    /// Used by the periodic delivery sweep: event-driven delivery can be
+    /// missed (holder down during the recipient's Alive event, or the
+    /// event landing before the recipient's gRPC listener is ready), so
+    /// the sweep iterates whatever is pending and retries delivery.
+    pub fn nodes_with_pending(&self) -> Vec<NodeId> {
+        let mut nodes: Vec<NodeId> = self
+            .queues
+            .iter()
+            .filter(|entry| !entry.value().is_empty())
+            .map(|entry| entry.key().clone())
+            .collect();
+        nodes.sort();
+        nodes
     }
 
     /// Returns the total number of pending hints across all nodes.
@@ -537,6 +635,10 @@ impl HintedHandoffManager {
                     }
                 }
             }
+        }
+
+        if total_pruned > 0 {
+            self.hints_expired_total.add(total_pruned as u64);
         }
 
         Ok(total_pruned)
@@ -1077,5 +1179,97 @@ mod tests {
         // nothing should be pruned.
         let pruned = manager.prune_all_expired(86_400 * 365).await.unwrap();
         assert_eq!(pruned, 0, "no entries should be pruned with fresh data and long TTL");
+    }
+
+    // ── Failure retention (the churn-cycle regression) ────────────────
+
+    #[tokio::test]
+    async fn test_failed_delivery_retains_all_hints_across_retries() {
+        let dir = tempdir().unwrap();
+        let wal_dir = dir.path().to_path_buf();
+        let mock = Arc::new(MockDeliveryClient::new());
+        let manager =
+            HintedHandoffManager::new(wal_dir.clone(), mock.clone(), make_test_config(wal_dir));
+
+        let target = NodeId::new("node-b");
+        for i in 0..500 {
+            manager
+                .enqueue(HintRecord::new_inline(
+                    target.clone(),
+                    BucketId::new("b"),
+                    format!("key-{i}").into(),
+                    vec![1].into(),
+                    oceanfs_core::Hlc::zero(),
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(manager.pending_count(&target), 500);
+
+        // Every delivery attempt fails (transport error), like the
+        // churn-cycle case where the target is down or its address is
+        // still missing from membership. The queue must survive intact —
+        // a dropped hint is silent data loss.
+        for attempt in 0..12 {
+            mock.add_response(Err(Error::ForwardFailed {
+                target: target.to_string(),
+                reason: "simulated transport failure".into(),
+            }));
+            let res = manager.deliver_pending(target.clone()).await;
+            assert!(res.is_err(), "attempt {attempt}: delivery must fail");
+            assert_eq!(
+                manager.pending_count(&target),
+                500,
+                "attempt {attempt}: all hints retained after failed delivery"
+            );
+        }
+
+        // Once the target is reachable, the batches drain (delivery is
+        // capped at max_batch_size per call).
+        let mut total_delivered = 0usize;
+        while manager.pending_count(&target) > 0 {
+            total_delivered += manager.deliver_pending(target.clone()).await.unwrap();
+        }
+        assert_eq!(total_delivered, 500, "all hints delivered after the outage");
+        assert_eq!(manager.pending_count(&target), 0);
+    }
+
+    // ── nodes_with_pending ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_nodes_with_pending_lists_only_nonempty_queues_sorted() {
+        let dir = tempdir().unwrap();
+        let wal_dir = dir.path().to_path_buf();
+        let mock = Arc::new(MockDeliveryClient::new());
+
+        let manager = HintedHandoffManager::new(wal_dir.clone(), mock, make_test_config(wal_dir));
+
+        assert!(manager.nodes_with_pending().is_empty(), "fresh manager has no pending");
+
+        // Hints for two nodes; a third stays empty.
+        for node in ["node-b", "node-a"] {
+            manager
+                .enqueue(HintRecord::new_inline(
+                    NodeId::new(node),
+                    BucketId::new("b"),
+                    "key".into(),
+                    vec![1].into(),
+                    oceanfs_core::Hlc::zero(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let nodes = manager.nodes_with_pending();
+        assert_eq!(
+            nodes,
+            vec![NodeId::new("node-a"), NodeId::new("node-b")],
+            "sorted, only nodes with pending hints"
+        );
+
+        // Deliver node-a's batch (mock accepts) — it drops out of the set.
+        manager.deliver_pending(NodeId::new("node-a")).await.unwrap();
+        let nodes = manager.nodes_with_pending();
+        assert_eq!(nodes, vec![NodeId::new("node-b")], "delivered node drops out");
     }
 }

@@ -105,7 +105,10 @@ impl ChurnScheduler {
     /// Runs the churn scheduler for the given duration.
     ///
     /// Returns a list of [`ChurnEvent`] records for each kill and restart
-    /// operation attempted.
+    /// operation attempted. The scheduler **drains pending restarts**
+    /// before returning: a node killed in the final tick is restarted in
+    /// a drain phase so the caller's post-run convergence and manifest
+    /// verification observe the full cluster.
     pub async fn run(mut self, duration: Duration) -> Vec<ChurnEvent> {
         let mut events = Vec::new();
         let start = Instant::now();
@@ -179,6 +182,25 @@ impl ChurnScheduler {
             }
 
             tokio::time::sleep(self.churn_interval).await;
+        }
+
+        // ── Drain phase ───────────────────────────────────────────
+        // The loop exits when the duration elapses; a node killed in the
+        // final tick is still down (its restart_delay may not have
+        // elapsed). Restart every remaining dead node so the caller's
+        // post-churn convergence/verification sees the full cluster.
+        for node_i in self.dead_nodes.iter().copied().collect::<Vec<_>>() {
+            let success = self.cluster.restart(node_i).await.is_ok();
+            if success {
+                self.dead_nodes.remove(&node_i);
+                self.killed_at[node_i] = None;
+            }
+            events.push(ChurnEvent {
+                timestamp: start.elapsed().as_secs_f64(),
+                action: ChurnAction::Restart,
+                node_index: node_i,
+                success,
+            });
         }
 
         events

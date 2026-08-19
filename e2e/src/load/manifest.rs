@@ -178,28 +178,47 @@ pub struct Mismatch {
 /// Returns `None` on success (the response hash matched one of the
 /// recorded versions), or `Some(Mismatch)` on failure.
 ///
-/// Retries with exponential backoff on transient errors. Reports the key
-/// as `"unreachable"` if all retries are exhausted.
+/// Retries with exponential backoff on transient errors (404 / 5xx /
+/// transport), reporting the key as `"unreachable"` if all retries are
+/// exhausted. Picks a random node per attempt.
 async fn verify_one<C: LoadTarget>(
     target: &C,
     composite_key: &str,
     expected: &HashSet<[u8; 32]>,
 ) -> Option<Mismatch> {
+    if target.is_empty() {
+        return Some(Mismatch {
+            key: composite_key.to_string(),
+            expected_hash: format!("one of {} recorded versions", expected.len()),
+            actual_hash: "unreachable".to_string(),
+            node: "(no nodes)".to_string(),
+        });
+    }
+
+    let node_idx = rand::random::<usize>() % target.len();
+    verify_one_from_node(target, node_idx, composite_key, expected).await
+}
+
+/// Verifies one key against ONE specific node.
+///
+/// Returns `None` when the node served a recorded version (success), or
+/// `Some(Mismatch)` when it served wrong content, a hard error status,
+/// or the request failed after the retry backoff.
+///
+/// The retry backoff is the same as [`verify_one`]'s (404/5xx/transport
+/// errors are retried up to 4 times with 100-800ms backoff), so a node
+/// that is still settling after a restart does not produce false
+/// mismatches.
+async fn verify_one_from_node<C: LoadTarget>(
+    target: &C,
+    node_idx: usize,
+    composite_key: &str,
+    expected: &HashSet<[u8; 32]>,
+) -> Option<Mismatch> {
     let backoffs = [100u64, 200, 400, 800];
+    let node_addr = target.node_addr(node_idx).to_string();
 
     for &backoff_ms in &backoffs {
-        if target.is_empty() {
-            return Some(Mismatch {
-                key: composite_key.to_string(),
-                expected_hash: format!("one of {} recorded versions", expected.len()),
-                actual_hash: "unreachable".to_string(),
-                node: "(no nodes)".to_string(),
-            });
-        }
-
-        let node_idx = rand::random::<usize>() % target.len();
-        let node_addr = target.node_addr(node_idx).to_string();
-
         match target.get(node_idx, &format!("/{composite_key}")).await {
             Ok(resp) if resp.status().is_success() => {
                 let body = resp.bytes().await.unwrap_or_default();
@@ -217,9 +236,6 @@ async fn verify_one<C: LoadTarget>(
             Ok(resp) => {
                 // Non-success status (e.g., 404, 500) — may be transient.
                 if resp.status().as_u16() == 404 || (500..600).contains(&resp.status().as_u16()) {
-                    // Key not found (404) or transient server error (5xx
-                    // — e.g. the node is still settling after a restart)
-                    // — retry with backoff.
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     continue;
                 }
@@ -239,13 +255,11 @@ async fn verify_one<C: LoadTarget>(
     }
 
     // All retries exhausted.
-    let node =
-        if target.is_empty() { "(no nodes)".to_string() } else { target.node_addr(0).to_string() };
     Some(Mismatch {
         key: composite_key.to_string(),
         expected_hash: format!("one of {} recorded versions", expected.len()),
         actual_hash: "unreachable".to_string(),
-        node,
+        node: node_addr,
     })
 }
 
@@ -282,6 +296,54 @@ impl Manifest {
             mismatches: mismatches.len(),
             mismatch_details: mismatches,
         }
+    }
+
+    /// Verifies the read quorum: every active key must be served with a
+    /// recorded version from at least `read_quorum` of the given nodes.
+    ///
+    /// Returns the composite keys that failed the quorum (served with
+    /// correct content by fewer than `read_quorum` nodes). A key is
+    /// "served correctly" by a node when the GET returns 2xx and the
+    /// body hash matches one of the recorded versions (same retry logic
+    /// as [`verify`](Self::verify)).
+    ///
+    /// `sample_max` optionally caps the number of keys checked (checked
+    /// in insertion order) — large runs may hold thousands of keys and
+    /// per-key per-node GETs at scale are slow; the phase-3 assertion
+    /// samples the manifest.
+    pub async fn verify_read_quorum<C: LoadTarget>(
+        &self,
+        target: &C,
+        node_indices: &[usize],
+        read_quorum: usize,
+        sample_max: Option<usize>,
+    ) -> Vec<String> {
+        let mut failed = Vec::new();
+        let mut checked = 0usize;
+
+        for entry in self.entries.iter() {
+            if sample_max.is_some_and(|max| checked >= max) {
+                break;
+            }
+            let key = entry.key().clone();
+            let (versions, deleted) = entry.value();
+            if deleted.load(Ordering::Relaxed) {
+                continue;
+            }
+            checked += 1;
+
+            let mut correct_nodes = 0usize;
+            for &node_idx in node_indices {
+                if verify_one_from_node(target, node_idx, &key, versions).await.is_none() {
+                    correct_nodes += 1;
+                }
+            }
+            if correct_nodes < read_quorum {
+                failed.push(key);
+            }
+        }
+
+        failed
     }
 }
 

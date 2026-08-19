@@ -41,7 +41,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::{generator::AggregateStats, manifest::ManifestSummary};
+use super::{churn::ChurnEvent, generator::AggregateStats, manifest::ManifestSummary};
 use crate::load::MetricsSnapshot;
 
 // ---------------------------------------------------------------------------
@@ -73,6 +73,13 @@ pub struct LoadReport {
     /// Periodic metric snapshots taken during the test.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub metric_snapshots: Vec<MetricsSnapshot>,
+    /// Churn events (kill/restart) recorded during a Phase 3 churn run.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub churn_events: Vec<ChurnEvent>,
+    /// Periodic per-node cluster membership + ring views (Phase 3),
+    /// one snapshot per node per poll round.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub cluster_views: Vec<ClusterViewSnapshot>,
     /// Named assertions checked during or after the test.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub assertions: Vec<AssertionResult>,
@@ -99,6 +106,29 @@ pub struct HarnessSelfMetrics {
     pub process_open_fds: u64,
 }
 
+/// A periodic per-node view of cluster membership + ring ownership during
+/// a Phase 3 churn run.
+///
+/// Recorded once per node per poll round so the post-run analysis can
+/// reconstruct convergence, ring consistency, and incarnation
+/// monotonicity from actual observations instead of log prose.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterViewSnapshot {
+    /// Seconds since the run start.
+    pub t_secs: f64,
+    /// Index of the node that produced this view.
+    pub node_index: usize,
+    /// Total members reported by this node (`/admin/cluster` nodes count).
+    pub members: usize,
+    /// Members in the Alive state per this node's view.
+    pub alive: usize,
+    /// (node_id, state, incarnation) per member as reported by this node.
+    pub members_detail: Vec<(String, String, u64)>,
+    /// Successor node IDs per ring probe (empty when `/admin/ring` is
+    /// unavailable — e.g. a node without a ring cache yet).
+    pub probe_successors: Vec<Vec<String>>,
+}
+
 impl LoadReport {
     /// Creates a new report for a given test phase and name.
     ///
@@ -114,6 +144,8 @@ impl LoadReport {
             worker_stats: None,
             manifest: None,
             metric_snapshots: Vec::new(),
+            churn_events: Vec::new(),
+            cluster_views: Vec::new(),
             assertions: Vec::new(),
             failures: Vec::new(),
             harness_metrics: None,

@@ -21,7 +21,7 @@ use oceanfs_core::{
     BucketId, ChunkRef, HashKey, HashOutput, Hlc, HlcClock, NodeId, ObjectKey, ObjectMetadata,
     OperationTimeouts, SegmentId, SegmentIndexEntry, SegmentSizeConfig, SizeTier, WriteResult,
 };
-use oceanfs_durability::{HintedHandoffConfig, HintedHandoffManager};
+use oceanfs_durability::HintedHandoffManager;
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::RingCache;
@@ -151,6 +151,12 @@ pub struct WriteCoordinator {
     size_config: SegmentSizeConfig,
     /// Hinted handoff buffer for writes to temporarily unreachable replicas.
     hinted_handoff: Arc<HintedHandoffManager>,
+    /// Cluster-readiness gate: closed while this node's ring is still
+    /// converging after (re)join; the write path refuses to
+    /// under-replicate while closed. Defaults to OPEN (`true`) so tests
+    /// and single-node deployments are unaffected; the composition root
+    /// installs a real gate via [`set_ready_gate`](Self::set_ready_gate).
+    ready: Arc<std::sync::atomic::AtomicBool>,
     /// Compression backend (accel dispatcher), injected by the
     /// composition root. `None` (default) disables per-bucket
     /// compression.
@@ -161,8 +167,6 @@ pub struct WriteCoordinator {
     /// spawn_blocking threads (perf §2.7).
     #[cfg(feature = "accel")]
     compress_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Hinted handoff configuration (inline threshold, etc.).
-    hint_config: HintedHandoffConfig,
     /// Accumulated blob index entries per segment, keyed by segment ID.
     /// Entries are drained when the segment is sealed.
     segment_entries: DashMap<SegmentId, Vec<SegmentIndexEntry>>,
@@ -276,7 +280,6 @@ impl WriteCoordinator {
         sealer: Arc<SegmentSealer>,
         lifecycle: Arc<SegmentLifecycleCoordinator>,
         hinted_handoff: Arc<HintedHandoffManager>,
-        hint_config: HintedHandoffConfig,
     ) -> Self {
         // Wrap the storage-api metadata store in the async adapter: the
         // Inline-tier write path's blocking RocksDB put runs on the
@@ -301,7 +304,7 @@ impl WriteCoordinator {
             lifecycle,
             size_config,
             hinted_handoff,
-            hint_config,
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             #[cfg(feature = "accel")]
             compressor: None,
             #[cfg(feature = "accel")]
@@ -348,6 +351,19 @@ impl WriteCoordinator {
         self
     }
 
+    /// Installs the cluster-readiness gate (composition root).
+    ///
+    /// The gate is closed while this node's ring is still converging
+    /// after (re)join; the write path refuses to under-replicate while
+    /// closed (phase-3 churn fix). Single-node deployments keep the
+    /// default open gate.
+    #[must_use]
+    #[doc(hidden)]
+    pub fn with_ready_gate(mut self, ready: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.ready = ready;
+        self
+    }
+
     /// Executes a distributed write through the segment pipeline.
     ///
     /// # Algorithm
@@ -371,6 +387,23 @@ impl WriteCoordinator {
         let replica_set = self.ring.lookup(req.hash_key.as_bytes());
         if replica_set.is_empty() {
             return Err(Error::Routing("ring returned empty replica set".into()));
+        }
+
+        // Step 1b: Cluster-readiness gate. A node that just (re)joined a
+        // cluster has a ring that still contains only itself until its
+        // membership pull converges; with the adaptive quorum
+        // (min(write_quorum, ring size)) such a window would ACK writes
+        // with a single durable copy — silent under-replication (found
+        // by the phase-3 churn test). While the gate is closed, writes
+        // fail with QuorumNotMet (503) instead of under-replicating.
+        // Single-node deployments (no seeds, no fallback seeds) never
+        // close the gate; the node-side gate flips open after
+        // convergence or a 5s bound.
+        if !self.ready.load(std::sync::atomic::Ordering::Relaxed) && replica_set.len() < 2 {
+            return Err(Error::QuorumNotMet {
+                required: req.write_quorum.min(2),
+                received: replica_set.len(),
+            });
         }
 
         let is_local = replica_set.contains(&self.node_id);
@@ -707,46 +740,24 @@ impl WriteCoordinator {
                     Err(e) => {
                         warn!(target = %target, error = %e, "replica write failed");
                         // Store hinted handoff for the unreachable replica.
-                        // For small blobs (≤inline_threshold_bytes): embed data inline.
-                        // For larger blobs: reference the segment/offset/length —
-                        //   data is already durable in the Segment WAL.
-                        let hint =
-                            if req.data.len() as u64 <= self.hint_config.inline_threshold_bytes {
-                                oceanfs_durability::hinted_handoff_rpc::HintRecord::new_inline(
-                                    target.clone(),
-                                    req.bucket.clone(),
-                                    req.key.to_string(),
-                                    req.data.clone(),
-                                    hlc,
-                                )
-                            } else if let Some(chunk) = chunks.first() {
-                                // Use the first chunk's segment reference.
-                                // For Small/Standard tier there is exactly one chunk.
-                                // For Multi tier, the first chunk covers the blob start.
-                                oceanfs_durability::hinted_handoff_rpc::HintRecord::new_segment_ref(
-                                    target.clone(),
-                                    req.bucket.clone(),
-                                    req.key.to_string(),
-                                    chunk.segment_id,
-                                    chunk.offset,
-                                    chunk.length,
-                                    hlc,
-                                )
-                            } else {
-                                // Safety guard: if chunks is empty (inline tier),
-                                // fall back to inline storage since no segment was used.
-                                warn!(
-                                    "no chunks available for segment-ref hint; \
-                                 falling back to inline for target {target}"
-                                );
-                                oceanfs_durability::hinted_handoff_rpc::HintRecord::new_inline(
-                                    target.clone(),
-                                    req.bucket.clone(),
-                                    req.key.to_string(),
-                                    req.data.clone(),
-                                    hlc,
-                                )
-                            };
+                        //
+                        // The hint ALWAYS carries the blob data inline.
+                        // Segment-ref hints (segment_id/offset/length,
+                        // no data) cannot be applied by the receiver:
+                        // applying requires fetching the shard from the
+                        // origin, which the hint protocol does not
+                        // support — a ref-only hint was buffered forever
+                        // and the write silently lost (found by the
+                        // phase-3 churn test). Inline data makes the
+                        // hint self-contained; the hint WAL absorbs the
+                        // transient growth and is truncated on delivery.
+                        let hint = oceanfs_durability::hinted_handoff_rpc::HintRecord::new_inline(
+                            target.clone(),
+                            req.bucket.clone(),
+                            req.key.to_string(),
+                            req.data.clone(),
+                            hlc,
+                        );
                         let _ = self.hinted_handoff.enqueue(hint).await;
                     }
                 }
@@ -1369,6 +1380,7 @@ mod tests {
         GossipConfig, Incarnation, NodeId, NodeState, PoolConfig, RingConfig, RpcConfig, SizeTier,
         Tombstone, WalConfig,
     };
+    use oceanfs_durability::HintedHandoffConfig;
     use oceanfs_routing::{hash_key, Ring};
     use oceanfs_storage::{BufferPool, RocksDbMetadataStore, SealConfig, WalWriter};
     use parking_lot::Mutex;
@@ -1507,7 +1519,7 @@ mod tests {
         );
         let sealer = Arc::new(SegmentSealer::new(seal_config, wal, Arc::clone(&lifecycle)));
 
-        use oceanfs_durability::{HintedHandoffConfig, HintedHandoffManager};
+        use oceanfs_durability::HintedHandoffManager;
 
         let hints_dir = dir.path().join("hints");
         let hint_config =
@@ -1531,7 +1543,6 @@ mod tests {
                 sealer,
                 lifecycle,
                 hinted_handoff,
-                hint_config,
             ),
             dir,
         )
@@ -2678,7 +2689,6 @@ mod tests {
                 sealer,
                 lifecycle.clone(),
                 hinted_handoff,
-                hint_config,
             )
             .with_segment_sealed_notifier(Arc::new(move |segment_id, merkle_root| {
                 sealed_events_notifier.lock().push((segment_id, merkle_root));
@@ -3451,7 +3461,7 @@ mod tests {
         let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
             Arc::new(GrpcHintDeliveryClient::new(pool.clone()));
         let hinted_handoff =
-            Arc::new(HintedHandoffManager::new(hints_dir, delivery_client, hint_config.clone()));
+            Arc::new(HintedHandoffManager::new(hints_dir, delivery_client, hint_config));
 
         let coord = Arc::new(WriteCoordinator::new(
             ring_cache.clone(),
@@ -3468,7 +3478,6 @@ mod tests {
             sealer,
             lifecycle,
             hinted_handoff,
-            hint_config,
         ));
         let _seal_handle = coord.start_seal_worker();
 

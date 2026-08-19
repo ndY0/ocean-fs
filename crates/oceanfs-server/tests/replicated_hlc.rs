@@ -217,7 +217,7 @@ async fn make_coordinator(
     let hinted_handoff = Arc::new(oceanfs_durability::HintedHandoffManager::new(
         hints_dir,
         delivery_client,
-        hint_config.clone(),
+        hint_config,
     ));
 
     let coord = WriteCoordinator::new(
@@ -235,7 +235,6 @@ async fn make_coordinator(
         sealer,
         lifecycle,
         hinted_handoff,
-        hint_config,
     );
     Coord { coord, membership }
 }
