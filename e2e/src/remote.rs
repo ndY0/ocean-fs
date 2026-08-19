@@ -20,8 +20,8 @@
 //!
 //! | Variable | Purpose |
 //! |---|---|
-//! | `TARGET_HOST` | Comma-separated `host:port` list of remote OceanFS endpoints (Phase 2: exactly one). |
-//! | `TARGET_HOST_SSH` | SSH target for crash control, e.g. `root@10.0.0.5` or a `~/.ssh/config` alias like `oceanfs-sut`. When unset, remote crash-recovery is skipped (local quick mode always covers it). |
+//! | `TARGET_HOST` | Comma-separated `host:port` list of remote OceanFS endpoints (Phase 2: exactly one; Phase 3: the fleet, one per node). |
+//! | `TARGET_HOST_SSH` | Comma-separated SSH targets for crash control, one per node, e.g. `root@10.0.0.2,root@10.0.0.3` or `~/.ssh/config` aliases. A single target (Phase 2) or a `~/.ssh/config` alias like `oceanfs-sut` also works. When unset, remote crash-recovery is skipped (local quick mode always covers it). |
 //! | `TARGET_SERVICE` | systemd unit name managing the SUT OceanFS process (default `oceanfs`). The unit must **not** auto-restart (`Restart=no`), otherwise the SIGKILL→restart sequencing is meaningless. |
 
 use std::{net::SocketAddr, time::Duration};
@@ -193,15 +193,16 @@ impl RemoteCluster {
         }
     }
 
-    /// Waits until `/admin/health` stops returning 2xx (the node is down)
-    /// or the timeout elapses. Returns `true` if the node went down.
-    async fn wait_health_down(&self, timeout: Duration) -> bool {
+    /// Waits until `/admin/health` on node `node_idx` stops returning 2xx
+    /// (the node is down) or the timeout elapses. Returns `true` if the
+    /// node went down.
+    async fn wait_node_health_down(&self, node_idx: usize, timeout: Duration) -> bool {
         let start = std::time::Instant::now();
         loop {
             if start.elapsed() > timeout {
                 return false;
             }
-            match self.nodes[0].get("/admin/health").await {
+            match self.nodes[node_idx].get("/admin/health").await {
                 Ok(resp) if resp.status().is_success() => {}
                 _ => return true,
             }
@@ -209,13 +210,14 @@ impl RemoteCluster {
         }
     }
 
-    /// SIGKILLs and restarts node 0's OceanFS service over SSH.
+    /// SIGKILLs and restarts node `node_idx`'s OceanFS service over SSH.
     ///
-    /// Used by the Phase 2 crash-recovery phase in remote-target mode:
-    /// `ssh <ssh_target> systemctl kill -s KILL <service>`, wait for the
-    /// node to go down, then `systemctl restart <service>` and wait for
-    /// health. The data directory persists on the SUT VM, so WAL replay
-    /// exercises the same recovery path as local SIGKILL.
+    /// Used by the Phase 3 churn scheduler in remote-target mode: the
+    /// node's VM is reached at `ssh_target` (the i-th `TARGET_HOST_SSH`
+    /// entry), `systemctl kill -s KILL <service>`, wait for THAT node to
+    /// go down, then `systemctl restart <service>` and wait for its health
+    /// to return. The data directory persists on the node's VM, so WAL
+    /// replay exercises the same recovery path as local SIGKILL.
     ///
     /// The systemd unit must be configured with `Restart=no`, otherwise
     /// the service may come back before the harness observes it down.
@@ -224,8 +226,9 @@ impl RemoteCluster {
     ///
     /// Returns [`Error::Ssh`] if any SSH command fails, the node never
     /// goes down, or it never comes back healthy.
-    pub async fn kill_and_restart_via_ssh(
+    pub async fn kill_and_restart_node_via_ssh(
         &self,
+        node_idx: usize,
         ssh_target: &str,
         service: &str,
     ) -> Result<(), Error> {
@@ -251,12 +254,12 @@ impl RemoteCluster {
         .await?;
 
         // 2. Wait for the node to go down.
-        if !self.wait_health_down(Duration::from_secs(30)).await {
+        if !self.wait_node_health_down(node_idx, Duration::from_secs(30)).await {
             return Err(Error::Ssh(format!(
-                "node {service} did not go down within 30s of SIGKILL (is the unit Restart=no?)"
+                "node {node_idx} ({service}) did not go down within 30s of SIGKILL (is the unit Restart=no?)"
             )));
         }
-        eprintln!("remote: node down after SIGKILL, restarting {service} via ssh");
+        eprintln!("remote: node {node_idx} down after SIGKILL, restarting {service} via ssh");
 
         // 3. Give systemd a moment to settle the unit state and the OS
         //    to release the listen socket.
@@ -275,8 +278,43 @@ impl RemoteCluster {
         ])
         .await?;
 
-        // 5. Wait for health.
-        self.wait_for_health(Duration::from_secs(60)).await
+        // 5. Wait for THIS node's health.
+        let start = std::time::Instant::now();
+        loop {
+            if start.elapsed() > Duration::from_secs(60) {
+                return Err(Error::HealthTimeout(Duration::from_secs(60)));
+            }
+            match self.nodes[node_idx].get("/admin/health").await {
+                Ok(resp) if resp.status().is_success() => {
+                    let _ = resp.bytes().await;
+                    return Ok(());
+                }
+                _ => tokio::time::sleep(Duration::from_millis(200)).await,
+            }
+        }
+    }
+
+    /// SIGKILLs and restarts node 0's OceanFS service over SSH.
+    ///
+    /// Used by the Phase 2 crash-recovery phase in remote-target mode:
+    /// `ssh <ssh_target> systemctl kill -s KILL <service>`, wait for the
+    /// node to go down, then `systemctl restart <service>` and wait for
+    /// health. The data directory persists on the SUT VM, so WAL replay
+    /// exercises the same recovery path as local SIGKILL.
+    ///
+    /// The systemd unit must be configured with `Restart=no`, otherwise
+    /// the service may come back before the harness observes it down.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Ssh`] if any SSH command fails, the node never
+    /// goes down, or it never comes back healthy.
+    pub async fn kill_and_restart_via_ssh(
+        &self,
+        ssh_target: &str,
+        service: &str,
+    ) -> Result<(), Error> {
+        self.kill_and_restart_node_via_ssh(0, ssh_target, service).await
     }
 }
 

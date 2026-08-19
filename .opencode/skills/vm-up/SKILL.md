@@ -1,22 +1,27 @@
 ---
 name: vm-up
-description: "Provision the OceanFS load-test VMs (SUT + Harness) on Hetzner Cloud for the two-VM test topology (ADR-0019). Use when the user asks to spin up the test VMs, create the cloud test infrastructure, or prepare a phase 2+ run on cloud VMs. Triggers: \"vm-up\", \"provision the VMs\", \"spin up the test VMs\", \"create the two VMs\", \"set up cloud VMs for phase N\"."
+description: "Provision the OceanFS load-test VMs on Hetzner Cloud. Phase 2: two-VM topology (SUT + Harness, ADR-0019). Phase 3-4: fleet topology (ADR-0026) — N dedicated node VMs (default 3, --nodes N) + an upgraded CX43 Harness. Use when the user asks to spin up the test VMs, create the cloud test infrastructure, or prepare a phase 2+ run on cloud VMs. Triggers: \"vm-up\", \"provision the VMs\", \"spin up the test VMs\", \"create the two VMs\", \"set up cloud VMs for phase N\"."
 ---
 
 # vm-up
 
-Provision the two-VM load-test topology on Hetzner Cloud per ADR-0019:
+Provision the load-test topology on Hetzner Cloud. Phase 2 (per ADR-0019):
 a **SUT VM** (OceanFS + Prometheus, no toolchain) and a **Harness VM**
 (Rust toolchain + e2e harness), connected over the internal network.
-All cost guardrails (hard size cap, confirmation gate, auto-shutdown TTL,
-budget gate) are enforced **inside** `scripts/vm-provision.sh` — the skill
-never bypasses them.
+Phase 3-4 (per ADR-0026): a **fleet of dedicated node VMs** —
+`{name}-sut-0..N-1`, one oceanfs node each (all on `:9000`/`:9001`,
+differing by internal IP), plus a **CX43 Harness VM** (8 vCPU — it must
+sustain ~3× the Phase 2 load; a 2-vCPU CX23 was maxed at ~150 ops/s).
+All cost guardrails (hard size cap, auto-shutdown TTL, budget gate) are
+enforced **inside** `scripts/vm-provision.sh` — the skill never bypasses
+them.
 
 ## Parameters
 
 | Parameter | Meaning | Default |
 |---|---|---|
-| `phase` | Load-test phase: 2 (SUT=CX33, Harness=CX23), 3-4 (SUT=CX33, Harness=CX23) | required |
+| `phase` | Load-test phase: 2 (SUT=CX33, Harness=CX23), 3-4 (fleet: `nodes`×CX33 SUT VMs + Harness=CX43) | required |
+| `nodes` | Fleet size for phase 3-4 (range 3-5) | 3 (`LOAD_TEST_CLUSTER_NODES`) |
 | `branch` | Git branch cloned on the Harness | `main` |
 | `commit` | Optional exact commit to check out | none |
 | `name` | VM name prefix | `oceanfs-loadtest-{phase}` |
@@ -28,6 +33,15 @@ never bypasses them.
 Phase 1 runs in CI — no VMs: `vm-provision.sh --phase 1` prints
 "Phase 1 runs in CI, no cloud VMs needed". Phases 5+ use a separate
 provisioning model (the script prints guidance).
+
+**Phase 3-4 fleet sizing (ADR-0026).** Each node VM is CX33 (4 vCPU /
+8 GB) — the calibrated Phase 2 SUT profile, since every node stores/codes
+a replica of every write. Node 0 is the bootstrap (no `seed_nodes`);
+nodes 1..N-1 seed to node 0's gRPC address (`[gossip] seed_nodes`),
+wired at deploy time by `sut-deploy.sh --cluster`. Node 0 also hosts
+Prometheus scraping **all** nodes (`instance=oceanfs-node-0..N-1`), so
+Grafana can follow each VM individually. Cost: ~€0.09/h for 3 nodes +
+CX43 harness — a 5-min smoke run costs about a cent.
 
 **Phase 2 sizing — SUT is CX33 (8 GB), not CX23.** The load-test deploy
 profile (`scripts/sut-deploy.sh`) targets the 8 GB CX33 (generous caches,

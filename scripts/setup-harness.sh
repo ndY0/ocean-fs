@@ -95,10 +95,27 @@ RECORD_REPO=$(get '.repo')
 RECORD_BRANCH=$(get '.branch')
 RECORD_COMMIT=$(get '.commit')
 RECORD_SSH_KEY=$(get '.ssh_key')
+# Phase 3+ fleet (ADR-0026): sut_nodes[] replaces the single `sut` object.
+# Extract the node list generically — works for both record shapes.
+SUT_NODE_IPS=()
+SUT_NODE_PUBLIC_IPS=()
+while IFS= read -r line; do
+    [ -n "$line" ] && SUT_NODE_IPS+=("$line")
+done < <(get '.sut_nodes[]?.internal_ip // empty')
+while IFS= read -r line; do
+    [ -n "$line" ] && SUT_NODE_PUBLIC_IPS+=("$line")
+done < <(get '.sut_nodes[]?.public_ip // empty')
 
-[ -n "$HARNESS_PUBLIC_IP" ] && [ -n "$SUT_INTERNAL_IP" ] \
-    || { log_error "Record is missing harness/sut IPs — is it a vm-provision.sh output?"; exit 1; }
-log_info "Harness ${HARNESS_PUBLIC_IP} -> SUT ${SUT_INTERNAL_IP} (internal)"
+[ -n "$HARNESS_PUBLIC_IP" ] || { log_error "Record is missing harness IP — is it a vm-provision.sh output?"; exit 1; }
+if [ "${#SUT_NODE_IPS[@]}" -gt 0 ]; then
+    # Phase 3+ fleet mode.
+    SUT_INTERNAL_IP="${SUT_NODE_IPS[0]}"
+    SUT_PUBLIC_IP="${SUT_NODE_PUBLIC_IPS[0]}"
+    log_info "Harness ${HARNESS_PUBLIC_IP} -> fleet of ${#SUT_NODE_IPS[@]} SUT nodes (${SUT_NODE_IPS[*]})"
+else
+    [ -n "$SUT_INTERNAL_IP" ] || { log_error "Record is missing harness/sut IPs — is it a vm-provision.sh output?"; exit 1; }
+    log_info "Harness ${HARNESS_PUBLIC_IP} -> SUT ${SUT_INTERNAL_IP} (internal)"
+fi
 
 # Resolve the SSH keys.
 SSH_KEY="${SSH_KEY:-$RECORD_SSH_KEY}"
@@ -114,17 +131,21 @@ fi
 chmod 600 "$SSH_PRIVATE_KEY" 2>/dev/null || true
 log_info "SSH identity: $SSH_PRIVATE_KEY (public: $SSH_KEY)"
 
-# 1. Seed the harness's SSH identity (harness -> SUT over internal net).
+# 1. Seed the harness's SSH identity (harness -> SUT node(s) over the
+# internal network). In fleet mode every node must be reachable — churn
+# crash control (TARGET_HOST_SSH) needs the harness key on each VM.
 log_info "Seeding harness SSH identity..."
 if [ "$DRY_RUN" = false ]; then
     scp $SSH_OPTS "$SSH_PRIVATE_KEY" "root@${HARNESS_PUBLIC_IP}:~/.ssh/id_ed25519"
     ssh $SSH_OPTS "root@${HARNESS_PUBLIC_IP}" "chmod 600 ~/.ssh/id_ed25519"
-    if ! ssh $SSH_OPTS -o BatchMode=yes "root@${HARNESS_PUBLIC_IP}" \
-        "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=5 root@${SUT_INTERNAL_IP} echo ok" >/dev/null 2>&1; then
-        log_error "Harness cannot reach the SUT at ${SUT_INTERNAL_IP} over the internal network."
-        exit 1
-    fi
-    log_info "Harness -> SUT (${SUT_INTERNAL_IP}) SSH verified."
+    for node_ip in "${SUT_NODE_IPS[@]:-${SUT_INTERNAL_IP}}"; do
+        if ! ssh $SSH_OPTS -o BatchMode=yes "root@${HARNESS_PUBLIC_IP}" \
+            "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=5 root@${node_ip} echo ok" >/dev/null 2>&1; then
+            log_error "Harness cannot reach the SUT node at ${node_ip} over the internal network."
+            exit 1
+        fi
+        log_info "Harness -> SUT node (${node_ip}) SSH verified."
+    done
 else
     log_info "[DRY-RUN] scp $SSH_PRIVATE_KEY -> root@${HARNESS_PUBLIC_IP}:~/.ssh/id_ed25519 + verify harness -> root@${SUT_INTERNAL_IP}"
 fi
@@ -167,43 +188,73 @@ fi
 
 # 3. Deploy to the SUT from the harness (the harness is the build machine,
 # per ADR-0019: build on the Harness VM, scp to the SUT VM). Reuses
-# sut-deploy.sh over the internal network.
-log_info "Deploying oceanfs to the SUT (${SUT_INTERNAL_IP}) from the harness..."
-if [ "$DRY_RUN" = false ]; then
-    if ! ssh $SSH_OPTS -o BatchMode=yes "root@${HARNESS_PUBLIC_IP}" \
-        "cd /root/ocean-fs && ./scripts/sut-deploy.sh --sut root@${SUT_INTERNAL_IP} --port 9000 --binary target/release/oceanfs"; then
-        log_error "SUT deploy failed. Check: ssh root@${SUT_PUBLIC_IP} 'systemctl status oceanfs'"
-        exit 1
+# sut-deploy.sh over the internal network. Fleet mode (ADR-0026) deploys
+# to every node via --cluster with per-node seed wiring.
+if [ "${#SUT_NODE_IPS[@]}" -gt 0 ]; then
+    fleet_ssh_list=""
+    for node_ip in "${SUT_NODE_IPS[@]}"; do
+        [ -z "$fleet_ssh_list" ] || fleet_ssh_list="${fleet_ssh_list},"
+        fleet_ssh_list="${fleet_ssh_list}root@${node_ip}"
+    done
+    log_info "Deploying oceanfs to the fleet (${SUT_NODE_IPS[*]}) from the harness..."
+    if [ "$DRY_RUN" = false ]; then
+        if ! ssh $SSH_OPTS -o BatchMode=yes "root@${HARNESS_PUBLIC_IP}" \
+            "cd /root/ocean-fs && ./scripts/sut-deploy.sh --cluster ${fleet_ssh_list} --port 9000 --binary target/release/oceanfs"; then
+            log_error "Cluster deploy failed. Check: ssh root@${SUT_PUBLIC_IP} 'systemctl status oceanfs'"
+            exit 1
+        fi
+        log_info "Cluster deployed from the harness (${#SUT_NODE_IPS[@]} nodes)."
+    else
+        log_info "[DRY-RUN] on harness: ./scripts/sut-deploy.sh --cluster ${fleet_ssh_list} --port 9000"
     fi
-    log_info "SUT deployed from the harness."
 else
-    log_info "[DRY-RUN] on harness: ./scripts/sut-deploy.sh --sut root@${SUT_INTERNAL_IP} --port 9000"
+    log_info "Deploying oceanfs to the SUT (${SUT_INTERNAL_IP}) from the harness..."
+    if [ "$DRY_RUN" = false ]; then
+        if ! ssh $SSH_OPTS -o BatchMode=yes "root@${HARNESS_PUBLIC_IP}" \
+            "cd /root/ocean-fs && ./scripts/sut-deploy.sh --sut root@${SUT_INTERNAL_IP} --port 9000 --binary target/release/oceanfs"; then
+            log_error "SUT deploy failed. Check: ssh root@${SUT_PUBLIC_IP} 'systemctl status oceanfs'"
+            exit 1
+        fi
+        log_info "SUT deployed from the harness."
+    else
+        log_info "[DRY-RUN] on harness: ./scripts/sut-deploy.sh --sut root@${SUT_INTERNAL_IP} --port 9000"
+    fi
 fi
 
 # 4. Ensure the observability stack on the SUT (idempotent; covers VMs
-# provisioned before the provisioner installed it by default).
+# provisioned before the provisioner installed it by default). Fleet mode
+# (ADR-0026): only node 0 hosts Prometheus, and it must scrape EVERY node
+# (localhost + peers over the internal network) so Grafana can show
+# per-instance panels.
 log_info "Ensuring observability stack on the SUT (${SUT_INTERNAL_IP})..."
 if [ "$DRY_RUN" = false ]; then
+    obs_targets="localhost:9000"
+    for ((obs_i = 1; obs_i < ${#SUT_NODE_IPS[@]}; obs_i++)); do
+        obs_targets="${obs_targets},${SUT_NODE_IPS[$obs_i]}:9000"
+    done
     if ! ssh $SSH_OPTS -o BatchMode=yes "root@${HARNESS_PUBLIC_IP}" \
-        "cd /root/ocean-fs && scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null scripts/setup-observability.sh root@${SUT_INTERNAL_IP}:/root/ && ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@${SUT_INTERNAL_IP} 'bash /root/setup-observability.sh'"; then
+        "cd /root/ocean-fs && scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null scripts/setup-observability.sh root@${SUT_INTERNAL_IP}:/root/ && ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@${SUT_INTERNAL_IP} 'bash /root/setup-observability.sh --scrape-targets ${obs_targets}'"; then
         log_warn "Observability setup failed on the SUT (non-fatal — the harness scrape still covers the run)."
     else
-        log_info "Observability stack ensured on the SUT."
+        log_info "Observability stack ensured on the SUT (scrape: ${obs_targets})."
     fi
 else
     log_info "[DRY-RUN] on harness: scp setup-observability.sh -> root@${SUT_INTERNAL_IP} && run it"
 fi
 
 # 5. Verify SUT health over the internal network (the path the harness
-# will actually use for the payload).
+# will actually use for the payload). Fleet mode: every node must be
+# healthy before a churn run.
 log_info "Verifying SUT health over the internal network..."
 if [ "$DRY_RUN" = false ]; then
-    if ! ssh $SSH_OPTS -o BatchMode=yes "root@${HARNESS_PUBLIC_IP}" \
-        "curl -sf --max-time 10 http://${SUT_INTERNAL_IP}:9000/admin/health" >/dev/null 2>&1; then
-        log_error "SUT ${SUT_INTERNAL_IP}:9000 not healthy. Check: ssh root@${SUT_PUBLIC_IP} 'systemctl status oceanfs'"
-        exit 1
-    fi
-    log_info "SUT healthy at http://${SUT_INTERNAL_IP}:9000/admin/health."
+    for node_ip in "${SUT_NODE_IPS[@]:-${SUT_INTERNAL_IP}}"; do
+        if ! ssh $SSH_OPTS -o BatchMode=yes "root@${HARNESS_PUBLIC_IP}" \
+            "curl -sf --max-time 10 http://${node_ip}:9000/admin/health" >/dev/null 2>&1; then
+            log_error "SUT node ${node_ip}:9000 not healthy. Check: ssh root@${node_ip} 'systemctl status oceanfs'"
+            exit 1
+        fi
+        log_info "SUT node healthy at http://${node_ip}:9000/admin/health."
+    done
 else
     log_info "[DRY-RUN] curl http://${SUT_INTERNAL_IP}:9000/admin/health from the harness"
 fi

@@ -23,6 +23,15 @@
 > This is a deliberate sizing deviation from the original ADR table; the
 > remaining guardrails (hard size cap, TTL, budget gate) are unchanged.
 
+> **Superseded (2026-08-19):** [ADR-0026](./0026-phase3-dedicated-node-vms.md)
+> supersedes **Decision 1** (two-VM topology) and **Decision 4**
+> (co-location mitigations) **for Phases 3+**. Phase 3+ runs a fleet of
+> dedicated node VMs (one `oceanfs` per VM, default 3 nodes, parametric)
+> plus an upgraded CX43 Harness VM. Phase 1 (CI) and Phase 2 (two-VM,
+> CX33 + CX23) are unchanged. This ADR's guardrails (TTL, size cap,
+> internal-network analysis) are retained; the size cap is raised to CX43
+> for the Harness role.
+
 ---
 
 ## Context

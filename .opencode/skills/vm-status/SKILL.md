@@ -28,7 +28,7 @@ The source of truth is the provisioning record written by `vm-provision.sh`:
    If no record exists, report `{ "status": "no_record" }` and tell the user
    to run **vm-up** first — there is nothing to check.
 
-2. **Read the topology from the record:**
+2. **Read the topology from the record** (fleet-aware, ADR-0026):
 
    ```bash
    SUT_PUB=$(jq -r '.sut.public_ip // empty' "$PROVISION_FILE")
@@ -38,10 +38,15 @@ The source of truth is the provisioning record written by `vm-provision.sh`:
    HARNESS_TYPE=$(jq -r '.harness.type // empty' "$PROVISION_FILE")
    # The record carries no top-level name — the prefix is the filename:
    PREFIX=$(basename "$PROVISION_FILE" | sed 's/^provision-//; s/\.json$//')
+   # Phase 3+ fleet (ADR-0026): sut_nodes[] replaces the single `sut`.
+   # If non-empty, iterate it instead of the singular fields — every node
+   # is an oceanfs VM with its own unit.
+   jq -r '.sut_nodes[]? | "\(.name) \(.public_ip) \(.internal_ip) \(.type)"' "$PROVISION_FILE"
    ```
 
 3. **Live checks over SSH** (BatchMode so a dead VM fails fast instead of
-   hanging on a password prompt). SUT:
+   hanging on a password prompt). Every SUT node (fleet mode: each entry of
+   `sut_nodes[]`):
 
    ```bash
    ssh -o BatchMode=yes -o ConnectTimeout=10 "root@${SUT_PUB}" \
@@ -49,7 +54,9 @@ The source of truth is the provisioning record written by `vm-provision.sh`:
       systemctl is-active oceanfs-ttl.timer; uptime -s; date -u +%Y-%m-%dT%H:%M:%SZ'
    ```
 
-   Harness (no oceanfs/prometheus — those run on the SUT only):
+   In fleet mode only node 0 runs Prometheus; the other nodes report
+   `prometheus: "n/a"`. Harness (no oceanfs/prometheus — those run on the
+   SUT only):
 
    ```bash
    ssh -o BatchMode=yes -o ConnectTimeout=10 "root@${HARNESS_PUB}" \
@@ -68,31 +75,36 @@ The source of truth is the provisioning record written by `vm-provision.sh`:
 
 ## Returns
 
-Return a structured JSON object:
+Return a structured JSON object. Phase 2 (single SUT) keeps the `sut`
+object; phase 3+ (fleet, ADR-0026) returns `sut_nodes` — one entry per
+node VM with the same per-node fields:
 
 ```json
 {
-  "prefix": "oceanfs-loadtest-2",
-  "record": ".hetzner/provision-oceanfs-loadtest-2.json",
-  "sut": {
-    "name": "oceanfs-loadtest-2-sut",
-    "status": "running",
-    "public_ip": "1.2.3.4",
-    "internal_ip": "10.0.0.5",
-    "type": "cx23",
-    "oceanfs": "active",
-    "prometheus": "active",
-    "ttl_timer": "active",
-    "booted": "2026-08-16T08:00:00Z"
-  },
+  "prefix": "oceanfs-loadtest-3",
+  "record": ".hetzner/provision-oceanfs-loadtest-3.json",
+  "sut_nodes": [
+    {
+      "name": "oceanfs-loadtest-3-sut-0",
+      "status": "running",
+      "public_ip": "1.2.3.4",
+      "internal_ip": "10.0.0.2",
+      "type": "cx33",
+      "oceanfs": "active",
+      "prometheus": "active",
+      "ttl_timer": "active",
+      "booted": "2026-08-19T08:00:00Z"
+    },
+    { "name": "oceanfs-loadtest-3-sut-1", "status": "running", "prometheus": "n/a", "...": "..." }
+  ],
   "harness": {
-    "name": "oceanfs-loadtest-2-harness",
+    "name": "oceanfs-loadtest-3-harness",
     "status": "running",
     "public_ip": "1.2.3.5",
     "internal_ip": "10.0.0.6",
-    "type": "cx23",
+    "type": "cx43",
     "ttl_timer": "active",
-    "booted": "2026-08-16T08:01:00Z"
+    "booted": "2026-08-19T08:01:00Z"
   },
   "tunnel": { "up": true, "url": "http://localhost:9090" }
 }

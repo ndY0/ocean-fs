@@ -16,7 +16,7 @@ OceanFS SUT, and the report is fetched back to the laptop.
 |---|---|---|---|
 | 1 | `load_concurrency` | CI runner, local spawn | in CI — no VMs, no skill invocation |
 | 2 | `load_sustained` | Harness VM → `TARGET_HOST=<sut-internal>:9000` | **implemented** — this skill |
-| 3-4 | `load_cluster_churn` / degraded | multi-node `TARGET_HOSTS` | not yet implemented — tell the user, do not fake a run |
+| 3-4 | `load_cluster_churn` / degraded | fleet `TARGET_HOSTS` (ADR-0026: N node VMs + CX43 harness, `run-phase3.sh`) | runner/deploy tooling done 2026-08-19; the test itself (`e2e/tests/load_cluster_churn.rs`) is the next implementation item — tell the user, do not fake a run |
 
 ## Parameters
 

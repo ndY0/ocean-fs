@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# vm-provision.sh — Two-VM Cloud Lifecycle with Cost Guardrails
+# vm-provision.sh — Cloud Lifecycle with Cost Guardrails
 #
-# Provisions two VMs (SUT + Harness) on Hetzner Cloud for OceanFS load testing
-# per ADR-0019. The SUT VM runs OceanFS and Prometheus only (no harness, no
-# toolchain). The Harness VM (always CX23) runs the e2e harness and Rust
-# toolchain, targeting the SUT VM over Hetzner's internal network.
+# Provisions the load-test topology on Hetzner Cloud per ADR-0019 and
+# ADR-0026. The SUT VMs run OceanFS (and Prometheus on node 0) only — no
+# harness, no toolchain. The Harness VM runs the e2e harness and Rust
+# toolchain, targeting the SUT over Hetzner's internal network.
 #
 # Usage:
 #   ./scripts/vm-provision.sh --phase N [OPTIONS]
@@ -18,11 +18,17 @@
 #            bodies — so CPU (hashing, EC encode) is the bottleneck; on a
 #            4 GB CX23 that profile OOM-kills the SUT mid-run. See commits
 #            7e4c3b4 and 5e7aa70.)
-#   Phase 3-4: SUT=CX33 (4 vCPU, 8 GB, 80 GB), Harness=CX23 (2 vCPU, 4 GB, 40 GB)
+#   Phase 3-4: CLUSTER of SUT node VMs (default 3, --nodes N) each CX33,
+#              + Harness=CX43 (8 vCPU, 16 GB, 80 GB) per ADR-0026. Nodes are
+#              named ${prefix}-sut-0..N-1; node 0 is the bootstrap and hosts
+#              Prometheus scraping every node. No port juggling: every node
+#              listens on :9000/:9001; nodes differ by internal IP.
 #   Phase 5+: N/A (separate provisioning model)
 #
-# Guardrails (four-layer defense per ADR-0019):
-#   Layer 1 — Hard VM size cap: MAX_AGENT_VM_TYPE="cx33"
+# Guardrails (four-layer defense per ADR-0019, retained by ADR-0026):
+#   Layer 1 — Hard VM size cap: MAX_AGENT_VM_TYPE="cx43" (harness role;
+#             SUT nodes stay capped at cx33 — raised 2026-08-19 per
+#             ADR-0026 Decision 2)
 #   Layer 2 — Confirmation gate: REMOVED (2026-08-17) — CX33 is the standard
 #             sizing for phases 2-4, so no size-based confirmation is required.
 #             The --confirm flag is still accepted for compatibility but is a
@@ -30,7 +36,7 @@
 #   Layer 3 — Auto-shutdown TTL: systemd timer on each VM (default 4h)
 #   Layer 4 — Budget gate: scaffolding (deferrable/v2)
 # Security: Hetzner VMs ship with NO firewall — managed firewalls are
-#   created and applied by default (SUT: SSH + internal-net 9000/9001;
+#   created and applied by default (SUT nodes: SSH + internal-net 9000/9001;
 #   Harness: SSH only). Disable with --no-firewall (not recommended).
 #
 # Requirements:
@@ -43,10 +49,12 @@
 # Environment Variables:
 #   HCLOUD_TOKEN              Hetzner Cloud API token (required)
 #   LOAD_TEST_TTL_HOURS       Override default TTL (default: 4)
+#   LOAD_TEST_CLUSTER_NODES   Override default cluster size for phase 3-4
+#                             (default: 3)
 #   LOAD_TEST_MAX_MONTHLY_EUR Optional monthly budget cap (deferrable, v2)
 #
 # Author: OceanFS
-# Date: 2026-08-11
+# Date: 2026-08-11 (phase 3+ fleet topology per ADR-0026: 2026-08-19)
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -62,7 +70,10 @@ unset _ENV_HETZNER
 # ---------------------------------------------------------------------------
 # Constants & defaults
 # ---------------------------------------------------------------------------
-readonly MAX_AGENT_VM_TYPE="cx33"
+# Layer 1 hard cap — raised to cx43 for the Harness role per ADR-0026
+# Decision 2 (Phase 3+ drives ~3× the load from the harness). SUT node
+# sizing remains capped at cx33 via resolve_phase.
+readonly MAX_AGENT_VM_TYPE="cx43"
 readonly DEFAULT_PROVIDER="hetzner"
 readonly DEFAULT_BRANCH="main"
 readonly DEFAULT_REPO="https://github.com/ndY0/ocean-fs.git"
@@ -125,6 +136,14 @@ HARNESS_TYPE=""
 HARNESS_IP=""
 HARNESS_PUBLIC_IP=""
 HARNESS_NAME=""
+# Phase 3+ cluster fleet size (per ADR-0026): number of dedicated SUT node
+# VMs. Node 0 is the bootstrap and hosts Prometheus. Override via
+# LOAD_TEST_CLUSTER_NODES or --nodes N.
+CLUSTER_NODES="${LOAD_TEST_CLUSTER_NODES:-3}"
+# Phase 3+ node VM names/IPs, indexed 0..N-1.
+SUT_NODE_NAMES=()
+SUT_NODE_IPS=()
+SUT_NODE_PUBLIC_IPS=()
 
 # Track created VMs for cleanup on failure
 CREATED_VM_NAMES=()
@@ -184,8 +203,11 @@ resolve_phase() {
             HARNESS_TYPE="cx23"
             ;;
         3|4)
+            # Per ADR-0026: a fleet of dedicated node VMs (default 3) plus
+            # an upgraded CX43 harness that must sustain ~3× the Phase 2
+            # load (2-vCPU CX23 was maxed at ~150 ops/s in Phase 2 runs).
             SUT_TYPE="cx33"
-            HARNESS_TYPE="cx23"
+            HARNESS_TYPE="cx43"
             ;;
         5|6)
             # Phase 5+ uses separate provisioning model
@@ -207,6 +229,17 @@ GUIDANCE
             die "Invalid phase: $phase. Valid phases are 1-6."
             ;;
     esac
+
+    # Validate the fleet size for cluster phases.
+    if [ "$phase" = "3" ] || [ "$phase" = "4" ]; then
+        if ! [[ "$CLUSTER_NODES" =~ ^[0-9]+$ ]] || [ "$CLUSTER_NODES" -lt 3 ]; then
+            die "Invalid cluster size: '$CLUSTER_NODES'. Phase 3-4 needs at least 3 nodes (quorum semantics). Use --nodes N or LOAD_TEST_CLUSTER_NODES."
+        fi
+        if [ "$CLUSTER_NODES" -gt 5 ]; then
+            die "Invalid cluster size: '$CLUSTER_NODES'. Phase 3-4 supports at most 5 nodes per ADR-0026. Larger fleets need the Phase 5 provisioning model."
+        fi
+        log_info "Phase $phase: provisioning cluster of $CLUSTER_NODES SUT node VMs (cx33 each) + Harness (cx43)."
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -272,12 +305,16 @@ check_budget_gate() {
         # Single VM: only pay for one (SUT is the provisioned VM)
         total_hourly=$(vm_hourly_cost "$SUT_TYPE")
     else
-        # Two VMs: SUT + Harness hourly rates
+        # SUT (+ fleet nodes for phase 3-4) + Harness hourly rates
         local s_cost h_cost
         s_cost="0"
         h_cost="0"
         if [ -n "$SUT_TYPE" ]; then
             s_cost=$(vm_hourly_cost "$SUT_TYPE")
+            if [ "$PHASE" = "3" ] || [ "$PHASE" = "4" ]; then
+                # One VM per cluster node (ADR-0026)
+                s_cost=$(echo "$s_cost * $CLUSTER_NODES" | bc -l 2>/dev/null || echo "$s_cost")
+            fi
         fi
         if [ -n "$HARNESS_TYPE" ]; then
             h_cost=$(vm_hourly_cost "$HARNESS_TYPE")
@@ -577,6 +614,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # run by the provisioner by default and re-ensured by setup-harness.sh.
 install_observability() {
     local public_ip="$1"
+    # Optional second arg: comma-separated scrape targets for the OceanFS
+    # job (ADR-0026 fleet mode — node 0 scrapes every node). Unset/empty
+    # keeps the historical single-SUT localhost:9000 scrape.
+    local scrape_targets="${2:-}"
     log_info "Installing observability stack on ${public_ip}..."
     if [ "$DRY_RUN" = true ]; then
         log_info "[DRY-RUN] scp ${SCRIPT_DIR}/setup-observability.sh -> root@${public_ip}:/root/ && run it"
@@ -585,8 +626,12 @@ install_observability() {
     scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
         "${SCRIPT_DIR}/setup-observability.sh" "root@${public_ip}:/root/setup-observability.sh" \
         || { log_error "Failed to copy setup-observability.sh to ${public_ip}"; return 1; }
+    local obs_args=()
+    if [ -n "$scrape_targets" ]; then
+        obs_args=(--scrape-targets "$scrape_targets")
+    fi
     if ! ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${public_ip}" \
-        "bash /root/setup-observability.sh"; then
+        "bash /root/setup-observability.sh ${obs_args[*]+"${obs_args[*]}"}"; then
         log_error "Observability setup failed on ${public_ip} (Prometheus unavailable; the harness's own scrape still covers the run)."
         return 1
     fi
@@ -594,9 +639,12 @@ install_observability() {
 }
 
 # Configure SUT VM (minimal — no Rust toolchain)
+# Optional second arg: comma-separated OceanFS scrape targets for node 0's
+# Prometheus (fleet mode, ADR-0026).
 configure_sut_vm() {
     local name="$1"
     local public_ip="$2"
+    local scrape_targets="${3:-}"
 
     log_info "Configuring SUT VM '${name}' (${public_ip})..."
 
@@ -615,7 +663,7 @@ apt-get update -qq
 apt-get install -y -qq curl
 SUT_SETUP
     if [ "$OBSERVABILITY" = true ]; then
-        install_observability "$public_ip" || log_warn "Observability install failed (non-fatal)."
+        install_observability "$public_ip" "$scrape_targets" || log_warn "Observability install failed (non-fatal)."
     else
         log_warn "Observability DISABLED (--no-observability) — Prometheus will not be installed."
     fi
@@ -782,18 +830,25 @@ cleanup() {
 destroy_vms() {
     local prefix="$1"
 
-    log_info "Looking for VMs matching '${prefix}-sut' and '${prefix}-harness'..."
+    log_info "Looking for VMs matching '${prefix}-sut*' and '${prefix}-harness'..."
 
     local sut_exists=false
     local harness_exists=false
 
-    # Check and delete SUT VM
-    if hcloud server describe "${prefix}-sut" --output json >/dev/null 2>&1; then
+    # Delete every SUT VM (single '${prefix}-sut' for phase 2, or the
+    # '${prefix}-sut-0..N-1' fleet for phase 3+ per ADR-0026).
+    local sut_vms
+    sut_vms=$(hcloud server list --output json 2>/dev/null | jq -r \
+        --arg p "${prefix}-sut" '.[].name | select(startswith($p))' || true)
+    if [ -n "$sut_vms" ]; then
         sut_exists=true
-        log_info "Deleting VM '${prefix}-sut'..."
-        hcloud server delete "${prefix}-sut" || log_error "Failed to delete VM '${prefix}-sut'."
+        while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            log_info "Deleting VM '${name}'..."
+            hcloud server delete "$name" || log_error "Failed to delete VM '${name}'."
+        done <<< "$sut_vms"
     else
-        log_info "VM '${prefix}-sut' not found."
+        log_info "No SUT VM matching '${prefix}-sut*' found."
     fi
 
     # Check and delete Harness VM
@@ -851,36 +906,97 @@ check_status() {
         harness_type=""
     fi
 
-    # Output JSON
-    jq -n \
-        --arg sut_status "$sut_status" \
-        --arg sut_ip "$sut_ip" \
-        --arg sut_public_ip "$sut_public_ip" \
-        --arg sut_name "${prefix}-sut" \
-        --arg sut_type "$sut_type" \
-        --arg harness_status "$harness_status" \
-        --arg harness_ip "$harness_ip" \
-        --arg harness_public_ip "$harness_public_ip" \
-        --arg harness_name "${prefix}-harness" \
-        --arg harness_type "$harness_type" \
-        --arg name "$prefix" \
-        '{
-            name: $name,
-            sut: {
-                name: $sut_name,
-                status: $sut_status,
-                internal_ip: $sut_ip,
-                public_ip: $sut_public_ip,
-                type: $sut_type
-            },
-            harness: {
-                name: $harness_name,
-                status: $harness_status,
-                internal_ip: $harness_ip,
-                public_ip: $harness_public_ip,
-                type: $harness_type
-            }
-        }'
+    # Output JSON — sut_nodes[] (phase 3+ fleet) or sut (phase 2)
+    local sut_json_part
+    local sut_vms
+    sut_vms=$(hcloud server list --output json 2>/dev/null | jq -r \
+        --arg p "${prefix}-sut" '.[].name | select(startswith($p))' || true)
+
+    if [ -n "$sut_vms" ]; then
+        # Fleet (or legacy single SUT): one object per VM, sorted.
+        sut_json_part=$(hcloud server list --output json 2>/dev/null | jq \
+            --arg p "${prefix}-sut" \
+            '[.[] | select(.name | startswith($p)) | sort_by(.name)[] | {
+                name: .name,
+                status: .status,
+                internal_ip: (.private_net[0].ip // ""),
+                public_ip: .public_net.ipv4.ip,
+                type: .server_type
+            }]' || echo "[]")
+        if [ "$(echo "$sut_json_part" | jq 'length')" = "1" ]; then
+            # Phase 2 shape: single `sut` object (backward compatible).
+            sut_json_part=$(echo "$sut_json_part" | jq '.[0]')
+            jq -n \
+                --argjson sut "$sut_json_part" \
+                --arg harness_status "$harness_status" \
+                --arg harness_ip "$harness_ip" \
+                --arg harness_public_ip "$harness_public_ip" \
+                --arg harness_name "${prefix}-harness" \
+                --arg harness_type "$harness_type" \
+                --arg name "$prefix" \
+                '{
+                    name: $name,
+                    sut: $sut,
+                    harness: {
+                        name: $harness_name,
+                        status: $harness_status,
+                        internal_ip: $harness_ip,
+                        public_ip: $harness_public_ip,
+                        type: $harness_type
+                    }
+                }'
+        else
+            jq -n \
+                --argjson sut_nodes "$sut_json_part" \
+                --arg harness_status "$harness_status" \
+                --arg harness_ip "$harness_ip" \
+                --arg harness_public_ip "$harness_public_ip" \
+                --arg harness_name "${prefix}-harness" \
+                --arg harness_type "$harness_type" \
+                --arg name "$prefix" \
+                '{
+                    name: $name,
+                    sut_nodes: $sut_nodes,
+                    harness: {
+                        name: $harness_name,
+                        status: $harness_status,
+                        internal_ip: $harness_ip,
+                        public_ip: $harness_public_ip,
+                        type: $harness_type
+                    }
+                }'
+        fi
+    else
+        jq -n \
+            --arg sut_status "$sut_status" \
+            --arg sut_ip "$sut_ip" \
+            --arg sut_public_ip "$sut_public_ip" \
+            --arg sut_name "${prefix}-sut" \
+            --arg sut_type "$sut_type" \
+            --arg harness_status "$harness_status" \
+            --arg harness_ip "$harness_ip" \
+            --arg harness_public_ip "$harness_public_ip" \
+            --arg harness_name "${prefix}-harness" \
+            --arg harness_type "$harness_type" \
+            --arg name "$prefix" \
+            '{
+                name: $name,
+                sut: {
+                    name: $sut_name,
+                    status: $sut_status,
+                    internal_ip: $sut_ip,
+                    public_ip: $sut_public_ip,
+                    type: $sut_type
+                },
+                harness: {
+                    name: $harness_name,
+                    status: $harness_status,
+                    internal_ip: $harness_ip,
+                    public_ip: $harness_public_ip,
+                    type: $harness_type
+                }
+            }'
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -891,25 +1007,14 @@ provision_vms() {
     local sut_name="${NAME_PREFIX}-sut"
     local harness_name="${NAME_PREFIX}-harness"
 
-    # Single-VM mode: warn for Phase 3-4
+    # Single-VM mode: Phase 2 only (ADR-0026 removed the Phase 3-4
+    # single-VM fallback — co-location corrupts gossip timing).
     if [ "$SINGLE_VM" = true ]; then
         if [ "$PHASE" = "2" ]; then
             log_info "Single-VM mode: co-locating SUT + Harness on one CX33."
             log_info "Reports will be written to /tmp (tmpfs) to avoid disk I/O contention."
         elif [ "$PHASE" = "3" ] || [ "$PHASE" = "4" ]; then
-            cat >&2 <<'WARNING'
-
-╔══════════════════════════════════════════════════════════════════════════╗
-║                              WARNING                                     ║
-║  Phase 3-4 on a single VM will cause CPU contention between the          ║
-║  harness and OceanFS processes. SWIM gossip timing may be affected.      ║
-║  Gossip intervals will be relaxed (gossip_interval=3s,                   ║
-║  suspicion_timeout=10s) to compensate.                                   ║
-║  Use the two-VM topology for reliable results.                           ║
-║  Per ADR-0019 Decision 4.                                                ║
-╚══════════════════════════════════════════════════════════════════════════╝
-
-WARNING
+            die "--single-vm is not supported for phase 3-4 (superseded by ADR-0026). Use the dedicated node-VM fleet: --phase $PHASE --nodes $CLUSTER_NODES."
         fi
     fi
 
@@ -920,8 +1025,64 @@ WARNING
         log_info "[DRY-RUN] Ensure network '${NETWORK_NAME}' exists."
     fi
 
-    # SUT VM provisioning
-    if [ -n "$SUT_TYPE" ]; then
+    # ── Phase 3+ cluster fleet (ADR-0026) ────────────────────────────────
+    # Create ALL node VMs first (so node 0's Prometheus can scrape the
+    # full fleet), then configure each. Node 0 is the bootstrap; it hosts
+    # Prometheus scraping every node endpoint.
+    if [ "$PHASE" = "3" ] || [ "$PHASE" = "4" ]; then
+        if [ -n "$SUT_TYPE" ]; then
+            # 1. Create + firewall every node VM.
+            for ((i = 0; i < CLUSTER_NODES; i++)); do
+                local node_name="${NAME_PREFIX}-sut-${i}"
+                log_info "Provisioning SUT node ${i}: name=${node_name}, type=${SUT_TYPE}..."
+                local node_ips
+                node_ips=$(create_vm "$node_name" "$SUT_TYPE" "$IMAGE" "$SSH_KEY_PATH")
+                SUT_NODE_NAMES+=("$node_name")
+                SUT_NODE_IPS+=("${node_ips%% *}")
+                SUT_NODE_PUBLIC_IPS+=("${node_ips##* }")
+                log_info "SUT node ${i}: internal_ip=${SUT_NODE_IPS[$i]}, public_ip=${SUT_NODE_PUBLIC_IPS[$i]}"
+
+                if [ "$DRY_RUN" = false ]; then
+                    if [ "$FIREWALLS" = true ]; then
+                        ensure_firewall "${NAME_PREFIX}-sut-fw" "$node_name" "$(sut_rules_json)"
+                    else
+                        log_warn "Firewalls DISABLED (--no-firewall) — ${node_name} is exposed to the internet."
+                    fi
+                else
+                    if [ "$FIREWALLS" = true ]; then
+                        log_info "[DRY-RUN] Create/update firewall '${NAME_PREFIX}-sut-fw' and apply to '${node_name}'"
+                    fi
+                fi
+            done
+
+            # 2. Configure each node. Node 0's Prometheus scrapes the whole
+            #    fleet (localhost + peers over the internal network).
+            local scrape_targets=""
+            for ((i = 0; i < CLUSTER_NODES; i++)); do
+                scrape_targets=""
+                if [ "$OBSERVABILITY" = true ] && [ "$i" -eq 0 ]; then
+                    scrape_targets="localhost:9000"
+                    for ((j = 1; j < CLUSTER_NODES; j++)); do
+                        scrape_targets="${scrape_targets},${SUT_NODE_IPS[$j]}:9000"
+                    done
+                fi
+                if [ "$DRY_RUN" = false ]; then
+                    configure_sut_vm "${SUT_NODE_NAMES[$i]}" "${SUT_NODE_PUBLIC_IPS[$i]}" "$scrape_targets" \
+                        || die "SUT node ${i} configuration failed."
+                    setup_ttl_timer "${SUT_NODE_NAMES[$i]}" "${SUT_NODE_PUBLIC_IPS[$i]}" \
+                        || log_warn "TTL timer setup failed on ${SUT_NODE_NAMES[$i]}. Manual TTL enforcement may be needed."
+                else
+                    log_info "[DRY-RUN] Configure ${SUT_NODE_NAMES[$i]}${scrape_targets:+ (scrape: $scrape_targets)} + TTL"
+                fi
+            done
+
+            # Single-VM compatibility view: node 0 is "the SUT".
+            SUT_NAME="${SUT_NODE_NAMES[0]}"
+            SUT_IP="${SUT_NODE_IPS[0]}"
+            SUT_PUBLIC_IP="${SUT_NODE_PUBLIC_IPS[0]}"
+        fi
+    # ── Phase 2 single-SUT path (unchanged) ──────────────────────────────
+    elif [ -n "$SUT_TYPE" ]; then
         log_info "Provisioning SUT VM: type=${SUT_TYPE}..."
         local sut_ips
         sut_ips=$(create_vm "$sut_name" "$SUT_TYPE" "$IMAGE" "$SSH_KEY_PATH")
@@ -1022,29 +1183,65 @@ output_json() {
                 single_vm: $single_vm
             }'
     else
-        jq -n \
-            --arg sut_ip "${SUT_IP:-}" \
-            --arg sut_public_ip "${SUT_PUBLIC_IP:-}" \
-            --arg sut_name "${SUT_NAME:-}" \
-            --arg sut_type "${SUT_TYPE:-}" \
-            --arg sut_internal_ip "${SUT_IP:-}" \
-            --arg harness_ip "${HARNESS_IP:-}" \
-            --arg harness_public_ip "${HARNESS_PUBLIC_IP:-}" \
-            --arg harness_name "${HARNESS_NAME:-}" \
-            --arg harness_type "${HARNESS_TYPE:-}" \
-            --arg harness_internal_ip "${HARNESS_IP:-}" \
-            --argjson phase "$PHASE" \
-            --arg provider "$PROVIDER" \
-            --arg network "$NETWORK_CIDR" \
-            --argjson ttl_hours "$TTL_HOURS" \
-            '{
-                sut: { ip: $sut_ip, public_ip: $sut_public_ip, name: $sut_name, type: $sut_type, internal_ip: $sut_internal_ip },
-                harness: { ip: $harness_ip, public_ip: $harness_public_ip, name: $harness_name, type: $harness_type, internal_ip: $harness_internal_ip },
-                phase: $phase,
-                provider: $provider,
-                network: $network,
-                ttl_hours: $ttl_hours
-            }'
+        # Phase 3+ fleet (ADR-0026): sut_nodes[] array (one entry per node
+        # VM). Phase 2 keeps the legacy single `sut` object.
+        if [ "$PHASE" = "3" ] || [ "$PHASE" = "4" ]; then
+            local nodes_json="[]"
+            for ((i = 0; i < CLUSTER_NODES; i++)); do
+                nodes_json=$(jq -n \
+                    --argjson acc "$nodes_json" \
+                    --arg name "${SUT_NODE_NAMES[$i]:-}" \
+                    --arg ip "${SUT_NODE_IPS[$i]:-}" \
+                    --arg public_ip "${SUT_NODE_PUBLIC_IPS[$i]:-}" \
+                    --arg type "${SUT_TYPE:-}" \
+                    '$acc + [{ name: $name, ip: $ip, public_ip: $public_ip, internal_ip: $ip, type: $type }]')
+            done
+            jq -n \
+                --argjson sut_nodes "$nodes_json" \
+                --arg harness_ip "${HARNESS_IP:-}" \
+                --arg harness_public_ip "${HARNESS_PUBLIC_IP:-}" \
+                --arg harness_name "${HARNESS_NAME:-}" \
+                --arg harness_type "${HARNESS_TYPE:-}" \
+                --arg harness_internal_ip "${HARNESS_IP:-}" \
+                --argjson phase "$PHASE" \
+                --arg provider "$PROVIDER" \
+                --arg network "$NETWORK_CIDR" \
+                --argjson ttl_hours "$TTL_HOURS" \
+                --argjson cluster_nodes "$CLUSTER_NODES" \
+                '{
+                    sut_nodes: $sut_nodes,
+                    harness: { ip: $harness_ip, public_ip: $harness_public_ip, name: $harness_name, type: $harness_type, internal_ip: $harness_internal_ip },
+                    phase: $phase,
+                    provider: $provider,
+                    network: $network,
+                    ttl_hours: $ttl_hours,
+                    cluster_nodes: $cluster_nodes
+                }'
+        else
+            jq -n \
+                --arg sut_ip "${SUT_IP:-}" \
+                --arg sut_public_ip "${SUT_PUBLIC_IP:-}" \
+                --arg sut_name "${SUT_NAME:-}" \
+                --arg sut_type "${SUT_TYPE:-}" \
+                --arg sut_internal_ip "${SUT_IP:-}" \
+                --arg harness_ip "${HARNESS_IP:-}" \
+                --arg harness_public_ip "${HARNESS_PUBLIC_IP:-}" \
+                --arg harness_name "${HARNESS_NAME:-}" \
+                --arg harness_type "${HARNESS_TYPE:-}" \
+                --arg harness_internal_ip "${HARNESS_IP:-}" \
+                --argjson phase "$PHASE" \
+                --arg provider "$PROVIDER" \
+                --arg network "$NETWORK_CIDR" \
+                --argjson ttl_hours "$TTL_HOURS" \
+                '{
+                    sut: { ip: $sut_ip, public_ip: $sut_public_ip, name: $sut_name, type: $sut_type, internal_ip: $sut_internal_ip },
+                    harness: { ip: $harness_ip, public_ip: $harness_public_ip, name: $harness_name, type: $harness_type, internal_ip: $harness_internal_ip },
+                    phase: $phase,
+                    provider: $provider,
+                    network: $network,
+                    ttl_hours: $ttl_hours
+                }'
+        fi
     fi
 }
 
@@ -1056,14 +1253,18 @@ usage() {
     cat <<'HELP'
 Usage: ./scripts/vm-provision.sh [OPTIONS]
 
-Provision two VMs (SUT + Harness) for OceanFS load testing per ADR-0019.
+Provision the load-test topology (SUT + Harness) for OceanFS per ADR-0019
+and ADR-0026.
 
 OPTIONS:
   --phase N            Load test phase (1-6). Determines VM sizes. [required]
                        Phase 1: N/A (runs in CI, no cloud VMs)
                        Phase 2: SUT=CX33, Harness=CX23
-                       Phase 3-4: SUT=CX33, Harness=CX23
+                       Phase 3-4: N SUT node VMs (default 3, each CX33,
+                       named {prefix}-sut-0..N-1) + Harness=CX43
                        Phase 5+: N/A (separate provisioning model)
+  --nodes N            Cluster fleet size for phase 3-4 (default: 3, or
+                       LOAD_TEST_CLUSTER_NODES; range 3-5)
   --provider NAME      Cloud provider: hetzner (default), gcp, aws
   --branch BRANCH      Git branch to clone on Harness VM (default: main)
   --repo URL           Git repo to clone on Harness VM (default: github.com/ndY0/ocean-fs)
@@ -1089,8 +1290,9 @@ OPTIONS:
   --ssh-source-ip IP   CIDR allowed to SSH into the VMs (default:
                        0.0.0.0/0). The SUT additionally allows the
                        internal test network for harness crash control.
-  --destroy NAME       Tear down both VMs with given name prefix
-  --status NAME        Check status of both VMs
+  --destroy NAME       Tear down all VMs with given name prefix
+                       ({prefix}-sut, {prefix}-sut-0..N-1, {prefix}-harness)
+  --status NAME        Check status of all VMs with given name prefix
   -h, --help           Show this help
 
 Environment Variables:
@@ -1098,19 +1300,24 @@ Environment Variables:
                             auto-loaded from .hetzner/.env by
                             lib/env-hetzner.sh)
   LOAD_TEST_TTL_HOURS       Override default TTL (default: 4)
+  LOAD_TEST_CLUSTER_NODES   Override cluster fleet size for phase 3-4
+                            (default: 3)
   LOAD_TEST_MAX_MONTHLY_EUR Optional monthly budget cap (deferrable, v2)
 
 Guardrails:
-  - Hard VM size cap: VMs >= CX43 require manual provisioning
+  - Hard VM size cap: VMs >= CX53 require manual provisioning (harness up
+    to CX43 per ADR-0026; SUT nodes capped at cx33)
   - Confirmation gate: removed (CX33 is the standard sizing for phases 2-4)
   - Auto-shutdown TTL: systemd timer powers off VMs after TTL expires
   - Budget gate: optional LOAD_TEST_MAX_MONTHLY_EUR scaffolding
 
-Output: JSON with sut + harness VM objects on stdout.
+Output: JSON with sut (phase 2) or sut_nodes array (phase 3-4) + harness
+VM objects on stdout.
 
 Examples:
   vm-provision.sh --phase 2 --branch feature/test
   vm-provision.sh --phase 3
+  vm-provision.sh --phase 3 --nodes 5
   vm-provision.sh --phase 1
   vm-provision.sh --destroy oceanfs-loadtest-2
   vm-provision.sh --status oceanfs-loadtest-2
@@ -1174,6 +1381,10 @@ parse_args() {
         case "$1" in
             --phase)
                 PHASE="${2:-}"
+                shift 2
+                ;;
+            --nodes)
+                CLUSTER_NODES="${2:-3}"
                 shift 2
                 ;;
             --provider)
@@ -1337,7 +1548,11 @@ main() {
     fi
 
     # Provision
-    log_info "Starting two-VM provisioning for Phase ${PHASE} (SUT=${SUT_TYPE:-N/A}, Harness=${HARNESS_TYPE:-N/A})..."
+    if [ "$PHASE" = "3" ] || [ "$PHASE" = "4" ]; then
+        log_info "Starting cluster provisioning for Phase ${PHASE}: ${CLUSTER_NODES} SUT node VMs (${SUT_TYPE:-N/A} each) + Harness (${HARNESS_TYPE:-N/A}) per ADR-0026..."
+    else
+        log_info "Starting two-VM provisioning for Phase ${PHASE} (SUT=${SUT_TYPE:-N/A}, Harness=${HARNESS_TYPE:-N/A})..."
+    fi
     log_info "TTL: ${TTL_HOURS}h, Provider: ${PROVIDER}, Branch: ${BRANCH}, Image: ${IMAGE}"
     if [ "$DRY_RUN" = true ]; then
         log_info "DRY-RUN mode: no actual VMs will be provisioned."

@@ -15,12 +15,18 @@
 #   --textfile-dir DIR    Textfile collector directory (default: /var/lib/prometheus/textfile)
 #   --retention-days N    TSDB retention in days (default: 7)
 #   --scrape-interval S   Scrape interval in seconds (default: 15)
+#   --scrape-targets LIST Comma-separated host:port list of OceanFS nodes to
+#                         scrape (default: localhost:9000, instance
+#                         'oceanfs-sut'). For a phase 3+ fleet (ADR-0026)
+#                         pass all node endpoints, e.g.
+#                         10.0.0.2:9000,10.0.0.3:9000,10.0.0.4:9000 —
+#                         instances are labeled oceanfs-node-0..N-1.
 #   -h, --help            Show this help
 #
 # Components:
 #   - Prometheus (via apt or official binary download)
 #   - prometheus.yml scrape config:
-#       job "oceanfs": localhost:9000/admin/metrics every 15s
+#       job "oceanfs": the scrape targets (/admin/metrics every 15s)
 #       job "load_test": textfile collector from /var/lib/prometheus/textfile/
 #   - systemd unit prometheus.service (enabled, started)
 #   - /var/lib/prometheus/textfile/ directory (writable by harness user)
@@ -199,7 +205,7 @@ create_prometheus_config() {
         scrape_oceanfs=$(grep -c "job_name: 'oceanfs'" "$config_file" 2>/dev/null || echo "0")
         local scrape_loadtest
         scrape_loadtest=$(grep -c "job_name: 'load_test'" "$config_file" 2>/dev/null || echo "0")
-        if [ "$scrape_oceanfs" -ge 1 ] && [ "$scrape_loadtest" -ge 1 ]; then
+        if [ "$scrape_oceanfs" -ge 1 ] && [ "$scrape_loadtest" -ge 1 ] && [ -z "${SCRAPE_TARGETS:-}" ]; then
             log_info "Prometheus config already contains oceanfs + load_test scrape jobs. Keeping existing."
             return 0
         fi
@@ -231,14 +237,41 @@ global:
 # rule_files: []
 
 scrape_configs:
-  # ── OceanFS SUT ─────────────────────────────────────────────────────────
+  # ── OceanFS nodes ──────────────────────────────────────────────────────
   - job_name: 'oceanfs'
     metrics_path: '/admin/metrics'
     static_configs:
+PROMETHEUS_CONFIG
+
+    # Render the OceanFS scrape targets. Phase 2 (default): the historical
+    # single-target shape with instance 'oceanfs-sut'. Phase 3+ fleet
+    # (--scrape-targets): one block per node, instances oceanfs-node-0..N-1
+    # (ADR-0026).
+    if [ -z "${SCRAPE_TARGETS:-}" ]; then
+        cat >> "$config_file" <<'PROMETHEUS_CONFIG'
       - targets: ['localhost:9000']
         labels:
           instance: 'oceanfs-sut'
           role: 'sut'
+PROMETHEUS_CONFIG
+    else
+        node_idx=0
+        IFS=',' read -ra TARGET_LIST <<< "$SCRAPE_TARGETS"
+        for target in "${TARGET_LIST[@]}"; do
+            target="$(echo "$target" | tr -d '[:space:]')"
+            if [ -n "$target" ]; then
+                cat >> "$config_file" <<PROMETHEUS_CONFIG
+      - targets: ['${target}']
+        labels:
+          instance: 'oceanfs-node-${node_idx}'
+          role: 'sut'
+PROMETHEUS_CONFIG
+                node_idx=$((node_idx + 1))
+            fi
+        done
+    fi
+
+    cat >> "$config_file" <<'PROMETHEUS_CONFIG'
 
   # ── Load Test Harness (textfile via Node Exporter) ─────────────────────
   - job_name: 'load_test'
@@ -600,6 +633,10 @@ parse_args() {
                 SCRAPE_INTERVAL="${2:-15}"
                 shift 2
                 ;;
+            --scrape-targets)
+                SCRAPE_TARGETS="${2:-}"
+                shift 2
+                ;;
             -h|--help)
                 usage
                 exit 0
@@ -626,6 +663,11 @@ main() {
     echo "═══════════════════════════════════════════════════════════════"
     echo "  OceanFS — Observability Stack Setup"
     echo "  Prometheus: port ${PROMETHEUS_PORT}, scrape every ${SCRAPE_INTERVAL}s"
+    if [ -n "${SCRAPE_TARGETS:-}" ]; then
+        echo "  Scrape targets: ${SCRAPE_TARGETS} (fleet mode, ADR-0026)"
+    else
+        echo "  Scrape targets: localhost:9000 (single-SUT mode)"
+    fi
     echo "  Node Exporter: port ${NODE_EXPORTER_PORT}, textfile collector"
     echo "  Retention: ${RETENTION_DAYS} days"
     echo "  Textfile dir: ${TEXTFILE_DIR}"
