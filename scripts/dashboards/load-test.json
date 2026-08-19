@@ -3078,6 +3078,92 @@
       },
       "gridPos": {
         "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 144
+      },
+      "id": 101,
+      "title": "Memory Composition (MiB) \u2014 RSS vs the bounded caches/pools",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "process_resident_memory_bytes{job=\"oceanfs\"} / 1048576",
+          "legendFormat": "rss_mib",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "cache_size_bytes{tier=\"l1\",job=\"oceanfs\"} / 1048576",
+          "legendFormat": "l1_cache_mib",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rocksdb_memtable_size_bytes{job=\"oceanfs\"} / 1048576",
+          "legendFormat": "rocksdb_memtable_mib",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "buffer_pool_bytes_allocated{job=\"oceanfs\"} / 1048576",
+          "legendFormat": "pool_buffers_mib",
+          "refId": "D"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "drawStyle": "line",
+            "stacking": {
+              "mode": "none"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": ""
+          },
+          "unit": "short",
+          "min": null,
+          "max": null
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
         "w": 8,
         "x": 16,
         "y": 128
