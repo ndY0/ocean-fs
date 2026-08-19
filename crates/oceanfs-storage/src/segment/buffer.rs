@@ -192,7 +192,7 @@ impl ActiveSegment {
 
 /// A segment that has been filled and is ready for the seal hand-off.
 ///
-/// Produced by [`ActiveSegment::seal`] when a slot's segment fills: the
+/// Produced by `ActiveSegment::seal` when a slot's segment fills: the
 /// backing buffer is frozen into a zero-copy `Bytes` and the slot's
 /// `Sealing` state retains a clone for the read window. EC parity is
 /// computed at seal time by the seal worker, not here.

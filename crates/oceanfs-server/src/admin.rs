@@ -631,10 +631,18 @@ async fn trigger_scrub(State(state): State<AdminState>) -> impl IntoResponse {
             let coordinator = coordinator.clone();
             let _metadata = metadata.clone();
             let data_store = data_store.clone();
-            let registry = state
-                .lifecycle_registry
-                .clone()
-                .expect("lifecycle registry wired with the scrub trigger");
+            // The lifecycle registry is wired together with the scrub
+            // trigger (both optional — a storage-less node has neither);
+            // a missing registry here is a misconfiguration, surfaced as
+            // 503 like the missing-coordinator case below.
+            let Some(registry) = state.lifecycle_registry.clone() else {
+                tracing::warn!("scrub trigger requested but lifecycle registry not configured");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Lifecycle registry not configured on this node",
+                )
+                    .into_response();
+            };
             match coordinator.trigger_manual(registry, data_store).await {
                 Ok(()) => {
                     tracing::info!("scrub triggered via admin API");

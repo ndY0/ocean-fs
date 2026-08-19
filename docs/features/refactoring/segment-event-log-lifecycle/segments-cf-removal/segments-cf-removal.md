@@ -203,41 +203,50 @@ Orphan reaper (was: deleted-marker write) → coordinator.request_delete
 - [ ] **Code:** `cargo build --all-targets`, `cargo fmt --check`,
       `cargo clippy --lib -- -D warnings` pass in all affected crates;
       `#![deny(missing_docs)]` passes.
-- [ ] **Tests:** `cargo test -p oceanfs-storage --lib -- --test-threads=1`,
+<!-- REVIEW: build (all 5 affected crates) and fmt pass; missing_docs denied everywhere. clippy FAILS on 2 errors introduced by this feature: crates/oceanfs-storage/src/segment/pool.rs:296-297 (`clippy::empty_line_after_doc_comments` — leftover doc line from the `try_seal_idle` removal in 41b6b42, now glued onto `install_replacement`) and crates/oceanfs-server/src/admin.rs:634-637 (`clippy::expect_used` on `state.lifecycle_registry` in production code, added by 2f78a34; the sibling fields use `if let Some`, only the registry uses `.expect()`). Fix: delete the orphaned doc lines in pool.rs; replace the expect with an `if let`/`ok_or` error response in admin.rs. RUSTDOCFLAGS="-D warnings" cargo doc also fails with 5 errors, 3 introduced here: lifecycle.rs:29 broken link to removed `seal_idle_segments`, lifecycle.rs:2076 private link `SegmentLifecycleRegistry::writer_join`, pool.rs:964 broken link `append_with_hook_async`; 2 pre-existing (buffer.rs:195, lifecycle.rs:1461). -->
+- [x] **Tests:** `cargo test -p oceanfs-storage --lib -- --test-threads=1`,
       `-p oceanfs-durability`, `-p oceanfs-server`, `-p oceanfs-node` green
       (PIPELINE.md §4.6), with the pre-existing CF-dependent tests migrated
       to machine-backed fixtures.
-- [ ] **Invariant — CF gone (grep-verifiable):** no `segments` CF, no
+<!-- REVIEW: verified independently: storage lib 317/317, server lib 218/218, node lib 32/32 (+2 ignored), durability lib 233/233, storage-api 0; all integration tests green (node 74, storage ~70, durability ~34, server ~30). Crash matrix rows 1-6 (segment/crash_matrix.rs) and rows 7-9 (gc/compaction_crash.rs) green. One load-induced flake observed: storage lib `io::segment_flush::tests::group_commit_batches_concurrent_registrations` failed once while the server suite compiled/runs concurrently on the same machine (asserts batches <= 2 on a 100 ms group-commit window); passes solo and 5/5 in isolation. -->
+- [x] **Invariant — CF gone (grep-verifiable):** no `segments` CF, no
       deleted-markers CF, no `put_segment`/`get_segment`/`list_segments`
       anywhere in the workspace; the RocksDB open lists exactly
       `objects` + `deletions`. Mutation check: re-adding a segment CF write
       must fail a test (there is no store to write to).
-- [ ] **Invariant — event log is the only durable writer of segment
+<!-- REVIEW: verified by grep — all matches are comments/docs/tests; the trait (oceanfs-storage-api/src/metadata_store.rs) has no segment methods; BatchOp has only object/tombstone variants; RocksDB opens objects+deletions only (metadata/store.rs:241-244; cf.rs). Mutation check holds structurally (no trait method exists to call). Minor leftover: `Error::MirrorDivergence` variant (error.rs:141) is dead code — never constructed, only referenced by a stale doc (lifecycle.rs:1467). -->
+- [x] **Invariant — event log is the only durable writer of segment
       state (final form):** the coordinator's `request_*` methods append
       events; no other durable segment-state store exists. Verified by the
       absence of the CF (above) plus the crash matrix.
-- [ ] **Invariant — WAL retention without CF scan:** the leak regression —
+<!-- REVIEW: coordinator holds no metadata-store handle (lifecycle.rs:1133-1141); event_wal is Option and every request_* (reserve/seal/delete/refresh/seal_finalized_batch) rejects with TransitionError::DurableWriteFailed when unwired (lifecycle.rs:1760, 1829-1846, 1899-1908, 1937-1942, 2003-2010) with tests at 2760/2893. -->
+- [x] **Invariant — WAL retention without CF scan:** the leak regression —
       a soak test drives reserve→seal→sweep churn and asserts the WAL
       `protected` file set stays flat (the 3.8 GB/hour class: previously
       17 → 45 in 30 min); `cleanup_old_wal_files` performs no metadata
       store lookup.
-- [ ] **Invariant — consumers read the machine:** GC liveness, scrub
+<!-- REVIEW: cleanup_old_wal_files takes an is_entry_garbage closure (wal/replay.rs:336-435) backed by entry_is_garbage (lifecycle.rs:306); no metadata-store lookup. record_data_wal_pos is max-monotonic and updates Reserved AND Sealed entries (lifecycle.rs:902-934; tests 3054-3090); the recovery pass overlays the last WAL position for every segment incl. Sealed (lifecycle.rs:1556-1601). e2e/tests/wal_retention.rs passes (2/2) against a binary rebuilt from 41b6b42 — NOTE: an earlier stale pre-commit release binary failed it (26 files, no convergence); after `cargo build --release` from the current commit it passes (peak 9, converges to 4). Test nit: the DURING-load peak assertion is vacuous (wal_retention.rs:99 `let peak = initial_files;` is never reassigned); the post-load convergence gate (<= initial+6) is the effective assertion. -->
+- [x] **Invariant — consumers read the machine:** GC liveness, scrub
       roots, AE rebuild, and reaper deletes are exercised by their existing
       suites with the CF removed; scrub's root now comes from the machine
       entry (test: sealed segment's root in the registry equals the scrub
       anchor).
-- [ ] **Crash matrix with no mirror:** the full nine-row matrix passes with
+<!-- REVIEW: GC run_cycle/start_background take &SegmentLifecycleRegistry + for_each liveness (gc/garbage_collector.rs:166,343,385); scrub run_cycle enumerates registry Sealed entries and the worker's anchor is registry.get(id).metadata.merkle_root (scrub.rs:706-727, 507-509); AE rebuild_from_segment_scan scans the registry (merkle/incremental_tree.rs:409-427); orphan reaper scans registry + request_delete with delete-before-unlink (gc/orphan_reaper.rs:128-153, 147-174); heal worker requests request_refresh_metadata (heal/worker.rs:417-418); healing_service reads the registry (healing_service.rs:30); admin /admin/segments wired via with_lifecycle_registry (admin.rs:422, node.rs:1230). -->
+- [x] **Crash matrix with no mirror:** the full nine-row matrix passes with
       the CF removed — no dual-read check exists to mask a fold error; rows
       1–6 (from `event-wal-recovery`) and 7–9 (from
       `compaction-state-machine`) all green in one suite.
+<!-- REVIEW: rows 1-6 green in segment/crash_matrix.rs (storage lib) and rows 7-9 green in gc/compaction_crash.rs (durability lib); no dual-read code remains. "One suite" is satisfied functionally (both suites green with no mirror); the rows remain physically split across the two crates as the DoD's own provenance line implies. -->
 - [ ] **Perf:** no hot-path trait boundary added (registry is in-crate for
       storage consumers; durability consumers keep their existing trait
       boundary — ADR-0025 Decision 1); the machine scan is O(live segments)
       and the AE rebuild benchmark stays within the ADR-0018 rebuild cost
       envelope (O(N) scan, ~1 s per 1M segments).
+<!-- REVIEW: registry is in-crate; shards use parking_lot::RwLock (perf 2.3); lock bodies contain no I/O (7.1); writer_count uses relaxed atomics (11.1); machine scan is O(live) by construction. Two gaps: (1) NO AE rebuild benchmark exists anywhere in benches/ — the "stays within the ADR-0018 rebuild cost envelope" claim is unverifiable; (2) durability consumers take the concrete SegmentLifecycleRegistry/Coordinator from oceanfs-storage rather than a trait defined in the consuming crate — deviation from the letter of ADR-0025 Decision 1's "trait-in-consuming-crate" wording (no hot path crosses the boundary; the machine is consumed only by background tasks). -->
 - [ ] **Integration:** a full node cycle — write, seal, delete, restart,
       GC run, scrub run, AE run — with the CF removed, all assertions from
       the pre-removal suites preserved (objects CF untouched).
+<!-- REVIEW: all 27 other e2e test files pass (write/seal/read/report via segment_lifecycle, restart via wal_recovery + cluster_lifecycle t42, GC, scrub, AE, orphan reaper, cluster paths). load_sustained FAILS on the dev machine: memory_bounded as claimed (run 2: RSS 1312116736 > 2x initial 593522688; run 1 passed — borderline), AND crash_recovery failed 2/2 of this reviewer's runs (1 of ~102-110 pre-crash objects "unreachable" — transport error on GET after SIGKILL+restart, keys load-test/hot-17 then hot-57), whereas the implementer's 07:53 run passed it. The crash_recovery claim is not reproducible on this machine; needs investigation or re-validation on the SUT VM. -->
 
 > **Lint & Doc Examples (non-gating):** `cargo clippy --all-targets -D
 > warnings` test-code warnings and `ignore`-tagged doc examples are

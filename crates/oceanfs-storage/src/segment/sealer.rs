@@ -149,9 +149,8 @@ impl SegmentSealer {
     }
 
     /// Returns the seal timeout in milliseconds — the maximum time a
-    /// non-empty active segment may go without being sealed. The pool's
-    /// idle-seal worker uses this so partially-filled segments are
-    /// sealed on the same cadence the sealer's own `try_seal` assumes.
+    /// non-empty active segment may go without being sealed (the
+    /// `try_seal` timeout check; test-exercised).
     pub fn seal_timeout_ms(&self) -> u64 {
         self.config.seal_timeout_ms
     }

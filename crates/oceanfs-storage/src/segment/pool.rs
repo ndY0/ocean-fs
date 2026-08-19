@@ -282,19 +282,6 @@ impl PoolSlot {
         }
     }
 
-    /// Seals the slot's segment if it has been idle (no appends) for at
-    /// least `timeout` and holds data.
-    ///
-    /// Returns the sealed payload for the caller to hand to the seal
-    /// queue (the same path as a fill-triggered seal). This is what
-    /// bounds the WAL: a partially-filled segment that never receives
-    /// another append would otherwise stay registered-unsealed forever,
-    /// and every WAL file holding its entries would be protected from
-    /// cleanup — the `wal_not_unbounded` leak (the count grew ~1.5
-    /// files/min under sustained load).
-    ///
-    /// Runs under the slot lock (same critical section as fill).
-
     /// Installs a replacement segment into a slot that is sealing or idle
     /// — a single pointer swap under one lock acquisition.
     ///
@@ -960,9 +947,8 @@ impl SegmentPool {
         }
     }
 
-    /// Enqueues a sealed payload returned by
-    /// [`append_with_hook_async`] — the caller-side half of the seal
-    /// hand-off.
+    /// Enqueues a sealed payload returned by `append_with_hook_async`
+    /// — the caller-side half of the seal hand-off.
     ///
     /// The write path calls this AFTER its data-WAL append and position
     /// record (the record precedes the enqueue, in the same task), so
@@ -972,11 +958,11 @@ impl SegmentPool {
     /// (ADR-0024 §Retention; a seal can never capture a stale `(0, 0)`
     /// that would pin the segment's WAL files).
     ///
-    /// Mirrors the internal [`finish_seal_handoff_async`] semantics:
+    /// Mirrors the internal `finish_seal_handoff_async` semantics:
     /// the frozen slot is re-armed and the work item enqueued within
     /// `deadline`; on failure the write is rejected (never acked), the
     /// registry entry keeps the in-flight read window, and the
-    /// idle-seal driver retries the seal.
+    /// pending-seal drain retries the seal.
     ///
     /// # Errors
     ///

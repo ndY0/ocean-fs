@@ -62,6 +62,14 @@ fn root_fn(data: &[u8]) -> Option<HashOutput> {
     crate::MerkleTree::build(data, 0).map(|tree| tree.root().hash())
 }
 
+/// Serializes the stall-seam tests: the seam's `STALL_AT`/`REACHED`
+/// statics are process-global, so concurrently running tests
+/// cross-talk (one harness can observe another test's milestone and
+/// kill its compactor at the wrong point — flaky rows 7-9 under
+/// parallel execution). Each test holds the lock for its whole body;
+/// the guard drops on unwind, so a panic can never deadlock the rest.
+static SEAM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A fully wired GC slice — store (objects + CF mirror), event wal,
 /// data wal, coordinator, sealer, data store, shard store, compactor.
 struct Harness {
@@ -293,6 +301,7 @@ impl ObjectLookup for StoreLookup {
 /// empty reserve (row 1); the old segment is untouched.
 #[tokio::test]
 async fn kill_before_dat_write_folds_copying_and_drops_the_reserve() {
+    let _seam = SEAM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let old_id = SegmentId::new();
     let old_data = vec![0xEE; 400];
@@ -335,6 +344,7 @@ async fn kill_before_dat_write_folds_copying_and_drops_the_reserve() {
 /// replacement is reaped like any orphan.
 #[tokio::test]
 async fn kill_between_dat_write_and_seal_adopts_the_new_dat() {
+    let _seam = SEAM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let old_id = SegmentId::new();
     let old_data = vec![0xEE; 400];
@@ -387,6 +397,7 @@ async fn kill_between_dat_write_and_seal_adopts_the_new_dat() {
 /// `.dat` is an orphan → `SweepNewOrphan(new)`.
 #[tokio::test]
 async fn row7_kill_between_new_sealed_and_objects_moved() {
+    let _seam = SEAM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let old_id = SegmentId::new();
     let old_data = vec![0xEE; 400];
@@ -454,6 +465,7 @@ async fn row7_kill_between_new_sealed_and_objects_moved() {
 /// sealed-orphan is finished: `FinishOldDeletion(old)`.
 #[tokio::test]
 async fn row8_kill_between_objects_moved_and_old_deleted() {
+    let _seam = SEAM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let old_id = SegmentId::new();
     let old_data = vec![0xEE; 400];
@@ -506,6 +518,7 @@ async fn row8_kill_between_objects_moved_and_old_deleted() {
 /// `.dat` residue remains → `SweepOldDat(old)`.
 #[tokio::test]
 async fn row9_kill_between_old_deleted_and_old_removed() {
+    let _seam = SEAM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let old_id = SegmentId::new();
     let old_data = vec![0xEE; 400];
@@ -559,6 +572,7 @@ async fn row9_kill_between_old_deleted_and_old_removed() {
 /// sweep — `startup-rebuild-from-machine`).
 #[tokio::test]
 async fn fully_dead_kill_after_delete_leaves_dat_residue() {
+    let _seam = SEAM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let old_id = SegmentId::new();
     let old_data = vec![0xEE; 400];
@@ -597,6 +611,7 @@ async fn fully_dead_kill_after_delete_leaves_dat_residue() {
 /// defect — flips the flag and fails this test).
 #[tokio::test]
 async fn repacked_compressed_chunk_reads_back_with_matching_digest() {
+    let _seam = SEAM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // "Compression": the on-disk bytes are a transformed form of the
     // logical bytes (XOR 0xFF). The read path decompresses when
     // `compressed` is true, yielding `logical_length` bytes.
@@ -681,6 +696,7 @@ async fn repacked_compressed_chunk_reads_back_with_matching_digest() {
 /// reads back with a matching digest.
 #[tokio::test]
 async fn post_compaction_segment_scrubs_healthy_against_the_machine_root() {
+    let _seam = SEAM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let old_id = SegmentId::new();
     let old_data = vec![0xEE; 400];
@@ -740,6 +756,7 @@ async fn post_compaction_segment_scrubs_healthy_against_the_machine_root() {
 /// `repacked_compressed_chunk_reads_back_with_matching_digest`).
 #[tokio::test]
 async fn repacked_uncompressed_chunk_reads_back_with_matching_digest() {
+    let _seam = SEAM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let logical: Vec<u8> = (0..512).map(|i| (i * 3) as u8).collect();
     let digest_before = blake3::hash(&logical);
 

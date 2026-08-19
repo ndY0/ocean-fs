@@ -95,8 +95,10 @@ async fn wal_file_count_stays_bounded_under_tiered_concurrent_churn() {
     }
     // Poll DURING the load: the count must stay bounded while the
     // rotations happen (the sealed entries become garbage and the
-    // rotations' cleanups prune), not just after the load stops.
-    let peak = initial_files;
+    // rotations' cleanups prune), not just after the load stops. The
+    // peak is tracked across the polls and asserted against the load
+    // test's contract (initial + 20) after the load.
+    let mut peak = initial_files;
     let poll_handle = {
         let cluster = Arc::clone(&cluster);
         tokio::spawn(async move {
@@ -104,6 +106,7 @@ async fn wal_file_count_stays_bounded_under_tiered_concurrent_churn() {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 let snap = MetricsSnapshot::scrape(&*cluster, 0).await.expect("scrape");
                 let files = snap.metrics.get("wal_file_count").copied().unwrap_or(0.0) as u64;
+                peak = peak.max(files);
                 let seg_resp = cluster.get(0, "/admin/segments").await.expect("segments");
                 let seg: SegmentReport =
                     e2e::harness::response_json(seg_resp).await.expect("segments json");

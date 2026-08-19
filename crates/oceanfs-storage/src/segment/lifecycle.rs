@@ -25,11 +25,12 @@
 //! - **Reserve before data.** `request_reserve` returns `Ok` only
 //!   after its durable side-effect; the write path calls it before the
 //!   first `DataEntry` (WAL entry) of its segment.
-//! - **Idle-seal.** The coordinator owns the idle-seal timer:
-//!   [`SegmentLifecycleCoordinator::seal_idle_segments`] sweeps the
-//!   pools for partially-filled segments that stopped receiving
-//!   writes, sealing them within `seal_timeout_ms` (empty segments are
-//!   never sealed — recovery drops empty reserves).
+//! - **Seal-on-zero.** The coordinator's pending-seal drain seals
+//!   partial segments deterministically: the write path joins every
+//!   segment it appends to (atomic writer count) and leaves at request
+//!   completion; the last leave seals the segment (empty segments are
+//!   never sealed — recovery drops empty reserves). No timer, no
+//!   heuristic.
 //!
 //! # LOCK ORDER
 //!
@@ -1458,15 +1459,13 @@ impl SegmentLifecycleCoordinator {
     ///
     /// The data WAL is consumed and truncated after the pass. The pass
     /// requires the pools wired via
-    /// [`with_idle_seal`](Self::with_idle_seal) and the sealer's `.dat`
-    /// directory.
+    /// [`with_seal_pools`](Self::with_seal_pools) and the sealer's
+    /// `.dat` directory.
     ///
     /// # Errors
     ///
-    /// Returns the fold's corruption errors, a
-    /// [`Error::MirrorDivergence`] when the CF mirror contradicts the
-    /// fold in the impossible direction, or an I/O error from the data
-    /// WAL / sealer.
+    /// Returns the fold's corruption errors or an I/O error from the
+    /// data WAL / sealer.
     pub async fn rebuild_with_data_wal(
         &self,
         events: impl Iterator<Item = Result<(EventWalPos, SegmentEvent)>>,
@@ -2067,13 +2066,9 @@ impl SegmentLifecycleCoordinator {
     /// and are re-enqueued here — a full seal queue delays the seal
     /// but never removes the read window (lifecycle-read-path). Once
     /// the in-flight count drops below the cap, slots re-arm.
-    ///
-    /// A timeout of zero means "idle immediately" (used by tests;
-    /// production wires the sealer's `seal_timeout_ms`).
     /// Writes a segment's writer-count join through the coordinator —
     /// the registry's only writer. Called by the write path right after
-    /// the reserve, before the first WAL entry (see the registry's
-    /// [`writer_join`](SegmentLifecycleRegistry::writer_join)).
+    /// the reserve, before the first WAL entry.
     pub fn writer_join(&self, id: SegmentId) {
         self.registry.writer_join(id);
     }
