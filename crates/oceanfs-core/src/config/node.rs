@@ -387,6 +387,25 @@ pub struct NodeConfig {
     /// sweep time — delivery becomes eventually-convergent under churn.
     #[serde(default = "default_hint_delivery_sweep_sec")]
     pub hint_delivery_sweep_sec: u64,
+
+    /// Cluster-readiness gate timeout in seconds (default 30).
+    ///
+    /// After (re)joining a cluster, a node's ring starts as a singleton
+    /// until its membership pull converges; with the adaptive quorum
+    /// that window would ACK writes with a single durable copy (silent
+    /// under-replication). While the gate is closed, writes fail with
+    /// 503. The gate opens when the ring reaches 2 nodes or this many
+    /// seconds elapse (the bound keeps a node whose seeds are
+    /// unreachable from stalling writes forever — the 503s it emits
+    /// while gated are the safer failure mode).
+    ///
+    /// NOTE: convergence time scales with the gossip configuration
+    /// (`[gossip] interval_ms` / `suspicion_timeout_ms` / `failure
+    /// _timeout_ms`) — tune this with the gossip profile, e.g. a fast
+    /// test profile can use a shorter timeout than a production profile
+    /// with 30s gossip intervals.
+    #[serde(default = "default_cluster_ready_timeout_sec")]
+    pub cluster_ready_timeout_sec: u64,
 }
 
 fn default_node_id() -> String {
@@ -566,6 +585,9 @@ fn default_hint_prune_interval() -> u64 {
 fn default_hint_delivery_sweep_sec() -> u64 {
     5
 }
+fn default_cluster_ready_timeout_sec() -> u64 {
+    30
+}
 
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -648,6 +670,7 @@ impl Default for NodeConfig {
             hint_ttl_sec: 604800,
             hint_prune_interval_sec: 3600,
             hint_delivery_sweep_sec: 5,
+            cluster_ready_timeout_sec: 30,
         }
     }
 }

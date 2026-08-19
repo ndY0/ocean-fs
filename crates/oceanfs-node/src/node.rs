@@ -1020,14 +1020,18 @@ impl Node {
         if is_cluster_node {
             let gate_membership = membership.clone();
             let gate = ready_gate.clone();
+            let gate_timeout_secs = config.cluster_ready_timeout_sec.max(1);
             tokio::spawn(async move {
                 // Open the gate when the ring reaches 2 nodes (enough
-                // for w=2 semantics) or after a 30s bound — the rejoin
-                // pull takes seconds; the bound keeps a node whose seeds
-                // are unreachable from stalling writes forever (it
-                // would serve stale data anyway — the 503s it emits
-                // while gated are the safer failure mode).
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                // for w=2 semantics) or after the configured bound —
+                // the rejoin pull takes seconds; the bound keeps a node
+                // whose seeds are unreachable from stalling writes
+                // forever (it would serve stale data anyway — the 503s
+                // it emits while gated are the safer failure mode).
+                // The timeout is config (`cluster_ready_timeout_sec`)
+                // because convergence scales with the gossip profile.
+                let deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(gate_timeout_secs);
                 loop {
                     let ring_nodes = gate_membership.ring().snapshot().node_count();
                     if ring_nodes >= 2 || tokio::time::Instant::now() >= deadline {
@@ -1066,6 +1070,7 @@ impl Node {
             // after (re)join, writes fail with 503 instead of
             // under-replicating (see the gate task above).
             .with_ready_gate(ready_gate)
+            .with_hint_inline_threshold(config.hint_inline_threshold_bytes)
             // Continuous anti-entropy: every successful seal updates the
             // incremental Merkle tree (with its seal-time root) so
             // recently-written segments participate in the root exchange
@@ -1420,7 +1425,14 @@ impl Node {
             heal_data_store.clone(),
             hlc_clock.clone(),
         )
-        .with_local_node_id(NodeId::new(&config.node_id));
+        .with_local_node_id(NodeId::new(&config.node_id))
+        // Segment-ref hint materialization: the receiver pulls the blob
+        // range from the origin (the hint sender) instead of the hint
+        // carrying the data inline — hints stay small for multipart/GB
+        // blobs.
+        .with_hint_data_fetcher(Arc::new(oceanfs_durability::GrpcHintDataFetcher::new(
+            pool.clone(),
+        )));
         let cache_service = oceanfs_server::grpc::cache_service::CacheGrpcService::new(
             Some(object_cache.clone()),
             Some(metadata_cache.clone()),

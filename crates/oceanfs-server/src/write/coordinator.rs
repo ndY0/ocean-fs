@@ -157,6 +157,10 @@ pub struct WriteCoordinator {
     /// and single-node deployments are unaffected; the composition root
     /// installs a real gate via [`set_ready_gate`](Self::set_ready_gate).
     ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Hint inline threshold: hints for blobs up to this size embed the
+    /// data; larger blobs are hinted as segment references (the
+    /// receiver pulls the range from this node). Defaults to 4 KB.
+    hint_inline_threshold_bytes: u64,
     /// Compression backend (accel dispatcher), injected by the
     /// composition root. `None` (default) disables per-bucket
     /// compression.
@@ -305,6 +309,7 @@ impl WriteCoordinator {
             size_config,
             hinted_handoff,
             ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            hint_inline_threshold_bytes: 4096,
             #[cfg(feature = "accel")]
             compressor: None,
             #[cfg(feature = "accel")]
@@ -361,6 +366,16 @@ impl WriteCoordinator {
     #[doc(hidden)]
     pub fn with_ready_gate(mut self, ready: Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.ready = ready;
+        self
+    }
+
+    /// Sets the hint inline threshold (hints above it become segment
+    /// references instead of embedding the blob data). The composition
+    /// root mirrors the node config's `hint_inline_threshold_bytes`.
+    #[must_use]
+    #[doc(hidden)]
+    pub fn with_hint_inline_threshold(mut self, bytes: u64) -> Self {
+        self.hint_inline_threshold_bytes = bytes;
         self
     }
 
@@ -741,23 +756,52 @@ impl WriteCoordinator {
                         warn!(target = %target, error = %e, "replica write failed");
                         // Store hinted handoff for the unreachable replica.
                         //
-                        // The hint ALWAYS carries the blob data inline.
-                        // Segment-ref hints (segment_id/offset/length,
-                        // no data) cannot be applied by the receiver:
-                        // applying requires fetching the shard from the
-                        // origin, which the hint protocol does not
-                        // support — a ref-only hint was buffered forever
-                        // and the write silently lost (found by the
-                        // phase-3 churn test). Inline data makes the
-                        // hint self-contained; the hint WAL absorbs the
-                        // transient growth and is truncated on delivery.
-                        let hint = oceanfs_durability::hinted_handoff_rpc::HintRecord::new_inline(
-                            target.clone(),
-                            req.bucket.clone(),
-                            req.key.to_string(),
-                            req.data.clone(),
-                            hlc,
-                        );
+                        // Small blobs (≤ inline_threshold_bytes) embed the
+                        // data inline. Larger blobs reference the segment
+                        // (segment_id + offset + length) WITHOUT the data:
+                        // the receiver pulls the range from this node over
+                        // gRPC (FetchHintData) and applies it. Refs keep
+                        // hints small — embedding data would break the
+                        // moment multipart uploads make blobs reach GB
+                        // sizes (the hint WAL and the gRPC batch would
+                        // balloon to the blob size).
+                        let hint = if req.data.len() as u64 <= self.hint_inline_threshold_bytes {
+                            oceanfs_durability::hinted_handoff_rpc::HintRecord::new_inline(
+                                target.clone(),
+                                req.bucket.clone(),
+                                req.key.to_string(),
+                                req.data.clone(),
+                                hlc,
+                            )
+                        } else if let Some(chunk) = chunks.first() {
+                            // Use the first chunk's segment reference.
+                            // For Small/Standard tier there is exactly
+                            // one chunk; for Multi tier, the first
+                            // chunk covers the blob start.
+                            oceanfs_durability::hinted_handoff_rpc::HintRecord::new_segment_ref(
+                                target.clone(),
+                                req.bucket.clone(),
+                                req.key.to_string(),
+                                chunk.segment_id,
+                                chunk.offset,
+                                chunk.length,
+                                hlc,
+                            )
+                        } else {
+                            // Safety guard: no chunk (inline tier) —
+                            // fall back to inline storage.
+                            warn!(
+                                "no chunks available for segment-ref hint; \
+                                 falling back to inline for target {target}"
+                            );
+                            oceanfs_durability::hinted_handoff_rpc::HintRecord::new_inline(
+                                target.clone(),
+                                req.bucket.clone(),
+                                req.key.to_string(),
+                                req.data.clone(),
+                                hlc,
+                            )
+                        };
                         let _ = self.hinted_handoff.enqueue(hint).await;
                     }
                 }

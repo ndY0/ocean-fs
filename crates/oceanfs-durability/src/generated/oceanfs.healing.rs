@@ -90,6 +90,27 @@ pub struct FetchShardChunk {
     #[prost(bytes = "bytes", tag = "2")]
     pub data: ::prost::bytes::Bytes,
 }
+/// Request to fetch a byte range of a segment's data — used by the
+/// hinted-handoff receiver to pull a segment-ref hint's blob from the
+/// origin node (the hint carries segment_id + offset + length, NOT the
+/// data, so hints stay small even for multipart/GB blobs).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FetchHintDataRequest {
+    #[prost(message, optional, tag = "1")]
+    pub segment_id: ::core::option::Option<::oceanfs_core::proto::common::SegmentId>,
+    #[prost(uint64, tag = "2")]
+    pub offset: u64,
+    #[prost(uint32, tag = "3")]
+    pub length: u32,
+}
+/// A chunk of the fetched range, streamed from the server.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FetchHintDataChunk {
+    #[prost(uint32, tag = "1")]
+    pub chunk_index: u32,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub data: ::prost::bytes::Bytes,
+}
 /// Request to push a reconstructed shard to a peer that owns it.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PushRepairedShardRequest {
@@ -300,6 +321,34 @@ pub mod healing_rpc_client {
                 .insert(GrpcMethod::new("oceanfs.healing.HealingRpc", "FetchShard"));
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Fetch a byte range of a segment's data — hinted-handoff segment-ref
+        /// delivery (the receiver pulls the blob from the origin instead of
+        /// the hint carrying it inline, which would not scale to multipart/GB
+        /// blobs). Server-streaming like FetchShard.
+        pub async fn fetch_hint_data(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FetchHintDataRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::FetchHintDataChunk>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/oceanfs.healing.HealingRpc/FetchHintData",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("oceanfs.healing.HealingRpc", "FetchHintData"));
+            self.inner.server_streaming(req, path, codec).await
+        }
         /// Push a reconstructed shard to a remote node that owns it.
         pub async fn push_repaired_shard(
             &mut self,
@@ -373,6 +422,23 @@ pub mod healing_rpc_server {
             &self,
             request: tonic::Request<super::FetchShardRequest>,
         ) -> std::result::Result<tonic::Response<Self::FetchShardStream>, tonic::Status>;
+        /// Server streaming response type for the FetchHintData method.
+        type FetchHintDataStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::FetchHintDataChunk, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Fetch a byte range of a segment's data — hinted-handoff segment-ref
+        /// delivery (the receiver pulls the blob from the origin instead of
+        /// the hint carrying it inline, which would not scale to multipart/GB
+        /// blobs). Server-streaming like FetchShard.
+        async fn fetch_hint_data(
+            &self,
+            request: tonic::Request<super::FetchHintDataRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::FetchHintDataStream>,
+            tonic::Status,
+        >;
         /// Push a reconstructed shard to a remote node that owns it.
         async fn push_repaired_shard(
             &self,
@@ -625,6 +691,52 @@ pub mod healing_rpc_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = FetchShardSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/oceanfs.healing.HealingRpc/FetchHintData" => {
+                    #[allow(non_camel_case_types)]
+                    struct FetchHintDataSvc<T: HealingRpc>(pub Arc<T>);
+                    impl<
+                        T: HealingRpc,
+                    > tonic::server::ServerStreamingService<super::FetchHintDataRequest>
+                    for FetchHintDataSvc<T> {
+                        type Response = super::FetchHintDataChunk;
+                        type ResponseStream = T::FetchHintDataStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::FetchHintDataRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as HealingRpc>::fetch_hint_data(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = FetchHintDataSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

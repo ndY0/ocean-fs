@@ -79,6 +79,12 @@ service HealingRpc {
   // to enable overlapping data transfer with processing (perf rule 4.4).
   rpc FetchShard(FetchShardRequest) returns (stream FetchShardChunk);
 
+  // Fetch a byte range of a segment's data — hinted-handoff segment-ref
+  // delivery (the receiver pulls the blob from the origin instead of
+  // the hint carrying it inline, which would not scale to multipart/GB
+  // blobs). Server-streaming like FetchShard.
+  rpc FetchHintData(FetchHintDataRequest) returns (stream FetchHintDataChunk);
+
   // Push a reconstructed shard to a remote node that owns it.
   rpc PushRepairedShard(PushRepairedShardRequest) returns (PushRepairedShardResponse);
 }
@@ -95,6 +101,22 @@ message FetchShardRequest {
 
 // A chunk of shard data streamed from the server.
 message FetchShardChunk {
+  uint32 chunk_index = 1;
+  bytes data = 2;
+}
+
+// Request to fetch a byte range of a segment's data — used by the
+// hinted-handoff receiver to pull a segment-ref hint's blob from the
+// origin node (the hint carries segment_id + offset + length, NOT the
+// data, so hints stay small even for multipart/GB blobs).
+message FetchHintDataRequest {
+  oceanfs.common.SegmentId segment_id = 1;
+  uint64 offset = 2;
+  uint32 length = 3;
+}
+
+// A chunk of the fetched range, streamed from the server.
+message FetchHintDataChunk {
   uint32 chunk_index = 1;
   bytes data = 2;
 }

@@ -3,7 +3,7 @@
 //! Handles `HealingRpc` RPCs for hinted handoff, Merkle exchange,
 //! shard fetch for EC reconstruction, and repaired shard push.
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use bytes::Bytes;
 use oceanfs_core::{Hlc, HlcClock, NodeId, SegmentId};
@@ -11,13 +11,33 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     healing_rpc::{
-        healing_rpc_server::HealingRpc, FetchShardChunk, FetchShardRequest, HintRequest,
-        HintResponse, MerkleRequest, MerkleResponse, PushRepairedShardRequest,
-        PushRepairedShardResponse,
+        healing_rpc_server::HealingRpc, FetchHintDataChunk, FetchHintDataRequest, FetchShardChunk,
+        FetchShardRequest, HintRequest, HintResponse, MerkleRequest, MerkleResponse,
+        PushRepairedShardRequest, PushRepairedShardResponse,
     },
     hinted_handoff_rpc::{hint_record::Record, HintedHandoffRequest, HintedHandoffResponse},
     SegmentDataStore,
 };
+
+/// Fetches a byte range of a segment from an origin node.
+///
+/// The hinted-handoff receiver uses this to materialize segment-ref
+/// hints: the hint carries `segment_id + offset + length` (NOT the
+/// blob data — hints stay small even for multipart/GB blobs), and the
+/// receiver pulls the range from the origin (the hint sender, which
+/// holds the segment) before applying it locally.
+#[async_trait::async_trait]
+pub trait HintDataFetcher: Send + Sync {
+    /// Fetches `length` bytes at `offset` of `segment_id` from
+    /// `origin` (the sender's gRPC address).
+    async fn fetch_range(
+        &self,
+        origin: SocketAddr,
+        segment_id: &SegmentId,
+        offset: u64,
+        length: u32,
+    ) -> Result<Bytes, String>;
+}
 
 /// gRPC service for healing and anti-entropy operations.
 pub struct HealingGrpcService {
@@ -38,6 +58,9 @@ pub struct HealingGrpcService {
     /// hint timestamps are merged via [`HlcClock::update`] so the local
     /// clock never lags the nodes that sent them.
     hlc_clock: Arc<HlcClock>,
+    /// Fetcher for materializing segment-ref hints from their origin.
+    /// `None` (tests) degrades to buffering the ref as before.
+    hint_data_fetcher: Option<Arc<dyn HintDataFetcher>>,
 }
 
 impl HealingGrpcService {
@@ -49,7 +72,15 @@ impl HealingGrpcService {
         data_store: Arc<dyn SegmentDataStore>,
         hlc_clock: Arc<HlcClock>,
     ) -> Self {
-        Self { handoff, metadata_store, registry, data_store, local_node_id: None, hlc_clock }
+        Self {
+            handoff,
+            metadata_store,
+            registry,
+            data_store,
+            local_node_id: None,
+            hlc_clock,
+            hint_data_fetcher: None,
+        }
     }
 
     /// Sets this node's identifier so that self-intended hints are
@@ -57,6 +88,19 @@ impl HealingGrpcService {
     #[must_use]
     pub fn with_local_node_id(mut self, node_id: NodeId) -> Self {
         self.local_node_id = Some(node_id);
+        self
+    }
+
+    /// Installs the segment-ref hint materializer (composition root).
+    ///
+    /// Segment-ref hints carry `segment_id + offset + length` instead of
+    /// the blob data (hints stay small for multipart/GB blobs); the
+    /// receiver pulls the range from the origin via this fetcher and
+    /// applies it locally. Without a fetcher, segment-ref hints degrade
+    /// to buffering (tests).
+    #[must_use]
+    pub fn with_hint_data_fetcher(mut self, fetcher: Arc<dyn HintDataFetcher>) -> Self {
+        self.hint_data_fetcher = Some(fetcher);
         self
     }
 
@@ -73,15 +117,22 @@ impl HealingGrpcService {
     /// `hlc` is the original write's timestamp (hlc-causality-closure
     /// G5): the applied metadata persists the *original* version, not
     /// zero, so a late delivery loses LWW against newer writes.
-    fn apply_inline_hint(
+    /// Applies a delayed write's data locally: writes the object
+    /// metadata (with the blob data inline) to the local metadata store
+    /// so reads succeed once hinted-handoff delivery completes (t21).
+    ///
+    /// `hlc` is the original write's timestamp (hlc-causality-closure
+    /// G5): the applied metadata persists the *original* version, not
+    /// zero, so a late delivery loses LWW against newer writes.
+    fn apply_hint_data(
         &self,
-        bucket: oceanfs_core::BucketId,
-        object_key: String,
+        bucket: &oceanfs_core::BucketId,
+        object_key: &str,
         data: Bytes,
         hlc: Hlc,
     ) {
         let meta = oceanfs_core::ObjectMetadata {
-            object_key: oceanfs_core::ObjectKey::new(&object_key),
+            object_key: oceanfs_core::ObjectKey::new(object_key),
             size: data.len() as u64,
             blake3_hash: Some(oceanfs_core::HashOutput::from_bytes(
                 *blake3::hash(&data).as_bytes(),
@@ -96,7 +147,7 @@ impl HealingGrpcService {
         };
         match oceanfs_storage_api::MetadataStore::put_object(
             self.metadata_store.as_ref(),
-            &bucket,
+            bucket,
             meta,
         ) {
             Ok(()) => {
@@ -104,7 +155,7 @@ impl HealingGrpcService {
                     bucket = %bucket,
                     key = %object_key,
                     size = data.len(),
-                    "applied inline hinted handoff locally"
+                    "applied hinted handoff locally"
                 );
             }
             Err(e) => {
@@ -112,16 +163,28 @@ impl HealingGrpcService {
                     bucket = %bucket,
                     key = %object_key,
                     error = %e,
-                    "failed to apply inline hinted handoff locally"
+                    "failed to apply hinted handoff locally"
                 );
             }
         }
+    }
+
+    fn apply_inline_hint(
+        &self,
+        bucket: oceanfs_core::BucketId,
+        object_key: String,
+        data: Bytes,
+        hlc: Hlc,
+    ) {
+        self.apply_hint_data(&bucket, &object_key, data, hlc);
     }
 }
 
 #[tonic::async_trait]
 impl HealingRpc for HealingGrpcService {
     type FetchShardStream = tokio_stream::wrappers::ReceiverStream<Result<FetchShardChunk, Status>>;
+    type FetchHintDataStream =
+        tokio_stream::wrappers::ReceiverStream<Result<FetchHintDataChunk, Status>>;
 
     async fn hinted_handoff_single(
         &self,
@@ -183,6 +246,9 @@ impl HealingRpc for HealingGrpcService {
         &self,
         request: Request<HintedHandoffRequest>,
     ) -> Result<Response<HintedHandoffResponse>, Status> {
+        // The sender's address — the origin for segment-ref hint data
+        // fetches (the hint sender holds the referenced segment).
+        let origin = request.remote_addr();
         let req = request.into_inner();
         let hint_count = req.hints.len() as u32;
         let mut accepted_count = 0u32;
@@ -266,26 +332,60 @@ impl HealingRpc for HealingGrpcService {
                     // Receive rule (G2): merge the remote timestamp.
                     self.hlc_clock.update(hlc);
 
-                    // Segment-ref hints carry a reference but not the data;
-                    // applying them locally requires fetching the segment
-                    // shard from the origin, which the current hint protocol
-                    // does not support. Buffered as before.
+                    let segment_id = seg_ref
+                        .segment_id
+                        .as_ref()
+                        .and_then(|sid| SegmentId::try_from(sid.clone()).ok())
+                        .unwrap_or_default();
+                    let bucket = seg_ref
+                        .bucket_id
+                        .clone()
+                        .map(oceanfs_core::BucketId::from)
+                        .unwrap_or_else(|| oceanfs_core::BucketId::new("default"));
+
+                    // A segment-ref hint intended for THIS node is a
+                    // delayed write: pull the blob range from the origin
+                    // (the hint sender — it holds the segment) and apply
+                    // it. Segment-ref hints deliberately do NOT carry the
+                    // data inline, so hints stay small even when blobs
+                    // reach multipart/GB sizes.
                     if self.is_local_hint(&intended_for) {
-                        tracing::warn!(
-                            intended_for = %intended_for,
-                            "segment-ref hint intended for self cannot be applied \
-                             without the segment data; buffering"
-                        );
+                        let mut applied = false;
+                        if let (Some(origin), Some(fetcher)) = (origin, &self.hint_data_fetcher) {
+                            match fetcher
+                                .fetch_range(origin, &segment_id, seg_ref.offset, seg_ref.length)
+                                .await
+                            {
+                                Ok(data) => {
+                                    self.apply_hint_data(&bucket, &seg_ref.object_key, data, hlc);
+                                    applied = true;
+                                    accepted_count += 1;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        intended_for = %intended_for,
+                                        segment_id = %segment_id,
+                                        error = %e,
+                                        "failed to fetch segment-ref hint data from origin; buffering"
+                                    );
+                                }
+                            }
+                        } else {
+                            tracing::warn!(
+                                intended_for = %intended_for,
+                                "segment-ref hint intended for self but no origin/fetcher \
+                                 available; buffering"
+                            );
+                        }
+                        if applied {
+                            continue;
+                        }
                     }
 
                     // For segment refs, store as a legacy hint with empty data.
                     let legacy_hint = crate::HintRecord {
                         intended_for: intended_for.clone(),
-                        segment_id: seg_ref
-                            .segment_id
-                            .as_ref()
-                            .and_then(|sid| SegmentId::try_from(sid.clone()).ok())
-                            .unwrap_or_default(),
+                        segment_id,
                         offset: seg_ref.offset,
                         length: seg_ref.length,
                         timestamp: hlc,
@@ -430,6 +530,48 @@ impl HealingRpc for HealingGrpcService {
             .map(|(i, off)| {
                 let end = (off + chunk_size).min(shard_data.len());
                 FetchShardChunk { chunk_index: i as u32, data: shard_data.slice(off..end) }
+            })
+            .collect();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(chunks.len().max(1));
+        for chunk in chunks {
+            if tx.send(Ok(chunk)).await.is_err() {
+                break;
+            }
+        }
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+
+    async fn fetch_hint_data(
+        &self,
+        request: Request<FetchHintDataRequest>,
+    ) -> Result<Response<Self::FetchHintDataStream>, Status> {
+        let req = request.into_inner();
+        let segment_id =
+            req.segment_id.and_then(|sid| SegmentId::try_from(sid).ok()).unwrap_or_default();
+        let offset = req.offset as usize;
+        let length = req.length as usize;
+
+        // The hinted-handoff receiver pulls the blob range of a
+        // segment-ref hint from the origin node. The origin's segment
+        // store holds the data; slice the requested range.
+        let data = self.data_store.read_segment_data(&segment_id).map_err(|e| {
+            Status::internal(format!("failed to read segment data for hint fetch: {e}"))
+        })?;
+
+        let end = (offset + length).min(data.len());
+        let range: Bytes = if offset < data.len() { data.slice(offset..end) } else { Bytes::new() };
+
+        // Stream the range in 64 KB chunks (overlapping transfer, perf
+        // rule 4.4 — same shape as FetchShard).
+        let chunk_size = 65536;
+        let chunks: Vec<FetchHintDataChunk> = (0..range.len())
+            .step_by(chunk_size)
+            .enumerate()
+            .map(|(i, off)| {
+                let end = (off + chunk_size).min(range.len());
+                FetchHintDataChunk { chunk_index: i as u32, data: range.slice(off..end) }
             })
             .collect();
 

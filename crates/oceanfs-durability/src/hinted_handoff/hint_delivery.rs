@@ -27,15 +27,16 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use bytes::Bytes;
 use dashmap::DashMap;
-use oceanfs_core::{Counter, LabelSet, MetricRegistrar, NodeId, OperationTimeouts};
+use oceanfs_core::{Counter, LabelSet, MetricRegistrar, NodeId, OperationTimeouts, SegmentId};
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use tracing::{debug, info, warn};
 
 use crate::{
     error::{Error, Result},
-    healing_rpc::healing_rpc_client::HealingRpcClient,
+    healing_rpc::{self, healing_rpc_client::HealingRpcClient},
     hinted_handoff_rpc::{self, HintRecord, HintedHandoffRequest, HintedHandoffResponse},
     HintWal,
 };
@@ -206,6 +207,53 @@ pub struct HintedHandoffManager {
     hints_delivered_total: Counter,
     /// Hints pruned from the WAL after TTL expiry.
     hints_expired_total: Counter,
+}
+
+/// Fetches a segment byte range from an origin node over gRPC.
+///
+/// Materializes segment-ref hints on the hinted-handoff receiver: the
+/// hint carries `segment_id + offset + length` (NOT the blob — hints
+/// stay small even for multipart/GB blobs), and the receiver pulls the
+/// range from the origin (the hint sender, which holds the segment)
+/// via [`HealingRpcClient::fetch_hint_data`] before applying it.
+pub struct GrpcHintDataFetcher {
+    pool: Arc<ConnectionPool>,
+}
+
+impl GrpcHintDataFetcher {
+    /// Creates a fetcher using the shared connection pool.
+    pub fn new(pool: Arc<ConnectionPool>) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::healing_service::HintDataFetcher for GrpcHintDataFetcher {
+    async fn fetch_range(
+        &self,
+        origin: SocketAddr,
+        segment_id: &SegmentId,
+        offset: u64,
+        length: u32,
+    ) -> std::result::Result<Bytes, String> {
+        let pooled = self.pool.get_channel(origin).await.map_err(|e| format!("pool: {e}"))?;
+        let mut client = HealingRpcClient::new(pooled.channel().clone());
+        let mut stream = client
+            .fetch_hint_data(healing_rpc::FetchHintDataRequest {
+                segment_id: Some((*segment_id).into()),
+                offset,
+                length,
+            })
+            .await
+            .map_err(|e| format!("fetch_hint_data rpc: {e}"))?
+            .into_inner();
+
+        let mut buf = Vec::with_capacity(length as usize);
+        while let Some(chunk) = stream.message().await.map_err(|e| format!("stream: {e}"))? {
+            buf.extend_from_slice(&chunk.data);
+        }
+        Ok(Bytes::from(buf))
+    }
 }
 
 impl HintedHandoffManager {
