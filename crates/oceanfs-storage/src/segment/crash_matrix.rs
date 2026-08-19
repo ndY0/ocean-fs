@@ -1108,3 +1108,64 @@ fn entry_is_garbage_deleted_is_always_garbage() {
         "Deleted entries are always garbage"
     );
 }
+
+/// Recursively copies a directory tree (the deterministic-rebuild
+/// test's "identical on-disk state" — the harness dirs hold RocksDB +
+/// event WAL + data WAL files).
+fn copy_dir_tree(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let target = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// Startup-rebuild DoD: rebuild from identical on-disk state always
+/// produces identical registry state and an identical `RebuildOutcome`
+/// (the deterministic rebuild invariant — state = fold(events), nothing
+/// else).
+#[tokio::test]
+async fn rebuild_is_deterministic_across_copied_data_dirs() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = SegmentId::new();
+    let id2 = SegmentId::new();
+    {
+        let h = Harness::boot(dir.path()).await;
+        h.reserve(id).await;
+        h.append(id, 0, b"deterministic").await;
+        h.seal(id, b"deterministic").await;
+        // A second reserved-unsealed segment exercises the data-WAL pass.
+        h.reserve(id2).await;
+        h.append(id2, 0, b"residue").await;
+        h.crash().await;
+    }
+
+    // Two identical copies of the on-disk state.
+    let dir2 = tempfile::tempdir().unwrap();
+    copy_dir_tree(dir.path(), dir2.path());
+    let h1 = Harness::boot(dir.path()).await;
+    let h2 = Harness::boot(dir2.path()).await;
+    let o1 = h1.recover().await;
+    let o2 = h2.recover().await;
+
+    // Identical outcome vectors.
+    assert_eq!(o1.folded_segments, o2.folded_segments, "folded must match");
+    assert_eq!(o1.dropped_empty_reserves, o2.dropped_empty_reserves);
+    assert_eq!(o1.re_sealed_segments, o2.re_sealed_segments);
+    assert_eq!(o1.adopted_segments, o2.adopted_segments);
+    assert_eq!(o1.swept_entries, o2.swept_entries);
+
+    // Identical registry state for every segment.
+    for (sid, label) in [(id, "sealed"), (id2, "residue")] {
+        let e1 = h1.entry(sid);
+        let e2 = h2.entry(sid);
+        assert_eq!(e1.state, e2.state, "{label} state must match");
+        assert_eq!(e1.data_wal_pos, e2.data_wal_pos, "{label} position must match");
+        assert_eq!(e1.metadata.merkle_root, e2.metadata.merkle_root, "{label} root must match");
+    }
+}

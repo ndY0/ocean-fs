@@ -9,12 +9,13 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use oceanfs_core::{
-    shard, AccelConfig, BucketId, Hlc, HlcClock, Incarnation, MetadataConfig, NodeConfig, NodeId,
-    ObjectKey, ObjectMetadata, PoolConfig, RingConfig, RpcConfig, SegmentSizeConfig, SizeTier,
-    Tombstone, WalConfig,
+    shard, AccelConfig, BucketId, Hlc, HlcClock, Incarnation, MetadataConfig, MetricRegistrar,
+    NodeConfig, NodeId, ObjectKey, ObjectMetadata, PoolConfig, RingConfig, RpcConfig,
+    SegmentSizeConfig, SizeTier, Tombstone, WalConfig,
 };
 use oceanfs_durability::{
-    GrpcHintDeliveryClient, HintedHandoff, HintedHandoffConfig, HintedHandoffManager,
+    recover_incomplete_compactions, CompactionRecoveryAction, GrpcHintDeliveryClient,
+    HintedHandoff, HintedHandoffConfig, HintedHandoffManager, StoreObjectLookup,
 };
 use oceanfs_network::{apply_opts_to_fd, create_reuseport_listener};
 use oceanfs_server::{
@@ -1041,12 +1042,20 @@ impl Node {
 
         // ---- 6a. Startup recovery: the machine path (ADR-0025 phase 2) ----
         // Deterministic recovery: fold the event log into the registry
-        // (state = fold(events)), verify the CF mirror (phase-2
-        // dual-read), then rebuild Reserved-unsealed segments from the
-        // data WAL — adopt the durable .dat (interrupted seal commit) or
-        // replay the entries. The legacy CF-driven path (seed +
-        // interrupted-seal adoption + replay_wal) is superseded by this
-        // fold and remains only for unwired-event-WAL configurations.
+        // (state = fold(events)) — the event log is the ONLY durable
+        // writer (ADR-0025 Decision 3 final form; the CF mirror is
+        // removed) — then rebuild Reserved-unsealed segments from the
+        // data WAL (adopt the durable `.dat` or replay the entries),
+        // then resolve incomplete compaction units (rows 7-9). The
+        // startup cost is bounded by the checkpoint threshold, never by
+        // lifetime event volume.
+        let startup_rebuild_gauge = oceanfs_core::Gauge::new(
+            "oceanfs_startup_rebuild_ms".into(),
+            "Startup rebuild duration (checkpoint + fold + data-WAL pass + compaction recovery), ms"
+                .into(),
+            oceanfs_core::LabelSet::empty(),
+        );
+        let rebuild_start = std::time::Instant::now();
         let wal_reader = oceanfs_storage::wal::WalReader::open(&wal_config)
             .map_err(|e| format!("failed to open WAL reader: {e}"))?;
         // Load the latest checkpoint (ADR-0024 Decision 3): its snapshot
@@ -1085,6 +1094,38 @@ impl Node {
             swept = recovery_outcome.swept_entries,
             "event-WAL recovery complete (ADR-0025 phase 2)"
         );
+        // Rows 7-9: incomplete compaction units — the folded registry's
+        // `repacked_from` markers, one objects-CF read per unit. Each
+        // action deletes through the coordinator (durable before
+        // unlink) and sweeps the `.dat` (idempotent).
+        let compaction_actions = recover_incomplete_compactions(
+            lifecycle.registry(),
+            &StoreObjectLookup(
+                Arc::clone(&metadata_store) as Arc<dyn oceanfs_storage_api::MetadataStore>
+            ),
+        )
+        .map_err(|e| format!("compaction recovery failed: {e}"))?;
+        for action in &compaction_actions {
+            let (segment_id, label) = match action {
+                CompactionRecoveryAction::FinishOldDeletion(id) => (*id, "finish_old_deletion"),
+                CompactionRecoveryAction::SweepNewOrphan(id) => (*id, "sweep_new_orphan"),
+                CompactionRecoveryAction::SweepOldDat(id) => (*id, "sweep_old_dat"),
+            };
+            if !matches!(action, CompactionRecoveryAction::SweepOldDat(_)) {
+                if let Err(e) = lifecycle.request_delete(segment_id).await {
+                    warn!(
+                        segment_id = %segment_id,
+                        error = %e,
+                        "compaction recovery delete failed (startup continues; the reaper retries)"
+                    );
+                }
+            }
+            let _ = std::fs::remove_file(segment_dir.join(format!("{segment_id}.dat")));
+            info!(segment_id = %segment_id, action = label, "compaction recovery action applied");
+        }
+        let rebuild_ms = rebuild_start.elapsed().as_millis() as u64;
+        startup_rebuild_gauge.set(rebuild_ms);
+        info!(rebuild_ms, "startup rebuild complete");
         // Retention liveness is machine-backed (ADR-0024 §Retention): an
         // entry at position p of segment S is garbage iff S is sealed
         // with data_wal_pos ≥ p, or deleted. Entries whose segment has
@@ -1152,6 +1193,7 @@ impl Node {
         let metrics = Arc::new(oceanfs_server::admin::MetricsRegistry::new());
 
         // Register subsystem metrics into the central registry.
+        metrics.register_gauge(startup_rebuild_gauge);
         object_cache.register_metrics(&*metrics);
         metadata_cache.register_metrics(&*metrics);
         negative_cache.register_metrics(&*metrics);

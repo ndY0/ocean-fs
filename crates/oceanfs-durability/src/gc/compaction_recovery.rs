@@ -24,6 +24,8 @@
 //! empty reserve (row 1); the unreferenced replacement is then reaped
 //! like any orphan.
 
+use std::sync::Arc;
+
 use oceanfs_core::{SegmentId, SizeTier};
 use oceanfs_storage::segment::lifecycle::{SegmentLifecycleRegistry, SegmentState};
 
@@ -83,6 +85,23 @@ pub trait ObjectLookup: Send + Sync {
     ///
     /// Returns an error if the objects store cannot be read.
     fn is_referenced(&self, segment_id: SegmentId) -> Result<bool>;
+}
+
+/// Production [`ObjectLookup`] over the objects store: one
+/// `list_objects_all_with_bucket` scan answers the reference question
+/// in a single store call — the DoD's "one objects-CF read per unit,
+/// no per-chunk scans".
+pub struct StoreObjectLookup(pub Arc<dyn oceanfs_storage_api::MetadataStore>);
+
+impl ObjectLookup for StoreObjectLookup {
+    fn is_referenced(&self, segment_id: SegmentId) -> Result<bool> {
+        Ok(self
+            .0
+            .list_objects_all_with_bucket()
+            .into_iter()
+            .flatten()
+            .any(|(_, meta)| meta.chunks.iter().any(|c| c.segment_id == segment_id)))
+    }
 }
 
 /// A startup recovery action for an incomplete compaction unit.

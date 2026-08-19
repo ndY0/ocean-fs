@@ -15,7 +15,7 @@ mod stats;
 
 pub use compaction_recovery::{
     recover_incomplete_compactions, CompactionRecoveryAction, CompactionState, CompactionUnit,
-    ObjectLookup,
+    ObjectLookup, StoreObjectLookup,
 };
 pub use config::GcConfig;
 pub use garbage_collector::{

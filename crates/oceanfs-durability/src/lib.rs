@@ -46,8 +46,9 @@ pub use anti_entropy::{
 };
 pub use error::{Error, Result};
 pub use gc::{
+    recover_incomplete_compactions, CompactionRecoveryAction, CompactionState, CompactionUnit,
     DiskSegmentShardStore, GarbageCollector, GcConfig, GcStats, InMemorySegmentShardStore,
-    OrphanReaper, OrphanStats, SegmentShardStore,
+    ObjectLookup, OrphanReaper, OrphanStats, SegmentShardStore, StoreObjectLookup,
 };
 pub use heal::{
     enqueue_heal, HealConfig, HealQueue, HealQueueSender, HealRequest, HealStats, HealWorker,
