@@ -2992,6 +2992,92 @@
       },
       "gridPos": {
         "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 136
+      },
+      "id": 100,
+      "title": "Compression (accel)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(accel_compress_duration_seconds_count{job=\"oceanfs\"}[1m])",
+          "legendFormat": "compress_ops/s",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(accel_compress_duration_seconds_sum{job=\"oceanfs\"}[1m])",
+          "legendFormat": "compress_ms/s",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(accel_decode_ops_total{job=\"oceanfs\"}[1m])",
+          "legendFormat": "decode_ops/s",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "accel_compression_fallback_total{job=\"oceanfs\"}",
+          "legendFormat": "fallbacks",
+          "refId": "D"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "drawStyle": "line",
+            "stacking": {
+              "mode": "none"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": ""
+          },
+          "unit": "short",
+          "min": null,
+          "max": null
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
         "w": 8,
         "x": 16,
         "y": 128
