@@ -118,15 +118,20 @@ if [ -n "$HARNESS" ]; then
 
     # The remote invocation drops --harness and runs the local flow.
     # Forward LOAD_TEST_DURATION_SECS so a duration override (e.g. from
-    # test-agent-workflow.sh --duration-secs) reaches the harness-side run.
+    # test-agent-workflow.sh --duration-secs) reaches the harness-side
+    # run, plus the compression switches — without them the harness-side
+    # script defaults to 0 and the load never opts the bucket into
+    # per-bucket compression (the accel compress counters stay zero).
     ssh $SSH_OPTS -o BatchMode=yes "$HARNESS" \
-        "cd /root/ocean-fs && ${LOAD_TEST_DURATION_SECS:+LOAD_TEST_DURATION_SECS=$LOAD_TEST_DURATION_SECS }./scripts/run-phase2.sh --${MODE} ${SUT:+--sut $SUT} ${SSH_TARGET:+--ssh $SSH_TARGET} --service ${SERVICE} --seed ${SEED} --report-dir ${REPORT_DIR}"
+        "cd /root/ocean-fs && ${LOAD_TEST_DURATION_SECS:+LOAD_TEST_DURATION_SECS=$LOAD_TEST_DURATION_SECS }${LOAD_TEST_COMPRESSION:+LOAD_TEST_COMPRESSION=$LOAD_TEST_COMPRESSION }${LOAD_TEST_COMPRESSIBLE:+LOAD_TEST_COMPRESSIBLE=$LOAD_TEST_COMPRESSIBLE }./scripts/run-phase2.sh --${MODE} ${SUT:+--sut $SUT} ${SSH_TARGET:+--ssh $SSH_TARGET} --service ${SERVICE} --seed ${SEED} --report-dir ${REPORT_DIR}"
+    # NOTE: this is the top-level script body, not a function — `local`
+    # would fail and silently lose the run's exit code.
     local_exit=$?
 
     # Push the load-test textfile into the SUT's Prometheus textfile
     # collector (best-effort: only when observability is installed).
     if [ -n "$SUT" ]; then
-        local sut_ip="${SUT%%:*}"
+        sut_ip="${SUT%%:*}"
         ssh $SSH_OPTS -o BatchMode=yes "$HARNESS" \
             "scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${REPORT_DIR}/load_test.prom root@${sut_ip}:/var/lib/prometheus/textfile/ 2>/dev/null || true" \
             || true
