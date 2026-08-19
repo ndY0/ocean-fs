@@ -48,13 +48,6 @@ pub struct ActiveSegment {
     cursor: u64,
     /// Target size in bytes — segment is considered full when `cursor >= target`.
     target_size: u64,
-    /// When the last append happened. The pool's idle-seal worker uses
-    /// this to seal partially-filled segments that stopped receiving
-    /// writes: without it, a segment that never fills would stay
-    /// registered-unsealed forever, pinning its WAL files (the
-    /// `wal_not_unbounded` leak — segments must be sealed so their WAL
-    /// entries become sweepable).
-    last_append: std::time::Instant,
 }
 
 impl ActiveSegment {
@@ -88,14 +81,7 @@ impl ActiveSegment {
 
         let buffer = pool.acquire_sized(target_size as usize);
 
-        Ok(Self {
-            id: SegmentId::new(),
-            tier,
-            buffer,
-            cursor: 0,
-            target_size,
-            last_append: std::time::Instant::now(),
-        })
+        Ok(Self { id: SegmentId::new(), tier, buffer, cursor: 0, target_size })
     }
 
     /// Creates an active segment with an **explicit** segment id.
@@ -152,7 +138,6 @@ impl ActiveSegment {
 
         self.buffer.extend_from_slice(data);
         self.cursor += length as u64;
-        self.last_append = std::time::Instant::now();
 
         Ok((offset, length))
     }
@@ -163,11 +148,6 @@ impl ActiveSegment {
     /// segment would produce a useless `.dat` and a phantom entry.
     pub(crate) fn is_empty(&self) -> bool {
         self.cursor == 0
-    }
-
-    /// Returns the duration since the last append.
-    pub(crate) fn idle_for(&self) -> std::time::Duration {
-        self.last_append.elapsed()
     }
 
     /// Returns `true` if the segment has reached or exceeded its target size.

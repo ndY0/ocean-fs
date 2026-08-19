@@ -178,7 +178,7 @@ impl Harness {
             builder = builder.with_checkpoint(checkpoint.clone(), event_wal_config);
         }
         let lifecycle =
-            Arc::new(builder.with_idle_seal(vec![pool_small.clone(), pool_standard.clone()], 5000));
+            Arc::new(builder.with_seal_pools(vec![pool_small.clone(), pool_standard.clone()]));
         let sealer = Arc::new(SegmentSealer::new(
             SealConfig { data_dir: dir.join("segments"), ..Default::default() },
             data_wal.clone(),

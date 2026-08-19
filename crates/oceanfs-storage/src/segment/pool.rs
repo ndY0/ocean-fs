@@ -294,21 +294,6 @@ impl PoolSlot {
     /// files/min under sustained load).
     ///
     /// Runs under the slot lock (same critical section as fill).
-    fn try_seal_idle(
-        &self,
-        timeout: std::time::Duration,
-        registry: &SegmentLifecycleRegistry,
-        tier: SizeTier,
-        ec_k: u8,
-        ec_m: u8,
-    ) -> Option<SealedSegment> {
-        let mut guard = self.state.lock();
-        let SlotState::Appending(segment) = &*guard else { return None };
-        if segment.is_empty() || segment.idle_for() < timeout {
-            return None;
-        }
-        Self::transition_to_sealing(&mut guard, registry, tier, ec_k, ec_m, false)
-    }
 
     /// Installs a replacement segment into a slot that is sealing or idle
     /// — a single pointer swap under one lock acquisition.
@@ -1248,56 +1233,49 @@ impl SegmentPool {
     /// worker persists the `.dat`, registers the sealed metadata (making
     /// the WAL entries sweepable), and the slot re-arms for new writes.
     ///
-    /// The returned handle can be aborted to stop the sweep.
-    pub fn start_idle_seal_worker(
-        self: &Arc<Self>,
-        interval: std::time::Duration,
-        idle_timeout: std::time::Duration,
-    ) -> tokio::task::JoinHandle<()> {
-        let this = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            // Skip the immediate first tick — a freshly started pool has
-            // nothing idle yet.
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                this.sweep_idle_segments(idle_timeout).await;
-            }
-        })
-    }
-
-    /// One idle-seal sweep across all slots.
+    /// Freezes a partial segment for sealing — the deterministic
+    /// seal-on-zero trigger's pool-side half (called by the
+    /// coordinator's pending-seal drain).
     ///
-    /// Seals every `Appending` segment idle past `idle_timeout` (with
-    /// data), enqueueing the sealed payload through the async hand-off.
-    /// Enqueue failures are logged and retried on the next sweep — an
-    /// idle segment is not a fresh write, so there is no ack to reject;
-    /// the segment simply stays unsealed one more interval.
+    /// Finds the slot still holding `segment_id` in `Appending` state
+    /// and runs the fill transition (freeze + attach the in-flight
+    /// window). `Ok(None)` when the slot moved on (a concurrent fill
+    /// already froze it — its work item is queued) or the in-flight
+    /// cap gated the freeze (the caller re-notes the segment and
+    /// retries on the next drain). The returned payload goes through
+    /// the same seal pipeline as a fill: blob index, merkle root,
+    /// `.dat`, `SealEvent`.
     ///
-    /// Driven by the lifecycle coordinator's `seal_idle_segments` tick
-    /// (ADR-0025 phase 1 — the coordinator owns the idle-seal timer).
-    pub(crate) async fn sweep_idle_segments(&self, idle_timeout: std::time::Duration) {
-        // Collect sealed payloads outside the slot locks (same pattern
-        // as the fill path: the critical section is the freeze).
-        let mut sealed: Vec<SealedSegment> = Vec::new();
+    /// # Errors
+    ///
+    /// Returns the underlying transition error (registry write
+    /// failure).
+    pub(crate) async fn freeze_partial_for_seal(
+        &self,
+        segment_id: SegmentId,
+    ) -> Result<Option<SealedSegment>, Error> {
         let (ec_k, ec_m, _strip) = self.ec_params();
         for slot in &self.slots {
-            if let Some(payload) =
-                slot.try_seal_idle(idle_timeout, &self.registry, self.tier, ec_k, ec_m)
-            {
-                sealed.push(payload);
+            let payload = {
+                let mut guard = slot.state.lock();
+                let SlotState::Appending(segment) = &*guard else { continue };
+                if segment.id() != segment_id {
+                    continue;
+                }
+                PoolSlot::transition_to_sealing(
+                    &mut guard,
+                    &self.registry,
+                    self.tier,
+                    ec_k,
+                    ec_m,
+                    false,
+                )
+            };
+            if let Some(payload) = payload {
+                return Ok(Some(payload));
             }
         }
-        for payload in sealed {
-            // Re-arm the slot and enqueue. Bounded wait: if the queue is
-            // full the segment waits for the next sweep (one interval),
-            // which is acceptable for idle data.
-            let deadline = std::time::Instant::now() + SLOT_ACTIVATION_WAIT;
-            if let Err(e) = self.finish_seal_handoff_async(Some(payload), deadline).await {
-                tracing::warn!(error = %e, "idle-seal enqueue failed; retrying next sweep");
-            }
-        }
+        Ok(None)
     }
 
     /// Seals a rebuilt segment that did not fill during replay (a
@@ -2988,7 +2966,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_seal_sweep_seals_partially_filled_segment() {
+    async fn freeze_partial_for_seal_preserves_read_window_and_rearms_slot() {
         let (pool_cfg, size_cfg) = test_config();
         let buf_pool = test_pool();
         let pool = Arc::new(
@@ -3013,14 +2991,16 @@ mod tests {
         assert_eq!(length, 7);
         reserve_segment(&pool, seg_id);
 
-        // A zero idle timeout forces the sweep to seal it immediately.
-        let handle = pool.start_idle_seal_worker(
-            std::time::Duration::from_millis(10),
-            std::time::Duration::ZERO,
-        );
-        // Give the worker a few ticks.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        handle.abort();
+        // The seal-on-zero trigger's pool half: freeze the partial
+        // segment and hand the payload to the seal queue.
+        let payload =
+            pool.freeze_partial_for_seal(seg_id).await.expect("freeze").expect("slot found");
+        pool.enqueue_seal_handoff(
+            Some(payload),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("enqueue");
 
         // The sealed segment's data remains readable during the seal
         // window (read-after-write gap preserved)...

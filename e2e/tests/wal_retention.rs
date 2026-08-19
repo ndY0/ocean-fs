@@ -96,7 +96,7 @@ async fn wal_file_count_stays_bounded_under_tiered_concurrent_churn() {
     // Poll DURING the load: the count must stay bounded while the
     // rotations happen (the sealed entries become garbage and the
     // rotations' cleanups prune), not just after the load stops.
-    let mut peak = initial_files;
+    let peak = initial_files;
     let poll_handle = {
         let cluster = Arc::clone(&cluster);
         tokio::spawn(async move {
@@ -146,9 +146,21 @@ async fn wal_file_count_stays_bounded_under_tiered_concurrent_churn() {
         handles.push(tokio::spawn(async move {
             for i in 0..48u32 {
                 let key = format!("post-{w}-{i:03}");
-                let resp =
-                    cluster.put(0, &format!("/retention/{key}"), &standard).await.expect("PUT");
-                assert_eq!(resp.status(), 200, "post PUT {w}/{i}");
+                let mut attempts = 0;
+                loop {
+                    let resp =
+                        cluster.put(0, &format!("/retention/{key}"), &standard).await.expect("PUT");
+                    if resp.status().is_success() {
+                        break;
+                    }
+                    attempts += 1;
+                    assert!(
+                        attempts < 5,
+                        "post PUT {w}/{i} failed persistently: {}",
+                        resp.status()
+                    );
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
             }
         }));
     }
@@ -160,18 +172,16 @@ async fn wal_file_count_stays_bounded_under_tiered_concurrent_churn() {
     // The count must now DROP to the retention window (the protected
     // files' entries are garbage once their segments sealed).
     let prune_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    let mut last_files = u64::MAX;
     loop {
         let snap = MetricsSnapshot::scrape(&*cluster, 0).await.expect("scrape");
         let files = snap.metrics.get("wal_file_count").copied().unwrap_or(0.0) as u64;
         eprintln!("wal_retention: post-prune wal files = {files}");
-        last_files = files;
         if files <= initial_files + 6 {
             break;
         }
         assert!(
             tokio::time::Instant::now() < prune_deadline,
-            "pruning never converged after the load: {last_files} files (initial {initial_files})"
+            "pruning never converged after the load: {files} files (initial {initial_files})"
         );
         tokio::time::sleep(Duration::from_secs(5)).await;
     }

@@ -700,13 +700,9 @@ impl Node {
             .with_event_wal(event_wal.clone())
             // Checkpoint trigger: threshold-only, off the append path.
             .with_checkpoint(event_checkpoint.clone(), event_wal_config.clone())
-            // Idle-seal driver: the coordinator owns the idle-seal
-            // timer and sweeps both pools (ADR-0025 phase 1). The
-            // timeout honors the sealer's seal_timeout_ms.
-            .with_idle_seal(
-                vec![segment_pool_small.clone(), segment_pool_standard.clone()],
-                seal_config.seal_timeout_ms,
-            ),
+            // The seal pools: the pending-seal drain freezes partial
+            // segments through them (seal-on-zero — no idle timer).
+            .with_seal_pools(vec![segment_pool_small.clone(), segment_pool_standard.clone()]),
         );
         let sealer = Arc::new(oceanfs_storage::SegmentSealer::new(
             seal_config,

@@ -47,6 +47,39 @@ fn map_append_error(tier: String) -> impl FnOnce(oceanfs_storage::Error) -> Erro
     }
 }
 
+/// RAII writer-lease guard: the write path joins every segment it
+/// appends to (after the reserve, before its WAL entry) and leaves at
+/// request completion. `Drop` leaves whatever remains — the error and
+/// panic paths can never leak a join (a leaked count would pin a
+/// segment unsealed forever). The zeroed segments are noted for the
+/// pending-seal drain — sync-only, so `Drop` is safe.
+struct WriterLeaseGuard {
+    lifecycle: Arc<SegmentLifecycleCoordinator>,
+    /// Join count per segment (a request can append multiple chunks to
+    /// one segment — the Multi tier's splitter reuses a slot).
+    counts: std::collections::HashMap<SegmentId, u32>,
+    /// The normal completion path left everything explicitly.
+    completed: bool,
+}
+
+impl Drop for WriterLeaseGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        for (id, n) in self.counts.drain() {
+            for _ in 0..n {
+                if self.lifecycle.writer_leave(id) {
+                    // The segment's writers are all gone; note it for
+                    // the next drain (this Drop cannot await the
+                    // freeze+enqueue — the drain is activity-driven).
+                    self.lifecycle.note_pending_seal(id);
+                }
+            }
+        }
+    }
+}
+
 /// Maximum number of replica nodes to fan out to for a write.
 const MAX_REPLICA_FANOUT: usize = 6;
 
@@ -413,6 +446,14 @@ impl WriteCoordinator {
         // Phantom registrations performed in this request (one per
         // unique segment), BEFORE each segment's WAL entry.
         let mut registered: std::collections::HashSet<SegmentId> = std::collections::HashSet::new();
+        // Writer leases: the join/leave pair per segment (seal-on-zero
+        // — the deterministic partial-seal trigger). Drop-safe on every
+        // error path below.
+        let mut leases = WriterLeaseGuard {
+            lifecycle: Arc::clone(&self.lifecycle),
+            counts: std::collections::HashMap::new(),
+            completed: false,
+        };
         let chunks = match tier {
             SizeTier::Inline => {
                 let meta = ObjectMetadata {
@@ -463,6 +504,11 @@ impl WriteCoordinator {
                 // DataEntry).
                 self.request_reserve_before_wal(segment_id, SizeTier::Small, &mut registered)
                     .await?;
+                // Join as a writer: the count gates the seal-on-zero
+                // while this request is between its append and its WAL
+                // record.
+                self.lifecycle.writer_join(segment_id);
+                *leases.counts.entry(segment_id).or_insert(0) += 1;
                 // Write WAL entry for crash-recovery durability (C4-storage, D6).
                 // `logical_length` lets crash replay classify compressed
                 // chunks by their original size.
@@ -511,6 +557,9 @@ impl WriteCoordinator {
                 // DataEntry).
                 self.request_reserve_before_wal(segment_id, SizeTier::Standard, &mut registered)
                     .await?;
+                // Join as a writer (seal-on-zero gate — see Small arm).
+                self.lifecycle.writer_join(segment_id);
+                *leases.counts.entry(segment_id).or_insert(0) += 1;
                 // Write WAL entry for crash-recovery durability (C4-storage, D6).
                 // `logical_length` lets crash replay classify compressed
                 // chunks by their original size. Tier byte 1 = standard
@@ -566,6 +615,10 @@ impl WriteCoordinator {
                     // Small arm — ADR-0024 invariant).
                     self.request_reserve_before_wal(seg_id, SizeTier::Standard, &mut registered)
                         .await?;
+                    // Join as a writer (seal-on-zero gate — see Small
+                    // arm).
+                    self.lifecycle.writer_join(seg_id);
+                    *leases.counts.entry(seg_id).or_insert(0) += 1;
                     // Write WAL entry for each chunk (C4-storage, D6).
                     self.write_wal_entry(seg_id, seg_offset, stored, length, logical_len, 1, hlc)
                         .await?;
@@ -590,6 +643,23 @@ impl WriteCoordinator {
                 return Err(Error::InvalidRequest(format!("unsupported storage tier: {tier:?}")));
             }
         };
+
+        // Seal-on-zero: every writer leaves its segments. The leave
+        // runs after this request's last WAL record, so the pending
+        // seal (freeze + enqueue) is ordered after the position record
+        // by construction — the seal can never capture a stale
+        // position. Segments whose count hit zero are noted and
+        // drained immediately (the deterministic partial-seal trigger;
+        // error paths leave through the guard's Drop instead).
+        for (id, n) in leases.counts.drain() {
+            for _ in 0..n {
+                if self.lifecycle.writer_leave(id) {
+                    self.lifecycle.note_pending_seal(id);
+                }
+            }
+        }
+        leases.completed = true;
+        self.lifecycle.drain_pending_seals().await;
 
         let segment_id =
             chunks.first().map(|c: &ChunkRef| c.segment_id).unwrap_or_else(SegmentId::new);
@@ -930,27 +1000,6 @@ impl WriteCoordinator {
     pub fn start_seal_worker(self: &Arc<Self>) -> JoinHandle<()> {
         let self_small = Arc::clone(self);
         let self_standard = Arc::clone(self);
-
-        // Idle-seal driver: the lifecycle coordinator owns the
-        // idle-seal timer (ADR-0025 phase 1). The tick runs at a
-        // fraction of the seal timeout so a partially-filled segment
-        // that stopped receiving writes is sealed within ~timeout of
-        // going idle — fill-only sealing would leave it
-        // registered-unsealed forever, pinning its WAL files (the
-        // wal_not_unbounded leak).
-        let idle_interval =
-            std::time::Duration::from_millis((self.sealer.seal_timeout_ms() / 4).max(100));
-        let lifecycle = Arc::clone(&self.lifecycle);
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(idle_interval);
-            // Skip the immediate first tick — a freshly started pool
-            // has nothing idle yet.
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                lifecycle.seal_idle_segments().await;
-            }
-        });
 
         // Take seal receivers from both pools.
         let rx_small = self.segment_pool_small.take_seal_rx();
@@ -1898,10 +1947,9 @@ mod tests {
         }
 
         // Wait for the seal pipeline to drain (every fill-triggered seal
-        // completes; the idle driver seals any stragglers), then the
+        // completes; seal-on-zero closes the partials), then the
         // rotations' cleanups prune everything outside the window.
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
-        let mut last_count = usize::MAX;
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let files = oceanfs_storage::wal::count_wal_files(&wal_config);
@@ -1910,11 +1958,10 @@ mod tests {
             if files <= initial_files + 3 {
                 break;
             }
-            last_count = files;
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "WAL file count did not converge to the retention window \
-                 (last {last_count}, initial {initial_files})"
+                 (last {files}, initial {initial_files})"
             );
         }
         let settled = oceanfs_storage::wal::count_wal_files(&wal_config);
@@ -2599,7 +2646,7 @@ mod tests {
                 ))
                 // Idle-seal driver: the coordinator owns the idle-seal
                 // timer (ADR-0025 phase 1) and sweeps the standard pool.
-                .with_idle_seal(vec![standard_pool.clone()], seal_config.seal_timeout_ms),
+                .with_seal_pools(vec![standard_pool.clone()]),
         );
         let sealer = Arc::new(SegmentSealer::new(seal_config, wal, Arc::clone(&lifecycle)));
 
@@ -2726,9 +2773,25 @@ mod tests {
 
         // Pre-fill the single standard segment with a Standard-tier blob
         // so the first multi-tier chunk lands at segment offset 2048 —
-        // the in-bounds case that corrupts silently (BadDigest).
+        // the in-bounds case that corrupts silently (BadDigest). The
+        // pre-fill mirrors the write path (append → reserve → join) but
+        // WITHOUT the completion leave: the test holds the writer lease,
+        // so seal-on-zero does not close the partial segment before the
+        // multi-tier PUT lands in it (a concurrent writer's lease).
         let prefill = vec![0x11u8; 2048];
-        put_and_persist(&fx.coord, &fx.metadata, "test", "prefill", Bytes::from(prefill)).await;
+        let mut prefill_registered = std::collections::HashSet::new();
+        let (held_segment, prefill_offset, _, _sealed) = fx
+            .coord
+            .segment_pool_standard
+            .append_with_hook_async(&prefill, |_, _, _| {}, std::time::Duration::from_secs(5))
+            .await
+            .expect("prefill append");
+        assert_eq!(prefill_offset, 0, "prefill lands at the segment start");
+        fx.coord
+            .request_reserve_before_wal(held_segment, SizeTier::Standard, &mut prefill_registered)
+            .await
+            .expect("prefill reserve");
+        fx.coord.lifecycle.writer_join(held_segment);
 
         // 10752 bytes > default_target_size (4096) → Multi tier,
         // split into 4096 + 4096 + 2560 chunks.
@@ -2741,6 +2804,13 @@ mod tests {
             Bytes::from(payload.clone()),
         )
         .await;
+
+        // Release the held lease (the pre-fill segment was fill-sealed
+        // by the multi chunk — the drain skips sealed entries).
+        if fx.coord.lifecycle.writer_leave(held_segment) {
+            fx.coord.lifecycle.note_pending_seal(held_segment);
+        }
+        fx.coord.lifecycle.drain_pending_seals().await;
 
         assert_eq!(put.chunks.len(), 3, "10.5 KiB blob must split into three chunks");
         // Chunk 0 lands after the 2048-byte pre-fill blob; chunk refs
@@ -2776,9 +2846,22 @@ mod tests {
     async fn multi_tier_roundtrip_sealed_segment_reads_back_from_disk() {
         let fx = make_multi_tier_fixture().await;
 
-        // Pre-fill so chunk 0 lands at a non-zero segment offset.
+        // Pre-fill so chunk 0 lands at a non-zero segment offset. The
+        // pre-fill holds a writer lease (see the active-segment test).
         let prefill = vec![0x22u8; 2048];
-        put_and_persist(&fx.coord, &fx.metadata, "test", "prefill", Bytes::from(prefill)).await;
+        let mut prefill_registered = std::collections::HashSet::new();
+        let (held_segment, prefill_offset, _, _sealed) = fx
+            .coord
+            .segment_pool_standard
+            .append_with_hook_async(&prefill, |_, _, _| {}, std::time::Duration::from_secs(5))
+            .await
+            .expect("prefill append");
+        assert_eq!(prefill_offset, 0, "prefill lands at the segment start");
+        fx.coord
+            .request_reserve_before_wal(held_segment, SizeTier::Standard, &mut prefill_registered)
+            .await
+            .expect("prefill reserve");
+        fx.coord.lifecycle.writer_join(held_segment);
 
         // Exactly two full chunks (8192 bytes): each fills its segment.
         let payload: Vec<u8> = (0..8192u32).map(|i| (i % 239) as u8).collect();
@@ -2790,6 +2873,12 @@ mod tests {
             Bytes::from(payload.clone()),
         )
         .await;
+
+        // Release the held lease.
+        if fx.coord.lifecycle.writer_leave(held_segment) {
+            fx.coord.lifecycle.note_pending_seal(held_segment);
+        }
+        fx.coord.lifecycle.drain_pending_seals().await;
         assert_eq!(put.chunks.len(), 2, "8 KiB blob must split into two chunks");
         assert_eq!(put.chunks[0].offset, 2048, "first chunk ref must be segment-relative");
 
@@ -3339,7 +3428,7 @@ mod tests {
                     .await
                     .unwrap(),
                 ))
-                .with_idle_seal(vec![standard_pool.clone()], 5000),
+                .with_seal_pools(vec![standard_pool.clone()]),
         );
         let sealer = Arc::new(SegmentSealer::new(
             SealConfig {
