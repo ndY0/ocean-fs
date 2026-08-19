@@ -1,7 +1,7 @@
 ---
 feature: "Startup Rebuild from the Machine — Checkpoint + Fold, Delete the Adoption Heuristic"
 epic: "refactoring/segment-event-log-lifecycle/segments-cf-removal"
-status: proposed
+status: in_progress
 priority: high
 owner: ""
 dependencies:
@@ -22,7 +22,7 @@ perf:
   - "7.1 Minimize lock hold duration"
   - "1.3 Pre-size collections with known capacity"
 created: 2026-08-17
-updated: 2026-08-17
+updated: 2026-08-19
 ---
 
 # Startup Rebuild from the Machine — Checkpoint + Fold, Delete the Adoption Heuristic
@@ -187,7 +187,9 @@ node start
       crash mid-compaction and mid-seal, GC + scrub + AE runs green on the
       rebuilt machine, WAL `protected` flat over a soak run (the
       3.8 GB/hour class closed end-to-end).
+      **Status: pending-SUT-VM-validation, not failed** (Deviations O1).
 <!-- REVIEW: not verifiable in this environment — requires the SUT-VM soak run (load_sustained crash_recovery/memory_bounded assertions), which the review constraint reserves for the owner-approved SUT VM. Mirrors the dependency feature's O1 (segments-cf-removal.md). Pending SUT-VM validation; not a code defect. -->
+<!-- SPEC-WRITER (2026-08-19): box marked pending-SUT-VM-validation, NOT failed (Deviations O1), mirroring segments-cf-removal.md O1. Closure requires the SUT-VM run: load_sustained's crash_recovery + memory_bounded assertions and the end-state soak (GC + scrub + AE green on the rebuilt machine, WAL `protected` flat over the 3.8 GB/hour-class window). Heavy e2e tests (load_sustained, wal_retention, load_concurrency) run only on the SUT VM with the owner's approval (segments-cf-removal.md O1/N1 convention). -->
 
 > **Lint & Doc Examples (non-gating):** `cargo clippy --all-targets -D
 > warnings` test-code warnings and `ignore`-tagged doc examples are
@@ -235,16 +237,25 @@ restart fold reads ≤ `event_wal_checkpoint_bytes` of events
 assertions are machine-variance flaky; the replay-volume bound is the
 mechanism the time bound derives from.
 
-### D4 — Stale doc comments (non-code)
+### D4 — Stale doc comments (non-code) — **CLOSED**
 
 The coordinator's `request_reserve`/`request_seal`/`request_delete` doc
 comments in `crates/oceanfs-storage/src/segment/lifecycle.rs` (lines
-~1716-1724, ~1779-1787, ~1875-1880) still describe the removed
+~1716-1724, ~1779-1787, ~1875-1880) still described the removed
 phase-1 CF fallback and phase-2 CF mirror ("then the CF mirror write"),
-and `node.rs:581-583` still references "the legacy CF-driven recovery
-helper". The code is CF-free (the event log is the only durable writer —
-verified); the comments lag the removal. Cosmetic; worth a doc sweep in a
-later pass.
+and `node.rs:581-583` still referenced "the legacy CF-driven recovery
+helper". The code was CF-free (the event log is the only durable writer —
+verified); the comments lagged the removal. **Closed by commit `30810af`**
+(`docs(storage): remove the remaining CF-mirror prose`, 2026-08-19):
+`request_seal`'s doc drops the removed mirror write ("then the fold, then
+the CF mirror write" → "then the fold."), the fold/`reserve_hint`
+pre-sizing wording no longer cites the "CF mirror estimate", and the
+`node.rs` pool-EC comment now reads "the machine's seal-on-zero freeze
+uses the same codec" — no reference to a CF-driven recovery helper
+remains. The phase-1/phase-2 evolution narrative retained on
+`request_reserve`/`request_delete` is intentional historical context; the
+write-site code comments state the final form ("the CF fallback is
+removed; the event log is the only durable writer").
 
 ### O1 — Open: Integration DoD pending SUT-VM validation
 
