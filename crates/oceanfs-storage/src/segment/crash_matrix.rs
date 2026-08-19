@@ -1169,3 +1169,38 @@ async fn rebuild_is_deterministic_across_copied_data_dirs() {
         assert_eq!(e1.metadata.merkle_root, e2.metadata.merkle_root, "{label} root must match");
     }
 }
+
+/// Startup-rebuild regression (SUT double-delete): two concurrent
+/// `request_delete`s can both validate and append their `DeleteEvent`
+/// — the first fold evicts, the second event is durable. The recovery
+/// fold must treat the duplicate delete as a no-op, not abort startup
+/// (a crash after the double-append previously bricked the node with
+/// `EventFoldError: segment not present in the lifecycle registry`).
+#[tokio::test]
+async fn duplicate_delete_event_folds_as_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = SegmentId::new();
+    {
+        let h = Harness::boot(dir.path()).await;
+        h.reserve(id).await;
+        h.append(id, 0, b"double-delete").await;
+        h.seal(id, b"double-delete").await;
+        h.delete(id).await; // valid delete: appends DeleteEvent #1, folds + evicts
+                            // The racing second delete: both validated before either folded —
+                            // its DeleteEvent is durable even though the fold of #1 evicted
+                            // the entry.
+        h.event_wal
+            .append(crate::segment::event_wal::SegmentEvent::Delete(
+                crate::segment::event_wal::DeleteEvent { segment_id: id },
+            ))
+            .await
+            .unwrap();
+        h.crash().await;
+    }
+    let h = Harness::boot(dir.path()).await;
+    let outcome = h.recover().await;
+
+    // The fold must not abort: the duplicate delete is a no-op.
+    assert_eq!(outcome.folded_segments, 1, "the reserve+seal+2 deletes fold");
+    assert!(h.lifecycle.registry().get(id).is_none(), "the segment stays deleted + evicted");
+}

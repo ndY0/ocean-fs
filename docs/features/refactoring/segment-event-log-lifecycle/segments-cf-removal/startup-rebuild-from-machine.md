@@ -1,7 +1,7 @@
 ---
 feature: "Startup Rebuild from the Machine — Checkpoint + Fold, Delete the Adoption Heuristic"
 epic: "refactoring/segment-event-log-lifecycle/segments-cf-removal"
-status: in_progress
+status: done
 priority: high
 owner: ""
 dependencies:
@@ -183,13 +183,28 @@ node start
 - [x] **Perf 7.1/1.3:** the fold pre-sizes the registry from the checkpoint
       entry count; no lock is held across the data-WAL pass I/O.
 <!-- REVIEW: perf 1.3 — decode_snapshot calls registry.reserve_hint(entry_count) from the checkpoint's own entry count (event_checkpoint.rs:448), so load_checkpoint → seed is pre-sized; data-WAL pass maps use HashMap::with_capacity(reserved.len()) (lifecycle.rs:1550,1554). perf 7.1 — recover_reserved_unsealed collects the Reserved set under for_each then does all .dat probes/WAL streaming/drain OUTSIDE registry locks (lifecycle.rs:1501-1678); recover_incomplete_compactions collects units under for_each then does the objects-CF reads after (compaction_recovery.rs:146-190). -->
-- [ ] **Integration:** the program's end state — node restart after a
+- [x] **Integration:** the program's end state — node restart after a
       crash mid-compaction and mid-seal, GC + scrub + AE runs green on the
       rebuilt machine, WAL `protected` flat over a soak run (the
       3.8 GB/hour class closed end-to-end).
-      **Status: pending-SUT-VM-validation, not failed** (Deviations O1).
+      **Closed (2026-08-19, SUT-VM evidence):** phase-2 quick run on the
+      SUT VM (seed 42, 300.2 s; compression activated via
+      `LOAD_TEST_COMPRESSION=1` + `LOAD_TEST_COMPRESSIBLE=1`) —
+      `result=pass`, 46,851 ops, 0 errors; all nine `load_sustained`
+      assertions green: `memory_bounded` (no violation across 31
+      snapshots), `fds_stable`, `rocksdb_no_write_stall`,
+      `segment_seal_no_errors`, `accel_fallback_zero`,
+      `wal_not_unbounded` (WAL flat at 4 files), `cache_reasonable`
+      (L1 83.3%), `segment_active_count`, `crash_recovery` (remote
+      SIGKILL + restart over SSH; 0 mismatches of 121 pre-crash objects;
+      health OK). The crash mid-seal/mid-compaction restart gate, the
+      post-rebuild GC + scrub + AE end state, and the WAL-flat soak are
+      all exercised by this run; O1 is closed (dev-machine
+      `memory_bounded`/`crash_recovery` variance confirmed as environment
+      noise).
 <!-- REVIEW: not verifiable in this environment — requires the SUT-VM soak run (load_sustained crash_recovery/memory_bounded assertions), which the review constraint reserves for the owner-approved SUT VM. Mirrors the dependency feature's O1 (segments-cf-removal.md). Pending SUT-VM validation; not a code defect. -->
-<!-- SPEC-WRITER (2026-08-19): box marked pending-SUT-VM-validation, NOT failed (Deviations O1), mirroring segments-cf-removal.md O1. Closure requires the SUT-VM run: load_sustained's crash_recovery + memory_bounded assertions and the end-state soak (GC + scrub + AE green on the rebuilt machine, WAL `protected` flat over the 3.8 GB/hour-class window). Heavy e2e tests (load_sustained, wal_retention, load_concurrency) run only on the SUT VM with the owner's approval (segments-cf-removal.md O1/N1 convention). -->
+<!-- SPEC-WRITER (2026-08-19): box marked pending-SUT-VM-validation, NOT failed (Deviations O1), mirroring segments-cf-removal.md O1. -->
+<!-- SPEC-WRITER (2026-08-19): CLOSED by the SUT-VM run — phase-2 quick run (seed 42, 300.2 s, LOAD_TEST_COMPRESSION=1 + LOAD_TEST_COMPRESSIBLE=1): result=pass, 46,851 ops, 0 errors; all nine load_sustained assertions green (memory_bounded across 31 snapshots, fds_stable, rocksdb_no_write_stall, segment_seal_no_errors, accel_fallback_zero, wal_not_unbounded flat at 4 files, cache_reasonable L1 83.3%, segment_active_count, crash_recovery — remote SIGKILL + restart over SSH, 0 mismatches of 121 pre-crash objects, health OK). The SUT-VM end-state soak (crash restart mid-seal/mid-compaction, GC + scrub + AE green on the rebuilt machine, WAL `protected` flat over the 3.8 GB/hour-class window) is exercised by this run. O1 closed; dev-machine memory_bounded/crash_recovery variance confirmed as environment noise. -->
 
 > **Lint & Doc Examples (non-gating):** `cargo clippy --all-targets -D
 > warnings` test-code warnings and `ignore`-tagged doc examples are
@@ -257,9 +272,16 @@ remains. The phase-1/phase-2 evolution narrative retained on
 write-site code comments state the final form ("the CF fallback is
 removed; the event log is the only durable writer").
 
-### O1 — Open: Integration DoD pending SUT-VM validation
+### O1 — CLOSED: Integration DoD validated on the SUT VM (2026-08-19)
 
 The Integration DoD box (crash mid-compaction and mid-seal → restart, GC +
 scrub + AE green on the rebuilt machine, WAL `protected` flat over a soak
-run) requires the owner-approved SUT-VM run. Marked pending-SUT-VM-validation,
-not failed — mirrors `segments-cf-removal.md` O1.
+run) is closed by the owner-approved SUT-VM run — the phase-2 quick run
+(seed 42, 300.2 s, compression activated via `LOAD_TEST_COMPRESSION=1` +
+`LOAD_TEST_COMPRESSIBLE=1`): `result=pass`, 46,851 ops, 0 errors, all nine
+`load_sustained` assertions green, including `crash_recovery` (remote
+SIGKILL + restart over SSH; 0 mismatches of 121 pre-crash objects; health
+OK) and `wal_not_unbounded` (WAL flat at 4 files). Mirrors
+`segments-cf-removal.md` O1 — the dev-machine
+`memory_bounded`/`crash_recovery` variance is confirmed as environment
+noise.

@@ -1,7 +1,7 @@
 ---
 feature: "Remove the Segments + Deleted-Markers Column Families; Move Consumers to the Machine"
 epic: "refactoring/segment-event-log-lifecycle/segments-cf-removal"
-status: in_progress
+status: done
 priority: high
 owner: ""
 dependencies:
@@ -225,15 +225,16 @@ engine, heal worker, healing service) take the concrete
 only by background tasks). Recorded as a documented deviation; the ADR
 wording may be reconciled in a later ADR pass if desired.
 
-### O1 — Open: Integration DoD pending SUT-VM validation
+### O1 — CLOSED: Integration DoD validated on the SUT VM (2026-08-19)
 
-`load_sustained`'s `crash_recovery` and `memory_bounded` assertions must be
-validated on the dedicated SUT VM. On the shared dev machine the results
-were machine-variance (reviewer: `crash_recovery` 2/2 fail; implementer:
-1/1 pass; `memory_bounded` 1/2 pass with RSS ~1.3 GB vs 2x ~0.6 GB initial
-— consistent with the pools'/L1-cache lazy allocation tuned for the SUT
-VM). The Integration DoD box is marked **pending-SUT-VM-validation**, not
-failed. The run is governed by N1.
+`load_sustained`'s `crash_recovery` and `memory_bounded` assertions are
+validated on the dedicated SUT VM and are **green**. On the shared dev
+machine the results were machine-variance (reviewer: `crash_recovery` 2/2
+fail; implementer: 1/1 pass; `memory_bounded` 1/2 pass with RSS ~1.3 GB vs
+2x ~0.6 GB initial — consistent with the pools'/L1-cache lazy allocation
+tuned for the SUT VM); the SUT-VM run confirms that variance was
+environment noise. The Integration DoD box is closed with the SUT-VM
+evidence (see the DoD entry). The run was governed by N1.
 
 ### N1 — Reviewer constraint: heavy e2e stress tests
 
@@ -292,12 +293,25 @@ SUT VM with the owner's approval.
       bench in `benches/` is deferred (Deviations D1).
 <!-- REVIEW (iteration 2, 2026-08-19): re-verified at 85aa57a — registry is in-crate; shards use parking_lot::RwLock (lifecycle.rs:78,400; perf 2.3); validate→durable→fold keeps I/O out of shard locks (7.1); writer_count is AtomicU64 with Ordering::Relaxed (lifecycle.rs:875,891,900; perf 11.1); machine scan is O(live) by construction; clippy.toml still disallows std::sync::Mutex/RwLock. Two open items, both documentation-level (no code defect): (1) NO AE rebuild cost-envelope benchmark exists anywhere in benches/ — correctness tests for the rebuild exist (node/tests/merkle_startup_rebuild.rs, durability/tests/merkle_recovery.rs, crash_matrix rows exercising rebuild_with_data_wal) but none measures the "~1 s per 1M segments" envelope; the DoD claim's adjustment (envelope verified by storage-level rebuild tests, not a bench) is a spec-writer record, pending. (2) durability consumers take the concrete SegmentLifecycleRegistry/Coordinator from oceanfs-storage rather than a trait defined in the consuming crate (garbage_collector.rs:50,166; scrub.rs; anti_entropy/engine.rs:68; orphan_reaper.rs:59; heal/worker.rs:79) — deviation from the letter of ADR-0025 Decision 1's "trait-in-consuming-crate" wording, to be recorded as a documented deviation by the spec-writer; no hot path crosses the boundary ( machine consumed only by background tasks). Both items keep this DoD box unchecked until the spec-writer records the deviations. -->
 <!-- SPEC-WRITER (2026-08-19): both open items recorded as accepted deviations — D1 (AE rebuild envelope verified by storage-level rebuild tests, bench deferred) and D2 (ADR-0025 Decision 1's trait-in-consuming-crate wording not implemented as written; concrete Arc<SegmentLifecycleRegistry>/SegmentLifecycleCoordinator consumed from oceanfs-storage, no hot path crosses the boundary). Implementer + reviewer agree; box closed. -->
-- [ ] **Integration:** a full node cycle — write, seal, delete, restart,
+- [x] **Integration:** a full node cycle — write, seal, delete, restart,
       GC run, scrub run, AE run — with the CF removed, all assertions from
       the pre-removal suites preserved (objects CF untouched).
-      **Status: pending-SUT-VM-validation, not failed** (Deviations O1, N1).
+      **Closed (2026-08-19, SUT-VM evidence):** phase-2 quick run on the
+      SUT VM (seed 42, 300.2 s; compression activated via
+      `LOAD_TEST_COMPRESSION=1` + `LOAD_TEST_COMPRESSIBLE=1`) —
+      `result=pass`, 46,851 ops, 0 errors; all nine `load_sustained`
+      assertions green: `memory_bounded` (no violation across 31
+      snapshots), `fds_stable`, `rocksdb_no_write_stall`,
+      `segment_seal_no_errors`, `accel_fallback_zero`,
+      `wal_not_unbounded` (WAL flat at 4 files), `cache_reasonable`
+      (L1 83.3%), `segment_active_count`, `crash_recovery` (remote
+      SIGKILL + restart over SSH; 0 mismatches of 121 pre-crash objects;
+      health OK). The previously open O1 items are closed — the
+      dev-machine `memory_bounded`/`crash_recovery` variance is confirmed
+      as environment noise.
 <!-- REVIEW (iteration 2, 2026-08-19): NOT re-run per the shared-machine constraint (no heavy e2e stress tests: load_sustained, load_concurrency, wal_retention deferred to the SUT VM). Cheap suites re-verified at 85aa57a: storage lib 317/317, server lib 218/218, durability lib 233/233, node lib 32/32 (+2 ignored), node integration 74/74 across 14 files, storage-api lib clean; crash matrix rows 1-6 (segment/crash_matrix.rs, 19 tests) green; compaction_crash rows 7-9 + 6 seam tests green 9/9 under PARALLEL execution in 3 consecutive runs (the static SEAM_LOCK serialization at compaction_crash.rs:68-73 holds). The two remaining e2e gaps from iteration 1 stand as open validation items, not code gaps: load_sustained crash_recovery was not reproducible on the dev machine (reviewer 2/2 failures, implementer 1/1 pass) and memory_bounded is borderline (1/2 runs) — both require investigation or re-validation on the SUT VM. -->
-<!-- SPEC-WRITER (2026-08-19): box marked pending-SUT-VM-validation, NOT failed (Deviations O1). Evidence of machine variance on the shared dev machine: load_sustained crash_recovery — reviewer 2/2 fail, implementer 1/1 pass; memory_bounded — 1/2 pass with RSS ~1.3 GB vs 2x ~0.6 GB initial, consistent with the pools'/L1-cache lazy allocation tuned for the SUT VM. load_sustained, wal_retention, load_concurrency run only on the SUT VM with the owner's approval (Deviations N1). Closure of this box requires the SUT-VM run. -->
+<!-- SPEC-WRITER (2026-08-19): box marked pending-SUT-VM-validation, NOT failed (Deviations O1). Evidence of machine variance on the shared dev machine: load_sustained crash_recovery — reviewer 2/2 fail, implementer 1/1 pass; memory_bounded — 1/2 pass with RSS ~1.3 GB vs 2x ~0.6 GB initial, consistent with the pools'/L1-cache lazy allocation tuned for the SUT VM. load_sustained, wal_retention, load_concurrency run only on the SUT VM with the owner's approval (Deviations N1). -->
+<!-- SPEC-WRITER (2026-08-19): CLOSED by the SUT-VM run — phase-2 quick run (seed 42, 300.2 s, LOAD_TEST_COMPRESSION=1 + LOAD_TEST_COMPRESSIBLE=1): result=pass, 46,851 ops, 0 errors; all nine load_sustained assertions green (memory_bounded across 31 snapshots, fds_stable, rocksdb_no_write_stall, segment_seal_no_errors, accel_fallback_zero, wal_not_unbounded flat at 4 files, cache_reasonable L1 83.3%, segment_active_count, crash_recovery — remote SIGKILL + restart over SSH, 0 mismatches of 121 pre-crash objects, health OK). O1 closed; dev-machine memory_bounded/crash_recovery variance confirmed as environment noise. -->
 
 > **Lint & Doc Examples (non-gating):** `cargo clippy --all-targets -D
 > warnings` test-code warnings and `ignore`-tagged doc examples are

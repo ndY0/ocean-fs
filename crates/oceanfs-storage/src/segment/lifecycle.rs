@@ -1421,6 +1421,29 @@ impl SegmentLifecycleCoordinator {
                     self.registry.fold_refresh(evt.segment_id, evt.merkle_root)
                 }
             };
+            // Idempotent fold outcomes: a duplicate `DeleteEvent` (two
+            // concurrent `request_delete`s both validated and appended —
+            // the first fold evicted, the second's event is durable) or
+            // a `MetadataRefreshEvent` racing a delete are benign, not
+            // corruption: the segment is already gone, the event is a
+            // no-op. Aborting startup on them would brick the node after
+            // a crash (the SUT's double-delete event log). `Seal` on a
+            // missing segment stays an abort — a seal without a reserve
+            // IS corruption.
+            let tolerated = matches!(
+                (&evt, &fold_result),
+                (SegmentEvent::Delete(_), Err(TransitionError::Missing))
+                    | (SegmentEvent::Delete(_), Err(TransitionError::AlreadyDeleted))
+                    | (SegmentEvent::MetadataRefresh(_), Err(TransitionError::Missing))
+            );
+            if tolerated {
+                tracing::debug!(
+                    segment_id = %segment_id,
+                    pos = ?pos,
+                    "fold no-op: event for an already-removed segment"
+                );
+                continue;
+            }
             fold_result.map_err(|e| Error::EventFoldError {
                 pos,
                 detail: format!("{e} (segment {segment_id})"),
