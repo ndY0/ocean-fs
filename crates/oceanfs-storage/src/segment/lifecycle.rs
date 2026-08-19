@@ -47,9 +47,9 @@
 //! freeze (the read window is continuous — `lifecycle-read-path`). It
 //! is safe because no code path acquires a shard and then a slot lock:
 //! `read_source` releases the shard before returning (the caller's
-//! slot scan happens after), `request_*` never touch slots, and
-//! `seal_idle_segments` sweeps slots and retries in-flight seals in
-//! separate steps. If a future feature introduces another order, this
+//! slot scan happens after), `request_*` never touch slots, and the
+//! pending-seal drain's freeze runs under the slot lock only (never
+//! a shard lock). If a future feature introduces another order, this
 //! comment must document the full ordering.
 //!
 //! Memory bound (ADR-0025 Decision 5 — stated at TB scale, not
@@ -1126,11 +1126,12 @@ impl SegmentLifecycleRegistry {
 /// [`with_event_wal`](Self::with_event_wal)) rejects every transition —
 /// there is no fallback store.
 ///
-/// The coordinator also owns the **idle-seal timer**: every `Reserved`
-/// segment that stops receiving writes for `seal_timeout_ms` is sealed
-/// (the pool slots are the idle detectors — they track per-segment
-/// last-append — and the coordinator's `seal_idle_segments` tick drives
-/// the sweep; empty segments are never sealed).
+/// The coordinator also drives the deterministic **seal-on-zero**
+/// trigger: the write path joins every segment it appends to (atomic
+/// writer count) and leaves at request completion; the last leave
+/// notes the segment, and the pending-seal drain freezes and enqueues
+/// it through the wired seal pools (empty segments are never sealed —
+/// recovery drops empty reserves). No timer, no heuristic.
 pub struct SegmentLifecycleCoordinator {
     registry: Arc<SegmentLifecycleRegistry>,
     /// The event WAL — the coordinator's ONLY durable writer
@@ -2053,19 +2054,6 @@ impl SegmentLifecycleCoordinator {
         out
     }
 
-    /// The idle-seal driver tick: sweeps every wired pool for
-    /// partially-filled segments that stopped receiving writes for
-    /// `seal_timeout_ms` and seals them (the fill path sealed only on
-    /// `is_full()`, leaving such segments `Reserved` forever and
-    /// pinning their WAL files — the `wal_not_unbounded` leak).
-    ///
-    /// Empty segments are never sealed (recovery drops empty
-    /// reserves). The tick also **retries deferred seals**: frozen
-    /// segments whose enqueue failed while the seal queue was at
-    /// capacity stay readable through the registry's in-flight window
-    /// and are re-enqueued here — a full seal queue delays the seal
-    /// but never removes the read window (lifecycle-read-path). Once
-    /// the in-flight count drops below the cap, slots re-arm.
     /// Writes a segment's writer-count join through the coordinator —
     /// the registry's only writer. Called by the write path right after
     /// the reserve, before the first WAL entry.
