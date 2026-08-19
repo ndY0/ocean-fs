@@ -1374,6 +1374,13 @@ impl SegmentLifecycleCoordinator {
         // set is bounded by live segments).
         let mut folded: std::collections::HashSet<SegmentId> =
             std::collections::HashSet::with_capacity(64);
+        // Segments whose `DeleteEvent` was folded: a later `Seal` for
+        // them is residue of a race (e.g., the compactor's seal append
+        // failed after partial durability and its cleanup deleted the
+        // Reserved replacement — the seal record then lands after the
+        // delete), never corruption. The delete wins.
+        let mut deleted: std::collections::HashSet<SegmentId> =
+            std::collections::HashSet::with_capacity(16);
 
         for item in events {
             let (pos, evt) = match item {
@@ -1416,26 +1423,34 @@ impl SegmentLifecycleCoordinator {
                     };
                     self.registry.seal_with(evt.segment_id, meta, evt.repacked_from)
                 }
-                SegmentEvent::Delete(evt) => self.registry.delete(evt.segment_id),
+                SegmentEvent::Delete(evt) => {
+                    deleted.insert(evt.segment_id);
+                    self.registry.delete(evt.segment_id)
+                }
                 SegmentEvent::MetadataRefresh(evt) => {
                     self.registry.fold_refresh(evt.segment_id, evt.merkle_root)
                 }
             };
-            // Idempotent fold outcomes: a duplicate `DeleteEvent` (two
-            // concurrent `request_delete`s both validated and appended —
-            // the first fold evicted, the second's event is durable) or
-            // a `MetadataRefreshEvent` racing a delete are benign, not
-            // corruption: the segment is already gone, the event is a
-            // no-op. Aborting startup on them would brick the node after
-            // a crash (the SUT's double-delete event log). `Seal` on a
-            // missing segment stays an abort — a seal without a reserve
-            // IS corruption.
-            let tolerated = matches!(
-                (&evt, &fold_result),
-                (SegmentEvent::Delete(_), Err(TransitionError::Missing))
-                    | (SegmentEvent::Delete(_), Err(TransitionError::AlreadyDeleted))
-                    | (SegmentEvent::MetadataRefresh(_), Err(TransitionError::Missing))
-            );
+            // Idempotent fold outcomes — benign race residue, not
+            // corruption:
+            // - a duplicate `DeleteEvent` (two concurrent deletes both
+            //   validated and appended; the first fold evicted);
+            // - a `Seal` or `MetadataRefresh` for a segment whose
+            //   `DeleteEvent` was already folded (the compactor's seal
+            //   append can fail after partial durability, its cleanup
+            //   deletes the Reserved replacement, and the seal record
+            //   lands after the delete — the delete wins; the SUT's
+            //   Reserve→Delete→Seal sequence bricked restart with
+            //   EventFoldError before this tolerance);
+            // - `MetadataRefresh` racing a delete.
+            // A `Seal` on a segment that was NEVER deleted stays an
+            // abort — a seal without a reserve IS corruption.
+            let tolerated = match &fold_result {
+                Err(TransitionError::Missing) | Err(TransitionError::AlreadyDeleted) => {
+                    deleted.contains(&segment_id) || matches!(evt, SegmentEvent::Delete(_))
+                }
+                _ => false,
+            };
             if tolerated {
                 tracing::debug!(
                     segment_id = %segment_id,

@@ -1204,3 +1204,43 @@ async fn duplicate_delete_event_folds_as_noop() {
     assert_eq!(outcome.folded_segments, 1, "the reserve+seal+2 deletes fold");
     assert!(h.lifecycle.registry().get(id).is_none(), "the segment stays deleted + evicted");
 }
+
+/// Startup-rebuild regression (SUT 30-min run): a segment whose
+/// `SealEvent` lands AFTER its `DeleteEvent` (the compactor's seal
+/// append failed after partial durability, its cleanup deleted the
+/// Reserved replacement, and the seal record hit the log afterwards —
+/// Reserve → Delete → Seal). The fold must let the delete win and
+/// treat the seal as a no-op — not abort startup.
+#[tokio::test]
+async fn seal_after_delete_folds_as_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = SegmentId::new();
+    {
+        let h = Harness::boot(dir.path()).await;
+        h.reserve(id).await;
+        h.delete(id).await; // e.g. the compactor's cleanup_reserved_new
+                            // The racing seal: its event append was in flight when the
+                            // delete landed — the seal record is durable AFTER the delete.
+        h.event_wal
+            .append(crate::segment::event_wal::SegmentEvent::Seal(
+                crate::segment::event_wal::SealEvent {
+                    segment_id: id,
+                    tier: oceanfs_core::SizeTier::Standard,
+                    ec_k: 4,
+                    ec_m: 2,
+                    merkle_root: oceanfs_core::HashOutput::from_bytes([0xAA; 32]),
+                    data_wal_pos: crate::segment::event_wal::DataWalPos { file_seq: 0, offset: 0 },
+                    repacked_from: None,
+                },
+            ))
+            .await
+            .unwrap();
+        h.crash().await;
+    }
+    let h = Harness::boot(dir.path()).await;
+    let outcome = h.recover().await;
+
+    // The fold must not abort; the delete wins (the entry stays gone).
+    assert_eq!(outcome.folded_segments, 1, "the reserve+delete+seal folds");
+    assert!(h.lifecycle.registry().get(id).is_none(), "the segment stays deleted + evicted");
+}
