@@ -993,14 +993,12 @@ impl Node {
         let hinted_handoff_manager = Arc::new(
             HintedHandoffManager::new(hints_dir.clone(), hint_delivery_client, hint_config.clone())
                 .with_membership(membership.clone())
-                .with_timeouts(op_timeouts.clone())
-                // Obsolete-key pre-check at drain time: hints whose key
-                // no longer exists on this node (deleted/superseded —
-                // the metadata is the truth) are dropped locally — no
-                // fetch, no network call, no retry loop.
-                .with_obsolete_check(Arc::new(oceanfs_durability::MetadataHintObsoleteCheck::new(
-                    metadata_store.clone(),
-                ))),
+                .with_timeouts(op_timeouts.clone()), // Delivery contract (ADR-0027 as amended): hints are
+                                                     // NEVER dropped at the sender — deliver everything, the
+                                                     // receiver's HLC-LWW apply is the single gate. The old
+                                                     // obsolete pre-check dropped hints based on the sender's
+                                                     // view of distributed state, which could diverge from
+                                                     // the truth (the churn residual class).
         );
 
         // Replay existing hints from the WAL into in-memory queues.

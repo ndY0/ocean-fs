@@ -605,10 +605,7 @@ async fn load_cluster_churn() {
             if let Ok(snap) = MetricsSnapshot::scrape(&*target, i).await {
                 pending += snap.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0)
                     - snap.counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0)
-                    - snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0)
-                    // Obsolete-dropped hints are resolved-by-deletion
-                    // (the metadata is the truth) — not undelivered.
-                    - snap.counter("hinted_handoff_hints_obsolete_total").unwrap_or(0.0);
+                    - snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0);
             }
         }
         if pending <= 0.0 {
@@ -632,16 +629,13 @@ async fn load_cluster_churn() {
             for i in 0..target.len() {
                 if let Ok(snap) = MetricsSnapshot::scrape(&*target, i).await {
                     eprintln!(
-                        "  node {i}: pending={:.0} stored={:.0} delivered={:.0} \
-                         expired={:.0} obsolete={:.0}",
+                        "  node {i}: pending={:.0} stored={:.0} delivered={:.0} expired={:.0}",
                         snap.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0)
                             - snap.counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0)
-                            - snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0)
-                            - snap.counter("hinted_handoff_hints_obsolete_total").unwrap_or(0.0),
+                            - snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0),
                         snap.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0),
                         snap.counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0),
                         snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0),
-                        snap.counter("hinted_handoff_hints_obsolete_total").unwrap_or(0.0),
                     );
                 }
             }
@@ -723,7 +717,6 @@ async fn load_cluster_churn() {
     let mut stored = 0.0;
     let mut delivered = 0.0;
     let mut expired = 0.0;
-    let mut obsolete = 0.0;
     for i in 0..target.len() {
         if let Ok(final_snap) = MetricsSnapshot::scrape(&*target, i).await {
             stored += final_snap.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0)
@@ -732,21 +725,15 @@ async fn load_cluster_churn() {
                 - initial_snaps[i].counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0);
             expired += final_snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0)
                 - initial_snaps[i].counter("hinted_handoff_hints_expired_total").unwrap_or(0.0);
-            obsolete += final_snap.counter("hinted_handoff_hints_obsolete_total").unwrap_or(0.0)
-                - initial_snaps[i].counter("hinted_handoff_hints_obsolete_total").unwrap_or(0.0);
         }
     }
     // Delivered may legitimately exceed stored (hints replayed from a
-    // restarted node's WAL were stored by the pre-restart process);
-    // obsolete-dropped hints are resolved-by-deletion (the metadata is
-    // the truth) and count as resolved, not lost. The DoD invariant is
-    // that no more than `HANDOFF_TOLERANCE` of stored hints remain
-    // undelivered.
-    let handoff_delta_ok =
-        stored == 0.0 || delivered + obsolete >= stored * (1.0 - HANDOFF_TOLERANCE);
+    // restarted node's WAL were stored by the pre-restart process). The
+    // DoD invariant is that no more than `HANDOFF_TOLERANCE` of stored
+    // hints remain undelivered.
+    let handoff_delta_ok = stored == 0.0 || delivered >= stored * (1.0 - HANDOFF_TOLERANCE);
     eprintln!(
-        "load_cluster_churn: handoff stored={stored:.0} delivered={delivered:.0} \
-         expired={expired:.0} obsolete={obsolete:.0}"
+        "load_cluster_churn: handoff stored={stored:.0} delivered={delivered:.0} expired={expired:.0}"
     );
 
     // ── Assertion 6: incarnation monotonicity ──────────────────
@@ -1004,8 +991,7 @@ async fn load_cluster_churn() {
          convergence: {converged} (per-cycle {converged_after:?})\n\
          manifest integrity: {} keys absent from every node (of {} keys)\n\
          read quorum: {} failures\n\
-         handoff: stored={stored:.0} delivered={delivered:.0} expired={expired:.0} \
-         obsolete={obsolete:.0}\n\
+         handoff: stored={stored:.0} delivered={delivered:.0} expired={expired:.0}\n\
          hlc monotonic: {:?}\n\
          ring consistency: {:?}\n\
          split brain: {:?}\n\

@@ -318,6 +318,7 @@ pub(crate) async fn get_object(
         key: object_key.clone(),
         hash_key: hk,
         metadata_only: false,
+        local_only: false,
         policy,
     };
 
@@ -431,6 +432,7 @@ pub(crate) async fn head_object(
         key: object_key,
         hash_key: hk,
         metadata_only: true,
+        local_only: false,
         policy,
     };
 

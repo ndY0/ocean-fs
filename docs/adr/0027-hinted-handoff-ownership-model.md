@@ -77,10 +77,15 @@ reached all N replicas". Its hint queue is the **durable debt ledger**
 - Complete: guaranteed by Decision 1 — every N-member is either acked
   or owed, and every failed replication attempt records debt (writes
   and deletes alike).
-- Cancellable: the sender-side obsolete check is the **debt-cancellation
-  rule** — a hint is dropped only when the sender's current state for
-  the key is a newer mutation than the hint (the sender coordinated the
-  mutation, so its view is authoritative for keys it owns).
+- Never cancelled at the sender (amended 2026-08-20): the obsolete-key
+  pre-check was removed. A sender-side opinion about distributed state
+  (the key is "absent" locally, therefore the hint is dead) can diverge
+  from the truth and silently drop a mutation the remote still needs —
+  the churn residual class. Delivery now ships **everything** and the
+  receiver's HLC-LWW apply is the single gate: a hint for a key the
+  sender later deleted is delivered and rejected by LWW on the
+  receiver (wasted work bounded by the mutation rate, never a lost
+  mutation).
 - Bounded: hints are enqueued **only after quorum is met** — a failed
   (rolled-back) write must not leave debt for a version that never
   existed.

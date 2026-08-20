@@ -29,8 +29,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use bytes::Bytes;
 pub use hint_delivery::{
-    GrpcHintDeliveryClient, GrpcHintObjectFetcher, HintDeliveryClient, HintObsoleteCheck,
-    HintedHandoffConfig, HintedHandoffManager, MetadataHintObsoleteCheck,
+    GrpcHintDeliveryClient, GrpcHintObjectFetcher, HintDeliveryClient, HintedHandoffConfig,
+    HintedHandoffManager,
 };
 pub use hint_wal::HintWal;
 use oceanfs_core::{Counter, Hlc, LabelSet, MetricRegistrar, NodeId, OperationTimeouts, SegmentId};

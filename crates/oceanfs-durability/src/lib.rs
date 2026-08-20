@@ -55,8 +55,8 @@ pub use heal::{
 };
 pub use hinted_handoff::{
     GrpcHintDeliveryClient, GrpcHintObjectFetcher, HintDeliveryClient, HintObjectFetcher,
-    HintObjectReader, HintObsoleteCheck, HintRecord, HintWal, HintedHandoff, HintedHandoffConfig,
-    HintedHandoffManager, MetadataHintObsoleteCheck,
+    HintObjectReader, HintRecord, HintWal, HintedHandoff, HintedHandoffConfig,
+    HintedHandoffManager,
 };
 pub use scrub::{ScrubConfig, ScrubCoordinator, ScrubReport, ScrubReportBuilder};
 pub use segment_store_impl::DiskSegmentStore;

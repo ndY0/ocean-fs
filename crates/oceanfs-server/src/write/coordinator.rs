@@ -3082,6 +3082,7 @@ mod tests {
             key: ObjectKey::new(key),
             hash_key: HashKey::from_bytes(hash_key(key.as_bytes())),
             metadata_only: false,
+            local_only: false,
             policy: None,
         };
         let result = read.get_object(req).await.unwrap();
@@ -3575,6 +3576,7 @@ mod tests {
                         key: ObjectKey::new(&key),
                         hash_key: HashKey::from_bytes(hash_key(key.as_bytes())),
                         metadata_only: false,
+                        local_only: false,
                         policy: None,
                     };
                     let result = read
@@ -3912,6 +3914,7 @@ mod tests {
                 key: ObjectKey::new(key),
                 hash_key: HashKey::from_bytes(hash_key(key.as_bytes())),
                 metadata_only: false,
+                local_only: false,
                 policy: None,
             };
             match fx.read.get_object(req).await {

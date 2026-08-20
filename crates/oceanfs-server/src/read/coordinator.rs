@@ -52,6 +52,13 @@ pub struct ReadRequest {
     pub hash_key: HashKey,
     /// If true, only fetch metadata (HEAD equivalent).
     pub metadata_only: bool,
+    /// If true, read the LOCAL state only: skip the multi-replica HLC
+    /// comparison and read repair. Used by the hinted-handoff fetch
+    /// (the origin's own state is exactly what the receiver must
+    /// converge to) — the comparison would turn every hint
+    /// materialization into a 3-node fanout and blow the sender's
+    /// delivery timeout.
+    pub local_only: bool,
     /// Per-bucket policy (configuration, resolver, etc.).
     pub policy: Option<Arc<crate::BucketPolicy>>,
 }
@@ -245,6 +252,9 @@ impl oceanfs_durability::HintObjectReader for ReadCoordinatorHintObjectReader {
             key: key.clone(),
             hash_key: HashKey::from_bytes(oceanfs_routing::hash_key(key.as_str().as_bytes())),
             metadata_only: false,
+            // The hint fetch serves the origin's OWN current state —
+            // no quorum comparison, no read repair (see the field doc).
+            local_only: true,
             policy: None,
         };
         match self.read.get(req).await {
@@ -438,13 +448,15 @@ impl ReadCoordinator {
 
         let mut obj_meta = self.lookup_metadata(&req).await?;
 
-        // Metadata-only requests (HEAD) return the LOCAL state directly.
-        // They skip the multi-replica comparison and read repair: a HEAD
-        // must observe what THIS node actually serves (that is what the
-        // churn test's ETag-based verify checks), and the comparison +
-        // repair fanout made every HEAD do remote gRPCs and spawn repair
-        // pushes — ~1.6s per HEAD under verify load, and a 2400-push
-        // storm on the cluster.
+        // Metadata-only requests (HEAD) return the LOCAL state directly,
+        // and local_only requests (the hinted-handoff fetch) read the
+        // LOCAL state with data. Both skip the multi-replica comparison
+        // and read repair: a HEAD must observe what THIS node actually
+        // serves (the ETag verify), and the fetch must be cheap — the
+        // comparison + repair fanout made every fetch a 3-node
+        // operation and blew the sender's delivery timeout (the churn
+        // stuck-hint class: batches of 186 hints × comparison-fetches
+        // exceeded the 10s RPC timeout forever).
         if req.metadata_only {
             return Ok(GetResult {
                 data: Bytes::new(),
@@ -454,19 +466,23 @@ impl ReadCoordinator {
                 segment_source: None,
             });
         }
+        let skip_remote = req.local_only;
 
         // §4.6: Multi-replica HLC comparison — when read_quorum > 1,
         // synchronously fetch metadata from replicas, compare HLCs,
         // and apply the winning version before responding to the client.
-        if let Some(winning_meta) = self.compare_with_quorum(&req.bucket, &req.key, &obj_meta).await
-        {
-            obj_meta = winning_meta;
-        }
+        if !skip_remote {
+            if let Some(winning_meta) =
+                self.compare_with_quorum(&req.bucket, &req.key, &obj_meta).await
+            {
+                obj_meta = winning_meta;
+            }
 
-        // §4.2: Read repair — asynchronously push corrected data to
-        // stale replicas. This is fire-and-forget; it does not block
-        // the client response.
-        self.run_read_repair(&req.bucket, &req.key, &obj_meta).await;
+            // §4.2: Read repair — asynchronously push corrected data to
+            // stale replicas. This is fire-and-forget; it does not block
+            // the client response.
+            self.run_read_repair(&req.bucket, &req.key, &obj_meta).await;
+        }
 
         let data = if let Some(ref inline) = obj_meta.inline_data {
             inline.clone()
@@ -1507,6 +1523,7 @@ mod tests {
             key: ObjectKey::new("obj"),
             hash_key: HashKey::from_bytes(hash_key(b"obj")),
             metadata_only: false,
+            local_only: false,
             policy: None,
         };
 
@@ -1525,6 +1542,7 @@ mod tests {
             key: ObjectKey::new("meta-only"),
             hash_key: HashKey::from_bytes(hash_key(b"meta-only")),
             metadata_only: true,
+            local_only: false,
             policy: None,
         };
 
@@ -1910,6 +1928,7 @@ mod tests {
             key: ObjectKey::new("full-pipe"),
             hash_key: HashKey::from_bytes(hash_key(b"full-pipe")),
             metadata_only: false,
+            local_only: false,
             policy: None,
         };
 
@@ -1967,6 +1986,7 @@ mod tests {
             key: ObjectKey::new("multi-full"),
             hash_key: HashKey::from_bytes(hash_key(b"multi-full")),
             metadata_only: false,
+            local_only: false,
             policy: None,
         };
 
@@ -2012,6 +2032,7 @@ mod tests {
             key: ObjectKey::new("mismatch-full"),
             hash_key: HashKey::from_bytes(hash_key(b"mismatch-full")),
             metadata_only: false,
+            local_only: false,
             policy: None,
         };
 
@@ -2033,6 +2054,7 @@ mod tests {
             key: ObjectKey::new("nonexistent"),
             hash_key: HashKey::from_bytes(hash_key(b"nonexistent")),
             metadata_only: false,
+            local_only: false,
             policy: None,
         };
 
@@ -2067,6 +2089,7 @@ mod tests {
             key: ObjectKey::new("inline-full"),
             hash_key: HashKey::from_bytes(hash_key(b"inline-full")),
             metadata_only: false,
+            local_only: false,
             policy: None,
         };
 
@@ -2119,6 +2142,7 @@ mod tests {
                     key: ObjectKey::new("concurrent"),
                     hash_key: HashKey::from_bytes(hash_key(b"concurrent")),
                     metadata_only: false,
+                    local_only: false,
                     policy: None,
                 };
                 coord.get(req).await.unwrap()
@@ -2162,6 +2186,7 @@ mod tests {
             key: ObjectKey::new("repair-obj"),
             hash_key: HashKey::from_bytes(hash_key(b"repair-obj")),
             metadata_only: false,
+            local_only: false,
             policy: None,
         };
 
@@ -2213,6 +2238,7 @@ mod tests {
             key: ObjectKey::new("repair-grpc"),
             hash_key: HashKey::from_bytes(hash_key(b"repair-grpc")),
             metadata_only: false,
+            local_only: false,
             policy: None,
         };
 
@@ -2338,6 +2364,7 @@ mod tests {
             key: ObjectKey::new("local-wins"),
             hash_key: HashKey::from_bytes(hash_key(b"local-wins")),
             metadata_only: false,
+            local_only: false,
             policy: None,
         };
 
@@ -2392,6 +2419,7 @@ mod tests {
             key: ObjectKey::new("graceful-fail"),
             hash_key: HashKey::from_bytes(hash_key(b"graceful-fail")),
             metadata_only: false,
+            local_only: false,
             policy: None,
         };
 
