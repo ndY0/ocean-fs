@@ -32,7 +32,7 @@ use tracing::{info, warn};
 
 use crate::{
     error::{Error, Result},
-    hinted_handoff_rpc::{hint_record::Record, HintInline, HintRecord, HintSegmentRef},
+    hinted_handoff_rpc::{hint_record::Record, HintDelete, HintInline, HintRecord, HintSegmentRef},
 };
 
 /// A write-ahead log for hinted handoff records.
@@ -447,6 +447,34 @@ impl HintRecord {
         }
     }
 
+    /// Creates a new `HintRecord` from an `HintDelete` (a tombstone for
+    /// an object deleted while the intended node was unreachable).
+    ///
+    /// `hlc` is the original delete's timestamp (hlc-causality-closure
+    /// G5) — see [`new_inline`](Self::new_inline). The receiver applies
+    /// the tombstone with HLC-LWW: a newer local write or a newer local
+    /// tombstone discards it.
+    pub fn new_delete(
+        intended_for: NodeId,
+        bucket_id: oceanfs_core::BucketId,
+        object_key: String,
+        hlc: oceanfs_core::Hlc,
+    ) -> Self {
+        let proto_intended: oceanfs_core::proto::common::NodeId = intended_for.into();
+        let proto_bucket: oceanfs_core::proto::common::BucketId = bucket_id.into();
+        let proto_hlc: oceanfs_core::proto::common::HlcTimestamp = hlc.into();
+
+        HintRecord {
+            record: Some(Record::Delete(HintDelete {
+                intended_for: Some(proto_intended),
+                bucket_id: Some(proto_bucket),
+                object_key,
+                hlc: Some(proto_hlc),
+            })),
+            stored_at_secs: 0,
+        }
+    }
+
     /// Returns the `intended_for` NodeId for this hint record.
     ///
     /// Returns `None` if the record type is not set or the `intended_for`
@@ -455,6 +483,7 @@ impl HintRecord {
         match &self.record {
             Some(Record::Inline(h)) => h.intended_for.clone().map(NodeId::from),
             Some(Record::SegmentRef(h)) => h.intended_for.clone().map(NodeId::from),
+            Some(Record::Delete(h)) => h.intended_for.clone().map(NodeId::from),
             None => None,
         }
     }

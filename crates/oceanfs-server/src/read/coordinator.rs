@@ -218,6 +218,43 @@ pub struct ReadCoordinator {
     decompress_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
+/// [`HintObjectReader`] backed by the read coordinator — serves the
+/// hinted-handoff fetch RPC with the node's FULL read path (metadata →
+/// chunks → segment reads → decompression), so the receiver gets the
+/// object's current logical data exactly as a GET would serve it.
+pub struct ReadCoordinatorHintObjectReader {
+    read: Arc<ReadCoordinator>,
+}
+
+impl ReadCoordinatorHintObjectReader {
+    /// Creates the reader over the node's read coordinator.
+    pub fn new(read: Arc<ReadCoordinator>) -> Self {
+        Self { read }
+    }
+}
+
+#[async_trait::async_trait]
+impl oceanfs_durability::HintObjectReader for ReadCoordinatorHintObjectReader {
+    async fn read_object(
+        &self,
+        bucket: &oceanfs_core::BucketId,
+        key: &oceanfs_core::ObjectKey,
+    ) -> std::result::Result<Option<(oceanfs_core::ObjectMetadata, Bytes)>, String> {
+        let req = ReadRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            hash_key: HashKey::from_bytes(oceanfs_routing::hash_key(key.as_str().as_bytes())),
+            metadata_only: false,
+            policy: None,
+        };
+        match self.read.get(req).await {
+            Ok(result) => Ok(Some((result.metadata, result.data))),
+            Err(crate::Error::NotFound(_)) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
 impl ReadCoordinator {
     /// Creates a new read coordinator.
     ///
@@ -489,7 +526,6 @@ impl ReadCoordinator {
     ) -> Option<ObjectMetadata> {
         let pool = self.pool.as_ref()?;
         let membership = self.membership.as_ref()?;
-        let metadata_store = self.metadata.as_ref()?;
 
         let hash_key = oceanfs_routing::hash_key(key.as_str().as_bytes());
         let replica_set = self.ring.lookup(&hash_key);
@@ -605,16 +641,15 @@ impl ReadCoordinator {
             }
         }
 
-        // If remote won, apply winning metadata locally and return it.
+        // If remote won, build the winning ObjectMetadata for the client
+        // response. NOTE: the winning metadata is NOT written into the
+        // local store. Its chunk references point at the WINNING node's
+        // segments — a local write would store metadata this node
+        // cannot read locally, and its (newer) HLC would then reject
+        // legitimate hinted-handoff applies that carry self-contained
+        // data (churn divergence: unrecorded/foreign versions served,
+        // hints dropped by LWW).
         if let Some(winning) = winning_meta {
-            Self::apply_winning_metadata_locally(metadata_store, bucket, key, &winning).await;
-
-            info!(
-                bucket = %bucket.as_str(),
-                key = %key.as_str(),
-                "quorum comparison: applied winning remote metadata locally"
-            );
-
             // Build the winning ObjectMetadata for the client response.
             let hlc = winning.hlc.map_or(Hlc::zero(), |p| Hlc::new(p.wall_time, p.logical));
             let mut chunks = smallvec::SmallVec::new();
@@ -704,16 +739,15 @@ impl ReadCoordinator {
         let local_hlc = local_meta.hlc;
         // Clone local metadata so we can push it to stale remotes.
         let local_meta_clone = local_meta.clone();
-        // Clone the metadata store so the spawned task can write corrections locally.
+        // Clone the metadata store so the spawned task can re-validate
+        // the local object before pushing anything (t19).
         let metadata_store = self.metadata.clone();
         // Clone the HLC clock for receive-merge inside the spawned task (G2).
         let hlc_clock = self.hlc_clock.clone();
 
         tokio::spawn(async move {
             let mut winning_hlc = local_hlc;
-            let mut winning_meta: Option<GetObjectMetadataResponse> = None;
             let mut stale_remotes: Vec<NodeId> = Vec::with_capacity(replica_set.len());
-            let mut local_is_stale: bool = false;
 
             // Fetch metadata from each remote replica in parallel.
             let mut fetches = FuturesUnordered::new();
@@ -780,13 +814,12 @@ impl ReadCoordinator {
                             resolver.resolve(&winning_hlc, &remote_hlc, &node_id, &target);
                         match resolution {
                             Resolution::AcceptRemote => {
-                                local_is_stale = true;
                                 winning_hlc = remote_hlc;
-                                winning_meta = Some(resp);
                                 info!(
                                     target = %target,
                                     remote_wall = remote_hlc.wall_time(),
-                                    "remote replica has newer version; read repair will pull data"
+                                    "remote replica has newer version; \
+                                     read repair leaves it to hinted handoff"
                                 );
                             }
                             Resolution::AcceptLocal => {
@@ -852,21 +885,13 @@ impl ReadCoordinator {
                 .await;
             }
 
-            // If local is stale, pull winning data from the winning remote
-            // and write to our own store.
-            if local_is_stale {
-                if let Some(ref winning) = winning_meta {
-                    if let Some(ref store) = metadata_store {
-                        Self::apply_winning_metadata_locally(
-                            store,
-                            &bucket_clone,
-                            &key_clone,
-                            winning,
-                        )
-                        .await;
-                    }
-                }
-            }
+            // If local is stale, do NOT write the winning metadata into
+            // our own store: its chunk references point at the winning
+            // node's segments — a local write would store metadata this
+            // node cannot read locally, and its (newer) HLC would then
+            // reject legitimate hinted-handoff applies that carry
+            // self-contained data. The local store converges via hinted
+            // handoff (data-bearing) or a future data-bearing repair.
         });
     }
 
@@ -934,81 +959,6 @@ impl ReadCoordinator {
         });
         if let Err(e) = client.invalidate(request).await {
             warn!(target = %target, error = %e, "cache invalidation failed during read repair");
-        }
-    }
-
-    /// Writes corrected metadata from a winning remote into the local
-    /// metadata store. Called when the local node is stale.
-    async fn apply_winning_metadata_locally(
-        store: &Arc<crate::metadata_async::AsyncMetadataOps>,
-        bucket: &BucketId,
-        key: &ObjectKey,
-        winning: &GetObjectMetadataResponse,
-    ) {
-        let hlc = match winning.hlc {
-            Some(ref hlc_proto) => Hlc::new(hlc_proto.wall_time, hlc_proto.logical),
-            None => Hlc::zero(),
-        };
-
-        let mut chunks = smallvec::SmallVec::new();
-        let count = winning
-            .chunk_segment_ids
-            .len()
-            .min(winning.chunk_offsets.len())
-            .min(winning.chunk_lengths.len());
-        for i in 0..count {
-            let seg_id = SegmentId::try_from(winning.chunk_segment_ids[i].clone())
-                .unwrap_or_else(|_| SegmentId::default());
-            chunks.push(oceanfs_core::ChunkRef {
-                segment_id: seg_id,
-                offset: winning.chunk_offsets[i],
-                length: winning.chunk_lengths[i],
-                compressed: winning.chunk_compressed.get(i).copied().unwrap_or(false),
-                logical_length: winning
-                    .chunk_logical_lengths
-                    .get(i)
-                    .copied()
-                    .unwrap_or(winning.chunk_lengths[i]),
-            });
-        }
-
-        let blake3_hash = if winning.blake3_hash.len() == 32 {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&winning.blake3_hash);
-            Some(HashOutput::from_bytes(arr))
-        } else {
-            None
-        };
-
-        let inline_data =
-            if winning.inline_data.is_empty() { None } else { Some(winning.inline_data.clone()) };
-
-        let meta = ObjectMetadata {
-            object_key: key.clone(),
-            size: winning.size,
-            blake3_hash,
-            chunks,
-            inline_data,
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64,
-            hlc,
-        };
-
-        match store.put_object(bucket, meta).await {
-            Ok(()) => info!(
-                bucket = %bucket.as_str(),
-                key = %key.as_str(),
-                wall = hlc.wall_time(),
-                "read repair: applied winning metadata locally"
-            ),
-            Err(e) => warn!(
-                bucket = %bucket.as_str(),
-                key = %key.as_str(),
-                error = %e,
-                "read repair: failed to apply winning metadata locally"
-            ),
         }
     }
 

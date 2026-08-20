@@ -483,13 +483,34 @@ pub(crate) async fn delete_object(
     // remote replica receive the same timestamp so delete-vs-write LWW
     // converges (hlc-causality-closure G4/G8).
     let hlc = state.write.hlc_clock().now();
+    let hk = HashKey::from_bytes(hash_key(object_key.as_str().as_bytes()));
+
+    // Ring-view gate (mirrors the write path's Step 1c): the requested
+    // quorum must be satisfiable by this ring view. The old adaptive
+    // `min(write_quorum, replica_count)` ACKED a partial delete — a
+    // stale 1-node ring view (post-restart gossip window) deleted the
+    // key locally with NO remote replication and NO hints (the
+    // coordinator doesn't know the other replicas exist) — the churn
+    // 404/404/200 divergence where one node keeps serving the deleted
+    // key. Fail before ANY local mutation: the client retries.
+    let write_quorum = state.buckets.get(&bucket).map(|p| p.consistency.write_quorum).unwrap_or(1);
+    let replica_count = state.write.replica_count(&hk);
+    if (replica_count as u8) < write_quorum {
+        let err = Error::QuorumNotMet { required: write_quorum, received: replica_count };
+        warn!(
+            key = %key,
+            required = write_quorum,
+            received = replica_count,
+            "DELETE quorum not satisfiable by ring view"
+        );
+        return s3_error_response(&err, &bucket, &key);
+    }
 
     match state.metadata.delete_object(&bucket_id, &object_key, hlc).await {
         Ok(()) => {
             // Replicate deletion to other replicas in the ring. The local
             // tombstone counts as one confirmed deletion; `write.delete`
             // returns the number of remote confirmations.
-            let hk = HashKey::from_bytes(hash_key(object_key.as_str().as_bytes()));
             let remote_deleted = match state.write.delete(&bucket_id, &object_key, &hk, hlc).await {
                 Ok(count) => count,
                 Err(e) => {
@@ -498,14 +519,10 @@ pub(crate) async fn delete_object(
                 }
             };
 
-            // Quorum check: local (1) + confirmed remote deletions. The
-            // required quorum is capped at the replica count — a
-            // single-node cluster cannot confirm more than one deletion
-            // (mirrors the write path's capping).
-            let write_quorum =
-                state.buckets.get(&bucket).map(|p| p.consistency.write_quorum).unwrap_or(1);
-            let required_quorum =
-                (write_quorum as usize).min(state.write.replica_count(&hk)).max(1);
+            // Quorum check: local (1) + confirmed remote deletions.
+            // No capping — the ring-view gate above guarantees the
+            // requested quorum is satisfiable.
+            let required_quorum = write_quorum as usize;
             let confirmed = 1 + remote_deleted;
             if confirmed < required_quorum {
                 let err =

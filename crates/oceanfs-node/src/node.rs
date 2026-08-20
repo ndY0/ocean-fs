@@ -993,7 +993,14 @@ impl Node {
         let hinted_handoff_manager = Arc::new(
             HintedHandoffManager::new(hints_dir.clone(), hint_delivery_client, hint_config.clone())
                 .with_membership(membership.clone())
-                .with_timeouts(op_timeouts.clone()),
+                .with_timeouts(op_timeouts.clone())
+                // Obsolete-key pre-check at drain time: hints whose key
+                // no longer exists on this node (deleted/superseded —
+                // the metadata is the truth) are dropped locally — no
+                // fetch, no network call, no retry loop.
+                .with_obsolete_check(Arc::new(oceanfs_durability::MetadataHintObsoleteCheck::new(
+                    metadata_store.clone(),
+                ))),
         );
 
         // Replay existing hints from the WAL into in-memory queues.
@@ -1231,6 +1238,9 @@ impl Node {
         let write_queue = Arc::new(tokio::sync::Semaphore::new(config.max_inflight_writes));
         let write_queue_timeout =
             std::time::Duration::from_millis(config.operation_timeouts.write_queue_ms);
+        // Clone for the hint-fetch reader (the coordinator is moved into
+        // the S3 handler below).
+        let read_coordinator_for_hints = read_coordinator.clone();
         let s3_handler = S3Handler::new_with_caches_and_backpressure(
             write_coordinator,
             read_coordinator,
@@ -1437,13 +1447,18 @@ impl Node {
             hlc_clock.clone(),
         )
         .with_local_node_id(NodeId::new(&config.node_id))
-        // Segment-ref hint materialization: the receiver pulls the blob
-        // range from the origin (the hint sender) instead of the hint
-        // carrying the data inline — hints stay small for multipart/GB
+        // Hint materialization: hints are resolved BY KEY — the
+        // receiver asks the origin for the object's CURRENT state (the
+        // metadata is the truth; a GC'd/reaped hinted version was
+        // deleted or superseded) and applies it with HLC-LWW. Hints
+        // carry no blob data, so they stay small for multipart/GB
         // blobs.
-        .with_hint_data_fetcher(Arc::new(oceanfs_durability::GrpcHintDataFetcher::new(
+        .with_hint_object_fetcher(Arc::new(oceanfs_durability::GrpcHintObjectFetcher::new(
             pool.clone(),
-        )));
+        )))
+        .with_hint_object_reader(Arc::new(
+            oceanfs_server::read::ReadCoordinatorHintObjectReader::new(read_coordinator_for_hints),
+        ));
         let cache_service = oceanfs_server::grpc::cache_service::CacheGrpcService::new(
             Some(object_cache.clone()),
             Some(metadata_cache.clone()),
@@ -1602,30 +1617,53 @@ impl Node {
             // binding when the Alive event lands; a failed batch is
             // re-enqueued, so retries are safe (duplicates are
             // overwritten on the receiving side).
+            //
+            // Drains the ENTIRE queue per invocation: each iteration
+            // delivers one batch (bounded by max_batch_size and
+            // max_batch_bytes). The old single-batch drain could not
+            // keep up with a full outage's hint debt — with the stable
+            // N-node topology every mutation during an outage becomes
+            // debt, and 7000 hints at 256/batch would take ~27 sweeps
+            // (~135s) to drain, longer than the test settle window.
+            // The batch cap (64) bounds one invocation so a
+            // persistently-rejected batch cannot spin forever.
             async fn drain_hints(hh: &HintedHandoffManager, node_id: NodeId) {
-                for attempt in 1..=5 {
+                let mut batches = 0u32;
+                while hh.pending_count(&node_id) > 0 && batches < 64 {
+                    batches += 1;
                     match hh.deliver_pending(node_id.clone()).await {
+                        Ok(0) => {
+                            // Queue empty (or nothing deliverable this
+                            // round) — stop.
+                            break;
+                        }
                         Ok(delivered) => {
                             info!(
                                 node = %node_id,
                                 delivered,
-                                attempt,
+                                batch = batches,
                                 "hinted handoff delivery"
                             );
-                            if delivered > 0 {
-                                break;
-                            }
                         }
                         Err(e) => {
                             warn!(
                                 node = %node_id,
-                                attempt,
+                                attempt = batches,
                                 error = %e,
                                 "hinted handoff delivery failed"
                             );
+                            // A failed batch is re-enqueued at the
+                            // front; a few quick retries cover the
+                            // returning node's listener still binding,
+                            // then give up this sweep (the next sweep
+                            // retries).
+                            if batches < 5 {
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                continue;
+                            }
+                            break;
                         }
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
             }
 

@@ -961,6 +961,40 @@ impl<C: LoadTarget> Worker<C> {
                                     e
                                 );
                             }
+                            // Unknown outcome (timeout/reset): the
+                            // server may have completed the write — the
+                            // churn divergence where a version is served
+                            // everywhere yet never recorded (the PUT
+                            // handler logged success; the response was
+                            // lost). RETRY on a different node: the
+                            // retry either lands a fresh recorded version
+                            // (superseding the lost one) or confirms the
+                            // failure. A quorum-failed write is rolled
+                            // back server-side, so a failed retry means
+                            // the version truly does not exist —
+                            // recording it anyway would create phantom
+                            // versions.
+                            let mut recorded = false;
+                            for attempt in 1..=3u32 {
+                                let retry_idx = (node_idx + attempt as usize) % node_count;
+                                if let Ok(retry_resp) =
+                                    self.cluster.put(retry_idx, &path, &body).await
+                                {
+                                    if retry_resp.status() == 200 {
+                                        recorded = true;
+                                        break;
+                                    }
+                                    // A definitive non-200 (5xx/4xx):
+                                    // keep retrying — a quorum-failed
+                                    // write was rolled back server-side.
+                                }
+                            }
+                            if recorded {
+                                // Only a definitive 200 records: a
+                                // rolled-back write must not leave a
+                                // phantom version in the manifest.
+                                self.manifest.record(bucket, &key, &body);
+                            }
                             self.stats.record_put(0, start.elapsed());
                             self.stats.record_error();
                         }
@@ -1015,7 +1049,17 @@ impl<C: LoadTarget> Worker<C> {
                                     status
                                 );
                             }
-                            if status == 204 {
+                            // The delete's outcome (204, 404-already-
+                            // gone, 5xx, Err) means the key is or may be
+                            // deleted server-side: the local tombstone is
+                            // written before the quorum check, and a
+                            // lost response doesn't undo it. Mark the
+                            // key deleted so the verify skips it — a
+                            // server-deleted key would otherwise be
+                            // flagged as missing everywhere. Only a
+                            // definitive client-error rejection (400/403)
+                            // leaves the key untouched.
+                            if status == 204 || status == 404 || status >= 500 {
                                 self.manifest.record_delete(bucket, &key);
                             }
                             self.stats.record_delete(status, latency);
@@ -1030,6 +1074,8 @@ impl<C: LoadTarget> Worker<C> {
                                     e
                                 );
                             }
+                            // Unknown outcome: mark deleted (see above).
+                            self.manifest.record_delete(bucket, &key);
                             self.stats.record_delete(0, start.elapsed());
                             self.stats.record_error();
                         }

@@ -661,7 +661,16 @@ mod tests {
     #[tokio::test]
     async fn put_object_returns_200() {
         let state = make_app_state().await;
-        state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
+        state.buckets.put(
+            "test-bucket".into(),
+            crate::bucket_config::BucketPolicy {
+                consistency: crate::bucket_config::ConsistencyConfig {
+                    write_quorum: 1,
+                    ..crate::bucket_config::ConsistencyConfig::default()
+                },
+                ..crate::bucket_config::BucketPolicy::default()
+            },
+        );
 
         let response = super::handlers::put_object(
             State(state),
@@ -676,7 +685,16 @@ mod tests {
     #[tokio::test]
     async fn put_object_sets_etag_header() {
         let state = make_app_state().await;
-        state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
+        state.buckets.put(
+            "test-bucket".into(),
+            crate::bucket_config::BucketPolicy {
+                consistency: crate::bucket_config::ConsistencyConfig {
+                    write_quorum: 1,
+                    ..crate::bucket_config::ConsistencyConfig::default()
+                },
+                ..crate::bucket_config::BucketPolicy::default()
+            },
+        );
 
         let response = super::handlers::put_object(
             State(state),
@@ -701,7 +719,16 @@ mod tests {
         let mut state = state;
         state.write_queue = Some(semaphore);
         state.write_queue_timeout = std::time::Duration::from_millis(20);
-        state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
+        state.buckets.put(
+            "test-bucket".into(),
+            crate::bucket_config::BucketPolicy {
+                consistency: crate::bucket_config::ConsistencyConfig {
+                    write_quorum: 1,
+                    ..crate::bucket_config::ConsistencyConfig::default()
+                },
+                ..crate::bucket_config::BucketPolicy::default()
+            },
+        );
 
         let response = super::handlers::put_object(
             State(state),
@@ -720,7 +747,16 @@ mod tests {
         let mut state = state;
         state.write_queue = Some(Arc::new(tokio::sync::Semaphore::new(8)));
         state.write_queue_timeout = std::time::Duration::from_secs(5);
-        state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
+        state.buckets.put(
+            "test-bucket".into(),
+            crate::bucket_config::BucketPolicy {
+                consistency: crate::bucket_config::ConsistencyConfig {
+                    write_quorum: 1,
+                    ..crate::bucket_config::ConsistencyConfig::default()
+                },
+                ..crate::bucket_config::BucketPolicy::default()
+            },
+        );
 
         let response = super::handlers::put_object(
             State(state),
@@ -735,7 +771,16 @@ mod tests {
     #[tokio::test]
     async fn put_get_object_roundtrip() {
         let state = make_app_state().await;
-        state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
+        state.buckets.put(
+            "test-bucket".into(),
+            crate::bucket_config::BucketPolicy {
+                consistency: crate::bucket_config::ConsistencyConfig {
+                    write_quorum: 1,
+                    ..crate::bucket_config::ConsistencyConfig::default()
+                },
+                ..crate::bucket_config::BucketPolicy::default()
+            },
+        );
 
         let test_data = b"round-trip test data for verification";
         let put_state = state.clone();
@@ -761,7 +806,16 @@ mod tests {
     #[tokio::test]
     async fn put_and_get_object_data_matches() {
         let state = make_app_state().await;
-        state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
+        state.buckets.put(
+            "test-bucket".into(),
+            crate::bucket_config::BucketPolicy {
+                consistency: crate::bucket_config::ConsistencyConfig {
+                    write_quorum: 1,
+                    ..crate::bucket_config::ConsistencyConfig::default()
+                },
+                ..crate::bucket_config::BucketPolicy::default()
+            },
+        );
 
         let test_data = b"exact match test data bytes";
         let put_state = state.clone();
@@ -784,7 +838,16 @@ mod tests {
     #[tokio::test]
     async fn get_object_returns_data() {
         let state = make_app_state().await;
-        state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
+        state.buckets.put(
+            "test-bucket".into(),
+            crate::bucket_config::BucketPolicy {
+                consistency: crate::bucket_config::ConsistencyConfig {
+                    write_quorum: 1,
+                    ..crate::bucket_config::ConsistencyConfig::default()
+                },
+                ..crate::bucket_config::BucketPolicy::default()
+            },
+        );
 
         let response = super::handlers::get_object(
             State(state),
@@ -798,7 +861,16 @@ mod tests {
     #[tokio::test]
     async fn head_object_returns_ok() {
         let state = make_app_state().await;
-        state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
+        state.buckets.put(
+            "test-bucket".into(),
+            crate::bucket_config::BucketPolicy {
+                consistency: crate::bucket_config::ConsistencyConfig {
+                    write_quorum: 1,
+                    ..crate::bucket_config::ConsistencyConfig::default()
+                },
+                ..crate::bucket_config::BucketPolicy::default()
+            },
+        );
 
         let response = super::handlers::head_object(
             State(state),
@@ -812,7 +884,16 @@ mod tests {
     #[tokio::test]
     async fn head_object_has_no_body() {
         let state = make_app_state().await;
-        state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
+        state.buckets.put(
+            "test-bucket".into(),
+            crate::bucket_config::BucketPolicy {
+                consistency: crate::bucket_config::ConsistencyConfig {
+                    write_quorum: 1,
+                    ..crate::bucket_config::ConsistencyConfig::default()
+                },
+                ..crate::bucket_config::BucketPolicy::default()
+            },
+        );
 
         let response = super::handlers::head_object(
             State(state),
@@ -879,7 +960,16 @@ mod tests {
     #[tokio::test]
     async fn list_objects_returns_xml() {
         let state = make_app_state().await;
-        state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
+        state.buckets.put(
+            "test-bucket".into(),
+            crate::bucket_config::BucketPolicy {
+                consistency: crate::bucket_config::ConsistencyConfig {
+                    write_quorum: 1,
+                    ..crate::bucket_config::ConsistencyConfig::default()
+                },
+                ..crate::bucket_config::BucketPolicy::default()
+            },
+        );
 
         let response = super::handlers::list_objects(
             State(state),
@@ -941,7 +1031,16 @@ mod tests {
     #[tokio::test]
     async fn cache_l1_hit_returns_200() {
         let state = make_app_state_with_caches().await;
-        state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
+        state.buckets.put(
+            "test-bucket".into(),
+            crate::bucket_config::BucketPolicy {
+                consistency: crate::bucket_config::ConsistencyConfig {
+                    write_quorum: 1,
+                    ..crate::bucket_config::ConsistencyConfig::default()
+                },
+                ..crate::bucket_config::BucketPolicy::default()
+            },
+        );
 
         let bucket_id = BucketId::new("test-bucket");
         let object_key = ObjectKey::new("cached.txt");
@@ -963,7 +1062,16 @@ mod tests {
     #[tokio::test]
     async fn cache_l3_negative_returns_404() {
         let state = make_app_state_with_caches().await;
-        state.buckets.put("test-bucket".into(), crate::bucket_config::BucketPolicy::default());
+        state.buckets.put(
+            "test-bucket".into(),
+            crate::bucket_config::BucketPolicy {
+                consistency: crate::bucket_config::ConsistencyConfig {
+                    write_quorum: 1,
+                    ..crate::bucket_config::ConsistencyConfig::default()
+                },
+                ..crate::bucket_config::BucketPolicy::default()
+            },
+        );
 
         let _bucket_id = BucketId::new("test-bucket");
         let _object_key = ObjectKey::new("definitely-missing");

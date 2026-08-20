@@ -19,7 +19,8 @@ use dashmap::DashMap;
 use oceanfs_cache::CacheRpcClient;
 use oceanfs_core::{
     BucketId, ChunkRef, HashKey, HashOutput, Hlc, HlcClock, NodeId, ObjectKey, ObjectMetadata,
-    OperationTimeouts, SegmentId, SegmentIndexEntry, SegmentSizeConfig, SizeTier, WriteResult,
+    OperationTimeouts, SegmentId, SegmentIndexEntry, SegmentSizeConfig, SizeTier, WriteAck,
+    WriteResult,
 };
 use oceanfs_durability::HintedHandoffManager;
 use oceanfs_membership::Membership;
@@ -421,6 +422,22 @@ impl WriteCoordinator {
             });
         }
 
+        // Step 1c: The requested quorum must be satisfiable by this
+        // ring view. The adaptive `min(write_quorum, ring size)` in
+        // Step 5 silently ACKs writes with FEWER copies than requested
+        // — with a stale 1-node ring view (the post-restart gossip
+        // window) a quorum=2 write would be acked with a single durable
+        // copy and NO hints (the coordinator doesn't even know the
+        // other replicas exist) — the churn 404/404/200 divergence.
+        // Fail instead: the client retries. An error is a retry signal;
+        // a degraded quorum is not.
+        if (replica_set.len() as u8) < req.write_quorum {
+            return Err(Error::QuorumNotMet {
+                required: req.write_quorum,
+                received: replica_set.len(),
+            });
+        }
+
         let is_local = replica_set.contains(&self.node_id);
 
         // Step 2: If not local, forward to the first available successor.
@@ -723,8 +740,11 @@ impl WriteCoordinator {
         );
 
         // Step 5: Replicate to W successors using the replication module.
-        let quorum = req.write_quorum.min(replica_set.len() as u8);
+        // The quorum is the REQUESTED quorum — Step 1c guarantees the
+        // ring view can satisfy it; there is no adaptive degradation.
+        let quorum = req.write_quorum;
         let mut acks_received: usize = 1; // local ack counted
+        let mut failed_targets: Vec<NodeId> = Vec::new();
 
         // Build list of remote replicas.
         let remote_targets: Vec<&NodeId> =
@@ -741,68 +761,41 @@ impl WriteCoordinator {
                 hlc,
                 write_timeout_ms,
                 &req,
+                &chunks,
+                &blake3_hash,
             )
             .await;
 
-            for (target, ack_result) in results {
-                match ack_result {
-                    Ok(_) => {
+            // EVERY remote target must be accounted for: acknowledged
+            // (counted) or recorded as failed for hinting AFTER the
+            // quorum check. The result list may omit targets whose RPC
+            // was still in-flight when the global replication deadline
+            // fired — those are treated as failures too. And the loop
+            // MUST NOT break on quorum: an unprocessed failed target
+            // would be silently abandoned (no data, no hint) — the
+            // churn 404/404/200 divergence where a write is alive on
+            // one node while the other replicas stay tombstoned.
+            //
+            // Hints are NOT enqueued here: a write that fails the
+            // quorum check must leave no trace — enqueuing first would
+            // spread the unacknowledged version to the failed replicas.
+            let mut results_by_target: std::collections::HashMap<NodeId, Result<WriteAck>> =
+                results.into_iter().collect();
+            for target in &remote_targets {
+                match results_by_target.remove(target) {
+                    Some(Ok(_)) => {
                         acks_received += 1;
-                        if acks_received >= quorum as usize {
-                            break;
-                        }
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         warn!(target = %target, error = %e, "replica write failed");
-                        // Store hinted handoff for the unreachable replica.
-                        //
-                        // Small blobs (≤ inline_threshold_bytes) embed the
-                        // data inline. Larger blobs reference the segment
-                        // (segment_id + offset + length) WITHOUT the data:
-                        // the receiver pulls the range from this node over
-                        // gRPC (FetchHintData) and applies it. Refs keep
-                        // hints small — embedding data would break the
-                        // moment multipart uploads make blobs reach GB
-                        // sizes (the hint WAL and the gRPC batch would
-                        // balloon to the blob size).
-                        let hint = if req.data.len() as u64 <= self.hint_inline_threshold_bytes {
-                            oceanfs_durability::hinted_handoff_rpc::HintRecord::new_inline(
-                                target.clone(),
-                                req.bucket.clone(),
-                                req.key.to_string(),
-                                req.data.clone(),
-                                hlc,
-                            )
-                        } else if let Some(chunk) = chunks.first() {
-                            // Use the first chunk's segment reference.
-                            // For Small/Standard tier there is exactly
-                            // one chunk; for Multi tier, the first
-                            // chunk covers the blob start.
-                            oceanfs_durability::hinted_handoff_rpc::HintRecord::new_segment_ref(
-                                target.clone(),
-                                req.bucket.clone(),
-                                req.key.to_string(),
-                                chunk.segment_id,
-                                chunk.offset,
-                                chunk.length,
-                                hlc,
-                            )
-                        } else {
-                            // Safety guard: no chunk (inline tier) —
-                            // fall back to inline storage.
-                            warn!(
-                                "no chunks available for segment-ref hint; \
-                                 falling back to inline for target {target}"
-                            );
-                            oceanfs_durability::hinted_handoff_rpc::HintRecord::new_inline(
-                                target.clone(),
-                                req.bucket.clone(),
-                                req.key.to_string(),
-                                req.data.clone(),
-                                hlc,
-                            )
-                        };
-                        let _ = self.hinted_handoff.enqueue(hint).await;
+                        failed_targets.push((*target).clone());
+                    }
+                    None => {
+                        warn!(
+                            target = %target,
+                            "replica write unresolved by replication deadline"
+                        );
+                        failed_targets.push((*target).clone());
                     }
                 }
             }
@@ -810,7 +803,38 @@ impl WriteCoordinator {
 
         // Step 6: Verify quorum.
         if acks_received < quorum as usize {
+            // Roll back the local write: the client sees the error and
+            // retries — the unacknowledged version must not linger
+            // locally (reads would serve a version no client ever
+            // acknowledged) nor spread via hints (hints are only
+            // enqueued after this check, Step 6b). The rollback
+            // tombstone carries a FRESH HLC (strictly newer than the
+            // write's) so any late hint for the failed write is
+            // discarded by LWW.
+            let rollback_hlc = self.hlc_clock.now();
+            warn!(
+                bucket = %req.bucket,
+                key = %req.key,
+                required = quorum,
+                received = acks_received,
+                "write quorum not met; rolling back local write"
+            );
+            if let Err(e) =
+                self.metadata_store.delete_object(&req.bucket, &req.key, rollback_hlc).await
+            {
+                warn!(
+                    bucket = %req.bucket,
+                    key = %req.key,
+                    error = %e,
+                    "write rollback failed"
+                );
+            }
             return Err(Error::QuorumNotMet { required: quorum, received: acks_received });
+        }
+
+        // Step 6b: Quorum met — hint the replicas that missed the write.
+        for target in failed_targets {
+            self.enqueue_write_hint(&target, &req, &chunks, hlc).await;
         }
 
         // Step 7: Build result.
@@ -821,6 +845,62 @@ impl WriteCoordinator {
             blake3_hash: Some(blake3_hash),
             hlc,
         })
+    }
+
+    /// Enqueues a hinted write for a replica that missed one.
+    ///
+    /// Small blobs (≤ inline_threshold_bytes) embed the data inline.
+    /// Larger blobs reference the segment (segment_id + offset +
+    /// length) WITHOUT the data: the receiver pulls the range from
+    /// this node over gRPC (FetchHintObject) and applies it. Refs keep
+    /// hints small — embedding data would break the moment multipart
+    /// uploads make blobs reach GB sizes (the hint WAL and the gRPC
+    /// batch would balloon to the blob size).
+    async fn enqueue_write_hint(
+        &self,
+        target: &NodeId,
+        req: &WriteRequest,
+        chunks: &[ChunkRef],
+        hlc: Hlc,
+    ) {
+        let hint = if req.data.len() as u64 <= self.hint_inline_threshold_bytes {
+            oceanfs_durability::hinted_handoff_rpc::HintRecord::new_inline(
+                target.clone(),
+                req.bucket.clone(),
+                req.key.to_string(),
+                req.data.clone(),
+                hlc,
+            )
+        } else if let Some(chunk) = chunks.first() {
+            // Use the first chunk's segment reference.
+            // For Small/Standard tier there is exactly
+            // one chunk; for Multi tier, the first
+            // chunk covers the blob start.
+            oceanfs_durability::hinted_handoff_rpc::HintRecord::new_segment_ref(
+                target.clone(),
+                req.bucket.clone(),
+                req.key.to_string(),
+                chunk.segment_id,
+                chunk.offset,
+                chunk.length,
+                hlc,
+            )
+        } else {
+            // Safety guard: no chunk (inline tier) —
+            // fall back to inline storage.
+            warn!(
+                "no chunks available for segment-ref hint; \
+                 falling back to inline for target {target}"
+            );
+            oceanfs_durability::hinted_handoff_rpc::HintRecord::new_inline(
+                target.clone(),
+                req.bucket.clone(),
+                req.key.to_string(),
+                req.data.clone(),
+                hlc,
+            )
+        };
+        let _ = self.hinted_handoff.enqueue(hint).await;
     }
 
     /// Writes a WAL entry for crash-recovery durability.
@@ -905,6 +985,11 @@ impl WriteCoordinator {
     #[doc(hidden)]
     pub fn hinted_handoff_for_test(&self) -> &Arc<HintedHandoffManager> {
         &self.hinted_handoff
+    }
+
+    /// Returns the async metadata store (for tests).
+    pub fn metadata_store_async_for_test(&self) -> &Arc<crate::metadata_async::AsyncMetadataOps> {
+        &self.metadata_store
     }
 
     /// Returns the number of replicas in the ring for the given key.
@@ -1352,8 +1437,14 @@ impl WriteCoordinator {
                         error = %e,
                         bucket = %bucket,
                         key = %key,
-                        "delete replication skipped: failed to acquire channel"
+                        "delete replication skipped: failed to acquire channel; \
+                         storing hinted handoff"
                     );
+                    // The pool pre-connects eagerly, so an unreachable
+                    // replica fails HERE (connection refused at channel
+                    // acquisition), not at the RPC call below. Hint it —
+                    // see the RPC failure branch.
+                    self.enqueue_delete_hint(target, bucket, key, hlc).await;
                     continue;
                 }
             };
@@ -1405,13 +1496,37 @@ impl WriteCoordinator {
                         error = %e,
                         bucket = %bucket,
                         key = %key,
-                        "delete replication failed"
+                        "delete replication failed; storing hinted handoff"
                     );
+                    self.enqueue_delete_hint(target, bucket, key, hlc).await;
                 }
             }
         }
 
         Ok(deleted)
+    }
+
+    /// Enqueues a hinted DELETE for a replica that missed a delete.
+    ///
+    /// The dead replica missed the delete: hint it so it applies the
+    /// tombstone when it returns. WITHOUT this, a node that missed a
+    /// delete keeps its stale row forever — and the sender-side
+    /// obsolete pre-check then drops later write hints for keys that
+    /// are still live elsewhere (churn divergence).
+    async fn enqueue_delete_hint(
+        &self,
+        target: &NodeId,
+        bucket: &BucketId,
+        key: &ObjectKey,
+        hlc: Hlc,
+    ) {
+        let hint = oceanfs_durability::hinted_handoff_rpc::HintRecord::new_delete(
+            target.clone(),
+            bucket.clone(),
+            key.to_string(),
+            hlc,
+        );
+        let _ = self.hinted_handoff.enqueue(hint).await;
     }
 }
 
@@ -1757,7 +1872,12 @@ mod tests {
 
     #[tokio::test]
     async fn coordinator_put_quorum_single_node_succeeds_with_quorum_1() {
-        // Single node in ring — quorum is capped at replica count (1).
+        // Single node in ring. A quorum the ring cannot satisfy must
+        // FAIL (no silent capping): with a 1-node ring view and
+        // write_quorum=2, the old adaptive `min` acked the write with a
+        // single durable copy and no hints — the churn 404/404/200
+        // divergence. An error is a retry signal; a degraded quorum is
+        // not.
         let coord = make_write_coordinator("n1", &["n1"]).await;
 
         let req = WriteRequest {
@@ -1771,9 +1891,45 @@ mod tests {
             policy: None,
         };
 
-        // Quorum is capped at replica_set.len() = 1, so writes succeed.
         let result = coord.put(req).await;
-        assert!(result.is_ok(), "write should succeed with capped quorum");
+        assert!(
+            matches!(result, Err(Error::QuorumNotMet { required: 2, received: 1 })),
+            "an unsatisfiable quorum must fail, got: {result:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_put_quorum_met_after_rollback_leaves_no_trace() {
+        // A quorum-failed write must roll back the local object: a
+        // subsequent read must NOT serve the unacknowledged version.
+        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"]).await;
+
+        // n2/n3 unreachable (default 127.0.0.1:9001, nothing listening)
+        // → acks = local only = 1 < quorum 2 → rollback.
+        let req = WriteRequest {
+            bucket: BucketId::new("test"),
+            key: ObjectKey::new("rollback"),
+            hash_key: HashKey::from_bytes(hash_key(b"rollback")),
+            data: Bytes::from_static(b"failed-write-data"),
+            write_quorum: 2,
+            ack_after_wal: true,
+            ec_async: false,
+            policy: None,
+        };
+
+        let result = coord.put(req).await;
+        assert!(matches!(result, Err(Error::QuorumNotMet { .. })), "quorum=2 unmet must fail");
+
+        let meta = coord
+            .metadata_store_async_for_test()
+            .get_object(&BucketId::new("test"), &ObjectKey::new("rollback"))
+            .await
+            .unwrap();
+        assert!(
+            meta.is_none(),
+            "the failed write must be rolled back — reads must not serve \
+             a version no client ever acknowledged",
+        );
     }
 
     #[tokio::test]
@@ -2132,6 +2288,8 @@ mod tests {
                 ec_async: false,
                 policy: None,
             },
+            &[],
+            &HashOutput::from_bytes([0u8; 32]),
         )
         .await;
 
@@ -2226,6 +2384,51 @@ mod tests {
         let n3 = NodeId::new("n3");
         assert!(coord.hinted_handoff.pending_count(&n2) > 0, "should have hints for n2");
         assert!(coord.hinted_handoff.pending_count(&n3) > 0, "should have hints for n3");
+    }
+
+    /// Regression: a failed replica MUST be hinted even when quorum is
+    /// already met by other replicas. The old loop broke on quorum, so
+    /// a failed replica whose result arrived after the quorum break was
+    /// silently abandoned (no data, no hint) — the churn 404/404/200
+    /// divergence where a write is alive on one node while the other
+    /// replicas stay tombstoned.
+    #[tokio::test]
+    async fn failed_replica_hinted_even_when_quorum_met_by_others() {
+        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"]).await;
+
+        // n2 gets a live server (its write acks → quorum met); n3 keeps
+        // the helper's default address (127.0.0.1:9001, nothing
+        // listening) → its replication fails.
+        let n2 = NodeId::new("n2");
+        let addr_n2 = spawn_segment_server(false).await;
+        coord.membership.upsert_node(
+            n2.clone(),
+            NodeState::Alive,
+            Incarnation::new(2),
+            Some(addr_n2),
+        );
+
+        let data = vec![0xABu8; 100]; // small → inline hint
+        let req = WriteRequest {
+            bucket: BucketId::new("quorum-break"),
+            key: ObjectKey::new("k"),
+            hash_key: HashKey::from_bytes(hash_key(b"k")),
+            data: Bytes::from(data),
+            write_quorum: 2, // local + n2 = quorum met without n3
+            ack_after_wal: true,
+            ec_async: false,
+            policy: None,
+        };
+
+        let result = coord.put(req).await;
+        assert!(result.is_ok(), "quorum=2 with one live replica must succeed");
+
+        let n3 = NodeId::new("n3");
+        assert_eq!(
+            coord.hinted_handoff.pending_count(&n3),
+            1,
+            "the failed replica must be hinted even though quorum was met without it",
+        );
     }
 
     #[tokio::test]
@@ -2470,6 +2673,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(deleted, 1, "only the reachable replica confirms");
+    }
+
+    /// F3d(4): a delete that fails to replicate is HINTED — a node
+    /// that misses a delete keeps its stale row forever, which
+    /// diverges the cluster (the sender-side obsolete pre-check then
+    /// drops later write hints for keys that are still live
+    /// elsewhere).
+    #[tokio::test]
+    async fn delete_unreachable_replica_enqueues_delete_hint() {
+        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"]).await;
+
+        // n2 gets a live server; n3 keeps the helper's default address
+        // (127.0.0.1:9001) where nothing is listening → its delete
+        // replication fails and must be hinted.
+        let n2 = NodeId::new("n2");
+        let addr_n2 = spawn_segment_server(false).await;
+        coord.membership.upsert_node(
+            n2.clone(),
+            NodeState::Alive,
+            Incarnation::new(2),
+            Some(addr_n2),
+        );
+
+        let hlc = coord.hlc_clock.now();
+        let deleted = coord
+            .delete(
+                &BucketId::new("test"),
+                &ObjectKey::new("obj"),
+                &HashKey::from_bytes(hash_key(b"obj")),
+                hlc,
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1, "only the reachable replica confirms");
+
+        let pending = coord.hinted_handoff_for_test().pending_count(&NodeId::new("n3"));
+        assert_eq!(pending, 1, "the failed delete replication must be hinted");
     }
 
     /// F3d(3): an empty ring returns the existing `Routing` error path.

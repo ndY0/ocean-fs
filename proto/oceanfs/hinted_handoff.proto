@@ -45,11 +45,28 @@ message HintSegmentRef {
   oceanfs.common.HlcTimestamp hlc = 7;
 }
 
-// A hinted handoff record — either inline or segment reference.
+// Delete hint record — a tombstone for an object deleted while the
+// intended node was unreachable. Deletes MUST be hinted too: without
+// it a node that missed a delete keeps its stale row forever, and the
+// sender-side obsolete pre-check would then drop later write hints for
+// a key that is still live elsewhere (cluster divergence).
+message HintDelete {
+  // The node this delete was originally intended for.
+  oceanfs.common.NodeId intended_for = 1;
+  // The bucket the object belongs to.
+  oceanfs.common.BucketId bucket_id = 2;
+  // The object key.
+  string object_key = 3;
+  // HLC timestamp of the original delete (hlc-causality-closure G5).
+  oceanfs.common.HlcTimestamp hlc = 4;
+}
+
+// A hinted handoff record — inline, segment reference, or delete.
 message HintRecord {
   oneof record {
     HintInline inline = 1;
     HintSegmentRef segment_ref = 2;
+    HintDelete delete = 3;
   }
 
   // Unix timestamp (seconds) when this hint was written.

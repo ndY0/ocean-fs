@@ -90,26 +90,48 @@ pub struct FetchShardChunk {
     #[prost(bytes = "bytes", tag = "2")]
     pub data: ::prost::bytes::Bytes,
 }
-/// Request to fetch a byte range of a segment's data — used by the
-/// hinted-handoff receiver to pull a segment-ref hint's blob from the
-/// origin node (the hint carries segment_id + offset + length, NOT the
-/// data, so hints stay small even for multipart/GB blobs).
+/// Request to fetch an object's CURRENT state from the origin node —
+/// hinted-handoff materialization BY KEY. The receiver asks "what is
+/// the current state of K?" and applies it (HLC-LWW against its local
+/// state). This is the correct semantics when the origin's segment data
+/// has been GC'd/reaped: the object no longer has the hinted version
+/// (deleted or superseded — the metadata is the truth), so the hint is
+/// resolved against the CURRENT state instead of replayed. Serving the
+/// stale version would resurrect a deleted object or regress a newer
+/// write. The sender additionally pre-checks the key locally at drain
+/// time and drops hints whose key no longer exists — no fetch is even
+/// attempted for resolved-by-deletion hints.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct FetchHintDataRequest {
+pub struct FetchHintObjectRequest {
     #[prost(message, optional, tag = "1")]
-    pub segment_id: ::core::option::Option<::oceanfs_core::proto::common::SegmentId>,
-    #[prost(uint64, tag = "2")]
-    pub offset: u64,
-    #[prost(uint32, tag = "3")]
-    pub length: u32,
+    pub bucket_id: ::core::option::Option<::oceanfs_core::proto::common::BucketId>,
+    #[prost(string, tag = "2")]
+    pub object_key: ::prost::alloc::string::String,
 }
-/// A chunk of the fetched range, streamed from the server.
+/// A chunk of the object's logical data, streamed from the server. The
+/// FIRST chunk carries the object's state (present + hlc + size); when
+/// the object is absent, the stream contains exactly one chunk with
+/// present=false (hlc = the tombstone's HLC when a tombstone exists).
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct FetchHintDataChunk {
+pub struct FetchHintObjectChunk {
     #[prost(uint32, tag = "1")]
     pub chunk_index: u32,
     #[prost(bytes = "bytes", tag = "2")]
     pub data: ::prost::bytes::Bytes,
+    #[prost(bool, tag = "3")]
+    pub present: bool,
+    #[prost(message, optional, tag = "4")]
+    pub hlc: ::core::option::Option<::oceanfs_core::proto::common::HlcTimestamp>,
+    #[prost(uint64, tag = "5")]
+    pub size: u64,
+    /// BLAKE3 hash of the object's logical data (carried on the FIRST
+    /// chunk). The receiver verifies the reassembled bytes against it —
+    /// a stream truncated mid-way (origin restart, network hiccup) must
+    /// not be applied as a full version: a partial object carrying the
+    /// full version's HLC would win LWW and spread unrecorded data to
+    /// every node that fetches from the same origin.
+    #[prost(bytes = "bytes", tag = "6")]
+    pub blake3_hash: ::prost::bytes::Bytes,
 }
 /// Request to push a reconstructed shard to a peer that owns it.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -321,15 +343,15 @@ pub mod healing_rpc_client {
                 .insert(GrpcMethod::new("oceanfs.healing.HealingRpc", "FetchShard"));
             self.inner.server_streaming(req, path, codec).await
         }
-        /// Fetch a byte range of a segment's data — hinted-handoff segment-ref
-        /// delivery (the receiver pulls the blob from the origin instead of
-        /// the hint carrying it inline, which would not scale to multipart/GB
-        /// blobs). Server-streaming like FetchShard.
-        pub async fn fetch_hint_data(
+        /// Fetch an object's CURRENT state by key — hinted-handoff
+        /// materialization (see FetchHintObjectRequest). The receiver applies
+        /// the current state with HLC-LWW instead of replaying the hinted
+        /// (possibly stale or deleted) version. Server-streaming.
+        pub async fn fetch_hint_object(
             &mut self,
-            request: impl tonic::IntoRequest<super::FetchHintDataRequest>,
+            request: impl tonic::IntoRequest<super::FetchHintObjectRequest>,
         ) -> std::result::Result<
-            tonic::Response<tonic::codec::Streaming<super::FetchHintDataChunk>>,
+            tonic::Response<tonic::codec::Streaming<super::FetchHintObjectChunk>>,
             tonic::Status,
         > {
             self.inner
@@ -342,11 +364,13 @@ pub mod healing_rpc_client {
                 })?;
             let codec = tonic::codec::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
-                "/oceanfs.healing.HealingRpc/FetchHintData",
+                "/oceanfs.healing.HealingRpc/FetchHintObject",
             );
             let mut req = request.into_request();
             req.extensions_mut()
-                .insert(GrpcMethod::new("oceanfs.healing.HealingRpc", "FetchHintData"));
+                .insert(
+                    GrpcMethod::new("oceanfs.healing.HealingRpc", "FetchHintObject"),
+                );
             self.inner.server_streaming(req, path, codec).await
         }
         /// Push a reconstructed shard to a remote node that owns it.
@@ -422,21 +446,21 @@ pub mod healing_rpc_server {
             &self,
             request: tonic::Request<super::FetchShardRequest>,
         ) -> std::result::Result<tonic::Response<Self::FetchShardStream>, tonic::Status>;
-        /// Server streaming response type for the FetchHintData method.
-        type FetchHintDataStream: tonic::codegen::tokio_stream::Stream<
-                Item = std::result::Result<super::FetchHintDataChunk, tonic::Status>,
+        /// Server streaming response type for the FetchHintObject method.
+        type FetchHintObjectStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::FetchHintObjectChunk, tonic::Status>,
             >
             + std::marker::Send
             + 'static;
-        /// Fetch a byte range of a segment's data — hinted-handoff segment-ref
-        /// delivery (the receiver pulls the blob from the origin instead of
-        /// the hint carrying it inline, which would not scale to multipart/GB
-        /// blobs). Server-streaming like FetchShard.
-        async fn fetch_hint_data(
+        /// Fetch an object's CURRENT state by key — hinted-handoff
+        /// materialization (see FetchHintObjectRequest). The receiver applies
+        /// the current state with HLC-LWW instead of replaying the hinted
+        /// (possibly stale or deleted) version. Server-streaming.
+        async fn fetch_hint_object(
             &self,
-            request: tonic::Request<super::FetchHintDataRequest>,
+            request: tonic::Request<super::FetchHintObjectRequest>,
         ) -> std::result::Result<
-            tonic::Response<Self::FetchHintDataStream>,
+            tonic::Response<Self::FetchHintObjectStream>,
             tonic::Status,
         >;
         /// Push a reconstructed shard to a remote node that owns it.
@@ -706,26 +730,27 @@ pub mod healing_rpc_server {
                     };
                     Box::pin(fut)
                 }
-                "/oceanfs.healing.HealingRpc/FetchHintData" => {
+                "/oceanfs.healing.HealingRpc/FetchHintObject" => {
                     #[allow(non_camel_case_types)]
-                    struct FetchHintDataSvc<T: HealingRpc>(pub Arc<T>);
+                    struct FetchHintObjectSvc<T: HealingRpc>(pub Arc<T>);
                     impl<
                         T: HealingRpc,
-                    > tonic::server::ServerStreamingService<super::FetchHintDataRequest>
-                    for FetchHintDataSvc<T> {
-                        type Response = super::FetchHintDataChunk;
-                        type ResponseStream = T::FetchHintDataStream;
+                    > tonic::server::ServerStreamingService<
+                        super::FetchHintObjectRequest,
+                    > for FetchHintObjectSvc<T> {
+                        type Response = super::FetchHintObjectChunk;
+                        type ResponseStream = T::FetchHintObjectStream;
                         type Future = BoxFuture<
                             tonic::Response<Self::ResponseStream>,
                             tonic::Status,
                         >;
                         fn call(
                             &mut self,
-                            request: tonic::Request<super::FetchHintDataRequest>,
+                            request: tonic::Request<super::FetchHintObjectRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as HealingRpc>::fetch_hint_data(&inner, request).await
+                                <T as HealingRpc>::fetch_hint_object(&inner, request).await
                             };
                             Box::pin(fut)
                         }
@@ -736,7 +761,7 @@ pub mod healing_rpc_server {
                     let max_encoding_message_size = self.max_encoding_message_size;
                     let inner = self.inner.clone();
                     let fut = async move {
-                        let method = FetchHintDataSvc(inner);
+                        let method = FetchHintObjectSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

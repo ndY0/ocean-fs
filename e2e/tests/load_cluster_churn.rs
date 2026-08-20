@@ -578,11 +578,16 @@ async fn load_cluster_churn() {
     // max_batch_size hints per node per sweep), so the final assertions
     // must run after the last outage's hints have drained — otherwise a
     // still-draining queue is misread as "hints never delivered". Wait
-    // until Σ(delivered - stored) >= 0 across all nodes (delivered can
-    // legitimately exceed stored: hints replayed from a restarted node's
-    // WAL were stored by the pre-restart process), plus a short grace
-    // period for the final batches to land.
+    // ── Settle: wait for the handoff queues to drain AND the counters
+    // to go quiet for a stable window. The final assertions must run
+    // only after the last outage's hints have been DELIVERED AND APPLIED
+    // (receiver-side metadata writes are async) — a single instant of
+    // pending <= 0 can race the last in-flight batch (churn: a key 404
+    // on two nodes at verify time while the resurrecting hints are still
+    // on the wire).
     let mut handoff_settled = false;
+    let mut quiet_checks = 0u32;
+    const QUIET_CHECKS_REQUIRED: u32 = 3; // 3 × 5s = 15s of quiet
     let settle_start = std::time::Instant::now();
     while settle_start.elapsed() < Duration::from_secs(120) {
         let mut pending = 0.0;
@@ -590,16 +595,45 @@ async fn load_cluster_churn() {
             if let Ok(snap) = MetricsSnapshot::scrape(&*target, i).await {
                 pending += snap.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0)
                     - snap.counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0)
-                    - snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0);
+                    - snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0)
+                    // Obsolete-dropped hints are resolved-by-deletion
+                    // (the metadata is the truth) — not undelivered.
+                    - snap.counter("hinted_handoff_hints_obsolete_total").unwrap_or(0.0);
             }
         }
         if pending <= 0.0 {
-            handoff_settled = true;
-            eprintln!(
-                "load_cluster_churn: handoff settled after {:.0}s (pending={pending:.0})",
-                settle_start.elapsed().as_secs_f64()
-            );
-            break;
+            quiet_checks += 1;
+            if quiet_checks >= QUIET_CHECKS_REQUIRED {
+                handoff_settled = true;
+                eprintln!(
+                    "load_cluster_churn: handoff settled after {:.0}s \
+                     (pending={pending:.0}, {} quiet checks)",
+                    settle_start.elapsed().as_secs_f64(),
+                    QUIET_CHECKS_REQUIRED,
+                );
+                break;
+            }
+        } else {
+            quiet_checks = 0;
+        }
+        if settle_start.elapsed().as_secs_f64() as u64 % 15 == 0 {
+            // Per-node progress heartbeat (which node is stuck, if any).
+            for i in 0..target.len() {
+                if let Ok(snap) = MetricsSnapshot::scrape(&*target, i).await {
+                    eprintln!(
+                        "  node {i}: pending={:.0} stored={:.0} delivered={:.0} \
+                         expired={:.0} obsolete={:.0}",
+                        snap.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0)
+                            - snap.counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0)
+                            - snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0)
+                            - snap.counter("hinted_handoff_hints_obsolete_total").unwrap_or(0.0),
+                        snap.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0),
+                        snap.counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0),
+                        snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0),
+                        snap.counter("hinted_handoff_hints_obsolete_total").unwrap_or(0.0),
+                    );
+                }
+            }
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
@@ -624,6 +658,9 @@ async fn load_cluster_churn() {
     let missing_keys =
         manifest.verify_read_quorum(&*target, &alive_indices, 1, Some(READ_QUORUM_SAMPLE)).await;
     eprintln!("load_cluster_churn: manifest missing keys = {}", missing_keys.len());
+    if !missing_keys.is_empty() {
+        eprintln!("load_cluster_churn: missing keys: {missing_keys:?}");
+    }
 
     // ── Assertion 3: read quorum (≥R nodes) ────────────────────
     // Only alive slots are addressed (the churn drain phase restarts
@@ -666,6 +703,7 @@ async fn load_cluster_churn() {
     let mut stored = 0.0;
     let mut delivered = 0.0;
     let mut expired = 0.0;
+    let mut obsolete = 0.0;
     for i in 0..target.len() {
         if let Ok(final_snap) = MetricsSnapshot::scrape(&*target, i).await {
             stored += final_snap.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0)
@@ -674,15 +712,21 @@ async fn load_cluster_churn() {
                 - initial_snaps[i].counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0);
             expired += final_snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0)
                 - initial_snaps[i].counter("hinted_handoff_hints_expired_total").unwrap_or(0.0);
+            obsolete += final_snap.counter("hinted_handoff_hints_obsolete_total").unwrap_or(0.0)
+                - initial_snaps[i].counter("hinted_handoff_hints_obsolete_total").unwrap_or(0.0);
         }
     }
     // Delivered may legitimately exceed stored (hints replayed from a
-    // restarted node's WAL were stored by the pre-restart process); the
-    // DoD invariant is that no more than `HANDOFF_TOLERANCE` of stored
-    // hints remain undelivered.
-    let handoff_delta_ok = stored == 0.0 || delivered >= stored * (1.0 - HANDOFF_TOLERANCE);
+    // restarted node's WAL were stored by the pre-restart process);
+    // obsolete-dropped hints are resolved-by-deletion (the metadata is
+    // the truth) and count as resolved, not lost. The DoD invariant is
+    // that no more than `HANDOFF_TOLERANCE` of stored hints remain
+    // undelivered.
+    let handoff_delta_ok =
+        stored == 0.0 || delivered + obsolete >= stored * (1.0 - HANDOFF_TOLERANCE);
     eprintln!(
-        "load_cluster_churn: handoff stored={stored:.0} delivered={delivered:.0} expired={expired:.0}"
+        "load_cluster_churn: handoff stored={stored:.0} delivered={delivered:.0} \
+         expired={expired:.0} obsolete={obsolete:.0}"
     );
 
     // ── Assertion 6: incarnation monotonicity ──────────────────
@@ -940,7 +984,8 @@ async fn load_cluster_churn() {
          convergence: {converged} (per-cycle {converged_after:?})\n\
          manifest integrity: {} keys absent from every node (of {} keys)\n\
          read quorum: {} failures\n\
-         handoff: stored={stored:.0} delivered={delivered:.0} expired={expired:.0}\n\
+         handoff: stored={stored:.0} delivered={delivered:.0} expired={expired:.0} \
+         obsolete={obsolete:.0}\n\
          hlc monotonic: {:?}\n\
          ring consistency: {:?}\n\
          split brain: {:?}\n\

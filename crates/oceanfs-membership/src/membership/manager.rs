@@ -568,19 +568,28 @@ impl Membership {
     }
 
     /// Adds or updates a node's state from external input (e.g., gossip merge).
-    /// New ALIVE nodes are added to the ring; Dead/Left nodes are removed.
+    /// New ALIVE nodes are added to the ring; LEFT nodes are removed.
+    /// DEAD nodes are RETAINED (state=Dead): the topology is the stable
+    /// N-set — liveness is a quorum concern, not a topology concern.
+    /// Removing dead nodes silently shrank the replica set, so a
+    /// quorum-met write never targeted the returning node and no hint
+    /// was created for it (the coordinator didn't know it existed) —
+    /// the churn 404/404/200 divergence.
     ///
     /// Enforces the F1d invariant: *if a node id is absent from
-    /// `state.nodes` and present in `state.incarnations` with value `N`,
-    /// only an entry with incarnation `> N` may (re)insert it.* A lower or
-    /// equal incarnation for a previously removed node is dropped — this
-    /// closes the Dead↔Alive oscillation loop (t24) and permits the
-    /// legitimate ADR-0022 self-rejoin (strictly higher incarnation with a
-    /// fresh address, t21/t43).
+    /// `state.nodes` (or recorded Dead/Left) and recorded with
+    /// incarnation `N`, only an entry with incarnation `> N` may
+    /// (re)admit it.* An equal/lower incarnation for a removed or dead
+    /// node is dropped — this closes the Dead↔Alive oscillation loop
+    /// (t24) and permits the legitimate ADR-0022 self-rejoin (strictly
+    /// higher incarnation with a fresh address, t21/t43).
     ///
     /// `address` may be `None` when the caller (e.g. the failure detector)
     /// does not know it; the existing stored address is then preserved.
-    /// A previously removed node cannot be re-admitted without an address.
+    ///
+    /// # Panics
+    ///
+    /// Never panics (the null-address fallback is infallible).
     pub fn upsert_node(
         &self,
         node_id: NodeId,
@@ -597,8 +606,17 @@ impl Membership {
         let old_state = old.unwrap_or(NodeState::Alive);
         let is_new = old.is_none();
 
-        // F1d re-admission guard.
-        if is_new && recorded.is_some_and(|last| incarnation <= last) {
+        // F1d re-admission guard: a node that is absent, Dead, or Left
+        // may only be re-admitted at a strictly higher incarnation.
+        // Stale ALIVE gossip at equal/lower incarnation must not revive
+        // it (the t24 Dead↔Alive oscillation loop). This applies to
+        // RETAINED Dead entries too — Dead nodes stay in the table (the
+        // topology is stable; liveness is a quorum concern), so
+        // `is_new` alone no longer covers the re-admission case.
+        let recorded_state = inner.nodes.get(&node_id).map(|(s, _, _)| *s);
+        let readmission_gated =
+            is_new || matches!(recorded_state, Some(NodeState::Dead) | Some(NodeState::Left));
+        if readmission_gated && recorded.is_some_and(|last| incarnation <= last) {
             trace!(
                 node_id = %node_id,
                 incoming = incarnation.value(),
@@ -612,15 +630,39 @@ impl Membership {
         // Incarnation must never regress below the recorded value (T8).
         let effective_incarnation = recorded.map_or(incarnation, |last| last.max(incarnation));
 
-        // Apply the transition. Dead/Left removal does not require an
-        // address; re/admission does.
+        // Apply the transition. A LEFT node is removed (it is gone for
+        // good — its data was handed off). A DEAD node is RETAINED with
+        // state=Dead and its last-known address: the topology must stay
+        // stable so the write/delete coordinators replicate to the FULL
+        // N-set — failed attempts against the dead node become hint
+        // debt that repays when it returns. Removing dead nodes from
+        // the table (and the ring) silently shrank the replica set: a
+        // quorum-met write never targeted the returning node, and NO
+        // hint was created for it (the coordinator didn't know it
+        // existed) — the churn 404/404/200 divergence.
         let effective_address: Option<SocketAddr>;
-        if state == NodeState::Dead || state == NodeState::Left {
+        if state == NodeState::Left {
             inner.nodes.remove(&node_id);
             // Retain the last-known incarnation so a later re-admission at
             // equal incarnation is rejected (F1d invariant).
             inner.incarnations.insert(node_id.clone(), effective_incarnation);
             effective_address = address.or(stored_address);
+        } else if state == NodeState::Dead {
+            // Retain the entry as Dead (liveness is a quorum concern,
+            // not a topology concern — see the comment above). A Dead
+            // transition with no known address uses a null placeholder:
+            // replication attempts against it fail fast (connection
+            // refused) and become hint debt.
+            let dead_addr = address.or(stored_address).unwrap_or_else(|| {
+                // Null placeholder: replication attempts against it
+                // fail fast (connection refused) and become hint debt.
+                "127.0.0.1:1"
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 1)))
+            });
+            inner.nodes.insert(node_id.clone(), (state, effective_incarnation, dead_addr));
+            inner.incarnations.insert(node_id.clone(), effective_incarnation);
+            effective_address = Some(dead_addr);
         } else {
             let addr = match address.or(stored_address) {
                 Some(addr) => addr,
@@ -657,15 +699,23 @@ impl Membership {
                 // New node — add to ring.
                 ring_snapshot.add_node(node_id.clone());
                 debug!(node_id = %node_id, "ring: added new node");
-            } else if state == NodeState::Dead || state == NodeState::Left {
-                // Transitioned to dead/left — remove from ring.
+            } else if state == NodeState::Left {
+                // A LEFT node is gone for good — remove from the ring.
                 if ring_snapshot.remove_node(node_id.clone()).is_ok() {
                     debug!(
                         node_id = %node_id,
                         state = ?state,
-                        "ring: removed dead/left node"
+                        "ring: removed left node"
                     );
                 }
+                // NOTE: DEAD nodes STAY in the ring. The topology is the
+                // stable N-set; liveness is a quorum concern. Removing a
+                // dead node silently shrank the replica set — a quorum-
+                // met write never targeted the returning node and no
+                // hint was created for it (the coordinator didn't know
+                // it existed): the churn 404/404/200 divergence. With
+                // the dead node retained, every write/delete attempts
+                // the full N-set and the failures become hint debt.
             }
 
             self.ring.update(ring_snapshot);
@@ -774,10 +824,11 @@ mod tests {
         assert_eq!(event.new_state, NodeState::Suspect);
     }
 
-    /// F1d invariant: a node absent from `nodes` but present in
-    /// `incarnations` may only be re-inserted at a strictly higher
-    /// incarnation. A stale ALIVE at equal or lower incarnation must
-    /// be dropped (this is the t24 Dead↔Alive oscillation loop).
+    /// F1d invariant: a DEAD node is RETAINED (state=Dead — the
+    /// topology stays stable; liveness is a quorum concern) and a stale
+    /// ALIVE at equal or lower incarnation must not revive it (this is
+    /// the t24 Dead↔Alive oscillation loop). Only a strictly higher
+    /// incarnation re-admits.
     #[test]
     fn upsert_rejects_readmission_at_equal_or_lower_incarnation() {
         let (_ring, m) = make_membership("observer");
@@ -789,11 +840,12 @@ mod tests {
             Incarnation::new(5),
             Some("127.0.0.1:9100".parse().unwrap()),
         );
-        // Declared Dead → removed from nodes, incarnation retained.
+        // Declared Dead → RETAINED as Dead (not removed).
         m.upsert_node(NodeId::new("victim"), NodeState::Dead, Incarnation::new(5), None);
-        assert_eq!(m.state_of(&NodeId::new("victim")), None);
+        assert_eq!(m.state_of(&NodeId::new("victim")), Some(NodeState::Dead));
 
-        // Stale gossip tries to revive at equal incarnation → rejected.
+        // Stale gossip tries to revive at equal incarnation → rejected
+        // (stays Dead).
         m.upsert_node(
             NodeId::new("victim"),
             NodeState::Alive,
@@ -802,7 +854,7 @@ mod tests {
         );
         assert_eq!(
             m.state_of(&NodeId::new("victim")),
-            None,
+            Some(NodeState::Dead),
             "equal-incarnation re-admission must be rejected"
         );
 
@@ -813,7 +865,7 @@ mod tests {
             Incarnation::new(4),
             Some("127.0.0.1:9100".parse().unwrap()),
         );
-        assert_eq!(m.state_of(&NodeId::new("victim")), None);
+        assert_eq!(m.state_of(&NodeId::new("victim")), Some(NodeState::Dead));
     }
 
     /// ADR-0022 Decision 2: a self-rejoin announcing a strictly higher
@@ -830,7 +882,7 @@ mod tests {
             Some("127.0.0.1:9100".parse().unwrap()),
         );
         m.upsert_node(NodeId::new("rejoiner"), NodeState::Dead, Incarnation::new(5), None);
-        assert_eq!(m.state_of(&NodeId::new("rejoiner")), None);
+        assert_eq!(m.state_of(&NodeId::new("rejoiner")), Some(NodeState::Dead));
 
         // Rejoin at incarnation 6 with a NEW address.
         let new_addr: SocketAddr = "127.0.0.1:9200".parse().unwrap();

@@ -40,6 +40,8 @@ pub(crate) async fn replicate_write(
     hlc: Hlc,
     write_timeout_ms: u64,
     req: &super::coordinator::WriteRequest,
+    chunks: &[oceanfs_core::ChunkRef],
+    blake3_hash: &oceanfs_core::HashOutput,
 ) -> Vec<(NodeId, Result<WriteAck>)> {
     if targets.is_empty() {
         return vec![];
@@ -54,9 +56,18 @@ pub(crate) async fn replicate_write(
         .map(|target| {
             let target = (*target).clone();
             async move {
-                let result =
-                    replicate_to_single(pool, membership, &target, segment_id, data, hlc, req)
-                        .await;
+                let result = replicate_to_single(
+                    pool,
+                    membership,
+                    &target,
+                    segment_id,
+                    data,
+                    hlc,
+                    req,
+                    chunks,
+                    blake3_hash,
+                )
+                .await;
                 (target, result)
             }
         })
@@ -94,6 +105,7 @@ pub(crate) async fn replicate_write(
 /// 2. Acquires a gRPC channel from the ConnectionPool.
 /// 3. Constructs a `SegmentRpcClient` and streams the append request.
 /// 4. Returns the server's `SegmentAppendResponse` as a `WriteAck`.
+#[allow(clippy::too_many_arguments)]
 async fn replicate_to_single(
     pool: &Arc<ConnectionPool>,
     membership: &Arc<Membership>,
@@ -102,6 +114,8 @@ async fn replicate_to_single(
     data: &[u8],
     hlc: Hlc,
     req: &super::coordinator::WriteRequest,
+    chunks: &[oceanfs_core::ChunkRef],
+    blake3_hash: &oceanfs_core::HashOutput,
 ) -> Result<WriteAck> {
     let addr = membership.address_of(target).ok_or_else(|| Error::ForwardFailed {
         target: target.to_string(),
@@ -138,10 +152,20 @@ async fn replicate_to_single(
         bucket_id: req.bucket.to_string(),
         object_key: req.key.to_string(),
         object_size: data.len() as u64,
-        blake3_hash: Bytes::new(),
-        chunk_segment_ids: vec![Bytes::copy_from_slice(segment_id.as_uuid().as_bytes())],
-        chunk_offsets: vec![0],
-        chunk_lengths: vec![data.len() as u32],
+        // The REAL chunk references + hash: replicated metadata must
+        // mirror the coordinator's — reads on the receiver then locate
+        // the object's actual bytes (offset/length within the segment)
+        // and verify them. The old single fake chunk (offset 0, no
+        // hash) made receivers read the WRONG bytes — segment offsets
+        // start past earlier objects — and serve them unverified: the
+        // churn all-nodes-identical-unrecorded-version divergence.
+        blake3_hash: Bytes::copy_from_slice(blake3_hash.as_bytes()),
+        chunk_segment_ids: chunks
+            .iter()
+            .map(|c| Bytes::copy_from_slice(c.segment_id.as_uuid().as_bytes()))
+            .collect(),
+        chunk_offsets: chunks.iter().map(|c| c.offset).collect(),
+        chunk_lengths: chunks.iter().map(|c| c.length).collect(),
     };
 
     let stream = tokio_stream::once(request);
@@ -222,6 +246,8 @@ mod tests {
             Hlc::zero(),
             5000,
             &req,
+            &[],
+            &oceanfs_core::HashOutput::from_bytes([0u8; 32]),
         )
         .await;
         assert!(results.is_empty());
@@ -251,6 +277,8 @@ mod tests {
             Hlc::zero(),
             5000,
             &req,
+            &[],
+            &oceanfs_core::HashOutput::from_bytes([0u8; 32]),
         )
         .await;
         assert_eq!(results.len(), 1);

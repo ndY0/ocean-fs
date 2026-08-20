@@ -29,8 +29,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use bytes::Bytes;
 pub use hint_delivery::{
-    GrpcHintDataFetcher, GrpcHintDeliveryClient, HintDeliveryClient, HintedHandoffConfig,
-    HintedHandoffManager,
+    GrpcHintDeliveryClient, GrpcHintObjectFetcher, HintDeliveryClient, HintObsoleteCheck,
+    HintedHandoffConfig, HintedHandoffManager, MetadataHintObsoleteCheck,
 };
 pub use hint_wal::HintWal;
 use oceanfs_core::{Counter, Hlc, LabelSet, MetricRegistrar, NodeId, OperationTimeouts, SegmentId};
@@ -39,7 +39,7 @@ use oceanfs_network::ConnectionPool;
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
-pub use crate::healing_service::HintDataFetcher;
+pub use crate::healing_service::{HintObjectFetcher, HintObjectReader};
 use crate::{
     error::{Error, Result},
     healing_rpc::{HintRequest, HintResponse},

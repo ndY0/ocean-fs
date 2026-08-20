@@ -29,7 +29,7 @@ use std::{
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use oceanfs_core::{Counter, LabelSet, MetricRegistrar, NodeId, OperationTimeouts, SegmentId};
+use oceanfs_core::{Counter, LabelSet, MetricRegistrar, NodeId, OperationTimeouts};
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use tracing::{debug, info, warn};
@@ -233,20 +233,64 @@ pub struct HintedHandoffManager {
     hints_delivered_total: Counter,
     /// Hints pruned from the WAL after TTL expiry.
     hints_expired_total: Counter,
+    /// Hints dropped at drain time because the hinted key no longer
+    /// exists on this node (deleted/superseded — resolved by deletion).
+    hints_obsolete_total: Counter,
+    /// Obsolete-key check (composition root; `None` skips the pre-check
+    /// — tests).
+    obsolete_check: Option<Arc<dyn HintObsoleteCheck>>,
 }
 
-/// Fetches a segment byte range from an origin node over gRPC.
+/// Determines whether a hinted key is OBSOLETE on the origin (the hint
+/// sender): the key no longer exists (deleted or superseded — the
+/// metadata is the truth). An obsolete hint resolved: the recipient
+/// must not receive the stale version, so the hint is dropped locally —
+/// no fetch, no network call, no retry loop.
 ///
-/// Materializes segment-ref hints on the hinted-handoff receiver: the
-/// hint carries `segment_id + offset + length` (NOT the blob — hints
-/// stay small even for multipart/GB blobs), and the receiver pulls the
-/// range from the origin (the hint sender, which holds the segment)
-/// via [`HealingRpcClient::fetch_hint_data`] before applying it.
-pub struct GrpcHintDataFetcher {
+/// A key that still exists is NOT obsolete even when its version is
+/// newer than the hint's: the receiver's key-based fetch returns the
+/// CURRENT state, which is exactly what the recipient should converge
+/// to (HLC-LWW on the receiver decides the apply).
+pub trait HintObsoleteCheck: Send + Sync {
+    /// Returns `true` when `key` no longer exists on this node.
+    fn is_obsolete(&self, bucket: &oceanfs_core::BucketId, key: &str) -> bool;
+}
+
+/// [`HintObsoleteCheck`] backed by the local metadata store: a key is
+/// obsolete when its object row is absent (deleted/tombstoned).
+pub struct MetadataHintObsoleteCheck {
+    store: Arc<dyn oceanfs_storage_api::MetadataStore>,
+}
+
+impl MetadataHintObsoleteCheck {
+    /// Creates the check over the local metadata store.
+    pub fn new(store: Arc<dyn oceanfs_storage_api::MetadataStore>) -> Self {
+        Self { store }
+    }
+}
+
+impl HintObsoleteCheck for MetadataHintObsoleteCheck {
+    fn is_obsolete(&self, bucket: &oceanfs_core::BucketId, key: &str) -> bool {
+        self.store
+            .get_object_metadata(bucket, &oceanfs_core::ObjectKey::new(key))
+            .ok()
+            .flatten()
+            .is_none()
+    }
+}
+
+/// Fetches an object's CURRENT state from an origin node over gRPC.
+///
+/// Materializes hints on the hinted-handoff receiver BY KEY: the
+/// receiver asks the origin "what is the current state of K?" and
+/// applies the answer with HLC-LWW. Hints carry no blob data (they
+/// stay small even for multipart/GB blobs); the fetch transfers the
+/// current logical data from the origin's read path.
+pub struct GrpcHintObjectFetcher {
     pool: Arc<ConnectionPool>,
 }
 
-impl GrpcHintDataFetcher {
+impl GrpcHintObjectFetcher {
     /// Creates a fetcher using the shared connection pool.
     pub fn new(pool: Arc<ConnectionPool>) -> Self {
         Self { pool }
@@ -254,31 +298,91 @@ impl GrpcHintDataFetcher {
 }
 
 #[async_trait::async_trait]
-impl crate::healing_service::HintDataFetcher for GrpcHintDataFetcher {
-    async fn fetch_range(
+impl crate::healing_service::HintObjectFetcher for GrpcHintObjectFetcher {
+    async fn fetch_object(
         &self,
         origin: SocketAddr,
-        segment_id: &SegmentId,
-        offset: u64,
-        length: u32,
-    ) -> std::result::Result<Bytes, String> {
+        bucket: &oceanfs_core::BucketId,
+        key: &str,
+    ) -> std::result::Result<Option<(oceanfs_core::ObjectMetadata, Bytes)>, String> {
         let pooled = self.pool.get_channel(origin).await.map_err(|e| format!("pool: {e}"))?;
         let mut client = HealingRpcClient::new(pooled.channel().clone());
         let mut stream = client
-            .fetch_hint_data(healing_rpc::FetchHintDataRequest {
-                segment_id: Some((*segment_id).into()),
-                offset,
-                length,
+            .fetch_hint_object(healing_rpc::FetchHintObjectRequest {
+                bucket_id: Some(oceanfs_core::proto::common::BucketId {
+                    name: bucket.as_str().to_string(),
+                }),
+                object_key: key.to_string(),
             })
             .await
-            .map_err(|e| format!("fetch_hint_data rpc: {e}"))?
+            .map_err(|e| format!("fetch_hint_object rpc: {e}"))?
             .into_inner();
 
-        let mut buf = Vec::with_capacity(length as usize);
+        // First chunk carries the object's state (present + hlc + size).
+        let first = stream
+            .message()
+            .await
+            .map_err(|e| format!("stream: {e}"))?
+            .ok_or_else(|| "empty fetch_hint_object stream".to_string())?;
+        if !first.present {
+            return Ok(None);
+        }
+        let hlc = first
+            .hlc
+            .as_ref()
+            .map(|h| oceanfs_core::Hlc::new(h.wall_time, h.logical))
+            .unwrap_or_else(oceanfs_core::Hlc::zero);
+        let size = first.size;
+        let advertised_hash: Option<[u8; 32]> = if first.blake3_hash.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&first.blake3_hash);
+            Some(arr)
+        } else {
+            None
+        };
+
+        let mut buf = Vec::with_capacity(size as usize);
+        buf.extend_from_slice(&first.data);
         while let Some(chunk) = stream.message().await.map_err(|e| format!("stream: {e}"))? {
             buf.extend_from_slice(&chunk.data);
         }
-        Ok(Bytes::from(buf))
+        let data = Bytes::from(buf);
+
+        // Integrity verification: the reassembled stream must match the
+        // origin's advertised size and hash. A stream truncated mid-way
+        // (origin restart, network hiccup) otherwise yields PARTIAL data
+        // carrying the FULL version's HLC — which would win LWW and
+        // spread unrecorded bytes to every node fetching from the same
+        // origin (churn: all replicas serve the same never-written hash).
+        // On mismatch the hint is NOT accepted — the sender retries.
+        if data.len() as u64 != size {
+            return Err(format!(
+                "hint object fetch integrity: size mismatch (advertised {size}, got {})",
+                data.len()
+            ));
+        }
+        if let Some(expected) = advertised_hash {
+            let actual = *blake3::hash(&data).as_bytes();
+            if actual != expected {
+                return Err(
+                    "hint object fetch integrity: blake3 mismatch (truncated or corrupted stream)"
+                        .to_string(),
+                );
+            }
+        }
+
+        let meta = oceanfs_core::ObjectMetadata {
+            object_key: oceanfs_core::ObjectKey::new(key),
+            size: data.len() as u64,
+            blake3_hash: Some(oceanfs_core::HashOutput::from_bytes(
+                *blake3::hash(&data).as_bytes(),
+            )),
+            chunks: smallvec::SmallVec::new(),
+            inline_data: None,
+            created_at: 0,
+            hlc,
+        };
+        Ok(Some((meta, data)))
     }
 }
 
@@ -318,6 +422,12 @@ impl HintedHandoffManager {
                 "Hints expired before delivery".into(),
                 LabelSet::empty(),
             ),
+            hints_obsolete_total: Counter::new(
+                "hinted_handoff_hints_obsolete_total".into(),
+                "Hints dropped because the hinted key no longer exists on the sender".into(),
+                LabelSet::empty(),
+            ),
+            obsolete_check: None,
         }
     }
 
@@ -331,6 +441,7 @@ impl HintedHandoffManager {
         registrar.register_counter(self.hints_stored_total.clone());
         registrar.register_counter(self.hints_delivered_total.clone());
         registrar.register_counter(self.hints_expired_total.clone());
+        registrar.register_counter(self.hints_obsolete_total.clone());
     }
 
     /// Sets the membership reference for address resolution.
@@ -344,6 +455,18 @@ impl HintedHandoffManager {
     #[must_use]
     pub fn with_timeouts(mut self, timeouts: Arc<OperationTimeouts>) -> Self {
         self.timeouts = timeouts;
+        self
+    }
+
+    /// Installs the obsolete-key pre-check (composition root).
+    ///
+    /// At drain time, hints whose key no longer exists on this node
+    /// (deleted/superseded — the metadata is the truth) are dropped
+    /// locally: no fetch, no network call, no retry loop. The recipient
+    /// must not receive the stale version anyway.
+    #[must_use]
+    pub fn with_obsolete_check(mut self, check: Arc<dyn HintObsoleteCheck>) -> Self {
+        self.obsolete_check = Some(check);
         self
     }
 
@@ -487,6 +610,7 @@ impl HintedHandoffManager {
                         inline.data.len() + 128
                     }
                     Some(hinted_handoff_rpc::hint_record::Record::SegmentRef(_)) => 256,
+                    Some(hinted_handoff_rpc::hint_record::Record::Delete(_)) => 128,
                     None => 128,
                 };
                 if batch_bytes + payload > self.config.max_batch_bytes {
@@ -496,6 +620,66 @@ impl HintedHandoffManager {
                 batch_bytes += payload;
             }
             queue.drain(..batch_size).collect()
+        };
+
+        // Obsolete-key pre-check: hints whose key no longer exists on
+        // THIS node (deleted/superseded — the metadata is the truth)
+        // resolved by deletion — drop them locally (no fetch, no
+        // network call, no retry loop). The recipient must not receive
+        // the stale version anyway.
+        //
+        // DELETE hints bypass the check: a tombstone hint is live
+        // precisely when the sender's view is tombstoned (the key is
+        // absent on the sender) — the whole point is to propagate the
+        // tombstone to a node that missed the delete. Filtering it
+        // would resurrect the stale-row divergence the hint exists to
+        // repair.
+        let drained: Vec<(u64, u64, HintRecord)> = match &self.obsolete_check {
+            Some(check) => {
+                let (mut live, mut obsolete) = (Vec::new(), 0usize);
+                for item in drained {
+                    let (bucket, key) = match &item.2.record {
+                        Some(hinted_handoff_rpc::hint_record::Record::Inline(inline)) => (
+                            inline
+                                .bucket_id
+                                .clone()
+                                .map(oceanfs_core::BucketId::from)
+                                .unwrap_or_else(|| oceanfs_core::BucketId::new("default")),
+                            inline.object_key.clone(),
+                        ),
+                        Some(hinted_handoff_rpc::hint_record::Record::SegmentRef(seg_ref)) => (
+                            seg_ref
+                                .bucket_id
+                                .clone()
+                                .map(oceanfs_core::BucketId::from)
+                                .unwrap_or_else(|| oceanfs_core::BucketId::new("default")),
+                            seg_ref.object_key.clone(),
+                        ),
+                        // Delete hints bypass the obsolete check (see
+                        // the doc comment above).
+                        Some(hinted_handoff_rpc::hint_record::Record::Delete(_)) => {
+                            live.push(item);
+                            continue;
+                        }
+                        None => continue,
+                    };
+                    if check.is_obsolete(&bucket, &key) {
+                        obsolete += 1;
+                    } else {
+                        live.push(item);
+                    }
+                }
+                if obsolete > 0 {
+                    self.hints_obsolete_total.add(obsolete as u64);
+                    info!(
+                        target = %target,
+                        dropped = obsolete,
+                        "dropped obsolete hints (hinted key no longer exists)"
+                    );
+                }
+                live
+            }
+            None => drained,
         };
 
         if drained.is_empty() {
@@ -1306,6 +1490,111 @@ mod tests {
         }
         assert_eq!(total_delivered, 500, "all hints delivered after the outage");
         assert_eq!(manager.pending_count(&target), 0);
+    }
+
+    // ── obsolete check ───────────────────────────────────────────────
+
+    #[test]
+    fn obsolete_check_false_for_existing_key_true_for_missing() {
+        use oceanfs_core::{HashOutput, ObjectKey, ObjectMetadata};
+        use oceanfs_storage::RocksDbMetadataStore;
+
+        let dir = tempdir().unwrap();
+        let store = Arc::new(
+            RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: dir.path().join("meta"),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let check = MetadataHintObsoleteCheck::new(store.clone());
+
+        let bucket = BucketId::new("load-test");
+        let key = ObjectKey::new("hot-1");
+        // Missing → obsolete.
+        assert!(check.is_obsolete(&bucket, key.as_str()));
+        // Present → not obsolete.
+        oceanfs_storage_api::MetadataStore::put_object(
+            store.as_ref(),
+            &bucket,
+            ObjectMetadata {
+                object_key: key.clone(),
+                size: 4,
+                blake3_hash: Some(HashOutput::from_bytes([1u8; 32])),
+                chunks: smallvec::SmallVec::new(),
+                inline_data: Some(bytes::Bytes::from_static(b"data")),
+                created_at: 0,
+                hlc: oceanfs_core::Hlc::zero(),
+            },
+        )
+        .unwrap();
+        assert!(!check.is_obsolete(&bucket, key.as_str()), "existing key must not be obsolete");
+    }
+
+    /// Delete hints BYPASS the obsolete pre-check: a tombstone hint is
+    /// live precisely when the sender's view is tombstoned (the key is
+    /// absent on the sender) — the whole point is to propagate the
+    /// tombstone to a node that missed the delete. Filtering it would
+    /// resurrect the stale-row divergence the hint exists to repair.
+    #[tokio::test]
+    async fn delete_hints_bypass_obsolete_precheck() {
+        use oceanfs_storage::RocksDbMetadataStore;
+
+        let dir = tempdir().unwrap();
+        let wal_dir = dir.path().join("hints");
+        let store = Arc::new(
+            RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: dir.path().join("meta"),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let check = MetadataHintObsoleteCheck::new(store.clone());
+        let mock = Arc::new(MockDeliveryClient::new());
+        mock.add_response(Ok(HintedHandoffResponse { accepted: true, accepted_count: 1 }));
+
+        let manager =
+            HintedHandoffManager::new(wal_dir.clone(), mock.clone(), make_test_config(wal_dir))
+                .with_obsolete_check(Arc::new(check));
+
+        let target = NodeId::new("node-a");
+        let bucket = BucketId::new("load-test");
+
+        // A WRITE hint for a key absent on this node → obsolete →
+        // dropped at drain.
+        manager
+            .enqueue(HintRecord::new_inline(
+                target.clone(),
+                bucket.clone(),
+                "gone".into(),
+                vec![1].into(),
+                oceanfs_core::Hlc::zero(),
+            ))
+            .await
+            .unwrap();
+        // A DELETE hint for the same absent key → must NOT be dropped.
+        manager
+            .enqueue(HintRecord::new_delete(
+                target.clone(),
+                bucket.clone(),
+                "gone".into(),
+                oceanfs_core::Hlc::new(100, 0),
+            ))
+            .await
+            .unwrap();
+
+        let delivered = manager.drain_and_deliver(target.clone()).await.unwrap();
+        assert_eq!(delivered, 1, "only the delete hint survives the obsolete pre-check");
+        assert_eq!(manager.pending_count(&target), 0);
+
+        let requests = mock.take_requests();
+        assert_eq!(requests.len(), 1);
+        let hints = &requests[0].1.hints;
+        assert_eq!(hints.len(), 1, "the obsolete write hint must not be in the batch");
+        assert!(
+            matches!(&hints[0].record, Some(hinted_handoff_rpc::hint_record::Record::Delete(_))),
+            "the surviving hint must be the delete"
+        );
     }
 
     // ── nodes_with_pending ───────────────────────────────────────────

@@ -9,6 +9,7 @@
 
 pub mod assembly;
 pub mod coordinator;
+pub use coordinator::ReadCoordinatorHintObjectReader;
 pub(crate) mod fetch;
 
 #[allow(unused_imports)]

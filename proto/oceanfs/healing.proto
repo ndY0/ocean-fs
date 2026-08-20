@@ -79,11 +79,11 @@ service HealingRpc {
   // to enable overlapping data transfer with processing (perf rule 4.4).
   rpc FetchShard(FetchShardRequest) returns (stream FetchShardChunk);
 
-  // Fetch a byte range of a segment's data — hinted-handoff segment-ref
-  // delivery (the receiver pulls the blob from the origin instead of
-  // the hint carrying it inline, which would not scale to multipart/GB
-  // blobs). Server-streaming like FetchShard.
-  rpc FetchHintData(FetchHintDataRequest) returns (stream FetchHintDataChunk);
+  // Fetch an object's CURRENT state by key — hinted-handoff
+  // materialization (see FetchHintObjectRequest). The receiver applies
+  // the current state with HLC-LWW instead of replaying the hinted
+  // (possibly stale or deleted) version. Server-streaming.
+  rpc FetchHintObject(FetchHintObjectRequest) returns (stream FetchHintObjectChunk);
 
   // Push a reconstructed shard to a remote node that owns it.
   rpc PushRepairedShard(PushRepairedShardRequest) returns (PushRepairedShardResponse);
@@ -105,20 +105,39 @@ message FetchShardChunk {
   bytes data = 2;
 }
 
-// Request to fetch a byte range of a segment's data — used by the
-// hinted-handoff receiver to pull a segment-ref hint's blob from the
-// origin node (the hint carries segment_id + offset + length, NOT the
-// data, so hints stay small even for multipart/GB blobs).
-message FetchHintDataRequest {
-  oceanfs.common.SegmentId segment_id = 1;
-  uint64 offset = 2;
-  uint32 length = 3;
+// Request to fetch an object's CURRENT state from the origin node —
+// hinted-handoff materialization BY KEY. The receiver asks "what is
+// the current state of K?" and applies it (HLC-LWW against its local
+// state). This is the correct semantics when the origin's segment data
+// has been GC'd/reaped: the object no longer has the hinted version
+// (deleted or superseded — the metadata is the truth), so the hint is
+// resolved against the CURRENT state instead of replayed. Serving the
+// stale version would resurrect a deleted object or regress a newer
+// write. The sender additionally pre-checks the key locally at drain
+// time and drops hints whose key no longer exists — no fetch is even
+// attempted for resolved-by-deletion hints.
+message FetchHintObjectRequest {
+  oceanfs.common.BucketId bucket_id = 1;
+  string object_key = 2;
 }
 
-// A chunk of the fetched range, streamed from the server.
-message FetchHintDataChunk {
+// A chunk of the object's logical data, streamed from the server. The
+// FIRST chunk carries the object's state (present + hlc + size); when
+// the object is absent, the stream contains exactly one chunk with
+// present=false (hlc = the tombstone's HLC when a tombstone exists).
+message FetchHintObjectChunk {
   uint32 chunk_index = 1;
   bytes data = 2;
+  bool present = 3;
+  oceanfs.common.HlcTimestamp hlc = 4;
+  uint64 size = 5;
+  // BLAKE3 hash of the object's logical data (carried on the FIRST
+  // chunk). The receiver verifies the reassembled bytes against it —
+  // a stream truncated mid-way (origin restart, network hiccup) must
+  // not be applied as a full version: a partial object carrying the
+  // full version's HLC would win LWW and spread unrecorded data to
+  // every node that fetches from the same origin.
+  bytes blake3_hash = 6;
 }
 
 // ---------------------------------------------------------------------------

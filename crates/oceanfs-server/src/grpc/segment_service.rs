@@ -208,11 +208,6 @@ impl SegmentRpc for SegmentGrpcService {
             }));
         }
 
-        // Write the accumulated data to the segment store.
-        self.data_store
-            .write_segment_data(&segment_id, &segment_data)
-            .map_err(|e| Status::internal(format!("segment write failed: {e}")))?;
-
         // Persist object metadata if this append carried it (cross-node replication).
         if let (Some(ref md_store), Some(bucket), Some(key)) =
             (&self.metadata_store, bucket_id, object_key)
@@ -237,6 +232,13 @@ impl SegmentRpc for SegmentGrpcService {
                     logical_length: chunk_lengths[i],
                 });
             }
+            // Inline objects (SizeTier::Inline on the coordinator)
+            // carry no chunk references — the metadata must embed the
+            // payload, or reads return EMPTY bytes (chunks empty +
+            // inline_data None → the fetch path yields nothing). The
+            // append stream's data IS the full blob, so store it inline
+            // for chunkless metadata.
+            let meta_chunks = chunks.clone();
             let meta = ObjectMetadata {
                 object_key: ObjectKey::new(&key),
                 size: object_size,
@@ -247,8 +249,12 @@ impl SegmentRpc for SegmentGrpcService {
                 } else {
                     None
                 },
-                chunks,
-                inline_data: None,
+                chunks: meta_chunks.clone(),
+                inline_data: if meta_chunks.is_empty() {
+                    Some(Bytes::copy_from_slice(&segment_data))
+                } else {
+                    None
+                },
                 created_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -259,13 +265,46 @@ impl SegmentRpc for SegmentGrpcService {
                 let bucket_id = oceanfs_core::BucketId::new(&bucket);
                 oceanfs_storage_api::MetadataStore::put_object(md_store.as_ref(), &bucket_id, meta)
             } {
+                // FAIL the append: the coordinator must see the ack as
+                // an error and HINT the target — a silent Ok (with only
+                // a warn) makes the coordinator count the ack, the
+                // write succeeds with quorum, and the receiver never
+                // gets the object (no data, no hint) — the churn
+                // 404/404/200 divergence.
                 tracing::warn!(
                     bucket = %bucket,
                     key = %key,
                     error = %e,
-                    "append_segment: failed to persist replicated metadata"
+                    "append_segment: failed to persist replicated metadata; \
+                     failing the append so the coordinator hints"
                 );
+                return Err(Status::internal(format!(
+                    "failed to persist replicated metadata: {e}"
+                )));
             }
+
+            // Write the local segment copy ONLY when it can serve the
+            // object exactly. The copy starts at offset 0 of the
+            // segment — for an object placed mid-segment on the
+            // coordinator (offset > 0), the copy would shadow owner
+            // fetches with CLAMPED garbage (the segment reader clamps
+            // out-of-range reads to the file length instead of
+            // erroring): reads would return wrong bytes and fail hash
+            // verification instead of falling back to the segment
+            // owner. With no copy, the local read misses and the
+            // gRPC fallback serves the owner's correct bytes.
+            let first_chunk_offset = meta_chunks.first().map(|c| c.offset).unwrap_or(0);
+            if first_chunk_offset == 0 {
+                self.data_store
+                    .write_segment_data(&segment_id, &segment_data)
+                    .map_err(|e| Status::internal(format!("segment write failed: {e}")))?;
+            }
+        } else {
+            // No metadata carried: keep the legacy behavior of writing
+            // the accumulated data to the segment store.
+            self.data_store
+                .write_segment_data(&segment_id, &segment_data)
+                .map_err(|e| Status::internal(format!("segment write failed: {e}")))?;
         }
 
         tracing::debug!(
@@ -586,6 +625,32 @@ impl SegmentRpc for SegmentGrpcService {
 
         let inline_data = if req.inline_data.is_empty() { None } else { Some(req.inline_data) };
 
+        // LWW gate: a push OLDER than the local row must not regress
+        // it. The pusher compared versions at ITS read time — by
+        // delivery time the receiver may have applied a newer write or
+        // hint; overwriting it would regress the newer version, after
+        // which an older delete hint could tombstone the key (the churn
+        // 404/404/200 divergence: one node serves the newest write,
+        // the other two tombstoned by stale pushes + older deletes).
+        if let Some(local) = oceanfs_storage_api::MetadataStore::get_object_metadata(
+            md_store.as_ref(),
+            &bucket,
+            &key,
+        )
+        .map_err(|e| Status::internal(format!("metadata lookup during read repair: {e}")))?
+        {
+            if hlc < local.hlc {
+                tracing::warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    push_wall = hlc.wall_time(),
+                    local_wall = local.hlc.wall_time(),
+                    "rejecting read-repair metadata push: local version is newer (LWW)"
+                );
+                return Err(Status::failed_precondition("push is older than local version"));
+            }
+        }
+
         let meta = ObjectMetadata {
             object_key: key,
             size: req.size,
@@ -844,11 +909,16 @@ mod tests {
     struct TombstoneMockMetadata {
         tombstoned: Mutex<HashMap<(String, String), Tombstone>>,
         last_put: Mutex<Option<ObjectMetadata>>,
+        local_row: Mutex<Option<ObjectMetadata>>,
     }
 
     impl TombstoneMockMetadata {
         fn new() -> Self {
-            Self { tombstoned: Mutex::new(HashMap::new()), last_put: Mutex::new(None) }
+            Self {
+                tombstoned: Mutex::new(HashMap::new()),
+                last_put: Mutex::new(None),
+                local_row: Mutex::new(None),
+            }
         }
 
         fn get_tombstone_value(&self, key: &str) -> Option<Tombstone> {
@@ -857,6 +927,11 @@ mod tests {
 
         fn last_put(&self) -> Option<ObjectMetadata> {
             self.last_put.lock().clone()
+        }
+
+        /// Seeds a local object row (the receiver's current version).
+        fn seed_local_row(&self, meta: ObjectMetadata) {
+            *self.local_row.lock() = Some(meta);
         }
     }
 
@@ -873,7 +948,7 @@ mod tests {
             _bucket: &BucketId,
             _key: &ObjectKey,
         ) -> std::io::Result<Option<ObjectMetadata>> {
-            Ok(None)
+            Ok(self.local_row.lock().clone())
         }
 
         fn list_objects(
@@ -1036,6 +1111,66 @@ mod tests {
         assert!(metadata.get_tombstone_value("k").is_none(), "tombstone must be cleared");
         let put = metadata.last_put().expect("push must persist object metadata");
         assert_eq!(put.hlc, Hlc::new(2000, 0), "persisted metadata carries the push's HLC");
+    }
+
+    /// LWW: a repair push OLDER than the local row is rejected — a
+    /// stale pusher must not regress a newer version (the churn
+    /// 404/404/200 divergence: a stale push regresses a node, after
+    /// which an older delete hint can tombstone the key).
+    #[tokio::test]
+    async fn put_object_metadata_older_than_local_row_rejected() {
+        let metadata = Arc::new(TombstoneMockMetadata::new());
+        // The receiver already has a NEWER version (2000, 0).
+        metadata.seed_local_row(oceanfs_core::ObjectMetadata {
+            object_key: ObjectKey::new("k"),
+            size: 5,
+            blake3_hash: None,
+            chunks: smallvec::SmallVec::new(),
+            inline_data: None,
+            created_at: 0,
+            hlc: Hlc::new(2000, 0),
+        });
+
+        let service = SegmentGrpcService::new(
+            Arc::new(TestSegmentStore::new()),
+            Some(metadata.clone() as Arc<dyn oceanfs_storage_api::MetadataStore>),
+            Arc::new(BufferPool::new(65536, 4)),
+            Arc::new(HlcClock::new()),
+        );
+
+        // A stale push (1000, 0) must be rejected.
+        let request = make_put_metadata_request_with_hlc(
+            "b",
+            "k",
+            Some(oceanfs_core::proto::common::HlcTimestamp { wall_time: 1000, logical: 0 }),
+        );
+        let result = service.put_object_metadata(tonic::Request::new(request)).await;
+        assert_eq!(
+            result.unwrap_err().code(),
+            tonic::Code::FailedPrecondition,
+            "a push older than the local row must be rejected (LWW)",
+        );
+        assert!(metadata.last_put().is_none(), "the stale push must not persist");
+
+        // An equal-HLC push is idempotent and accepted.
+        let request = make_put_metadata_request_with_hlc(
+            "b",
+            "k",
+            Some(oceanfs_core::proto::common::HlcTimestamp { wall_time: 2000, logical: 0 }),
+        );
+        let result = service.put_object_metadata(tonic::Request::new(request)).await;
+        assert!(result.is_ok(), "an equal-HLC push is idempotent");
+
+        // A NEWER push is accepted.
+        let request = make_put_metadata_request_with_hlc(
+            "b",
+            "k",
+            Some(oceanfs_core::proto::common::HlcTimestamp { wall_time: 3000, logical: 0 }),
+        );
+        let result = service.put_object_metadata(tonic::Request::new(request)).await;
+        assert!(result.is_ok(), "a newer push must be accepted");
+        let put = metadata.last_put().expect("newer push must persist");
+        assert_eq!(put.hlc, Hlc::new(3000, 0));
     }
 
     /// G6: a repair push older than the tombstone is rejected.

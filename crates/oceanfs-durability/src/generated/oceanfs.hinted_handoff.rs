@@ -47,14 +47,34 @@ pub struct HintSegmentRef {
     #[prost(message, optional, tag = "7")]
     pub hlc: ::core::option::Option<::oceanfs_core::proto::common::HlcTimestamp>,
 }
-/// A hinted handoff record — either inline or segment reference.
+/// Delete hint record — a tombstone for an object deleted while the
+/// intended node was unreachable. Deletes MUST be hinted too: without
+/// it a node that missed a delete keeps its stale row forever, and the
+/// sender-side obsolete pre-check would then drop later write hints for
+/// a key that is still live elsewhere (cluster divergence).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HintDelete {
+    /// The node this delete was originally intended for.
+    #[prost(message, optional, tag = "1")]
+    pub intended_for: ::core::option::Option<::oceanfs_core::proto::common::NodeId>,
+    /// The bucket the object belongs to.
+    #[prost(message, optional, tag = "2")]
+    pub bucket_id: ::core::option::Option<::oceanfs_core::proto::common::BucketId>,
+    /// The object key.
+    #[prost(string, tag = "3")]
+    pub object_key: ::prost::alloc::string::String,
+    /// HLC timestamp of the original delete (hlc-causality-closure G5).
+    #[prost(message, optional, tag = "4")]
+    pub hlc: ::core::option::Option<::oceanfs_core::proto::common::HlcTimestamp>,
+}
+/// A hinted handoff record — inline, segment reference, or delete.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct HintRecord {
     /// Unix timestamp (seconds) when this hint was written.
     /// Used for TTL-based pruning of stale entries.
     #[prost(uint64, tag = "10")]
     pub stored_at_secs: u64,
-    #[prost(oneof = "hint_record::Record", tags = "1, 2")]
+    #[prost(oneof = "hint_record::Record", tags = "1, 2, 3")]
     pub record: ::core::option::Option<hint_record::Record>,
 }
 /// Nested message and enum types in `HintRecord`.
@@ -65,6 +85,8 @@ pub mod hint_record {
         Inline(super::HintInline),
         #[prost(message, tag = "2")]
         SegmentRef(super::HintSegmentRef),
+        #[prost(message, tag = "3")]
+        Delete(super::HintDelete),
     }
 }
 /// Batched hinted handoff delivery request.
