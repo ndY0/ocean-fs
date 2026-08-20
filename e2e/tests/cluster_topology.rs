@@ -102,8 +102,10 @@ async fn t2_three_node_join_all_rings_converged() {
 // T3: Graceful leave
 // ---------------------------------------------------------------------------
 
-/// T3: Node C sends SIGTERM. Nodes A and B remove C from membership
-/// and ring within `failure_timeout_ms`.
+/// T3: A SIGKILLed node is detected DEAD. Per ADR-0027 Decision 1 the
+/// dead node is RETAINED (state=Dead) — the topology is the stable
+/// N-set; only a graceful Left removes a node. The alive nodes' views
+/// keep 3 entries, one marked Dead.
 #[tokio::test]
 async fn t3_graceful_leave_departed_node_removed_from_rings() {
     let cluster = Cluster::spawn(3, &config_fast_swim()).await.expect("spawn 3-node cluster");
@@ -114,21 +116,43 @@ async fn t3_graceful_leave_departed_node_removed_from_rings() {
     // Per DK-005: use SIGKILL for failure detection tests.
     cluster.kill(2).expect("kill node 2");
 
-    // Wait for remaining nodes to detect the departure.
-    // Poll for convergence down to 2 on alive nodes.
-    cluster.wait_for_convergence(2).await.expect("cluster should converge to 2 nodes after kill");
+    // Wait for remaining nodes to detect the departure (SUSPECT → DEAD,
+    // retained as Dead).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut seen_dead = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok(resp) = cluster.get(0, "/admin/cluster").await {
+            if let Ok(view) = response_json::<serde_json::Value>(resp).await {
+                let nodes: Vec<serde_json::Value> =
+                    view["nodes"].as_array().cloned().unwrap_or_default();
+                seen_dead =
+                    nodes.iter().any(|n| n["id"] == "e2e-cluster-2" && n["state"] == "Dead");
+                if seen_dead {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(seen_dead, "node 2 must be detected Dead");
 
-    // Remaining nodes should report 2 members.
+    // Alive nodes report 3 members — the dead node RETAINED as Dead.
     for i in 0..2 {
         let resp = cluster.get(i, "/admin/cluster").await.expect("GET cluster");
         assert_eq!(resp.status(), 200);
         let view: ClusterView = response_json(resp).await.expect("parse cluster view");
         assert_eq!(
             view.nodes.len(),
-            2,
-            "node {i} should report 2 nodes after departure, got {}: {:?}",
+            3,
+            "node {i} should report 3 entries (2 alive + 1 retained Dead), got {}: {:?}",
             view.nodes.len(),
             view.nodes
+        );
+        let dead = view.nodes.iter().find(|n| n.id == "e2e-cluster-2");
+        assert_eq!(
+            dead.map(|n| n.state.as_str()),
+            Some("Dead"),
+            "the killed node must be retained as Dead (ADR-0027)"
         );
     }
 

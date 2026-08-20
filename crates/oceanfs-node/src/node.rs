@@ -1088,6 +1088,12 @@ impl Node {
             // after (re)join, writes fail with 503 instead of
             // under-replicating (see the gate task above).
             .with_ready_gate(ready_gate)
+            // Step 1c (honest quorum): cluster nodes require the ring
+            // view to satisfy the requested write quorum; single-node
+            // deployments (no seeds) keep the adaptive capping — the
+            // default bucket policy (w=2) would otherwise reject every
+            // write on a permanently 1-node ring.
+            .with_quorum_requires_ring(is_cluster_node)
             .with_hint_inline_threshold(config.hint_inline_threshold_bytes)
             // Continuous anti-entropy: every successful seal updates the
             // incremental Merkle tree (with its seal-time root) so

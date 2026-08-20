@@ -141,7 +141,9 @@ async fn t24_suspect_on_direct_ping_timeout() {
 // ---------------------------------------------------------------------------
 
 /// T25: After `suspicion_timeout_ms`, SUSPECT transitions to DEAD.
-/// DEAD nodes are removed from membership — cluster converges 3 → 2.
+/// DEAD nodes are RETAINED as Dead (ADR-0027 Decision 1: the topology
+/// is the stable N-set; liveness is a quorum concern) — the cluster
+/// view stays 3 entries, one marked Dead.
 #[tokio::test]
 async fn t25_dead_on_suspicion_timeout() {
     let cluster = Cluster::spawn(3, &config_fast_swim()).await.expect("spawn 3-node cluster");
@@ -151,9 +153,30 @@ async fn t25_dead_on_suspicion_timeout() {
     // Kill node 2.
     cluster.kill(2).expect("kill node 2");
 
-    // Wait for failure detection: SUSPECT → DEAD → removal from
-    // membership. Cluster should converge to 2 nodes.
-    cluster.wait_for_convergence(2).await.expect("cluster should converge to 2 after DEAD removal");
+    // Wait for failure detection: SUSPECT → DEAD. The dead node stays
+    // in the membership table (state=Dead) — never evicted.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut seen_dead = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok(resp) = cluster.get(0, "/admin/cluster").await {
+            if let Ok(view) = response_json::<serde_json::Value>(resp).await {
+                let nodes: Vec<serde_json::Value> =
+                    view["nodes"].as_array().cloned().unwrap_or_default();
+                seen_dead =
+                    nodes.iter().any(|n| n["id"] == "e2e-cluster-2" && n["state"] == "Dead");
+                if seen_dead {
+                    assert_eq!(
+                        nodes.len(),
+                        3,
+                        "the dead node must be RETAINED (ADR-0027) — the view keeps 3 entries",
+                    );
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(seen_dead, "node 2 must be detected Dead and retained in the view");
 
     drop(cluster);
 }

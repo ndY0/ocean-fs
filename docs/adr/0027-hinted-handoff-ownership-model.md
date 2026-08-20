@@ -54,9 +54,17 @@ accounting), never a topology concern.
 
 - The write/delete coordinators always attempt the full N-set. A dead
   member's failed attempt is exactly what becomes hint debt.
-- Consumers that need liveness (e.g., the read path's chunk-fetch
-  fallback, the forward path) filter by `state_of(...) == Alive` at the
-  point of use — they do not mutate the topology.
+- Consumers that need liveness filter at the point of use: the forward
+  path picks the first `state_of(...) == Alive` successor; the read
+  path's chunk-fetch fallback iterates the replica set and skips
+  unreachable members (a dead member fails fast and the fetch moves to
+  the next). They never mutate the topology.
+- Single-node deployments (no seeds, no fallback seeds) are exempt from
+  the honest-quorum checks (`quorum_requires_ring = false`): the ring
+  is permanently 1 node and the default bucket policy (w=2) would
+  otherwise reject every write/delete. For them the adaptive capping is
+  retained — the exemption is wired from the same `is_cluster_node`
+  signal as the cluster-readiness gate.
 - The F1d re-admission gate (ADR-0022) now also covers retained-Dead
   entries: equal/lower-incarnation gossip cannot revive a Dead node.
 

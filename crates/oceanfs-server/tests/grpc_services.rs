@@ -649,9 +649,13 @@ async fn swim_death_detection_within_timeout() {
     assert_eq!(dead_event.old_state, NodeState::Suspect);
     assert_eq!(dead_event.new_state, NodeState::Dead);
 
-    // Final verification: node is removed from state (Dead nodes
-    // are evicted from the state map to keep cluster views clean).
-    assert_eq!(membership.state_of(&NodeId::new("target-node")), None);
+    // Final verification (ADR-0027 Decision 1): DEAD nodes are
+    // RETAINED as Dead — the topology is the stable N-set; liveness is
+    // a quorum concern, not a topology concern. (The old behavior
+    // evicted Dead nodes, which silently shrank the replica set and
+    // left returning nodes unhinted — the churn 404/404/200
+    // divergence.)
+    assert_eq!(membership.state_of(&NodeId::new("target-node")), Some(NodeState::Dead));
 }
 
 /// T5.2: `SegmentGrpcService` uses `BufferPool` for segment data buffers.

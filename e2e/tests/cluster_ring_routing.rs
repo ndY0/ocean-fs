@@ -135,9 +135,10 @@ async fn t34_ring_rebalance_on_node_add_affects_minimal_keys() {
 // T35: Ring rebalance on node remove
 // ---------------------------------------------------------------------------
 
-/// T35: 3-node cluster. Remove node C. Keys that had C in their
-/// replica set now have a different successor. Assert lookup still
-/// returns `replication_factor` distinct nodes.
+/// T35: 3-node cluster. A SIGKILLed node is detected DEAD and
+/// RETAINED (ADR-0027 Decision 1: stable N-set). The ring stays 3
+/// nodes; keys keep their replica sets (the dead member's writes
+/// become hint debt, repaid on return).
 #[tokio::test]
 async fn t35_ring_rebalance_on_node_remove_maintains_distinct_replicas() {
     let cluster = Cluster::spawn(3, &config_fast_swim()).await.expect("spawn 3-node cluster");
@@ -154,10 +155,26 @@ async fn t35_ring_rebalance_on_node_remove_maintains_distinct_replicas() {
     // Kill node 2.
     cluster.kill(2).expect("kill node 2");
 
-    // Wait for convergence down to 2.
-    cluster.wait_for_convergence(2).await.expect("cluster should converge to 2 nodes");
+    // Wait for the dead node to be detected (retained as Dead).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut seen_dead = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok(resp) = cluster.get(0, "/admin/cluster").await {
+            if let Ok(view) = response_json::<serde_json::Value>(resp).await {
+                let nodes: Vec<serde_json::Value> =
+                    view["nodes"].as_array().cloned().unwrap_or_default();
+                seen_dead =
+                    nodes.iter().any(|n| n["id"] == "e2e-cluster-2" && n["state"] == "Dead");
+                if seen_dead {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(seen_dead, "node 2 must be detected Dead");
 
-    // Verify the remaining nodes report 2 members and new generation.
+    // The remaining nodes report 3 members (2 alive + 1 retained Dead).
     for i in 0..2 {
         let resp = cluster.get(i, "/admin/cluster").await;
         assert!(resp.is_ok(), "node {i}: cluster endpoint must respond after removal");
@@ -166,19 +183,24 @@ async fn t35_ring_rebalance_on_node_remove_maintains_distinct_replicas() {
 
         let view: ClusterView = response_json(resp).await.expect("parse cluster view");
 
-        // All remaining node IDs should be unique.
+        // All member IDs should be unique.
         let ids: Vec<&str> = view.nodes.iter().map(|n| n.id.as_str()).collect();
         let mut unique = ids.clone();
         unique.sort();
         unique.dedup();
-        assert_eq!(
-            unique.len(),
-            ids.len(),
-            "node {i}: remaining node IDs must be unique: {:?}",
-            ids
-        );
+        assert_eq!(unique.len(), ids.len(), "node {i}: member IDs must be unique: {:?}", ids);
 
-        assert_eq!(view.nodes.len(), 2, "node {i}: expected 2 nodes after removal");
+        assert_eq!(
+            view.nodes.len(),
+            3,
+            "node {i}: expected 3 entries (2 alive + 1 retained Dead) after the kill",
+        );
+        let dead = view.nodes.iter().find(|n| n.id == "e2e-cluster-2");
+        assert_eq!(
+            dead.map(|n| n.state.as_str()),
+            Some("Dead"),
+            "node {i}: the killed node must be retained as Dead (ADR-0027)"
+        );
     }
 
     drop(cluster);

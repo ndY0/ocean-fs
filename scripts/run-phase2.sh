@@ -182,6 +182,6 @@ env \
     TARGET_HOST="${SUT:-}" \
     TARGET_HOST_SSH="${SSH_TARGET:-}" \
     TARGET_SERVICE="$SERVICE" \
-    cargo test -p e2e --release --test load_sustained -- --test-threads=1
+    cargo test -p e2e --release --test load_sustained -- --ignored --test-threads=1
 
 log_info "Report: ${REPORT_DIR}/2_load_sustained_*.json"

@@ -218,10 +218,10 @@ pub struct ReadCoordinator {
     decompress_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
-/// [`HintObjectReader`] backed by the read coordinator — serves the
-/// hinted-handoff fetch RPC with the node's FULL read path (metadata →
-/// chunks → segment reads → decompression), so the receiver gets the
-/// object's current logical data exactly as a GET would serve it.
+/// [`ReadCoordinatorHintObjectReader`] backs the hinted-handoff fetch
+/// RPC with the node's FULL read path (metadata → chunks → segment
+/// reads → decompression), so the receiver gets the object's current
+/// logical data exactly as a GET would serve it.
 pub struct ReadCoordinatorHintObjectReader {
     read: Arc<ReadCoordinator>,
 }

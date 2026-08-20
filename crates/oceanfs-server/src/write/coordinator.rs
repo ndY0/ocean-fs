@@ -158,6 +158,12 @@ pub struct WriteCoordinator {
     /// and single-node deployments are unaffected; the composition root
     /// installs a real gate via [`set_ready_gate`](Self::set_ready_gate).
     ready: Arc<std::sync::atomic::AtomicBool>,
+    /// When true (cluster mode), Step 1c requires the ring view to
+    /// satisfy the requested write quorum. Single-node deployments
+    /// (no seeds) set this false: the ring is permanently 1 node and
+    /// the default bucket policy (w=2) would otherwise reject every
+    /// write — the old adaptive capping is retained for them only.
+    quorum_requires_ring: bool,
     /// Hint inline threshold: hints for blobs up to this size embed the
     /// data; larger blobs are hinted as segment references (the
     /// receiver pulls the range from this node). Defaults to 4 KB.
@@ -310,6 +316,7 @@ impl WriteCoordinator {
             size_config,
             hinted_handoff,
             ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            quorum_requires_ring: true,
             hint_inline_threshold_bytes: 4096,
             #[cfg(feature = "accel")]
             compressor: None,
@@ -368,6 +375,23 @@ impl WriteCoordinator {
     pub fn with_ready_gate(mut self, ready: Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.ready = ready;
         self
+    }
+
+    /// Sets whether Step 1c requires the ring view to satisfy the
+    /// requested write quorum. Cluster nodes keep the honest check;
+    /// single-node deployments (no seeds) disable it — the ring is
+    /// permanently 1 node and the default bucket policy (w=2) would
+    /// otherwise reject every write.
+    #[must_use]
+    pub fn with_quorum_requires_ring(mut self, requires: bool) -> Self {
+        self.quorum_requires_ring = requires;
+        self
+    }
+
+    /// Returns whether the ring view must satisfy the write quorum
+    /// (used by the S3 delete handler's ring-view gate).
+    pub fn quorum_requires_ring(&self) -> bool {
+        self.quorum_requires_ring
     }
 
     /// Sets the hint inline threshold (hints above it become segment
@@ -431,7 +455,7 @@ impl WriteCoordinator {
         // other replicas exist) — the churn 404/404/200 divergence.
         // Fail instead: the client retries. An error is a retry signal;
         // a degraded quorum is not.
-        if (replica_set.len() as u8) < req.write_quorum {
+        if self.quorum_requires_ring && (replica_set.len() as u8) < req.write_quorum {
             return Err(Error::QuorumNotMet {
                 required: req.write_quorum,
                 received: replica_set.len(),
@@ -740,9 +764,17 @@ impl WriteCoordinator {
         );
 
         // Step 5: Replicate to W successors using the replication module.
-        // The quorum is the REQUESTED quorum — Step 1c guarantees the
-        // ring view can satisfy it; there is no adaptive degradation.
-        let quorum = req.write_quorum;
+        // Cluster mode: the quorum is the REQUESTED quorum — Step 1c
+        // guarantees the ring view can satisfy it; there is no adaptive
+        // degradation. Single-node deployments (quorum_requires_ring =
+        // false) keep the adaptive cap — the ring is permanently 1 node
+        // and the default bucket policy (w=2) must not reject every
+        // write.
+        let quorum = if self.quorum_requires_ring {
+            req.write_quorum
+        } else {
+            req.write_quorum.min(replica_set.len() as u8)
+        };
         let mut acks_received: usize = 1; // local ack counted
         let mut failed_targets: Vec<NodeId> = Vec::new();
 
@@ -994,9 +1026,10 @@ impl WriteCoordinator {
 
     /// Returns the number of replicas in the ring for the given key.
     ///
-    /// Used by the delete handler to cap the required quorum at the
-    /// replica count (a single-node cluster cannot confirm more than
-    /// one deletion), mirroring the write path's quorum capping.
+    /// Used by the S3 delete handler's ring-view gate: cluster mode
+    /// requires the ring view to satisfy the requested quorum (no
+    /// capping); single-node deployments cap the required quorum at the
+    /// replica count.
     pub fn replica_count(&self, hash_key: &HashKey) -> usize {
         self.ring.lookup(hash_key.as_bytes()).len()
     }

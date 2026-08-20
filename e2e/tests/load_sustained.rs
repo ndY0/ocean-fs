@@ -453,6 +453,19 @@ fn snapshot_assertions(state: &PollerState) -> Vec<e2e::load::AssertionResult> {
 /// See the module documentation for modes, environment variables, and
 /// invariants. Uses the multi-threaded tokio runtime so workers and the
 /// metric poller run concurrently.
+///
+/// # VM-only — never run on the development machine
+///
+/// This test is the Phase-2 SUT-VM validation (see
+/// `scripts/run-phase2.sh` and the `vm-*` skills): it runs minutes of
+/// sustained load with tight resource assertions that assume the SUT
+/// VM's dedicated resources. On the development machine it fights
+/// editor/compiler/build traffic for CPU and memory, producing flaky
+/// resource-assertion failures that are NOT product defects. The
+/// default suite must skip it (`#[ignore]`); it runs explicitly on the
+/// SUT VM with `cargo test -p e2e --test load_sustained -- --ignored`
+/// (or via the phase-2 harness scripts).
+#[ignore = "VM-only: runs on the SUT VM (run-phase2.sh), never on the dev machine"]
 #[tokio::test(flavor = "multi_thread")]
 async fn load_sustained() {
     // ── Parse environment variables ────────────────────────────

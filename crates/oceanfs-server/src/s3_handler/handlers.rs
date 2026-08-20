@@ -495,7 +495,7 @@ pub(crate) async fn delete_object(
     // key. Fail before ANY local mutation: the client retries.
     let write_quorum = state.buckets.get(&bucket).map(|p| p.consistency.write_quorum).unwrap_or(1);
     let replica_count = state.write.replica_count(&hk);
-    if (replica_count as u8) < write_quorum {
+    if state.write.quorum_requires_ring() && (replica_count as u8) < write_quorum {
         let err = Error::QuorumNotMet { required: write_quorum, received: replica_count };
         warn!(
             key = %key,
@@ -522,7 +522,14 @@ pub(crate) async fn delete_object(
             // Quorum check: local (1) + confirmed remote deletions.
             // No capping — the ring-view gate above guarantees the
             // requested quorum is satisfiable.
-            let required_quorum = write_quorum as usize;
+            // Cluster mode: the requested quorum (the ring-view gate
+            // above guarantees satisfiability). Single-node deployments
+            // keep the adaptive cap — see the gate.
+            let required_quorum = if state.write.quorum_requires_ring() {
+                write_quorum as usize
+            } else {
+                (write_quorum.min(replica_count as u8)) as usize
+            };
             let confirmed = 1 + remote_deleted;
             if confirmed < required_quorum {
                 let err =
