@@ -181,6 +181,8 @@ impl HealingGrpcService {
                 tracing::debug!(
                     bucket = %bucket,
                     key = %object_key,
+                    local_wall = local.hlc.wall_time(),
+                    hint_wall = meta.hlc.wall_time(),
                     "hint discarded: local version newer (LWW)"
                 );
                 return;
@@ -192,6 +194,8 @@ impl HealingGrpcService {
                 tracing::debug!(
                     bucket = %bucket,
                     key = %object_key,
+                    tombstone_wall = tombstone.hlc.wall_time(),
+                    hint_wall = meta.hlc.wall_time(),
                     "hint discarded: local tombstone newer (LWW)"
                 );
                 return;
@@ -275,6 +279,8 @@ impl HealingGrpcService {
                 tracing::debug!(
                     bucket = %bucket,
                     key = %object_key,
+                    local_wall = local.hlc.wall_time(),
+                    hint_wall = hlc.wall_time(),
                     "hint delete discarded: local version newer (LWW)"
                 );
                 return;
@@ -286,6 +292,8 @@ impl HealingGrpcService {
                 tracing::debug!(
                     bucket = %bucket,
                     key = %object_key,
+                    tombstone_wall = tombstone.hlc.wall_time(),
+                    hint_wall = hlc.wall_time(),
                     "hint delete discarded: local tombstone newer (LWW)"
                 );
                 return;
@@ -653,6 +661,11 @@ impl HealingRpc for HealingGrpcService {
                         // the hint resolved (the delete/supersede won).
                         // Accept it: the recipient must not receive the
                         // stale version.
+                        tracing::debug!(
+                            bucket = %_bucket,
+                            key = %_key,
+                            "hint resolved: object absent on origin"
+                        );
                         accepted_count += 1;
                     }
                     Ok((bucket, key, Err(e))) => {

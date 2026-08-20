@@ -233,8 +233,14 @@ pub struct HintedHandoffManager {
     hints_delivered_total: Counter,
     /// Hints pruned from the WAL after TTL expiry.
     hints_expired_total: Counter,
+    /// Hint debt that FAILED to record (WAL write error). A failed
+    /// enqueue means the mutation is NOT owed anywhere — the hint is
+    /// gone — so it must be visible (the churn residual class: the
+    /// newest mutation's hint silently missing from every queue).
+    hints_enqueue_failed_total: Counter,
 }
 
+/// Human-readable (bucket, key, type) for a hint record (tracing).
 /// The hint delivery contract (ADR-0027 Decision 2 as amended):
 /// hints are NEVER dropped at the sender. The coordinator records
 /// every failed replication attempt as durable debt; delivery delivers
@@ -387,6 +393,11 @@ impl HintedHandoffManager {
                 "Hints expired before delivery".into(),
                 LabelSet::empty(),
             ),
+            hints_enqueue_failed_total: Counter::new(
+                "hinted_handoff_hints_enqueue_failed_total".into(),
+                "Hint debt that failed to record (WAL write error)".into(),
+                LabelSet::empty(),
+            ),
         }
     }
 
@@ -400,6 +411,7 @@ impl HintedHandoffManager {
         registrar.register_counter(self.hints_stored_total.clone());
         registrar.register_counter(self.hints_delivered_total.clone());
         registrar.register_counter(self.hints_expired_total.clone());
+        registrar.register_counter(self.hints_enqueue_failed_total.clone());
     }
 
     /// Sets the membership reference for address resolution.
@@ -497,17 +509,27 @@ impl HintedHandoffManager {
             .intended_for()
             .ok_or_else(|| Error::Internal("hint record has no intended_for field".into()))?;
 
+        // Serialize the WAL write + queue push against the drain's
+        // truncate under the per-target queue lock: the delivery-success
+        // truncate must never wipe an entry being written concurrently
+        // (the churn residual class — a hint that existed only in the
+        // in-memory queue and vanished on crash).
+        let mut queue = self.queues.entry(target.clone()).or_default();
+
         // Resolve or lazily open the per-node WAL file.
-        let wal = self.get_or_open_node_wal(&target).await?;
+        let wal = self.get_or_open_node_wal(&target).await.inspect_err(|_| {
+            self.hints_enqueue_failed_total.add(1);
+        })?;
 
         // Write to WAL first for durability.
         record.stored_at_secs =
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        let (position, end_position) = wal.write_hint(&record).await?;
+        let (position, end_position) = wal.write_hint(&record).await.inspect_err(|_| {
+            self.hints_enqueue_failed_total.add(1);
+        })?;
 
         // Then add to in-memory queue.
-        let mut queue = self.queues.entry(target.clone()).or_default();
-        queue.push_back((position, end_position, record));
+        queue.push_back((position, end_position, record.clone()));
         self.hints_stored_total.add(1);
 
         debug!(
@@ -622,6 +644,12 @@ impl HintedHandoffManager {
             Ok(resp) => {
                 if !resp.accepted {
                     // Re-enqueue: delivery was attempted but remote node rejected.
+                    warn!(
+                        target = %target,
+                        accepted = resp.accepted_count,
+                        count = drained.len(),
+                        "hint batch not fully accepted; re-enqueuing wholesale"
+                    );
                     self.reenqueue_front(&target, drained);
                     return Err(Error::ForwardFailed {
                         target: target.to_string(),
@@ -629,16 +657,33 @@ impl HintedHandoffManager {
                     });
                 }
 
-                // Success — truncate the per-node WAL file to zero and remove
-                // it from the map. The file is fully delivered and no longer needed.
-                if let Some(wal) = self.node_wals.get(&target) {
-                    let _ = wal.truncate_after(0).await;
+                // Success — truncate the per-node WAL under the same
+                // per-target queue lock the enqueue holds: the truncate
+                // can never wipe an entry being written concurrently.
+                // When the queue is fully drained, wipe the file (all
+                // delivered); otherwise truncate to the drained tail
+                // (preserving concurrently-enqueued entries). The old
+                // code always truncated to ZERO and unlinked the file
+                // outside any lock — racing a concurrent enqueue and
+                // losing its entry on crash.
+                let drained_end = drained.last().map(|(_, end, _)| *end).unwrap_or(0);
+                {
+                    let queue = self.queues.entry(target.clone()).or_default();
+                    if queue.is_empty() {
+                        if let Some(wal) = self.node_wals.get(&target) {
+                            let _ = wal.truncate_after(0).await;
+                        }
+                        let file_path = self.wal_dir.join(format!("{}.wal", target));
+                        let _ = std::fs::remove_file(&file_path);
+                        self.node_wals.remove(&target);
+                        self.last_access.remove(&target);
+                    } else {
+                        if let Some(wal) = self.node_wals.get(&target) {
+                            let _ = wal.truncate_after(drained_end).await;
+                        }
+                        self.last_access.insert(target.clone(), std::time::Instant::now());
+                    }
                 }
-                // Remove the empty file to free disk space.
-                let file_path = self.wal_dir.join(format!("{}.wal", target));
-                let _ = std::fs::remove_file(&file_path);
-                self.node_wals.remove(&target);
-                self.last_access.remove(&target);
 
                 let delivered = drained.len();
                 self.hints_delivered_total.add(delivered as u64);
@@ -1176,14 +1221,15 @@ mod tests {
             .await
             .unwrap();
 
-        // Deliver node-a only — its WAL file should be removed.
+        // Deliver node-a only — its queue fully drained, so its WAL is
+        // wiped and removed (all delivered); node-b's stays.
         let delivered = manager.drain_and_deliver(node_a.clone()).await.unwrap();
         assert_eq!(delivered, 2);
 
         // Verify node-a.wal is gone, node-b.wal still exists.
         assert!(
             !wal_dir.join("node-a.wal").exists(),
-            "node-a.wal should be removed after delivery"
+            "node-a.wal should be removed after full delivery"
         );
         assert!(wal_dir.join("node-b.wal").exists(), "node-b.wal should still exist");
         assert_eq!(manager.pending_count(&node_b), 1);

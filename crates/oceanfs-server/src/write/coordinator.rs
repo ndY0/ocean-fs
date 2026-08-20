@@ -932,7 +932,19 @@ impl WriteCoordinator {
                 hlc,
             )
         };
-        let _ = self.hinted_handoff.enqueue(hint).await;
+        if let Err(e) = self.hinted_handoff.enqueue(hint).await {
+            // A failed enqueue means the debt was NOT recorded anywhere
+            // (no WAL entry, no queue entry) — the mutation is lost for
+            // this replica. Never silent: the counter + this warn are
+            // the only trace (the churn residual class).
+            warn!(
+                target = %target,
+                bucket = %req.bucket,
+                key = %req.key,
+                error = %e,
+                "hinted handoff enqueue FAILED — write debt lost"
+            );
+        }
     }
 
     /// Writes a WAL entry for crash-recovery durability.
@@ -1559,7 +1571,17 @@ impl WriteCoordinator {
             key.to_string(),
             hlc,
         );
-        let _ = self.hinted_handoff.enqueue(hint).await;
+        if let Err(e) = self.hinted_handoff.enqueue(hint).await {
+            // See enqueue_write_hint: a failed enqueue is a LOST delete
+            // — the tombstone will never reach the dead replica.
+            warn!(
+                target = %target,
+                bucket = %bucket,
+                key = %key,
+                error = %e,
+                "hinted handoff enqueue FAILED — delete debt lost"
+            );
+        }
     }
 }
 
