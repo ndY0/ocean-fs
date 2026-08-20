@@ -912,7 +912,7 @@ impl HintedHandoffManager {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::unnecessary_cast, clippy::useless_conversion)]
 mod tests {
     use oceanfs_core::BucketId;
     use parking_lot::Mutex as StdMutex;

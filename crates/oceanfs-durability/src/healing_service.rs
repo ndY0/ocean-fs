@@ -939,7 +939,7 @@ impl HealingRpc for HealingGrpcService {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::unnecessary_cast, clippy::useless_conversion)]
 mod tests {
     use std::collections::HashMap;
 

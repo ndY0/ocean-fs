@@ -529,7 +529,14 @@ impl HealWorker {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::needless_borrow,
+    clippy::useless_conversion,
+    clippy::needless_borrows_for_generic_args,
+    clippy::explicit_auto_deref
+)]
 mod tests {
     use oceanfs_core::{SegmentId, SegmentMetadata, SizeTier};
     use oceanfs_ec::Encoder;

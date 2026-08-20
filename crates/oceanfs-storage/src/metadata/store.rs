@@ -1247,7 +1247,7 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_types)]
 mod tests {
     use oceanfs_core::{HashOutput, Hlc};
 

@@ -237,7 +237,7 @@ fn current_time_millis() -> u64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_types)]
 mod tests {
     use super::*;
 

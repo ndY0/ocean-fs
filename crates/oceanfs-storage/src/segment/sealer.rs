@@ -569,7 +569,7 @@ fn write_segment_temp(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::needless_range_loop)]
 mod tests {
     use oceanfs_core::{HashOutput, LifecycleConfig, WalConfig};
 

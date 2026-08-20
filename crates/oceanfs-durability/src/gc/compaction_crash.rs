@@ -25,6 +25,14 @@
 //! `.dat` on disk — the table's windows are the only ones reachable.
 
 #![cfg(test)]
+#![allow(
+    clippy::disallowed_types,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::needless_borrows_for_generic_args,
+    clippy::needless_borrow,
+    clippy::await_holding_lock
+)]
 
 use std::{
     collections::HashSet,

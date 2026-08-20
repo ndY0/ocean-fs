@@ -1095,7 +1095,7 @@ pub fn config_3node_w2_r2() -> String {
 node_id = "e2e-c3n-0"
 listen_addr = "127.0.0.1:{http_port}"
 grpc_listen_addr = "127.0.0.1:{grpc_port}"
-log_level = "error"
+log_level = "warn"
 prefetch_enabled = false
 write_quorum = 2
 read_quorum = 2
@@ -1187,8 +1187,14 @@ scrub_interval_sec = 60
 
 [gossip]
 interval_ms = 500
-suspicion_timeout_ms = 3000
-failure_timeout_ms = 8000
+# The failure detector must tolerate the load-test machine's CPU
+# contention (SWIM pings timing out under load produced FALSE
+# suspect/dead markings during the settle — a live node marked dead by
+# a peer, observed 2026-08-20). The timings are looser than the
+# fast-swim test profile: convergence is exercised by the churn cycles
+# themselves, not by tight suspicion windows.
+suspicion_timeout_ms = 6000
+failure_timeout_ms = 15000
 "#
     .to_string()
 }
@@ -2149,8 +2155,8 @@ mod tests {
             // Pin the manifest files to a fixed OLD time so tests can
             // control which file is "newest" via explicit mtimes below.
             let old = filetime::FileTime::from_unix_time(50, 0);
-            filetime::set_file_mtime(&dir.path().join("Cargo.toml"), old).expect("pin Cargo.toml");
-            filetime::set_file_mtime(&dir.path().join("Cargo.lock"), old).expect("pin Cargo.lock");
+            filetime::set_file_mtime(dir.path().join("Cargo.toml"), old).expect("pin Cargo.toml");
+            filetime::set_file_mtime(dir.path().join("Cargo.lock"), old).expect("pin Cargo.lock");
             Self { dir, bin_path }
         }
 
@@ -2302,12 +2308,12 @@ mod tests {
         std::fs::write(dir.path().join("crates/oceanfs-core/src/lib.rs"), "a").expect("write rs");
         std::fs::write(dir.path().join("Cargo.lock"), "# lock\n").expect("write lock");
         filetime::set_file_mtime(
-            &dir.path().join("crates/oceanfs-core/src/lib.rs"),
+            dir.path().join("crates/oceanfs-core/src/lib.rs"),
             filetime::FileTime::from_unix_time(100, 0),
         )
         .expect("mt rs");
         filetime::set_file_mtime(
-            &dir.path().join("Cargo.lock"),
+            dir.path().join("Cargo.lock"),
             filetime::FileTime::from_unix_time(400, 0),
         )
         .expect("mt lock");
@@ -2347,13 +2353,13 @@ mod tests {
     #[test]
     fn resolve_capture_precedence_options_env_default() {
         // Explicit options win; env opt-out is "0"/"false"; default on.
-        assert_eq!(resolve_capture(Some(false), Some("1")), false);
-        assert_eq!(resolve_capture(Some(true), Some("0")), true);
-        assert_eq!(resolve_capture(None, Some("0")), false);
-        assert_eq!(resolve_capture(None, Some("false")), false);
-        assert_eq!(resolve_capture(None, Some("1")), true);
-        assert_eq!(resolve_capture(None, Some("true")), true);
-        assert_eq!(resolve_capture(None, None), true);
+        assert!(!resolve_capture(Some(false), Some("1")));
+        assert!(resolve_capture(Some(true), Some("0")));
+        assert!(!resolve_capture(None, Some("0")));
+        assert!(!resolve_capture(None, Some("false")));
+        assert!(resolve_capture(None, Some("1")));
+        assert!(resolve_capture(None, Some("true")));
+        assert!(resolve_capture(None, None));
     }
 
     #[test]
@@ -2367,11 +2373,11 @@ mod tests {
         .expect("write fixture log");
 
         let matches =
-            grep_logs_in_files(&[log.clone()], "seal queue full").expect("grep must succeed");
+            grep_logs_in_files(std::slice::from_ref(&log), "seal queue full").expect("grep must succeed");
         assert_eq!(matches.len(), 1);
         assert!(matches[0].contains("seal queue full; seal deferred"));
 
-        let none = grep_logs_in_files(&[log], "BadDigest").expect("grep must succeed");
+        let none = grep_logs_in_files(std::slice::from_ref(&log), "BadDigest").expect("grep must succeed");
         assert!(none.is_empty(), "pattern not present must yield no matches");
     }
 

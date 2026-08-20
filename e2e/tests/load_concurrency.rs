@@ -158,7 +158,7 @@ async fn load_concurrency() {
 
     report.assert(assert_that(
         "accel_fallback_zero",
-        accel_fallback.map_or(false, |v| v == 0.0),
+        accel_fallback.is_some_and(|v| v == 0.0),
         "accel_ec_fallback_total == 0 (no acceleration fallbacks)",
         format!(
             "accel_ec_fallback_total = {}",

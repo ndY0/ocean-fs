@@ -717,14 +717,14 @@ async fn load_cluster_churn() {
     let mut stored = 0.0;
     let mut delivered = 0.0;
     let mut expired = 0.0;
-    for i in 0..target.len() {
+    for (i, initial) in initial_snaps.iter().enumerate() {
         if let Ok(final_snap) = MetricsSnapshot::scrape(&*target, i).await {
             stored += final_snap.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0)
-                - initial_snaps[i].counter("hinted_handoff_hints_stored_total").unwrap_or(0.0);
+                - initial.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0);
             delivered += final_snap.counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0)
-                - initial_snaps[i].counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0);
+                - initial.counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0);
             expired += final_snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0)
-                - initial_snaps[i].counter("hinted_handoff_hints_expired_total").unwrap_or(0.0);
+                - initial.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0);
         }
     }
     // Delivered may legitimately exceed stored (hints replayed from a

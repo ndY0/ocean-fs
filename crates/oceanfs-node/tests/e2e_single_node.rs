@@ -300,6 +300,7 @@ mod helpers {
                 key: object_key,
                 hash_key: hk,
                 metadata_only: false,
+                local_only: false,
                 policy: None,
             };
 

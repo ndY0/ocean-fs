@@ -25,6 +25,7 @@ async fn read_metadata_only_returns_empty_data() {
         key: ObjectKey::new("meta-only"),
         hash_key: HashKey::from_bytes(hash_key(b"meta-only")),
         metadata_only: true,
+        local_only: false,
         policy: None,
     };
     let result = coord.get(req).await.unwrap();
@@ -111,6 +112,7 @@ async fn test_fastest_k_returns_on_k_arrival() {
         key: ObjectKey::new("fastest-k-test"),
         hash_key: HashKey::from_bytes(hash_key(b"fastest-k-test")),
         metadata_only: true,
+        local_only: false,
         policy: None,
     };
     let result = coord.get(req).await.unwrap();

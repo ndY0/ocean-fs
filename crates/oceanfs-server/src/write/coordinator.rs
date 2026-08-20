@@ -1586,7 +1586,13 @@ impl WriteCoordinator {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::disallowed_types,
+    clippy::op_ref,
+    clippy::too_many_arguments
+)]
 mod tests {
     use std::net::SocketAddr;
 

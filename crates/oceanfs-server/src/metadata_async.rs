@@ -221,7 +221,7 @@ impl MetadataOps for StorageOpsAdapter {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_types)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
