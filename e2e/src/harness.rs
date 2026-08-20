@@ -1712,7 +1712,14 @@ impl Cluster {
             .await
             .map_err(|e| Error::ClusterError(format!("failed to parse cluster JSON: {e}")))?;
 
-        Ok(body["nodes"].as_array().map(|a| a.len()).unwrap_or(0))
+        // Count ALIVE entries only (ADR-0027 Decision 1): dead nodes are
+        // RETAINED in the table (state=Dead), so counting raw entries
+        // would report "3 nodes" for 2 alive + 1 retained dead —
+        // convergence would pass while a node is still down.
+        Ok(body["nodes"]
+            .as_array()
+            .map(|a| a.iter().filter(|n| n["state"] == "Alive").count())
+            .unwrap_or(0))
     }
 
     /// Shut down all nodes gracefully (SIGTERM), waiting for each to exit.

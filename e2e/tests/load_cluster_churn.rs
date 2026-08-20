@@ -105,7 +105,10 @@ const CHURN_INTERVAL: Duration = Duration::from_secs(15);
 const RESTART_DELAY: Duration = Duration::from_secs(10);
 /// Membership convergence timeout after churn (feature doc: 10s; 30s for
 /// the relaxed single-VM profile — we only run the two-VM/fast profile).
-const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
+// A churn cycle's restart can take up to the spawn's 60s health-wait
+// under load (hint-debt WAL replay), so the post-churn convergence
+// window must cover it.
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Metric + cluster-view poll interval (spec: every 10s).
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// Hinted-handoff delivery tolerance (within 5%).
@@ -422,6 +425,7 @@ async fn load_cluster_churn() {
             s
         });
     eprintln!("load_cluster_churn: seed={seed}");
+    let phase_start = std::time::Instant::now();
 
     let duration_secs: u64 =
         std::env::var("LOAD_TEST_DURATION_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
@@ -472,7 +476,10 @@ async fn load_cluster_churn() {
         wait_for_convergence(&target, NODE_COUNT, CONVERGENCE_TIMEOUT).await,
         "cluster must converge before the run starts"
     );
-    eprintln!("load_cluster_churn: initial convergence OK ({NODE_COUNT} nodes alive)");
+    eprintln!(
+        "load_cluster_churn: initial convergence OK ({NODE_COUNT} nodes alive) — t={:.0}s",
+        phase_start.elapsed().as_secs_f64()
+    );
 
     // ── Build the load scenario ────────────────────────────────
     // Workers route each op to a random node (per-worker seeded RNG), so
@@ -571,7 +578,10 @@ async fn load_cluster_churn() {
 
     // ── Post-churn convergence (assertion 1) ───────────────────
     let converged = wait_for_convergence(&target, NODE_COUNT, CONVERGENCE_TIMEOUT).await;
-    eprintln!("load_cluster_churn: post-churn convergence = {converged}");
+    eprintln!(
+        "load_cluster_churn: post-churn convergence = {converged} — t={:.0}s",
+        phase_start.elapsed().as_secs_f64()
+    );
 
     // ── Hinted-handoff convergence ─────────────────────────────
     // Delivery is eventually-convergent (the 5s sweep drains ≤
@@ -607,9 +617,10 @@ async fn load_cluster_churn() {
                 handoff_settled = true;
                 eprintln!(
                     "load_cluster_churn: handoff settled after {:.0}s \
-                     (pending={pending:.0}, {} quiet checks)",
+                     (pending={pending:.0}, {} quiet checks) — t={:.0}s",
                     settle_start.elapsed().as_secs_f64(),
                     QUIET_CHECKS_REQUIRED,
+                    phase_start.elapsed().as_secs_f64(),
                 );
                 break;
             }
@@ -644,6 +655,11 @@ async fn load_cluster_churn() {
     // metadata store asynchronously; give it a moment before verifying.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
+    eprintln!(
+        "load_cluster_churn: verifying manifest (HEAD+ETag) — t={:.0}s",
+        phase_start.elapsed().as_secs_f64()
+    );
+
     // ── Assertion 2: manifest integrity (≥1 node) ──────────────
     // The single-random-node verify is too weak for a 3-node cluster:
     // a key on 2 of 3 nodes fails it 1/3 of the time. Integrity here
@@ -669,7 +685,11 @@ async fn load_cluster_churn() {
     let quorum_failed = manifest
         .verify_read_quorum(&*target, &alive_indices, READ_QUORUM, Some(READ_QUORUM_SAMPLE))
         .await;
-    eprintln!("load_cluster_churn: read-quorum failures = {}", quorum_failed.len());
+    eprintln!(
+        "load_cluster_churn: read-quorum failures = {} — t={:.0}s",
+        quorum_failed.len(),
+        phase_start.elapsed().as_secs_f64()
+    );
     if !quorum_failed.is_empty() {
         eprintln!("load_cluster_churn: quorum-failed keys: {quorum_failed:?}");
         // Per-node diagnostics: what does each node serve for the failed

@@ -438,6 +438,23 @@ impl ReadCoordinator {
 
         let mut obj_meta = self.lookup_metadata(&req).await?;
 
+        // Metadata-only requests (HEAD) return the LOCAL state directly.
+        // They skip the multi-replica comparison and read repair: a HEAD
+        // must observe what THIS node actually serves (that is what the
+        // churn test's ETag-based verify checks), and the comparison +
+        // repair fanout made every HEAD do remote gRPCs and spawn repair
+        // pushes — ~1.6s per HEAD under verify load, and a 2400-push
+        // storm on the cluster.
+        if req.metadata_only {
+            return Ok(GetResult {
+                data: Bytes::new(),
+                metadata: obj_meta,
+                cache_hit: CacheHitLevel::Miss,
+                hash: HashOutput::from_bytes([0u8; 32]),
+                segment_source: None,
+            });
+        }
+
         // §4.6: Multi-replica HLC comparison — when read_quorum > 1,
         // synchronously fetch metadata from replicas, compare HLCs,
         // and apply the winning version before responding to the client.
@@ -453,14 +470,6 @@ impl ReadCoordinator {
 
         let data = if let Some(ref inline) = obj_meta.inline_data {
             inline.clone()
-        } else if req.metadata_only {
-            return Ok(GetResult {
-                data: Bytes::new(),
-                metadata: obj_meta,
-                cache_hit: CacheHitLevel::Miss,
-                hash: HashOutput::from_bytes([0u8; 32]),
-                segment_source: None,
-            });
         } else if !obj_meta.chunks.is_empty() {
             // Resolve effective fetch strategy: per-bucket override → node default.
             let strategy = req

@@ -218,18 +218,32 @@ async fn verify_one_from_node<C: LoadTarget>(
     let backoffs = [100u64, 200, 400, 800];
     let node_addr = target.node_addr(node_idx).to_string();
 
+    // HEAD + ETag compare instead of GET + body hash: the S3 handlers
+    // set the ETag to the stored object's BLAKE3 (hex), and the read
+    // path VERIFIES the assembled bytes against that stored hash before
+    // serving (a mismatch errors the read). An ETag match therefore
+    // implies the node serves a verified recorded version — without
+    // downloading up to 2 MiB per key per node (the old verify took
+    // ~450s of the churn test's runtime in body transfers + hashing).
     for &backoff_ms in &backoffs {
-        match target.get(node_idx, &format!("/{composite_key}")).await {
+        match target.head(node_idx, &format!("/{composite_key}")).await {
             Ok(resp) if resp.status().is_success() => {
-                let body = resp.bytes().await.unwrap_or_default();
-                let actual_hash = blake3::hash(&body);
-                if expected.contains(actual_hash.as_bytes()) {
+                let etag = resp
+                    .headers()
+                    .get(reqwest::header::ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default();
+                if expected.iter().any(|h| hex::encode(h) == etag) {
                     return None; // Success — matched a written version.
                 }
                 return Some(Mismatch {
                     key: composite_key.to_string(),
                     expected_hash: format!("one of {} recorded versions", expected.len()),
-                    actual_hash: hex::encode(actual_hash.as_bytes()),
+                    actual_hash: if etag.is_empty() {
+                        "no ETag on HEAD".to_string()
+                    } else {
+                        etag.to_string()
+                    },
                     node: node_addr,
                 });
             }
