@@ -2372,12 +2372,13 @@ mod tests {
         )
         .expect("write fixture log");
 
-        let matches =
-            grep_logs_in_files(std::slice::from_ref(&log), "seal queue full").expect("grep must succeed");
+        let matches = grep_logs_in_files(std::slice::from_ref(&log), "seal queue full")
+            .expect("grep must succeed");
         assert_eq!(matches.len(), 1);
         assert!(matches[0].contains("seal queue full; seal deferred"));
 
-        let none = grep_logs_in_files(std::slice::from_ref(&log), "BadDigest").expect("grep must succeed");
+        let none =
+            grep_logs_in_files(std::slice::from_ref(&log), "BadDigest").expect("grep must succeed");
         assert!(none.is_empty(), "pattern not present must yield no matches");
     }
 

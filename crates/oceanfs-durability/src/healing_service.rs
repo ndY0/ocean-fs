@@ -221,6 +221,8 @@ impl HealingGrpcService {
                     bucket = %bucket,
                     key = %object_key,
                     size = data.len(),
+                    hlc_wall = meta.hlc.wall_time(),
+                    hlc_logical = meta.hlc.logical(),
                     "applied hinted handoff locally"
                 );
             }
@@ -310,6 +312,8 @@ impl HealingGrpcService {
                 tracing::info!(
                     bucket = %bucket,
                     key = %object_key,
+                    hlc_wall = hlc.wall_time(),
+                    hlc_logical = hlc.logical(),
                     "applied hinted delete locally"
                 );
             }
@@ -939,7 +943,12 @@ impl HealingRpc for HealingGrpcService {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::unnecessary_cast, clippy::useless_conversion)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::unnecessary_cast,
+    clippy::useless_conversion
+)]
 mod tests {
     use std::collections::HashMap;
 

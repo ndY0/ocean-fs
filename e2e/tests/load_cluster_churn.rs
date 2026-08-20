@@ -637,6 +637,29 @@ async fn load_cluster_churn() {
                         snap.counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0),
                         snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0),
                     );
+                    // Ring-view probe (1a): the ring's member set per
+                    // node + the probe-0 successors — catches transient
+                    // ring gaps (a member missing from a peer's ring
+                    // means debt is never created for it).
+                    if let Ok(ring_resp) = target.get(i, "/admin/ring").await {
+                        if let Ok(v) =
+                            e2e::harness::response_json::<serde_json::Value>(ring_resp).await
+                        {
+                            let node_count = v["node_count"].as_u64().unwrap_or(0);
+                            let succ: Vec<String> = v["probes"][0]["successors"]
+                                .as_array()
+                                .map(|a| {
+                                    a.iter()
+                                        .map(|s| s.as_str().unwrap_or("?").to_string())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            eprintln!(
+                                "  ring node {i}: count={node_count} succ={}",
+                                succ.join(",")
+                            );
+                        }
+                    }
                 }
             }
         }

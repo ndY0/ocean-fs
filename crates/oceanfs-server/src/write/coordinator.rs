@@ -932,6 +932,14 @@ impl WriteCoordinator {
                 hlc,
             )
         };
+        debug!(
+            target = %target,
+            bucket = %req.bucket,
+            key = %req.key,
+            hlc_wall = hlc.wall_time(),
+            hlc_logical = hlc.logical(),
+            "enqueue write hint"
+        );
         if let Err(e) = self.hinted_handoff.enqueue(hint).await {
             // A failed enqueue means the debt was NOT recorded anywhere
             // (no WAL entry, no queue entry) — the mutation is lost for
@@ -1570,6 +1578,14 @@ impl WriteCoordinator {
             bucket.clone(),
             key.to_string(),
             hlc,
+        );
+        debug!(
+            target = %target,
+            bucket = %bucket,
+            key = %key,
+            hlc_wall = hlc.wall_time(),
+            hlc_logical = hlc.logical(),
+            "enqueue delete hint"
         );
         if let Err(e) = self.hinted_handoff.enqueue(hint).await {
             // See enqueue_write_hint: a failed enqueue is a LOST delete

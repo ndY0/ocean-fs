@@ -920,84 +920,97 @@ impl<C: LoadTarget> Worker<C> {
                     };
                     let gen_elapsed = gen_start.elapsed(); // kept for debug trace
                     let start = Instant::now(); // HTTP-only latency
-                    match self.cluster.put(node_idx, &path, &body).await {
-                        Ok(resp) => {
-                            let status = resp.status().as_u16();
-                            let _ = resp.bytes().await; // consume body
-                            let latency = start.elapsed();
-                            if debug_trace {
-                                // `total_ms` keeps its original meaning:
-                                // generation + HTTP round-trip.
-                                eprintln!(
-                                    "[worker-{}] PUT {} size={} gen_ms={:.2} total_ms={:.2} status={}",
-                                    self.id,
-                                    key,
-                                    size,
-                                    gen_elapsed.as_secs_f64() * 1e3,
-                                    (gen_elapsed + latency).as_secs_f64() * 1e3,
-                                    status
-                                );
-                            }
-                            if status == 200 {
-                                self.manifest.record(bucket, &key, &body);
-                                // Tier counters count successes, not
-                                // attempts: a 413-rejected PUT never
-                                // exercised that tier's storage path.
-                                self.stats.record_blob_size_tier(size);
-                            }
-                            self.stats.record_put(status, latency);
-                        }
-                        Err(e) => {
-                            if debug_trace {
-                                // `total_ms` keeps its original meaning:
-                                // generation + HTTP round-trip.
-                                eprintln!(
-                                    "[worker-{}] PUT {} size={} gen_ms={:.2} total_ms={:.2} ERR={}",
-                                    self.id,
-                                    key,
-                                    size,
-                                    gen_elapsed.as_secs_f64() * 1e3,
-                                    (gen_elapsed + start.elapsed()).as_secs_f64() * 1e3,
-                                    e
-                                );
-                            }
-                            // Unknown outcome (timeout/reset): the
-                            // server may have completed the write — the
-                            // churn divergence where a version is served
-                            // everywhere yet never recorded (the PUT
-                            // handler logged success; the response was
-                            // lost). RETRY on a different node: the
-                            // retry either lands a fresh recorded version
-                            // (superseding the lost one) or confirms the
-                            // failure. A quorum-failed write is rolled
-                            // back server-side, so a failed retry means
-                            // the version truly does not exist —
-                            // recording it anyway would create phantom
-                            // versions.
-                            let mut recorded = false;
-                            for attempt in 1..=3u32 {
-                                let retry_idx = (node_idx + attempt as usize) % node_count;
-                                if let Ok(retry_resp) =
-                                    self.cluster.put(retry_idx, &path, &body).await
-                                {
-                                    if retry_resp.status() == 200 {
-                                        recorded = true;
-                                        break;
+                                                // Snapshot the key's delete epoch BEFORE the
+                                                // request. A `record_delete` landing while this PUT
+                                                // is in flight means the server stamped the delete's
+                                                // tombstone AFTER our write — LWW makes the delete
+                                                // the winner, so the version is (correctly) gone
+                                                // everywhere. Recording it would re-activate the key
+                                                // in the manifest while the cluster serves 404 — the
+                                                // manifest-truth divergence (hot-3/churn49 face). A
+                                                // changed epoch at ack time triggers a retry: the
+                                                // fresh write is stamped after the delete and wins.
+                    let mut epoch = self.manifest.delete_epoch(bucket, &key);
+                    let mut recorded = false;
+                    let mut first_status: u16 = 0;
+                    for attempt in 0..=3u32 {
+                        let target_idx = (node_idx + attempt as usize) % node_count;
+                        match self.cluster.put(target_idx, &path, &body).await {
+                            Ok(resp) => {
+                                let status = resp.status().as_u16();
+                                let _ = resp.bytes().await; // consume body
+                                if attempt == 0 {
+                                    first_status = status;
+                                    if debug_trace {
+                                        // `total_ms` keeps its original
+                                        // meaning: generation + HTTP
+                                        // round-trip.
+                                        eprintln!(
+                                            "[worker-{}] PUT {} size={} gen_ms={:.2} total_ms={:.2} status={}",
+                                            self.id,
+                                            key,
+                                            size,
+                                            gen_elapsed.as_secs_f64() * 1e3,
+                                            (gen_elapsed + start.elapsed()).as_secs_f64() * 1e3,
+                                            status
+                                        );
                                     }
-                                    // A definitive non-200 (5xx/4xx):
-                                    // keep retrying — a quorum-failed
-                                    // write was rolled back server-side.
                                 }
+                                if status == 200
+                                    && self.manifest.delete_epoch(bucket, &key) == epoch
+                                {
+                                    // Only a definitive 200 with no
+                                    // superseding delete records: a
+                                    // rolled-back write must not leave a
+                                    // phantom version in the manifest.
+                                    self.manifest.record(bucket, &key, &body);
+                                    // Tier counters count successes, not
+                                    // attempts: a 413-rejected PUT never
+                                    // exercised that tier's storage path.
+                                    self.stats.record_blob_size_tier(size);
+                                    recorded = true;
+                                    break;
+                                }
+                                // 5xx/4xx, or a 200 superseded by a
+                                // concurrent delete: keep retrying.
+                                epoch = self.manifest.delete_epoch(bucket, &key);
                             }
-                            if recorded {
-                                // Only a definitive 200 records: a
-                                // rolled-back write must not leave a
-                                // phantom version in the manifest.
-                                self.manifest.record(bucket, &key, &body);
+                            Err(e) => {
+                                if attempt == 0 && debug_trace {
+                                    // `total_ms` keeps its original
+                                    // meaning: generation + HTTP
+                                    // round-trip.
+                                    eprintln!(
+                                        "[worker-{}] PUT {} size={} gen_ms={:.2} total_ms={:.2} ERR={}",
+                                        self.id,
+                                        key,
+                                        size,
+                                        gen_elapsed.as_secs_f64() * 1e3,
+                                        (gen_elapsed + start.elapsed()).as_secs_f64() * 1e3,
+                                        e
+                                    );
+                                }
+                                // Unknown outcome (timeout/reset): the
+                                // server may have completed the write —
+                                // the churn divergence where a version
+                                // is served everywhere yet never recorded
+                                // (the PUT handler logged success; the
+                                // response was lost). RETRY on a
+                                // different node: the retry either lands
+                                // a fresh recorded version (superseding
+                                // the lost one) or confirms the failure.
+                                // A quorum-failed write is rolled back
+                                // server-side, so a failed retry means
+                                // the version truly does not exist —
+                                // recording it anyway would create
+                                // phantom versions.
+                                epoch = self.manifest.delete_epoch(bucket, &key);
                             }
-                            self.stats.record_put(0, start.elapsed());
-                            self.stats.record_error();
                         }
+                    }
+                    self.stats.record_put(first_status, start.elapsed());
+                    if !recorded {
+                        self.stats.record_error();
                     }
                 }
                 Operation::Get => {

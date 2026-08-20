@@ -22,7 +22,7 @@
 
 use std::{
     collections::HashSet,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use dashmap::DashMap;
@@ -54,8 +54,17 @@ use crate::harness::LoadTarget;
 /// # }
 /// ```
 pub struct Manifest {
-    /// Map from `"{bucket}/{key}"` to `(version_hash_set, is_deleted)`.
-    entries: DashMap<String, (HashSet<[u8; 32]>, AtomicBool)>,
+    /// Map from `"{bucket}/{key}"` to
+    /// `(version_hash_set, is_deleted, delete_epoch)`.
+    ///
+    /// `delete_epoch` counts `record_delete` calls since the last
+    /// `record`. The PUT arm snapshots it before issuing the request:
+    /// an epoch change while the write was in flight means a delete's
+    /// tombstone was stamped after this write — LWW makes the delete
+    /// the winner, so recording the version would re-activate a key
+    /// that is (correctly) absent everywhere (the manifest-truth
+    /// divergence class).
+    entries: DashMap<String, (HashSet<[u8; 32]>, AtomicBool, AtomicU64)>,
     /// Total number of keys ever inserted (including deleted ones).
     total_count: AtomicUsize,
 }
@@ -77,10 +86,11 @@ impl Manifest {
         let hash = *blake3::hash(body).as_bytes();
         let mut entry = self.entries.entry(composite_key).or_insert_with(|| {
             self.total_count.fetch_add(1, Ordering::Relaxed);
-            (HashSet::new(), AtomicBool::new(false))
+            (HashSet::new(), AtomicBool::new(false), AtomicU64::new(0))
         });
         entry.0.insert(hash);
         entry.1.store(false, Ordering::Relaxed);
+        entry.2.store(0, Ordering::Relaxed);
     }
 
     /// Marks a key as deleted so that [`verify`](Self::verify) skips it.
@@ -91,7 +101,17 @@ impl Manifest {
         let composite_key = format!("{bucket}/{key}");
         if let Some(entry) = self.entries.get(&composite_key) {
             entry.1.store(true, Ordering::Relaxed);
+            entry.2.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Returns the delete epoch for a key: the number of deletes
+    /// recorded since the last PUT record (0 when never deleted).
+    pub fn delete_epoch(&self, bucket: &str, key: &str) -> u64 {
+        self.entries
+            .get(&format!("{bucket}/{key}"))
+            .map(|e| e.2.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     /// Returns the total number of entries (including deleted ones).
@@ -129,7 +149,7 @@ impl Manifest {
 
         for entry in self.entries.iter() {
             let key = entry.key().clone();
-            let (versions, deleted) = entry.value();
+            let (versions, deleted, _epoch) = entry.value();
             if deleted.load(Ordering::Relaxed) {
                 continue;
             }
@@ -340,7 +360,7 @@ impl Manifest {
                 break;
             }
             let key = entry.key().clone();
-            let (versions, deleted) = entry.value();
+            let (versions, deleted, _epoch) = entry.value();
             if deleted.load(Ordering::Relaxed) {
                 continue;
             }
@@ -542,7 +562,7 @@ mod tests {
 
         let expected = blake3::hash(body);
         let entry = manifest.entries.get("bucket/key1").expect("entry should exist");
-        let (versions, deleted) = entry.value();
+        let (versions, deleted, _epoch) = entry.value();
         assert!(
             versions.contains(expected.as_bytes()),
             "recorded version set must contain the hash"
@@ -596,14 +616,14 @@ mod tests {
         // Verify each deleted key is flagged.
         for i in 0..30 {
             let entry = manifest.entries.get(&format!("bucket/key{i}")).expect("entry exists");
-            let (_hash, deleted) = entry.value();
+            let (_hash, deleted, _epoch) = entry.value();
             assert!(deleted.load(Ordering::Relaxed), "key key{i} should be deleted");
         }
 
         // Verify active keys are NOT flagged.
         for i in 30..100 {
             let entry = manifest.entries.get(&format!("bucket/key{i}")).expect("entry exists");
-            let (_hash, deleted) = entry.value();
+            let (_hash, deleted, _epoch) = entry.value();
             assert!(!deleted.load(Ordering::Relaxed), "key key{i} should be active");
         }
     }

@@ -490,7 +490,12 @@ impl HintRecord {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::unnecessary_cast, clippy::useless_conversion)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::unnecessary_cast,
+    clippy::useless_conversion
+)]
 mod tests {
     use oceanfs_core::{BucketId, SegmentId};
     use tempfile::tempdir;
