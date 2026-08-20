@@ -512,7 +512,10 @@ impl NodeProcess {
         };
 
         // ---- 6. Wait for health endpoint ----
-        node.wait_for_health(Duration::from_secs(30)).await?;
+        // 60s: a restart under heavy load (the churn test's hint-debt
+        // replay + drain) can take longer than 30s to become healthy —
+        // a tight wait produced one flaky churn-restart failure.
+        node.wait_for_health(Duration::from_secs(60)).await?;
 
         Ok(node)
     }
