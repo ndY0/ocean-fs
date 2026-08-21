@@ -450,6 +450,43 @@ mod tests {
         assert!(found, "expected DEAD event for target-node after suspicion timeout");
     }
 
+    /// The stale-suspicion cancellation (fleet churn fix): a suspicion
+    /// timer started at incarnation 4 must NOT declare DEAD when the
+    /// node has since re-announced (rejoined) at incarnation 5 — the
+    /// fresh Alive supersedes the pending suspicion.
+    #[test]
+    fn stale_suspicion_cancelled_when_node_reannounced_at_higher_incarnation() {
+        let (mut detector, _cmd_tx, mut event_rx) = make_detector();
+        let target = NodeId::new("target-node");
+        // The node was killed (suspicion started at inc 4) and has
+        // since rejoined at inc 5 — the detector's synced view.
+        detector.alive_nodes = vec![(
+            target.clone(),
+            NodeState::Alive,
+            "127.0.0.1:9000".parse().unwrap(),
+            Incarnation::new(5),
+        )];
+        // Pending suspicion with the STALE incarnation 4, expired.
+        let past = std::time::Instant::now().checked_sub(Duration::from_millis(200)).unwrap();
+        detector.suspicion_timers.insert(target.clone(), (Incarnation::new(4), past));
+
+        suspicion::check_suspicion_timers(&mut detector);
+
+        // No DEAD event, no SUSPECT→ALIVE-revert: the timer is gone
+        // and the recovery event fired (SUSPECT → ALIVE).
+        assert!(
+            !detector.suspicion_timers.contains_key(&target),
+            "stale suspicion timer must be cancelled"
+        );
+        let mut saw_dead = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if event.node_id == target && event.new_state == NodeState::Dead {
+                saw_dead = true;
+            }
+        }
+        assert!(!saw_dead, "stale suspicion must not declare DEAD after a rejoin");
+    }
+
     #[test]
     fn incarnation_for_returns_incarnation_when_node_in_alive_list() {
         let (mut detector, _cmd_tx, _event_rx) = make_detector();

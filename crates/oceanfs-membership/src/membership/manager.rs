@@ -627,6 +627,28 @@ impl Membership {
             return;
         }
 
+        // A Suspect/Dead downgrade at an incarnation BELOW the
+        // recorded one is stale: the node re-announced (rejoined) at a
+        // higher incarnation after the suspicion started (the failure
+        // detector fires its suspicion timer with the OLD incarnation —
+        // see failure_detector/suspicion.rs). Applying the downgrade
+        // would record Dead at the max incarnation and strand the
+        // rejoined node: F1d then rejects its equal-incarnation
+        // re-announcements forever (fleet churn: node-1 stuck Dead(5)
+        // after a successful rejoin).
+        if matches!(state, NodeState::Suspect | NodeState::Dead)
+            && recorded.is_some_and(|last| incarnation < last)
+        {
+            trace!(
+                node_id = %node_id,
+                incoming = incarnation.value(),
+                recorded = recorded.map(|i| i.value()).unwrap_or(0),
+                "upsert_node: rejecting stale Suspect/Dead below recorded incarnation"
+            );
+            drop(inner);
+            return;
+        }
+
         // Incarnation must never regress below the recorded value (T8).
         let effective_incarnation = recorded.map_or(incarnation, |last| last.max(incarnation));
 
@@ -866,6 +888,48 @@ mod tests {
             Some("127.0.0.1:9100".parse().unwrap()),
         );
         assert_eq!(m.state_of(&NodeId::new("victim")), Some(NodeState::Dead));
+    }
+
+    /// Stale-downgrade guard (fleet churn fix): a Suspect/Dead
+    /// transition at an incarnation BELOW the recorded one is stale —
+    /// the node re-announced (rejoined) at a higher incarnation while
+    /// the suspicion was pending. Applying the downgrade would record
+    /// Dead at the max incarnation and F1d would then reject the
+    /// rejoined node's equal-incarnation re-announcements forever
+    /// (node-1 stuck Dead(5) after a successful rejoin in the fleet
+    /// churn run). The fresh Alive must not be regressed.
+    #[test]
+    fn upsert_rejects_stale_suspect_or_dead_below_recorded_incarnation() {
+        let (_ring, m) = make_membership("observer");
+
+        // The node rejoined: Alive at incarnation 5 (accepted over the
+        // retained Dead(4)).
+        m.upsert_node(
+            NodeId::new("rejoiner"),
+            NodeState::Alive,
+            Incarnation::new(5),
+            Some("127.0.0.1:9100".parse().unwrap()),
+        );
+        assert_eq!(m.state_of(&NodeId::new("rejoiner")), Some(NodeState::Alive));
+
+        // The stale suspicion (started at inc 4 while the node was
+        // down) fires DEAD at incarnation 4 — must be rejected: the
+        // recorded incarnation (5) is higher.
+        m.upsert_node(NodeId::new("rejoiner"), NodeState::Dead, Incarnation::new(4), None);
+        assert_eq!(
+            m.state_of(&NodeId::new("rejoiner")),
+            Some(NodeState::Alive),
+            "stale Dead at incarnation below recorded must not regress the rejoin"
+        );
+
+        // Same for a stale Suspect.
+        m.upsert_node(NodeId::new("rejoiner"), NodeState::Suspect, Incarnation::new(4), None);
+        assert_eq!(m.state_of(&NodeId::new("rejoiner")), Some(NodeState::Alive));
+
+        // A Dead at the CURRENT incarnation is still legitimate (the
+        // node died at inc 5 without rejoining).
+        m.upsert_node(NodeId::new("rejoiner"), NodeState::Dead, Incarnation::new(5), None);
+        assert_eq!(m.state_of(&NodeId::new("rejoiner")), Some(NodeState::Dead));
     }
 
     /// ADR-0022 Decision 2: a self-rejoin announcing a strictly higher

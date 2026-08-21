@@ -63,6 +63,34 @@ pub(crate) fn check_suspicion_timers(detector: &mut FailureDetector) {
     }
 
     for node_id in expired {
+        let timer = detector.suspicion_timers.get(&node_id).copied();
+
+        // The node may have re-announced (rejoined) at a HIGHER
+        // incarnation while the suspicion was pending (the kill +
+        // restart window: the announcement lands before the suspicion
+        // timer expires). Declaring DEAD with the stale timer
+        // incarnation would revert the fresh Alive — the membership
+        // manager's effective-incarnation rule then records Dead at
+        // the NEW incarnation and F1d rejects every equal-incarnation
+        // re-announcement, stranding the rejoined node forever (the
+        // fleet churn convergence failure: node-1 stuck Dead(5) after
+        // a successful rejoin). The fresh Alive supersedes the stale
+        // suspicion — cancel instead.
+        if let (Some((timer_inc, _)), Some(current_inc)) =
+            (timer, detector.incarnation_for(&node_id))
+        {
+            if current_inc > timer_inc {
+                trace!(
+                    node_id = %node_id,
+                    timer_inc = timer_inc.value(),
+                    current_inc = current_inc.value(),
+                    "cancelling stale suspicion: node re-announced at higher incarnation"
+                );
+                detector.recover_suspect(&node_id);
+                continue;
+            }
+        }
+
         let timer = detector.suspicion_timers.remove(&node_id);
 
         // F1c: a Dead node must leave the probe set immediately — the
