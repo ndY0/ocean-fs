@@ -22,7 +22,7 @@
 #              + Harness=CX43 (8 vCPU, 16 GB, 80 GB) per ADR-0026. Nodes are
 #              named ${prefix}-sut-0..N-1; node 0 is the bootstrap and hosts
 #              Prometheus scraping every node. No port juggling: every node
-#              listens on :9000/:9001; nodes differ by internal IP.
+#              listens on :9000/:9001/:9002; nodes differ by internal IP.
 #   Phase 5+: N/A (separate provisioning model)
 #
 # Guardrails (four-layer defense per ADR-0019, retained by ADR-0026):
@@ -36,7 +36,7 @@
 #   Layer 3 — Auto-shutdown TTL: systemd timer on each VM (default 4h)
 #   Layer 4 — Budget gate: scaffolding (deferrable/v2)
 # Security: Hetzner VMs ship with NO firewall — managed firewalls are
-#   created and applied by default (SUT nodes: SSH + internal-net 9000/9001;
+#   created and applied by default (SUT nodes: SSH + internal-net 9000/9001/9002;
 #   Harness: SSH only). Disable with --no-firewall (not recommended).
 #
 # Requirements:
@@ -450,7 +450,8 @@ create_network() {
 # Firewall helpers
 #
 # Hetzner VMs have NO firewall by default — every port is world-exposed.
-# The SUT's OceanFS API (:9000) and gRPC (:9001) must only be reachable
+# The SUT's OceanFS API (:9000), gRPC data plane (:9001), and the
+# membership plane (:9002, ADR-0028) must only be reachable
 # from the internal test network; Prometheus (:9090) is reached via an
 # SSH tunnel only and stays closed. Managed firewalls are applied right
 # after each VM is created, BEFORE the config steps (SSH must stay open).
@@ -466,6 +467,7 @@ sut_rules_json() {
   {"direction": "in", "protocol": "tcp", "port": "22", "source_ips": ["${SSH_SOURCE_IP}", "${NETWORK_CIDR}", "::/0"]},
   {"direction": "in", "protocol": "tcp", "port": "9000", "source_ips": ["${NETWORK_CIDR}"]},
   {"direction": "in", "protocol": "tcp", "port": "9001", "source_ips": ["${NETWORK_CIDR}"]},
+  {"direction": "in", "protocol": "tcp", "port": "9002", "source_ips": ["${NETWORK_CIDR}"]},
   {"direction": "in", "protocol": "icmp", "source_ips": ["0.0.0.0/0", "::/0"]}
 ]
 EOF

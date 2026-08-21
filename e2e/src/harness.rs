@@ -70,43 +70,56 @@ fn bind_random_port() -> Result<SocketAddr, Error> {
     Ok(addr)
 }
 
-/// Saves the assigned HTTP and gRPC ports to a TOML file so a
-/// subsequent restart can reuse the same ports.
-fn save_ports(ports_file: &Path, http_port: u16, grpc_port: u16) -> Result<(), Error> {
-    let content = format!("http_port = {http_port}\ngrpc_port = {grpc_port}\n");
+/// Saves the assigned HTTP, gRPC, and membership-plane ports to a TOML
+/// file so a subsequent restart can reuse the same ports.
+fn save_ports(
+    ports_file: &Path,
+    http_port: u16,
+    grpc_port: u16,
+    membership_port: u16,
+) -> Result<(), Error> {
+    let content = format!(
+        "http_port = {http_port}\ngrpc_port = {grpc_port}\nmembership_port = {membership_port}\n"
+    );
     fs::write(ports_file, content).map_err(Error::ConfigWrite)?;
     Ok(())
 }
 
 /// Attempts to restore previously-saved ports from the port file.
 ///
-/// Returns `Some((http, grpc))` on success, or `None` if the file is
-/// missing or corrupt.
-fn restore_ports(ports_file: &Path) -> Option<(u16, u16)> {
+/// Returns `Some((http, grpc, membership))` on success, or `None` if the
+/// file is missing or corrupt.
+fn restore_ports(ports_file: &Path) -> Option<(u16, u16, u16)> {
     let content = fs::read_to_string(ports_file).ok()?;
     let http = content
         .lines()
         .find(|l| l.starts_with("http_port"))
         .and_then(|l| l.split('=').nth(1))
-        .and_then(|v| v.trim().parse().ok())?;
+        .and_then(|v| v.trim().parse::<u16>().ok())?;
     let grpc = content
         .lines()
         .find(|l| l.starts_with("grpc_port"))
         .and_then(|l| l.split('=').nth(1))
-        .and_then(|v| v.trim().parse().ok())?;
-    Some((http, grpc))
+        .and_then(|v| v.trim().parse::<u16>().ok())?;
+    let membership = content
+        .lines()
+        .find(|l| l.starts_with("membership_port"))
+        .and_then(|l| l.split('=').nth(1))
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .unwrap_or(grpc.saturating_add(1));
+    Some((http, grpc, membership))
 }
 
-/// Acquires the HTTP and gRPC ports for a node.
+/// Acquires the HTTP, gRPC, and membership-plane ports for a node.
 ///
-/// On first spawn (`ports_file` does not exist) two random ephemeral
+/// On first spawn (`ports_file` does not exist) three random ephemeral
 /// ports are bound, then saved. On restart (`ports_file` exists) the
 /// saved ports are reused if available; if they have been taken by
 /// another process the function falls back to random ports and
 /// overwrites the file.
-fn bind_ports(ports_file: &Path) -> Result<(SocketAddr, SocketAddr), Error> {
+fn bind_ports(ports_file: &Path) -> Result<(SocketAddr, SocketAddr, SocketAddr), Error> {
     // Try to restore ports from a previous run.
-    if let Some((http_port, grpc_port)) = restore_ports(ports_file) {
+    if let Some((http_port, grpc_port, membership_port)) = restore_ports(ports_file) {
         // Try to bind to the saved HTTP port.
         let http_addr = match TcpListener::bind(format!("127.0.0.1:{http_port}"))
             .map_err(Error::PortDiscovery)
@@ -142,16 +155,31 @@ fn bind_ports(ports_file: &Path) -> Result<(SocketAddr, SocketAddr), Error> {
             bind_random_port()?
         };
 
+        // Membership-plane port: independent of the others (the plane
+        // is a separate listener, ADR-0028 D1). Restored if free,
+        // otherwise random.
+        let membership_addr = match TcpListener::bind(format!("127.0.0.1:{membership_port}"))
+            .map_err(Error::PortDiscovery)
+        {
+            Ok(listener) => {
+                let addr = listener.local_addr().map_err(Error::PortDiscovery)?;
+                drop(listener);
+                addr
+            }
+            Err(_) => bind_random_port()?,
+        };
+
         // Always save the actual ports used (may differ from saved values).
-        save_ports(ports_file, http_addr.port(), grpc_addr.port())?;
-        return Ok((http_addr, grpc_addr));
+        save_ports(ports_file, http_addr.port(), grpc_addr.port(), membership_addr.port())?;
+        return Ok((http_addr, grpc_addr, membership_addr));
     }
 
     // First spawn: bind random ports and save them.
     let http_addr = bind_random_port()?;
     let grpc_addr = bind_random_port()?;
-    save_ports(ports_file, http_addr.port(), grpc_addr.port())?;
-    Ok((http_addr, grpc_addr))
+    let membership_addr = bind_random_port()?;
+    save_ports(ports_file, http_addr.port(), grpc_addr.port(), membership_addr.port())?;
+    Ok((http_addr, grpc_addr, membership_addr))
 }
 
 // ---------------------------------------------------------------------------
@@ -420,12 +448,13 @@ impl NodeProcess {
 
         // ---- 2. Discover / restore ports ----
         let ports_file = data_dir.join(PORTS_FILE_NAME);
-        let (http_addr, grpc_addr) = bind_ports(&ports_file)?;
+        let (http_addr, grpc_addr, membership_addr) = bind_ports(&ports_file)?;
 
         // ---- 3. Build config with resolved ports ----
         let resolved_config = config_toml
             .replace("{http_port}", &http_addr.port().to_string())
-            .replace("{grpc_port}", &grpc_addr.port().to_string());
+            .replace("{grpc_port}", &grpc_addr.port().to_string())
+            .replace("{membership_port}", &membership_addr.port().to_string());
 
         let full_config = format!(
             "data_dir = \"{data_dir_path}\"\n{resolved_config}",
@@ -974,6 +1003,7 @@ pub fn config_standard() -> String {
 node_id = "e2e-standard"
 listen_addr = "127.0.0.1:{http_port}"
 grpc_listen_addr = "127.0.0.1:{grpc_port}"
+membership_listen_addr = "127.0.0.1:{membership_port}"
 log_level = "error"
 prefetch_enabled = false
 max_body_size = 16777216   # 16 MiB — matches BlobSizeDist MULTI_MAX
@@ -989,6 +1019,7 @@ pub fn config_prefetch_enabled() -> String {
 node_id = "e2e-prefetch"
 listen_addr = "127.0.0.1:{http_port}"
 grpc_listen_addr = "127.0.0.1:{grpc_port}"
+membership_listen_addr = "127.0.0.1:{membership_port}"
 log_level = "error"
 prefetch_enabled = true
 "#
@@ -1006,6 +1037,7 @@ pub fn config_short_gc() -> String {
 node_id = "e2e-gc"
 listen_addr = "127.0.0.1:{http_port}"
 grpc_listen_addr = "127.0.0.1:{grpc_port}"
+membership_listen_addr = "127.0.0.1:{membership_port}"
 log_level = "error"
 prefetch_enabled = false
 gc_interval_sec = 10
@@ -1023,6 +1055,7 @@ pub fn config_short_ae() -> String {
 node_id = "e2e-ae"
 listen_addr = "127.0.0.1:{http_port}"
 grpc_listen_addr = "127.0.0.1:{grpc_port}"
+membership_listen_addr = "127.0.0.1:{membership_port}"
 log_level = "error"
 prefetch_enabled = false
 ae_interval_sec = 10
@@ -1040,6 +1073,7 @@ pub fn config_short_scrub() -> String {
 node_id = "e2e-scrub"
 listen_addr = "127.0.0.1:{http_port}"
 grpc_listen_addr = "127.0.0.1:{grpc_port}"
+membership_listen_addr = "127.0.0.1:{membership_port}"
 log_level = "error"
 prefetch_enabled = false
 scrub_interval_sec = 60
@@ -1067,6 +1101,7 @@ pub fn config_sustained() -> String {
 node_id = "e2e-sustained"
 listen_addr = "127.0.0.1:{http_port}"
 grpc_listen_addr = "127.0.0.1:{grpc_port}"
+membership_listen_addr = "127.0.0.1:{membership_port}"
 log_level = "error"
 prefetch_enabled = false
 max_body_size = 16777216   # 16 MiB — matches BlobSizeDist MULTI_MAX
@@ -1095,6 +1130,7 @@ pub fn config_3node_w2_r2() -> String {
 node_id = "e2e-c3n-0"
 listen_addr = "127.0.0.1:{http_port}"
 grpc_listen_addr = "127.0.0.1:{grpc_port}"
+membership_listen_addr = "127.0.0.1:{membership_port}"
 log_level = "warn"
 prefetch_enabled = false
 write_quorum = 2
@@ -1116,6 +1152,7 @@ pub fn config_fast_gossip() -> String {
 node_id = "e2e-gossip-0"
 listen_addr = "127.0.0.1:{http_port}"
 grpc_listen_addr = "127.0.0.1:{grpc_port}"
+membership_listen_addr = "127.0.0.1:{membership_port}"
 log_level = "error"
 prefetch_enabled = false
 
@@ -1134,6 +1171,7 @@ pub fn config_fast_swim() -> String {
 node_id = "e2e-swim-0"
 listen_addr = "127.0.0.1:{http_port}"
 grpc_listen_addr = "127.0.0.1:{grpc_port}"
+membership_listen_addr = "127.0.0.1:{membership_port}"
 log_level = "error"
 prefetch_enabled = false
 
@@ -1154,6 +1192,7 @@ pub fn config_fast_ae() -> String {
 node_id = "e2e-ae-0"
 listen_addr = "127.0.0.1:{http_port}"
 grpc_listen_addr = "127.0.0.1:{grpc_port}"
+membership_listen_addr = "127.0.0.1:{membership_port}"
 log_level = "error"
 prefetch_enabled = false
 ae_interval_sec = 10
@@ -1174,6 +1213,7 @@ pub fn config_cluster_churn() -> String {
 node_id = "e2e-churn-0"
 listen_addr = "127.0.0.1:{http_port}"
 grpc_listen_addr = "127.0.0.1:{grpc_port}"
+membership_listen_addr = "127.0.0.1:{membership_port}"
 log_level = "error"
 prefetch_enabled = false
 write_quorum = 2
@@ -1604,7 +1644,7 @@ impl Cluster {
                     None => {
                         let ports_file = self._temp_dir.path().join("node-0").join(PORTS_FILE_NAME);
                         restore_ports(&ports_file)
-                            .map(|(_, grpc_port)| format!("127.0.0.1:{grpc_port}"))
+                            .map(|(_, grpc_port, _)| format!("127.0.0.1:{grpc_port}"))
                             .unwrap_or_default()
                     }
                 }
@@ -2019,14 +2059,30 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let ports_file = dir.path().join(PORTS_FILE_NAME);
 
-        // Save known ports.
-        save_ports(&ports_file, 12345, 12346).expect("save");
+        // Save known ports (http, grpc, membership).
+        save_ports(&ports_file, 12345, 12346, 12347).expect("save");
         assert!(ports_file.exists(), "port file must exist after save");
 
         // Restore.
-        let (http, grpc) = restore_ports(&ports_file).expect("restore");
+        let (http, grpc, membership) = restore_ports(&ports_file).expect("restore");
         assert_eq!(http, 12345);
         assert_eq!(grpc, 12346);
+        assert_eq!(membership, 12347);
+    }
+
+    /// ADR-0028 D1: a port file written before the membership plane
+    /// existed (no membership_port line) must still restore, deriving
+    /// the membership port from the gRPC port.
+    #[test]
+    fn restore_ports_without_membership_line_falls_back() {
+        let dir = TempDir::new().expect("temp dir");
+        let ports_file = dir.path().join(PORTS_FILE_NAME);
+        fs::write(&ports_file, "http_port = 20001\ngrpc_port = 20002\n").expect("write");
+
+        let (http, grpc, membership) = restore_ports(&ports_file).expect("restore");
+        assert_eq!(http, 20001);
+        assert_eq!(grpc, 20002);
+        assert_eq!(membership, 20003, "membership port falls back to grpc + 1");
     }
 
     #[test]
@@ -2042,10 +2098,12 @@ mod tests {
         let ports_file = dir.path().join(PORTS_FILE_NAME);
 
         assert!(!ports_file.exists(), "no port file before first spawn");
-        let (http, grpc) = bind_ports(&ports_file).expect("bind");
+        let (http, grpc, membership) = bind_ports(&ports_file).expect("bind");
         assert!(ports_file.exists(), "port file must exist after first spawn");
         assert_ne!(http.port(), 0, "HTTP port must be non-zero");
         assert_ne!(grpc.port(), 0, "gRPC port must be non-zero");
+        assert_ne!(membership.port(), 0, "membership port must be non-zero");
+        assert_ne!(grpc.port(), membership.port(), "membership plane port must differ from gRPC");
     }
 
     #[test]
@@ -2054,11 +2112,14 @@ mod tests {
         let ports_file = dir.path().join(PORTS_FILE_NAME);
 
         // First spawn: write ports.
-        let (first_http, first_grpc) = bind_ports(&ports_file).expect("first bind");
+        let (first_http, first_grpc, first_membership) =
+            bind_ports(&ports_file).expect("first bind");
         assert_ne!(first_http.port(), first_grpc.port(), "ports must differ");
+        assert_ne!(first_grpc.port(), first_membership.port(), "planes must differ");
 
         // Restart: should reuse the same ports.
-        let (second_http, second_grpc) = bind_ports(&ports_file).expect("second bind");
+        let (second_http, second_grpc, second_membership) =
+            bind_ports(&ports_file).expect("second bind");
         assert_eq!(
             first_http.port(),
             second_http.port(),
@@ -2069,6 +2130,11 @@ mod tests {
             second_grpc.port(),
             "gRPC port must be preserved across restart"
         );
+        assert_eq!(
+            first_membership.port(),
+            second_membership.port(),
+            "membership port must be preserved across restart"
+        );
     }
 
     #[test]
@@ -2077,7 +2143,8 @@ mod tests {
         let ports_file = dir.path().join(PORTS_FILE_NAME);
 
         // First spawn.
-        let (first_http, first_grpc) = bind_ports(&ports_file).expect("first bind");
+        let (first_http, first_grpc, _first_membership) =
+            bind_ports(&ports_file).expect("first bind");
 
         // Hold the HTTP port so the restart cannot bind to it.
         let _holder =
@@ -2085,7 +2152,7 @@ mod tests {
 
         // Restart: HTTP port is taken — falls back to random, but
         // must still succeed.
-        let (second_http, second_grpc) =
+        let (second_http, second_grpc, _second_membership) =
             bind_ports(&ports_file).expect("second bind with fallback");
         assert_ne!(
             second_http.port(),

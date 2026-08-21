@@ -35,6 +35,14 @@ impl Membership {
         self.state.read().nodes.get(node_id).map(|(state, _, _)| *state)
     }
 
+    /// Returns the recorded incarnation of a specific node.
+    ///
+    /// Used by the SWIM probe service to answer direct probes with the
+    /// target's current incarnation (ADR-0028 D2).
+    pub fn incarnation_of(&self, node_id: &NodeId) -> Option<Incarnation> {
+        self.state.read().nodes.get(node_id).map(|(_, incarnation, _)| *incarnation)
+    }
+
     /// Returns the network address of a specific node.
     pub fn address_of(&self, node_id: &NodeId) -> Option<SocketAddr> {
         self.state.read().nodes.get(node_id).map(|(_, _, addr)| *addr)

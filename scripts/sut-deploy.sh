@@ -18,8 +18,8 @@
 #     Deploys to every node. Node 0 is the bootstrap (no seed_nodes);
 #     nodes 1..N-1 get [gossip] seed_nodes = ["<node0>:9001"] and the
 #     phase-3 fast-gossip profile (1s gossip, 3s suspicion, 8s failure).
-#     Every node listens on :9000/:9001 — nodes differ by IP, no port
-#     juggling. node_id = oceanfs-node-{i} per node.
+#     Every node listens on :9000/:9001/:9002 — nodes differ by IP, no port
+#     juggling (9002 = membership plane, ADR-0028). node_id = oceanfs-node-{i} per node.
 #
 # Usage:
 #   ./scripts/sut-deploy.sh --sut root@10.0.0.5 [OPTIONS]
@@ -185,6 +185,9 @@ listen_addr = "0.0.0.0:${PORT}"
 # (peers dial it directly): 0.0.0.0 here made every node dial ITSELF
 # and gossip never converged past the seed path.
 grpc_listen_addr = "${NODE_IP}:$((${PORT} + 1))"
+# ADR-0028 D1: the membership plane (gossip + SWIM probes) listens on
+# its own port (9002 for PORT=9000), isolated from the data plane.
+membership_listen_addr = "${NODE_IP}:$((${PORT} + 2))"
 data_dir = "${DATA_DIR}"
 log_level = "info"
 # ── CX33 (8 GB RAM) — generous memory profile ──────────────────────────────

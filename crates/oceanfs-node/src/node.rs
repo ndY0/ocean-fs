@@ -484,10 +484,26 @@ impl Node {
             .grpc_listen_addr
             .parse()
             .map_err(|e| format!("invalid grpc_listen_addr: {e}"))?;
+        // ADR-0028 D1: the announced membership address is the membership
+        // plane's listen address with the data-plane's advertised IP
+        // substituted for 0.0.0.0 (the gRPC address is already the
+        // reachable IP — the deploy scripts write the node's IP there).
+        let membership_addr: SocketAddr = config
+            .membership_listen_addr
+            .parse()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 9002)));
+        let membership_announce_addr = if membership_addr.ip().is_unspecified() {
+            oceanfs_membership::plane::membership_address(
+                &config.membership_listen_addr,
+                Some(&grpc_addr.ip().to_string()),
+            )
+        } else {
+            membership_addr
+        };
         let gossip_config = config.gossip.clone();
         let membership = Arc::new(oceanfs_membership::Membership::new(
             NodeId::new(&config.node_id),
-            grpc_addr,
+            membership_announce_addr,
             gossip_config,
             ring_cache.clone(),
         ));
@@ -522,12 +538,19 @@ impl Node {
             "rejoin state loaded: announcing with bumped incarnation"
         );
 
-        // ---- 5. Construct connection pool ----
+        // ---- 5. Construct connection pools ----
         let rpc_config = RpcConfig::default();
         let quickack = rpc_config.quickack;
         let busy_poll = rpc_config.busy_poll_us;
+        // ADR-0028 D1: the membership plane has its own dedicated pool
+        // (per-peer 2, probe-derived timeouts) so probe/gossip latency is
+        // never coupled to the data plane's channel semaphore.
+        let membership_pool = oceanfs_membership::plane::membership_pool(
+            config.gossip.failure_timeout_ms / 3,
+            rpc_config.tls_cert_path.clone(),
+        );
         let pool = Arc::new(oceanfs_network::ConnectionPool::new(rpc_config));
-        membership.set_pool(pool.clone());
+        membership.set_pool(membership_pool.clone());
 
         // ---- 6. Construct storage components ----
         let segment_size = SegmentSizeConfig::default();
@@ -1448,8 +1471,17 @@ impl Node {
         // never see the receiver's .dat files (the fleet disk-fill
         // root cause).
         .with_lifecycle(lifecycle.clone());
+        // ADR-0028 D1: the membership services (gossip + probe) move to
+        // the membership plane — the data-plane server below hosts only
+        // Segment/Healing/Cache/Scrub.
         let gossip_service =
             oceanfs_membership::grpc::gossip_service::GossipGrpcService::new(membership.clone());
+        let probe_service = oceanfs_membership::grpc::probe_service::ProbeGrpcService::new(
+            NodeId::new(&config.node_id),
+            membership.clone(),
+            membership_pool.clone(),
+            config.gossip.failure_timeout_ms / 3,
+        );
 
         let healing_service = oceanfs_durability::healing_service::HealingGrpcService::new(
             hinted_handoff.clone(),
@@ -1507,7 +1539,6 @@ impl Node {
                 oceanfs_storage::SegmentRpcServer::new(segment_service)
                     .max_decoding_message_size(64 * 1024 * 1024),
             )
-            .add_service(oceanfs_network::GossipRpcServer::new(gossip_service))
             .add_service(
                 oceanfs_durability::HealingRpcServer::new(healing_service)
                     .max_decoding_message_size(64 * 1024 * 1024),
@@ -1546,7 +1577,35 @@ impl Node {
             }
         });
 
-        // ---- 15a. Bootstrap membership: start failure detection +
+        // ---- 15b. Bind the membership plane (ADR-0028 D1) ----
+        // A separate listener on membership_listen_addr hosting ONLY the
+        // membership services: GossipRpc (push/pull) + ProbeRpc (SWIM).
+        // Isolation from the data plane is the point — probe latency must
+        // not inherit the data plane's tail (16 MiB streams, hint
+        // batches). Bound BEFORE membership.start(): peers probe and
+        // push to this listener immediately after the join announcement.
+        let membership_router = tonic::transport::Server::builder()
+            .add_service(oceanfs_network::GossipRpcServer::new(gossip_service))
+            .add_service(oceanfs_network::gossip::probe_rpc_server::ProbeRpcServer::new(
+                probe_service,
+            ));
+
+        let membership_listener = tokio::net::TcpListener::bind(membership_addr)
+            .await
+            .map_err(|e| format!("failed to bind membership plane on {membership_addr}: {e}"))?;
+
+        tokio::spawn(async move {
+            if let Err(e) = membership_router
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                    membership_listener,
+                ))
+                .await
+            {
+                error!("membership plane server error: {e}");
+            }
+        });
+
+        // ---- 15c. Bootstrap membership: start failure detection +
         // gossip, then join the ring. MUST happen after the gRPC server
         // is bound: peers probe and deliver hinted handoffs to our gRPC
         // listener immediately after the join announcement, and a join
@@ -2281,6 +2340,9 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             listen_addr: "127.0.0.1:0".into(),
             grpc_listen_addr: "127.0.0.1:0".into(),
+            // Ephemeral membership plane port — the default 0.0.0.0:9002
+            // conflicts across parallel test nodes (ADR-0028 D1).
+            membership_listen_addr: "127.0.0.1:0".into(),
             // The event WAL lives under the temp data dir (the default
             // /var/lib/oceanfs/event-wal is not writable in tests).
             event_wal: oceanfs_core::EventWalConfig {
