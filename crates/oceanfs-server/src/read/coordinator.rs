@@ -2223,6 +2223,7 @@ mod tests {
         let membership = Arc::new(Membership::new(
             NodeId::new("n1"),
             "127.0.0.1:9000".parse().unwrap(),
+            "127.0.0.1:9000".parse().unwrap(),
             gossip_cfg,
             ring_cache.clone(),
         ));
@@ -2303,6 +2304,7 @@ mod tests {
         let membership = Arc::new(Membership::new(
             NodeId::new("n1"),
             "127.0.0.1:9000".parse().unwrap(),
+            "127.0.0.1:9000".parse().unwrap(),
             oceanfs_core::GossipConfig::default(),
             ring_cache.clone(),
         ));
@@ -2348,6 +2350,7 @@ mod tests {
 
         let membership = Arc::new(Membership::new(
             NodeId::new("n1"),
+            "127.0.0.1:9000".parse().unwrap(),
             "127.0.0.1:9000".parse().unwrap(),
             oceanfs_core::GossipConfig::default(),
             ring_cache.clone(),
@@ -2403,6 +2406,7 @@ mod tests {
 
         let membership = Arc::new(Membership::new(
             NodeId::new("n1"),
+            "127.0.0.1:9000".parse().unwrap(),
             "127.0.0.1:9000".parse().unwrap(),
             oceanfs_core::GossipConfig::default(),
             ring_cache.clone(),

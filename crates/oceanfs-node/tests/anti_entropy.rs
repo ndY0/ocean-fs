@@ -33,6 +33,7 @@ fn make_membership(node_id: &str) -> (Arc<Membership>, Arc<RingCache>) {
     let membership = Arc::new(Membership::new(
         NodeId::new(node_id),
         addr,
+        addr,
         oceanfs_core::GossipConfig::default(),
         ring_cache.clone(),
     ));

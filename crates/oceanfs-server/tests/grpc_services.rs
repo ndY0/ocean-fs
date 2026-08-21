@@ -60,7 +60,7 @@ fn make_membership(node_id: &str) -> Arc<Membership> {
     ring.add_node(NodeId::new(node_id));
     let ring_cache = Arc::new(RingCache::new(ring));
     let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-    Arc::new(Membership::new(NodeId::new(node_id), addr, GossipConfig::default(), ring_cache))
+    Arc::new(Membership::new(NodeId::new(node_id), addr, addr, GossipConfig::default(), ring_cache))
 }
 
 /// Structure holding a running segment server + its data store, supporting
@@ -243,6 +243,7 @@ async fn gossip_push_then_pull_converges_membership() {
         last_seen: None,
         version: 0,
         origin: String::new(),
+        grpc_address: "127.0.0.1:9001".to_string(),
     };
 
     let msg = GossipMessage {
@@ -589,7 +590,7 @@ async fn swim_death_detection_within_timeout() {
     let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
 
     let membership =
-        Arc::new(Membership::new(NodeId::new("detector-node"), addr, config, ring_cache));
+        Arc::new(Membership::new(NodeId::new("detector-node"), addr, addr, config, ring_cache));
 
     let mut event_rx = membership.subscribe();
 

@@ -49,6 +49,9 @@ pub struct MembershipEvent {
     pub version: u64,
     /// The observer that emitted this event.
     pub origin: NodeId,
+    /// The node's membership plane address, when the emitter knows it
+    /// (ADR-0028 D1) — distinct from `address` (the data plane).
+    pub membership_address: Option<SocketAddr>,
 }
 
 /// The authority-class table (ADR-0028 D3).
@@ -148,8 +151,14 @@ pub(crate) fn authority_class(
 pub struct Membership {
     /// This node's identifier.
     pub(crate) node_id: NodeId,
-    /// This node's gRPC address.
+    /// This node's membership plane address (gossip + probes,
+    /// ADR-0028 D1) — what the node announces and peers dial for the
+    /// protocol.
     pub(crate) address: SocketAddr,
+    /// This node's data-plane gRPC address (replication, hints,
+    /// healing) — announced alongside the plane address so peers can
+    /// dial both planes.
+    pub(crate) grpc_address: SocketAddr,
     /// Gossip configuration.
     pub(crate) config: GossipConfig,
     /// Current membership state.

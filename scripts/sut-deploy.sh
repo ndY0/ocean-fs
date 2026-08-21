@@ -16,7 +16,8 @@
 #   Cluster fleet (Phase 3+, per ADR-0026):
 #       --cluster "root@10.0.0.2,root@10.0.0.3,root@10.0.0.4"
 #     Deploys to every node. Node 0 is the bootstrap (no seed_nodes);
-#     nodes 1..N-1 get [gossip] seed_nodes = ["<node0>:9001"] and the
+#     nodes 1..N-1 get [gossip] seed_nodes = ["<node0>:9002"] (the
+#     membership plane port, ADR-0028 D1) and the
 #     phase-3 fast-gossip profile (1s gossip, 3s suspicion, 8s failure).
 #     Every node listens on :9000/:9001/:9002 — nodes differ by IP, no port
 #     juggling (9002 = membership plane, ADR-0028). node_id = oceanfs-node-{i} per node.
@@ -102,13 +103,15 @@ FLEET_SEEDS=()
 if [ -n "$CLUSTER" ]; then
     IFS=',' read -ra FLEET_TARGETS <<< "$CLUSTER"
     [ "${#FLEET_TARGETS[@]}" -ge 3 ] || { log_error "--cluster needs at least 3 nodes (quorum semantics, ADR-0026)."; exit 1; }
-    # Resolve node 0's internal gRPC endpoint for seed_nodes. Accept either
-    # user@host or user@host:port forms; the seed always uses port+1.
+    # Resolve node 0's internal MEMBERSHIP endpoint for seed_nodes
+    # (ADR-0028 D1: gossip lives on its own port — PORT+2; the data
+    # plane at PORT+1 no longer serves GossipRpc). Accept either
+    # user@host or user@host:port forms.
     local_node0="${FLEET_TARGETS[0]}"
     seed_host="${local_node0##*@}"
     FLEET_SEEDS[0]=""
     for ((i = 1; i < ${#FLEET_TARGETS[@]}; i++)); do
-        FLEET_SEEDS[$i]="${seed_host}:$((${PORT} + 1))"
+        FLEET_SEEDS[$i]="${seed_host}:$((${PORT} + 2))"
     done
     log_info "Cluster deploy: ${#FLEET_TARGETS[@]} nodes, seed=${FLEET_SEEDS[1]:-none} (node 0 is bootstrap)"
 fi

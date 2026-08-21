@@ -717,6 +717,7 @@ mod tests {
         let membership = Arc::new(Membership::new(
             node_id.clone(),
             addr,
+            addr,
             oceanfs_core::GossipConfig::default(),
             ring_cache,
         ));
@@ -884,6 +885,7 @@ mod tests {
         let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
         let membership = Arc::new(Membership::new(
             node_id.clone(),
+            stale_addr,
             stale_addr,
             oceanfs_core::GossipConfig::default(),
             ring_cache,

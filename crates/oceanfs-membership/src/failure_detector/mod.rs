@@ -140,6 +140,7 @@ impl FailureDetector {
                 address: None,
                 version,
                 origin: self.node_id.clone(),
+                membership_address: None,
             });
             info!(node_id = %target, "node recovered: SUSPECT → ALIVE after successful ping");
         }

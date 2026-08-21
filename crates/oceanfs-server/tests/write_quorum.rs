@@ -35,6 +35,7 @@ async fn make_coordinator(node_id: &str, nodes: &[&str]) -> WriteCoordinator {
     let membership = Arc::new(Membership::new(
         NodeId::new(node_id),
         addr,
+        addr,
         GossipConfig::default(),
         ring_cache.clone(),
     ));

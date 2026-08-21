@@ -118,11 +118,16 @@ impl GossipRpc for GossipGrpcService {
                         .parse::<SocketAddr>()
                         .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 9001)));
 
+                    let grpc_address = entry
+                        .grpc_address
+                        .parse::<SocketAddr>()
+                        .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 9001)));
                     changed.push(crate::membership::state::NodeEntry {
                         node_id,
                         incarnation,
                         state,
                         address,
+                        grpc_address,
                         version: entry.version,
                         origin: NodeId::new(&entry.origin),
                     });
@@ -142,9 +147,10 @@ impl GossipRpc for GossipGrpcService {
                             entry.node_id,
                             entry.state,
                             entry.incarnation,
-                            Some(entry.address),
+                            Some(entry.grpc_address),
                             entry.version,
                             entry.origin,
+                            Some(entry.address),
                         );
                     }
                 }
@@ -160,36 +166,47 @@ impl GossipRpc for GossipGrpcService {
         let pull_delta = oceanfs_core::proto::membership::MembershipList {
             entries: nodes
                 .iter()
-                .filter(|(node_id, _, _, _, version, origin)| {
+                .filter(|(node_id, _, _, _, _, version, origin)| {
                     requester_vector
                         .get(node_id)
                         .and_then(|origins| origins.get(origin))
                         .map_or(true, |known| *version > *known)
                 })
-                .map(|(node_id, state, incarnation, address, version, origin)| {
-                    oceanfs_core::proto::membership::MembershipEntry {
-                        node_id: Some(oceanfs_core::proto::common::NodeId {
-                            id: node_id.to_string(),
-                        }),
-                        state: match state {
-                            NodeState::Alive => 0,
-                            NodeState::Suspect => 1,
-                            NodeState::Dead => 2,
-                            NodeState::Leaving => 3,
-                            NodeState::Left => 4,
-                        },
-                        incarnation: incarnation.value(),
-                        address: address.to_string(),
-                        last_seen: None,
-                        version: *version,
-                        origin: origin.to_string(),
-                    }
-                })
+                .map(
+                    |(
+                        node_id,
+                        state,
+                        incarnation,
+                        address,
+                        membership_address,
+                        version,
+                        origin,
+                    )| {
+                        oceanfs_core::proto::membership::MembershipEntry {
+                            node_id: Some(oceanfs_core::proto::common::NodeId {
+                                id: node_id.to_string(),
+                            }),
+                            state: match state {
+                                NodeState::Alive => 0,
+                                NodeState::Suspect => 1,
+                                NodeState::Dead => 2,
+                                NodeState::Leaving => 3,
+                                NodeState::Left => 4,
+                            },
+                            incarnation: incarnation.value(),
+                            address: membership_address.to_string(),
+                            last_seen: None,
+                            version: *version,
+                            origin: origin.to_string(),
+                            grpc_address: address.to_string(),
+                        }
+                    },
+                )
                 .collect(),
         };
         let ack_vector = nodes
             .iter()
-            .map(|(node_id, _, _, _, version, origin)| {
+            .map(|(node_id, _, _, _, _, version, origin)| {
                 (node_id.to_string(), (origin.to_string(), *version))
             })
             .fold(
@@ -254,7 +271,7 @@ impl GossipRpc for GossipGrpcService {
             // entry.
             let filtered: Vec<_> = nodes
                 .into_iter()
-                .filter(|(node_id, _, _, _, version, origin)| {
+                .filter(|(node_id, _, _, _, _, version, origin)| {
                     version_vector
                         .get(node_id)
                         .and_then(|origins| origins.get(origin))
@@ -271,7 +288,9 @@ impl GossipRpc for GossipGrpcService {
                     }))
                     .await;
             } else {
-                for (node_id, state, incarnation, address, version, origin) in filtered {
+                for (node_id, state, incarnation, address, membership_address, version, origin) in
+                    filtered
+                {
                     let proto_node_id =
                         oceanfs_core::proto::common::NodeId { id: node_id.to_string() };
 
@@ -287,11 +306,12 @@ impl GossipRpc for GossipGrpcService {
                         node_id: Some(proto_node_id),
                         state: proto_state,
                         incarnation: incarnation.value(),
-                        address: address.to_string(),
+                        address: membership_address.to_string(),
                         last_seen: None,
                         // ADR-0028 D3: attribution travels with the entry.
                         version,
                         origin: origin.to_string(),
+                        grpc_address: address.to_string(),
                     };
 
                     let delta =
@@ -335,7 +355,13 @@ mod tests {
         ring.add_node(NodeId::new(node_id));
         let ring_cache = Arc::new(RingCache::new(ring));
         let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-        Arc::new(Membership::new(NodeId::new(node_id), addr, GossipConfig::default(), ring_cache))
+        Arc::new(Membership::new(
+            NodeId::new(node_id),
+            addr,
+            addr,
+            GossipConfig::default(),
+            ring_cache,
+        ))
     }
 
     /// Helper to start a test gRPC server with the gossip service and return a client.
@@ -375,6 +401,7 @@ mod tests {
             last_seen: None,
             version: 0,
             origin: String::new(),
+            grpc_address: "127.0.0.1:9001".to_string(),
         };
 
         let delta = oceanfs_core::proto::membership::MembershipList { entries: vec![entry] };
@@ -460,6 +487,7 @@ mod tests {
             Some("127.0.0.1:9002".parse().unwrap()),
             1,
             NodeId::new("node-b"),
+            None,
         );
 
         let mut client = test_server(membership).await;

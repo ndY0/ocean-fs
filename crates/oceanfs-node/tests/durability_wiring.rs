@@ -42,6 +42,7 @@ async fn durability_components_are_wireable_and_spawnable() {
     let membership = Arc::new(Membership::new(
         NodeId::new("test-node"),
         "127.0.0.1:9001".parse().unwrap(),
+        "127.0.0.1:9001".parse().unwrap(),
         oceanfs_core::GossipConfig::default(),
         ring_cache.clone(),
     ));
@@ -181,6 +182,7 @@ async fn test_anti_entropy_accepts_trait_object() {
     let ring_cache = Arc::new(RingCache::new(ring));
     let membership = Arc::new(Membership::new(
         NodeId::new("test-ae-trait"),
+        "127.0.0.1:9002".parse().unwrap(),
         "127.0.0.1:9002".parse().unwrap(),
         oceanfs_core::GossipConfig::default(),
         ring_cache.clone(),

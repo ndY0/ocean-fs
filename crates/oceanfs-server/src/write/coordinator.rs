@@ -1867,6 +1867,7 @@ mod tests {
         let membership = Arc::new(Membership::new(
             NodeId::new(node_id),
             addr,
+            addr,
             GossipConfig::default(),
             ring_cache.clone(),
         ));
@@ -2669,6 +2670,7 @@ mod tests {
         let membership = Arc::new(Membership::new(
             NodeId::new(node_id),
             addr,
+            addr,
             GossipConfig::default(),
             ring_cache,
         ));
@@ -3200,6 +3202,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
         let membership = Arc::new(Membership::new(
             NodeId::new("n1"),
+            addr,
             addr,
             GossipConfig::default(),
             ring_cache.clone(),
@@ -4002,6 +4005,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
         let membership = Arc::new(Membership::new(
             NodeId::new("n1"),
+            addr,
             addr,
             GossipConfig::default(),
             ring_cache.clone(),

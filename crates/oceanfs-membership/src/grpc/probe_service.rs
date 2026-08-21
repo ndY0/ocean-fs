@@ -203,7 +203,7 @@ impl ProbeGrpcService {
     /// Resolves the target's announced membership address and probes it
     /// over the membership plane pool, bounded by `ping_timeout_ms`.
     async fn forward_to(&self, target_id: &NodeId) -> ProbeResponse {
-        let Some(addr) = self.membership.address_of(target_id) else {
+        let Some(addr) = self.membership.membership_address_of(target_id) else {
             tracing::trace!(target = %target_id, "relay: target unknown locally — nack");
             return ProbeResponse { ack: false, incarnation: 0 };
         };

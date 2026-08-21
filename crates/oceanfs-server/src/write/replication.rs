@@ -204,6 +204,7 @@ mod tests {
         let membership = Arc::new(Membership::new(
             NodeId::new(node_id),
             addr,
+            addr,
             oceanfs_core::GossipConfig::default(),
             ring_cache,
         ));

@@ -319,8 +319,10 @@ pub struct NodeProcess {
     child: Child,
     /// HTTP API address.
     http_addr: SocketAddr,
-    /// gRPC API address.
+    /// gRPC API address (the data plane).
     grpc_addr: SocketAddr,
+    /// Membership plane address (gossip + SWIM probes, ADR-0028 D1).
+    membership_addr: SocketAddr,
     /// Temporary data directory (cleaned up on drop of `_temp_dir`).
     /// Path is accessible even after `_temp_dir` is consumed.
     data_dir: PathBuf,
@@ -533,6 +535,7 @@ impl NodeProcess {
             child,
             http_addr,
             grpc_addr,
+            membership_addr,
             data_dir,
             _temp_dir: temp_dir,
             _config_path: config_path,
@@ -565,6 +568,13 @@ impl NodeProcess {
     /// Returns the gRPC API address (e.g., `127.0.0.1:9001`).
     pub fn grpc_addr(&self) -> SocketAddr {
         self.grpc_addr
+    }
+
+    /// Returns the membership plane address (e.g., `127.0.0.1:9002`) —
+    /// the address peers dial for gossip push/pull and SWIM probes
+    /// (ADR-0028 D1).
+    pub fn membership_addr(&self) -> SocketAddr {
+        self.membership_addr
     }
 
     /// Returns the paths of the log files written for this node process.
@@ -1478,7 +1488,10 @@ impl Cluster {
         let node0 =
             NodeProcess::spawn_with_data_dir_and_options(&node0_config, &node0_dir, options)
                 .await?;
-        let seed_addr = format!("127.0.0.1:{}", node0.grpc_addr().port());
+        // ADR-0028 D1: the seed must be the MEMBERSHIP plane address —
+        // gossip lives on its own port now; the gRPC (data-plane) port
+        // no longer serves GossipRpc.
+        let seed_addr = format!("127.0.0.1:{}", node0.membership_addr().port());
         nodes.push(Some(node0));
 
         // Spawn remaining nodes with node 0 as seed.
@@ -1640,11 +1653,11 @@ impl Cluster {
                 // isolated singleton (observed as churn-run
                 // convergence=false).
                 match nodes[0].as_ref() {
-                    Some(node0) => format!("127.0.0.1:{}", node0.grpc_addr().port()),
+                    Some(node0) => format!("127.0.0.1:{}", node0.membership_addr().port()),
                     None => {
                         let ports_file = self._temp_dir.path().join("node-0").join(PORTS_FILE_NAME);
                         restore_ports(&ports_file)
-                            .map(|(_, grpc_port, _)| format!("127.0.0.1:{grpc_port}"))
+                            .map(|(_, _, membership_port)| format!("127.0.0.1:{membership_port}"))
                             .unwrap_or_default()
                     }
                 }

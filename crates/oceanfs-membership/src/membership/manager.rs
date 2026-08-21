@@ -29,6 +29,7 @@ impl Membership {
     pub fn new(
         node_id: NodeId,
         address: SocketAddr,
+        grpc_address: SocketAddr,
         config: oceanfs_core::GossipConfig,
         ring: Arc<oceanfs_routing::RingCache>,
     ) -> Self {
@@ -37,6 +38,7 @@ impl Membership {
         Self {
             node_id,
             address,
+            grpc_address,
             config,
             state: RwLock::new(MembershipState::new()),
             ring,
@@ -139,7 +141,7 @@ impl Membership {
                             .read()
                             .nodes
                             .iter()
-                            .map(|(id, e)| (id.clone(), e.state, e.address, e.incarnation))
+                            .map(|(id, e)| (id.clone(), e.state, e.membership_address, e.incarnation))
                             .collect();
                         let _ = sync_detector_tx.try_send(
                             DetectorCommand::UpdateAliveNodes { nodes: alive },
@@ -205,12 +207,13 @@ impl Membership {
                         match event {
                             Ok(MembershipEvent {
                                 node_id,
+                                old_state: _old_state,
                                 new_state,
                                 incarnation,
                                 address,
                                 version,
                                 origin,
-                                ..
+                                membership_address,
                             }) => {
                                 // The event itself carries the incarnation,
                                 // address, version, and origin (ADR-0022,
@@ -222,7 +225,13 @@ impl Membership {
                                 // and block legitimate re-admission
                                 // (t24/t43).
                                 event_membership.upsert_node_attributed(
-                                    node_id, new_state, incarnation, address, version, origin,
+                                    node_id,
+                                    new_state,
+                                    incarnation,
+                                    address,
+                                    version,
+                                    origin,
+                                    membership_address,
                                 );
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -370,6 +379,11 @@ impl Membership {
             if let Some(seed_addr) = joined_seed_addr {
                 debug!(seed = %seed_addr, "announcing self to seed via gossip push");
 
+                // The self-announcement version (ADR-0028 D3): bumped
+                // once per join, shared with the local upsert below.
+                let self_version =
+                    self.self_version.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+
                 let pooled = pool.get_channel(seed_addr).await.map_err(|e| {
                     Error::JoinFailed(format!("failed to connect to seed for push: {e}"))
                 })?;
@@ -385,9 +399,10 @@ impl Membership {
                     incarnation: self_incarnation.value(),
                     address: self.address.to_string(),
                     last_seen: None,
-                    // ADR-0028 D3: attribution lands in f4.
-                    version: 0,
-                    origin: String::new(),
+                    // ADR-0028 D3: attribution travels with the entry.
+                    version: self_version,
+                    origin: self.node_id.to_string(),
+                    grpc_address: self.grpc_address.to_string(),
                 };
                 let delta =
                     oceanfs_core::proto::membership::MembershipList { entries: vec![proto_entry] };
@@ -434,9 +449,10 @@ impl Membership {
             self.node_id.clone(),
             NodeState::Alive,
             self_incarnation,
-            Some(self.address),
+            Some(self.grpc_address),
             self_version,
             self.node_id.clone(),
+            Some(self.address),
         );
 
         info!(node_id = %self.node_id, "joined cluster successfully");
@@ -503,8 +519,12 @@ impl Membership {
                                     _ => continue,
                                 };
                                 let inc = Incarnation::new(entry.incarnation);
-                                let addr = entry
+                                let membership_addr = entry
                                     .address
+                                    .parse::<SocketAddr>()
+                                    .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 9001)));
+                                let grpc_addr = entry
+                                    .grpc_address
                                     .parse::<SocketAddr>()
                                     .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 9001)));
                                 if let Some(id) = nid {
@@ -517,9 +537,10 @@ impl Membership {
                                         id,
                                         state,
                                         inc,
-                                        Some(addr),
+                                        Some(grpc_addr),
                                         0,
                                         NodeId::new(""),
+                                        Some(membership_addr),
                                     );
                                 }
                             }
@@ -593,6 +614,7 @@ impl Membership {
             address: Some(self.address),
             version: leave_version,
             origin: self.node_id.clone(),
+            membership_address: Some(self.address),
         });
 
         info!(
@@ -634,6 +656,7 @@ impl Membership {
             address: Some(self.address),
             version: leave_version,
             origin: self.node_id.clone(),
+            membership_address: Some(self.address),
         });
 
         // Remove self from ring.
@@ -680,7 +703,15 @@ impl Membership {
         incarnation: Incarnation,
         address: Option<SocketAddr>,
     ) {
-        self.upsert_node_attributed(node_id, state, incarnation, address, 0, self.node_id.clone());
+        self.upsert_node_attributed(
+            node_id,
+            state,
+            incarnation,
+            address,
+            0,
+            self.node_id.clone(),
+            None,
+        );
     }
 
     /// The attributed entry point (ADR-0028 D3): `version` is the
@@ -703,6 +734,7 @@ impl Membership {
     /// Within the same class and origin, the higher `version` wins.
     /// These rules replace the historical terminality/stale-suspect/
     /// self-guard heuristics.
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_node_attributed(
         &self,
         node_id: NodeId,
@@ -711,12 +743,14 @@ impl Membership {
         address: Option<SocketAddr>,
         version: u64,
         origin: NodeId,
+        membership_address: Option<SocketAddr>,
     ) {
         let mut inner = self.state.write();
 
         // Capture old state and the recorded incarnation before modifying.
         let old = inner.nodes.get(&node_id).map(|e| e.state);
         let stored_address = inner.nodes.get(&node_id).map(|e| e.address);
+        let stored_membership_address = inner.nodes.get(&node_id).map(|e| e.membership_address);
         let recorded = inner.incarnations.get(&node_id).copied();
         let old_state = old.unwrap_or(NodeState::Alive);
         let is_new = old.is_none();
@@ -873,6 +907,8 @@ impl Membership {
                     state,
                     incarnation: effective_incarnation,
                     address: dead_addr,
+                    membership_address: membership_address
+                        .unwrap_or(stored_membership_address.unwrap_or(dead_addr)),
                     version,
                     origin: origin.clone(),
                 },
@@ -900,6 +936,8 @@ impl Membership {
                     state,
                     incarnation: effective_incarnation,
                     address: addr,
+                    membership_address: membership_address
+                        .unwrap_or(stored_membership_address.unwrap_or(addr)),
                     version,
                     origin: origin.clone(),
                 },
@@ -917,6 +955,7 @@ impl Membership {
                 address: effective_address,
                 version,
                 origin: origin.clone(),
+                membership_address,
             });
 
             // PR4: Update ring synchronously on membership changes.
@@ -963,7 +1002,11 @@ impl Membership {
                     node_id: node_id.clone(),
                     incarnation: effective_incarnation,
                     state,
-                    address: effective_address
+                    address: membership_address.unwrap_or(
+                        stored_membership_address
+                            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 9001))),
+                    ),
+                    grpc_address: effective_address
                         .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 9001))),
                     version,
                     origin: origin.clone(),
@@ -996,6 +1039,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
         let membership = Membership::new(
             NodeId::new(node_id),
+            addr,
             addr,
             GossipConfig::default(),
             ring_cache.clone(),
@@ -1039,6 +1083,7 @@ mod tests {
             Some("127.0.0.1:9003".parse().unwrap()),
             1,
             NodeId::new("target"),
+            None,
         );
         let _ = rx.try_recv(); // consume add event
 
@@ -1050,6 +1095,7 @@ mod tests {
             Some("127.0.0.1:9003".parse().unwrap()),
             5,
             NodeId::new("peer-detector"),
+            None,
         );
 
         let event = rx.try_recv().expect("should receive transition event");
@@ -1074,6 +1120,7 @@ mod tests {
             Some("127.0.0.1:9100".parse().unwrap()),
             1,
             NodeId::new("victim"),
+            None,
         );
         // A peer's detector declares Dead → RETAINED as Dead (not
         // removed); the remote detector fact (class 2) beats the
@@ -1085,6 +1132,7 @@ mod tests {
             None,
             7,
             NodeId::new("peer-detector"),
+            None,
         );
         assert_eq!(m.state_of(&NodeId::new("victim")), Some(NodeState::Dead));
 
@@ -1097,6 +1145,7 @@ mod tests {
             Some("127.0.0.1:9100".parse().unwrap()),
             2,
             NodeId::new("victim"),
+            None,
         );
         assert_eq!(
             m.state_of(&NodeId::new("victim")),
@@ -1112,6 +1161,7 @@ mod tests {
             Some("127.0.0.1:9100".parse().unwrap()),
             3,
             NodeId::new("victim"),
+            None,
         );
         assert_eq!(m.state_of(&NodeId::new("victim")), Some(NodeState::Dead));
     }
@@ -1137,6 +1187,7 @@ mod tests {
             Some("127.0.0.1:9100".parse().unwrap()),
             1,
             NodeId::new("rejoiner"),
+            None,
         );
         assert_eq!(m.state_of(&NodeId::new("rejoiner")), Some(NodeState::Alive));
 
@@ -1151,6 +1202,7 @@ mod tests {
             None,
             9,
             NodeId::new("peer-detector"),
+            None,
         );
         assert_eq!(
             m.state_of(&NodeId::new("rejoiner")),
@@ -1166,6 +1218,7 @@ mod tests {
             None,
             9,
             NodeId::new("peer-detector"),
+            None,
         );
         assert_eq!(m.state_of(&NodeId::new("rejoiner")), Some(NodeState::Alive));
 
@@ -1179,6 +1232,7 @@ mod tests {
             None,
             10,
             NodeId::new("peer-detector"),
+            None,
         );
         assert_eq!(m.state_of(&NodeId::new("rejoiner")), Some(NodeState::Dead));
     }
@@ -1201,6 +1255,7 @@ mod tests {
             Some("127.0.0.1:9100".parse().unwrap()),
             1,
             NodeId::new("myself"),
+            None,
         );
 
         // Gossip brings a Suspect for SELF from a peer — rejected by
@@ -1212,6 +1267,7 @@ mod tests {
             None,
             7,
             NodeId::new("peer-detector"),
+            None,
         );
         assert_eq!(m.state_of(&NodeId::new("myself")), Some(NodeState::Alive));
 
@@ -1223,6 +1279,7 @@ mod tests {
             None,
             8,
             NodeId::new("peer-detector"),
+            None,
         );
         assert_eq!(m.state_of(&NodeId::new("myself")), Some(NodeState::Alive));
 
@@ -1236,6 +1293,7 @@ mod tests {
             Some("127.0.0.1:9101".parse().unwrap()),
             1,
             NodeId::new("peer"),
+            None,
         );
         m.upsert_node_attributed(
             NodeId::new("peer"),
@@ -1244,6 +1302,7 @@ mod tests {
             None,
             9,
             NodeId::new("another-detector"),
+            None,
         );
         assert_eq!(m.state_of(&NodeId::new("peer")), Some(NodeState::Suspect));
     }
@@ -1263,6 +1322,7 @@ mod tests {
             Some("127.0.0.1:9100".parse().unwrap()),
             1,
             NodeId::new("victim"),
+            None,
         );
         // My detector's Suspect (class 3) — applies.
         m.upsert_node_attributed(
@@ -1272,6 +1332,7 @@ mod tests {
             None,
             7,
             NodeId::new("observer"),
+            None,
         );
         assert_eq!(m.state_of(&NodeId::new("victim")), Some(NodeState::Suspect));
     }
@@ -1291,6 +1352,7 @@ mod tests {
             Some("127.0.0.1:9100".parse().unwrap()),
             9,
             NodeId::new("observer"),
+            None,
         );
         // The leaver's own Left (class 4) — applies.
         m.upsert_node_attributed(
@@ -1300,6 +1362,7 @@ mod tests {
             Some("127.0.0.1:9100".parse().unwrap()),
             2,
             NodeId::new("leaver"),
+            None,
         );
         assert_eq!(m.state_of(&NodeId::new("leaver")), None, "Left removes the node");
     }
@@ -1318,6 +1381,7 @@ mod tests {
             Some("127.0.0.1:9100".parse().unwrap()),
             5,
             NodeId::new("observer"),
+            None,
         );
         // The echo: identical (origin, version) — no change, no event.
         let mut rx = m.subscribe();
@@ -1329,6 +1393,7 @@ mod tests {
             Some("127.0.0.1:9100".parse().unwrap()),
             5,
             NodeId::new("observer"),
+            None,
         );
         assert!(rx.try_recv().is_err(), "an idempotent echo must not emit an event");
     }
@@ -1347,6 +1412,7 @@ mod tests {
             Some("127.0.0.1:9100".parse().unwrap()),
             1,
             NodeId::new("rejoiner"),
+            None,
         );
         m.upsert_node_attributed(
             NodeId::new("rejoiner"),
@@ -1355,6 +1421,7 @@ mod tests {
             None,
             7,
             NodeId::new("peer-detector"),
+            None,
         );
         assert_eq!(m.state_of(&NodeId::new("rejoiner")), Some(NodeState::Dead));
 
@@ -1404,6 +1471,7 @@ mod tests {
 
         let m = Membership::new(
             NodeId::new("rejoiner"),
+            "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
             "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
             GossipConfig { seed_nodes: vec![], ..GossipConfig::default() },
             ring_cache.clone(),
@@ -1486,6 +1554,7 @@ mod tests {
         let m = Membership::new(
             NodeId::new("joiner"),
             "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
+            "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
             GossipConfig { seed_nodes: vec![], ..GossipConfig::default() },
             ring_cache.clone(),
         );
@@ -1505,6 +1574,7 @@ mod tests {
 
         let m = std::sync::Arc::new(Membership::new(
             NodeId::new("leaver"),
+            "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
             "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
             GossipConfig::default(),
             ring_cache.clone(),

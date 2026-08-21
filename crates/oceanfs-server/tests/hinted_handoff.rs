@@ -148,6 +148,7 @@ async fn write_coordinator_handoff_on_replica_failure() {
     let membership = Arc::new(Membership::new(
         NodeId::new("n1"),
         addr,
+        addr,
         GossipConfig::default(),
         ring_cache.clone(),
     ));

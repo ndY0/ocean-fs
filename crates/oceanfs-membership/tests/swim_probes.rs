@@ -55,8 +55,13 @@ async fn start_node(name: &str, config: GossipConfig) -> TestNode {
     ring.add_node(NodeId::new(name));
     let ring_cache = Arc::new(RingCache::new(ring));
 
-    let membership =
-        Arc::new(Membership::new(NodeId::new(name), probe_addr, config.clone(), ring_cache));
+    let membership = Arc::new(Membership::new(
+        NodeId::new(name),
+        probe_addr,
+        probe_addr,
+        config.clone(),
+        ring_cache,
+    ));
     let pool = plane::membership_pool(config.failure_timeout_ms / 3, None);
     membership.set_pool(pool.clone());
 
@@ -259,7 +264,13 @@ async fn killed_target_is_suspected_then_dead_and_rejoin_recovers() {
         ring.add_node(NodeId::new("node-b"));
         Arc::new(RingCache::new(ring))
     };
-    let b2 = Arc::new(Membership::new(NodeId::new("node-b"), b2_addr, gossip_config(), b2_ring));
+    let b2 = Arc::new(Membership::new(
+        NodeId::new("node-b"),
+        b2_addr,
+        b2_addr,
+        gossip_config(),
+        b2_ring,
+    ));
     let b2_pool = plane::membership_pool(100, None);
     b2.set_pool(b2_pool.clone());
     let b2_service = ProbeGrpcService::new(NodeId::new("node-b"), b2.clone(), b2_pool, 100);

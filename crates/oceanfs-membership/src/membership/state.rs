@@ -19,8 +19,11 @@ pub(crate) struct NodeEntry {
     pub incarnation: Incarnation,
     /// Current state (Alive, Suspect, Dead, Leaving, Left).
     pub state: NodeState,
-    /// The node's gRPC address.
+    /// The node's membership plane address (gossip + probes, ADR-0028
+    /// D1) — the address peers dial for the protocol.
     pub address: SocketAddr,
+    /// The node's data-plane gRPC address (replication, hints, healing).
+    pub grpc_address: SocketAddr,
     /// Per-(node, origin) logical clock: every state change by the
     /// observer bumps the version it announces for that node. Orders
     /// same-origin entries at the same incarnation.
@@ -76,8 +79,11 @@ pub(crate) struct StoredEntry {
     pub state: NodeState,
     /// Current incarnation.
     pub incarnation: Incarnation,
-    /// The node's address.
+    /// The node's data-plane gRPC address (replication, hints, healing).
     pub address: SocketAddr,
+    /// The node's membership plane address (gossip + probes, ADR-0028
+    /// D1) — the address peers dial for the protocol.
+    pub membership_address: SocketAddr,
     /// The observer's version for this node (per-(node, origin) clock).
     pub version: u64,
     /// The observer that last changed this entry.

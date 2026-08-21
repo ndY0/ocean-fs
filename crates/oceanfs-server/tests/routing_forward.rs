@@ -23,6 +23,7 @@ fn make_router(local_node: &str, ring_nodes: &[&str]) -> Router {
     let membership = Arc::new(Membership::new(
         NodeId::new(local_node),
         "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
+        "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
         GossipConfig::default(),
         ring_cache.clone(),
     ));
@@ -88,6 +89,7 @@ async fn route_with_all_dead_nodes_still_returns_replica_set() {
 
         let membership = Arc::new(Membership::new(
             NodeId::new("requester"),
+            "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
             "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
             GossipConfig::default(),
             ring_cache.clone(),

@@ -1101,6 +1101,7 @@ mod tests {
         let membership = Arc::new(Membership::new(
             NodeId::new(node_id_str),
             addr,
+            addr,
             GossipConfig::default(),
             ring_cache.clone(),
         ));

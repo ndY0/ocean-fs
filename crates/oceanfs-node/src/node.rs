@@ -504,6 +504,7 @@ impl Node {
         let membership = Arc::new(oceanfs_membership::Membership::new(
             NodeId::new(&config.node_id),
             membership_announce_addr,
+            grpc_addr,
             gossip_config,
             ring_cache.clone(),
         ));
@@ -1660,15 +1661,30 @@ impl Node {
         // this write also captures members learned from the seed pull.
         // Self is excluded: its own old address is useless after a
         // restart (t43).
+        //
+        // A seedless singleton join (no configured seeds, all fallback
+        // seeds down at restart time) must NOT wipe the persisted list:
+        // the snapshot would contain only self → `save_fallback_seeds([])`
+        // — and every later restart would then have no seeds at all,
+        // stranding the node forever (observed in the churn run: node-0
+        // restarted at inc 2 with fallback_seeds=2, then inc 3/4/5 with
+        // fallback_seeds=0 after the wipe). The persisted list is the
+        // last-known truth; only a join that actually learned peers may
+        // replace it.
         {
             let self_id = NodeId::new(&config.node_id);
             let seeds: Vec<String> = membership
                 .nodes_full()
                 .iter()
-                .filter(|(id, _, _, _, _, _)| *id != self_id)
-                .map(|(_, _, _, addr, _, _)| addr.to_string())
+                .filter(|(id, _, _, _, _, _, _)| *id != self_id)
+                .map(|(_, _, _, _, membership_addr, _, _)| membership_addr.to_string())
                 .collect();
-            if let Err(e) = membership_state_store.save_fallback_seeds(&seeds) {
+            if seeds.is_empty() {
+                tracing::debug!(
+                    node_id = %config.node_id,
+                    "join learned no peers — keeping the persisted fallback seeds"
+                );
+            } else if let Err(e) = membership_state_store.save_fallback_seeds(&seeds) {
                 warn!(error = %e, "failed to persist fallback seeds after join");
             }
         }
@@ -1797,11 +1813,21 @@ impl Node {
                                 // Record the member address as a fallback
                                 // seed (ADR-0022 D3). Self is skipped: the
                                 // node's own old address is useless after a
-                                // restart (t43). Events without an address
-                                // (detector recoveries) are skipped — the
-                                // address was recorded when the node joined.
+                                // restart (t43). The MEMBERSHIP PLANE
+                                // address is recorded — the join dials
+                                // fallback seeds for the gossip pull
+                                // (ADR-0028 D1); the data-plane address in
+                                // `ev.address` would dial a port that does
+                                // not serve GossipRpc (observed: persisted
+                                // data addresses made every rejoin pull
+                                // fail with Unimplemented and strand the
+                                // restarted bootstrap node). Detector
+                                // recovery events carry
+                                // membership_address=None and are skipped —
+                                // the address was recorded when the node
+                                // joined.
                                 if ev.node_id != self_node_id {
-                                    if let Some(addr) = ev.address {
+                                    if let Some(addr) = ev.membership_address {
                                         if let Err(e) = seed_store
                                             .add_fallback_seed(&addr.to_string())
                                         {
@@ -2465,6 +2491,7 @@ mod tests {
         let membership = Arc::new(oceanfs_membership::Membership::new(
             oceanfs_core::NodeId::new("test-node"),
             "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
             oceanfs_core::GossipConfig::default(),
             ring_cache,
         ));
@@ -2668,6 +2695,7 @@ mod tests {
         let membership = Arc::new(Membership::new(
             NodeId::new("watcher-test"),
             addr,
+            addr,
             oceanfs_core::GossipConfig::default(),
             ring_cache,
         ));
@@ -2767,6 +2795,7 @@ mod tests {
         let membership = Arc::new(Membership::new(
             NodeId::new("ignorer"),
             addr,
+            addr,
             oceanfs_core::GossipConfig::default(),
             ring_cache,
         ));
@@ -2858,6 +2887,7 @@ mod tests {
         let membership = Arc::new(Membership::new(
             NodeId::new("leave-test"),
             "127.0.0.1:9100".parse().unwrap(),
+            "127.0.0.1:9100".parse().unwrap(),
             oceanfs_core::GossipConfig::default(),
             ring_cache,
         ));
@@ -2902,6 +2932,7 @@ mod tests {
         let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
         let membership = Arc::new(Membership::new(
             NodeId::new("empty-blob"),
+            "127.0.0.1:9200".parse().unwrap(),
             "127.0.0.1:9200".parse().unwrap(),
             oceanfs_core::GossipConfig::default(),
             ring_cache,
@@ -2960,6 +2991,7 @@ mod tests {
         let addr: std::net::SocketAddr = "127.0.0.1:9300".parse().unwrap();
         let membership = Arc::new(Membership::new(
             NodeId::new("blob-test"),
+            addr,
             addr,
             oceanfs_core::GossipConfig::default(),
             ring_cache,
@@ -3024,6 +3056,7 @@ mod tests {
         let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
         let membership = Arc::new(Membership::new(
             NodeId::new("leave-call-test"),
+            "127.0.0.1:9400".parse().unwrap(),
             "127.0.0.1:9400".parse().unwrap(),
             oceanfs_core::GossipConfig::default(),
             ring_cache.clone(),
@@ -3149,6 +3182,7 @@ mod tests {
 
         let membership = Arc::new(Membership::new(
             NodeId::new("leaver"),
+            "127.0.0.1:9999".parse().unwrap(),
             "127.0.0.1:9999".parse().unwrap(),
             oceanfs_core::GossipConfig::default(),
             ring_cache.clone(),

@@ -34,6 +34,7 @@ fn make_membership(node_id_str: &str) -> (Arc<Membership>, Arc<RingCache>) {
     let membership = Arc::new(Membership::new(
         NodeId::new(node_id_str),
         addr,
+        addr,
         GossipConfig::default(),
         ring_cache.clone(),
     ));
@@ -324,6 +325,7 @@ async fn real_two_node_anti_entropy_cycle() {
     let membership_a = Arc::new(Membership::new(
         NodeId::new("node-a"),
         addr_a,
+        addr_a,
         GossipConfig::default(),
         ring_cache_a.clone(),
     ));
@@ -340,6 +342,7 @@ async fn real_two_node_anti_entropy_cycle() {
     let addr_b: std::net::SocketAddr = "127.0.0.1:9002".parse().unwrap();
     let membership_b = Arc::new(Membership::new(
         NodeId::new("node-b"),
+        addr_b,
         addr_b,
         GossipConfig::default(),
         ring_cache_b.clone(),

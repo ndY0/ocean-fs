@@ -29,16 +29,26 @@ fn test_addr() -> SocketAddr {
 #[test]
 fn membership_creation_has_correct_node_id() {
     let ring = make_ring();
-    let membership =
-        Membership::new(NodeId::new("test-node"), test_addr(), GossipConfig::default(), ring);
+    let membership = Membership::new(
+        NodeId::new("test-node"),
+        test_addr(),
+        test_addr(),
+        GossipConfig::default(),
+        ring,
+    );
     assert_eq!(membership.node_id().as_str(), "test-node");
 }
 
 #[test]
 fn subscribe_receives_state_change_events() {
     let ring = make_ring();
-    let membership =
-        Membership::new(NodeId::new("observer"), test_addr(), GossipConfig::default(), ring);
+    let membership = Membership::new(
+        NodeId::new("observer"),
+        test_addr(),
+        test_addr(),
+        GossipConfig::default(),
+        ring,
+    );
 
     let mut rx = membership.subscribe();
 
@@ -59,8 +69,13 @@ fn subscribe_receives_state_change_events() {
 #[test]
 fn state_transition_emits_event_with_correct_old_and_new_state() {
     let ring = make_ring();
-    let membership =
-        Membership::new(NodeId::new("observer"), test_addr(), GossipConfig::default(), ring);
+    let membership = Membership::new(
+        NodeId::new("observer"),
+        test_addr(),
+        test_addr(),
+        GossipConfig::default(),
+        ring,
+    );
 
     let mut rx = membership.subscribe();
 
@@ -72,6 +87,7 @@ fn state_transition_emits_event_with_correct_old_and_new_state() {
         Some("127.0.0.1:9003".parse().unwrap()),
         1,
         NodeId::new("target"),
+        None,
     );
     // Drain the initial add event.
     let _ = rx.try_recv();
@@ -85,6 +101,7 @@ fn state_transition_emits_event_with_correct_old_and_new_state() {
         Some("127.0.0.1:9003".parse().unwrap()),
         5,
         NodeId::new("peer-detector"),
+        None,
     );
     let event = rx.try_recv().expect("should receive SUSPECT event");
     assert_eq!(event.old_state, NodeState::Alive);
@@ -94,8 +111,13 @@ fn state_transition_emits_event_with_correct_old_and_new_state() {
 #[test]
 fn nodes_returns_all_known_nodes() {
     let ring = make_ring();
-    let membership =
-        Membership::new(NodeId::new("local"), test_addr(), GossipConfig::default(), ring);
+    let membership = Membership::new(
+        NodeId::new("local"),
+        test_addr(),
+        test_addr(),
+        GossipConfig::default(),
+        ring,
+    );
 
     membership.upsert_node(
         NodeId::new("a"),
@@ -119,8 +141,13 @@ fn nodes_returns_all_known_nodes() {
 #[test]
 fn state_of_returns_correct_state_for_known_node() {
     let ring = make_ring();
-    let membership =
-        Membership::new(NodeId::new("local"), test_addr(), GossipConfig::default(), ring);
+    let membership = Membership::new(
+        NodeId::new("local"),
+        test_addr(),
+        test_addr(),
+        GossipConfig::default(),
+        ring,
+    );
 
     membership.upsert_node(
         NodeId::new("known"),
@@ -143,6 +170,7 @@ fn join_without_seed_nodes_adds_self_to_ring() {
 
         let membership = Membership::new(
             NodeId::new("joiner"),
+            test_addr(),
             test_addr(),
             GossipConfig { seed_nodes: vec![], ..GossipConfig::default() },
             ring_cache.clone(),
@@ -167,6 +195,7 @@ fn leave_transitions_state_and_removes_self_from_ring() {
 
         let membership = Arc::new(Membership::new(
             NodeId::new("leaver"),
+            test_addr(),
             test_addr(),
             GossipConfig::default(),
             ring_cache.clone(),
@@ -199,6 +228,7 @@ fn seed_learns_joiner_on_join_via_push_after_pull() {
 
         let seed_membership = Arc::new(Membership::new(
             NodeId::new("seed-node"),
+            seed_addr,
             seed_addr,
             GossipConfig::default(),
             seed_ring_cache.clone(),
@@ -234,6 +264,7 @@ fn seed_learns_joiner_on_join_via_push_after_pull() {
 
         let joiner_membership = Arc::new(Membership::new(
             NodeId::new("joiner-node"),
+            joiner_addr,
             joiner_addr,
             joiner_config,
             joiner_ring_cache.clone(),
@@ -288,6 +319,7 @@ fn seedless_node_rejoins_via_fallback_seeds() {
         let seed_membership = Arc::new(Membership::new(
             NodeId::new("seed-node"),
             seed_addr,
+            seed_addr,
             GossipConfig::default(),
             seed_ring_cache.clone(),
         ));
@@ -323,6 +355,7 @@ fn seedless_node_rejoins_via_fallback_seeds() {
         let joiner_config = GossipConfig { seed_nodes: vec![], ..GossipConfig::default() };
         let joiner_membership = Arc::new(Membership::new(
             NodeId::new("bootstrap-node"),
+            joiner_addr,
             joiner_addr,
             joiner_config,
             joiner_ring_cache.clone(),

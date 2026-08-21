@@ -16,7 +16,7 @@
 #                    mode with a locally spawned cluster).
 #
 # Fleet topology (ADR-0026): one oceanfs node per SUT VM, all on the same
-# ports (:9000/:9001); nodes differ by internal IP. Node 0 is the
+# ports (:9000/:9001/:9002); nodes differ by internal IP. Node 0 is the
 # bootstrap; nodes 1..N-1 seed to node 0's gRPC address. TARGET_HOSTS is
 # the comma-separated node:9000 list as seen from the harness; churn crash
 # control maps node index i to the i-th entry of TARGET_HOST_SSH.

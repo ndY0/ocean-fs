@@ -24,6 +24,12 @@ pub struct MembershipEntry {
     /// entries produced before attribution.
     #[prost(string, tag = "7")]
     pub origin: ::prost::alloc::string::String,
+    /// The data-plane gRPC address (replication, hints, healing). `address`
+    /// above is the membership plane address (gossip + probes, ADR-0028
+    /// D1) — peers dial it for the protocol; this field is what the data
+    /// plane dials for segment replication and hinted handoff.
+    #[prost(string, tag = "8")]
+    pub grpc_address: ::prost::alloc::string::String,
 }
 /// Full membership list.
 #[derive(Clone, PartialEq, ::prost::Message)]

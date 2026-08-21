@@ -644,6 +644,7 @@ mod tests {
         let membership = Arc::new(Membership::new(
             oceanfs_core::NodeId::new("n1"),
             "127.0.0.1:9000".parse().unwrap(),
+            "127.0.0.1:9000".parse().unwrap(),
             oceanfs_core::GossipConfig::default(),
             ring_cache,
         ));

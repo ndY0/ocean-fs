@@ -17,13 +17,26 @@ use super::{Membership, MembershipEvent};
 impl Membership {
     /// Returns all known nodes with their states, incarnations,
     /// addresses, and attribution (version + origin, ADR-0028 D3).
-    pub fn nodes_full(&self) -> Vec<(NodeId, NodeState, Incarnation, SocketAddr, u64, NodeId)> {
+    /// Returns all known nodes with their states, incarnations, both
+    /// addresses (data plane, membership plane), and attribution
+    /// (version + origin, ADR-0028 D3).
+    pub fn nodes_full(
+        &self,
+    ) -> Vec<(NodeId, NodeState, Incarnation, SocketAddr, SocketAddr, u64, NodeId)> {
         self.state
             .read()
             .nodes
             .iter()
             .map(|(id, e)| {
-                (id.clone(), e.state, e.incarnation, e.address, e.version, e.origin.clone())
+                (
+                    id.clone(),
+                    e.state,
+                    e.incarnation,
+                    e.address,
+                    e.membership_address,
+                    e.version,
+                    e.origin.clone(),
+                )
             })
             .collect()
     }
@@ -46,9 +59,16 @@ impl Membership {
         self.state.read().nodes.get(node_id).map(|e| e.incarnation)
     }
 
-    /// Returns the network address of a specific node.
+    /// Returns the data-plane gRPC address of a specific node
+    /// (replication, hints, healing).
     pub fn address_of(&self, node_id: &NodeId) -> Option<SocketAddr> {
         self.state.read().nodes.get(node_id).map(|e| e.address)
+    }
+
+    /// Returns the membership plane address of a specific node (gossip
+    /// + SWIM probes, ADR-0028 D1).
+    pub fn membership_address_of(&self, node_id: &NodeId) -> Option<SocketAddr> {
+        self.state.read().nodes.get(node_id).map(|e| e.membership_address)
     }
 
     /// Subscribes to membership change events.

@@ -325,6 +325,7 @@ impl GossipProtocol {
                                 // the entry.
                                 version: e.version,
                                 origin: e.origin.to_string(),
+                                grpc_address: e.grpc_address.to_string(),
                             })
                             .collect();
 
@@ -570,9 +571,10 @@ impl GossipProtocol {
                     old_state,
                     new_state: entry.state,
                     incarnation: entry.incarnation,
-                    address: Some(entry.address),
+                    address: Some(entry.grpc_address),
                     version: entry.version,
                     origin: entry.origin.clone(),
+                    membership_address: Some(entry.address),
                 });
 
                 // If a node is declared DEAD, notify the failure detector.
@@ -694,11 +696,16 @@ fn entry_from_proto(entry: &oceanfs_core::proto::membership::MembershipEntry) ->
         .address
         .parse::<std::net::SocketAddr>()
         .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 9001)));
+    let grpc_address = entry
+        .grpc_address
+        .parse::<std::net::SocketAddr>()
+        .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 9001)));
     NodeEntry {
         node_id,
         incarnation: Incarnation::new(entry.incarnation),
         state,
         address,
+        grpc_address,
         version: entry.version,
         origin: NodeId::new(&entry.origin),
     }
@@ -732,7 +739,8 @@ mod tests {
             node_id: NodeId::new(id),
             incarnation: Incarnation::new(incarnation),
             state,
-            address: "127.0.0.1:9001".parse().unwrap(),
+            address: "127.0.0.1:9002".parse().unwrap(),
+            grpc_address: "127.0.0.1:9001".parse().unwrap(),
             version: 1,
             // Pre-attribution helper default: the origin is the target
             // itself (its own announcement) unless a test overrides it.

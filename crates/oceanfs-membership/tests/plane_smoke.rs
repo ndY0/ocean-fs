@@ -27,6 +27,7 @@ fn attributed_membership_entry_survives_wire_roundtrip() {
         last_seen: None,
         version: 7,
         origin: "node-2".to_string(),
+        grpc_address: "10.0.0.2:9001".to_string(),
     };
 
     let mut buf = Vec::new();
