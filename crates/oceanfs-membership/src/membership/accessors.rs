@@ -15,24 +15,27 @@ use tracing::info;
 use super::{Membership, MembershipEvent};
 
 impl Membership {
-    /// Returns all known nodes with their states, incarnations, and addresses.
-    pub fn nodes_full(&self) -> Vec<(NodeId, NodeState, Incarnation, SocketAddr)> {
+    /// Returns all known nodes with their states, incarnations,
+    /// addresses, and attribution (version + origin, ADR-0028 D3).
+    pub fn nodes_full(&self) -> Vec<(NodeId, NodeState, Incarnation, SocketAddr, u64, NodeId)> {
         self.state
             .read()
             .nodes
             .iter()
-            .map(|(id, (state, incarnation, addr))| (id.clone(), *state, *incarnation, *addr))
+            .map(|(id, e)| {
+                (id.clone(), e.state, e.incarnation, e.address, e.version, e.origin.clone())
+            })
             .collect()
     }
 
     /// Returns all known nodes and their states.
     pub fn nodes(&self) -> Vec<(NodeId, NodeState)> {
-        self.state.read().nodes.iter().map(|(id, (state, _, _))| (id.clone(), *state)).collect()
+        self.state.read().nodes.iter().map(|(id, e)| (id.clone(), e.state)).collect()
     }
 
     /// Returns the state of a specific node.
     pub fn state_of(&self, node_id: &NodeId) -> Option<NodeState> {
-        self.state.read().nodes.get(node_id).map(|(state, _, _)| *state)
+        self.state.read().nodes.get(node_id).map(|e| e.state)
     }
 
     /// Returns the recorded incarnation of a specific node.
@@ -40,12 +43,12 @@ impl Membership {
     /// Used by the SWIM probe service to answer direct probes with the
     /// target's current incarnation (ADR-0028 D2).
     pub fn incarnation_of(&self, node_id: &NodeId) -> Option<Incarnation> {
-        self.state.read().nodes.get(node_id).map(|(_, incarnation, _)| *incarnation)
+        self.state.read().nodes.get(node_id).map(|e| e.incarnation)
     }
 
     /// Returns the network address of a specific node.
     pub fn address_of(&self, node_id: &NodeId) -> Option<SocketAddr> {
-        self.state.read().nodes.get(node_id).map(|(_, _, addr)| *addr)
+        self.state.read().nodes.get(node_id).map(|e| e.address)
     }
 
     /// Subscribes to membership change events.

@@ -265,11 +265,10 @@ impl GossipProtocol {
                                 incarnation: e.incarnation.value(),
                                 address: e.address.to_string(),
                                 last_seen: None,
-                                // ADR-0028 D3: attribution lands in f4 —
-                                // empty origin means "self", version 0 is
-                                // the pre-attribution value.
-                                version: 0,
-                                origin: String::new(),
+                                // ADR-0028 D3: attribution travels with
+                                // the entry.
+                                version: e.version,
+                                origin: e.origin.to_string(),
                             })
                             .collect();
 
@@ -377,50 +376,15 @@ impl GossipProtocol {
             // higher-incarnation rejoin may keep the same state while
             // changing the address (ADR-0022), which must still propagate.
             let previous_entry = local_entry.cloned();
-            // At equal incarnation, don't let a less-terminal state
-            // overwrite a more-terminal one. Also, don't re-add a
-            // previously-removed node (present in incarnations but
-            // absent from state.nodes) at the same incarnation.
+
+            // ADR-0028 D3: at equal incarnation, order by the
+            // authority-class table. Higher class wins regardless of
+            // version; within the same class and origin, higher version
+            // wins; the same class with a different origin keeps the
+            // local entry. Also reject re-adding a previously-removed
+            // node (present in incarnations but absent from state.nodes)
+            // at the same incarnation.
             if entry.incarnation == current_incarnation {
-                let terminality = |s: NodeState| -> u8 {
-                    match s {
-                        NodeState::Dead => 3,
-                        NodeState::Left => 3,
-                        NodeState::Leaving => 2,
-                        NodeState::Suspect => 1,
-                        NodeState::Alive => 0,
-                    }
-                };
-                // Reject if incoming state is not more terminal than
-                // what we already know.
-                if terminality(entry.state) <= terminality(old_state) {
-                    trace!(
-                        node_id = %entry.node_id,
-                        incoming = ?entry.state,
-                        current = ?old_state,
-                        "ignoring delta: current state is equally or more terminal"
-                    );
-                    continue;
-                }
-                // A Suspect over a local ALIVE at the equal incarnation
-                // is a STALE suspicion: the local state was set by the
-                // failure detector's ping-verified recovery — the
-                // sender's Suspect predates the recovery (the fleet
-                // churn oscillation: the gossip deltas kept re-applying
-                // the Suspect, the pings kept recovering it, and the
-                // convergence check caught the Suspect moments). Only
-                // the LOCAL detector's own suspicion (the authoritative
-                // event path, not the merge) may downgrade an Alive.
-                if entry.state == NodeState::Suspect && old_state == NodeState::Alive {
-                    trace!(
-                        node_id = %entry.node_id,
-                        incarnation = current_incarnation.value(),
-                        "ignoring delta: stale Suspect over ping-verified Alive"
-                    );
-                    continue;
-                }
-                // Also reject if node was previously removed (absent
-                // from state.nodes) and re-adding at same incarnation.
                 if local_entry.is_none() && current_incarnation > Incarnation::new(0) {
                     trace!(
                         node_id = %entry.node_id,
@@ -428,6 +392,51 @@ impl GossipProtocol {
                         "ignoring delta: node was removed and re-added at same incarnation"
                     );
                     continue;
+                }
+                if let Some(local) = local_entry {
+                    let self_id = &self.node_id;
+                    let incoming_class = crate::membership::authority_class(
+                        &entry.node_id,
+                        &entry.origin,
+                        entry.state,
+                        self_id,
+                    );
+                    let local_class = crate::membership::authority_class(
+                        &entry.node_id,
+                        &local.origin,
+                        local.state,
+                        self_id,
+                    );
+                    if incoming_class < local_class {
+                        trace!(
+                            node_id = %entry.node_id,
+                            incoming = ?entry.state,
+                            current = ?local.state,
+                            "ignoring delta: incoming authority class below local"
+                        );
+                        continue;
+                    }
+                    if incoming_class == local_class {
+                        if entry.origin == local.origin {
+                            if entry.version <= local.version {
+                                trace!(
+                                    node_id = %entry.node_id,
+                                    incoming = ?entry.state,
+                                    current = ?local.state,
+                                    "ignoring delta: same-origin entry not newer"
+                                );
+                                continue;
+                            }
+                        } else {
+                            trace!(
+                                node_id = %entry.node_id,
+                                incoming = ?entry.state,
+                                current = ?local.state,
+                                "ignoring delta: equal authority class, different origin"
+                            );
+                            continue;
+                        }
+                    }
                 }
             }
 
@@ -469,6 +478,8 @@ impl GossipProtocol {
                     new_state: entry.state,
                     incarnation: entry.incarnation,
                     address: Some(entry.address),
+                    version: entry.version,
+                    origin: entry.origin.clone(),
                 });
 
                 // If a node is declared DEAD, notify the failure detector.
@@ -563,6 +574,10 @@ mod tests {
             incarnation: Incarnation::new(incarnation),
             state,
             address: "127.0.0.1:9001".parse().unwrap(),
+            version: 1,
+            // Pre-attribution helper default: the origin is the target
+            // itself (its own announcement) unless a test overrides it.
+            origin: NodeId::new(id),
         }
     }
 

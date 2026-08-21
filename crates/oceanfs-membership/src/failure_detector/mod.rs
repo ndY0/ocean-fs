@@ -100,6 +100,15 @@ impl FailureDetector {
         true
     }
 
+    /// Bumps and returns this detector's version for a target
+    /// (ADR-0028 D3): every emitted event about a target carries a
+    /// strictly increasing per-origin version.
+    pub(crate) fn next_version(&mut self, target: &NodeId) -> u64 {
+        let next = self.versions.get(target).copied().unwrap_or(0) + 1;
+        self.versions.insert(target.clone(), next);
+        next
+    }
+
     /// Recovers a Suspect node after a successful ping (F1b).
     ///
     /// Removing the suspicion timer alone left the node stuck in
@@ -122,12 +131,15 @@ impl FailureDetector {
             .map(|(i, _)| i)
             .or_else(|| self.incarnation_for(target));
         if let Some(incarnation) = incarnation {
+            let version = self.next_version(target);
             let _ = self.event_tx.send(MembershipEvent {
                 node_id: target.clone(),
                 old_state: NodeState::Suspect,
                 new_state: NodeState::Alive,
                 incarnation,
                 address: None,
+                version,
+                origin: self.node_id.clone(),
             });
             info!(node_id = %target, "node recovered: SUSPECT → ALIVE after successful ping");
         }

@@ -52,11 +52,12 @@ impl GossipRpc for GossipGrpcService {
     ///
     /// Each `GossipMessage` in the stream may contain a membership
     /// delta with one or more entries. Entries are routed through the
-    /// gossip protocol's guarded `merge_delta` (F1d): merging them
-    /// directly via `upsert_node` would bypass the incarnation and
-    /// terminality guards and let a peer's stale view clobber the local
-    /// Suspect/Dead state (t24 oscillation). When the protocol task is
-    /// not running (tests), the direct upsert fallback is used.
+    /// gossip protocol's guarded `merge_delta` (F1d + the ADR-0028 D3
+    /// authority-class rules): merging them directly via `upsert_node`
+    /// would bypass the incarnation/attribution ordering and let a
+    /// peer's stale view clobber the local Suspect/Dead state (t24
+    /// oscillation). When the protocol task is not running (tests), the
+    /// direct upsert fallback is used.
     ///
     /// Returns `GossipAck { accepted: true, updated_entries: N }`.
     async fn push(
@@ -102,6 +103,8 @@ impl GossipRpc for GossipGrpcService {
                         incarnation,
                         state,
                         address,
+                        version: entry.version,
+                        origin: NodeId::new(&entry.origin),
                     });
                     entry_count += 1;
                 }
@@ -115,11 +118,13 @@ impl GossipRpc for GossipGrpcService {
                     });
                 } else {
                     for entry in changed {
-                        self.membership.upsert_node(
+                        self.membership.upsert_node_attributed(
                             entry.node_id,
                             entry.state,
                             entry.incarnation,
                             Some(entry.address),
+                            entry.version,
+                            entry.origin,
                         );
                     }
                 }
@@ -175,7 +180,7 @@ impl GossipRpc for GossipGrpcService {
             // the requester's recorded value for that node.
             let filtered: Vec<_> = nodes
                 .into_iter()
-                .filter(|(node_id, _, incarnation, _)| {
+                .filter(|(node_id, _, incarnation, _, _, _)| {
                     version_vector
                         .get(node_id.as_str())
                         .map_or(true, |known| incarnation.value() > *known)
@@ -186,7 +191,7 @@ impl GossipRpc for GossipGrpcService {
                 // Send an empty delta to acknowledge the pull.
                 let _ = tx.send(Ok(GossipMessage { delta: None })).await;
             } else {
-                for (node_id, state, incarnation, address) in filtered {
+                for (node_id, state, incarnation, address, version, origin) in filtered {
                     let proto_node_id =
                         oceanfs_core::proto::common::NodeId { id: node_id.to_string() };
 
@@ -204,9 +209,9 @@ impl GossipRpc for GossipGrpcService {
                         incarnation: incarnation.value(),
                         address: address.to_string(),
                         last_seen: None,
-                        // ADR-0028 D3: attribution lands in f4.
-                        version: 0,
-                        origin: String::new(),
+                        // ADR-0028 D3: attribution travels with the entry.
+                        version,
+                        origin: origin.to_string(),
                     };
 
                     let delta =

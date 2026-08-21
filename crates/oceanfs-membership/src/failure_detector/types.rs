@@ -106,6 +106,10 @@ pub(crate) struct FailureDetector {
     pub(crate) pool: Option<Arc<oceanfs_network::ConnectionPool>>,
     /// SWIM probe cycle metrics (shared with the spawned tasks).
     pub(crate) metrics: ProbeMetrics,
+    /// Per-target version clock for emitted events (ADR-0028 D3): every
+    /// event about a target bumps its counter, giving peers an ordering
+    /// for same-origin entries at the same incarnation.
+    pub(crate) versions: HashMap<NodeId, u64>,
 }
 
 impl FailureDetector {
@@ -147,6 +151,7 @@ impl FailureDetector {
                         LabelSet::empty(),
                     ),
                 },
+                versions: HashMap::new(),
             },
             tx,
         )

@@ -64,22 +64,27 @@ fn state_transition_emits_event_with_correct_old_and_new_state() {
 
     let mut rx = membership.subscribe();
 
-    // Add a node as ALIVE.
-    membership.upsert_node(
+    // Add a node as ALIVE (its own announcement, ADR-0028 D3).
+    membership.upsert_node_attributed(
         NodeId::new("target"),
         NodeState::Alive,
         Incarnation::new(1),
         Some("127.0.0.1:9003".parse().unwrap()),
+        1,
+        NodeId::new("target"),
     );
     // Drain the initial add event.
     let _ = rx.try_recv();
 
-    // Transition to SUSPECT.
-    membership.upsert_node(
+    // Transition to SUSPECT (a remote detector's fact beats the
+    // target's announcement at the same incarnation).
+    membership.upsert_node_attributed(
         NodeId::new("target"),
         NodeState::Suspect,
         Incarnation::new(1),
         Some("127.0.0.1:9003".parse().unwrap()),
+        5,
+        NodeId::new("peer-detector"),
     );
     let event = rx.try_recv().expect("should receive SUSPECT event");
     assert_eq!(event.old_state, NodeState::Alive);

@@ -54,6 +54,7 @@ impl Membership {
             probe_duration: RwLock::new(None),
             probe_failures: RwLock::new(None),
             indirect_probes: RwLock::new(None),
+            self_version: std::sync::atomic::AtomicU64::new(0),
             ring_version: Gauge::new(
                 "ring_version".into(),
                 "Ring topology version, incremented on each change".into(),
@@ -137,7 +138,7 @@ impl Membership {
                             .read()
                             .nodes
                             .iter()
-                            .map(|(id, (state, inc, addr))| (id.clone(), *state, *addr, *inc))
+                            .map(|(id, e)| (id.clone(), e.state, e.address, e.incarnation))
                             .collect();
                         let _ = sync_detector_tx.try_send(
                             DetectorCommand::UpdateAliveNodes { nodes: alive },
@@ -202,17 +203,21 @@ impl Membership {
                                 new_state,
                                 incarnation,
                                 address,
+                                version,
+                                origin,
                                 ..
                             }) => {
-                                // The event itself carries the incarnation and
-                                // address (ADR-0022): a re-admitted node is
-                                // absent from local state, so only the event
-                                // can supply its fresh incarnation/address.
-                                // Deriving them from state.nodes would regress
-                                // the incarnation to a stale value and block
-                                // legitimate re-admission (t24/t43).
-                                event_membership.upsert_node(
-                                    node_id, new_state, incarnation, address,
+                                // The event itself carries the incarnation,
+                                // address, version, and origin (ADR-0022,
+                                // ADR-0028 D3): a re-admitted node is absent
+                                // from local state, so only the event can
+                                // supply its fresh incarnation/address;
+                                // deriving them from state.nodes would
+                                // regress the incarnation to a stale value
+                                // and block legitimate re-admission
+                                // (t24/t43).
+                                event_membership.upsert_node_attributed(
+                                    node_id, new_state, incarnation, address, version, origin,
                                 );
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -411,12 +416,16 @@ impl Membership {
         // notified. The incarnation is the announcement value (persisted + 1
         // on restart, 1 on first boot) — never a hardcoded 1 (ADR-0022 D1).
         // The probe service answers with `Membership::incarnation_of` —
-        // this upsert keeps that value in sync (ADR-0028 D2).
-        self.upsert_node(
+        // this upsert keeps that value in sync (ADR-0028 D2). The entry
+        // carries origin = self with a fresh version (ADR-0028 D3).
+        let self_version = self.self_version.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        self.upsert_node_attributed(
             self.node_id.clone(),
             NodeState::Alive,
             self_incarnation,
             Some(self.address),
+            self_version,
+            self.node_id.clone(),
         );
 
         info!(node_id = %self.node_id, "joined cluster successfully");
@@ -488,7 +497,19 @@ impl Membership {
                                     .parse::<SocketAddr>()
                                     .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 9001)));
                                 if let Some(id) = nid {
-                                    self.upsert_node(id, state, inc, Some(addr));
+                                    // Join-time pull: entries carry no
+                                    // attribution (version 0, empty
+                                    // origin — the joiner has no local
+                                    // facts yet, so the incarnation and
+                                    // F1d gates alone decide).
+                                    self.upsert_node_attributed(
+                                        id,
+                                        state,
+                                        inc,
+                                        Some(addr),
+                                        0,
+                                        NodeId::new(""),
+                                    );
                                 }
                             }
                         }
@@ -542,9 +563,15 @@ impl Membership {
                 .incarnations
                 .get(&node_id)
                 .copied()
-                .or_else(|| state.nodes.get(&node_id).map(|(_, inc, _)| *inc))
+                .or_else(|| state.nodes.get(&node_id).map(|e| e.incarnation))
                 .unwrap_or_else(|| Incarnation::new(1))
         };
+
+        // The leaver's own version for itself (ADR-0028 D3): the
+        // Leaving/Left entries carry origin = self so peers apply them
+        // with the leaver-authority class.
+        let leave_version =
+            self.self_version.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
 
         // Transition to LEAVING.
         let _ = self.event_tx.send(MembershipEvent {
@@ -553,6 +580,8 @@ impl Membership {
             new_state: NodeState::Leaving,
             incarnation: self_incarnation,
             address: Some(self.address),
+            version: leave_version,
+            origin: self.node_id.clone(),
         });
 
         info!(
@@ -592,6 +621,8 @@ impl Membership {
             new_state: NodeState::Left,
             incarnation: self_incarnation,
             address: Some(self.address),
+            version: leave_version,
+            origin: self.node_id.clone(),
         });
 
         // Remove self from ring.
@@ -619,13 +650,11 @@ impl Membership {
     /// was created for it (the coordinator didn't know it existed) —
     /// the churn 404/404/200 divergence.
     ///
-    /// Enforces the F1d invariant: *if a node id is absent from
-    /// `state.nodes` (or recorded Dead/Left) and recorded with
-    /// incarnation `N`, only an entry with incarnation `> N` may
-    /// (re)admit it.* An equal/lower incarnation for a removed or dead
-    /// node is dropped — this closes the Dead↔Alive oscillation loop
-    /// (t24) and permits the legitimate ADR-0022 self-rejoin (strictly
-    /// higher incarnation with a fresh address, t21/t43).
+    /// The wrapper attributes the entry to the LOCAL node with version 0
+    /// (a local observation, ADR-0028 D3): callers without their own
+    /// version clocks — the write coordinator, hinted handoff, admin —
+    /// report facts as "observed locally". The attributed entry point is
+    /// [`Self::upsert_node_attributed`].
     ///
     /// `address` may be `None` when the caller (e.g. the failure detector)
     /// does not know it; the existing stored address is then preserved.
@@ -640,33 +669,47 @@ impl Membership {
         incarnation: Incarnation,
         address: Option<SocketAddr>,
     ) {
+        self.upsert_node_attributed(node_id, state, incarnation, address, 0, self.node_id.clone());
+    }
+
+    /// The attributed entry point (ADR-0028 D3): `version` is the
+    /// observer's logical clock for this node and `origin` the observer
+    /// — the authority-class merge rules use them to order facts.
+    ///
+    /// Enforces the F1d invariant: *if a node id is absent from
+    /// `state.nodes` (or recorded Dead/Left) and recorded with
+    /// incarnation `N`, only an entry with incarnation `> N` may
+    /// (re)admit it.* An equal/lower incarnation for a removed or dead
+    /// node is dropped — this closes the Dead↔Alive oscillation loop
+    /// (t24) and permits the legitimate ADR-0022 self-rejoin (strictly
+    /// higher incarnation with a fresh address, t21/t43).
+    ///
+    /// Attribution (ADR-0028 D3): entries are ordered at equal
+    /// incarnation by the authority-class table (`authority_class` in
+    /// `membership/mod.rs`): my own detector's facts beat remote
+    /// detectors' facts, remote detector facts beat the target's own
+    /// announcements, and entries about SELF must originate from self.
+    /// Within the same class and origin, the higher `version` wins.
+    /// These rules replace the historical terminality/stale-suspect/
+    /// self-guard heuristics.
+    pub fn upsert_node_attributed(
+        &self,
+        node_id: NodeId,
+        state: NodeState,
+        incarnation: Incarnation,
+        address: Option<SocketAddr>,
+        version: u64,
+        origin: NodeId,
+    ) {
         let mut inner = self.state.write();
 
-        // SELF-AUTHORITY: a node must never accept a Suspect/Dead state
-        // for ITSELF from gossip or a seed pull. The node is the only
-        // authority on its own liveness — a stale Suspect(8) window on
-        // a peer (47ms in the fleet churn run) gets pulled by the
-        // rejoined node, applied to its own entry (equal incarnation
-        // passes the stale-downgrade guard), and then SPREAD back to
-        // every peer forever — the cluster converges to Suspect and
-        // the churn convergence check fails. Self Alive announcements
-        // still flow normally.
-        if node_id == self.node_id && matches!(state, NodeState::Suspect | NodeState::Dead) {
-            trace!(
-                node_id = %node_id,
-                incoming = ?state,
-                "upsert_node: rejecting self-downgrade from gossip"
-            );
-            drop(inner);
-            return;
-        }
-
         // Capture old state and the recorded incarnation before modifying.
-        let old = inner.nodes.get(&node_id).map(|(s, _, _)| *s);
-        let stored_address = inner.nodes.get(&node_id).map(|(_, _, addr)| *addr);
+        let old = inner.nodes.get(&node_id).map(|e| e.state);
+        let stored_address = inner.nodes.get(&node_id).map(|e| e.address);
         let recorded = inner.incarnations.get(&node_id).copied();
         let old_state = old.unwrap_or(NodeState::Alive);
         let is_new = old.is_none();
+        let self_id = self.node_id.clone();
 
         // F1d re-admission guard: a node that is absent, Dead, or Left
         // may only be re-admitted at a strictly higher incarnation.
@@ -675,7 +718,7 @@ impl Membership {
         // RETAINED Dead entries too — Dead nodes stay in the table (the
         // topology is stable; liveness is a quorum concern), so
         // `is_new` alone no longer covers the re-admission case.
-        let recorded_state = inner.nodes.get(&node_id).map(|(s, _, _)| *s);
+        let recorded_state = inner.nodes.get(&node_id).map(|e| e.state);
         let readmission_gated =
             is_new || matches!(recorded_state, Some(NodeState::Dead) | Some(NodeState::Left));
         if readmission_gated && recorded.is_some_and(|last| incarnation <= last) {
@@ -689,26 +732,95 @@ impl Membership {
             return;
         }
 
-        // A Suspect/Dead downgrade at an incarnation BELOW the
-        // recorded one is stale: the node re-announced (rejoined) at a
-        // higher incarnation after the suspicion started (the failure
-        // detector fires its suspicion timer with the OLD incarnation —
-        // see failure_detector/suspicion.rs). Applying the downgrade
-        // would record Dead at the max incarnation and strand the
-        // rejoined node: F1d then rejects its equal-incarnation
-        // re-announcements forever (fleet churn: node-1 stuck Dead(5)
-        // after a successful rejoin).
-        if matches!(state, NodeState::Suspect | NodeState::Dead)
-            && recorded.is_some_and(|last| incarnation < last)
-        {
+        // ADR-0028 D3 rule 2: an incarnation BELOW the recorded value is
+        // stale for ANY entry — a Suspect/Dead downgrade fired with the
+        // pre-rejoin incarnation must not regress the fresh Alive (the
+        // fleet node-1 stuck Dead(5) class). The incarnation never
+        // regresses (T8).
+        if recorded.is_some_and(|last| incarnation < last) {
             trace!(
                 node_id = %node_id,
-                incoming = incarnation.value(),
+                incoming = ?state,
+                incoming_inc = incarnation.value(),
                 recorded = recorded.map(|i| i.value()).unwrap_or(0),
-                "upsert_node: rejecting stale Suspect/Dead below recorded incarnation"
+                "upsert_node: rejecting entry below the recorded incarnation"
             );
             drop(inner);
             return;
+        }
+
+        // SELF-LIVENESS AUTHORITY (ADR-0028 D3): a node must never
+        // accept any state for ITSELF from another origin — the node is
+        // the only authority on its own liveness. The historical guard
+        // rejected only Suspect/Dead for self; the attribution model
+        // rejects every non-self origin outright (a self-origin Alive
+        // with a stale version is still idempotent below).
+        if node_id == self_id && origin != self_id {
+            trace!(
+                node_id = %node_id,
+                incoming = ?state,
+                "upsert_node: rejecting non-self-origin entry about self"
+            );
+            drop(inner);
+            return;
+        }
+
+        // Equal-incarnation ordering by the authority class (D3).
+        // A lower-class incoming entry never overwrites a higher-class
+        // local fact; the same class with the same origin is ordered by
+        // version; the same class with a different origin keeps the
+        // local entry (no cross-origin churn — my own detector is the
+        // authority to move the state forward).
+        if let Some(local) = inner.nodes.get(&node_id) {
+            if incarnation == local.incarnation {
+                let incoming_class =
+                    crate::membership::authority_class(&node_id, &origin, state, &self_id);
+                let local_class = crate::membership::authority_class(
+                    &node_id,
+                    &local.origin,
+                    local.state,
+                    &self_id,
+                );
+                if incoming_class < local_class {
+                    trace!(
+                        node_id = %node_id,
+                        incoming = ?state,
+                        incoming_class,
+                        current = ?local.state,
+                        local_class,
+                        "upsert_node: rejecting lower-authority entry at equal incarnation"
+                    );
+                    drop(inner);
+                    return;
+                }
+                if incoming_class == local_class {
+                    if origin == local.origin {
+                        if version <= local.version {
+                            trace!(
+                                node_id = %node_id,
+                                incoming = ?state,
+                                version,
+                                current = ?local.state,
+                                current_version = local.version,
+                                "upsert_node: rejecting same-origin entry at version <= local"
+                            );
+                            drop(inner);
+                            return;
+                        }
+                    } else {
+                        // Same class, different origin: keep the local
+                        // entry (no churn between remote facts).
+                        trace!(
+                            node_id = %node_id,
+                            incoming = ?state,
+                            current = ?local.state,
+                            "upsert_node: keeping local entry at equal authority class"
+                        );
+                        drop(inner);
+                        return;
+                    }
+                }
+            }
         }
 
         // Incarnation must never regress below the recorded value (T8).
@@ -744,7 +856,16 @@ impl Membership {
                     .parse::<std::net::SocketAddr>()
                     .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 1)))
             });
-            inner.nodes.insert(node_id.clone(), (state, effective_incarnation, dead_addr));
+            inner.nodes.insert(
+                node_id.clone(),
+                crate::membership::state::StoredEntry {
+                    state,
+                    incarnation: effective_incarnation,
+                    address: dead_addr,
+                    version,
+                    origin: origin.clone(),
+                },
+            );
             inner.incarnations.insert(node_id.clone(), effective_incarnation);
             effective_address = Some(dead_addr);
         } else {
@@ -762,7 +883,16 @@ impl Membership {
                 }
             };
             effective_address = Some(addr);
-            inner.nodes.insert(node_id.clone(), (state, effective_incarnation, addr));
+            inner.nodes.insert(
+                node_id.clone(),
+                crate::membership::state::StoredEntry {
+                    state,
+                    incarnation: effective_incarnation,
+                    address: addr,
+                    version,
+                    origin: origin.clone(),
+                },
+            );
             inner.incarnations.insert(node_id.clone(), effective_incarnation);
         }
         drop(inner);
@@ -774,6 +904,8 @@ impl Membership {
                 new_state: state,
                 incarnation: effective_incarnation,
                 address: effective_address,
+                version,
+                origin: origin.clone(),
             });
 
             // PR4: Update ring synchronously on membership changes.
@@ -822,6 +954,8 @@ impl Membership {
                     state,
                     address: effective_address
                         .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 9001))),
+                    version,
+                    origin: origin.clone(),
                 };
                 let _ = tx.try_send(GossipCommand::AddNode { entry });
                 debug!(
@@ -886,21 +1020,25 @@ mod tests {
         let (_ring, m) = make_membership("observer");
         let mut rx = m.subscribe();
 
-        // Add node as ALIVE.
-        m.upsert_node(
+        // Add node as ALIVE (its own announcement).
+        m.upsert_node_attributed(
             NodeId::new("target"),
             NodeState::Alive,
             Incarnation::new(1),
             Some("127.0.0.1:9003".parse().unwrap()),
+            1,
+            NodeId::new("target"),
         );
         let _ = rx.try_recv(); // consume add event
 
-        // Transition to SUSPECT.
-        m.upsert_node(
+        // Transition to SUSPECT (a remote detector's fact).
+        m.upsert_node_attributed(
             NodeId::new("target"),
             NodeState::Suspect,
             Incarnation::new(1),
             Some("127.0.0.1:9003".parse().unwrap()),
+            5,
+            NodeId::new("peer-detector"),
         );
 
         let event = rx.try_recv().expect("should receive transition event");
@@ -917,24 +1055,37 @@ mod tests {
     fn upsert_rejects_readmission_at_equal_or_lower_incarnation() {
         let (_ring, m) = make_membership("observer");
 
-        // Node was known Alive at incarnation 5.
-        m.upsert_node(
+        // Node was known Alive at incarnation 5 (its own announcement).
+        m.upsert_node_attributed(
             NodeId::new("victim"),
             NodeState::Alive,
             Incarnation::new(5),
             Some("127.0.0.1:9100".parse().unwrap()),
+            1,
+            NodeId::new("victim"),
         );
-        // Declared Dead → RETAINED as Dead (not removed).
-        m.upsert_node(NodeId::new("victim"), NodeState::Dead, Incarnation::new(5), None);
+        // A peer's detector declares Dead → RETAINED as Dead (not
+        // removed); the remote detector fact (class 2) beats the
+        // target's announcement (class 1).
+        m.upsert_node_attributed(
+            NodeId::new("victim"),
+            NodeState::Dead,
+            Incarnation::new(5),
+            None,
+            7,
+            NodeId::new("peer-detector"),
+        );
         assert_eq!(m.state_of(&NodeId::new("victim")), Some(NodeState::Dead));
 
         // Stale gossip tries to revive at equal incarnation → rejected
-        // (stays Dead).
-        m.upsert_node(
+        // (stays Dead — F1d).
+        m.upsert_node_attributed(
             NodeId::new("victim"),
             NodeState::Alive,
             Incarnation::new(5),
             Some("127.0.0.1:9100".parse().unwrap()),
+            2,
+            NodeId::new("victim"),
         );
         assert_eq!(
             m.state_of(&NodeId::new("victim")),
@@ -943,11 +1094,13 @@ mod tests {
         );
 
         // Lower incarnation → rejected too.
-        m.upsert_node(
+        m.upsert_node_attributed(
             NodeId::new("victim"),
             NodeState::Alive,
             Incarnation::new(4),
             Some("127.0.0.1:9100".parse().unwrap()),
+            3,
+            NodeId::new("victim"),
         );
         assert_eq!(m.state_of(&NodeId::new("victim")), Some(NodeState::Dead));
     }
@@ -965,19 +1118,29 @@ mod tests {
         let (_ring, m) = make_membership("observer");
 
         // The node rejoined: Alive at incarnation 5 (accepted over the
-        // retained Dead(4)).
-        m.upsert_node(
+        // retained Dead(4)) — its own announcement.
+        m.upsert_node_attributed(
             NodeId::new("rejoiner"),
             NodeState::Alive,
             Incarnation::new(5),
             Some("127.0.0.1:9100".parse().unwrap()),
+            1,
+            NodeId::new("rejoiner"),
         );
         assert_eq!(m.state_of(&NodeId::new("rejoiner")), Some(NodeState::Alive));
 
         // The stale suspicion (started at inc 4 while the node was
         // down) fires DEAD at incarnation 4 — must be rejected: the
-        // recorded incarnation (5) is higher.
-        m.upsert_node(NodeId::new("rejoiner"), NodeState::Dead, Incarnation::new(4), None);
+        // recorded incarnation (5) is higher (the incarnation gate,
+        // ADR-0028 D3 rule 2).
+        m.upsert_node_attributed(
+            NodeId::new("rejoiner"),
+            NodeState::Dead,
+            Incarnation::new(4),
+            None,
+            9,
+            NodeId::new("peer-detector"),
+        );
         assert_eq!(
             m.state_of(&NodeId::new("rejoiner")),
             Some(NodeState::Alive),
@@ -985,12 +1148,27 @@ mod tests {
         );
 
         // Same for a stale Suspect.
-        m.upsert_node(NodeId::new("rejoiner"), NodeState::Suspect, Incarnation::new(4), None);
+        m.upsert_node_attributed(
+            NodeId::new("rejoiner"),
+            NodeState::Suspect,
+            Incarnation::new(4),
+            None,
+            9,
+            NodeId::new("peer-detector"),
+        );
         assert_eq!(m.state_of(&NodeId::new("rejoiner")), Some(NodeState::Alive));
 
         // A Dead at the CURRENT incarnation is still legitimate (the
-        // node died at inc 5 without rejoining).
-        m.upsert_node(NodeId::new("rejoiner"), NodeState::Dead, Incarnation::new(5), None);
+        // node died at inc 5 without rejoining): the remote detector
+        // fact (class 2) beats the target's announcement (class 1).
+        m.upsert_node_attributed(
+            NodeId::new("rejoiner"),
+            NodeState::Dead,
+            Incarnation::new(5),
+            None,
+            10,
+            NodeId::new("peer-detector"),
+        );
         assert_eq!(m.state_of(&NodeId::new("rejoiner")), Some(NodeState::Dead));
     }
 
@@ -1004,32 +1182,144 @@ mod tests {
     fn upsert_rejects_self_suspect_or_dead_from_gossip() {
         let (_ring, m) = make_membership("myself");
 
-        // The node knows it is alive (its own view).
-        m.upsert_node(
+        // The node announces itself alive (its own view).
+        m.upsert_node_attributed(
             NodeId::new("myself"),
             NodeState::Alive,
             Incarnation::new(8),
             Some("127.0.0.1:9100".parse().unwrap()),
+            1,
+            NodeId::new("myself"),
         );
 
-        // Gossip brings a stale Suspect for SELF — must be rejected.
-        m.upsert_node(NodeId::new("myself"), NodeState::Suspect, Incarnation::new(8), None);
+        // Gossip brings a Suspect for SELF from a peer — rejected by
+        // the self-liveness authority (non-self origin about self).
+        m.upsert_node_attributed(
+            NodeId::new("myself"),
+            NodeState::Suspect,
+            Incarnation::new(8),
+            None,
+            7,
+            NodeId::new("peer-detector"),
+        );
         assert_eq!(m.state_of(&NodeId::new("myself")), Some(NodeState::Alive));
 
-        // Even a Dead for SELF is rejected.
-        m.upsert_node(NodeId::new("myself"), NodeState::Dead, Incarnation::new(8), None);
+        // Even a Dead for SELF from a peer is rejected.
+        m.upsert_node_attributed(
+            NodeId::new("myself"),
+            NodeState::Dead,
+            Incarnation::new(8),
+            None,
+            8,
+            NodeId::new("peer-detector"),
+        );
         assert_eq!(m.state_of(&NodeId::new("myself")), Some(NodeState::Alive));
 
-        // A PEER's Suspect at equal incarnation is still accepted (the
-        // detector's own suspicion is legitimate).
-        m.upsert_node(
+        // A PEER's Suspect at equal incarnation is still accepted: the
+        // remote detector fact (class 2) beats the peer's own Alive
+        // announcement (class 1).
+        m.upsert_node_attributed(
             NodeId::new("peer"),
             NodeState::Alive,
             Incarnation::new(8),
             Some("127.0.0.1:9101".parse().unwrap()),
+            1,
+            NodeId::new("peer"),
         );
-        m.upsert_node(NodeId::new("peer"), NodeState::Suspect, Incarnation::new(8), None);
+        m.upsert_node_attributed(
+            NodeId::new("peer"),
+            NodeState::Suspect,
+            Incarnation::new(8),
+            None,
+            9,
+            NodeId::new("another-detector"),
+        );
         assert_eq!(m.state_of(&NodeId::new("peer")), Some(NodeState::Suspect));
+    }
+
+    /// ADR-0028 D3 table cell (class 3 > class 1): MY detector's
+    /// Suspect applies over the target's own Alive announcement at the
+    /// same incarnation — this is what makes suspicion work at all.
+    #[test]
+    fn my_detector_suspect_beats_target_announcement() {
+        let (_ring, m) = make_membership("observer");
+
+        // The target announced itself Alive (class 1).
+        m.upsert_node_attributed(
+            NodeId::new("victim"),
+            NodeState::Alive,
+            Incarnation::new(4),
+            Some("127.0.0.1:9100".parse().unwrap()),
+            1,
+            NodeId::new("victim"),
+        );
+        // My detector's Suspect (class 3) — applies.
+        m.upsert_node_attributed(
+            NodeId::new("victim"),
+            NodeState::Suspect,
+            Incarnation::new(4),
+            None,
+            7,
+            NodeId::new("observer"),
+        );
+        assert_eq!(m.state_of(&NodeId::new("victim")), Some(NodeState::Suspect));
+    }
+
+    /// ADR-0028 D3 table cell (class 4 > class 3): the leaver's own
+    /// Left claim beats my detector's stale Alive at the same
+    /// incarnation — graceful leave propagates.
+    #[test]
+    fn leaver_left_beats_stale_detector_alive() {
+        let (_ring, m) = make_membership("observer");
+
+        // My detector verified the leaver alive (class 3).
+        m.upsert_node_attributed(
+            NodeId::new("leaver"),
+            NodeState::Alive,
+            Incarnation::new(3),
+            Some("127.0.0.1:9100".parse().unwrap()),
+            9,
+            NodeId::new("observer"),
+        );
+        // The leaver's own Left (class 4) — applies.
+        m.upsert_node_attributed(
+            NodeId::new("leaver"),
+            NodeState::Left,
+            Incarnation::new(3),
+            Some("127.0.0.1:9100".parse().unwrap()),
+            2,
+            NodeId::new("leaver"),
+        );
+        assert_eq!(m.state_of(&NodeId::new("leaver")), None, "Left removes the node");
+    }
+
+    /// ADR-0028 D3: an exact echo of my own fact (same origin, same
+    /// version) is idempotent — the oscillation classes (t24, the
+    /// fleet Suspect loop) close by construction.
+    #[test]
+    fn same_origin_same_version_echo_is_idempotent() {
+        let (_ring, m) = make_membership("observer");
+
+        m.upsert_node_attributed(
+            NodeId::new("victim"),
+            NodeState::Suspect,
+            Incarnation::new(2),
+            Some("127.0.0.1:9100".parse().unwrap()),
+            5,
+            NodeId::new("observer"),
+        );
+        // The echo: identical (origin, version) — no change, no event.
+        let mut rx = m.subscribe();
+        let _ = rx.try_recv(); // drain the Suspect event
+        m.upsert_node_attributed(
+            NodeId::new("victim"),
+            NodeState::Suspect,
+            Incarnation::new(2),
+            Some("127.0.0.1:9100".parse().unwrap()),
+            5,
+            NodeId::new("observer"),
+        );
+        assert!(rx.try_recv().is_err(), "an idempotent echo must not emit an event");
     }
 
     /// ADR-0022 Decision 2: a self-rejoin announcing a strictly higher
@@ -1039,13 +1329,22 @@ mod tests {
     fn upsert_accepts_readmission_at_strictly_higher_incarnation() {
         let (_ring, m) = make_membership("observer");
 
-        m.upsert_node(
+        m.upsert_node_attributed(
             NodeId::new("rejoiner"),
             NodeState::Alive,
             Incarnation::new(5),
             Some("127.0.0.1:9100".parse().unwrap()),
+            1,
+            NodeId::new("rejoiner"),
         );
-        m.upsert_node(NodeId::new("rejoiner"), NodeState::Dead, Incarnation::new(5), None);
+        m.upsert_node_attributed(
+            NodeId::new("rejoiner"),
+            NodeState::Dead,
+            Incarnation::new(5),
+            None,
+            7,
+            NodeId::new("peer-detector"),
+        );
         assert_eq!(m.state_of(&NodeId::new("rejoiner")), Some(NodeState::Dead));
 
         // Rejoin at incarnation 6 with a NEW address.
@@ -1101,14 +1400,14 @@ mod tests {
 
         m.join(Incarnation::new(6), &[]).await.expect("join should succeed");
 
-        let (_, stored_incarnation, _) = m
+        let stored = m
             .state
             .read()
             .nodes
             .get(&NodeId::new("rejoiner"))
-            .copied()
+            .cloned()
             .expect("self must be in membership state");
-        assert_eq!(stored_incarnation, Incarnation::new(6));
+        assert_eq!(stored.incarnation, Incarnation::new(6));
     }
 
     #[test]

@@ -1665,8 +1665,8 @@ impl Node {
             let seeds: Vec<String> = membership
                 .nodes_full()
                 .iter()
-                .filter(|(id, _, _, _)| *id != self_id)
-                .map(|(_, _, _, addr)| addr.to_string())
+                .filter(|(id, _, _, _, _, _)| *id != self_id)
+                .map(|(_, _, _, addr, _, _)| addr.to_string())
                 .collect();
             if let Err(e) = membership_state_store.save_fallback_seeds(&seeds) {
                 warn!(error = %e, "failed to persist fallback seeds after join");

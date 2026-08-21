@@ -39,12 +39,15 @@ pub(crate) fn mark_suspect(detector: &mut FailureDetector, node_id: &NodeId) {
 
     detector.suspicion_timers.insert(node_id.clone(), (incarnation, Instant::now()));
 
+    let version = detector.next_version(node_id);
     let _ = detector.event_tx.send(MembershipEvent {
         node_id: node_id.clone(),
         old_state: NodeState::Alive,
         new_state: NodeState::Suspect,
         incarnation,
         address: None,
+        version,
+        origin: detector.node_id.clone(),
     });
 
     info!(node_id = %node_id, incarnation = incarnation.value(), "node marked SUSPECT");
@@ -103,12 +106,15 @@ pub(crate) fn check_suspicion_timers(detector: &mut FailureDetector) {
         let incarnation =
             timer.map(|(incarnation, _)| incarnation).unwrap_or_else(|| Incarnation::new(1));
 
+        let version = detector.next_version(&node_id);
         let _ = detector.event_tx.send(MembershipEvent {
             node_id: node_id.clone(),
             old_state: NodeState::Suspect,
             new_state: NodeState::Dead,
             incarnation,
             address: None,
+            version,
+            origin: detector.node_id.clone(),
         });
         warn!(
             node_id = %node_id,

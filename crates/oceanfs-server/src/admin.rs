@@ -626,7 +626,7 @@ async fn cluster_view(State(state): State<AdminState>) -> impl IntoResponse {
         membership
             .nodes_full()
             .into_iter()
-            .map(|(node_id, node_state, incarnation, addr)| NodeInfo {
+            .map(|(node_id, node_state, incarnation, addr, _, _)| NodeInfo {
                 id: node_id.to_string(),
                 state: format!("{:?}", node_state),
                 address: addr.to_string(),

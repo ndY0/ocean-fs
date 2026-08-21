@@ -10,17 +10,25 @@ use std::{collections::HashMap, net::SocketAddr};
 use oceanfs_core::{Incarnation, NodeId, NodeState};
 use serde::{Deserialize, Serialize};
 
-/// A single node's membership entry for gossip exchange.
+/// A single node's membership entry for gossip exchange (ADR-0028 D3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct NodeEntry {
     /// The node's unique identifier.
     pub node_id: NodeId,
-    /// Current incarnation number.
+    /// Current incarnation number (node-authoritative, ADR-0022).
     pub incarnation: Incarnation,
     /// Current state (Alive, Suspect, Dead, Leaving, Left).
     pub state: NodeState,
     /// The node's gRPC address.
     pub address: SocketAddr,
+    /// Per-(node, origin) logical clock: every state change by the
+    /// observer bumps the version it announces for that node. Orders
+    /// same-origin entries at the same incarnation.
+    pub version: u64,
+    /// The node that last observed/changed this entry (self for
+    /// announcements, the detector node for Suspect/Dead, the leaver
+    /// for Leaving/Left).
+    pub origin: NodeId,
 }
 
 /// Full membership state for gossip exchange.
@@ -61,15 +69,30 @@ pub(crate) enum GossipDirection {
     Pull,
 }
 
+/// A stored membership entry in the coordinator state (ADR-0028 D3).
+#[derive(Debug, Clone)]
+pub(crate) struct StoredEntry {
+    /// Current state.
+    pub state: NodeState,
+    /// Current incarnation.
+    pub incarnation: Incarnation,
+    /// The node's address.
+    pub address: SocketAddr,
+    /// The observer's version for this node (per-(node, origin) clock).
+    pub version: u64,
+    /// The observer that last changed this entry.
+    pub origin: NodeId,
+}
+
 /// Aggregate membership state for the [`Membership`] coordinator.
 ///
-/// Tracks per-node state, incarnation, and address. This is the
-/// internal state used by the coordinator — distinct from the
-/// gossip-exchange types above.
+/// Tracks per-node state, incarnation, address, and attribution
+/// (version + origin). This is the internal state used by the
+/// coordinator — distinct from the gossip-exchange types above.
 #[derive(Debug, Clone)]
 pub(crate) struct MembershipState {
-    /// Per-node state.
-    pub(crate) nodes: HashMap<NodeId, (NodeState, Incarnation, SocketAddr)>,
+    /// Per-node entries.
+    pub(crate) nodes: HashMap<NodeId, StoredEntry>,
     /// Last-known incarnation per node, **retained after Dead/Left
     /// removal** (F1d). A node absent from `nodes` but present here
     /// may only be re-admitted at a strictly higher incarnation —

@@ -28,6 +28,11 @@ pub mod state;
 /// without re-deriving them from local state — a re-admitted node is
 /// absent from local state, so the event is the only carrier of the
 /// fresh address (ADR-0022 Decision 2).
+///
+/// Attribution (ADR-0028 D3): `version` is the emitter's logical clock
+/// for this node (bumped on every emission) and `origin` is the emitter
+/// itself — the authority-class merge rules in `upsert_node` use them to
+/// order facts without last-writer-wins heuristics.
 #[derive(Debug, Clone)]
 pub struct MembershipEvent {
     /// The node whose state changed.
@@ -40,6 +45,73 @@ pub struct MembershipEvent {
     pub incarnation: Incarnation,
     /// The node's address, when the emitter knows it.
     pub address: Option<SocketAddr>,
+    /// The emitter's version for this node (per-(node, origin) clock).
+    pub version: u64,
+    /// The observer that emitted this event.
+    pub origin: NodeId,
+}
+
+/// The authority-class table (ADR-0028 D3).
+///
+/// For an entry about `target` from `origin` as seen by `self_id`, at
+/// the SAME incarnation, higher class wins regardless of version; within
+/// the same class and origin, higher version wins.
+///
+/// | Class | Meaning |
+/// |---|---|
+/// | 4 | The leaver's own Left/Leaving claim (target == origin) |
+/// | 3 | My own detector's observation / my own facts |
+/// | 2 | Another member's detector facts (Suspect/Dead/recovery) |
+/// | 1 | The target's own Alive announcement (replayable history) |
+/// | 0 | Rejected: entries about SELF not originating from self |
+///
+/// Class 3 > 2 implements "ping-verified Alive beats remote Suspect"
+/// and "DEAD is detector-local"; class 2 > 1 implements remote
+/// suspicion; class 4 > 3 lets a graceful leave propagate over stale
+/// detector facts.
+pub(crate) fn authority_class(
+    target: &NodeId,
+    origin: &NodeId,
+    state: NodeState,
+    self_id: &NodeId,
+) -> u8 {
+    if target == self_id {
+        // Self-liveness authority: only the node itself may describe
+        // its own state. Any other origin is rejected outright.
+        return if origin == self_id { 4 } else { 0 };
+    }
+    match state {
+        NodeState::Leaving | NodeState::Left => {
+            if origin == target {
+                4
+            } else if origin == self_id {
+                3
+            } else {
+                2
+            }
+        }
+        NodeState::Suspect | NodeState::Dead => {
+            if origin == self_id {
+                3
+            } else if origin == target {
+                // A target cannot legitimately suspect itself; treat a
+                // replayed Suspect with the target's origin as its
+                // announcement class (beatable by any detector fact).
+                1
+            } else {
+                2
+            }
+        }
+        NodeState::Alive => {
+            if origin == self_id {
+                3
+            } else if origin == target {
+                1
+            } else {
+                2
+            }
+        }
+    }
 }
 
 /// Cluster membership tracker with SWIM failure detection and gossip.
@@ -115,6 +187,10 @@ pub struct Membership {
     pub(crate) probe_failures: RwLock<Option<Counter>>,
     /// SWIM indirect (relayed) probes sent (set during start).
     pub(crate) indirect_probes: RwLock<Option<Counter>>,
+    /// The local node's version clock for its own entries (ADR-0028 D3):
+    /// bumped on every self-announcement / leave event so peers can
+    /// order same-incarnation self-origin entries.
+    pub(crate) self_version: std::sync::atomic::AtomicU64,
     /// Ring version gauge — increments on each ring topology change.
     pub(crate) ring_version: Gauge,
 }
