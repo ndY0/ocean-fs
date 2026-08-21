@@ -336,14 +336,13 @@ impl Membership {
                     incarnation: self_incarnation.value(),
                     address: self.address.to_string(),
                     last_seen: None,
+                    // ADR-0028 D3: attribution lands in f4.
+                    version: 0,
+                    origin: String::new(),
                 };
                 let delta =
                     oceanfs_core::proto::membership::MembershipList { entries: vec![proto_entry] };
-                let msg = oceanfs_network::gossip::GossipMessage {
-                    delta: Some(delta),
-                    ring_version: 0,
-                    hlc: None,
-                };
+                let msg = oceanfs_network::gossip::GossipMessage { delta: Some(delta) };
                 let stream = tokio_stream::iter(vec![msg]);
 
                 match push_client.push(tonic::Request::new(stream)).await {
@@ -433,7 +432,8 @@ impl Membership {
             let mut client = oceanfs_network::GossipRpcClient::new(channel);
             let request = tonic::Request::new(oceanfs_network::gossip::GossipPullRequest {
                 node_id: Some(oceanfs_core::proto::common::NodeId { id: self.node_id.to_string() }),
-                last_known_version: 0,
+                // Empty version vector = "send everything" (join, ADR-0028 D4).
+                version_vector: std::collections::HashMap::new(),
             });
 
             match client.pull(request).await {

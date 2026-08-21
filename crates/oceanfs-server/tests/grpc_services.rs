@@ -241,13 +241,11 @@ async fn gossip_push_then_pull_converges_membership() {
         incarnation: 1,
         address: "127.0.0.1:9002".to_string(),
         last_seen: None,
+        version: 0,
+        origin: String::new(),
     };
 
-    let msg = GossipMessage {
-        delta: Some(MembershipList { entries: vec![entry] }),
-        ring_version: 0,
-        hlc: None,
-    };
+    let msg = GossipMessage { delta: Some(MembershipList { entries: vec![entry] }) };
 
     let push_response =
         client_a.push(tonic::Request::new(tokio_stream::iter(vec![msg]))).await.unwrap();
@@ -261,7 +259,7 @@ async fn gossip_push_then_pull_converges_membership() {
     let pull_response = client_b
         .pull(tonic::Request::new(GossipPullRequest {
             node_id: Some(oceanfs_core::proto::common::NodeId { id: "node-b".to_string() }),
-            last_known_version: 0,
+            version_vector: std::collections::HashMap::new(),
         }))
         .await
         .unwrap();

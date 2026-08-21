@@ -13,6 +13,17 @@ pub struct MembershipEntry {
     pub address: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "5")]
     pub last_seen: ::core::option::Option<super::common::HlcTimestamp>,
+    /// ADR-0028 D3: per-(node, origin) logical clock. Every state change by
+    /// an observer bumps the version it announces for that node; the merge
+    /// compares (incarnation, authority-class, version).
+    #[prost(uint64, tag = "6")]
+    pub version: u64,
+    /// ADR-0028 D3: the node that last observed/changed this entry (self for
+    /// announcements, the detector node for Suspect/Dead, the leaver for
+    /// Leaving/Left). Empty string means "self" for backwards-compatible
+    /// entries produced before attribution.
+    #[prost(string, tag = "7")]
+    pub origin: ::prost::alloc::string::String,
 }
 /// Full membership list.
 #[derive(Clone, PartialEq, ::prost::Message)]

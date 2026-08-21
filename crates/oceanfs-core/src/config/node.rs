@@ -96,6 +96,15 @@ pub struct NodeConfig {
     /// Address for internal gRPC node-to-node communication.
     #[serde(default = "default_grpc_listen_addr")]
     pub grpc_listen_addr: String,
+    /// Address the membership plane (gossip + SWIM probes) listens on
+    /// (ADR-0028 D1).
+    ///
+    /// The membership protocol runs on its own listener and connection
+    /// pool so that probe latency is never coupled to the data plane's
+    /// behavior (16 MiB replica streams, hinted-handoff batches, healing
+    /// transfers). Default: `0.0.0.0:9002`.
+    #[serde(default = "default_membership_listen_addr")]
+    pub membership_listen_addr: String,
     /// Gossip membership protocol configuration.
     ///
     /// Controls SWIM gossip interval, suspicion/failure timeouts,
@@ -420,6 +429,9 @@ fn default_listen_addr() -> String {
 fn default_grpc_listen_addr() -> String {
     "0.0.0.0:9001".into()
 }
+fn default_membership_listen_addr() -> String {
+    "0.0.0.0:9002".into()
+}
 fn default_log_level() -> String {
     "info".into()
 }
@@ -596,6 +608,7 @@ impl Default for NodeConfig {
             data_dir: PathBuf::from("/var/lib/oceanfs"),
             listen_addr: "0.0.0.0:9000".into(),
             grpc_listen_addr: "0.0.0.0:9001".into(),
+            membership_listen_addr: "0.0.0.0:9002".into(),
             gossip: crate::GossipConfig::default(),
             log_level: "info".into(),
             metrics_enabled: true,
@@ -685,6 +698,31 @@ mod tests {
     fn default_config_has_expected_listen_addr() {
         let config = NodeConfig::default();
         assert_eq!(config.listen_addr, "0.0.0.0:9000");
+    }
+
+    /// ADR-0028 D1: the membership plane defaults to its own port,
+    /// distinct from the data-plane gRPC port.
+    #[test]
+    fn default_membership_listen_addr_is_its_own_port() {
+        let config = NodeConfig::default();
+        assert_eq!(config.grpc_listen_addr, "0.0.0.0:9001");
+        assert_eq!(config.membership_listen_addr, "0.0.0.0:9002");
+        assert_ne!(
+            config.grpc_listen_addr, config.membership_listen_addr,
+            "the membership plane must not share the data-plane port"
+        );
+    }
+
+    /// ADR-0028 D1: an explicit membership_listen_addr round-trips
+    /// through serde.
+    #[test]
+    fn explicit_membership_listen_addr_round_trips() {
+        let toml = r#"
+            node_id = "node-1"
+            membership_listen_addr = "10.0.0.2:9002"
+        "#;
+        let config: NodeConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.membership_listen_addr, "10.0.0.2:9002");
     }
 
     #[test]

@@ -275,6 +275,11 @@ impl GossipProtocol {
                                 incarnation: e.incarnation.value(),
                                 address: e.address.to_string(),
                                 last_seen: None,
+                                // ADR-0028 D3: attribution lands in f4 —
+                                // empty origin means "self", version 0 is
+                                // the pre-attribution value.
+                                version: 0,
+                                origin: String::new(),
                             })
                             .collect();
 
@@ -293,8 +298,6 @@ impl GossipProtocol {
                                                 entries,
                                             },
                                         ),
-                                        ring_version: 0,
-                                        hlc: None,
                                     };
 
                                     let stream = tokio_stream::iter(vec![msg]);

@@ -6,26 +6,37 @@ import "oceanfs/common.proto";
 import "oceanfs/membership.proto";
 
 // ---------------------------------------------------------------------------
-// Gossip protocol messages and service.
+// Gossip protocol messages and service (the membership plane, ADR-0028).
 // ---------------------------------------------------------------------------
 
 // A gossip message carrying a delta of the membership list.
 message GossipMessage {
   oceanfs.membership.MembershipList delta = 1;
-  uint64 ring_version = 2;
-  oceanfs.common.HlcTimestamp hlc = 3;
 }
 
 // Request to pull membership updates from a peer.
+//
+// `version_vector` maps NodeId -> highest version the requester has
+// applied for that node (ADR-0028 D4). An empty vector means "send
+// everything" (join). Replaces the historical single
+// `last_known_version` counter, which could not express per-node
+// deltas.
 message GossipPullRequest {
   oceanfs.common.NodeId node_id = 1;
-  uint64 last_known_version = 2;
+  map<string, uint64> version_vector = 2;
 }
 
 // Acknowledgment of a gossip push.
 message GossipAck {
   bool accepted = 1;
   uint32 updated_entries = 2;
+  // ADR-0028 D4: the push response carries the peer's pull — entries the
+  // peer holds that are newer than the requester's version vector — so a
+  // push-pull round costs one round trip per peer.
+  oceanfs.membership.MembershipList delta = 3;
+  // The peer's version vector, used by the requester to advance its
+  // per-peer watermark.
+  map<string, uint64> version_vector = 4;
 }
 
 // Gossip RPC service for SWIM-based membership dissemination.
@@ -35,4 +46,16 @@ service GossipRpc {
 
   // Pull membership updates from a peer.
   rpc Pull(GossipPullRequest) returns (stream GossipMessage);
+}
+
+// SWIM probe service (spec §12.3, ADR-0028 D2).
+//
+// Direct probe: origin sends Probe{target, is_indirect: false} to the
+// target; the target acks with its incarnation.
+//
+// Indirect probe: origin sends Probe{target, is_indirect: true} to a
+// relay; the relay forwards a direct probe to the target and relays the
+// ack back to the origin.
+service ProbeRpc {
+  rpc Probe(oceanfs.membership.ProbeRequest) returns (oceanfs.membership.ProbeResponse);
 }

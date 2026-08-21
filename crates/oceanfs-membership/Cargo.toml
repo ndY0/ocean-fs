@@ -21,6 +21,7 @@ tonic.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+prost.workspace = true
 static_assertions.workspace = true
 
 [lints]

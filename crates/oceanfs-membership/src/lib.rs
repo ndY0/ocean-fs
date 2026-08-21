@@ -27,6 +27,7 @@ mod gossip;
 mod graceful_leave;
 pub mod grpc;
 mod membership;
+pub mod plane;
 
 pub use error::{Error, Result};
 pub use graceful_leave::GracefulLeaveHandler;

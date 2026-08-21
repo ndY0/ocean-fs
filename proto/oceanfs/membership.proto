@@ -24,6 +24,15 @@ message MembershipEntry {
   uint64 incarnation = 3;
   string address = 4;                // host:port
   oceanfs.common.HlcTimestamp last_seen = 5;
+  // ADR-0028 D3: per-(node, origin) logical clock. Every state change by
+  // an observer bumps the version it announces for that node; the merge
+  // compares (incarnation, authority-class, version).
+  uint64 version = 6;
+  // ADR-0028 D3: the node that last observed/changed this entry (self for
+  // announcements, the detector node for Suspect/Dead, the leaver for
+  // Leaving/Left). Empty string means "self" for backwards-compatible
+  // entries produced before attribution.
+  string origin = 7;
 }
 
 // Full membership list.
