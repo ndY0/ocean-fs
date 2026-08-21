@@ -1479,7 +1479,17 @@ impl Node {
         // receiver) gets a 64 MiB decode limit — the client-side
         // max_batch_bytes cap (32 MiB) keeps batches comfortably inside.
         let grpc_router = tonic::transport::Server::builder()
-            .add_service(oceanfs_storage::SegmentRpcServer::new(segment_service))
+            // The append replication receiver must accept chunks up to
+            // max_body_size (16 MiB in the load-test profile): the 4 MiB
+            // tonic default made every >4 MiB replica write fail with
+            // OutOfRange "decoded message length too large" — the write
+            // degraded to the slow hint path and replicas lagged at
+            // verify time (fleet read-quorum failures hot-15/hot-57;
+            // the 2 MiB local profile never exceeded the default).
+            .add_service(
+                oceanfs_storage::SegmentRpcServer::new(segment_service)
+                    .max_decoding_message_size(64 * 1024 * 1024),
+            )
             .add_service(oceanfs_network::GossipRpcServer::new(gossip_service))
             .add_service(
                 oceanfs_durability::HealingRpcServer::new(healing_service)
