@@ -135,13 +135,13 @@ impl GossipProtocol {
                 LabelSet::empty(),
             ),
             round_duration_us: Arc::new(Histogram::new(
-                "gossip_round_duration_seconds".into(),
+                "gossip_round_duration_microseconds".into(),
                 "Gossip round duration in microseconds".into(),
                 &sub_millisecond_histogram_config(),
                 LabelSet::empty(),
             )),
             push_duration_us: Arc::new(Histogram::new(
-                "gossip_push_duration_seconds".into(),
+                "gossip_push_duration_microseconds".into(),
                 "Gossip push (SWIM ping proxy) duration in microseconds".into(),
                 &sub_millisecond_histogram_config(),
                 LabelSet::empty(),
