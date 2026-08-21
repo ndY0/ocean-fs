@@ -224,8 +224,13 @@ read_quorum = 2
 replication_factor = 3
 [gossip]
 interval_ms = 1000
-suspicion_timeout_ms = 3000
-failure_timeout_ms = 8000
+# Loosened from 3000/8000: under load-test CPU contention the gossip
+# push (which carries the SWIM pings, DK-007) lags and the tight
+# windows produced FALSE suspects — a live node marked suspect/dead
+# during the settle and convergence never recovered (local churn47
+# + fleet churn runs 4-6). Matches the local churn profile.
+suspicion_timeout_ms = 6000
+failure_timeout_ms = 15000
 indirect_ping_count = 3
 seed_nodes = [${SEED:+$(printf '"%s"' "$SEED")}]
 CONFIG
