@@ -82,16 +82,16 @@ proto  → version/origin/vector fields → carried but unused until f4/f5
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds in all affected crates
-- [ ] **Tests:** config round-trip (listen addr default + explicit);
+- [x] **Code:** `cargo build --all-targets` succeeds in all affected crates
+- [x] **Tests:** config round-trip (listen addr default + explicit);
       address-derivation unit tests (0.0.0.0 substitution, explicit IP);
       pool construction with probe timeouts
-- [ ] **Docs:** every `pub` item has `# Examples`; `#![deny(missing_docs)]`
+- [x] **Docs:** every `pub` item has `# Examples`; `#![deny(missing_docs)]`
       passes
-- [ ] **ADR:** ADR-0028 D1 (config + pool), D2 (Probe RPC on the wire),
+- [x] **ADR:** ADR-0028 D1 (config + pool), D2 (Probe RPC on the wire),
       D4 (proto fields) satisfied
-- [ ] **Perf:** 1.3 (pre-sized vectors for deltas), 4.1 (pool per peer),
+- [x] **Perf:** 1.3 (pre-sized vectors for deltas), 4.1 (pool per peer),
       4.5 (probe-derived timeouts), 7.1 (no lock held across pool ops)
-- [ ] **Integration:** a generated-code smoke test round-trips a
+- [x] **Integration:** a generated-code smoke test round-trips a
       `MembershipEntry{version, origin}` and a `Probe` call over the
       existing test server

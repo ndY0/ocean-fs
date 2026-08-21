@@ -1591,17 +1591,34 @@ impl Node {
                 probe_service,
             ));
 
-        let membership_listener = tokio::net::TcpListener::bind(membership_addr)
-            .await
-            .map_err(|e| format!("failed to bind membership plane on {membership_addr}: {e}"))?;
+        let membership_listener = match create_reuseport_listener(membership_addr) {
+            Ok(l) => l,
+            Err(e) => {
+                error!("membership plane listener creation failed for {membership_addr}: {e}");
+                return Err(format!(
+                    "membership plane listener creation failed for {membership_addr}: {e}"
+                )
+                .into());
+            }
+        };
 
         tokio::spawn(async move {
-            if let Err(e) = membership_router
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
-                    membership_listener,
-                ))
-                .await
-            {
+            // Same socket treatment as the data plane (perf 4.3):
+            // quickack + busy-poll on accepted membership connections —
+            // probe latency is the detection bound.
+            use std::os::unix::io::AsRawFd;
+
+            use tokio_stream::StreamExt;
+
+            let stream = tokio_stream::wrappers::TcpListenerStream::new(membership_listener).map(
+                move |conn| {
+                    if let Ok(ref stream) = conn {
+                        apply_opts_to_fd(stream.as_raw_fd(), quickack, busy_poll);
+                    }
+                    conn
+                },
+            );
+            if let Err(e) = membership_router.serve_with_incoming(stream).await {
                 error!("membership plane server error: {e}");
             }
         });
@@ -1618,7 +1635,7 @@ impl Node {
         // start() — an earlier registration captured None and the
         // gossip series never appeared (the timing-metrics run
         // queried an empty metric).
-        membership.register_gossip_metrics(&*metrics_for_late_registration);
+        membership.register_membership_metrics(&*metrics_for_late_registration);
         let join_incarnation = Incarnation::new(announce_incarnation);
         let join_fallback_seeds = durable_state.fallback_seeds.clone();
         if let Err(e) = membership.join(join_incarnation, &join_fallback_seeds).await {

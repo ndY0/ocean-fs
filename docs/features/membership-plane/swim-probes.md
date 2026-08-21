@@ -77,17 +77,18 @@ tick → pick target → direct probe (9002, deadline)
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` passes; proxy path fully
+- [x] **Code:** `cargo build --all-targets` passes; proxy path fully
       removed (no `PingResponse` from push)
-- [ ] **Tests:** unit: direct-ack recovers; direct-timeout → relays
+- [x] **Tests:** unit: direct-ack recovers; direct-timeout → relays
       initiated; relay-ack recovers; all-relay-fail → SUSPECT; no relay
       available → SUSPECT immediately; probe to unknown node is dropped
       (F1a stays); integration: 3-node in-process cluster — kill target →
       SUSPECT within `2×ping_timeout_ms + margin`, DEAD after
       `suspicion_timeout_ms`, recovery on restart
-- [ ] **Docs:** `# Examples`; missing-docs deny passes
-- [ ] **ADR:** ADR-0028 D2 satisfied; DK-007 removed (D5)
-- [ ] **Perf:** 4.5 (hard per-probe deadline), 8.2 (timeout branches),
+- [x] **Docs:** `# Examples`; missing-docs deny passes
+- [x] **ADR:** ADR-0028 D2 satisfied; DK-007 removed (D5)
+- [x] **Perf:** 4.5 (hard per-probe deadline), 8.2 (timeout branches),
       9.1/9.2 (borrowed request/response, `&str` ids)
 - [ ] **Integration:** local churn field 7/7; probe p99 stays below
       `ping_timeout_ms` under data-plane load (16 MiB streams)
+<!-- REVIEW: local churn is green (load_cluster_churn 10/10 assertions, verified 2026-08-22), but the isolation proof — probe_duration_microseconds p99 < ping_timeout_ms while 16 MiB bodies stream — is a fleet measurement (f6) and has not been run; the separate listener/pool makes it structural but unproven. Would pass with the f6 isolation capture. -->

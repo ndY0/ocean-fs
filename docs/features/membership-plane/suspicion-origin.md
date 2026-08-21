@@ -79,17 +79,17 @@ echo of my own fact   → class 0 → idempotent (oscillation closed)
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` passes; the four deleted
+- [x] **Code:** `cargo build --all-targets` passes; the four deleted
       guards are absent from the merge paths (grep-verifiable)
-- [ ] **Tests:** one test per table cell (self beats peer Suspect; local
+- [x] **Tests:** one test per table cell (self beats peer Suspect; local
       detector beats remote Suspect; remote Suspect applies when no newer
       local fact; equal-version echo idempotent; rejoin at higher
       incarnation beats pending Dead; stale timer cancellation); the
       pre-existing guard tests pass unchanged or re-expressed
-- [ ] **Docs:** `# Examples`; missing-docs deny passes
-- [ ] **ADR:** ADR-0028 D3 satisfied; D5 (kept invariants) verified
-- [ ] **Perf:** 1.3 (pre-sized merge loops), 7.1 (short write-lock
+- [x] **Docs:** `# Examples`; missing-docs deny passes
+- [x] **ADR:** ADR-0028 D3 satisfied; D5 (kept invariants) verified
+- [x] **Perf:** 1.3 (pre-sized merge loops), 7.1 (short write-lock
       windows), 6.4 (class compare as integer, no dynamic dispatch)
-- [ ] **Integration:** local churn field 7/7 with the authority merge;
+- [x] **Integration:** local churn field 7/7 with the authority merge;
       the t24/fleet regression scenarios (kill + rejoin + stale-gossip
       replay) converge without oscillation

@@ -167,13 +167,28 @@ MemberEntry = (node_id, state, incarnation, version, address, origin)
 
    | Class | Origin | Wins against |
    |---|---|---|
-   | 3 | X itself (self-announcement) | everything at equal incarnation |
-   | 2 | local detector (my own probe facts) | class 1, 0 |
-   | 1 | another member's detector | class 0 |
-   | 0 | gossip echo (origin = X or my detector, replayed) | nothing (idempotent) |
+   | 4 | the target itself, for Left/Leaving (the leaver's terminal claim) | everything at equal incarnation |
+   | 3 | my own detector / my own local observations | class 2, 1 |
+   | 2 | another member's detector facts (Suspect/Dead/recovery) | class 1 |
+   | 1 | the target's own Alive announcement (replayable history) | nothing (idempotent within same origin+version) |
+   | 0 | entries about SELF from another origin | rejected outright (self-liveness authority) |
 
    Within the same class, higher `version` wins; equal version is
-   idempotent (dropped).
+   idempotent (dropped); the same class from a different origin keeps
+   the local entry (no cross-origin churn — my own detector is the
+   authority to move the state forward).
+
+   Note (implementation clarification, 2026-08): the target's own Alive
+   announcement is class **1**, not the top — a node's announcement
+   records that it WAS alive at announce time; liveness is a present-
+   time fact only my own probes establish. Class 4 (the leaver's own
+   Left/Leaving) is what an earlier draft's "self-announcement wins
+   over everything" was really about: terminal leave claims must beat
+   stale detector facts. This ordering preserves every documented
+   outcome — remote suspicion applies over announcements (class 2 >
+   1), my ping-verified Alive beats remote Suspect (class 3 > 2), and
+   rejoin authority is governed by the incarnation gate, not the class
+   table.
 
 **Rules that fall out of the table:**
 

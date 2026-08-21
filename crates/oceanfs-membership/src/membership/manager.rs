@@ -273,7 +273,7 @@ impl Membership {
     }
 
     /// Registers gossip + probe counters with a metrics registrar.
-    pub fn register_gossip_metrics(&self, registrar: &dyn oceanfs_core::MetricRegistrar) {
+    pub fn register_membership_metrics(&self, registrar: &dyn oceanfs_core::MetricRegistrar) {
         if let Some(ref c) = *self.gossip_sent.read() {
             registrar.register_counter(c.clone());
         }
@@ -1652,7 +1652,7 @@ mod tests {
         let (_ring, m) = make_membership("node");
         let reg = TestRegistrar { gauge_names: parking_lot::Mutex::new(Vec::new()) };
 
-        m.register_gossip_metrics(&reg);
+        m.register_membership_metrics(&reg);
 
         let names = reg.gauge_names.lock();
         assert!(

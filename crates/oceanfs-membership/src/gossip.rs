@@ -1072,6 +1072,32 @@ mod tests {
         );
     }
 
+    /// ADR-0028 D4 re-sync: a deliberately diverged peer vector (a node
+    /// key it never acked) is healed by the next round — the entry the
+    /// peer lacks is included in the delta for it until its vector
+    /// covers the (node, origin) key. The push-pull round makes an
+    /// explicit re-sync pull redundant: the ack's pull (computed from
+    /// MY vector) covers the opposite direction every round.
+    #[test]
+    fn diverged_peer_vector_is_healed_by_the_next_delta() {
+        let mut protocol = make_protocol();
+        let peer = NodeId::new("peer");
+
+        protocol.add_node(make_node_entry("heal-me", 2, NodeState::Alive));
+
+        // The peer's vector covers OTHER nodes but is missing
+        // "heal-me" entirely — a divergence.
+        let mut vector = std::collections::HashMap::new();
+        let mut origins = std::collections::HashMap::new();
+        origins.insert(NodeId::new("peer"), 1u64);
+        vector.insert(NodeId::new("peer"), origins);
+        protocol.watermarks.insert(peer.clone(), vector);
+
+        let delta = protocol.build_delta_for(&peer);
+        assert_eq!(delta.changed.len(), 1, "the missing node must be re-sent");
+        assert_eq!(delta.changed[0].node_id.as_str(), "heal-me");
+    }
+
     /// ADR-0028 D4: an ack advances the watermark and the next delta
     /// for that peer excludes the acked entries.
     #[tokio::test]

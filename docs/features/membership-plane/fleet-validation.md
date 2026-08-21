@@ -83,3 +83,9 @@ build → deploy fleet (9001 data + 9002 membership) → churn runs ×3
 - [ ] **Perf:** probe p99 under `ping_timeout_ms` during churn
 - [ ] **Integration:** 3/3 consecutive churn quick runs fully green on
       the fleet; local churn field spotless before the fleet deploy
+
+<!-- REVIEW: f6 not implemented or run — no fleet deploy (VMs not
+      provisioned), no settle_grace_ms knob in e2e/src/harness.rs, no
+      handoff-delta counter-reset re-base in load_cluster_churn.rs, no
+      probe-p99 capture. Local half of the Integration bullet is green
+      (load_cluster_churn + cluster_* suites pass locally). -->

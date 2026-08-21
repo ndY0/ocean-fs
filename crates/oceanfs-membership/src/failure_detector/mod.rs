@@ -13,7 +13,7 @@
 use std::time::Duration;
 
 use oceanfs_core::{NodeId, NodeState};
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
 use crate::membership::MembershipEvent;
 
@@ -124,7 +124,26 @@ impl FailureDetector {
     /// convergence failures: node stuck Suspect on the peers through
     /// the settle). Every successful ping is authoritative: the node
     /// is reachable, so any Suspect must clear.
+    ///
+    /// The recovery event is emitted ONLY when the target is actually
+    /// Suspect (timer present, or the synced view says Suspect — the
+    /// gossip-applied case). Emitting on every successful probe would
+    /// bump the per-(node, origin) version every interval for an
+    /// already-Alive target, so the prober's entry never stabilizes:
+    /// the ack-carried pull keeps re-sending it, the receiver rejects
+    /// the newer version of a remote fact it already holds, and the
+    /// sender's watermark can never cover it — unbounded version
+    /// churn and non-empty deltas forever (reviewer finding, 2026-08).
     fn recover_suspect(&mut self, target: &NodeId) {
+        let is_suspect = self.suspicion_timers.contains_key(target)
+            || self
+                .alive_nodes
+                .iter()
+                .any(|(id, state, _, _)| id == target && *state == NodeState::Suspect);
+        if !is_suspect {
+            trace!(node_id = %target, "recover_suspect: target not suspect — no event");
+            return;
+        }
         let incarnation = self
             .suspicion_timers
             .remove(target)
@@ -249,6 +268,48 @@ mod tests {
                 "no Suspect event for an unknown node"
             );
         }
+    }
+
+    /// Reviewer finding (2026-08): a successful probe of an ALREADY
+    /// Alive target must not emit a recovery event — unconditional
+    /// emission bumped the per-(node, origin) version every interval,
+    /// so the prober's entry never stabilized and the ack-carried pull
+    /// re-sent it forever (unbounded version churn).
+    #[tokio::test]
+    async fn successful_probe_of_alive_target_emits_no_recovery_event() {
+        let (mut detector, cmd_tx, mut event_rx) = make_detector();
+        let target = NodeId::new("target-node");
+        detector.alive_nodes = vec![(
+            target.clone(),
+            NodeState::Alive,
+            "127.0.0.1:9000".parse().unwrap(),
+            Incarnation::new(1),
+        )];
+
+        // Two successful probe verdicts — neither may emit an event.
+        cmd_tx
+            .send(DetectorCommand::PingResponse { target: target.clone(), success: true })
+            .await
+            .unwrap();
+        cmd_tx
+            .send(DetectorCommand::PingResponse { target: target.clone(), success: true })
+            .await
+            .unwrap();
+        cmd_tx.send(DetectorCommand::Shutdown).await.unwrap();
+        detector.run().await;
+
+        while let Ok(event) = event_rx.try_recv() {
+            assert_ne!(
+                (event.node_id.as_str(), event.new_state),
+                ("target-node", NodeState::Alive),
+                "an already-Alive target must not produce recovery events"
+            );
+        }
+        assert_eq!(
+            detector.versions.get(&target),
+            None,
+            "no version bump for an already-Alive target"
+        );
     }
 
     /// F1b: a successful indirect ping of a node currently in Suspect

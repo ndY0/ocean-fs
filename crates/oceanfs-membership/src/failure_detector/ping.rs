@@ -303,7 +303,50 @@ pub(crate) fn select_random_peer<'a>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use oceanfs_core::RpcConfig;
+
     use super::*;
+
+    /// ADR-0028 D2 DoD: with NO relays available, a failed direct probe
+    /// must yield a failure verdict (the detector escalates to SUSPECT).
+    #[tokio::test]
+    async fn probe_cycle_without_relays_fails_when_direct_probe_fails() {
+        let pool = Arc::new(ConnectionPool::new(RpcConfig {
+            connect_timeout_ms: 200,
+            request_timeout_ms: 200,
+            ..RpcConfig::default()
+        }));
+        let origin = NodeId::new("origin");
+        let target = NodeId::new("target");
+        // Bind then drop a local listener: the port is guaranteed
+        // refused (RST) — a fast, deterministic direct-probe failure.
+        let refused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = refused.local_addr().unwrap();
+        drop(refused);
+        let relays: Vec<(NodeId, SocketAddr)> = Vec::new();
+        let metrics = super::super::ProbeMetrics {
+            duration_us: Arc::new(oceanfs_core::Histogram::new(
+                "t".into(),
+                "t".into(),
+                &oceanfs_core::sub_millisecond_histogram_config(),
+                oceanfs_core::LabelSet::empty(),
+            )),
+            failures_total: oceanfs_core::Counter::new(
+                "t".into(),
+                "t".into(),
+                oceanfs_core::LabelSet::empty(),
+            ),
+            indirect_total: oceanfs_core::Counter::new(
+                "t".into(),
+                "t".into(),
+                oceanfs_core::LabelSet::empty(),
+            ),
+        };
+
+        let verdict =
+            run_probe_cycle(&pool, &origin, &target, target_addr, &relays, 200, &metrics).await;
+        assert!(!verdict, "a failed direct probe with no relays must fail the cycle");
+    }
 
     #[test]
     fn select_random_peer_returns_alive_node() {

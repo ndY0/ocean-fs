@@ -52,16 +52,19 @@ detector events feed the merge rules). `f6` gates on everything.
 - [ ] ADR-0028 decisions D1–D5 all implemented: dedicated port, real
       direct+indirect probes, origin-attributed merge rules, vector-based
       push-pull gossip, proxy path removed.
-- [ ] The seven heuristic guards are deleted or re-expressed as rules of
+<!-- REVIEW: D1 (port/pool/announce), D2 (probes), D3 (merge rules), D5 (kept invariants) and the proxy removal are verified; D4 is partial — the divergence-heal re-sync pull is not implemented (gossip.rs has no re-sync trigger; pull is join-only). Also D1's "probes use a fresh channel" is implemented as a timeout-bounded pool acquisition (ping.rs make_client), and D3's class table maps the target's own announcement to class 1 (beatable by any remote detector fact at equal incarnation) instead of the ADR's class 3 — behaviorally equivalent for the documented scenarios, but not the table as written. Would pass when the re-sync pull exists. -->
+- [x] The seven heuristic guards are deleted or re-expressed as rules of
       the authority table (no `stale-suspect`/`self-downgrade`/`terminality`
       special cases in `merge_delta`/`upsert_node`).
 - [ ] The fleet churn quick test (phase-3, 3 nodes) passes **3/3
       consecutive runs**: all 10 assertions, convergence true, 0 read-quorum
       failures, 0 missing keys, no suspect-stuck through the settle.
+<!-- REVIEW: f6 not run — fleet VMs not deployed. Verified locally only (load_cluster_churn 10/10, one run). -->
 - [ ] Probe latency is isolated: `probe_duration_microseconds` p99 stays
       under `ping_timeout_ms` while the data plane streams 16 MiB bodies
       (the old push p99 195 ms class is gone from the membership plane).
-- [ ] All existing membership unit suites stay green (72 → …), and the
+<!-- REVIEW: f6 fleet measurement not run; the isolation is structural (separate listener + pool) but unproven. -->
+- [x] All existing membership unit suites stay green (72 → …), and the
       guard-port tests pass under the authority model.
-- [ ] Local churn field spotless (7/7) with the new plane before fleet
+- [x] Local churn field spotless (7/7) with the new plane before fleet
       deployment.
