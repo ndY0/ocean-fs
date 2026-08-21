@@ -55,6 +55,11 @@ pub struct SegmentGrpcService {
     /// timestamps arriving on this service are merged via
     /// [`HlcClock::update`] so the local clock never lags replicas.
     hlc_clock: Arc<HlcClock>,
+    /// Lifecycle coordinator (wired by the composition root). Replica
+    /// appends REGISTER their segments here — an unregistered `.dat`
+    /// is invisible to the GC and the orphan reaper (the fleet
+    /// disk-fill root cause).
+    lifecycle: Option<Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>>,
 }
 
 impl SegmentGrpcService {
@@ -75,7 +80,18 @@ impl SegmentGrpcService {
         let metadata_async = metadata_store
             .clone()
             .map(|s| Arc::new(crate::metadata_async::AsyncMetadataOps::from_storage(s)));
-        Self { data_store, metadata_store, metadata_async, buffer_pool, hlc_clock }
+        Self { data_store, metadata_store, metadata_async, buffer_pool, hlc_clock, lifecycle: None }
+    }
+
+    /// Wires the lifecycle coordinator so replicated appends register
+    /// their segments (composition root).
+    #[must_use]
+    pub fn with_lifecycle(
+        mut self,
+        lifecycle: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
+    ) -> Self {
+        self.lifecycle = Some(lifecycle);
+        self
     }
 
     /// Returns a reference to the underlying data store (for testing).
@@ -313,6 +329,56 @@ impl SegmentRpc for SegmentGrpcService {
             "append_segment: wrote {} bytes to store",
             total_bytes
         );
+
+        // Register the replica segment in the lifecycle machine. The
+        // registry drives the GC and the orphan reaper — a raw `.dat`
+        // without an entry is INVISIBLE to both: the GC never
+        // attributes its dead bytes, the reaper never sweeps it, and
+        // the disk fills with replica copies (the fleet disk-fill root
+        // cause: ~10k unregistered files vs 32 registered; phase 2 has
+        // no replication, so every segment was a registered local
+        // append and stayed bounded). The segment is complete on
+        // arrival, so it is reserved and immediately sealed; the
+        // durable ReserveEvent precedes the data (ADR-0024).
+        if let Some(lifecycle) = &self.lifecycle {
+            let tier = oceanfs_storage::TierRouter::new(oceanfs_core::SegmentSizeConfig::default())
+                .classify(total_bytes);
+            let sealed_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let merkle_root =
+                oceanfs_durability::MerkleTree::build(&segment_data, 0).map(|t| t.root().hash());
+            let meta = oceanfs_core::SegmentMetadata {
+                segment_id,
+                ec_k: 1,
+                ec_m: 0,
+                size_tier: tier,
+                merkle_root,
+                storage_locations: smallvec::SmallVec::new(),
+                sealed_at: Some(sealed_at),
+            };
+            match lifecycle.request_reserve(segment_id, tier, 1, 0).await {
+                Ok(()) => {
+                    if let Err(e) = lifecycle.request_seal(segment_id, meta, None).await {
+                        tracing::warn!(
+                            segment_id = %segment_id,
+                            error = ?e,
+                            "append_segment: failed to seal replica segment"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Already registered (replayed or duplicate) —
+                    // nothing to do.
+                    tracing::debug!(
+                        segment_id = %segment_id,
+                        error = ?e,
+                        "append_segment: replica segment already registered"
+                    );
+                }
+            }
+        }
 
         Ok(Response::new(SegmentAppendResponse {
             wal_position: total_bytes,
@@ -744,6 +810,114 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         SegmentRpcClient::connect(format!("http://{addr}")).await.unwrap()
+    }
+
+    /// Test server variant with the lifecycle coordinator wired (the
+    /// composition-root shape) — the replica appends must register
+    /// their segments.
+    async fn test_server_with_lifecycle(
+        store: Arc<dyn SegmentDataStore>,
+        metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
+    ) -> (
+        SegmentRpcClient<tonic::transport::Channel>,
+        Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
+    ) {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let lifecycle = Arc::new(
+            oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            )
+            .with_event_wal(Arc::new(
+                oceanfs_storage::segment::event_wal::EventWal::open(
+                    tempfile::tempdir().unwrap().path().join("event-wal"),
+                    &oceanfs_core::EventWalConfig {
+                        event_wal_dir: tempfile::tempdir().unwrap().path().join("event-wal"),
+                        event_wal_file_size_bytes: 1024 * 1024,
+                        event_wal_fsync_batch_timeout_ms: 10,
+                        event_wal_checkpoint_bytes: 1024 * 1024,
+                    },
+                )
+                .await
+                .unwrap(),
+            )),
+        );
+        let service = SegmentGrpcService::new(
+            store,
+            Some(metadata),
+            Arc::new(BufferPool::new(65536, 1024)),
+            Arc::new(HlcClock::new()),
+        )
+        .with_lifecycle(Arc::clone(&lifecycle));
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(SegmentRpcServer::new(service))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = SegmentRpcClient::connect(format!("http://{addr}")).await.unwrap();
+        (client, lifecycle)
+    }
+
+    /// The replication receiver must REGISTER the replica segment in
+    /// the lifecycle machine: an unregistered `.dat` is invisible to
+    /// the GC and the orphan reaper — the fleet disk-fill root cause
+    /// (the registry knew 32 segments while the disk held ~10k files).
+    #[tokio::test]
+    async fn append_segment_registers_replica_segment_in_lifecycle() {
+        use oceanfs_storage_api::MetadataStore as _;
+        let store: Arc<dyn SegmentDataStore> = Arc::new(TestSegmentStore::new());
+        let metadata: Arc<dyn oceanfs_storage_api::MetadataStore> = Arc::new(
+            oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: tempfile::tempdir().unwrap().path().join("meta"),
+                block_cache_size: 1024,
+                memtable_size: 1024,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+
+        let (mut client, lifecycle) = test_server_with_lifecycle(store, metadata).await;
+
+        let segment_id = SegmentId::new();
+        let chunk = make_append_chunk(Some(oceanfs_core::proto::common::HlcTimestamp {
+            wall_time: 1_700_000_000_000,
+            logical: 1,
+        }));
+        // The first chunk carries the segment id + the object metadata.
+        let mut request = oceanfs_core::proto::segment::SegmentAppendRequest {
+            segment_id: Some(ProtoSegmentId::from(segment_id)),
+            shard_index: None,
+            offset: 0,
+            data: Bytes::from(vec![0xAB; 1024]),
+            hlc: Some(oceanfs_core::proto::common::HlcTimestamp {
+                wall_time: 1_700_000_000_000,
+                logical: 1,
+            }),
+            bucket_id: "test".into(),
+            object_key: "obj".into(),
+            object_size: 1024,
+            blake3_hash: Bytes::new(),
+            chunk_segment_ids: vec![Bytes::copy_from_slice(segment_id.as_uuid().as_bytes())],
+            chunk_offsets: vec![0],
+            chunk_lengths: vec![1024],
+            ..Default::default()
+        };
+        request.data = chunk.data;
+
+        let response = client.append_segment(tokio_stream::iter(vec![request])).await.unwrap();
+        assert_eq!(response.into_inner().ack as i32, 0, "ack must be Ok");
+
+        // The segment must now be registered AND sealed in the lifecycle.
+        let entry = lifecycle.registry().get(segment_id).expect("segment registered");
+        assert_eq!(entry.state, oceanfs_storage::SegmentState::Sealed);
+        assert!(entry.metadata.sealed_at.is_some(), "sealed_at must be set (reaper TTL gate)");
     }
 
     #[tokio::test]

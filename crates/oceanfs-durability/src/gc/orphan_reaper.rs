@@ -138,6 +138,35 @@ impl OrphanReaper {
             }
         });
 
+        // Phase 2b: the ON-DISK segments the registry does not know.
+        // The replication receiver (append_segment) historically wrote
+        // raw `.dat` files WITHOUT lifecycle registration, so the
+        // registry scan above never saw them — the fleet disk-fill
+        // root cause (~10k unregistered files vs 32 registered). A
+        // file with no object-row reference is garbage regardless of
+        // the registry; the file's mtime stands in for `sealed_at`
+        // (the TTL grace gate).
+        let registered: std::collections::HashSet<SegmentId> = {
+            let mut set = std::collections::HashSet::new();
+            self.lifecycle.registry().for_each(|id, _| {
+                set.insert(id);
+            });
+            set
+        };
+        let on_disk = self
+            .store
+            .list_segment_files()
+            .map_err(|e| oceanfs_storage::Error::Io(std::io::Error::other(e.to_string())))?;
+        for (segment_id, file_mtime) in on_disk {
+            if registered.contains(&segment_id) || referenced.contains(&segment_id) {
+                continue;
+            }
+            if file_mtime > 0 && now_ms - file_mtime > ttl_ms {
+                orphan_ids.push(segment_id);
+                stats.orphans_found += 1;
+            }
+        }
+
         // Phase 3: Reclaim orphans with double-check.
         //
         // The double-check re-uses the Phase-1 referenced set — a
@@ -672,6 +701,65 @@ mod tests {
         assert_eq!(stats.orphans_found, 0);
         assert_eq!(stats.orphans_deleted, 0);
         assert!(registry.get(seg_id).is_some());
+    }
+
+    /// The on-disk sweep (the fleet disk-fill fix): a segment `.dat`
+    /// file the lifecycle registry does NOT know — the replication
+    /// receiver's unregistered appends — must be reclaimed when no
+    /// object row references it. The registry-only scan never saw
+    /// these files (~10k unregistered vs 32 registered on the fleet).
+    #[tokio::test]
+    async fn sweeps_unregistered_on_disk_segments() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+
+        // Simulate the receiver's raw write: a .dat file with NO
+        // registry entry and NO object-row reference. The InMemory
+        // store's listing is empty, so use the DISK store directly.
+        let dir = tempfile::tempdir().unwrap();
+        let disk_store = Arc::new(DiskSegmentShardStore::new(dir.path().to_path_buf()));
+        let unregistered = SegmentId::new();
+        let mtime =
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64 - 60_000; // older than the 5s TTL
+        std::fs::write(dir.path().join(format!("{unregistered}.dat")), vec![0xAB; 100]).unwrap();
+        // Set the mtime to the past so the TTL gate passes.
+        let past = SystemTime::now() - std::time::Duration::from_secs(60);
+        let _ = std::fs::File::options()
+            .write(true)
+            .open(dir.path().join(format!("{unregistered}.dat")))
+            .and_then(|f| f.set_modified(past));
+        let _ = mtime;
+
+        let lifecycle = Arc::new(
+            SegmentLifecycleCoordinator::with_registry(Arc::clone(&registry)).with_event_wal(
+                Arc::new(
+                    oceanfs_storage::segment::event_wal::EventWal::open(
+                        tempfile::tempdir().unwrap().path().join("event-wal"),
+                        &oceanfs_core::EventWalConfig {
+                            event_wal_dir: tempfile::tempdir().unwrap().path().join("event-wal"),
+                            event_wal_file_size_bytes: 1024 * 1024,
+                            event_wal_fsync_batch_timeout_ms: 10,
+                            event_wal_checkpoint_bytes: 1024 * 1024,
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                ),
+            ),
+        );
+        // Load-profile-like config: a 5s tombstone TTL (the default is
+        // 3 days — the file-scan's mtime gate would never pass).
+        let config = GcConfig::new(10, 5, 0.5, 4, 64);
+        let reaper = OrphanReaper::new(metadata, lifecycle, disk_store.clone(), config);
+        let stats = reaper.run_cycle().await.unwrap();
+        assert_eq!(stats.orphans_found, 1, "the unregistered .dat must be found");
+        assert_eq!(stats.orphans_deleted, 1);
+        assert!(
+            !dir.path().join(format!("{unregistered}.dat")).exists(),
+            "the unregistered .dat must be swept"
+        );
     }
 
     #[tokio::test]

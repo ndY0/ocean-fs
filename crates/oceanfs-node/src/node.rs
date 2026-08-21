@@ -1442,7 +1442,12 @@ impl Node {
             Some(metadata_store.clone()),
             shard_buffer_pool.clone(),
             hlc_clock.clone(),
-        );
+        )
+        // Replica appends register their segments in the lifecycle
+        // machine: without registration the GC and the orphan reaper
+        // never see the receiver's .dat files (the fleet disk-fill
+        // root cause).
+        .with_lifecycle(lifecycle.clone());
         let gossip_service =
             oceanfs_membership::grpc::gossip_service::GossipGrpcService::new(membership.clone());
 

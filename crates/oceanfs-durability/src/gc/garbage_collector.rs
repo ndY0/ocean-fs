@@ -482,6 +482,17 @@ pub trait SegmentShardStore: Send + Sync {
     /// Returns an error if the shard files cannot be deleted (e.g.,
     /// I/O error, segment not found).
     fn delete_shards(&self, segment_id: SegmentId) -> Result<u64>;
+
+    /// Lists the segment files present on disk as `(segment_id,
+    /// mtime_millis)`.
+    ///
+    /// The orphan reaper uses the listing to sweep segments the
+    /// lifecycle registry does not know — the replication receiver
+    /// (`append_segment`) historically wrote raw `.dat` files without
+    /// registration, and a registry-only scan never saw them (the
+    /// fleet disk-fill root cause: ~10k unregistered files vs 32
+    /// registered).
+    fn list_segment_files(&self) -> Result<Vec<(SegmentId, i64)>>;
 }
 
 /// An in-memory mock segment shard store for testing.
@@ -523,6 +534,31 @@ impl SegmentShardStore for DiskSegmentShardStore {
         std::fs::remove_file(&path).map_err(crate::Error::Io)?;
         Ok(metadata)
     }
+
+    fn list_segment_files(&self) -> Result<Vec<(SegmentId, i64)>> {
+        use std::time::UNIX_EPOCH;
+        let mut out = Vec::new();
+        let entries = match std::fs::read_dir(&self.segment_dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(crate::Error::Io(e)),
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(id_str) = name.strip_suffix(".dat") else { continue };
+            let Ok(uuid) = uuid::Uuid::parse_str(id_str) else { continue };
+            let id = SegmentId::from_uuid_bytes(*uuid.as_bytes());
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            out.push((id, mtime));
+        }
+        Ok(out)
+    }
 }
 
 impl InMemorySegmentShardStore {
@@ -545,6 +581,10 @@ impl SegmentShardStore for InMemorySegmentShardStore {
     fn delete_shards(&self, segment_id: SegmentId) -> Result<u64> {
         self.deleted.lock().insert(segment_id);
         Ok(self.bytes_per_segment)
+    }
+
+    fn list_segment_files(&self) -> Result<Vec<(SegmentId, i64)>> {
+        Ok(Vec::new()) // the mock tracks deletions only; no disk files
     }
 }
 
