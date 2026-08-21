@@ -180,6 +180,8 @@ pub struct Membership {
     /// dissemination push latency (ADR-0028: no longer the liveness
     /// signal; probes have their own plane and histogram).
     pub(crate) gossip_push_duration: RwLock<Option<Arc<Histogram>>>,
+    /// Gossip delta size histogram (set during start, ADR-0028 D4).
+    pub(crate) gossip_delta_entries: RwLock<Option<Arc<Histogram>>>,
     /// SWIM probe cycle duration histogram (set during start,
     /// ADR-0028 D2).
     pub(crate) probe_duration: RwLock<Option<Arc<Histogram>>>,

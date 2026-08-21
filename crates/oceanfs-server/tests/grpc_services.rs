@@ -245,7 +245,10 @@ async fn gossip_push_then_pull_converges_membership() {
         origin: String::new(),
     };
 
-    let msg = GossipMessage { delta: Some(MembershipList { entries: vec![entry] }) };
+    let msg = GossipMessage {
+        delta: Some(MembershipList { entries: vec![entry] }),
+        version_vector: std::collections::HashMap::new(),
+    };
 
     let push_response =
         client_a.push(tonic::Request::new(tokio_stream::iter(vec![msg]))).await.unwrap();
@@ -576,6 +579,7 @@ async fn swim_death_detection_within_timeout() {
         suspicion_timeout_ms: 200,
         failure_timeout_ms: 500,
         indirect_ping_count: 2,
+        fanout_k: 3,
         seed_nodes: vec![],
     };
 

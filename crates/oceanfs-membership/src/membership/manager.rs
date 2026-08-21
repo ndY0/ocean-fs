@@ -51,6 +51,7 @@ impl Membership {
             gossip_dropped: RwLock::new(None),
             gossip_round_duration: RwLock::new(None),
             gossip_push_duration: RwLock::new(None),
+            gossip_delta_entries: RwLock::new(None),
             probe_duration: RwLock::new(None),
             probe_failures: RwLock::new(None),
             indirect_probes: RwLock::new(None),
@@ -154,10 +155,12 @@ impl Membership {
 
         let mut gossip_protocol = GossipProtocol::new(
             gossip_cmd_rx,
+            gossip_cmd_tx.clone(),
             gossip_event_tx,
             self.event_tx.clone(),
             self.config.interval_ms,
             self.node_id.clone(),
+            self.config.fanout_k,
         );
 
         // If the connection pool is already set, pass it to the gossip protocol.
@@ -171,6 +174,8 @@ impl Membership {
             let mut dropped = self.gossip_dropped.write();
             let mut round = self.gossip_round_duration.write();
             let mut push = self.gossip_push_duration.write();
+            let mut delta_entries = self.gossip_delta_entries.write();
+            *delta_entries = Some(gossip_protocol.delta_entries_hist.clone());
             *sent = Some(gossip_protocol.messages_sent.clone());
             *recv = Some(gossip_protocol.messages_received.clone());
             *dropped = Some(gossip_protocol.messages_dropped.clone());
@@ -273,6 +278,9 @@ impl Membership {
             registrar.register_histogram(h.clone());
         }
         if let Some(ref h) = *self.gossip_push_duration.read() {
+            registrar.register_histogram(h.clone());
+        }
+        if let Some(ref h) = *self.gossip_delta_entries.read() {
             registrar.register_histogram(h.clone());
         }
         // SWIM probe metrics (ADR-0028 D2): the liveness plane's own
@@ -383,7 +391,10 @@ impl Membership {
                 };
                 let delta =
                     oceanfs_core::proto::membership::MembershipList { entries: vec![proto_entry] };
-                let msg = oceanfs_network::gossip::GossipMessage { delta: Some(delta) };
+                let msg = oceanfs_network::gossip::GossipMessage {
+                    delta: Some(delta),
+                    version_vector: std::collections::HashMap::new(),
+                };
                 let stream = tokio_stream::iter(vec![msg]);
 
                 match push_client.push(tonic::Request::new(stream)).await {

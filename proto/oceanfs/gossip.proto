@@ -9,21 +9,32 @@ import "oceanfs/membership.proto";
 // Gossip protocol messages and service (the membership plane, ADR-0028).
 // ---------------------------------------------------------------------------
 
+// A version vector: origin -> highest version applied for that origin.
+// Per-node in the full vector — `VersionVector` maps a node to its
+// per-origin versions (ADR-0028 D4).
+message VersionVector {
+  map<string, uint64> versions = 1;
+}
+
 // A gossip message carrying a delta of the membership list.
 message GossipMessage {
   oceanfs.membership.MembershipList delta = 1;
+  // The sender's version vector (node -> origin -> version): the peer
+  // uses it to compute the pull (entries the sender lacks) in the ack.
+  // An empty vector means "send everything" (join).
+  map<string, VersionVector> version_vector = 2;
 }
 
 // Request to pull membership updates from a peer.
 //
-// `version_vector` maps NodeId -> highest version the requester has
-// applied for that node (ADR-0028 D4). An empty vector means "send
+// `version_vector` maps NodeId -> origin -> highest version the
+// requester has applied (ADR-0028 D4). An empty vector means "send
 // everything" (join). Replaces the historical single
 // `last_known_version` counter, which could not express per-node
 // deltas.
 message GossipPullRequest {
   oceanfs.common.NodeId node_id = 1;
-  map<string, uint64> version_vector = 2;
+  map<string, VersionVector> version_vector = 2;
 }
 
 // Acknowledgment of a gossip push.
@@ -36,7 +47,7 @@ message GossipAck {
   oceanfs.membership.MembershipList delta = 3;
   // The peer's version vector, used by the requester to advance its
   // per-peer watermark.
-  map<string, uint64> version_vector = 4;
+  map<string, VersionVector> version_vector = 4;
 }
 
 // Gossip RPC service for SWIM-based membership dissemination.

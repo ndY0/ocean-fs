@@ -14,6 +14,7 @@ use oceanfs_core::{
     sub_millisecond_histogram_config, Counter, Histogram, Incarnation, LabelSet, NodeId, NodeState,
 };
 use oceanfs_network::ConnectionPool;
+use rand::seq::IteratorRandom;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, trace, warn};
 
@@ -26,6 +27,14 @@ pub(crate) enum GossipCommand {
     Push { peer: NodeId, delta: GossipDelta },
     /// Receive a delta from a peer and merge it.
     ReceiveDelta { from: NodeId, delta: GossipDelta },
+    /// A push response: the peer's pull (delta newer than our vector)
+    /// plus its version vector (ADR-0028 D4) — merges and advances the
+    /// per-peer watermark.
+    Ack {
+        peer: NodeId,
+        delta: GossipDelta,
+        version_vector: std::collections::HashMap<NodeId, std::collections::HashMap<NodeId, u64>>,
+    },
     /// Set or update the connection pool for gRPC push calls.
     SetPool { pool: Arc<ConnectionPool> },
     /// Add a node entry to the local gossip state.
@@ -47,6 +56,11 @@ impl std::fmt::Debug for GossipCommand {
                 .field("from", from)
                 .field("delta_len", &delta.changed.len())
                 .finish(),
+            Self::Ack { peer, delta, .. } => f
+                .debug_struct("Ack")
+                .field("peer", peer)
+                .field("delta_len", &delta.changed.len())
+                .finish(),
             Self::SetPool { .. } => f.debug_struct("SetPool").finish(),
             Self::AddNode { entry } => {
                 f.debug_struct("AddNode").field("node_id", &entry.node_id).finish()
@@ -63,6 +77,8 @@ impl std::fmt::Debug for GossipCommand {
 pub(crate) struct GossipProtocol {
     /// Receiver for gossip commands and incoming deltas.
     rx: mpsc::Receiver<GossipCommand>,
+    /// Sender clone for spawned push tasks to report acks.
+    command_tx: mpsc::Sender<GossipCommand>,
     /// Sender for membership events (state transitions).
     event_tx: broadcast::Sender<GossipCommand>,
     /// Local membership state.
@@ -75,6 +91,8 @@ pub(crate) struct GossipProtocol {
     pool: Option<Arc<ConnectionPool>>,
     /// Interval between periodic gossip rounds in milliseconds.
     gossip_interval_ms: u64,
+    /// Random alive peers pushed per round (ADR-0028 D4 bounded fanout).
+    fanout_k: u8,
     /// This node's identifier (for excluding self from peer selection).
     node_id: NodeId,
     /// Gossip messages sent counter.
@@ -90,25 +108,39 @@ pub(crate) struct GossipProtocol {
     /// probe metric (`probe_duration_microseconds`) on the membership
     /// plane. This histogram measures dissemination only.
     pub(crate) push_duration_us: Arc<Histogram>,
+    /// Delta sizes pushed per round (ADR-0028 D4) — bounded deltas
+    /// after warmup prove the watermarks prune.
+    pub(crate) delta_entries_hist: Arc<Histogram>,
+    /// Per-peer watermarks: peer → (node → (origin → version)) — the
+    /// highest version each peer has acknowledged per attributed entry.
+    /// `build_delta_for` only sends entries newer than the watermark.
+    pub(crate) watermarks: std::collections::HashMap<
+        NodeId,
+        std::collections::HashMap<NodeId, std::collections::HashMap<NodeId, u64>>,
+    >,
 }
 
 impl GossipProtocol {
     /// Creates a new gossip protocol instance.
     pub fn new(
         rx: mpsc::Receiver<GossipCommand>,
+        command_tx: mpsc::Sender<GossipCommand>,
         event_tx: broadcast::Sender<GossipCommand>,
         membership_event_tx: broadcast::Sender<crate::membership::MembershipEvent>,
         gossip_interval_ms: u64,
         node_id: NodeId,
+        fanout_k: u8,
     ) -> Self {
         Self {
             rx,
+            command_tx,
             event_tx,
             state: GossipState::new(),
             incarnations: HashMap::new(),
             membership_event_tx,
             pool: None,
             gossip_interval_ms,
+            fanout_k,
             node_id,
             messages_sent: Counter::new(
                 "gossip_messages_sent_total".into(),
@@ -133,10 +165,17 @@ impl GossipProtocol {
             )),
             push_duration_us: Arc::new(Histogram::new(
                 "gossip_push_duration_microseconds".into(),
-                "Gossip push (SWIM ping proxy) duration in microseconds".into(),
+                "Gossip push (dissemination) duration in microseconds".into(),
                 &sub_millisecond_histogram_config(),
                 LabelSet::empty(),
             )),
+            delta_entries_hist: Arc::new(Histogram::new(
+                "gossip_delta_entries".into(),
+                "Membership entries per gossip push delta".into(),
+                &sub_millisecond_histogram_config(),
+                LabelSet::empty(),
+            )),
+            watermarks: std::collections::HashMap::new(),
         }
     }
 
@@ -152,6 +191,7 @@ impl GossipProtocol {
         registrar.register_counter(self.messages_dropped.clone());
         registrar.register_histogram(Arc::clone(&self.round_duration_us));
         registrar.register_histogram(Arc::clone(&self.push_duration_us));
+        registrar.register_histogram(Arc::clone(&self.delta_entries_hist));
     }
 
     /// Runs the gossip protocol loop.
@@ -186,9 +226,10 @@ impl GossipProtocol {
 
     /// Fires on each gossip interval tick.
     ///
-    /// Pushes the current membership delta to all alive peers so that
-    /// state changes propagate quickly and failure detection can
-    /// observe unreachable peers immediately.
+    /// Selects `k = min(fanout_k, alive-1)` random alive peers and
+    /// pushes each a delta computed against that peer's watermark
+    /// (ADR-0028 D4) — the historical fanout-all full-state push is
+    /// replaced by bounded push-pull rounds.
     async fn on_gossip_tick(&mut self) {
         let start = std::time::Instant::now();
 
@@ -208,19 +249,30 @@ impl GossipProtocol {
             return;
         }
 
-        let delta = self.build_delta();
-        if delta.changed.is_empty() {
-            trace!("gossip tick: delta is empty, skipping push");
-            return;
-        }
+        // Bounded fanout: k random peers per round (ADR-0028 D4). The
+        // RNG is scoped so it drops before any await (ThreadRng is not
+        // Send).
+        let peers: Vec<NodeId> = {
+            let mut rng = rand::thread_rng();
+            let fanout = self.fanout_k.min(alive.len() as u8) as usize;
+            alive
+                .iter()
+                .choose_multiple(&mut rng, fanout)
+                .into_iter()
+                .map(|p| (*p).clone())
+                .collect()
+        };
 
-        // Push to all alive peers so failure detection hits every
-        // unreachable peer on every tick, not just a random subset.
-        for peer in &alive {
+        for peer in &peers {
+            let delta = self.build_delta_for(peer);
+            if delta.changed.is_empty() {
+                trace!(peer = %peer, "gossip tick: no new entries for peer");
+                continue;
+            }
             debug!(peer = %peer, changed = delta.changed.len(), "periodic gossip push");
             self.messages_sent.inc();
-            self.handle_command(GossipCommand::Push { peer: peer.clone(), delta: delta.clone() })
-                .await;
+            self.delta_entries_hist.observe(delta.changed.len() as u64);
+            self.handle_command(GossipCommand::Push { peer: peer.clone(), delta }).await;
         }
         self.round_duration_us.observe(start.elapsed().as_micros() as u64);
     }
@@ -236,7 +288,7 @@ impl GossipProtocol {
 
                 // Spawn the gRPC push in a background task so it doesn't block
                 // the gossip ticker. If the peer is dead, the connection timeout
-                // (default 5s) would otherwise block the select! loop and prevent
+                // would otherwise block the select! loop and prevent
                 // the ticker from firing, making failure detection stall.
                 if let Some(ref pool) = self.pool {
                     let messages_dropped = self.messages_dropped.clone();
@@ -245,6 +297,10 @@ impl GossipProtocol {
                         let pool = pool.clone();
                         let push_hist = Arc::clone(&self.push_duration_us);
                         let peer_clone = peer.clone();
+                        let command_tx = self.command_tx.clone();
+                        // Our version vector travels with the push so the
+                        // peer can compute the pull (ADR-0028 D4).
+                        let version_vector = self.version_vector_proto();
 
                         // Convert the GossipDelta into protobuf GossipMessages
                         // outside the spawned task to avoid cloning the delta.
@@ -291,6 +347,7 @@ impl GossipProtocol {
                                                 entries,
                                             },
                                         ),
+                                        version_vector,
                                     };
 
                                     let stream = tokio_stream::iter(vec![msg]);
@@ -306,6 +363,34 @@ impl GossipProtocol {
                                                     "gossip push ack received"
                                                 );
                                             }
+                                            // The ack carries the peer's
+                                            // pull + vector (ADR-0028 D4).
+                                            let ack_delta = ack.delta.map(|list| GossipDelta {
+                                                changed: list
+                                                    .entries
+                                                    .iter()
+                                                    .map(entry_from_proto)
+                                                    .collect(),
+                                            });
+                                            let ack_vector: std::collections::HashMap<_, _> = ack
+                                                .version_vector
+                                                .iter()
+                                                .map(|(node, vv)| {
+                                                    (
+                                                        NodeId::new(node),
+                                                        vv.versions
+                                                            .iter()
+                                                            .map(|(o, v)| (NodeId::new(o), *v))
+                                                            .collect::<std::collections::HashMap<_, _>>(),
+                                                    )
+                                                })
+                                                .collect();
+                                            let _ = command_tx.try_send(GossipCommand::Ack {
+                                                peer: peer_clone,
+                                                delta: ack_delta
+                                                    .unwrap_or(GossipDelta { changed: Vec::new() }),
+                                                version_vector: ack_vector,
+                                            });
                                         }
                                         Err(status) => {
                                             warn!(peer = %peer_clone, error = %status, "gossip push failed");
@@ -323,6 +408,14 @@ impl GossipProtocol {
                         });
                     }
                 }
+            }
+            GossipCommand::Ack { peer, delta, version_vector } => {
+                debug!(peer = %peer, changed = delta.changed.len(), "gossip ack: merging peer pull");
+                self.messages_received.inc();
+                self.merge_delta(&delta);
+                // Advance the per-peer watermark: the peer's vector is
+                // the highest (node, origin) version it has applied.
+                self.watermarks.insert(peer, version_vector);
             }
             GossipCommand::ReceiveDelta { from, delta } => {
                 debug!(from = %from, changed = delta.changed.len(), "received gossip delta");
@@ -495,6 +588,41 @@ impl GossipProtocol {
         GossipDelta { changed: self.state.nodes.values().cloned().collect() }
     }
 
+    /// Builds the delta for a specific peer (ADR-0028 D4): only entries
+    /// the peer has not acknowledged — per (node, origin), the version
+    /// must exceed the peer's watermark, or the (node, origin) key is
+    /// unknown to the peer.
+    pub(crate) fn build_delta_for(&self, peer: &NodeId) -> GossipDelta {
+        let watermark = self.watermarks.get(peer);
+        let changed: Vec<_> = self
+            .state
+            .nodes
+            .values()
+            .filter(|e| {
+                watermark
+                    .and_then(|wm| wm.get(&e.node_id))
+                    .and_then(|origins| origins.get(&e.origin))
+                    .map_or(true, |known| e.version > *known)
+            })
+            .cloned()
+            .collect();
+        GossipDelta { changed }
+    }
+
+    /// The local version vector as protobuf (node → origin → version).
+    pub(crate) fn version_vector_proto(
+        &self,
+    ) -> std::collections::HashMap<String, oceanfs_network::gossip::VersionVector> {
+        let mut vector = std::collections::HashMap::new();
+        for entry in self.state.nodes.values() {
+            let vv = vector
+                .entry(entry.node_id.to_string())
+                .or_insert_with(oceanfs_network::gossip::VersionVector::default);
+            vv.versions.insert(entry.origin.to_string(), entry.version);
+        }
+        vector
+    }
+
     /// Returns a snapshot of the current gossip state.
     pub(crate) fn snapshot(&self) -> &GossipState {
         &self.state
@@ -547,6 +675,35 @@ impl GossipProtocol {
     }
 }
 
+/// Converts a protobuf membership entry into the internal node entry.
+fn entry_from_proto(entry: &oceanfs_core::proto::membership::MembershipEntry) -> NodeEntry {
+    let node_id = entry
+        .node_id
+        .as_ref()
+        .map(|nid| NodeId::new(&nid.id))
+        .unwrap_or_else(|| NodeId::new("unknown"));
+    let state = match entry.state {
+        0 => NodeState::Alive,
+        1 => NodeState::Suspect,
+        2 => NodeState::Dead,
+        3 => NodeState::Leaving,
+        4 => NodeState::Left,
+        _ => NodeState::Alive,
+    };
+    let address = entry
+        .address
+        .parse::<std::net::SocketAddr>()
+        .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 9001)));
+    NodeEntry {
+        node_id,
+        incarnation: Incarnation::new(entry.incarnation),
+        state,
+        address,
+        version: entry.version,
+        origin: NodeId::new(&entry.origin),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -561,10 +718,12 @@ mod tests {
         let (membership_tx, _membership_rx) = tokio::sync::broadcast::channel(16);
         GossipProtocol::new(
             cmd_rx,
+            _cmd_tx.clone(),
             event_tx,
             membership_tx,
             1000, // gossip_interval_ms
             NodeId::new("test-node"),
+            3, // fanout_k
         )
     }
 
@@ -857,6 +1016,98 @@ mod tests {
 
         let delta = protocol.build_delta();
         assert_eq!(delta.changed.len(), 2);
+    }
+
+    /// ADR-0028 D4: `build_delta_for` excludes entries the peer's
+    /// watermark already covers, per (node, origin).
+    #[test]
+    fn build_delta_for_excludes_watermarked_entries() {
+        let mut protocol = make_protocol();
+        let peer = NodeId::new("peer");
+
+        // The applied entry: my detector's Suspect (origin test-node,
+        // version 9) — it replaced the target's own earlier
+        // announcement (origin victim, version 5).
+        let mut suspected = make_node_entry("victim", 3, NodeState::Suspect);
+        suspected.origin = NodeId::new("test-node");
+        suspected.version = 9;
+        protocol.add_node(suspected);
+
+        // No watermark yet → included.
+        assert_eq!(protocol.build_delta_for(&peer).changed.len(), 1);
+
+        // The peer acked (victim → victim) at version 5 — the OLD
+        // announcement's key. The detector's newer Suspect (victim →
+        // test-node) is a DIFFERENT origin key → still included (a new
+        // attributed fact must propagate even when the node's entry
+        // version regresses relative to another origin's sequence).
+        let mut watermark = std::collections::HashMap::new();
+        let mut origins = std::collections::HashMap::new();
+        origins.insert(NodeId::new("victim"), 5u64);
+        watermark.insert(NodeId::new("victim"), origins);
+        protocol.watermarks.insert(peer.clone(), watermark);
+
+        let delta = protocol.build_delta_for(&peer);
+        assert_eq!(delta.changed.len(), 1);
+        assert_eq!(delta.changed[0].origin, NodeId::new("test-node"));
+
+        // The peer acked the actual entry's key (victim → test-node)
+        // at version 9 → covered → nothing to push.
+        let mut watermark2 = std::collections::HashMap::new();
+        let mut origins2 = std::collections::HashMap::new();
+        origins2.insert(NodeId::new("test-node"), 9u64);
+        watermark2.insert(NodeId::new("victim"), origins2);
+        protocol.watermarks.insert(peer.clone(), watermark2);
+        assert!(
+            protocol.build_delta_for(&peer).changed.is_empty(),
+            "the acked attributed entry must not be re-pushed"
+        );
+    }
+
+    /// ADR-0028 D4: an ack advances the watermark and the next delta
+    /// for that peer excludes the acked entries.
+    #[tokio::test]
+    async fn ack_advances_watermark_and_prunes_next_delta() {
+        let mut protocol = make_protocol();
+        let peer = NodeId::new("peer");
+
+        protocol.add_node(make_node_entry("victim", 3, NodeState::Alive));
+
+        // Simulate the ack: the peer's vector covers (victim → victim)
+        // at version 1.
+        let mut vector = std::collections::HashMap::new();
+        let mut origins = std::collections::HashMap::new();
+        origins.insert(NodeId::new("victim"), 1u64);
+        vector.insert(NodeId::new("victim"), origins);
+        protocol
+            .handle_command(GossipCommand::Ack {
+                peer: peer.clone(),
+                delta: GossipDelta { changed: Vec::new() },
+                version_vector: vector,
+            })
+            .await;
+
+        // The entry's version is 1 (make_node_entry default) → covered.
+        assert!(
+            protocol.build_delta_for(&peer).changed.is_empty(),
+            "acked entries must not be re-pushed"
+        );
+    }
+
+    /// ADR-0028 D4: the round pushes to at most `fanout_k` peers.
+    #[tokio::test]
+    async fn gossip_tick_respects_fanout_k() {
+        let mut protocol = make_protocol();
+        // 5 alive peers + fanout_k 3 (make_protocol default).
+        for i in 0..5 {
+            protocol.add_node(make_node_entry(&format!("peer-{i}"), 1, NodeState::Alive));
+        }
+        protocol.on_gossip_tick().await;
+        assert_eq!(
+            protocol.messages_sent.get(),
+            3,
+            "the round must push to exactly fanout_k peers"
+        );
     }
 
     #[test]

@@ -117,6 +117,10 @@ pub struct GossipConfig {
     pub failure_timeout_ms: u64,
     /// Number of peers to route indirect pings through.
     pub indirect_ping_count: u8,
+    /// Number of random alive peers each gossip round pushes to
+    /// (ADR-0028 D4: bounded fanout — the full-state fanout-all push is
+    /// replaced by k-random push-pull rounds). Capped at alive-1.
+    pub fanout_k: u8,
     /// Bootstrap nodes for cluster discovery (host:port pairs).
     pub seed_nodes: Vec<String>,
 }
@@ -128,6 +132,7 @@ impl Default for GossipConfig {
             suspicion_timeout_ms: 5000,
             failure_timeout_ms: 15000,
             indirect_ping_count: 3,
+            fanout_k: 3,
             seed_nodes: Vec::new(),
         }
     }

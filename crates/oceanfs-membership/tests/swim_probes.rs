@@ -40,6 +40,7 @@ fn gossip_config() -> GossipConfig {
         suspicion_timeout_ms: 200,
         failure_timeout_ms: 300,
         indirect_ping_count: 2,
+        fanout_k: 3,
         seed_nodes: Vec::new(),
     }
 }

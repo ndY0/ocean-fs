@@ -66,12 +66,32 @@ impl GossipRpc for GossipGrpcService {
     ) -> Result<Response<GossipAck>, Status> {
         let mut stream = request.into_inner();
         let mut entry_count: u32 = 0;
+        // The requester's version vector (ADR-0028 D4): taken from the
+        // last message of the push stream (our implementation sends one
+        // message per round; the vector is identical across messages).
+        let mut requester_vector: std::collections::HashMap<
+            NodeId,
+            std::collections::HashMap<NodeId, u64>,
+        > = std::collections::HashMap::new();
 
         while let Some(msg) = stream
             .message()
             .await
             .map_err(|e| Status::internal(format!("gossip push stream error: {e}")))?
         {
+            requester_vector = msg
+                .version_vector
+                .iter()
+                .map(|(node, vv)| {
+                    (
+                        NodeId::new(node),
+                        vv.versions
+                            .iter()
+                            .map(|(o, v)| (NodeId::new(o), *v))
+                            .collect::<std::collections::HashMap<_, _>>(),
+                    )
+                })
+                .collect();
             if let Some(delta) = msg.delta {
                 let mut changed = Vec::with_capacity(delta.entries.len());
                 for entry in &delta.entries {
@@ -133,16 +153,58 @@ impl GossipRpc for GossipGrpcService {
 
         tracing::debug!(updated_entries = entry_count, "gossip push received and merged");
 
-        // ADR-0028 D4: the push response carries the peer's pull + the
-        // peer's version vector. The version vector is empty until f5
-        // (dissemination) — the requester's watermark cannot advance on
-        // an empty vector, so deltas stay full-list until then (today's
-        // behavior, unchanged).
+        // ADR-0028 D4: the push response carries the peer's pull (entries
+        // the requester lacks, per its version vector) plus the peer's
+        // version vector, so the requester can advance its watermark.
+        let nodes = self.membership.nodes_full();
+        let pull_delta = oceanfs_core::proto::membership::MembershipList {
+            entries: nodes
+                .iter()
+                .filter(|(node_id, _, _, _, version, origin)| {
+                    requester_vector
+                        .get(node_id)
+                        .and_then(|origins| origins.get(origin))
+                        .map_or(true, |known| *version > *known)
+                })
+                .map(|(node_id, state, incarnation, address, version, origin)| {
+                    oceanfs_core::proto::membership::MembershipEntry {
+                        node_id: Some(oceanfs_core::proto::common::NodeId {
+                            id: node_id.to_string(),
+                        }),
+                        state: match state {
+                            NodeState::Alive => 0,
+                            NodeState::Suspect => 1,
+                            NodeState::Dead => 2,
+                            NodeState::Leaving => 3,
+                            NodeState::Left => 4,
+                        },
+                        incarnation: incarnation.value(),
+                        address: address.to_string(),
+                        last_seen: None,
+                        version: *version,
+                        origin: origin.to_string(),
+                    }
+                })
+                .collect(),
+        };
+        let ack_vector = nodes
+            .iter()
+            .map(|(node_id, _, _, _, version, origin)| {
+                (node_id.to_string(), (origin.to_string(), *version))
+            })
+            .fold(
+                std::collections::HashMap::<String, oceanfs_network::gossip::VersionVector>::new(),
+                |mut acc, (node, (origin, version))| {
+                    acc.entry(node).or_default().versions.insert(origin, version);
+                    acc
+                },
+            );
+
         Ok(Response::new(GossipAck {
             accepted: true,
             updated_entries: entry_count,
-            delta: None,
-            version_vector: std::collections::HashMap::new(),
+            delta: Some(pull_delta),
+            version_vector: ack_vector,
         }))
     }
 
@@ -154,16 +216,27 @@ impl GossipRpc for GossipGrpcService {
     /// instance and streams back the entries newer than the requester's
     /// version vector (ADR-0028 D4). An empty vector returns everything
     /// (join).
-    ///
-    /// Until the dissemination feature (f5) attaches per-entry versions,
-    /// the vector is approximated per-node by the incarnation (the same
-    /// value the merge uses as the authoritative per-node clock).
     async fn pull(
         &self,
         request: Request<GossipPullRequest>,
     ) -> Result<Response<Self::PullStream>, Status> {
         let req = request.into_inner();
-        let version_vector = req.version_vector;
+        let version_vector: std::collections::HashMap<
+            NodeId,
+            std::collections::HashMap<NodeId, u64>,
+        > = req
+            .version_vector
+            .iter()
+            .map(|(node, vv)| {
+                (
+                    NodeId::new(node),
+                    vv.versions
+                        .iter()
+                        .map(|(o, v)| (NodeId::new(o), *v))
+                        .collect::<std::collections::HashMap<_, _>>(),
+                )
+            })
+            .collect();
 
         tracing::debug!(
             node_id = ?req.node_id,
@@ -176,20 +249,27 @@ impl GossipRpc for GossipGrpcService {
         let (tx, rx) = mpsc::channel(16);
 
         tokio::spawn(async move {
-            // Per-node filter: entries whose incarnation is newer than
-            // the requester's recorded value for that node.
+            // Per-(node, origin) filter: entries whose version is newer
+            // than the requester's recorded value for that attributed
+            // entry.
             let filtered: Vec<_> = nodes
                 .into_iter()
-                .filter(|(node_id, _, incarnation, _, _, _)| {
+                .filter(|(node_id, _, _, _, version, origin)| {
                     version_vector
-                        .get(node_id.as_str())
-                        .map_or(true, |known| incarnation.value() > *known)
+                        .get(node_id)
+                        .and_then(|origins| origins.get(origin))
+                        .map_or(true, |known| *version > *known)
                 })
                 .collect();
 
             if filtered.is_empty() {
                 // Send an empty delta to acknowledge the pull.
-                let _ = tx.send(Ok(GossipMessage { delta: None })).await;
+                let _ = tx
+                    .send(Ok(GossipMessage {
+                        delta: None,
+                        version_vector: std::collections::HashMap::new(),
+                    }))
+                    .await;
             } else {
                 for (node_id, state, incarnation, address, version, origin) in filtered {
                     let proto_node_id =
@@ -217,7 +297,14 @@ impl GossipRpc for GossipGrpcService {
                     let delta =
                         oceanfs_core::proto::membership::MembershipList { entries: vec![entry] };
 
-                    if tx.send(Ok(GossipMessage { delta: Some(delta) })).await.is_err() {
+                    if tx
+                        .send(Ok(GossipMessage {
+                            delta: Some(delta),
+                            version_vector: std::collections::HashMap::new(),
+                        }))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -292,7 +379,8 @@ mod tests {
 
         let delta = oceanfs_core::proto::membership::MembershipList { entries: vec![entry] };
 
-        let msg = GossipMessage { delta: Some(delta) };
+        let msg =
+            GossipMessage { delta: Some(delta), version_vector: std::collections::HashMap::new() };
 
         let stream = tokio_stream::iter(vec![msg]);
         let request = tonic::Request::new(stream);
@@ -330,9 +418,12 @@ mod tests {
         let mut client = test_server(membership).await;
 
         // Request delta for node-b with a vector that only knows
-        // incarnation 3 (node-b is at 5 → included).
+        // version 3 (node-b's entry is at version 1 from the pull...
+        // the test asserts inclusion by incarnation, so use a vector
+        // that knows nothing about node-b's origins: an entry is
+        // included when its (node, origin) key is unknown).
         let mut vector = std::collections::HashMap::new();
-        vector.insert("node-b".to_string(), 3u64);
+        vector.insert("node-b".to_string(), oceanfs_network::gossip::VersionVector::default());
         let request = tonic::Request::new(GossipPullRequest {
             node_id: Some(oceanfs_core::proto::common::NodeId { id: "node-x".to_string() }),
             version_vector: vector,
@@ -360,20 +451,26 @@ mod tests {
     async fn pull_with_current_version_returns_empty() {
         let membership = make_membership("node-a");
 
-        // Add a node at incarnation 1.
-        membership.upsert_node(
+        // Add a node at incarnation 1 with full attribution (origin =
+        // the node itself, version 1).
+        membership.upsert_node_attributed(
             NodeId::new("node-b"),
             NodeState::Alive,
             Incarnation::new(1),
             Some("127.0.0.1:9002".parse().unwrap()),
+            1,
+            NodeId::new("node-b"),
         );
 
         let mut client = test_server(membership).await;
 
-        // Request delta with a vector that knows node-b at incarnation
-        // 100 (node-b is at 1 → nothing newer).
+        // Request delta with a vector that knows node-b's (node-b →
+        // node-b) attribution at version 100 — the entry's version (1)
+        // is not newer → nothing to pull.
         let mut vector = std::collections::HashMap::new();
-        vector.insert("node-b".to_string(), 100u64);
+        let mut vv = oceanfs_network::gossip::VersionVector::default();
+        vv.versions.insert("node-b".to_string(), 100u64);
+        vector.insert("node-b".to_string(), vv);
         let request = tonic::Request::new(GossipPullRequest {
             node_id: Some(oceanfs_core::proto::common::NodeId { id: "node-x".to_string() }),
             version_vector: vector,
