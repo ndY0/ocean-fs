@@ -1,164 +1,283 @@
-//! SWIM ping logic — direct and indirect peer probing.
+//! SWIM ping logic — real direct and indirect probing (ADR-0028 D2).
 //!
-//! Handles the periodic ping cycle: selecting a random alive peer,
-//! sending a direct ping, tracking timeouts, and initiating indirect
-//! pings through relay peers when direct pings fail.
+//! Each interval the detector picks one random alive peer and spawns a
+//! probe cycle task:
+//!
+//! 1. **Direct probe**: `Probe{origin: self, target, is_indirect: false}`
+//!    over the membership plane with a hard `ping_timeout_ms` deadline.
+//! 2. On timeout: **indirect probes** through `indirect_ping_count`
+//!    relays — `Probe{origin: self, target, is_indirect: true}` to each
+//!    relay, which forwards to the target and relays the ack back.
+//! 3. **Verdict**: any ack → alive; all probes failed/timed out →
+//!    failure, which escalates to SUSPECT.
+//!
+//! The timeout chain is bound to actual messages. The historical
+//! "gossip push as ping proxy" (DK-007) — where the liveness signal was
+//! "did the full-state push to the peer succeed" — is removed: probes
+//! are tiny, bounded RPCs on the dedicated membership plane, decoupled
+//! from dissemination.
 
-use std::time::{Duration, Instant};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use oceanfs_core::{proto::membership::ProbeRequest, NodeId, NodeState};
+use oceanfs_core::{NodeId, NodeState};
+use oceanfs_network::{gossip::probe_rpc_client::ProbeRpcClient, ConnectionPool};
 use rand::seq::IteratorRandom;
 use tracing::{debug, trace, warn};
 
-use super::FailureDetector;
+use super::{DetectorCommand, FailureDetector, ProbeMetrics};
 
 /// Called on each SWIM interval tick.
 ///
-/// Selects a random peer (excluding self), sends a direct
-/// ping, and registers a pending ping for timeout tracking.
-///
-/// Suspect nodes are probed too: the suspicion window exists precisely
-/// so that a transient failure (e.g. a joiner whose gRPC listener is
-/// not bound yet) gets a chance to respond. If Suspect nodes were
-/// excluded, the successful-ping recovery path could never fire and
-/// every transient failure would escalate to DEAD (t5/t24).
+/// Selects a random peer (excluding self and nodes with an in-flight
+/// probe), then spawns the probe cycle for it. Suspect nodes are probed
+/// too: the suspicion window exists precisely so that a transient
+/// failure gets a chance to respond — if Suspect nodes were excluded,
+/// the successful-probe recovery path could never fire and every
+/// transient failure would escalate to DEAD (t5/t24).
 pub(crate) fn on_ping_tick(detector: &mut FailureDetector) {
     // Filter nodes that are Alive or Suspect, not self, and not already
-    // pending.
-    let target = {
-        let alive: Vec<_> = detector
+    // being probed.
+    let picked = {
+        let candidates: Vec<_> = detector
             .alive_nodes
             .iter()
             .filter(|(id, state, _, _)| {
                 (*state == NodeState::Alive || *state == NodeState::Suspect)
                     && *id != detector.node_id
-                    && !detector.pending_pings.contains_key(id)
+                    && !detector.pending_probes.contains_key(id)
             })
-            .map(|(id, _, _, _)| id)
+            .map(|(id, _, addr, _)| (id.clone(), *addr))
             .collect();
 
-        if alive.is_empty() {
-            trace!("SWIM tick: no alive peers to ping");
+        if candidates.is_empty() {
+            trace!("SWIM tick: no alive peers to probe");
             return;
         }
 
         let mut rng = rand::thread_rng();
-        match alive.iter().choose(&mut rng) {
-            Some(p) => (*p).clone(),
-            None => return,
-        }
+        let Some((id, addr)) = candidates.iter().choose(&mut rng) else {
+            return;
+        };
+        (id.clone(), *addr)
     };
 
-    debug!(target = %target, "SWIM: initiating direct ping");
+    let (target, target_addr) = picked;
 
-    // SWIM remote probes are handled via the gossip-push-as-ping-proxy approach
-    // (DK-007). The gossip protocol carries the failure detector's probe
-    // information through the gossip push/pull delta, allowing nodes to
-    // detect failures without a dedicated gRPC Probe RPC.
-    //
-    // For self-ping (localhost), we handle the probe in-process.
-    // For remote targets, the probe result arrives asynchronously through
-    // the gossip merge path — we register a pending ping to track the timeout.
-    if target == detector.node_id {
-        // Self-ping: handle in-process.
-        let request = ProbeRequest {
-            target: Some(oceanfs_core::proto::common::NodeId { id: target.to_string() }),
-            origin: Some(oceanfs_core::proto::common::NodeId { id: detector.node_id.to_string() }),
-            is_indirect: false,
-        };
-        let response = detector.probe_handler.handle_probe(&request);
-
-        if response.ack {
-            debug!(target = %target, "SWIM: self-ping ack received");
-        }
-    } else {
-        // Remote target: probe handled via gossip proxy (DK-007).
-        // Register pending ping for timeout tracking; the result
-        // arrives through the gossip merge → DetectorCommand::PingResponse.
-        debug!(
-            target = %target,
-            "SWIM: remote ping via gossip proxy (DK-007)"
-        );
-        detector.pending_pings.insert(target, Instant::now());
-    }
-}
-
-/// Checks pending direct pings for timeout.
-///
-/// If a direct ping has been pending longer than `ping_timeout_ms`,
-/// initiates indirect pings or marks the target as SUSPECT.
-pub(crate) fn check_ping_timeouts(detector: &mut FailureDetector) {
-    let timeout = Duration::from_millis(detector.config.ping_timeout_ms);
-    let now = Instant::now();
-
-    let timed_out: Vec<NodeId> = detector
-        .pending_pings
-        .iter()
-        .filter(|(_, start)| now.duration_since(**start) >= timeout)
-        .map(|(id, _)| id.clone())
-        .collect();
-
-    for target in timed_out {
-        detector.pending_pings.remove(&target);
-        debug!(target = %target, "SWIM: direct ping timed out");
-        initiate_indirect_pings(detector, &target);
-    }
-
-    // Check indirect ping timeouts.
-    let indirect_timeout = Duration::from_millis(detector.config.ping_timeout_ms);
-    let indirect_timed_out: Vec<NodeId> = detector
-        .pending_indirect
-        .iter()
-        .filter(|(_, (_, start))| now.duration_since(*start) >= indirect_timeout)
-        .map(|(id, _)| id.clone())
-        .collect();
-
-    for target in indirect_timed_out {
-        detector.pending_indirect.remove(&target);
-        warn!(
-            target = %target,
-            "SWIM: all indirect pings timed out — marking SUSPECT"
-        );
-        super::suspicion::mark_suspect(detector, &target);
-    }
-}
-
-/// Initiates indirect pings for a target whose direct ping failed.
-///
-/// Selects k random alive peers (excluding self and target) as relays.
-/// If no relays are available, marks the target SUSPECT immediately.
-pub(crate) fn initiate_indirect_pings(detector: &mut FailureDetector, target: &NodeId) {
-    let indirect_candidates: Vec<_> = detector
+    // Select relays for the indirect phase: Alive peers other than self
+    // and the target, capped at indirect_ping_count.
+    let mut rng = rand::thread_rng();
+    let relays: Vec<(NodeId, SocketAddr)> = detector
         .alive_nodes
         .iter()
         .filter(|(id, state, _, _)| {
-            *state == NodeState::Alive && *id != detector.node_id && *id != *target
+            *state == NodeState::Alive && *id != detector.node_id && *id != target
         })
-        .map(|(id, _, _, _)| id.clone())
-        .collect();
+        .map(|(id, _, addr, _)| (id.clone(), *addr))
+        .choose_multiple(&mut rng, detector.config.indirect_ping_count as usize);
 
-    let mut rng = rand::thread_rng();
-    let indirect_count = detector.config.indirect_ping_count as usize;
-    let indirect_targets: Vec<_> = indirect_candidates
-        .iter()
-        .choose_multiple(&mut rng, indirect_count.min(indirect_candidates.len()))
-        .into_iter()
-        .cloned()
-        .collect();
+    let Some(pool) = detector.pool.clone() else {
+        debug!("SWIM: no membership plane pool — skipping probe of {target}");
+        return;
+    };
 
-    if indirect_targets.is_empty() {
-        // No indirect peers available — mark suspect immediately.
-        super::suspicion::mark_suspect(detector, target);
+    debug!(target = %target, relays = relays.len(), "SWIM: starting probe cycle");
+    detector.pending_probes.insert(target.clone(), Instant::now());
+
+    let detector_tx = detector.command_tx.clone();
+    let self_id = detector.node_id.clone();
+    let ping_timeout_ms = detector.config.ping_timeout_ms;
+    let metrics = detector.metrics.clone();
+
+    tokio::spawn(async move {
+        let verdict = run_probe_cycle(
+            &pool,
+            &self_id,
+            &target,
+            target_addr,
+            &relays,
+            ping_timeout_ms,
+            &metrics,
+        )
+        .await;
+        if verdict {
+            debug!(target = %target, "SWIM: probe cycle succeeded");
+        } else {
+            warn!(target = %target, "SWIM: probe cycle failed — escalating");
+            metrics.failures_total.inc();
+        }
+        let _ = detector_tx.send(DetectorCommand::PingResponse { target, success: verdict }).await;
+    });
+}
+
+/// Runs the full probe cycle for a target and returns the verdict.
+///
+/// Direct probe first (bounded by `ping_timeout_ms`); on failure,
+/// concurrent relayed indirect probes (each bounded by
+/// `ping_timeout_ms`). Any ack wins.
+async fn run_probe_cycle(
+    pool: &Arc<ConnectionPool>,
+    origin: &NodeId,
+    target: &NodeId,
+    target_addr: SocketAddr,
+    relays: &[(NodeId, SocketAddr)],
+    ping_timeout_ms: u64,
+    metrics: &ProbeMetrics,
+) -> bool {
+    let start = Instant::now();
+    let direct = probe_direct(pool, target_addr, target, origin, ping_timeout_ms).await;
+    let success = if direct.ack {
+        true
+    } else if relays.is_empty() {
+        false
     } else {
-        for relay in &indirect_targets {
-            debug!(
-                target = %target,
-                relay = %relay,
-                "SWIM: initiating indirect ping"
-            );
-            detector.pending_indirect.insert(target.clone(), (relay.clone(), Instant::now()));
+        metrics.indirect_total.add(relays.len() as u64);
+        indirect_probe(pool, origin, target, relays, ping_timeout_ms).await
+    };
+
+    metrics.duration_us.observe(start.elapsed().as_micros() as u64);
+    if success {
+        debug!(target = %target, elapsed_us = start.elapsed().as_micros(), "SWIM: probe cycle succeeded");
+    }
+    success
+}
+
+/// Sends a direct probe to `addr` and returns the response.
+async fn probe_direct(
+    pool: &Arc<ConnectionPool>,
+    addr: SocketAddr,
+    target: &NodeId,
+    origin: &NodeId,
+    ping_timeout_ms: u64,
+) -> oceanfs_core::proto::membership::ProbeResponse {
+    let Some(mut client) = make_client(pool, addr, ping_timeout_ms).await else {
+        return oceanfs_core::proto::membership::ProbeResponse { ack: false, incarnation: 0 };
+    };
+    let request = oceanfs_core::proto::membership::ProbeRequest {
+        target: Some(oceanfs_core::proto::common::NodeId { id: target.to_string() }),
+        origin: Some(oceanfs_core::proto::common::NodeId { id: origin.to_string() }),
+        is_indirect: false,
+    };
+    match tokio::time::timeout(
+        Duration::from_millis(ping_timeout_ms),
+        client.probe(tonic::Request::new(request)),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response.into_inner(),
+        Ok(Err(status)) => {
+            debug!(target = %target, error = %status, "SWIM: direct probe failed");
+            oceanfs_core::proto::membership::ProbeResponse { ack: false, incarnation: 0 }
+        }
+        Err(_) => {
+            debug!(target = %target, "SWIM: direct probe timed out");
+            oceanfs_core::proto::membership::ProbeResponse { ack: false, incarnation: 0 }
         }
     }
+}
+
+/// Sends concurrent indirect probes through `relays`; any ack wins.
+///
+/// Each relay receives `Probe{is_indirect: true}` and forwards to the
+/// target itself. All relay probes run concurrently (JoinSet), each
+/// bounded by `ping_timeout_ms`, so the indirect phase adds at most one
+/// `ping_timeout_ms` to the detection bound. The first ack aborts the
+/// remaining relays.
+async fn indirect_probe(
+    pool: &Arc<ConnectionPool>,
+    origin: &NodeId,
+    target: &NodeId,
+    relays: &[(NodeId, SocketAddr)],
+    ping_timeout_ms: u64,
+) -> bool {
+    let mut set = tokio::task::JoinSet::new();
+    for (relay_id, relay_addr) in relays {
+        let pool = Arc::clone(pool);
+        let origin = origin.clone();
+        let target = target.clone();
+        let relay_id = relay_id.clone();
+        let relay_addr = *relay_addr;
+        set.spawn(async move {
+            probe_relay(&pool, relay_addr, &relay_id, &target, &origin, ping_timeout_ms).await
+        });
+    }
+
+    let mut any_ack = false;
+    while let Some(result) = set.join_next().await {
+        if let Ok(response) = result {
+            if response.ack {
+                any_ack = true;
+                trace!(target = %target, "SWIM: indirect probe ack received");
+                set.abort_all();
+                break;
+            }
+        }
+    }
+    any_ack
+}
+
+/// Sends an indirect probe to a relay, which forwards to the target.
+async fn probe_relay(
+    pool: &Arc<ConnectionPool>,
+    relay_addr: SocketAddr,
+    relay_id: &NodeId,
+    target: &NodeId,
+    origin: &NodeId,
+    ping_timeout_ms: u64,
+) -> oceanfs_core::proto::membership::ProbeResponse {
+    let Some(mut client) = make_client(pool, relay_addr, ping_timeout_ms).await else {
+        return oceanfs_core::proto::membership::ProbeResponse { ack: false, incarnation: 0 };
+    };
+    let request = oceanfs_core::proto::membership::ProbeRequest {
+        target: Some(oceanfs_core::proto::common::NodeId { id: target.to_string() }),
+        origin: Some(oceanfs_core::proto::common::NodeId { id: origin.to_string() }),
+        is_indirect: true,
+    };
+    match tokio::time::timeout(
+        Duration::from_millis(ping_timeout_ms),
+        client.probe(tonic::Request::new(request)),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response.into_inner(),
+        Ok(Err(status)) => {
+            debug!(relay = %relay_id, error = %status, "SWIM: indirect probe via relay failed");
+            oceanfs_core::proto::membership::ProbeResponse { ack: false, incarnation: 0 }
+        }
+        Err(_) => {
+            debug!(relay = %relay_id, "SWIM: indirect probe via relay timed out");
+            oceanfs_core::proto::membership::ProbeResponse { ack: false, incarnation: 0 }
+        }
+    }
+}
+
+/// Acquires a probe client for the given address over the membership
+/// plane pool, bounded by the ping timeout.
+async fn make_client(
+    pool: &Arc<ConnectionPool>,
+    addr: SocketAddr,
+    ping_timeout_ms: u64,
+) -> Option<ProbeRpcClient<tonic::transport::Channel>> {
+    let pooled =
+        match tokio::time::timeout(Duration::from_millis(ping_timeout_ms), pool.get_channel(addr))
+            .await
+        {
+            Ok(Ok(pooled)) => pooled,
+            Ok(Err(e)) => {
+                debug!(peer = %addr, error = %e, "SWIM: channel acquisition failed");
+                return None;
+            }
+            Err(_) => {
+                debug!(peer = %addr, "SWIM: channel acquisition timed out");
+                return None;
+            }
+        };
+    let channel = pooled.channel().clone();
+    drop(pooled);
+    Some(ProbeRpcClient::new(channel))
 }
 
 /// Selects a random alive peer from the given list.

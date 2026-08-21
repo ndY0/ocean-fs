@@ -51,6 +51,9 @@ impl Membership {
             gossip_dropped: RwLock::new(None),
             gossip_round_duration: RwLock::new(None),
             gossip_push_duration: RwLock::new(None),
+            probe_duration: RwLock::new(None),
+            probe_failures: RwLock::new(None),
+            indirect_probes: RwLock::new(None),
             ring_version: Gauge::new(
                 "ring_version".into(),
                 "Ring topology version, incremented on each change".into(),
@@ -79,17 +82,32 @@ impl Membership {
             failure_timeout_ms: self.config.failure_timeout_ms,
             indirect_ping_count: self.config.indirect_ping_count,
         };
+        // ADR-0028 D1: probes run over the membership plane's dedicated
+        // pool (wired via `set_pool` before `start` in the node; may
+        // also arrive later via `DetectorCommand::SetPool`).
+        let detector_pool = self.pool.read().clone();
         let (mut detector, detector_cmd_tx) = FailureDetector::new(
             detector_config,
             self.event_tx.clone(),
             self.node_id.clone(),
-            Incarnation::new(1),
             64,
+            detector_pool,
         );
 
         // Store the command sender so other methods can control the detector.
         let detector_tx_for_gossip = detector_cmd_tx.clone();
         *self.detector_tx.write() = Some(detector_cmd_tx);
+
+        // Extract the probe metrics for registration (the detector owns
+        // them; registration happens after start()).
+        {
+            let mut dur = self.probe_duration.write();
+            let mut failures = self.probe_failures.write();
+            let mut indirect = self.indirect_probes.write();
+            *dur = Some(detector.metrics.duration_us.clone());
+            *failures = Some(detector.metrics.failures_total.clone());
+            *indirect = Some(detector.metrics.indirect_total.clone());
+        }
 
         let detector_shutdown = self.shutdown.clone();
         tokio::spawn(async move {
@@ -136,7 +154,6 @@ impl Membership {
         let mut gossip_protocol = GossipProtocol::new(
             gossip_cmd_rx,
             gossip_event_tx,
-            detector_tx_for_gossip,
             self.event_tx.clone(),
             self.config.interval_ms,
             self.node_id.clone(),
@@ -218,19 +235,25 @@ impl Membership {
     /// Sets the connection pool for gRPC-based gossip and join operations.
     ///
     /// Must be called before [`Self::join`] if seed nodes are configured.
-    /// The pool is shared with the gossip protocol for push/pull.
+    /// The pool is shared with the gossip protocol for push/pull and with
+    /// the failure detector for SWIM probes (ADR-0028 D1: the membership
+    /// plane's dedicated pool).
     ///
-    /// If the gossip protocol has already been started, this sends a
-    /// `SetPool` command to update it asynchronously.
+    /// If the background tasks have already been started, this sends a
+    /// `SetPool` command to each to update them asynchronously.
     pub fn set_pool(&self, pool: Arc<ConnectionPool>) {
         // Update the gossip protocol if it's already running.
         if let Some(tx) = self.gossip_tx.read().as_ref() {
             let _ = tx.try_send(GossipCommand::SetPool { pool: pool.clone() });
         }
+        // Update the failure detector if it's already running.
+        if let Some(tx) = self.detector_tx.read().as_ref() {
+            let _ = tx.try_send(DetectorCommand::SetPool { pool: pool.clone() });
+        }
         *self.pool.write() = Some(pool);
     }
 
-    /// Registers gossip counters with a metrics registrar.
+    /// Registers gossip + probe counters with a metrics registrar.
     pub fn register_gossip_metrics(&self, registrar: &dyn oceanfs_core::MetricRegistrar) {
         if let Some(ref c) = *self.gossip_sent.read() {
             registrar.register_counter(c.clone());
@@ -246,6 +269,19 @@ impl Membership {
         }
         if let Some(ref h) = *self.gossip_push_duration.read() {
             registrar.register_histogram(h.clone());
+        }
+        // SWIM probe metrics (ADR-0028 D2): the liveness plane's own
+        // observability — the fleet churn campaign measured the proxy
+        // push at 195 ms p99; probe latency is the detection-bound
+        // signal now.
+        if let Some(ref h) = *self.probe_duration.read() {
+            registrar.register_histogram(h.clone());
+        }
+        if let Some(ref c) = *self.probe_failures.read() {
+            registrar.register_counter(c.clone());
+        }
+        if let Some(ref c) = *self.indirect_probes.read() {
+            registrar.register_counter(c.clone());
         }
         registrar.register_gauge(self.ring_version.clone());
     }
@@ -374,19 +410,14 @@ impl Membership {
         // Announce self as ALIVE via upsert_node so the gossip protocol is
         // notified. The incarnation is the announcement value (persisted + 1
         // on restart, 1 on first boot) — never a hardcoded 1 (ADR-0022 D1).
+        // The probe service answers with `Membership::incarnation_of` —
+        // this upsert keeps that value in sync (ADR-0028 D2).
         self.upsert_node(
             self.node_id.clone(),
             NodeState::Alive,
             self_incarnation,
             Some(self.address),
         );
-
-        // Keep the failure detector's probe responses in sync with the
-        // announced incarnation so peers observe monotonic values.
-        if let Some(tx) = self.detector_tx.read().as_ref() {
-            let _ = tx
-                .try_send(DetectorCommand::UpdateSelfIncarnation { incarnation: self_incarnation });
-        }
 
         info!(node_id = %self.node_id, "joined cluster successfully");
         Ok(())

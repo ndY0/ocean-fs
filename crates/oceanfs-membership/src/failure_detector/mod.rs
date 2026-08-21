@@ -1,8 +1,10 @@
 //! SWIM failure detector.
 //!
-//! Implements the SWIM failure detection algorithm:
-//! 1. Direct ping: send a ping to a random peer
-//! 2. If no ack within timeout: indirect ping via k random peers
+//! Implements the SWIM failure detection algorithm (ADR-0028 D2):
+//! 1. Direct probe: send a real probe RPC to a random peer over the
+//!    membership plane
+//! 2. If no ack within `ping_timeout_ms`: indirect probes via k random
+//!    relays (each relay forwards to the target and relays the ack)
 //! 3. If still no ack: mark the peer SUSPECT
 //! 4. After suspicion timeout: mark DEAD
 //!
@@ -10,8 +12,7 @@
 
 use std::time::Duration;
 
-use oceanfs_core::{Incarnation, NodeId, NodeState};
-use tokio::sync::mpsc;
+use oceanfs_core::{NodeId, NodeState};
 use tracing::{debug, info};
 
 use crate::membership::MembershipEvent;
@@ -20,59 +21,14 @@ mod ping;
 mod suspicion;
 mod types;
 
-pub(crate) use types::{DetectorCommand, DetectorConfig, FailureDetector};
+pub(crate) use types::{DetectorCommand, DetectorConfig, FailureDetector, ProbeMetrics};
 
 impl FailureDetector {
-    /// Creates a new failure detector and returns a command sender.
-    pub fn new(
-        config: DetectorConfig,
-        event_tx: tokio::sync::broadcast::Sender<MembershipEvent>,
-        node_id: oceanfs_core::NodeId,
-        incarnation: Incarnation,
-        buffer: usize,
-    ) -> (Self, mpsc::Sender<DetectorCommand>) {
-        use std::collections::HashMap;
-
-        use crate::grpc::probe_service::ProbeHandler;
-
-        let (tx, rx) = mpsc::channel(buffer);
-        (
-            Self {
-                rx,
-                event_tx,
-                config,
-                suspicion_timers: HashMap::new(),
-                node_id: node_id.clone(),
-                alive_nodes: Vec::new(),
-                probe_handler: ProbeHandler::new(node_id, incarnation),
-                pending_pings: HashMap::new(),
-                pending_indirect: HashMap::new(),
-            },
-            tx,
-        )
-    }
-
-    /// Looks up the current incarnation for a node from the alive list.
-    ///
-    /// Returns `None` if the node is not found in the alive nodes list.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let incarnation = detector.incarnation_for(&node_id);
-    /// ```
-    pub fn incarnation_for(&self, node_id: &NodeId) -> Option<Incarnation> {
-        self.alive_nodes
-            .iter()
-            .find(|(id, _, _, _)| *id == *node_id)
-            .map(|(_, _, _, incarnation)| *incarnation)
-    }
-
     /// Runs the failure detector loop.
     ///
-    /// This should be spawned as a background task. It handles ping
-    /// responses, suspicion timeout expiry, and initiates periodic
-    /// SWIM pings to random alive peers.
+    /// This should be spawned as a background task. It handles probe
+    /// verdicts, suspicion timeout expiry, and initiates periodic SWIM
+    /// probe cycles to random alive peers.
     pub async fn run(&mut self) {
         let mut ticker = tokio::time::interval(Duration::from_millis(self.config.interval_ms));
         // Don't fire immediately — wait for the first interval.
@@ -91,46 +47,32 @@ impl FailureDetector {
                     }
                 }
                 _ = ticker.tick() => {
-                    // Interval tick: initiate ping cycle, check timeouts.
+                    // Interval tick: initiate a probe cycle, check
+                    // suspicion timers.
                     ping::on_ping_tick(self);
-                    ping::check_ping_timeouts(self);
                     suspicion::check_suspicion_timers(self);
                 }
             }
         }
     }
 
-    /// Handles a ping result or other command.
+    /// Handles a probe verdict or other command.
     async fn handle_command(&mut self, cmd: DetectorCommand) -> bool {
         match cmd {
             DetectorCommand::PingResponse { target, success } => {
-                self.pending_pings.remove(&target);
-                if !success {
-                    if !self.pending_indirect.contains_key(&target) {
-                        debug!(
-                            node_id = %target,
-                            "direct ping failed, initiating indirect pings"
-                        );
-                        ping::initiate_indirect_pings(self, &target);
-                    }
+                self.pending_probes.remove(&target);
+                if success {
+                    debug!(
+                        node_id = %target,
+                        "probe cycle succeeded — target is alive"
+                    );
+                    self.recover_suspect(&target);
                 } else {
                     debug!(
                         node_id = %target,
-                        "direct ping succeeded — target is alive"
+                        "probe cycle failed — marking suspect"
                     );
-                    self.recover_suspect(&target);
-                }
-            }
-            DetectorCommand::IndirectPingResult { origin: _origin, target, success } => {
-                self.pending_indirect.remove(&target);
-                if !success {
                     suspicion::mark_suspect(self, &target);
-                } else {
-                    debug!(
-                        node_id = %target,
-                        "indirect ping succeeded — target is alive"
-                    );
-                    self.recover_suspect(&target);
                 }
             }
             DetectorCommand::UpdateAliveNodes { nodes } => {
@@ -144,14 +86,14 @@ impl FailureDetector {
                 let removed = self.alive_nodes.iter().any(|(id, _, _, _)| *id == node_id);
                 self.alive_nodes.retain(|(id, _, _, _)| *id != node_id);
                 self.suspicion_timers.remove(&node_id);
-                self.pending_pings.remove(&node_id);
-                self.pending_indirect.remove(&node_id);
+                self.pending_probes.remove(&node_id);
                 if removed {
                     debug!(node_id = %node_id, "detector: dropped node from probe set");
                 }
             }
-            DetectorCommand::UpdateSelfIncarnation { incarnation } => {
-                self.probe_handler.set_incarnation(incarnation);
+            DetectorCommand::SetPool { pool } => {
+                debug!("detector: membership plane pool set");
+                self.pool = Some(pool);
             }
             DetectorCommand::Shutdown => return false,
         }
@@ -214,8 +156,7 @@ mod tests {
             indirect_ping_count: 3,
         };
         let node_id = NodeId::new("test-node");
-        let incarnation = Incarnation::new(1);
-        let (detector, cmd_tx) = FailureDetector::new(config, event_tx, node_id, incarnation, 8);
+        let (detector, cmd_tx) = FailureDetector::new(config, event_tx, node_id, 8, None);
         (detector, cmd_tx, event_rx)
     }
 
@@ -227,7 +168,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn indirect_ping_failure_emits_suspect_event() {
+    async fn probe_cycle_failure_emits_suspect_event() {
         let (mut detector, cmd_tx, mut event_rx) = make_detector();
         let target = NodeId::new("target-node");
         // The target must be known-Alive: a node that was never known-Alive
@@ -239,11 +180,7 @@ mod tests {
             Incarnation::new(1),
         )];
         cmd_tx
-            .send(DetectorCommand::IndirectPingResult {
-                origin: NodeId::new("origin"),
-                target: target.clone(),
-                success: false,
-            })
+            .send(DetectorCommand::PingResponse { target: target.clone(), success: false })
             .await
             .unwrap();
         cmd_tx.send(DetectorCommand::Shutdown).await.unwrap();
@@ -259,15 +196,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_indirect_ping_does_not_emit_suspect() {
+    async fn successful_probe_does_not_emit_suspect() {
         let (mut detector, cmd_tx, mut event_rx) = make_detector();
         let target = NodeId::new("target-node");
         cmd_tx
-            .send(DetectorCommand::IndirectPingResult {
-                origin: NodeId::new("origin"),
-                target: target.clone(),
-                success: true,
-            })
+            .send(DetectorCommand::PingResponse { target: target.clone(), success: true })
             .await
             .unwrap();
         cmd_tx.send(DetectorCommand::Shutdown).await.unwrap();
@@ -286,11 +219,7 @@ mod tests {
         let target = NodeId::new("unknown-target");
 
         cmd_tx
-            .send(DetectorCommand::IndirectPingResult {
-                origin: NodeId::new("origin"),
-                target: target.clone(),
-                success: false,
-            })
+            .send(DetectorCommand::PingResponse { target: target.clone(), success: false })
             .await
             .unwrap();
         cmd_tx.send(DetectorCommand::Shutdown).await.unwrap();
@@ -326,19 +255,11 @@ mod tests {
             incarnation,
         )];
         cmd_tx
-            .send(DetectorCommand::IndirectPingResult {
-                origin: NodeId::new("origin"),
-                target: target.clone(),
-                success: false,
-            })
+            .send(DetectorCommand::PingResponse { target: target.clone(), success: false })
             .await
             .unwrap();
         cmd_tx
-            .send(DetectorCommand::IndirectPingResult {
-                origin: NodeId::new("origin"),
-                target: target.clone(),
-                success: true,
-            })
+            .send(DetectorCommand::PingResponse { target: target.clone(), success: true })
             .await
             .unwrap();
         cmd_tx.send(DetectorCommand::Shutdown).await.unwrap();
@@ -377,7 +298,7 @@ mod tests {
         detector
             .suspicion_timers
             .insert(target.clone(), (Incarnation::new(1), std::time::Instant::now()));
-        detector.pending_pings.insert(target.clone(), std::time::Instant::now());
+        detector.pending_probes.insert(target.clone(), std::time::Instant::now());
 
         cmd_tx.send(DetectorCommand::RemoveNode { node_id: target.clone() }).await.unwrap();
         cmd_tx.send(DetectorCommand::Shutdown).await.unwrap();
@@ -385,7 +306,7 @@ mod tests {
 
         assert!(detector.alive_nodes.is_empty(), "dead node must leave alive_nodes");
         assert!(!detector.suspicion_timers.contains_key(&target));
-        assert!(!detector.pending_pings.contains_key(&target));
+        assert!(!detector.pending_probes.contains_key(&target));
     }
 
     /// F1c (detector side): declaring a node Dead must drop it from the
@@ -403,29 +324,34 @@ mod tests {
         )];
         let past = std::time::Instant::now().checked_sub(Duration::from_millis(200)).unwrap();
         detector.suspicion_timers.insert(target.clone(), (Incarnation::new(3), past));
-        detector.pending_pings.insert(target.clone(), std::time::Instant::now());
+        detector.pending_probes.insert(target.clone(), std::time::Instant::now());
 
         suspicion::check_suspicion_timers(&mut detector);
 
         assert!(detector.alive_nodes.is_empty(), "dead node must leave alive_nodes");
         assert!(!detector.suspicion_timers.contains_key(&target));
-        assert!(!detector.pending_pings.contains_key(&target));
+        assert!(!detector.pending_probes.contains_key(&target));
     }
 
-    /// F2: `UpdateSelfIncarnation` keeps the probe handler's incarnation
-    /// in sync with the announced rejoin value.
+    /// ADR-0028 D1: the detector accepts the membership plane's pool via
+    /// a command when it arrives after `start()`.
     #[tokio::test]
-    async fn update_self_incarnation_updates_probe_handler() {
+    async fn set_pool_command_wires_the_plane_pool() {
         let (mut detector, cmd_tx, _event_rx) = make_detector();
+        assert!(detector.pool.is_none());
 
         cmd_tx
-            .send(DetectorCommand::UpdateSelfIncarnation { incarnation: Incarnation::new(9) })
+            .send(DetectorCommand::SetPool {
+                pool: std::sync::Arc::new(oceanfs_network::ConnectionPool::new(
+                    oceanfs_core::RpcConfig::default(),
+                )),
+            })
             .await
             .unwrap();
         cmd_tx.send(DetectorCommand::Shutdown).await.unwrap();
         detector.run().await;
 
-        assert_eq!(detector.probe_handler.incarnation(), Incarnation::new(9));
+        assert!(detector.pool.is_some(), "SetPool must wire the plane pool");
     }
 
     #[tokio::test]
@@ -440,11 +366,7 @@ mod tests {
             Incarnation::new(1),
         )];
         cmd_tx
-            .send(DetectorCommand::IndirectPingResult {
-                origin: NodeId::new("origin"),
-                target: target.clone(),
-                success: false,
-            })
+            .send(DetectorCommand::PingResponse { target: target.clone(), success: false })
             .await
             .unwrap();
         {
@@ -590,13 +512,9 @@ mod tests {
             incarnation,
         )];
 
-        // Trigger an indirect ping failure, which calls mark_suspect.
+        // Trigger a failed probe cycle, which calls mark_suspect.
         cmd_tx
-            .send(DetectorCommand::IndirectPingResult {
-                origin: NodeId::new("origin"),
-                target: target.clone(),
-                success: false,
-            })
+            .send(DetectorCommand::PingResponse { target: target.clone(), success: false })
             .await
             .unwrap();
         cmd_tx.send(DetectorCommand::Shutdown).await.unwrap();
@@ -604,10 +522,7 @@ mod tests {
 
         // Assert the suspicion timer uses incarnation 5 from alive_nodes.
         let timer = detector.suspicion_timers.get(&target);
-        assert!(
-            timer.is_some(),
-            "target should have a suspicion timer after indirect ping failure"
-        );
+        assert!(timer.is_some(), "target should have a suspicion timer after a failed probe cycle");
         assert_eq!(
             timer.unwrap().0,
             Incarnation::new(5),

@@ -98,8 +98,7 @@ pub(crate) fn check_suspicion_timers(detector: &mut FailureDetector) {
         // is the authority on its own structures and must not keep
         // probing the removed node between sync ticks.
         detector.alive_nodes.retain(|(id, _, _, _)| id != &node_id);
-        detector.pending_pings.remove(&node_id);
-        detector.pending_indirect.remove(&node_id);
+        detector.pending_probes.remove(&node_id);
 
         let incarnation =
             timer.map(|(incarnation, _)| incarnation).unwrap_or_else(|| Incarnation::new(1));

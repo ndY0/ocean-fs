@@ -17,10 +17,7 @@ use oceanfs_network::ConnectionPool;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, trace, warn};
 
-use crate::{
-    failure_detector::DetectorCommand,
-    membership::state::{GossipDelta, GossipState, NodeEntry},
-};
+use crate::membership::state::{GossipDelta, GossipState, NodeEntry};
 
 /// Internal command to the gossip task.
 #[derive(Clone)]
@@ -68,8 +65,6 @@ pub(crate) struct GossipProtocol {
     rx: mpsc::Receiver<GossipCommand>,
     /// Sender for membership events (state transitions).
     event_tx: broadcast::Sender<GossipCommand>,
-    /// Sender for failure detector commands.
-    detector_tx: mpsc::Sender<DetectorCommand>,
     /// Local membership state.
     state: GossipState,
     /// Tracked incarnations per node for conflict resolution.
@@ -90,12 +85,10 @@ pub(crate) struct GossipProtocol {
     pub(crate) messages_dropped: Counter,
     /// Gossip round duration histogram (microseconds).
     pub(crate) round_duration_us: Arc<Histogram>,
-    /// Peer push (the SWIM ping proxy, DK-007) duration histogram —
-    /// the ping latency the failure detector's timeouts are measured
-    /// against. The fleet churn suspect-stuck class: under load the
-    /// pushes (and their channel acquisitions) lag past
-    /// ping_timeout_ms, the detector marks the peer suspect, and the
-    /// recovery only lands when a push happens to fit the window.
+    /// Peer push (dissemination) duration histogram. ADR-0028 D2: the
+    /// push is no longer the SWIM ping proxy — liveness has its own
+    /// probe metric (`probe_duration_microseconds`) on the membership
+    /// plane. This histogram measures dissemination only.
     pub(crate) push_duration_us: Arc<Histogram>,
 }
 
@@ -104,7 +97,6 @@ impl GossipProtocol {
     pub fn new(
         rx: mpsc::Receiver<GossipCommand>,
         event_tx: broadcast::Sender<GossipCommand>,
-        detector_tx: mpsc::Sender<DetectorCommand>,
         membership_event_tx: broadcast::Sender<crate::membership::MembershipEvent>,
         gossip_interval_ms: u64,
         node_id: NodeId,
@@ -112,7 +104,6 @@ impl GossipProtocol {
         Self {
             rx,
             event_tx,
-            detector_tx,
             state: GossipState::new(),
             incarnations: HashMap::new(),
             membership_event_tx,
@@ -252,7 +243,6 @@ impl GossipProtocol {
                     if let Some(entry) = self.state.nodes.get(&peer) {
                         let peer_addr = entry.address;
                         let pool = pool.clone();
-                        let detector = self.detector_tx.clone();
                         let push_hist = Arc::clone(&self.push_duration_us);
                         let peer_clone = peer.clone();
 
@@ -283,6 +273,10 @@ impl GossipProtocol {
                             })
                             .collect();
 
+                        // The push is dissemination only (ADR-0028 D2):
+                        // the failure detector's liveness signal is the
+                        // real Probe RPC on the membership plane — the
+                        // push-as-ping-proxy (DK-007) is removed.
                         tokio::spawn(async move {
                             let push_start = std::time::Instant::now();
                             match pool.get_channel(peer_addr).await {
@@ -313,32 +307,18 @@ impl GossipProtocol {
                                                     "gossip push ack received"
                                                 );
                                             }
-                                            let _ =
-                                                detector.try_send(DetectorCommand::PingResponse {
-                                                    target: peer_clone,
-                                                    success: true,
-                                                });
                                         }
                                         Err(status) => {
                                             warn!(peer = %peer_clone, error = %status, "gossip push failed");
                                             messages_dropped.inc();
                                             push_hist
                                                 .observe(push_start.elapsed().as_micros() as u64);
-                                            let _ =
-                                                detector.try_send(DetectorCommand::PingResponse {
-                                                    target: peer_clone,
-                                                    success: false,
-                                                });
                                         }
                                     }
                                 }
                                 Err(e) => {
                                     warn!(peer = %peer_clone, error = %e, "failed to acquire channel for push");
                                     messages_dropped.inc();
-                                    let _ = detector.try_send(DetectorCommand::PingResponse {
-                                        target: peer_clone,
-                                        success: false,
-                                    });
                                 }
                             }
                         });
@@ -567,12 +547,10 @@ mod tests {
     fn make_protocol() -> GossipProtocol {
         let (_cmd_tx, cmd_rx) = mpsc::channel(8);
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
-        let (detector_tx, _detector_rx) = mpsc::channel(8);
         let (membership_tx, _membership_rx) = tokio::sync::broadcast::channel(16);
         GossipProtocol::new(
             cmd_rx,
             event_tx,
-            detector_tx,
             membership_tx,
             1000, // gossip_interval_ms
             NodeId::new("test-node"),

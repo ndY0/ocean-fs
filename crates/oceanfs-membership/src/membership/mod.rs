@@ -104,10 +104,17 @@ pub struct Membership {
     pub(crate) gossip_dropped: RwLock<Option<Counter>>,
     /// Gossip round duration histogram (set during start).
     pub(crate) gossip_round_duration: RwLock<Option<Arc<Histogram>>>,
-    /// Gossip push (SWIM ping proxy) duration histogram (set during
-    /// start) — the ping latency the failure detector's timeouts are
-    /// measured against.
+    /// Gossip push duration histogram (set during start) — the
+    /// dissemination push latency (ADR-0028: no longer the liveness
+    /// signal; probes have their own plane and histogram).
     pub(crate) gossip_push_duration: RwLock<Option<Arc<Histogram>>>,
+    /// SWIM probe cycle duration histogram (set during start,
+    /// ADR-0028 D2).
+    pub(crate) probe_duration: RwLock<Option<Arc<Histogram>>>,
+    /// SWIM probe cycles that ended in failure (set during start).
+    pub(crate) probe_failures: RwLock<Option<Counter>>,
+    /// SWIM indirect (relayed) probes sent (set during start).
+    pub(crate) indirect_probes: RwLock<Option<Counter>>,
     /// Ring version gauge — increments on each ring topology change.
     pub(crate) ring_version: Gauge,
 }
