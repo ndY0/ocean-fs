@@ -138,10 +138,28 @@ impl OrphanReaper {
             }
         });
 
-        // Phase 3: Reclaim orphans with double-check
+        // Phase 3: Reclaim orphans with double-check.
+        //
+        // The double-check re-uses the Phase-1 referenced set — a
+        // per-orphan FULL metadata rescan made the cycle cost scale as
+        // O(orphans × metadata): with ~1000 orphans per cycle the
+        // reaper did ~1000 full scans per cycle, its reclaim rate
+        // capped below the write rate, and the disk climbed
+        // monotonically (the fleet churn disk-fill — the metadata was
+        // already small after the hint-apply fix, so the orphan count
+        // alone was enough to stall the reaper).
+        //
+        // The race a fresh rescan closed — a row written mid-cycle
+        // referencing a just-reaped segment — is closed by
+        // construction: sealed segments receive no new appends, and
+        // the only row writers (direct PUT, hint apply) reference
+        // freshly-appended segments; the read-repair push references
+        // the winner's (foreign) segment ids. The durable Deleted
+        // marker (delete-before-unlink, ADR-0024) remains the crash
+        // guard between request_delete and the unlink.
         for segment_id in &orphan_ids {
-            // Double-check: re-verify segment still unreferenced
-            let still_orphan = !self.is_segment_referenced(*segment_id)?;
+            // Double-check against the cycle's snapshot.
+            let still_orphan = !referenced.contains(segment_id);
 
             if still_orphan {
                 // Delete-before-unlink (ADR-0024 invariant 3): the
@@ -250,14 +268,6 @@ impl OrphanReaper {
         }
 
         Ok(referenced)
-    }
-
-    /// Checks whether a segment is still referenced by any object.
-    /// Used as a double-check before deletion to prevent races with
-    /// concurrent writers.
-    pub(crate) fn is_segment_referenced(&self, segment_id: SegmentId) -> Result<bool> {
-        let referenced = self.build_referenced_set()?;
-        Ok(referenced.contains(&segment_id))
     }
 }
 
@@ -619,9 +629,10 @@ mod tests {
     #[tokio::test]
     async fn double_check_correctly_identifies_referenced_segments() {
         let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
-        // The double-check mechanism works by calling is_segment_referenced()
-        // before each deletion. This test validates that is_segment_referenced
-        // correctly distinguishes referenced from unreferenced segments.
+        // The double-check re-uses the cycle's referenced-set snapshot
+        // (one metadata scan per cycle — the per-orphan full rescan
+        // scaled O(orphans × metadata) and stalled the reaper). This
+        // test validates the SET semantics the double-check relies on.
         let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
 
         let seg_id = SegmentId::new();
@@ -633,10 +644,10 @@ mod tests {
             make_reaper(metadata.clone(), store, GcConfig::default(), Arc::clone(&registry)).await;
 
         // Initially unreferenced — would be an orphan candidate
-        assert!(!reaper.is_segment_referenced(seg_id).unwrap());
+        assert!(!reaper.build_referenced_set().unwrap().contains(&seg_id));
 
-        // Simulate concurrent write: an object referencing the segment
-        // is inserted between the scan phase and the delete phase.
+        // Simulate a write that happened before the cycle's snapshot:
+        // an object referencing the segment is inserted.
         let obj_meta = make_object_meta(
             "concurrent.txt",
             100,
@@ -650,10 +661,10 @@ mod tests {
         );
         metadata.put_object(obj_meta).unwrap();
 
-        // Double-check after concurrent write: now referenced
-        // If this check were the delete-phase double-check, it would
-        // correctly prevent deletion.
-        assert!(reaper.is_segment_referenced(seg_id).unwrap());
+        // A fresh snapshot now sees it as referenced — the cycle's
+        // Phase-1 scan (which runs after this insert) would classify
+        // the segment as live, not an orphan.
+        assert!(reaper.build_referenced_set().unwrap().contains(&seg_id));
 
         // Run the full cycle. The segment is now referenced, so
         // it should NOT be detected as orphan during scan.
@@ -856,16 +867,16 @@ mod tests {
 
     // -----------------------------------------------------------------------
 
-    // is_segment_referenced
+    // referenced-set snapshot
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn is_segment_referenced_returns_false_for_nonexistent() {
+    async fn referenced_set_empty_for_no_objects() {
         let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
         let store = test_shard_store();
         let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
         let reaper = make_reaper(metadata, store, GcConfig::default(), Arc::clone(&registry)).await;
-        assert!(!reaper.is_segment_referenced(SegmentId::new()).unwrap());
+        assert!(!reaper.build_referenced_set().unwrap().contains(&SegmentId::new()));
     }
 
     // -----------------------------------------------------------------------
