@@ -871,7 +871,6 @@ mod tests {
     /// (the registry knew 32 segments while the disk held ~10k files).
     #[tokio::test]
     async fn append_segment_registers_replica_segment_in_lifecycle() {
-        use oceanfs_storage_api::MetadataStore as _;
         let store: Arc<dyn SegmentDataStore> = Arc::new(TestSegmentStore::new());
         let metadata: Arc<dyn oceanfs_storage_api::MetadataStore> = Arc::new(
             oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
@@ -907,7 +906,6 @@ mod tests {
             chunk_segment_ids: vec![Bytes::copy_from_slice(segment_id.as_uuid().as_bytes())],
             chunk_offsets: vec![0],
             chunk_lengths: vec![1024],
-            ..Default::default()
         };
         request.data = chunk.data;
 
