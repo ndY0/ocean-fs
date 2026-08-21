@@ -599,6 +599,25 @@ impl Membership {
     ) {
         let mut inner = self.state.write();
 
+        // SELF-AUTHORITY: a node must never accept a Suspect/Dead state
+        // for ITSELF from gossip or a seed pull. The node is the only
+        // authority on its own liveness — a stale Suspect(8) window on
+        // a peer (47ms in the fleet churn run) gets pulled by the
+        // rejoined node, applied to its own entry (equal incarnation
+        // passes the stale-downgrade guard), and then SPREAD back to
+        // every peer forever — the cluster converges to Suspect and
+        // the churn convergence check fails. Self Alive announcements
+        // still flow normally.
+        if node_id == self.node_id && matches!(state, NodeState::Suspect | NodeState::Dead) {
+            trace!(
+                node_id = %node_id,
+                incoming = ?state,
+                "upsert_node: rejecting self-downgrade from gossip"
+            );
+            drop(inner);
+            return;
+        }
+
         // Capture old state and the recorded incarnation before modifying.
         let old = inner.nodes.get(&node_id).map(|(s, _, _)| *s);
         let stored_address = inner.nodes.get(&node_id).map(|(_, _, addr)| *addr);
@@ -930,6 +949,44 @@ mod tests {
         // node died at inc 5 without rejoining).
         m.upsert_node(NodeId::new("rejoiner"), NodeState::Dead, Incarnation::new(5), None);
         assert_eq!(m.state_of(&NodeId::new("rejoiner")), Some(NodeState::Dead));
+    }
+
+    /// SELF-AUTHORITY guard (fleet churn fix): a node must never accept
+    /// a Suspect/Dead state for ITSELF from gossip — the node is the
+    /// authority on its own liveness. Without this, a stale Suspect
+    /// window on a peer is pulled by the rejoined node, applied to its
+    /// own entry, and spread back to every peer forever (node-2 stuck
+    /// Suspect(8) in the fleet churn run).
+    #[test]
+    fn upsert_rejects_self_suspect_or_dead_from_gossip() {
+        let (_ring, m) = make_membership("myself");
+
+        // The node knows it is alive (its own view).
+        m.upsert_node(
+            NodeId::new("myself"),
+            NodeState::Alive,
+            Incarnation::new(8),
+            Some("127.0.0.1:9100".parse().unwrap()),
+        );
+
+        // Gossip brings a stale Suspect for SELF — must be rejected.
+        m.upsert_node(NodeId::new("myself"), NodeState::Suspect, Incarnation::new(8), None);
+        assert_eq!(m.state_of(&NodeId::new("myself")), Some(NodeState::Alive));
+
+        // Even a Dead for SELF is rejected.
+        m.upsert_node(NodeId::new("myself"), NodeState::Dead, Incarnation::new(8), None);
+        assert_eq!(m.state_of(&NodeId::new("myself")), Some(NodeState::Alive));
+
+        // A PEER's Suspect at equal incarnation is still accepted (the
+        // detector's own suspicion is legitimate).
+        m.upsert_node(
+            NodeId::new("peer"),
+            NodeState::Alive,
+            Incarnation::new(8),
+            Some("127.0.0.1:9101".parse().unwrap()),
+        );
+        m.upsert_node(NodeId::new("peer"), NodeState::Suspect, Incarnation::new(8), None);
+        assert_eq!(m.state_of(&NodeId::new("peer")), Some(NodeState::Suspect));
     }
 
     /// ADR-0022 Decision 2: a self-rejoin announcing a strictly higher
