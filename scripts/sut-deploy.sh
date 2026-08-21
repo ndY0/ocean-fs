@@ -150,11 +150,13 @@ deploy_node() {
         return 0
     fi
 
+    # NB: ssh JOINS the remote command line with spaces, so an empty
+    # "$seed" would vanish and shift every positional — pass a
+    # sentinel and normalize it on the remote side (phase-2 single
+    # node: seed must be empty for `seed_nodes = []`). The comment MUST
+    # precede the ssh command — a comment on a `\`-continued line
+    # swallows the whole remote command.
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "$target" \
-        # NB: ssh JOINS the remote command line with spaces, so an empty
-        # "$seed" would vanish and shift every positional — pass a
-        # sentinel and normalize it on the remote side (phase-2 single
-        # node: seed must be empty for `seed_nodes = []`).
         bash -s -- "$PORT" "$DATA_DIR" "$CONFIG_DIR" "$SERVICE" "$node_name" "${seed:-NONE}" <<'SUT_SETUP'
 set -euo pipefail
 PORT="$1"; DATA_DIR="$2"; CONFIG_DIR="$3"; SERVICE="$4"; NODE_NAME="$5"; SEED="$6"
