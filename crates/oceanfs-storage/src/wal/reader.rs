@@ -141,6 +141,17 @@ impl Iterator for WalReplayIter {
                         let mut data_buf = vec![0u8; data_len];
                         if let Err(e) = reader.read_exact(&mut data_buf) {
                             tracing::warn!("truncated WAL entry data: {e}");
+                            if self.current >= self.file_paths.len() {
+                                // The truncated entry is the log TAIL:
+                                // the crash (SIGKILL) cut the last write
+                                // mid-record, so nothing valid can
+                                // follow it. End the replay cleanly —
+                                // the recovery then truncates the WAL
+                                // to the last valid entry. A truncated
+                                // entry with LATER files is mid-log
+                                // corruption and keeps the error.
+                                return None;
+                            }
                             return Some(Err(std::io::Error::new(
                                 std::io::ErrorKind::UnexpectedEof,
                                 e,
@@ -242,6 +253,11 @@ impl Iterator for WalReplayPosIter {
                         let mut data_buf = vec![0u8; data_len];
                         if let Err(e) = reader.read_exact(&mut data_buf) {
                             tracing::warn!("truncated WAL entry data: {e}");
+                            if self.current >= self.file_paths.len() {
+                                // Log TAIL (see WalReplayIter): the torn
+                                // record ends the log — stop cleanly.
+                                return None;
+                            }
                             return Some(Err(std::io::Error::new(
                                 std::io::ErrorKind::UnexpectedEof,
                                 e,
@@ -350,6 +366,53 @@ mod tests {
         let reader = WalReader::open(&config).unwrap();
         let entries: Vec<_> = reader.replay().collect::<Result<Vec<_>>>().unwrap();
         assert!(entries.is_empty());
+    }
+
+    /// The crash-tail fix (fleet churn): a SIGKILL mid-WAL-write tears
+    /// the LAST record. The replay must end cleanly at the torn tail
+    /// (the recovery then truncates the WAL) instead of hard-failing
+    /// startup ("event-WAL recovery failed: failed to fill whole
+    /// buffer" — node-1 could not restart after its churn kill).
+    #[tokio::test]
+    async fn replay_ends_cleanly_at_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = WalConfig {
+            data_dir: dir.path().to_path_buf(),
+            max_file_size_bytes: 1024 * 1024,
+            fsync_batch_timeout_ms: 5,
+            ..Default::default()
+        };
+
+        {
+            let writer = WalWriter::open(&config).await.unwrap();
+            for i in 0..3 {
+                let entry = make_test_entry(SegmentId::new(), (i * 100) as u64, 100, i as u8);
+                writer.append(entry).await.unwrap();
+            }
+        }
+
+        // Simulate the crash: append a torn record — a full valid
+        // header claiming a 100 000-byte payload, followed by only
+        // 100 bytes (the SIGKILL cut the write mid-payload).
+        let wal_file = std::fs::read_dir(&config.data_dir)
+            .unwrap_or_else(|_| panic!("wal dir readable: {}", config.data_dir.display()))
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "log"))
+            .unwrap_or_else(|| panic!("no wal file in {}", config.data_dir.display()));
+        let mut file = std::fs::OpenOptions::new().append(true).open(&wal_file).unwrap();
+        let torn_header = make_test_entry(SegmentId::new(), 0, 100_000, 0xFF).to_header_bytes();
+        std::io::Write::write_all(&mut file, &torn_header).unwrap();
+        std::io::Write::write_all(&mut file, &[0xAA; 100]).unwrap(); // 100 of 100_000 bytes
+        drop(file);
+
+        let reader = WalReader::open(&config).unwrap();
+        let entries: Vec<_> = reader.replay().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(
+            entries.len(),
+            3,
+            "replay must yield the complete entries and stop cleanly at the torn tail"
+        );
     }
 
     #[tokio::test]
