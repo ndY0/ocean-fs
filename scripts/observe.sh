@@ -60,7 +60,10 @@ done
 if [ -z "$SUT" ]; then
     local_record=$(ls -t .hetzner/provision-*.json 2>/dev/null | head -1 || true)
     if [ -n "$local_record" ]; then
+        # Phase 2 record: .sut.public_ip. Phase 3+ fleet (ADR-0026):
+        # .sut_nodes[] — node 0 hosts Prometheus.
         SUT=$(jq -r '.sut.public_ip // empty' "$local_record" 2>/dev/null || true)
+        [ -n "$SUT" ] || SUT=$(jq -r '.sut_nodes[0].public_ip // empty' "$local_record" 2>/dev/null || true)
     fi
 fi
 [ -n "$SUT" ] || { log_info "No SUT known — pass --sut HOST or re-run vm-provision.sh first."; exit 1; }
