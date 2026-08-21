@@ -143,8 +143,20 @@ if [ -n "$HARNESS" ]; then
 
     # The remote invocation drops --harness and runs the local flow.
     # Forward LOAD_TEST_DURATION_SECS plus the compression switches.
+    # --nodes must carry the RAW IPs: the harness-side script appends
+    # :9000 itself, so forwarding the derived TARGET_HOSTS (already
+    # port-suffixed) produced "10.0.0.2:9000:9000" and the test aborted
+    # at target parsing.
+    if [ -n "$NODES" ]; then
+        NODES_FWD="$NODES"
+    elif [ -n "$TARGET_HOSTS" ]; then
+        # TARGET_HOSTS-env fallback: strip any :port suffix.
+        NODES_FWD="$(echo "$TARGET_HOSTS" | sed 's/:[0-9]*//g')"
+    else
+        NODES_FWD=""
+    fi
     ssh $SSH_OPTS -o BatchMode=yes "$HARNESS" \
-        "cd /root/ocean-fs && ${LOAD_TEST_DURATION_SECS:+LOAD_TEST_DURATION_SECS=$LOAD_TEST_DURATION_SECS }${LOAD_TEST_COMPRESSION:+LOAD_TEST_COMPRESSION=$LOAD_TEST_COMPRESSION }${LOAD_TEST_COMPRESSIBLE:+LOAD_TEST_COMPRESSIBLE=$LOAD_TEST_COMPRESSIBLE }./scripts/run-phase3.sh --${MODE} ${TARGET_HOSTS:+--nodes $TARGET_HOSTS} ${SSH_LIST:+--ssh $SSH_LIST} --service ${SERVICE} --seed ${SEED} --report-dir ${REPORT_DIR}"
+        "cd /root/ocean-fs && ${LOAD_TEST_DURATION_SECS:+LOAD_TEST_DURATION_SECS=$LOAD_TEST_DURATION_SECS }${LOAD_TEST_COMPRESSION:+LOAD_TEST_COMPRESSION=$LOAD_TEST_COMPRESSION }${LOAD_TEST_COMPRESSIBLE:+LOAD_TEST_COMPRESSIBLE=$LOAD_TEST_COMPRESSIBLE }./scripts/run-phase3.sh --${MODE} ${NODES_FWD:+--nodes $NODES_FWD} ${SSH_LIST:+--ssh $SSH_LIST} --service ${SERVICE} --seed ${SEED} --report-dir ${REPORT_DIR}"
     # NOTE: this is the top-level script body, not a function — `local`
     # would fail and silently lose the run's exit code.
     local_exit=$?
