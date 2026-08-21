@@ -7,7 +7,7 @@
 
 use std::{net::SocketAddr, sync::Arc};
 
-use oceanfs_core::{Counter, Gauge, GossipConfig, Incarnation, NodeId, NodeState};
+use oceanfs_core::{Counter, Gauge, GossipConfig, Histogram, Incarnation, NodeId, NodeState};
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::RingCache;
 use parking_lot::RwLock;
@@ -102,6 +102,12 @@ pub struct Membership {
     pub(crate) gossip_received: RwLock<Option<Counter>>,
     /// Gossip messages dropped (set during start).
     pub(crate) gossip_dropped: RwLock<Option<Counter>>,
+    /// Gossip round duration histogram (set during start).
+    pub(crate) gossip_round_duration: RwLock<Option<Arc<Histogram>>>,
+    /// Gossip push (SWIM ping proxy) duration histogram (set during
+    /// start) — the ping latency the failure detector's timeouts are
+    /// measured against.
+    pub(crate) gossip_push_duration: RwLock<Option<Arc<Histogram>>>,
     /// Ring version gauge — increments on each ring topology change.
     pub(crate) ring_version: Gauge,
 }

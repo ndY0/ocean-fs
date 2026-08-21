@@ -49,6 +49,8 @@ impl Membership {
             gossip_sent: RwLock::new(None),
             gossip_received: RwLock::new(None),
             gossip_dropped: RwLock::new(None),
+            gossip_round_duration: RwLock::new(None),
+            gossip_push_duration: RwLock::new(None),
             ring_version: Gauge::new(
                 "ring_version".into(),
                 "Ring topology version, incremented on each change".into(),
@@ -144,14 +146,18 @@ impl Membership {
         if let Some(pool) = self.pool.read().as_ref() {
             gossip_protocol.set_pool(pool.clone());
         }
-        // Extract gossip counters for metrics registration.
+        // Extract gossip counters + histograms for metrics registration.
         {
             let mut sent = self.gossip_sent.write();
             let mut recv = self.gossip_received.write();
             let mut dropped = self.gossip_dropped.write();
+            let mut round = self.gossip_round_duration.write();
+            let mut push = self.gossip_push_duration.write();
             *sent = Some(gossip_protocol.messages_sent.clone());
             *recv = Some(gossip_protocol.messages_received.clone());
             *dropped = Some(gossip_protocol.messages_dropped.clone());
+            *round = Some(gossip_protocol.round_duration_us.clone());
+            *push = Some(gossip_protocol.push_duration_us.clone());
         }
         *self.gossip_tx.write() = Some(gossip_cmd_tx);
         let gossip_shutdown = self.shutdown.clone();
@@ -234,6 +240,12 @@ impl Membership {
         }
         if let Some(ref c) = *self.gossip_dropped.read() {
             registrar.register_counter(c.clone());
+        }
+        if let Some(ref h) = *self.gossip_round_duration.read() {
+            registrar.register_histogram(h.clone());
+        }
+        if let Some(ref h) = *self.gossip_push_duration.read() {
+            registrar.register_histogram(h.clone());
         }
         registrar.register_gauge(self.ring_version.clone());
     }
