@@ -90,6 +90,13 @@ pub(crate) struct GossipProtocol {
     pub(crate) messages_dropped: Counter,
     /// Gossip round duration histogram (microseconds).
     pub(crate) round_duration_us: Arc<Histogram>,
+    /// Peer push (the SWIM ping proxy, DK-007) duration histogram —
+    /// the ping latency the failure detector's timeouts are measured
+    /// against. The fleet churn suspect-stuck class: under load the
+    /// pushes (and their channel acquisitions) lag past
+    /// ping_timeout_ms, the detector marks the peer suspect, and the
+    /// recovery only lands when a push happens to fit the window.
+    pub(crate) push_duration_us: Arc<Histogram>,
 }
 
 impl GossipProtocol {
@@ -133,6 +140,12 @@ impl GossipProtocol {
                 &sub_millisecond_histogram_config(),
                 LabelSet::empty(),
             )),
+            push_duration_us: Arc::new(Histogram::new(
+                "gossip_push_duration_seconds".into(),
+                "Gossip push (SWIM ping proxy) duration in microseconds".into(),
+                &sub_millisecond_histogram_config(),
+                LabelSet::empty(),
+            )),
         }
     }
 
@@ -147,6 +160,7 @@ impl GossipProtocol {
         registrar.register_counter(self.messages_received.clone());
         registrar.register_counter(self.messages_dropped.clone());
         registrar.register_histogram(Arc::clone(&self.round_duration_us));
+        registrar.register_histogram(Arc::clone(&self.push_duration_us));
     }
 
     /// Runs the gossip protocol loop.
@@ -239,6 +253,7 @@ impl GossipProtocol {
                         let peer_addr = entry.address;
                         let pool = pool.clone();
                         let detector = self.detector_tx.clone();
+                        let push_hist = Arc::clone(&self.push_duration_us);
                         let peer_clone = peer.clone();
 
                         // Convert the GossipDelta into protobuf GossipMessages
@@ -264,6 +279,7 @@ impl GossipProtocol {
                             .collect();
 
                         tokio::spawn(async move {
+                            let push_start = std::time::Instant::now();
                             match pool.get_channel(peer_addr).await {
                                 Ok(pooled) => {
                                     let channel = pooled.channel().clone();
@@ -285,6 +301,8 @@ impl GossipProtocol {
                                     match client.push(tonic::Request::new(stream)).await {
                                         Ok(response) => {
                                             let ack = response.into_inner();
+                                            push_hist
+                                                .observe(push_start.elapsed().as_micros() as u64);
                                             if ack.accepted {
                                                 debug!(
                                                     peer = %peer_clone,
@@ -301,6 +319,8 @@ impl GossipProtocol {
                                         Err(status) => {
                                             warn!(peer = %peer_clone, error = %status, "gossip push failed");
                                             messages_dropped.inc();
+                                            push_hist
+                                                .observe(push_start.elapsed().as_micros() as u64);
                                             let _ =
                                                 detector.try_send(DetectorCommand::PingResponse {
                                                     target: peer_clone,
