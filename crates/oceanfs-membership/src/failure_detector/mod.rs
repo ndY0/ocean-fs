@@ -164,8 +164,22 @@ impl FailureDetector {
     /// Suspect forever (t19): membership and gossip never learned
     /// the recovery. Emitting the Suspect→Alive event lets the
     /// membership manager re-admit the node as Alive.
+    ///
+    /// The event must fire even WITHOUT a pending timer: a Suspect
+    /// state can arrive via GOSSIP deltas (equal incarnation,
+    /// last-writer-wins) and creates no timer here — with the old
+    /// guard the successful pings (every interval!) never cleared it
+    /// and the node stayed Suspect forever (the fleet churn
+    /// convergence failures: node stuck Suspect on the peers through
+    /// the settle). Every successful ping is authoritative: the node
+    /// is reachable, so any Suspect must clear.
     fn recover_suspect(&mut self, target: &NodeId) {
-        if let Some((incarnation, _since)) = self.suspicion_timers.remove(target) {
+        let incarnation = self
+            .suspicion_timers
+            .remove(target)
+            .map(|(i, _)| i)
+            .or_else(|| self.incarnation_for(target));
+        if let Some(incarnation) = incarnation {
             let _ = self.event_tx.send(MembershipEvent {
                 node_id: target.clone(),
                 old_state: NodeState::Suspect,
@@ -485,6 +499,37 @@ mod tests {
             }
         }
         assert!(!saw_dead, "stale suspicion must not declare DEAD after a rejoin");
+    }
+
+    /// The gossip-applied Suspect recovery (fleet churn fix): a
+    /// Suspect that arrived via GOSSIP (no detector timer) must still
+    /// clear on the next successful ping — with the old timer-only
+    /// guard the node stayed Suspect forever through the settle.
+    #[test]
+    fn successful_ping_recovers_gossip_applied_suspect_without_timer() {
+        let (mut detector, _cmd_tx, mut event_rx) = make_detector();
+        let target = NodeId::new("target-node");
+        // The node is in the detector's synced view at incarnation 7.
+        detector.alive_nodes = vec![(
+            target.clone(),
+            NodeState::Suspect,
+            "127.0.0.1:9000".parse().unwrap(),
+            Incarnation::new(7),
+        )];
+        // NO suspicion timer (the Suspect came from a gossip delta).
+
+        detector.recover_suspect(&target);
+
+        let mut saw_recovery = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if event.node_id == target && event.new_state == NodeState::Alive {
+                saw_recovery = true;
+            }
+        }
+        assert!(
+            saw_recovery,
+            "a successful ping must recover a gossip-applied Suspect even without a timer"
+        );
     }
 
     #[test]
