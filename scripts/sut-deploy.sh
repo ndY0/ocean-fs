@@ -156,10 +156,16 @@ deploy_node() {
     # node: seed must be empty for `seed_nodes = []`). The comment MUST
     # precede the ssh command — a comment on a `\`-continued line
     # swallows the whole remote command.
+    # NODE_IP: the node's reachable address for the ADVERTISED gRPC
+    # address. `grpc_listen_addr = "0.0.0.0:9001"` makes every node
+    # advertise 0.0.0.0 — peers then connect to THEIR OWN grpc port
+    # (Unimplemented) and gossip dies beyond the explicit seed path
+    # (the fleet never converges: observed node-1 stuck at 2/3).
+    node_ip="${target##*@}"
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "$target" \
-        bash -s -- "$PORT" "$DATA_DIR" "$CONFIG_DIR" "$SERVICE" "$node_name" "${seed:-NONE}" <<'SUT_SETUP'
+        bash -s -- "$PORT" "$DATA_DIR" "$CONFIG_DIR" "$SERVICE" "$node_name" "$node_ip" "${seed:-NONE}" <<'SUT_SETUP'
 set -euo pipefail
-PORT="$1"; DATA_DIR="$2"; CONFIG_DIR="$3"; SERVICE="$4"; NODE_NAME="$5"; SEED="$6"
+PORT="$1"; DATA_DIR="$2"; CONFIG_DIR="$3"; SERVICE="$4"; NODE_NAME="$5"; NODE_IP="$6"; SEED="$7"
 [ "$SEED" = "NONE" ] && SEED=""
 
 mkdir -p "$DATA_DIR" "$CONFIG_DIR"
@@ -175,7 +181,10 @@ fi
 cat > "${CONFIG_DIR}/oceanfs.toml" <<CONFIG
 node_id = "${NODE_NAME}"
 listen_addr = "0.0.0.0:${PORT}"
-grpc_listen_addr = "0.0.0.0:$((${PORT} + 1))"
+# The ADVERTISED gRPC address must be the node's own reachable IP
+# (peers dial it directly): 0.0.0.0 here made every node dial ITSELF
+# and gossip never converged past the seed path.
+grpc_listen_addr = "${NODE_IP}:$((${PORT} + 1))"
 data_dir = "${DATA_DIR}"
 log_level = "info"
 # ── CX33 (8 GB RAM) — generous memory profile ──────────────────────────────
