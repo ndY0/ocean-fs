@@ -1105,6 +1105,9 @@ impl Node {
         // Start background seal worker — drains filled segments from both
         // pools and writes them to disk via the segment sealer (Epic 3).
         let _seal_handle = write_coordinator.start_seal_worker();
+        // Clone for the hint-applier adapter (the coordinator is moved
+        // into the S3 handler state below).
+        let write_coordinator_for_applier = Arc::clone(&write_coordinator);
 
         // ---- 6a. Startup recovery: the machine path (ADR-0025 phase 2) ----
         // Deterministic recovery: fold the event log into the registry
@@ -1462,6 +1465,15 @@ impl Node {
         )))
         .with_hint_object_reader(Arc::new(
             oceanfs_server::read::ReadCoordinatorHintObjectReader::new(read_coordinator_for_hints),
+        ))
+        // Hint apply goes through the node's OWN segment pipeline (the
+        // write coordinator's local append): the hinted data lands in a
+        // local segment with REAL chunk refs instead of the historical
+        // inline-in-metadata storage — which ballooned the objects CF
+        // (16 MiB blobs) and collapsed the orphan reaper's metadata
+        // scan (the fleet disk-fill root cause).
+        .with_hint_object_applier(Arc::new(
+            oceanfs_server::WriteCoordinatorHintObjectApplier::new(write_coordinator_for_applier),
         ));
         let cache_service = oceanfs_server::grpc::cache_service::CacheGrpcService::new(
             Some(object_cache.clone()),

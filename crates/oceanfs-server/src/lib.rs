@@ -50,4 +50,4 @@ pub use read::coordinator::{
 };
 pub use router::{RouteRequest, RouteResponse, Router};
 pub use s3_handler::S3Handler;
-pub use write::coordinator::{WriteCoordinator, WriteRequest};
+pub use write::coordinator::{WriteCoordinator, WriteCoordinatorHintObjectApplier, WriteRequest};

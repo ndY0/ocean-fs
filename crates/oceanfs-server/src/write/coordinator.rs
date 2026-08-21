@@ -879,6 +879,181 @@ impl WriteCoordinator {
         })
     }
 
+    /// Applies a hinted object to the LOCAL store — the hinted-handoff
+    /// receiver's write path. The hint IS the replication, so there is
+    /// no fan-out, no quorum, no re-hinting: the data is appended to a
+    /// local segment through the normal pipeline (tier selection,
+    /// reserve-before-WAL, writer lease, WAL entry, seal hand-off) and
+    /// the object row is persisted with the REAL local chunk refs and
+    /// the hint's HLC (LWW semantics preserved).
+    ///
+    /// This replaces the healing service's inline-in-metadata storage
+    /// for non-inline blobs: storing 16 MiB hinted objects inline
+    /// ballooned the objects CF (1.2 GB on a churn node) and the
+    /// orphan reaper's full-metadata scan (build_referenced_set — once
+    /// per cycle plus once PER orphan for the double-check) collapsed
+    /// under it — the fleet disk-fill root cause. Segment-applied
+    /// objects get the normal lifecycle: the row references the local
+    /// segment, the reaper sees it referenced, the tombstone captures
+    /// the local chunks, the GC compacts it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the storage error when the append, WAL write, or
+    /// metadata write fails — the sender keeps the hint and retries.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_hinted_object(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+        data: Bytes,
+        hlc: Hlc,
+        created_at: i64,
+    ) -> Result<ObjectMetadata> {
+        let blob_size = data.len() as u64;
+        let hash = blake3::hash(&data);
+        let blake3_hash = HashOutput::from_bytes(*hash.as_bytes());
+        let tier = self.tier_router.classify(blob_size);
+        let wal_data = data.clone();
+
+        #[cfg(feature = "accel")]
+        let compression_ctx: Option<WriteCompression> = None;
+        #[cfg(not(feature = "accel"))]
+        let compression_ctx: Option<()> = None;
+
+        // Phantom registrations + writer leases (mirrors put() Step 4).
+        let mut registered: std::collections::HashSet<SegmentId> = std::collections::HashSet::new();
+        let mut leases = WriterLeaseGuard {
+            lifecycle: Arc::clone(&self.lifecycle),
+            counts: std::collections::HashMap::new(),
+            completed: false,
+        };
+        let chunks = match tier {
+            SizeTier::Inline => {
+                let meta = ObjectMetadata {
+                    object_key: key.clone(),
+                    size: blob_size,
+                    blake3_hash: Some(blake3_hash),
+                    chunks: smallvec::SmallVec::new(),
+                    inline_data: Some(data.clone()),
+                    created_at,
+                    hlc,
+                };
+                self.metadata_store
+                    .put_object(bucket, meta)
+                    .await
+                    .map_err(|e| Error::Storage(format!("inline metadata write: {e}")))?;
+                smallvec::SmallVec::new()
+            }
+            SizeTier::Small => {
+                let (stored, logical_len, compressed) =
+                    compress_chunk(&compression_ctx, &wal_data).await?;
+                let write_deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(self.timeouts.write_queue_ms);
+                let (segment_id, offset, length, sealed) = self
+                    .segment_pool_small
+                    .append_with_hook_async(
+                        &stored[..],
+                        |seg_id, off, len| {
+                            self.record_blob_entry(seg_id, off, len, blake3_hash);
+                        },
+                        std::time::Duration::from_millis(self.timeouts.write_queue_ms),
+                    )
+                    .await
+                    .map_err(map_append_error("small".into()))?;
+                self.request_reserve_before_wal(segment_id, SizeTier::Small, &mut registered)
+                    .await?;
+                self.lifecycle.writer_join(segment_id);
+                *leases.counts.entry(segment_id).or_insert(0) += 1;
+                self.write_wal_entry(segment_id, offset, stored, length, logical_len, 0, hlc)
+                    .await?;
+                self.segment_pool_small
+                    .enqueue_seal_handoff(sealed, write_deadline)
+                    .await
+                    .map_err(map_append_error("small".into()))?;
+                let mut chunks = smallvec::SmallVec::new();
+                chunks.push(ChunkRef {
+                    segment_id,
+                    offset,
+                    length,
+                    compressed,
+                    logical_length: logical_len,
+                });
+                chunks
+            }
+            SizeTier::Standard => {
+                let (stored, logical_len, compressed) =
+                    compress_chunk(&compression_ctx, &wal_data).await?;
+                let write_deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(self.timeouts.write_queue_ms);
+                let (segment_id, offset, length, sealed) = self
+                    .segment_pool_standard
+                    .append_with_hook_async(
+                        &stored[..],
+                        |seg_id, off, len| {
+                            self.record_blob_entry(seg_id, off, len, blake3_hash);
+                        },
+                        std::time::Duration::from_millis(self.timeouts.write_queue_ms),
+                    )
+                    .await
+                    .map_err(map_append_error("standard".into()))?;
+                self.request_reserve_before_wal(segment_id, SizeTier::Standard, &mut registered)
+                    .await?;
+                self.lifecycle.writer_join(segment_id);
+                *leases.counts.entry(segment_id).or_insert(0) += 1;
+                self.write_wal_entry(segment_id, offset, stored, length, logical_len, 1, hlc)
+                    .await?;
+                self.segment_pool_standard
+                    .enqueue_seal_handoff(sealed, write_deadline)
+                    .await
+                    .map_err(map_append_error("standard".into()))?;
+                let mut chunks = smallvec::SmallVec::new();
+                chunks.push(ChunkRef {
+                    segment_id,
+                    offset,
+                    length,
+                    compressed,
+                    logical_length: logical_len,
+                });
+                chunks
+            }
+            _ => {
+                return Err(Error::InvalidRequest(
+                    "hinted objects are single-chunk; Multi tier unsupported".into(),
+                ));
+            }
+        };
+
+        // Seal-on-zero (mirrors put() Step 4's leave/drain).
+        for (id, n) in leases.counts.drain() {
+            for _ in 0..n {
+                if self.lifecycle.writer_leave(id) {
+                    self.lifecycle.note_pending_seal(id);
+                }
+            }
+        }
+        leases.completed = true;
+        self.lifecycle.drain_pending_seals().await;
+
+        let inline = chunks.is_empty();
+        let meta = ObjectMetadata {
+            object_key: key.clone(),
+            size: blob_size,
+            blake3_hash: Some(blake3_hash),
+            chunks,
+            inline_data: if inline { Some(data) } else { None },
+            created_at,
+            hlc,
+        };
+        if !meta.chunks.is_empty() {
+            self.metadata_store
+                .put_object(bucket, meta.clone())
+                .await
+                .map_err(|e| Error::Storage(format!("object metadata write: {e}")))?;
+        }
+        Ok(meta)
+    }
+
     /// Enqueues a hinted write for a replica that missed one.
     ///
     /// Small blobs (≤ inline_threshold_bytes) embed the data inline.
@@ -1601,6 +1776,38 @@ impl WriteCoordinator {
     }
 }
 
+/// Adapter exposing [`WriteCoordinator::apply_hinted_object`] through
+/// the healing service's [`HintObjectApplier`] trait (the composition
+/// root wires it — the hint receiver's data lands in a LOCAL segment
+/// via the node's own pipeline).
+pub struct WriteCoordinatorHintObjectApplier {
+    coordinator: Arc<WriteCoordinator>,
+}
+
+impl WriteCoordinatorHintObjectApplier {
+    /// Wraps a coordinator for hinted-object application.
+    pub fn new(coordinator: Arc<WriteCoordinator>) -> Self {
+        Self { coordinator }
+    }
+}
+
+#[async_trait::async_trait]
+impl oceanfs_durability::healing_service::HintObjectApplier for WriteCoordinatorHintObjectApplier {
+    async fn apply_object(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+        data: Bytes,
+        hlc: Hlc,
+        created_at: i64,
+    ) -> std::result::Result<ObjectMetadata, String> {
+        self.coordinator
+            .apply_hinted_object(bucket, key, data, hlc, created_at)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -1891,6 +2098,84 @@ mod tests {
         assert_eq!(result.chunks.len(), 1);
         assert_eq!(result.chunks[0].length, 5000);
         assert!(result.blake3_hash.is_some(), "BLAKE3 hash must be computed");
+    }
+
+    /// The hinted-object apply (the healing path's storage fix): the
+    /// data must land in a LOCAL segment with REAL chunk refs and the
+    /// hint's HLC — NOT inline in the metadata (the inline storage
+    /// ballooned the objects CF and collapsed the orphan reaper's
+    /// scan — the fleet disk-fill root cause).
+    #[tokio::test]
+    async fn apply_hinted_object_stores_chunk_refs_and_hlc() {
+        let (coord, _dir) = {
+            use oceanfs_durability::GrpcHintDeliveryClient;
+            let dir = tempfile::tempdir().unwrap();
+            let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
+            let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
+                Arc::new(GrpcHintDeliveryClient::new(pool.clone()));
+            make_write_coordinator_with_delivery("n1", &["n1"], dir, pool, delivery_client).await
+        };
+        let hlc = Hlc::new(1_700_000_000_000, 42);
+        let data = Bytes::from(vec![0xCDu8; 500_000]); // Standard tier (> small threshold)
+
+        let meta = coord
+            .apply_hinted_object(
+                &BucketId::new("test"),
+                &ObjectKey::new("hinted"),
+                data.clone(),
+                hlc,
+                1234,
+            )
+            .await
+            .expect("apply must succeed");
+
+        assert_eq!(meta.hlc, hlc, "the hint's HLC must be preserved (LWW semantics)");
+        assert_eq!(meta.created_at, 1234);
+        assert_eq!(meta.size, 500_000);
+        assert_eq!(meta.chunks.len(), 1, "the chunked tiers must store REAL chunk refs");
+        assert!(meta.inline_data.is_none(), "chunked objects must not be stored inline");
+
+        // The row must be readable with the chunk refs intact.
+        let stored = coord
+            .metadata_store
+            .get_object(&BucketId::new("test"), &ObjectKey::new("hinted"))
+            .await
+            .expect("read back")
+            .expect("row exists");
+        assert_eq!(stored.chunks.len(), 1);
+        assert_eq!(stored.chunks[0].length, 500_000);
+        assert_eq!(stored.hlc, hlc);
+
+        // And the segment must be REGISTERED in the lifecycle registry —
+        // the data landed in a real segment (not inline in RocksDB),
+        // with the normal lifecycle (reserve → seal → reaper/GC).
+        let segment_id = stored.chunks[0].segment_id;
+        let registered = coord.lifecycle.registry().get(segment_id).is_some();
+        assert!(registered, "segment must be registered in the lifecycle registry");
+    }
+
+    /// The inline tier of the hinted apply keeps the historical
+    /// metadata-inline behavior (small objects are designed to live in
+    /// the objects CF).
+    #[tokio::test]
+    async fn apply_hinted_object_inline_tier_stays_inline() {
+        let coord = make_write_coordinator("n1", &["n1"]).await;
+        let hlc = Hlc::new(1_700_000_000_000, 7);
+        let data = Bytes::from(vec![0xABu8; 100]); // inline tier
+
+        let meta = coord
+            .apply_hinted_object(
+                &BucketId::new("test"),
+                &ObjectKey::new("tiny"),
+                data.clone(),
+                hlc,
+                0,
+            )
+            .await
+            .expect("apply must succeed");
+        assert!(meta.chunks.is_empty());
+        assert!(meta.inline_data.is_some());
+        assert_eq!(meta.hlc, hlc);
     }
 
     #[tokio::test]

@@ -62,6 +62,38 @@ pub trait HintObjectReader: Send + Sync {
     ) -> Result<Option<(oceanfs_core::ObjectMetadata, Bytes)>, String>;
 }
 
+/// Applies a hinted object's data to the LOCAL store through the
+/// normal segment pipeline (tier selection + append + WAL + seal +
+/// metadata row with REAL chunk refs and the hint's HLC).
+///
+/// The alternative — the healing service storing the fetched data
+/// inline in the objects CF — ballooned the metadata with 16 MiB
+/// blobs and collapsed the orphan reaper's full-metadata scan
+/// (build_referenced_set runs once per cycle AND once per orphan for
+/// the double-check) — the fleet disk-fill root cause. Segment-
+/// applied objects get the normal lifecycle: the row references the
+/// local segment, the reaper sees it referenced, the tombstone
+/// captures the local chunks, the GC compacts it.
+#[async_trait::async_trait]
+pub trait HintObjectApplier: Send + Sync {
+    /// Appends `data` to a local segment (or stores it inline for the
+    /// inline tier) and persists the object row with `hlc`. Returns
+    /// the applied metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a string error when the append or metadata write fails
+    /// — the sender keeps the hint and retries.
+    async fn apply_object(
+        &self,
+        bucket: &oceanfs_core::BucketId,
+        key: &oceanfs_core::ObjectKey,
+        data: bytes::Bytes,
+        hlc: Hlc,
+        created_at: i64,
+    ) -> Result<oceanfs_core::ObjectMetadata, String>;
+}
+
 /// gRPC service for healing and anti-entropy operations.
 pub struct HealingGrpcService {
     /// Handoff buffer for storing hints.
@@ -88,6 +120,10 @@ pub struct HealingGrpcService {
     /// Server-side object reader for the hint fetch RPC (wired by the
     /// composition root to the node's read path).
     hint_object_reader: Option<Arc<dyn HintObjectReader>>,
+    /// Local applier for hinted object data (wired by the composition
+    /// root to the node's segment pipeline). `None` (tests) degrades
+    /// to the historical inline-in-metadata storage.
+    hint_object_applier: Option<Arc<dyn HintObjectApplier>>,
 }
 
 impl HealingGrpcService {
@@ -108,6 +144,7 @@ impl HealingGrpcService {
             hlc_clock,
             hint_object_fetcher: None,
             hint_object_reader: None,
+            hint_object_applier: None,
         }
     }
 
@@ -141,6 +178,14 @@ impl HealingGrpcService {
         self
     }
 
+    /// Installs the local applier for hinted object data (composition
+    /// root — the node's segment pipeline).
+    #[must_use]
+    pub fn with_hint_object_applier(mut self, applier: Arc<dyn HintObjectApplier>) -> Self {
+        self.hint_object_applier = Some(applier);
+        self
+    }
+
     /// Returns `true` when the hint is intended for this node and must
     /// be applied locally rather than buffered for remote delivery.
     fn is_local_hint(&self, intended_for: &NodeId) -> bool {
@@ -168,7 +213,7 @@ impl HealingGrpcService {
     ///
     /// The applied metadata stores the data inline (self-contained —
     /// the receiver needs no segment access of its own).
-    fn apply_hint_object(
+    async fn apply_hint_object(
         &self,
         bucket: &oceanfs_core::BucketId,
         object_key: &str,
@@ -202,25 +247,54 @@ impl HealingGrpcService {
             }
         }
 
-        let applied = oceanfs_core::ObjectMetadata {
-            object_key: meta.object_key,
-            size: meta.size,
-            blake3_hash: meta.blake3_hash,
-            chunks: smallvec::SmallVec::new(),
-            inline_data: Some(data.clone()),
-            created_at: meta.created_at,
-            hlc: meta.hlc,
+        let data_len = data.len();
+        // The composition root wires the segment pipeline (when set):
+        // the data is appended to a local segment through the normal
+        // write path and the row carries the REAL local chunk refs —
+        // the object gets the normal lifecycle (reaper sees it
+        // referenced, the tombstone captures the local chunks, the GC
+        // compacts). Without the applier (tests) the historical
+        // inline-in-metadata storage is used.
+        let result = match &self.hint_object_applier {
+            Some(applier) => {
+                applier
+                    .apply_object(bucket, &meta.object_key, data.clone(), meta.hlc, meta.created_at)
+                    .await
+            }
+            None => {
+                let applied = oceanfs_core::ObjectMetadata {
+                    object_key: meta.object_key.clone(),
+                    size: meta.size,
+                    blake3_hash: meta.blake3_hash,
+                    chunks: smallvec::SmallVec::new(),
+                    inline_data: Some(data.clone()),
+                    created_at: meta.created_at,
+                    hlc: meta.hlc,
+                };
+                match oceanfs_storage_api::MetadataStore::put_object(
+                    self.metadata_store.as_ref(),
+                    bucket,
+                    applied,
+                ) {
+                    Ok(()) => Ok(oceanfs_core::ObjectMetadata {
+                        object_key: meta.object_key,
+                        size: meta.size,
+                        blake3_hash: meta.blake3_hash,
+                        chunks: smallvec::SmallVec::new(),
+                        inline_data: Some(data),
+                        created_at: meta.created_at,
+                        hlc: meta.hlc,
+                    }),
+                    Err(e) => Err(e.to_string()),
+                }
+            }
         };
-        match oceanfs_storage_api::MetadataStore::put_object(
-            self.metadata_store.as_ref(),
-            bucket,
-            applied,
-        ) {
-            Ok(()) => {
+        match result {
+            Ok(_) => {
                 tracing::info!(
                     bucket = %bucket,
                     key = %object_key,
-                    size = data.len(),
+                    size = data_len,
                     hlc_wall = meta.hlc.wall_time(),
                     hlc_logical = meta.hlc.logical(),
                     "applied hinted handoff locally"
@@ -237,7 +311,7 @@ impl HealingGrpcService {
         }
     }
 
-    fn apply_inline_hint(
+    async fn apply_inline_hint(
         &self,
         bucket: oceanfs_core::BucketId,
         object_key: String,
@@ -258,7 +332,7 @@ impl HealingGrpcService {
                 .as_millis() as i64,
             hlc,
         };
-        self.apply_hint_object(&bucket, &object_key, meta, data);
+        self.apply_hint_object(&bucket, &object_key, meta, data).await;
     }
 
     /// Applies a hinted DELETE (a tombstone) with HLC-LWW: the delete
@@ -450,7 +524,8 @@ impl HealingRpc for HealingGrpcService {
                             inline.object_key.clone(),
                             inline.data.clone(),
                             hlc,
-                        );
+                        )
+                        .await;
                         accepted_count += 1;
                         continue;
                     }
@@ -657,7 +732,7 @@ impl HealingRpc for HealingGrpcService {
             while let Some(joined) = set.join_next().await {
                 match joined {
                     Ok((bucket, key, Ok(Some((meta, data))))) => {
-                        self.apply_hint_object(&bucket, &key, meta, data);
+                        self.apply_hint_object(&bucket, &key, meta, data).await;
                         accepted_count += 1;
                     }
                     Ok((_bucket, _key, Ok(None))) => {
