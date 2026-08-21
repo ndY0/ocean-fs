@@ -419,6 +419,23 @@ impl GossipProtocol {
                     );
                     continue;
                 }
+                // A Suspect over a local ALIVE at the equal incarnation
+                // is a STALE suspicion: the local state was set by the
+                // failure detector's ping-verified recovery — the
+                // sender's Suspect predates the recovery (the fleet
+                // churn oscillation: the gossip deltas kept re-applying
+                // the Suspect, the pings kept recovering it, and the
+                // convergence check caught the Suspect moments). Only
+                // the LOCAL detector's own suspicion (the authoritative
+                // event path, not the merge) may downgrade an Alive.
+                if entry.state == NodeState::Suspect && old_state == NodeState::Alive {
+                    trace!(
+                        node_id = %entry.node_id,
+                        incarnation = current_incarnation.value(),
+                        "ignoring delta: stale Suspect over ping-verified Alive"
+                    );
+                    continue;
+                }
                 // Also reject if node was previously removed (absent
                 // from state.nodes) and re-adding at same incarnation.
                 if local_entry.is_none() && current_incarnation > Incarnation::new(0) {
@@ -566,6 +583,41 @@ mod tests {
             state,
             address: "127.0.0.1:9001".parse().unwrap(),
         }
+    }
+
+    /// The fleet churn oscillation fix: a Suspect in a gossip delta at
+    /// the SAME incarnation as a local ALIVE must be rejected — the
+    /// local Alive was set by the detector's ping-verified recovery
+    /// and the sender's Suspect predates it. Without this the deltas
+    /// kept re-applying the Suspect (last-writer-wins), the pings kept
+    /// recovering it, and the convergence check caught the Suspect
+    /// moments.
+    #[test]
+    fn merge_delta_rejects_stale_suspect_over_ping_verified_alive() {
+        let mut protocol = make_protocol();
+
+        // The node was suspected and then RECOVERED locally (the
+        // detector's ping-verified Alive at incarnation 9).
+        protocol.add_node(make_node_entry("victim", 9, NodeState::Alive));
+
+        // A peer's delta still carries the STALE Suspect at 9.
+        let delta = GossipDelta { changed: vec![make_node_entry("victim", 9, NodeState::Suspect)] };
+        protocol.merge_delta(&delta);
+
+        let entry = protocol.state.nodes.get(&NodeId::new("victim")).unwrap();
+        assert_eq!(
+            entry.state,
+            NodeState::Alive,
+            "a stale equal-incarnation Suspect must not downgrade a ping-verified Alive"
+        );
+
+        // A Suspect at a HIGHER incarnation (the node genuinely died
+        // again) still applies.
+        let delta2 =
+            GossipDelta { changed: vec![make_node_entry("victim", 10, NodeState::Suspect)] };
+        protocol.merge_delta(&delta2);
+        let entry2 = protocol.state.nodes.get(&NodeId::new("victim")).unwrap();
+        assert_eq!(entry2.state, NodeState::Suspect);
     }
 
     #[test]
