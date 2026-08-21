@@ -1263,6 +1263,7 @@ impl Node {
         .with_router(router);
 
         let metrics = Arc::new(oceanfs_server::admin::MetricsRegistry::new());
+        let metrics_for_late_registration = Arc::clone(&metrics);
 
         // Register subsystem metrics into the central registry.
         metrics.register_gauge(startup_rebuild_gauge);
@@ -1290,7 +1291,6 @@ impl Node {
         // asserts the segment pipeline is producing segments).
         shard_small_metrics.register_metrics(&*metrics);
         shard_standard_metrics.register_metrics(&*metrics);
-        membership.register_gossip_metrics(&*metrics);
         wal_writer.register_metrics(&*metrics);
         sealer.register_metrics(&*metrics);
         // Lifecycle registry-size gauges (ADR-0025 Decision 5 — the
@@ -1553,6 +1553,12 @@ impl Node {
         // that precedes the bind produces join-time false Suspects and
         // refused hint deliveries (t5/t21).
         membership.start().map_err(|e| format!("failed to start membership: {e}"))?;
+        // Register the gossip metrics AFTER start(): the gossip
+        // protocol + its counters/histograms are created inside
+        // start() — an earlier registration captured None and the
+        // gossip series never appeared (the timing-metrics run
+        // queried an empty metric).
+        membership.register_gossip_metrics(&*metrics_for_late_registration);
         let join_incarnation = Incarnation::new(announce_incarnation);
         let join_fallback_seeds = durable_state.fallback_seeds.clone();
         if let Err(e) = membership.join(join_incarnation, &join_fallback_seeds).await {
