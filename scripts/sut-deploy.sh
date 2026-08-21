@@ -151,9 +151,14 @@ deploy_node() {
     fi
 
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "$target" \
-        bash -s -- "$PORT" "$DATA_DIR" "$CONFIG_DIR" "$SERVICE" "$node_name" "$seed" <<'SUT_SETUP'
+        # NB: ssh JOINS the remote command line with spaces, so an empty
+        # "$seed" would vanish and shift every positional — pass a
+        # sentinel and normalize it on the remote side (phase-2 single
+        # node: seed must be empty for `seed_nodes = []`).
+        bash -s -- "$PORT" "$DATA_DIR" "$CONFIG_DIR" "$SERVICE" "$node_name" "${seed:-NONE}" <<'SUT_SETUP'
 set -euo pipefail
 PORT="$1"; DATA_DIR="$2"; CONFIG_DIR="$3"; SERVICE="$4"; NODE_NAME="$5"; SEED="$6"
+[ "$SEED" = "NONE" ] && SEED=""
 
 mkdir -p "$DATA_DIR" "$CONFIG_DIR"
 
