@@ -28,7 +28,7 @@ use std::{
 use oceanfs_core::NodeId;
 use parking_lot::Mutex;
 use prost::Message;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     error::{Error, Result},
@@ -193,6 +193,12 @@ impl HintWal {
                     remaining = remaining.len(),
                     "hint WAL truncated frame at end of file"
                 );
+                // Self-heal (the fleet churn class): a SIGKILL mid-append
+                // tears the final frame. Truncate the file to the last
+                // valid position so the next append continues cleanly —
+                // a hard error here bricked node restart (node-0: hint
+                // WAL CRC32 mismatch after its churn kill).
+                self.truncate_to(cursor)?;
                 break;
             }
 
@@ -204,6 +210,22 @@ impl HintWal {
             // Verify CRC32.
             let actual_crc = crc32fast::hash(payload);
             if actual_crc != expected_crc {
+                let is_tail = (cursor as usize) + frame_total >= buffer.len();
+                if is_tail {
+                    // Torn tail: a full-size frame whose payload/CRC are
+                    // a partial write (the SIGKILL landed mid-frame but
+                    // the length made the frame look complete). End
+                    // replay cleanly and truncate — the surviving
+                    // records replay, the garbage is discarded.
+                    warn!(
+                        position = cursor,
+                        expected = format!("{expected_crc:#x}"),
+                        actual = format!("{actual_crc:#x}"),
+                        "hint WAL torn tail (CRC mismatch at EOF) — truncating"
+                    );
+                    self.truncate_to(cursor)?;
+                    break;
+                }
                 return Err(Error::Internal(format!(
                     "hint WAL CRC32 mismatch at position {}: expected {:#x}, got {:#x}",
                     cursor, expected_crc, actual_crc
@@ -249,13 +271,28 @@ impl HintWal {
         file.flush().map_err(Error::Io)?;
 
         *pos = position;
+        drop(pos);
 
-        info!(
+        debug!(
             path = %self.path.display(),
-            new_size = position,
-            "truncated hint WAL"
+            position,
+            "hint WAL truncated after position"
         );
+        Ok(())
+    }
 
+    /// Truncates the WAL file to `position` (synchronous variant used by
+    /// the replay's torn-tail self-heal).
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the truncation fails.
+    fn truncate_to(&self, position: u64) -> Result<()> {
+        let mut file = self.file.lock();
+        file.set_len(position).map_err(Error::Io)?;
+        file.seek(SeekFrom::Start(position)).map_err(Error::Io)?;
+        file.flush().map_err(Error::Io)?;
+        *self.position.lock() = position;
         Ok(())
     }
 
@@ -747,9 +784,68 @@ mod tests {
         );
     }
 
-    // ── T1.4: WalWriter trait ────────────────────────────────────────
-
+    /// The fleet churn crash-tail fix: a SIGKILL mid-append can tear the
+    /// FINAL frame — a full-size frame (valid length) whose payload/CRC
+    /// are a partial write. The replay must end cleanly at the torn tail
+    /// and TRUNCATE the file (node-0 could not restart after its churn
+    /// kill: "hint WAL CRC32 mismatch at position 12440").
     #[tokio::test]
+    async fn test_hint_wal_torn_tail_crc_mismatch_ends_cleanly() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("hints.wal");
+
+        {
+            let wal = HintWal::open(&wal_path).await.unwrap();
+            for i in 0..3 {
+                let record = HintRecord::new_inline(
+                    NodeId::new("n1"),
+                    BucketId::new("b"),
+                    format!("key-{i}"),
+                    vec![i as u8; 10].into(),
+                    oceanfs_core::Hlc::zero(),
+                );
+                let _ = wal.write_hint(&record).await.unwrap();
+            }
+        }
+
+        // Append a torn frame: a valid-looking length header, garbage
+        // payload, and a garbage CRC — exactly what a SIGKILL mid-write
+        // can leave behind (the frame is full-size, so the old
+        // truncated-frame path did not catch it).
+        {
+            use std::io::Write;
+            let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+            let garbage_payload = vec![0xAB; 100];
+            file.write_all(&(garbage_payload.len() as u32).to_le_bytes()).unwrap();
+            file.write_all(&garbage_payload).unwrap();
+            file.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap(); // bogus CRC
+        }
+
+        // Replay must succeed, keep the 3 valid records, and truncate
+        // the torn tail away.
+        let wal = HintWal::open(&wal_path).await.unwrap();
+        let records = wal.replay().await.expect("torn tail must not hard-fail");
+        assert_eq!(records.len(), 3, "the valid records must replay");
+
+        let file_len = std::fs::metadata(&wal_path).unwrap().len();
+        let last_end = records.last().map(|(_, end, _)| *end).unwrap();
+        assert_eq!(file_len, last_end, "the torn tail must be truncated to the last valid frame");
+
+        // A subsequent append + replay still works.
+        let record = HintRecord::new_inline(
+            NodeId::new("n1"),
+            BucketId::new("b"),
+            "key-after".into(),
+            vec![1u8; 10].into(),
+            oceanfs_core::Hlc::zero(),
+        );
+        wal.write_hint(&record).await.unwrap();
+        drop(wal);
+        let wal = HintWal::open(&wal_path).await.unwrap();
+        let records = wal.replay().await.unwrap();
+        assert_eq!(records.len(), 4, "the append after the torn tail must survive");
+    }
+
     async fn test_hint_wal_implements_wal_writer_trait() {
         use oceanfs_storage_api::WalWriter;
 

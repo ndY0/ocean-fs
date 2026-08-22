@@ -932,10 +932,7 @@ async fn load_cluster_churn() {
             "{} of {} sampled keys failed quorum{}",
             quorum_failed.len(),
             READ_QUORUM_SAMPLE.min(manifest.len()),
-            report_quorum_diag
-                .as_ref()
-                .map(|d| format!("; per-node: {d:?}"))
-                .unwrap_or_default()
+            report_quorum_diag.as_ref().map(|d| format!("; per-node: {d:?}")).unwrap_or_default()
         ),
     ));
 
