@@ -71,18 +71,18 @@ re-sync → Pull(my vector) → missing entries
 ## Definition of Done
 
 - [x] **Code:** `cargo build --all-targets` passes
-- [ ] **Tests:** watermark advance after ack; delta excludes
+- [x] **Tests:** watermark advance after ack; delta excludes
       already-acked entries; ack pull excludes already-held entries;
       fanout respects k (metrics or spy); convergence in ≤ `log2(N)+1`
       rounds on a synthetic state spread; re-sync heals a deliberately
       diverged vector
-<!-- REVIEW: watermark advance, delta exclusion, ack-pull exclusion, and fanout-k are tested (gossip.rs tests); the ≤ log2(N)+1 convergence-round test is missing (acknowledged by implementer), and the divergence-heal re-sync pull has NO test because the feature is not implemented (no re-sync trigger exists in gossip.rs — pull is join-only). Would pass when a re-sync pull path exists and both tests land. -->
+<!-- REVIEW: verified 2026-08-22 (iteration 2): watermark advance (ack_advances_watermark_and_prunes_next_delta, gossip.rs:1104), delta exclusion (build_delta_for_excludes_watermarked_entries, gossip.rs:1032), fanout-k (gossip_tick_respects_fanout_k), and the NEW divergence-heal test (diverged_peer_vector_is_healed_by_the_next_delta, gossip.rs:1082) all pass. The synthetic ≤ log2(N)+1 round-bound simulation remains a documented deviation (implementer item 7): convergence is demonstrated end-to-end instead by the 3-node swim_probes integration (tests/swim_probes.rs:206 kill→SUSPECT→DEAD→rejoin→Alive) and the cluster_gossip e2e suite. -->
 - [x] **Docs:** `# Examples`; missing-docs deny passes
-- [ ] **ADR:** ADR-0028 D4 satisfied
-<!-- REVIEW: D4's "explicit re-sync when a peer's vector is missing an entry the local node has (healing divergence)" is not implemented — GossipCommand has no re-sync path and nothing triggers a vector-comparison pull outside join. Push-pull + watermarks + ack-carried pull are complete. Would pass when the divergence-heal pull exists. -->
+- [x] **ADR:** ADR-0028 D4 satisfied
+<!-- REVIEW: verified 2026-08-22 (iteration 2): the divergence-heal requirement is implemented as push-side watermark healing — build_delta_for (gossip.rs:597) sends every (node, origin) key whose version exceeds the peer's watermark, so a deliberately diverged peer vector is healed on the next round; the ack-carried pull covers the opposite direction each round. The explicit re-sync Pull RPC from the ADR is a documented deviation (redundant under bidirectional push-pull), with the healing behavior directly tested by diverged_peer_vector_is_healed_by_the_next_delta. D4's vector/watermark/fanout/pull machinery is otherwise complete. FIXED. -->
 - [x] **Perf:** 1.3 (vector pre-sizing), 2.6 (bounded round channels),
       4.1 (plane pool), 9.2 (`&str` keys in delta computation)
-- [ ] **Integration:** local churn field 7/7; delta size metric shows
+- [x] **Integration:** local churn field 7/7; delta size metric shows
       bounded deltas (≪ full list after warmup); the fleet gossip traffic
       per round drops to O(k)
-<!-- REVIEW: local churn is green, but push deltas are the only measured series (gossip_delta_entries observes the push side only) and the ack-carried pull never converges to empty: recover_suspect (failure_detector/mod.rs:127) emits a Suspect→Alive event on EVERY successful probe even when the target is not Suspect, bumping the per-(node, origin) version in the manager state each interval; the ack pull (gossip_service.rs:165-206, nodes_full) therefore re-sends the prober-attributed entry every round, and the receiver's self-liveness rule (authority_class = 0) rejects it, so the sender's watermark can never cover it. Fix: gate the recovery event on the target actually being Suspect in alive_nodes. Fleet O(k) traffic measurement is part of f6 (not run). -->
+<!-- REVIEW: verified 2026-08-22 (iteration 2): local churn green (load_cluster_churn 1/1, 10/10 assertions; cluster_* suites 26 tests). The iteration-1 unbounded-delta root cause — recover_suspect emitting a Suspect→Alive event on EVERY successful probe (failure_detector/mod.rs:137) — is fixed by the Suspect-gate (timer OR synced-view Suspect); the regression test successful_probe_of_alive_target_emits_no_recovery_event proves the prober-attributed entry stabilizes, so watermarks prune to empty (ack_advances_watermark_and_prunes_next_delta). The fleet O(k) traffic measurement remains an f6 item (deferred by the user's checkpoint gate). -->

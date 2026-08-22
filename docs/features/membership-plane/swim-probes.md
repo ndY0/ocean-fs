@@ -91,4 +91,4 @@ tick → pick target → direct probe (9002, deadline)
       9.1/9.2 (borrowed request/response, `&str` ids)
 - [ ] **Integration:** local churn field 7/7; probe p99 stays below
       `ping_timeout_ms` under data-plane load (16 MiB streams)
-<!-- REVIEW: local churn is green (load_cluster_churn 10/10 assertions, verified 2026-08-22), but the isolation proof — probe_duration_microseconds p99 < ping_timeout_ms while 16 MiB bodies stream — is a fleet measurement (f6) and has not been run; the separate listener/pool makes it structural but unproven. Would pass with the f6 isolation capture. -->
+<!-- REVIEW: local churn green (load_cluster_churn 1/1, 10/10 assertions, verified 2026-08-22); the isolation proof — probe_duration_microseconds p99 < ping_timeout_ms while 16 MiB bodies stream — is a fleet measurement (f6, deferred by the user's checkpoint gate) and has not been run; the separate listener + pool + socket opts (node.rs:1594-1620) make it structural but unproven. -->

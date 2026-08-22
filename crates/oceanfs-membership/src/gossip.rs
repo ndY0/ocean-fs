@@ -438,12 +438,17 @@ impl GossipProtocol {
 
     /// Merges a gossip delta into the local state.
     ///
-    /// Uses incarnation numbers for conflict resolution:
-    /// higher incarnation always wins. If incarnations are equal,
-    /// - For nodes present in local state, the more terminal state
-    ///   (Dead > Suspect > Alive) wins — a DEAD node is not revived.
-    /// - For nodes absent from local state (previously removed via
-    ///   Death), only a higher incarnation re-admits them.
+    /// Conflict resolution (ADR-0028 D3): the incarnation is the
+    /// outer gate — a higher incarnation always wins (rejoin
+    /// authority, ADR-0022); a lower one is stale. At equal
+    /// incarnation, the authority-class table orders the entry:
+    /// the leaver's own Left/Leaving (4) > my detector's facts (3) >
+    /// remote detector facts (2) > the target's own announcement (1);
+    /// entries about SELF from another origin (0) are rejected. Same
+    /// class + same origin is ordered by version; the same class from
+    /// a different origin keeps the local entry. Nodes absent from
+    /// local state (previously removed via Death) are only re-admitted
+    /// at a strictly higher incarnation (F1d).
     fn merge_delta(&mut self, delta: &GossipDelta) {
         for entry in &delta.changed {
             let current_incarnation =

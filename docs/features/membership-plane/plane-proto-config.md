@@ -67,9 +67,10 @@ merge until the later features use them.
 ## Interface (Public API)
 
 - `NodeConfig::membership_listen_addr: String` — bind address of the
-  membership plane.
-- `oceanfs_membership::plane::MembershipPlane::new(config, pool_config) -> Arc<ConnectionPool>` —
-  the dedicated pool.
+  membership plane (default `0.0.0.0:9002`).
+- `oceanfs_membership::plane::membership_pool(ping_timeout_ms: u64, tls_cert_path: Option<PathBuf>) -> Arc<ConnectionPool>` —
+  the membership plane's dedicated pool (per-peer 2, probe-derived
+  timeouts).
 - `oceanfs_membership::plane::membership_address(listen: &str, advertise_ip: Option<&str>) -> SocketAddr` —
   the address announced to peers (D1).
 

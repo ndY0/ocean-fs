@@ -84,8 +84,10 @@ build → deploy fleet (9001 data + 9002 membership) → churn runs ×3
 - [ ] **Integration:** 3/3 consecutive churn quick runs fully green on
       the fleet; local churn field spotless before the fleet deploy
 
-<!-- REVIEW: f6 not implemented or run — no fleet deploy (VMs not
-      provisioned), no settle_grace_ms knob in e2e/src/harness.rs, no
-      handoff-delta counter-reset re-base in load_cluster_churn.rs, no
-      probe-p99 capture. Local half of the Integration bullet is green
-      (load_cluster_churn + cluster_* suites pass locally). -->
+<!-- REVIEW: f6 is DEFERRED by the user's checkpoint gate — fleet VMs not
+      provisioned, so no fleet deploy, no settle_grace_ms knob in
+      e2e/src/harness.rs, no handoff-delta counter-reset re-base in
+      load_cluster_churn.rs, no probe-p99 capture, no 3/3 churn runs.
+      This is a deferred epic-gate item, NOT a code gap. Local half of
+      the Integration bullet is verified (2026-08-22): load_cluster_churn
+      1/1 + all cluster_* suites green. -->

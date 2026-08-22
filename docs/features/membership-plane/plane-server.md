@@ -83,9 +83,9 @@ peer A → Probe{indirect, target=B} → relay C (9002) → direct probe B → a
       cluster (probe from A through C to B, ack returns B's incarnation)
 - [x] **Docs:** `# Examples` on new `pub` items; missing-docs deny passes
 - [x] **ADR:** ADR-0028 D1 satisfied; D2 service present
-- [ ] **Perf:** 4.1 (plane pool), 4.3 (socket opts), 7.1 (no lock held
+- [x] **Perf:** 4.1 (plane pool), 4.3 (socket opts), 7.1 (no lock held
       across the forward call)
-<!-- REVIEW: membership listener at crates/oceanfs-node/src/node.rs:1594 uses a plain TcpListener::bind — no reuseport and no apply_opts_to_fd(quickack/busy_poll) unlike the data-plane listener (node.rs:1560-1574); TCP_NODELAY is therefore not applied to accepted membership-plane sockets. Would pass when the membership listener gets the same socket-opts treatment as the data-plane listener. -->
+<!-- REVIEW: verified 2026-08-22 (iteration 2): the membership listener at crates/oceanfs-node/src/node.rs:1594 now binds via create_reuseport_listener, and accepted connections get apply_opts_to_fd(quickack, busy_poll) in the TcpListenerStream map (node.rs:1613-1620) — the same socket-opts treatment as the data-plane listener (node.rs:1560-1574). FIXED. -->
 - [x] **Integration:** local 3-node churn field still spotless (7/7) with
       gossip now on 9002; deploy script provisions a 3-node fleet with
       9002 open and gossip converges
