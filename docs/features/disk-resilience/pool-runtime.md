@@ -1,7 +1,7 @@
 ---
 feature: "Storage Pools: Pool Runtime + Registry"
 epic: "disk-resilience"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies: ["pool-config"]
@@ -113,19 +113,37 @@ NodeConfig.storage ──▶ PoolRegistry::from_config
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` in `oceanfs-storage`
-- [ ] **Tests:** all listed tests green (probe policy, weight resolution,
+- [x] **Code:** `cargo build --all-targets` in `oceanfs-storage`
+      (verified: clean; also `cargo fmt --all -- --check` clean)
+- [x] **Tests:** all listed tests green (probe policy, weight resolution,
       capacity refresh, lookups, legacy fallback)
-- [ ] **Docs:** `# Examples` on every `pub` item; rustdoc clean
-- [ ] **ADR:** ADR-0029 §D1 (pool runtime = unit of placement/routing),
+      (verified: 13 `pool::tests` + 334 lib + 38 doctests + 10 integration
+      binaries in oceanfs-storage, 32 lib in oceanfs-node — all green,
+      `--test-threads=1`)
+- [x] **Docs:** `# Examples` on every `pub` item; rustdoc clean
+      (verified: `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+      -p oceanfs-storage` clean; all 3 pub types + 16 pub methods have
+      `# Examples`; `from_config` has `# Errors`)
+- [x] **ADR:** ADR-0029 §D1 (pool runtime = unit of placement/routing),
       §D8 startup probing + weights + capacity auto-detect satisfied
-- [ ] **Perf:** 2.3 (parking_lot RwLock), 7.2 (read-only Arc snapshots;
+      (verified: registry = lookup API only; probe write+read per root;
+      Fatal/Degraded policy; weight auto = max(1, total/GiB); zero-config
+      fallback; no Ceph-OSD / node-granular / probe-blind rejected
+      alternatives re-implemented)
+- [x] **Perf:** 2.3 (parking_lot RwLock), 7.2 (read-only Arc snapshots;
       lookups never hold the lock during I/O — `refresh_capacity` runs
       outside the lock by taking a snapshot first), 2.4 (Arc<StoragePool>
       shared immutably, no per-request clone)
-- [ ] **Integration:** a test in `oceanfs-node` builds a `PoolRegistry`
+      (verified: `parking_lot::RwLock` at pool.rs:626; `refresh_capacity`
+      snapshot-then-statvfs at pool.rs:865-875; atomics for status/
+      write_degraded/capacity — no lock on read paths; pre-sized Vec at
+      pool.rs:671-672)
+- [x] **Integration:** a test in `oceanfs-node` builds a `PoolRegistry`
       from a 4-pool tempdir config and asserts all four roots are probed +
       registered (exercises the public API end to end)
+      (verified: `cargo test -p oceanfs-node --test pool_registry` — 1
+      passed; asserts roots created, no `.probe-*` litter, ids 0..3, roles,
+      lookups, capacity refresh)
 
 ## Deviations (accepted, Phase A)
 
@@ -136,3 +154,19 @@ NodeConfig.storage ──▶ PoolRegistry::from_config
 - **Degraded at startup is a status flag only.** Until Phase B, a
   Degraded-registered pool is treated as Healthy by consumers; the status
   field exists so Phase B's routing hooks have a place to read.
+- **Metrics construction vs registration.** Metric descriptors are
+  constructed in `PoolRegistry::from_config`, but registration happens
+  through a separate `register_metrics(&self, registrar)` method — the same
+  durability-counters pattern this doc references (e.g.
+  `hinted_handoff_hints_stored_total`). The node wires the registration call
+  in f4 (role-pinned path wiring); `from_config` alone does not touch the
+  global metrics registry, keeping `oceanfs-storage` side-effect-free.
+- **Legacy-mode probe is always Fatal.** The implicit legacy pool's
+  `data_dir` root probe uses `MissingRootPolicy::Fatal` semantics regardless
+  of the configured `missing_root_policy`, mirroring today's node behavior
+  (`create_dir_all` failure refuses startup, node.rs:2015-2016). The policy
+  only applies to explicit pools.
+- **Doctests use tempdirs, not real paths.** `# Examples` blocks build their
+  fixtures in `tempfile::TempDir` rather than `/var/lib/oceanfs` (or any
+  real filesystem path), so `cargo test --doc` never touches real paths on
+  the host and is safe to run anywhere.

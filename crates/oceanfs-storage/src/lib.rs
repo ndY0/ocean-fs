@@ -32,6 +32,7 @@ mod buffer_pool;
 mod error;
 pub mod io;
 pub mod metadata;
+pub mod pool;
 pub mod segment;
 mod traits;
 pub mod wal;
@@ -39,6 +40,7 @@ pub mod wal;
 pub use buffer_pool::BufferPool;
 pub use error::{Error, Result};
 pub use metadata::{BatchOp, RocksDbMetadataStore, RocksDbMetrics};
+pub use pool::{PoolRegistry, PoolStatus, StoragePool};
 pub use segment::{
     entry_is_garbage, ActiveSegment, CheckpointInfo, DataWalPos, DeleteEvent, EventCheckpoint,
     EventWal, EventWalPos, EventWalReader, LifecycleEntry, RebuildOutcome, ReserveEvent,
