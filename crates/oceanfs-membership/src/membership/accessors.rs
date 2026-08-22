@@ -15,14 +15,24 @@ use tracing::info;
 use super::{Membership, MembershipEvent};
 
 impl Membership {
-    /// Returns all known nodes with their states, incarnations,
-    /// addresses, and attribution (version + origin, ADR-0028 D3).
     /// Returns all known nodes with their states, incarnations, both
-    /// addresses (data plane, membership plane), and attribution
-    /// (version + origin, ADR-0028 D3).
+    /// addresses (data plane, membership plane), attribution
+    /// (version + origin, ADR-0028 D3), and the storage-pool manifest
+    /// (ADR-0029 D2) — the last element, `None` for peers that predate
+    /// the manifest.
+    #[allow(clippy::type_complexity)]
     pub fn nodes_full(
         &self,
-    ) -> Vec<(NodeId, NodeState, Incarnation, SocketAddr, SocketAddr, u64, NodeId)> {
+    ) -> Vec<(
+        NodeId,
+        NodeState,
+        Incarnation,
+        SocketAddr,
+        SocketAddr,
+        u64,
+        NodeId,
+        Option<std::sync::Arc<crate::manifest::NodeManifest>>,
+    )> {
         self.state
             .read()
             .nodes
@@ -36,9 +46,44 @@ impl Membership {
                     e.membership_address,
                     e.version,
                     e.origin.clone(),
+                    e.manifest.clone(),
                 )
             })
             .collect()
+    }
+
+    /// Returns the storage-pool manifest of a specific node (ADR-0029
+    /// D2), when one has been gossiped.
+    ///
+    /// The read accessor f7's routing cache consumes: peers cache the
+    /// last-known manifest per node and replace it wholesale on a
+    /// version bump (the merge never interprets the manifest).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::{Incarnation, NodeId, NodeState};
+    /// use oceanfs_membership::{manifest::NodeManifest, Membership};
+    /// # use oceanfs_core::{GossipConfig, RingConfig};
+    /// # use oceanfs_routing::{Ring, RingCache};
+    /// # use std::net::SocketAddr;
+    /// # use std::sync::Arc;
+    /// # let mut ring = Ring::new(RingConfig::default());
+    /// # ring.add_node(NodeId::new("node-1"));
+    /// # let ring_cache = Arc::new(RingCache::new(ring));
+    /// # let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+    /// # let membership = Membership::new(NodeId::new("node-1"), addr, addr,
+    /// #     GossipConfig::default(), ring_cache);
+    /// let manifest = NodeManifest::from_pools(1, &[]);
+    /// membership.set_self_manifest(manifest.clone());
+    /// assert_eq!(membership.manifest_of(&NodeId::new("node-1")), Some(manifest));
+    /// ```
+    pub fn manifest_of(&self, node_id: &NodeId) -> Option<crate::manifest::NodeManifest> {
+        self.state
+            .read()
+            .nodes
+            .get(node_id)
+            .and_then(|e| e.manifest.as_ref().map(|m| m.as_ref().clone()))
     }
 
     /// Returns all known nodes and their states.

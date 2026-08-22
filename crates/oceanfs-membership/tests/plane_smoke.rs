@@ -28,6 +28,9 @@ fn attributed_membership_entry_survives_wire_roundtrip() {
         version: 7,
         origin: "node-2".to_string(),
         grpc_address: "10.0.0.2:9001".to_string(),
+        // ADR-0029 D2: the manifest field is an optional schema
+        // addition — absent here (a pre-manifest entry).
+        manifest: None,
     };
 
     let mut buf = Vec::new();

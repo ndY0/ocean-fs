@@ -122,6 +122,12 @@ impl GossipRpc for GossipGrpcService {
                         .grpc_address
                         .parse::<SocketAddr>()
                         .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 9001)));
+                    // ADR-0029 D2: the storage-pool manifest rides the
+                    // entry as an opaque attribute.
+                    let manifest = entry
+                        .manifest
+                        .as_ref()
+                        .map(|m| std::sync::Arc::new(crate::manifest::NodeManifest::from_proto(m)));
                     changed.push(crate::membership::state::NodeEntry {
                         node_id,
                         incarnation,
@@ -130,6 +136,7 @@ impl GossipRpc for GossipGrpcService {
                         grpc_address,
                         version: entry.version,
                         origin: NodeId::new(&entry.origin),
+                        manifest,
                     });
                     entry_count += 1;
                 }
@@ -143,7 +150,7 @@ impl GossipRpc for GossipGrpcService {
                     });
                 } else {
                     for entry in changed {
-                        self.membership.upsert_node_attributed(
+                        self.membership.upsert_node_attributed_inner(
                             entry.node_id,
                             entry.state,
                             entry.incarnation,
@@ -151,6 +158,7 @@ impl GossipRpc for GossipGrpcService {
                             entry.version,
                             entry.origin,
                             Some(entry.address),
+                            entry.manifest,
                         );
                     }
                 }
@@ -166,7 +174,7 @@ impl GossipRpc for GossipGrpcService {
         let pull_delta = oceanfs_core::proto::membership::MembershipList {
             entries: nodes
                 .iter()
-                .filter(|(node_id, _, _, _, _, version, origin)| {
+                .filter(|(node_id, _, _, _, _, version, origin, _)| {
                     requester_vector
                         .get(node_id)
                         .and_then(|origins| origins.get(origin))
@@ -181,6 +189,7 @@ impl GossipRpc for GossipGrpcService {
                         membership_address,
                         version,
                         origin,
+                        manifest,
                     )| {
                         oceanfs_core::proto::membership::MembershipEntry {
                             node_id: Some(oceanfs_core::proto::common::NodeId {
@@ -199,6 +208,10 @@ impl GossipRpc for GossipGrpcService {
                             version: *version,
                             origin: origin.to_string(),
                             grpc_address: address.to_string(),
+                            // ADR-0029 D2: the manifest rides the pull
+                            // so joiners and watermarked peers receive
+                            // it without waiting for the next round.
+                            manifest: manifest.as_ref().map(|m| m.to_proto()),
                         }
                     },
                 )
@@ -206,7 +219,7 @@ impl GossipRpc for GossipGrpcService {
         };
         let ack_vector = nodes
             .iter()
-            .map(|(node_id, _, _, _, _, version, origin)| {
+            .map(|(node_id, _, _, _, _, version, origin, _)| {
                 (node_id.to_string(), (origin.to_string(), *version))
             })
             .fold(
@@ -271,7 +284,7 @@ impl GossipRpc for GossipGrpcService {
             // entry.
             let filtered: Vec<_> = nodes
                 .into_iter()
-                .filter(|(node_id, _, _, _, _, version, origin)| {
+                .filter(|(node_id, _, _, _, _, version, origin, _)| {
                     version_vector
                         .get(node_id)
                         .and_then(|origins| origins.get(origin))
@@ -288,8 +301,16 @@ impl GossipRpc for GossipGrpcService {
                     }))
                     .await;
             } else {
-                for (node_id, state, incarnation, address, membership_address, version, origin) in
-                    filtered
+                for (
+                    node_id,
+                    state,
+                    incarnation,
+                    address,
+                    membership_address,
+                    version,
+                    origin,
+                    manifest,
+                ) in filtered
                 {
                     let proto_node_id =
                         oceanfs_core::proto::common::NodeId { id: node_id.to_string() };
@@ -312,6 +333,9 @@ impl GossipRpc for GossipGrpcService {
                         version,
                         origin: origin.to_string(),
                         grpc_address: address.to_string(),
+                        // ADR-0029 D2: the storage-pool manifest rides
+                        // the pull stream.
+                        manifest: manifest.as_ref().map(|m| m.to_proto()),
                     };
 
                     let delta =
@@ -402,6 +426,7 @@ mod tests {
             version: 0,
             origin: String::new(),
             grpc_address: "127.0.0.1:9001".to_string(),
+            manifest: None,
         };
 
         let delta = oceanfs_core::proto::membership::MembershipList { entries: vec![entry] };
@@ -516,5 +541,104 @@ mod tests {
         }
         assert!(count >= 1, "should receive at least one response");
         assert!(!has_data, "all deltas should be empty when version is current");
+    }
+
+    /// ADR-0029 D2: a manifest attached to a pushed entry survives the
+    /// full wire round-trip — the receiving node's `manifest_of` returns
+    /// exactly what the sender encoded.
+    #[tokio::test]
+    async fn push_carries_manifest_round_trip() {
+        let membership = make_membership("node-a");
+        let mut client = test_server(membership.clone()).await;
+
+        let manifest = crate::manifest::NodeManifest::from_pools(
+            1,
+            &[
+                crate::manifest::PoolManifest::new(0, "data", "healthy", false, 1 << 40, 2),
+                crate::manifest::PoolManifest::new(1, "wal", "healthy", false, 1 << 30, 1),
+            ],
+        );
+        let entry = oceanfs_core::proto::membership::MembershipEntry {
+            node_id: Some(oceanfs_core::proto::common::NodeId { id: "node-b".to_string() }),
+            state: 0, // ALIVE
+            incarnation: 1,
+            address: "127.0.0.1:9002".to_string(),
+            last_seen: None,
+            version: 1,
+            origin: "node-b".to_string(),
+            grpc_address: "127.0.0.1:9001".to_string(),
+            manifest: Some(manifest.to_proto()),
+        };
+
+        let delta = oceanfs_core::proto::membership::MembershipList { entries: vec![entry] };
+        let msg =
+            GossipMessage { delta: Some(delta), version_vector: std::collections::HashMap::new() };
+        let stream = tokio_stream::iter(vec![msg]);
+        let response = client.push(tonic::Request::new(stream)).await.unwrap();
+        let ack = response.into_inner();
+        assert!(ack.accepted);
+        assert_eq!(ack.updated_entries, 1);
+
+        assert_eq!(
+            membership.manifest_of(&NodeId::new("node-b")),
+            Some(manifest),
+            "the manifest must survive the push round-trip"
+        );
+    }
+
+    /// ADR-0029 D5: a push WITHOUT a manifest (an older node) must not
+    /// erase a cached manifest.
+    #[tokio::test]
+    async fn push_without_manifest_preserves_cached_copy() {
+        let membership = make_membership("node-a");
+        let mut client = test_server(membership.clone()).await;
+
+        let manifest = crate::manifest::NodeManifest::from_pools(
+            1,
+            &[crate::manifest::PoolManifest::new(0, "data", "healthy", false, 1 << 40, 2)],
+        );
+        let mut entry = oceanfs_core::proto::membership::MembershipEntry {
+            node_id: Some(oceanfs_core::proto::common::NodeId { id: "node-b".to_string() }),
+            state: 0, // ALIVE
+            incarnation: 1,
+            address: "127.0.0.1:9002".to_string(),
+            last_seen: None,
+            version: 1,
+            origin: "node-b".to_string(),
+            grpc_address: "127.0.0.1:9001".to_string(),
+            manifest: None,
+        };
+        let delta =
+            oceanfs_core::proto::membership::MembershipList { entries: vec![entry.clone()] };
+        let msg =
+            GossipMessage { delta: Some(delta), version_vector: std::collections::HashMap::new() };
+        client.push(tonic::Request::new(tokio_stream::iter(vec![msg]))).await.unwrap();
+
+        // The first push carried no manifest; nothing to preserve yet.
+        assert_eq!(membership.manifest_of(&NodeId::new("node-b")), None);
+
+        // Now push WITH a manifest at a higher version.
+        entry.version = 2;
+        entry.manifest = Some(manifest.to_proto());
+        let delta =
+            oceanfs_core::proto::membership::MembershipList { entries: vec![entry.clone()] };
+        let msg =
+            GossipMessage { delta: Some(delta), version_vector: std::collections::HashMap::new() };
+        client.push(tonic::Request::new(tokio_stream::iter(vec![msg]))).await.unwrap();
+        assert_eq!(membership.manifest_of(&NodeId::new("node-b")), Some(manifest.clone()));
+
+        // A manifest-less entry at an even higher version (the sender's
+        // clock moved on) must NOT erase the cached manifest.
+        entry.version = 3;
+        entry.manifest = None;
+        let delta = oceanfs_core::proto::membership::MembershipList { entries: vec![entry] };
+        let msg =
+            GossipMessage { delta: Some(delta), version_vector: std::collections::HashMap::new() };
+        client.push(tonic::Request::new(tokio_stream::iter(vec![msg]))).await.unwrap();
+        assert_eq!(
+            membership.manifest_of(&NodeId::new("node-b")),
+            Some(manifest),
+            "a manifest-less push must preserve the cached manifest"
+        );
     }
 }

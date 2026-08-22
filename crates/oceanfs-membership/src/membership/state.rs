@@ -5,10 +5,12 @@
 //! (`NodeEntry`, `GossipState`, `GossipDelta`) exchanged between
 //! peers during gossip push/pull.
 
-use std::{collections::HashMap, net::SocketAddr};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use oceanfs_core::{Incarnation, NodeId, NodeState};
 use serde::{Deserialize, Serialize};
+
+use crate::manifest::NodeManifest;
 
 /// A single node's membership entry for gossip exchange (ADR-0028 D3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +34,14 @@ pub(crate) struct NodeEntry {
     /// announcements, the detector node for Suspect/Dead, the leaver
     /// for Leaving/Left).
     pub origin: NodeId,
+    /// The node's storage-pool manifest (ADR-0029 D2) — an opaque
+    /// attached attribute: the merge never interprets it, it follows
+    /// the entry's version. `None` when the declaring node predates
+    /// the manifest (older peers) — the merge preserves the cached
+    /// copy (stale-but-present beats absent, ADR-0029 D5). Shared via
+    /// `Arc` (perf rule 2.4): built once per change, pointer-cloned on
+    /// every entry copy.
+    pub manifest: Option<Arc<NodeManifest>>,
 }
 
 /// Full membership state for gossip exchange.
@@ -88,6 +98,13 @@ pub(crate) struct StoredEntry {
     pub version: u64,
     /// The observer that last changed this entry.
     pub origin: NodeId,
+    /// The node's storage-pool manifest (ADR-0029 D2) — the opaque
+    /// attached attribute f7's routing cache reads via
+    /// `Membership::manifest_of`. `None` for peers that predate the
+    /// manifest; the upsert preserves the cached copy when an incoming
+    /// entry carries no manifest (stale-but-present beats absent).
+    /// Shared via `Arc` (perf rule 2.4).
+    pub manifest: Option<Arc<NodeManifest>>,
 }
 
 /// Aggregate membership state for the [`Membership`] coordinator.

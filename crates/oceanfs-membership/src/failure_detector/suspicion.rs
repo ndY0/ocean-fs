@@ -49,6 +49,7 @@ pub(crate) fn mark_suspect(detector: &mut FailureDetector, node_id: &NodeId) {
         version,
         origin: detector.node_id.clone(),
         membership_address: None,
+        manifest: None,
     });
 
     info!(node_id = %node_id, incarnation = incarnation.value(), "node marked SUSPECT");
@@ -117,6 +118,7 @@ pub(crate) fn check_suspicion_timers(detector: &mut FailureDetector) {
             version,
             origin: detector.node_id.clone(),
             membership_address: None,
+            manifest: None,
         });
         warn!(
             node_id = %node_id,

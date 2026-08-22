@@ -326,6 +326,9 @@ impl GossipProtocol {
                                 version: e.version,
                                 origin: e.origin.to_string(),
                                 grpc_address: e.grpc_address.to_string(),
+                                // ADR-0029 D2: the storage-pool manifest
+                                // rides the delta as an opaque attribute.
+                                manifest: e.manifest.as_ref().map(|m| m.to_proto()),
                             })
                             .collect();
 
@@ -539,9 +542,14 @@ impl GossipProtocol {
                 }
             }
 
-            // Update local state.
-            self.state.nodes.insert(entry.node_id.clone(), entry.clone());
-            self.incarnations.insert(entry.node_id.clone(), entry.incarnation);
+            // Update local state. The storage-pool manifest (ADR-0029
+            // D2) is an opaque attached attribute: an incoming entry
+            // without one (older peer or a non-manifest path) preserves
+            // the cached copy — stale-but-present beats absent (D5).
+            let mut accepted = entry.clone();
+            if accepted.manifest.is_none() {
+                accepted.manifest = local_entry.and_then(|e| e.manifest.clone());
+            }
 
             debug!(
                 node_id = %entry.node_id,
@@ -551,19 +559,28 @@ impl GossipProtocol {
             );
 
             // Emit a membership event when anything meaningful changed:
-            // state, address, incarnation — or when the node is new.
-            // ADR-0022: a strictly-higher-incarnation rejoin keeps the
-            // state (Alive→Alive) but carries a fresh address; without
-            // emission on address change, the membership manager never
-            // learns the new address and hint delivery keeps dialing the
-            // stale one (t21). New nodes must emit too: the gRPC push
-            // path routes peer deltas through `merge_delta` (F1d), so a
-            // brand-new joiner has no state transition.
+            // state, address, incarnation, storage-pool manifest — or
+            // when the node is new. ADR-0022: a strictly-higher-
+            // incarnation rejoin keeps the state (Alive→Alive) but
+            // carries a fresh address; without emission on address
+            // change, the membership manager never learns the new
+            // address and hint delivery keeps dialing the stale one
+            // (t21). New nodes must emit too: the gRPC push path routes
+            // peer deltas through `merge_delta` (F1d), so a brand-new
+            // joiner has no state transition. A manifest change (the
+            // version-bumped re-announcement of a pool change, ADR-0029
+            // D2) must emit so the manager stores the new manifest.
+            // The comparison uses the *accepted* manifest (preserved
+            // on None) so a no-op preserve does not emit.
             let changed = old_state != entry.state
                 || is_new_entry
                 || previous_entry.as_ref().is_some_and(|e| {
-                    e.address != entry.address || e.incarnation != entry.incarnation
+                    e.address != entry.address
+                        || e.incarnation != entry.incarnation
+                        || e.manifest != accepted.manifest
                 });
+            self.state.nodes.insert(entry.node_id.clone(), accepted);
+            self.incarnations.insert(entry.node_id.clone(), entry.incarnation);
             if changed {
                 debug!(
                     node_id = %entry.node_id,
@@ -580,6 +597,7 @@ impl GossipProtocol {
                     version: entry.version,
                     origin: entry.origin.clone(),
                     membership_address: Some(entry.address),
+                    manifest: entry.manifest.clone(),
                 });
 
                 // If a node is declared DEAD, notify the failure detector.
@@ -713,11 +731,15 @@ fn entry_from_proto(entry: &oceanfs_core::proto::membership::MembershipEntry) ->
         grpc_address,
         version: entry.version,
         origin: NodeId::new(&entry.origin),
+        manifest: entry
+            .manifest
+            .as_ref()
+            .map(|m| std::sync::Arc::new(crate::manifest::NodeManifest::from_proto(m))),
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use oceanfs_core::{Incarnation, NodeId, NodeState};
     use tokio::sync::mpsc;
@@ -750,6 +772,7 @@ mod tests {
             // Pre-attribution helper default: the origin is the target
             // itself (its own announcement) unless a test overrides it.
             origin: NodeId::new(id),
+            manifest: None,
         }
     }
 
@@ -1018,6 +1041,133 @@ mod tests {
                 "stale Alive must not emit a membership event"
             );
         }
+    }
+
+    /// ADR-0029 D2: a manifest-carrying entry rides a gossip delta —
+    /// the gossip state stores the manifest and the emitted membership
+    /// event carries it (the manager's event handler stores it on the
+    /// entry, which is what `manifest_of` reads).
+    #[test]
+    fn merge_delta_carries_manifest_and_event() {
+        let mut protocol = make_protocol();
+        let mut membership_rx = protocol.membership_event_tx.subscribe();
+
+        let manifest = crate::manifest::NodeManifest::from_pools(
+            1,
+            &[crate::manifest::PoolManifest::new(0, "data", "healthy", false, 1 << 40, 2)],
+        );
+        let mut entry = make_node_entry("pooled", 1, NodeState::Alive);
+        entry.manifest = Some(std::sync::Arc::new(manifest.clone()));
+        protocol.merge_delta(&GossipDelta { changed: vec![entry] });
+
+        // The gossip state stores the manifest on the entry.
+        let stored = protocol.state.nodes.get(&NodeId::new("pooled")).expect("entry stored");
+        assert_eq!(
+            stored.manifest.as_ref().map(|m| m.as_ref().clone()),
+            Some(manifest.clone()),
+            "the manifest must ride the delta into the gossip state"
+        );
+
+        // The emitted membership event carries it to the manager.
+        let mut carried = false;
+        while let Ok(event) = membership_rx.try_recv() {
+            if event.node_id.as_str() == "pooled" {
+                assert_eq!(
+                    event.manifest.as_ref().map(|m| m.as_ref().clone()),
+                    Some(manifest.clone()),
+                    "the event must carry the manifest to the manager"
+                );
+                carried = true;
+            }
+        }
+        assert!(carried, "the manifest-carrying entry must emit an event");
+    }
+
+    /// ADR-0029 D5: an incoming entry WITHOUT a manifest (an older peer
+    /// or a non-manifest path) must not erase the cached copy — the
+    /// merge preserves it (stale-but-present beats absent).
+    #[test]
+    fn merge_delta_preserves_cached_manifest_when_incoming_absent() {
+        let mut protocol = make_protocol();
+
+        let manifest = crate::manifest::NodeManifest::from_pools(
+            1,
+            &[crate::manifest::PoolManifest::new(0, "data", "healthy", false, 1 << 40, 2)],
+        );
+        let mut with_manifest = make_node_entry("holder", 1, NodeState::Alive);
+        with_manifest.manifest = Some(std::sync::Arc::new(manifest.clone()));
+        protocol.merge_delta(&GossipDelta { changed: vec![with_manifest] });
+
+        // A later entry WITHOUT a manifest, at a higher version (the
+        // version clock of a peer that predates the manifest).
+        let mut without_manifest = make_node_entry("holder", 1, NodeState::Alive);
+        without_manifest.version = 9;
+        protocol.merge_delta(&GossipDelta { changed: vec![without_manifest] });
+
+        let stored = protocol.state.nodes.get(&NodeId::new("holder")).expect("entry stored");
+        assert_eq!(
+            stored.manifest.as_ref().map(|m| m.as_ref().clone()),
+            Some(manifest),
+            "an absent manifest must not erase the cached copy"
+        );
+    }
+
+    /// A manifest-only change (the version-bumped re-announcement of a
+    /// pool change) emits a membership event even though state, address,
+    /// and incarnation are unchanged — the manager must learn the new
+    /// manifest.
+    #[test]
+    fn merge_delta_emits_event_for_manifest_only_change() {
+        let mut protocol = make_protocol();
+        let mut membership_rx = protocol.membership_event_tx.subscribe();
+
+        // Baseline entry, version 1, no manifest.
+        protocol.merge_delta(&GossipDelta {
+            changed: vec![make_node_entry("changer", 3, NodeState::Alive)],
+        });
+        let _ = membership_rx.try_recv(); // drain the add event
+
+        // Same node, same state/address/incarnation, HIGHER version,
+        // with a manifest — the pool-change re-announcement.
+        let manifest = crate::manifest::NodeManifest::from_pools(
+            3,
+            &[crate::manifest::PoolManifest::new(0, "data", "healthy", false, 1 << 40, 2)],
+        );
+        let mut changed = make_node_entry("changer", 3, NodeState::Alive);
+        changed.version = 2;
+        changed.manifest = Some(std::sync::Arc::new(manifest));
+        protocol.merge_delta(&GossipDelta { changed: vec![changed] });
+
+        let mut emitted = false;
+        while let Ok(event) = membership_rx.try_recv() {
+            if event.node_id.as_str() == "changer" && event.manifest.is_some() {
+                emitted = true;
+            }
+        }
+        assert!(emitted, "a manifest-only change must emit an event so the manager stores it");
+    }
+
+    /// ADR-0028 D3: a delta with an ABSENT manifest on a node that never
+    /// had one is merge-neutral — no manifest, no event about manifests,
+    /// and the entry itself still merges normally.
+    #[test]
+    fn absent_manifest_is_merge_neutral() {
+        let mut protocol = make_protocol();
+        let mut membership_rx = protocol.membership_event_tx.subscribe();
+
+        let entry = make_node_entry("plain", 2, NodeState::Alive);
+        protocol.merge_delta(&GossipDelta { changed: vec![entry] });
+
+        let stored = protocol.state.nodes.get(&NodeId::new("plain")).expect("entry stored");
+        assert!(stored.manifest.is_none());
+
+        let mut manifest_events = 0;
+        while let Ok(event) = membership_rx.try_recv() {
+            if event.node_id.as_str() == "plain" && event.manifest.is_some() {
+                manifest_events += 1;
+            }
+        }
+        assert_eq!(manifest_events, 0, "no manifest must mean no manifest in events");
     }
 
     #[test]

@@ -33,6 +33,10 @@ pub mod state;
 /// for this node (bumped on every emission) and `origin` is the emitter
 /// itself — the authority-class merge rules in `upsert_node` use them to
 /// order facts without last-writer-wins heuristics.
+///
+/// The storage-pool manifest (ADR-0029 D2) rides the event as an opaque
+/// attribute so the manager can store it on the entry — it is never
+/// interpreted by the merge.
 #[derive(Debug, Clone)]
 pub struct MembershipEvent {
     /// The node whose state changed.
@@ -52,6 +56,10 @@ pub struct MembershipEvent {
     /// The node's membership plane address, when the emitter knows it
     /// (ADR-0028 D1) — distinct from `address` (the data plane).
     pub membership_address: Option<SocketAddr>,
+    /// The node's storage-pool manifest (ADR-0029 D2), when the event
+    /// carries one — stored on the entry, never merged. Shared via
+    /// `Arc` (perf rule 2.4).
+    pub manifest: Option<std::sync::Arc<crate::manifest::NodeManifest>>,
 }
 
 /// The authority-class table (ADR-0028 D3).
@@ -202,6 +210,11 @@ pub struct Membership {
     /// bumped on every self-announcement / leave event so peers can
     /// order same-incarnation self-origin entries.
     pub(crate) self_version: std::sync::atomic::AtomicU64,
+    /// This node's storage-pool manifest (ADR-0029 D2), set via
+    /// [`Membership::set_self_manifest`]. Read by `join` so the
+    /// self-announcement to a seed carries the manifest immediately.
+    /// Shared via `Arc` (perf rule 2.4).
+    pub(crate) self_manifest: RwLock<Option<std::sync::Arc<crate::manifest::NodeManifest>>>,
     /// Ring version gauge — increments on each ring topology change.
     pub(crate) ring_version: Gauge,
 }

@@ -26,9 +26,11 @@ mod failure_detector;
 mod gossip;
 mod graceful_leave;
 pub mod grpc;
+pub mod manifest;
 mod membership;
 pub mod plane;
 
 pub use error::{Error, Result};
 pub use graceful_leave::GracefulLeaveHandler;
+pub use manifest::{NodeManifest, PoolManifest};
 pub use membership::{Membership, MembershipEvent};

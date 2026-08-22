@@ -58,6 +58,7 @@ impl Membership {
             probe_failures: RwLock::new(None),
             indirect_probes: RwLock::new(None),
             self_version: std::sync::atomic::AtomicU64::new(0),
+            self_manifest: RwLock::new(None),
             ring_version: Gauge::new(
                 "ring_version".into(),
                 "Ring topology version, incremented on each change".into(),
@@ -214,6 +215,7 @@ impl Membership {
                                 version,
                                 origin,
                                 membership_address,
+                                manifest,
                             }) => {
                                 // The event itself carries the incarnation,
                                 // address, version, and origin (ADR-0022,
@@ -223,8 +225,10 @@ impl Membership {
                                 // deriving them from state.nodes would
                                 // regress the incarnation to a stale value
                                 // and block legitimate re-admission
-                                // (t24/t43).
-                                event_membership.upsert_node_attributed(
+                                // (t24/t43). The storage-pool manifest
+                                // (ADR-0029 D2) rides along as an opaque
+                                // attached attribute.
+                                event_membership.upsert_node_attributed_inner(
                                     node_id,
                                     new_state,
                                     incarnation,
@@ -232,6 +236,7 @@ impl Membership {
                                     version,
                                     origin,
                                     membership_address,
+                                    manifest,
                                 );
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -336,6 +341,11 @@ impl Membership {
     ) -> Result<()> {
         let seed_nodes = &self.config.seed_nodes;
 
+        // The self storage-pool manifest (ADR-0029 D2), when one has
+        // been set: it rides the seed announcement and the local
+        // self-upsert so peers learn the manifest immediately.
+        let self_manifest = self.self_manifest.read().clone();
+
         let mut joined_seed_addr: Option<SocketAddr> = None;
 
         let must_contact = !seed_nodes.is_empty() || !fallback_seeds.is_empty();
@@ -403,6 +413,9 @@ impl Membership {
                     version: self_version,
                     origin: self.node_id.to_string(),
                     grpc_address: self.grpc_address.to_string(),
+                    // ADR-0029 D2: the storage-pool manifest rides the
+                    // self-announcement.
+                    manifest: self_manifest.as_ref().map(|m| m.to_proto()),
                 };
                 let delta =
                     oceanfs_core::proto::membership::MembershipList { entries: vec![proto_entry] };
@@ -445,7 +458,7 @@ impl Membership {
         // this upsert keeps that value in sync (ADR-0028 D2). The entry
         // carries origin = self with a fresh version (ADR-0028 D3).
         let self_version = self.self_version.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        self.upsert_node_attributed(
+        self.upsert_node_attributed_inner(
             self.node_id.clone(),
             NodeState::Alive,
             self_incarnation,
@@ -453,6 +466,7 @@ impl Membership {
             self_version,
             self.node_id.clone(),
             Some(self.address),
+            self_manifest,
         );
 
         info!(node_id = %self.node_id, "joined cluster successfully");
@@ -532,8 +546,15 @@ impl Membership {
                                     // attribution (version 0, empty
                                     // origin — the joiner has no local
                                     // facts yet, so the incarnation and
-                                    // F1d gates alone decide).
-                                    self.upsert_node_attributed(
+                                    // F1d gates alone decide). The
+                                    // storage-pool manifest (ADR-0029
+                                    // D2), when present, rides along.
+                                    let manifest = entry.manifest.as_ref().map(|m| {
+                                        std::sync::Arc::new(
+                                            crate::manifest::NodeManifest::from_proto(m),
+                                        )
+                                    });
+                                    self.upsert_node_attributed_inner(
                                         id,
                                         state,
                                         inc,
@@ -541,6 +562,7 @@ impl Membership {
                                         0,
                                         NodeId::new(""),
                                         Some(membership_addr),
+                                        manifest,
                                     );
                                 }
                             }
@@ -605,7 +627,9 @@ impl Membership {
         let leave_version =
             self.self_version.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
 
-        // Transition to LEAVING.
+        // Transition to LEAVING. No manifest: the Leaving/Left events
+        // are about liveness, and the entry's cached manifest survives
+        // (preserve-on-None).
         let _ = self.event_tx.send(MembershipEvent {
             node_id: node_id.clone(),
             old_state: NodeState::Alive,
@@ -615,6 +639,7 @@ impl Membership {
             version: leave_version,
             origin: self.node_id.clone(),
             membership_address: Some(self.address),
+            manifest: None,
         });
 
         info!(
@@ -657,6 +682,7 @@ impl Membership {
             version: leave_version,
             origin: self.node_id.clone(),
             membership_address: Some(self.address),
+            manifest: None,
         });
 
         // Remove self from ring.
@@ -673,6 +699,104 @@ impl Membership {
 
         info!(node_id = %node_id, "node left cluster");
         Ok(())
+    }
+
+    /// Sets this node's storage-pool manifest (ADR-0029 D2) and
+    /// propagates it to peers.
+    ///
+    /// Replaces the node's own manifest attribute and bumps the node's
+    /// own **entry version** (the per-(node, origin) clock, ADR-0028
+    /// D3) — **not** the incarnation: a pool change is not a restart.
+    /// Peers see the version bump and re-apply the entry; the
+    /// authority-class merge is untouched (the manifest is carried
+    /// along, never interpreted).
+    ///
+    /// The gossip protocol is notified directly (an `AddNode` with the
+    /// bumped version) so the new manifest enters the local gossip
+    /// state even though the node's state (Alive) and incarnation are
+    /// unchanged — the state-transition event path does not fire for a
+    /// manifest-only change. Requires the background tasks started
+    /// ([`Self::start`]); may be called before or after [`Self::join`]
+    /// — the join announcement carries the manifest either way.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_membership::{manifest::PoolManifest, Membership};
+    /// # use oceanfs_core::{GossipConfig, NodeId, RingConfig};
+    /// # use oceanfs_routing::{Ring, RingCache};
+    /// # use std::net::SocketAddr;
+    /// # use std::sync::Arc;
+    /// # let mut ring = Ring::new(RingConfig::default());
+    /// # ring.add_node(NodeId::new("node-1"));
+    /// # let ring_cache = Arc::new(RingCache::new(ring));
+    /// # let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+    /// # let membership = Membership::new(NodeId::new("node-1"), addr, addr,
+    /// #     GossipConfig::default(), ring_cache);
+    /// let pools = vec![PoolManifest::new(0, "data", "healthy", false, 1 << 40, 2)];
+    /// let manifest = oceanfs_membership::manifest::NodeManifest::from_pools(1, &pools);
+    /// membership.set_self_manifest(manifest);
+    /// ```
+    pub fn set_self_manifest(&self, manifest: crate::manifest::NodeManifest) {
+        // Perf rule 2.4: the manifest is built once per change and
+        // shared via Arc — every entry copy (delta build, event,
+        // storage) is a pointer clone, never a rebuild.
+        let manifest = std::sync::Arc::new(manifest);
+
+        // ADR-0028 D3: the self version clock bumps once per manifest
+        // change — peers order the new manifest after the old entry.
+        let version = self.self_version.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+
+        let (incarnation, grpc_address, membership_address) = {
+            let state = self.state.read();
+            let entry = state.nodes.get(&self.node_id);
+            let incarnation = state
+                .incarnations
+                .get(&self.node_id)
+                .copied()
+                .or_else(|| entry.map(|e| e.incarnation))
+                .unwrap_or_else(|| Incarnation::new(1));
+            (
+                incarnation,
+                entry.map(|e| e.address).unwrap_or(self.grpc_address),
+                entry.map(|e| e.membership_address).unwrap_or(self.address),
+            )
+        };
+
+        *self.self_manifest.write() = Some(manifest.clone());
+
+        // Store the manifest on the self entry (same state/incarnation
+        // → no event; the version bump is all the dissemination layer
+        // needs to forward the new manifest).
+        self.upsert_node_attributed_inner(
+            self.node_id.clone(),
+            NodeState::Alive,
+            incarnation,
+            Some(grpc_address),
+            version,
+            self.node_id.clone(),
+            Some(membership_address),
+            Some(manifest.clone()),
+        );
+
+        // Force the gossip state to carry the bumped entry with the
+        // manifest: the upsert above changes no state/address/
+        // incarnation, so its `AddNode` emission does not fire.
+        if let Some(tx) = self.gossip_tx.read().as_ref() {
+            let entry = NodeEntry {
+                node_id: self.node_id.clone(),
+                incarnation,
+                state: NodeState::Alive,
+                address: membership_address,
+                grpc_address,
+                version,
+                origin: self.node_id.clone(),
+                manifest: Some(manifest),
+            };
+            let _ = tx.try_send(GossipCommand::AddNode { entry });
+        }
+
+        info!(node_id = %self.node_id, version, "self storage-pool manifest set");
     }
 
     /// Adds or updates a node's state from external input (e.g., gossip merge).
@@ -734,6 +858,10 @@ impl Membership {
     /// Within the same class and origin, the higher `version` wins.
     /// These rules replace the historical terminality/stale-suspect/
     /// self-guard heuristics.
+    ///
+    /// This variant carries no storage-pool manifest (ADR-0029 D2);
+    /// the manifest-carrying entry point is the crate-internal
+    /// `upsert_node_attributed_inner` used by the event handler.
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_node_attributed(
         &self,
@@ -745,16 +873,53 @@ impl Membership {
         origin: NodeId,
         membership_address: Option<SocketAddr>,
     ) {
+        self.upsert_node_attributed_inner(
+            node_id,
+            state,
+            incarnation,
+            address,
+            version,
+            origin,
+            membership_address,
+            None,
+        );
+    }
+
+    /// The manifest-carrying attributed entry point (ADR-0029 D2): the
+    /// storage-pool manifest rides the entry as an **opaque attached
+    /// attribute** — the authority-class merge never interprets it.
+    ///
+    /// The manifest is preserved on `None` (stale-but-present beats
+    /// absent, ADR-0029 D5): an entry that predates the manifest (older
+    /// peer, or a non-manifest path like the failure detector) must not
+    /// erase the cached copy. Only an explicit `Some` replaces it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn upsert_node_attributed_inner(
+        &self,
+        node_id: NodeId,
+        state: NodeState,
+        incarnation: Incarnation,
+        address: Option<SocketAddr>,
+        version: u64,
+        origin: NodeId,
+        membership_address: Option<SocketAddr>,
+        manifest: Option<std::sync::Arc<crate::manifest::NodeManifest>>,
+    ) {
         let mut inner = self.state.write();
 
         // Capture old state and the recorded incarnation before modifying.
         let old = inner.nodes.get(&node_id).map(|e| e.state);
         let stored_address = inner.nodes.get(&node_id).map(|e| e.address);
         let stored_membership_address = inner.nodes.get(&node_id).map(|e| e.membership_address);
+        let stored_manifest = inner.nodes.get(&node_id).and_then(|e| e.manifest.clone());
         let recorded = inner.incarnations.get(&node_id).copied();
         let old_state = old.unwrap_or(NodeState::Alive);
         let is_new = old.is_none();
         let self_id = self.node_id.clone();
+
+        // The effective manifest: an incoming Some replaces the cached
+        // copy; an incoming None (a pre-manifest path) preserves it.
+        let effective_manifest = manifest.or(stored_manifest);
 
         // F1d re-admission guard: a node that is absent, Dead, or Left
         // may only be re-admitted at a strictly higher incarnation.
@@ -911,6 +1076,7 @@ impl Membership {
                         .unwrap_or(stored_membership_address.unwrap_or(dead_addr)),
                     version,
                     origin: origin.clone(),
+                    manifest: effective_manifest.clone(),
                 },
             );
             inner.incarnations.insert(node_id.clone(), effective_incarnation);
@@ -940,6 +1106,7 @@ impl Membership {
                         .unwrap_or(stored_membership_address.unwrap_or(addr)),
                     version,
                     origin: origin.clone(),
+                    manifest: effective_manifest.clone(),
                 },
             );
             inner.incarnations.insert(node_id.clone(), effective_incarnation);
@@ -956,6 +1123,7 @@ impl Membership {
                 version,
                 origin: origin.clone(),
                 membership_address,
+                manifest: effective_manifest.clone(),
             });
 
             // PR4: Update ring synchronously on membership changes.
@@ -1010,6 +1178,7 @@ impl Membership {
                         .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 9001))),
                     version,
                     origin: origin.clone(),
+                    manifest: effective_manifest.clone(),
                 };
                 let _ = tx.try_send(GossipCommand::AddNode { entry });
                 debug!(
@@ -1658,6 +1827,93 @@ mod tests {
         assert!(
             names.contains(&"ring_version".to_string()),
             "ring_version gauge should be registered, got: {names:?}"
+        );
+    }
+
+    /// ADR-0029 D2: `set_self_manifest` attaches the manifest to the
+    /// self entry and bumps the entry version (the per-(node, origin)
+    /// clock) — NOT the incarnation: a pool change is not a restart.
+    #[test]
+    fn set_self_manifest_attaches_manifest_and_bumps_version_only() {
+        let (_ring, m) = make_membership("test-node");
+
+        // The node joined: the join flow bumps the self version clock
+        // and upserts self at incarnation 1 with that version.
+        let join_version = m.self_version.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        m.upsert_node_attributed(
+            NodeId::new("test-node"),
+            NodeState::Alive,
+            Incarnation::new(1),
+            Some(addr),
+            join_version,
+            NodeId::new("test-node"),
+            Some(addr),
+        );
+
+        let manifest = crate::manifest::NodeManifest::from_pools(
+            1,
+            &[crate::manifest::PoolManifest::new(0, "data", "healthy", false, 1 << 40, 2)],
+        );
+        m.set_self_manifest(manifest.clone());
+
+        // The manifest is readable back.
+        assert_eq!(
+            m.manifest_of(&NodeId::new("test-node")),
+            Some(manifest),
+            "manifest_of must return the self manifest after set_self_manifest"
+        );
+
+        // The entry version bumped (1 → 2); the incarnation did not.
+        let entries = m.nodes_full();
+        let (_, _, incarnation, _, _, version, _, _) = entries
+            .iter()
+            .find(|(id, _, _, _, _, _, _, _)| id.as_str() == "test-node")
+            .expect("self entry");
+        assert_eq!(*version, 2, "the self entry version must bump on a manifest change");
+        assert_eq!(incarnation.value(), 1, "the incarnation must NOT change for a pool change");
+    }
+
+    /// An entry update WITHOUT a manifest (a pre-manifest path like the
+    /// failure detector) must not erase the cached manifest — the
+    /// preserve-on-None rule (ADR-0029 D5, stale-but-present beats
+    /// absent).
+    #[test]
+    fn upsert_preserves_manifest_when_incoming_absent() {
+        let (_ring, m) = make_membership("observer");
+
+        let manifest = crate::manifest::NodeManifest::from_pools(
+            1,
+            &[crate::manifest::PoolManifest::new(0, "data", "healthy", false, 1 << 40, 2)],
+        );
+        let addr: SocketAddr = "127.0.0.1:9003".parse().unwrap();
+        // A peer joins with its manifest.
+        m.upsert_node_attributed_inner(
+            NodeId::new("peer"),
+            NodeState::Alive,
+            Incarnation::new(1),
+            Some(addr),
+            1,
+            NodeId::new("peer"),
+            Some(addr),
+            Some(std::sync::Arc::new(manifest.clone())),
+        );
+        assert_eq!(m.manifest_of(&NodeId::new("peer")), Some(manifest.clone()));
+
+        // A detector observation about the peer, no manifest.
+        m.upsert_node_attributed(
+            NodeId::new("peer"),
+            NodeState::Suspect,
+            Incarnation::new(1),
+            None,
+            5,
+            NodeId::new("observer"),
+            None,
+        );
+        assert_eq!(
+            m.manifest_of(&NodeId::new("peer")),
+            Some(manifest),
+            "a manifest-less entry must preserve the cached manifest"
         );
     }
 }

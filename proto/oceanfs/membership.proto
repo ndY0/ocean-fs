@@ -38,6 +38,35 @@ message MembershipEntry {
   // D1) — peers dial it for the protocol; this field is what the data
   // plane dials for segment replication and hinted handoff.
   string grpc_address = 8;
+  // ADR-0029 D2: the node's storage-pool manifest, carried as an opaque
+  // attached attribute — the authority-class merge never interprets it.
+  // Schema addition: older nodes leave it absent; peers preserve their
+  // cached copy (stale-but-present beats absent, ADR-0029 D5).
+  optional NodeManifest manifest = 9;
+}
+
+// One storage pool's view inside a node's manifest (ADR-0029 D2).
+message PoolManifest {
+  uint32 id = 1;
+  // f2 role constant: "data" | "wal" | "metadata" | "hints" (string for
+  // forward compatibility — Phase B adds no new roles, but the wire
+  // format should not force a redesign).
+  string role = 2;
+  // f2 status constant: "healthy" | "degraded" | "dead" (Phase A always
+  // "healthy"; Degraded/Dead transition in Phase B's health monitor).
+  string status = 3;
+  bool write_degraded = 4;
+  uint64 capacity_free_bytes = 5;
+  uint32 weight = 6;
+}
+
+// The node's storage-pool manifest (ADR-0029 D2): compact, schema'd,
+// versioned. `incarnation` ties to the SWIM incarnation — a restart
+// re-declares it. A pool change bumps the owning entry's `version`
+// (ADR-0028 D3), never the incarnation.
+message NodeManifest {
+  uint64 incarnation = 1;
+  repeated PoolManifest pools = 2;
 }
 
 // Full membership list.

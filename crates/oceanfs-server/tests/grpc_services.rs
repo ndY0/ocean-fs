@@ -244,6 +244,8 @@ async fn gossip_push_then_pull_converges_membership() {
         version: 0,
         origin: String::new(),
         grpc_address: "127.0.0.1:9001".to_string(),
+        // ADR-0029 D2: pre-manifest entry — the optional field is absent.
+        manifest: None,
     };
 
     let msg = GossipMessage {

@@ -1707,6 +1707,19 @@ impl Node {
         // gossip series never appeared (the timing-metrics run
         // queried an empty metric).
         membership.register_membership_metrics(&*metrics_for_late_registration);
+
+        // ---- 15d. Declare the storage-pool manifest (ADR-0029 D2) ----
+        // Built once from the registry with the announce incarnation and
+        // attached to the self membership entry: the version bump the
+        // manifest triggers is all the gossip plane needs to propagate it
+        // (a pool change is not a restart — the incarnation is untouched).
+        // Phase A registers at boot only; f8 (runtime-attach) re-declares
+        // on pool set changes. The join() below carries the manifest in
+        // its self-announcement, so seeds learn it immediately.
+        let node_manifest =
+            crate::pool_manifest::build_node_manifest(announce_incarnation, &pool_registry);
+        membership.set_self_manifest(node_manifest);
+
         let join_incarnation = Incarnation::new(announce_incarnation);
         let join_fallback_seeds = durable_state.fallback_seeds.clone();
         if let Err(e) = membership.join(join_incarnation, &join_fallback_seeds).await {
@@ -1764,8 +1777,8 @@ impl Node {
             let seeds: Vec<String> = membership
                 .nodes_full()
                 .iter()
-                .filter(|(id, _, _, _, _, _, _)| *id != self_id)
-                .map(|(_, _, _, _, membership_addr, _, _)| membership_addr.to_string())
+                .filter(|(id, _, _, _, _, _, _, _)| *id != self_id)
+                .map(|(_, _, _, _, membership_addr, _, _, _)| membership_addr.to_string())
                 .collect();
             if seeds.is_empty() {
                 tracing::debug!(

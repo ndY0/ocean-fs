@@ -30,6 +30,44 @@ pub struct MembershipEntry {
     /// plane dials for segment replication and hinted handoff.
     #[prost(string, tag = "8")]
     pub grpc_address: ::prost::alloc::string::String,
+    /// ADR-0029 D2: the node's storage-pool manifest, carried as an opaque
+    /// attached attribute — the authority-class merge never interprets it.
+    /// Schema addition: older nodes leave it absent; peers preserve their
+    /// cached copy (stale-but-present beats absent, ADR-0029 D5).
+    #[prost(message, optional, tag = "9")]
+    pub manifest: ::core::option::Option<NodeManifest>,
+}
+/// One storage pool's view inside a node's manifest (ADR-0029 D2).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PoolManifest {
+    #[prost(uint32, tag = "1")]
+    pub id: u32,
+    /// f2 role constant: "data" | "wal" | "metadata" | "hints" (string for
+    /// forward compatibility — Phase B adds no new roles, but the wire
+    /// format should not force a redesign).
+    #[prost(string, tag = "2")]
+    pub role: ::prost::alloc::string::String,
+    /// f2 status constant: "healthy" | "degraded" | "dead" (Phase A always
+    /// "healthy"; Degraded/Dead transition in Phase B's health monitor).
+    #[prost(string, tag = "3")]
+    pub status: ::prost::alloc::string::String,
+    #[prost(bool, tag = "4")]
+    pub write_degraded: bool,
+    #[prost(uint64, tag = "5")]
+    pub capacity_free_bytes: u64,
+    #[prost(uint32, tag = "6")]
+    pub weight: u32,
+}
+/// The node's storage-pool manifest (ADR-0029 D2): compact, schema'd,
+/// versioned. `incarnation` ties to the SWIM incarnation — a restart
+/// re-declares it. A pool change bumps the owning entry's `version`
+/// (ADR-0028 D3), never the incarnation.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NodeManifest {
+    #[prost(uint64, tag = "1")]
+    pub incarnation: u64,
+    #[prost(message, repeated, tag = "2")]
+    pub pools: ::prost::alloc::vec::Vec<PoolManifest>,
 }
 /// Full membership list.
 #[derive(Clone, PartialEq, ::prost::Message)]

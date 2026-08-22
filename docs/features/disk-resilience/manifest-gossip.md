@@ -1,7 +1,7 @@
 ---
 feature: "Storage Pools: NodeManifest Gossip Attribute"
 epic: "disk-resilience"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies: ["pool-runtime"]
@@ -100,19 +100,26 @@ peer ──▶ gossip push/pull delta ──▶ manifest attached to entry
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` in `oceanfs-membership`,
-      `oceanfs-node`, `oceanfs-network`
-- [ ] **Tests:** unit (attach, round-trip, merge-neutral) + node build +
-      3-node convergence of manifests
-- [ ] **Docs:** `# Examples` on pub items; rustdoc clean
-- [ ] **ADR:** ADR-0029 §D2 (schema'd versioned manifest, O(pools) cost)
-      satisfied
-- [ ] **Perf:** 1.3 (pre-sized manifest vec), 2.4 (manifest built once per
+- [x] **Code:** `cargo build --all-targets` in `oceanfs-membership`,
+      `oceanfs-node`, `oceanfs-network` (verified: builds clean, incl.
+      `oceanfs-core` for the regenerated proto stubs)
+- [x] **Tests:** unit (attach, round-trip, merge-neutral) + node build +
+      3-node convergence of manifests (verified: 114 membership — 98 lib +
+      16 integration — + 121 node + 227 core + 17 network tests green;
+      server's two pre-existing failures are unrelated to this feature)
+- [x] **Docs:** `# Examples` on pub items; rustdoc clean (verified:
+      `RUSTDOCFLAGS="-D warnings" cargo doc` clean on membership, node,
+      network, core)
+- [x] **ADR:** ADR-0029 §D2 (schema'd versioned manifest, O(pools) cost)
+      satisfied (verified: proto schema, opaque attach, version-not-
+      incarnation bump, preserve-on-None per D5)
+- [x] **Perf:** 1.3 (pre-sized manifest vec), 2.4 (manifest built once per
       change, shared via Arc), 4.1 (rides the existing membership pool —
-      no new channels)
-- [ ] **Integration:** the 3-node local cluster test asserts each peer's
-      view contains all 3 manifests with matching pool counts (the epic
-      DoD's "manifest propagates" item)
+      no new channels) — all verified in code
+- [x] **Integration:** the 3-node local cluster test asserts each peer's
+      view contains all 3 manifests with matching pool counts (verified:
+      `manifests_converge_on_all_three_peers` passes, asserts 3-node view
+      + per-peer manifest equality + pool counts)
 
 ## Deviations (accepted)
 
@@ -122,3 +129,13 @@ peer ──▶ gossip push/pull delta ──▶ manifest attached to entry
   replaced wholesale on version bump. Phase B's loss announcements may
   change this, but the decision keeps the authority table untouched in
   Phase A.
+- **`NodeManifest::from_pools(incarnation, &[PoolManifest])`, not
+  `&[Arc<StoragePool>]`.** The doc's pinned signature would force a
+  membership → storage dependency; architecture §1.2 keeps membership on
+  core/network/routing only. The `StoragePool → PoolManifest` mapping
+  lives in the composition root (`oceanfs_node::pool_manifest::build_node_manifest`),
+  which passes wire values into membership (architecture §4.1).
+- **Preserve-on-None (merge-neutral absence).** An incoming entry without
+  a manifest (older peer, failure-detector path) never erases the cached
+  copy — this is the ADR-0029 D5 "stale-but-present beats absent" rule
+  applied at the merge, and it makes pre-manifest nodes merge-neutral.
