@@ -7,6 +7,8 @@
 //! snapshotted via `statvfs`, and per-pool metrics are registered once at
 //! construction.
 //!
+//! Placement over the registry lives in the [`placement`] submodule (f3).
+//!
 //! ## Phase A scope (epic `disk-resilience`)
 //!
 //! - All pools start `Healthy` (or `Degraded` when the startup probe failed
@@ -32,6 +34,8 @@
 //! I/O or across another lock. `PoolMetrics` is immutable after construction
 //! (its gauges/counters are interior-mutable atomics).
 
+pub mod placement;
+
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -44,6 +48,7 @@ use oceanfs_core::{
     Counter, Gauge, LabelSet, MetricRegistrar, MissingRootPolicy, PoolRole, PoolTech, StorageConfig,
 };
 use parking_lot::RwLock;
+pub use placement::PlacementPolicy;
 
 /// One GiB — the unit auto-derived placement weights are scaled to
 /// (ADR-0029 §D8 "weights with capacity auto-detect default").
@@ -931,6 +936,42 @@ impl PoolRegistry {
         }
     }
 
+    /// Overrides a pool's capacity snapshot and its metrics.
+    ///
+    /// The node's maintenance task normally drives capacity via
+    /// [`PoolRegistry::refresh_capacity`] (`statvfs`). This setter exists
+    /// for the paths where statvfs is not the source of truth: drain /
+    /// rebalance accounting and runtime pool attach (Phase C / f8), and
+    /// integration tests that simulate capacity evolution. Unknown ids are
+    /// ignored (no-op).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_storage::PoolRegistry;
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// let registry = PoolRegistry::from_config(
+    ///     &oceanfs_core::StorageConfig::default(),
+    ///     &data_dir,
+    /// )
+    /// .expect("registry");
+    /// registry.set_pool_capacity(0, 100 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024);
+    /// let pool = registry.pool_by_id(0).expect("pool");
+    /// assert_eq!(pool.total_bytes(), 100 * 1024 * 1024 * 1024);
+    /// assert_eq!(pool.free_bytes(), 10 * 1024 * 1024 * 1024);
+    /// ```
+    pub fn set_pool_capacity(&self, id: u32, total_bytes: u64, free_bytes: u64) {
+        if let Some(pool) = self.pool_by_id(id) {
+            pool.set_capacity(PoolCapacity { total_bytes, free_bytes });
+            if let Some(metric) = self.metrics_for(id) {
+                metric.bytes_free.set(free_bytes);
+                metric.bytes_total.set(total_bytes);
+            }
+        }
+    }
+
     /// Registers every per-pool metric series with the node's registry.
     ///
     /// Called once at startup (the node's composition root), after
@@ -1255,6 +1296,23 @@ mod tests {
         // Unknown ids are a no-op.
         registry.set_status(99, PoolStatus::Dead);
         registry.set_write_degraded(99, true);
+        drop(tmp);
+    }
+
+    #[test]
+    fn set_pool_capacity_overrides_snapshot_and_metrics() {
+        let (tmp, data_dir) = layout();
+        let (storage, _roots) = four_pool_config(tmp.path());
+        let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
+
+        registry.set_pool_capacity(0, 100 * GIB, 10 * GIB);
+        let pool = registry.pool_by_id(0).unwrap();
+        assert_eq!(pool.total_bytes(), 100 * GIB);
+        assert_eq!(pool.free_bytes(), 10 * GIB);
+
+        // Unknown id is a no-op.
+        registry.set_pool_capacity(99, 1, 1);
+        assert!(registry.pool_by_id(99).is_none());
         drop(tmp);
     }
 

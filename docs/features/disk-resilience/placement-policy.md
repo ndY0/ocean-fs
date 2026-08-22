@@ -1,7 +1,7 @@
 ---
 feature: "Storage Pools: Placement Policy"
 epic: "disk-resilience"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies: ["pool-runtime"]
@@ -49,7 +49,18 @@ least-free-capacity within the weighted budget. Pure logic over a
   - Degraded/`write_degraded` pools excluded (status is Healthy-only in
     Phase A, but the filter is exercised via `set_status` stub);
   - weighted least-free: pool A `weight 1 / free 10 GiB` vs pool B
-    `weight 2 / free 10 GiB` → B wins (5 GiB/weight vs 10 GiB/weight);
+    `weight 2 / free 10 GiB` → A wins (10 GiB/weight vs 5 GiB/weight);
+    <!-- REVIEW: corrected by review 2026-08-22 — the doc originally said
+    "B wins (5 GiB/weight vs 10 GiB/weight)". That example contradicted the
+    Scope rule text, the Interface, and this same doc's capacity test below
+    (after sealing 15 GiB into B, A must win — under the min rule B would
+    win, so the capacity flip requires max). Resolution: max free/weight is
+    authoritative (normative rule text + Interface + capacity example all
+    require it; "weight = 2 attracts ~2×" holds under max water-filling and
+    fails under min, which starves high-weight pools). Implemented as
+    `select_data_pool` (placement.rs:112-145), pinned by
+    `weighted_selection_prefers_pool_with_more_free_per_weight`
+    (placement.rs:246-258). No code flip needed. -->
   - capacity: pool A `weight 1 / free 10 GiB` vs pool B
     `weight 1 / free 20 GiB` → B wins; after sealing 15 GiB into B
     (simulated via registry capacity), A wins;
@@ -89,21 +100,44 @@ f4: metadata/wal/hints dirs ──▶ select_pinned_pool(registry, role) ──�
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` in `oceanfs-storage`
-- [ ] **Tests:** every case above green (incl. Degraded exclusion via the
+- [x] **Code:** `cargo build --all-targets` in `oceanfs-storage`
+      (verified by review: `cargo build --all-targets -p oceanfs-storage`
+      clean; `cargo fmt --all -- --check` clean; `cargo clippy -p
+      oceanfs-storage --lib -- -D warnings` clean; `cargo clippy -p
+      oceanfs-node --tests -- -D warnings` clean)
+- [x] **Tests:** every case above green (incl. Degraded exclusion via the
       f2 stub, determinism, headroom)
-- [ ] **Docs:** `# Examples` on pub items; rustdoc clean
-- [ ] **ADR:** ADR-0029 §D1 (placement at pool granularity) + §D8
+      (verified by review: 11 `pool::placement::tests` + 346 storage lib +
+      43 doctests + 10 storage integration binaries + node
+      `placement_policy` + `pool_registry` + 32 node lib — all green,
+      `--test-threads=1`)
+- [x] **Docs:** `# Examples` on pub items; rustdoc clean
+      (verified by review: `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+      -p oceanfs-storage` clean; `# Examples` on all 4 pub items in
+      `placement.rs` and on `set_pool_capacity`)
+- [x] **ADR:** ADR-0029 §D1 (placement at pool granularity) + §D8
       (weight-aware, capacity-aware) satisfied
-- [ ] **Perf:** 1.3 (pre-sized candidate vec), 7.1 (single snapshot read of
+      (verified by review: role/weight/capacity-aware selection over the
+      node's own pools; weights resolved by f2; no Ceph-OSD ring-membership
+      / node-granular-only / probe-blind rejected alternatives re-implemented)
+- [x] **Perf:** 1.3 (pre-sized candidate vec), 7.1 (single snapshot read of
       the registry; no lock held across the scoring loop — snapshot taken
       once, cloned Arcs), 9.3 (pool id comparison, no string work in the
       hot path)
-- [ ] **Integration:** an `oceanfs-node` test constructs a 2-data-pool
+      (verified by review: `Vec::with_capacity` at placement.rs:119; one
+      `data_pools()` snapshot at placement.rs:116, scoring lock-free on
+      cloned Arcs at placement.rs:131-143; integer-only `free/weight` score
+      at placement.rs:133, `id()` comparison at placement.rs:137)
+- [x] **Integration:** an `oceanfs-node` test constructs a 2-data-pool
       registry, seals several small segments through the existing
       `SegmentSealer` with the policy injected, and asserts the distribution
       lands on both pools (this exercises f2+f3 together; f5 completes the
       multi-root store)
+      (verified by review: `cargo test -p oceanfs-node --test
+      placement_policy -- --test-threads=1` — 1 passed; real
+      `SegmentSealer`/`WalWriter`/`SegmentLifecycleCoordinator`/`EventWal`,
+      `.dat` files land in the policy-selected roots, 8 seals distribute
+      4/4)
 
 ## Deviations (accepted)
 
@@ -112,3 +146,28 @@ f4: metadata/wal/hints dirs ──▶ select_pinned_pool(registry, role) ──�
   deterministic, capacity- and weight-aware rule that needs no tuning.
   If fleet measurements show pathological skew, a knob can be added in
   Phase C without changing the selection contract.
+- **f2 API amendment: `PoolRegistry::set_pool_capacity(id, total, free)`.**
+  Added in f3 (pool/mod.rs:965) because the DoD integration test drives
+  capacity evolution on a single test filesystem — both tempdir pool roots
+  share one filesystem, so real `statvfs` cannot show per-pool deltas and
+  the least-free flip cannot be observed. Mirrors the f2
+  `set_status`/`set_write_degraded` shape (same no-op-on-unknown-id
+  semantics, updates the metric gauges); documented for future
+  drain/rebalance accounting (Phase C) and runtime pool attach (f8).
+  <!-- REVIEW: recorded by review 2026-08-22 — the implementer flagged this
+  in the Implementation Report (deviation #2) but the feature doc's
+  Deviations section was not updated. Verified justified: without it the
+  DoD integration test cannot assert distribution on both pools (the
+  equal-capacity tie-break would send every seal to the lower pool id). -->
+- **Doc correction: original weighted example contradicted the max-rule
+  contract.** The draft's Scope example ("pool A `weight 1` vs pool B
+  `weight 2`, both `free 10 GiB` → B wins") asserted the min-rule outcome.
+  The normative rule text, the Interface, and the doc's own capacity
+  example all require the max rule (`max free_bytes / weight`, so A wins,
+  10 GiB/weight vs 5 GiB/weight), and the max rule is what makes
+  "weight = 2 attracts ~2× the segments" hold under water-filling. The
+  example in the Scope test list was corrected (inline REVIEW comment
+  there, 2026-08-22); no code flip was needed — `select_data_pool`
+  (placement.rs:112-145) and the pinning test
+  `weighted_selection_prefers_pool_with_more_free_per_weight`
+  (placement.rs:246-258) were already max-rule compliant.
