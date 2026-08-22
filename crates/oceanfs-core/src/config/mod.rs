@@ -13,6 +13,7 @@ mod metadata;
 mod node;
 mod ring;
 pub mod shard;
+mod storage;
 mod wal;
 
 pub use accel::AccelConfig;
@@ -23,4 +24,10 @@ pub use lifecycle::LifecycleConfig;
 pub use metadata::MetadataConfig;
 pub use node::{AntiEntropyConfig, NodeConfig};
 pub use ring::RingConfig;
+// The storage-pool definition type is named `PoolConfig` in this module, but
+// the crate facade already exports `types::config::PoolConfig` (the active
+// segment pool). The storage one is re-exported as `StoragePoolConfig` to
+// keep both reachable without ambiguity.
+pub use storage::PoolConfig as StoragePoolConfig;
+pub use storage::{MissingRootPolicy, PoolHealthConfig, PoolRole, PoolTech, StorageConfig};
 pub use wal::WalConfig;

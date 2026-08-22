@@ -249,9 +249,7 @@ name = "hot-nvme"
 role = "data"
 root = "/mnt/nvme2"
 tech = "nvme"
-health = { error_rate_threshold = 0.001, min_errors = 3,
-           latency_factor = 5.0, trend_window_secs = 300,
-           detection_window_secs = 30, recovery_window_secs = 300 }
+health = { error_rate_threshold = 0.001, min_errors = 3, latency_factor = 5.0, trend_window_secs = 300, detection_window_secs = 30, recovery_window_secs = 300 }
 ```
 
 Rules:

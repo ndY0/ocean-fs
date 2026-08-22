@@ -90,6 +90,13 @@ pub struct NodeConfig {
     /// Directory for all persistent data (RocksDB, WAL, segments).
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+    /// Storage-pool topology (ADR-0029 §D8).
+    ///
+    /// Empty `pools` = legacy single-`data_dir` mode, byte-for-byte today's
+    /// behavior. Non-empty = one `StoragePool` per pool entry, consumed by
+    /// the pool registry (feature f2).
+    #[serde(default)]
+    pub storage: crate::StorageConfig,
     /// Address the S3 HTTP API listens on.
     #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
@@ -606,6 +613,7 @@ impl Default for NodeConfig {
         Self {
             node_id: "node-1".into(),
             data_dir: PathBuf::from("/var/lib/oceanfs"),
+            storage: crate::StorageConfig::default(),
             listen_addr: "0.0.0.0:9000".into(),
             grpc_listen_addr: "0.0.0.0:9001".into(),
             membership_listen_addr: "0.0.0.0:9002".into(),

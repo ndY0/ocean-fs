@@ -1,7 +1,7 @@
 ---
 feature: "Storage Pools: Config Schema + Validation"
 epic: "disk-resilience"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies: []
@@ -113,17 +113,51 @@ oceanfs.toml
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds in `oceanfs-core`
-- [ ] **Tests:** round-trip + one test per validation rule (incl. legacy
+- [x] **Code:** `cargo build --all-targets` succeeds in `oceanfs-core`
+      (verified: `cargo build --all-targets -p oceanfs-core` clean; dependent
+      crates oceanfs-node/server/storage/oceanfs also build)
+- [x] **Tests:** round-trip + one test per validation rule (incl. legacy
       fallback); existing `NodeConfig` tests unchanged and green
-- [ ] **Docs:** every `pub` item has `# Examples`; rustdoc `-D warnings`
-- [ ] **ADR:** ADR-0029 §D8 config schema (one root per pool, roles,
+      (verified: 29 `config::storage` tests, 225 lib + 5 integration + 58
+      doctests all pass; `git diff` shows zero test churn)
+- [x] **Docs:** every `pub` item has `# Examples`; rustdoc `-D warnings`
+      (verified: `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p oceanfs-core` clean;
+      all 8 pub items in `config/storage.rs` have `# Examples`, `validate` also has `# Errors`)
+- [x] **ADR:** ADR-0029 §D8 config schema (one root per pool, roles,
       weights, tech, health) and §D8 zero-config fallback satisfied
-- [ ] **Perf:** none (config-only, cold path)
-- [ ] **Integration:** a `oceanfs-core` unit test deserializes a full
+      (verified against ADR-0029 §D8; zero-consumption of pool types outside
+      oceanfs-core — f2/f3/f4/f5/f6/f7/f8 and Phase B correctly absent)
+- [x] **Perf:** none (config-only, cold path)
+- [x] **Integration:** a `oceanfs-core` unit test deserializes a full
       example `[storage]` block from the ADR §D8 and validates it
+      (verified: `adr_d8_example_deserializes_and_validates` +
+      `adr_d8_example_parses_inside_node_config` pass; note: the ADR's
+      multi-line inline `health` table is not valid TOML — tests use the same
+      data single-line, see Deviations below)
 
-## Deviations (none)
+## Deviations
 
-(Intentionally empty — resolved in the brainstorm rev. 2: multi-root pools
+1. **Naming — `PoolConfig` re-exported as `StoragePoolConfig`.** The
+   feature's interface name `pub struct PoolConfig` collides with the
+   pre-existing `oceanfs_core::PoolConfig` (active-segment-pool config,
+   `types/config.rs`, ~95 mentions across 23 files in node/storage/server).
+   The storage-pool type keeps the module-level name `PoolConfig` in
+   `config/storage.rs` but is re-exported from the facade as
+   `oceanfs_core::StoragePoolConfig` (documented in `config/mod.rs` and the
+   type's doc comment). Accepted by review: renaming the pre-existing type
+   would break ~95 usages — out of scope for f1.
+2. **Extra validation rule — pool roots disjoint from the legacy
+   `data_dir`.** Not listed verbatim in this feature's rule list: a pool
+   whose root equals or is nested inside `data_dir` is rejected
+   (`paths_overlap`, storage.rs:441). Justification accepted: the
+   `validate(&self, data_dir)` signature is specified by this feature, and
+   the check gives it meaning — pool mode and legacy mode are mutually
+   exclusive layouts; overlap would silently mix pool-managed and
+   legacy-managed paths. Conservative reject; no behavior change.
+3. **ADR §D8 example as printed is not valid TOML.** The ADR wraps the
+   per-pool `health` inline table across two lines; TOML inline tables must
+   be single-line (verified with tomllib). Tests use the same values on one
+   line. Consider fixing the ADR's example formatting.
+
+(Originally empty — resolved in the brainstorm rev. 2: multi-root pools
 forbidden; `tech` default Auto resolved in f2 placeholder.)
