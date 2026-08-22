@@ -35,6 +35,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     error::{Error, Result},
+    routing_hint::RoutingHint,
     write::replication::replicate_write,
 };
 
@@ -189,6 +190,11 @@ pub struct WriteCoordinator {
     /// Merkle tree covers segments sealed after startup (continuous
     /// anti-entropy).
     segment_sealed_notifier: Option<Arc<dyn Fn(SegmentId, HashOutput) + Send + Sync>>,
+    /// Peer-side routing hint source (ADR-0029 §D5): the node's cached
+    /// storage-pool manifests, consulted as a hint when selecting
+    /// replica targets for replication. `None` (default) disables the
+    /// hint — the write path behaves exactly as before.
+    routing_hint: Option<Arc<dyn RoutingHint>>,
 }
 
 /// Per-PUT compression context: backend + bucket config + semaphore +
@@ -327,6 +333,7 @@ impl WriteCoordinator {
             segment_entries: DashMap::new(),
             timeouts: Arc::new(OperationTimeouts::default()),
             segment_sealed_notifier: None,
+            routing_hint: None,
         }
     }
 
@@ -364,6 +371,19 @@ impl WriteCoordinator {
         self
     }
 
+    /// Injects the peer-side routing hint source (ADR-0029 §D5).
+    ///
+    /// The manifest cache's write-target exclusion filter applies to
+    /// replica-target selection: nodes whose manifest reports
+    /// `write_degraded` or zero Healthy data pools are skipped. `None`
+    /// (the default, when this builder is not called) disables the
+    /// hint — the write path behaves exactly as before.
+    #[must_use]
+    pub fn with_routing_hint(mut self, hint: Arc<dyn RoutingHint>) -> Self {
+        self.routing_hint = Some(hint);
+        self
+    }
+
     /// Installs the cluster-readiness gate (composition root).
     ///
     /// The gate is closed while this node's ring is still converging
@@ -392,6 +412,14 @@ impl WriteCoordinator {
     /// (used by the S3 delete handler's ring-view gate).
     pub fn quorum_requires_ring(&self) -> bool {
         self.quorum_requires_ring
+    }
+
+    /// Whether the write-path routing hint excludes `node` as a replica
+    /// target: its cached manifest reports `write_degraded` or zero
+    /// Healthy data pools. `false` when the hint is unset or the cache
+    /// has no entry (unknown node stays eligible).
+    fn excluded_write_target(&self, node: &NodeId) -> bool {
+        self.routing_hint.as_ref().is_some_and(|hint| hint.exclude_write_target(node))
     }
 
     /// Sets the hint inline threshold (hints above it become segment
@@ -466,9 +494,22 @@ impl WriteCoordinator {
 
         // Step 2: If not local, forward to the first available successor.
         if !is_local {
+            // ADR-0029 §D5: the forwarding target must not be excluded
+            // by the write-path hint (write_degraded / zero Healthy data
+            // pools) — the hint is a preference, not a dependency: when
+            // every alive candidate is excluded or unknown, fall back to
+            // the first alive node and let the I/O error path decide.
             let forward_target = replica_set
                 .iter()
-                .find(|n| self.membership.state_of(n) == Some(oceanfs_core::NodeState::Alive))
+                .find(|n| {
+                    self.membership.state_of(n) == Some(oceanfs_core::NodeState::Alive)
+                        && !self.excluded_write_target(n)
+                })
+                .or_else(|| {
+                    replica_set.iter().find(|n| {
+                        self.membership.state_of(n) == Some(oceanfs_core::NodeState::Alive)
+                    })
+                })
                 .cloned()
                 .ok_or_else(|| Error::Routing("no alive replica to forward write".into()))?;
 
@@ -778,9 +819,14 @@ impl WriteCoordinator {
         let mut acks_received: usize = 1; // local ack counted
         let mut failed_targets: Vec<NodeId> = Vec::new();
 
-        // Build list of remote replicas.
-        let remote_targets: Vec<&NodeId> =
-            replica_set.iter().filter(|n| *n != &self.node_id).take(MAX_REPLICA_FANOUT).collect();
+        // Build list of remote replicas. ADR-0029 §D5: exclude nodes
+        // whose manifest reports `write_degraded` or zero Healthy data
+        // pools (the write-path hint); unknown nodes stay eligible.
+        let remote_targets: Vec<&NodeId> = replica_set
+            .iter()
+            .filter(|n| *n != &self.node_id && !self.excluded_write_target(n))
+            .take(MAX_REPLICA_FANOUT)
+            .collect();
 
         if !remote_targets.is_empty() {
             let write_timeout_ms = self.timeouts.wal_write_ms;

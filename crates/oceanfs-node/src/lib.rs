@@ -26,6 +26,7 @@ mod metadata_adapter;
 mod node;
 pub mod pool_manifest;
 pub mod pool_paths;
+pub mod routing_cache;
 pub mod startup;
 
 pub use metadata_adapter::MetadataStoreAdapter;

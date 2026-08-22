@@ -20,7 +20,7 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use futures::{stream::FuturesUnordered, StreamExt};
 use oceanfs_core::{
-    proto::segment::FetchShardRequest as GprcFetchShardRequest, ChunkRef, ObjectMetadata,
+    proto::segment::FetchShardRequest as GprcFetchShardRequest, ChunkRef, NodeId, ObjectMetadata,
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
@@ -32,6 +32,7 @@ use tracing::{debug, warn};
 use crate::{
     error::{Error, Result},
     read::coordinator::SegmentReader,
+    routing_hint::RoutingHint,
 };
 
 /// Parameters for EC recovery during chunk fetch.
@@ -141,6 +142,7 @@ pub(crate) async fn fetch_chunks(
         None,
         None,
         None,
+        None,
         true,
         true,
         None,
@@ -162,6 +164,7 @@ pub(crate) async fn fetch_chunks_with_grpc(
     segment_reader: Option<&Arc<dyn SegmentReader>>,
     pool: Option<&Arc<ConnectionPool>>,
     membership: Option<&Arc<Membership>>,
+    routing_hint: Option<&Arc<dyn RoutingHint>>,
     parallel_fetch: bool,
     use_fastest_k: bool,
     stripe_semaphore: Option<&Arc<Semaphore>>,
@@ -174,6 +177,7 @@ pub(crate) async fn fetch_chunks_with_grpc(
         segment_reader,
         pool,
         membership,
+        routing_hint,
         None,
         parallel_fetch,
         use_fastest_k,
@@ -197,6 +201,7 @@ pub(crate) async fn fetch_chunks_with_ec(
     segment_reader: Option<&Arc<dyn SegmentReader>>,
     pool: Option<&Arc<ConnectionPool>>,
     membership: Option<&Arc<Membership>>,
+    routing_hint: Option<&Arc<dyn RoutingHint>>,
     ec_params: &EcRecoveryParams,
     parallel_fetch: bool,
     use_fastest_k: bool,
@@ -210,6 +215,7 @@ pub(crate) async fn fetch_chunks_with_ec(
         segment_reader,
         pool,
         membership,
+        routing_hint,
         Some(ec_params),
         parallel_fetch,
         use_fastest_k,
@@ -236,6 +242,7 @@ async fn fetch_chunks_inner(
     segment_reader: Option<&Arc<dyn SegmentReader>>,
     pool: Option<&Arc<ConnectionPool>>,
     membership: Option<&Arc<Membership>>,
+    routing_hint: Option<&Arc<dyn RoutingHint>>,
     #[cfg_attr(not(feature = "ec"), allow(unused_variables))] ec_params: Option<&EcRecoveryParams>,
     parallel_fetch: bool,
     #[cfg_attr(not(feature = "ec"), allow(unused_variables))] use_fastest_k: bool,
@@ -261,6 +268,7 @@ async fn fetch_chunks_inner(
             segment_reader,
             pool,
             membership,
+            routing_hint,
             ec_params,
             use_fastest_k,
             stripe_semaphore,
@@ -275,6 +283,7 @@ async fn fetch_chunks_inner(
             segment_reader,
             pool,
             membership,
+            routing_hint,
             ec_params,
             use_fastest_k,
             stripe_semaphore,
@@ -302,6 +311,7 @@ async fn fetch_all_chunks_parallel(
     segment_reader: Option<&Arc<dyn SegmentReader>>,
     pool: Option<&Arc<ConnectionPool>>,
     membership: Option<&Arc<Membership>>,
+    routing_hint: Option<&Arc<dyn RoutingHint>>,
     ec_params: Option<&EcRecoveryParams>,
     use_fastest_k: bool,
     stripe_semaphore: Option<&Arc<Semaphore>>,
@@ -337,6 +347,7 @@ async fn fetch_all_chunks_parallel(
             let segment_reader = segment_reader.cloned();
             let pool = pool.cloned();
             let membership = membership.cloned();
+            let routing_hint = routing_hint.cloned();
             let ec = ec_params_arc.clone();
             let sem = sem.clone();
             async move {
@@ -348,6 +359,7 @@ async fn fetch_all_chunks_parallel(
                     segment_reader.as_ref(),
                     pool.as_ref(),
                     membership.as_ref(),
+                    routing_hint.as_ref(),
                     ec.as_ref(),
                     sem.as_ref(),
                 )
@@ -411,6 +423,7 @@ async fn fetch_all_chunks_serial(
     segment_reader: Option<&Arc<dyn SegmentReader>>,
     pool: Option<&Arc<ConnectionPool>>,
     membership: Option<&Arc<Membership>>,
+    routing_hint: Option<&Arc<dyn RoutingHint>>,
     ec_params: Option<&EcRecoveryParams>,
     #[allow(unused_variables)] use_fastest_k: bool,
     stripe_semaphore: Option<&Arc<Semaphore>>,
@@ -435,6 +448,7 @@ async fn fetch_all_chunks_serial(
             segment_reader,
             pool,
             membership,
+            routing_hint,
             ec_params_arc.as_ref(),
             sem.as_ref(),
         )
@@ -457,6 +471,7 @@ async fn fetch_single_chunk(
     segment_reader: Option<&Arc<dyn SegmentReader>>,
     pool: Option<&Arc<ConnectionPool>>,
     membership: Option<&Arc<Membership>>,
+    routing_hint: Option<&Arc<dyn RoutingHint>>,
     #[cfg_attr(not(feature = "ec"), allow(unused_variables))] ec_params: Option<
         &Arc<EcRecoveryParams>,
     >,
@@ -469,6 +484,7 @@ async fn fetch_single_chunk(
         segment_reader,
         pool,
         membership,
+        routing_hint,
         ec_params,
         stripe_semaphore,
     )
@@ -487,6 +503,7 @@ async fn fetch_single_chunk_raw(
     segment_reader: Option<&Arc<dyn SegmentReader>>,
     pool: Option<&Arc<ConnectionPool>>,
     membership: Option<&Arc<Membership>>,
+    routing_hint: Option<&Arc<dyn RoutingHint>>,
     #[cfg_attr(not(feature = "ec"), allow(unused_variables))] ec_params: Option<
         &Arc<EcRecoveryParams>,
     >,
@@ -518,6 +535,16 @@ async fn fetch_single_chunk_raw(
     let segment_hash = blake3::hash(chunk.segment_id.to_string().as_bytes());
     let replica_set = ring.lookup(segment_hash.as_bytes());
 
+    // ADR-0029 §D5: exclude candidates whose manifest reports zero
+    // Healthy data pools (the node cannot serve segment reads). The
+    // manifest is a HINT — an unknown node stays eligible and the
+    // error-driven fallback below is the guarantee.
+    let replica_set: Vec<NodeId> = if let Some(hint) = routing_hint {
+        replica_set.iter().filter(|n| !hint.exclude_read_candidate(n)).cloned().collect()
+    } else {
+        replica_set
+    };
+
     if replica_set.is_empty() {
         // If no replicas but EC recovery is available, try it before giving up.
         #[cfg(feature = "ec")]
@@ -531,6 +558,7 @@ async fn fetch_single_chunk_raw(
                         ring,
                         pool,
                         membership,
+                        routing_hint,
                         timeout_ms,
                         stripe_semaphore,
                     )
@@ -585,6 +613,9 @@ async fn fetch_single_chunk_raw(
                 Ok(p) => p,
                 Err(e) => {
                     debug!(replica = %replica, error = %e, "failed to acquire channel for fetch");
+                    if let Some(hint) = routing_hint {
+                        hint.on_failover();
+                    }
                     continue;
                 }
             };
@@ -638,6 +669,11 @@ async fn fetch_single_chunk_raw(
                         );
                         return Ok(data.freeze());
                     }
+                    // Empty response: the replica served nothing — an
+                    // error-driven fall-through to the next replica.
+                    if let Some(hint) = routing_hint {
+                        hint.on_failover();
+                    }
                 }
                 Ok(Err(status)) => {
                     debug!(
@@ -645,6 +681,9 @@ async fn fetch_single_chunk_raw(
                         error = %status,
                         "gRPC fetch failed for replica"
                     );
+                    if let Some(hint) = routing_hint {
+                        hint.on_failover();
+                    }
                 }
                 Err(_elapsed) => {
                     debug!(
@@ -652,6 +691,9 @@ async fn fetch_single_chunk_raw(
                         timeout_ms,
                         "gRPC fetch timed out for replica"
                     );
+                    if let Some(hint) = routing_hint {
+                        hint.on_failover();
+                    }
                 }
             }
         }
@@ -669,6 +711,7 @@ async fn fetch_single_chunk_raw(
                     ring,
                     pool,
                     membership,
+                    routing_hint,
                     timeout_ms,
                     stripe_semaphore,
                 )
@@ -713,6 +756,7 @@ async fn fetch_single_chunk_raw(
 ///
 /// Only compiled when the `ec` feature is enabled.
 #[cfg(feature = "ec")]
+#[allow(clippy::too_many_arguments)]
 async fn fetch_parity_shard_via_grpc(
     ring: &Arc<RingCache>,
     chunk: &ChunkRef,
@@ -720,10 +764,19 @@ async fn fetch_parity_shard_via_grpc(
     shard_size: u64,
     pool: &Arc<ConnectionPool>,
     membership: &Arc<Membership>,
+    routing_hint: Option<&Arc<dyn RoutingHint>>,
     timeout_ms: u64,
 ) -> Result<Bytes> {
     let segment_hash = blake3::hash(chunk.segment_id.to_string().as_bytes());
     let replica_set = ring.lookup(segment_hash.as_bytes());
+
+    // ADR-0029 §D5: same read-candidate exclusion as the data-shard
+    // path — a node with zero Healthy data pools cannot serve reads.
+    let replica_set: Vec<NodeId> = if let Some(hint) = routing_hint {
+        replica_set.iter().filter(|n| !hint.exclude_read_candidate(n)).cloned().collect()
+    } else {
+        replica_set
+    };
 
     for replica in &replica_set {
         let addr = match membership.address_of(replica) {
@@ -732,7 +785,12 @@ async fn fetch_parity_shard_via_grpc(
         };
         let pooled = match pool.get_channel(addr).await {
             Ok(p) => p,
-            Err(_) => continue,
+            Err(_) => {
+                if let Some(hint) = routing_hint {
+                    hint.on_failover();
+                }
+                continue;
+            }
         };
         let channel = pooled.channel().clone();
         drop(pooled);
@@ -780,6 +838,9 @@ async fn fetch_parity_shard_via_grpc(
                     error = %status,
                     "gRPC parity shard fetch failed"
                 );
+                if let Some(hint) = routing_hint {
+                    hint.on_failover();
+                }
             }
             Err(_elapsed) => {
                 debug!(
@@ -788,6 +849,9 @@ async fn fetch_parity_shard_via_grpc(
                     timeout_ms,
                     "gRPC parity shard fetch timed out"
                 );
+                if let Some(hint) = routing_hint {
+                    hint.on_failover();
+                }
             }
         }
     }
@@ -820,6 +884,7 @@ async fn try_ec_recovery_for_chunk(
     ring: &Arc<RingCache>,
     pool: Option<&Arc<ConnectionPool>>,
     membership: Option<&Arc<Membership>>,
+    routing_hint: Option<&Arc<dyn RoutingHint>>,
     timeout_ms: u64,
     stripe_semaphore: Option<&Arc<Semaphore>>,
 ) -> Result<Bytes> {
@@ -919,6 +984,7 @@ async fn try_ec_recovery_for_chunk(
                 shard_size as u64,
                 pool,
                 membership,
+                routing_hint,
                 timeout_ms,
             )
             .await?;
@@ -966,13 +1032,169 @@ async fn try_ec_recovery_for_chunk(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use oceanfs_core::{NodeId, RingConfig, SegmentId};
-    use oceanfs_routing::Ring;
+    use std::{net::SocketAddr, sync::atomic::AtomicU64};
+
+    use oceanfs_core::{GossipConfig, HlcClock, NodeId, RingConfig, SegmentId};
+    use oceanfs_durability::SegmentDataStore;
+    use oceanfs_membership::Membership;
+    use oceanfs_network::ConnectionPool;
+    use oceanfs_routing::{Ring, RingCache};
+    use oceanfs_storage::{BufferPool, SegmentRpcServer};
+    use parking_lot::Mutex;
+    use tonic::transport::Server;
 
     use super::*;
-    use crate::read::coordinator::InMemorySegmentReader;
+    use crate::{
+        grpc::segment_service::SegmentGrpcService, read::coordinator::InMemorySegmentReader,
+        routing_hint::RoutingHint,
+    };
+
+    /// An in-memory segment store for the failover test's gRPC servers.
+    struct TestSegmentStore {
+        data: Mutex<std::collections::HashMap<SegmentId, Bytes>>,
+    }
+
+    impl TestSegmentStore {
+        fn new() -> Self {
+            Self { data: Mutex::new(std::collections::HashMap::new()) }
+        }
+    }
+
+    impl SegmentDataStore for TestSegmentStore {
+        fn write_segment_data(
+            &self,
+            segment_id: &SegmentId,
+            data: &[u8],
+        ) -> Result<(), oceanfs_storage::Error> {
+            self.data.lock().insert(*segment_id, Bytes::copy_from_slice(data));
+            Ok(())
+        }
+        fn read_segment_data(
+            &self,
+            segment_id: &SegmentId,
+        ) -> Result<Bytes, oceanfs_storage::Error> {
+            self.data
+                .lock()
+                .get(segment_id)
+                .cloned()
+                .ok_or(oceanfs_storage::Error::SegmentNotFound(*segment_id))
+        }
+    }
+
+    /// Starts a segment gRPC server over `store`; returns its address.
+    async fn serve_segment(store: Arc<dyn SegmentDataStore>) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let service = SegmentGrpcService::new(
+            store,
+            None,
+            Arc::new(BufferPool::new(65536, 1024)),
+            Arc::new(HlcClock::new()),
+        );
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(SegmentRpcServer::new(service))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        addr
+    }
+
+    /// A counting routing hint: never excludes, counts failovers.
+    struct CountingHint(Arc<AtomicU64>);
+
+    impl RoutingHint for CountingHint {
+        fn exclude_read_candidate(&self, _: &NodeId) -> bool {
+            false
+        }
+        fn exclude_write_target(&self, _: &NodeId) -> bool {
+            false
+        }
+        fn on_failover(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// ADR-0029 §D5 failover test: an error on the first replica falls
+    /// through to the next replica, and the failover counter records the
+    /// event — the cache was a hint, the I/O error was the truth.
+    #[tokio::test]
+    async fn fetch_falls_through_on_replica_error_and_counts_failover() {
+        // Two replicas. The first has NO data for the segment (its
+        // FetchShard errors), the second serves it.
+        let seg_id = SegmentId::new();
+        let test_data = Bytes::from_static(b"failover test data");
+        let failing_store = Arc::new(TestSegmentStore::new()) as Arc<dyn SegmentDataStore>;
+        let serving_store = Arc::new(TestSegmentStore::new()) as Arc<dyn SegmentDataStore>;
+        serving_store.write_segment_data(&seg_id, &test_data).unwrap();
+
+        let failing_addr = serve_segment(failing_store).await;
+        let serving_addr = serve_segment(serving_store).await;
+
+        // Ring with two replicas (RF 2 so both are in the lookup set).
+        let mut ring = Ring::new(RingConfig { replication_factor: 2, ..RingConfig::default() });
+        ring.add_node(NodeId::new("n1"));
+        ring.add_node(NodeId::new("n2"));
+        let ring_cache = Arc::new(RingCache::new(ring));
+
+        // Membership resolving both replicas to the test servers.
+        let membership = Arc::new(Membership::new(
+            NodeId::new("reader"),
+            "127.0.0.1:9300".parse().unwrap(),
+            "127.0.0.1:9300".parse().unwrap(),
+            GossipConfig::default(),
+            ring_cache.clone(),
+        ));
+        membership.upsert_node(
+            NodeId::new("n1"),
+            oceanfs_core::NodeState::Alive,
+            oceanfs_core::Incarnation::new(1),
+            Some(failing_addr),
+        );
+        membership.upsert_node(
+            NodeId::new("n2"),
+            oceanfs_core::NodeState::Alive,
+            oceanfs_core::Incarnation::new(1),
+            Some(serving_addr),
+        );
+
+        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
+        let hint = Arc::new(CountingHint(Arc::new(AtomicU64::new(0))));
+        let hint_dyn: Arc<dyn RoutingHint> = hint.clone();
+
+        let chunk = ChunkRef {
+            segment_id: seg_id,
+            offset: 0,
+            length: test_data.len() as u32,
+            compressed: false,
+            logical_length: test_data.len() as u32,
+        };
+
+        let data = fetch_single_chunk_raw(
+            &ring_cache,
+            &chunk,
+            5000,
+            None,
+            Some(&pool),
+            Some(&membership),
+            Some(&hint_dyn),
+            None,
+            None,
+        )
+        .await
+        .expect("the second replica must serve the chunk");
+
+        assert_eq!(&data[..], &test_data[..], "data must come from the healthy replica");
+        assert_eq!(
+            hint.0.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the failed first replica must count one failover"
+        );
+    }
 
     #[tokio::test]
     async fn fetch_inline_metadata_returns_inline_data() {
@@ -1192,10 +1414,11 @@ mod tests {
                 logical_length: 8,
             };
 
-            let recovered =
-                try_ec_recovery_for_chunk(&reader, &chunk, &params, &ring, None, None, 5000, None)
-                    .await
-                    .unwrap();
+            let recovered = try_ec_recovery_for_chunk(
+                &reader, &chunk, &params, &ring, None, None, None, 5000, None,
+            )
+            .await
+            .unwrap();
 
             // Should recover the original shard 0 data.
             assert_eq!(&recovered[..], &original_data[0][0..8]);
@@ -1229,10 +1452,11 @@ mod tests {
                 logical_length: 8,
             };
 
-            let recovered =
-                try_ec_recovery_for_chunk(&reader, &chunk, &params, &ring, None, None, 5000, None)
-                    .await
-                    .unwrap();
+            let recovered = try_ec_recovery_for_chunk(
+                &reader, &chunk, &params, &ring, None, None, None, 5000, None,
+            )
+            .await
+            .unwrap();
 
             assert_eq!(&recovered[..], &original_data[0][0..8]);
         }
@@ -1254,9 +1478,10 @@ mod tests {
                 logical_length: 8,
             };
 
-            let result =
-                try_ec_recovery_for_chunk(&reader, &chunk, &params, &ring, None, None, 5000, None)
-                    .await;
+            let result = try_ec_recovery_for_chunk(
+                &reader, &chunk, &params, &ring, None, None, None, 5000, None,
+            )
+            .await;
             assert!(result.is_err());
         }
     }

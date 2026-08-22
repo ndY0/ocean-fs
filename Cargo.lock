@@ -1715,6 +1715,7 @@ dependencies = [
 name = "oceanfs-node"
 version = "0.2.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "axum 0.8.9",
  "blake3",

@@ -1,7 +1,7 @@
 ---
 feature: "Storage Pools: Cached Routing State"
 epic: "disk-resilience"
-status: proposed
+status: done
 priority: medium
 owner: ""
 dependencies: ["data-pool-placement", "manifest-gossip"]
@@ -99,17 +99,40 @@ membership events (f6) ──▶ ManifestCache.update(node_id, manifest)
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` in `oceanfs-node`
-- [ ] **Tests:** all listed green (cache ops, filters, failover, cluster
-      propagation)
-- [ ] **Docs:** `# Examples` on pub items; rustdoc clean
-- [ ] **ADR:** ADR-0029 §D5 (cached routing = hint, not dependency;
-      failover on error) satisfied
-- [ ] **Perf:** 2.4 (ArcSwap lock-free reads on the hot path), 7.2
-      (read-only shared manifests; no lock in the read/write path)
-- [ ] **Integration:** the 3-node cluster test asserts post-convergence
+- [x] **Code:** `cargo build --all-targets` in `oceanfs-node`
+      (independently verified: build clean for `oceanfs-node`,
+      `oceanfs-server`, `oceanfs-membership`)
+- [x] **Tests:** all listed green (cache ops, filters, failover, cluster
+      propagation) — 9 `routing_cache` lib tests + 1 integration test +
+      99 membership lib tests (incl. the join-pull regression) + 49 node
+      lib + all 19 node integration binaries + 226 server lib tests
+      (all `--test-threads=1`), including the fetch-path failover unit
+      test (`fetch_falls_through_on_replica_error_and_counts_failover`,
+      read/fetch.rs): a gRPC error on replica 1 falls through to replica
+      2 and increments the counter. The only server failure
+      (`grpc_services::swim_death_detection_within_timeout`) was
+      independently confirmed pre-existing on HEAD (f6)
+- [x] **Docs:** `# Examples` on pub items; rustdoc clean — node +
+      membership rustdoc clean under `-D warnings`; doc tests pass
+      (6+11+11); server rustdoc has 2 broken-link errors
+      (`admin.rs:325`, `write/coordinator.rs:1826`) independently
+      confirmed pre-existing on HEAD (f6)
+<!-- REVIEW: LOW — ManifestCache::len / is_empty (routing_cache.rs:174,179)
+have doc comments but no `# Examples`; minor vs coding §5.1. -->
+- [x] **ADR:** ADR-0029 §D5 (cached routing = hint, not dependency;
+      failover on error) satisfied — unknown peers stay eligible
+      (None → no filter), all Healthy manifests never exclude (Phase-A
+      neutral), stale-but-present beats absent, `on_failover` fires on
+      every error-driven read fallthrough
+- [x] **Perf:** 2.4 (ArcSwap lock-free reads on the hot path), 7.2
+      (read-only shared manifests; no lock in the read/write path) —
+      `ArcSwap<HashMap<NodeId, Arc<NodeManifest>>>`, wholesale replace on
+      update, `get`/filters are lock-free; no `std::sync` locks in the
+      modified code
+- [x] **Integration:** the 3-node cluster test asserts post-convergence
       caches match and that the synthetic status-flip changes routing (the
-      epic DoD's "cached routing state" item)
+      epic DoD's "cached routing state" item) — verified green
+      (`caches_converge_and_status_flip_changes_routing`, 0.7–0.9s)
 
 ## Deviations (accepted)
 
@@ -117,3 +140,28 @@ membership events (f6) ──▶ ManifestCache.update(node_id, manifest)
   per-range detail (by design, ADR-0029 §D4); the filter works at
   node/pool granularity. Range-level refinement is Phase B's loss
   announcement consumer, not this feature.
+- **Hooks live in `oceanfs-server`, not `oceanfs-node`.** The feature's
+  Crate Impact table listed only `oceanfs-node`, but replica selection
+  happens in the server's read/write coordinators and `oceanfs-node`
+  depends on `oceanfs-server` (never reverse, architecture §1.1 DAG). The
+  `RoutingHint` trait is defined in the consuming crate (`oceanfs-server`,
+  architecture §2.1); `oceanfs-node`'s `ManifestCache` implements it and
+  the composition root wires it via `with_routing_hint`. Review-verified:
+  no crate cycle, trait placement matches §2.1. (Same layering resolution
+  as f6's `from_pools` deviation.)
+- **Join-pull attribution fix (membership change).** The join-time pull
+  now carries the seed's stored (origin, version) through instead of
+  forcing `version 0 / origin ""`. The forced values created `X@0
+  origin ""` entries that outrank the target's own announcements in the
+  authority-class merge (class 2 beats class 1 at equal incarnation) and
+  echoed cluster-wide, permanently blocking version-bumped
+  re-announcements — a pool-status flip could never propagate. Review-
+  verified correct and safe (legacy `origin ""`/`version 0` entries
+  unchanged; F1d/incarnation gates still decide the outer order);
+  regression test `join_pull_preserves_attribution_so_version_bumps_propagate`.
+
+## Pre-existing failures (unchanged, verified on f6 HEAD)
+
+- `oceanfs-server::tests::grpc_services::swim_death_detection_within_timeout`
+- 2 server rustdoc broken-link errors (`admin.rs:325` private
+  intra-doc link, `write/coordinator.rs` `HintObjectApplier` link)

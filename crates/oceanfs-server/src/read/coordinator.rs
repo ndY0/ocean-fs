@@ -223,6 +223,11 @@ pub struct ReadCoordinator {
     /// Bounds concurrent decompression on the blocking pool (perf §2.7).
     #[cfg(feature = "accel")]
     decompress_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Peer-side routing hint source (ADR-0029 §D5): the node's cached
+    /// storage-pool manifests, consulted as a hint when selecting
+    /// replica nodes for gRPC chunk fetch. `None` (default) disables
+    /// the hint — the fetch path behaves exactly as before.
+    routing_hint: Option<Arc<dyn crate::routing_hint::RoutingHint>>,
 }
 
 /// [`ReadCoordinatorHintObjectReader`] backs the hinted-handoff fetch
@@ -298,6 +303,7 @@ impl ReadCoordinator {
             decompress_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 std::thread::available_parallelism().map_or(4, |n| n.get().saturating_mul(2)),
             )),
+            routing_hint: None,
         }
     }
 
@@ -335,6 +341,7 @@ impl ReadCoordinator {
             decompress_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 std::thread::available_parallelism().map_or(4, |n| n.get().saturating_mul(2)),
             )),
+            routing_hint: None,
         }
     }
 
@@ -417,6 +424,18 @@ impl ReadCoordinator {
     #[must_use]
     pub fn with_default_fetch_strategy(mut self, strategy: FetchStrategy) -> Self {
         self.default_fetch_strategy = strategy;
+        self
+    }
+
+    /// Injects the peer-side routing hint source (ADR-0029 §D5).
+    ///
+    /// The manifest cache's read-exclusion filter applies to replica-node
+    /// selection in the gRPC chunk-fetch path. `None` (the default,
+    /// when this builder is not called) disables the hint — the fetch
+    /// path behaves exactly as before.
+    #[must_use]
+    pub fn with_routing_hint(mut self, hint: Arc<dyn crate::routing_hint::RoutingHint>) -> Self {
+        self.routing_hint = Some(hint);
         self
     }
 
@@ -1065,6 +1084,10 @@ impl ReadCoordinator {
 
         let timeout_ms = self.timeouts.read_default_ms;
 
+        // Peer-side routing hint (ADR-0029 §D5): the node's cached pool
+        // manifests filter replica candidates in the gRPC fetch path.
+        let routing_hint = self.routing_hint.as_ref();
+
         // Fetch strategy drives parallelism and fastest-k behaviour.
         let parallel_fetch = strategy.parallel_fetch();
         let use_fastest_k = strategy.use_fastest_k();
@@ -1120,6 +1143,7 @@ impl ReadCoordinator {
                     self.segment_reader.as_ref(),
                     self.pool.as_ref(),
                     self.membership.as_ref(),
+                    routing_hint,
                     ec,
                     parallel_fetch,
                     use_fastest_k,
@@ -1135,6 +1159,7 @@ impl ReadCoordinator {
                     self.segment_reader.as_ref(),
                     self.pool.as_ref(),
                     self.membership.as_ref(),
+                    routing_hint,
                     parallel_fetch,
                     use_fastest_k,
                     sem_ref,
@@ -1150,6 +1175,7 @@ impl ReadCoordinator {
                 self.segment_reader.as_ref(),
                 self.pool.as_ref(),
                 self.membership.as_ref(),
+                routing_hint,
                 parallel_fetch,
                 use_fastest_k,
                 sem_ref,
@@ -1165,6 +1191,7 @@ impl ReadCoordinator {
                     meta,
                     timeout_ms,
                     self.segment_reader.as_ref(),
+                    None,
                     None,
                     None,
                     ec,
@@ -1438,6 +1465,7 @@ impl Default for ReadCoordinator {
             decompress_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 std::thread::available_parallelism().map_or(4, |n| n.get().saturating_mul(2)),
             )),
+            routing_hint: None,
         }
     }
 }

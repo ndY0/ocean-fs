@@ -33,6 +33,7 @@ pub mod metadata_async;
 pub mod metadata_ops;
 pub mod read;
 mod router;
+pub mod routing_hint;
 mod s3_handler;
 pub mod s3_xml;
 mod write;
@@ -49,5 +50,6 @@ pub use read::coordinator::{
     ReadResult, SegmentReader,
 };
 pub use router::{RouteRequest, RouteResponse, Router};
+pub use routing_hint::RoutingHint;
 pub use s3_handler::S3Handler;
 pub use write::coordinator::{WriteCoordinator, WriteCoordinatorHintObjectApplier, WriteRequest};

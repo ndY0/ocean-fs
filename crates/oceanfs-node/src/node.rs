@@ -555,6 +555,15 @@ impl Node {
             "rejoin state loaded: announcing with bumped incarnation"
         );
 
+        // ---- 4b. Peer-side routing cache (ADR-0029 §D5) ----
+        // The per-peer NodeManifest cache consulted as a routing hint by
+        // the read/write coordinators (lock-free ArcSwap reads on the
+        // hot path; populated from membership events below and seeded
+        // with the self manifest at step 15d). Phase A: every manifest
+        // is Healthy, so the exclusion filters are observationally
+        // neutral — the structure and metrics land for Phase B.
+        let manifest_cache = Arc::new(crate::routing_cache::ManifestCache::new());
+
         // ---- 5. Construct connection pools ----
         let rpc_config = RpcConfig::default();
         let quickack = rpc_config.quickack;
@@ -1174,6 +1183,10 @@ impl Node {
             // write on a permanently 1-node ring.
             .with_quorum_requires_ring(is_cluster_node)
             .with_hint_inline_threshold(config.hint_inline_threshold_bytes)
+            // Peer-side routing hint (ADR-0029 §D5): replica targets
+            // whose manifest reports write_degraded / zero Healthy data
+            // pools are excluded; Phase A all-healthy = neutral.
+            .with_routing_hint(manifest_cache.clone())
             // Continuous anti-entropy: every successful seal updates the
             // incremental Merkle tree (with its seal-time root) so
             // recently-written segments participate in the root exchange
@@ -1317,7 +1330,11 @@ impl Node {
             .with_compressor(Some(accel.clone()))
             .with_timeouts(op_timeouts.clone())
             .with_default_fetch_strategy(config.default_fetch_strategy)
-            .with_hlc_clock(hlc_clock.clone()),
+            .with_hlc_clock(hlc_clock.clone())
+            // Peer-side routing hint (ADR-0029 §D5): replica candidates
+            // with zero Healthy data pools are excluded from the gRPC
+            // fetch path; Phase A all-healthy = neutral.
+            .with_routing_hint(manifest_cache.clone()),
         );
 
         // Router handles request forwarding to correct coordinator nodes.
@@ -1395,6 +1412,9 @@ impl Node {
         // Storage pool metrics (ADR-0029 — status, bytes free/total,
         // I/O error counter per pool).
         pool_registry.register_metrics(&*metrics);
+        // Routing-cache metrics (ADR-0029 §D5 — cache misses,
+        // error-driven failovers).
+        manifest_cache.register_metrics(&*metrics);
 
         // Register RocksDB property gauges into the central metrics registry.
         metadata_store.metrics().register(&*metrics);
@@ -1718,7 +1738,50 @@ impl Node {
         // its self-announcement, so seeds learn it immediately.
         let node_manifest =
             crate::pool_manifest::build_node_manifest(announce_incarnation, &pool_registry);
-        membership.set_self_manifest(node_manifest);
+        membership.set_self_manifest(node_manifest.clone());
+        // Seed the routing cache with the self manifest so the node's
+        // own pool state is visible to the exclusion filters (and the
+        // peers' caches converge to include it via gossip).
+        manifest_cache.update(NodeId::new(&config.node_id), Arc::new(node_manifest));
+
+        // ---- 15e. Routing-cache event subscriber (ADR-0029 §D5) ----
+        // Populates the per-peer manifest cache from membership events:
+        // version-bumped entries carry the manifest (f6), Dead/Left
+        // members are evicted. The cache is a hint — a stale-but-present
+        // manifest beats absent, and the error path is the guarantee.
+        let cache_events = membership.subscribe();
+        let cache_for_events = manifest_cache.clone();
+        let cache_shutdown = membership.shutdown_token();
+        tokio::spawn(async move {
+            let mut cache_events = cache_events;
+            loop {
+                tokio::select! {
+                    event = cache_events.recv() => {
+                        match event {
+                            Ok(ev) => {
+                                match ev.new_state {
+                                    oceanfs_core::NodeState::Dead
+                                    | oceanfs_core::NodeState::Left => {
+                                        cache_for_events.remove(&ev.node_id);
+                                    }
+                                    _ => {
+                                        if let Some(manifest) = ev.manifest {
+                                            cache_for_events.update(ev.node_id, manifest);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!(skipped = n, "routing cache subscriber lagged");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                    _ = cache_shutdown.cancelled() => break,
+                }
+            }
+            tracing::debug!("routing cache subscriber shut down");
+        });
 
         let join_incarnation = Incarnation::new(announce_incarnation);
         let join_fallback_seeds = durable_state.fallback_seeds.clone();

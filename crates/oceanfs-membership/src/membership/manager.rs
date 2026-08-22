@@ -542,13 +542,25 @@ impl Membership {
                                     .parse::<SocketAddr>()
                                     .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 9001)));
                                 if let Some(id) = nid {
-                                    // Join-time pull: entries carry no
-                                    // attribution (version 0, empty
-                                    // origin — the joiner has no local
-                                    // facts yet, so the incarnation and
-                                    // F1d gates alone decide). The
-                                    // storage-pool manifest (ADR-0029
-                                    // D2), when present, rides along.
+                                    // Join-time pull: the pulled entry's
+                                    // REAL attribution travels with it —
+                                    // the seed's stored (origin, version)
+                                    // is exactly what the joiner must
+                                    // converge to. Forcing version 0 /
+                                    // empty origin here created `X@0
+                                    // origin ""` entries that outrank the
+                                    // target's own announcements (class 2
+                                    // beats class 1 at equal incarnation)
+                                    // and echoed cluster-wide, regressing
+                                    // versions (f7 routing-cache exposed:
+                                    // the version-bumped manifest flip
+                                    // never propagated). Pre-attribution
+                                    // entries (origin "", version 0) keep
+                                    // those values — the incarnation and
+                                    // F1d gates still decide the outer
+                                    // order. The storage-pool manifest
+                                    // (ADR-0029 D2), when present, rides
+                                    // along.
                                     let manifest = entry.manifest.as_ref().map(|m| {
                                         std::sync::Arc::new(
                                             crate::manifest::NodeManifest::from_proto(m),
@@ -559,8 +571,8 @@ impl Membership {
                                         state,
                                         inc,
                                         Some(grpc_addr),
-                                        0,
-                                        NodeId::new(""),
+                                        entry.version,
+                                        NodeId::new(&entry.origin),
                                         Some(membership_addr),
                                         manifest,
                                     );
@@ -1915,5 +1927,62 @@ mod tests {
             Some(manifest),
             "a manifest-less entry must preserve the cached manifest"
         );
+    }
+
+    /// Join-pull attribution regression (f7): the join-time pull must
+    /// store the pulled entry's REAL (version, origin) — the seed's
+    /// stored attribution is exactly what the joiner must converge to.
+    /// The historical force-to-(0, "") created `X@0 origin ""` entries
+    /// that outrank the target's own announcements (class 2 beats
+    /// class 1 at equal incarnation), so a later version-bumped
+    /// re-announcement (a pool-change manifest flip, ADR-0029 D2) was
+    /// rejected forever — the flip never propagated.
+    #[test]
+    fn join_pull_preserves_attribution_so_version_bumps_propagate() {
+        let (_ring, m) = make_membership("joiner");
+
+        // What the seed's pull response carries: the target's own
+        // announcement as the seed stored it (origin = target, its
+        // real version). The pull upserts exactly this.
+        let addr: SocketAddr = "127.0.0.1:9005".parse().unwrap();
+        m.upsert_node_attributed_inner(
+            NodeId::new("peer"),
+            NodeState::Alive,
+            Incarnation::new(1),
+            Some(addr),
+            5,
+            NodeId::new("peer"),
+            Some(addr),
+            None,
+        );
+
+        // The joiner's stored entry carries the seed's attribution —
+        // NOT the forced (version 0, origin "") of the old code.
+        let stored = m
+            .nodes_full()
+            .into_iter()
+            .find(|(id, _, _, _, _, _, _, _)| id.as_str() == "peer")
+            .expect("peer entry stored");
+        assert_eq!(stored.5, 5, "the pulled version must be preserved");
+        assert_eq!(stored.6.as_str(), "peer", "the pulled origin must be preserved");
+
+        // A later version-bumped re-announcement from the target (the
+        // f7 manifest flip) merges: same origin, higher version — no
+        // class-2 "" blocker stands in its way.
+        m.upsert_node_attributed(
+            NodeId::new("peer"),
+            NodeState::Alive,
+            Incarnation::new(1),
+            Some(addr),
+            6,
+            NodeId::new("peer"),
+            Some(addr),
+        );
+        let bumped = m
+            .nodes_full()
+            .into_iter()
+            .find(|(id, _, _, _, _, _, _, _)| id.as_str() == "peer")
+            .expect("peer entry stored");
+        assert_eq!(bumped.5, 6, "the version-bumped announcement must be applied");
     }
 }
