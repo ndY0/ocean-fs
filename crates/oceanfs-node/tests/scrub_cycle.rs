@@ -36,6 +36,7 @@ fn make_data_store(entries: Vec<(SegmentId, Vec<u8>)>) -> Arc<dyn SegmentDataSto
 fn make_sealed_segment(id: SegmentId, data: &[u8]) -> SegmentMetadata {
     let merkle_root = MerkleTree::build(data, 0).map(|t| t.root().hash());
     SegmentMetadata {
+        pool_id: 0,
         segment_id: id,
         ec_k: 4,
         ec_m: 2,
@@ -172,6 +173,7 @@ async fn scrub_without_merkle_root_still_scans_bytes() {
 
     // Segment WITHOUT a stored Merkle root
     let seg_meta = SegmentMetadata {
+        pool_id: 0,
         segment_id: seg_id,
         ec_k: 4,
         ec_m: 2,

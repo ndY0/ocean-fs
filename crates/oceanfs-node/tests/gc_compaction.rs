@@ -49,6 +49,7 @@ fn make_object(key: &str, size: u64, chunk: ChunkRef) -> ObjectMetadata {
 /// Helper: create a sealed segment metadata entry.
 fn make_segment(id: SegmentId, tier: SizeTier, sealed_at: i64) -> SegmentMetadata {
     SegmentMetadata {
+        pool_id: 0,
         segment_id: id,
         ec_k: 4,
         ec_m: 2,

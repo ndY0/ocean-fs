@@ -1534,6 +1534,7 @@ mod tests {
             .reserve(
                 id,
                 SegmentMetadata {
+                    pool_id: 0,
                     segment_id: id,
                     ec_k: 0,
                     ec_m: 0,
@@ -2558,6 +2559,7 @@ mod tests {
         let drain = std::thread::spawn(move || {
             while let Some(work) = rx.blocking_recv() {
                 let meta = SegmentMetadata {
+                    pool_id: 0,
                     segment_id: work.segment_id,
                     ec_k: work.ec_k,
                     ec_m: work.ec_m,

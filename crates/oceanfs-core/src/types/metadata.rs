@@ -116,8 +116,11 @@ impl ObjectMetadata {
 
 /// Metadata for a sealed segment.
 ///
-/// Stored in the `segments` RocksDB column family. Tracks EC parameters,
-/// storage locations, and the Merkle root for integrity verification.
+/// Tracks EC parameters, storage locations, the Merkle root for integrity
+/// verification, and the storage-pool id (ADR-0029: the segment→pool
+/// mapping, persisted through the event WAL / checkpoint — the only
+/// durable segment-state path, ADR-0024/25). `pool_id = 0` is the legacy
+/// single-root layout.
 ///
 /// # Examples
 ///
@@ -132,6 +135,7 @@ impl ObjectMetadata {
 ///     merkle_root: None,
 ///     storage_locations: smallvec::SmallVec::new(),
 ///     sealed_at: Some(1700000000000),
+///     pool_id: 0,
 /// };
 /// assert!(meta.is_sealed());
 /// ```
@@ -151,6 +155,13 @@ pub struct SegmentMetadata {
     pub storage_locations: smallvec::SmallVec<[NodeId; 16]>,
     /// Timestamp when the segment was sealed (milliseconds since epoch).
     pub sealed_at: Option<i64>,
+    /// The storage pool holding this segment's `.dat` file (ADR-0029 §D1).
+    ///
+    /// `0` = the legacy `{data_dir}/segments` root. Defaults to `0` on
+    /// deserialize so legacy event-WAL records, checkpoints, and metadata
+    /// payloads keep working — no migration pass (f5 accepted deviation).
+    #[serde(default)]
+    pub pool_id: u32,
 }
 
 impl SegmentMetadata {
@@ -339,6 +350,7 @@ mod tests {
     #[test]
     fn segment_metadata_is_sealed_when_sealed_at_present() {
         let meta = SegmentMetadata {
+            pool_id: 0,
             segment_id: SegmentId::new(),
             ec_k: 4,
             ec_m: 2,
@@ -360,8 +372,52 @@ mod tests {
             merkle_root: None,
             storage_locations: smallvec::SmallVec::new(),
             sealed_at: None,
+            pool_id: 0,
         };
         assert!(!meta.is_sealed());
+    }
+
+    // -- SegmentMetadata: pool_id (ADR-0029 f5) --
+
+    /// The pool_id round-trips through serde (json + bincode — the
+    /// checkpoint wire format).
+    #[test]
+    fn segment_metadata_pool_id_serde_roundtrip() {
+        let meta = SegmentMetadata {
+            segment_id: SegmentId::new(),
+            ec_k: 4,
+            ec_m: 2,
+            size_tier: SizeTier::Standard,
+            merkle_root: None,
+            storage_locations: smallvec::SmallVec::new(),
+            sealed_at: Some(1700000000000),
+            pool_id: 3,
+        };
+
+        let json = serde_json::to_string(&meta).unwrap();
+        let from_json: SegmentMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(from_json.pool_id, 3);
+
+        let bincode_bytes = bincode::serialize(&meta).unwrap();
+        let from_bincode: SegmentMetadata = bincode::deserialize(&bincode_bytes).unwrap();
+        assert_eq!(from_bincode.pool_id, 3);
+    }
+
+    /// Legacy records (no pool_id field) deserialize with pool_id = 0 —
+    /// the legacy root. No migration needed (f5 accepted deviation).
+    #[test]
+    fn segment_metadata_legacy_record_defaults_pool_id_zero() {
+        let legacy_json = r#"{
+            "segment_id": "00000000-0000-0000-0000-000000000001",
+            "ec_k": 4,
+            "ec_m": 2,
+            "size_tier": "Standard",
+            "merkle_root": null,
+            "storage_locations": [],
+            "sealed_at": 1700000000000
+        }"#;
+        let meta: SegmentMetadata = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(meta.pool_id, 0, "legacy records default to the legacy root");
     }
 
     // -- SegmentIndexEntry --

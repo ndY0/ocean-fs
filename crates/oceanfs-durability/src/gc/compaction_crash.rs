@@ -131,8 +131,13 @@ impl Harness {
                 .with_event_wal(event_wal.clone()),
         );
         let segments_dir = dir.join("segments");
-        let data_store = Arc::new(DiskSegmentStore::new(segments_dir.clone()));
-        let shard_store = Arc::new(DiskSegmentShardStore::new(segments_dir.clone()));
+        let data_store =
+            Arc::new(DiskSegmentStore::new(Vec::new(), segments_dir.clone(), Arc::new(|_| None)));
+        let shard_store = Arc::new(DiskSegmentShardStore::new(
+            Vec::new(),
+            segments_dir.clone(),
+            Arc::new(|_| None),
+        ));
         let sealer = Arc::new(SegmentSealer::new(
             SealConfig { data_dir: segments_dir.clone(), ..Default::default() },
             data_wal.clone(),
@@ -167,6 +172,7 @@ impl Harness {
         self.lifecycle.request_reserve(id, SizeTier::Standard, 4, 2).await.unwrap();
         self.data_store.write_segment_data(&id, data).unwrap();
         let meta = SegmentMetadata {
+            pool_id: 0,
             segment_id: id,
             ec_k: 4,
             ec_m: 2,

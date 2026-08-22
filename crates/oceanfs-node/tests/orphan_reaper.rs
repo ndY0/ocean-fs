@@ -68,6 +68,7 @@ fn make_shard_store() -> Arc<InMemorySegmentShardStore> {
 /// Helper: create a segment metadata with the given sealed timestamp.
 fn make_segment(id: SegmentId, sealed_at: i64) -> SegmentMetadata {
     SegmentMetadata {
+        pool_id: 0,
         segment_id: id,
         ec_k: 4,
         ec_m: 2,

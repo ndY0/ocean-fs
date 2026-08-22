@@ -143,7 +143,7 @@ impl SegmentCompactor {
             self.request_old_deletion(segment_id).await?;
             self.stall_at(5).await; // seam: after the DeleteEvent(old) (fully-dead path)
             self.shard_store
-                .delete_shards(segment_id)
+                .delete_shards_with_pool(segment_meta.pool_id, segment_id)
                 .map_err(|e| oceanfs_storage::Error::Io(std::io::Error::other(e.to_string())))?;
             tracing::info!(
                 segment_id = %segment_id,
@@ -281,6 +281,7 @@ impl SegmentCompactor {
         let now_ms =
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
         let new_seg_meta = SegmentMetadata {
+            pool_id: 0,
             segment_id: new_segment_id,
             ec_k: segment_meta.ec_k,
             ec_m: segment_meta.ec_m,
@@ -352,11 +353,12 @@ impl SegmentCompactor {
         self.stall_at(5).await; // seam: after the DeleteEvent(old) (OldDeleted)
 
         // OldRemoved → unlink the old `.dat` (only after the durable
-        // delete returned).
+        // delete returned) — from the old segment's pool root (the
+        // metadata the caller holds; ADR-0029 f5).
         state = CompactionState::OldRemoved;
         tracing::debug!(?state, "compaction milestone: old .dat unlinked");
         self.shard_store
-            .delete_shards(segment_id)
+            .delete_shards_with_pool(segment_meta.pool_id, segment_id)
             .map_err(|e| oceanfs_storage::Error::Io(std::io::Error::other(e.to_string())))?;
 
         tracing::info!(
@@ -397,7 +399,12 @@ impl SegmentCompactor {
                 "compaction cleanup delete failed; the Reserved entry is dropped by the next recovery"
             );
         }
-        let _ = self.shard_store.delete_shards(new_segment_id);
+        // The new segment's `.dat` was written via `write_segment_data`
+        // (resolver-based): for a not-yet-registered segment the resolver
+        // yields None → pool_id 0 → the first data pool root when pools
+        // are configured, else the legacy dir — consistent with this
+        // unlink (Phase A compaction placement, ADR-0029 f5).
+        let _ = self.shard_store.delete_shards_with_pool(0, new_segment_id);
     }
 
     /// Test seam for the compaction crash-window matrix (rows 7–9):
@@ -495,6 +502,7 @@ mod tests {
 
     fn make_segment_meta(id: SegmentId, tier: SizeTier, sealed_at: i64) -> SegmentMetadata {
         SegmentMetadata {
+            pool_id: 0,
             segment_id: id,
             ec_k: 4,
             ec_m: 2,

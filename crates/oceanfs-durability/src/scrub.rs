@@ -1070,6 +1070,7 @@ mod tests {
         let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
+            pool_id: 0,
             segment_id: seg_id,
             ec_k: 4,
             ec_m: 2,
@@ -1101,6 +1102,7 @@ mod tests {
         let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
+            pool_id: 0,
             segment_id: seg_id,
             ec_k: 4,
             ec_m: 2,
@@ -1157,6 +1159,7 @@ mod tests {
         let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
+            pool_id: 0,
             segment_id: seg_id,
             ec_k: 4,
             ec_m: 2,
@@ -1190,6 +1193,7 @@ mod tests {
         let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
+            pool_id: 0,
             segment_id: seg_id,
             ec_k: 4,
             ec_m: 2,
@@ -1218,6 +1222,7 @@ mod tests {
         let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
+            pool_id: 0,
             segment_id: seg_id,
             ec_k: 4,
             ec_m: 2,
@@ -1252,6 +1257,7 @@ mod tests {
         let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
+            pool_id: 0,
             segment_id: seg_id,
             ec_k: 4,
             ec_m: 2,
@@ -1282,6 +1288,7 @@ mod tests {
 
         let seg_id = SegmentId::new();
         let seg_meta = SegmentMetadata {
+            pool_id: 0,
             segment_id: seg_id,
             ec_k: 4,
             ec_m: 2,
@@ -1310,6 +1317,7 @@ mod tests {
         let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
+            pool_id: 0,
             segment_id: seg_id,
             ec_k: 4,
             ec_m: 2,
@@ -1358,6 +1366,7 @@ mod tests {
             .reserve(
                 sealed_id,
                 SegmentMetadata {
+                    pool_id: 0,
                     segment_id: sealed_id,
                     ec_k: 4,
                     ec_m: 2,
@@ -1372,6 +1381,7 @@ mod tests {
             .seal(
                 sealed_id,
                 SegmentMetadata {
+                    pool_id: 0,
                     segment_id: sealed_id,
                     ec_k: 4,
                     ec_m: 2,
@@ -1391,6 +1401,7 @@ mod tests {
             .reserve(
                 phantom_id,
                 SegmentMetadata {
+                    pool_id: 0,
                     segment_id: phantom_id,
                     ec_k: 4,
                     ec_m: 2,
@@ -1430,6 +1441,7 @@ mod tests {
             stored_data.push((seg_id, data));
 
             let seg_meta = SegmentMetadata {
+                pool_id: 0,
                 segment_id: seg_id,
                 ec_k: 4,
                 ec_m: 2,
@@ -1468,6 +1480,7 @@ mod tests {
 
         // Metadata stores the correct Merkle root
         let seg_meta = SegmentMetadata {
+            pool_id: 0,
             segment_id: seg_id,
             ec_k: 4,
             ec_m: 2,
@@ -1581,6 +1594,7 @@ mod tests {
         let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
+            pool_id: 0,
             segment_id: seg_id,
             ec_k: 4,
             ec_m: 2,
@@ -1699,6 +1713,7 @@ mod tests {
             stored_data.push((seg_id, data));
 
             let seg_meta = SegmentMetadata {
+                pool_id: 0,
                 segment_id: seg_id,
                 ec_k: 4,
                 ec_m: 2,

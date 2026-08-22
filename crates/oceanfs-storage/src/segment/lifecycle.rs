@@ -298,6 +298,7 @@ pub struct RebuildOutcome {
 ///     merkle_root: None,
 ///     storage_locations: smallvec::SmallVec::new(),
 ///     sealed_at: None,
+///     pool_id: 0,
 /// };
 /// registry.reserve(id, meta).unwrap();
 /// let entry = registry.get(id).unwrap();
@@ -319,27 +320,35 @@ pub fn entry_is_garbage(entry: &LifecycleEntry, pos: &DataWalPos) -> bool {
 // later entries (a segment's final `data_wal_pos` must be recorded
 // before its re-seal reads it).
 
-/// Reads a segment's data section from its durable `.dat` and computes
-/// the recovery merkle root via the caller's root builder — the same
-/// construction the seal worker uses, so adopted segments carry
+/// Reads a segment's data section from its durable `.dat` (in any of the
+/// candidate (dir, pool_id) pairs — the legacy dir plus pool roots) and
+/// computes the recovery merkle root via the caller's root builder — the
+/// same construction the seal worker uses, so adopted segments carry
 /// matching roots (crash-window row 3).
 ///
-/// `None` when the file is missing or unparsable (the segment falls
-/// back to WAL replay).
+/// Returns `(root, pool_id)` of the directory that held the file. `None`
+/// when the file is missing or unparsable in every candidate dir (the
+/// segment falls back to WAL replay).
 fn read_segment_data_root(
-    segments_dir: &std::path::Path,
+    segments_dirs: &[(std::path::PathBuf, u32)],
     id: SegmentId,
     merkle_root_fn: &(dyn Fn(&[u8]) -> Option<HashOutput> + Send + Sync),
-) -> Option<HashOutput> {
-    let path = segments_dir.join(format!("{id}.dat"));
-    let raw = std::fs::read(path).ok()?;
-    let header = SegmentHeader::from_bytes(&raw)?;
-    let hdr_size = SegmentHeader::header_size(header.version);
-    let data_end = (hdr_size as u64 + header.size) as usize;
-    if data_end > raw.len() {
-        return None; // truncated tail — leave to WAL replay
+) -> Option<(HashOutput, u32)> {
+    for (segments_dir, pool_id) in segments_dirs {
+        let path = segments_dir.join(format!("{id}.dat"));
+        let Ok(raw) = std::fs::read(path) else { continue };
+        let Some(header) = SegmentHeader::from_bytes(&raw) else { continue };
+        let hdr_size = SegmentHeader::header_size(header.version);
+        let data_end = (hdr_size as u64 + header.size) as usize;
+        if data_end > raw.len() {
+            // Truncated tail — leave to WAL replay, but keep probing
+            // other candidate dirs (the file may exist elsewhere).
+            continue;
+        }
+        let root = merkle_root_fn(&raw[hdr_size..data_end])?;
+        return Some((root, *pool_id));
     }
-    merkle_root_fn(&raw[hdr_size..data_end])
+    None
 }
 
 /// Returns the number of registry shards for the given configuration.
@@ -392,6 +401,7 @@ pub fn shard_count(config: &LifecycleConfig) -> usize {
 ///     merkle_root: None,
 ///     storage_locations: smallvec::SmallVec::new(),
 ///     sealed_at: None,
+///     pool_id: 0,
 /// };
 /// assert!(registry.reserve(id, meta).is_ok());
 /// assert_eq!(registry.len(), 1);
@@ -608,6 +618,7 @@ impl SegmentLifecycleRegistry {
     ///     merkle_root: None,
     ///     storage_locations: smallvec::SmallVec::new(),
     ///     sealed_at: None,
+    ///     pool_id: 0,
     /// };
     /// registry.reserve(id, meta).unwrap();
     /// assert!(matches!(registry.read_source(id), SegmentReadSource::ActiveSlot));
@@ -671,6 +682,7 @@ impl SegmentLifecycleRegistry {
             }
             None => {
                 let meta = SegmentMetadata {
+                    pool_id: 0,
                     segment_id: id,
                     ec_k,
                     ec_m,
@@ -1403,6 +1415,7 @@ impl SegmentLifecycleCoordinator {
             let fold_result = match evt {
                 SegmentEvent::Reserve(evt) => {
                     let meta = SegmentMetadata {
+                        pool_id: 0,
                         segment_id: evt.segment_id,
                         ec_k: evt.ec_k,
                         ec_m: evt.ec_m,
@@ -1419,6 +1432,7 @@ impl SegmentLifecycleCoordinator {
                     // entries only; the seal keeps the position).
                     self.registry.record_data_wal_pos(evt.segment_id, evt.data_wal_pos);
                     let meta = SegmentMetadata {
+                        pool_id: 0,
                         segment_id: evt.segment_id,
                         ec_k: evt.ec_k,
                         ec_m: evt.ec_m,
@@ -1427,6 +1441,10 @@ impl SegmentLifecycleCoordinator {
                         storage_locations: smallvec::SmallVec::new(),
                         sealed_at: Some(0), // deterministic sentinel — the event carries no timestamp
                     };
+                    // The durable segment→pool mapping (ADR-0029 f5):
+                    // legacy events carry pool_id = 0 (the legacy root).
+                    let mut meta = meta;
+                    meta.pool_id = evt.pool_id;
                     self.registry.seal_with(evt.segment_id, meta, evt.repacked_from)
                 }
                 SegmentEvent::Delete(evt) => self.registry.delete(evt.segment_id),
@@ -1562,7 +1580,10 @@ impl SegmentLifecycleCoordinator {
         });
         let reserved_ids: std::collections::HashSet<SegmentId> =
             reserved.iter().map(|(id, _)| *id).collect();
-        let segments_dir = sealer.segment_data_dir().to_path_buf();
+        // Multi-root adopt probe (ADR-0029 f5): an interrupted seal's
+        // `.dat` may live in the legacy segments dir OR any data pool
+        // root (the seal selected the target before the crash).
+        let segments_dirs = sealer.segment_data_dirs();
 
         // 2. Split adopt vs replay by the durable `.dat` presence. The
         //    probe validates the FULL data section (header + data_end
@@ -1573,25 +1594,28 @@ impl SegmentLifecycleCoordinator {
         //    and then truncate its only durable copy).
         let mut adopt: std::collections::HashSet<SegmentId> = std::collections::HashSet::new();
         for (id, _) in &reserved {
-            let path = segments_dir.join(format!("{id}.dat"));
-            if let Ok(raw) = std::fs::read(&path) {
-                if let Some(header) = SegmentHeader::from_bytes(&raw) {
-                    let hdr_size = SegmentHeader::header_size(header.version);
-                    let data_end = (hdr_size as u64 + header.size) as usize;
-                    if data_end <= raw.len() {
-                        adopt.insert(*id);
-                        continue;
+            for (segments_dir, _pool_id) in &segments_dirs {
+                let path = segments_dir.join(format!("{id}.dat"));
+                if let Ok(raw) = std::fs::read(&path) {
+                    if let Some(header) = SegmentHeader::from_bytes(&raw) {
+                        let hdr_size = SegmentHeader::header_size(header.version);
+                        let data_end = (hdr_size as u64 + header.size) as usize;
+                        if data_end <= raw.len() {
+                            adopt.insert(*id);
+                            break;
+                        }
                     }
+                    tracing::warn!(
+                        segment_id = %id,
+                        "interrupted-seal .dat unparsable or truncated; removing it and falling back to WAL replay"
+                    );
+                    // The file is untrustworthy (an interrupted seal's
+                    // artifact is only valid if fully written). Remove it
+                    // so the re-seal's readiness wait actually waits for
+                    // the fresh .dat instead of seeing the corrupt one.
+                    let _ = std::fs::remove_file(&path);
+                    break;
                 }
-                tracing::warn!(
-                    segment_id = %id,
-                    "interrupted-seal .dat unparsable or truncated; removing it and falling back to WAL replay"
-                );
-                // The file is untrustworthy (an interrupted seal's
-                // artifact is only valid if fully written). Remove it
-                // so the re-seal's readiness wait actually waits for
-                // the fresh .dat instead of seeing the corrupt one.
-                let _ = std::fs::remove_file(&path);
             }
         }
 
@@ -1659,14 +1683,18 @@ impl SegmentLifecycleCoordinator {
 
         // 5. Adopt the durable `.dat` segments (row 3): recompute the
         //    root and append the SealEvent via request_seal — no re-seal
-        //    I/O.
+        //    I/O. The owning pool id of the directory that held the file
+        //    is stamped on the adopted metadata (the interrupted seal's
+        //    durable selection, ADR-0029 f5).
         for &id in &adopt {
             let Some(entry) = self.registry.get(id) else { continue };
-            let Some(root) = read_segment_data_root(&segments_dir, id, merkle_root_fn) else {
+            let Some((root, pool_id)) = read_segment_data_root(&segments_dirs, id, merkle_root_fn)
+            else {
                 tracing::warn!(segment_id = %id, "adopt failed to read .dat; leaving Reserved");
                 continue;
             };
             let meta = SegmentMetadata {
+                pool_id: 0,
                 segment_id: id,
                 ec_k: entry.metadata.ec_k,
                 ec_m: entry.metadata.ec_m,
@@ -1680,6 +1708,10 @@ impl SegmentLifecycleCoordinator {
                         .as_millis() as i64,
                 ),
             };
+            // The durable segment→pool mapping: the directory that held
+            // the `.dat` (legacy = 0) is the segment's pool.
+            let mut meta = meta;
+            meta.pool_id = pool_id;
             self.request_seal(id, meta, None)
                 .await
                 .map_err(|e| Error::Io(std::io::Error::other(format!("adopt seal failed: {e}"))))?;
@@ -1710,8 +1742,11 @@ impl SegmentLifecycleCoordinator {
         if !replayed_ids.is_empty() {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             for id in &replayed_ids {
-                let path = segments_dir.join(format!("{id}.dat"));
-                while !path.exists() {
+                // The re-seal may target any data pool root (ADR-0029
+                // f5) — wait for the `.dat` in ANY candidate dir.
+                let exists =
+                    || segments_dirs.iter().any(|(dir, _)| dir.join(format!("{id}.dat")).exists());
+                while !exists() {
                     if std::time::Instant::now() > deadline {
                         tracing::warn!(
                             segment_id = %id,
@@ -1799,6 +1834,7 @@ impl SegmentLifecycleCoordinator {
     ) -> Result<(), TransitionError> {
         self.registry.validate_reserve(id)?;
         let meta = SegmentMetadata {
+            pool_id: 0,
             segment_id: id,
             ec_k,
             ec_m,
@@ -1912,6 +1948,7 @@ impl SegmentLifecycleCoordinator {
             merkle_root,
             data_wal_pos,
             repacked_from,
+            pool_id: metadata.pool_id,
         });
         let pos = event_wal
             .append(evt)
@@ -2087,6 +2124,7 @@ impl SegmentLifecycleCoordinator {
                 merkle_root,
                 data_wal_pos,
                 repacked_from: None,
+                pool_id: meta.pool_id,
             });
             match event_wal.append(evt).await {
                 Ok(pos) => {
@@ -2279,6 +2317,7 @@ mod tests {
 
     fn test_metadata(segment_id: SegmentId, sealed: bool) -> SegmentMetadata {
         SegmentMetadata {
+            pool_id: 0,
             segment_id,
             ec_k: 4,
             ec_m: 2,
@@ -3066,6 +3105,7 @@ mod tests {
                         sealer.append_wal_entry(entry).await.unwrap();
                     }
                     let meta = SegmentMetadata {
+                        pool_id: 0,
                         segment_id: seg_id,
                         ec_k: 2,
                         ec_m: 1,
@@ -3466,6 +3506,7 @@ mod tests {
         );
 
         let sealed_meta = SegmentMetadata {
+            pool_id: 0,
             segment_id: id,
             ec_k: 4,
             ec_m: 2,
@@ -3518,6 +3559,7 @@ mod tests {
             match evt {
                 SegmentEvent::Reserve(evt) => {
                     let meta = SegmentMetadata {
+                        pool_id: 0,
                         segment_id: evt.segment_id,
                         ec_k: evt.ec_k,
                         ec_m: evt.ec_m,
@@ -3530,6 +3572,7 @@ mod tests {
                 }
                 SegmentEvent::Seal(evt) => {
                     let meta = SegmentMetadata {
+                        pool_id: 0,
                         segment_id: evt.segment_id,
                         ec_k: evt.ec_k,
                         ec_m: evt.ec_m,

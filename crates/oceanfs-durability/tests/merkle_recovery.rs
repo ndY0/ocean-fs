@@ -19,6 +19,7 @@ fn test_rebuild_from_segment_scan_populates_tree() {
     let seg_id1 = SegmentId::new();
     let merkle_root1 = oceanfs_core::HashOutput::from_bytes([0x11u8; 32]);
     let meta1 = SegmentMetadata {
+        pool_id: 0,
         segment_id: seg_id1,
         ec_k: 4,
         ec_m: 2,
@@ -33,6 +34,7 @@ fn test_rebuild_from_segment_scan_populates_tree() {
     let seg_id2 = SegmentId::new();
     let merkle_root2 = oceanfs_core::HashOutput::from_bytes([0x22u8; 32]);
     let meta2 = SegmentMetadata {
+        pool_id: 0,
         segment_id: seg_id2,
         ec_k: 4,
         ec_m: 2,
@@ -71,6 +73,7 @@ fn test_rebuild_from_segment_scan_ignores_unsealed() {
         .reserve(
             seg_unsealed,
             SegmentMetadata {
+                pool_id: 0,
                 segment_id: seg_unsealed,
                 ec_k: 4,
                 ec_m: 2,
@@ -88,6 +91,7 @@ fn test_rebuild_from_segment_scan_ignores_unsealed() {
         .reserve(
             seg_no_root,
             SegmentMetadata {
+                pool_id: 0,
                 segment_id: seg_no_root,
                 ec_k: 4,
                 ec_m: 2,
@@ -102,6 +106,7 @@ fn test_rebuild_from_segment_scan_ignores_unsealed() {
         .seal(
             seg_no_root,
             SegmentMetadata {
+                pool_id: 0,
                 segment_id: seg_no_root,
                 ec_k: 4,
                 ec_m: 2,

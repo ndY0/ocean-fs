@@ -60,6 +60,7 @@ fn make_segment_metadata(
     merkle_root: Option<HashOutput>,
 ) -> SegmentMetadata {
     SegmentMetadata {
+        pool_id: 0,
         segment_id: id,
         ec_k: 4,
         ec_m: 2,
@@ -376,6 +377,7 @@ async fn real_two_node_anti_entropy_cycle() {
     let tree_a = MerkleTree::build(&segment_data, 65536).unwrap();
     let root_a = tree_a.root().hash();
     let seg_meta_a = SegmentMetadata {
+        pool_id: 0,
         segment_id: seg_id,
         ec_k: 4,
         ec_m: 2,
@@ -391,6 +393,7 @@ async fn real_two_node_anti_entropy_cycle() {
     let tree_b = MerkleTree::build(&segment_data, 65536).unwrap();
     let root_b = tree_b.root().hash();
     let seg_meta_b = SegmentMetadata {
+        pool_id: 0,
         segment_id: seg_id,
         ec_k: 4,
         ec_m: 2,
@@ -485,6 +488,7 @@ async fn anti_entropy_handles_unreachable_peer() {
     segment_store.write_segment_data(&seg_id, &segment_data).unwrap();
 
     let seg = SegmentMetadata {
+        pool_id: 0,
         segment_id: seg_id,
         ec_k: 4,
         ec_m: 2,
@@ -527,6 +531,7 @@ async fn anti_entropy_with_no_alive_peers() {
 
     let tree = MerkleTree::build(&segment_data, 65536).unwrap();
     let seg = SegmentMetadata {
+        pool_id: 0,
         segment_id: seg_id,
         ec_k: 4,
         ec_m: 2,

@@ -40,7 +40,9 @@ pub mod wal;
 pub use buffer_pool::BufferPool;
 pub use error::{Error, Result};
 pub use metadata::{BatchOp, RocksDbMetadataStore, RocksDbMetrics};
-pub use pool::{PlacementPolicy, PoolRegistry, PoolStatus, StoragePool};
+pub use pool::{
+    resolve_pool_root, PlacementPolicy, PoolIdResolver, PoolRegistry, PoolStatus, StoragePool,
+};
 pub use segment::{
     entry_is_garbage, ActiveSegment, CheckpointInfo, DataWalPos, DeleteEvent, EventCheckpoint,
     EventWal, EventWalPos, EventWalReader, LifecycleEntry, RebuildOutcome, ReserveEvent,

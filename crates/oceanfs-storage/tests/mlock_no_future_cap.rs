@@ -111,6 +111,7 @@ fn mlock_block_cache_never_caps_future_allocations() {
     // ── 3. Verify the store works. ──────────────────────────────────
     let id = oceanfs_core::SegmentId::new();
     let meta = oceanfs_core::SegmentMetadata {
+        pool_id: 0,
         segment_id: id,
         ec_k: 0,
         ec_m: 0,

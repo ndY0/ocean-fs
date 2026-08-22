@@ -656,24 +656,45 @@ impl Node {
         );
 
         // ADR-0001: tiered segment sizing driven by SegmentSizeConfig.
+        // ---- f5: pool-aware segment placement + resolution ----
+        // Sealed segments spread across the node's data pools: the sealer
+        // selects the target once per segment (PlacementPolicy over the
+        // registry snapshot) and stamps `pool_id` on the metadata; every
+        // reader/GC store resolves the owning root through this resolver
+        // (the lifecycle registry's `SegmentMetadata.pool_id`, durable via
+        // the event WAL + checkpoint).
+        // Legacy mode (no pools configured) must pass an EMPTY pool list:
+        // the registry's implicit data pool (root = data_dir) is a
+        // runtime fallback, not a placement target — the sealer's legacy
+        // branch (empty `data_pools` → `data_dir`, pool_id 0) keeps
+        // today's byte-for-byte layout.
+        let data_pools =
+            if config.storage.pools.is_empty() { Vec::new() } else { pool_registry.data_pools() };
+        let segment_legacy_dir = config.data_dir.join("segments");
+        let pool_id_for: oceanfs_storage::PoolIdResolver = {
+            let registry = Arc::clone(&lifecycle_registry);
+            Arc::new(move |segment_id: &oceanfs_core::SegmentId| {
+                registry.get(*segment_id).map(|entry| entry.metadata.pool_id)
+            })
+        };
         let seal_config = oceanfs_storage::SealConfig {
+            data_pools: data_pools.clone(),
             target_size_bytes: segment_size.default_target_size,
             seal_timeout_ms: 5000,
-            data_dir: config.data_dir.join("segments"),
+            data_dir: segment_legacy_dir.clone(),
             io_mode: oceanfs_storage::io::IoReadMode::from_config(config.read_cache_segments),
-            write_mode: oceanfs_storage::io::SegmentWriteMode::probe(
-                config.data_dir.join("segments"),
-            ),
+            write_mode: oceanfs_storage::io::SegmentWriteMode::probe(segment_legacy_dir.clone()),
             // Seal pipeline batching (userland-configurable): the fsync
             // group-commit window and the early-flush trigger size.
             fsync_batch_timeout_ms: config.seal_fsync_batch_timeout_ms,
             fsync_max_waiters: config.seal_fsync_max_waiters,
         };
         // SegmentSealer is the authoritative persistence path. Sealed
-        // segments are written to {data_dir}/segments/ with the configured
-        // I/O mode (O_DIRECT or buffered). The shared segment data store
-        // is used by anti-entropy and healing below.
-        let segment_dir = config.data_dir.join("segments");
+        // segments are written to {data_dir}/segments/ (legacy) or the
+        // selected data pool root (pool mode, ADR-0029 f5) with the
+        // configured I/O mode (O_DIRECT or buffered). The shared segment
+        // data store is used by anti-entropy and healing below.
+        let segment_dir = segment_legacy_dir.clone();
         // The seal worker runs BEFORE the WAL replay (replayed segments
         // seal during replay), so the segment directory must already
         // exist when the first replay seal fires.
@@ -770,11 +791,15 @@ impl Node {
         let gc_worker = Arc::new(
             oceanfs_durability::GarbageCollector::new(gc_config.clone())
                 .with_data_store(Arc::new(oceanfs_durability::DiskSegmentStore::new(
-                    segment_dir.clone(),
+                    data_pools.clone(),
+                    segment_legacy_dir.clone(),
+                    pool_id_for.clone(),
                 )))
                 .with_lifecycle(lifecycle.clone())
                 .with_shard_store(Arc::new(oceanfs_durability::DiskSegmentShardStore::new(
-                    segment_dir.clone(),
+                    data_pools.clone(),
+                    segment_legacy_dir.clone(),
+                    pool_id_for.clone(),
                 ))),
         );
 
@@ -812,7 +837,11 @@ impl Node {
             membership.clone(),
             Arc::clone(&lifecycle_registry),
             pool.clone(),
-            Arc::new(oceanfs_durability::DiskSegmentStore::new(segment_dir.clone())),
+            Arc::new(oceanfs_durability::DiskSegmentStore::new(
+                data_pools.clone(),
+                segment_legacy_dir.clone(),
+                pool_id_for.clone(),
+            )),
             merkle_tree.clone(),
         ));
         let mut scrub_config = oceanfs_durability::ScrubConfig::default();
@@ -821,20 +850,27 @@ impl Node {
         let scrub_worker = Arc::new(oceanfs_durability::ScrubCoordinator::new(scrub_config));
         // OrphanReaper deletes segment data files from disk when reclaiming
         // orphaned segments after GC compaction.
-        let reaper_shard_store: Arc<dyn oceanfs_durability::SegmentShardStore> = Arc::new(
-            oceanfs_durability::DiskSegmentShardStore::new(config.data_dir.join("segments")),
-        );
+        let reaper_shard_store: Arc<dyn oceanfs_durability::SegmentShardStore> =
+            Arc::new(oceanfs_durability::DiskSegmentShardStore::new(
+                data_pools.clone(),
+                segment_legacy_dir.clone(),
+                pool_id_for.clone(),
+            ));
         let reaper = Arc::new(oceanfs_durability::OrphanReaper::new(
             metadata_store.clone(),
             lifecycle.clone(),
-            reaper_shard_store,
+            reaper_shard_store.clone(),
             gc_config,
         ));
 
         // ---- 7b. Construct segment data store (shared by heal and gRPC) ----
         // DiskSegmentStore reads/writes the authoritative segment files.
         let heal_data_store: Arc<dyn oceanfs_durability::SegmentDataStore> =
-            Arc::new(oceanfs_durability::DiskSegmentStore::new(segment_dir.clone()));
+            Arc::new(oceanfs_durability::DiskSegmentStore::new(
+                data_pools.clone(),
+                segment_legacy_dir.clone(),
+                pool_id_for.clone(),
+            ));
 
         // ---- 7c. Construct heal dispatch pipeline ----
         let heal_config = oceanfs_durability::HealConfig::default()
@@ -994,10 +1030,13 @@ impl Node {
                 io_mode,
                 disk_io.clone(),
                 mmap_cache,
-                config.data_dir.join("segments"),
+                segment_dir.clone(),
                 Some(accel.clone()),
                 Some(accel.clone()),
             )
+            // Pool-aware resolution (ADR-0029 f5): sealed segments read
+            // from the owning data pool root.
+            .with_data_pools(data_pools.clone(), segment_legacy_dir.clone(), pool_id_for.clone())
             .with_evict_after_read(!config.read_cache_segments),
         );
 
@@ -1231,7 +1270,18 @@ impl Node {
                     );
                 }
             }
-            let _ = std::fs::remove_file(segment_dir.join(format!("{segment_id}.dat")));
+            // Sweep the `.dat` through the pool-aware shard store (the
+            // segment's pool id resolves to its root; ADR-0029 f5).
+            // Idempotent; a residue the resolver cannot place (an
+            // unregistered orphan on a non-zero pool) is backstopped by
+            // the orphan reaper's multi-root listing.
+            if let Err(e) = reaper_shard_store.delete_shards(segment_id) {
+                warn!(
+                    segment_id = %segment_id,
+                    error = %e,
+                    "compaction recovery sweep failed (startup continues; the reaper retries)"
+                );
+            }
             info!(segment_id = %segment_id, action = label, "compaction recovery action applied");
         }
         let rebuild_ms = rebuild_start.elapsed().as_millis() as u64;
@@ -2560,7 +2610,7 @@ mod tests {
         let reaper = Arc::new(oceanfs_durability::OrphanReaper::new(
             metadata_store.clone(),
             lifecycle,
-            reaper_shard_store,
+            reaper_shard_store.clone(),
             gc_config,
         ));
 

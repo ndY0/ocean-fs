@@ -57,6 +57,46 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// Marker bytes written and read back by the startup root probe.
 const POOL_PROBE_MARKER: &[u8] = b"oceanfs pool probe";
 
+/// Resolves a segment's durable pool id (the node backs it with the
+/// lifecycle registry's `SegmentMetadata.pool_id`). `None`/unknown ids
+/// fall back to the legacy dir (f5).
+pub type PoolIdResolver = Arc<dyn Fn(&oceanfs_core::SegmentId) -> Option<u32> + Send + Sync>;
+
+/// Resolves a segment's pool root from its durable `pool_id`.
+///
+/// With pools configured, every pool-mode segment carries a real pool id
+/// (the f2 config-order scheme: 0 = the first data pool), so `pool_id`
+/// names that pool's root; the legacy `legacy_dir` is used only when no
+/// pools are configured or the id is unknown (a stale mapping). Pure
+/// lookup over the pool snapshot — no locks, no I/O (f5 perf: 2.3/7.2).
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_storage::{resolve_pool_root, PoolRegistry};
+///
+/// # let tmp = tempfile::tempdir().expect("tempdir");
+/// # let data_dir = tmp.path().join("data");
+/// let registry = PoolRegistry::from_config(
+///     &oceanfs_core::StorageConfig::default(),
+///     &data_dir,
+/// )
+/// .expect("registry");
+///
+/// // No pools configured: any id resolves to the legacy segments dir.
+/// assert_eq!(
+///     resolve_pool_root(&[], 0, std::path::Path::new("/legacy/segments")),
+///     std::path::PathBuf::from("/legacy/segments")
+/// );
+/// ```
+pub fn resolve_pool_root(pools: &[Arc<StoragePool>], pool_id: u32, legacy_dir: &Path) -> PathBuf {
+    pools
+        .iter()
+        .find(|pool| pool.id() == pool_id)
+        .map(|pool| pool.root().to_path_buf())
+        .unwrap_or_else(|| legacy_dir.to_path_buf())
+}
+
 // ---------------------------------------------------------------------------
 // PoolStatus
 // ---------------------------------------------------------------------------

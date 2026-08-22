@@ -284,6 +284,7 @@ impl Harness {
 
     async fn seal(&self, id: SegmentId, data: &[u8]) {
         let meta = SegmentMetadata {
+            pool_id: 0,
             segment_id: id,
             ec_k: 4,
             ec_m: 2,
@@ -928,6 +929,7 @@ async fn mid_log_corruption_aborts_the_fold_with_the_position() {
         // valid record follows it.
         h.event_wal
             .append(SegmentEvent::Seal(crate::segment::event_wal::SealEvent {
+                pool_id: 0,
                 segment_id: id,
                 tier: SizeTier::Small,
                 ec_k: 4,
@@ -989,6 +991,7 @@ fn entry_is_garbage_position_boundary() {
     let registry = SegmentLifecycleRegistry::new(&LifecycleConfig::default());
     let id = SegmentId::new();
     let reserved_meta = SegmentMetadata {
+        pool_id: 0,
         segment_id: id,
         ec_k: 4,
         ec_m: 2,
@@ -1008,6 +1011,7 @@ fn entry_is_garbage_sealed_position_rule_and_mutation_checks() {
     let registry = SegmentLifecycleRegistry::new(&LifecycleConfig::default());
     let id = SegmentId::new();
     let sealed_meta = SegmentMetadata {
+        pool_id: 0,
         segment_id: id,
         ec_k: 4,
         ec_m: 2,
@@ -1024,6 +1028,7 @@ fn entry_is_garbage_sealed_position_rule_and_mutation_checks() {
         .reserve(
             id,
             SegmentMetadata {
+                pool_id: 0,
                 segment_id: id,
                 ec_k: 4,
                 ec_m: 2,
@@ -1079,6 +1084,7 @@ fn entry_is_garbage_deleted_is_always_garbage() {
         .reserve(
             id,
             SegmentMetadata {
+                pool_id: 0,
                 segment_id: id,
                 ec_k: 4,
                 ec_m: 2,
@@ -1100,6 +1106,7 @@ fn entry_is_garbage_deleted_is_always_garbage() {
         .reserve(
             id,
             SegmentMetadata {
+                pool_id: 0,
                 segment_id: id,
                 ec_k: 4,
                 ec_m: 2,
@@ -1234,6 +1241,7 @@ async fn seal_after_delete_folds_as_noop() {
         h.event_wal
             .append(crate::segment::event_wal::SegmentEvent::Seal(
                 crate::segment::event_wal::SealEvent {
+                    pool_id: 0,
                     segment_id: id,
                     tier: oceanfs_core::SizeTier::Standard,
                     ec_k: 4,

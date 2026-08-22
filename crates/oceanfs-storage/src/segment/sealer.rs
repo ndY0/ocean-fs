@@ -41,6 +41,13 @@ pub struct SealConfig {
     pub seal_timeout_ms: u64,
     /// Directory where sealed segment files are written.
     pub data_dir: PathBuf,
+    /// Data pools sealed segments are spread across (ADR-0029 f5).
+    ///
+    /// Empty = legacy mode: every segment lands in `data_dir`. Non-empty:
+    /// the sealer consults `PlacementPolicy` once per new segment, writes
+    /// the `.dat` under the selected pool root, and stamps the pool id on
+    /// the segment metadata (the durable segment→pool mapping).
+    pub data_pools: Vec<Arc<crate::pool::StoragePool>>,
     /// I/O read mode for segment data I/O.
     ///
     /// When `Direct`, segment data files are opened with `O_DIRECT`
@@ -77,6 +84,7 @@ impl Default for SealConfig {
             target_size_bytes: 4 * 1024 * 1024,
             seal_timeout_ms: 5000,
             data_dir: PathBuf::new(),
+            data_pools: Vec::new(),
             io_mode: IoReadMode::Buffered,
             write_mode: SegmentWriteMode::Rename,
             fsync_batch_timeout_ms: 10,
@@ -141,7 +149,6 @@ impl SegmentSealer {
         self.flush.get_or_init(|| {
             std::sync::Arc::new(SegmentFlushGroup::new(
                 Arc::clone(&self.lifecycle),
-                self.config.data_dir.clone(),
                 self.config.fsync_batch_timeout_ms,
                 self.config.fsync_max_waiters,
             ))
@@ -329,7 +336,27 @@ impl SegmentSealer {
 
         // Write segment file: header + data + [parity] + index.
         let filename = format!("{segment_id}.dat");
-        let dir = self.config.data_dir.clone();
+        // ---- Target pool selection (ADR-0029 f5) ----
+        // Chosen once per new segment (each active segment is sealed
+        // exactly once — never per blob append). Legacy mode (no data
+        // pools configured) keeps the single `data_dir`, pool_id 0.
+        // When no pool is eligible (all below the free headroom), the
+        // first pool is used — every pool-mode segment carries a REAL
+        // pool id, so pool_id 0 is unambiguous (it names the first data
+        // pool; the legacy root only exists in legacy mode — the f5
+        // "0 = legacy" note is corrected for the f2 config-order id
+        // scheme, see the feature doc deviations).
+        let (dir, pool_id) = if self.config.data_pools.is_empty() {
+            (self.config.data_dir.clone(), 0)
+        } else {
+            match crate::pool::PlacementPolicy::new().select_from_pools(&self.config.data_pools) {
+                Some(pool) => (pool.root().to_path_buf(), pool.id()),
+                None => {
+                    let pool = &self.config.data_pools[0];
+                    (pool.root().to_path_buf(), pool.id())
+                }
+            }
+        };
         tokio::fs::create_dir_all(&dir).await?;
 
         // Metadata is built before the flush registration — the flush
@@ -338,6 +365,7 @@ impl SegmentSealer {
         // durable → fold — the coordinator is the only writer of
         // segment lifecycle state; ADR-0025 phase 1).
         let meta = SegmentMetadata {
+            pool_id: 0,
             segment_id,
             ec_k,
             ec_m,
@@ -351,6 +379,11 @@ impl SegmentSealer {
                     .as_millis() as i64,
             ),
         };
+        // The durable segment→pool mapping: stamp the selected pool id on
+        // the metadata the lifecycle coordinator persists (event WAL +
+        // checkpoint, ADR-0024/25 — the only durable segment-state path).
+        let mut meta = meta;
+        meta.pool_id = pool_id;
 
         // Design A — write/flush split: write the data to a temp file
         // (no fsync yet) on the blocking pool, then register with the
@@ -367,6 +400,9 @@ impl SegmentSealer {
         let write_mode = self.config.write_mode;
         let write_filename = filename.clone();
         let cleanup_dir = dir.clone();
+        // The flush registration needs its own copy — `dir` is moved into
+        // the temp-write closure below.
+        let submit_dir = dir.clone();
         let (file, finalize_op) = tokio::task::spawn_blocking(move || {
             let parts = SegmentFileParts {
                 header: &header_bytes,
@@ -395,7 +431,7 @@ impl SegmentSealer {
             ))
         })?;
 
-        self.flush_group().submit(file, filename, finalize_op, meta).await?;
+        self.flush_group().submit(file, filename, finalize_op, meta, submit_dir).await?;
 
         // WAL entries for sealed segments are cleaned up at file rotation time.
         Ok(SegmentHandle::new(segment_id, vec![]))
@@ -421,11 +457,17 @@ impl SegmentSealer {
         &self.wal
     }
 
-    /// Returns the directory holding sealed `.dat` files — the recovery
-    /// pass's adopt probe (a durable `.dat` for a `Reserved` segment is
-    /// an interrupted seal commit, crash-window row 3).
-    pub(crate) fn segment_data_dir(&self) -> &std::path::Path {
-        &self.config.data_dir
+    /// Returns every (directory, pool_id) pair that may hold sealed
+    /// `.dat` files: the legacy `data_dir` (pool_id 0) plus each data
+    /// pool root (ADR-0029 f5). The recovery pass probes each for an
+    /// interrupted-seal `.dat` and stamps the owning pool id on the
+    /// adopted segment.
+    pub(crate) fn segment_data_dirs(&self) -> Vec<(std::path::PathBuf, u32)> {
+        let mut dirs = vec![(self.config.data_dir.clone(), 0)];
+        dirs.extend(
+            self.config.data_pools.iter().map(|pool| (pool.root().to_path_buf(), pool.id())),
+        );
+        dirs
     }
 
     /// Appends a data-WAL entry and records its position with the
@@ -803,6 +845,7 @@ mod tests {
         // exercised deterministically: 16 seals → at most 2 flush
         // batches (max_waiters = 8).
         let config = SealConfig {
+            data_pools: Vec::new(),
             target_size_bytes: 4096,
             seal_timeout_ms: 1000,
             data_dir: dir.path().join("segments"),
@@ -910,6 +953,7 @@ mod tests {
             .unwrap(),
         );
         let config = SealConfig {
+            data_pools: Vec::new(),
             target_size_bytes: 4096,
             seal_timeout_ms: 1000,
             data_dir: dir.path().join("segments"),
@@ -1065,5 +1109,273 @@ mod tests {
             encode_thread, test_thread,
             "the parity encode must run on the blocking pool, not the runtime worker"
         );
+    }
+
+    /// ADR-0029 f5: the sealer spreads sealed segments across the
+    /// configured data pools, stamps each segment's `pool_id` on the
+    /// durable metadata (the lifecycle registry entry), and writes the
+    /// `.dat` into the selected pool root.
+    #[tokio::test]
+    async fn seal_stamps_pool_id_and_writes_to_selected_pool_root() {
+        use oceanfs_core::{
+            MissingRootPolicy, PoolRole, PoolTech, StorageConfig, StoragePoolConfig,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let pool_a_root = dir.path().join("nvme0");
+        let pool_b_root = dir.path().join("nvme1");
+        let storage = StorageConfig {
+            pools: vec![
+                StoragePoolConfig {
+                    name: "pool-a".into(),
+                    role: PoolRole::Data,
+                    root: pool_a_root.clone(),
+                    weight: Some(1),
+                    tech: PoolTech::Auto,
+                    health: Default::default(),
+                },
+                StoragePoolConfig {
+                    name: "pool-b".into(),
+                    role: PoolRole::Data,
+                    root: pool_b_root.clone(),
+                    weight: Some(1),
+                    tech: PoolTech::Auto,
+                    health: Default::default(),
+                },
+            ],
+            missing_root_policy: MissingRootPolicy::Fatal,
+        };
+        let registry = crate::pool::PoolRegistry::from_config(&storage, &data_dir).unwrap();
+        // Equal free space on both pools: the first seal ties to pool 0,
+        // then each seal's capacity decrement hands the lead to the other.
+        for id in 0..2 {
+            registry.set_pool_capacity(id, 100 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024);
+        }
+        let data_pools = registry.data_pools();
+        assert_eq!(data_pools.len(), 2);
+
+        let lifecycle = Arc::new(
+            SegmentLifecycleCoordinator::new(&LifecycleConfig::default()).with_event_wal(Arc::new(
+                crate::segment::event_wal::EventWal::open(
+                    dir.path().join("event-wal"),
+                    &oceanfs_core::EventWalConfig {
+                        event_wal_dir: dir.path().join("event-wal"),
+                        event_wal_file_size_bytes: 1024 * 1024,
+                        event_wal_fsync_batch_timeout_ms: 10,
+                        event_wal_checkpoint_bytes: 1024 * 1024,
+                    },
+                )
+                .await
+                .unwrap(),
+            )),
+        );
+        let wal = Arc::new(
+            WalWriter::open(&WalConfig {
+                data_dir: dir.path().join("wal"),
+                max_file_size_bytes: 1024 * 1024,
+                fsync_batch_timeout_ms: 5,
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let config = SealConfig {
+            target_size_bytes: 100,
+            seal_timeout_ms: 1000,
+            data_dir: dir.path().join("segments"),
+            data_pools: data_pools.clone(),
+            io_mode: IoReadMode::Buffered,
+            write_mode: SegmentWriteMode::Rename,
+            ..Default::default()
+        };
+        let sealer = SegmentSealer::new(config, wal, Arc::clone(&lifecycle));
+
+        let size_config =
+            SegmentSizeConfig { default_target_size: 100, ..SegmentSizeConfig::default() };
+        let mut sealed: Vec<(SegmentId, u32)> = Vec::new();
+        for _ in 0..4 {
+            let pool = BufferPool::new(65536, 4);
+            let mut active = ActiveSegment::new(SizeTier::Standard, &size_config, &pool).unwrap();
+            active.append(&[0u8; 120]).unwrap();
+            // The ActiveSegment generates its own id — reserve THAT id.
+            lifecycle.request_reserve(active.id(), SizeTier::Standard, 0, 0).await.unwrap();
+            let entries =
+                vec![SegmentIndexEntry { offset: 0, length: 120, blob_key_hash: [0xAB; 32] }];
+            let handle = sealer
+                .try_seal(&mut active, 0, &entries, Some(HashOutput::from_bytes([0xAB; 32])))
+                .await
+                .unwrap()
+                .expect("segment must seal when full");
+            let entry = lifecycle.registry().get(handle.id()).expect("registry entry");
+            sealed.push((handle.id(), entry.metadata.pool_id));
+
+            // Consume capacity from the selected pool so the next seal
+            // flips to the other pool.
+            let selected = data_pools.iter().find(|p| p.id() == entry.metadata.pool_id).unwrap();
+            registry.set_pool_capacity(
+                selected.id(),
+                selected.total_bytes(),
+                selected.free_bytes() - 1024 * 1024,
+            );
+        }
+
+        // Both pools received segments, and each `.dat` lives in the
+        // pool root named by the stamped pool_id.
+        let stamped: std::collections::HashSet<u32> =
+            sealed.iter().map(|(_, pool_id)| *pool_id).collect();
+        assert_eq!(stamped.len(), 2, "segments must spread across both data pools");
+        for (segment_id, pool_id) in &sealed {
+            let root = data_pools.iter().find(|p| p.id() == *pool_id).unwrap().root();
+            assert!(
+                root.join(format!("{segment_id}.dat")).exists(),
+                "segment {segment_id} (pool {pool_id}) must live in {root:?}"
+            );
+            // The legacy dir must NOT hold pool-mode segments.
+            assert!(!dir.path().join("segments").join(format!("{segment_id}.dat")).exists());
+        }
+    }
+
+    /// ADR-0029 f5 restart persistence: segments sealed onto 2 pools are
+    /// re-resolved after a cold re-open — the event-WAL records carry
+    /// `pool_id` (nothing is reconstructed; this proves persistence, not
+    /// rebuild).
+    #[tokio::test]
+    async fn restart_fold_preserves_pool_ids_and_resolution() {
+        use oceanfs_core::{
+            MissingRootPolicy, PoolRole, PoolTech, StorageConfig, StoragePoolConfig,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let pool_a_root = dir.path().join("nvme0");
+        let pool_b_root = dir.path().join("nvme1");
+        let storage = StorageConfig {
+            pools: vec![
+                StoragePoolConfig {
+                    name: "pool-a".into(),
+                    role: PoolRole::Data,
+                    root: pool_a_root.clone(),
+                    weight: Some(1),
+                    tech: PoolTech::Auto,
+                    health: Default::default(),
+                },
+                StoragePoolConfig {
+                    name: "pool-b".into(),
+                    role: PoolRole::Data,
+                    root: pool_b_root.clone(),
+                    weight: Some(1),
+                    tech: PoolTech::Auto,
+                    health: Default::default(),
+                },
+            ],
+            missing_root_policy: MissingRootPolicy::Fatal,
+        };
+        let registry = crate::pool::PoolRegistry::from_config(&storage, &data_dir).unwrap();
+        for id in 0..2 {
+            registry.set_pool_capacity(id, 100 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024);
+        }
+        let data_pools = registry.data_pools();
+
+        let event_wal_dir = dir.path().join("event-wal");
+        let event_config = oceanfs_core::EventWalConfig {
+            event_wal_dir: event_wal_dir.clone(),
+            event_wal_file_size_bytes: 1024 * 1024,
+            event_wal_fsync_batch_timeout_ms: 10,
+            event_wal_checkpoint_bytes: 1024 * 1024,
+        };
+
+        // ---- First boot: seal 4 segments across the 2 pools ----
+        let (sealed, _lifecycle) = {
+            let lifecycle = Arc::new(
+                SegmentLifecycleCoordinator::new(&LifecycleConfig::default()).with_event_wal(
+                    Arc::new(
+                        crate::segment::event_wal::EventWal::open(
+                            event_wal_dir.clone(),
+                            &event_config,
+                        )
+                        .await
+                        .unwrap(),
+                    ),
+                ),
+            );
+            let wal = Arc::new(
+                WalWriter::open(&WalConfig {
+                    data_dir: dir.path().join("wal"),
+                    max_file_size_bytes: 1024 * 1024,
+                    fsync_batch_timeout_ms: 5,
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+            );
+            let config = SealConfig {
+                target_size_bytes: 100,
+                seal_timeout_ms: 1000,
+                data_dir: dir.path().join("segments"),
+                data_pools: data_pools.clone(),
+                io_mode: IoReadMode::Buffered,
+                write_mode: SegmentWriteMode::Rename,
+                ..Default::default()
+            };
+            let sealer = SegmentSealer::new(config, wal, Arc::clone(&lifecycle));
+            let size_config =
+                SegmentSizeConfig { default_target_size: 100, ..SegmentSizeConfig::default() };
+            let mut sealed = Vec::new();
+            for _ in 0..4 {
+                let pool = BufferPool::new(65536, 4);
+                let mut active =
+                    ActiveSegment::new(SizeTier::Standard, &size_config, &pool).unwrap();
+                active.append(&[0u8; 120]).unwrap();
+                lifecycle.request_reserve(active.id(), SizeTier::Standard, 0, 0).await.unwrap();
+                let entries =
+                    vec![SegmentIndexEntry { offset: 0, length: 120, blob_key_hash: [0xAB; 32] }];
+                let handle = sealer
+                    .try_seal(&mut active, 0, &entries, Some(HashOutput::from_bytes([0xAB; 32])))
+                    .await
+                    .unwrap()
+                    .expect("seal");
+                let entry = lifecycle.registry().get(handle.id()).expect("entry");
+                sealed.push((handle.id(), entry.metadata.pool_id));
+                let selected =
+                    data_pools.iter().find(|p| p.id() == entry.metadata.pool_id).unwrap();
+                registry.set_pool_capacity(
+                    selected.id(),
+                    selected.total_bytes(),
+                    selected.free_bytes() - 1024 * 1024,
+                );
+            }
+            (sealed, lifecycle)
+        };
+
+        // ---- "Restart": drop the coordinator, re-open the event WAL ----
+        // and fold it into a fresh registry — the pool ids survive.
+        let event_wal_reopened = Arc::new(
+            crate::segment::event_wal::EventWal::open(event_wal_dir, &event_config).await.unwrap(),
+        );
+        let fresh = SegmentLifecycleCoordinator::new(&LifecycleConfig::default())
+            .with_event_wal(Arc::clone(&event_wal_reopened));
+        let start = crate::segment::event_wal::EventWalPos { file_seq: 0, offset: 0 };
+        let outcome = fresh.rebuild_from_events(event_wal_reopened.read_from(start)).unwrap();
+        assert!(
+            outcome.folded_segments >= 4,
+            "reserve + seal events must fold 4 segments: {outcome:?}"
+        );
+
+        for (segment_id, pool_id) in &sealed {
+            let entry = fresh.registry().get(*segment_id).expect("rebuilt entry");
+            assert_eq!(
+                entry.metadata.pool_id, *pool_id,
+                "restart must preserve the durable segment→pool mapping"
+            );
+            // The rebuilt mapping resolves to the same pool root that
+            // holds the `.dat`.
+            let root =
+                crate::pool::resolve_pool_root(&data_pools, *pool_id, &dir.path().join("segments"));
+            assert!(
+                root.join(format!("{segment_id}.dat")).exists(),
+                "segment {segment_id} (pool {pool_id}) must resolve to {root:?}"
+            );
+        }
     }
 }

@@ -124,14 +124,17 @@ impl OrphanReaper {
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
         let ttl_ms = (self.config.tombstone_ttl_sec * 1000) as i64;
 
-        let mut orphan_ids = Vec::new();
+        // (segment_id, pool_id) — the pool id names the root holding the
+        // `.dat` (0 = legacy), so the unlink lands on the right root
+        // (ADR-0029 f5).
+        let mut orphan_ids: Vec<(SegmentId, u32)> = Vec::new();
         self.lifecycle.registry().for_each(|segment_id, entry| {
             stats.segments_scanned += 1;
             if !referenced.contains(&segment_id) {
                 // Not referenced by any object — check if old enough
                 if let Some(sealed_at) = entry.metadata.sealed_at {
                     if now_ms - sealed_at > ttl_ms {
-                        orphan_ids.push(segment_id);
+                        orphan_ids.push((segment_id, entry.metadata.pool_id));
                         stats.orphans_found += 1;
                     }
                 }
@@ -157,12 +160,12 @@ impl OrphanReaper {
             .store
             .list_segment_files()
             .map_err(|e| oceanfs_storage::Error::Io(std::io::Error::other(e.to_string())))?;
-        for (segment_id, file_mtime) in on_disk {
+        for (segment_id, file_mtime, pool_id) in on_disk {
             if registered.contains(&segment_id) || referenced.contains(&segment_id) {
                 continue;
             }
             if file_mtime > 0 && now_ms - file_mtime > ttl_ms {
-                orphan_ids.push(segment_id);
+                orphan_ids.push((segment_id, pool_id));
                 stats.orphans_found += 1;
             }
         }
@@ -186,7 +189,7 @@ impl OrphanReaper {
         // the winner's (foreign) segment ids. The durable Deleted
         // marker (delete-before-unlink, ADR-0024) remains the crash
         // guard between request_delete and the unlink.
-        for segment_id in &orphan_ids {
+        for (segment_id, pool_id) in &orphan_ids {
             // Double-check against the cycle's snapshot.
             let still_orphan = !referenced.contains(segment_id);
 
@@ -217,8 +220,9 @@ impl OrphanReaper {
                 }
 
                 // Delete shard data from disk after the deletion is
-                // durable.
-                match self.store.delete_shards(*segment_id) {
+                // durable — from the root the file was listed in (or the
+                // registry entry's pool id; ADR-0029 f5).
+                match self.store.delete_shards_with_pool(*pool_id, *segment_id) {
                     Ok(bytes) => {
                         tracing::info!(
                             segment_id = %segment_id,
@@ -383,6 +387,7 @@ mod tests {
 
     fn make_segment_meta(id: SegmentId, tier: SizeTier, sealed_at: i64) -> SegmentMetadata {
         SegmentMetadata {
+            pool_id: 0,
             segment_id: id,
             ec_k: 4,
             ec_m: 2,
@@ -719,7 +724,11 @@ mod tests {
         // registry entry and NO object-row reference. The InMemory
         // store's listing is empty, so use the DISK store directly.
         let dir = tempfile::tempdir().unwrap();
-        let disk_store = Arc::new(DiskSegmentShardStore::new(dir.path().to_path_buf()));
+        let disk_store = Arc::new(DiskSegmentShardStore::new(
+            Vec::new(),
+            dir.path().to_path_buf(),
+            Arc::new(|_| None),
+        ));
         let unregistered = SegmentId::new();
         let mtime =
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64 - 60_000; // older than the 5s TTL

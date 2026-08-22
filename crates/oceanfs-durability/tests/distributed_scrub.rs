@@ -54,6 +54,7 @@ async fn scrub_cycle_verifies_healthy_segments() {
         stored_data.push((seg_id, data));
 
         let seg = SegmentMetadata {
+            pool_id: 0,
             segment_id: seg_id,
             ec_k: 4,
             ec_m: 2,
@@ -87,6 +88,7 @@ async fn scrub_cycle_detects_corruption() {
     let correct_root = MerkleTree::build(&correct_data, 0).unwrap().root().hash();
 
     let seg = SegmentMetadata {
+        pool_id: 0,
         segment_id: seg_id,
         ec_k: 4,
         ec_m: 2,
@@ -129,6 +131,7 @@ async fn run_cycle_with_missing_data_skips_not_corrupt() {
 
     // Put segment metadata with a Merkle root
     let seg = SegmentMetadata {
+        pool_id: 0,
         segment_id: seg_id,
         ec_k: 4,
         ec_m: 2,

@@ -1589,11 +1589,13 @@ name = "oceanfs-core"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "bincode",
  "bytes",
  "chrono",
  "portable-atomic",
  "prost",
  "serde",
+ "serde_json",
  "smallvec",
  "static_assertions",
  "thiserror 2.0.19",
@@ -1835,6 +1837,7 @@ dependencies = [
  "prost",
  "rand 0.8.7",
  "rocksdb",
+ "serde",
  "serde_json",
  "smallvec",
  "static_assertions",

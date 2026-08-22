@@ -726,6 +726,7 @@ mod tests {
         data_store.write_segment_data(&segment_id, &data).unwrap();
 
         let segment_meta = SegmentMetadata {
+            pool_id: 0,
             segment_id,
             ec_k: 3,
             ec_m: 1,
@@ -780,6 +781,7 @@ mod tests {
         data_store.write_segment_data(&segment_id, &[1, 2, 3]).unwrap();
 
         let segment_meta = SegmentMetadata {
+            pool_id: 0,
             segment_id,
             ec_k: 0,
             ec_m: 0,
@@ -850,6 +852,7 @@ mod tests {
         data_store.write_segment_data(&segment_id, &data).unwrap();
 
         let segment_meta = SegmentMetadata {
+            pool_id: 0,
             segment_id,
             ec_k: 2,
             ec_m: 2,
@@ -914,6 +917,7 @@ mod tests {
         data_store.write_segment_data(&segment_id, &data).unwrap();
 
         let segment_meta = SegmentMetadata {
+            pool_id: 0,
             segment_id,
             ec_k: 3,
             ec_m: 1,
@@ -988,6 +992,7 @@ mod tests {
         data_store.write_segment_data(&segment_id, &data).unwrap();
 
         let segment_meta = SegmentMetadata {
+            pool_id: 0,
             segment_id,
             ec_k: 3,
             ec_m: 1,
@@ -1066,6 +1071,7 @@ mod tests {
         data_store.write_segment_data(&segment_id, &data).unwrap();
 
         let segment_meta = SegmentMetadata {
+            pool_id: 0,
             segment_id,
             ec_k: 3,
             ec_m: 1,
@@ -1111,6 +1117,7 @@ mod tests {
         data_store.write_segment_data(&segment_id, &data).unwrap();
 
         let segment_meta = SegmentMetadata {
+            pool_id: 0,
             segment_id,
             ec_k: 3,
             ec_m: 1,

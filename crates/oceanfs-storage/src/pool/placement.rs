@@ -113,16 +113,46 @@ impl PlacementPolicy {
         // Single snapshot read of the registry (perf 7.1): `data_pools`
         // clones the Arcs under one short read lock; scoring runs outside
         // any lock.
-        let candidates = registry.data_pools();
+        self.select_from_pools(&registry.data_pools())
+    }
 
-        // Pre-size to the data-pool count (perf 1.3).
-        let mut eligible: Vec<Arc<StoragePool>> = Vec::with_capacity(candidates.len());
-        for pool in candidates {
+    /// Selects the target pool from an explicit pool slice (f5: the
+    /// sealer holds a snapshot of the node's data pools and selects once
+    /// per new segment without touching the registry).
+    ///
+    /// Same eligibility and scoring as [`PlacementPolicy::select_data_pool`],
+    /// over a caller-provided pool list: role/status/headroom filtering is
+    /// skipped for pools the caller already filtered (the sealer's
+    /// `data_pools` are all `Data`-role); the weighted-least-free score
+    /// (`max free / weight`, ties → lower id) and the 64 MiB headroom
+    /// exclusion apply.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_storage::{PlacementPolicy, PoolRegistry};
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// let registry = PoolRegistry::from_config(
+    ///     &oceanfs_core::StorageConfig::default(),
+    ///     &data_dir,
+    /// )
+    /// .expect("registry");
+    ///
+    /// let policy = PlacementPolicy::new();
+    /// let pools = registry.data_pools();
+    /// assert!(policy.select_from_pools(&pools).is_some());
+    /// ```
+    pub fn select_from_pools(&self, pools: &[Arc<StoragePool>]) -> Option<Arc<StoragePool>> {
+        // Pre-size to the pool count (perf 1.3).
+        let mut eligible: Vec<Arc<StoragePool>> = Vec::with_capacity(pools.len());
+        for pool in pools {
             if pool.status() == PoolStatus::Healthy
                 && !pool.write_degraded()
                 && pool.free_bytes() > MIN_FREE_HEADROOM_BYTES
             {
-                eligible.push(pool);
+                eligible.push(Arc::clone(pool));
             }
         }
 

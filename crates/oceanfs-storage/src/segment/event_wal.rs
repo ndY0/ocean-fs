@@ -91,8 +91,15 @@ pub(crate) const SEAL_PAYLOAD_SIZE: usize = 48;
 /// `repacked_from` marker (16 — a segment id).
 pub(crate) const SEAL_REPACKED_FROM_SIZE: usize = 16;
 
-/// Flags byte of the Seal payload: bit 0 set → `repacked_from` present.
+/// Extra payload bytes of a `SealEvent` carrying the storage pool id
+/// (4 — u32 LE; ADR-0029 f5, the durable segment→pool mapping).
+pub(crate) const SEAL_POOL_ID_SIZE: usize = 4;
+
+/// Flags byte of the Seal payload: bit 0 set → `repacked_from` present;
+/// bit 1 set → `pool_id` present (ADR-0029 f5). Flags are never combined
+/// with a legacy length: a payload length mismatch rejects the record.
 pub(crate) const SEAL_FLAG_REPACKED_FROM: u8 = 1;
+pub(crate) const SEAL_FLAG_POOL_ID: u8 = 2;
 
 /// Payload size of a `DeleteEvent`.
 pub(crate) const DELETE_PAYLOAD_SIZE: usize = 0;
@@ -108,7 +115,8 @@ pub(crate) const REFRESH_ROOT_SIZE: usize = 32;
 /// Largest possible payload size (the Seal payload with the compaction
 /// marker) — bounds the reader's allocation so a corrupt `payload_len`
 /// can never allocate arbitrarily.
-pub(crate) const MAX_PAYLOAD_SIZE: usize = SEAL_PAYLOAD_SIZE + SEAL_REPACKED_FROM_SIZE;
+pub(crate) const MAX_PAYLOAD_SIZE: usize =
+    SEAL_PAYLOAD_SIZE + SEAL_REPACKED_FROM_SIZE + SEAL_POOL_ID_SIZE;
 
 /// Record kind bytes on disk.
 pub(crate) const KIND_RESERVE: u8 = 0;
@@ -195,6 +203,12 @@ pub struct SealEvent {
     /// the marker to identify incomplete compaction units (crash-window
     /// rows 7–9) with a single objects-CF read per unit.
     pub repacked_from: Option<SegmentId>,
+    /// The storage pool holding this segment's `.dat` (ADR-0029 f5).
+    ///
+    /// `0` = the legacy `{data_dir}/segments` root. Legacy event records
+    /// (written before this field existed) decode with `pool_id = 0` —
+    /// the flags byte + payload length discriminate the variants.
+    pub pool_id: u32,
 }
 
 /// A segment **Delete** event — replaces the deleted-marker CF write
@@ -269,17 +283,32 @@ impl SegmentEvent {
                 (KIND_RESERVE, payload)
             }
             SegmentEvent::Seal(evt) => {
-                let extra = if evt.repacked_from.is_some() { SEAL_REPACKED_FROM_SIZE } else { 0 };
+                // Backward-compatible extension: the pool_id is appended
+                // only when non-zero, flagged in the flags byte — legacy
+                // logs (no pool id) keep their exact byte layout, and
+                // new records with pool_id = 0 stay byte-identical too.
+                let extra = if evt.repacked_from.is_some() { SEAL_REPACKED_FROM_SIZE } else { 0 }
+                    + if evt.pool_id != 0 { SEAL_POOL_ID_SIZE } else { 0 };
                 let mut payload = Vec::with_capacity(SEAL_PAYLOAD_SIZE + extra);
                 payload.push(tier_to_u8(evt.tier));
                 payload.push(evt.ec_k);
                 payload.push(evt.ec_m);
-                payload.push(if evt.repacked_from.is_some() { SEAL_FLAG_REPACKED_FROM } else { 0 });
+                let mut flags = 0u8;
+                if evt.repacked_from.is_some() {
+                    flags |= SEAL_FLAG_REPACKED_FROM;
+                }
+                if evt.pool_id != 0 {
+                    flags |= SEAL_FLAG_POOL_ID;
+                }
+                payload.push(flags);
                 payload.extend_from_slice(evt.merkle_root.as_bytes());
                 payload.extend_from_slice(&evt.data_wal_pos.file_seq.to_le_bytes());
                 payload.extend_from_slice(&evt.data_wal_pos.offset.to_le_bytes());
                 if let Some(old) = evt.repacked_from {
                     payload.extend_from_slice(old.as_uuid().as_bytes());
+                }
+                if evt.pool_id != 0 {
+                    payload.extend_from_slice(&evt.pool_id.to_le_bytes());
                 }
                 (KIND_SEAL, payload)
             }
@@ -394,10 +423,31 @@ fn decode_payload(kind: u8, segment_id: SegmentId, payload: &[u8]) -> Option<Seg
                     offset: u64::from_le_bytes(payload[40..48].try_into().ok()?),
                 },
                 repacked_from: None,
+                pool_id: 0,
+            }))
+        }
+        KIND_SEAL
+            if payload.len() == SEAL_PAYLOAD_SIZE + SEAL_POOL_ID_SIZE
+                && payload[3] & !(SEAL_FLAG_REPACKED_FROM | SEAL_FLAG_POOL_ID) == 0
+                && payload[3] & SEAL_FLAG_POOL_ID != 0 =>
+        {
+            Some(SegmentEvent::Seal(SealEvent {
+                segment_id,
+                tier: tier_from_u8(payload[0])?,
+                ec_k: payload[1],
+                ec_m: payload[2],
+                merkle_root: HashOutput::from_bytes(payload[4..36].try_into().ok()?),
+                data_wal_pos: DataWalPos {
+                    file_seq: u32::from_le_bytes(payload[36..40].try_into().ok()?),
+                    offset: u64::from_le_bytes(payload[40..48].try_into().ok()?),
+                },
+                repacked_from: None,
+                pool_id: u32::from_le_bytes(payload[48..52].try_into().ok()?),
             }))
         }
         KIND_SEAL
             if payload.len() == SEAL_PAYLOAD_SIZE + SEAL_REPACKED_FROM_SIZE
+                && payload[3] & !SEAL_FLAG_REPACKED_FROM == 0
                 && payload[3] & SEAL_FLAG_REPACKED_FROM != 0 =>
         {
             Some(SegmentEvent::Seal(SealEvent {
@@ -411,6 +461,27 @@ fn decode_payload(kind: u8, segment_id: SegmentId, payload: &[u8]) -> Option<Seg
                     offset: u64::from_le_bytes(payload[40..48].try_into().ok()?),
                 },
                 repacked_from: Some(SegmentId::from_uuid_bytes(payload[48..64].try_into().ok()?)),
+                pool_id: 0,
+            }))
+        }
+        KIND_SEAL
+            if payload.len() == SEAL_PAYLOAD_SIZE + SEAL_REPACKED_FROM_SIZE + SEAL_POOL_ID_SIZE
+                && payload[3] & !(SEAL_FLAG_REPACKED_FROM | SEAL_FLAG_POOL_ID) == 0
+                && payload[3] & (SEAL_FLAG_REPACKED_FROM | SEAL_FLAG_POOL_ID)
+                    == (SEAL_FLAG_REPACKED_FROM | SEAL_FLAG_POOL_ID) =>
+        {
+            Some(SegmentEvent::Seal(SealEvent {
+                segment_id,
+                tier: tier_from_u8(payload[0])?,
+                ec_k: payload[1],
+                ec_m: payload[2],
+                merkle_root: HashOutput::from_bytes(payload[4..36].try_into().ok()?),
+                data_wal_pos: DataWalPos {
+                    file_seq: u32::from_le_bytes(payload[36..40].try_into().ok()?),
+                    offset: u64::from_le_bytes(payload[40..48].try_into().ok()?),
+                },
+                repacked_from: Some(SegmentId::from_uuid_bytes(payload[48..64].try_into().ok()?)),
+                pool_id: u32::from_le_bytes(payload[64..68].try_into().ok()?),
             }))
         }
         KIND_DELETE if payload.len() == DELETE_PAYLOAD_SIZE => {
@@ -1324,6 +1395,7 @@ mod tests {
 
     fn seal_event(id: SegmentId) -> SegmentEvent {
         SegmentEvent::Seal(SealEvent {
+            pool_id: 0,
             segment_id: id,
             tier: SizeTier::Standard,
             ec_k: 4,
@@ -1336,6 +1408,7 @@ mod tests {
 
     fn seal_event_with_repacked(id: SegmentId, old: SegmentId) -> SegmentEvent {
         SegmentEvent::Seal(SealEvent {
+            pool_id: 0,
             segment_id: id,
             tier: SizeTier::Standard,
             ec_k: 4,
@@ -1372,6 +1445,58 @@ mod tests {
             let bytes = evt.to_record_bytes();
             let decoded = SegmentEvent::from_record_bytes(&bytes).expect("record decodes");
             assert_eq!(decoded, evt, "record must round-trip byte-exact");
+        }
+    }
+
+    /// ADR-0029 f5: the seal event's pool_id survives the wire format.
+    #[test]
+    fn seal_event_pool_id_roundtrips() {
+        let id = SegmentId::new();
+        let evt = SegmentEvent::Seal(SealEvent {
+            pool_id: 3,
+            ..match seal_event(id) {
+                SegmentEvent::Seal(e) => e,
+                _ => unreachable!(),
+            }
+        });
+        let bytes = evt.to_record_bytes();
+        let decoded = SegmentEvent::from_record_bytes(&bytes).expect("record decodes");
+        assert_eq!(decoded, evt, "pool_id must round-trip");
+    }
+
+    /// ADR-0029 f5: seal events carrying `repacked_from` + pool_id both
+    /// survive (the longest payload variant).
+    #[test]
+    fn seal_event_repacked_with_pool_id_roundtrips() {
+        let id = SegmentId::new();
+        let old = SegmentId::new();
+        let mut evt = seal_event_with_repacked(id, old);
+        if let SegmentEvent::Seal(seal) = &mut evt {
+            seal.pool_id = 7;
+        }
+        let bytes = evt.to_record_bytes();
+        let decoded = SegmentEvent::from_record_bytes(&bytes).expect("record decodes");
+        assert_eq!(decoded, evt);
+    }
+
+    /// ADR-0029 f5: legacy seal records (written before pool_id existed —
+    /// the 48-byte payload without the pool flag) decode with pool_id 0,
+    /// and pool_id-0 records stay byte-identical to the pre-f5 format.
+    #[test]
+    fn legacy_seal_record_decodes_pool_id_zero() {
+        let id = SegmentId::new();
+        // A pool_id-0 event serializes exactly like the pre-f5 format.
+        let evt = seal_event(id);
+        let bytes = evt.to_record_bytes();
+        // 28 header + 48 payload + 4 crc = 80 — the legacy record size.
+        assert_eq!(bytes.len(), EVENT_RECORD_HEADER_SIZE + SEAL_PAYLOAD_SIZE + 4);
+        let decoded = SegmentEvent::from_record_bytes(&bytes).expect("legacy record decodes");
+        match decoded {
+            SegmentEvent::Seal(seal) => {
+                assert_eq!(seal.pool_id, 0, "legacy records default to the legacy root");
+                assert_eq!(seal.repacked_from, None);
+            }
+            other => panic!("expected Seal, got {other:?}"),
         }
     }
 

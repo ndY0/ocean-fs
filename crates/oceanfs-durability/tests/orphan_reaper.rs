@@ -62,6 +62,7 @@ fn seed_sealed(registry: &SegmentLifecycleRegistry, meta: oceanfs_core::SegmentM
 
 fn make_segment(id: oceanfs_core::SegmentId, sealed_at: i64) -> oceanfs_core::SegmentMetadata {
     oceanfs_core::SegmentMetadata {
+        pool_id: 0,
         segment_id: id,
         ec_k: 4,
         ec_m: 2,

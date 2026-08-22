@@ -43,6 +43,7 @@ fn make_membership(node_id: &str) -> (Arc<Membership>, Arc<RingCache>) {
 /// Helper: create a sealed segment metadata with a merkle root.
 fn make_sealed_segment(id: SegmentId, merkle_root: Option<HashOutput>) -> SegmentMetadata {
     SegmentMetadata {
+        pool_id: 0,
         segment_id: id,
         ec_k: 4,
         ec_m: 2,

@@ -33,7 +33,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
     io,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -67,6 +67,9 @@ struct FlushRegistration {
     /// Segment metadata persisted by the lifecycle coordinator in the
     /// batch after the file is durable.
     meta: SegmentMetadata,
+    /// Target directory the file is finalized into — the selected pool
+    /// root (ADR-0029 f5) or the legacy segments dir (pool_id 0).
+    dir: PathBuf,
     /// Completion signal: `Ok` = file synced + finalized + metadata
     /// committed through the lifecycle coordinator.
     done: oneshot::Sender<Result<()>>,
@@ -145,7 +148,6 @@ impl SegmentFlushGroup {
     /// Must be called from within a tokio runtime context.
     pub(crate) fn new(
         lifecycle: Arc<SegmentLifecycleCoordinator>,
-        data_dir: PathBuf,
         batch_timeout_ms: u64,
         max_waiters: usize,
     ) -> Self {
@@ -195,10 +197,9 @@ impl SegmentFlushGroup {
                 // caller's submit awaits) plus the seal worker's
                 // semaphore.
                 let lifecycle = Arc::clone(&lifecycle);
-                let data_dir = data_dir.clone();
                 let stats = Arc::clone(&stats_task);
                 tokio::task::spawn_blocking(move || {
-                    flush_batch(batch, &lifecycle, &data_dir, &stats);
+                    flush_batch(batch, &lifecycle, &stats);
                 });
             }
         });
@@ -211,8 +212,10 @@ impl SegmentFlushGroup {
     /// The caller (the seal task) has written `file`'s data (temp file,
     /// **not yet synced**) and awaits the returned future, which
     /// resolves once the flusher has synced the file, finalized it
-    /// under `filename`, and submitted `meta` in the batch metadata
-    /// write.
+    /// under `filename` in `dir`, and submitted `meta` in the batch
+    /// metadata write. `dir` is the target pool root (or the legacy
+    /// segments dir) — the file's durability lands where the seal
+    /// selected it.
     ///
     /// # Errors
     ///
@@ -224,10 +227,11 @@ impl SegmentFlushGroup {
         filename: String,
         op: FinalizeOp,
         meta: SegmentMetadata,
+        dir: PathBuf,
     ) -> Result<()> {
         let (done_tx, done_rx) = oneshot::channel();
         self.tx
-            .send(FlushRegistration { file, filename, op, meta, done: done_tx })
+            .send(FlushRegistration { file, filename, op, meta, dir, done: done_tx })
             .await
             .map_err(|_| Error::Io(io::Error::other("segment flush coordinator is shut down")))?;
         done_rx.await.map_err(|_| {
@@ -250,7 +254,6 @@ impl SegmentFlushGroup {
 fn flush_batch(
     batch: Vec<FlushRegistration>,
     lifecycle: &SegmentLifecycleCoordinator,
-    data_dir: &Path,
     stats: &FlushStats,
 ) {
     #[cfg(test)]
@@ -287,19 +290,19 @@ fn flush_batch(
         if FAIL_SYNC.load(Ordering::Relaxed) && reg.filename == "fail.dat" {
             // Hygiene: same cleanup as the real error path.
             let _ =
-                std::fs::remove_file(crate::io::atomic_write::temp_path(data_dir, &reg.filename));
+                std::fs::remove_file(crate::io::atomic_write::temp_path(&reg.dir, &reg.filename));
             let _ = reg.done.send(Err(Error::Io(io::Error::other("test seam: sync failed"))));
             continue;
         }
 
-        let FlushRegistration { file, filename, op, meta, done } = reg;
+        let FlushRegistration { file, filename, op, meta, dir, done } = reg;
         let sync_result = file.sync_data();
         let finalize_result = sync_result.and_then(|()| {
             let mode = match op {
                 FinalizeOp::Link => SegmentWriteMode::Tmpfile,
                 FinalizeOp::Rename => SegmentWriteMode::Rename,
             };
-            finalize_temp(mode, file, data_dir, &filename)
+            finalize_temp(mode, file, &dir, &filename)
         });
 
         match finalize_result {
@@ -318,8 +321,7 @@ fn flush_batch(
                 // unnamed O_TMPFILE which the kernel reclaims on fd
                 // close). Remove the named temp so failed seals do not
                 // accumulate disk garbage.
-                let _ =
-                    std::fs::remove_file(crate::io::atomic_write::temp_path(data_dir, &filename));
+                let _ = std::fs::remove_file(crate::io::atomic_write::temp_path(&dir, &filename));
                 let _ = done.send(Err(Error::Io(e)));
             }
         }
@@ -390,6 +392,7 @@ mod tests {
 
     fn make_meta(segment_id: SegmentId) -> SegmentMetadata {
         SegmentMetadata {
+            pool_id: 0,
             segment_id,
             ec_k: 0,
             ec_m: 0,
@@ -406,7 +409,7 @@ mod tests {
         let seg_dir = dir.path().join("segments");
         std::fs::create_dir_all(&seg_dir).unwrap();
 
-        let group = Arc::new(SegmentFlushGroup::new(lifecycle.clone(), seg_dir.clone(), 100, 8));
+        let group = Arc::new(SegmentFlushGroup::new(lifecycle.clone(), 100, 8));
 
         // 16 concurrent registrations with max_waiters=8 → at most 2 batches.
         let mut handles = Vec::new();
@@ -425,7 +428,10 @@ mod tests {
                 let tmp = seg_dir.join(format!(".tmp.{filename}"));
                 std::fs::write(&tmp, vec![0xAB; 1024]).unwrap();
                 let file = std::fs::File::open(&tmp).unwrap();
-                group.submit(file, filename, FinalizeOp::Rename, meta).await.unwrap();
+                group
+                    .submit(file, filename, FinalizeOp::Rename, meta, seg_dir.clone())
+                    .await
+                    .unwrap();
             }));
         }
         for h in handles {
@@ -461,7 +467,7 @@ mod tests {
         let seg_dir = dir.path().join("segments");
         std::fs::create_dir_all(&seg_dir).unwrap();
 
-        let group = Arc::new(SegmentFlushGroup::new(lifecycle.clone(), seg_dir.clone(), 100, 8));
+        let group = Arc::new(SegmentFlushGroup::new(lifecycle.clone(), 100, 8));
 
         FAIL_SYNC.store(true, Ordering::Relaxed);
         let id = SegmentId::new();
@@ -470,7 +476,8 @@ mod tests {
         let tmp = seg_dir.join(".tmp.fail");
         std::fs::write(&tmp, vec![0xCD; 512]).unwrap();
         let file = std::fs::File::open(&tmp).unwrap();
-        let result = group.submit(file, "fail.dat".into(), FinalizeOp::Rename, meta).await;
+        let result =
+            group.submit(file, "fail.dat".into(), FinalizeOp::Rename, meta, seg_dir.clone()).await;
         FAIL_SYNC.store(false, Ordering::Relaxed);
 
         assert!(result.is_err(), "sync failure must propagate to the waiter");
@@ -496,13 +503,16 @@ mod tests {
         std::thread::current().id().hash(&mut hasher);
         let test_thread = hasher.finish();
 
-        let group = Arc::new(SegmentFlushGroup::new(lifecycle.clone(), seg_dir.clone(), 100, 8));
+        let group = Arc::new(SegmentFlushGroup::new(lifecycle.clone(), 100, 8));
         let tmp = seg_dir.join(".tmp.pin.dat");
         std::fs::write(&tmp, vec![0xEE; 512]).unwrap();
         let file = std::fs::File::open(&tmp).unwrap();
         let id = SegmentId::new();
         lifecycle.request_reserve(id, SizeTier::Standard, 0, 0).await.unwrap();
-        group.submit(file, "pin.dat".into(), FinalizeOp::Rename, make_meta(id)).await.unwrap();
+        group
+            .submit(file, "pin.dat".into(), FinalizeOp::Rename, make_meta(id), seg_dir)
+            .await
+            .unwrap();
 
         let flush_thread = LAST_FLUSH_THREAD.load(Ordering::Relaxed);
         assert_ne!(

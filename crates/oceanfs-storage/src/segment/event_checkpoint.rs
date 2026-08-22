@@ -19,8 +19,9 @@
 //!
 //! ```text
 //! checkpoint-{file_seq:08}-{offset}:
-//!   magic        [4]   = b"CHK\\1"
-//!   version      [1]   = 2
+//!   magic        [4]   = b"CHK\1"
+//!   version      [1]   = 3 (2 = legacy: 7-field metadata, no pool_id —
+//!                      decoded as pool_id 0, ADR-0029 f5)
 //!   covered_pos  [12]  file_seq(4 LE) + offset(8 LE) — the EventWalPos
 //!                      covered by this snapshot (the fold starts after it)
 //!   entry_count  [4]   LE
@@ -32,20 +33,23 @@
 //!                      (extension over the ADR sketch: the bincode payload
 //!                      is variable-length and needs a length prefix)
 //!     metadata   [meta_len]  bincode(SegmentMetadata) — the full metadata
-//!                      incl. merkle_root for Sealed entries
+//!                      incl. merkle_root for Sealed entries; v3 adds
+//!                      `pool_id` (ADR-0029 f5, the durable segment→pool
+//!                      mapping); v2 blobs decode via the 7-field legacy
+//!                      shape → pool_id 0
 //!     data_wal_pos [12]  file_seq(4 LE) + offset(8 LE) — Sealed entries
 //!                      only (retention needs it to survive checkpointing)
-//!     repacked_flag [1]  0/1 — Sealed entries only (version 2: the
-//!                      compaction marker, ADR-0025 Decision 4 — recovery
-//!                      needs it to identify incomplete compaction units)
+//!     repacked_flag [1]  0/1 — Sealed entries only (the compaction
+//!                      marker, ADR-0025 Decision 4 — recovery needs it to
+//!                      identify incomplete compaction units)
 //!     repacked_from [16]  segment id — present iff repacked_flag = 1
 //!   crc32        [4]   over all preceding bytes
 //! ```
 //!
-//! Version 2 adds the compaction marker to Sealed entries; version 1
-//! snapshots (without the flag byte) are rejected — no deployed
-//! checkpoints exist (the format landed with EPIC 2), so no legacy
-//! files need reading.
+//! Version 2 adds the compaction marker to Sealed entries (version 1
+//! snapshots without the flag byte are rejected — none exist in the
+//! field); version 3 adds `pool_id` to the metadata. v2 files are the
+//! pre-f5 legacy format and decode with `pool_id = 0` (the legacy root).
 
 use std::{
     io::Write,
@@ -57,7 +61,8 @@ use std::{
 };
 
 use oceanfs_core::{
-    Counter, EventWalConfig, LabelSet, MetricRegistrar, SegmentId, SegmentMetadata,
+    Counter, EventWalConfig, HashOutput, LabelSet, MetricRegistrar, NodeId, SegmentId,
+    SegmentMetadata, SizeTier,
 };
 
 use crate::{
@@ -72,7 +77,16 @@ use crate::{
 pub(crate) const CHECKPOINT_MAGIC: [u8; 4] = [b'C', b'H', b'K', 1];
 
 /// On-disk format version of checkpoint files.
-pub(crate) const CHECKPOINT_VERSION: u8 = 2;
+/// Checkpoint format version. v3 (current): `SegmentMetadata` carries
+/// `pool_id` (ADR-0029 f5). v2 (`LEGACY_CHECKPOINT_VERSION`): the pre-f5
+/// 7-field metadata — decoded into `pool_id = 0` (the legacy root) so
+/// pre-f5 checkpoints load without migration (f5 deviation).
+pub(crate) const CHECKPOINT_VERSION: u8 = 3;
+
+/// The pre-f5 checkpoint format (7-field `SegmentMetadata`, no `pool_id`).
+/// bincode does not apply serde defaults to missing trailing fields, so
+/// legacy blobs must be decoded through the explicit legacy shape.
+pub(crate) const LEGACY_CHECKPOINT_VERSION: u8 = 2;
 
 /// Fixed header size of a checkpoint file: magic(4) + version(1) +
 /// covered_pos(12) + entry_count(4) = 21.
@@ -421,6 +435,21 @@ fn encode_snapshot(registry: &SegmentLifecycleRegistry, up_to: EventWalPos) -> R
     Ok(buf)
 }
 
+/// The pre-f5 `SegmentMetadata` shape (7 fields, no `pool_id`) — legacy
+/// checkpoint entries (version 2) decode through this shape, then map to
+/// `pool_id = 0`. Field order and types must mirror the committed struct
+/// exactly (bincode is positional).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LegacySegmentMetadata {
+    segment_id: SegmentId,
+    ec_k: u8,
+    ec_m: u8,
+    size_tier: SizeTier,
+    merkle_root: Option<HashOutput>,
+    storage_locations: smallvec::SmallVec<[NodeId; 16]>,
+    sealed_at: Option<i64>,
+}
+
 /// Deserializes a snapshot into a fresh registry; `None` on any framing
 /// error (bad magic, unsupported version, CRC mismatch, truncated
 /// entries, unknown state).
@@ -431,7 +460,8 @@ fn decode_snapshot(bytes: &[u8]) -> Option<(EventWalPos, SegmentLifecycleRegistr
     if bytes[0..4] != CHECKPOINT_MAGIC {
         return None;
     }
-    if bytes[4] != CHECKPOINT_VERSION {
+    let version = bytes[4];
+    if version != CHECKPOINT_VERSION && version != LEGACY_CHECKPOINT_VERSION {
         return None;
     }
     let stored_crc = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().ok()?);
@@ -461,9 +491,28 @@ fn decode_snapshot(bytes: &[u8]) -> Option<(EventWalPos, SegmentLifecycleRegistr
         if cursor + meta_len > bytes.len() - 4 {
             return None;
         }
-        let meta: SegmentMetadata = match bincode::deserialize(&bytes[cursor..cursor + meta_len]) {
-            Ok(meta) => meta,
-            Err(_) => return None,
+        let meta: SegmentMetadata = if version == LEGACY_CHECKPOINT_VERSION {
+            // Pre-f5 blob: the 7-field shape without `pool_id`. bincode
+            // does not honor `#[serde(default)]` for the missing trailing
+            // field, so decode through the explicit legacy shape and map
+            // to pool_id 0 (the legacy root — f5 deviation).
+            let legacy: LegacySegmentMetadata =
+                bincode::deserialize(&bytes[cursor..cursor + meta_len]).ok()?;
+            SegmentMetadata {
+                segment_id: legacy.segment_id,
+                ec_k: legacy.ec_k,
+                ec_m: legacy.ec_m,
+                size_tier: legacy.size_tier,
+                merkle_root: legacy.merkle_root,
+                storage_locations: legacy.storage_locations,
+                sealed_at: legacy.sealed_at,
+                pool_id: 0,
+            }
+        } else {
+            match bincode::deserialize(&bytes[cursor..cursor + meta_len]) {
+                Ok(meta) => meta,
+                Err(_) => return None,
+            }
         };
         cursor += meta_len;
         match state_byte {
@@ -500,6 +549,7 @@ fn decode_snapshot(bytes: &[u8]) -> Option<(EventWalPos, SegmentLifecycleRegistr
                 // the seal (the record updates Reserved entries; the
                 // seal keeps it).
                 let reserved_meta = SegmentMetadata {
+                    pool_id: 0,
                     segment_id,
                     ec_k: meta.ec_k,
                     ec_m: meta.ec_m,
@@ -533,6 +583,7 @@ mod tests {
                 .reserve(
                     id,
                     SegmentMetadata {
+                        pool_id: 0,
                         segment_id: id,
                         ec_k: 4,
                         ec_m: 2,
@@ -550,6 +601,7 @@ mod tests {
                     .seal(
                         id,
                         SegmentMetadata {
+                            pool_id: 0,
                             segment_id: id,
                             ec_k: 4,
                             ec_m: 2,
@@ -581,6 +633,56 @@ mod tests {
     // Snapshot encode/decode round trip
     // ------------------------------------------------------------------
 
+    /// ADR-0029 f5: a pre-f5 (v2) checkpoint — whose metadata blobs lack
+    /// `pool_id` — decodes with `pool_id = 0` (the legacy root). bincode
+    /// does not apply serde defaults to missing trailing fields, so the
+    /// legacy shape is decoded explicitly. Without this, a pre-f5
+    /// checkpoint would fail to load and every segment it covered would
+    /// silently vanish from the rebuilt registry (the log is already
+    /// truncated at the checkpoint).
+    #[test]
+    fn legacy_v2_checkpoint_decodes_with_pool_id_zero() {
+        let id = SegmentId::new();
+        let legacy_meta = LegacySegmentMetadata {
+            segment_id: id,
+            ec_k: 4,
+            ec_m: 2,
+            size_tier: SizeTier::Standard,
+            merkle_root: Some(HashOutput::from_bytes([0xAB; 32])),
+            storage_locations: smallvec::SmallVec::new(),
+            sealed_at: Some(1_700_000_000_000),
+        };
+        let meta_bytes = bincode::serialize(&legacy_meta).unwrap();
+
+        // Craft a v2 snapshot with one sealed entry: header + entry
+        // (id + state + meta_len + legacy meta + sealed extras) + crc.
+        let covered = EventWalPos { file_seq: 3, offset: 4096 };
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&CHECKPOINT_MAGIC);
+        buf.push(LEGACY_CHECKPOINT_VERSION);
+        buf.extend_from_slice(&covered.file_seq.to_le_bytes());
+        buf.extend_from_slice(&covered.offset.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(id.as_uuid().as_bytes());
+        buf.push(STATE_SEALED);
+        buf.extend_from_slice(&(meta_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&meta_bytes);
+        // Sealed extras: data_wal_pos (4 + 8) + repacked flag (1).
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.push(0);
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+
+        let (loaded_covered, registry) = decode_snapshot(&buf).expect("legacy snapshot decodes");
+        assert_eq!(loaded_covered, covered);
+        let entry = registry.get(id).expect("legacy entry restored");
+        assert_eq!(entry.metadata.pool_id, 0, "legacy checkpoints map to the legacy root");
+        assert_eq!(entry.metadata.ec_k, 4);
+        assert_eq!(entry.metadata.ec_m, 2);
+        assert_eq!(entry.metadata.merkle_root, Some(HashOutput::from_bytes([0xAB; 32])));
+    }
+
     #[test]
     fn snapshot_round_trip_preserves_registry_and_covered_pos() {
         let registry = test_registry_with(10);
@@ -607,6 +709,7 @@ mod tests {
         let id = SegmentId::new();
         let old = SegmentId::new();
         let meta = SegmentMetadata {
+            pool_id: 0,
             segment_id: id,
             ec_k: 4,
             ec_m: 2,
@@ -644,6 +747,7 @@ mod tests {
             .reserve(
                 id,
                 SegmentMetadata {
+                    pool_id: 0,
                     segment_id: id,
                     ec_k: 4,
                     ec_m: 2,
@@ -831,6 +935,7 @@ mod tests {
         .unwrap(); // file 0
         wal.append(crate::segment::event_wal::SegmentEvent::Seal(
             crate::segment::event_wal::SealEvent {
+                pool_id: 0,
                 segment_id: id,
                 tier: SizeTier::Standard,
                 ec_k: 4,
@@ -849,6 +954,7 @@ mod tests {
         // A later append rotates the straddling file away.
         wal.append(crate::segment::event_wal::SegmentEvent::Seal(
             crate::segment::event_wal::SealEvent {
+                pool_id: 0,
                 segment_id: id,
                 tier: SizeTier::Standard,
                 ec_k: 4,
@@ -917,6 +1023,7 @@ mod tests {
         .unwrap(); // file 0
         wal.append(crate::segment::event_wal::SegmentEvent::Seal(
             crate::segment::event_wal::SealEvent {
+                pool_id: 0,
                 segment_id: id,
                 tier: SizeTier::Standard,
                 ec_k: 4,
@@ -939,6 +1046,7 @@ mod tests {
         .unwrap(); // file 2 [0..32)
         wal.append(crate::segment::event_wal::SegmentEvent::Seal(
             crate::segment::event_wal::SealEvent {
+                pool_id: 0,
                 segment_id: id,
                 tier: SizeTier::Standard,
                 ec_k: 4,

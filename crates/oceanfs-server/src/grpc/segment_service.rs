@@ -350,6 +350,7 @@ impl SegmentRpc for SegmentGrpcService {
             let merkle_root =
                 oceanfs_durability::MerkleTree::build(&segment_data, 0).map(|t| t.root().hash());
             let meta = oceanfs_core::SegmentMetadata {
+                pool_id: 0,
                 segment_id,
                 ec_k: 1,
                 ec_m: 0,

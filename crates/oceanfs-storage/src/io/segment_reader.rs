@@ -142,8 +142,19 @@ pub struct DiskSegmentReader {
     disk_io: Arc<DiskIo>,
     /// Optional LRU cache of memory-mapped segment files.
     mmap_cache: Option<Arc<SegmentFileCache>>,
-    /// Base directory for segment files.
-    segment_dir: PathBuf,
+    /// Data pool roots sealed segments are spread across (ADR-0029 f5).
+    /// Empty = legacy mode: every segment resolves to `legacy_dir`.
+    data_pools: Vec<Arc<crate::pool::StoragePool>>,
+    /// Legacy segments directory (pool_id 0 / no pools).
+    legacy_dir: PathBuf,
+    /// Resolves a segment's durable pool id (the lifecycle registry's
+    /// `SegmentMetadata.pool_id`); `None`/0 → the legacy dir.
+    pool_id_for: crate::pool::PoolIdResolver,
+    /// Per-segment resolved pool ids. The registry lookup (a sharded
+    /// read lock + entry clone) runs ONCE per segment per process; every
+    /// subsequent read resolves from this cache — no registry lock on
+    /// the read path (f5 perf 7.2).
+    pool_id_cache: parking_lot::Mutex<HashMap<SegmentId, u32>>,
     /// Tracks the source of the most recent read, keyed by segment_id.
     last_source: Mutex<HashMap<SegmentId, SegmentReadSource>>,
     /// First-touch integrity state: maps segment_id → on-disk header
@@ -168,7 +179,9 @@ impl DiskSegmentReader {
     /// Creates a new disk-backed segment reader.
     ///
     /// `mmap_cache` should be `Some` when `read_mode == IoReadMode::Mmap`.
-    /// Otherwise it is ignored.
+    /// Otherwise it is ignored. `segment_dir` is the legacy segments
+    /// directory; call [`DiskSegmentReader::with_data_pools`] to enable
+    /// multi-pool resolution (ADR-0029 f5).
     pub fn new(
         read_mode: IoReadMode,
         disk_io: Arc<DiskIo>,
@@ -181,13 +194,36 @@ impl DiskSegmentReader {
             read_mode,
             disk_io,
             mmap_cache,
-            segment_dir,
+            data_pools: Vec::new(),
+            legacy_dir: segment_dir,
+            pool_id_for: Arc::new(|_| None),
+            pool_id_cache: Mutex::new(HashMap::new()),
             ec_decoder,
             ec_encoder,
             last_source: Mutex::new(HashMap::new()),
             verified_headers: Mutex::new(HashMap::new()),
             evict_after_read: false,
         }
+    }
+
+    /// Enables pool-aware segment resolution (ADR-0029 f5).
+    ///
+    /// `data_pools` are the node's data pools (a snapshot); `legacy_dir`
+    /// is the fallback for pool_id 0 and unknown ids; `pool_id_for`
+    /// resolves a segment's durable pool id (the node backs it with the
+    /// lifecycle registry's `SegmentMetadata.pool_id`). Reads then land
+    /// on the owning pool root — plain joins over the pool snapshot, no
+    /// locks in the read path.
+    pub fn with_data_pools(
+        mut self,
+        data_pools: Vec<Arc<crate::pool::StoragePool>>,
+        legacy_dir: PathBuf,
+        pool_id_for: crate::pool::PoolIdResolver,
+    ) -> Self {
+        self.data_pools = data_pools;
+        self.legacy_dir = legacy_dir;
+        self.pool_id_for = pool_id_for;
+        self
     }
 
     /// Enables `madvise(MADV_DONTNEED)` after each mmap read to eagerly
@@ -248,9 +284,32 @@ impl DiskSegmentReader {
         Ok((hdr_size, data_size))
     }
 
-    /// Returns the filesystem path for a segment file.
+    /// Returns the filesystem path for a segment file — resolved through
+    /// the segment's durable pool id (ADR-0029 f5); legacy (no pools /
+    /// pool_id 0 / unknown id) resolves to the legacy segments dir. The
+    /// pool-id lookup is cached per segment, so the registry is touched
+    /// once per segment per process (f5 perf 7.2: no registry lock on
+    /// the read path).
     fn segment_path(&self, segment_id: &SegmentId) -> PathBuf {
-        self.segment_dir.join(format!("{segment_id}.dat"))
+        let pool_id = if self.data_pools.is_empty() {
+            0
+        } else {
+            // Cache lookup: the guard from the first lock() is dropped at
+            // the end of THIS statement — never hold it across the
+            // resolver call or the second lock() (parking_lot Mutex is
+            // not reentrant).
+            let cached = self.pool_id_cache.lock().get(segment_id).copied();
+            match cached {
+                Some(pool_id) => pool_id,
+                None => {
+                    let pool_id = (self.pool_id_for)(segment_id).unwrap_or(0);
+                    self.pool_id_cache.lock().insert(*segment_id, pool_id);
+                    pool_id
+                }
+            }
+        };
+        crate::pool::resolve_pool_root(&self.data_pools, pool_id, &self.legacy_dir)
+            .join(format!("{segment_id}.dat"))
     }
 }
 
@@ -810,6 +869,7 @@ mod tests {
             .reserve(
                 seg_id,
                 oceanfs_core::SegmentMetadata {
+                    pool_id: 0,
                     segment_id: seg_id,
                     ec_k: 0,
                     ec_m: 0,

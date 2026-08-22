@@ -488,6 +488,7 @@ async fn retention_sweeps_sealed_segments_with_machine_liveness() {
             sealer.append_wal_entry(make_entry(seg_id, chunk * 64, 64)).await.unwrap();
         }
         let meta = SegmentMetadata {
+            pool_id: 0,
             segment_id: seg_id,
             ec_k: 2,
             ec_m: 1,
