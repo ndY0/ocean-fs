@@ -484,7 +484,13 @@ async fn load_cluster_churn() {
     // ── Build the load scenario ────────────────────────────────
     // Workers route each op to a random node (per-worker seeded RNG), so
     // the cluster sees genuinely distributed coordination traffic.
-    let concurrency = (num_cpus::get() * 2).clamp(6, 24);
+    // LOAD_TEST_CONCURRENCY overrides the derived worker count (the
+    // fleet CX43 harness can drive far more concurrency than the
+    // laptop-derived default — the phase-3 campaign pushes the SUTs).
+    let concurrency = std::env::var("LOAD_TEST_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| (num_cpus::get() * 2).clamp(6, 24));
     eprintln!("load_cluster_churn: concurrency={concurrency}");
     let scenario = LoadScenario {
         concurrency,
@@ -494,11 +500,23 @@ async fn load_cluster_churn() {
             OpWeight { op: Operation::Get, weight: 0.50 },
             OpWeight { op: Operation::Delete, weight: 0.10 },
         ],
-        blob_sizes: BlobSizeDist::Tiered {
-            inline_pct: 15.0,
-            small_pct: 35.0,
-            standard_pct: 35.0,
-            multi_pct: 15.0,
+        // LOAD_TEST_BLOB_PROFILE=heavy shifts the tier weights to big
+        // bodies (standard 45% / multi 35%): the SUTs' compression +
+        // IO pipeline is the point of the fleet campaign — small bodies
+        // leave the accel tier nearly idle at quorum-fsync write rates.
+        blob_sizes: match std::env::var("LOAD_TEST_BLOB_PROFILE").as_deref() {
+            Ok("heavy") => BlobSizeDist::Tiered {
+                inline_pct: 5.0,
+                small_pct: 15.0,
+                standard_pct: 45.0,
+                multi_pct: 35.0,
+            },
+            _ => BlobSizeDist::Tiered {
+                inline_pct: 15.0,
+                small_pct: 35.0,
+                standard_pct: 35.0,
+                multi_pct: 15.0,
+            },
         },
         key_space: KeySpace::Zipfian { hot_keys: 100, cold_keys: 9900, skew: 1.0 },
         seed,
@@ -670,7 +688,14 @@ async fn load_cluster_churn() {
     }
     // Grace period: the last delivered batch lands on the receiver's
     // metadata store asynchronously; give it a moment before verifying.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // LOAD_TEST_SETTLE_GRACE_MS overrides the default 5000ms (the
+    // fleet campaign: verify-time read-quorum misses while the last
+    // batch's async metadata apply races the sample).
+    let settle_grace_ms: u64 = std::env::var("LOAD_TEST_SETTLE_GRACE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5000);
+    tokio::time::sleep(Duration::from_millis(settle_grace_ms)).await;
 
     eprintln!(
         "load_cluster_churn: verifying manifest (HEAD+ETag) — t={:.0}s",
@@ -699,6 +724,9 @@ async fn load_cluster_churn() {
     // Only alive slots are addressed (the churn drain phase restarts
     // every node, but a still-settling slot is not a data-loss signal —
     // this guard keeps the quorum semantics honest).
+    // Per-key diagnostics for failed keys are recorded here and
+    // surfaced in the report details (fleet stdout is not captured).
+    let mut report_quorum_diag: Option<Vec<(String, u16, Option<String>)>> = None;
     let quorum_failed = manifest
         .verify_read_quorum(&*target, &alive_indices, READ_QUORUM, Some(READ_QUORUM_SAMPLE))
         .await;
@@ -710,7 +738,9 @@ async fn load_cluster_churn() {
     if !quorum_failed.is_empty() {
         eprintln!("load_cluster_churn: quorum-failed keys: {quorum_failed:?}");
         // Per-node diagnostics: what does each node serve for the failed
-        // keys (status + body hash prefix)?
+        // keys (status + body hash prefix)? Recorded in the report too —
+        // the fleet harness stdout is not always captured.
+        let mut per_node: Vec<(String, u16, Option<String>)> = Vec::new();
         for key in quorum_failed.iter().take(5) {
             for i in 0..target.len() {
                 match target.get(i, &format!("/{key}")).await {
@@ -729,11 +759,16 @@ async fn load_cluster_churn() {
                             )
                         });
                         eprintln!("  {key}: node {i} -> HTTP {status} hash={hash:?}");
+                        per_node.push((key.clone(), status, hash));
                     }
-                    Err(e) => eprintln!("  {key}: node {i} -> ERR {e}"),
+                    Err(e) => {
+                        eprintln!("  {key}: node {i} -> ERR {e}");
+                        per_node.push((key.clone(), 0, Some(e.to_string())));
+                    }
                 }
             }
         }
+        report_quorum_diag = Some(per_node);
     }
 
     // ── Assertions 4-5: hinted handoff ─────────────────────────
@@ -894,9 +929,13 @@ async fn load_cluster_churn() {
         quorum_failed.is_empty(),
         format!("every sampled key served from >= {READ_QUORUM} nodes"),
         format!(
-            "{} of {} sampled keys failed quorum",
+            "{} of {} sampled keys failed quorum{}",
             quorum_failed.len(),
-            READ_QUORUM_SAMPLE.min(manifest.len())
+            READ_QUORUM_SAMPLE.min(manifest.len()),
+            report_quorum_diag
+                .as_ref()
+                .map(|d| format!("; per-node: {d:?}"))
+                .unwrap_or_default()
         ),
     ));
 
