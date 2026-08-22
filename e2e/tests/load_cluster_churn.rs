@@ -619,14 +619,29 @@ async fn load_cluster_churn() {
     let settle_start = std::time::Instant::now();
     while settle_start.elapsed() < Duration::from_secs(120) {
         let mut pending = 0.0;
+        let mut unreachable = Vec::new();
         for i in 0..target.len() {
-            if let Ok(snap) = MetricsSnapshot::scrape(&*target, i).await {
-                pending += snap.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0)
-                    - snap.counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0)
-                    - snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0);
+            match MetricsSnapshot::scrape(&*target, i).await {
+                Ok(snap) => {
+                    pending += snap.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0)
+                        - snap.counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0)
+                        - snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0);
+                }
+                Err(_) => unreachable.push(i),
             }
         }
-        if pending <= 0.0 {
+        if !unreachable.is_empty() {
+            // A node is down or restarting: its pending is UNKNOWN and its
+            // WAL replay may still be draining, so a failed scrape must
+            // never count as a quiet check — otherwise the settle loop
+            // declares "quiet" while verify races the restart's tail
+            // (fleet campaign: read-quorum 404s on a resurrecting node).
+            quiet_checks = 0;
+            eprintln!(
+                "load_cluster_churn: settle check skipped — unreachable \
+                 nodes {unreachable:?} (reachable pending={pending:.0})"
+            );
+        } else if pending <= 0.0 {
             quiet_checks += 1;
             if quiet_checks >= QUIET_CHECKS_REQUIRED {
                 handoff_settled = true;
@@ -688,13 +703,14 @@ async fn load_cluster_churn() {
     }
     // Grace period: the last delivered batch lands on the receiver's
     // metadata store asynchronously; give it a moment before verifying.
-    // LOAD_TEST_SETTLE_GRACE_MS overrides the default 5000ms (the
+    // LOAD_TEST_SETTLE_GRACE_MS overrides the default 30000ms (the
     // fleet campaign: verify-time read-quorum misses while the last
-    // batch's async metadata apply races the sample).
+    // batch's async metadata apply races the sample — 5s proved too
+    // short under the heavy blob profile, so the default is 30s).
     let settle_grace_ms: u64 = std::env::var("LOAD_TEST_SETTLE_GRACE_MS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(5000);
+        .unwrap_or(30_000);
     tokio::time::sleep(Duration::from_millis(settle_grace_ms)).await;
 
     eprintln!(
@@ -772,17 +788,37 @@ async fn load_cluster_churn() {
     }
 
     // ── Assertions 4-5: hinted handoff ─────────────────────────
+    // A churn restart resets a node's Prometheus counters, so a naive
+    // `final - initial` undercounts/overcounts per node (fleet campaign:
+    // delivered = -350 after a restart). Reset-aware delta: if the
+    // counter went backwards the node restarted, so count only its
+    // post-restart accumulation (the pre-restart total is unknowable
+    // from the scrape pair — the WAL-replay deliveries land in the
+    // post-restart counter and are still counted here).
+    let delta = |final_v: f64, initial_v: f64| {
+        if final_v >= initial_v {
+            final_v - initial_v
+        } else {
+            final_v // counter reset on restart: post-restart accumulation only
+        }
+    };
     let mut stored = 0.0;
     let mut delivered = 0.0;
     let mut expired = 0.0;
     for (i, initial) in initial_snaps.iter().enumerate() {
         if let Ok(final_snap) = MetricsSnapshot::scrape(&*target, i).await {
-            stored += final_snap.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0)
-                - initial.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0);
-            delivered += final_snap.counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0)
-                - initial.counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0);
-            expired += final_snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0)
-                - initial.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0);
+            stored += delta(
+                final_snap.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0),
+                initial.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0),
+            );
+            delivered += delta(
+                final_snap.counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0),
+                initial.counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0),
+            );
+            expired += delta(
+                final_snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0),
+                initial.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0),
+            );
         }
     }
     // Delivered may legitimately exceed stored (hints replayed from a
