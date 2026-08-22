@@ -210,26 +210,25 @@ impl HintWal {
             // Verify CRC32.
             let actual_crc = crc32fast::hash(payload);
             if actual_crc != expected_crc {
-                let is_tail = (cursor as usize) + frame_total >= buffer.len();
-                if is_tail {
-                    // Torn tail: a full-size frame whose payload/CRC are
-                    // a partial write (the SIGKILL landed mid-frame but
-                    // the length made the frame look complete). End
-                    // replay cleanly and truncate — the surviving
-                    // records replay, the garbage is discarded.
-                    warn!(
-                        position = cursor,
-                        expected = format!("{expected_crc:#x}"),
-                        actual = format!("{actual_crc:#x}"),
-                        "hint WAL torn tail (CRC mismatch at EOF) — truncating"
-                    );
-                    self.truncate_to(cursor)?;
-                    break;
-                }
-                return Err(Error::Internal(format!(
-                    "hint WAL CRC32 mismatch at position {}: expected {:#x}, got {:#x}",
-                    cursor, expected_crc, actual_crc
-                )));
+                // A CRC mismatch is a torn write — either a partial
+                // final frame (SIGKILL mid-append) or a torn overwrite
+                // (the crash left the append position out of sync with
+                // the file, mixing old and new bytes at a frame
+                // boundary — observed in the fleet: node-0's hint WAL
+                // had 94 valid frames, then a bad frame at 12440 with
+                // garbage after). The hint WAL is delivery intent, not
+                // the source of truth: the node MUST restart — replay
+                // the valid prefix, truncate the corruption away, and
+                // let the write path re-form hint debt as needed.
+                warn!(
+                    position = cursor,
+                    expected = format!("{expected_crc:#x}"),
+                    actual = format!("{actual_crc:#x}"),
+                    valid_prefix = cursor,
+                    "hint WAL CRC mismatch — replaying the valid prefix and truncating"
+                );
+                self.truncate_to(cursor)?;
+                break;
             }
 
             // Decode protobuf.
@@ -772,16 +771,16 @@ mod tests {
             file.flush().unwrap();
         }
 
-        // Reopen and replay — should error on CRC mismatch.
+        // Reopen and replay — a mid-file CRC mismatch is a torn write:
+        // the valid PREFIX replays, the file is truncated at the
+        // corruption, and the node starts (hints are delivery intent,
+        // not the source of truth — the fleet churn node-0 class).
         let wal2 = HintWal::open(&wal_path).await.unwrap();
-        let result = wal2.replay().await;
-        assert!(result.is_err(), "replay must fail on CRC mismatch");
-        let err = result.unwrap_err();
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("CRC32 mismatch") || err_msg.contains("CRc"),
-            "error must mention CRC mismatch: {err_msg}"
-        );
+        let records = wal2.replay().await.expect("CRC mismatch must not brick replay");
+        assert_eq!(records.len(), 1, "only the first valid record survives");
+        let file_len = std::fs::metadata(&wal_path).unwrap().len();
+        let first_end = records[0].1;
+        assert_eq!(file_len, first_end, "the file must be truncated at the corruption");
     }
 
     /// The fleet churn crash-tail fix: a SIGKILL mid-append can tear the
