@@ -459,9 +459,25 @@ impl Node {
             "Starting OceanFS node"
         );
 
+        // ---- 0. Storage pool registry (ADR-0029) + role-pinned paths ----
+        // The registry probes every configured pool root at boot: the
+        // `Fatal` policy refuses to start on an unprobeable root, the
+        // `Degraded` policy registers the pool as Degraded (f4 falls back
+        // to the legacy path for that role with a WARN). The role-pinned
+        // dirs resolve ONCE here — the write path never re-resolves them
+        // (perf guidelines 3.4/7.1: boot-time only, no locks in the hot
+        // path). Legacy mode (no pools) resolves byte-for-byte to today's
+        // `{data_dir}/{metadata,wal,event-wal,hints}` layout.
+        let pool_registry = Arc::new(
+            oceanfs_storage::PoolRegistry::from_config(&config.storage, &config.data_dir)
+                .map_err(|e| format!("storage pool registry: {e}"))?,
+        );
+        let paths =
+            crate::pool_paths::pool_paths(&pool_registry, &config.data_dir, &config.hint_wal_dir);
+
         // ---- 1. Open metadata store ----
         let metadata_config =
-            MetadataConfig { data_dir: config.data_dir.join("metadata"), ..Default::default() };
+            MetadataConfig { data_dir: paths.metadata.clone(), ..Default::default() };
         let metadata_store = Arc::new(
             oceanfs_storage::RocksDbMetadataStore::open(&metadata_config)
                 .map_err(|e| format!("failed to open metadata store: {e}"))?,
@@ -555,8 +571,7 @@ impl Node {
 
         // ---- 6. Construct storage components ----
         let segment_size = SegmentSizeConfig::default();
-        let wal_config =
-            WalConfig { data_dir: config.data_dir.join("wal"), ..WalConfig::default() };
+        let wal_config = WalConfig { data_dir: paths.wal.clone(), ..WalConfig::default() };
         let wal_writer = Arc::new(
             oceanfs_storage::WalWriter::open(&wal_config)
                 .await
@@ -685,16 +700,17 @@ impl Node {
         // write becomes a derived mirror performed after the event
         // (dual-read verification surface — the event log is the source
         // of truth for segment lifecycle).
-        // The event WAL dir is composed from `{data_dir}/event-wal`
-        // exactly like every other data path (data WAL at
-        // `{data_dir}/wal`, metadata at `{data_dir}/metadata`): the
-        // crate-level default (`/var/lib/oceanfs/event-wal`) is the
-        // system-layout default, and the node always overrides it with
-        // its own data dir — the same pattern applied to `WalConfig`
-        // above. Without this, any non-root run (dev, e2e, tests)
-        // fails to open the event WAL with permission denied.
+        // The event WAL dir is composed from `{data_dir}/event-wal` in
+        // legacy mode exactly like every other data path (data WAL at
+        // `{data_dir}/wal`, metadata at `{data_dir}/metadata`); in pool
+        // mode it rides the pinned wal pool root (`{wal pool}/event-wal`,
+        // ADR-0024 + ADR-0029 §D8 role pinning). The crate-level default
+        // (`/var/lib/oceanfs/event-wal`) is the system-layout default, and
+        // the node always overrides it — the same pattern applied to
+        // `WalConfig` above. Without this, any non-root run (dev, e2e,
+        // tests) fails to open the event WAL with permission denied.
         let event_wal_config = oceanfs_core::EventWalConfig {
-            event_wal_dir: config.data_dir.join("event-wal"),
+            event_wal_dir: paths.event_wal.clone(),
             ..config.event_wal.clone()
         };
         let event_wal = Arc::new(
@@ -993,8 +1009,10 @@ impl Node {
 
         // Construct the persistent per-node HintWAL directory and
         // HintedHandoffManager for durable hinted handoff (ADR-0018 Decision 2).
-        let hints_dir =
-            config.hint_wal_dir.clone().unwrap_or_else(|| config.data_dir.join("hints"));
+        // The hints WAL lives on the pinned hints pool root when
+        // configured; the legacy `hint_wal_dir` override (or
+        // `{data_dir}/hints`) applies otherwise (resolved in pool_paths).
+        let hints_dir = paths.hints.clone();
         let hint_delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> = Arc::new(
             GrpcHintDeliveryClient::new(pool.clone())
                 // The hint receiver fetches segment-ref data back
@@ -1324,6 +1342,9 @@ impl Node {
         event_wal.register_metrics(&*metrics);
         // Checkpoint metrics (checkpoint bytes written, bytes truncated).
         event_checkpoint.register_metrics(&*metrics);
+        // Storage pool metrics (ADR-0029 — status, bytes free/total,
+        // I/O error counter per pool).
+        pool_registry.register_metrics(&*metrics);
 
         // Register RocksDB property gauges into the central metrics registry.
         metadata_store.metrics().register(&*metrics);

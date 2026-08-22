@@ -1,7 +1,7 @@
 ---
 feature: "Storage Pools: Role Isolation (WAL/Metadata/Hints Pinning)"
 epic: "disk-resilience"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies: ["pool-runtime"]
@@ -101,18 +101,63 @@ config ──▶ PoolRegistry ──▶ pool_paths(registry, data_dir, hint_wal_
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` in `oceanfs-node` and
+- [x] **Code:** `cargo build --all-targets` in `oceanfs-node` and
       dependents
-- [ ] **Tests:** unit resolution matrix + node boot test + regression
+      (verified by review: `cargo build --all-targets -p oceanfs-node`
+      and `-p oceanfs` clean; `cargo fmt --all -- --check` clean; `cargo
+      clippy -p oceanfs-node --lib -- -D warnings` and `--tests` clean)
+- [x] **Tests:** unit resolution matrix + node boot test + regression
       (legacy layout identical)
-- [ ] **Docs:** `# Examples` on pub items; rustdoc clean
-- [ ] **ADR:** ADR-0029 §D8 role pinning (WAL/metadata/hints isolation)
+      (verified by review: 4 `pool_paths` unit tests — legacy
+      byte-for-byte, explicit pinned incl. `wal_root/event-wal`,
+      pool-mode-without-role fallback, Degraded fallback; 3
+      `role_isolation` integration tests — 4-pool boot, legacy
+      regression, S3 PUT+GET on pinned roots. All green,
+      `--test-threads=1`. Full node suite as regression gate: 36 lib +
+      79 integration (17 binaries) + 2 doctests = 117 passed, 0 failed.)
+- [x] **Docs:** `# Examples` on pub items; rustdoc clean
+      (verified: `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p
+      oceanfs-node` clean; `# Examples` on `PoolPaths` (pool_paths.rs:19-31),
+      module docs on `pool_paths.rs`; doctest runs green)
+- [x] **ADR:** ADR-0029 §D8 role pinning (WAL/metadata/hints isolation)
       satisfied
-- [ ] **Perf:** 3.4 (group-commit WAL unchanged — only the dir resolves
+      (verified: metadata → metadata pool root, WAL → wal pool root,
+      event WAL → wal root/event-wal, hints → hints pool root; legacy
+      zero-config fallback byte-for-byte; Fatal probe failure surfaces at
+      `from_config` with the pool root in the error (pool/mod.rs:715-719);
+      Degraded falls back with a WARN only when a pool of the role exists
+      but is not Healthy (pool_paths.rs:90-98) — legacy mode never warns;
+      no Ceph-OSD / node-granular / probe-blind rejected alternatives
+      re-implemented)
+- [x] **Perf:** 3.4 (group-commit WAL unchanged — only the dir resolves
       once at boot, not per-write), 7.1 (path resolution is a boot-time
       operation; no lock in the write path)
-- [ ] **Integration:** a 4-pool node boots and serves an S3 PUT+GET in a
+      (verified by review: `pool_paths()` called once at node.rs:475-476;
+      the four `paths.*` values feed MetadataConfig/WalConfig/
+      EventWalConfig/HintedHandoffConfig only; WAL write path code
+      untouched; no locks added)
+- [x] **Integration:** a 4-pool node boots and serves an S3 PUT+GET in a
       local e2e test; the report asserts files landed on the pinned roots
+      (verified by review: `cargo test -p oceanfs-node --test
+      role_isolation -- --test-threads=1` — 3 passed; RocksDB CURRENT at
+      the metadata root, `wal_*.log` at the wal root, event-wal under the
+      wal root, legacy `data_dir/{metadata,wal,event-wal,hints}` absent,
+      segments stay at `data_dir/segments`; PUT+GET 200 with body
+      round-trip on the 4-pool node)
+      <!-- REVIEW: hints pinning is only weakly proven end-to-end:
+      `hints_root.exists()` (tests/role_isolation.rs:88) holds because the
+      pool probe creates the root — it would pass even if the hints wiring
+      fell back to data_dir/hints. Hint WAL files are opened lazily per
+      peer node on first hint (hinted_handoff/hint_wal.rs:77-89), so no
+      hint file exists at boot to assert. Mitigated by the unit tests
+      (explicit_mode_resolves_to_pool_roots asserts the hints root) and
+      the static one-line binding node.rs:1015. A stronger e2e would force
+      a hint (e.g., write a HintWal at the hints root and replay, or make
+      a peer hand off). LOW severity — DoD integration item is met. -->
+      <!-- REVIEW: the Degraded WARN is not asserted by any test (only the
+      fallback path is, pool_paths.rs:232-244). A tracing-subscriber test
+      would pin the "WARN only when a role pool exists but is Degraded"
+      behavior. LOW severity. -->
 
 ## Deviations (accepted)
 
@@ -120,3 +165,23 @@ config ──▶ PoolRegistry ──▶ pool_paths(registry, data_dir, hint_wal_
   role** rather than failing the node. This is a Phase A bridge: real
   degraded semantics (route around, reject writes) arrive in Phase B; the
   fallback keeps a misconfigured node bootable and loudly WARNs.
+
+### Implementation Notes
+
+- **f2 → f4 closure (`PoolRegistry::register_metrics`).** The f2 spec note
+  (`pool-runtime.md`, "metrics" section) said the node wires
+  `register_metrics` in f4; that wiring landed here as part of this feature:
+  `pool_registry.register_metrics(&*metrics)` in `Node::start`'s metrics
+  block (`node.rs:1347`), alongside the other per-component registrations.
+- **Degraded fallback WARN is conditional.** The prominent WARN fires only
+  when a pool of the role exists but is not Healthy; the legacy-mode (no
+  pools) and pool-mode-without-role fallbacks are silent. Behavior pinned by
+  tracing-subscriber unit tests (`degraded_pinned_pool_fallback_emits_warn`,
+  `legacy_fallback_is_silent` in `pool_paths.rs`).
+- **Tracked follow-up (reviewer LOW): hints pinning not end-to-end
+  observable at boot.** `HintedHandoffManager` opens per-peer hint WAL files
+  lazily on first hint, so no hint file exists at boot to assert pinning.
+  The pinning is covered by the `explicit_mode_resolves_to_pool_roots` unit
+  test and the static `node.rs` binding; closing the gap requires driving a
+  real hint handoff (Phase B machinery). Consolidates the inline REVIEW
+  comments under the DoD Integration item.

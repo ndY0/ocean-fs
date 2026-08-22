@@ -24,6 +24,7 @@
 mod membership_state;
 mod metadata_adapter;
 mod node;
+pub mod pool_paths;
 pub mod startup;
 
 pub use metadata_adapter::MetadataStoreAdapter;
