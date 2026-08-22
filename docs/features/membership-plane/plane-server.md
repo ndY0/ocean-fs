@@ -1,7 +1,7 @@
 ---
 feature: "Membership Plane: Dedicated Server + Deploy"
 epic: "membership-plane"
-status: proposed
+status: implemented
 priority: high
 owner: ""
 dependencies:
@@ -89,3 +89,13 @@ peer A → Probe{indirect, target=B} → relay C (9002) → direct probe B → a
 - [x] **Integration:** local 3-node churn field still spotless (7/7) with
       gossip now on 9002; deploy script provisions a 3-node fleet with
       9002 open and gossip converges
+
+## Deviations (accepted)
+
+- **Probe transport: timeout-bounded pooled channel, not a fresh
+  channel.** The plane pool this feature wires into
+  `Membership::set_pool` is used for probe transport via
+  `make_client(pool, addr, ping_timeout_ms)`
+  (`failure_detector/ping.rs:259`) — a pool acquisition bounded by
+  `ping_timeout_ms` — instead of ADR-0028 D1's fresh channel per probe.
+  The hard per-probe deadline is preserved (see f1).

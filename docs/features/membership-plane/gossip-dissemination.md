@@ -1,7 +1,7 @@
 ---
 feature: "Membership Plane: Version Vectors + Push-Pull Dissemination"
 epic: "membership-plane"
-status: proposed
+status: implemented
 priority: medium
 owner: ""
 dependencies:
@@ -22,7 +22,8 @@ push-pull gossip. Each node keeps a per-node version vector; deltas are
 computed against the peer's watermark; the push response carries the
 peer's pull (one round trip per peer per round); fanout is
 `k = min(fanout_k, alive-1)` random peers (default 3). Pull remains for
-join and explicit re-sync.
+join; divergence healing is push-side watermark healing (deviation — the
+explicit re-sync Pull RPC is superseded, see Deviations).
 
 ## Scope
 
@@ -36,8 +37,10 @@ join and explicit re-sync.
 - Round: pick k random alive peers → `Push(delta, my vector)` →
   `GossipAck{accepted, delta: peer's pull, version_vector}` → merge (f4
   rules) → advance watermarks.
-- `Pull` path: join pulls with an empty vector (full list); re-sync pull
-  when a peer's vector lacks an entry I hold (divergence heal).
+- `Pull` path: join pulls with an empty vector (full list). Divergence
+  healing is push-side (deviation, see below): unacked (node, origin)
+  keys stay in the delta until the peer acks; the ack-carried pull
+  covers the opposite direction each round.
 - `GossipMessage.ring_version`/`hlc` removal consumed (f1).
 - Metrics: `gossip_delta_entries` histogram, per-round push/pull counts.
 
@@ -65,7 +68,9 @@ join and explicit re-sync.
 round → pick k peers → Push(delta vs watermark, my vector)
      ← Ack(delta vs my vector, peer vector) → merge → advance watermarks
 join → Pull(empty vector) → full list → announce self
-re-sync → Pull(my vector) → missing entries
+divergence heal → push-side watermark healing: unacked (node,origin)
+                  keys stay in the delta until acked (re-sync Pull RPC
+                  superseded)
 ```
 
 ## Definition of Done
@@ -86,3 +91,20 @@ re-sync → Pull(my vector) → missing entries
       bounded deltas (≪ full list after warmup); the fleet gossip traffic
       per round drops to O(k)
 <!-- REVIEW: verified 2026-08-22 (iteration 2): local churn green (load_cluster_churn 1/1, 10/10 assertions; cluster_* suites 26 tests). The iteration-1 unbounded-delta root cause — recover_suspect emitting a Suspect→Alive event on EVERY successful probe (failure_detector/mod.rs:137) — is fixed by the Suspect-gate (timer OR synced-view Suspect); the regression test successful_probe_of_alive_target_emits_no_recovery_event proves the prober-attributed entry stabilizes, so watermarks prune to empty (ack_advances_watermark_and_prunes_next_delta). The fleet O(k) traffic measurement remains an f6 item (deferred by the user's checkpoint gate). -->
+
+## Deviations (accepted)
+
+- **Explicit re-sync Pull RPC superseded by push-side watermark
+  healing.** ADR-0028 D4's re-sync pull ("pull when a peer's vector
+  lacks an entry I hold") is implemented on the push side instead:
+  `build_delta_for` (gossip.rs:597) keeps every (node, origin) key whose
+  version exceeds the peer's watermark **in the delta until the peer
+  acks** — unacked keys are never pruned — so a deliberately diverged
+  peer vector is healed by the next round, and the ack-carried pull
+  covers the opposite direction each round. The dedicated re-sync Pull
+  RPC is redundant under bidirectional push-pull. Directly tested by
+  `diverged_peer_vector_is_healed_by_the_next_delta` (gossip.rs:1082).
+- **Synthetic ≤ `log2(N)+1` convergence-round test replaced** by the
+  end-to-end 3-node integration (`tests/swim_probes.rs`: kill → SUSPECT
+  → DEAD → rejoin → Alive) plus the `cluster_gossip` e2e suite —
+  convergence is proven on real messages (see f3).

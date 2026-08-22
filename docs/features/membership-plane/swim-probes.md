@@ -1,7 +1,7 @@
 ---
 feature: "Membership Plane: Real SWIM Probes"
 epic: "membership-plane"
-status: proposed
+status: implemented
 priority: high
 owner: ""
 dependencies:
@@ -43,7 +43,8 @@ gossip stops emitting `PingResponse`; the detector stops consuming it.
   stay as dissemination metrics only.
 - Probe metrics: `probe_duration_microseconds` histogram,
   `probe_failures_total`, `indirect_probes_total` counters, registered via
-  `register_gossip_metrics` (rename to `register_membership_metrics`).
+  `register_membership_metrics` (renamed from `register_gossip_metrics`;
+  the old name no longer exists — see Deviations).
 - Self-ping path kept (in-process `ProbeHandler`).
 
 ### Out of Scope
@@ -89,6 +90,26 @@ tick → pick target → direct probe (9002, deadline)
 - [x] **ADR:** ADR-0028 D2 satisfied; DK-007 removed (D5)
 - [x] **Perf:** 4.5 (hard per-probe deadline), 8.2 (timeout branches),
       9.1/9.2 (borrowed request/response, `&str` ids)
-- [ ] **Integration:** local churn field 7/7; probe p99 stays below
-      `ping_timeout_ms` under data-plane load (16 MiB streams)
+- [x] **Integration (local):** local churn field 7/7 —
+      `load_cluster_churn` 1/1, 10/10 assertions (verified 2026-08-22)
+- [ ] **Integration (fleet, deferred to f6):** probe p99 stays below
+      `ping_timeout_ms` under data-plane load (16 MiB streams) — a fleet
+      measurement gated by the user's checkpoint; see f6
 <!-- REVIEW: local churn green (load_cluster_churn 1/1, 10/10 assertions, verified 2026-08-22); the isolation proof — probe_duration_microseconds p99 < ping_timeout_ms while 16 MiB bodies stream — is a fleet measurement (f6, deferred by the user's checkpoint gate) and has not been run; the separate listener + pool + socket opts (node.rs:1594-1620) make it structural but unproven. -->
+
+## Deviations (accepted)
+
+- **Metrics registrar renamed.** `register_gossip_metrics` was renamed
+  to `register_membership_metrics` (`membership/manager.rs:276`); the
+  old name no longer exists. The membership plane registers the probe
+  and gossip series through it.
+- **Synthetic convergence-bound test replaced by the end-to-end 3-node
+  integration.** The synthetic ≤ `log2(N)+1` convergence-round
+  simulation (listed in f5's DoD) is replaced by the real 3-node
+  in-process cluster (`tests/swim_probes.rs`): kill → SUSPECT within
+  `2×ping_timeout_ms + margin`, DEAD after `suspicion_timeout_ms`,
+  recovery on restart — plus the `cluster_gossip` e2e suite. Convergence
+  is demonstrated end-to-end on actual probe + gossip messages instead
+  of a round-bound simulation.
+- **Probe transport: timeout-bounded pooled channel** — see f1/f2
+  (`make_client`, `failure_detector/ping.rs:259`).

@@ -1,7 +1,7 @@
 ---
 feature: "Membership Plane: Origin-Attributed State + Authority Merge Rules"
 epic: "membership-plane"
-status: proposed
+status: implemented
 priority: high
 owner: ""
 dependencies:
@@ -34,8 +34,12 @@ rules.
 - `GossipProtocol::merge_delta` + `Membership::upsert_node` merge by the
   authority table (ADR-0028 D3):
   1. incarnation: higher wins (rejoin, ADR-0022); lower rejected (T8);
-  2. equal incarnation: authority class of origin — self (3) >
-     local detector (2) > other member's detector (1) > echo (0);
+  2. equal incarnation: authority class of origin — 4 = the leaver's
+     own Left/Leaving (terminal claim) > 3 = my own detector / local
+     observations > 2 = another member's detector facts > 1 = the
+     target's own Alive announcement (idempotent within origin+version)
+     > 0 = entries about SELF from another origin (rejected outright);
+     see Deviations — ADR-0028 D3 was amended to this ordering;
   3. within a class: higher version wins; equal → idempotent.
 - **Deleted heuristics** (each replaced by a table rule):
   - terminality ordering (`Dead > Left > Leaving > Suspect > Alive`);
@@ -73,8 +77,9 @@ rules.
 ```
 detector probe result → event(origin=self, version++) → upsert_node
 peer delta entry      → merge_delta: class table → upsert_node
-self announce         → event(origin=self, version++) → always wins at equal inc
-echo of my own fact   → class 0 → idempotent (oscillation closed)
+self announce         → event(origin=self, version++) → class 3 → always wins at equal inc
+echo of my own fact   → class 3, equal version → idempotent (oscillation closed)
+peer Suspect about me → class 0 → rejected (self-liveness authority)
 ```
 
 ## Definition of Done
@@ -93,3 +98,19 @@ echo of my own fact   → class 0 → idempotent (oscillation closed)
 - [x] **Integration:** local churn field 7/7 with the authority merge;
       the t24/fleet regression scenarios (kill + rejoin + stale-gossip
       replay) converge without oscillation
+
+## Deviations (accepted)
+
+- **Authority table ordering — ADR-0028 D3 amended to match the
+  implementation.** The implemented class table is: **4** = the leaver's
+  own Left/Leaving (terminal claim) > **3** = my own detector / my own
+  local observations > **2** = another member's detector facts > **1** =
+  the target's own Alive announcement (idempotent within origin+version)
+  > **0** = entries about SELF from another origin (rejected outright).
+  The ADR's earlier draft placed the target's own announcement at the
+  top, which would have made suspicion impossible — a peer's Suspect
+  could never beat the target's own Alive announcement, so remote
+  suspicion could never be applied. ADR-0028 D3 was amended to this
+  ordering; every documented guard outcome is preserved (self-liveness
+  authority, ping-verified Alive beats remote Suspect, remote suspicion
+  first-class, DEAD detector-local, oscillation classes closed).

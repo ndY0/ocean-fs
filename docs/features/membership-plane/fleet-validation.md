@@ -91,3 +91,15 @@ build → deploy fleet (9001 data + 9002 membership) → churn runs ×3
       This is a deferred epic-gate item, NOT a code gap. Local half of
       the Integration bullet is verified (2026-08-22): load_cluster_churn
       1/1 + all cluster_* suites green. -->
+
+## Deviations (accepted)
+
+- **Deferred — user checkpoint gate.** Fleet validation is deferred:
+  fleet VMs are not provisioned, so there is no fleet deploy, no
+  `settle_grace_ms` knob in `e2e/src/harness.rs`, no handoff-delta
+  counter-reset re-base in `load_cluster_churn.rs`, no probe-p99
+  capture, and no 3/3 churn quick runs. This is a deferred epic-gate
+  item, NOT a code gap (epic DoD items 3–4 carry the same deferral).
+  The local half of the Integration DoD is complete (verified
+  2026-08-22): `load_cluster_churn` 1/1 with 10/10 assertions (204 s)
+  and all `cluster_*` e2e suites green.

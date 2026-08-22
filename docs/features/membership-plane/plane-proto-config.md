@@ -1,7 +1,7 @@
 ---
 feature: "Membership Plane: Proto + Config + Pool"
 epic: "membership-plane"
-status: proposed
+status: implemented
 priority: high
 owner: ""
 dependencies: []
@@ -96,3 +96,17 @@ proto  → version/origin/vector fields → carried but unused until f4/f5
 - [x] **Integration:** a generated-code smoke test round-trips a
       `MembershipEntry{version, origin}` and a `Probe` call over the
       existing test server
+
+## Deviations (accepted)
+
+- **Probe transport: timeout-bounded pooled channel, not a fresh
+  channel.** ADR-0028 D1 specified that probes use "a fresh channel with
+  a hard per-call deadline rather than waiting on the pool semaphore".
+  The implementation instead acquires a channel from the membership pool
+  under a hard deadline — `make_client(pool, addr, ping_timeout_ms)`
+  (`failure_detector/ping.rs:259`) — so a probe never waits unbounded,
+  and the hard `ping_timeout_ms` bound D1 was designed to guarantee is
+  preserved. The pool shape (per-peer 2, connect timeout derived from
+  `ping_timeout_ms`) is unchanged; only the per-probe acquisition is
+  bounded rather than creating a fresh channel per probe. Same deviation
+  recorded in f2/f3.
