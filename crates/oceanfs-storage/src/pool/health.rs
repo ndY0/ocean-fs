@@ -602,6 +602,44 @@ impl HealthMonitor {
         }
     }
 
+    /// Resets the monitor's per-pool state to match an **external**
+    /// status change — g7's WAL/metadata replacement resets a Dead pool
+    /// to Healthy after a fresh store + catch-up.
+    ///
+    /// Without this, the monitor's internal mirror would stay `Dead`
+    /// and the pool could never be re-confirmed Dead (or re-degraded)
+    /// after recovery — `decide_transition(Dead, …)` is absorbing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use oceanfs_storage::io::IoObserver;
+    /// use oceanfs_storage::pool::health::{HealthMonitor, HealthMonitorConfig};
+    /// use oceanfs_storage::{PoolRegistry, PoolStatus};
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// let registry = Arc::new(
+    ///     PoolRegistry::from_config(&oceanfs_core::StorageConfig::default(), &data_dir)
+    ///         .expect("registry"),
+    /// );
+    /// let observer = Arc::new(IoObserver::new());
+    /// registry.observe_into(&observer);
+    /// let (monitor, _events) =
+    ///     HealthMonitor::new(registry.clone(), observer.clone(), HealthMonitorConfig::default());
+    /// monitor.reset_pool(0, PoolStatus::Healthy);
+    /// assert_eq!(registry.pool_by_id(0).expect("pool").status(), PoolStatus::Healthy);
+    /// ```
+    pub fn reset_pool(&self, pool_id: u32, status: PoolStatus) {
+        let mut state = self.state.lock();
+        let entry = state.entry(pool_id).or_insert_with(|| PoolState::new(status, Instant::now()));
+        entry.status = status;
+        entry.clean_windows = 0;
+        entry.history.clear();
+        entry.next_tick = Instant::now();
+    }
+
     /// Runs the per-node monitor loop until `shutdown` is cancelled.
     ///
     /// A coarse 1s base ticker drives the per-pool cadence (each pool
@@ -1406,6 +1444,43 @@ mod tests {
             registry.pool_by_id(pool_id).unwrap().status(),
             PoolStatus::Dead,
             "an explicit confirmed-loss report must force Dead"
+        );
+    }
+
+    #[test]
+    fn monitor_reconfirms_dead_after_registry_reset() {
+        // g7 handoff: after a WAL/store replacement resets a Dead pool
+        // to Healthy, the monitor must be able to re-degrade and
+        // re-confirm it — its internal mirror must not stay Dead.
+        let (registry, observer, monitor, _events, _tmp) = monitor_setup();
+        let pool_id = 0;
+
+        // Dead first.
+        let mut now = Instant::now();
+        observer.record_error(pool_id, IoErrorKind::TimedOut);
+        observer.record_latency(pool_id, IoOp::Read, Duration::from_micros(1));
+        tick_all(&monitor, &mut now);
+        observer.record_error(pool_id, IoErrorKind::NotFound);
+        observer.record_latency(pool_id, IoOp::Read, Duration::from_micros(1));
+        tick_all(&monitor, &mut now);
+        assert_eq!(registry.pool_by_id(pool_id).unwrap().status(), PoolStatus::Dead);
+
+        // g7 replaces the device: registry + monitor reset to Healthy.
+        registry.set_status(pool_id, PoolStatus::Healthy);
+        monitor.reset_pool(pool_id, PoolStatus::Healthy);
+
+        // Re-degrade + re-confirm works.
+        observer.record_error(pool_id, IoErrorKind::TimedOut);
+        observer.record_latency(pool_id, IoOp::Read, Duration::from_micros(1));
+        tick_all(&monitor, &mut now);
+        assert_eq!(registry.pool_by_id(pool_id).unwrap().status(), PoolStatus::Degraded);
+        observer.record_error(pool_id, IoErrorKind::NotFound);
+        observer.record_latency(pool_id, IoOp::Read, Duration::from_micros(1));
+        tick_all(&monitor, &mut now);
+        assert_eq!(
+            registry.pool_by_id(pool_id).unwrap().status(),
+            PoolStatus::Dead,
+            "a reset pool must be re-confirmable Dead (g7 handoff)"
         );
     }
 

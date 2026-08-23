@@ -65,7 +65,8 @@ alone.
 - Tests:
   - unit: each transition rule (incl. "latency alone never confirms
     Dead"; hysteresis window; recovery clears write_degraded);
-  - unit: role matrix — wal Degraded sets write_degraded; metadata Dead
+  - unit: role matrix — wal Degraded does NOT set write_degraded,
+      wal Dead sets it; metadata Dead
     sets node_unavailable; hints Dead rejects enqueue;
   - unit: confirmed-loss inputs (ENOENT/EIO from the observer's error
     kinds) transition to Dead; unplug (write-verify failure) does too.
@@ -90,7 +91,8 @@ alone.
   `run(shutdown_token)`.
 - `pub enum ConfirmedLoss { SegmentNotFound, FsyncIo, DeviceUnplug }` —
   the only inputs that may transition Degraded → Dead.
-- `pub fn derive_affected_segments(registry: &LifecycleRegistry, pool_id: u32) -> Vec<SegmentId>`
+- `pub fn derive_affected_segments(registry: &SegmentLifecycleRegistry, pool_id: u32)
+  -> Vec<SegmentId>`
   (node-side helper, Phase A f5 mapping).
 
 ## Data Flow
@@ -107,20 +109,62 @@ IoObserver.snapshot ──▶ HealthMonitor tick ──▶ evaluate_trend (g1)
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` in `oceanfs-storage`,
+- [x] **Code:** `cargo build --all-targets` in `oceanfs-storage`,
       `oceanfs-node`
-- [ ] **Tests:** all listed green (transitions, hysteresis, role matrix,
+      (verified: workspace build clean at HEAD 1aec8cd)
+- [x] **Tests:** all listed green (transitions, hysteresis, role matrix,
       confirmed-loss rules)
-- [ ] **Docs:** `# Examples` on pub items; rustdoc clean
-- [ ] **ADR:** ADR-0029 §D3 (typed failure semantics, role-aware
+      (verified: storage 419 lib + 87 doc + 81 integration (10 bins),
+      node 49 lib + 24 integration bins incl. failure_state_machine,
+      server 227 lib incl. hints_pool_guard — all pass under
+      `--test-threads=1`; 36 pool::health unit tests incl. "latency alone
+      never confirms Dead", hysteresis, wal Degraded/Dead write_degraded
+      matrix)
+- [x] **Docs:** `# Examples` on pub items; rustdoc clean
+      (verified: `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p
+      oceanfs-storage -p oceanfs-node` clean; server's 2 link errors are
+      pre-existing and unrelated — RING_PROBE_HASHES admin.rs:325,
+      HintObjectApplier coordinator.rs:1879)
+- [x] **ADR:** ADR-0029 §D3 (typed failure semantics, role-aware
       consequences) satisfied
-- [ ] **Perf:** 2.3/7.1 (state transitions are rare; the monitor's
+      (verified: Dead requires confirmed loss only — decide_transition
+      crates/oceanfs-storage/src/pool/health.rs:746; Degraded never sets
+      write_degraded — health.rs:688-694; role matrix wired — node/health.rs
+      metadata→node_unavailable, data→derive_affected_segments,
+      coordinator.rs:1152/1841 hints rejection)
+- [x] **Perf:** 2.3/7.1 (state transitions are rare; the monitor's
       per-tick snapshot is off the hot path; `set_status` takes the
       registry write lock briefly)
-- [ ] **Integration:** a 4-pool node boots; a FaultyIo-injected pool
+      (verified: parking_lot only in affected files; decision computed
+      under per-pool state lock with registry writes outside —
+      health.rs:641-679; no std::sync::Mutex/RwLock, bounded event channel)
+- [x] **Integration:** a 4-pool node boots; a FaultyIo-injected pool
       degrades and recovers under the monitor, and the manifest's
       `write_degraded` flag flips accordingly (verified via the f6
       membership API)
+      (verified: failure_state_machine e2e drives wal Degraded → manifest
+      degraded → recover (hysteresis) → Dead → manifest dead +
+      write_degraded, and metadata Dead → node_unavailable. Accepted
+      deviation: injection is via synthetic observer signals — the
+      FaultyIo→observer path is covered by g1's io_observer_faulty.rs; the
+      monitor consumes the observer by design)
+<!-- REVIEW: g7 handoff gap — HealthMonitor::state (crates/oceanfs-storage/src/pool/health.rs:453,
+     PoolState.status) is never reset when the node recovers a Dead pool via
+     registry.set_status(id, Healthy). After such a reset, the monitor's entry.status
+     stays Dead, so decide_transition(Dead, …) returns Dead with no change and the
+     registry is never re-written to Dead on a future confirmed loss — even
+     report_confirmed_loss (health.rs:579-603) is a no-op because `changed` is false.
+     g7 (out of scope here) MUST add a HealthMonitor::reset_pool(pool_id, status)
+     (or reconcile-from-registry) and call it after replacement + catch-up; add a
+     unit test "monitor re-confirms Dead after registry reset". Would be exercised
+     by the next feature's recovery path. -->
+<!-- REVIEW: doc contradiction — In-Scope (lines 46-51) correctly states "Degraded
+     never sets write_degraded" but the Tests bullet (line 68) says "wal Degraded
+     sets write_degraded". Implementation follows the ADR (Degraded never sets it;
+     Dead sets it) — fix the test bullet wording. Also Interface section says
+     `LifecycleRegistry` (fixed: the codebase type is
+     `SegmentLifecycleRegistry`)
+     (crates/oceanfs-node/src/health.rs:72). -->
 
 ## Deviations (accepted)
 
