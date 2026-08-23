@@ -82,6 +82,11 @@ pub fn derive_affected_segments(
     affected
 }
 
+/// The g3 loss-announcement fan-out closure: `(pool_id, affected
+/// segments)` → announce to the affected segments' replica holders
+/// (ADR-0029 §D4 fast path).
+pub type LossAnnouncer = Arc<dyn Fn(u32, Vec<SegmentId>) + Send + Sync>;
+
 /// Spawns the node's health-consequence applier task.
 ///
 /// Consumes the monitor's status events and applies the D3 role matrix
@@ -89,6 +94,13 @@ pub fn derive_affected_segments(
 /// derivation), then re-declares the node manifest so peers see the
 /// change. Returns the join handle (the caller holds its cancellation
 /// token).
+///
+/// `loss_announcer` (g3 `loss-announcement`, ADR-0029 §D4 fast path):
+/// when a **data** pool is confirmed Dead, the applier derives the
+/// affected segment set and hands it to the closure, which fans the
+/// announcement out to `union(storage_locations − self)` over the set
+/// (bounded retries; the g4 reconciliation loop is the failsafe). `None`
+/// (tests) skips the announcement.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_health_consequences(
     events: mpsc::Receiver<HealthEvent>,
@@ -99,6 +111,7 @@ pub fn spawn_health_consequences(
     boot_incarnation: u64,
     manifest_cache: Arc<ManifestCache>,
     node_unavailable: Arc<AtomicBool>,
+    loss_announcer: Option<LossAnnouncer>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut events = events;
@@ -123,8 +136,11 @@ pub fn spawn_health_consequences(
                     tracing::warn!(
                         pool_id,
                         affected_segments = affected.len(),
-                        "data pool Dead: affected segments derived (g3 announcement pending)"
+                        "data pool Dead: affected segments derived"
                     );
+                    if let Some(announcer) = &loss_announcer {
+                        announcer(pool_id, affected);
+                    }
                 }
                 // wal (write_degraded is driven by the monitor) and
                 // hints (rejection is checked at enqueue time) need no

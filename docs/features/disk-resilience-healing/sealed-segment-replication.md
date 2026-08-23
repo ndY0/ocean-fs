@@ -314,7 +314,7 @@ These findings came from the compaction-variant integration test plus a
 deliberate race-condition sweep of the new data path. They are NOT fixed in
 this feature; each is a concrete requirement for the next features.
 
-### GAP-1 (CRITICAL for g3/g4): compaction metadata remap does not propagate to replicas
+### GAP-1 (CLOSED by g3 `loss-announcement` Option A): compaction metadata remap does not propagate to replicas
 
 **Observation (from the compaction-variant test):** after A's GC compacts a
 segment, A's object metadata is remapped to the NEW repacked segment id.
@@ -328,29 +328,24 @@ DELETE the original from their stores.
 ORIGINAL segment id from B's metadata, and that segment no longer exists
 on B (their GC deleted it) NOR on A (its GC deleted it) NOR anywhere else
 (the repacked ids differ per node). Result: `500 cannot fetch chunk ... no
-segment reader and gRPC not available`. The read-availability assertion in
-the compaction-variant test was therefore scoped DOWN to "survivors
-readable through the owner while the owner's data is intact"; the stronger
-"read from replicas after owner death" is impossible until this gap is
-closed.
+segment reader and gRPC not available`.
 
-**Reproduction evidence:** the test's probe (before scoping) showed the
-failing chunk `45c8-7f50-bca0-7bd1` — an original segment present in NEITHER
-node's directory at failure time, while A/B/C each held different repacked
-ids (`7c03`, `7bfb`, `4dbe`...).
+**Closed by g3 (Option A — owner-approved):** the owner broadcasts
+`SegmentRemap { old, new, chunk_table }` to `storage_locations(old) − self`
+after `ObjectsMoved`; receivers re-point their own object rows through the
+chunk table, record the alias (so LATE metadata appends are translated at
+write time), and delete their stale replica. Integration coverage:
+`compacted_segments_are_readable_from_every_node` asserts surviving objects
+are byte-identical when read through A, B, AND C after DELETE + compaction.
+The mandatory pull failsafe (g4 reconciliation) still detects "metadata
+references a segment on no live holder" and re-points anything the push
+missed.
 
-**Required by:**
-- g3 (`loss-announcement`): the announcement/fan-out must carry the
-  segment-remap (old id → new id) so replicas re-point their metadata, or
-- g4 (`reconciliation`): the repair loop must detect "metadata references
-  a segment id that exists on no live holder" and re-point it (a
-  metadata-repair primitive, not just a replica-count repair).
-
-**Also implies:** tombstone propagation currently triggers EVERY node's GC
-to compact its own copies independently — the repacked ids diverge per
-node. If the design intent is "one repacked segment per logical segment",
-the compactor needs a deterministic repack id (e.g., derived from the old
-id) or the owner's repack must be authoritative and propagated.
+**Also implies (design decision):** Option C (deterministic repack id) was
+rejected — two nodes compacting "the same" segment produce different bytes
+(different dead sets at different times, different metadata arrival), so a
+deterministic id would collide with divergent content (the push receiver's
+merkle check would reject one). Worse than divergent ids; not implemented.
 
 ### GAP-2 (FIXED in this feature): needs-set leak / hot-loop on compacted-away segments
 

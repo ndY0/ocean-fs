@@ -75,7 +75,7 @@ pub use types::{
     CompressionTier, EncodingPlan, EvictionPolicyType, FetchStrategy, FetchStrategyConfig,
     GossipConfig, GpuConfig, HashKey, HashOutput, HealConfig, HealRequest, HealStats, Incarnation,
     IntendedFor, NodeId, NodeState, NvcompCodec, NvcompConfig, ObjectKey, ObjectMetadata,
-    OperationType, PeerAddress, PoolConfig, RpcConfig, SegmentId, SegmentIndexEntry,
-    SegmentMetadata, SegmentSizeConfig, ShardIndex, SizeTier, StorageLocation, Tombstone,
-    VnodeRange, WriteAck, WriteQuorum, WriteResult,
+    OperationType, PeerAddress, PoolConfig, RemappedChunk, RpcConfig, SegmentId, SegmentIndexEntry,
+    SegmentMetadata, SegmentRemapAlias, SegmentSizeConfig, ShardIndex, SharedSegmentRemapAlias,
+    SizeTier, StorageLocation, Tombstone, VnodeRange, WriteAck, WriteQuorum, WriteResult,
 };

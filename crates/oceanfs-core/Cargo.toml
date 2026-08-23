@@ -21,6 +21,7 @@ portable-atomic.workspace = true
 
 # External
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+parking_lot.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true

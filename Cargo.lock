@@ -1592,6 +1592,7 @@ dependencies = [
  "bincode",
  "bytes",
  "chrono",
+ "parking_lot",
  "portable-atomic",
  "prost",
  "serde",

@@ -3,10 +3,10 @@
 //! Handles `HealingRpc` RPCs for hinted handoff, Merkle exchange,
 //! shard fetch for EC reconstruction, and repaired shard push.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use bytes::Bytes;
-use oceanfs_core::{Hlc, HlcClock, NodeId, SegmentId};
+use oceanfs_core::{Hlc, HlcClock, NodeId, RemappedChunk, SegmentId, SegmentRemapAlias};
 
 /// Converts a core [`Hlc`] to the proto timestamp for the hint fetch
 /// response header.
@@ -18,11 +18,12 @@ use tonic::{Request, Response, Status};
 use crate::{
     healing_rpc::{
         healing_rpc_server::HealingRpc, FetchHintObjectChunk, FetchHintObjectRequest,
-        FetchShardChunk, FetchShardRequest, HintRequest, HintResponse, MerkleRequest,
-        MerkleResponse, PushRepairedShardRequest, PushRepairedShardResponse,
+        FetchShardChunk, FetchShardRequest, HintRequest, HintResponse, LossAck, LossAnnouncement,
+        MerkleRequest, MerkleResponse, PushRepairedShardRequest, PushRepairedShardResponse,
+        RemapAck, SegmentRemap,
     },
     hinted_handoff_rpc::{hint_record::Record, HintedHandoffRequest, HintedHandoffResponse},
-    SegmentDataStore,
+    SegmentDataStore, SegmentShardStore,
 };
 
 /// Fetches an object's CURRENT state from an origin node.
@@ -94,6 +95,69 @@ pub trait HintObjectApplier: Send + Sync {
     ) -> Result<oceanfs_core::ObjectMetadata, String>;
 }
 
+/// A single re-replication repair request enqueued by the loss
+/// announcement handler (g3, ADR-0029 §D4 fast path).
+///
+/// The announcement is an event, not state: it never rides the
+/// NodeManifest. The receiver verifies it holds a replica of the
+/// announced segment, then enqueues a repair so the ReRepWorker (g5)
+/// restores RF. This is the "re-replicate" trigger, distinct from the
+/// heal queue (which repairs EC shard corruption).
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::NodeId;
+/// use oceanfs_durability::healing_service::ReRepRequest;
+///
+/// let req = ReRepRequest {
+///     origin: NodeId::new("node-a"),
+///     segment_id: oceanfs_core::SegmentId::new(),
+/// };
+/// assert_eq!(req.origin, NodeId::new("node-a"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReRepRequest {
+    /// The node that announced the loss (whose pool died).
+    pub origin: NodeId,
+    /// The segment needing an additional live copy.
+    pub segment_id: SegmentId,
+}
+
+/// Receives verified re-replication requests from the loss-announcement
+/// handler (g3). The composition root wires this to the ReRepWorker's
+/// bounded queue (g5); `None` (tests / minimal embeddings) means the
+/// handler still verifies + acks but enqueues nothing.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use oceanfs_core::NodeId;
+/// use oceanfs_durability::healing_service::{ReRepRequest, RepairSink};
+///
+/// struct Sink;
+/// #[async_trait::async_trait]
+/// impl RepairSink for Sink {
+///     async fn enqueue(&self, _req: ReRepRequest) -> Result<(), String> {
+///         Ok(())
+///     }
+/// }
+/// let sink: Arc<dyn RepairSink> = Arc::new(Sink);
+/// assert!(Arc::strong_count(&sink) >= 1);
+/// ```
+#[async_trait::async_trait]
+pub trait RepairSink: Send + Sync {
+    /// Accepts one repair request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a string error when the queue is at capacity or closed —
+    /// the announcement is best-effort (the g4 reconciliation loop is
+    /// the mandatory failsafe).
+    async fn enqueue(&self, request: ReRepRequest) -> Result<(), String>;
+}
+
 /// gRPC service for healing and anti-entropy operations.
 pub struct HealingGrpcService {
     /// Handoff buffer for storing hints.
@@ -124,6 +188,33 @@ pub struct HealingGrpcService {
     /// root to the node's segment pipeline). `None` (tests) degrades
     /// to the historical inline-in-metadata storage.
     hint_object_applier: Option<Arc<dyn HintObjectApplier>>,
+    /// Receiver-side compaction remap alias (`old → new`). The
+    /// `AnnounceRemap` handler records it so the append/read-repair
+    /// handlers translate late chunk refs at write time, and the
+    /// `batch_write` re-point below rewrites already-persisted rows.
+    /// `None` (tests) means remaps are verified + acknowledged but
+    /// recorded nowhere (a no-op — the g4 reconciliation failsafe still
+    /// covers the divergence).
+    remap_alias: Option<Arc<SegmentRemapAlias>>,
+    /// Lifecycle coordinator (wired by the composition root). The
+    /// `AnnounceRemap` handler deletes the stale replica THROUGH the
+    /// machine (`request_delete`) after re-pointing — the ADR-0025
+    /// delete-before-unlink invariant, never a direct registry write.
+    /// `None` (tests) means the stale replica is left for the receiver's
+    /// own GC to reclaim (fully-dead path).
+    lifecycle_coordinator:
+        Option<Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>>,
+    /// Shard store for unlinking the stale replica's `.dat` after the
+    /// durable delete (ADR-0024 invariant 3). `None` (tests) skips the
+    /// unlink.
+    shard_store: Option<Arc<dyn SegmentShardStore>>,
+    /// Re-replication repair sink (g3 → g5). `None` (tests) verifies +
+    /// acks but enqueues nothing.
+    repair_sink: Option<Arc<dyn RepairSink>>,
+    /// g3 announcement receive counters (ADR-0029 §D4 observability).
+    /// Incremented by the `announce_loss` / `announce_remap` handlers.
+    announce_rx_total: oceanfs_core::Counter,
+    announce_accepted_total: oceanfs_core::Counter,
 }
 
 impl HealingGrpcService {
@@ -145,7 +236,27 @@ impl HealingGrpcService {
             hint_object_fetcher: None,
             hint_object_reader: None,
             hint_object_applier: None,
+            remap_alias: None,
+            lifecycle_coordinator: None,
+            shard_store: None,
+            repair_sink: None,
+            announce_rx_total: oceanfs_core::Counter::new(
+                "oceanfs_announcements_rx_total".into(),
+                "Loss/remap announcements received".into(),
+                oceanfs_core::LabelSet::empty(),
+            ),
+            announce_accepted_total: oceanfs_core::Counter::new(
+                "oceanfs_announcements_accepted".into(),
+                "Announced segments accepted for repair/remap".into(),
+                oceanfs_core::LabelSet::empty(),
+            ),
         }
+    }
+
+    /// Registers the g3 announcement counters with a registrar.
+    pub fn register_metrics(&self, registrar: &dyn oceanfs_core::MetricRegistrar) {
+        registrar.register_counter(self.announce_rx_total.clone());
+        registrar.register_counter(self.announce_accepted_total.clone());
     }
 
     /// Sets this node's identifier so that self-intended hints are
@@ -183,6 +294,43 @@ impl HealingGrpcService {
     #[must_use]
     pub fn with_hint_object_applier(mut self, applier: Arc<dyn HintObjectApplier>) -> Self {
         self.hint_object_applier = Some(applier);
+        self
+    }
+
+    /// Installs the receiver-side compaction remap alias (composition
+    /// root). `AnnounceRemap` records `old → new` here so the append /
+    /// read-repair handlers translate late chunk refs at write time.
+    #[must_use]
+    pub fn with_remap_alias(mut self, alias: Arc<SegmentRemapAlias>) -> Self {
+        self.remap_alias = Some(alias);
+        self
+    }
+
+    /// Installs the lifecycle coordinator (composition root). The remap
+    /// handler deletes the stale replica through the machine
+    /// (`request_delete` — ADR-0025 Decision 4).
+    #[must_use]
+    pub fn with_lifecycle_coordinator(
+        mut self,
+        coordinator: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
+    ) -> Self {
+        self.lifecycle_coordinator = Some(coordinator);
+        self
+    }
+
+    /// Installs the shard store used to unlink a stale replica's `.dat`
+    /// after its durable delete (composition root).
+    #[must_use]
+    pub fn with_shard_store(mut self, shard_store: Arc<dyn SegmentShardStore>) -> Self {
+        self.shard_store = Some(shard_store);
+        self
+    }
+
+    /// Installs the re-replication repair sink (composition root; g3 →
+    /// g5). `AnnounceLoss` enqueues verified repairs here.
+    #[must_use]
+    pub fn with_repair_sink(mut self, sink: Arc<dyn RepairSink>) -> Self {
+        self.repair_sink = Some(sink);
         self
     }
 
@@ -400,6 +548,77 @@ impl HealingGrpcService {
                 );
             }
         }
+    }
+
+    /// Rewrites every locally-persisted object row that references the
+    /// old (compacted) segment to reference the new one, translating
+    /// each chunk ref through the repacked chunk table.
+    ///
+    /// The table maps `(old_offset, length) → new_offset`. A chunk whose
+    /// `(offset, length)` is absent from the table is left untouched —
+    /// it was NOT part of the repack (e.g. a chunk of a tombstoned
+    /// object the compactor filtered out), so re-pointing it would be
+    /// wrong.
+    ///
+    /// Returns the number of rewritten rows.
+    fn repoint_objects(
+        &self,
+        old_segment_id: SegmentId,
+        new_segment_id: SegmentId,
+        chunk_table: &[RemappedChunk],
+    ) -> std::io::Result<usize> {
+        // Build the lookup: (old_offset, length) → new_offset.
+        let mut table: HashMap<(u64, u32), u64> = HashMap::with_capacity(chunk_table.len());
+        for c in chunk_table {
+            table.insert((c.old_offset, c.length), c.new_offset);
+        }
+        if table.is_empty() {
+            return Ok(0);
+        }
+
+        let mut ops: Vec<oceanfs_storage_api::BatchOp> = Vec::new();
+        let mut rewritten = 0usize;
+        for obj_result in self.metadata_store.list_objects_all_with_bucket() {
+            let Ok((bucket, obj)) = obj_result else { continue };
+            // Only rows that actually reference the old segment change.
+            if !obj.chunks.iter().any(|c| c.segment_id == old_segment_id) {
+                continue;
+            }
+            let mut new_chunks = smallvec::SmallVec::<[oceanfs_core::ChunkRef; 4]>::new();
+            let mut changed = false;
+            for chunk in &obj.chunks {
+                if chunk.segment_id == old_segment_id {
+                    if let Some(new_offset) = table.get(&(chunk.offset, chunk.length)) {
+                        new_chunks.push(oceanfs_core::ChunkRef {
+                            segment_id: new_segment_id,
+                            offset: *new_offset,
+                            length: chunk.length,
+                            compressed: chunk.compressed,
+                            logical_length: chunk.logical_length,
+                        });
+                        changed = true;
+                        continue;
+                    }
+                    // Chunk not in the repack (tombstoned object) — keep
+                    // the old ref; the object is deleted anyway.
+                }
+                new_chunks.push(*chunk);
+            }
+            if changed {
+                let updated_meta =
+                    oceanfs_core::ObjectMetadata { chunks: new_chunks, ..obj.clone() };
+                ops.push(oceanfs_storage_api::BatchOp::PutObject(
+                    bucket,
+                    obj.object_key.clone(),
+                    updated_meta,
+                ));
+                rewritten += 1;
+            }
+        }
+        if !ops.is_empty() {
+            self.metadata_store.batch_write(ops)?;
+        }
+        Ok(rewritten)
     }
 }
 
@@ -1015,6 +1234,214 @@ impl HealingRpc for HealingGrpcService {
             }
         }
     }
+
+    /// Handles a loss announcement (ADR-0029 §D4 fast path; g3).
+    ///
+    /// The sender's data pool died; it announces the affected segment
+    /// set. For each segment, the receiver verifies it actually HOLDS a
+    /// replica (lifecycle registry contains the segment AND the segment's
+    /// `storage_locations` includes the origin — the origin was a
+    /// legitimate holder). Verified segments are enqueued as
+    /// re-replication repair requests (the g5 ReRepWorker restores RF);
+    /// the ack counts exactly what was enqueued. Un-held segments are
+    /// NOT acked — the sender's bounded retries (or g4's reconciliation
+    /// failsafe) cover them.
+    async fn announce_loss(
+        &self,
+        request: Request<LossAnnouncement>,
+    ) -> Result<Response<LossAck>, Status> {
+        let req = request.into_inner();
+        let origin = req.origin.map(NodeId::from).unwrap_or_else(|| NodeId::new("unknown"));
+        let mut accepted = 0u32;
+        self.announce_rx_total.inc();
+
+        let Some(sink) = &self.repair_sink else {
+            // No repair sink wired (tests / minimal embedding): verify
+            // nothing, ack nothing. The announcement is best-effort; g4
+            // is the failsafe.
+            tracing::debug!(
+                origin = %origin,
+                pool_id = req.pool_id,
+                announced = req.segments.len(),
+                "loss announcement received but no repair sink wired; nothing accepted"
+            );
+            return Ok(Response::new(LossAck { accepted: 0 }));
+        };
+
+        for proto_sid in &req.segments {
+            let segment_id = match SegmentId::try_from(proto_sid.clone()) {
+                Ok(sid) => sid,
+                Err(_) => continue,
+            };
+            // Verify the local hold-set: the receiver holds a replica of
+            // the announced segment AND the origin was one of its
+            // storage_locations holders (a legitimate announcer).
+            let holds = self
+                .registry
+                .get(segment_id)
+                .map(|entry| entry.metadata.storage_locations.iter().any(|loc| loc == &origin))
+                .unwrap_or(false);
+            if !holds {
+                tracing::debug!(
+                    origin = %origin,
+                    segment_id = %segment_id,
+                    "loss announcement: receiver does not hold a verified replica; not accepted"
+                );
+                continue;
+            }
+            match sink.enqueue(ReRepRequest { origin: origin.clone(), segment_id }).await {
+                Ok(()) => {
+                    accepted += 1;
+                    self.announce_accepted_total.inc();
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        origin = %origin,
+                        segment_id = %segment_id,
+                        error = %e,
+                        "loss announcement: repair enqueue failed (queue full/closed); not accepted — g4 failsafe"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(
+            origin = %origin,
+            pool_id = req.pool_id,
+            announced = req.segments.len(),
+            accepted,
+            "loss announcement processed"
+        );
+        Ok(Response::new(LossAck { accepted }))
+    }
+
+    /// Handles a compaction segment-remap (g3 Option A —
+    /// owner-authoritative compaction propagation).
+    ///
+    /// The owner compacted `old_segment_id → new_segment_id` and rewrote
+    /// only its own metadata. This receiver (a holder of the old segment)
+    /// must:
+    ///
+    /// 1. verify it holds the old segment AND the origin was a
+    ///    legitimate holder (`storage_locations` contains origin);
+    /// 2. record the alias + chunk table so the append/read-repair
+    ///    handlers translate late chunk refs at write time;
+    /// 3. batch-rewrite its already-persisted object rows through the
+    ///    chunk table;
+    /// 4. delete the stale replica (durable `request_delete` then
+    ///    unlink — ADR-0024 invariant 3).
+    ///
+    /// `RemapAck.applied` is true only when all four succeeded. A
+    /// receiver that does not hold the old segment acks `applied=false`
+    /// — the sender's bounded retries (or g4's reconciliation failsafe)
+    /// cover it.
+    async fn announce_remap(
+        &self,
+        request: Request<SegmentRemap>,
+    ) -> Result<Response<RemapAck>, Status> {
+        let req = request.into_inner();
+        let origin = req.origin.map(NodeId::from).unwrap_or_else(|| NodeId::new("unknown"));
+        self.announce_rx_total.inc();
+        let Some(old_sid) =
+            req.old_segment_id.as_ref().and_then(|s| SegmentId::try_from(s.clone()).ok())
+        else {
+            return Ok(Response::new(RemapAck { applied: false }));
+        };
+        let Some(new_sid) =
+            req.new_segment_id.as_ref().and_then(|s| SegmentId::try_from(s.clone()).ok())
+        else {
+            return Ok(Response::new(RemapAck { applied: false }));
+        };
+        let chunk_table: Vec<RemappedChunk> = req
+            .chunks
+            .iter()
+            .map(|c| RemappedChunk {
+                old_offset: c.old_offset,
+                length: c.length,
+                new_offset: c.new_offset,
+            })
+            .collect();
+
+        // Step 1: verify the receiver holds the old segment AND the
+        // origin was a legitimate holder. A non-holder has nothing to
+        // re-point and must not be tricked by a spoofed remap.
+        let verified = self
+            .registry
+            .get(old_sid)
+            .map(|entry| entry.metadata.storage_locations.iter().any(|loc| loc == &origin))
+            .unwrap_or(false);
+        if !verified {
+            tracing::warn!(
+                origin = %origin,
+                old_segment_id = %old_sid,
+                "remap rejected: receiver does not hold the old segment with the origin as a holder"
+            );
+            return Ok(Response::new(RemapAck { applied: false }));
+        }
+
+        // Step 2: record the alias + chunk table so LATE metadata
+        // referencing the old segment is translated at write time (the
+        // GAP-1 mechanism — a row landing after this peer's GC compacted
+        // the old segment away would otherwise reference a segment that
+        // exists nowhere).
+        if let Some(alias) = &self.remap_alias {
+            alias.insert(old_sid, new_sid, chunk_table.clone());
+        }
+
+        // Step 3: batch-rewrite already-persisted object rows.
+        if let Err(e) = self.repoint_objects(old_sid, new_sid, &chunk_table) {
+            tracing::warn!(
+                origin = %origin,
+                old_segment_id = %old_sid,
+                new_segment_id = %new_sid,
+                error = %e,
+                "remap: object metadata re-point failed; alias recorded — g4 failsafe"
+            );
+            return Ok(Response::new(RemapAck { applied: false }));
+        }
+
+        // Step 4: delete the stale replica through the machine
+        // (ADR-0025 Decision 4 — the coordinator is the only writer of
+        // lifecycle state), then unlink its `.dat` (ADR-0024 invariant
+        // 3: delete before unlink). The receiver's own GC would
+        // otherwise re-compact the stale replica into a divergent id.
+        if let Some(coordinator) = &self.lifecycle_coordinator {
+            match coordinator.request_delete(old_sid).await {
+                Ok(())
+                | Err(oceanfs_storage::segment::lifecycle::TransitionError::AlreadyDeleted)
+                | Err(oceanfs_storage::segment::lifecycle::TransitionError::Missing) => {
+                    if let Some(shard_store) = &self.shard_store {
+                        // The stale replica was registered with pool_id 0
+                        // (replica placement is pool-0/legacy).
+                        if let Err(e) = shard_store.delete_shards_with_pool(0, old_sid) {
+                            tracing::warn!(
+                                old_segment_id = %old_sid,
+                                error = %e,
+                                "remap: stale replica .dat unlink failed; GC will reclaim"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        old_segment_id = %old_sid,
+                        error = ?e,
+                        "remap: stale replica delete failed; receiver GC will reclaim"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(
+            origin = %origin,
+            old_segment_id = %old_sid,
+            new_segment_id = %new_sid,
+            chunks = chunk_table.len(),
+            "compaction remap applied"
+        );
+        self.announce_accepted_total.inc();
+        Ok(Response::new(RemapAck { applied: true }))
+    }
 }
 
 #[cfg(test)]
@@ -1031,7 +1458,9 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
-    use crate::{HintedHandoff, SegmentDataStore};
+    use crate::{
+        healing_rpc::RemappedChunk as ProtoRemappedChunk, HintedHandoff, SegmentDataStore,
+    };
 
     /// In-memory store for healing tests.
     struct TestHealStore {
@@ -1436,5 +1865,332 @@ mod tests {
         for (i, leaf) in resp.leaf_hashes.iter().enumerate() {
             assert_eq!(leaf.len(), 32, "leaf hash {} should be 32 bytes", i);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // g3 `loss-announcement` / compaction-remap handlers
+    // -----------------------------------------------------------------------
+
+    /// A repair sink that records every enqueued request (shared with
+    /// the handler via `Arc`).
+    #[derive(Clone, Default)]
+    struct RecordingRepairSink {
+        requests: Arc<parking_lot::Mutex<Vec<ReRepRequest>>>,
+        reject: Arc<parking_lot::Mutex<bool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RepairSink for RecordingRepairSink {
+        async fn enqueue(&self, request: ReRepRequest) -> Result<(), String> {
+            if *self.reject.lock() {
+                return Err("queue full".to_string());
+            }
+            self.requests.lock().push(request);
+            Ok(())
+        }
+    }
+
+    /// Seeds a Sealed segment entry whose `storage_locations` lists
+    /// `[origin, self_id]` — the shape a push-receiver holds after the
+    /// backbone stamped the holder set. The locations ride the SEAL
+    /// metadata (the seal replaces the reserved metadata entirely —
+    /// matching the push receiver's `request_reserve` + `request_seal`
+    /// with the pushed metadata).
+    fn seed_sealed_with_locations(
+        registry: &oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry,
+        segment_id: SegmentId,
+        origin: &NodeId,
+        self_id: &NodeId,
+    ) {
+        let mut locations = smallvec::SmallVec::new();
+        locations.push(origin.clone());
+        locations.push(self_id.clone());
+        registry
+            .reserve(
+                segment_id,
+                oceanfs_core::SegmentMetadata {
+                    pool_id: 0,
+                    segment_id,
+                    ec_k: 4,
+                    ec_m: 2,
+                    size_tier: oceanfs_core::SizeTier::Standard,
+                    merkle_root: None,
+                    storage_locations: smallvec::SmallVec::new(),
+                    sealed_at: None,
+                },
+            )
+            .unwrap();
+        registry
+            .seal(
+                segment_id,
+                oceanfs_core::SegmentMetadata {
+                    pool_id: 0,
+                    segment_id,
+                    ec_k: 4,
+                    ec_m: 2,
+                    size_tier: oceanfs_core::SizeTier::Standard,
+                    merkle_root: Some(oceanfs_core::HashOutput::from_bytes([0x11; 32])),
+                    storage_locations: locations,
+                    sealed_at: Some(1),
+                },
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn announce_loss_acks_only_held_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore> = Arc::new(
+            oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
+        let origin = NodeId::new("node-a");
+        let self_id = NodeId::new("node-b");
+        let held = SegmentId::new();
+        let unheld = SegmentId::new();
+        seed_sealed_with_locations(&registry, held, &origin, &self_id);
+
+        let sink = RecordingRepairSink::default();
+        let service = HealingGrpcService::new(
+            Arc::new(HintedHandoff::new()),
+            metadata_store,
+            registry,
+            Arc::new(TestHealStore::new()),
+            Arc::new(HlcClock::new()),
+        )
+        .with_repair_sink(Arc::new(sink.clone()));
+
+        let proto_origin: oceanfs_core::proto::common::NodeId = origin.clone().into();
+        let request = tonic::Request::new(LossAnnouncement {
+            origin: Some(proto_origin),
+            pool_id: 3,
+            segments: vec![held.into(), unheld.into()],
+        });
+
+        let response = service.announce_loss(request).await.unwrap();
+        assert_eq!(response.into_inner().accepted, 1, "only the held+verified segment is accepted");
+        let recorded = sink.requests.lock();
+        assert_eq!(recorded.len(), 1, "exactly one repair enqueued");
+        assert_eq!(recorded[0].segment_id, held);
+        assert_eq!(recorded[0].origin, origin);
+    }
+
+    #[tokio::test]
+    async fn announce_loss_ignores_unknown_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore> = Arc::new(
+            oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
+        let self_id = NodeId::new("node-b");
+        let held = SegmentId::new();
+        seed_sealed_with_locations(&registry, held, &NodeId::new("node-a"), &self_id);
+
+        let sink = RecordingRepairSink::default();
+        let service = HealingGrpcService::new(
+            Arc::new(HintedHandoff::new()),
+            metadata_store,
+            registry,
+            Arc::new(TestHealStore::new()),
+            Arc::new(HlcClock::new()),
+        )
+        .with_repair_sink(Arc::new(sink.clone()));
+
+        // A DIFFERENT origin (not in storage_locations) announces — the
+        // receiver must not enqueue: the origin was never a holder.
+        let proto_origin: oceanfs_core::proto::common::NodeId = NodeId::new("node-attacker").into();
+        let request = tonic::Request::new(LossAnnouncement {
+            origin: Some(proto_origin),
+            pool_id: 3,
+            segments: vec![held.into()],
+        });
+
+        let response = service.announce_loss(request).await.unwrap();
+        assert_eq!(response.into_inner().accepted, 0, "an unknown origin must not trigger repairs");
+        assert!(sink.requests.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn announce_remap_repoints_objects_and_records_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore> = Arc::new(
+            oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
+        let origin = NodeId::new("node-a");
+        let self_id = NodeId::new("node-b");
+        let old = SegmentId::new();
+        let new = SegmentId::new();
+        seed_sealed_with_locations(&registry, old, &origin, &self_id);
+
+        // Seed an object row whose chunk references the OLD segment.
+        let bucket = oceanfs_core::BucketId::new("b");
+        let key = oceanfs_core::ObjectKey::new("k");
+        let mut chunks = smallvec::SmallVec::new();
+        chunks.push(oceanfs_core::ChunkRef {
+            segment_id: old,
+            offset: 100,
+            length: 32,
+            compressed: false,
+            logical_length: 32,
+        });
+        oceanfs_storage_api::MetadataStore::put_object(
+            metadata_store.as_ref(),
+            &bucket,
+            oceanfs_core::ObjectMetadata {
+                object_key: key.clone(),
+                size: 32,
+                blake3_hash: None,
+                chunks,
+                inline_data: None,
+                created_at: 0,
+                hlc: Hlc::zero(),
+            },
+        )
+        .unwrap();
+
+        let alias = Arc::new(SegmentRemapAlias::new());
+        let service = HealingGrpcService::new(
+            Arc::new(HintedHandoff::new()),
+            metadata_store.clone(),
+            registry,
+            Arc::new(TestHealStore::new()),
+            Arc::new(HlcClock::new()),
+        )
+        .with_remap_alias(Arc::clone(&alias));
+
+        let proto_origin: oceanfs_core::proto::common::NodeId = origin.into();
+        let request = tonic::Request::new(SegmentRemap {
+            origin: Some(proto_origin),
+            old_segment_id: Some(old.into()),
+            new_segment_id: Some(new.into()),
+            chunks: vec![ProtoRemappedChunk { old_offset: 100, length: 32, new_offset: 0 }],
+        });
+
+        let response = service.announce_remap(request).await.unwrap();
+        assert!(response.into_inner().applied, "verified remap must apply");
+
+        // The object row now references the NEW segment at the new offset.
+        let meta = oceanfs_storage_api::MetadataStore::get_object_metadata(
+            metadata_store.as_ref(),
+            &bucket,
+            &key,
+        )
+        .unwrap()
+        .expect("object survives remap");
+        assert_eq!(meta.chunks.len(), 1);
+        assert_eq!(meta.chunks[0].segment_id, new);
+        assert_eq!(meta.chunks[0].offset, 0, "chunk offset translated through the table");
+        assert_eq!(meta.chunks[0].length, 32);
+
+        // The alias is recorded for late metadata writes.
+        assert_eq!(alias.resolve(old, 100, 32), Some((new, 0)));
+    }
+
+    #[tokio::test]
+    async fn announce_remap_rejects_unheld_or_spoofed() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore> = Arc::new(
+            oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
+        let self_id = NodeId::new("node-b");
+        let old = SegmentId::new();
+        let new = SegmentId::new();
+        // The receiver holds `old` but the origin is NOT a holder.
+        seed_sealed_with_locations(&registry, old, &NodeId::new("node-c"), &self_id);
+
+        let alias = Arc::new(SegmentRemapAlias::new());
+        let service = HealingGrpcService::new(
+            Arc::new(HintedHandoff::new()),
+            metadata_store,
+            registry,
+            Arc::new(TestHealStore::new()),
+            Arc::new(HlcClock::new()),
+        )
+        .with_remap_alias(Arc::clone(&alias));
+
+        let proto_origin: oceanfs_core::proto::common::NodeId = NodeId::new("node-attacker").into();
+        let request = tonic::Request::new(SegmentRemap {
+            origin: Some(proto_origin),
+            old_segment_id: Some(old.into()),
+            new_segment_id: Some(new.into()),
+            chunks: vec![],
+        });
+
+        let response = service.announce_remap(request).await.unwrap();
+        assert!(
+            !response.into_inner().applied,
+            "a spoofed remap (origin not a holder) must be rejected"
+        );
+        assert!(alias.is_empty(), "no alias recorded for a rejected remap");
+    }
+
+    #[tokio::test]
+    async fn announce_loss_no_sink_acks_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore> = Arc::new(
+            oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
+        let origin = NodeId::new("node-a");
+        let self_id = NodeId::new("node-b");
+        let held = SegmentId::new();
+        seed_sealed_with_locations(&registry, held, &origin, &self_id);
+
+        // No repair sink wired — the handler verifies nothing and acks 0
+        // (the announcement is best-effort; g4 is the failsafe).
+        let service = HealingGrpcService::new(
+            Arc::new(HintedHandoff::new()),
+            metadata_store,
+            registry,
+            Arc::new(TestHealStore::new()),
+            Arc::new(HlcClock::new()),
+        );
+
+        let proto_origin: oceanfs_core::proto::common::NodeId = origin.into();
+        let request = tonic::Request::new(LossAnnouncement {
+            origin: Some(proto_origin),
+            pool_id: 3,
+            segments: vec![held.into()],
+        });
+
+        let response = service.announce_loss(request).await.unwrap();
+        assert_eq!(response.into_inner().accepted, 0);
     }
 }

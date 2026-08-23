@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use oceanfs_core::{BucketId, ChunkRef, ObjectMetadata, SegmentId, SegmentMetadata};
+use oceanfs_core::{BucketId, ChunkRef, ObjectMetadata, RemappedChunk, SegmentId, SegmentMetadata};
 use oceanfs_storage::{
     segment::{lifecycle::SegmentLifecycleCoordinator, TierRouter},
     Result,
@@ -74,6 +74,26 @@ pub(crate) struct SegmentCompactor {
     /// this hook post-compaction objects would silently have zero
     /// replicas).
     sealed_notifier: Option<Arc<dyn Fn(SegmentId) + Send + Sync>>,
+    /// Optional compaction-remap notifier (g3 `loss-announcement`,
+    /// Option A — owner-authoritative compaction propagation).
+    ///
+    /// Fired with `(old_segment_id, new_segment_id, chunk_table)` AFTER
+    /// the `ObjectsMoved` milestone commits: the owner's metadata is
+    /// authoritatively re-pointed to the new id, and the owner still
+    /// holds the old segment's data (the `OldDeleted` milestone has not
+    /// run yet), so a peer that has not yet processed the remap can
+    /// still fetch the old segment from the owner via the read path's
+    /// gRPC fallback. Without this hook, peers' metadata for the same
+    /// objects silently diverges from the owner's after compaction —
+    /// reads routed to a peer can reference a segment that exists
+    /// nowhere (GAP-1).
+    ///
+    /// `chunk_table` maps every live chunk repacked from the old segment
+    /// into the new one (`(old_offset, length) → new_offset`): the
+    /// repacked layout is NOT offset-preserving, so peers must translate
+    /// chunk refs through this table rather than re-point by segment id
+    /// alone.
+    compaction_remap_notifier: Option<crate::gc::CompactionRemapFn>,
 }
 
 impl SegmentCompactor {
@@ -85,7 +105,15 @@ impl SegmentCompactor {
         lifecycle: Arc<SegmentLifecycleCoordinator>,
         shard_store: Arc<dyn SegmentShardStore>,
     ) -> Self {
-        Self { metadata, tier_router, data_store, lifecycle, shard_store, sealed_notifier: None }
+        Self {
+            metadata,
+            tier_router,
+            data_store,
+            lifecycle,
+            shard_store,
+            sealed_notifier: None,
+            compaction_remap_notifier: None,
+        }
     }
 
     /// Wires the sealed-segment notifier (composition root).
@@ -97,9 +125,29 @@ impl SegmentCompactor {
         self
     }
 
+    /// Wires the compaction-remap notifier (composition root; g3
+    /// `loss-announcement` Option A). Fired with `(old, new, chunks)`
+    /// after the `ObjectsMoved` metadata remap commits, so the owner's
+    /// rows are authoritative at the new id before any peer is told to
+    /// re-point.
+    pub(crate) fn with_compaction_remap_notifier(
+        mut self,
+        notifier: crate::gc::CompactionRemapFn,
+    ) -> Self {
+        self.compaction_remap_notifier = Some(notifier);
+        self
+    }
+
     /// Returns the tier router used for blob classification during repacking.
     pub(crate) fn tier_router(&self) -> &TierRouter {
         &self.tier_router
+    }
+
+    /// Returns the data store (tests only — re-wires the compactor with
+    /// a remap notifier on the same store).
+    #[cfg(test)]
+    pub(crate) fn data_store(&self) -> Arc<dyn SegmentDataStore> {
+        Arc::clone(&self.data_store)
     }
 
     /// Compacts a single segment: re-packs live blobs, updates metadata,
@@ -370,6 +418,34 @@ impl SegmentCompactor {
         }
         self.stall_at(4).await; // seam: after the objects remap (ObjectsMoved)
 
+        // The owner's metadata is NOW authoritatively re-pointed to the
+        // new id, and the old segment's `.dat` is still present (the
+        // `OldDeleted` milestone has not run yet): publish the
+        // compaction remap so peers re-point their OWN object rows
+        // (g3 `loss-announcement` Option A — owner-authoritative
+        // propagation). A peer that has not processed the remap yet can
+        // still fetch the old segment from the owner via the read path's
+        // gRPC fallback, so there is no read window here.
+        //
+        // The chunk table carries EVERY live chunk repacked from the old
+        // segment into the new one — the repacked layout is not
+        // offset-preserving, so peers translate `(old_offset, length) →
+        // new_offset` rather than re-pointing by segment id alone.
+        if let Some(remap_notifier) = &self.compaction_remap_notifier {
+            let mut chunk_table: Vec<RemappedChunk> = Vec::with_capacity(chunk_remap.len());
+            for (key, new_chunk) in &chunk_remap {
+                // key = (old_segment_id, old_offset, length); all keys
+                // reference the same old segment.
+                let (_old_seg, old_offset, length) = *key;
+                chunk_table.push(RemappedChunk {
+                    old_offset,
+                    length,
+                    new_offset: new_chunk.offset,
+                });
+            }
+            remap_notifier(unit.old_segment_id, new_segment_id, chunk_table);
+        }
+
         // OldDeleted → the DeleteEvent(old) is durable before the old
         // `.dat` is unlinked (ADR-0024 invariant 3; crash-window row 9
         // is the safe residue between the two).
@@ -486,7 +562,7 @@ mod tests {
 
     use oceanfs_core::{
         BucketId, ChunkRef, Hlc, LifecycleConfig, MetadataConfig, ObjectKey, ObjectMetadata,
-        SegmentId, SegmentMetadata, SizeTier, Tombstone,
+        RemappedChunk, SegmentId, SegmentMetadata, SizeTier, Tombstone,
     };
     use oceanfs_storage::{
         metadata::RocksDbMetadataStore,
@@ -654,6 +730,79 @@ mod tests {
 
     // SegmentCompactor additional tests
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn compaction_fires_remap_notifier_with_chunk_table() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let old_seg_id = SegmentId::new();
+        let old_seg_meta = make_segment_meta(old_seg_id, SizeTier::Standard, 1700000000000);
+        let (compactor, lifecycle) =
+            make_compactor(metadata.clone(), vec![(old_seg_id, vec![0xEF; 400])]).await;
+        seed_sealed(&lifecycle, old_seg_meta.clone()).await;
+
+        // One live object at (old_seg_id, offset 0, length 400).
+        let _bucket = BucketId::new("default");
+        let _obj_key = ObjectKey::new("remapped.txt");
+        let obj_meta = make_object_meta(
+            "remapped.txt",
+            400,
+            ChunkRef {
+                segment_id: old_seg_id,
+                offset: 0,
+                length: 400,
+                compressed: false,
+                logical_length: 400,
+            },
+        );
+        metadata.put_object(obj_meta).unwrap();
+
+        // Wire the remap notifier: capture (old, new, chunk_table).
+        let fired = Arc::new(AtomicUsize::new(0));
+        let captured_old = Arc::new(parking_lot::Mutex::new(None::<SegmentId>));
+        let captured_new = Arc::new(parking_lot::Mutex::new(None::<SegmentId>));
+        let captured_table = Arc::new(parking_lot::Mutex::new(Vec::<RemappedChunk>::new()));
+        let compactor = SegmentCompactor::new(
+            metadata.clone(),
+            TierRouter::new(oceanfs_core::SegmentSizeConfig::default()),
+            compactor.data_store(),
+            lifecycle.clone(),
+            Arc::new(InMemorySegmentShardStore::new(0)),
+        )
+        .with_compaction_remap_notifier({
+            let fired = Arc::clone(&fired);
+            let captured_old = Arc::clone(&captured_old);
+            let captured_new = Arc::clone(&captured_new);
+            let captured_table = Arc::clone(&captured_table);
+            Arc::new(move |old, new, table| {
+                fired.fetch_add(1, Ordering::SeqCst);
+                *captured_old.lock() = Some(old);
+                *captured_new.lock() = Some(new);
+                *captured_table.lock() = table;
+            })
+        });
+
+        let empty_dead = HashSet::new();
+        let result = compactor.compact_segment(old_seg_id, &old_seg_meta, &empty_dead).await;
+        assert!(result.is_ok());
+
+        // The notifier fired exactly once with the right ids + table.
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "remap notifier must fire once");
+        assert_eq!(captured_old.lock().as_ref(), Some(&old_seg_id));
+        let new_id = *captured_new.lock().as_ref().expect("new id captured");
+        assert_ne!(new_id, old_seg_id);
+        // The chunk (0, 400) was repacked → table contains (0, 400) → new_offset.
+        let table = captured_table.lock();
+        assert!(
+            table.iter().any(|c| c.old_offset == 0 && c.length == 400),
+            "chunk table must carry the repacked chunk: {table:?}"
+        );
+        assert!(
+            table.iter().all(|c| c.length == 400 && c.old_offset == 0),
+            "only the live chunk is in the table"
+        );
+    }
 
     #[tokio::test]
     async fn compactor_segment_with_no_objects() {

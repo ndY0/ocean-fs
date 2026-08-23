@@ -4,7 +4,7 @@ epic: "disk-resilience-healing"
 status: proposed
 priority: high
 owner: ""
-dependencies: ["failure-state-machine"]
+dependencies: ["failure-state-machine", "sealed-segment-replication"]
 adr: [0029]
 perf: [1.3, 2.6, 7.1]
 created: 2026-08-22
@@ -127,3 +127,12 @@ failed repair ──▶ retry after retry_after_ticks (never hot-loop)
   live until scrub/AE catches it. Disk-truth verification stays with the
   existing scrub/anti-entropy machinery; the reconciliation loop's job is
   replica-count restoration, not integrity.
+- **Metadata-repair primitive (MANDATORY — g3 handoff, GAP-1 failsafe).**
+  Beyond replica-count restoration, the loop must detect **"metadata
+  references a segment that exists on no live holder"** and re-point it
+  (fetch the object's current chunks from the owner, like the hint
+  materialization path). This is the pull failsafe for whatever the
+  g3 announcement push missed: a late metadata append that raced both the
+  remap and the receiver's re-point scan, a remap that lost to a partition,
+  or a remap whose target was down through all retries. Without it, reads
+  can 500 until the next tick on a dangling segment reference.

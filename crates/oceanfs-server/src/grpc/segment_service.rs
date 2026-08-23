@@ -61,6 +61,15 @@ pub struct SegmentGrpcService {
     /// unregistered `.dat` is invisible to the GC and the orphan reaper
     /// (the fleet disk-fill root cause).
     lifecycle: Option<Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>>,
+    /// Receiver-side compaction remap alias (g3 `loss-announcement`
+    /// Option A). Consulted when persisting replicated object metadata:
+    /// a chunk ref referencing a segment the local GC already compacted
+    /// away (a LATE metadata append that raced the remap) is translated
+    /// to the repacked segment id + offset through the alias's chunk
+    /// table — without this, the persisted row references a segment that
+    /// exists nowhere and every read 500s (GAP-1). `None` (tests /
+    /// minimal embeddings) skips the translation.
+    remap_alias: Option<Arc<oceanfs_core::SegmentRemapAlias>>,
 }
 
 impl SegmentGrpcService {
@@ -81,7 +90,15 @@ impl SegmentGrpcService {
         let metadata_async = metadata_store
             .clone()
             .map(|s| Arc::new(crate::metadata_async::AsyncMetadataOps::from_storage(s)));
-        Self { data_store, metadata_store, metadata_async, buffer_pool, hlc_clock, lifecycle: None }
+        Self {
+            data_store,
+            metadata_store,
+            metadata_async,
+            buffer_pool,
+            hlc_clock,
+            lifecycle: None,
+            remap_alias: None,
+        }
     }
 
     /// Wires the lifecycle coordinator so replicated appends register
@@ -92,6 +109,16 @@ impl SegmentGrpcService {
         lifecycle: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
     ) -> Self {
         self.lifecycle = Some(lifecycle);
+        self
+    }
+
+    /// Wires the compaction remap alias (composition root; g3
+    /// `loss-announcement` Option A). Late metadata appends referencing
+    /// a locally compacted-away segment are translated through it at
+    /// write time.
+    #[must_use]
+    pub fn with_remap_alias(mut self, alias: Arc<oceanfs_core::SegmentRemapAlias>) -> Self {
+        self.remap_alias = Some(alias);
         self
     }
 
@@ -267,12 +294,28 @@ impl SegmentRpc for SegmentGrpcService {
             for i in 0..chunk_segment_ids.len().min(chunk_offsets.len()).min(chunk_lengths.len()) {
                 let seg_bytes: [u8; 16] =
                     chunk_segment_ids[i].as_ref().try_into().unwrap_or([0u8; 16]);
+                let segment_id = SegmentId::from_uuid_bytes(seg_bytes);
+                let offset = chunk_offsets[i];
+                let length = chunk_lengths[i];
+                // g3 Option A: translate a chunk ref that references a
+                // segment the LOCAL GC already compacted away (a late
+                // metadata append that raced the compaction remap). The
+                // alias's chunk table gives the repacked segment id +
+                // new offset — persisting the stale ref would leave the
+                // object pointing at a segment that exists nowhere
+                // (GAP-1).
+                let (final_segment_id, final_offset) = match &self.remap_alias {
+                    Some(alias) => {
+                        alias.resolve(segment_id, offset, length).unwrap_or((segment_id, offset))
+                    }
+                    None => (segment_id, offset),
+                };
                 chunks.push(ChunkRef {
-                    segment_id: SegmentId::from_uuid_bytes(seg_bytes),
-                    offset: chunk_offsets[i],
-                    length: chunk_lengths[i],
+                    segment_id: final_segment_id,
+                    offset: final_offset,
+                    length,
                     compressed: false,
-                    logical_length: chunk_lengths[i],
+                    logical_length: length,
                 });
             }
             // Inline objects (SizeTier::Inline on the coordinator)

@@ -24,6 +24,7 @@ mod heal;
 mod id;
 mod metadata;
 mod node;
+mod remap;
 
 // --- Cache types ---
 pub use cache::CacheInvalidateRequest;
@@ -54,3 +55,5 @@ pub use node::{
     Incarnation, IntendedFor, NodeState, OperationType, PeerAddress, VnodeRange, WriteAck,
     WriteQuorum, WriteResult,
 };
+// --- Remap alias types (g3 compaction propagation) ---
+pub use remap::{RemappedChunk, SegmentRemapAlias, SharedSegmentRemapAlias};

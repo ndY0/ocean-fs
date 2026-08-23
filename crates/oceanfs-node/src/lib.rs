@@ -21,6 +21,7 @@
     missing_docs
 )]
 
+pub mod announce;
 pub mod health;
 mod membership_state;
 mod metadata_adapter;

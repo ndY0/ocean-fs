@@ -64,26 +64,33 @@ binding for this epic's features:
 ```
 g1 disk-io-observability
  └── g2 failure-state-machine
-      ├── g3 loss-announcement
-      ├── g4 reconciliation
-      └── g6 routing-manifests
- g4 ──→ g5 re-replication-worker
- g3 + g5 ──→ g7 wal-loss-recovery
- g2 + g5 ──→ g8 metadata-loss-recovery
+      ├── sealed-segment-replication   (corrective backbone — g3's premise)
+      │    ├── g3 loss-announcement    (+ compaction remap, Option A)
+      │    ├── g4 reconciliation
+      │    └── g6 routing-manifests
+  g4 ──→ g5 re-replication-worker
+  g3 + g5 ──→ g7 wal-loss-recovery
+  g2 + g5 ──→ g8 metadata-loss-recovery
 ```
 
-Implementation order: **g1 → g2 → g3 → g4 → g5 → g6 → g7 → g8**. After g2,
-g3/g4/g6 are independent; g5 needs g4 (repair requests); g7 needs g3 (own
-loss announcement) + g5 (fetch machinery); g8 needs g2 (metadata-dead
-detection) + g5 (reuses its fetch/worker pattern — but NO re-replication
-runs; see the feature's correction note).
+Implementation order: **g1 → g2 → sealed-segment-replication → g3 → g4 →
+g5 → g6 → g7 → g8**. The backbone (discovered while scoping g3) is the
+data-replication prerequisite: object bytes are only durable on the
+segment ring after a sealed segment's full data section is pushed to its
+replicas and `storage_locations` is stamped. g3's fan-out targets
+(`storage_locations − self`) are real only because of it. After the
+backbone, g3/g4/g6 are independent; g5 needs g4 (repair requests); g7
+needs g3 (own loss announcement) + g5 (fetch machinery); g8 needs g2
+(metadata-dead detection) + g5 (reuses its fetch/worker pattern — but NO
+re-replication runs; see the feature's correction note).
 
 | # | Feature | Touches | Depends on |
 |---|---|---|---|
 | g1 | `disk-io-observability` — DiskIo abstraction, FaultyIo, signal buckets, trend detector, tech profiles | storage, core | f2, f3 (Phase A) |
 | g2 | `failure-state-machine` — status transitions, role consequences, write rejection | storage, node, server | g1 |
-| g3 | `loss-announcement` — segment-set announcement, targeted fan-out | membership, node | g2 |
-| g4 | `reconciliation` — 5s repair loop, risk-prioritized queue | node, durability | g2 |
+| — | `sealed-segment-replication` — data-replication backbone: seal-time push, storage_locations, needs set (corrective; discovered mid-epic) | node, server, storage, durability, routing | g2 |
+| g3 | `loss-announcement` — segment-set announcement + compaction remap, targeted fan-out | node, durability, core | g2, sealed-segment-replication |
+| g4 | `reconciliation` — 5s repair loop, risk-prioritized queue, metadata-repair primitive (GAP-1 failsafe) | node, durability | g2, sealed-segment-replication |
 | g5 | `re-replication-worker` — repair execution, capacity-aware targets | durability, node | g4 |
 | g6 | `routing-manifests` — read/write path filters, hint target preference | node, server | g2, f7 (Phase A) |
 | g7 | `wal-loss-recovery` — fresh WAL, registry rebuild, catch-up from replicas | durability, node, storage | g3, g5 |

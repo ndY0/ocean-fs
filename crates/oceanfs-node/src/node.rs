@@ -10,9 +10,14 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use bytes::Bytes;
 use oceanfs_core::{
     shard, AccelConfig, BucketId, Hlc, HlcClock, Incarnation, MetadataConfig, MetricRegistrar,
-    NodeConfig, NodeId, ObjectKey, ObjectMetadata, PoolConfig, RingConfig, RpcConfig,
+    NodeConfig, NodeId, ObjectKey, ObjectMetadata, PoolConfig, RingConfig, RpcConfig, SegmentId,
     SegmentSizeConfig, SizeTier, Tombstone, WalConfig,
 };
+// ---------------------------------------------------------------------------
+// RepairSinkChannel — g3 → g5 re-replication repair queue adapter
+// ---------------------------------------------------------------------------
+/// A re-replication repair request (g5 ReRepWorker input).
+pub use oceanfs_durability::healing_service::ReRepRequest as RepairRequest;
 use oceanfs_durability::{
     recover_incomplete_compactions, CompactionRecoveryAction, GrpcHintDeliveryClient,
     HintedHandoff, HintedHandoffConfig, HintedHandoffManager, StoreObjectLookup,
@@ -31,6 +36,23 @@ use crate::{
     membership_state::{default_state_path, MembershipStateStore},
     metadata_adapter::MetadataStoreAdapter,
 };
+
+/// Bounded-channel-backed [`RepairSink`](oceanfs_durability::healing_service::RepairSink)
+/// — the g3 loss-announcement handler's enqueue target. The ReRepWorker
+/// (g5) drains `Node::repair_rx`.
+struct RepairSinkChannel {
+    tx: tokio::sync::mpsc::Sender<RepairRequest>,
+}
+
+#[async_trait::async_trait]
+impl oceanfs_durability::healing_service::RepairSink for RepairSinkChannel {
+    async fn enqueue(&self, request: RepairRequest) -> Result<(), String> {
+        self.tx.try_send(request).map_err(|e| match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => "repair queue full".to_string(),
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => "repair queue closed".to_string(),
+        })
+    }
+}
 
 // ---------------------------------------------------------------------------
 // PrefetchStoreAdapter — bridges concrete store to oceanfs_storage_api::MetadataStore
@@ -453,6 +475,15 @@ pub struct Node {
     /// The seal-time segment replicator (sealed-segment-replication) —
     /// held so tests can observe the replication pipeline.
     pub(crate) segment_replicator: Arc<crate::segment_replicator::SegmentReplicator>,
+    /// The compaction-remap alias (g3 `loss-announcement` Option A) —
+    /// shared by the append handler (late metadata) and the healing
+    /// service's remap handler. Held for tests/observability.
+    pub(crate) remap_alias: Arc<oceanfs_core::SegmentRemapAlias>,
+    /// The re-replication repair queue receiver (g3 → g5). The
+    /// loss-announcement handler fills it; the ReRepWorker (g5) drains
+    /// it. Held here (not wired to a worker yet) so g5 can take it and
+    /// tests can observe its depth.
+    pub(crate) repair_rx: parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<RepairRequest>>>,
 }
 
 impl Node {
@@ -865,6 +896,23 @@ impl Node {
             config.gc_max_concurrent_compactions,
             config.gc_compaction_queue_capacity,
         );
+        // The compaction-remap alias (g3 `loss-announcement` Option A):
+        // a single shared map consulted by the append handler (late
+        // metadata) and the healing service's remap handler (records
+        // old→new + chunk table).
+        let remap_alias: Arc<oceanfs_core::SegmentRemapAlias> =
+            Arc::new(oceanfs_core::SegmentRemapAlias::new());
+        // Announcement transmit metrics (g3 — ADR-0029 §D4
+        // observability). Shared by the loss-announcer and the compactor
+        // remap closures; registered with the central metrics registry.
+        let announce_metrics = Arc::new(crate::announce::AnnounceMetrics::new());
+        // The re-replication repair sink (g3 → g5): a bounded channel the
+        // loss-announcement handler fills and the ReRepWorker (g5) drains.
+        // A bounded queue is mandatory (perf 2.6 — the healing service
+        // must never block on enqueue).
+        let (repair_tx, repair_rx) =
+            tokio::sync::mpsc::channel::<oceanfs_durability::healing_service::ReRepRequest>(1024);
+        let repair_sink = Arc::new(RepairSinkChannel { tx: repair_tx });
         // GC compaction repacks live blobs into new segments — it must
         // persist the repacked data through the segment data store (the
         // compactor reads the old segment's bytes and writes the new
@@ -897,6 +945,81 @@ impl Node {
                     let replicator = Arc::clone(&segment_replicator);
                     Arc::new(move |segment_id| {
                         replicator.enqueue(segment_id);
+                    })
+                })
+                // The compaction remap (g3 `loss-announcement` Option A):
+                // after the owner's metadata remap commits, tell the OLD
+                // segment's holders so they re-point their own object
+                // rows. Targets = `storage_locations(old) − self` (the
+                // pinned fan-out). The announcement is a bounded-retry
+                // best-effort push; g4's reconciliation is the failsafe.
+                .with_compaction_remap_notifier({
+                    let membership = Arc::clone(&membership);
+                    let pool = Arc::clone(&pool);
+                    let lifecycle_registry = Arc::clone(&lifecycle_registry);
+                    let self_id = NodeId::new(&config.node_id);
+                    let announce_metrics = Arc::clone(&announce_metrics);
+                    Arc::new(move |old_segment_id, new_segment_id, chunk_table| {
+                        let lifecycle_registry = Arc::clone(&lifecycle_registry);
+                        let membership = Arc::clone(&membership);
+                        let pool = Arc::clone(&pool);
+                        let self_id = self_id.clone();
+                        let announce_metrics = Arc::clone(&announce_metrics);
+                        tokio::spawn(async move {
+                            // Resolve the old segment's holders — the
+                            // remap goes to exactly the nodes that hold a
+                            // stale copy referencing the old id.
+                            let targets: Vec<NodeId> = lifecycle_registry
+                                .get(old_segment_id)
+                                .map(|entry| {
+                                    entry
+                                        .metadata
+                                        .storage_locations
+                                        .iter()
+                                        .filter(|n| *n != &self_id)
+                                        .cloned()
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if targets.is_empty() {
+                                tracing::debug!(
+                                    old_segment_id = %old_segment_id,
+                                    "compaction remap: no peer holders to notify"
+                                );
+                                return;
+                            }
+                            match crate::announce::announce_segment_remap(
+                                &self_id,
+                                old_segment_id,
+                                new_segment_id,
+                                &chunk_table,
+                                &targets,
+                                &pool,
+                                &membership,
+                                None,
+                                None,
+                                Some(&announce_metrics),
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        old_segment_id = %old_segment_id,
+                                        new_segment_id = %new_segment_id,
+                                        targets = targets.len(),
+                                        "compaction remap announced"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        old_segment_id = %old_segment_id,
+                                        new_segment_id = %new_segment_id,
+                                        error = %e,
+                                        "compaction remap not fully delivered (g4 failsafe)"
+                                    );
+                                }
+                            }
+                        });
                     })
                 }),
         );
@@ -1516,6 +1639,8 @@ impl Node {
         reaper.register_metrics(&*metrics);
         scrub_worker.register_metrics(&*metrics);
         ae_worker.register_metrics(&*metrics);
+        // g3 announcements (ADR-0029 §D4 observability).
+        announce_metrics.register_metrics(&*metrics);
         // The manager is the component that actually stores and delivers
         // hints; its counters are the authoritative
         // hinted_handoff_hints_{stored,delivered,expired}_total series.
@@ -1720,7 +1845,11 @@ impl Node {
         // machine: without registration the GC and the orphan reaper
         // never see the receiver's .dat files (the fleet disk-fill
         // root cause).
-        .with_lifecycle(lifecycle.clone());
+        .with_lifecycle(lifecycle.clone())
+        // Late metadata appends referencing a locally compacted-away
+        // segment are translated through the remap alias (g3 Option A —
+        // GAP-1 closure).
+        .with_remap_alias(Arc::clone(&remap_alias));
         // ADR-0028 D1: the membership services (gossip + probe) move to
         // the membership plane — the data-plane server below hosts only
         // Segment/Healing/Cache/Scrub.
@@ -1759,9 +1888,24 @@ impl Node {
         // inline-in-metadata storage — which ballooned the objects CF
         // (16 MiB blobs) and collapsed the orphan reaper's metadata
         // scan (the fleet disk-fill root cause).
-        .with_hint_object_applier(Arc::new(
-            oceanfs_server::WriteCoordinatorHintObjectApplier::new(write_coordinator_for_applier),
-        ));
+        .with_hint_object_applier(Arc::new(oceanfs_server::WriteCoordinatorHintObjectApplier::new(
+            write_coordinator_for_applier,
+        )))
+        // g3 `loss-announcement` Option A (compaction remap): the remap
+        // handler records the alias + chunk table so the append handler
+        // translates late chunk refs, re-points local rows, and deletes
+        // the stale replica through the machine + shard store.
+        .with_remap_alias(Arc::clone(&remap_alias))
+        .with_lifecycle_coordinator(lifecycle.clone())
+        .with_shard_store(Arc::new(oceanfs_durability::DiskSegmentShardStore::new(
+            data_pools.clone(),
+            segment_legacy_dir.clone(),
+            pool_id_for.clone(),
+        )))
+        // g3 `loss-announcement` (data-pool death): verified held
+        // segments enqueue re-replication repairs (g5 drains the queue).
+        .with_repair_sink(repair_sink);
+        healing_service.register_metrics(&*metrics_for_late_registration);
         let cache_service = oceanfs_server::grpc::cache_service::CacheGrpcService::new(
             Some(object_cache.clone()),
             Some(metadata_cache.clone()),
@@ -2052,6 +2196,79 @@ impl Node {
         // (g3 announces it; g6's read/S3 path rejects). Exposed for
         // tests/observability.
         let node_unavailable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // g3 `loss-announcement` fan-out (ADR-0029 §D4 fast path): when a
+        // data pool is confirmed Dead, announce the affected segment set
+        // to `union(storage_locations − self)` over the set — bounded
+        // retries, then drop (g4 reconciliation is the failsafe).
+        let loss_announcer: Option<crate::health::LossAnnouncer> = {
+            let lifecycle_registry = Arc::clone(&lifecycle_registry);
+            let membership = Arc::clone(&membership);
+            let pool = Arc::clone(&pool);
+            let self_id = NodeId::new(&config.node_id);
+            let announce_metrics = Arc::clone(&announce_metrics);
+            Some(Arc::new(move |pool_id, affected| {
+                let lifecycle_registry = Arc::clone(&lifecycle_registry);
+                let membership = Arc::clone(&membership);
+                let pool = Arc::clone(&pool);
+                let self_id = self_id.clone();
+                let announce_metrics = Arc::clone(&announce_metrics);
+                tokio::spawn(async move {
+                    if affected.is_empty() {
+                        return;
+                    }
+                    // Pinned fan-out: the union of every affected
+                    // segment's storage_locations, minus self. NOT the
+                    // whole cluster, NOT ring.lookup.
+                    let locations: Vec<(SegmentId, Vec<NodeId>)> = affected
+                        .iter()
+                        .filter_map(|segment_id| {
+                            lifecycle_registry.get(*segment_id).map(|entry| {
+                                (*segment_id, entry.metadata.storage_locations.to_vec())
+                            })
+                        })
+                        .collect();
+                    let targets = crate::announce::derive_fan_out_targets(&locations, &self_id);
+                    if targets.is_empty() {
+                        tracing::debug!(
+                            pool_id,
+                            affected = affected.len(),
+                            "loss announcement: no peer holders to notify"
+                        );
+                        return;
+                    }
+                    match crate::announce::announce_pool_loss(
+                        &self_id,
+                        pool_id,
+                        &affected,
+                        &targets,
+                        &pool,
+                        &membership,
+                        None,
+                        None,
+                        Some(&announce_metrics),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            tracing::info!(
+                                pool_id,
+                                affected = affected.len(),
+                                targets = targets.len(),
+                                "loss announcement fanned out"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                pool_id,
+                                affected = affected.len(),
+                                error = %e,
+                                "loss announcement not fully delivered (g4 failsafe)"
+                            );
+                        }
+                    }
+                });
+            }))
+        };
         let consequences_handle = crate::health::spawn_health_consequences(
             health_events,
             pool_registry.clone(),
@@ -2061,6 +2278,7 @@ impl Node {
             announce_incarnation,
             manifest_cache.clone(),
             node_unavailable.clone(),
+            loss_announcer,
         );
         background.health_consequences = Some(consequences_handle);
 
@@ -2260,6 +2478,8 @@ impl Node {
             io_observer,
             node_unavailable,
             segment_replicator,
+            remap_alias,
+            repair_rx: parking_lot::Mutex::new(Some(repair_rx)),
         })
     }
 
@@ -2368,6 +2588,57 @@ impl Node {
     /// ```
     pub fn segment_replicator(&self) -> Arc<crate::segment_replicator::SegmentReplicator> {
         self.segment_replicator.clone()
+    }
+
+    /// Returns the compaction-remap alias map (g3 `loss-announcement`
+    /// Option A) — consulted by the append handler to translate late
+    /// chunk refs and recorded by the healing service's remap handler.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn example() {
+    /// use oceanfs_core::NodeConfig;
+    /// use oceanfs_node::Node;
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let config = NodeConfig {
+    /// #     data_dir: tmp.path().join("data"),
+    /// #     listen_addr: "127.0.0.1:0".into(),
+    /// #     grpc_listen_addr: "127.0.0.1:0".into(),
+    /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     ..NodeConfig::default()
+    /// # };
+    /// let node = Node::start(config).await.expect("node");
+    /// assert!(node.remap_alias().is_empty());
+    /// node.shutdown().await.expect("shutdown");
+    /// # }
+    /// ```
+    pub fn remap_alias(&self) -> Arc<oceanfs_core::SegmentRemapAlias> {
+        self.remap_alias.clone()
+    }
+
+    /// Drains one re-replication repair request from the g3 →
+    /// g5 repair queue (the loss-announcement handler's enqueue target).
+    /// Returns `None` when the queue is empty or already handed to the
+    /// ReRepWorker (g5 takes the receiver once).
+    pub fn try_recv_repair(&self) -> Option<RepairRequest> {
+        let mut guard = self.repair_rx.lock();
+        let rx = guard.as_mut()?;
+        match rx.try_recv() {
+            Ok(req) => Some(req),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                *guard = None;
+                None
+            }
+        }
+    }
+
+    /// Returns the number of pending re-replication repair requests
+    /// (g3 loss-announcement observability / tests).
+    pub fn pending_repairs(&self) -> usize {
+        let guard = self.repair_rx.lock();
+        guard.as_ref().map_or(0, |rx| rx.len())
     }
 
     /// Returns this node's current `NodeManifest` (ADR-0029 D2), as

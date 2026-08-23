@@ -87,6 +87,15 @@ service HealingRpc {
 
   // Push a reconstructed shard to a remote node that owns it.
   rpc PushRepairedShard(PushRepairedShardRequest) returns (PushRepairedShardResponse);
+
+  // Announce a data pool's confirmed loss to the replica holders of its
+  // affected segments (ADR-0029 §D4 fast path; g3). RF-bounded fan-out —
+  // the sender targets exactly `storage_locations − self`.
+  rpc AnnounceLoss(LossAnnouncement) returns (LossAck);
+
+  // Announce a compaction segment-remap (old id → new id) to the holders
+  // of the old segment so they re-point their metadata (GAP-1 closure).
+  rpc AnnounceRemap(SegmentRemap) returns (RemapAck);
 }
 
 // ---------------------------------------------------------------------------
@@ -155,4 +164,71 @@ message PushRepairedShardRequest {
 // Response acknowledging receipt of the repaired shard.
 message PushRepairedShardResponse {
   bool accepted = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Loss announcements (ADR-0029 §D4 targeted push; g3 loss-announcement)
+// ---------------------------------------------------------------------------
+
+// A data pool's confirmed-loss announcement. The sender (the node whose
+// pool died) carries the exact affected segment set — peers cannot derive
+// a node's local segment→pool mapping, so the set rides the event
+// (ADR-0029 §D4 correction note). Segment ids are 16 bytes; a 10k-segment
+// pool is ~160 KB — bounded and rare.
+message LossAnnouncement {
+  // The announcing node (whose data pool died).
+  oceanfs.common.NodeId origin = 1;
+  // The dead pool id (config-order, ADR-0029 §D8).
+  uint32 pool_id = 2;
+  // The affected segment set (derive_affected_segments, g2).
+  repeated oceanfs.common.SegmentId segments = 3;
+}
+
+// Acknowledges a loss announcement. `accepted` counts the announced
+// segments the receiver verified it holds AND enqueued for repair
+// (re-replication, g5).
+message LossAck {
+  uint32 accepted = 1;
+}
+
+// A compaction remap: the owner compacted `old_segment_id` into the NEW
+// repacked `new_segment_id`. The receiver must re-point any object
+// metadata referencing the old id to the new id — the owner's compaction
+// rewrites only its own RocksDB, and without propagation replicas'
+// metadata silently diverges until reads reference a segment that exists
+// nowhere (GAP-1). This is the owner-authoritative fast path; the
+// periodic reconciliation (g4) is the mandatory failsafe that catches
+// whatever this push missed.
+message SegmentRemap {
+  // The compacting (owner) node.
+  oceanfs.common.NodeId origin = 1;
+  // The pre-compaction segment id being replaced.
+  oceanfs.common.SegmentId old_segment_id = 2;
+  // The repacked replacement segment id.
+  oceanfs.common.SegmentId new_segment_id = 3;
+  // The chunk-remap table: every live chunk repacked from the old
+  // segment into the new one. The repacked byte layout is NOT
+  // offset-preserving (the compactor packs live chunks contiguously),
+  // so a receiver cannot re-point `old → new` keeping the same offset —
+  // it must translate each chunk ref through this table.
+  repeated RemappedChunk chunks = 4;
+}
+
+// One repacked chunk: the receiver translates every chunk ref
+// `(old_segment_id, old_offset, length)` it holds into
+// `(new_segment_id, new_offset, length)`.
+message RemappedChunk {
+  // The chunk's offset in the OLD segment's data section.
+  uint64 old_offset = 1;
+  // The chunk's length (unchanged by repacking).
+  uint32 length = 2;
+  // The chunk's offset in the NEW segment's data section.
+  uint64 new_offset = 3;
+}
+
+// Acknowledges a segment remap. `applied` is true when the receiver
+// verified it held the old segment (and the origin was a legitimate
+// holder) and re-pointed its metadata.
+message RemapAck {
+  bool applied = 1;
 }

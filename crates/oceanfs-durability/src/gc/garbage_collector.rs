@@ -6,9 +6,15 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use oceanfs_core::{BucketId, Counter, LabelSet, MetricRegistrar, ObjectKey, SegmentId};
+use oceanfs_core::{
+    BucketId, Counter, LabelSet, MetricRegistrar, ObjectKey, RemappedChunk, SegmentId,
+};
 use oceanfs_storage::segment::TierRouter;
 use tokio::sync::Semaphore;
+
+/// The compaction-remap notifier signature (g3 `loss-announcement`
+/// Option A): `(old_segment_id, new_segment_id, chunk_table)`.
+pub type CompactionRemapFn = Arc<dyn Fn(SegmentId, SegmentId, Vec<RemappedChunk>) + Send + Sync>;
 
 use super::{
     config::GcConfig, liveness_tracker::LivenessTracker, segment_compactor::SegmentCompactor,
@@ -58,6 +64,12 @@ pub struct GarbageCollector {
     /// its ring replicas. `None` (default) keeps the un-wired path
     /// identical.
     sealed_notifier: Option<Arc<dyn Fn(SegmentId) + Send + Sync>>,
+    /// Optional compaction-remap notifier (g3 `loss-announcement`
+    /// Option A): fired with `(old, new, chunk_table)` after the owner's
+    /// `ObjectsMoved` metadata remap commits, so peers re-point their
+    /// own object rows. `None` (default) keeps the un-wired path
+    /// identical.
+    compaction_remap_notifier: Option<CompactionRemapFn>,
 }
 
 type TombstoneResult =
@@ -99,6 +111,7 @@ impl GarbageCollector {
             lifecycle: None,
             shard_store: None,
             sealed_notifier: None,
+            compaction_remap_notifier: None,
         }
     }
 
@@ -167,6 +180,17 @@ impl GarbageCollector {
         notifier: Arc<dyn Fn(SegmentId) + Send + Sync>,
     ) -> Self {
         self.sealed_notifier = Some(notifier);
+        self
+    }
+
+    /// Wires the compaction-remap notifier (g3 `loss-announcement`
+    /// Option A): fired with `(old, new, chunk_table)` after the owner's
+    /// metadata remap commits, so peers re-point their own object rows.
+    /// The repacked segment bypasses the write-path seal worker, so
+    /// without this hook peers' metadata silently diverges from the
+    /// owner's after compaction (GAP-1).
+    pub fn with_compaction_remap_notifier(mut self, notifier: CompactionRemapFn) -> Self {
+        self.compaction_remap_notifier = Some(notifier);
         self
     }
 
@@ -274,6 +298,10 @@ impl GarbageCollector {
         );
         let compactor = match &self.sealed_notifier {
             Some(notifier) => compactor.with_sealed_notifier(Arc::clone(notifier)),
+            None => compactor,
+        };
+        let compactor = match &self.compaction_remap_notifier {
+            Some(notifier) => compactor.with_compaction_remap_notifier(Arc::clone(notifier)),
             None => compactor,
         };
         let compactor = Arc::new(compactor);

@@ -151,6 +151,81 @@ pub struct PushRepairedShardResponse {
     #[prost(bool, tag = "1")]
     pub accepted: bool,
 }
+/// A data pool's confirmed-loss announcement. The sender (the node whose
+/// pool died) carries the exact affected segment set — peers cannot derive
+/// a node's local segment→pool mapping, so the set rides the event
+/// (ADR-0029 §D4 correction note). Segment ids are 16 bytes; a 10k-segment
+/// pool is ~160 KB — bounded and rare.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LossAnnouncement {
+    /// The announcing node (whose data pool died).
+    #[prost(message, optional, tag = "1")]
+    pub origin: ::core::option::Option<::oceanfs_core::proto::common::NodeId>,
+    /// The dead pool id (config-order, ADR-0029 §D8).
+    #[prost(uint32, tag = "2")]
+    pub pool_id: u32,
+    /// The affected segment set (derive_affected_segments, g2).
+    #[prost(message, repeated, tag = "3")]
+    pub segments: ::prost::alloc::vec::Vec<::oceanfs_core::proto::common::SegmentId>,
+}
+/// Acknowledges a loss announcement. `accepted` counts the announced
+/// segments the receiver verified it holds AND enqueued for repair
+/// (re-replication, g5).
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct LossAck {
+    #[prost(uint32, tag = "1")]
+    pub accepted: u32,
+}
+/// A compaction remap: the owner compacted `old_segment_id` into the NEW
+/// repacked `new_segment_id`. The receiver must re-point any object
+/// metadata referencing the old id to the new id — the owner's compaction
+/// rewrites only its own RocksDB, and without propagation replicas'
+/// metadata silently diverges until reads reference a segment that exists
+/// nowhere (GAP-1). This is the owner-authoritative fast path; the
+/// periodic reconciliation (g4) is the mandatory failsafe that catches
+/// whatever this push missed.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SegmentRemap {
+    /// The compacting (owner) node.
+    #[prost(message, optional, tag = "1")]
+    pub origin: ::core::option::Option<::oceanfs_core::proto::common::NodeId>,
+    /// The pre-compaction segment id being replaced.
+    #[prost(message, optional, tag = "2")]
+    pub old_segment_id: ::core::option::Option<::oceanfs_core::proto::common::SegmentId>,
+    /// The repacked replacement segment id.
+    #[prost(message, optional, tag = "3")]
+    pub new_segment_id: ::core::option::Option<::oceanfs_core::proto::common::SegmentId>,
+    /// The chunk-remap table: every live chunk repacked from the old
+    /// segment into the new one. The repacked byte layout is NOT
+    /// offset-preserving (the compactor packs live chunks contiguously),
+    /// so a receiver cannot re-point `old → new` keeping the same offset —
+    /// it must translate each chunk ref through this table.
+    #[prost(message, repeated, tag = "4")]
+    pub chunks: ::prost::alloc::vec::Vec<RemappedChunk>,
+}
+/// One repacked chunk: the receiver translates every chunk ref
+/// `(old_segment_id, old_offset, length)` it holds into
+/// `(new_segment_id, new_offset, length)`.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RemappedChunk {
+    /// The chunk's offset in the OLD segment's data section.
+    #[prost(uint64, tag = "1")]
+    pub old_offset: u64,
+    /// The chunk's length (unchanged by repacking).
+    #[prost(uint32, tag = "2")]
+    pub length: u32,
+    /// The chunk's offset in the NEW segment's data section.
+    #[prost(uint64, tag = "3")]
+    pub new_offset: u64,
+}
+/// Acknowledges a segment remap. `applied` is true when the receiver
+/// verified it held the old segment (and the origin was a legitimate
+/// holder) and re-pointed its metadata.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RemapAck {
+    #[prost(bool, tag = "1")]
+    pub applied: bool,
+}
 /// Generated client implementations.
 pub mod healing_rpc_client {
     #![allow(
@@ -400,6 +475,53 @@ pub mod healing_rpc_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Announce a data pool's confirmed loss to the replica holders of its
+        /// affected segments (ADR-0029 §D4 fast path; g3). RF-bounded fan-out —
+        /// the sender targets exactly `storage_locations − self`.
+        pub async fn announce_loss(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LossAnnouncement>,
+        ) -> std::result::Result<tonic::Response<super::LossAck>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/oceanfs.healing.HealingRpc/AnnounceLoss",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("oceanfs.healing.HealingRpc", "AnnounceLoss"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Announce a compaction segment-remap (old id → new id) to the holders
+        /// of the old segment so they re-point their metadata (GAP-1 closure).
+        pub async fn announce_remap(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SegmentRemap>,
+        ) -> std::result::Result<tonic::Response<super::RemapAck>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/oceanfs.healing.HealingRpc/AnnounceRemap",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("oceanfs.healing.HealingRpc", "AnnounceRemap"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -471,6 +593,19 @@ pub mod healing_rpc_server {
             tonic::Response<super::PushRepairedShardResponse>,
             tonic::Status,
         >;
+        /// Announce a data pool's confirmed loss to the replica holders of its
+        /// affected segments (ADR-0029 §D4 fast path; g3). RF-bounded fan-out —
+        /// the sender targets exactly `storage_locations − self`.
+        async fn announce_loss(
+            &self,
+            request: tonic::Request<super::LossAnnouncement>,
+        ) -> std::result::Result<tonic::Response<super::LossAck>, tonic::Status>;
+        /// Announce a compaction segment-remap (old id → new id) to the holders
+        /// of the old segment so they re-point their metadata (GAP-1 closure).
+        async fn announce_remap(
+            &self,
+            request: tonic::Request<super::SegmentRemap>,
+        ) -> std::result::Result<tonic::Response<super::RemapAck>, tonic::Status>;
     }
     /// Healing RPC service for hinted handoff, anti-entropy, and EC-based repair.
     #[derive(Debug)]
@@ -808,6 +943,94 @@ pub mod healing_rpc_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = PushRepairedShardSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/oceanfs.healing.HealingRpc/AnnounceLoss" => {
+                    #[allow(non_camel_case_types)]
+                    struct AnnounceLossSvc<T: HealingRpc>(pub Arc<T>);
+                    impl<
+                        T: HealingRpc,
+                    > tonic::server::UnaryService<super::LossAnnouncement>
+                    for AnnounceLossSvc<T> {
+                        type Response = super::LossAck;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::LossAnnouncement>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as HealingRpc>::announce_loss(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AnnounceLossSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/oceanfs.healing.HealingRpc/AnnounceRemap" => {
+                    #[allow(non_camel_case_types)]
+                    struct AnnounceRemapSvc<T: HealingRpc>(pub Arc<T>);
+                    impl<T: HealingRpc> tonic::server::UnaryService<super::SegmentRemap>
+                    for AnnounceRemapSvc<T> {
+                        type Response = super::RemapAck;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SegmentRemap>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as HealingRpc>::announce_remap(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AnnounceRemapSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

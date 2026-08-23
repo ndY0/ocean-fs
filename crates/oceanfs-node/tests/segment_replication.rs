@@ -299,7 +299,192 @@ async fn data_survives_owner_disk_death_via_segment_replicas() {
     node_c.shutdown().await.expect("node C shutdown");
 }
 
-/// Compaction variant (sealed-segment-replication DoD): the GC compactor
+/// GAP-1 closure (g3 `loss-announcement` Option A — owner-authoritative
+/// compaction propagation): after GC compaction rewrites ONLY the owner's
+/// metadata, every node must converge on the repacked segment so reads
+/// work through ALL THREE nodes — not just the owner.
+///
+/// Before this feature, the backbone's compaction-variant test
+/// deliberately scoped DOWN read-availability because a GET routed to B
+/// (or C) used ITS metadata, which still referenced the original segment
+/// — and B/C's own GC had compacted that original away. Result: reads
+/// referenced a segment that existed nowhere (500). This test asserts
+/// the fix: after DELETE + compaction + remap propagation, every object
+/// is byte-identical when read through A, B, AND C.
+#[tokio::test]
+async fn compacted_segments_are_readable_from_every_node() {
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    let ports = free_ports(6);
+    let a_addrs = NodeAddrs {
+        grpc: format!("127.0.0.1:{}", ports[0]),
+        membership: format!("127.0.0.1:{}", ports[1]),
+    };
+    let b_addrs = NodeAddrs {
+        grpc: format!("127.0.0.1:{}", ports[2]),
+        membership: format!("127.0.0.1:{}", ports[3]),
+    };
+    let c_addrs = NodeAddrs {
+        grpc: format!("127.0.0.1:{}", ports[4]),
+        membership: format!("127.0.0.1:{}", ports[5]),
+    };
+    let (node_a, tmp_a) = boot_node("node-a", None, &a_addrs, true).await;
+    let (node_b, tmp_b) = boot_node("node-b", Some(&a_addrs.membership), &b_addrs, true).await;
+    let (node_c, tmp_c) = boot_node("node-c", Some(&a_addrs.membership), &c_addrs, true).await;
+
+    wait_for_cluster_convergence(&node_a).await;
+    wait_for_cluster_convergence(&node_b).await;
+    wait_for_cluster_convergence(&node_c).await;
+
+    let client =
+        reqwest::Client::builder().timeout(Duration::from_secs(15)).build().expect("client");
+    let addr_a = node_a.server_addr();
+    let addr_b = node_b.server_addr();
+    let addr_c = node_c.server_addr();
+
+    // ---- PUT 8 × 32 KiB objects concurrently (packed into segments) ----
+    let body: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
+    let keys: Vec<String> = (0..8).map(|i| format!("obj-{i:02}")).collect();
+    let mut handles = Vec::new();
+    for key in &keys {
+        let client = client.clone();
+        let body = body.clone();
+        let key = key.clone();
+        handles.push(tokio::spawn(async move {
+            put(&client, addr_a, &key, &body).await;
+        }));
+    }
+    for h in handles {
+        h.await.expect("PUT task");
+    }
+
+    // ---- Wait for initial seals + replication to land on B/C ----
+    let segments_dir_a = tmp_a.path().join("data/segments");
+    let segments_dir_b = tmp_b.path().join("data/segments");
+    let segments_dir_c = tmp_c.path().join("data/segments");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let initial_ids = loop {
+        let ids = segment_ids(&segments_dir_a);
+        if ids.len() >= 2 {
+            break ids;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "owner must seal at least 2 segments within 60s"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    wait_for_segment_files(&segments_dir_b, initial_ids.len()).await;
+    wait_for_segment_files(&segments_dir_c, initial_ids.len()).await;
+    // The owner's replicator drained (all pushes acked).
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if node_a.segment_replicator().needs_len() == 0 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "replicator must drain before compaction");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // ---- Sanity: reads work through all three nodes BEFORE deletion ----
+    for key in &keys {
+        for addr in [addr_a, addr_b, addr_c] {
+            let resp = get(&client, addr, key).await;
+            assert_eq!(resp.status(), 200, "pre-delete GET {key} via {addr}");
+        }
+    }
+
+    // ---- DELETE half the objects (tombstones replicate to B/C) ----
+    for key in keys.iter().take(4) {
+        delete(&client, addr_a, key).await;
+    }
+
+    // ---- Wait for GC compaction to produce the repacked segments ----
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let on_a = segment_ids(&segments_dir_a);
+        let repacked: Vec<String> =
+            on_a.iter().filter(|id| !initial_ids.contains(id)).cloned().collect();
+        let on_b = segment_ids(&segments_dir_b);
+        let on_c = segment_ids(&segments_dir_c);
+        if !repacked.is_empty() && repacked.iter().all(|id| on_b.contains(id) && on_c.contains(id))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "all repacked segments must be replicated to B and C within 60s"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // ---- GAP-1 closure: the remap must have propagated. ----
+    // Every node's metadata must now reference the repacked segments for
+    // the surviving objects; reads through A, B, AND C must return
+    // byte-identical data. Wait for convergence (the remap push + the
+    // receiver-side re-point are async). Only the SURVIVING keys are
+    // polled (the deleted 4 must 404 — never 200).
+    let surviving_keys: Vec<String> = keys.iter().skip(4).cloned().collect();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut all_readable = true;
+        for key in &surviving_keys {
+            for addr in [addr_a, addr_b, addr_c] {
+                let resp = get(&client, addr, key).await;
+                if resp.status() != 200 {
+                    all_readable = false;
+                }
+            }
+        }
+        if all_readable {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "surviving objects must be readable through A, B, C after compaction remap"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // The surviving objects (the 4 NOT deleted) are byte-identical on
+    // every node. The deleted 4 return 404 everywhere (their tombstones
+    // replicated).
+    let deleted_keys: Vec<String> = keys.iter().take(4).cloned().collect();
+    for key in &keys {
+        for addr in [addr_a, addr_b, addr_c] {
+            let resp = get(&client, addr, key).await;
+            if deleted_keys.contains(key) {
+                assert_eq!(
+                    resp.status(),
+                    404,
+                    "deleted {key} must 404 via {addr} (tombstone replicated)"
+                );
+            } else {
+                assert_eq!(
+                    resp.status(),
+                    200,
+                    "surviving {key} must be readable via {addr} after compaction"
+                );
+                let got = resp.bytes().await.expect("read body");
+                assert_eq!(
+                    &got[..],
+                    &body[..],
+                    "surviving {key} must be byte-identical via {addr}"
+                );
+            }
+        }
+    }
+
+    node_a.shutdown().await.expect("node A shutdown");
+    node_b.shutdown().await.expect("node B shutdown");
+    node_c.shutdown().await.expect("node C shutdown");
+}
 /// seals a NEW repacked segment OUTSIDE the write-path seal worker — the
 /// compactor's `with_segment_sealed_notifier` hook must enqueue it so the
 /// replicator fans it out to the segment's ring replicas. Without that
