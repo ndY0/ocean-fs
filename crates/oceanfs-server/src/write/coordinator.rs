@@ -153,6 +153,9 @@ pub struct WriteCoordinator {
     size_config: SegmentSizeConfig,
     /// Hinted handoff buffer for writes to temporarily unreachable replicas.
     hinted_handoff: Arc<HintedHandoffManager>,
+    /// The live pool registry (g2): when set, the hint enqueue path
+    /// rejects new debt while the **hints** pool is Dead (ADR-0029 §D3).
+    pool_registry: Option<Arc<oceanfs_storage::PoolRegistry>>,
     /// Cluster-readiness gate: closed while this node's ring is still
     /// converging after (re)join; the write path refuses to
     /// under-replicate while closed. Defaults to OPEN (`true`) so tests
@@ -321,6 +324,7 @@ impl WriteCoordinator {
             lifecycle,
             size_config,
             hinted_handoff,
+            pool_registry: None,
             ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             quorum_requires_ring: true,
             hint_inline_threshold_bytes: 4096,
@@ -394,6 +398,18 @@ impl WriteCoordinator {
     #[doc(hidden)]
     pub fn with_ready_gate(mut self, ready: Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.ready = ready;
+        self
+    }
+
+    /// Installs the live pool registry (g2 `failure-state-machine`): the
+    /// hint enqueue path rejects new debt while the **hints** pool is
+    /// Dead (ADR-0029 §D3 — reconciliation rebuilds lost debt).
+    ///
+    /// `None` (the default, when this builder is not called) keeps the
+    /// pre-g2 behavior — hint enqueue is never rejected.
+    #[must_use]
+    pub fn with_pool_registry(mut self, registry: Arc<oceanfs_storage::PoolRegistry>) -> Self {
+        self.pool_registry = Some(registry);
         self
     }
 
@@ -1109,6 +1125,19 @@ impl WriteCoordinator {
     /// hints small — embedding data would break the moment multipart
     /// uploads make blobs reach GB sizes (the hint WAL and the gRPC
     /// batch would balloon to the blob size).
+    /// `true` when the hinted-handoff path may accept new debt: the
+    /// **hints** pool (ADR-0029 §D3) is not Dead. No registry wired or no
+    /// hints pool configured → always accepts (legacy behavior).
+    fn hints_pool_accepts(&self) -> bool {
+        match &self.pool_registry {
+            Some(registry) => registry
+                .pool_by_role(oceanfs_core::PoolRole::Hints)
+                .map(|pool| pool.status() != oceanfs_storage::PoolStatus::Dead)
+                .unwrap_or(true),
+            None => true,
+        }
+    }
+
     async fn enqueue_write_hint(
         &self,
         target: &NodeId,
@@ -1116,6 +1145,19 @@ impl WriteCoordinator {
         chunks: &[ChunkRef],
         hlc: Hlc,
     ) {
+        // g2 (ADR-0029 §D3): a Dead hints pool cannot persist new debt.
+        // The hint is delivery intent, not data — reconciliation rebuilds
+        // any debt lost with the device, so skipping is the correct
+        // consequence (same "debt lost" warn the failed enqueue emits).
+        if !self.hints_pool_accepts() {
+            warn!(
+                target = %target,
+                bucket = %req.bucket,
+                key = %req.key,
+                "hinted handoff enqueue REJECTED — hints pool Dead (ADR-0029 D3); debt lost, reconciliation rebuilds"
+            );
+            return;
+        }
         let hint = if req.data.len() as u64 <= self.hint_inline_threshold_bytes {
             oceanfs_durability::hinted_handoff_rpc::HintRecord::new_inline(
                 target.clone(),
@@ -1794,6 +1836,17 @@ impl WriteCoordinator {
         key: &ObjectKey,
         hlc: Hlc,
     ) {
+        // g2 (ADR-0029 §D3): a Dead hints pool cannot persist new debt —
+        // skip (reconciliation rebuilds lost delete debt).
+        if !self.hints_pool_accepts() {
+            warn!(
+                target = %target,
+                bucket = %bucket,
+                key = %key,
+                "hinted handoff delete enqueue REJECTED — hints pool Dead (ADR-0029 D3)"
+            );
+            return;
+        }
         let hint = oceanfs_durability::hinted_handoff_rpc::HintRecord::new_delete(
             target.clone(),
             bucket.clone(),
@@ -2121,6 +2174,74 @@ mod tests {
             })
             .expect("captured request must contain an inline hint with an hlc");
         assert!(hint_hlc > Hlc::zero(), "the hint must carry the write's stamped HLC");
+    }
+
+    #[tokio::test]
+    async fn hints_pool_guard_rejects_when_hints_pool_dead() {
+        // g2 (ADR-0029 §D3): a Dead hints pool rejects new debt.
+        use oceanfs_core::{
+            MissingRootPolicy, PoolRole, PoolTech, StorageConfig, StoragePoolConfig,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let storage = StorageConfig {
+            pools: vec![
+                StoragePoolConfig {
+                    name: "data-a".into(),
+                    role: PoolRole::Data,
+                    root: dir.path().join("nvme0"),
+                    weight: None,
+                    tech: PoolTech::Auto,
+                    health: Default::default(),
+                },
+                StoragePoolConfig {
+                    name: "hints-dev".into(),
+                    role: PoolRole::Hints,
+                    root: dir.path().join("hints-dev"),
+                    weight: None,
+                    tech: PoolTech::Auto,
+                    health: Default::default(),
+                },
+            ],
+            missing_root_policy: MissingRootPolicy::Fatal,
+        };
+        let registry = Arc::new(
+            oceanfs_storage::PoolRegistry::from_config(&storage, &data_dir).expect("registry"),
+        );
+
+        let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
+        let coord = make_write_coordinator_with_delivery(
+            "n1",
+            &["n1", "n2", "n3"],
+            dir,
+            pool,
+            Arc::new(CaptureDeliveryClient::default()),
+        )
+        .await
+        .0
+        .with_pool_registry(registry.clone());
+
+        let hints_id = registry.pool_by_role(PoolRole::Hints).expect("hints pool").id();
+        assert!(coord.hints_pool_accepts(), "healthy hints pool accepts debt");
+
+        registry.set_status(hints_id, oceanfs_storage::PoolStatus::Dead);
+        assert!(!coord.hints_pool_accepts(), "Dead hints pool rejects debt");
+
+        registry.set_status(hints_id, oceanfs_storage::PoolStatus::Degraded);
+        assert!(coord.hints_pool_accepts(), "Degraded never rejects (D3 matrix)");
+
+        // No registry wired → legacy behavior (always accepts).
+        let plain = make_write_coordinator_with_delivery(
+            "n1",
+            &["n1", "n2", "n3"],
+            tempfile::tempdir().unwrap(),
+            Arc::new(ConnectionPool::new(RpcConfig::default())),
+            Arc::new(CaptureDeliveryClient::default()),
+        )
+        .await
+        .0;
+        assert!(plain.hints_pool_accepts());
     }
 
     #[tokio::test]

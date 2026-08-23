@@ -383,6 +383,15 @@ pub struct BackgroundTasks {
 
     /// Health check loop cancellation token.
     pub(crate) health_check_cancel: CancellationToken,
+
+    /// Pool health monitor task (g2): ticks pools through the D3 state
+    /// machine. `None` before the monitor is spawned.
+    pub(crate) health_monitor: Option<JoinHandle<()>>,
+    /// Pool health monitor cancellation token.
+    pub(crate) health_cancel: CancellationToken,
+    /// Health-consequence applier task (role matrix + manifest
+    /// re-declaration). `None` before the applier is spawned.
+    pub(crate) health_consequences: Option<JoinHandle<()>>,
 }
 
 /// Resolves a RocksDB property string to a u64. Used by tests.
@@ -431,6 +440,10 @@ pub struct Node {
     /// seal pipeline records write/fsync signals into it; the g2 health
     /// monitor consumes snapshots. Held for tests/observability.
     pub(crate) io_observer: Arc<oceanfs_storage::io::IoObserver>,
+    /// The g2 `node_unavailable` flag: set when the **metadata** pool is
+    /// Dead (ADR-0029 §D3 — the node serves nothing; g3 announces it,
+    /// g6's S3/read path rejects).
+    node_unavailable: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Node {
@@ -1223,6 +1236,9 @@ impl Node {
             // whose manifest reports write_degraded / zero Healthy data
             // pools are excluded; Phase A all-healthy = neutral.
             .with_routing_hint(manifest_cache.clone())
+            // g2 (ADR-0029 §D3): the hint enqueue path rejects new debt
+            // while the hints pool is Dead.
+            .with_pool_registry(pool_registry.clone())
             // Continuous anti-entropy: every successful seal updates the
             // incremental Merkle tree (with its seal-time root) so
             // recently-written segments participate in the root exchange
@@ -1934,6 +1950,42 @@ impl Node {
         background.grpc_shutdown = grpc_shutdown;
         background.grpc_server = Some(grpc_server_handle);
 
+        // ---- 16b. Spawn the pool health monitor + consequence applier ----
+        // (g2 `failure-state-machine`, ADR-0029 §D3). The monitor ticks
+        // each pool every `detection_window_secs` (f1 per-pool knobs),
+        // drives registry status + wal write_degraded, and emits bounded
+        // status events; the applier maps role → consequences
+        // (metadata → node_unavailable, data Dead → affected segments)
+        // and re-declares the manifest so peers see the change.
+        let (health_monitor, health_events) = oceanfs_storage::pool::health::HealthMonitor::new(
+            pool_registry.clone(),
+            io_observer.clone(),
+            oceanfs_storage::pool::health::HealthMonitorConfig::default(),
+        );
+        let health_cancel = CancellationToken::new();
+        let health_token = health_cancel.clone();
+        let health_handle = tokio::spawn(async move {
+            health_monitor.run(health_token).await;
+            info!("Pool health monitor stopped");
+        });
+        background.health_monitor = Some(health_handle);
+        background.health_cancel = health_cancel;
+        // The node_unavailable flag: set when the metadata pool is Dead
+        // (g3 announces it; g6's read/S3 path rejects). Exposed for
+        // tests/observability.
+        let node_unavailable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let consequences_handle = crate::health::spawn_health_consequences(
+            health_events,
+            pool_registry.clone(),
+            membership.clone(),
+            Arc::clone(&lifecycle_registry),
+            NodeId::new(&config.node_id),
+            announce_incarnation,
+            manifest_cache.clone(),
+            node_unavailable.clone(),
+        );
+        background.health_consequences = Some(consequences_handle);
+
         // ---- 17. Spawn hinted handoff delivery watcher ----
         // Watches for membership events and drains the handoff buffer
         // for nodes that are (or return to) ALIVE. Any Alive event —
@@ -2113,6 +2165,7 @@ impl Node {
             wal_writer: wal_writer.clone(),
             pool_registry,
             io_observer,
+            node_unavailable,
         })
     }
 
@@ -2167,6 +2220,33 @@ impl Node {
     /// ```
     pub fn io_observer(&self) -> Arc<oceanfs_storage::io::IoObserver> {
         self.io_observer.clone()
+    }
+
+    /// Returns whether the node has declared itself unavailable (the
+    /// **metadata** pool is Dead — ADR-0029 §D3). g3 announces this;
+    /// g6's S3/read path rejects while it is set.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn example() {
+    /// use oceanfs_core::NodeConfig;
+    /// use oceanfs_node::Node;
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let config = NodeConfig {
+    /// #     data_dir: tmp.path().join("data"),
+    /// #     listen_addr: "127.0.0.1:0".into(),
+    /// #     grpc_listen_addr: "127.0.0.1:0".into(),
+    /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     ..NodeConfig::default()
+    /// # };
+    /// let node = Node::start(config).await.expect("node");
+    /// assert!(!node.node_unavailable());
+    /// node.shutdown().await.expect("shutdown");
+    /// # }
+    /// ```
+    pub fn node_unavailable(&self) -> bool {
+        self.node_unavailable.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Returns this node's current `NodeManifest` (ADR-0029 D2), as
@@ -2274,6 +2354,7 @@ impl Node {
         self.background.delivery_cancel.cancel();
         self.background.hint_prune_cancel.cancel();
         self.background.health_check_cancel.cancel();
+        self.background.health_cancel.cancel();
 
         // ---- 5. Wait for background tasks with a timeout ----
         let _ = tokio::time::timeout(Duration::from_secs(10), async {
@@ -2640,6 +2721,9 @@ impl Node {
             grpc_server: None,
             grpc_shutdown: CancellationToken::new(),
             health_check_cancel: CancellationToken::new(),
+            health_monitor: None,
+            health_cancel: CancellationToken::new(),
+            health_consequences: None,
         }
     }
 }

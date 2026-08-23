@@ -45,7 +45,10 @@ pub use io::{
 };
 pub use metadata::{BatchOp, RocksDbMetadataStore, RocksDbMetrics};
 pub use pool::{
-    health::{evaluate_trend, Latency, PoolSignal, SmartCounters, TrendVerdict},
+    health::{
+        decide_transition, evaluate_trend, ConfirmedLoss, HealthEvent, HealthMonitor,
+        HealthMonitorConfig, Latency, PoolSignal, SmartCounters, TrendVerdict,
+    },
     resolve_pool_root, PlacementPolicy, PoolIdResolver, PoolRegistry, PoolStatus, StoragePool,
 };
 pub use segment::{

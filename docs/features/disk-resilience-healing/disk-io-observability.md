@@ -1,7 +1,7 @@
 ---
 feature: "Disk IO Observability + Fault Injection"
 epic: "disk-resilience-healing"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies: []
@@ -113,16 +113,11 @@ unit tests ──▶ FaultyIo ──▶ DiskIo under injection
 - [x] **Tests:** all listed green (FaultyIo, observer, trend per-tech)
       (verified: storage 479 tests, node 49 lib + 20 integration bins incl.
       the 2 new io_observer tests, server 226 lib — all pass under
-      `--test-threads=1`)
-<!-- REVIEW: `cargo clippy -p oceanfs-node --all-targets -- -D warnings` FAILS on
-     the new integration test crates/oceanfs-node/tests/io_observer_faulty.rs:9-10
-     (`doc_lazy_continuation` — "doc list item without indentation"). The lib
-     target is clean; only the new file's `//!` doc list continuation trips the
-     lint. Fix: indent the continuation lines under the list item. Would pass
-     once `cargo clippy -p oceanfs-node --all-targets -- -D warnings` is clean.
-     Also note: the pre-existing `grpc_services::swim_death_detection_within_timeout`
-     failure (crates/oceanfs-server/tests/grpc_services.rs:631) reproduces at HEAD
-     b53d6aa and is unrelated to this feature. -->
+      `--test-threads=1`; `cargo clippy -p oceanfs-node --all-targets
+      -- -D warnings` clean — the doc_lazy_continuation gap is fixed)
+      (residual, pre-existing and unrelated at HEAD b53d6aa:
+      `grpc_services::swim_death_detection_within_timeout` in
+      crates/oceanfs-server/tests/grpc_services.rs:631)
 - [x] **Docs:** `# Examples` on pub items; rustdoc clean
       (verified: `RUSTDOCFLAGS="-D warnings" cargo doc` clean on
       oceanfs-storage + oceanfs-node; 78 doctests pass; server's 2 link errors

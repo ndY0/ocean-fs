@@ -93,8 +93,9 @@ pub enum IoOp {
     Open,
 }
 
-/// Number of [`IoOp`] variants (the width of per-op signal arrays).
-pub(crate) const IO_OP_COUNT: usize = (IoOp::Open as u8 as usize) + 1;
+/// Number of [`IoOp`] variants (the width of per-op signal arrays, e.g.
+/// `PoolSignal::latency`).
+pub const IO_OP_COUNT: usize = (IoOp::Open as u8 as usize) + 1;
 
 impl IoOp {
     /// Returns the numeric discriminant (`0..IO_OP_COUNT`) — the index
@@ -182,8 +183,9 @@ pub enum IoErrorKind {
 }
 
 /// Number of [`IoErrorKind`] variants (the width of the per-window
-/// error-kind counter array). Bump when a variant is added.
-pub(crate) const IO_ERROR_KIND_COUNT: usize = (IoErrorKind::Other as u8 as usize) + 1;
+/// error-kind counter array and `PoolSignal::error_kinds`). Bump when a
+/// variant is added.
+pub const IO_ERROR_KIND_COUNT: usize = (IoErrorKind::Other as u8 as usize) + 1;
 
 impl IoErrorKind {
     /// Classifies a `std::io::Error` into the observed kind set.
@@ -514,11 +516,11 @@ impl IoObserver {
         let ops = window.ops.swap(0, Ordering::Relaxed);
         let errors = window.errors.swap(0, Ordering::Relaxed);
         let latency = std::array::from_fn(|i| window.latency[i].snapshot());
-        // The per-kind counters are reset on rotation; the aggregate
-        // counts ride in `errors`. (Kinds are for g2 diagnostics.)
-        for counter in &window.error_kinds {
-            counter.swap(0, Ordering::Relaxed);
-        }
+        // The per-kind counters ride the same rotation as the aggregate:
+        // g2's HealthMonitor consumes them for confirmed-loss detection
+        // (ENOENT → SegmentNotFound, EIO → FsyncIo, write-verify →
+        // DeviceUnplug — ADR-0029 §D3 Dead-confirming kinds).
+        let error_kinds = std::array::from_fn(|i| window.error_kinds[i].swap(0, Ordering::Relaxed));
         let smart = SmartCounters {
             reallocated_sectors: Some(window.smart_reallocated.swap(0, Ordering::Relaxed)),
             pending_sectors: Some(window.smart_pending.swap(0, Ordering::Relaxed)),
@@ -531,6 +533,7 @@ impl IoObserver {
             errors,
             latency,
             smart,
+            error_kinds,
         })
     }
 

@@ -52,7 +52,8 @@ use std::{
 };
 
 use oceanfs_core::{
-    Counter, Gauge, LabelSet, MetricRegistrar, MissingRootPolicy, PoolRole, PoolTech, StorageConfig,
+    Counter, Gauge, LabelSet, MetricRegistrar, MissingRootPolicy, PoolHealthConfig, PoolRole,
+    PoolTech, StorageConfig,
 };
 use parking_lot::RwLock;
 pub use placement::PlacementPolicy;
@@ -226,8 +227,13 @@ pub struct StoragePool {
     tech: PoolTech,
     /// Health status byte (see [`PoolStatus::as_u8`]).
     status: AtomicU8,
-    /// Role-consequence flag (ADR-0029 §D3); Phase A: always `false`.
+    /// Role-consequence flag (ADR-0029 §D3); g2's health monitor drives
+    /// it (wal pool Dead).
     write_degraded: AtomicBool,
+    /// Per-pool health-monitor knobs (f1) — consumed by g2's
+    /// `HealthMonitor` (thresholds, windows; the monitor's tick cadence
+    /// comes from `detection_window_secs`).
+    health: PoolHealthConfig,
     /// Total filesystem bytes at last capacity refresh.
     total_bytes: AtomicU64,
     /// Free filesystem bytes at last capacity refresh.
@@ -237,7 +243,7 @@ pub struct StoragePool {
 impl StoragePool {
     /// Creates a pool with fully resolved values. Internal: construction
     /// happens in [`PoolRegistry::from_config`].
-    // Clippy: 8 positional args; a config-bundle struct would hide the
+    // Clippy: 9 positional args; a config-bundle struct would hide the
     // resolved values this constructor pins (weight/tech/status/capacity),
     // and there is exactly one caller.
     #[allow(clippy::too_many_arguments)]
@@ -250,6 +256,7 @@ impl StoragePool {
         tech: PoolTech,
         status: PoolStatus,
         capacity: PoolCapacity,
+        health: PoolHealthConfig,
     ) -> Self {
         Self {
             id,
@@ -260,6 +267,7 @@ impl StoragePool {
             tech,
             status: AtomicU8::new(status.as_u8()),
             write_degraded: AtomicBool::new(false),
+            health,
             total_bytes: AtomicU64::new(capacity.total_bytes),
             free_bytes: AtomicU64::new(capacity.free_bytes),
         }
@@ -387,6 +395,27 @@ impl StoragePool {
     /// ```
     pub fn tech(&self) -> PoolTech {
         self.tech
+    }
+
+    /// Returns the pool's per-pool health-monitor knobs (f1) — consumed
+    /// by g2's [`HealthMonitor`](crate::pool::health::HealthMonitor).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_storage::PoolRegistry;
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// let registry = PoolRegistry::from_config(
+    ///     &oceanfs_core::StorageConfig::default(),
+    ///     &data_dir,
+    /// )
+    /// .expect("registry");
+    /// assert_eq!(registry.pools()[0].health_config().detection_window_secs, 30);
+    /// ```
+    pub fn health_config(&self) -> PoolHealthConfig {
+        self.health
     }
 
     /// Returns the pool's health status.
@@ -613,6 +642,9 @@ pub(crate) struct PoolMetrics {
     bytes_free: Gauge,
     /// `oceanfs_pool_bytes_total{pool_id}`.
     bytes_total: Gauge,
+    /// `oceanfs_pool_write_degraded{pool_id}` — 1 when the pool rejects
+    /// new writes (wal pool Dead, ADR-0029 §D3; g2 drives it).
+    write_degraded: Gauge,
     /// `oceanfs_pool_io_errors_total{pool_id}` — g1's `DiskIo` observer
     /// increments it via the bound handle (see `observe_into`).
     io_errors: Counter,
@@ -638,6 +670,11 @@ impl PoolMetrics {
             bytes_total: Gauge::new(
                 "oceanfs_pool_bytes_total".into(),
                 "Total bytes on the pool's filesystem".into(),
+                id_label.clone(),
+            ),
+            write_degraded: Gauge::new(
+                "oceanfs_pool_write_degraded".into(),
+                "Pool rejects new writes (wal pool Dead, ADR-0029 D3)".into(),
                 id_label,
             ),
             io_errors: Counter::new(
@@ -759,6 +796,7 @@ impl PoolRegistry {
                 resolve_tech(PoolTech::Auto),
                 PoolStatus::Healthy,
                 capacity,
+                PoolHealthConfig::default(),
             ));
             metrics.push(PoolMetrics::new(&pool));
             pools.push(pool);
@@ -799,6 +837,7 @@ impl PoolRegistry {
                     resolve_tech(config.tech),
                     status,
                     capacity,
+                    config.health,
                 ));
                 metrics.push(PoolMetrics::new(&pool));
                 pools.push(pool);
@@ -1005,6 +1044,9 @@ impl PoolRegistry {
     pub fn set_write_degraded(&self, id: u32, write_degraded: bool) {
         if let Some(pool) = self.pool_by_id(id) {
             pool.set_write_degraded(write_degraded);
+            if let Some(metric) = self.metrics_for(id) {
+                metric.write_degraded.set(u64::from(write_degraded));
+            }
         }
     }
 
@@ -1137,14 +1179,16 @@ impl PoolRegistry {
         let name = pool.name.clone();
         let role = pool.role;
         let root = pool.root.clone();
+        let health = pool.health;
         let id = {
             let mut pools = self.pools.write();
             // Re-validate under the write lock (TOCTOU: a concurrent
             // attach may have registered a duplicate since step 1).
             Self::validate_attach(self, &pool, &pools)?;
             let id = pools.len() as u32;
-            let registered =
-                Arc::new(StoragePool::new(id, name, role, root, weight, tech, status, capacity));
+            let registered = Arc::new(StoragePool::new(
+                id, name, role, root, weight, tech, status, capacity, health,
+            ));
             // Publish the initial capacity/status to the metric series.
             let metric = PoolMetrics::new(&registered);
             metric.status.set(status.as_u8() as u64);
@@ -1289,6 +1333,7 @@ impl PoolRegistry {
             registrar.register_gauge(metric.status.clone());
             registrar.register_gauge(metric.bytes_free.clone());
             registrar.register_gauge(metric.bytes_total.clone());
+            registrar.register_gauge(metric.write_degraded.clone());
             registrar.register_counter(metric.io_errors.clone());
         }
     }
@@ -1690,8 +1735,9 @@ mod tests {
 
         let gauges = registrar.gauges.lock();
         let counters = registrar.counters.lock();
-        // 4 pools × (status + bytes_free + bytes_total) gauges.
-        assert_eq!(gauges.len(), 12);
+        // 4 pools × (status + bytes_free + bytes_total + write_degraded)
+        // gauges (g2 added the write_degraded series).
+        assert_eq!(gauges.len(), 16);
         // 4 pools × io_errors counter.
         assert_eq!(counters.len(), 4);
 

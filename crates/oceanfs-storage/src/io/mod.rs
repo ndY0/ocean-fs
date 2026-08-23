@@ -58,6 +58,7 @@ pub use atomic_write::SegmentWriteMode;
 pub use direct::DirectIoBuf;
 pub use disk_io::{
     DiskIo, FaultyIo, IoErrorKind, IoObserver, IoObserving, IoOp, NoopIoObserver, ObservedIo,
+    IO_ERROR_KIND_COUNT, IO_OP_COUNT,
 };
 pub use mmap::SegmentFileCache;
 pub use sched::{apply_background_cpu_sched, apply_background_io_class};
