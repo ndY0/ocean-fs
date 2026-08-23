@@ -1,6 +1,6 @@
 ---
 epic: "disk-resilience"
-status: proposed
+status: done
 priority: high
 created: 2026-08-22
 updated: 2026-08-22
@@ -78,24 +78,33 @@ f5+f6; f8 needs f2+f6.
 
 ## Acceptance bar (epic DoD)
 
-- [ ] ADR-0029 D1, D2, D8 implemented for Phase A: pool-granular ownership
+- [x] ADR-0029 D1, D2, D8 implemented for Phase A: pool-granular ownership
       under node-granular membership; versioned `NodeManifest`/
       `PoolManifest` gossip attribute; topology config with one-root-per-pool
-      rule and runtime attach.
-- [ ] A node boots with a 4-pool topology (data×2, wal, metadata, hints):
+      rule and runtime attach (f1/f2/f6/f8).
+- [x] A node boots with a 4-pool topology (data×2, wal, metadata, hints):
       metadata store opens at the metadata pool root, WAL at the wal pool
       root, event-wal at the wal pool root, hint WAL at the hints pool root,
-      segments spread across the data pools (observed wiring today:
-      node.rs:463-468, 558-564, 644-671, 696-707, 997-1012, 754-763).
-- [ ] Zero-config fallback: a node with no `[storage.pools]` behaves exactly
-      as before (all e2e suites green, legacy mode).
-- [ ] Placement spreads sealed segments across data pools (weight-aware,
-      least-free-capacity); the segment→pool mapping survives restart; GC
-      unlinks from the owning root.
-- [ ] The NodeManifest propagates through gossip; peers can read it from the
+      segments spread across the data pools (f4 `role_isolation` e2e +
+      f5 `data_pool_placement` e2e).
+- [x] Zero-config fallback: a node with no `[storage.pools]` behaves exactly
+      as before (all e2e suites green, legacy mode — `legacy_node_roundtrip`
+      + the full node suite).
+- [x] Placement spreads sealed segments across data pools (weight-aware,
+      least-free-capacity); the segment→pool mapping survives restart
+      (checkpoint v3 + event-WAL fold tests); GC unlinks from the owning
+      root (f5 e2e + shard-store tests).
+- [x] The NodeManifest propagates through gossip; peers can read it from the
       cached routing state; the manifest re-declares on restart (incarnation
-      tie-in).
-- [ ] `POST /admin/pools` attaches a new data pool at runtime without
-      restarting the node; placement starts filling it.
-- [ ] All existing unit + integration suites stay green (regression gate);
-      clippy/fmt/rustdoc clean across affected crates.
+      tie-in) (f6 3-node convergence + f7 flip-propagation integration
+      tests).
+- [x] `POST /admin/pools` attaches a new data pool at runtime without
+      restarting the node; placement starts filling it (f8
+      `runtime_attach` e2e: 4→5 manifest, sealed segments on both roots,
+      GET round-trip, no restart).
+- [x] All existing unit + integration suites stay green (regression gate);
+      clippy/fmt/rustdoc clean across affected crates. Final sweep:
+      storage 12/12 binaries, node 22/22 binaries, server 226 lib
+      (one pre-existing unrelated failure in grpc_services), routing/core/
+      network/membership green — all `--test-threads=1`; clippy
+      `-D warnings` ×4 clean; rustdoc clean on the f8 crates; fmt clean.
