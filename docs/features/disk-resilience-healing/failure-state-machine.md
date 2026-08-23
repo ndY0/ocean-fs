@@ -1,14 +1,14 @@
 ---
 feature: "Pool Failure State Machine + Role Consequences"
 epic: "disk-resilience-healing"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies: ["disk-io-observability"]
 adr: [0029]
 perf: [2.3, 7.1]
 created: 2026-08-22
-updated: 2026-08-22
+updated: 2026-08-23
 ---
 
 # Pool Failure State Machine + Role Consequences
@@ -148,23 +148,6 @@ IoObserver.snapshot ──▶ HealthMonitor tick ──▶ evaluate_trend (g1)
       deviation: injection is via synthetic observer signals — the
       FaultyIo→observer path is covered by g1's io_observer_faulty.rs; the
       monitor consumes the observer by design)
-<!-- REVIEW: g7 handoff gap — HealthMonitor::state (crates/oceanfs-storage/src/pool/health.rs:453,
-     PoolState.status) is never reset when the node recovers a Dead pool via
-     registry.set_status(id, Healthy). After such a reset, the monitor's entry.status
-     stays Dead, so decide_transition(Dead, …) returns Dead with no change and the
-     registry is never re-written to Dead on a future confirmed loss — even
-     report_confirmed_loss (health.rs:579-603) is a no-op because `changed` is false.
-     g7 (out of scope here) MUST add a HealthMonitor::reset_pool(pool_id, status)
-     (or reconcile-from-registry) and call it after replacement + catch-up; add a
-     unit test "monitor re-confirms Dead after registry reset". Would be exercised
-     by the next feature's recovery path. -->
-<!-- REVIEW: doc contradiction — In-Scope (lines 46-51) correctly states "Degraded
-     never sets write_degraded" but the Tests bullet (line 68) says "wal Degraded
-     sets write_degraded". Implementation follows the ADR (Degraded never sets it;
-     Dead sets it) — fix the test bullet wording. Also Interface section says
-     `LifecycleRegistry` (fixed: the codebase type is
-     `SegmentLifecycleRegistry`)
-     (crates/oceanfs-node/src/health.rs:72). -->
 
 ## Deviations (accepted)
 
@@ -172,3 +155,34 @@ IoObserver.snapshot ──▶ HealthMonitor tick ──▶ evaluate_trend (g1)
   syscall errno at the call site.** The `DiskIo` wrapper (g1) classifies
   ENOENT/EIO at the op boundary — the monitor never interprets errno
   itself. This keeps the storage layer's error semantics in one place.
+
+- **DoD "FaultyIo-injection" is exercised via synthetic observer signals,
+  not the FaultyIo injector.** The monitor consumes the g1 `IoObserver`
+  trait by design; the FaultyIo injector lives at the storage/io layer
+  (covered by g1's `io_observer_faulty.rs`). The e2e test drives the
+  monitor's observer input directly (see the Integration DoD note).
+
+- **`HealthMonitorConfig.tick_interval` is overridable for tests.**
+  The per-pool f1 knobs (`detection_window_secs`, `recovery_window_secs`,
+  thresholds) remain the default cadence; the tick override exists only to
+  make unit/e2e tests deterministic without waiting real windows.
+
+- **`write_degraded` is driven by the monitor (storage), not the node
+  applier.** This matches the In-Scope bullet "drives
+  `PoolRegistry::set_status` + `set_write_degraded`" — the monitor owns the
+  wal Dead → write_degraded decision. The node applier handles only the
+  metadata/data/hints consequences (`node_unavailable`,
+  `derive_affected_segments`, hint-enqueue rejection).
+
+- **`HealthMonitor::new` returns `(Arc<HealthMonitor>, mpsc::Receiver<HealthEvent>)`.**
+  The bounded event channel is the seam the consequence applier consumes;
+  `run(shutdown_token)` consumes the registry side. This replaces the
+  simple `new(registry, observer, config)` signature sketched in the
+  Interface section.
+
+- **`reset_pool(pool_id, status)` is the g7 handoff seam.** Dead recovery
+  (replacement + catch-up) is out of g2 scope; without `reset_pool`, the
+  monitor's Dead mirror would remain absorbed forever after an external
+  `registry.set_status(id, Healthy)` — a future confirmed loss would be a
+  no-op. g7 calls `reset_pool` after replacement + catch-up; covered by
+  the unit test `monitor_reconfirms_dead_after_registry_reset`.
