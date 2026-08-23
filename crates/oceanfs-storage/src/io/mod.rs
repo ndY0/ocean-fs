@@ -24,13 +24,28 @@
 //! | `false` (default) | Buffered `tokio::fs::read` | O_DIRECT |
 //! | `true`  | mmap | Buffered |
 //!
-//! The `io_uring` backend is selected at startup via `DiskIo::new()` which
+//! The `io_uring` backend is selected at startup via `IoBackend::new()` which
 //! probes `io_uring` availability once and caches the result. When available,
 //! I/O requests are dispatched to a dedicated background thread running an
 //! `io_uring` event loop — fully asynchronous, no thread-pool contention.
+//!
+//! ## Observed I/O surface (g1 `disk-io-observability`)
+//!
+//! [`DiskIo`] is the single *observed* file-op surface (read/write/fsync/
+//! open) the health monitor's signal source feeds from (ADR-0029 §D3).
+//! It is implemented by:
+//!
+//! - [`IoBackend`] — the concrete dispatcher, in its default state
+//!   (pool 0, [`NoopIoObserver`] — no recording);
+//! - [`ObservedIo`] — the pool-aware wrapper (pool id + shared
+//!   [`IoObserver`]) the seal pipeline and (g2) the read path perform
+//!   observed ops through;
+//! - [`FaultyIo`] — the unit-level fault injector (test framework
+//!   Level-1), wrapping any `DiskIo`.
 
 pub mod atomic_write;
 pub mod direct;
+pub mod disk_io;
 pub mod mmap;
 pub mod sched;
 pub mod segment_flush;
@@ -41,6 +56,9 @@ pub mod uring;
 
 pub use atomic_write::SegmentWriteMode;
 pub use direct::DirectIoBuf;
+pub use disk_io::{
+    DiskIo, FaultyIo, IoErrorKind, IoObserver, IoObserving, IoOp, NoopIoObserver, ObservedIo,
+};
 pub use mmap::SegmentFileCache;
 pub use sched::{apply_background_cpu_sched, apply_background_io_class};
 pub use segment_reader::{
@@ -48,7 +66,7 @@ pub use segment_reader::{
 };
 #[cfg(feature = "sendfile")]
 pub use sendfile::SegmentFileBody;
-pub use uring::DiskIo;
+pub use uring::IoBackend;
 
 /// Read strategy resolved from configuration.
 ///

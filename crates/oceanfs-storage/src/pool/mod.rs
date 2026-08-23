@@ -40,6 +40,7 @@
 //! are immutable after construction (gauges/counters are
 //! interior-mutable atomics); a new series is pushed on attach.
 
+pub mod health;
 pub mod placement;
 
 use std::{
@@ -598,8 +599,12 @@ fn resolve_tech(tech: PoolTech) -> PoolTech {
 
 /// Per-pool Prometheus series, registered once at construction (the same
 /// pattern the durability counters use, e.g. `hinted_handoff_*`).
+///
+/// `pub(crate)`: the g1 [`IoObserver`](crate::io::IoObserver) binds the
+/// `io_errors` counter handle so recorded disk errors increment the same
+/// series the node's metric registry renders.
 #[derive(Clone)]
-struct PoolMetrics {
+pub(crate) struct PoolMetrics {
     /// Pool id the series belong to (used to find the right series).
     pool_id: u32,
     /// `oceanfs_pool_status{pool_id, role}` — 0=Healthy 1=Degraded 2=Dead.
@@ -608,8 +613,8 @@ struct PoolMetrics {
     bytes_free: Gauge,
     /// `oceanfs_pool_bytes_total{pool_id}`.
     bytes_total: Gauge,
-    /// `oceanfs_pool_io_errors_total{pool_id}` — Phase A: exists, always 0
-    /// (Phase B's `DiskIo` fault path increments it).
+    /// `oceanfs_pool_io_errors_total{pool_id}` — g1's `DiskIo` observer
+    /// increments it via the bound handle (see `observe_into`).
     io_errors: Counter,
 }
 
@@ -637,10 +642,15 @@ impl PoolMetrics {
             ),
             io_errors: Counter::new(
                 "oceanfs_pool_io_errors_total".into(),
-                "I/O errors observed on the pool (Phase A: always 0)".into(),
+                "I/O errors observed on the pool (g1 DiskIo observer increments it)".into(),
                 LabelSet::new(&[("pool_id", &pool_id)]),
             ),
         }
+    }
+
+    /// The `oceanfs_pool_io_errors_total{pool_id}` counter handle.
+    pub(crate) fn io_errors(&self) -> &Counter {
+        &self.io_errors
     }
 }
 
@@ -1287,6 +1297,65 @@ impl PoolRegistry {
     /// are 5–20, and this is a cold path).
     fn metrics_for(&self, pool_id: u32) -> Option<PoolMetrics> {
         self.metrics.read().iter().find(|metric| metric.pool_id == pool_id).cloned()
+    }
+
+    /// Returns the pool's `oceanfs_pool_io_errors_total{pool_id}` counter
+    /// handle, if the pool has a metric series (g1: the
+    /// [`IoObserver`](crate::io::IoObserver)
+    /// binds it so recorded disk errors increment the same series the
+    /// node's registry renders).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_storage::PoolRegistry;
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// let registry = PoolRegistry::from_config(
+    ///     &oceanfs_core::StorageConfig::default(),
+    ///     &data_dir,
+    /// )
+    /// .expect("registry");
+    /// let counter = registry.io_error_counter(0).expect("pool 0 series");
+    /// counter.inc();
+    /// assert_eq!(counter.get(), 1);
+    /// ```
+    pub fn io_error_counter(&self, pool_id: u32) -> Option<Counter> {
+        self.metrics_for(pool_id).map(|metric| metric.io_errors().clone())
+    }
+
+    /// Registers every pool's signal state with the g1
+    /// [`IoObserver`](crate::io::IoObserver),
+    /// binding each pool's `oceanfs_pool_io_errors_total` counter.
+    ///
+    /// The node composition root calls this once after constructing the
+    /// observer, so the segment I/O path can record per-pool signals
+    /// immediately (ADR-0029 §D3). Runtime-attached pools (f8) are
+    /// registered by the attach hook.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_storage::io::IoObserver;
+    /// use oceanfs_storage::PoolRegistry;
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// let registry = PoolRegistry::from_config(
+    ///     &oceanfs_core::StorageConfig::default(),
+    ///     &data_dir,
+    /// )
+    /// .expect("registry");
+    /// let observer = IoObserver::new();
+    /// registry.observe_into(&observer);
+    /// assert!(observer.snapshot(0).is_some());
+    /// ```
+    pub fn observe_into(&self, observer: &crate::io::IoObserver) {
+        for pool in self.pools() {
+            let counter = self.io_error_counter(pool.id());
+            observer.register_pool(pool.id(), counter);
+        }
     }
 }
 

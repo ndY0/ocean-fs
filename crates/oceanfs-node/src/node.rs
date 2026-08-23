@@ -427,6 +427,10 @@ pub struct Node {
     /// The live storage-pool registry (ADR-0029) — held so the admin
     /// attach surface and tests can observe the pool set.
     pub(crate) pool_registry: Arc<oceanfs_storage::PoolRegistry>,
+    /// The g1 shared per-pool I/O signal observer (ADR-0029 §D3) — the
+    /// seal pipeline records write/fsync signals into it; the g2 health
+    /// monitor consumes snapshots. Held for tests/observability.
+    pub(crate) io_observer: Arc<oceanfs_storage::io::IoObserver>,
 }
 
 impl Node {
@@ -689,6 +693,15 @@ impl Node {
                 registry.get(*segment_id).map(|entry| entry.metadata.pool_id)
             })
         };
+        // g1 `disk-io-observability` (ADR-0029 §D3): the shared per-pool
+        // I/O signal observer. The seal pipeline records write/fsync
+        // latency + errors per pool through it immediately; the health
+        // monitor (g2) consumes `snapshot`s. Every boot pool's signal
+        // state is registered with its `oceanfs_pool_io_errors_total`
+        // counter bound.
+        let io_observer = Arc::new(oceanfs_storage::io::IoObserver::new());
+        pool_registry.observe_into(&io_observer);
+        let io_backend = Arc::new(oceanfs_storage::io::IoBackend::new());
         let seal_config = oceanfs_storage::SealConfig {
             data_pools: data_pools.clone(),
             // f8 runtime attach: the sealer refreshes the data-pool list
@@ -707,6 +720,10 @@ impl Node {
             data_dir: segment_legacy_dir.clone(),
             io_mode: oceanfs_storage::io::IoReadMode::from_config(config.read_cache_segments),
             write_mode: oceanfs_storage::io::SegmentWriteMode::probe(segment_legacy_dir.clone()),
+            // g1: the seal pipeline performs its writes/fsyncs through
+            // the observed DiskIo (per-pool signals).
+            io_backend: io_backend.clone(),
+            observer: io_observer.clone(),
             // Seal pipeline batching (userland-configurable): the fsync
             // group-commit window and the early-flush trigger size.
             fsync_batch_timeout_ms: config.seal_fsync_batch_timeout_ms,
@@ -1031,7 +1048,7 @@ impl Node {
 
         // ---- 11. Construct I/O infrastructure ----
         let hlc_clock = Arc::new(HlcClock::new());
-        let disk_io = Arc::new(oceanfs_storage::io::DiskIo::new());
+        let disk_io = io_backend.clone();
         let io_mode = oceanfs_storage::io::IoReadMode::from_config(config.read_cache_segments);
 
         // Build the mmap segment cache when read-optimised mode is enabled.
@@ -2095,6 +2112,7 @@ impl Node {
             metadata_store,
             wal_writer: wal_writer.clone(),
             pool_registry,
+            io_observer,
         })
     }
 
@@ -2122,6 +2140,33 @@ impl Node {
     /// ```
     pub fn pool_registry(&self) -> Arc<oceanfs_storage::PoolRegistry> {
         self.pool_registry.clone()
+    }
+
+    /// Returns the g1 per-pool I/O signal observer (ADR-0029 §D3) the
+    /// seal pipeline records write/fsync signals into.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn example() {
+    /// use oceanfs_core::NodeConfig;
+    /// use oceanfs_node::Node;
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let config = NodeConfig {
+    /// #     data_dir: tmp.path().join("data"),
+    /// #     listen_addr: "127.0.0.1:0".into(),
+    /// #     grpc_listen_addr: "127.0.0.1:0".into(),
+    /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     ..NodeConfig::default()
+    /// # };
+    /// let node = Node::start(config).await.expect("node");
+    /// let observer = node.io_observer();
+    /// assert!(observer.snapshot(0).is_some());
+    /// node.shutdown().await.expect("shutdown");
+    /// # }
+    /// ```
+    pub fn io_observer(&self) -> Arc<oceanfs_storage::io::IoObserver> {
+        self.io_observer.clone()
     }
 
     /// Returns this node's current `NodeManifest` (ADR-0029 D2), as

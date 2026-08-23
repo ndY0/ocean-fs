@@ -72,6 +72,8 @@ async fn concurrent_seals(
             data_dir: tmpdir.join("segments"),
             io_mode: IoReadMode::Buffered,
             write_mode: SegmentWriteMode::Rename,
+            io_backend: Arc::new(oceanfs_storage::io::IoBackend::default()),
+            observer: Arc::new(oceanfs_storage::io::NoopIoObserver),
             // 10 ms group-commit window, flush early at 8 pending seals.
             fsync_batch_timeout_ms: 10,
             fsync_max_waiters: 8,

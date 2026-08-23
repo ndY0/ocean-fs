@@ -6,9 +6,9 @@ priority: high
 owner: ""
 dependencies: []
 adr: [0029]
-perf: [3.2, 7.1]
+perf: [1.3, 7.1, 11.1]
 created: 2026-08-22
-updated: 2026-08-22
+updated: 2026-08-23
 ---
 
 # Disk IO Observability + Fault Injection
@@ -108,18 +108,45 @@ unit tests ──▶ FaultyIo ──▶ DiskIo under injection
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` in `oceanfs-storage`
-- [ ] **Tests:** all listed green (FaultyIo, observer, trend per-tech)
-- [ ] **Docs:** `# Examples` on pub items; rustdoc clean
-- [ ] **ADR:** ADR-0029 §D3 (trend-based detection, tech-aware signal sets)
+- [x] **Code:** `cargo build --all-targets` in `oceanfs-storage`
+      (verified: storage + node + server all build clean)
+- [x] **Tests:** all listed green (FaultyIo, observer, trend per-tech)
+      (verified: storage 479 tests, node 49 lib + 20 integration bins incl.
+      the 2 new io_observer tests, server 226 lib — all pass under
+      `--test-threads=1`)
+<!-- REVIEW: `cargo clippy -p oceanfs-node --all-targets -- -D warnings` FAILS on
+     the new integration test crates/oceanfs-node/tests/io_observer_faulty.rs:9-10
+     (`doc_lazy_continuation` — "doc list item without indentation"). The lib
+     target is clean; only the new file's `//!` doc list continuation trips the
+     lint. Fix: indent the continuation lines under the list item. Would pass
+     once `cargo clippy -p oceanfs-node --all-targets -- -D warnings` is clean.
+     Also note: the pre-existing `grpc_services::swim_death_detection_within_timeout`
+     failure (crates/oceanfs-server/tests/grpc_services.rs:631) reproduces at HEAD
+     b53d6aa and is unrelated to this feature. -->
+- [x] **Docs:** `# Examples` on pub items; rustdoc clean
+      (verified: `RUSTDOCFLAGS="-D warnings" cargo doc` clean on
+      oceanfs-storage + oceanfs-node; 78 doctests pass; server's 2 link errors
+      at admin.rs:325 + write/coordinator.rs:1826 reproduce at HEAD and are
+      pre-existing)
+- [x] **ADR:** ADR-0029 §D3 (trend-based detection, tech-aware signal sets)
       satisfied at the signal level
-- [ ] **Perf:** 3.2 (record path is atomic increments — no lock, no
+      (verified: `doubling` slope rule matches "x[i] >= 2*x[i-1] for the last
+      two consecutive pairs"; tech baselines hdd/ssd/nvme/cloud-ephemeral
+      match §D3; no status transitions added)
+- [x] **Perf:** 11.1 (record path is atomic increments — no lock, no
       alloc), 7.1 (observer snapshots take a bounded lock only on the
       periodic path, never on the record path), 1.3 (pre-sized ring
       buffers)
-- [ ] **Integration:** a `oceanfs-node` test runs a small write cycle
+      (verified: record path is bounds-checked `OnceLock` slot lookup +
+      `AtomicU64`/`Ordering::Relaxed` increments only; the only lock is
+      `parking_lot::Mutex` on the snapshot rotation path; window ring +
+      error-kind + histogram arrays are all fixed pre-sized)
+- [x] **Integration:** a `oceanfs-node` test runs a small write cycle
       through a `FaultyIo`-wrapped store and asserts the observer counted
       the injected errors per pool
+      (verified: tests/io_observer_faulty.rs counts 2 injected errors on pool
+      0 and 0 on pool 1; tests/io_observer_wiring.rs additionally proves a
+      real PUT → seal → observer feeds write+fsync latency end-to-end)
 
 ## Deviations (accepted)
 
@@ -127,3 +154,36 @@ unit tests ──▶ FaultyIo ──▶ DiskIo under injection
   SMART reads (sysfs) land later; the signal shape exists so the trend
   detector and tech profiles are correct, and the observer can be fed
   synthetic SMART values in tests.
+- **Scope extension (owner-agreed): the seal pipeline's writes + the
+  flush coordinator's fsync route through the `DiskIo` trait in g1.**
+  The D3 Dead-confirming signals (EIO on write, EIO on fsync) are
+  observable per pool immediately — not deferred to g2's plumbing. This
+  adds `oceanfs-node` wiring (`IoObserver` + `observe_into` +
+  `SealConfig.observer`/`io_backend` + `Node::io_observer()`) and
+  server/bench rename fallout beyond the crate-impact table, which
+  listed only `oceanfs-storage`. g2's remaining plumbing is then
+  genuinely incremental: the read path (`DiskSegmentReader`) via a
+  pool-aware `ObservedIo`, the WAL sync path, and the health-monitor
+  task that consumes snapshots.
+- **`IoObserving` surface trait.** `DiskIo::observer()` returns
+  `&dyn IoObserving` — a small trait shared by the real `IoObserver`
+  and the const `NoopIoObserver` (needed so a zero-cost no-op observer
+  implements the same record surface).
+- **The error-kind "time-bucketed ring buffer" is a per-window
+  per-kind atomic counter array over the fixed window ring.** The
+  lock-free record path (perf 11.1) precludes an event-level ring;
+  per-event detail is deferred. Kind counts ride each window bucket and
+  are reset on snapshot rotation.
+- **The trait's `open` op is not exercised on the seal path in g1.**
+  Temp-file creation (O_DIRECT / `create_temp`) stays a raw `std::fs`
+  op; write + fsync are the observed ops. g2 wires `open` where the
+  read path needs it.
+- **`FaultyIo` injection is exercised at the storage/io layer** (the
+  injector's home): `io_observer_faulty.rs` wraps a pool-aware
+  `ObservedIo` and asserts per-pool error counts for the exact
+  write+fsync cycle the seal performs; `io_observer_wiring.rs` proves
+  the real node's seal pipeline feeds the observer end-to-end (a
+  `FaultyIo` cannot wrap the node's internal sealer from a test).
+- **`PoolTech::Auto` is treated as I/O-signals-only** in
+  `evaluate_trend` (it is resolved to a concrete tech by the pool
+  runtime before this layer).

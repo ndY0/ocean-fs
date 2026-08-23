@@ -39,8 +39,13 @@ pub mod wal;
 
 pub use buffer_pool::BufferPool;
 pub use error::{Error, Result};
+pub use io::{
+    DiskIo, FaultyIo, IoBackend, IoErrorKind, IoObserver, IoOp, IoReadMode, NoopIoObserver,
+    ObservedIo, SegmentWriteMode,
+};
 pub use metadata::{BatchOp, RocksDbMetadataStore, RocksDbMetrics};
 pub use pool::{
+    health::{evaluate_trend, Latency, PoolSignal, SmartCounters, TrendVerdict},
     resolve_pool_root, PlacementPolicy, PoolIdResolver, PoolRegistry, PoolStatus, StoragePool,
 };
 pub use segment::{

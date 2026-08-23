@@ -70,6 +70,23 @@ pub struct SealConfig {
     /// rename path. Probe once at startup with
     /// `SegmentWriteMode::probe()`.
     pub write_mode: SegmentWriteMode,
+    /// The concrete I/O backend the seal pipeline performs its file ops
+    /// through (g1 `disk-io-observability`). The pool-aware
+    /// [`ObservedIo`](crate::io::ObservedIo) wrapper is built per seal from this backend plus
+    /// the selected pool id and [`SealConfig::observer`]. Default: the
+    /// `tokio::fs` backend.
+    pub io_backend: Arc<crate::io::IoBackend>,
+    /// The shared I/O signal observer (g1 `disk-io-observability`).
+    ///
+    /// When the real [`crate::io::IoObserver`] is wired (the node
+    /// composition root), the seal pipeline records write + fsync
+    /// latency and errors **per pool** through the
+    /// [`DiskIo`](crate::io::DiskIo) trait —
+    /// the ADR-0029 §D3 Dead-confirming signals (EIO on write/fsync)
+    /// become observable immediately. The
+    /// [`NoopIoObserver`](crate::io::NoopIoObserver) default
+    /// keeps the un-wired path identical (no recording).
+    pub observer: Arc<dyn crate::io::IoObserving>,
     /// Group-commit window for sealed-segment fsync, in milliseconds:
     /// how long the flush coordinator collects seal registrations
     /// before issuing the batch's per-file sync barriers (mirrors the
@@ -97,6 +114,8 @@ impl Default for SealConfig {
             registry: None,
             io_mode: IoReadMode::Buffered,
             write_mode: SegmentWriteMode::Rename,
+            io_backend: Arc::new(crate::io::IoBackend::default()),
+            observer: Arc::new(crate::io::NoopIoObserver),
             fsync_batch_timeout_ms: 10,
             fsync_max_waiters: 8,
         }
@@ -421,6 +440,17 @@ impl SegmentSealer {
         // The flush registration needs its own copy — `dir` is moved into
         // the temp-write closure below.
         let submit_dir = dir.clone();
+        // g1 `disk-io-observability`: the pool-aware observed `DiskIo`
+        // for this seal. The seal pipeline performs its writes + fsyncs
+        // through it — ONE observed file-op surface (read/write/fsync/
+        // open) fed per pool (ADR-0029 §D3). The `NoopIoObserver`
+        // default keeps the un-wired path identical.
+        let io: Arc<dyn crate::io::DiskIo> = Arc::new(crate::io::ObservedIo {
+            pool_id,
+            backend: Arc::clone(&self.config.io_backend),
+            observer: Arc::clone(&self.config.observer),
+        });
+        let flush_io = Arc::clone(&io);
         let (file, finalize_op) = tokio::task::spawn_blocking(move || {
             let parts = SegmentFileParts {
                 header: &header_bytes,
@@ -428,7 +458,7 @@ impl SegmentSealer {
                 parity: parity_bytes.as_deref(),
                 index: &index_bytes,
             };
-            write_segment_temp(&dir, &write_filename, parts, io_mode, write_mode)
+            write_segment_temp(&dir, &write_filename, parts, io_mode, write_mode, io.as_ref())
         })
         .await
         .map_err(|e| {
@@ -449,7 +479,7 @@ impl SegmentSealer {
             ))
         })?;
 
-        self.flush_group().submit(file, filename, finalize_op, meta, submit_dir).await?;
+        self.flush_group().submit(file, filename, finalize_op, meta, submit_dir, flush_io).await?;
 
         // WAL entries for sealed segments are cleaned up at file rotation time.
         Ok(SegmentHandle::new(segment_id, vec![]))
@@ -569,12 +599,11 @@ fn write_segment_temp(
     parts: SegmentFileParts<'_>,
     io_mode: IoReadMode,
     write_mode: SegmentWriteMode,
+    io: &dyn crate::io::DiskIo,
 ) -> std::io::Result<(std::fs::File, FinalizeOp)> {
     if io_mode == IoReadMode::Direct {
         #[cfg(target_os = "linux")]
         {
-            use std::io::Write;
-
             // O_DIRECT requires the buffer to be 512-byte aligned AND
             // the I/O size to be a multiple of 512 bytes. Build ONE
             // aligned buffer from the parts and pad in place.
@@ -597,13 +626,16 @@ fn write_segment_temp(
             // `pad` bytes remain zero (DirectIoBuf is zero-initialised).
 
             let tmp = temp_path(dir, filename);
-            let mut file = std::fs::OpenOptions::new()
+            let file = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
                 .with_direct()
                 .open(&tmp)?;
-            file.write_all(aligned.as_bytes())?;
+            // g1: the write runs through the observed DiskIo (per-pool
+            // latency/error signals); the O_DIRECT open itself stays a
+            // raw std::fs op (g2 adds open observation where needed).
+            io.write_handle(&file, aligned.as_bytes())?;
             return Ok((file, FinalizeOp::Rename));
         }
         #[cfg(not(target_os = "linux"))]
@@ -616,14 +648,14 @@ fn write_segment_temp(
 
     let file = create_temp(write_mode, dir, filename)?;
     {
-        use std::io::Write;
-        // Zero-copy: write each part directly from its source slice.
-        (&file).write_all(parts.header)?;
-        (&file).write_all(parts.data)?;
+        // Zero-copy: write each part directly from its source slice,
+        // through the observed DiskIo (g1: per-pool signals).
+        io.write_handle(&file, parts.header)?;
+        io.write_handle(&file, parts.data)?;
         if let Some(p) = parts.parity {
-            (&file).write_all(p)?;
+            io.write_handle(&file, p)?;
         }
-        (&file).write_all(parts.index)?;
+        io.write_handle(&file, parts.index)?;
     }
     let op = match write_mode {
         SegmentWriteMode::Tmpfile => FinalizeOp::Link,
@@ -874,6 +906,8 @@ mod tests {
             data_dir: dir.path().join("segments"),
             io_mode: IoReadMode::Buffered,
             write_mode: SegmentWriteMode::Rename,
+            io_backend: Arc::new(crate::io::IoBackend::default()),
+            observer: Arc::new(crate::io::NoopIoObserver),
             fsync_batch_timeout_ms: 100,
             fsync_max_waiters: 8,
         };
@@ -983,6 +1017,8 @@ mod tests {
             data_dir: dir.path().join("segments"),
             io_mode: IoReadMode::Direct,
             write_mode: SegmentWriteMode::Rename,
+            io_backend: Arc::new(crate::io::IoBackend::default()),
+            observer: Arc::new(crate::io::NoopIoObserver),
             fsync_batch_timeout_ms: 100,
             fsync_max_waiters: 8,
         };

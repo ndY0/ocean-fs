@@ -3529,7 +3529,7 @@ mod tests {
         // the seal window), falling back to disk.
         let disk = Arc::new(oceanfs_storage::io::DiskSegmentReader::new(
             oceanfs_storage::io::IoReadMode::Direct,
-            Arc::new(oceanfs_storage::io::DiskIo::TokioFs),
+            Arc::new(oceanfs_storage::io::IoBackend::TokioFs),
             None,
             fx.seal_dir.clone(),
             None,
@@ -3668,7 +3668,7 @@ mod tests {
         // through the seal path.
         let disk = Arc::new(oceanfs_storage::io::DiskSegmentReader::new(
             oceanfs_storage::io::IoReadMode::Direct,
-            Arc::new(oceanfs_storage::io::DiskIo::TokioFs),
+            Arc::new(oceanfs_storage::io::IoBackend::TokioFs),
             None,
             fx.seal_dir.clone(),
             None,
@@ -3743,7 +3743,7 @@ mod tests {
         // .dat through the seal path.
         let disk = Arc::new(oceanfs_storage::io::DiskSegmentReader::new(
             oceanfs_storage::io::IoReadMode::Direct,
-            Arc::new(oceanfs_storage::io::DiskIo::TokioFs),
+            Arc::new(oceanfs_storage::io::IoBackend::TokioFs),
             None,
             fx.seal_dir.clone(),
             None,
@@ -3849,7 +3849,7 @@ mod tests {
         let fx = make_multi_tier_fixture().await;
         let disk = Arc::new(oceanfs_storage::io::DiskSegmentReader::new(
             oceanfs_storage::io::IoReadMode::Buffered,
-            Arc::new(oceanfs_storage::io::DiskIo::TokioFs),
+            Arc::new(oceanfs_storage::io::IoBackend::TokioFs),
             None,
             fx.seal_dir.clone(),
             None,
@@ -4183,7 +4183,7 @@ mod tests {
             Arc::new(StressMetadataOps { store: metadata.clone() });
         let disk = Arc::new(oceanfs_storage::io::DiskSegmentReader::new(
             oceanfs_storage::io::IoReadMode::Buffered,
-            Arc::new(oceanfs_storage::io::DiskIo::TokioFs),
+            Arc::new(oceanfs_storage::io::IoBackend::TokioFs),
             None,
             seal_dir.clone(),
             None,

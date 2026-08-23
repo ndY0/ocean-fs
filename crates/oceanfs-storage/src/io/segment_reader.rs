@@ -5,7 +5,7 @@
 //!
 //! - [`DiskSegmentReader`] — reads from segment files on disk via the
 //!   configured [`IoReadMode`] (mmap / O_DIRECT / buffered). Uses
-//!   [`SegmentFileCache`] for zero-copy mmap reads and [`DiskIo`] for
+//!   [`SegmentFileCache`] for zero-copy mmap reads and [`IoBackend`] for
 //!   io_uring-accelerated I/O.
 //!
 //! - [`InMemorySegmentReader`] — stores segment data in a `HashMap`.
@@ -28,7 +28,7 @@ use bytes::Bytes;
 use oceanfs_core::SegmentId;
 use parking_lot::{Mutex, RwLock};
 
-use super::{DiskIo, IoReadMode, SegmentFileCache};
+use super::{IoBackend, IoReadMode, SegmentFileCache};
 
 // ---------------------------------------------------------------------------
 // SegmentReader trait
@@ -127,7 +127,7 @@ pub enum SegmentReadSource {
 /// | `IoReadMode` | Read Path |
 /// |---|---|
 /// | `Mmap` | `SegmentFileCache::get_or_map()` → `&[u8]` slice → `Bytes` |
-/// | `Direct` | `DirectIoBuf` → `DiskIo::read()` → `Bytes` |
+/// | `Direct` | `DirectIoBuf` → `IoBackend::read()` → `Bytes` |
 /// | `Buffered` | `tokio::fs::File::read_at()` → `Bytes` |
 ///
 /// ## Memory Bounds
@@ -139,7 +139,7 @@ pub struct DiskSegmentReader {
     /// The configured read mode, resolved at construction.
     read_mode: IoReadMode,
     /// The disk I/O backend (io_uring or tokio::fs).
-    disk_io: Arc<DiskIo>,
+    disk_io: Arc<IoBackend>,
     /// Optional LRU cache of memory-mapped segment files.
     mmap_cache: Option<Arc<SegmentFileCache>>,
     /// Data pool roots sealed segments are spread across (ADR-0029 f5).
@@ -189,7 +189,7 @@ impl DiskSegmentReader {
     /// multi-pool resolution (ADR-0029 f5).
     pub fn new(
         read_mode: IoReadMode,
-        disk_io: Arc<DiskIo>,
+        disk_io: Arc<IoBackend>,
         mmap_cache: Option<Arc<SegmentFileCache>>,
         segment_dir: PathBuf,
         ec_decoder: Option<std::sync::Arc<dyn oceanfs_ec::Decoder>>,
@@ -244,7 +244,7 @@ impl DiskSegmentReader {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// use oceanfs_storage::io::{DiskIo, DiskSegmentReader, IoReadMode};
+    /// use oceanfs_storage::io::{IoBackend, DiskSegmentReader, IoReadMode};
     /// use oceanfs_storage::PoolRegistry;
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
@@ -255,7 +255,7 @@ impl DiskSegmentReader {
     /// .expect("registry");
     /// let reader = DiskSegmentReader::new(
     ///     IoReadMode::Buffered,
-    ///     Arc::new(DiskIo::default()),
+    ///     Arc::new(IoBackend::default()),
     ///     None,
     ///     tmp.path().join("segments"),
     ///     None,
@@ -433,7 +433,7 @@ impl SegmentReader for DiskSegmentReader {
                 let len = length as usize;
                 let mut buf = crate::io::DirectIoBuf::new(len)
                     .map_err(|e| format!("DirectIoBuf allocation failed for {segment_id}: {e}"))?;
-                // `DiskIo::read` performs a single read syscall per call.
+                // `IoBackend::read` performs a single read syscall per call.
                 // `tokio::fs::File` caps a single read at 2 MiB, so a
                 // larger request returns short — loop until the buffer
                 // is full (read-path-integrity-under-load: the ignored
@@ -736,7 +736,7 @@ mod tests {
 
         let reader = DiskSegmentReader::new(
             IoReadMode::Buffered,
-            Arc::new(DiskIo::TokioFs),
+            Arc::new(IoBackend::TokioFs),
             None,
             dir.path().to_path_buf(),
             None,
@@ -757,7 +757,7 @@ mod tests {
         let cache = Arc::new(SegmentFileCache::new(4));
         let reader = DiskSegmentReader::new(
             IoReadMode::Mmap,
-            Arc::new(DiskIo::TokioFs),
+            Arc::new(IoBackend::TokioFs),
             Some(cache),
             dir.path().to_path_buf(),
             None,
@@ -782,7 +782,7 @@ mod tests {
         let cache = Arc::new(SegmentFileCache::new(4));
         let reader = DiskSegmentReader::new(
             IoReadMode::Mmap,
-            Arc::new(DiskIo::TokioFs),
+            Arc::new(IoBackend::TokioFs),
             Some(cache.clone()),
             dir.path().to_path_buf(),
             None,
@@ -801,7 +801,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let reader = DiskSegmentReader::new(
             IoReadMode::Buffered,
-            Arc::new(DiskIo::TokioFs),
+            Arc::new(IoBackend::TokioFs),
             None,
             dir.path().to_path_buf(),
             None,
@@ -820,7 +820,7 @@ mod tests {
 
         let reader = DiskSegmentReader::new(
             IoReadMode::Direct,
-            Arc::new(DiskIo::TokioFs),
+            Arc::new(IoBackend::TokioFs),
             None,
             dir.path().to_path_buf(),
             None,
@@ -847,7 +847,7 @@ mod tests {
         for &mode in &[IoReadMode::Buffered, IoReadMode::Direct] {
             let reader = DiskSegmentReader::new(
                 mode,
-                Arc::new(DiskIo::TokioFs),
+                Arc::new(IoBackend::TokioFs),
                 None,
                 dir.path().to_path_buf(),
                 None,
@@ -874,7 +874,7 @@ mod tests {
 
         let reader = DiskSegmentReader::new(
             IoReadMode::Direct,
-            Arc::new(DiskIo::TokioFs),
+            Arc::new(IoBackend::TokioFs),
             None,
             dir.path().to_path_buf(),
             None,

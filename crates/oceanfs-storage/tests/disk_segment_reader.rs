@@ -11,7 +11,7 @@ use bytes::Bytes;
 use oceanfs_core::SegmentId;
 use oceanfs_storage::{
     io::{
-        DiskIo, DiskSegmentReader, InMemorySegmentReader, IoReadMode, SegmentFileCache,
+        DiskSegmentReader, InMemorySegmentReader, IoBackend, IoReadMode, SegmentFileCache,
         SegmentReadSource, SegmentReader,
     },
     segment::header::SEGMENT_HEADER_SIZE_V1 as V1_HEADER_SIZE,
@@ -45,7 +45,7 @@ async fn disk_reader_buffered_read_write_roundtrip() {
     // Create a disk reader in buffered mode.
     let reader = DiskSegmentReader::new(
         IoReadMode::Buffered,
-        Arc::new(DiskIo::TokioFs),
+        Arc::new(IoBackend::TokioFs),
         None,
         dir.path().to_path_buf(),
         None,
@@ -77,7 +77,7 @@ async fn disk_reader_mmap_read_write_roundtrip() {
     let cache = Arc::new(SegmentFileCache::new(8));
     let reader = DiskSegmentReader::new(
         IoReadMode::Mmap,
-        Arc::new(DiskIo::TokioFs),
+        Arc::new(IoBackend::TokioFs),
         Some(cache.clone()),
         dir.path().to_path_buf(),
         None,
@@ -110,7 +110,7 @@ async fn disk_reader_multiple_segments() {
     let cache = Arc::new(SegmentFileCache::new(4));
     let reader = DiskSegmentReader::new(
         IoReadMode::Mmap,
-        Arc::new(DiskIo::TokioFs),
+        Arc::new(IoBackend::TokioFs),
         Some(cache),
         dir.path().to_path_buf(),
         None,
@@ -152,7 +152,7 @@ async fn disk_reader_error_on_missing_file() {
     let dir = tempfile::tempdir().unwrap();
     let reader = DiskSegmentReader::new(
         IoReadMode::Buffered,
-        Arc::new(DiskIo::TokioFs),
+        Arc::new(IoBackend::TokioFs),
         None,
         dir.path().to_path_buf(),
         None,
@@ -176,7 +176,7 @@ async fn disk_reader_respects_io_mode_buffered() {
 
     let reader = DiskSegmentReader::new(
         IoReadMode::Buffered,
-        Arc::new(DiskIo::TokioFs),
+        Arc::new(IoBackend::TokioFs),
         None,
         dir.path().to_path_buf(),
         None,
@@ -205,7 +205,7 @@ async fn segment_cache_eviction_preserves_mmap_data() {
 
     let reader = DiskSegmentReader::new(
         IoReadMode::Mmap,
-        Arc::new(DiskIo::TokioFs),
+        Arc::new(IoBackend::TokioFs),
         Some(cache.clone()),
         dir.path().to_path_buf(),
         None,
@@ -237,7 +237,7 @@ async fn segment_cache_invalidation_allows_re_read() {
     let cache = Arc::new(SegmentFileCache::new(4));
     let reader = DiskSegmentReader::new(
         IoReadMode::Mmap,
-        Arc::new(DiskIo::TokioFs),
+        Arc::new(IoBackend::TokioFs),
         Some(cache.clone()),
         dir.path().to_path_buf(),
         None,
@@ -267,7 +267,7 @@ mod write_read_roundtrip {
 
     use oceanfs_core::{SegmentId, SegmentIndexEntry, SizeTier, WalConfig};
     use oceanfs_storage::{
-        io::{DiskIo, DiskSegmentReader, IoReadMode, SegmentReader},
+        io::{DiskSegmentReader, IoBackend, IoReadMode, SegmentReader},
         segment::{
             lifecycle::SegmentLifecycleCoordinator,
             sealer::{SealConfig, SegmentSealer},
@@ -324,7 +324,7 @@ mod write_read_roundtrip {
 
         let reader = Arc::new(DiskSegmentReader::new(
             io_mode,
-            Arc::new(DiskIo::TokioFs),
+            Arc::new(IoBackend::TokioFs),
             None,
             segments_dir,
             None,

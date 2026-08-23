@@ -70,6 +70,11 @@ struct FlushRegistration {
     /// Target directory the file is finalized into — the selected pool
     /// root (ADR-0029 f5) or the legacy segments dir (pool_id 0).
     dir: PathBuf,
+    /// The pool-aware observed [`DiskIo`](crate::io::DiskIo) this seal
+    /// was written through (g1): the per-file fsync barrier records its
+    /// latency/errors on the pool's observer (ADR-0029 §D3 — the EIO-on-
+    /// fsync Dead-confirming signal).
+    io: Arc<dyn crate::io::DiskIo>,
     /// Completion signal: `Ok` = file synced + finalized + metadata
     /// committed through the lifecycle coordinator.
     done: oneshot::Sender<Result<()>>,
@@ -215,7 +220,9 @@ impl SegmentFlushGroup {
     /// under `filename` in `dir`, and submitted `meta` in the batch
     /// metadata write. `dir` is the target pool root (or the legacy
     /// segments dir) — the file's durability lands where the seal
-    /// selected it.
+    /// selected it. `io` is the pool-aware observed [`DiskIo`]
+    /// (crate::io::DiskIo) the seal was written through — the fsync
+    /// barrier records on the pool's observer (g1).
     ///
     /// # Errors
     ///
@@ -228,10 +235,11 @@ impl SegmentFlushGroup {
         op: FinalizeOp,
         meta: SegmentMetadata,
         dir: PathBuf,
+        io: Arc<dyn crate::io::DiskIo>,
     ) -> Result<()> {
         let (done_tx, done_rx) = oneshot::channel();
         self.tx
-            .send(FlushRegistration { file, filename, op, meta, dir, done: done_tx })
+            .send(FlushRegistration { file, filename, op, meta, dir, io, done: done_tx })
             .await
             .map_err(|_| Error::Io(io::Error::other("segment flush coordinator is shut down")))?;
         done_rx.await.map_err(|_| {
@@ -295,8 +303,11 @@ fn flush_batch(
             continue;
         }
 
-        let FlushRegistration { file, filename, op, meta, dir, done } = reg;
-        let sync_result = file.sync_data();
+        let FlushRegistration { file, filename, op, meta, dir, io, done } = reg;
+        // g1: the per-file fsync barrier runs through the seal's
+        // pool-aware observed DiskIo — EIO-on-fsync (the ADR-0029 §D3
+        // Dead-confirming signal) is recorded per pool on the observer.
+        let sync_result = io.fsync_handle(&file);
         let finalize_result = sync_result.and_then(|()| {
             let mode = match op {
                 FinalizeOp::Link => SegmentWriteMode::Tmpfile,
@@ -429,7 +440,18 @@ mod tests {
                 std::fs::write(&tmp, vec![0xAB; 1024]).unwrap();
                 let file = std::fs::File::open(&tmp).unwrap();
                 group
-                    .submit(file, filename, FinalizeOp::Rename, meta, seg_dir.clone())
+                    .submit(
+                        file,
+                        filename,
+                        FinalizeOp::Rename,
+                        meta,
+                        seg_dir.clone(),
+                        Arc::new(crate::io::ObservedIo {
+                            pool_id: 0,
+                            backend: Arc::new(crate::io::IoBackend::default()),
+                            observer: Arc::new(crate::io::NoopIoObserver),
+                        }),
+                    )
                     .await
                     .unwrap();
             }));
@@ -476,8 +498,20 @@ mod tests {
         let tmp = seg_dir.join(".tmp.fail");
         std::fs::write(&tmp, vec![0xCD; 512]).unwrap();
         let file = std::fs::File::open(&tmp).unwrap();
-        let result =
-            group.submit(file, "fail.dat".into(), FinalizeOp::Rename, meta, seg_dir.clone()).await;
+        let result = group
+            .submit(
+                file,
+                "fail.dat".into(),
+                FinalizeOp::Rename,
+                meta,
+                seg_dir.clone(),
+                Arc::new(crate::io::ObservedIo {
+                    pool_id: 0,
+                    backend: Arc::new(crate::io::IoBackend::default()),
+                    observer: Arc::new(crate::io::NoopIoObserver),
+                }),
+            )
+            .await;
         FAIL_SYNC.store(false, Ordering::Relaxed);
 
         assert!(result.is_err(), "sync failure must propagate to the waiter");
@@ -510,7 +544,18 @@ mod tests {
         let id = SegmentId::new();
         lifecycle.request_reserve(id, SizeTier::Standard, 0, 0).await.unwrap();
         group
-            .submit(file, "pin.dat".into(), FinalizeOp::Rename, make_meta(id), seg_dir)
+            .submit(
+                file,
+                "pin.dat".into(),
+                FinalizeOp::Rename,
+                make_meta(id),
+                seg_dir,
+                Arc::new(crate::io::ObservedIo {
+                    pool_id: 0,
+                    backend: Arc::new(crate::io::IoBackend::default()),
+                    observer: Arc::new(crate::io::NoopIoObserver),
+                }),
+            )
             .await
             .unwrap();
 

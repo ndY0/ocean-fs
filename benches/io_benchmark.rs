@@ -12,7 +12,7 @@
 use std::{io::Write, time::Duration};
 
 use criterion::{black_box, Criterion, Throughput};
-use oceanfs_storage::io::{direct::DirectIoBuf, mmap::SegmentFileCache, uring::DiskIo};
+use oceanfs_storage::io::{direct::DirectIoBuf, mmap::SegmentFileCache, uring::IoBackend};
 
 // ---------------------------------------------------------------------------
 // O_DIRECT benchmarks
@@ -154,7 +154,7 @@ fn bench_disk_io_write_throughput(c: &mut Criterion) {
 
     group.bench_function("tokio_fs_small", |b| {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let io = DiskIo::TokioFs;
+        let io = IoBackend::TokioFs;
         b.iter(|| {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("write.dat");
