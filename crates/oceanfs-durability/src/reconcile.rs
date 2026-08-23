@@ -44,7 +44,7 @@ use oceanfs_membership::Membership;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::healing_service::{ReRepRequest, RepairSink};
+use crate::healing_service::{ReRepRequest, RepairReason, RepairSink};
 
 // ---------------------------------------------------------------------------
 // ReconcileConfig
@@ -344,11 +344,18 @@ pub struct ReconciliationLoop {
 ///
 /// ```
 /// use oceanfs_core::NodeId;
-/// use oceanfs_durability::healing_service::{ReRepRequest, RepairSink};
+/// use oceanfs_durability::healing_service::{ReRepRequest, RepairReason, RepairSink};
 /// use oceanfs_durability::reconcile::NoopRepairSink;
 ///
 /// let sink = NoopRepairSink;
-/// let req = ReRepRequest { origin: NodeId::new("a"), segment_id: oceanfs_core::SegmentId::new() };
+/// let req = ReRepRequest {
+///     origin: NodeId::new("a"),
+///     segment_id: oceanfs_core::SegmentId::new(),
+///     holders: vec![NodeId::new("b")],
+///     reason: RepairReason::Announcement,
+///     retry_count: 0,
+///     merkle_root: None,
+/// };
 /// let rt = tokio::runtime::Runtime::new().expect("runtime");
 /// assert!(rt.block_on(sink.enqueue(req)).is_ok());
 /// ```
@@ -678,9 +685,25 @@ impl ReconciliationLoop {
             }
         }
 
-        // Enqueue the repairs (g5 executes them). No locks held.
+        // Enqueue the repairs (g5 executes them). No locks held. The
+        // request carries the FULL holder set from this node's registry
+        // entry; the node-side dispatcher filters it to LIVE holders
+        // before selecting a target and sending the RPC (ADR-0030).
         for segment_id in to_enqueue {
-            let request = ReRepRequest { origin: self.self_id.clone(), segment_id };
+            let entry = self.registry.get(segment_id);
+            let holders: Vec<NodeId> = entry
+                .as_ref()
+                .map(|entry| entry.metadata.storage_locations.to_vec())
+                .unwrap_or_default();
+            let merkle_root = entry.as_ref().and_then(|e| e.metadata.merkle_root);
+            let request = ReRepRequest {
+                origin: self.self_id.clone(),
+                segment_id,
+                holders,
+                reason: RepairReason::Reconciliation,
+                retry_count: 0,
+                merkle_root,
+            };
             match self.repair_sink.enqueue(request).await {
                 Ok(()) => {
                     repaired += 1;
@@ -794,7 +817,14 @@ mod tests {
     #[tokio::test]
     async fn noop_sink_accepts_requests() {
         let sink = NoopRepairSink;
-        let req = ReRepRequest { origin: NodeId::new("a"), segment_id: SegmentId::new() };
+        let req = ReRepRequest {
+            origin: NodeId::new("a"),
+            segment_id: SegmentId::new(),
+            holders: vec![NodeId::new("b")],
+            reason: RepairReason::Reconciliation,
+            retry_count: 0,
+            merkle_root: None,
+        };
         assert!(sink.enqueue(req).await.is_ok());
     }
 

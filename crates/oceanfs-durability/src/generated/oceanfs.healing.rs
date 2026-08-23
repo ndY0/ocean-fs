@@ -74,6 +74,36 @@ pub struct MerkleResponse {
     #[prost(message, repeated, tag = "5")]
     pub internal_nodes: ::prost::alloc::vec::Vec<TreeNode>,
 }
+/// A re-replication request from a holder-side dispatcher to an
+/// acquiring target node (ADR-0030 Decision 2).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RequestReReplicationRequest {
+    /// The segment needing an additional live copy.
+    #[prost(message, optional, tag = "1")]
+    pub segment_id: ::core::option::Option<::oceanfs_core::proto::common::SegmentId>,
+    /// LIVE holders the target may fetch the segment data from
+    /// (the dispatcher filters out unavailable nodes before sending).
+    #[prost(message, repeated, tag = "2")]
+    pub holders: ::prost::alloc::vec::Vec<::oceanfs_core::proto::common::NodeId>,
+    /// Which detector drove this repair (Announcement | Reconciliation).
+    #[prost(enumeration = "RepairReason", tag = "3")]
+    pub reason: i32,
+    /// The segment's seal-time merkle root (32 bytes), read by the
+    /// dispatcher from ITS OWN registry entry. The acquiring worker
+    /// verifies the fetched data section against it — a truncated or
+    /// corrupt transfer is rejected instead of being materialized as a
+    /// self-consistent-but-wrong copy (the same integrity check
+    /// `push_sealed_segment` performs on the owner side).
+    #[prost(bytes = "bytes", tag = "4")]
+    pub merkle_root: ::prost::bytes::Bytes,
+}
+/// Acknowledges a re-replication request. `accepted` is true when the
+/// target enqueued the repair (it will pull + write + stamp).
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RequestReReplicationResponse {
+    #[prost(bool, tag = "1")]
+    pub accepted: bool,
+}
 /// Request to fetch a single shard from a specific segment.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FetchShardRequest {
@@ -81,6 +111,15 @@ pub struct FetchShardRequest {
     pub segment_id: ::core::option::Option<::oceanfs_core::proto::common::SegmentId>,
     #[prost(uint32, tag = "2")]
     pub shard_index: u32,
+    /// Full-segment mode (ADR-0030 target-pull): when `offset == 0 &&
+    /// length == 0`, the server streams the ENTIRE data section of the
+    /// segment, regardless of shard_index — the re-replication fetch. In
+    /// the single-shard mode (offset/length > 0), the server returns the
+    /// requested byte range of the named shard (EC reconstruction).
+    #[prost(uint64, tag = "3")]
+    pub offset: u64,
+    #[prost(uint64, tag = "4")]
+    pub length: u64,
 }
 /// A chunk of shard data streamed from the server.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -225,6 +264,39 @@ pub struct RemappedChunk {
 pub struct RemapAck {
     #[prost(bool, tag = "1")]
     pub applied: bool,
+}
+/// Why a re-replication repair was requested (ADR-0029 §D6 urgency; the
+/// worker reports it as `oceanfs_repair_queue_depth{priority}`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum RepairReason {
+    Unspecified = 0,
+    /// The g3 loss-announcement fast path.
+    Announcement = 1,
+    /// The g4 periodic reconciliation safety net.
+    Reconciliation = 2,
+}
+impl RepairReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "REPAIR_REASON_UNSPECIFIED",
+            Self::Announcement => "REPAIR_REASON_ANNOUNCEMENT",
+            Self::Reconciliation => "REPAIR_REASON_RECONCILIATION",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "REPAIR_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "REPAIR_REASON_ANNOUNCEMENT" => Some(Self::Announcement),
+            "REPAIR_REASON_RECONCILIATION" => Some(Self::Reconciliation),
+            _ => None,
+        }
+    }
 }
 /// Generated client implementations.
 pub mod healing_rpc_client {
@@ -522,6 +594,37 @@ pub mod healing_rpc_client {
                 .insert(GrpcMethod::new("oceanfs.healing.HealingRpc", "AnnounceRemap"));
             self.inner.unary(req, path, codec).await
         }
+        /// Request a node to re-replicate a segment it does not yet hold
+        /// (ADR-0030 target-pull; g5). The sender is the DISPATCHER (a live
+        /// holder that detected under-replication); the receiver is the
+        /// acquiring node whose pool will hold the new copy. The request is
+        /// routing intent only — the data moves over FetchShard.
+        pub async fn request_re_replication(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RequestReReplicationRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RequestReReplicationResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/oceanfs.healing.HealingRpc/RequestReReplication",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("oceanfs.healing.HealingRpc", "RequestReReplication"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -606,6 +709,18 @@ pub mod healing_rpc_server {
             &self,
             request: tonic::Request<super::SegmentRemap>,
         ) -> std::result::Result<tonic::Response<super::RemapAck>, tonic::Status>;
+        /// Request a node to re-replicate a segment it does not yet hold
+        /// (ADR-0030 target-pull; g5). The sender is the DISPATCHER (a live
+        /// holder that detected under-replication); the receiver is the
+        /// acquiring node whose pool will hold the new copy. The request is
+        /// routing intent only — the data moves over FetchShard.
+        async fn request_re_replication(
+            &self,
+            request: tonic::Request<super::RequestReReplicationRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RequestReReplicationResponse>,
+            tonic::Status,
+        >;
     }
     /// Healing RPC service for hinted handoff, anti-entropy, and EC-based repair.
     #[derive(Debug)]
@@ -1031,6 +1146,52 @@ pub mod healing_rpc_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = AnnounceRemapSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/oceanfs.healing.HealingRpc/RequestReReplication" => {
+                    #[allow(non_camel_case_types)]
+                    struct RequestReReplicationSvc<T: HealingRpc>(pub Arc<T>);
+                    impl<
+                        T: HealingRpc,
+                    > tonic::server::UnaryService<super::RequestReReplicationRequest>
+                    for RequestReReplicationSvc<T> {
+                        type Response = super::RequestReReplicationResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RequestReReplicationRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as HealingRpc>::request_re_replication(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RequestReReplicationSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

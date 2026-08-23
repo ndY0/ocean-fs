@@ -811,6 +811,63 @@ impl Membership {
         info!(node_id = %self.node_id, version, "self storage-pool manifest set");
     }
 
+    /// Replaces the cached storage-pool manifest of a PEER node
+    /// (ADR-0029 D2) without a state/incarnation change — the
+    /// observability/test twin of [`Self::set_self_manifest`].
+    ///
+    /// The node-side re-replication target selector (g5, ADR-0030) is
+    /// tested against peer manifests; production peers learn manifests
+    /// through gossip instead of this path. The existing entry's
+    /// incarnation/addresses are preserved; the manifest is replaced
+    /// wholesale (stale-but-present beats absent, ADR-0029 D5).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_membership::{manifest::PoolManifest, Membership};
+    /// # use oceanfs_core::{GossipConfig, NodeId, RingConfig};
+    /// # use oceanfs_routing::{Ring, RingCache};
+    /// # use std::net::SocketAddr;
+    /// # use std::sync::Arc;
+    /// # let mut ring = Ring::new(RingConfig::default());
+    /// # ring.add_node(NodeId::new("node-1"));
+    /// # let ring_cache = Arc::new(RingCache::new(ring));
+    /// # let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+    /// # let membership = Membership::new(NodeId::new("node-1"), addr, addr,
+    /// #     GossipConfig::default(), ring_cache);
+    /// let pools = vec![PoolManifest::new(0, "data", "healthy", false, 1 << 40, 2)];
+    /// let manifest = oceanfs_membership::manifest::NodeManifest::from_pools(1, &pools);
+    /// membership.set_peer_manifest(NodeId::new("node-2"), manifest);
+    /// assert!(membership.manifest_of(&NodeId::new("node-2")).is_some());
+    /// ```
+    pub fn set_peer_manifest(&self, node_id: NodeId, manifest: crate::manifest::NodeManifest) {
+        let manifest = std::sync::Arc::new(manifest);
+        let mut inner = self.state.write();
+        // Preserve the entry's incarnation + addresses; replace the
+        // manifest. An absent entry is created as Alive (peers are
+        // assumed live when a manifest is attached — the test/observe
+        // path only attaches manifests to known peers).
+        match inner.nodes.get_mut(&node_id) {
+            Some(entry) => {
+                entry.manifest = Some(manifest);
+            }
+            None => {
+                inner.nodes.insert(
+                    node_id.clone(),
+                    super::state::StoredEntry {
+                        state: NodeState::Alive,
+                        incarnation: Incarnation::new(1),
+                        address: self.grpc_address,
+                        membership_address: self.address,
+                        version: 1,
+                        origin: self.node_id.clone(),
+                        manifest: Some(manifest),
+                    },
+                );
+            }
+        }
+    }
+
     /// Adds or updates a node's state from external input (e.g., gossip merge).
     /// New ALIVE nodes are added to the ring; LEFT nodes are removed.
     /// DEAD nodes are RETAINED (state=Dead): the topology is the stable

@@ -96,6 +96,49 @@ service HealingRpc {
   // Announce a compaction segment-remap (old id → new id) to the holders
   // of the old segment so they re-point their metadata (GAP-1 closure).
   rpc AnnounceRemap(SegmentRemap) returns (RemapAck);
+
+  // Request a node to re-replicate a segment it does not yet hold
+  // (ADR-0030 target-pull; g5). The sender is the DISPATCHER (a live
+  // holder that detected under-replication); the receiver is the
+  // acquiring node whose pool will hold the new copy. The request is
+  // routing intent only — the data moves over FetchShard.
+  rpc RequestReReplication(RequestReReplicationRequest)
+      returns (RequestReReplicationResponse);
+}
+
+// Why a re-replication repair was requested (ADR-0029 §D6 urgency; the
+// worker reports it as `oceanfs_repair_queue_depth{priority}`).
+enum RepairReason {
+  REPAIR_REASON_UNSPECIFIED = 0;
+  // The g3 loss-announcement fast path.
+  REPAIR_REASON_ANNOUNCEMENT = 1;
+  // The g4 periodic reconciliation safety net.
+  REPAIR_REASON_RECONCILIATION = 2;
+}
+
+// A re-replication request from a holder-side dispatcher to an
+// acquiring target node (ADR-0030 Decision 2).
+message RequestReReplicationRequest {
+  // The segment needing an additional live copy.
+  oceanfs.common.SegmentId segment_id = 1;
+  // LIVE holders the target may fetch the segment data from
+  // (the dispatcher filters out unavailable nodes before sending).
+  repeated oceanfs.common.NodeId holders = 2;
+  // Which detector drove this repair (Announcement | Reconciliation).
+  RepairReason reason = 3;
+  // The segment's seal-time merkle root (32 bytes), read by the
+  // dispatcher from ITS OWN registry entry. The acquiring worker
+  // verifies the fetched data section against it — a truncated or
+  // corrupt transfer is rejected instead of being materialized as a
+  // self-consistent-but-wrong copy (the same integrity check
+  // `push_sealed_segment` performs on the owner side).
+  bytes merkle_root = 4;
+}
+
+// Acknowledges a re-replication request. `accepted` is true when the
+// target enqueued the repair (it will pull + write + stamp).
+message RequestReReplicationResponse {
+  bool accepted = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +149,13 @@ service HealingRpc {
 message FetchShardRequest {
   oceanfs.common.SegmentId segment_id = 1;
   uint32 shard_index = 2;
+  // Full-segment mode (ADR-0030 target-pull): when `offset == 0 &&
+  // length == 0`, the server streams the ENTIRE data section of the
+  // segment, regardless of shard_index — the re-replication fetch. In
+  // the single-shard mode (offset/length > 0), the server returns the
+  // requested byte range of the named shard (EC reconstruction).
+  uint64 offset = 3;
+  uint64 length = 4;
 }
 
 // A chunk of shard data streamed from the server.

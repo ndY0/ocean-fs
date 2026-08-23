@@ -91,7 +91,7 @@ re-replication runs; see the feature's correction note).
 | — | `sealed-segment-replication` — data-replication backbone: seal-time push, storage_locations, needs set (corrective; discovered mid-epic) | node, server, storage, durability, routing | g2 |
 | g3 | `loss-announcement` — segment-set announcement + compaction remap, targeted fan-out | node, durability, core | g2, sealed-segment-replication |
 | g4 | `reconciliation` — event-driven pull safety net + read-driven dangling-metadata repair (GAP-1 failsafe) | node, durability, server, storage | g2, sealed-segment-replication |
-| g5 | `re-replication-worker` — repair execution, capacity-aware targets | durability, node | g4 |
+| g5 | `re-replication-worker` — target-pull repair execution, capacity-aware targets (ADR-0030) | durability, node, storage | g4 |
 | g6 | `routing-manifests` — read/write path filters, hint target preference | node, server | g2, f7 (Phase A) |
 | g7 | `wal-loss-recovery` — fresh WAL, registry rebuild, catch-up from replicas | durability, node, storage | g3, g5 |
 | g8 | `metadata-loss-recovery` — unavailability, fresh store, objects rebuild (NO re-replication) | node, server, storage | g2, g5 |

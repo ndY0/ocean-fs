@@ -1078,6 +1078,7 @@ impl SegmentLifecycleRegistry {
         &self,
         id: SegmentId,
         merkle_root: Option<oceanfs_core::HashOutput>,
+        storage_locations: Option<smallvec::SmallVec<[oceanfs_core::NodeId; 16]>>,
     ) -> Result<(), TransitionError> {
         let shard = &self.shards[self.shard_for(id)];
         let mut guard = shard.write();
@@ -1086,6 +1087,9 @@ impl SegmentLifecycleRegistry {
         match guard.get_mut(&id) {
             Some(entry) if entry.state == SegmentState::Sealed => {
                 entry.metadata.merkle_root = merkle_root;
+                if let Some(locations) = storage_locations {
+                    entry.metadata.storage_locations = locations;
+                }
                 Ok(())
             }
             Some(entry) if entry.state == SegmentState::Reserved => {
@@ -1463,7 +1467,7 @@ impl SegmentLifecycleCoordinator {
                 Err(e) => return Err(e),
             };
             let segment_id = evt.segment_id();
-            let fold_result = match evt {
+            let fold_result = match &evt {
                 SegmentEvent::Reserve(evt) => {
                     let meta = SegmentMetadata {
                         pool_id: 0,
@@ -1499,9 +1503,11 @@ impl SegmentLifecycleCoordinator {
                     self.registry.seal_with(evt.segment_id, meta, evt.repacked_from)
                 }
                 SegmentEvent::Delete(evt) => self.registry.delete(evt.segment_id),
-                SegmentEvent::MetadataRefresh(evt) => {
-                    self.registry.fold_refresh(evt.segment_id, evt.merkle_root)
-                }
+                SegmentEvent::MetadataRefresh(evt) => self.registry.fold_refresh(
+                    evt.segment_id,
+                    evt.merkle_root,
+                    evt.storage_locations.clone(),
+                ),
             };
             // Idempotent fold outcomes — benign race residue, not
             // corruption:
@@ -2057,12 +2063,18 @@ impl SegmentLifecycleCoordinator {
         Ok(())
     }
 
-    /// Refreshes a `Sealed` segment's metadata anchor durably: validate
+    /// Refreshes a `Sealed` segment's metadata durably: validate
     /// (`Sealed` only — no state change) → `MetadataRefresh` event →
     /// fold. Replaces the heal worker's post-repair CF
     /// `put_segment(merkle_root: None)` (ADR-0025 Decision 3: the
     /// machine's entry metadata is the scrub/AE anchor, and the stale
     /// root must not survive a restart).
+    ///
+    /// ADR-0030 extends the refresh to optionally carry a new
+    /// `storage_locations` set — the durable post-repair holder stamp.
+    /// The re-replication worker records the acquiring target as a new
+    /// holder through this path, keeping the event-WAL the single
+    /// durable writer. `None` leaves the holder set untouched.
     ///
     /// # Errors
     ///
@@ -2075,6 +2087,7 @@ impl SegmentLifecycleCoordinator {
         &self,
         id: SegmentId,
         merkle_root: Option<oceanfs_core::HashOutput>,
+        storage_locations: Option<smallvec::SmallVec<[oceanfs_core::NodeId; 16]>>,
     ) -> Result<(), TransitionError> {
         // Sealed-only: validate through the seal validator, then reject
         // non-Sealed explicitly (the validator returns Ok only for
@@ -2093,13 +2106,16 @@ impl SegmentLifecycleCoordinator {
                 SegmentState::Deleted => TransitionError::AlreadyDeleted,
             });
         }
-        let evt =
-            SegmentEvent::MetadataRefresh(MetadataRefreshEvent { segment_id: id, merkle_root });
+        let evt = SegmentEvent::MetadataRefresh(MetadataRefreshEvent {
+            segment_id: id,
+            merkle_root,
+            storage_locations: storage_locations.clone(),
+        });
         let pos = event_wal
             .append(evt)
             .await
             .map_err(|e| TransitionError::DurableWriteFailed(e.to_string()))?;
-        self.registry.fold_refresh(id, merkle_root)?;
+        self.registry.fold_refresh(id, merkle_root, storage_locations)?;
         self.last_folded_pos.store(pos.packed(), std::sync::atomic::Ordering::Release);
         self.maybe_checkpoint().await;
         self.update_gauges();

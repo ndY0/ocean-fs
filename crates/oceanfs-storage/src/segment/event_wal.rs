@@ -112,11 +112,24 @@ pub(crate) const REFRESH_PAYLOAD_SIZE: usize = 1;
 /// (merkle_root(32)).
 pub(crate) const REFRESH_ROOT_SIZE: usize = 32;
 
-/// Largest possible payload size (the Seal payload with the compaction
-/// marker) — bounds the reader's allocation so a corrupt `payload_len`
-/// can never allocate arbitrarily.
-pub(crate) const MAX_PAYLOAD_SIZE: usize =
-    SEAL_PAYLOAD_SIZE + SEAL_REPACKED_FROM_SIZE + SEAL_POOL_ID_SIZE;
+/// Maximum number of `storage_locations` entries carried by an extended
+/// `MetadataRefreshEvent` (ADR-0030). Matches the `SmallVec<[NodeId; 16]>`
+/// capacity the registry stores.
+pub(crate) const REFRESH_MAX_LOCATIONS: usize = 16;
+
+/// Maximum encoded length of one `NodeId` in an extended refresh
+/// (len(1) + utf8 bytes). Node ids are short host/container names; 255
+/// bounds the on-disk record.
+pub(crate) const REFRESH_MAX_NODE_ID_LEN: usize = 255;
+
+/// Largest possible payload size — the extended MetadataRefresh payload
+/// (merkle_flag(1) + root(32) + loc_count(1) + 16 × (len(1) + 255)) is
+/// the largest variant. Bounds the reader's allocation so a corrupt
+/// `payload_len` can never allocate arbitrarily.
+pub(crate) const MAX_PAYLOAD_SIZE: usize = REFRESH_PAYLOAD_SIZE
+    + REFRESH_ROOT_SIZE
+    + 1
+    + REFRESH_MAX_LOCATIONS * (1 + REFRESH_MAX_NODE_ID_LEN);
 
 /// Record kind bytes on disk.
 pub(crate) const KIND_RESERVE: u8 = 0;
@@ -231,18 +244,35 @@ pub struct DeleteEvent {
 /// `put_segment(merkle_root: None)` CF write (the `segments` CF is
 /// removed); the fold swaps the entry's `merkle_root` so the stale
 /// anchor never survives a restart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// ADR-0030 extends the event to optionally carry a `storage_locations`
+/// set — the durable post-repair holder stamp (the re-replication
+/// worker records the target as a new holder through the event-WAL, the
+/// single durable writer). `None` keeps the legacy anchor-only shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataRefreshEvent {
     /// The segment whose anchor is refreshed.
     pub segment_id: SegmentId,
     /// The new anchor: `None` invalidates the root until rebuilt.
     pub merkle_root: Option<HashOutput>,
+    /// The new holder set (ADR-0030): `Some` replaces
+    /// `storage_locations` durably; `None` leaves it untouched.
+    pub storage_locations: Option<smallvec::SmallVec<[oceanfs_core::NodeId; 16]>>,
 }
 
 /// A segment lifecycle transition — the only record family of the event
 /// log (ADR-0024 Decision 1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The variants are deliberately size-non-uniform: the extended
+/// `MetadataRefreshEvent` (ADR-0030) carries an optional `SmallVec`
+/// holder set — larger than the fixed-size Reserve/Seal/Delete records.
+/// The event is built once per transition and dropped after the WAL
+/// append + fold; it is never stored in a vec/array of `SegmentEvent`,
+/// so the enum's size is the small fixed variants' size plus the
+/// `SmallVec` inline capacity — a bounded, non-hot-path cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
+#[allow(clippy::large_enum_variant)]
 pub enum SegmentEvent {
     /// Segment reserved (replaces the phantom CF write).
     Reserve(ReserveEvent),
@@ -314,13 +344,34 @@ impl SegmentEvent {
             }
             SegmentEvent::Delete(_) => (KIND_DELETE, Vec::new()),
             SegmentEvent::MetadataRefresh(evt) => {
-                let mut payload = Vec::with_capacity(REFRESH_PAYLOAD_SIZE);
-                match evt.merkle_root {
-                    Some(root) => {
-                        payload.push(1);
-                        payload.extend_from_slice(root.as_bytes());
+                // Flags byte: bit 0 = merkle_root present, bit 1 =
+                // storage_locations present (ADR-0030). Legacy records
+                // (bits 0/1 = 0x00/0x01) keep their exact byte layout;
+                // the locations section is appended only when present.
+                let mut flags = 0u8;
+                if evt.merkle_root.is_some() {
+                    flags |= 1;
+                }
+                if evt.storage_locations.is_some() {
+                    flags |= 2;
+                }
+                let mut payload = Vec::with_capacity(
+                    REFRESH_PAYLOAD_SIZE
+                        + REFRESH_ROOT_SIZE
+                        + 1
+                        + evt.storage_locations.as_ref().map_or(0, |l| l.len() * (1 + 8)),
+                );
+                payload.push(flags);
+                if let Some(root) = evt.merkle_root {
+                    payload.extend_from_slice(root.as_bytes());
+                }
+                if let Some(locations) = &evt.storage_locations {
+                    payload.push(locations.len() as u8);
+                    for loc in locations.iter() {
+                        let bytes = loc.as_str().as_bytes();
+                        payload.push(bytes.len() as u8);
+                        payload.extend_from_slice(bytes);
                     }
-                    None => payload.push(0),
                 }
                 (KIND_METADATA_REFRESH, payload)
             }
@@ -491,6 +542,7 @@ fn decode_payload(kind: u8, segment_id: SegmentId, payload: &[u8]) -> Option<Seg
             Some(SegmentEvent::MetadataRefresh(MetadataRefreshEvent {
                 segment_id,
                 merkle_root: None,
+                storage_locations: None,
             }))
         }
         KIND_METADATA_REFRESH
@@ -499,6 +551,50 @@ fn decode_payload(kind: u8, segment_id: SegmentId, payload: &[u8]) -> Option<Seg
             Some(SegmentEvent::MetadataRefresh(MetadataRefreshEvent {
                 segment_id,
                 merkle_root: Some(HashOutput::from_bytes(payload[1..33].try_into().ok()?)),
+                storage_locations: None,
+            }))
+        }
+        // Extended refresh (ADR-0030): flags byte bit 1 = locations
+        // present. Layout: [flags][merkle_root(32) if bit 0][count(1)]
+        // [(len(1) + utf8)*count]. The payload length is bounds-checked
+        // BEFORE any slice so a crafted (CRC-valid) short record is
+        // rejected, never panicked on.
+        KIND_METADATA_REFRESH if payload[0] & 2 != 0 => {
+            let locs_start = 1 + if payload[0] & 1 != 0 { REFRESH_ROOT_SIZE } else { 0 };
+            if payload.len() < locs_start {
+                return None;
+            }
+            let merkle_root = if payload[0] & 1 != 0 {
+                Some(HashOutput::from_bytes(payload[1..33].try_into().ok()?))
+            } else {
+                None
+            };
+            if payload.len() < locs_start + 1 {
+                return None;
+            }
+            let count = payload[locs_start] as usize;
+            if count > REFRESH_MAX_LOCATIONS {
+                return None;
+            }
+            let mut storage_locations = smallvec::SmallVec::<[oceanfs_core::NodeId; 16]>::new();
+            let mut cursor = locs_start + 1;
+            for _ in 0..count {
+                if payload.len() < cursor + 1 {
+                    return None;
+                }
+                let len = payload[cursor] as usize;
+                cursor += 1;
+                if payload.len() < cursor + len || len > REFRESH_MAX_NODE_ID_LEN {
+                    return None;
+                }
+                let id = std::str::from_utf8(&payload[cursor..cursor + len]).ok()?;
+                storage_locations.push(oceanfs_core::NodeId::new(id));
+                cursor += len;
+            }
+            Some(SegmentEvent::MetadataRefresh(MetadataRefreshEvent {
+                segment_id,
+                merkle_root,
+                storage_locations: Some(storage_locations),
             }))
         }
         _ => None,
@@ -1427,6 +1523,7 @@ mod tests {
         SegmentEvent::MetadataRefresh(MetadataRefreshEvent {
             segment_id: id,
             merkle_root: Some(HashOutput::from_bytes([0xCD; 32])),
+            storage_locations: None,
         })
     }
 
@@ -1529,10 +1626,75 @@ mod tests {
         let invalidate = SegmentEvent::MetadataRefresh(MetadataRefreshEvent {
             segment_id: id,
             merkle_root: None,
+            storage_locations: None,
         });
         let decoded =
             SegmentEvent::from_record_bytes(&invalidate.to_record_bytes()).expect("record decodes");
         assert_eq!(decoded, invalidate);
+    }
+
+    /// ADR-0030: the extended MetadataRefresh carrying a
+    /// `storage_locations` set round-trips byte-exact, and the legacy
+    /// anchor-only records (no locations section) still decode with
+    /// `storage_locations: None`.
+    #[test]
+    fn metadata_refresh_with_locations_roundtrips() {
+        let id = SegmentId::new();
+        let mut locations = smallvec::SmallVec::<[oceanfs_core::NodeId; 16]>::new();
+        locations.push(oceanfs_core::NodeId::new("node-b"));
+        locations.push(oceanfs_core::NodeId::new("node-c"));
+        let evt = SegmentEvent::MetadataRefresh(MetadataRefreshEvent {
+            segment_id: id,
+            merkle_root: Some(HashOutput::from_bytes([0xCD; 32])),
+            storage_locations: Some(locations),
+        });
+        let bytes = evt.to_record_bytes();
+        let decoded = SegmentEvent::from_record_bytes(&bytes).expect("extended record decodes");
+        assert_eq!(decoded, evt, "locations + root must round-trip byte-exact");
+    }
+
+    /// ADR-0030: an extended refresh WITHOUT a merkle root (locations
+    /// only) round-trips too.
+    #[test]
+    fn metadata_refresh_locations_only_roundtrips() {
+        let id = SegmentId::new();
+        let mut locations = smallvec::SmallVec::<[oceanfs_core::NodeId; 16]>::new();
+        locations.push(oceanfs_core::NodeId::new("node-x"));
+        let evt = SegmentEvent::MetadataRefresh(MetadataRefreshEvent {
+            segment_id: id,
+            merkle_root: None,
+            storage_locations: Some(locations),
+        });
+        let decoded =
+            SegmentEvent::from_record_bytes(&evt.to_record_bytes()).expect("record decodes");
+        assert_eq!(decoded, evt);
+    }
+
+    /// ADR-0030: a corrupt extended refresh (node id claims more bytes
+    /// than the record holds) is rejected by the decoder — the reader's
+    /// length discipline.
+    #[test]
+    fn metadata_refresh_rejects_overlong_node_id() {
+        let id = SegmentId::new();
+        // flags(3 = root + locations) + root(32) + count(1) + len(1).
+        // The len byte claims 255 bytes but the record holds none — the
+        // decoder must bound-check and reject (no OOB read).
+        let payload = vec![0u8; 1 + 32 + 1 + 1];
+        let mut payload = payload;
+        payload[0] = 3; // merkle + locations
+        payload[33] = 1; // count = 1
+        payload[34] = 255; // node id length claims 255 bytes — absent
+        let mut buf = Vec::with_capacity(28 + payload.len() + 4);
+        buf.extend_from_slice(&EVENT_RECORD_MAGIC);
+        buf.push(EVENT_RECORD_VERSION);
+        buf.push(KIND_METADATA_REFRESH);
+        buf.extend_from_slice(&[0u8; 2]);
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(id.as_uuid().as_bytes());
+        buf.extend_from_slice(&payload);
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        assert!(SegmentEvent::from_record_bytes(&buf).is_none(), "over-long id must be rejected");
     }
 
     #[test]

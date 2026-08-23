@@ -28,6 +28,7 @@ mod metadata_adapter;
 mod node;
 pub mod pool_manifest;
 pub mod pool_paths;
+pub mod repair;
 pub mod routing_cache;
 pub mod segment_replicator;
 pub mod startup;

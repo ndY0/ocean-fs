@@ -20,7 +20,7 @@ use crate::{
         healing_rpc_server::HealingRpc, FetchHintObjectChunk, FetchHintObjectRequest,
         FetchShardChunk, FetchShardRequest, HintRequest, HintResponse, LossAck, LossAnnouncement,
         MerkleRequest, MerkleResponse, PushRepairedShardRequest, PushRepairedShardResponse,
-        RemapAck, SegmentRemap,
+        RemapAck, RequestReReplicationRequest, RequestReReplicationResponse, SegmentRemap,
     },
     hinted_handoff_rpc::{hint_record::Record, HintedHandoffRequest, HintedHandoffResponse},
     SegmentDataStore, SegmentShardStore,
@@ -96,32 +96,95 @@ pub trait HintObjectApplier: Send + Sync {
 }
 
 /// A single re-replication repair request enqueued by the loss
-/// announcement handler (g3, ADR-0029 §D4 fast path).
+/// announcement handler (g3, ADR-0029 §D4 fast path) or the
+/// reconciliation loop (g4, ADR-0029 §D4 pull safety net).
 ///
-/// The announcement is an event, not state: it never rides the
-/// NodeManifest. The receiver verifies it holds a replica of the
-/// announced segment, then enqueues a repair so the ReRepWorker (g5)
-/// restores RF. This is the "re-replicate" trigger, distinct from the
-/// heal queue (which repairs EC shard corruption).
+/// The request is routing intent only (ADR-0030 Decision 2): it names
+/// the segment and the LIVE holders the acquiring node may fetch the
+/// data from, plus which detector drove the repair (pacing/metrics).
+/// The holder side dispatches it to the acquiring target via the
+/// `RequestReReplication` RPC; the target's `ReRepWorker` (g5) pulls
+/// the segment, writes it through its pool-aware store, and stamps
+/// `storage_locations`. This is distinct from the heal queue (which
+/// repairs EC shard corruption).
 ///
 /// # Examples
 ///
 /// ```
 /// use oceanfs_core::NodeId;
-/// use oceanfs_durability::healing_service::ReRepRequest;
+/// use oceanfs_durability::healing_service::{ReRepRequest, RepairReason};
 ///
 /// let req = ReRepRequest {
 ///     origin: NodeId::new("node-a"),
 ///     segment_id: oceanfs_core::SegmentId::new(),
+///     holders: vec![NodeId::new("node-b")],
+///     reason: RepairReason::Announcement,
+///     retry_count: 0,
+///     merkle_root: None,
 /// };
 /// assert_eq!(req.origin, NodeId::new("node-a"));
+/// assert_eq!(req.reason, RepairReason::Announcement);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReRepRequest {
-    /// The node that announced the loss (whose pool died).
+    /// The node that announced the loss (whose pool died), or the
+    /// reconciliation loop's self id.
     pub origin: NodeId,
     /// The segment needing an additional live copy.
     pub segment_id: SegmentId,
+    /// LIVE holders the acquiring target may fetch the segment data
+    /// from (the dispatcher filters unavailable nodes before sending).
+    pub holders: Vec<NodeId>,
+    /// Which detector drove this repair (metrics/pacing).
+    pub reason: RepairReason,
+    /// Retry attempt counter (the worker re-enqueues with an
+    /// incremented count on failure; bounded by `ReRepConfig::retry_limit`).
+    pub retry_count: u32,
+    /// The segment's seal-time merkle root (the dispatcher reads it from
+    /// its own registry entry). The worker verifies the fetched data
+    /// against it — a truncated/corrupt transfer is rejected (ADR-0030).
+    /// `None` (tests / legacy enqueuers) skips the verification.
+    pub merkle_root: Option<oceanfs_core::HashOutput>,
+}
+
+/// Which detector drove a re-replication repair (ADR-0029 §D6 — the
+/// worker reports it as `oceanfs_repair_queue_depth{priority}`).
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_durability::healing_service::RepairReason;
+///
+/// let reason = RepairReason::Reconciliation;
+/// assert_eq!(u32::from(reason), 2);
+/// assert_eq!(RepairReason::from(2), RepairReason::Reconciliation);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RepairReason {
+    /// The g3 loss-announcement fast path.
+    Announcement,
+    /// The g4 periodic reconciliation safety net.
+    Reconciliation,
+}
+
+impl From<RepairReason> for u32 {
+    fn from(reason: RepairReason) -> Self {
+        match reason {
+            RepairReason::Announcement => 1,
+            RepairReason::Reconciliation => 2,
+        }
+    }
+}
+
+impl From<u32> for RepairReason {
+    fn from(value: u32) -> Self {
+        match value {
+            1 => RepairReason::Announcement,
+            2 => RepairReason::Reconciliation,
+            _ => RepairReason::Reconciliation,
+        }
+    }
 }
 
 /// Receives verified re-replication requests from the loss-announcement
@@ -211,6 +274,11 @@ pub struct HealingGrpcService {
     /// Re-replication repair sink (g3 → g5). `None` (tests) verifies +
     /// acks but enqueues nothing.
     repair_sink: Option<Arc<dyn RepairSink>>,
+    /// Re-replication request sink (g5 → target). The `RequestReReplication`
+    /// RPC handler enqueues into the LOCAL `ReRepWorker` queue here; the
+    /// worker pulls + writes + stamps (ADR-0030). `None` (tests) acks but
+    /// enqueues nothing.
+    replication_request_sink: Option<Arc<dyn RepairSink>>,
     /// g3 announcement receive counters (ADR-0029 §D4 observability).
     /// Incremented by the `announce_loss` / `announce_remap` handlers.
     announce_rx_total: oceanfs_core::Counter,
@@ -240,6 +308,7 @@ impl HealingGrpcService {
             lifecycle_coordinator: None,
             shard_store: None,
             repair_sink: None,
+            replication_request_sink: None,
             announce_rx_total: oceanfs_core::Counter::new(
                 "oceanfs_announcements_rx_total".into(),
                 "Loss/remap announcements received".into(),
@@ -331,6 +400,15 @@ impl HealingGrpcService {
     #[must_use]
     pub fn with_repair_sink(mut self, sink: Arc<dyn RepairSink>) -> Self {
         self.repair_sink = Some(sink);
+        self
+    }
+
+    /// Installs the re-replication request sink (composition root; g5 →
+    /// target). The `RequestReReplication` handler enqueues into the
+    /// local `ReRepWorker` queue here.
+    #[must_use]
+    pub fn with_replication_request_sink(mut self, sink: Arc<dyn RepairSink>) -> Self {
+        self.replication_request_sink = Some(sink);
         self
     }
 
@@ -1085,15 +1163,28 @@ impl HealingRpc for HealingGrpcService {
             Status::internal(format!("failed to read segment data for shard fetch: {e}"))
         })?;
 
-        // Determine shard size from total data length and known k+m.
-        // This is a simplification — in production, we'd look up ec_k/ec_m from metadata.
-        let total_shards = 6; // default k=4, m=2
-        let shard_size = if data.is_empty() { 0 } else { data.len() / total_shards };
-
-        let start = shard_index * shard_size;
-        let end = (start + shard_size).min(data.len());
-        let shard_data: Bytes =
-            if start < data.len() { data.slice(start..end) } else { Bytes::new() };
+        // Full-segment mode (ADR-0030 target-pull; g5): when offset 0 +
+        // length 0, stream the ENTIRE data section — the re-replication
+        // fetch (the worker materializes a whole copy on the target).
+        // Otherwise, return the named shard's requested byte range (EC
+        // reconstruction).
+        let shard_data: Bytes = if req.offset == 0 && req.length == 0 {
+            data
+        } else {
+            // Determine shard size from total data length and known k+m.
+            // This is a simplification — in production, we'd look up
+            // ec_k/ec_m from metadata.
+            let total_shards = 6; // default k=4, m=2
+            let shard_size = if data.is_empty() { 0 } else { data.len() / total_shards };
+            let start = (shard_index * shard_size).saturating_add(req.offset as usize);
+            let len = req.length as usize;
+            let end = (start + len).min(data.len());
+            if start < data.len() {
+                data.slice(start..end)
+            } else {
+                Bytes::new()
+            }
+        };
 
         // Stream the shard data in chunks.
         let chunk_size = 65536; // 64 KB chunks
@@ -1289,7 +1380,27 @@ impl HealingRpc for HealingGrpcService {
                 );
                 continue;
             }
-            match sink.enqueue(ReRepRequest { origin: origin.clone(), segment_id }).await {
+            // The request carries the FULL holder set from the local
+            // registry entry; the node-side dispatcher filters it to the
+            // LIVE holders before selecting a target and sending the
+            // RequestReReplication RPC (ADR-0030).
+            let entry = self.registry.get(segment_id);
+            let holders: Vec<NodeId> = entry
+                .as_ref()
+                .map(|entry| entry.metadata.storage_locations.to_vec())
+                .unwrap_or_default();
+            let merkle_root = entry.as_ref().and_then(|e| e.metadata.merkle_root);
+            match sink
+                .enqueue(ReRepRequest {
+                    origin: origin.clone(),
+                    segment_id,
+                    holders,
+                    reason: RepairReason::Announcement,
+                    retry_count: 0,
+                    merkle_root,
+                })
+                .await
+            {
                 Ok(()) => {
                     accepted += 1;
                     self.announce_accepted_total.inc();
@@ -1441,6 +1552,100 @@ impl HealingRpc for HealingGrpcService {
         );
         self.announce_accepted_total.inc();
         Ok(Response::new(RemapAck { applied: true }))
+    }
+
+    /// Handles a re-replication request (ADR-0030 target-pull; g5).
+    ///
+    /// The sender is a DISPATCHER — a live holder that detected
+    /// under-replication — asking THIS node (the acquiring target) to
+    /// pull the segment data from a live holder and materialize a new
+    /// copy. The request is routing intent only: it carries the segment
+    /// id and the live holder set to fetch from.
+    ///
+    /// The handler enqueues the request into the local `ReRepWorker`
+    /// queue (the `replication_request_sink`); the worker performs the
+    /// actual fetch + write + register + stamp. `accepted` is true when
+    /// the request was enqueued. No local verification is required —
+    /// the dispatcher verified the sender is a legitimate holder before
+    /// sending, and the target's worker is idempotent (a duplicate
+    /// request for an already-held segment is a no-op).
+    async fn request_re_replication(
+        &self,
+        request: Request<RequestReReplicationRequest>,
+    ) -> Result<Response<RequestReReplicationResponse>, Status> {
+        let req = request.into_inner();
+        let segment_id = match req.segment_id {
+            Some(sid) => match SegmentId::try_from(sid) {
+                Ok(sid) => sid,
+                Err(_) => {
+                    return Ok(Response::new(RequestReReplicationResponse { accepted: false }));
+                }
+            },
+            None => {
+                return Ok(Response::new(RequestReReplicationResponse { accepted: false }));
+            }
+        };
+        let holders: Vec<NodeId> = req.holders.into_iter().map(NodeId::from).collect();
+        // The segment's seal-time merkle root (the dispatcher read it
+        // from its own registry entry). The worker verifies the fetched
+        // data against it (ADR-0030). Empty (a legacy/tests sender)
+        // skips the verification.
+        let merkle_root = if req.merkle_root.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&req.merkle_root);
+            Some(oceanfs_core::HashOutput::from_bytes(arr))
+        } else {
+            None
+        };
+        // The proto enum's integer value is our wire format (1 =
+        // Announcement, 2 = Reconciliation); map through the generated
+        // enum so an unknown value degrades to Reconciliation.
+        let reason = match crate::healing_rpc::RepairReason::try_from(req.reason) {
+            Ok(crate::healing_rpc::RepairReason::Announcement) => RepairReason::Announcement,
+            Ok(_) => RepairReason::Reconciliation,
+            Err(_) => RepairReason::Reconciliation,
+        };
+
+        let Some(sink) = &self.replication_request_sink else {
+            // No worker queue wired (tests / minimal embedding): ack
+            // nothing. The dispatcher's bounded retries (or g4's
+            // reconciliation failsafe) cover it.
+            tracing::debug!(
+                segment_id = %segment_id,
+                holders = holders.len(),
+                "re-replication request received but no local worker queue wired; not accepted"
+            );
+            return Ok(Response::new(RequestReReplicationResponse { accepted: false }));
+        };
+
+        let req = ReRepRequest {
+            origin: NodeId::new("dispatcher"),
+            segment_id,
+            holders,
+            reason,
+            retry_count: 0,
+            merkle_root,
+        };
+        let holder_count = req.holders.len();
+        match sink.enqueue(req).await {
+            Ok(()) => {
+                tracing::info!(
+                    segment_id = %segment_id,
+                    holders = holder_count,
+                    reason = ?reason,
+                    "re-replication request accepted; worker will pull"
+                );
+                Ok(Response::new(RequestReReplicationResponse { accepted: true }))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    segment_id = %segment_id,
+                    error = %e,
+                    "re-replication request enqueue failed (queue full/closed); not accepted"
+                );
+                Ok(Response::new(RequestReReplicationResponse { accepted: false }))
+            }
+        }
     }
 }
 
@@ -1980,6 +2185,16 @@ mod tests {
         assert_eq!(recorded.len(), 1, "exactly one repair enqueued");
         assert_eq!(recorded[0].segment_id, held);
         assert_eq!(recorded[0].origin, origin);
+        assert_eq!(
+            recorded[0].holders,
+            vec![origin.clone(), self_id.clone()],
+            "the request carries the full holder set from the registry entry"
+        );
+        assert_eq!(
+            recorded[0].reason,
+            RepairReason::Announcement,
+            "g3 requests are announcement-driven"
+        );
     }
 
     #[tokio::test]
@@ -2192,5 +2407,184 @@ mod tests {
 
         let response = service.announce_loss(request).await.unwrap();
         assert_eq!(response.into_inner().accepted, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // g5 `request_re_replication` (ADR-0030 target-pull)
+    // -----------------------------------------------------------------------
+
+    /// The `RequestReReplication` handler enqueues the request into the
+    /// local worker queue and acks `accepted = true`.
+    #[tokio::test]
+    async fn request_re_replication_enqueues_into_local_worker_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore> = Arc::new(
+            oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let service = HealingGrpcService::new(
+            Arc::new(HintedHandoff::new()),
+            metadata_store,
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            )),
+            Arc::new(TestHealStore::new()),
+            Arc::new(HlcClock::new()),
+        );
+
+        let sink = RecordingRepairSink::default();
+        let service = service.with_replication_request_sink(Arc::new(sink.clone()));
+
+        let segment_id = SegmentId::new();
+        let holder_a = NodeId::new("node-a");
+        let holder_b = NodeId::new("node-b");
+        let proto_sid: oceanfs_core::proto::common::SegmentId = segment_id.into();
+        let root = oceanfs_core::HashOutput::from_bytes([0xAB; 32]);
+        let request = tonic::Request::new(RequestReReplicationRequest {
+            segment_id: Some(proto_sid),
+            holders: vec![holder_a.clone().into(), holder_b.clone().into()],
+            reason: crate::healing_rpc::RepairReason::Announcement as i32,
+            merkle_root: bytes::Bytes::copy_from_slice(root.as_bytes()),
+        });
+
+        let response = service.request_re_replication(request).await.unwrap();
+        assert!(response.into_inner().accepted, "the target must accept the request");
+        let recorded = sink.requests.lock();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].segment_id, segment_id);
+        assert_eq!(recorded[0].holders, vec![holder_a, holder_b]);
+        assert_eq!(recorded[0].reason, RepairReason::Announcement);
+        assert_eq!(recorded[0].merkle_root, Some(root), "the seal-time root rides the request");
+    }
+
+    /// Without a local worker queue wired, the handler acks nothing
+    /// (the dispatcher's retries / g4 failsafe cover it).
+    #[tokio::test]
+    async fn request_re_replication_no_queue_acks_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore> = Arc::new(
+            oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let service = HealingGrpcService::new(
+            Arc::new(HintedHandoff::new()),
+            metadata_store,
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            )),
+            Arc::new(TestHealStore::new()),
+            Arc::new(HlcClock::new()),
+        );
+
+        let segment_id = SegmentId::new();
+        let proto_sid: oceanfs_core::proto::common::SegmentId = segment_id.into();
+        let request = tonic::Request::new(RequestReReplicationRequest {
+            segment_id: Some(proto_sid),
+            holders: vec![NodeId::new("node-a").into()],
+            reason: crate::healing_rpc::RepairReason::Reconciliation as i32,
+            merkle_root: bytes::Bytes::new(),
+        });
+
+        let response = service.request_re_replication(request).await.unwrap();
+        assert!(!response.into_inner().accepted, "no queue → not accepted");
+    }
+
+    /// The healing `fetch_shard` full-segment mode (offset 0 + length 0)
+    /// streams the ENTIRE data section — the g5 re-replication fetch.
+    #[tokio::test]
+    async fn fetch_shard_full_segment_mode_returns_whole_data() {
+        let store = TestHealStore::new();
+        let segment_id = SegmentId::new();
+        let data: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+        store.write_segment_data(&segment_id, &data).unwrap();
+
+        let service = HealingGrpcService::new(
+            Arc::new(HintedHandoff::new()),
+            Arc::new(
+                oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                    data_dir: std::env::temp_dir()
+                        .join(format!("oceanfs-test-fetch-full-{}", std::process::id())),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            )),
+            Arc::new(store),
+            Arc::new(HlcClock::new()),
+        );
+
+        let proto_sid: oceanfs_core::proto::common::SegmentId = segment_id.into();
+        let request = tonic::Request::new(FetchShardRequest {
+            segment_id: Some(proto_sid),
+            shard_index: 0,
+            offset: 0,
+            length: 0, // full-segment mode
+        });
+
+        let response = service.fetch_shard(request).await.unwrap();
+        let mut stream = response.into_inner();
+        let mut received = bytes::BytesMut::new();
+        use tokio_stream::StreamExt;
+        while let Some(chunk_result) = stream.next().await {
+            if let Ok(chunk) = chunk_result {
+                received.extend_from_slice(&chunk.data);
+            }
+        }
+        assert_eq!(&received[..], &data[..], "full-segment fetch returns the whole data section");
+    }
+
+    /// The single-shard mode (length > 0) still returns the requested
+    /// byte range of the named shard (EC reconstruction unchanged).
+    #[tokio::test]
+    async fn fetch_shard_single_shard_mode_unchanged() {
+        let store = TestHealStore::new();
+        let segment_id = SegmentId::new();
+        let data: Vec<u8> = (0..60_000).map(|i| (i % 251) as u8).collect();
+        store.write_segment_data(&segment_id, &data).unwrap();
+
+        let service = HealingGrpcService::new(
+            Arc::new(HintedHandoff::new()),
+            Arc::new(
+                oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                    data_dir: std::env::temp_dir()
+                        .join(format!("oceanfs-test-fetch-shard-{}", std::process::id())),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            )),
+            Arc::new(store),
+            Arc::new(HlcClock::new()),
+        );
+
+        let proto_sid: oceanfs_core::proto::common::SegmentId = segment_id.into();
+        // shard_index 0, offset 100, length 500 → bytes [100, 600).
+        let request = tonic::Request::new(FetchShardRequest {
+            segment_id: Some(proto_sid),
+            shard_index: 0,
+            offset: 100,
+            length: 500,
+        });
+
+        let response = service.fetch_shard(request).await.unwrap();
+        let mut stream = response.into_inner();
+        let mut received = bytes::BytesMut::new();
+        use tokio_stream::StreamExt;
+        while let Some(chunk_result) = stream.next().await {
+            if let Ok(chunk) = chunk_result {
+                received.extend_from_slice(&chunk.data);
+            }
+        }
+        assert_eq!(&received[..], &data[100..600], "single-shard mode returns the requested range");
     }
 }

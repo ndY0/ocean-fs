@@ -38,14 +38,14 @@ use crate::{
 };
 
 /// Bounded-channel-backed [`RepairSink`](oceanfs_durability::healing_service::RepairSink)
-/// — the g3 loss-announcement handler's enqueue target. The ReRepWorker
-/// (g5) drains `Node::repair_rx`.
-struct RepairSinkChannel {
+/// — the g5 `request_re_replication` handler's enqueue target on the
+/// acquiring node. The target's `ReRepWorker` drains the queue.
+struct WorkerQueueSink {
     tx: tokio::sync::mpsc::Sender<RepairRequest>,
 }
 
 #[async_trait::async_trait]
-impl oceanfs_durability::healing_service::RepairSink for RepairSinkChannel {
+impl oceanfs_durability::healing_service::RepairSink for WorkerQueueSink {
     async fn enqueue(&self, request: RepairRequest) -> Result<(), String> {
         self.tx.try_send(request).map_err(|e| match e {
             tokio::sync::mpsc::error::TrySendError::Full(_) => "repair queue full".to_string(),
@@ -426,6 +426,17 @@ pub struct BackgroundTasks {
     pub(crate) reconciliation: Option<JoinHandle<()>>,
     /// Reconciliation loop cancellation token.
     pub(crate) reconciliation_cancel: CancellationToken,
+
+    /// Re-replication worker task (g5, ADR-0030 target-pull — the
+    /// acquiring-side executor). `None` before the worker is spawned.
+    pub(crate) rep_worker: Option<JoinHandle<()>>,
+    /// Re-replication worker cancellation token.
+    pub(crate) rep_worker_cancel: CancellationToken,
+    /// Re-replication dispatcher task (g5 — the holder-side router).
+    /// `None` before the dispatcher is spawned.
+    pub(crate) rep_dispatcher: Option<JoinHandle<()>>,
+    /// Re-replication dispatcher cancellation token.
+    pub(crate) rep_dispatcher_cancel: CancellationToken,
 }
 
 /// Resolves a RocksDB property string to a u64. Used by tests.
@@ -485,11 +496,18 @@ pub struct Node {
     /// shared by the append handler (late metadata) and the healing
     /// service's remap handler. Held for tests/observability.
     pub(crate) remap_alias: Arc<oceanfs_core::SegmentRemapAlias>,
-    /// The re-replication repair queue receiver (g3 → g5). The
-    /// loss-announcement handler fills it; the ReRepWorker (g5) drains
-    /// it. Held here (not wired to a worker yet) so g5 can take it and
-    /// tests can observe its depth.
-    pub(crate) repair_rx: parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<RepairRequest>>>,
+    /// The re-replication dispatcher (g5, ADR-0030 target-pull) — the
+    /// `RepairSink` g3/g4 enqueue into. It selects an acquiring target
+    /// and sends the `RequestReReplication` RPC; requests with no
+    /// eligible target are parked (the honest cannot-reach-RF state).
+    /// Held for tests/observability (`pending_repairs`).
+    pub(crate) repair_dispatcher: Arc<crate::repair::RepairDispatcher>,
+    /// The re-replication worker (g5) — the ACQUIRING-side executor.
+    /// Held so the node can spawn it and tests can observe it.
+    pub(crate) rep_worker: Arc<oceanfs_durability::ReRepWorker>,
+    /// The lifecycle coordinator — the node's segment lifecycle
+    /// machine. Held for g5 observability (`segment_locations`).
+    pub(crate) lifecycle: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
     /// The periodic reconciliation loop (g4 `reconciliation` — the
     /// ADR-0029 §D4 pull safety net). Held so tests can observe its
     /// pending-queue depth and holder index.
@@ -916,13 +934,41 @@ impl Node {
         // observability). Shared by the loss-announcer and the compactor
         // remap closures; registered with the central metrics registry.
         let announce_metrics = Arc::new(crate::announce::AnnounceMetrics::new());
-        // The re-replication repair sink (g3 → g5): a bounded channel the
-        // loss-announcement handler fills and the ReRepWorker (g5) drains.
-        // A bounded queue is mandatory (perf 2.6 — the healing service
-        // must never block on enqueue).
-        let (repair_tx, repair_rx) =
-            tokio::sync::mpsc::channel::<oceanfs_durability::healing_service::ReRepRequest>(1024);
-        let repair_sink = Arc::new(RepairSinkChannel { tx: repair_tx });
+        // ---- Re-replication (g5, ADR-0030 target-pull) ----
+        // The HOLDER side dispatches (selects a target + sends the
+        // RequestReReplication RPC); the ACQUIRING node's ReRepWorker
+        // pulls + writes + stamps. The `RepairSink` that g3's
+        // announce_loss and g4's reconciliation enqueue into is the
+        // dispatcher; the target-side worker queue is fed by the
+        // healing service's `request_re_replication` handler.
+        let repair_selector: Arc<dyn oceanfs_durability::RepairTargetSelector> =
+            Arc::new(crate::repair::ManifestRepairTargetSelector::new(
+                membership.clone(),
+                NodeId::new(&config.node_id),
+            ));
+        let repair_dispatcher = Arc::new(crate::repair::RepairDispatcher::new(
+            repair_selector,
+            pool.clone(),
+            membership.clone(),
+            lifecycle.clone(),
+            NodeId::new(&config.node_id),
+        ));
+        // The acquiring-side worker (bound to THIS node's pool-aware
+        // store + lifecycle; the migration pool/membership are injected
+        // plane-agnostically, ADR-0030 Decision 4).
+        let rep_worker = Arc::new(oceanfs_durability::ReRepWorker::new(
+            oceanfs_durability::ReRepConfig::default(),
+            Arc::new(oceanfs_durability::DiskSegmentStore::new(
+                data_pools.clone(),
+                segment_legacy_dir.clone(),
+                pool_id_for.clone(),
+            )),
+            lifecycle.clone(),
+            pool.clone(),
+            membership.clone(),
+            Arc::new(config.operation_timeouts),
+        ));
+        let repair_sink = repair_dispatcher.clone();
         // The periodic reconciliation loop (g4 `reconciliation` — the
         // ADR-0029 §D4 pull safety net): event-driven wake (a node died /
         // its pools died → exactly the affected segments via the holder
@@ -1677,6 +1723,8 @@ impl Node {
         announce_metrics.register_metrics(&*metrics);
         // g4 reconciliation (ADR-0029 §D4 observability).
         reconciliation.register_metrics(&*metrics);
+        // g5 re-replication (ADR-0030 observability).
+        repair_dispatcher.register_metrics(&*metrics);
         // The manager is the component that actually stores and delivers
         // hints; its counters are the authoritative
         // hinted_handoff_hints_{stored,delivered,expired}_total series.
@@ -1898,7 +1946,7 @@ impl Node {
             config.gossip.failure_timeout_ms / 3,
         );
 
-        let healing_service = oceanfs_durability::healing_service::HealingGrpcService::new(
+        let mut healing_service = oceanfs_durability::healing_service::HealingGrpcService::new(
             hinted_handoff.clone(),
             metadata_store.clone(),
             Arc::clone(&lifecycle_registry),
@@ -1939,8 +1987,21 @@ impl Node {
             pool_id_for.clone(),
         )))
         // g3 `loss-announcement` (data-pool death): verified held
-        // segments enqueue re-replication repairs (g5 drains the queue).
+        // segments enqueue re-replication repairs — the repair sink is
+        // the HOLDER-side dispatcher (ADR-0030 target-pull).
         .with_repair_sink(repair_sink);
+        // g5 `request_re_replication` (ADR-0030): the acquiring node's
+        // healing service routes incoming re-replication requests into
+        // the LOCAL ReRepWorker queue (the worker pulls + writes +
+        // stamps). The worker queue sender is guaranteed present before
+        // `run` is spawned (the worker is constructed above).
+        let rep_worker_queue = rep_worker
+            .sender()
+            .ok_or_else(|| std::io::Error::other("re-replication worker queue unavailable"))?;
+        healing_service =
+            healing_service.with_replication_request_sink(Arc::new(crate::node::WorkerQueueSink {
+                tx: rep_worker_queue,
+            }));
         healing_service.register_metrics(&*metrics_for_late_registration);
         let cache_service = oceanfs_server::grpc::cache_service::CacheGrpcService::new(
             Some(object_cache.clone()),
@@ -2353,6 +2414,31 @@ impl Node {
         background.reconciliation = Some(reconciliation_handle);
         background.reconciliation_cancel = reconciliation_cancel;
 
+        // ---- 16e. Spawn the re-replication worker + dispatcher (g5) ----
+        // (ADR-0030 target-pull). The worker drains the acquiring-side
+        // queue (fed by the request_re_replication RPC handler) and
+        // pulls + writes + stamps; the dispatcher retries parked
+        // requests that had no eligible target.
+        let rep_worker_cancel = CancellationToken::new();
+        let rep_worker_token = rep_worker_cancel.clone();
+        let rep_worker_for_spawn = Arc::clone(&rep_worker);
+        let rep_worker_handle = tokio::spawn(async move {
+            rep_worker_for_spawn.run(rep_worker_token).await;
+            info!("Re-replication worker stopped");
+        });
+        background.rep_worker = Some(rep_worker_handle);
+        background.rep_worker_cancel = rep_worker_cancel;
+
+        let rep_dispatcher_cancel = CancellationToken::new();
+        let rep_dispatcher_token = rep_dispatcher_cancel.clone();
+        let rep_dispatcher_for_spawn = Arc::clone(&repair_dispatcher);
+        let rep_dispatcher_handle = tokio::spawn(async move {
+            rep_dispatcher_for_spawn.run(rep_dispatcher_token).await;
+            info!("Re-replication dispatcher stopped");
+        });
+        background.rep_dispatcher = Some(rep_dispatcher_handle);
+        background.rep_dispatcher_cancel = rep_dispatcher_cancel;
+
         // ---- 17. Spawn hinted handoff delivery watcher ----
         // Watches for membership events and drains the handoff buffer
         // for nodes that are (or return to) ALIVE. Any Alive event —
@@ -2535,7 +2621,9 @@ impl Node {
             node_unavailable,
             segment_replicator,
             remap_alias,
-            repair_rx: parking_lot::Mutex::new(Some(repair_rx)),
+            repair_dispatcher,
+            rep_worker,
+            lifecycle,
             reconciliation,
         })
     }
@@ -2701,28 +2789,74 @@ impl Node {
         self.reconciliation.clone()
     }
 
-    /// Drains one re-replication repair request from the g3 →
-    /// g5 repair queue (the loss-announcement handler's enqueue target).
-    /// Returns `None` when the queue is empty or already handed to the
-    /// ReRepWorker (g5 takes the receiver once).
+    /// Removes one parked re-replication repair from the dispatcher's
+    /// awaiting-target set (g5 observability / tests). Returns `None`
+    /// when nothing is parked.
     pub fn try_recv_repair(&self) -> Option<RepairRequest> {
-        let mut guard = self.repair_rx.lock();
-        let rx = guard.as_mut()?;
-        match rx.try_recv() {
-            Ok(req) => Some(req),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                *guard = None;
-                None
-            }
-        }
+        self.repair_dispatcher.parked_remove_one()
     }
 
     /// Returns the number of pending re-replication repair requests
-    /// (g3 loss-announcement observability / tests).
+    /// (g3/g4 observability — the dispatcher's awaiting-target set).
     pub fn pending_repairs(&self) -> usize {
-        let guard = self.repair_rx.lock();
-        guard.as_ref().map_or(0, |rx| rx.len())
+        self.repair_dispatcher.pending_len()
+    }
+
+    /// Returns the re-replication worker (g5, ADR-0030) — the
+    /// acquiring-side executor (held for tests/observability).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn example() {
+    /// use oceanfs_core::NodeConfig;
+    /// use oceanfs_node::Node;
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let config = NodeConfig {
+    /// #     data_dir: tmp.path().join("data"),
+    /// #     listen_addr: "127.0.0.1:0".into(),
+    /// #     grpc_listen_addr: "127.0.0.1:0".into(),
+    /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     ..NodeConfig::default()
+    /// # };
+    /// let node = Node::start(config).await.expect("node");
+    /// let worker = node.rep_worker();
+    /// node.shutdown().await.expect("shutdown");
+    /// # }
+    /// ```
+    pub fn rep_worker(&self) -> Arc<oceanfs_durability::ReRepWorker> {
+        self.rep_worker.clone()
+    }
+
+    /// Returns the `storage_locations` holder set for a segment on THIS
+    /// node (g5 observability / tests — the re-replication convergence
+    /// check: the acquiring node's registry entry must list itself).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn example() {
+    /// use oceanfs_core::{NodeConfig, SegmentId};
+    /// use oceanfs_node::Node;
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let config = NodeConfig {
+    /// #     data_dir: tmp.path().join("data"),
+    /// #     listen_addr: "127.0.0.1:0".into(),
+    /// #     grpc_listen_addr: "127.0.0.1:0".into(),
+    /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     ..NodeConfig::default()
+    /// # };
+    /// let node = Node::start(config).await.expect("node");
+    /// // A segment this node does not hold → empty.
+    /// assert!(node.segment_locations(&SegmentId::new()).is_none());
+    /// node.shutdown().await.expect("shutdown");
+    /// # }
+    /// ```
+    pub fn segment_locations(&self, segment_id: &SegmentId) -> Option<Vec<NodeId>> {
+        self.lifecycle
+            .registry()
+            .get(*segment_id)
+            .map(|entry| entry.metadata.storage_locations.to_vec())
     }
 
     /// Returns this node's current `NodeManifest` (ADR-0029 D2), as
@@ -2832,6 +2966,10 @@ impl Node {
         self.background.health_check_cancel.cancel();
         self.background.health_cancel.cancel();
         self.background.segment_replicator_cancel.cancel();
+        // g5 re-replication (ADR-0030): stop the acquiring-side worker
+        // and the holder-side dispatcher sweep.
+        self.background.rep_worker_cancel.cancel();
+        self.background.rep_dispatcher_cancel.cancel();
 
         // ---- 5. Wait for background tasks with a timeout ----
         let _ = tokio::time::timeout(Duration::from_secs(10), async {
@@ -2849,6 +2987,20 @@ impl Node {
                 // receiver is dropped by the node drop anyway).
                 async {
                     match self.background.segment_replicator {
+                        Some(h) => h.await.map_err(|e| format!("{e}")),
+                        None => Ok(()),
+                    }
+                },
+                // g5: the worker drains its bounded queue; the dispatcher
+                // stops its sweep. Both bound the wait via the timeout.
+                async {
+                    match self.background.rep_worker {
+                        Some(h) => h.await.map_err(|e| format!("{e}")),
+                        None => Ok(()),
+                    }
+                },
+                async {
+                    match self.background.rep_dispatcher {
                         Some(h) => h.await.map_err(|e| format!("{e}")),
                         None => Ok(()),
                     }
@@ -3214,6 +3366,10 @@ impl Node {
             segment_replicator_cancel: CancellationToken::new(),
             reconciliation: None,
             reconciliation_cancel: CancellationToken::new(),
+            rep_worker: None,
+            rep_worker_cancel: CancellationToken::new(),
+            rep_dispatcher: None,
+            rep_dispatcher_cancel: CancellationToken::new(),
         }
     }
 }
