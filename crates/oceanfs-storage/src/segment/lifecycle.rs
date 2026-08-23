@@ -1187,7 +1187,26 @@ pub struct SegmentLifecycleCoordinator {
     /// Registry memory estimate gauge
     /// (`oceanfs_lifecycle_registry_bytes_estimate`).
     bytes_gauge: Gauge,
+    /// Optional storage-locations notifier (g4 `reconciliation`).
+    ///
+    /// Fired with `(segment_id, locations)` after
+    /// [`set_storage_locations`](Self::set_storage_locations) commits —
+    /// the SINGLE choke point where a segment's holder set is written
+    /// (the replicator's stamp after full ack, the push receiver's
+    /// registration). The reconciliation loop consumes this to maintain
+    /// its reverse HolderIndex incrementally (O(RF) per stamp, never a
+    /// full scan). `None` (default) keeps the un-wired path identical.
+    ///
+    /// Interior-mutable (a `RwLock<Option<...>>`) so the composition
+    /// root can wire it AFTER the coordinator is constructed (the
+    /// reconciliation loop — which owns the notifier target — is built
+    /// later in node startup).
+    storage_locations_notifier: parking_lot::RwLock<Option<StorageLocationsNotifier>>,
 }
+
+/// The storage-locations notifier signature (g4 `reconciliation`):
+/// `(segment_id, locations)` after every holder-set commit.
+pub type StorageLocationsNotifier = Arc<dyn Fn(SegmentId, &[oceanfs_core::NodeId]) + Send + Sync>;
 
 impl SegmentLifecycleCoordinator {
     /// Creates a new lifecycle coordinator with a fresh registry.
@@ -1241,6 +1260,7 @@ impl SegmentLifecycleCoordinator {
             pending_seals: parking_lot::Mutex::new(Vec::new()),
             entries_gauge,
             bytes_gauge,
+            storage_locations_notifier: parking_lot::RwLock::new(None),
         };
         coordinator.update_gauges();
         coordinator
@@ -1273,6 +1293,37 @@ impl SegmentLifecycleCoordinator {
         self.checkpoint = Some(checkpoint);
         self.checkpoint_config = Some(config);
         self
+    }
+
+    /// Wires the storage-locations notifier (composition root; g4
+    /// `reconciliation`). Fired with `(segment_id, locations)` after
+    /// every [`set_storage_locations`](Self::set_storage_locations)
+    /// commit — the reconciliation loop's HolderIndex update source.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use oceanfs_core::{LifecycleConfig, NodeId, SegmentId};
+    /// use oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator;
+    ///
+    /// let coordinator = SegmentLifecycleCoordinator::new(&LifecycleConfig::default())
+    ///     .with_storage_locations_notifier(Arc::new(|_id: SegmentId, _locs: &[NodeId]| {
+    ///         // Maintain the reconciliation holder index.
+    ///     }));
+    /// // Builder-returned; `coordinator` is ready.
+    /// ```
+    #[must_use]
+    pub fn with_storage_locations_notifier(self, notifier: StorageLocationsNotifier) -> Self {
+        self.set_storage_locations_notifier(notifier);
+        self
+    }
+
+    /// Late-binds the storage-locations notifier after construction
+    /// (composition root — the reconciliation loop is built after the
+    /// coordinator in node startup).
+    pub fn set_storage_locations_notifier(&self, notifier: StorageLocationsNotifier) {
+        *self.storage_locations_notifier.write() = Some(notifier);
     }
 
     /// The threshold-only checkpoint trigger (ADR-0024 Decision 3):
@@ -2100,12 +2151,25 @@ impl SegmentLifecycleCoordinator {
         let mut guard = shard.write();
         let now = Instant::now();
         SegmentLifecycleRegistry::evict_expired_locked(&mut guard, now);
-        match guard.get_mut(&id) {
+        let committed = match guard.get_mut(&id) {
             Some(entry) if entry.state == SegmentState::Sealed => {
-                entry.metadata.storage_locations = locations;
-                Ok(())
+                entry.metadata.storage_locations = locations.clone();
+                true
             }
-            Some(_) | None => Err(TransitionError::Missing),
+            Some(_) | None => false,
+        };
+        drop(guard);
+        if committed {
+            // Fire AFTER the commit AND after the shard write lock is
+            // dropped (the notifier takes the HolderIndex's own lock —
+            // never hold the shard lock across notifier work; lock order
+            // is always shard → index, never index → shard).
+            if let Some(notifier) = self.storage_locations_notifier.read().as_ref() {
+                notifier(id, &locations);
+            }
+            Ok(())
+        } else {
+            Err(TransitionError::Missing)
         }
     }
 

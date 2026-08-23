@@ -739,11 +739,12 @@ async fn fetch_single_chunk_raw(
         }
     }
 
-    // Neither local reader nor gRPC succeeded.
-    Err(Error::Internal(format!(
-        "cannot fetch chunk {} — no segment reader and gRPC not available",
-        chunk.segment_id
-    )))
+    // Neither local reader nor gRPC succeeded. This is the g4 Job B
+    // trigger: the segment exists on no live holder — the object's
+    // metadata references a compacted-away segment the remap missed
+    // (GAP-1 failsafe). The read coordinator catches this variant and
+    // attempts a one-shot dangling-metadata repair before surfacing it.
+    Err(Error::SegmentUnavailable(chunk.segment_id))
 }
 
 /// Fetches a single parity shard from a remote replica via gRPC

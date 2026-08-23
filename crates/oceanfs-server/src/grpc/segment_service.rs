@@ -858,12 +858,28 @@ impl SegmentRpc for SegmentGrpcService {
             };
             match lifecycle.request_reserve(segment_id, tier, ec_k, ec_m).await {
                 Ok(()) => {
-                    if let Err(e) = lifecycle.request_seal(segment_id, meta, None).await {
+                    if let Err(e) = lifecycle.request_seal(segment_id, meta.clone(), None).await {
                         tracing::warn!(
                             segment_id = %segment_id,
                             error = ?e,
                             "push_sealed_segment: failed to seal replica segment"
                         );
+                    } else {
+                        // The seal carried the pushed holder set in the
+                        // metadata, but the g4 holder-index notifier only
+                        // fires on `set_storage_locations` — call it
+                        // explicitly so the reconciliation loop observes
+                        // the pushed locations (the fresh-registration
+                        // path).
+                        if let Err(stamp_err) = lifecycle
+                            .set_storage_locations(segment_id, meta.storage_locations.clone())
+                        {
+                            tracing::warn!(
+                                segment_id = %segment_id,
+                                stamp_error = ?stamp_err,
+                                "push_sealed_segment: fresh seal; storage_locations stamp failed"
+                            );
+                        }
                     }
                 }
                 Err(e) => {

@@ -147,6 +147,13 @@ pub struct NodeConfig {
     /// Garbage collection interval in seconds (default 3600).
     #[serde(default = "default_gc_interval")]
     pub gc_interval_sec: u64,
+    /// Whether the g3 loss-announcement push is enabled (default true).
+    ///
+    /// The g4 reconciliation loop is the MANDATORY safety net that runs
+    /// regardless; disabling announcements (tests) proves reconciliation
+    /// restores RF independently of any push (ADR-0029 §D4).
+    #[serde(default = "default_true")]
+    pub announcements_enabled: bool,
     /// Tombstone TTL in seconds before deleted objects are
     /// permanently reclaimed (default 259200 = 3 days).
     #[serde(default = "default_tombstone_ttl")]
@@ -632,6 +639,7 @@ impl Default for NodeConfig {
             max_body_size: 2 * 1024 * 1024,
             gc_interval_sec: 3600,
             tombstone_ttl_sec: 259200,
+            announcements_enabled: true,
             ae_interval_sec: 300,
             scrub_interval_sec: 604800,
             orphan_reaper_interval_sec: 3600,

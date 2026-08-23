@@ -90,7 +90,7 @@ re-replication runs; see the feature's correction note).
 | g2 | `failure-state-machine` — status transitions, role consequences, write rejection | storage, node, server | g1 |
 | — | `sealed-segment-replication` — data-replication backbone: seal-time push, storage_locations, needs set (corrective; discovered mid-epic) | node, server, storage, durability, routing | g2 |
 | g3 | `loss-announcement` — segment-set announcement + compaction remap, targeted fan-out | node, durability, core | g2, sealed-segment-replication |
-| g4 | `reconciliation` — 5s repair loop, risk-prioritized queue, metadata-repair primitive (GAP-1 failsafe) | node, durability | g2, sealed-segment-replication |
+| g4 | `reconciliation` — event-driven pull safety net + read-driven dangling-metadata repair (GAP-1 failsafe) | node, durability, server, storage | g2, sealed-segment-replication |
 | g5 | `re-replication-worker` — repair execution, capacity-aware targets | durability, node | g4 |
 | g6 | `routing-manifests` — read/write path filters, hint target preference | node, server | g2, f7 (Phase A) |
 | g7 | `wal-loss-recovery` — fresh WAL, registry rebuild, catch-up from replicas | durability, node, storage | g3, g5 |

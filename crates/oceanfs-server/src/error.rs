@@ -102,6 +102,15 @@ pub enum Error {
     #[error("internal server error: {0}")]
     Internal(String),
 
+    /// The chunk's segment is unreachable on every holder (g4 Job B,
+    /// read-driven dangling-metadata repair trigger). Raised by the
+    /// fetch path when neither the local reader nor ANY gRPC replica can
+    /// serve the segment — the object's metadata references a segment
+    /// that exists on no live holder (a compaction remap the push missed,
+    /// GAP-1 failsafe).
+    #[error("segment {0} is unavailable on every holder")]
+    SegmentUnavailable(oceanfs_core::SegmentId),
+
     /// Invalid request (malformed XML, bad parameters).
     #[error("invalid request: {0}")]
     InvalidRequest(String),
@@ -138,7 +147,7 @@ impl Error {
             | Self::Routing(_)
             | Self::ForwardFailed { .. }
             | Self::AllForwardingFailed { .. } => "ServiceUnavailable",
-            Self::Storage(_) | Self::Internal(_) => "InternalError",
+            Self::Storage(_) | Self::Internal(_) | Self::SegmentUnavailable(_) => "InternalError",
             Self::Metadata(ref e) => match e {
                 crate::metadata_ops::MetadataError::NotFound(_) => "NoSuchKey",
                 _ => "InternalError",
@@ -172,6 +181,7 @@ impl Error {
             | Self::ForwardFailed { .. }
             | Self::AllForwardingFailed { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Storage(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::SegmentUnavailable(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Metadata(ref e) => match e {
                 crate::metadata_ops::MetadataError::NotFound(_) => StatusCode::NOT_FOUND,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,

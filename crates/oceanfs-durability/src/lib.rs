@@ -33,6 +33,7 @@ pub mod gc;
 pub mod heal;
 pub mod hinted_handoff;
 pub mod merkle;
+pub mod reconcile;
 pub mod scrub;
 mod segment_store_impl;
 
@@ -57,6 +58,9 @@ pub use hinted_handoff::{
     GrpcHintDeliveryClient, GrpcHintObjectFetcher, HintDeliveryClient, HintObjectFetcher,
     HintObjectReader, HintRecord, HintWal, HintedHandoff, HintedHandoffConfig,
     HintedHandoffManager,
+};
+pub use reconcile::{
+    live_copy_count, HolderIndex, NoopRepairSink, ReconcileConfig, ReconciliationLoop,
 };
 pub use scrub::{ScrubConfig, ScrubCoordinator, ScrubReport, ScrubReportBuilder};
 pub use segment_store_impl::DiskSegmentStore;

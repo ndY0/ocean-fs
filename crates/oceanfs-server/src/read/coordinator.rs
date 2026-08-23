@@ -41,6 +41,62 @@ use crate::{
     read::assembly::MultiChunkAssembler,
 };
 
+/// Returns `true` when `e` is the dangling-segment error raised by the
+/// fetch path (g4 Job B trigger): the chunk's segment is unreachable on
+/// every holder — the object's metadata references a compacted-away
+/// segment a remap missed (GAP-1 failsafe).
+fn is_dangling_segment_error(e: &Error) -> bool {
+    matches!(e, Error::SegmentUnavailable(_))
+}
+
+/// Builds an [`ObjectMetadata`] from a `GetObjectMetadataResponse`,
+/// preserving the object's key from the caller's local metadata.
+fn object_metadata_from_response(
+    resp: &GetObjectMetadataResponse,
+    key: &ObjectKey,
+    baseline: &ObjectMetadata,
+) -> ObjectMetadata {
+    let hlc = resp.hlc.map_or(Hlc::zero(), |p| Hlc::new(p.wall_time, p.logical));
+    let mut chunks = smallvec::SmallVec::new();
+    let count =
+        resp.chunk_segment_ids.len().min(resp.chunk_offsets.len()).min(resp.chunk_lengths.len());
+    for i in 0..count {
+        let seg_id = SegmentId::try_from(resp.chunk_segment_ids[i].clone())
+            .unwrap_or_else(|_| SegmentId::default());
+        chunks.push(oceanfs_core::ChunkRef {
+            segment_id: seg_id,
+            offset: resp.chunk_offsets[i],
+            length: resp.chunk_lengths[i],
+            compressed: resp.chunk_compressed.get(i).copied().unwrap_or(false),
+            logical_length: resp
+                .chunk_logical_lengths
+                .get(i)
+                .copied()
+                .unwrap_or(resp.chunk_lengths[i]),
+        });
+    }
+    let blake3_hash = if resp.blake3_hash.len() == 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&resp.blake3_hash);
+        Some(HashOutput::from_bytes(arr))
+    } else {
+        None
+    };
+    let inline_data =
+        if resp.inline_data.is_empty() { None } else { Some(resp.inline_data.clone()) };
+    ObjectMetadata {
+        object_key: key.clone(),
+        size: resp.size,
+        blake3_hash,
+        chunks,
+        inline_data,
+        // Preserve the local created_at (the remote response does not
+        // carry it); the HLC is the remote's current version.
+        created_at: baseline.created_at,
+        hlc,
+    }
+}
+
 /// A request to read an object.
 #[derive(Debug, Clone)]
 pub struct ReadRequest {
@@ -513,18 +569,91 @@ impl ReadCoordinator {
                 .map(|p| p.effective_fetch_strategy(self.default_fetch_strategy))
                 .unwrap_or(self.default_fetch_strategy);
 
-            let (data, source) =
-                self.assemble_chunks(&obj_meta, strategy, req.policy.as_deref()).await?;
-            // Build result with source metadata.
-            let computed_hash = blake3::hash(&data);
-            let hash = HashOutput::from_bytes(*computed_hash.as_bytes());
-            return Ok(GetResult {
-                data,
-                metadata: obj_meta,
-                cache_hit: CacheHitLevel::Miss,
-                hash,
-                segment_source: source,
-            });
+            match self.assemble_chunks(&obj_meta, strategy, req.policy.as_deref()).await {
+                Ok((data, source)) => {
+                    let computed_hash = blake3::hash(&data);
+                    let hash = HashOutput::from_bytes(*computed_hash.as_bytes());
+                    return Ok(GetResult {
+                        data,
+                        metadata: obj_meta,
+                        cache_hit: CacheHitLevel::Miss,
+                        hash,
+                        segment_source: source,
+                    });
+                }
+                Err(e) if is_dangling_segment_error(&e) && !skip_remote => {
+                    // Job B (g4 `reconciliation`, read-driven metadata
+                    // repair): the object's metadata references a segment
+                    // that exists on no live holder (a compaction remap
+                    // the push missed — GAP-1 failsafe). Re-point the
+                    // object's metadata from the owner (the object's ring
+                    // replicas hold its CURRENT metadata), write the
+                    // corrected rows locally, and retry the read ONCE.
+                    // If the owner is unreachable / the repair cannot find
+                    // a live chunk set, fall through to the original error
+                    // (the deferred corner → g8 metadata-loss rebuild).
+                    match self.repair_dangling_metadata(&req.bucket, &req.key, &obj_meta).await {
+                        Ok(Some(repaired_meta)) => {
+                            let strategy = req
+                                .policy
+                                .as_ref()
+                                .map(|p| p.effective_fetch_strategy(self.default_fetch_strategy))
+                                .unwrap_or(self.default_fetch_strategy);
+                            match self
+                                .assemble_chunks(&repaired_meta, strategy, req.policy.as_deref())
+                                .await
+                            {
+                                Ok((data, source)) => {
+                                    info!(
+                                        bucket = %req.bucket,
+                                        key = %req.key,
+                                        "read-driven dangling metadata repair: object re-pointed \
+                                         and read succeeded"
+                                    );
+                                    let computed_hash = blake3::hash(&data);
+                                    let hash = HashOutput::from_bytes(*computed_hash.as_bytes());
+                                    return Ok(GetResult {
+                                        data,
+                                        metadata: repaired_meta,
+                                        cache_hit: CacheHitLevel::Miss,
+                                        hash,
+                                        segment_source: source,
+                                    });
+                                }
+                                Err(retry_err) => {
+                                    warn!(
+                                        bucket = %req.bucket,
+                                        key = %req.key,
+                                        error = %retry_err,
+                                        "read-driven dangling repair: re-pointed read still failed; \
+                                         returning the original error"
+                                    );
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            warn!(
+                                bucket = %req.bucket,
+                                key = %req.key,
+                                "read-driven dangling repair: no live chunk set found on replicas; \
+                                 returning the original error (g8 metadata-loss rebuild)"
+                            );
+                            return Err(e);
+                        }
+                        Err(repair_err) => {
+                            warn!(
+                                bucket = %req.bucket,
+                                key = %req.key,
+                                error = %repair_err,
+                                "read-driven dangling repair failed; returning the original error"
+                            );
+                            return Err(e);
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         } else if self.metadata.is_some() {
             // Has a metadata store but no data: genuinely not found.
             return Err(Error::NotFound(format!("{}/{}", req.bucket, req.key)));
@@ -543,6 +672,128 @@ impl ReadCoordinator {
             hash,
             segment_source: None,
         })
+    }
+
+    /// Read-driven dangling-metadata repair (g4 `reconciliation`, Job B —
+    /// the GAP-1 failsafe).
+    ///
+    /// Called when [`assemble_chunks`](Self::assemble_chunks) failed with
+    /// [`Error::SegmentUnavailable`]: the object's metadata references a
+    /// segment that exists on no live holder (a compaction remap the g3
+    /// push missed — a late append racing both the remap and the
+    /// receiver's re-point scan, or a remap lost to a partition). This is
+    /// the pull failsafe: fetch the object's CURRENT metadata from its
+    /// ring replicas (they hold the object's metadata by construction),
+    /// and if a replica reports chunk references to a LIVE segment, write
+    /// the corrected rows locally and return the repaired metadata.
+    ///
+    /// Returns `Ok(Some(repaired))` on success, `Ok(None)` when no
+    /// replica reports a usable chunk set (the owner is unreachable or
+    /// the object is genuinely gone — the deferred corner → g8
+    /// metadata-loss rebuild), and `Err` on transport/metadata failure.
+    async fn repair_dangling_metadata(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+        local_meta: &ObjectMetadata,
+    ) -> Result<Option<ObjectMetadata>> {
+        let (Some(pool), Some(membership), Some(store)) =
+            (&self.pool, &self.membership, &self.metadata)
+        else {
+            return Ok(None);
+        };
+
+        let hash_key = oceanfs_routing::hash_key(key.as_str().as_bytes());
+        let replica_set = self.ring.lookup(&hash_key);
+        let node_id = self.node_id.clone();
+        let timeout = Duration::from_millis(self.timeouts.metadata_read_ms);
+
+        let mut fetches = FuturesUnordered::new();
+        for target in &replica_set {
+            if *target == node_id {
+                continue;
+            }
+            let target = target.clone();
+            let addr = match membership.address_of(&target) {
+                Some(a) => a,
+                None => continue,
+            };
+            let pooled = match pool.get_channel(addr).await {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let channel = pooled.channel().clone();
+            drop(pooled);
+            let bucket_str = bucket.as_str().to_string();
+            let key_str = key.as_str().to_string();
+            fetches.push(async move {
+                let mut client = SegmentRpcClient::new(channel);
+                let request = tonic::Request::new(GetObjectMetadataRequest {
+                    bucket_id: bucket_str,
+                    object_key: key_str,
+                });
+                let result =
+                    tokio::time::timeout(timeout, client.get_object_metadata(request)).await;
+                match result {
+                    Ok(Ok(resp)) => (target, Ok(resp.into_inner())),
+                    Ok(Err(e)) => (target, Err(e)),
+                    Err(_elapsed) => (
+                        target,
+                        Err(tonic::Status::deadline_exceeded(
+                            "metadata fetch timeout during dangling repair",
+                        )),
+                    ),
+                }
+            });
+        }
+
+        // The local metadata is the fallback baseline; a remote chunk set
+        // is accepted only when it differs from the dangling local one AND
+        // references a segment this node can serve (a real re-point).
+        let mut best: Option<ObjectMetadata> = None;
+        while let Some((_target, result)) = fetches.next().await {
+            let Ok(resp) = result else { continue };
+            if !resp.found || resp.chunk_segment_ids.is_empty() {
+                continue;
+            }
+            let repaired = object_metadata_from_response(&resp, key, local_meta);
+            // The repaired metadata must reference at least one segment
+            // DIFFERENT from the dangling one, and it must be readable
+            // locally — otherwise the re-point would not help.
+            if repaired.chunks.is_empty() {
+                continue;
+            }
+            if repaired
+                .chunks
+                .iter()
+                .all(|c| local_meta.chunks.iter().any(|lc| lc.segment_id == c.segment_id))
+            {
+                // Same segment set as local — the replica is equally
+                // stale; not a usable re-point.
+                continue;
+            }
+            // Accept the first replica with a DIFFERENT chunk set. The
+            // follow-up `assemble_chunks` retry is the real validator: if
+            // these chunks still reference an unreachable segment, the
+            // retry fails and the original error is returned.
+            best = Some(repaired);
+            break;
+        }
+
+        let Some(repaired) = best else { return Ok(None) };
+
+        // Persist the re-pointed metadata locally (the async adapter runs
+        // the blocking RocksDB write off the runtime worker).
+        store
+            .put_object(bucket, repaired.clone())
+            .await
+            .map_err(|e| Error::Internal(format!("dangling repair metadata write: {e}")))?;
+        info!(
+            bucket = %bucket,
+            key = %key,
+            "dangling metadata repaired: object re-pointed from owner"
+        );
+        Ok(Some(repaired))
     }
 
     /// Synchronously compares local HLC against remote replicas (§4.6).
@@ -1540,6 +1791,53 @@ mod tests {
             segments.put(*id, Bytes::copy_from_slice(data));
         }
         make_coordinator().with_segment_reader(segments)
+    }
+
+    /// Job B (g4): the dangling-segment error detector matches exactly
+    /// the `SegmentUnavailable` variant — the fetch path's total-failure
+    /// signal.
+    #[test]
+    fn dangling_segment_error_detector() {
+        let seg = SegmentId::new();
+        assert!(is_dangling_segment_error(&Error::SegmentUnavailable(seg)));
+        assert!(!is_dangling_segment_error(&Error::Internal("boom".into())));
+        assert!(!is_dangling_segment_error(&Error::NotFound("x".into())));
+        assert!(!is_dangling_segment_error(&Error::Routing("r".into())));
+    }
+
+    /// Job B (g4): converting a `GetObjectMetadataResponse` preserves the
+    /// remote's chunk refs + HLC and keeps the local key + created_at.
+    #[test]
+    fn object_metadata_from_response_preserves_chunks_and_hlc() {
+        let seg = SegmentId::new();
+        let resp = GetObjectMetadataResponse {
+            found: true,
+            size: 100,
+            blake3_hash: Bytes::from_static(&[0xAB; 32]),
+            hlc: Some(oceanfs_core::proto::common::HlcTimestamp { wall_time: 555, logical: 2 }),
+            inline_data: Bytes::new(),
+            chunk_segment_ids: vec![seg.into()],
+            chunk_offsets: vec![0],
+            chunk_lengths: vec![100],
+            chunk_logical_lengths: vec![100],
+            chunk_compressed: vec![false],
+        };
+        let key = ObjectKey::new("k");
+        let baseline = ObjectMetadata {
+            object_key: key.clone(),
+            size: 50,
+            blake3_hash: None,
+            chunks: smallvec::SmallVec::new(),
+            inline_data: None,
+            created_at: 12345,
+            hlc: Hlc::zero(),
+        };
+        let meta = object_metadata_from_response(&resp, &key, &baseline);
+        assert_eq!(meta.chunks.len(), 1);
+        assert_eq!(meta.chunks[0].segment_id, seg);
+        assert_eq!(meta.chunks[0].length, 100);
+        assert_eq!(meta.hlc, Hlc::new(555, 2));
+        assert_eq!(meta.created_at, 12345, "local created_at preserved");
     }
 
     #[tokio::test]

@@ -420,6 +420,12 @@ pub struct BackgroundTasks {
     pub(crate) segment_replicator: Option<JoinHandle<()>>,
     /// Segment replicator cancellation token.
     pub(crate) segment_replicator_cancel: CancellationToken,
+
+    /// Periodic reconciliation loop task (g4 `reconciliation` — the
+    /// ADR-0029 §D4 pull safety net). `None` before the loop is spawned.
+    pub(crate) reconciliation: Option<JoinHandle<()>>,
+    /// Reconciliation loop cancellation token.
+    pub(crate) reconciliation_cancel: CancellationToken,
 }
 
 /// Resolves a RocksDB property string to a u64. Used by tests.
@@ -484,6 +490,10 @@ pub struct Node {
     /// it. Held here (not wired to a worker yet) so g5 can take it and
     /// tests can observe its depth.
     pub(crate) repair_rx: parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<RepairRequest>>>,
+    /// The periodic reconciliation loop (g4 `reconciliation` — the
+    /// ADR-0029 §D4 pull safety net). Held so tests can observe its
+    /// pending-queue depth and holder index.
+    pub(crate) reconciliation: Arc<oceanfs_durability::ReconciliationLoop>,
 }
 
 impl Node {
@@ -913,6 +923,30 @@ impl Node {
         let (repair_tx, repair_rx) =
             tokio::sync::mpsc::channel::<oceanfs_durability::healing_service::ReRepRequest>(1024);
         let repair_sink = Arc::new(RepairSinkChannel { tx: repair_tx });
+        // The periodic reconciliation loop (g4 `reconciliation` — the
+        // ADR-0029 §D4 pull safety net): event-driven wake (a node died /
+        // its pools died → exactly the affected segments via the holder
+        // index), bounded risk-prioritized queue processing per tick, and
+        // an hourly full drift scan. It runs INDEPENDENTLY of any
+        // announcement — the complete safety net when announcements are
+        // suppressed.
+        let reconciliation = Arc::new(oceanfs_durability::ReconciliationLoop::new(
+            Arc::clone(&lifecycle_registry),
+            membership.clone(),
+            repair_sink.clone(),
+            NodeId::new(&config.node_id),
+            config.replication_factor as usize,
+            oceanfs_durability::ReconcileConfig::default(),
+        ));
+        // Wire the holder-index notifier: the reconciliation loop's
+        // reverse index is maintained incrementally from the SINGLE
+        // choke point where a segment's storage_locations is written.
+        lifecycle.set_storage_locations_notifier({
+            let reconciliation = Arc::clone(&reconciliation);
+            Arc::new(move |segment_id, locations| {
+                reconciliation.on_storage_locations(segment_id, locations);
+            })
+        });
         // GC compaction repacks live blobs into new segments — it must
         // persist the repacked data through the segment data store (the
         // compactor reads the old segment's bytes and writes the new
@@ -1641,6 +1675,8 @@ impl Node {
         ae_worker.register_metrics(&*metrics);
         // g3 announcements (ADR-0029 §D4 observability).
         announce_metrics.register_metrics(&*metrics);
+        // g4 reconciliation (ADR-0029 §D4 observability).
+        reconciliation.register_metrics(&*metrics);
         // The manager is the component that actually stores and delivers
         // hints; its counters are the authoritative
         // hinted_handoff_hints_{stored,delivered,expired}_total series.
@@ -2200,7 +2236,10 @@ impl Node {
         // data pool is confirmed Dead, announce the affected segment set
         // to `union(storage_locations − self)` over the set — bounded
         // retries, then drop (g4 reconciliation is the failsafe).
-        let loss_announcer: Option<crate::health::LossAnnouncer> = {
+        // `announcements_enabled=false` (tests) disables the push so the
+        // g4 reconciliation loop is proven to be the independent safety
+        // net.
+        let loss_announcer: Option<crate::health::LossAnnouncer> = if config.announcements_enabled {
             let lifecycle_registry = Arc::clone(&lifecycle_registry);
             let membership = Arc::clone(&membership);
             let pool = Arc::clone(&pool);
@@ -2268,6 +2307,9 @@ impl Node {
                     }
                 });
             }))
+        } else {
+            tracing::info!("g3 loss announcements disabled (announcements_enabled=false)");
+            None
         };
         let consequences_handle = crate::health::spawn_health_consequences(
             health_events,
@@ -2296,6 +2338,20 @@ impl Node {
         });
         background.segment_replicator = Some(replicator_handle);
         background.segment_replicator_cancel = replicator_cancel;
+
+        // ---- 16d. Spawn the periodic reconciliation loop (g4) ----
+        // (ADR-0029 §D4 pull safety net). Event-driven wake + bounded
+        // risk-prioritized queue + hourly drift scan. Runs independently
+        // of announcements — the complete safety net.
+        let reconciliation_cancel = CancellationToken::new();
+        let reconciliation_token = reconciliation_cancel.clone();
+        let reconciliation_for_spawn = Arc::clone(&reconciliation);
+        let reconciliation_handle = tokio::spawn(async move {
+            reconciliation_for_spawn.run(reconciliation_token).await;
+            info!("Reconciliation loop stopped");
+        });
+        background.reconciliation = Some(reconciliation_handle);
+        background.reconciliation_cancel = reconciliation_cancel;
 
         // ---- 17. Spawn hinted handoff delivery watcher ----
         // Watches for membership events and drains the handoff buffer
@@ -2480,6 +2536,7 @@ impl Node {
             segment_replicator,
             remap_alias,
             repair_rx: parking_lot::Mutex::new(Some(repair_rx)),
+            reconciliation,
         })
     }
 
@@ -2615,6 +2672,33 @@ impl Node {
     /// ```
     pub fn remap_alias(&self) -> Arc<oceanfs_core::SegmentRemapAlias> {
         self.remap_alias.clone()
+    }
+
+    /// Returns the periodic reconciliation loop (g4 `reconciliation` —
+    /// the ADR-0029 §D4 pull safety net) — held so tests can observe its
+    /// pending-queue depth and holder index.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn example() {
+    /// use oceanfs_core::NodeConfig;
+    /// use oceanfs_node::Node;
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let config = NodeConfig {
+    /// #     data_dir: tmp.path().join("data"),
+    /// #     listen_addr: "127.0.0.1:0".into(),
+    /// #     grpc_listen_addr: "127.0.0.1:0".into(),
+    /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     ..NodeConfig::default()
+    /// # };
+    /// let node = Node::start(config).await.expect("node");
+    /// assert_eq!(node.reconciliation().pending_len(), 0);
+    /// node.shutdown().await.expect("shutdown");
+    /// # }
+    /// ```
+    pub fn reconciliation(&self) -> Arc<oceanfs_durability::ReconciliationLoop> {
+        self.reconciliation.clone()
     }
 
     /// Drains one re-replication repair request from the g3 →
@@ -3128,6 +3212,8 @@ impl Node {
             health_consequences: None,
             segment_replicator: None,
             segment_replicator_cancel: CancellationToken::new(),
+            reconciliation: None,
+            reconciliation_cancel: CancellationToken::new(),
         }
     }
 }
