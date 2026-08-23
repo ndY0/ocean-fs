@@ -2055,6 +2055,60 @@ impl SegmentLifecycleCoordinator {
         Ok(())
     }
 
+    /// Stamps the segment's `storage_locations` on the live registry
+    /// entry (sealed-segment-replication).
+    ///
+    /// Called by the segment replicator once every intended holder has
+    /// acked its push, so a non-empty set means "every listed holder was
+    /// confirmed". The update is **in-memory only**: the next checkpoint
+    /// persists it (the checkpoint serializes the full `SegmentMetadata`
+    /// via bincode), but the event WAL is untouched — the `SealEvent`
+    /// binary format is fixed-size and byte-exact, and the holder set is
+    /// re-derivable from the ring at startup for any entry whose
+    /// locations were never stamped (the seal→stamp crash window).
+    ///
+    /// `Sealed`-only; a missing / Reserved / Deleted entry is left
+    /// untouched (the replicator never stamps an entry it did not seal).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransitionError::Missing`] when no live entry exists.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::{NodeId, SegmentId};
+    /// use oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator;
+    ///
+    /// let lifecycle = SegmentLifecycleCoordinator::new(
+    ///     &oceanfs_core::LifecycleConfig::default(),
+    /// );
+    /// // Stamp a holder set on a segment (Sealed-only; a missing entry
+    /// // returns Missing — the caller ignores the error for deleted
+    /// // segments).
+    /// let mut locations = smallvec::SmallVec::new();
+    /// locations.push(NodeId::new("n1"));
+    /// locations.push(NodeId::new("n2"));
+    /// let _ = lifecycle.set_storage_locations(SegmentId::new(), locations);
+    /// ```
+    pub fn set_storage_locations(
+        &self,
+        id: SegmentId,
+        locations: smallvec::SmallVec<[oceanfs_core::NodeId; 16]>,
+    ) -> Result<(), TransitionError> {
+        let shard = &self.registry.shards[self.registry.shard_for(id)];
+        let mut guard = shard.write();
+        let now = Instant::now();
+        SegmentLifecycleRegistry::evict_expired_locked(&mut guard, now);
+        match guard.get_mut(&id) {
+            Some(entry) if entry.state == SegmentState::Sealed => {
+                entry.metadata.storage_locations = locations;
+                Ok(())
+            }
+            Some(_) | None => Err(TransitionError::Missing),
+        }
+    }
+
     /// Seals a batch of segments whose `.dat` files are already
     /// durable (fsynced + finalized by the flush coordinator).
     ///

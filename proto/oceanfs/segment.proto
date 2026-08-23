@@ -139,3 +139,25 @@ message PutObjectMetadataRequest {
 message PutObjectMetadataResponse {
   bool written = 1;
 }
+
+// A request to push a FULL SEALED segment's data to a replica node
+// (sealed-segment-replication). Client-streaming: the first chunk carries
+// the segment metadata (segment_id, tier, ec, merkle_root,
+// storage_locations) plus the first slice of the data section; every
+// chunk carries data. The receiver assembles the full data section,
+// verifies the merkle root against it, persists it, and registers the
+// segment idempotently.
+message PushSealedSegmentRequest {
+  oceanfs.common.SegmentId segment_id = 1;
+  uint32 tier = 2;                    // oceanfs_core::SizeTier as u8
+  uint32 ec_k = 3;
+  uint32 ec_m = 4;
+  bytes merkle_root = 5;              // 32 bytes BLAKE3 over the data section
+  repeated oceanfs.common.NodeId storage_locations = 6;
+  bytes data = 7;                     // slice of the segment data section
+}
+
+// Response to a sealed-segment push.
+message PushSealedSegmentResponse {
+  bool acked = 1;
+}

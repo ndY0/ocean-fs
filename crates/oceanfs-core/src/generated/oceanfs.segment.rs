@@ -185,6 +185,39 @@ pub struct PutObjectMetadataResponse {
     #[prost(bool, tag = "1")]
     pub written: bool,
 }
+/// A request to push a FULL SEALED segment's data to a replica node
+/// (sealed-segment-replication). Client-streaming: the first chunk carries
+/// the segment metadata (segment_id, tier, ec, merkle_root,
+/// storage_locations) plus the first slice of the data section; every
+/// chunk carries data. The receiver assembles the full data section,
+/// verifies the merkle root against it, persists it, and registers the
+/// segment idempotently.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PushSealedSegmentRequest {
+    #[prost(message, optional, tag = "1")]
+    pub segment_id: ::core::option::Option<super::common::SegmentId>,
+    /// oceanfs_core::SizeTier as u8
+    #[prost(uint32, tag = "2")]
+    pub tier: u32,
+    #[prost(uint32, tag = "3")]
+    pub ec_k: u32,
+    #[prost(uint32, tag = "4")]
+    pub ec_m: u32,
+    /// 32 bytes BLAKE3 over the data section
+    #[prost(bytes = "bytes", tag = "5")]
+    pub merkle_root: ::prost::bytes::Bytes,
+    #[prost(message, repeated, tag = "6")]
+    pub storage_locations: ::prost::alloc::vec::Vec<super::common::NodeId>,
+    /// slice of the segment data section
+    #[prost(bytes = "bytes", tag = "7")]
+    pub data: ::prost::bytes::Bytes,
+}
+/// Response to a sealed-segment push.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct PushSealedSegmentResponse {
+    #[prost(bool, tag = "1")]
+    pub acked: bool,
+}
 /// Status for segment append acknowledgement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

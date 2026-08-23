@@ -249,6 +249,12 @@ pub struct NodeConfig {
     /// Heal throughput throttle in bytes/sec (0 = unlimited, default 0).
     #[serde(default)]
     pub heal_throttle_bytes_sec: u64,
+    /// Seal-time segment-replication throughput throttle in bytes/sec
+    /// (0 = unlimited, default 0). Bounds the background replication
+    /// push rate so seal traffic backs off during write/read bursts —
+    /// mirrors `heal_throttle_bytes_sec` (sealed-segment-replication).
+    #[serde(default)]
+    pub replication_throttle_bytes_sec: u64,
 
     // ── Item 3: Cache configuration ──
     /// Whether the L1 object cache is enabled (default true).
@@ -652,6 +658,7 @@ impl Default for NodeConfig {
             ae_peer_count: 1,
             heal_parallel_segments: 16,
             heal_throttle_bytes_sec: 0,
+            replication_throttle_bytes_sec: 0,
             // Item 3: Cache
             object_cache_enabled: true,
             object_cache_size_bytes: 512 * 1024 * 1024,

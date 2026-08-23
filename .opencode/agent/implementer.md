@@ -266,6 +266,34 @@ built, not what was originally planned.
 
 ## Constraints
 
+- **NEVER make architecturally significant decisions on your own.** This is
+  the single most important rule. Any decision that changes how the system
+  behaves — protocol design, concurrency/locking models, coupling between
+  components, data-flow paths, error semantics, public API shape, placement
+  of logic across crates — MUST be brought to the user BEFORE implementing.
+  You do not design. You research, you present the options with their
+  tradeoffs, and the user decides. The user must always understand what
+  happens, the tradeoffs, and the design decisions. If the user does not
+  understand the system, everything we do is meaningless.
+- **Before implementing anything with architectural weight:**
+  1. Present the situation and the proposed approach to the user.
+  2. List the alternatives and their tradeoffs (latency, coupling,
+     complexity, failure modes).
+  3. Ask explicitly: "I plan to do X because of Y. Is that right, or should
+     we do Z?"
+  4. Wait for the user's decision. Do not proceed without it.
+- **Small, purely-mechanical changes** (renames, doc fixes, obvious bug
+  fixes that don't change behavior contracts) do not need pre-approval, but
+  anything touching performance characteristics, hot paths, locking, or
+  cross-crate contracts does.
+- **NEVER keep dead code.** If a code path, branch, parameter, or helper
+  has no production caller (verified by `grep` across the crate), REMOVE
+  it — do not leave it "for later" or "for tests". Dead code accumulates
+  cost in the long run: readers must understand it, it can be reached by
+  accident, and it rots. Tests that exist only to exercise a dead path are
+  themselves dead — migrate them to the live path or remove them. The
+  only exception is a deliberately retained public API with a documented
+  deprecation note.
 - **Never skip the guidelines.** Read them at the start of every session.
 - **Never skip the MCP search.** `get_edit_surface` before any edit.
 - **Never spawn concurrent subagents.** Sequential dispatch only. Each

@@ -392,6 +392,12 @@ pub struct BackgroundTasks {
     /// Health-consequence applier task (role matrix + manifest
     /// re-declaration). `None` before the applier is spawned.
     pub(crate) health_consequences: Option<JoinHandle<()>>,
+
+    /// Seal-time segment replicator task (sealed-segment-replication).
+    /// `None` before the replicator is spawned.
+    pub(crate) segment_replicator: Option<JoinHandle<()>>,
+    /// Segment replicator cancellation token.
+    pub(crate) segment_replicator_cancel: CancellationToken,
 }
 
 /// Resolves a RocksDB property string to a u64. Used by tests.
@@ -444,6 +450,9 @@ pub struct Node {
     /// Dead (ADR-0029 §D3 — the node serves nothing; g3 announces it,
     /// g6's S3/read path rejects).
     node_unavailable: Arc<std::sync::atomic::AtomicBool>,
+    /// The seal-time segment replicator (sealed-segment-replication) —
+    /// held so tests can observe the replication pipeline.
+    pub(crate) segment_replicator: Arc<crate::segment_replicator::SegmentReplicator>,
 }
 
 impl Node {
@@ -823,6 +832,31 @@ impl Node {
             wal_writer.clone(),
             lifecycle.clone(),
         ));
+        // ---- 6c. Seal-time segment replicator (sealed-segment-replication) ----
+        // The data-replication backbone: after a segment seals on this
+        // node, its full data section is pushed to the segment's ring
+        // replicas (segment_replica_set − self) — the exact set the read
+        // path's gRPC fallback fetches from. Seal itself never makes a
+        // network call: the seal worker / compactor only `enqueue` (one
+        // atomic channel send); the decoupled `run` task does the pushes.
+        // The replicator's own data store mirrors the heal/GC store (pool
+        // resolution via the lifecycle registry).
+        let segment_replicator = Arc::new(crate::segment_replicator::SegmentReplicator::new(
+            ring_cache.clone(),
+            membership.clone(),
+            pool.clone(),
+            Arc::new(oceanfs_durability::DiskSegmentStore::new(
+                data_pools.clone(),
+                segment_legacy_dir.clone(),
+                pool_id_for.clone(),
+            )),
+            lifecycle.clone(),
+            NodeId::new(&config.node_id),
+            crate::segment_replicator::ReplicationConfig {
+                throttle_bytes_sec: config.replication_throttle_bytes_sec,
+                ..Default::default()
+            },
+        ));
         // ---- 7. Construct durability workers ----
         let gc_config = oceanfs_durability::GcConfig::new(
             config.gc_interval_sec,
@@ -853,7 +887,18 @@ impl Node {
                     data_pools.clone(),
                     segment_legacy_dir.clone(),
                     pool_id_for.clone(),
-                ))),
+                )))
+                // The repacked segment is a NEW owner-side seal that
+                // bypasses the write-path seal worker: publish it so the
+                // segment replicator fans it out to its ring replicas
+                // (sealed-segment-replication — without this hook,
+                // post-compaction objects silently have zero replicas).
+                .with_segment_sealed_notifier({
+                    let replicator = Arc::clone(&segment_replicator);
+                    Arc::new(move |segment_id| {
+                        replicator.enqueue(segment_id);
+                    })
+                }),
         );
 
         // Construct IncrementalMerkleTree for anti-entropy by scanning
@@ -1243,9 +1288,16 @@ impl Node {
             // incremental Merkle tree (with its seal-time root) so
             // recently-written segments participate in the root exchange
             // without waiting for the next startup rebuild.
-            .with_segment_sealed_notifier(Arc::new(move |segment_id, merkle_root| {
-                ae_worker_notifier.on_segment_sealed(segment_id, merkle_root);
-            })),
+            .with_segment_sealed_notifier({
+                let replicator = Arc::clone(&segment_replicator);
+                Arc::new(move |segment_id, merkle_root| {
+                    ae_worker_notifier.on_segment_sealed(segment_id, merkle_root);
+                    // Seal-time segment replication (sealed-segment-replication):
+                    // publish the sealed segment for the replicator — a single
+                    // non-blocking channel send, NO network on the seal path.
+                    replicator.enqueue(segment_id);
+                })
+            }),
         );
 
         // Start background seal worker — drains filled segments from both
@@ -1365,6 +1417,29 @@ impl Node {
             }));
         }
 
+        // ---- 6b. Startup replication pass (sealed-segment-replication) ----
+        // Segments whose storage_locations was never stamped (sealed but
+        // the replicator never completed a push — a crash between the
+        // SealEvent and the first ack, or a segment adopted/replayed by
+        // recovery) must be re-published so the replicator fans them out.
+        // Non-empty storage_locations = fully acked, skip. One pass, off
+        // the hot path; the replicator's channel is bounded (overflow
+        // routes to its needs set).
+        {
+            let mut pending = 0u64;
+            lifecycle.registry().for_each(|segment_id, entry| {
+                if entry.state == oceanfs_storage::SegmentState::Sealed
+                    && entry.metadata.storage_locations.is_empty()
+                {
+                    segment_replicator.enqueue(segment_id);
+                    pending += 1;
+                }
+            });
+            if pending > 0 {
+                info!(pending, "startup replication pass enqueued sealed segments");
+            }
+        }
+
         let read_coordinator = Arc::new(
             ReadCoordinator::new_with_metadata(
                 ring_cache.clone(),
@@ -1467,6 +1542,9 @@ impl Node {
         // Routing-cache metrics (ADR-0029 §D5 — cache misses,
         // error-driven failovers).
         manifest_cache.register_metrics(&*metrics);
+        // Seal-time segment replication metrics (pushed/bytes/retries/
+        // failures/needs gauge).
+        segment_replicator.register_metrics(&*metrics);
 
         // Register RocksDB property gauges into the central metrics registry.
         metadata_store.metrics().register(&*metrics);
@@ -1986,6 +2064,21 @@ impl Node {
         );
         background.health_consequences = Some(consequences_handle);
 
+        // ---- 16c. Spawn the seal-time segment replicator ----
+        // (sealed-segment-replication). The drain loop consumes
+        // sealed-segment events (seal worker + compactor + startup pass)
+        // and pushes each segment's data to its ring replicas; the sweep
+        // retries the needs set. Runs until shutdown.
+        let replicator_cancel = CancellationToken::new();
+        let replicator_token = replicator_cancel.clone();
+        let replicator_for_spawn = Arc::clone(&segment_replicator);
+        let replicator_handle = tokio::spawn(async move {
+            replicator_for_spawn.run(replicator_token).await;
+            info!("Segment replicator stopped");
+        });
+        background.segment_replicator = Some(replicator_handle);
+        background.segment_replicator_cancel = replicator_cancel;
+
         // ---- 17. Spawn hinted handoff delivery watcher ----
         // Watches for membership events and drains the handoff buffer
         // for nodes that are (or return to) ALIVE. Any Alive event —
@@ -2166,6 +2259,7 @@ impl Node {
             pool_registry,
             io_observer,
             node_unavailable,
+            segment_replicator,
         })
     }
 
@@ -2247,6 +2341,33 @@ impl Node {
     /// ```
     pub fn node_unavailable(&self) -> bool {
         self.node_unavailable.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Returns the seal-time segment replicator
+    /// (sealed-segment-replication) — the pipeline that pushes sealed
+    /// segments to their ring replicas. Exposed for tests/observability.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn example() {
+    /// use oceanfs_core::NodeConfig;
+    /// use oceanfs_node::Node;
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let config = NodeConfig {
+    /// #     data_dir: tmp.path().join("data"),
+    /// #     listen_addr: "127.0.0.1:0".into(),
+    /// #     grpc_listen_addr: "127.0.0.1:0".into(),
+    /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     ..NodeConfig::default()
+    /// # };
+    /// let node = Node::start(config).await.expect("node");
+    /// // Single-node ring: nothing to replicate, but the pipeline exists.
+    /// node.shutdown().await.expect("shutdown");
+    /// # }
+    /// ```
+    pub fn segment_replicator(&self) -> Arc<crate::segment_replicator::SegmentReplicator> {
+        self.segment_replicator.clone()
     }
 
     /// Returns this node's current `NodeManifest` (ADR-0029 D2), as
@@ -2355,6 +2476,7 @@ impl Node {
         self.background.hint_prune_cancel.cancel();
         self.background.health_check_cancel.cancel();
         self.background.health_cancel.cancel();
+        self.background.segment_replicator_cancel.cancel();
 
         // ---- 5. Wait for background tasks with a timeout ----
         let _ = tokio::time::timeout(Duration::from_secs(10), async {
@@ -2367,6 +2489,15 @@ impl Node {
                 async { self.background.failure_detector.await.map_err(|e| format!("{e}")) },
                 async { self.background.heal.await.map_err(|e| format!("{e}")) },
                 async { self.background.hinted_handoff_prune.await.map_err(|e| format!("{e}")) },
+                // The segment replicator drains its bounded channel; if it
+                // is mid-push the timeout below bounds the wait (its
+                // receiver is dropped by the node drop anyway).
+                async {
+                    match self.background.segment_replicator {
+                        Some(h) => h.await.map_err(|e| format!("{e}")),
+                        None => Ok(()),
+                    }
+                },
             );
         })
         .await;
@@ -2724,6 +2855,8 @@ impl Node {
             health_monitor: None,
             health_cancel: CancellationToken::new(),
             health_consequences: None,
+            segment_replicator: None,
+            segment_replicator_cancel: CancellationToken::new(),
         }
     }
 }

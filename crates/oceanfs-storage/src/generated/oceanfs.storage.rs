@@ -235,6 +235,38 @@ pub mod segment_rpc_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Push a full sealed segment's data to a replica node (client-streaming).
+        /// The seal-time segment replicator uses this to fan a sealed segment's
+        /// data section out to its ring replicas; the receiver verifies the
+        /// merkle root, persists the data, and registers the segment idempotently.
+        pub async fn push_sealed_segment(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<
+                Message = ::oceanfs_core::proto::segment::PushSealedSegmentRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<::oceanfs_core::proto::segment::PushSealedSegmentResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/oceanfs.storage.SegmentRpc/PushSealedSegment",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("oceanfs.storage.SegmentRpc", "PushSealedSegment"),
+                );
+            self.inner.client_streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -303,6 +335,21 @@ pub mod segment_rpc_server {
             >,
         ) -> std::result::Result<
             tonic::Response<::oceanfs_core::proto::segment::PutObjectMetadataResponse>,
+            tonic::Status,
+        >;
+        /// Push a full sealed segment's data to a replica node (client-streaming).
+        /// The seal-time segment replicator uses this to fan a sealed segment's
+        /// data section out to its ring replicas; the receiver verifies the
+        /// merkle root, persists the data, and registers the segment idempotently.
+        async fn push_sealed_segment(
+            &self,
+            request: tonic::Request<
+                tonic::Streaming<
+                    ::oceanfs_core::proto::segment::PushSealedSegmentRequest,
+                >,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<::oceanfs_core::proto::segment::PushSealedSegmentResponse>,
             tonic::Status,
         >;
     }
@@ -624,6 +671,57 @@ pub mod segment_rpc_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/oceanfs.storage.SegmentRpc/PushSealedSegment" => {
+                    #[allow(non_camel_case_types)]
+                    struct PushSealedSegmentSvc<T: SegmentRpc>(pub Arc<T>);
+                    impl<
+                        T: SegmentRpc,
+                    > tonic::server::ClientStreamingService<
+                        ::oceanfs_core::proto::segment::PushSealedSegmentRequest,
+                    > for PushSealedSegmentSvc<T> {
+                        type Response = ::oceanfs_core::proto::segment::PushSealedSegmentResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<
+                                    ::oceanfs_core::proto::segment::PushSealedSegmentRequest,
+                                >,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SegmentRpc>::push_sealed_segment(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PushSealedSegmentSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.client_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

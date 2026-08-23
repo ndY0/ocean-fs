@@ -22,10 +22,11 @@ use bytes::{Bytes, BytesMut};
 use oceanfs_core::{
     proto::segment::{
         AckStatus, DeleteObjectRequest, DeleteObjectResponse, FetchShardRequest,
-        GetObjectMetadataRequest, GetObjectMetadataResponse, PutObjectMetadataRequest,
-        PutObjectMetadataResponse, SegmentAppendRequest, SegmentAppendResponse, ShardResponse,
+        GetObjectMetadataRequest, GetObjectMetadataResponse, PushSealedSegmentRequest,
+        PushSealedSegmentResponse, PutObjectMetadataRequest, PutObjectMetadataResponse,
+        SegmentAppendRequest, SegmentAppendResponse, ShardResponse,
     },
-    BucketId, ChunkRef, Hlc, HlcClock, ObjectKey, ObjectMetadata, SegmentId,
+    BucketId, ChunkRef, Hlc, HlcClock, ObjectKey, ObjectMetadata, SegmentId, SizeTier,
 };
 use oceanfs_durability::SegmentDataStore;
 use oceanfs_storage::{BufferPool, SegmentRpc};
@@ -55,10 +56,10 @@ pub struct SegmentGrpcService {
     /// timestamps arriving on this service are merged via
     /// [`HlcClock::update`] so the local clock never lags replicas.
     hlc_clock: Arc<HlcClock>,
-    /// Lifecycle coordinator (wired by the composition root). Replica
-    /// appends REGISTER their segments here — an unregistered `.dat`
-    /// is invisible to the GC and the orphan reaper (the fleet
-    /// disk-fill root cause).
+    /// Lifecycle coordinator (wired by the composition root). Sealed
+    /// segments arriving via `push_sealed_segment` REGISTER here — an
+    /// unregistered `.dat` is invisible to the GC and the orphan reaper
+    /// (the fleet disk-fill root cause).
     lifecycle: Option<Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>>,
 }
 
@@ -225,8 +226,34 @@ impl SegmentRpc for SegmentGrpcService {
         }
 
         // Persist object metadata if this append carried it (cross-node replication).
-        if let (Some(ref md_store), Some(bucket), Some(key)) =
-            (&self.metadata_store, bucket_id, object_key)
+        //
+        // Option A (sealed-segment-replication): the append path is
+        // METADATA-ONLY. The offset-0 fragment write is removed — it was
+        // the phase-2 partial-replication mechanism, and it created a
+        // second writer of `{segment_id}.dat` racing the segment-ring
+        // `push_sealed_segment` (a truncated fragment overwriting the
+        // full push failed every mid-segment read). The segment data is
+        // now delivered ONLY by the seal-time push; the object-ring
+        // append persists metadata so reads locate the object, and the
+        // bytes come from the segment's ring replicas (or the owner) via
+        // the read path's gRPC fallback. No lock, no write-path
+        // interference with replication.
+        //
+        // A metadata-less append (no bucket/key) is a protocol violation:
+        // every production caller (`replicate_write`, `forward_write`)
+        // carries object metadata, and a metadata-less append has nothing
+        // to persist (the old raw-data branch was dead code — removed).
+        // Fail loudly so the coordinator treats the append as failed and
+        // hints the target, exactly like the metadata-persist failure
+        // below.
+        let (md_store, bucket, key) = match (&self.metadata_store, bucket_id, object_key) {
+            (Some(md_store), Some(bucket), Some(key)) => (md_store, bucket, key),
+            _ => {
+                return Err(Status::invalid_argument(
+                    "append_segment without object metadata is not supported",
+                ));
+            }
+        };
         {
             // G3: the coordinator's HLC travels with the request and is
             // persisted — replicated metadata must carry the original
@@ -298,88 +325,14 @@ impl SegmentRpc for SegmentGrpcService {
                     "failed to persist replicated metadata: {e}"
                 )));
             }
-
-            // Write the local segment copy ONLY when it can serve the
-            // object exactly. The copy starts at offset 0 of the
-            // segment — for an object placed mid-segment on the
-            // coordinator (offset > 0), the copy would shadow owner
-            // fetches with CLAMPED garbage (the segment reader clamps
-            // out-of-range reads to the file length instead of
-            // erroring): reads would return wrong bytes and fail hash
-            // verification instead of falling back to the segment
-            // owner. With no copy, the local read misses and the
-            // gRPC fallback serves the owner's correct bytes.
-            let first_chunk_offset = meta_chunks.first().map(|c| c.offset).unwrap_or(0);
-            if first_chunk_offset == 0 {
-                self.data_store
-                    .write_segment_data(&segment_id, &segment_data)
-                    .map_err(|e| Status::internal(format!("segment write failed: {e}")))?;
-            }
-        } else {
-            // No metadata carried: keep the legacy behavior of writing
-            // the accumulated data to the segment store.
-            self.data_store
-                .write_segment_data(&segment_id, &segment_data)
-                .map_err(|e| Status::internal(format!("segment write failed: {e}")))?;
         }
 
         tracing::debug!(
             segment_id = %segment_id,
             total_bytes = total_bytes,
-            "append_segment: wrote {} bytes to store",
+            "append_segment: persisted replicated metadata for {} bytes",
             total_bytes
         );
-
-        // Register the replica segment in the lifecycle machine. The
-        // registry drives the GC and the orphan reaper — a raw `.dat`
-        // without an entry is INVISIBLE to both: the GC never
-        // attributes its dead bytes, the reaper never sweeps it, and
-        // the disk fills with replica copies (the fleet disk-fill root
-        // cause: ~10k unregistered files vs 32 registered; phase 2 has
-        // no replication, so every segment was a registered local
-        // append and stayed bounded). The segment is complete on
-        // arrival, so it is reserved and immediately sealed; the
-        // durable ReserveEvent precedes the data (ADR-0024).
-        if let Some(lifecycle) = &self.lifecycle {
-            let tier = oceanfs_storage::TierRouter::new(oceanfs_core::SegmentSizeConfig::default())
-                .classify(total_bytes);
-            let sealed_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
-            let merkle_root =
-                oceanfs_durability::MerkleTree::build(&segment_data, 0).map(|t| t.root().hash());
-            let meta = oceanfs_core::SegmentMetadata {
-                pool_id: 0,
-                segment_id,
-                ec_k: 1,
-                ec_m: 0,
-                size_tier: tier,
-                merkle_root,
-                storage_locations: smallvec::SmallVec::new(),
-                sealed_at: Some(sealed_at),
-            };
-            match lifecycle.request_reserve(segment_id, tier, 1, 0).await {
-                Ok(()) => {
-                    if let Err(e) = lifecycle.request_seal(segment_id, meta, None).await {
-                        tracing::warn!(
-                            segment_id = %segment_id,
-                            error = ?e,
-                            "append_segment: failed to seal replica segment"
-                        );
-                    }
-                }
-                Err(e) => {
-                    // Already registered (replayed or duplicate) —
-                    // nothing to do.
-                    tracing::debug!(
-                        segment_id = %segment_id,
-                        error = ?e,
-                        "append_segment: replica segment already registered"
-                    );
-                }
-            }
-        }
 
         Ok(Response::new(SegmentAppendResponse {
             wal_position: total_bytes,
@@ -736,6 +689,169 @@ impl SegmentRpc for SegmentGrpcService {
 
         Ok(Response::new(PutObjectMetadataResponse { written: true }))
     }
+
+    /// Handles a sealed-segment push from the owner's segment replicator.
+    ///
+    /// Assembles the full data section from the stream, verifies the
+    /// pushed merkle root against it (a corrupt push must never
+    /// register), persists the data via the segment data store, and
+    /// registers the segment in the lifecycle machine idempotently
+    /// (reserve → seal; duplicate pushes converge to one copy).
+    ///
+    /// Returns `Ok(acked)` on success. Returns `InvalidArgument` on a
+    /// merkle-root mismatch and `Internal` on I/O or registration
+    /// failure.
+    async fn push_sealed_segment(
+        &self,
+        request: Request<Streaming<PushSealedSegmentRequest>>,
+    ) -> Result<Response<PushSealedSegmentResponse>, Status> {
+        let mut stream = request.into_inner();
+        let mut segment_id = SegmentId::default();
+        let mut tier = SizeTier::Standard;
+        let mut ec_k = 1u8;
+        let mut ec_m = 0u8;
+        let mut merkle_root = Bytes::new();
+        let mut storage_locations: Vec<oceanfs_core::proto::common::NodeId> = Vec::new();
+        let mut total_bytes: u64 = 0;
+        let mut segment_data = self.buffer_pool.acquire();
+
+        while let Some(chunk) = stream
+            .message()
+            .await
+            .map_err(|e| Status::internal(format!("push stream error: {e}")))?
+        {
+            // Capture metadata from the first chunk that carries it.
+            if let Some(ref proto_sid) = chunk.segment_id {
+                if let Ok(sid) = SegmentId::try_from(proto_sid.clone()) {
+                    segment_id = sid;
+                }
+            }
+            if merkle_root.is_empty() && !chunk.merkle_root.is_empty() {
+                tier = match chunk.tier {
+                    0 => SizeTier::Inline,
+                    1 => SizeTier::Small,
+                    2 => SizeTier::Standard,
+                    3 => SizeTier::Multi,
+                    _ => SizeTier::Standard,
+                };
+                ec_k = chunk.ec_k as u8;
+                ec_m = chunk.ec_m as u8;
+                merkle_root = chunk.merkle_root.clone();
+                storage_locations = chunk.storage_locations.clone();
+            }
+            let chunk_len = chunk.data.len() as u64;
+            segment_data.extend_from_slice(&chunk.data);
+            total_bytes += chunk_len;
+        }
+
+        if total_bytes == 0 {
+            return Err(Status::invalid_argument("push of an empty segment"));
+        }
+
+        // The pushed root is the seal-time anchor (64 KiB leaves — the
+        // shared seal/scrub/AE default). A mismatch means the bytes are
+        // corrupt (torn push, wrong segment) — reject rather than
+        // register a replica that would fail AE verification and serve
+        // wrong bytes.
+        if merkle_root.len() != 32 {
+            return Err(Status::invalid_argument("push without a 32-byte merkle root"));
+        }
+        let computed = oceanfs_durability::MerkleTree::build(&segment_data, 0)
+            .ok_or_else(|| Status::internal("merkle build failed"))?
+            .root()
+            .hash();
+        if computed.as_bytes() != &merkle_root[..] {
+            return Err(Status::invalid_argument(format!(
+                "pushed merkle root does not match segment data for {segment_id}"
+            )));
+        }
+
+        // Persist the full data section (the existing store writes a
+        // valid v1 header — the heal-worker precedent; the replica serves
+        // the same data section the owner sealed).
+        //
+        // Option A (sealed-segment-replication): the push is the SOLE
+        // writer of `{segment_id}.dat`. The object-ring append path is
+        // metadata-only (the offset-0 fragment writer was removed), so
+        // there is no second writer to serialize against — no lock, no
+        // write-path interference with replication.
+        self.data_store
+            .write_segment_data(&segment_id, &segment_data)
+            .map_err(|e| Status::internal(format!("segment write failed: {e}")))?;
+
+        tracing::debug!(
+            segment_id = %segment_id,
+            total_bytes = total_bytes,
+            "push_sealed_segment: wrote {} bytes",
+            total_bytes
+        );
+
+        // Register idempotently (the append_segment registration
+        // precedent): the registry drives the GC and the orphan reaper,
+        // and the pushed `storage_locations` becomes the g4 holder set.
+        if let Some(lifecycle) = &self.lifecycle {
+            let mut locations = smallvec::SmallVec::new();
+            for loc in &storage_locations {
+                locations.push(oceanfs_core::NodeId::new(&loc.id));
+            }
+            let sealed_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let mut meta = oceanfs_core::SegmentMetadata {
+                pool_id: 0,
+                segment_id,
+                ec_k,
+                ec_m,
+                size_tier: tier,
+                merkle_root: None,
+                storage_locations: locations,
+                sealed_at: Some(sealed_at),
+            };
+            meta.merkle_root = {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&merkle_root);
+                Some(oceanfs_core::HashOutput::from_bytes(arr))
+            };
+            match lifecycle.request_reserve(segment_id, tier, ec_k, ec_m).await {
+                Ok(()) => {
+                    if let Err(e) = lifecycle.request_seal(segment_id, meta, None).await {
+                        tracing::warn!(
+                            segment_id = %segment_id,
+                            error = ?e,
+                            "push_sealed_segment: failed to seal replica segment"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Already registered — either this is a duplicate
+                    // push (data overwritten above with the same bytes)
+                    // or the object-ring append registered the segment
+                    // first. Either way the pushed holder set must
+                    // still land: without it, g4's live-copy count on
+                    // this node would see an empty set and compute
+                    // live=0 → a re-replication storm.
+                    if let Err(stamp_err) =
+                        lifecycle.set_storage_locations(segment_id, meta.storage_locations.clone())
+                    {
+                        tracing::warn!(
+                            segment_id = %segment_id,
+                            error = ?e,
+                            stamp_error = ?stamp_err,
+                            "push_sealed_segment: already registered; storage_locations stamp failed"
+                        );
+                    }
+                    tracing::debug!(
+                        segment_id = %segment_id,
+                        error = ?e,
+                        "push_sealed_segment: replica segment already registered; locations stamped"
+                    );
+                }
+            }
+        }
+
+        Ok(Response::new(PushSealedSegmentResponse { acked: true }))
+    }
 }
 
 #[cfg(test)]
@@ -866,12 +982,18 @@ mod tests {
         (client, lifecycle)
     }
 
-    /// The replication receiver must REGISTER the replica segment in
-    /// the lifecycle machine: an unregistered `.dat` is invisible to
-    /// the GC and the orphan reaper — the fleet disk-fill root cause
-    /// (the registry knew 32 segments while the disk held ~10k files).
+    /// Option A (sealed-segment-replication): the object-ring append is
+    /// METADATA-ONLY — it persists replicated object metadata (so reads
+    /// locate the object) but does NOT write segment data and does NOT
+    /// register the segment in the lifecycle. The segment's `.dat` and
+    /// its lifecycle registration are owned exclusively by
+    /// `push_sealed_segment` (the segment-ring replication path); the
+    /// registration is covered by
+    /// [`push_sealed_segment_registers_and_serves`]. This keeps
+    /// replication fully decoupled from the write path — one writer per
+    /// `.dat`, no lock, no interference.
     #[tokio::test]
-    async fn append_segment_registers_replica_segment_in_lifecycle() {
+    async fn append_segment_is_metadata_only_no_registration() {
         let store: Arc<dyn SegmentDataStore> = Arc::new(TestSegmentStore::new());
         let metadata: Arc<dyn oceanfs_storage_api::MetadataStore> = Arc::new(
             oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
@@ -883,7 +1005,7 @@ mod tests {
             .unwrap(),
         );
 
-        let (mut client, lifecycle) = test_server_with_lifecycle(store, metadata).await;
+        let (mut client, lifecycle) = test_server_with_lifecycle(store.clone(), metadata).await;
 
         let segment_id = SegmentId::new();
         let chunk = make_append_chunk(Some(oceanfs_core::proto::common::HlcTimestamp {
@@ -913,10 +1035,18 @@ mod tests {
         let response = client.append_segment(tokio_stream::iter(vec![request])).await.unwrap();
         assert_eq!(response.into_inner().ack as i32, 0, "ack must be Ok");
 
-        // The segment must now be registered AND sealed in the lifecycle.
-        let entry = lifecycle.registry().get(segment_id).expect("segment registered");
-        assert_eq!(entry.state, oceanfs_storage::SegmentState::Sealed);
-        assert!(entry.metadata.sealed_at.is_some(), "sealed_at must be set (reaper TTL gate)");
+        // The segment was NOT registered and NO data was written: the
+        // push owns the `.dat` and its lifecycle entry. (Metadata
+        // persistence is asserted by `append_segment_persists_coordinator_hlc`,
+        // which inspects the recording store directly.)
+        assert!(
+            lifecycle.registry().get(segment_id).is_none(),
+            "append must NOT register the segment (push owns registration)"
+        );
+        assert!(
+            store.read_segment_data(&segment_id).is_err(),
+            "append must NOT write segment data (push owns the .dat)"
+        );
     }
 
     #[tokio::test]
@@ -931,8 +1061,12 @@ mod tests {
         assert_eq!(resp.ack, AckStatus::Error as i32);
     }
 
+    /// Option A (sealed-segment-replication): a metadata-less append is a
+    /// protocol violation and is REJECTED (the old raw-data branch was
+    /// dead code — every production caller carries object metadata, and
+    /// raw segment placement is exclusively `push_sealed_segment`'s job).
     #[tokio::test]
-    async fn append_valid_stream_persists_data() {
+    async fn append_without_metadata_is_rejected() {
         let store = Arc::new(TestSegmentStore::new());
         let mut client = test_server(store.clone()).await;
 
@@ -957,15 +1091,14 @@ mod tests {
 
         let stream = tokio_stream::iter(vec![chunk]);
         let request = tonic::Request::new(stream);
-        let response = client.append_segment(request).await.unwrap();
-        let resp = response.into_inner();
-
-        assert_eq!(resp.ack, AckStatus::Ok as i32);
-        assert_eq!(resp.wal_position as usize, test_data.len());
-
-        // Verify data was actually stored.
-        let stored = store.read_segment_data(&seg_id).unwrap();
-        assert_eq!(stored, test_data);
+        let result = client.append_segment(request).await;
+        assert!(result.is_err(), "a metadata-less append must be rejected (protocol violation)");
+        assert_eq!(
+            result.unwrap_err().code(),
+            tonic::Code::InvalidArgument,
+            "metadata-less append → InvalidArgument"
+        );
+        assert!(store.read_segment_data(&seg_id).is_err(), "rejected append must not write data");
     }
 
     #[tokio::test]
@@ -1645,5 +1778,154 @@ mod tests {
         );
         // The service clock must have merged the remote timestamp (G2).
         assert!(clock.now().wall_time() >= 2_222_222, "clock must merge the remote delete HLC");
+    }
+
+    // ── Sealed-segment push (sealed-segment-replication) ────────────────
+
+    /// Builds a push request stream for `data` with the given merkle root.
+    fn make_push_stream(
+        segment_id: SegmentId,
+        data: &[u8],
+        merkle_root: Bytes,
+        locations: Vec<oceanfs_core::NodeId>,
+    ) -> Vec<PushSealedSegmentRequest> {
+        let proto_sid: ProtoSegmentId = segment_id.into();
+        let proto_locations: Vec<oceanfs_core::proto::common::NodeId> =
+            locations.iter().map(|n| n.clone().into()).collect();
+        // 64 KB chunks like the replicator sends; the first chunk carries
+        // the metadata.
+        let mut chunks = Vec::new();
+        let mut offset = 0usize;
+        let mut first = true;
+        while offset < data.len() || first {
+            let end = (offset + 65536).min(data.len());
+            let slice = Bytes::copy_from_slice(&data[offset..end]);
+            chunks.push(PushSealedSegmentRequest {
+                segment_id: Some(proto_sid.clone()),
+                tier: 2, // Standard
+                ec_k: 1,
+                ec_m: 0,
+                merkle_root: if first { merkle_root.clone() } else { Bytes::new() },
+                storage_locations: if first { proto_locations.clone() } else { Vec::new() },
+                data: slice,
+            });
+            if end >= data.len() {
+                break;
+            }
+            offset = end;
+            first = false;
+        }
+        chunks
+    }
+
+    /// A valid push registers the segment (reserve→seal) and the data is
+    /// readable via the store.
+    #[tokio::test]
+    async fn push_sealed_segment_registers_and_serves() {
+        let store: Arc<dyn SegmentDataStore> = Arc::new(TestSegmentStore::new());
+        let (mut client, lifecycle) = test_server_with_lifecycle(
+            store.clone(),
+            Arc::new(
+                oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                    data_dir: tempfile::tempdir().unwrap().path().join("meta"),
+                    block_cache_size: 1024,
+                    memtable_size: 1024,
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+        )
+        .await;
+
+        let segment_id = SegmentId::new();
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let root = oceanfs_durability::MerkleTree::build(&data, 0).unwrap().root().hash();
+        let locations = vec![oceanfs_core::NodeId::new("n1"), oceanfs_core::NodeId::new("n2")];
+
+        let stream = tokio_stream::iter(make_push_stream(
+            segment_id,
+            &data,
+            Bytes::copy_from_slice(root.as_bytes()),
+            locations.clone(),
+        ));
+        let resp = client.push_sealed_segment(tonic::Request::new(stream)).await.unwrap();
+        assert!(resp.into_inner().acked, "valid push must ack");
+
+        // Data persisted + registered + sealed with the pushed metadata.
+        let stored = store.read_segment_data(&segment_id).unwrap();
+        assert_eq!(&stored[..], &data[..], "the full data section must be stored");
+        let entry = lifecycle.registry().get(segment_id).expect("segment registered");
+        assert_eq!(entry.state, oceanfs_storage::SegmentState::Sealed);
+        assert_eq!(entry.metadata.storage_locations.len(), 2, "pushed locations must persist");
+        assert_eq!(
+            entry.metadata.merkle_root.expect("merkle root"),
+            oceanfs_core::HashOutput::from_bytes(*root.as_bytes()),
+            "the pushed seal-time root must be registered (AE anchor)"
+        );
+    }
+
+    /// A push whose merkle root does not match the data is rejected —
+    /// a corrupt push must never register.
+    #[tokio::test]
+    async fn push_sealed_segment_rejects_wrong_merkle_root() {
+        let store: Arc<dyn SegmentDataStore> = Arc::new(TestSegmentStore::new());
+        let mut client = test_server(store.clone()).await;
+
+        let segment_id = SegmentId::new();
+        let data = vec![0xABu8; 8192];
+        let wrong_root = Bytes::from(vec![0x42u8; 32]);
+
+        let stream = tokio_stream::iter(make_push_stream(segment_id, &data, wrong_root, vec![]));
+        let result = client.push_sealed_segment(tonic::Request::new(stream)).await;
+        assert!(result.is_err(), "merkle mismatch must reject");
+        assert_eq!(
+            result.unwrap_err().code(),
+            tonic::Code::InvalidArgument,
+            "corrupt push → InvalidArgument"
+        );
+        assert!(
+            store.read_segment_data(&segment_id).is_err(),
+            "rejected push must not persist data"
+        );
+    }
+
+    /// A duplicate push of the same segment converges: the second push
+    /// overwrites the data (same bytes) and is tolerated (AlreadySealed).
+    #[tokio::test]
+    async fn push_sealed_segment_is_idempotent() {
+        let store: Arc<dyn SegmentDataStore> = Arc::new(TestSegmentStore::new());
+        let (mut client, lifecycle) = test_server_with_lifecycle(
+            store.clone(),
+            Arc::new(
+                oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                    data_dir: tempfile::tempdir().unwrap().path().join("meta"),
+                    block_cache_size: 1024,
+                    memtable_size: 1024,
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+        )
+        .await;
+
+        let segment_id = SegmentId::new();
+        let data: Vec<u8> = (0..65_536u32).map(|i| (i % 251) as u8).collect();
+        let root = oceanfs_durability::MerkleTree::build(&data, 0).unwrap().root().hash();
+
+        for _ in 0..2 {
+            let stream = tokio_stream::iter(make_push_stream(
+                segment_id,
+                &data,
+                Bytes::copy_from_slice(root.as_bytes()),
+                vec![oceanfs_core::NodeId::new("n1")],
+            ));
+            let resp = client.push_sealed_segment(tonic::Request::new(stream)).await.unwrap();
+            assert!(resp.into_inner().acked, "duplicate push must still ack");
+        }
+
+        let entry = lifecycle.registry().get(segment_id).expect("segment registered once");
+        assert_eq!(entry.state, oceanfs_storage::SegmentState::Sealed);
+        let stored = store.read_segment_data(&segment_id).unwrap();
+        assert_eq!(&stored[..], &data[..], "duplicate push must converge to one copy");
     }
 }

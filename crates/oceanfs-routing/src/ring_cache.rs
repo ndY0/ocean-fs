@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use oceanfs_core::NodeId;
+use oceanfs_core::{NodeId, SegmentId};
 
 use crate::ring::Ring;
 
@@ -57,6 +57,36 @@ impl RingCache {
     }
 }
 
+/// Derives the replica set for a segment's data: the ring's successors of
+/// `blake3(segment_id)`.
+///
+/// This is the ONE derivation the data plane uses for "which nodes hold a
+/// segment's data": the read path's gRPC fallback (fetch.rs), the seal-time
+/// segment replicator, g3's announcement fan-out, and g4's live-copy count
+/// all consult `segment_replica_set`. It MUST stay identical across call
+/// sites — a divergence means the replicator pushes to a set the read path
+/// never fetches from (the phase-2 replication defect this helper exists
+/// to prevent).
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::{NodeId, RingConfig, SegmentId};
+/// use oceanfs_routing::{Ring, RingCache};
+///
+/// let mut ring = Ring::new(RingConfig::default());
+/// ring.add_node(NodeId::new("a"));
+/// ring.add_node(NodeId::new("b"));
+/// ring.add_node(NodeId::new("c"));
+/// let cache = RingCache::new(ring);
+/// let replicas = oceanfs_routing::segment_replica_set(&cache, &SegmentId::new());
+/// assert_eq!(replicas.len(), 3);
+/// ```
+pub fn segment_replica_set(ring: &RingCache, segment_id: &SegmentId) -> Vec<NodeId> {
+    let segment_hash = blake3::hash(segment_id.to_string().as_bytes());
+    ring.lookup(segment_hash.as_bytes())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -99,5 +129,25 @@ mod tests {
         let cache = RingCache::new(ring);
         let snap = cache.snapshot();
         assert_eq!(snap.node_count(), 2);
+    }
+
+    /// The segment-replica derivation is exactly `ring.lookup(hash(id))`:
+    /// the seal-time replicator pushes to the same set the read path
+    /// fetches from. A divergence is the phase-2 replication defect.
+    #[test]
+    fn segment_replica_set_matches_ring_lookup_of_segment_hash() {
+        let ring = make_ring();
+        let cache = RingCache::new(ring);
+        let id = SegmentId::new();
+        let hash = blake3::hash(id.to_string().as_bytes());
+        assert_eq!(segment_replica_set(&cache, &id), cache.lookup(hash.as_bytes()));
+        // The set is the ring's successors (both nodes in this 2-node
+        // ring), never empty.
+        assert_eq!(segment_replica_set(&cache, &id).len(), 2);
+        // Distinct segment ids may map to distinct sets — but each is the
+        // ring's derivation, not an arbitrary list.
+        let id2 = SegmentId::new();
+        let hash2 = blake3::hash(id2.to_string().as_bytes());
+        assert_eq!(segment_replica_set(&cache, &id2), cache.lookup(hash2.as_bytes()));
     }
 }

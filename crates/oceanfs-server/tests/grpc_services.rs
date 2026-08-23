@@ -12,7 +12,6 @@ use oceanfs_core::{
     proto::{
         common::SegmentId as ProtoSegmentId,
         membership::{MembershipEntry, MembershipList},
-        segment::{AckStatus, SegmentAppendRequest},
     },
     GossipConfig, Incarnation, NodeId, NodeState, RingConfig, SegmentId,
 };
@@ -157,30 +156,28 @@ async fn start_gossip_server(
     (client, server_addr)
 }
 
-/// Appends data to a node and returns the segment ID.
-async fn append_to_node(
+/// Pushes a full sealed segment's data to a node (the data-placement RPC
+/// under sealed-segment-replication Option A — the successor of the
+/// metadata-less append, which was removed as dead code).
+async fn push_to_node(
     client: &mut SegmentRpcClient<tonic::transport::Channel>,
     seg_id: SegmentId,
     data: &[u8],
 ) -> SegmentId {
     let proto_sid: ProtoSegmentId = seg_id.into();
-    let chunk = SegmentAppendRequest {
+    let root = oceanfs_durability::MerkleTree::build(data, 0).unwrap().root().hash();
+    let chunk = oceanfs_core::proto::segment::PushSealedSegmentRequest {
         segment_id: Some(proto_sid),
-        shard_index: None,
-        offset: 0,
+        tier: 2, // Standard
+        ec_k: 1,
+        ec_m: 0,
+        merkle_root: Bytes::copy_from_slice(root.as_bytes()),
+        storage_locations: vec![],
         data: Bytes::from(data.to_vec()),
-        hlc: None,
-        bucket_id: String::new(),
-        object_key: String::new(),
-        object_size: 0,
-        blake3_hash: vec![].into(),
-        chunk_segment_ids: vec![],
-        chunk_offsets: vec![],
-        chunk_lengths: vec![],
     };
     let stream = tokio_stream::iter(vec![chunk]);
-    let response = client.append_segment(tonic::Request::new(stream)).await.unwrap();
-    assert_eq!(response.into_inner().ack, AckStatus::Ok as i32);
+    let response = client.push_sealed_segment(tonic::Request::new(stream)).await.unwrap();
+    assert!(response.into_inner().acked, "push must ack");
     seg_id
 }
 
@@ -215,13 +212,13 @@ async fn fetch_from_node(
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn two_node_append_and_fetch_roundtrip() {
+async fn two_node_push_and_fetch_roundtrip() {
     let store1: Arc<dyn SegmentDataStore> = Arc::new(TestStore::new());
     let (mut client1, _addr1) = start_segment_server(store1.clone()).await;
 
     let seg_id = SegmentId::new();
-    let test_data = b"two-node segment append roundtrip test data";
-    append_to_node(&mut client1, seg_id, test_data).await;
+    let test_data = b"two-node segment push roundtrip test data";
+    push_to_node(&mut client1, seg_id, test_data).await;
     let received = fetch_from_node(&mut client1, seg_id, test_data.len() as u64).await;
     assert_eq!(received, test_data.to_vec());
 }
@@ -317,44 +314,21 @@ async fn three_node_write_with_w2_via_grpc() {
     let store2: Arc<dyn SegmentDataStore> = Arc::new(TestStore::new());
     let store3: Arc<dyn SegmentDataStore> = Arc::new(TestStore::new());
 
-    let (client1, _addr1) = start_segment_server(store1.clone()).await;
-    let (client2, _addr2) = start_segment_server(store2.clone()).await;
+    let (mut client1, _addr1) = start_segment_server(store1.clone()).await;
+    let (mut client2, _addr2) = start_segment_server(store2.clone()).await;
     let (mut client3, _addr3) = start_segment_server(store3.clone()).await;
 
     let seg_id = SegmentId::new();
     let test_data = b"three-node W=2 replication test data payload".to_vec();
     let proto_sid: ProtoSegmentId = seg_id.into();
 
-    let chunk = SegmentAppendRequest {
-        segment_id: Some(proto_sid.clone()),
-        shard_index: None,
-        offset: 0,
-        data: Bytes::from(test_data.clone()),
-        hlc: None,
-        bucket_id: String::new(),
-        object_key: String::new(),
-        object_size: 0,
-        blake3_hash: vec![].into(),
-        chunk_segment_ids: vec![],
-        chunk_offsets: vec![],
-        chunk_lengths: vec![],
-    };
-    let stream_data = vec![chunk];
-
-    let f1 = {
-        let data = stream_data.clone();
-        let mut client = client1;
-        async move { client.append_segment(tonic::Request::new(tokio_stream::iter(data))).await }
-    };
-    let f2 = {
-        let data = stream_data;
-        let mut client = client2;
-        async move { client.append_segment(tonic::Request::new(tokio_stream::iter(data))).await }
-    };
-
-    let (r1, r2) = tokio::join!(f1, f2);
-    assert_eq!(r1.unwrap().into_inner().ack, AckStatus::Ok as i32);
-    assert_eq!(r2.unwrap().into_inner().ack, AckStatus::Ok as i32);
+    // Place the sealed segment data on nodes 1 and 2 (W=2) via the
+    // data-placement RPC.
+    let f1 = push_to_node(&mut client1, seg_id, &test_data);
+    let f2 = push_to_node(&mut client2, seg_id, &test_data);
+    let (s1, s2) = tokio::join!(f1, f2);
+    assert_eq!(s1, seg_id);
+    assert_eq!(s2, seg_id);
 
     let stored1 = store1.read_segment_data(&seg_id).unwrap();
     let stored2 = store2.read_segment_data(&seg_id).unwrap();
@@ -480,40 +454,14 @@ async fn three_node_cluster_with_node_kill() {
     // ---- Phase 1: Write blob-1 to node-1 and node-2 (W=2) ----
     let seg1 = SegmentId::new();
     let blob1 = b"end-to-end blob before node kill".to_vec();
-    let proto1: ProtoSegmentId = seg1.into();
-
-    let chunk1 = SegmentAppendRequest {
-        segment_id: Some(proto1.clone()),
-        shard_index: None,
-        offset: 0,
-        data: Bytes::from(blob1.clone()),
-        hlc: None,
-        bucket_id: String::new(),
-        object_key: String::new(),
-        object_size: 0,
-        blake3_hash: vec![].into(),
-        chunk_segment_ids: vec![],
-        chunk_offsets: vec![],
-        chunk_lengths: vec![],
-    };
-
-    // Replicate blob1 to nodes 1 and 2.
+    // Place the sealed segment data on nodes 1 and 2 (W=2) via the
+    // data-placement RPC.
     let (r1, r2) = tokio::join!(
-        {
-            let data = vec![chunk1.clone()];
-            async {
-                node1.client.append_segment(tonic::Request::new(tokio_stream::iter(data))).await
-            }
-        },
-        {
-            let data = vec![chunk1];
-            async {
-                node2.client.append_segment(tonic::Request::new(tokio_stream::iter(data))).await
-            }
-        }
+        push_to_node(&mut node1.client, seg1, &blob1),
+        push_to_node(&mut node2.client, seg1, &blob1),
     );
-    assert_eq!(r1.unwrap().into_inner().ack, AckStatus::Ok as i32);
-    assert_eq!(r2.unwrap().into_inner().ack, AckStatus::Ok as i32);
+    assert_eq!(r1, seg1);
+    assert_eq!(r2, seg1);
 
     // Read blob1 back from node-1.
     let got1 = fetch_from_node(&mut node1.client, seg1, blob1.len() as u64).await;
@@ -531,28 +479,9 @@ async fn three_node_cluster_with_node_kill() {
     // ---- Phase 3: Write blob-2 (node-3 is dead, but nodes 1 and 2 alive) ----
     let seg2 = SegmentId::new();
     let blob2 = b"end-to-end blob after node-3 kill".to_vec();
-    let proto2: ProtoSegmentId = seg2.into();
-
-    let chunk2 = SegmentAppendRequest {
-        segment_id: Some(proto2.clone()),
-        shard_index: None,
-        offset: 0,
-        data: Bytes::from(blob2.clone()),
-        hlc: None,
-        bucket_id: String::new(),
-        object_key: String::new(),
-        object_size: 0,
-        blake3_hash: vec![].into(),
-        chunk_segment_ids: vec![],
-        chunk_offsets: vec![],
-        chunk_lengths: vec![],
-    };
-
     // Write to node-1 (the only available replica).
-    let resp =
-        node1.client.append_segment(tonic::Request::new(tokio_stream::iter(vec![chunk2]))).await;
-    assert!(resp.is_ok(), "write should succeed even with node-3 dead");
-    assert_eq!(resp.unwrap().into_inner().ack, AckStatus::Ok as i32);
+    let pushed = push_to_node(&mut node1.client, seg2, &blob2).await;
+    assert_eq!(pushed, seg2, "write should succeed even with node-3 dead");
 
     // Read blob2 back from node-1.
     let got3 = fetch_from_node(&mut node1.client, seg2, blob2.len() as u64).await;

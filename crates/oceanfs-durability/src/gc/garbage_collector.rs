@@ -52,6 +52,12 @@ pub struct GarbageCollector {
     /// the durable delete. `None` means compaction is not wired. See
     /// [`Self::with_shard_store`].
     shard_store: Option<Arc<dyn SegmentShardStore>>,
+    /// Optional sealed-segment notifier (sealed-segment-replication):
+    /// fired with each repacked segment's NEW id once its `SealEvent` is
+    /// durable, so the segment replicator fans the fresh segment out to
+    /// its ring replicas. `None` (default) keeps the un-wired path
+    /// identical.
+    sealed_notifier: Option<Arc<dyn Fn(SegmentId) + Send + Sync>>,
 }
 
 type TombstoneResult =
@@ -92,6 +98,7 @@ impl GarbageCollector {
             data_store: None,
             lifecycle: None,
             shard_store: None,
+            sealed_notifier: None,
         }
     }
 
@@ -131,6 +138,35 @@ impl GarbageCollector {
     /// not compacted.
     pub fn with_shard_store(mut self, shard_store: Arc<dyn SegmentShardStore>) -> Self {
         self.shard_store = Some(shard_store);
+        self
+    }
+
+    /// Wires the sealed-segment notifier (sealed-segment-replication):
+    /// fired with each repacked segment's NEW id after its `SealEvent`
+    /// is durable, so the node's segment replicator can fan the fresh
+    /// segment out to its ring replicas. The repacked segment is a new
+    /// owner-side seal that bypasses the write-path seal worker — without
+    /// this hook, post-compaction objects have zero replicas.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use oceanfs_core::{NodeId, SegmentId};
+    /// use oceanfs_durability::{GarbageCollector, GcConfig};
+    ///
+    /// let gc = GarbageCollector::new(GcConfig::default())
+    ///     .with_segment_sealed_notifier(Arc::new(|segment_id: SegmentId| {
+    ///         // Publish the repacked segment for replication.
+    ///         let _ = segment_id;
+    ///     }));
+    /// // Builder-returned; `gc` is ready to run cycles.
+    /// ```
+    pub fn with_segment_sealed_notifier(
+        mut self,
+        notifier: Arc<dyn Fn(SegmentId) + Send + Sync>,
+    ) -> Self {
+        self.sealed_notifier = Some(notifier);
         self
     }
 
@@ -229,13 +265,18 @@ impl GarbageCollector {
         // Phase 3: Compact candidate segments concurrency-limited
         let semaphore = Arc::new(Semaphore::new(self.config.max_concurrent_compactions));
         let tier_router = TierRouter::new(oceanfs_core::SegmentSizeConfig::default());
-        let compactor = Arc::new(SegmentCompactor::new(
+        let compactor = SegmentCompactor::new(
             metadata.clone(),
             tier_router,
             data_store,
             lifecycle,
             shard_store,
-        ));
+        );
+        let compactor = match &self.sealed_notifier {
+            Some(notifier) => compactor.with_sealed_notifier(Arc::clone(notifier)),
+            None => compactor,
+        };
+        let compactor = Arc::new(compactor);
 
         tracing::debug!(
             "GC compaction phase: tier router configured for repacking, {} segment(s) candidate",

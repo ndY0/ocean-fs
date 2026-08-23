@@ -24,7 +24,7 @@ use oceanfs_core::{
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
-use oceanfs_routing::{shard_batch, RingCache};
+use oceanfs_routing::{segment_replica_set, shard_batch, RingCache};
 use oceanfs_storage::SegmentRpcClient;
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
@@ -532,8 +532,10 @@ async fn fetch_single_chunk_raw(
     }
 
     // Determine replica set for this chunk's segment.
-    let segment_hash = blake3::hash(chunk.segment_id.to_string().as_bytes());
-    let replica_set = ring.lookup(segment_hash.as_bytes());
+    // The shared segment-replica derivation: the seal-time replicator
+    // pushes to exactly this set, so a local miss falls through to nodes
+    // that actually hold the data (sealed-segment-replication).
+    let replica_set = segment_replica_set(ring, &chunk.segment_id);
 
     // ADR-0029 §D5: exclude candidates whose manifest reports zero
     // Healthy data pools (the node cannot serve segment reads). The
@@ -767,8 +769,9 @@ async fn fetch_parity_shard_via_grpc(
     routing_hint: Option<&Arc<dyn RoutingHint>>,
     timeout_ms: u64,
 ) -> Result<Bytes> {
-    let segment_hash = blake3::hash(chunk.segment_id.to_string().as_bytes());
-    let replica_set = ring.lookup(segment_hash.as_bytes());
+    // The shared segment-replica derivation (the seal-time replicator's
+    // target set — see fetch_single_chunk_raw).
+    let replica_set = segment_replica_set(ring, &chunk.segment_id);
 
     // ADR-0029 §D5: same read-candidate exclusion as the data-shard
     // path — a node with zero Healthy data pools cannot serve reads.

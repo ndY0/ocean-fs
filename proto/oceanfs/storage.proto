@@ -36,4 +36,11 @@ service SegmentRpc {
   // Push corrected object metadata to a stale replica during read repair (4.2).
   rpc PutObjectMetadata(oceanfs.segment.PutObjectMetadataRequest)
       returns (oceanfs.segment.PutObjectMetadataResponse);
+
+  // Push a full sealed segment's data to a replica node (client-streaming).
+  // The seal-time segment replicator uses this to fan a sealed segment's
+  // data section out to its ring replicas; the receiver verifies the
+  // merkle root, persists the data, and registers the segment idempotently.
+  rpc PushSealedSegment(stream oceanfs.segment.PushSealedSegmentRequest)
+      returns (oceanfs.segment.PushSealedSegmentResponse);
 }

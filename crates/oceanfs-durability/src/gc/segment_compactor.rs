@@ -65,6 +65,15 @@ pub(crate) struct SegmentCompactor {
     /// `.dat` **only after** `request_delete` returns durable
     /// (ADR-0024 invariant 3: delete before unlink).
     shard_store: Arc<dyn SegmentShardStore>,
+    /// Optional sealed-segment notifier (sealed-segment-replication).
+    ///
+    /// Fired with the NEW segment id once its `SealEvent` is durable —
+    /// the repacked segment is a fresh owner-side seal that the segment
+    /// replicator must fan out to the new segment's ring replicas (the
+    /// compactor seals OUTSIDE the write-path seal worker, so without
+    /// this hook post-compaction objects would silently have zero
+    /// replicas).
+    sealed_notifier: Option<Arc<dyn Fn(SegmentId) + Send + Sync>>,
 }
 
 impl SegmentCompactor {
@@ -76,7 +85,16 @@ impl SegmentCompactor {
         lifecycle: Arc<SegmentLifecycleCoordinator>,
         shard_store: Arc<dyn SegmentShardStore>,
     ) -> Self {
-        Self { metadata, tier_router, data_store, lifecycle, shard_store }
+        Self { metadata, tier_router, data_store, lifecycle, shard_store, sealed_notifier: None }
+    }
+
+    /// Wires the sealed-segment notifier (composition root).
+    pub(crate) fn with_sealed_notifier(
+        mut self,
+        notifier: Arc<dyn Fn(SegmentId) + Send + Sync>,
+    ) -> Self {
+        self.sealed_notifier = Some(notifier);
+        self
     }
 
     /// Returns the tier router used for blob classification during repacking.
@@ -299,6 +317,14 @@ impl SegmentCompactor {
             ))));
         }
         self.stall_at(3).await; // seam: after the SealEvent(new) (NewSealed)
+
+        // The repacked segment is durable + registered: publish it for
+        // segment replication (the replicator fans the new segment's data
+        // out to its ring replicas — the compactor's seal bypasses the
+        // write-path seal worker, so this is the only owner-side hook).
+        if let Some(notifier) = &self.sealed_notifier {
+            notifier(new_segment_id);
+        }
 
         // ObjectsMoved → commit the object metadata remap (RocksDB; the
         // one cross-store hop). No lifecycle write rides in this batch —
