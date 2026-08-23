@@ -4,8 +4,6 @@
 //! shards destined for the same peer can be sent in a single batched
 //! gRPC call rather than one RPC per shard.
 
-use std::collections::HashMap;
-
 use oceanfs_core::NodeId;
 
 /// A shard fetch request targeting a specific data shard.
@@ -26,14 +24,20 @@ pub struct ShardRequest {
 
 /// Group shard fetch requests by target node.
 ///
-/// Callers provide a resolution function that maps each shard to
-/// its owning node (e.g., via the DHT ring and membership state).
-/// Shards whose owner cannot be resolved are silently excluded.
+/// Callers provide a resolution function that maps each shard to its
+/// owning node (e.g., via the DHT ring and membership state). Shards
+/// whose owner cannot be resolved are silently excluded.
+///
+/// The returned groups preserve FIRST-SEEN (insertion) order — the
+/// order of `shards` — so callers that iterate the groups (e.g. the
+/// read path's replica fallback loop) honor the ring's replica order
+/// deterministically. A `HashMap`-backed variant would randomize that
+/// order per process (a random hash seed), breaking the intended
+/// first-replica preference (f7's error-driven failover counts on it).
 ///
 /// # Examples
 ///
 /// ```
-/// use std::collections::HashMap;
 /// use oceanfs_core::{NodeId, SegmentId};
 /// use oceanfs_routing::shard_batch::{group_by_node, ShardRequest};
 ///
@@ -48,19 +52,24 @@ pub struct ShardRequest {
 /// let node_a = NodeId::new("a");
 /// let groups = group_by_node(&shards, |_req| Some(node_a.clone()));
 /// assert_eq!(groups.len(), 1);
-/// assert_eq!(groups.get(&NodeId::new("a")).unwrap().len(), 1);
+/// assert_eq!(groups[0].1.len(), 1);
 /// ```
 pub fn group_by_node<F>(
     shards: &[ShardRequest],
     resolve_owner: F,
-) -> HashMap<NodeId, Vec<ShardRequest>>
+) -> Vec<(NodeId, Vec<ShardRequest>)>
 where
     F: Fn(&ShardRequest) -> Option<NodeId>,
 {
-    let mut groups: HashMap<NodeId, Vec<ShardRequest>> = HashMap::new();
+    // Linear first-seen grouping: pool counts are 5–20 and a fetch
+    // batches at most a handful of shards, so the O(n·m) scan is
+    // negligible and preserves order (perf 1.3 pre-size the result).
+    let mut groups: Vec<(NodeId, Vec<ShardRequest>)> = Vec::new();
     for shard in shards {
-        if let Some(node_id) = resolve_owner(shard) {
-            groups.entry(node_id).or_default().push(shard.clone());
+        let Some(node_id) = resolve_owner(shard) else { continue };
+        match groups.iter_mut().find(|(id, _)| *id == node_id) {
+            Some((_, shards_for_node)) => shards_for_node.push(shard.clone()),
+            None => groups.push((node_id, vec![shard.clone()])),
         }
     }
     groups
@@ -87,7 +96,8 @@ mod tests {
             make_shard(4),
             make_shard(5),
         ];
-        // Map: even shards → node-a, odd shards → node-b
+        // Map: even shards → node-a, odd shards → node-b. First-seen
+        // order is preserved (node-a first — shard 0 is even).
         let groups = group_by_node(&shards, |req| {
             if req.shard_index % 2 == 0 {
                 Some(NodeId::new("node-a"))
@@ -96,8 +106,10 @@ mod tests {
             }
         });
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups.get(&NodeId::new("node-a")).unwrap().len(), 3); // 0, 2, 4
-        assert_eq!(groups.get(&NodeId::new("node-b")).unwrap().len(), 3); // 1, 3, 5
+        assert_eq!(groups[0].0, NodeId::new("node-a"));
+        assert_eq!(groups[0].1.len(), 3); // 0, 2, 4
+        assert_eq!(groups[1].0, NodeId::new("node-b"));
+        assert_eq!(groups[1].1.len(), 3); // 1, 3, 5
     }
 
     #[test]
@@ -117,6 +129,7 @@ mod tests {
             }
         });
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups.get(&NodeId::new("a")).unwrap().len(), 1);
+        assert_eq!(groups[0].0, NodeId::new("a"));
+        assert_eq!(groups[0].1.len(), 1);
     }
 }

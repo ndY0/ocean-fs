@@ -145,16 +145,21 @@ pub struct DiskSegmentReader {
     /// Data pool roots sealed segments are spread across (ADR-0029 f5).
     /// Empty = legacy mode: every segment resolves to `legacy_dir`.
     data_pools: Vec<Arc<crate::pool::StoragePool>>,
+    /// The live `PoolRegistry` (f8 runtime attach), when wired: root
+    /// resolution refreshes from it so a pool attached mid-run is
+    /// readable immediately. `None` uses the boot-time `data_pools`.
+    registry: Option<Arc<crate::pool::PoolRegistry>>,
     /// Legacy segments directory (pool_id 0 / no pools).
     legacy_dir: PathBuf,
     /// Resolves a segment's durable pool id (the lifecycle registry's
     /// `SegmentMetadata.pool_id`); `None`/0 → the legacy dir.
     pool_id_for: crate::pool::PoolIdResolver,
-    /// Per-segment resolved pool ids. The registry lookup (a sharded
-    /// read lock + entry clone) runs ONCE per segment per process; every
-    /// subsequent read resolves from this cache — no registry lock on
-    /// the read path (f5 perf 7.2).
-    pool_id_cache: parking_lot::Mutex<HashMap<SegmentId, u32>>,
+    /// Per-segment RESOLVED ROOT directory. The registry snapshot (a
+    /// read lock) is taken ONCE per segment per process — on the first
+    /// read, when the root is resolved; every subsequent read hits this
+    /// cache, so there is no registry lock on the steady-state read
+    /// path (f5 perf 7.2).
+    pool_root_cache: parking_lot::Mutex<HashMap<SegmentId, PathBuf>>,
     /// Tracks the source of the most recent read, keyed by segment_id.
     last_source: Mutex<HashMap<SegmentId, SegmentReadSource>>,
     /// First-touch integrity state: maps segment_id → on-disk header
@@ -195,9 +200,10 @@ impl DiskSegmentReader {
             disk_io,
             mmap_cache,
             data_pools: Vec::new(),
+            registry: None,
             legacy_dir: segment_dir,
             pool_id_for: Arc::new(|_| None),
-            pool_id_cache: Mutex::new(HashMap::new()),
+            pool_root_cache: Mutex::new(HashMap::new()),
             ec_decoder,
             ec_encoder,
             last_source: Mutex::new(HashMap::new()),
@@ -223,6 +229,43 @@ impl DiskSegmentReader {
         self.data_pools = data_pools;
         self.legacy_dir = legacy_dir;
         self.pool_id_for = pool_id_for;
+        self
+    }
+
+    /// Wires the live `PoolRegistry` (f8 runtime attach).
+    ///
+    /// When set, root resolution refreshes the pool list from the
+    /// registry so a pool attached via `POST /admin/pools` is readable
+    /// immediately. The refresh happens once per segment (the first
+    /// read caches the resolved root — f5 perf 7.2: no registry lock on
+    /// the steady-state read path).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// use oceanfs_storage::io::{DiskIo, DiskSegmentReader, IoReadMode};
+    /// use oceanfs_storage::PoolRegistry;
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// let registry = PoolRegistry::from_config(
+    ///     &oceanfs_core::StorageConfig::default(),
+    ///     &data_dir,
+    /// )
+    /// .expect("registry");
+    /// let reader = DiskSegmentReader::new(
+    ///     IoReadMode::Buffered,
+    ///     Arc::new(DiskIo::default()),
+    ///     None,
+    ///     tmp.path().join("segments"),
+    ///     None,
+    ///     None,
+    /// )
+    /// .with_registry(Arc::new(registry));
+    /// # let _ = reader;
+    /// ```
+    pub fn with_registry(mut self, registry: Arc<crate::pool::PoolRegistry>) -> Self {
+        self.registry = Some(registry);
         self
     }
 
@@ -291,25 +334,34 @@ impl DiskSegmentReader {
     /// once per segment per process (f5 perf 7.2: no registry lock on
     /// the read path).
     fn segment_path(&self, segment_id: &SegmentId) -> PathBuf {
-        let pool_id = if self.data_pools.is_empty() {
-            0
+        let root = if self.data_pools.is_empty() {
+            self.legacy_dir.clone()
         } else {
             // Cache lookup: the guard from the first lock() is dropped at
             // the end of THIS statement — never hold it across the
             // resolver call or the second lock() (parking_lot Mutex is
             // not reentrant).
-            let cached = self.pool_id_cache.lock().get(segment_id).copied();
+            let cached = self.pool_root_cache.lock().get(segment_id).cloned();
             match cached {
-                Some(pool_id) => pool_id,
+                Some(root) => root,
                 None => {
                     let pool_id = (self.pool_id_for)(segment_id).unwrap_or(0);
-                    self.pool_id_cache.lock().insert(*segment_id, pool_id);
-                    pool_id
+                    // f8: refresh the pool list from the live registry
+                    // when wired (a runtime-attached pool resolves here);
+                    // the resolved root is cached, so the registry read
+                    // lock is taken once per segment per process (f5
+                    // perf 7.2 — no registry lock on the read path).
+                    let pools: Vec<Arc<crate::pool::StoragePool>> = match &self.registry {
+                        Some(registry) => registry.data_pools(),
+                        None => self.data_pools.clone(),
+                    };
+                    let root = crate::pool::resolve_pool_root(&pools, pool_id, &self.legacy_dir);
+                    self.pool_root_cache.lock().insert(*segment_id, root.clone());
+                    root
                 }
             }
         };
-        crate::pool::resolve_pool_root(&self.data_pools, pool_id, &self.legacy_dir)
-            .join(format!("{segment_id}.dat"))
+        root.join(format!("{segment_id}.dat"))
     }
 }
 

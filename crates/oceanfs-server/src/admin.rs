@@ -417,6 +417,16 @@ pub(crate) struct AdminState {
     /// Segment data store for scrub (storage feature only).
     #[cfg(feature = "storage")]
     pub data_store: Option<Arc<dyn oceanfs_durability::SegmentDataStore>>,
+    /// The live storage-pool registry (ADR-0029, f8): `POST /admin/pools`
+    /// attaches a pool at runtime without a restart. `None` when the
+    /// pool surface is not wired.
+    #[cfg(feature = "storage")]
+    pub pool_registry: Option<Arc<oceanfs_storage::PoolRegistry>>,
+    /// Post-attach hook the composition root wires: rebuild + re-gossip
+    /// the `NodeManifest` (f6) and update the routing cache (f7) after a
+    /// pool is registered. Errors are logged — the pool IS attached.
+    #[cfg(feature = "storage")]
+    pub on_pool_attached: Option<Arc<dyn Fn() -> Result<(), String> + Send + Sync>>,
     /// L1 object cache for cache stats (cache feature only).
     #[cfg(feature = "cache")]
     pub object_cache: Option<Arc<ObjectCache>>,
@@ -460,6 +470,10 @@ impl AdminHandler {
                 lifecycle_registry: None,
                 #[cfg(feature = "storage")]
                 data_store: None,
+                #[cfg(feature = "storage")]
+                pool_registry: None,
+                #[cfg(feature = "storage")]
+                on_pool_attached: None,
                 #[cfg(feature = "cache")]
                 object_cache: None,
                 #[cfg(feature = "cache")]
@@ -493,6 +507,10 @@ impl AdminHandler {
                 lifecycle_registry: None,
                 #[cfg(feature = "storage")]
                 data_store: None,
+                #[cfg(feature = "storage")]
+                pool_registry: None,
+                #[cfg(feature = "storage")]
+                on_pool_attached: None,
                 #[cfg(feature = "cache")]
                 object_cache: None,
                 #[cfg(feature = "cache")]
@@ -565,12 +583,50 @@ impl AdminHandler {
         self
     }
 
+    /// Wires the runtime pool-attach surface (ADR-0029 §D8, f8).
+    ///
+    /// `registry` is the node's live `PoolRegistry`; `on_attached` is the
+    /// composition root's post-attach hook (rebuild + re-gossip the
+    /// `NodeManifest` and update the routing cache). Without this, the
+    /// `POST /admin/pools` route answers `501 Not Implemented`.
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// use oceanfs_server::admin::{AdminHandler, MetricsRegistry};
+    /// use oceanfs_server::BucketConfigStore;
+    /// use oceanfs_storage::PoolRegistry;
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// let registry = PoolRegistry::from_config(
+    ///     &oceanfs_core::StorageConfig::default(),
+    ///     &data_dir,
+    /// )
+    /// .expect("registry");
+    /// let handler = AdminHandler::new(
+    ///     Arc::new(BucketConfigStore::new()),
+    ///     Arc::new(MetricsRegistry::new()),
+    /// )
+    /// .with_pool_attach(Arc::new(registry), Arc::new(|| Ok(())));
+    /// # let _ = handler;
+    /// ```
+    #[cfg(feature = "storage")]
+    pub fn with_pool_attach(
+        mut self,
+        registry: Arc<oceanfs_storage::PoolRegistry>,
+        on_attached: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    ) -> Self {
+        self.state.pool_registry = Some(registry);
+        self.state.on_pool_attached = Some(on_attached);
+        self
+    }
+
     /// Consumes the handler and returns an axum `Router` for the
     /// `/admin/` prefix.
     pub fn into_router(self) -> Router {
         let state = self.state;
 
-        Router::new()
+        let router = Router::new()
             .route("/admin/health", get(health_check))
             .route("/admin/cluster", get(cluster_view))
             .route("/admin/ring", get(ring_view))
@@ -579,8 +635,13 @@ impl AdminHandler {
             .route("/admin/scrub", post(trigger_scrub))
             .route("/admin/metrics", get(metrics_endpoint))
             .route("/admin/acceleration", get(acceleration_status))
-            .route("/admin/buckets/{bucket}/policy", put(set_bucket_policy))
-            .with_state(state)
+            .route("/admin/buckets/{bucket}/policy", put(set_bucket_policy));
+
+        // Runtime pool attach (ADR-0029 §D8, f8) — storage feature only.
+        #[cfg(feature = "storage")]
+        let router = router.route("/admin/pools", post(attach_pool));
+
+        router.with_state(state)
     }
 }
 
@@ -814,6 +875,70 @@ async fn acceleration_status(State(_state): State<AdminState>) -> impl IntoRespo
     let status =
         AccelerationStatus { active_tier: "CpuSimd".into(), fallback_count: 0, healthy: true };
     Json(status).into_response()
+}
+
+/// `POST /admin/pools` — attach a storage pool at runtime (ADR-0029 §D8,
+/// f8): validate → probe → register → re-gossip the manifest → `201`.
+///
+/// Response codes: `201` attached (with `{"pool_id": n}`); `400`
+/// validation failure; `409` duplicate name/root; `500` probe failure;
+/// `501` when the pool surface is not wired (no storage feature or the
+/// composition root did not call `with_pool_attach`).
+///
+/// The admin path is per-node (the operator addresses the node whose
+/// topology they are changing) — consistent with the per-node topology
+/// config model (ADR-0029 §D8).
+#[cfg(feature = "storage")]
+#[instrument(skip(state))]
+async fn attach_pool(
+    State(state): State<AdminState>,
+    Json(pool): Json<oceanfs_core::StoragePoolConfig>,
+) -> impl IntoResponse {
+    let (registry, on_attached) =
+        match (state.pool_registry.as_ref(), state.on_pool_attached.as_ref()) {
+            (Some(registry), Some(on_attached)) => (registry.clone(), on_attached.clone()),
+            _ => {
+                return (
+                    StatusCode::NOT_IMPLEMENTED,
+                    Json(serde_json::json!({
+                        "error": "pool attach is not configured on this node",
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+    match registry.attach(pool) {
+        Ok(pool_id) => {
+            // The pool IS registered — re-gossip the manifest so peers
+            // see the new capacity. A hook failure is logged loudly but
+            // must not fail the attach (the operator can re-trigger via
+            // a subsequent call or a restart).
+            if let Err(e) = on_attached() {
+                tracing::error!(
+                    error = %e,
+                    pool_id,
+                    "pool attached but manifest re-gossip failed; \
+                     peers may not see the new pool until the next change"
+                );
+            }
+            (StatusCode::CREATED, Json(serde_json::json!({ "pool_id": pool_id }))).into_response()
+        }
+        Err(message) => {
+            // Classify: duplicate name/root → 409; probe failure → 500;
+            // anything else is a validation failure → 400.
+            let status = if message.contains("duplicate pool name")
+                || message.contains("duplicate pool root")
+            {
+                StatusCode::CONFLICT
+            } else if message.contains("probe failed") {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (status, Json(serde_json::json!({ "error": message }))).into_response()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

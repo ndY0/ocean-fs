@@ -66,6 +66,7 @@ async fn concurrent_seals(
     let sealer = Arc::new(SegmentSealer::new(
         oceanfs_storage::SealConfig {
             data_pools: Vec::new(),
+            registry: None,
             target_size_bytes: data_size as u64,
             seal_timeout_ms: 60_000,
             data_dir: tmpdir.join("segments"),

@@ -30,9 +30,15 @@
 //!
 //! # LOCK ORDER
 //!
-//! Single lock only (`PoolRegistry.pools`), held briefly and never across
-//! I/O or across another lock. `PoolMetrics` is immutable after construction
-//! (its gauges/counters are interior-mutable atomics).
+//! Two independent `RwLock`s: `PoolRegistry.pools` (placement/routing
+//! reads dominate — perf 7.2) and `PoolRegistry.metrics` (cold: boot
+//! registration + the maintenance-tick capacity refresh). Each is held
+//! briefly and never across I/O or across the other lock; the probe
+//! (`statvfs`) in `attach`/`refresh_capacity` runs OUTSIDE both. Pool
+//! registration on runtime attach (f8) takes the write lock only to
+//! push the pre-constructed pool + metric series. `PoolMetrics` series
+//! are immutable after construction (gauges/counters are
+//! interior-mutable atomics); a new series is pushed on attach.
 
 pub mod placement;
 
@@ -592,6 +598,7 @@ fn resolve_tech(tech: PoolTech) -> PoolTech {
 
 /// Per-pool Prometheus series, registered once at construction (the same
 /// pattern the durability counters use, e.g. `hinted_handoff_*`).
+#[derive(Clone)]
 struct PoolMetrics {
     /// Pool id the series belong to (used to find the right series).
     pool_id: u32,
@@ -669,9 +676,19 @@ pub struct PoolRegistry {
     /// request), so an `RwLock` (perf guideline 7.2); the list only changes
     /// on runtime attach (f8).
     pools: RwLock<Vec<Arc<StoragePool>>>,
-    /// Per-pool metric series; immutable after construction (gauges and
-    /// counters are interior-mutable).
-    metrics: Vec<PoolMetrics>,
+    /// Per-pool metric series. Reads are cold (registration at boot,
+    /// capacity refresh on the maintenance tick); a new series is pushed
+    /// under the write lock on runtime attach (f8) — a rare admin op
+    /// (perf 7.1: the lock is held only for registration, never during
+    /// placement reads).
+    metrics: RwLock<Vec<PoolMetrics>>,
+    /// The node's `MissingRootPolicy`: how a runtime attach's probe
+    /// failure resolves (`Fatal` → `Err`, `Degraded` → pool registered as
+    /// Degraded). Captured at construction from the topology config.
+    missing_root_policy: MissingRootPolicy,
+    /// The node's legacy `data_dir`: a pool root must stay disjoint from
+    /// it (f1 rule) — checked at attach time too, not just at boot.
+    data_dir: PathBuf,
 }
 
 impl PoolRegistry {
@@ -787,7 +804,12 @@ impl PoolRegistry {
             }
         }
 
-        Ok(PoolRegistry { pools: RwLock::new(pools), metrics })
+        Ok(PoolRegistry {
+            pools: RwLock::new(pools),
+            metrics: RwLock::new(metrics),
+            missing_root_policy: storage.missing_root_policy,
+            data_dir: data_dir.to_path_buf(),
+        })
     }
 
     /// Returns a snapshot copy of all pools (config order; legacy mode:
@@ -1012,6 +1034,219 @@ impl PoolRegistry {
         }
     }
 
+    /// Attaches a new pool at runtime (ADR-0029 §D8, f8) — no restart.
+    ///
+    /// The admin path calls this for `POST /admin/pools`: validate the
+    /// single pool against the LIVE registry (f1 rules: non-empty unique
+    /// name, absolute unique root, role cardinality, weight/health knobs,
+    /// root disjoint from the legacy `data_dir`), probe the root (the
+    /// node's `MissingRootPolicy` decides `Fatal` → `Err` vs `Degraded`),
+    /// resolve weight/tech, and register under the registry's write lock
+    /// (perf 7.1: a short critical section held only for registration —
+    /// never during placement reads, which take the read lock). The new
+    /// pool gets the next sequential id and is visible to placement
+    /// immediately (placement reads the registry snapshot per selection).
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message for validation failures
+    /// ("duplicate pool name"/"duplicate pool root"/role cardinality),
+    /// probe failures under the `Fatal` policy, or registration errors.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::{PoolRole, StoragePoolConfig};
+    /// use oceanfs_storage::PoolRegistry;
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// # let attach_root = tmp.path().join("nvme-attach");
+    /// let registry = PoolRegistry::from_config(
+    ///     &oceanfs_core::StorageConfig::default(),
+    ///     &data_dir,
+    /// )
+    /// .expect("registry");
+    /// let id = registry
+    ///     .attach(StoragePoolConfig {
+    ///         name: "fast-nvme-0".into(),
+    ///         role: PoolRole::Data,
+    ///         root: attach_root,
+    ///         weight: None,
+    ///         tech: oceanfs_core::PoolTech::Auto,
+    ///         health: Default::default(),
+    ///     })
+    ///     .expect("attach must succeed");
+    /// assert_eq!(registry.pool_count(), 2);
+    /// assert!(registry.pool_by_id(id).is_some());
+    /// ```
+    pub fn attach(&self, pool: oceanfs_core::StoragePoolConfig) -> Result<u32, String> {
+        // ---- 1. Validate the single pool against the live registry. ----
+        // Fast-fail under a read lock BEFORE the probe I/O; the same
+        // checks re-run under the write lock at registration (step 3) —
+        // a concurrent attach between the two locks would otherwise pass
+        // both validations and both register (the id stays race-free,
+        // but duplicates would slip through). The admin path is
+        // single-operator; the re-check is cheap (no I/O).
+        {
+            let existing = self.pools.read();
+            Self::validate_attach(self, &pool, &existing)?;
+        }
+
+        // ---- 2. Probe the root (outside any lock — filesystem I/O). ----
+        let (status, capacity) = match probe_root(&pool.root) {
+            Ok(()) => (PoolStatus::Healthy, statvfs_capacity(&pool.root).unwrap_or_default()),
+            Err(e) if self.missing_root_policy == MissingRootPolicy::Degraded => {
+                tracing::warn!(
+                    pool = %pool.name,
+                    error = %e,
+                    "attached pool root probe failed; registering pool as Degraded \
+                     (Phase A: treated as Healthy by consumers until Phase B)"
+                );
+                (PoolStatus::Degraded, PoolCapacity::default())
+            }
+            Err(e) => {
+                return Err(format!(
+                    "pool '{}' root '{}' probe failed: {e}",
+                    pool.name,
+                    pool.root.display()
+                ));
+            }
+        };
+        let weight = match pool.weight {
+            Some(weight) => weight,
+            None => auto_weight(capacity.total_bytes),
+        };
+
+        // ---- 3. Register under the write lock (short critical section). ----
+        // The pool + metric series are constructed OUTSIDE the lock (the
+        // only work inside is the pure push — perf 7.1); the id is
+        // `pools.len()` under the lock, so concurrent attaches cannot
+        // collide.
+        let tech = resolve_tech(pool.tech);
+        let name = pool.name.clone();
+        let role = pool.role;
+        let root = pool.root.clone();
+        let id = {
+            let mut pools = self.pools.write();
+            // Re-validate under the write lock (TOCTOU: a concurrent
+            // attach may have registered a duplicate since step 1).
+            Self::validate_attach(self, &pool, &pools)?;
+            let id = pools.len() as u32;
+            let registered =
+                Arc::new(StoragePool::new(id, name, role, root, weight, tech, status, capacity));
+            // Publish the initial capacity/status to the metric series.
+            let metric = PoolMetrics::new(&registered);
+            metric.status.set(status.as_u8() as u64);
+            metric.bytes_free.set(capacity.free_bytes);
+            metric.bytes_total.set(capacity.total_bytes);
+            self.metrics.write().push(metric);
+            pools.push(registered);
+            id
+        };
+
+        tracing::info!(
+            pool = %pool.name,
+            pool_id = id,
+            role = %pool.role.as_str(),
+            root = %pool.root.display(),
+            "storage pool attached at runtime"
+        );
+        Ok(id)
+    }
+
+    /// Validates a single pool definition against a registry snapshot
+    /// (f1 rules): non-empty unique name, absolute unique root, role
+    /// cardinality, weight/health knobs, root disjoint from the legacy
+    /// `data_dir`. Shared by the attach read-lock fast-fail and the
+    /// write-lock TOCTOU re-check.
+    fn validate_attach(
+        &self,
+        pool: &oceanfs_core::StoragePoolConfig,
+        existing: &[Arc<crate::pool::StoragePool>],
+    ) -> Result<(), String> {
+        if pool.name.trim().is_empty() {
+            return Err("pool name must be non-empty".to_string());
+        }
+        if !pool.root.is_absolute() {
+            return Err(format!(
+                "pool '{}' root must be an absolute path, got '{}'",
+                pool.name,
+                pool.root.display()
+            ));
+        }
+        for current in existing.iter() {
+            if current.name() == pool.name {
+                return Err(format!("duplicate pool name: '{}'", pool.name));
+            }
+            if current.root() == pool.root {
+                return Err(format!("duplicate pool root: '{}'", pool.root.display()));
+            }
+        }
+        // Role cardinality: wal/metadata/hints are at most one each.
+        if matches!(pool.role, PoolRole::Wal | PoolRole::Metadata | PoolRole::Hints)
+            && existing.iter().any(|current| current.role() == pool.role)
+        {
+            return Err(format!("at most one '{}' pool is allowed per node", pool.role.as_str()));
+        }
+        if let Some(weight) = pool.weight {
+            if weight == 0 {
+                return Err(format!("pool '{}' weight must be > 0, got 0", pool.name));
+            }
+        }
+        let health = &pool.health;
+        if !(health.error_rate_threshold > 0.0 && health.error_rate_threshold < 1.0) {
+            return Err(format!(
+                "pool '{}' health.error_rate_threshold must be in (0, 1), got {}",
+                pool.name, health.error_rate_threshold
+            ));
+        }
+        if health.trend_window_secs == 0
+            || health.detection_window_secs == 0
+            || health.recovery_window_secs == 0
+        {
+            return Err(format!(
+                "pool '{}' health windows (trend/detection/recovery) must all be > 0",
+                pool.name
+            ));
+        }
+        // The pool root must stay disjoint from the legacy data_dir (pool
+        // mode and legacy mode are mutually exclusive layouts).
+        let overlaps = pool.root == self.data_dir
+            || pool.root.starts_with(&self.data_dir)
+            || self.data_dir.starts_with(&pool.root);
+        if overlaps {
+            return Err(format!(
+                "pool '{}' root '{}' overlaps the legacy data_dir '{}'; \
+                 pool roots must be disjoint from data_dir",
+                pool.name,
+                pool.root.display(),
+                self.data_dir.display()
+            ));
+        }
+        Ok(())
+    }
+
+    /// The number of registered pools (admin/observability).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_storage::PoolRegistry;
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// let registry = PoolRegistry::from_config(
+    ///     &oceanfs_core::StorageConfig::default(),
+    ///     &data_dir,
+    /// )
+    /// .expect("registry");
+    /// assert_eq!(registry.pool_count(), 1);
+    /// ```
+    pub fn pool_count(&self) -> usize {
+        self.pools.read().len()
+    }
+
     /// Registers every per-pool metric series with the node's registry.
     ///
     /// Called once at startup (the node's composition root), after
@@ -1040,7 +1275,7 @@ impl PoolRegistry {
     /// registry.register_metrics(&Noop);
     /// ```
     pub fn register_metrics(&self, registrar: &dyn MetricRegistrar) {
-        for metric in &self.metrics {
+        for metric in self.metrics.read().iter() {
             registrar.register_gauge(metric.status.clone());
             registrar.register_gauge(metric.bytes_free.clone());
             registrar.register_gauge(metric.bytes_total.clone());
@@ -1050,8 +1285,8 @@ impl PoolRegistry {
 
     /// Returns the metric series for a pool id (linear scan; pool counts
     /// are 5–20, and this is a cold path).
-    fn metrics_for(&self, pool_id: u32) -> Option<&PoolMetrics> {
-        self.metrics.iter().find(|metric| metric.pool_id == pool_id)
+    fn metrics_for(&self, pool_id: u32) -> Option<PoolMetrics> {
+        self.metrics.read().iter().find(|metric| metric.pool_id == pool_id).cloned()
     }
 }
 
@@ -1061,7 +1296,7 @@ impl std::fmt::Debug for PoolRegistry {
         // rendering the pool list only is the useful surface.
         f.debug_struct("PoolRegistry")
             .field("pools", &self.pools())
-            .field("metric_series", &self.metrics.len())
+            .field("metric_series", &self.metrics.read().len())
             .finish()
     }
 }
@@ -1425,5 +1660,175 @@ mod tests {
         registry.set_status(0, PoolStatus::Degraded);
         assert_eq!(healthy.get(), 1);
         drop(tmp);
+    }
+
+    /// f8: attach assigns sequential ids — the first attach gets
+    /// `pools.len()`, the next one bumps.
+    #[test]
+    fn attach_assigns_sequential_ids() {
+        let (tmp, data_dir) = layout();
+        let registry = PoolRegistry::from_config(&StorageConfig::default(), &data_dir).unwrap();
+        assert_eq!(registry.pool_count(), 1);
+
+        let first = registry
+            .attach(pool("attach-0", PoolRole::Data, &tmp.path().join("root-a"), None))
+            .unwrap();
+        assert_eq!(first, 1, "first attach id = current pool count");
+        assert_eq!(registry.pool_count(), 2);
+
+        let second = registry
+            .attach(pool("attach-1", PoolRole::Data, &tmp.path().join("root-b"), None))
+            .unwrap();
+        assert_eq!(second, 2);
+        assert_eq!(registry.pool_count(), 3);
+
+        // The attached pools are visible to lookups and carry their root.
+        assert_eq!(registry.pool_by_id(first).unwrap().root(), tmp.path().join("root-a"));
+        assert_eq!(registry.pool_by_id(second).unwrap().name(), "attach-1");
+    }
+
+    /// f8: duplicate name and duplicate root are rejected against the
+    /// LIVE registry (including the boot-configured pools).
+    #[test]
+    fn attach_rejects_duplicate_name_and_root() {
+        let (tmp, data_dir) = layout();
+        let root = tmp.path().join("root-a");
+        let registry = PoolRegistry::from_config(&StorageConfig::default(), &data_dir).unwrap();
+
+        let id = registry.attach(pool("dup", PoolRole::Data, &root, None)).unwrap();
+        assert!(registry.pool_by_id(id).is_some());
+
+        // Duplicate name (different root).
+        let dup_name =
+            registry.attach(pool("dup", PoolRole::Data, &tmp.path().join("root-b"), None));
+        assert!(dup_name.is_err(), "duplicate name must be rejected");
+        assert!(dup_name.unwrap_err().contains("duplicate pool name"));
+
+        // Duplicate root (different name).
+        let dup_root = registry.attach(pool("other", PoolRole::Data, &root, None));
+        assert!(dup_root.is_err(), "duplicate root must be rejected");
+        assert!(dup_root.unwrap_err().contains("duplicate pool root"));
+
+        // Nothing was registered by the rejected attaches.
+        assert_eq!(registry.pool_count(), 2);
+    }
+
+    /// f8: role cardinality is enforced against live pools — a second
+    /// wal/metadata/hints pool is rejected, a second data pool is fine.
+    #[test]
+    fn attach_enforces_role_cardinality() {
+        let (tmp, data_dir) = layout();
+        let registry = PoolRegistry::from_config(&StorageConfig::default(), &data_dir).unwrap();
+
+        let wal_id = registry
+            .attach(pool("journal", PoolRole::Wal, &tmp.path().join("optane0"), None))
+            .unwrap();
+        assert!(registry.pool_by_id(wal_id).is_some());
+
+        // Second wal pool → rejected.
+        let second_wal =
+            registry.attach(pool("journal-2", PoolRole::Wal, &tmp.path().join("optane1"), None));
+        assert!(second_wal.is_err(), "at most one wal pool");
+        assert!(second_wal.unwrap_err().contains("wal"));
+
+        // A second data pool is allowed (placement spread).
+        let data2 = registry
+            .attach(pool("data-2", PoolRole::Data, &tmp.path().join("nvme1"), None))
+            .unwrap();
+        assert_eq!(data2, 2);
+        assert_eq!(registry.pool_count(), 3);
+    }
+
+    /// f8: a probe failure under the Fatal policy rejects the attach; the
+    /// missing root is not registered.
+    #[test]
+    fn attach_probe_failure_under_fatal_policy_rejects() {
+        let (tmp, data_dir) = layout();
+        // Fatal policy: a root that cannot be probed fails the attach.
+        let registry = PoolRegistry::from_config(
+            &StorageConfig {
+                missing_root_policy: MissingRootPolicy::Fatal,
+                ..StorageConfig::default()
+            },
+            &data_dir,
+        )
+        .unwrap();
+
+        // A root path that cannot be created (a regular file in the way).
+        let blocked = tmp.path().join("blocked");
+        std::fs::write(&blocked, b"file").unwrap();
+        let attach = registry.attach(pool("bad", PoolRole::Data, &blocked, None));
+        assert!(attach.is_err(), "Fatal policy must reject an unprobeable root");
+        assert!(attach.unwrap_err().contains("probe failed"));
+        assert_eq!(registry.pool_count(), 1, "the failed attach must not register");
+    }
+
+    /// f8: the Degraded policy registers an unprobeable root as Degraded
+    /// (Phase A: treated as Healthy by consumers until Phase B).
+    #[test]
+    fn attach_probe_failure_under_degraded_policy_registers_degraded() {
+        let (tmp, data_dir) = layout();
+        let registry = PoolRegistry::from_config(
+            &StorageConfig {
+                missing_root_policy: MissingRootPolicy::Degraded,
+                ..StorageConfig::default()
+            },
+            &data_dir,
+        )
+        .unwrap();
+
+        let blocked = tmp.path().join("blocked");
+        std::fs::write(&blocked, b"file").unwrap();
+        let id = registry.attach(pool("soft", PoolRole::Data, &blocked, None)).unwrap();
+        assert_eq!(registry.pool_by_id(id).unwrap().status(), PoolStatus::Degraded);
+    }
+
+    /// f8: the attached pool's root must stay disjoint from the legacy
+    /// data_dir.
+    #[test]
+    fn attach_rejects_root_overlapping_data_dir() {
+        let (_tmp, data_dir) = layout();
+        let registry = PoolRegistry::from_config(&StorageConfig::default(), &data_dir).unwrap();
+
+        // data_dir itself is already the implicit pool's root (duplicate
+        // root); a nested path trips the overlap rule.
+        let direct = registry.attach(pool("bad-0", PoolRole::Data, &data_dir, None));
+        assert!(direct.is_err(), "a root equal to data_dir must be rejected");
+
+        let nested =
+            registry.attach(pool("bad-1", PoolRole::Data, &data_dir.join("segments"), None));
+        assert!(nested.is_err(), "a root nested in data_dir must be rejected");
+        assert!(nested.unwrap_err().contains("overlaps the legacy data_dir"));
+
+        assert_eq!(registry.pool_count(), 1);
+    }
+
+    /// f8: after attach, placement selection sees the new pool
+    /// immediately (it reads the registry snapshot per selection — no
+    /// cached pool list in the policy).
+    #[test]
+    fn placement_selects_attached_pool() {
+        use crate::pool::placement::PlacementPolicy;
+
+        let (tmp, data_dir) = layout();
+        let registry = PoolRegistry::from_config(&StorageConfig::default(), &data_dir).unwrap();
+        let policy = PlacementPolicy::new();
+
+        // Only the implicit pool initially.
+        assert_eq!(registry.data_pools().len(), 1);
+        let before = policy.select_data_pool(&registry);
+        assert_eq!(before.unwrap().id(), 0);
+
+        // Attach a second data pool; selection may now return it.
+        registry
+            .attach(pool("attached", PoolRole::Data, &tmp.path().join("nvme-a"), None))
+            .unwrap();
+        assert_eq!(registry.data_pools().len(), 2);
+        let after = policy.select_data_pool(&registry).expect("a data pool");
+        assert!(
+            after.id() == 0 || after.id() == 1,
+            "selection must see the attached pool, got {}",
+            after.id()
+        );
     }
 }

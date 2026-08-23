@@ -331,8 +331,8 @@ mod tests {
                 ("hints", PoolRole::Hints, 1),
             ],
             &[
-                (100 * GIB, 1 * GIB),
-                (100 * GIB, 1 * GIB),
+                (100 * GIB, GIB),
+                (100 * GIB, GIB),
                 (1_000 * GIB, 900 * GIB), // wal: huge free, never eligible
                 (1_000 * GIB, 900 * GIB), // metadata: huge free, never eligible
                 (1_000 * GIB, 900 * GIB), // hints: huge free, never eligible

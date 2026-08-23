@@ -47,7 +47,16 @@ pub struct SealConfig {
     /// the sealer consults `PlacementPolicy` once per new segment, writes
     /// the `.dat` under the selected pool root, and stamps the pool id on
     /// the segment metadata (the durable segment→pool mapping).
+    ///
+    /// With `registry` set (f8 runtime attach), the sealer reads the LIVE
+    /// data-pool snapshot from the registry at each seal instead of this
+    /// boot-time list — a pool attached mid-run is visible to placement
+    /// immediately, without a restart.
     pub data_pools: Vec<Arc<crate::pool::StoragePool>>,
+    /// The live `PoolRegistry`, when wired (f8). When `Some`, the sealer
+    /// refreshes the data-pool list from it per seal (and per recovery
+    /// dir enumeration); `None` uses the boot-time `data_pools` list.
+    pub registry: Option<Arc<crate::pool::PoolRegistry>>,
     /// I/O read mode for segment data I/O.
     ///
     /// When `Direct`, segment data files are opened with `O_DIRECT`
@@ -85,6 +94,7 @@ impl Default for SealConfig {
             seal_timeout_ms: 5000,
             data_dir: PathBuf::new(),
             data_pools: Vec::new(),
+            registry: None,
             io_mode: IoReadMode::Buffered,
             write_mode: SegmentWriteMode::Rename,
             fsync_batch_timeout_ms: 10,
@@ -346,13 +356,21 @@ impl SegmentSealer {
         // pool; the legacy root only exists in legacy mode — the f5
         // "0 = legacy" note is corrected for the f2 config-order id
         // scheme, see the feature doc deviations).
-        let (dir, pool_id) = if self.config.data_pools.is_empty() {
+        // f8: refresh the data-pool list from the live registry when
+        // wired, so a runtime-attached pool is a placement target
+        // immediately (perf 7.1: a read-lock snapshot per seal — the
+        // seal is not the hot path).
+        let data_pools: Vec<Arc<crate::pool::StoragePool>> = match &self.config.registry {
+            Some(registry) => registry.data_pools(),
+            None => self.config.data_pools.clone(),
+        };
+        let (dir, pool_id) = if data_pools.is_empty() {
             (self.config.data_dir.clone(), 0)
         } else {
-            match crate::pool::PlacementPolicy::new().select_from_pools(&self.config.data_pools) {
+            match crate::pool::PlacementPolicy::new().select_from_pools(&data_pools) {
                 Some(pool) => (pool.root().to_path_buf(), pool.id()),
                 None => {
-                    let pool = &self.config.data_pools[0];
+                    let pool = &data_pools[0];
                     (pool.root().to_path_buf(), pool.id())
                 }
             }
@@ -463,10 +481,14 @@ impl SegmentSealer {
     /// interrupted-seal `.dat` and stamps the owning pool id on the
     /// adopted segment.
     pub(crate) fn segment_data_dirs(&self) -> Vec<(std::path::PathBuf, u32)> {
+        // f8: the live registry snapshot, when wired — a runtime-attached
+        // pool's root is enumerated on the next recovery fold.
+        let data_pools: Vec<Arc<crate::pool::StoragePool>> = match &self.config.registry {
+            Some(registry) => registry.data_pools(),
+            None => self.config.data_pools.clone(),
+        };
         let mut dirs = vec![(self.config.data_dir.clone(), 0)];
-        dirs.extend(
-            self.config.data_pools.iter().map(|pool| (pool.root().to_path_buf(), pool.id())),
-        );
+        dirs.extend(data_pools.iter().map(|pool| (pool.root().to_path_buf(), pool.id())));
         dirs
     }
 
@@ -846,6 +868,7 @@ mod tests {
         // batches (max_waiters = 8).
         let config = SealConfig {
             data_pools: Vec::new(),
+            registry: None,
             target_size_bytes: 4096,
             seal_timeout_ms: 1000,
             data_dir: dir.path().join("segments"),
@@ -954,6 +977,7 @@ mod tests {
         );
         let config = SealConfig {
             data_pools: Vec::new(),
+            registry: None,
             target_size_bytes: 4096,
             seal_timeout_ms: 1000,
             data_dir: dir.path().join("segments"),

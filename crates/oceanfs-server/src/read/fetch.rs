@@ -1126,20 +1126,31 @@ mod tests {
     async fn fetch_falls_through_on_replica_error_and_counts_failover() {
         // Two replicas. The first has NO data for the segment (its
         // FetchShard errors), the second serves it.
-        let seg_id = SegmentId::new();
         let test_data = Bytes::from_static(b"failover test data");
         let failing_store = Arc::new(TestSegmentStore::new()) as Arc<dyn SegmentDataStore>;
         let serving_store = Arc::new(TestSegmentStore::new()) as Arc<dyn SegmentDataStore>;
-        serving_store.write_segment_data(&seg_id, &test_data).unwrap();
-
-        let failing_addr = serve_segment(failing_store).await;
-        let serving_addr = serve_segment(serving_store).await;
 
         // Ring with two replicas (RF 2 so both are in the lookup set).
         let mut ring = Ring::new(RingConfig { replication_factor: 2, ..RingConfig::default() });
         ring.add_node(NodeId::new("n1"));
         ring.add_node(NodeId::new("n2"));
+
+        // The replica ORDER depends on the segment id's hash — pick a
+        // segment id whose lookup puts the FAILING replica (n1) first, so
+        // the fall-through is exercised deterministically.
+        let seg_id = loop {
+            let candidate = SegmentId::new();
+            let hash = blake3::hash(candidate.to_string().as_bytes());
+            if ring.lookup(hash.as_bytes()).first() == Some(&NodeId::new("n1")) {
+                break candidate;
+            }
+        };
+        serving_store.write_segment_data(&seg_id, &test_data).unwrap();
+
         let ring_cache = Arc::new(RingCache::new(ring));
+
+        let failing_addr = serve_segment(failing_store).await;
+        let serving_addr = serve_segment(serving_store).await;
 
         // Membership resolving both replicas to the test servers.
         let membership = Arc::new(Membership::new(

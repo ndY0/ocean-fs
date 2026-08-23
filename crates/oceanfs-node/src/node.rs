@@ -424,6 +424,9 @@ pub struct Node {
     metadata_store: Arc<oceanfs_storage::RocksDbMetadataStore>,
     /// WAL writer (held for graceful shutdown sync).
     wal_writer: Arc<oceanfs_storage::WalWriter>,
+    /// The live storage-pool registry (ADR-0029) — held so the admin
+    /// attach surface and tests can observe the pool set.
+    pub(crate) pool_registry: Arc<oceanfs_storage::PoolRegistry>,
 }
 
 impl Node {
@@ -688,6 +691,17 @@ impl Node {
         };
         let seal_config = oceanfs_storage::SealConfig {
             data_pools: data_pools.clone(),
+            // f8 runtime attach: the sealer refreshes the data-pool list
+            // from the LIVE registry at each seal, so a pool attached via
+            // POST /admin/pools is a placement target immediately (no
+            // restart). Pool mode only — legacy mode keeps the boot-time
+            // empty list (registry: None) so the byte-for-byte layout is
+            // untouched.
+            registry: if config.storage.pools.is_empty() {
+                None
+            } else {
+                Some(pool_registry.clone())
+            },
             target_size_bytes: segment_size.default_target_size,
             seal_timeout_ms: 5000,
             data_dir: segment_legacy_dir.clone(),
@@ -1044,8 +1058,13 @@ impl Node {
                 Some(accel.clone()),
             )
             // Pool-aware resolution (ADR-0029 f5): sealed segments read
-            // from the owning data pool root.
+            // from the owning data pool root. f8 runtime attach: the
+            // live registry is wired so a pool attached mid-run resolves
+            // (the resolved root is cached per segment — no registry
+            // lock on the steady-state read path; legacy mode
+            // short-circuits to legacy_dir before touching the registry).
             .with_data_pools(data_pools.clone(), segment_legacy_dir.clone(), pool_id_for.clone())
+            .with_registry(pool_registry.clone())
             .with_evict_after_read(!config.read_cache_segments),
         );
 
@@ -1454,6 +1473,33 @@ impl Node {
             }
         });
 
+        // Runtime pool attach (ADR-0029 §D8, f8): after `POST
+        // /admin/pools` registers a pool, re-declare the NodeManifest
+        // (f6) so peers see the new capacity and re-seed the routing
+        // cache's self entry (f7). The incarnation tracks the CURRENT
+        // one (a rejoin bumps it) with the boot value as the fallback.
+        let attach_membership = membership.clone();
+        let attach_registry = pool_registry.clone();
+        let attach_cache = manifest_cache.clone();
+        let attach_self_id = NodeId::new(&config.node_id);
+        let attach_boot_incarnation = announce_incarnation;
+        let attach_metrics = metrics.clone();
+        let on_pool_attached: Arc<dyn Fn() -> Result<(), String> + Send + Sync> =
+            Arc::new(move || {
+                let incarnation = attach_membership
+                    .incarnation_of(&attach_self_id)
+                    .map(|inc| inc.value())
+                    .unwrap_or(attach_boot_incarnation);
+                let manifest =
+                    crate::pool_manifest::build_node_manifest(incarnation, &attach_registry);
+                attach_membership.set_self_manifest(manifest.clone());
+                attach_cache.update(attach_self_id.clone(), Arc::new(manifest));
+                // Register the attached pool's metric series with the
+                // global registry (idempotent — existing series are kept).
+                attach_registry.register_metrics(&*attach_metrics);
+                Ok(())
+            });
+
         let admin_handler = AdminHandler::new_with_cluster(
             bucket_store,
             metrics,
@@ -1467,7 +1513,8 @@ impl Node {
             Some(metadata_cache.clone()),
             Some(negative_cache.clone()),
         )
-        .with_accel(accel.clone());
+        .with_accel(accel.clone())
+        .with_pool_attach(pool_registry.clone(), on_pool_attached);
 
         // ---- 13. Build axum router ----
         // Auth middleware is config-driven: when `s3_auth_enabled = true`,
@@ -2047,7 +2094,86 @@ impl Node {
             membership,
             metadata_store,
             wal_writer: wal_writer.clone(),
+            pool_registry,
         })
+    }
+
+    /// Returns the live storage-pool registry (ADR-0029) — the pool set
+    /// the attach surface mutates and tests observe.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn example() {
+    /// use oceanfs_core::NodeConfig;
+    /// use oceanfs_node::Node;
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let config = NodeConfig {
+    /// #     data_dir: tmp.path().join("data"),
+    /// #     listen_addr: "127.0.0.1:0".into(),
+    /// #     grpc_listen_addr: "127.0.0.1:0".into(),
+    /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     ..NodeConfig::default()
+    /// # };
+    /// let node = Node::start(config).await.expect("node");
+    /// assert!(node.pool_registry().pool_count() >= 1);
+    /// node.shutdown().await.expect("shutdown");
+    /// # }
+    /// ```
+    pub fn pool_registry(&self) -> Arc<oceanfs_storage::PoolRegistry> {
+        self.pool_registry.clone()
+    }
+
+    /// Returns this node's current `NodeManifest` (ADR-0029 D2), as
+    /// gossiped to peers — `None` before the boot-time declaration.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn example() {
+    /// use oceanfs_core::NodeConfig;
+    /// use oceanfs_node::Node;
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let config = NodeConfig {
+    /// #     data_dir: tmp.path().join("data"),
+    /// #     listen_addr: "127.0.0.1:0".into(),
+    /// #     grpc_listen_addr: "127.0.0.1:0".into(),
+    /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     ..NodeConfig::default()
+    /// # };
+    /// let node = Node::start(config).await.expect("node");
+    /// // The boot-time manifest declares at least the implicit pool.
+    /// assert!(node.self_manifest().is_some());
+    /// node.shutdown().await.expect("shutdown");
+    /// # }
+    /// ```
+    pub fn self_manifest(&self) -> Option<oceanfs_membership::manifest::NodeManifest> {
+        self.membership.manifest_of(&self.node_id())
+    }
+
+    /// This node's id (from the config it booted with).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn example() {
+    /// use oceanfs_core::NodeConfig;
+    /// use oceanfs_node::Node;
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let config = NodeConfig {
+    /// #     data_dir: tmp.path().join("data"),
+    /// #     listen_addr: "127.0.0.1:0".into(),
+    /// #     grpc_listen_addr: "127.0.0.1:0".into(),
+    /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     ..NodeConfig::default()
+    /// # };
+    /// let node = Node::start(config).await.expect("node");
+    /// assert!(!node.node_id().as_str().is_empty());
+    /// node.shutdown().await.expect("shutdown");
+    /// # }
+    /// ```
+    pub fn node_id(&self) -> oceanfs_core::NodeId {
+        oceanfs_core::NodeId::new(&self.config.node_id)
     }
 
     /// Returns the acceleration dispatcher probed at startup (ADR-0006).
