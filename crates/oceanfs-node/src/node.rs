@@ -149,6 +149,12 @@ impl oceanfs_storage_api::MetadataStore for PrefetchStoreAdapter {
 // Node leave handler — implements GracefulLeaveHandler for WAL + shard handoff
 // ---------------------------------------------------------------------------
 
+// [review][performance][critical]
+// read the whole data dir, wich is potentially terabytes of data. Data pool refactor omitted this part
+// it is still consuming directly the a unique segment data dir. more broadly, since data is replicated, there is not point
+// in handing over the whole data to an another node. at shutdown, the node should stop accepting new request, and try best effort to
+// finish the wwork in progress.
+// [end]
 /// Handles WAL sealing and segment shard streaming during graceful leave.
 struct NodeLeaveHandler {
     /// WAL writer for flushing pending entries.
@@ -179,6 +185,9 @@ impl NodeLeaveHandler {
         Ok(ids)
     }
 
+    // [review][correctness][critical]
+    // read a fixed 76 byte offset for the headers. since we introduced compression, headers are variable size.
+    // [end]
     /// Reads segment data, skipping the 76-byte header.
     fn read_segment_data(
         &self,
@@ -525,6 +534,10 @@ impl Node {
     pub async fn start(config: NodeConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let config = Arc::new(Self::validate_config(config)?);
 
+        // [review][cleanup]
+        // we ditched rayon in favor of a unified design around a unique tokio thread executor.
+        // if this is never used anywhere, it should be discarded. otherwise, the consumer side should also be refactored out of rayon.
+        // [end]
         // Configure the rayon global thread pool for EC encode/decode.
         // Leave 2 cores for tokio's async runtime to avoid CPU oversubscription
         // when both compute (EC) and I/O (gRPC, RocksDB) run concurrently.
@@ -547,6 +560,10 @@ impl Node {
             "Starting OceanFS node"
         );
 
+        // [review][cleanup][high]
+        // pool registration : we handle legacy behaviour inside an unpublished software. this is not a public facing api, nor should wwe espect customers to use
+        // the former unique data_dir. we should not complexify the data pool with legacy behaviour, because there is none to begin with.
+        // [end]
         // ---- 0. Storage pool registry (ADR-0029) + role-pinned paths ----
         // The registry probes every configured pool root at boot: the
         // `Fatal` policy refuses to start on an unprobeable root, the
@@ -564,13 +581,19 @@ impl Node {
             crate::pool_paths::pool_paths(&pool_registry, &config.data_dir, &config.hint_wal_dir);
 
         // ---- 1. Open metadata store ----
+        // [review][config][high]
+        // metadata config : the configuration is mostly default hardcoded values, without any inputed user config.
+        // the metadata store must be configurable, a part of the configuration is dedicated to it.
+        // [end]
         let metadata_config =
             MetadataConfig { data_dir: paths.metadata.clone(), ..Default::default() };
         let metadata_store = Arc::new(
             oceanfs_storage::RocksDbMetadataStore::open(&metadata_config)
                 .map_err(|e| format!("failed to open metadata store: {e}"))?,
         );
-
+        // [review][config][high]
+        // acceleration config : same comment that of the metadata store. what is the point of config if static
+        // [end]
         // ---- 2. Probe acceleration hardware ----
         let accel_config = AccelConfig::default();
         let accel = Arc::new(oceanfs_accel::AccelDispatcher::new(accel_config));
@@ -618,6 +641,12 @@ impl Node {
         // rejoins as the same identity with a bumped incarnation (D1) and
         // can re-contact the cluster when configured seeds are unreachable
         // or empty (D3).
+        // [review][config][critical]
+        // membership persistante across restart information follow the old one data dir approach.
+        // this is incompatible with the pooled data dirs approach.
+        // moreover, loosing the data drive means loosing the ability to rejoin at restart. this should not be possible.
+        // a safer approach, using a foreign config store for cluster critical informations should be considered instead.
+        // [end]
         let membership_state_store =
             MembershipStateStore::new(default_state_path(&config.data_dir));
         let durable_state = membership_state_store.load().map_err(|e| {
@@ -652,6 +681,9 @@ impl Node {
         // neutral — the structure and metrics land for Phase B.
         let manifest_cache = Arc::new(crate::routing_cache::ManifestCache::new());
 
+        // [review][config][high]
+        // no rpc config from config is operational, only the default values are used. rpc should be configurable
+        // [end]
         // ---- 5. Construct connection pools ----
         let rpc_config = RpcConfig::default();
         let quickack = rpc_config.quickack;
@@ -666,8 +698,14 @@ impl Node {
         let pool = Arc::new(oceanfs_network::ConnectionPool::new(rpc_config));
         membership.set_pool(membership_pool.clone());
 
+        // [review][config][critical]
+        // segment tiers sizes should be configurable by the end user too
+        // [end]
         // ---- 6. Construct storage components ----
         let segment_size = SegmentSizeConfig::default();
+        // [review][config][critical]
+        // wal configuration should be configurable by the end user too
+        // [end]
         let wal_config = WalConfig { data_dir: paths.wal.clone(), ..WalConfig::default() };
         let wal_writer = Arc::new(
             oceanfs_storage::WalWriter::open(&wal_config)
@@ -705,10 +743,16 @@ impl Node {
         let shard_small_metrics = Arc::clone(&shard_small);
         let shard_standard_metrics = Arc::clone(&shard_standard);
 
+        // [review][config][critical]
+        // pools configurations should be configurable by the end user
+        // [end]
         // Segment pools for pipeline parallelism (perf rule §2.7).
         // Created before WAL replay so that replayed entries can be
         // reconstructed into active segments (C4-storage, D6).
         let pool_config = PoolConfig::default();
+        // [review][config][critical]
+        // pools configurations should be configurable by the end user
+        // [end]
         // EC codec for the segment pools: work items carry (k, m, strip)
         // so the seal worker computes and persists per-segment parity at
         // seal time (single scheduler — the parallel encode runs on the
@@ -752,6 +796,10 @@ impl Node {
             .map_err(|e| format!("failed to create standard segment pool: {e}"))?,
         );
 
+        // [review][architecture][high]
+        // a node without a data pool should not be permitted to start, since their is not legacy mode to consider.
+        // also, a silent fallback to an arcane legacy mode is big bark pattern, an should never take place
+        // [end]
         // ADR-0001: tiered segment sizing driven by SegmentSizeConfig.
         // ---- f5: pool-aware segment placement + resolution ----
         // Sealed segments spread across the node's data pools: the sealer
