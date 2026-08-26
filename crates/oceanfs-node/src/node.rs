@@ -831,6 +831,10 @@ impl Node {
         let io_observer = Arc::new(oceanfs_storage::io::IoObserver::new());
         pool_registry.observe_into(&io_observer);
         let io_backend = Arc::new(oceanfs_storage::io::IoBackend::new());
+        // [review][implementation][critical]
+        // seal config must be unique per pool path : write and read mode could differ
+        // between each mount
+        // [end]
         let seal_config = oceanfs_storage::SealConfig {
             data_pools: data_pools.clone(),
             // f8 runtime attach: the sealer refreshes the data-pool list
@@ -839,12 +843,20 @@ impl Node {
             // restart). Pool mode only — legacy mode keeps the boot-time
             // empty list (registry: None) so the byte-for-byte layout is
             // untouched.
+            // [review][config][high]
+            // consequence here : the registry cannot be none, since pool is not
+            // allpwed empty.
+            // [end]
             registry: if config.storage.pools.is_empty() {
                 None
             } else {
                 Some(pool_registry.clone())
             },
             target_size_bytes: segment_size.default_target_size,
+            // [review][config][high]
+            // seal timeout should be allowed to be user configured since
+            // and its default value cannot be a magic constant
+            // [end]
             seal_timeout_ms: 5000,
             data_dir: segment_legacy_dir.clone(),
             io_mode: oceanfs_storage::io::IoReadMode::from_config(config.read_cache_segments),
