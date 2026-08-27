@@ -6,6 +6,9 @@ pub(crate) const CF_OBJECTS: &str = "objects";
 /// Column family name for deletion tombstones.
 pub(crate) const CF_DELETIONS: &str = "deletions";
 
+// [review][cleanup][medium]
+// remove unused code
+// [end]
 /// All column families used by the metadata store — `objects` +
 /// `deletions` only (ADR-0025 Decision 3: the `segments` and
 /// `deleted_segments` CFs are removed; segment lifecycle state lives in

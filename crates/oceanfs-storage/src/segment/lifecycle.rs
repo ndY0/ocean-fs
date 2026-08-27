@@ -1801,7 +1801,8 @@ impl SegmentLifecycleCoordinator {
 
         // [review][algorithmic][high]
         // this approach is a heuristic. it's gotten worst with the multi pool design, a deterministic one would
-        // be to use oneshots signals through the seal pipeline with a temporary state registry for the replayed ids.
+        // be to use oneshots signals through the seal pipeline with a temporary state registry for the replayed ids,
+        // or a tokio notify
         // no arbitrary counter, nor deadline.
         // [end]
         // 7. The replayed seals complete asynchronously on the seal
@@ -2327,10 +2328,10 @@ impl SegmentLifecycleCoordinator {
     }
 
     // [review][algorithmic][critical]
-    // this is falsly advertised as 'not timer based' : the deadline constitute an arbitrary timer contract for the sealing pipeline to 
-    // execute. a signaling approach  (for instance, oneshot channels) would trully allow a full backpressure approach, and to trigger seal retry
-    // just in time, rather than guesstimating with a timer. we need a torough discussion on this topic, since this leaves at the heart of the software,
-    // and costs should be weighted carefully 
+    // alternatively, we could notify a background task notified on drain of the sealing queue.
+    // we previously used a timer based approach, but never considered a signaling one.
+    // right now, i have a problem with the deadline approahc, since it only translate the lack of proper
+    // awarness of the state of the queue, that a signaling approcah would get use
     // [end]
     /// Drains the pending-seal set — the deterministic seal trigger,
     /// the replacement for the idle-seal timer.

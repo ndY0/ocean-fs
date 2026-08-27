@@ -12,6 +12,9 @@ use crate::{
     RocksDbMetadataStore,
 };
 
+// [review][cleanup][medium]
+// if not used, should be cleaned up
+// [end]
 /// Writes blobs directly to the metadata store (inline path).
 // TODO(write-path-unification): remove once cleanup task L5 is done.
 #[allow(dead_code)]
@@ -45,6 +48,10 @@ impl InlineWriter {
     }
 }
 
+// [review][cleanup][medium]
+// if not used, should be cleaned up
+// [end]
+/// Writes blobs directly to the metadata store (inline path).
 /// Routes a blob write to the appropriate tier.
 // TODO(write-path-unification): remove once cleanup task L5 is done.
 #[allow(dead_code)]
