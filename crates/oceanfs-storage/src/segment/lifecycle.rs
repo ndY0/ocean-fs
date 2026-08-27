@@ -422,6 +422,9 @@ impl SegmentLifecycleRegistry {
         Self { shards: shards.into_boxed_slice(), config: config.clone() }
     }
 
+    // [review][algo][medium]
+    // are we sure this hashing converge to a uniform distribution of segment ids over the index span ?
+    // [end]
     /// Returns the shard index for a segment id.
     fn shard_for(&self, id: SegmentId) -> usize {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1125,6 +1128,12 @@ impl SegmentLifecycleRegistry {
     }
 }
 
+// [review][strategy][critcial]
+// topic to discuss : with the strategy of sealing we established, a segment end up been sealed when the last writer exit,
+// wich is fine under contention, since there is a lot of concurrent writers. but under low or scarse load, 
+// we will end up waisting a load of disk space. i am wondering : considering we have the data wal + event wal, wont it be possible
+// now to switch to a seal-on-full mode ? we are not really at risk of loosing any data i think. i need your opinion on that.
+// [end]
 /// The single writer of segment lifecycle state.
 ///
 /// The **only** writer of the registry and the **only** writer of the
@@ -1790,6 +1799,11 @@ impl SegmentLifecycleCoordinator {
             }
         }
 
+        // [review][algorithmic][high]
+        // this approach is a heuristic. it's gotten worst with the multi pool design, a deterministic one would
+        // be to use oneshots signals through the seal pipeline with a temporary state registry for the replayed ids.
+        // no arbitrary counter, nor deadline.
+        // [end]
         // 7. The replayed seals complete asynchronously on the seal
         //    worker; wait for their .dat files (reads must never race a
         //    partially-written segment — the node's pre-bind readiness).
@@ -2312,6 +2326,12 @@ impl SegmentLifecycleCoordinator {
         self.pending_seals.lock().push(id);
     }
 
+    // [review][algorithmic][critical]
+    // this is falsly advertised as 'not timer based' : the deadline constitute an arbitrary timer contract for the sealing pipeline to 
+    // execute. a signaling approach  (for instance, oneshot channels) would trully allow a full backpressure approach, and to trigger seal retry
+    // just in time, rather than guesstimating with a timer. we need a torough discussion on this topic, since this leaves at the heart of the software,
+    // and costs should be weighted carefully 
+    // [end]
     /// Drains the pending-seal set — the deterministic seal trigger,
     /// the replacement for the idle-seal timer.
     ///

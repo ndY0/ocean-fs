@@ -497,6 +497,9 @@ impl SegmentPool {
 
         let seal_semaphore = Arc::new(Semaphore::new(config.max_inflight_encodes));
 
+
+        // HERE
+
         Ok(Self {
             slots,
             tier,

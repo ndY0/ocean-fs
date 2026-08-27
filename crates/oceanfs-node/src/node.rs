@@ -833,7 +833,7 @@ impl Node {
         let io_backend = Arc::new(oceanfs_storage::io::IoBackend::new());
         // [review][implementation][critical]
         // seal config must be unique per pool path : write and read mode could differ
-        // between each mount
+        // between each mount, since they depend on the nature of the FS
         // [end]
         let seal_config = oceanfs_storage::SealConfig {
             data_pools: data_pools.clone(),

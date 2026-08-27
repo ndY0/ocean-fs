@@ -134,6 +134,10 @@ impl<E: Encoder + ?Sized> ParallelEncoder<E> {
         let mut parity_shards: Vec<BytesMut> =
             (0..m).map(|_| BytesMut::zeroed(total_stripes * shard_size)).collect();
 
+        // [review][async runtime][critical]
+        // we should not use rayon inside the tokio runtime, since the two runtimes are going to
+        // fight each others
+        // [end]
         let results: Vec<Result<Vec<Bytes>>> = (0..total_stripes)
             .into_par_iter()
             .map(|stripe_idx| {
@@ -223,6 +227,10 @@ impl<D: Decoder + ?Sized> ParallelDecoder<D> {
         let mut recovered_data: Vec<BytesMut> =
             (0..k as usize).map(|_| BytesMut::zeroed(total_stripes * shard_size)).collect();
 
+        // [review][async runtime][critical]
+        // we should not use rayon inside the tokio runtime, since the two runtimes are going to
+        // fight each others
+        // [end]
         let results: Vec<Result<Vec<Bytes>>> = (0..total_stripes)
             .into_par_iter()
             .map(|stripe_idx| {
