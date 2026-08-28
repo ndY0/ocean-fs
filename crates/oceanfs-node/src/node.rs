@@ -149,11 +149,14 @@ impl oceanfs_storage_api::MetadataStore for PrefetchStoreAdapter {
 // Node leave handler — implements GracefulLeaveHandler for WAL + shard handoff
 // ---------------------------------------------------------------------------
 
-// [review][performance][critical]
+// [review][architecture][critical]
 // read the whole data dir, wich is potentially terabytes of data. Data pool refactor omitted this part
-// it is still consuming directly the a unique segment data dir. more broadly, since data is replicated, there is not point
+// it is still consuming directly a unique segment data dir. more broadly, since data is replicated, there is not point
 // in handing over the whole data to an another node. at shutdown, the node should stop accepting new request, and try best effort to
-// finish the wwork in progress.
+// finish the wwork in progress. other nodes sharing replicas should detect the under replication after the end of the grace period
+// (node is marked dead), elect a new primary holder, and the holder should start re-replication. this is a rather complicated mechanism,
+// but i think it is more realistic than waiting terabytes of transfer during a node shutdown. moreover, we implicitely rely on the node
+// gracefully shutting down, wich could very well be forcelfully killed instead.
 // [end]
 /// Handles WAL sealing and segment shard streaming during graceful leave.
 struct NodeLeaveHandler {

@@ -780,6 +780,10 @@ impl PoolRegistry {
         let mut pools: Vec<Arc<StoragePool>> = Vec::with_capacity(storage.pools.len().max(1));
         let mut metrics: Vec<PoolMetrics> = Vec::with_capacity(storage.pools.len().max(1));
 
+        // [review][architecture][high]
+        // since we do not support legacy behaviour, the applicatin should not be allowed to start
+        // without declared pools
+        // [end]
         if storage.pools.is_empty() {
             // Legacy zero-config fallback: single implicit data pool at
             // data_dir, probed with Fatal semantics (today's behavior).

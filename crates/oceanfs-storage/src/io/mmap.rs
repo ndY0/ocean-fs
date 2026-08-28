@@ -58,7 +58,11 @@ struct CacheEntry {
     /// Approximate access timestamp for LRU eviction.
     last_access: u64,
 }
-
+// [review][implementation][critical]
+// i believe we never tested this optimization.
+// in a broader sense, we should update phase 2 test harness to allow testing for different
+// combinaisons of optimizations, io modes, even target cpu and so on
+// [end]
 impl SegmentFileCache {
     /// Creates a new cache with the given maximum capacity.
     ///
