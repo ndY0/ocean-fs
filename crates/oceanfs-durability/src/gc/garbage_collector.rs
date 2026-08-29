@@ -26,6 +26,9 @@ use crate::{Error, Result};
 // GarbageCollector
 // ---------------------------------------------------------------------------
 
+// [review][architecture][critical]
+// data store and shard store are the same abstraction, this discrepency must be resolved
+// [end]
 /// Garbage collector for tombstone-based deletion and segment compaction.
 ///
 /// # Examples
@@ -579,6 +582,10 @@ pub trait SegmentShardStore: Send + Sync {
     fn list_segment_files(&self) -> Result<Vec<(SegmentId, i64, u32)>>;
 }
 
+// [review][code smell][high]
+// if this is only used in tests, it should be guarded with a cfg macro
+// otherwise it bloats the production binary for no reason
+// [end]
 /// An in-memory mock segment shard store for testing.
 ///
 /// Tracks which segments have been "deleted" from disk. Used in
@@ -589,6 +596,13 @@ pub struct InMemorySegmentShardStore {
     bytes_per_segment: u64,
 }
 
+// [review][duplication][critcal]
+// this struct is verbatim the same as the one in 'segment_store_impl'
+// this duplication hurts code quality a lot, and must be resolved with a very high priority.
+// on an another topic, no disk io abstraction is used, greatly reducing the interest of having taken the time
+// of constructing optimized io access. this must also be resolved with high priority.
+// finally, we must get ride of the legacy support
+// [end]
 /// Production segment shard store that deletes segment data files
 /// from the filesystem.
 ///

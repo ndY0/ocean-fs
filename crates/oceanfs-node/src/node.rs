@@ -355,7 +355,17 @@ impl NodeLeaveHandler {
 // ---------------------------------------------------------------------------
 // BackgroundTasks
 // ---------------------------------------------------------------------------
-
+// [review][architecture][critical]
+// we are running a lot of background tasks, each independently managing the following :
+// - concurrency
+// - scheduling
+// - event binding
+// this approach doesnt allow use to be able to manage the concurrency of background tasks at a global level.
+// i think we need a global task scheduler approach, with a semaphore driven global concurrency for background tasks.
+// this trully ensure the tasks cannot hurt the performance beyond a certain defined threshold.
+// also, we could integrate a reactor approach for the event driven communication between subsystems. this would simplify a few of them
+// i need an honest and torough discussion about this topic, since it is structurally very significant.
+// [end]
 /// Aggregated join handles and cancellation tokens for background loops.
 pub struct BackgroundTasks {
     /// Gossip protocol task handle (Membership drives gossip internally;
@@ -873,6 +883,10 @@ impl Node {
             fsync_batch_timeout_ms: config.seal_fsync_batch_timeout_ms,
             fsync_max_waiters: config.seal_fsync_max_waiters,
         };
+        // [review][cleanup][medium]
+        // since roots are now handled within the pool registry, this part is probably
+        // useless. if not, it is part of the legacy we must remove.
+        // [end]
         // SegmentSealer is the authoritative persistence path. Sealed
         // segments are written to {data_dir}/segments/ (legacy) or the
         // selected data pool root (pool mode, ADR-0029 f5) with the
@@ -954,6 +968,9 @@ impl Node {
             wal_writer.clone(),
             lifecycle.clone(),
         ));
+        // [review][config][high]
+        // segment relicator config shoudl be fully configurable by the end user
+        // [end]
         // ---- 6c. Seal-time segment replicator (sealed-segment-replication) ----
         // The data-replication backbone: after a segment seals on this
         // node, its full data section is pushed to the segment's ring
@@ -1031,7 +1048,13 @@ impl Node {
             membership.clone(),
             Arc::new(config.operation_timeouts),
         ));
+        // [review][code smell][medium]
+        // pointless cloning.
+        // [end]
         let repair_sink = repair_dispatcher.clone();
+        // [review][config][high]
+        // reconciliation configuration should be fully configurable by the end user
+        // [end]
         // The periodic reconciliation loop (g4 `reconciliation` — the
         // ADR-0029 §D4 pull safety net): event-driven wake (a node died /
         // its pools died → exactly the affected segments via the holder
@@ -1167,6 +1190,9 @@ impl Node {
                 }),
         );
 
+        // [review][config][high]
+        // as previously stated, any config should be possibly driven by the end user
+        // [end]
         // Construct IncrementalMerkleTree for anti-entropy by scanning
         // the machine's Sealed entries — supersedes ADR-0018 Decision
         // 1's segments-CF scan (ADR-0025 Decision 3).
@@ -1186,6 +1212,11 @@ impl Node {
             )
         };
 
+        // [review][architecture][critical]
+        // the anti antropy worker create it's own data store.
+        // since a data store is responsible to write to disk, we are running the risk of concurrency.
+        // there should only be one data store. need some investigation and discussion.
+        // [end]
         let ae_worker = Arc::new(oceanfs_durability::AntiEntropy::new(
             oceanfs_durability::AntiEntropyConfig::new(
                 config.ae_interval_sec,
@@ -1208,12 +1239,18 @@ impl Node {
             )),
             merkle_tree.clone(),
         ));
+        // [review][config][high]
+        // scrub config is not fully customizable
+        // [end]
         let mut scrub_config = oceanfs_durability::ScrubConfig::default();
         scrub_config.set_interval_sec(config.scrub_interval_sec);
         scrub_config.set_parallel_nodes(config.scrub_parallel_nodes);
         let scrub_worker = Arc::new(oceanfs_durability::ScrubCoordinator::new(scrub_config));
         // OrphanReaper deletes segment data files from disk when reclaiming
         // orphaned segments after GC compaction.
+        // [review][architecture][critical]
+        // again, we are instanciating a lot of stores. this is not a good architectural decision.
+        // [end]
         let reaper_shard_store: Arc<dyn oceanfs_durability::SegmentShardStore> =
             Arc::new(oceanfs_durability::DiskSegmentShardStore::new(
                 data_pools.clone(),
@@ -1227,6 +1264,9 @@ impl Node {
             gc_config,
         ));
 
+        // [review][architecture][high]
+        // same remark about the store duplication
+        // [end]
         // ---- 7b. Construct segment data store (shared by heal and gRPC) ----
         // DiskSegmentStore reads/writes the authoritative segment files.
         let heal_data_store: Arc<dyn oceanfs_durability::SegmentDataStore> =
@@ -1312,12 +1352,18 @@ impl Node {
                 tracing::warn!(
                     "Adaptive eviction policy not yet implemented; falling back to TTL-LRU for L2"
                 );
+                // [review][config][high]
+                // missing config from userland
+                // [end]
                 Box::new(oceanfs_cache::eviction::TtlLruPolicy::new(
                     oceanfs_cache::eviction::TtlLruConfig::default(),
                 ))
             }
             _ => {
                 tracing::warn!("Unknown L2 eviction policy; falling back to TTL-LRU");
+                // [review][config][high]
+                // same remark
+                // [end]
                 Box::new(oceanfs_cache::eviction::TtlLruPolicy::new(
                     oceanfs_cache::eviction::TtlLruConfig::default(),
                 ))
@@ -1383,7 +1429,10 @@ impl Node {
         } else {
             None
         };
-
+        // [review][architecture][critical]
+        // we have 3 abstractions to access disk : DiskSegmentStore, DiskSegmentShardStore and DiskSegmentReader.
+        // each independently implements optimisations or not, without unified logic. this is awfull, and must be resolved.
+        // [end]
         // Disk-backed segment reader: reads sealed segment files from disk
         // via the configured I/O mode (mmap / O_DIRECT / buffered).
         // Replaces the previous InMemorySegmentReader — segment data is read
@@ -1431,9 +1480,17 @@ impl Node {
                     config
                         .grpc_listen_addr
                         .parse::<std::net::SocketAddr>()
+                        // [review][configuration][critical]
+                        // we cannot take any default network adresses : a missing protocol means the system cannot work.
+                        // as a guideline rule : a missing essential configuration, that cannot be defaulted, must halt the startup with
+                        // an explicit error
+                        // [end]
                         .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 9001))),
                 ),
         );
+        // [review][config][fhigh]
+        // no magic constants, user should be able to configure the subsystem
+        // [end]
         let hint_config = HintedHandoffConfig {
             wal_dir: hints_dir.clone(),
             inline_threshold_bytes: config.hint_inline_threshold_bytes,
@@ -1487,6 +1544,10 @@ impl Node {
             let gate_membership = membership.clone();
             let gate = ready_gate.clone();
             let gate_timeout_secs = config.cluster_ready_timeout_sec.max(1);
+            // [review][architecture][critical]
+            // minimal quorum definition should be derived from actual config, not from a hardcoded
+            // w=2 estimation. this is very dangerous
+            // [end]
             tokio::spawn(async move {
                 // Open the gate when the ring reaches 2 nodes (enough
                 // for w=2 semantics) or after the configured bound —
@@ -1510,6 +1571,10 @@ impl Node {
         } else {
             ready_gate.store(true, std::sync::atomic::Ordering::Release);
         }
+
+        // HERE
+        // TODO : finish node startup sequence, then ocean durability, then membership and quorum functionnalities
+
         let write_coordinator = Arc::new(
             WriteCoordinator::new(
                 ring_cache.clone(),

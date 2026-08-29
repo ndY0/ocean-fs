@@ -13,6 +13,9 @@ use oceanfs_storage::Error;
 
 use crate::anti_entropy::SegmentDataStore;
 
+// [review][cleanup][high]
+// no legacy mode
+// [end]
 /// A `SegmentDataStore` backed by segment files under the legacy
 /// segments dir or a data pool root.
 ///
