@@ -536,6 +536,17 @@ pub struct Node {
     pub(crate) reconciliation: Arc<oceanfs_durability::ReconciliationLoop>,
 }
 
+// [review][architectural][critical]
+// the startup function is more than a thousand of lines. i would like
+// to consider using compile time Dependency injection, to decompose the responsibilities of setup to the modules themselves,
+// and to properly be able to compose the application. for this, i would like you to reviez the shaku crate,
+// and we should have a discussion about it.
+// this should also be a good point to discuss module organisation / distribution : right now, it seems we construct analogous
+// or equal constructs for different submodules, because of the initial layout and incremental nature of the construction
+// of the start method.
+// i believe that maintainability will necessary stem from a clear dependency module graph,
+// a rationalisation of the abstractions we currently use, and the use of a proper composability helper crate
+// [end]
 impl Node {
     /// Starts an OceanFS node: wires all subsystems, binds servers,
     /// spawns background tasks, and returns a running [`Node`].
@@ -1573,7 +1584,7 @@ impl Node {
         }
 
         // HERE
-        // TODO : finish node startup sequence, then ocean durability, then membership and quorum functionnalities
+        // TODO : finish node startup sequence, then ocean durability, then server and quorum functionnalities
 
         let write_coordinator = Arc::new(
             WriteCoordinator::new(
@@ -1619,6 +1630,9 @@ impl Node {
             // incremental Merkle tree (with its seal-time root) so
             // recently-written segments participate in the root exchange
             // without waiting for the next startup rebuild.
+            // [review][architectural][high]
+            // this is also a proper 
+            // [end]
             .with_segment_sealed_notifier({
                 let replicator = Arc::clone(&segment_replicator);
                 Arc::new(move |segment_id, merkle_root| {
@@ -1904,6 +1918,11 @@ impl Node {
         // Spawn a background poller for process-level metrics (every 15s).
         // RocksDB metrics are polled separately by metadata_store.start_metrics_task().
         let wal_dir = wal_config.data_dir.clone();
+        // [review][implementation][high]
+        // the metric poller cannot be cancelled, unkink other background tasks
+        // on an another topic : we seems to make the start function bear the initialisation logic of every module.
+        // a good implementation approach would be to rather make dedicated modules hide the implementation behind a setup method
+        // [end]
         let _process_poller = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(15));
             loop {
@@ -2323,6 +2342,10 @@ impl Node {
             warn!(error = %e, "initial cluster join failed; retrying in the background");
         }
 
+        // [review][implementation][critical]
+        // waiting for 2 nodes accomodate for a specific case only. the number of nodes to be present should be derived from the minimums
+        // extracted from the config, not this heuristic
+        // [end]
         // Background rejoin: retry the (idempotent) join every 3s until
         // the ring reaches 2 nodes. Covers the seedless-restart path
         // (fallback seeds) and fleet nodes that boot before their seed
@@ -2566,6 +2589,9 @@ impl Node {
         });
         background.rep_dispatcher = Some(rep_dispatcher_handle);
         background.rep_dispatcher_cancel = rep_dispatcher_cancel;
+
+
+        // HERE
 
         // ---- 17. Spawn hinted handoff delivery watcher ----
         // Watches for membership events and drains the handoff buffer
