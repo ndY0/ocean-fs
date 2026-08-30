@@ -157,6 +157,9 @@ impl GarbageCollector {
         self
     }
 
+    // [review][architecture][high]
+    // this binding could benefit from a proper reactor implementation
+    // [end]
     /// Wires the sealed-segment notifier (sealed-segment-replication):
     /// fired with each repacked segment's NEW id after its `SealEvent`
     /// is durable, so the node's segment replicator can fan the fresh
@@ -186,6 +189,9 @@ impl GarbageCollector {
         self
     }
 
+    // [review][architecture][high]
+    // this binding could benefit from a proper reactor implementation
+    // [end]
     /// Wires the compaction-remap notifier (g3 `loss-announcement`
     /// Option A): fired with `(old, new, chunk_table)` after the owner's
     /// metadata remap commits, so peers re-point their own object rows.
@@ -259,7 +265,11 @@ impl GarbageCollector {
         if candidates.is_empty() {
             return Ok(stats);
         }
-
+        // [review][architecture][critical]
+        // why do we have the segment store write side outside of the segment lifecycle coordinator ?
+        // segments persistence to disk is not effectively driven by the coordinator, this is britle in my opinion.
+        // we need a discussion on this
+        // [end]
         // Compaction needs a data store: repacking reads the old segment's
         // bytes and writes the new segment's `.dat` BEFORE the metadata
         // swap (a metadata-only remap would point objects at a segment
@@ -535,6 +545,10 @@ impl GarbageCollector {
     }
 }
 
+// [review][architectural][critical]
+// same remark about the multiplication of abstraction of segment data access
+// we need an unification
+// [end]
 // ---------------------------------------------------------------------------
 // SegmentShardStore — trait for deleting segment shards from disk
 // ---------------------------------------------------------------------------

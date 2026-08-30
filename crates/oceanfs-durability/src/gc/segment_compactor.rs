@@ -253,6 +253,11 @@ impl SegmentCompactor {
         for (_bucket, obj) in &live_objects {
             for chunk in &obj.chunks {
                 if chunk.segment_id == segment_id {
+                    // [review][architectural][high]
+                    // rather than using a boolean for the compressed state, we should plan ahead for encryption,
+                    // and supporting different compression / encryption backend : for this regard,
+                    // we should leverage bit flags and masking
+                    // [end]
                     let new_chunk = ChunkRef {
                         segment_id: new_segment_id,
                         offset: new_offset,

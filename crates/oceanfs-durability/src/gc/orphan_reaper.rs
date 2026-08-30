@@ -294,6 +294,10 @@ impl OrphanReaper {
     pub(crate) fn build_referenced_set(&self) -> Result<HashSet<SegmentId>> {
         let mut referenced = HashSet::new();
 
+        // [review][architectural][high]
+        // i am a bit worried on reading the list of all object on a prodcution sitting with millions of records
+        // we should discuss about it and elaborate an eventual strategy
+        // [end]
         // Scan EVERY bucket: a per-bucket scan would classify every
         // segment owned by other buckets as an orphan and delete live
         // data (e.g. the load-test bucket in Phase 2 runs).
