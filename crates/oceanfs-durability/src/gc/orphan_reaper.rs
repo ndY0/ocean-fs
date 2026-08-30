@@ -1,5 +1,10 @@
 //! Orphan reaper — detects and reclaims segments with no live references.
 
+// [review][pacement][critical]
+// why is the orphan reaper placed under the garbage collection ?
+// this is a separate mechanism.
+// [end]
+
 use std::{
     collections::HashSet,
     sync::Arc,

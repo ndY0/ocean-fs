@@ -2610,6 +2610,12 @@ impl Node {
         let mut sweep_interval = tokio::time::interval(std::time::Duration::from_secs(
             config.hint_delivery_sweep_sec.max(1),
         ));
+        // [review][architecture][high]
+        // at multiple points during the startup phase, we define submodules using inner function and spawn + handle pattern directly inside the
+        // startup function. this bloats the function out, an blurs the responsibilities.
+        // as a matter of principle, any submodules should have it's own dedicated file / module and expose
+        // its startup sequence.
+        // [end]
         let delivery_handle = tokio::spawn(async move {
             // Bounded retry helper shared by the event path and the sweep
             // path. The returning node's gRPC listener may still be
@@ -3125,6 +3131,10 @@ impl Node {
         self.background.rep_worker_cancel.cancel();
         self.background.rep_dispatcher_cancel.cancel();
 
+        // [review][config][high]
+        // the shutdown grace period should be configurable, since it's dimensions is the product
+        // of the queues sizes, and expected system load.
+        // [end]
         // ---- 5. Wait for background tasks with a timeout ----
         let _ = tokio::time::timeout(Duration::from_secs(10), async {
             let _ = tokio::try_join!(
