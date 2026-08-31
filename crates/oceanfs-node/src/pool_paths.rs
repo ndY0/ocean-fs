@@ -41,6 +41,9 @@ pub struct PoolPaths {
     pub hints: PathBuf,
 }
 
+// [review][implementation][high]
+// we need to get ride of the legacy mode
+// [end]
 /// Resolves the role-pinned data paths from the pool registry.
 ///
 /// Precedence rule (pinned): each role resolves to its `Healthy` pinned

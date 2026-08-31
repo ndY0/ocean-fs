@@ -9,9 +9,11 @@
 // this is the placement for broader remarks, improvement axis discussions.
 // - we may need an adaptative strategy for sub-systems doing full scans of spaces (metadata or data) : above a certain threshold, or a certain proportionnal load,
 //   switch to a different strategy (round-robin, random subset, ...)
-// - backgroubd tasks, submodules could benefit from implementing a startup module trait, making wiring easier (to be discussed, i am not sure)
+// - background tasks, submodules could benefit from implementing a startup module trait, making wiring easier (to be discussed, i am not sure)
 // - compile time Dependency injection : reduce complexity on composition pattern, make module composition clearer
 // - cleaner durability crate architecture : the scrub service has not its own folder, reconciliation neither
+// - using a dependency injection make it impossible to use the with_* incremental composition on most modules
+// - we construct large in memory data (see reconcile comments), we should discuss mitigation approaches.
 // [end]
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};

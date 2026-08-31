@@ -598,7 +598,11 @@ impl ScrubCoordinator {
             None => Vec::new(),
         }
     }
-
+    // [review][implementation][critical]
+    // partitioned scrub must be delivered a tsome point : when key counts will grow, so does the scrub workload.
+    // another note : this implementation assumes that each peer holds this node segments, wich will be note true with the replication
+    // introduced with the data pools evolution. we need to brainstorm about that, maybe leverage the manifest ?
+    // [end]
     /// Partitions all sealed segments across currently-alive nodes.
     ///
     /// When membership is configured, discovers alive peers automatically

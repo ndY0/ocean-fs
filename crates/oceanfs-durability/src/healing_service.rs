@@ -656,6 +656,10 @@ impl HealingGrpcService {
 
         let mut ops: Vec<oceanfs_storage_api::BatchOp> = Vec::new();
         let mut rewritten = 0usize;
+        // [review][performance][critical]
+        // here also we list every single metadata for the node, wich will potentially become a problem
+        // when we will be dealing with millions of objects
+        // [end]
         for obj_result in self.metadata_store.list_objects_all_with_bucket() {
             let Ok((bucket, obj)) = obj_result else { continue };
             // Only rows that actually reference the old segment change.
@@ -1011,6 +1015,11 @@ impl HealingRpc for HealingGrpcService {
                 }));
             };
 
+            // [review][architecture][critical]
+            // here (and in diverse submodules), we control concurrency, but since the run concurrently themselves,
+            // we dont effectively manage the maximum concurrency. that is why i suggested a global semaphore in a worker manager
+            // to be discussed
+            // [end]
             const FETCH_CONCURRENCY: usize = 16;
             let semaphore = Arc::new(tokio::sync::Semaphore::new(FETCH_CONCURRENCY));
             let mut set = tokio::task::JoinSet::new();
@@ -1303,7 +1312,10 @@ impl HealingRpc for HealingGrpcService {
         let req = request.into_inner();
         let segment_id =
             req.segment_id.and_then(|sid| SegmentId::try_from(sid).ok()).unwrap_or_default();
-
+        // [review][architecture][critical]
+        // again, we have a lot of concurrent tasks writing to disk through the store, potentially conflicting.
+        // this is a huge architectural oversight in my opinion, and must be discussed with high priority
+        // [end]
         // Write the repaired shard into the data store.
         // In production this would merge the shard into the correct position.
         match self.data_store.write_segment_data(&segment_id, &req.data) {
