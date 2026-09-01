@@ -12,6 +12,16 @@
 //! Per performance guideline §2.6 (bounded channels), §4.5 (adaptive
 //! timeouts), and §9.3 (pre-compute key hash once).
 
+// [review][algorithmic][high]
+// should the response await the replication ? replication is a durability concern,
+// but should it be part of the acknoxwledgment to the user ? this touch the subject of
+// what an acknoledgement garantees, and i tend to believe awaiting replication is a very costly and
+// congestionning operation, that does not add a lot for the user. durability is an internal process, acknoledgement
+// basically says "the data has been processed with the minimal garantee for serving".
+// one thing to be certain about before : do we need the full replication for serving data ?
+// this is the only eventual barrier in my opinion.
+// [end]
+
 use std::sync::Arc;
 
 use bytes::Bytes;

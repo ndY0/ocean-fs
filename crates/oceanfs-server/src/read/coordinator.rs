@@ -1307,6 +1307,10 @@ impl ReadCoordinator {
         }
     }
 
+    // [review][architecture][critical]
+    // same remark as of the fetcvh module : in the case of Gb of segment data to be returned, this is synchronous,
+    // and willl hold them in memory. we must implement a streaming approach.
+    // [end]
     /// Assembles blob data from chunk references.
     ///
     /// First tries to fetch chunks via the local segment reader, then
@@ -1501,6 +1505,9 @@ impl ReadCoordinator {
         assembler.finalize().map(|data| (data, source))
     }
 
+    // [review][cleanup][high]
+    // if this is actual dead code, it must be cleaned up
+    // [end]
     /// Verifies the BLAKE3 hash of data against stored metadata.
     #[allow(dead_code)]
     fn verify_blake3(data: &[u8], meta: &ObjectMetadata) -> bool {

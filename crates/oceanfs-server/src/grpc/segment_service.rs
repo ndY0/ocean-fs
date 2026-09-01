@@ -297,6 +297,10 @@ impl SegmentRpc for SegmentGrpcService {
                 let segment_id = SegmentId::from_uuid_bytes(seg_bytes);
                 let offset = chunk_offsets[i];
                 let length = chunk_lengths[i];
+                // [review][logical][high]
+                // isnt the remap alias initilased once at the grpc service creation ?
+                // if so, it does not keep up with the compaction work, and keeps a stale mapping isnt it ?
+                // [end]
                 // g3 Option A: translate a chunk ref that references a
                 // segment the LOCAL GC already compacted away (a late
                 // metadata append that raced the compaction remap). The
@@ -460,6 +464,10 @@ impl SegmentRpc for SegmentGrpcService {
 
         let segment_bytes = segment_data;
 
+        // [review][implementation][critical]
+        // this is a placeholder, real data is carried by the metadata store,
+        // we must finish the implementation properly
+        // [end]
         // Determine total shards from known configuration (k+m).
         let total_shards = 6; // default k=4, m=2
 
@@ -616,7 +624,9 @@ impl SegmentRpc for SegmentGrpcService {
             .metadata_store
             .as_ref()
             .ok_or_else(|| Status::unimplemented("no metadata store configured"))?;
-
+        // [review][implementation][high]
+        // no legacy support during the build phase. there cannot be no hlc, if so, this is a bug and should be completely discarded
+        // [end]
         let hlc = match req.hlc {
             Some(ref hlc_proto) => Hlc::new(hlc_proto.wall_time, hlc_proto.logical),
             None => Hlc::zero(),
@@ -733,6 +743,10 @@ impl SegmentRpc for SegmentGrpcService {
         Ok(Response::new(PutObjectMetadataResponse { written: true }))
     }
 
+    // [review][implementation][critical]
+    // there could not be "default" metadata for a segment. either they are present,
+    // or we must drop the process, we cannot silently degrade the information.
+    // [end]
     /// Handles a sealed-segment push from the owner's segment replicator.
     ///
     /// Assembles the full data section from the stream, verifies the
@@ -808,7 +822,9 @@ impl SegmentRpc for SegmentGrpcService {
                 "pushed merkle root does not match segment data for {segment_id}"
             )));
         }
-
+        // [review][architecture][high]
+        // couldn't there be other task running in parallel also writing to this precise segment ?
+        // [end]
         // Persist the full data section (the existing store writes a
         // valid v1 header — the heal-worker precedent; the replica serves
         // the same data section the owner sealed).
