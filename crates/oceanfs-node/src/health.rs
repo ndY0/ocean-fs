@@ -5,8 +5,9 @@
 //! [`HealthEvent`]s. This module is the
 //! node layer's half of the D3 role-consequence matrix:
 //!
-//! - **metadata** Dead → the node's `node_unavailable` flag flips (g3's
-//!   announcement payload; the S3/read path rejects in g6);
+//! - **metadata** Dead → the node serves nothing (surfaced lazily via
+//!   `PoolRegistry::node_serves_requests`; the S3/read + write gates
+//!   reject 503 in g6);
 //! - **data** Dead → the affected segment set is derived from the
 //!   lifecycle registry (`pool_id == dead_pool`, Phase A f5) — handed to
 //!   g3 for the loss announcement;
@@ -20,10 +21,7 @@
 //! propagates via gossip; f7's routing cache updates through the
 //! membership event subscriber).
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 
 use oceanfs_core::{NodeId, PoolRole, SegmentId};
 use oceanfs_membership::{manifest::NodeManifest, Membership};
@@ -96,7 +94,8 @@ pub type LossAnnouncer = Arc<dyn Fn(u32, Vec<SegmentId>) + Send + Sync>;
 /// Spawns the node's health-consequence applier task.
 ///
 /// Consumes the monitor's status events and applies the D3 role matrix
-/// (metadata → `node_unavailable`, data Dead → affected-segment
+/// (metadata Dead → the node serves nothing — surfaced to readers via
+/// `PoolRegistry::node_serves_requests`, data Dead → affected-segment
 /// derivation), then re-declares the node manifest so peers see the
 /// change. Returns the join handle (the caller holds its cancellation
 /// token).
@@ -116,7 +115,6 @@ pub fn spawn_health_consequences(
     self_id: NodeId,
     boot_incarnation: u64,
     manifest_cache: Arc<ManifestCache>,
-    node_unavailable: Arc<AtomicBool>,
     loss_announcer: Option<LossAnnouncer>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -128,14 +126,14 @@ pub fn spawn_health_consequences(
             };
             let Some(pool) = registry.pool_by_id(pool_id) else { continue };
             match pool.role() {
+                // The metadata-Dead consequence (node serves nothing) is
+                // derived lazily from the REGISTRY by the read/write
+                // gates (`PoolRegistry::node_serves_requests`) — the
+                // monitor already set the pool Dead before this event, so
+                // there is no separate flag to maintain (one source of
+                // truth). Only the manifest re-declaration below matters.
                 PoolRole::Metadata => {
-                    let unavailable = status == PoolStatus::Dead;
-                    node_unavailable.store(unavailable, Ordering::Relaxed);
-                    tracing::info!(
-                        pool_id,
-                        unavailable,
-                        "metadata pool status change → node_unavailable"
-                    );
+                    tracing::info!(pool_id, "metadata pool status change observed");
                 }
                 PoolRole::Data if status == PoolStatus::Dead => {
                     let affected = derive_affected_segments(&lifecycle, pool_id);

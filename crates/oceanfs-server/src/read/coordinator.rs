@@ -284,6 +284,13 @@ pub struct ReadCoordinator {
     /// replica nodes for gRPC chunk fetch. `None` (default) disables
     /// the hint — the fetch path behaves exactly as before.
     routing_hint: Option<Arc<dyn crate::routing_hint::RoutingHint>>,
+    /// The live pool registry (g6, ADR-0029 §D3): when set, the read
+    /// entry gate derives the node's OWN availability from it — a Dead
+    /// metadata pool means the object index is gone, so the node can
+    /// serve nothing and reads reject with 503. This is the SAME
+    /// registry instance the write coordinator consults: one source of
+    /// truth for local availability.
+    pool_registry: Option<Arc<oceanfs_storage::PoolRegistry>>,
 }
 
 /// [`ReadCoordinatorHintObjectReader`] backs the hinted-handoff fetch
@@ -360,6 +367,7 @@ impl ReadCoordinator {
                 std::thread::available_parallelism().map_or(4, |n| n.get().saturating_mul(2)),
             )),
             routing_hint: None,
+            pool_registry: None,
         }
     }
 
@@ -398,6 +406,7 @@ impl ReadCoordinator {
                 std::thread::available_parallelism().map_or(4, |n| n.get().saturating_mul(2)),
             )),
             routing_hint: None,
+            pool_registry: None,
         }
     }
 
@@ -495,6 +504,16 @@ impl ReadCoordinator {
         self
     }
 
+    /// Sets the live pool registry (g6) — the SAME instance the write
+    /// coordinator consults. When set, the read entry gate rejects with
+    /// 503 while the local metadata pool is Dead (the node's object
+    /// index is gone; it can serve nothing). `None` (default) leaves the
+    /// read path ungated (legacy single-pool embeddings).
+    pub fn with_pool_registry(mut self, registry: Arc<oceanfs_storage::PoolRegistry>) -> Self {
+        self.pool_registry = Some(registry);
+        self
+    }
+
     /// Sets the HLC clock for receive-merge (hlc-causality-closure G2).
     ///
     /// When set, remote HLC timestamps observed during quorum comparison
@@ -519,6 +538,18 @@ impl ReadCoordinator {
     /// Returns [`Error::NotFound`] if the object does not exist.
     /// Returns [`Error::HashMismatch`] if the hash verification fails.
     pub async fn get_object(&self, req: ReadRequest) -> Result<GetResult> {
+        // Local-availability gate (g6, ADR-0029 §D3): a node whose
+        // metadata pool is Dead has lost its object index — it can serve
+        // nothing, so reads reject with a retryable 503 BEFORE any
+        // metadata lookup or replica fetch. Derived from the pool
+        // registry — the same source the write coordinator consults
+        // (one source of truth, no mirrored flag).
+        if let Some(registry) = &self.pool_registry {
+            if !registry.node_serves_requests() {
+                return Err(Error::ServiceUnavailable("node unavailable — metadata pool dead"));
+            }
+        }
+
         let _replica_set = self.ring.lookup(req.hash_key.as_bytes());
 
         let mut obj_meta = self.lookup_metadata(&req).await?;
@@ -1724,6 +1755,7 @@ impl Default for ReadCoordinator {
                 std::thread::available_parallelism().map_or(4, |n| n.get().saturating_mul(2)),
             )),
             routing_hint: None,
+            pool_registry: None,
         }
     }
 }
@@ -1778,7 +1810,7 @@ fn build_put_metadata_request(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use oceanfs_core::{ChunkRef, NodeId, RingConfig, SegmentId};
     use oceanfs_routing::{hash_key, Ring};
@@ -1798,6 +1830,78 @@ mod tests {
             segments.put(*id, Bytes::copy_from_slice(data));
         }
         make_coordinator().with_segment_reader(segments)
+    }
+
+    /// g6 (ADR-0029 §D3): the read coordinator's LOCAL availability gate
+    /// — a Dead metadata pool (the node's object index is gone) rejects
+    /// every read with 503. Derived from the SAME pool registry the
+    /// write coordinator consults; a healthy node is unaffected.
+    #[tokio::test]
+    async fn read_gate_rejects_when_metadata_pool_dead() {
+        use oceanfs_core::{
+            MissingRootPolicy, PoolRole, PoolTech, StorageConfig, StoragePoolConfig,
+        };
+        use oceanfs_storage::PoolStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let storage = StorageConfig {
+            pools: vec![
+                StoragePoolConfig {
+                    name: "data-a".into(),
+                    role: PoolRole::Data,
+                    root: dir.path().join("nvme0"),
+                    weight: None,
+                    tech: PoolTech::Auto,
+                    health: Default::default(),
+                },
+                StoragePoolConfig {
+                    name: "journal".into(),
+                    role: PoolRole::Wal,
+                    root: dir.path().join("optane0"),
+                    weight: None,
+                    tech: PoolTech::Auto,
+                    health: Default::default(),
+                },
+                StoragePoolConfig {
+                    name: "meta".into(),
+                    role: PoolRole::Metadata,
+                    root: dir.path().join("optane1"),
+                    weight: None,
+                    tech: PoolTech::Auto,
+                    health: Default::default(),
+                },
+            ],
+            missing_root_policy: MissingRootPolicy::Fatal,
+        };
+        let registry = Arc::new(
+            oceanfs_storage::PoolRegistry::from_config(&storage, &data_dir).expect("registry"),
+        );
+        let coord = make_coordinator().with_pool_registry(registry.clone());
+
+        let read_req = ReadRequest {
+            bucket: BucketId::new("test"),
+            key: ObjectKey::new("missing"),
+            hash_key: HashKey::from_bytes(hash_key(b"missing")),
+            metadata_only: false,
+            local_only: true,
+            policy: None,
+        };
+
+        // Healthy metadata pool → the gate is open: the read proceeds
+        // (inline-only mode returns an empty Ok for a missing key, NOT
+        // a 503 — the point is the gate is not tripped).
+        assert!(coord.get(read_req.clone()).await.is_ok(), "healthy node must NOT reject with 503");
+
+        // metadata Dead → every read rejects with 503 BEFORE lookup.
+        let meta_id = registry.pool_by_role(PoolRole::Metadata).expect("metadata pool").id();
+        registry.set_status(meta_id, PoolStatus::Dead);
+        match coord.get(read_req).await {
+            Err(Error::ServiceUnavailable(msg)) => {
+                assert!(msg.contains("metadata pool dead"), "metadata-dead message: {msg}");
+            }
+            other => panic!("metadata Dead must reject with 503, got: {other:?}"),
+        }
     }
 
     /// Job B (g4): the dangling-segment error detector matches exactly

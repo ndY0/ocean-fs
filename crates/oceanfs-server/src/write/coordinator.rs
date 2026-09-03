@@ -168,7 +168,11 @@ pub struct WriteCoordinator {
     /// Hinted handoff buffer for writes to temporarily unreachable replicas.
     hinted_handoff: Arc<HintedHandoffManager>,
     /// The live pool registry (g2): when set, the hint enqueue path
-    /// rejects new debt while the **hints** pool is Dead (ADR-0029 §D3).
+    /// rejects new debt while the **hints** pool is Dead (ADR-0029 §D3),
+    /// and the local write gate derives the node's OWN availability from
+    /// it (metadata pool Dead → 503; wal `write_degraded` → 503 — g6).
+    /// This is the SAME registry instance the read coordinator consults:
+    /// one source of truth for local availability.
     pool_registry: Option<Arc<oceanfs_storage::PoolRegistry>>,
     /// Cluster-readiness gate: closed while this node's ring is still
     /// converging after (re)join; the write path refuses to
@@ -488,6 +492,20 @@ impl WriteCoordinator {
     /// acknowledgments is not received within the timeout.
     /// Returns [`Error::Routing`] if the ring returns an empty set.
     pub async fn put(&self, req: WriteRequest) -> Result<WriteResult> {
+        // Step 0: Local-availability gate (g6, ADR-0029 §D3). A node
+        // whose metadata pool is Dead cannot serve anything (its object
+        // index is gone) — reject at the S3/write boundary with a
+        // retryable 503 BEFORE any routing or forwarding (the client
+        // routes to another node). Derived from the pool registry — the
+        // same source the read coordinator consults. The wal
+        // `write_degraded` case is gated on the LOCAL write path below
+        // (a forwarding node does not journal).
+        if let Some(registry) = &self.pool_registry {
+            if !registry.node_serves_requests() {
+                return Err(Error::ServiceUnavailable("node unavailable — metadata pool dead"));
+            }
+        }
+
         // Step 1: Route the key.
         let replica_set = self.ring.lookup(req.hash_key.as_bytes());
         if replica_set.is_empty() {
@@ -554,6 +572,20 @@ impl WriteCoordinator {
         }
 
         // Step 3: Local write + timestamp. Handle empty blobs early.
+        // Local-write gate (g6, ADR-0029 §D3): THIS node is the ring
+        // owner and must journal — a `write_degraded` wal pool (Dead)
+        // cannot persist the entry, so reject with a retryable 503
+        // BEFORE the WAL append (the manifest already tells peers to
+        // route around this node; this is the local enforcement so a
+        // write that still lands here fails cleanly instead of being
+        // silently lost). A forwarding node never reaches this branch
+        // (it proxies to the owner without journaling).
+        if let Some(registry) = &self.pool_registry {
+            if !registry.accepts_writes() {
+                return Err(Error::ServiceUnavailable("node write_degraded — wal pool dead"));
+            }
+        }
+
         let hlc = self.hlc_clock.now();
         let blob_size = req.data.len() as u64;
         if blob_size == 0 {
@@ -1969,6 +2001,24 @@ mod tests {
             .0
     }
 
+    /// A local write request targeting this node (used by the g6 local
+    /// availability gate test).
+    async fn local_write(coord: &WriteCoordinator) -> Result<WriteResult> {
+        let data = vec![0xABu8; 8192];
+        coord
+            .put(WriteRequest {
+                bucket: BucketId::new("test"),
+                key: ObjectKey::new("obj"),
+                hash_key: HashKey::from_bytes(hash_key(b"obj")),
+                data: Bytes::from(data),
+                write_quorum: 1,
+                ack_after_wal: true,
+                ec_async: false,
+                policy: None,
+            })
+            .await
+    }
+
     /// A fresh lifecycle registry for pool construction (the pools hold
     /// it for the read path and the in-flight attach).
     fn test_registry() -> Arc<oceanfs_storage::SegmentLifecycleRegistry> {
@@ -2269,6 +2319,149 @@ mod tests {
         .await
         .0;
         assert!(plain.hints_pool_accepts());
+    }
+
+    /// g6 (ADR-0029 §D3): the write coordinator's LOCAL availability
+    /// gate — a Dead metadata pool rejects every write with 503, and a
+    /// `write_degraded` wal pool rejects LOCAL writes with 503 (the node
+    /// must journal; it cannot). Both are derived from the SAME pool
+    /// registry the read coordinator consults.
+    #[tokio::test]
+    async fn local_availability_gate_rejects_when_metadata_dead_or_wal_write_degraded() {
+        use oceanfs_core::{
+            MissingRootPolicy, PoolRole, PoolTech, StorageConfig, StoragePoolConfig,
+        };
+        use oceanfs_storage::PoolStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let storage = StorageConfig {
+            pools: vec![
+                StoragePoolConfig {
+                    name: "data-a".into(),
+                    role: PoolRole::Data,
+                    root: dir.path().join("nvme0"),
+                    weight: None,
+                    tech: PoolTech::Auto,
+                    health: Default::default(),
+                },
+                StoragePoolConfig {
+                    name: "journal".into(),
+                    role: PoolRole::Wal,
+                    root: dir.path().join("optane0"),
+                    weight: None,
+                    tech: PoolTech::Auto,
+                    health: Default::default(),
+                },
+                StoragePoolConfig {
+                    name: "meta".into(),
+                    role: PoolRole::Metadata,
+                    root: dir.path().join("optane1"),
+                    weight: None,
+                    tech: PoolTech::Auto,
+                    health: Default::default(),
+                },
+            ],
+            missing_root_policy: MissingRootPolicy::Fatal,
+        };
+        let registry = Arc::new(
+            oceanfs_storage::PoolRegistry::from_config(&storage, &data_dir).expect("registry"),
+        );
+        let coord = make_write_coordinator_with_delivery(
+            "n1",
+            &["n1", "n2", "n3"],
+            dir,
+            Arc::new(ConnectionPool::new(RpcConfig::default())),
+            Arc::new(CaptureDeliveryClient::default()),
+        )
+        .await
+        .0
+        .with_pool_registry(registry.clone());
+
+        let wal_id = registry.pool_by_role(PoolRole::Wal).expect("wal pool").id();
+        let meta_id = registry.pool_by_role(PoolRole::Metadata).expect("metadata pool").id();
+
+        // wal Dead → write_degraded: LOCAL writes reject with 503.
+        registry.set_status(wal_id, PoolStatus::Dead);
+        registry.set_write_degraded(wal_id, true);
+        match local_write(&coord).await {
+            Err(Error::ServiceUnavailable(msg)) => {
+                assert!(msg.contains("write_degraded"), "wal-dead message: {msg}");
+            }
+            other => panic!("wal write_degraded must reject with 503, got: {other:?}"),
+        }
+
+        // metadata Dead → ALL writes reject with 503.
+        registry.set_status(meta_id, PoolStatus::Dead);
+        match local_write(&coord).await {
+            Err(Error::ServiceUnavailable(msg)) => {
+                assert!(msg.contains("metadata pool dead"), "metadata-dead message: {msg}");
+            }
+            other => panic!("metadata Dead must reject with 503, got: {other:?}"),
+        }
+    }
+
+    /// A routing hint that excludes every peer (write_degraded /
+    /// zero-Healthy manifest) but never excludes the local node — models
+    /// a peer the manifest cache flags as unavailable.
+    struct ExcludePeersHint;
+
+    impl RoutingHint for ExcludePeersHint {
+        fn exclude_read_candidate(&self, _: &NodeId) -> bool {
+            false
+        }
+        fn exclude_write_target(&self, node: &NodeId) -> bool {
+            node.as_str() != "n1"
+        }
+        fn on_failover(&self) {}
+    }
+
+    /// g6 (ADR-0029 §D5): the coordinator's remote-target selection
+    /// skips a peer the routing hint excludes — a local write whose ring
+    /// replica set contains only excluded peers still succeeds (the
+    /// quorum is met locally; the excluded peers are never contacted as
+    /// targets). This exercises the `excluded_write_target` filter in
+    /// the replica fan-out loop.
+    #[tokio::test]
+    async fn write_target_selection_skips_excluded_peers() {
+        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"])
+            .await
+            .with_routing_hint(Arc::new(ExcludePeersHint));
+
+        // Sanity: the coordinator's exclusion predicate reflects the
+        // hint (n1 is self → eligible; n2/n3 are excluded peers).
+        assert!(!coord.excluded_write_target(&NodeId::new("n1")));
+        assert!(coord.excluded_write_target(&NodeId::new("n2")));
+        assert!(coord.excluded_write_target(&NodeId::new("n3")));
+
+        // A local write (n1 is the ring owner for this key's hash when
+        // the key is in the n1 hash range — the ring has 8 vnodes/node
+        // over 3 nodes, so a handful of attempts covers an n1-owned
+        // key). With every remote peer excluded, the write still
+        // succeeds (quorum 1 met locally, no peer is contacted).
+        let mut landed = false;
+        for i in 0..50 {
+            let key = format!("excl-{i}");
+            let req = WriteRequest {
+                bucket: BucketId::new("test"),
+                key: ObjectKey::new(&key),
+                hash_key: HashKey::from_bytes(hash_key(key.as_bytes())),
+                data: Bytes::from(vec![0xABu8; 8192]),
+                write_quorum: 1,
+                ack_after_wal: true,
+                ec_async: false,
+                policy: None,
+            };
+            match coord.put(req).await {
+                Ok(_) => {
+                    landed = true;
+                    break;
+                }
+                Err(Error::Routing(_)) => continue, // not an n1-owned key; try the next
+                Err(e) => panic!("write with all peers excluded must not error: {e:?}"),
+            }
+        }
+        assert!(landed, "at least one attempted key must be n1-owned");
     }
 
     #[tokio::test]

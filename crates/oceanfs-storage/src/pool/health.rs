@@ -342,8 +342,9 @@ impl ConfirmedLoss {
 ///
 /// The node's consequence applier consumes these to map role → D3
 /// consequences (wal → write_degraded is driven by the monitor itself;
-/// metadata → node_unavailable, data → affected segments, hints → hint
-/// rejection are node-layer).
+/// metadata Dead → the node serves nothing — derived lazily from the
+/// registry by the g6 read/write gates; data → affected segments,
+/// hints → hint rejection are node-layer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum HealthEvent {

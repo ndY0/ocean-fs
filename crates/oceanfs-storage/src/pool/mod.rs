@@ -1054,6 +1054,64 @@ impl PoolRegistry {
         }
     }
 
+    /// Whether this node can serve requests at all (g6, ADR-0029 §D3):
+    /// the metadata pool is NOT Dead. A node whose metadata pool is Dead
+    /// has lost its object index — it can serve neither reads nor writes
+    /// (g2's `node_unavailable` consequence). No metadata pool configured
+    /// (the legacy single-data-pool topology) → available.
+    ///
+    /// This is the SINGLE availability derivation the read and write
+    /// paths consult (a node-level gate on top of the peer-side manifest
+    /// routing in `oceanfs-node::routing_cache`). It reads the registry
+    /// — the one source of truth — rather than a separately-maintained
+    /// flag.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_storage::{PoolRegistry, PoolStatus};
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// let registry = PoolRegistry::from_config(
+    ///     &oceanfs_core::StorageConfig::default(),
+    ///     &data_dir,
+    /// )
+    /// .expect("registry");
+    /// assert!(registry.node_serves_requests(), "no metadata pool → available");
+    /// ```
+    pub fn node_serves_requests(&self) -> bool {
+        self.pool_by_role(PoolRole::Metadata)
+            .map(|pool| pool.status() != PoolStatus::Dead)
+            .unwrap_or(true)
+    }
+
+    /// Whether this node can accept NEW writes (g6, ADR-0029 §D3): the
+    /// node serves requests AND no wal pool is `write_degraded` (a Dead
+    /// wal pool cannot journal — new writes must be rejected, not
+    /// silently lost). No wal pool configured → not write-degraded.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_storage::PoolRegistry;
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// let registry = PoolRegistry::from_config(
+    ///     &oceanfs_core::StorageConfig::default(),
+    ///     &data_dir,
+    /// )
+    /// .expect("registry");
+    /// assert!(registry.accepts_writes(), "no wal pool → not write_degraded");
+    /// ```
+    pub fn accepts_writes(&self) -> bool {
+        if !self.node_serves_requests() {
+            return false;
+        }
+        self.pool_by_role(PoolRole::Wal).map(|pool| !pool.write_degraded()).unwrap_or(true)
+    }
+
     /// Overrides a pool's capacity snapshot and its metrics.
     ///
     /// The node's maintenance task normally drives capacity via
@@ -1689,6 +1747,48 @@ mod tests {
         // Unknown ids are a no-op.
         registry.set_status(99, PoolStatus::Dead);
         registry.set_write_degraded(99, true);
+        drop(tmp);
+    }
+
+    /// g6: the shared availability derivation — a Dead metadata pool
+    /// flips `node_serves_requests` to false (the node serves nothing);
+    /// wal Dead sets `write_degraded`, which flips `accepts_writes` but
+    /// NOT `node_serves_requests` (reads still served). This is the ONE
+    /// source both the read and write coordinators' gates consult.
+    #[test]
+    fn availability_derives_from_metadata_and_wal_pools() {
+        let (tmp, data_dir) = layout();
+        let (storage, _roots) = four_pool_config(tmp.path());
+        let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
+        let wal_id = registry.pool_by_role(PoolRole::Wal).unwrap().id();
+        let meta_id = registry.pool_by_role(PoolRole::Metadata).unwrap().id();
+
+        // Healthy start.
+        assert!(registry.node_serves_requests(), "healthy metadata pool serves");
+        assert!(registry.accepts_writes(), "healthy wal pool accepts writes");
+
+        // wal Dead → write_degraded (the monitor sets the flag on Dead):
+        // writes rejected, reads still served.
+        registry.set_status(wal_id, PoolStatus::Dead);
+        registry.set_write_degraded(wal_id, true);
+        assert!(registry.node_serves_requests(), "metadata alive → serves reads");
+        assert!(!registry.accepts_writes(), "wal write_degraded → no new writes");
+
+        // metadata Dead → the node serves nothing (reads AND writes).
+        registry.set_status(meta_id, PoolStatus::Dead);
+        assert!(!registry.node_serves_requests(), "metadata Dead → serves nothing");
+        assert!(!registry.accepts_writes(), "metadata Dead → no writes either");
+        drop(tmp);
+    }
+
+    /// g6: no metadata/wal pool configured (the legacy single-data-pool
+    /// topology) → the node is available and accepts writes.
+    #[test]
+    fn availability_defaults_open_without_role_pools() {
+        let (tmp, data_dir) = layout();
+        let registry = PoolRegistry::from_config(&StorageConfig::default(), &data_dir).unwrap();
+        assert!(registry.node_serves_requests(), "no metadata pool → available");
+        assert!(registry.accepts_writes(), "no wal pool → accepts writes");
         drop(tmp);
     }
 

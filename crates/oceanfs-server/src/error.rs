@@ -34,6 +34,13 @@ pub enum Error {
         attempts: usize,
     },
 
+    /// The local node cannot serve the request (g6, ADR-0029 §D3 role
+    /// consequences): the metadata pool is Dead (the objects CF is gone —
+    /// serve nothing) or the wal pool is `write_degraded` (cannot journal
+    /// new writes). Retryable — the client should route to another node.
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(&'static str),
+
     /// Write quorum was not met.
     #[error("write quorum not met: required {required} but only {received} acks received")]
     QuorumNotMet {
@@ -146,7 +153,8 @@ impl Error {
             Self::NoReachableNode
             | Self::Routing(_)
             | Self::ForwardFailed { .. }
-            | Self::AllForwardingFailed { .. } => "ServiceUnavailable",
+            | Self::AllForwardingFailed { .. }
+            | Self::ServiceUnavailable(_) => "ServiceUnavailable",
             Self::Storage(_) | Self::Internal(_) | Self::SegmentUnavailable(_) => "InternalError",
             Self::Metadata(ref e) => match e {
                 crate::metadata_ops::MetadataError::NotFound(_) => "NoSuchKey",
@@ -179,7 +187,8 @@ impl Error {
             Self::NoReachableNode
             | Self::Routing(_)
             | Self::ForwardFailed { .. }
-            | Self::AllForwardingFailed { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            | Self::AllForwardingFailed { .. }
+            | Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Storage(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::SegmentUnavailable(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Metadata(ref e) => match e {
@@ -231,5 +240,14 @@ mod tests {
             Error::HashMismatch { expected: "a".into(), actual: "b".into() }.s3_status(),
             StatusCode::INTERNAL_SERVER_ERROR,
         );
+    }
+
+    /// The g6 local-availability rejection maps to 503 Service
+    /// Unavailable (a client retry signal — route to another node).
+    #[test]
+    fn service_unavailable_maps_to_503() {
+        let err = Error::ServiceUnavailable("node unavailable — metadata pool dead");
+        assert_eq!(err.s3_status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.s3_code(), "ServiceUnavailable");
     }
 }

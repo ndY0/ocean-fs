@@ -64,6 +64,14 @@ pub struct ManifestCache {
     /// `oceanfs_routing_failover_total` — error-driven fallback to the
     /// next replica (the cache was a hint; the I/O error was the truth).
     failover_total: Counter,
+    /// `oceanfs_routing_manifest_skips_total{path="read"}` — a read
+    /// candidate excluded because its manifest reported zero Healthy
+    /// data pools (g6).
+    read_skips: Counter,
+    /// `oceanfs_routing_manifest_skips_total{path="write"}` — a write
+    /// target excluded because its manifest reported `write_degraded` or
+    /// zero Healthy data pools (g6).
+    write_skips: Counter,
 }
 
 impl ManifestCache {
@@ -89,6 +97,17 @@ impl ManifestCache {
                 "oceanfs_routing_failover_total".into(),
                 "Error-driven fallbacks to the next replica".into(),
                 LabelSet::empty(),
+            ),
+            read_skips: Counter::new(
+                "oceanfs_routing_manifest_skips_total".into(),
+                "Read candidates skipped due to their manifest (zero Healthy data pools)".into(),
+                LabelSet::new(&[("path", "read")]),
+            ),
+            write_skips: Counter::new(
+                "oceanfs_routing_manifest_skips_total".into(),
+                "Write targets skipped due to their manifest (write_degraded / zero Healthy pools)"
+                    .into(),
+                LabelSet::new(&[("path", "write")]),
             ),
         }
     }
@@ -219,6 +238,8 @@ impl ManifestCache {
     pub fn register_metrics(&self, registrar: &dyn MetricRegistrar) {
         registrar.register_counter(self.cache_misses.clone());
         registrar.register_counter(self.failover_total.clone());
+        registrar.register_counter(self.read_skips.clone());
+        registrar.register_counter(self.write_skips.clone());
     }
 }
 
@@ -285,23 +306,63 @@ pub fn is_write_degraded(manifest: &NodeManifest) -> bool {
     manifest.pools().iter().any(|p| p.write_degraded())
 }
 
+/// Whether a node manifest reports the node as able to accept NEW
+/// writes (g6, ADR-0029 §D5): not `write_degraded` AND at least one
+/// Healthy data pool. This is the shared write-path filter — the same
+/// predicate the peer routing hint applies when selecting replica
+/// targets (a manifest miss stays eligible; the I/O error path is the
+/// guarantee).
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_membership::manifest::{NodeManifest, PoolManifest};
+/// use oceanfs_node::routing_cache::can_accept_writes;
+///
+/// let ok = NodeManifest::from_pools(
+///     1,
+///     &[PoolManifest::new(0, "data", "healthy", false, 1 << 40, 2)],
+/// );
+/// assert!(can_accept_writes(&ok));
+///
+/// let degraded = NodeManifest::from_pools(
+///     1,
+///     &[PoolManifest::new(0, "data", "healthy", true, 1 << 40, 2)],
+/// );
+/// assert!(!can_accept_writes(&degraded));
+///
+/// let no_pool = NodeManifest::from_pools(1, &[]);
+/// assert!(!can_accept_writes(&no_pool));
+/// ```
+pub fn can_accept_writes(manifest: &NodeManifest) -> bool {
+    !is_write_degraded(manifest) && healthy_data_pools(manifest) > 0
+}
+
 impl RoutingHint for ManifestCache {
     fn exclude_read_candidate(&self, node_id: &NodeId) -> bool {
-        match self.get(node_id) {
+        let excluded = match self.get(node_id) {
             Some(manifest) => healthy_data_pools(&manifest) == 0,
             // Unknown peer = no pool info: stay eligible; the
             // error-driven fallback is the guarantee (ADR-0029 §D5).
             None => false,
+        };
+        if excluded {
+            self.read_skips.inc();
         }
+        excluded
     }
 
     fn exclude_write_target(&self, node_id: &NodeId) -> bool {
-        match self.get(node_id) {
-            Some(manifest) => is_write_degraded(&manifest) || healthy_data_pools(&manifest) == 0,
+        let excluded = match self.get(node_id) {
+            Some(manifest) => !can_accept_writes(&manifest),
             // Unknown peer stays eligible; write failures become
             // hinted-handoff debt.
             None => false,
+        };
+        if excluded {
+            self.write_skips.inc();
         }
+        excluded
     }
 
     fn on_failover(&self) {
@@ -440,6 +501,34 @@ mod tests {
         cache.on_failover();
         cache.on_failover();
         assert_eq!(cache.failover_total.get(), 2);
+    }
+
+    /// g6: each manifest-driven skip increments the per-path
+    /// `oceanfs_routing_manifest_skips_total{path}` counter — reads and
+    /// writes counted separately, healthy/unknown candidates not counted.
+    #[test]
+    fn manifest_skips_count_per_path() {
+        let cache = ManifestCache::new();
+        let degraded = NodeId::new("degraded");
+        let all_dead = NodeId::new("all-dead");
+        let healthy = NodeId::new("healthy");
+
+        cache.update(degraded.clone(), Arc::new(data_manifest("healthy", true, 2)));
+        cache.update(all_dead.clone(), Arc::new(data_manifest("dead", false, 1)));
+        cache.update(healthy.clone(), Arc::new(data_manifest("healthy", false, 1)));
+
+        // A write skip (write_degraded target) and a read skip (zero
+        // Healthy data pools) + one healthy (not counted).
+        assert!(cache.exclude_write_target(&degraded), "write_degraded excluded");
+        assert!(cache.exclude_read_candidate(&all_dead), "all-dead read candidate excluded");
+        assert!(!cache.exclude_write_target(&healthy), "healthy stays a target");
+
+        assert_eq!(cache.read_skips.get(), 1, "one read skip counted");
+        assert_eq!(cache.write_skips.get(), 1, "one write skip counted");
+
+        // Repeated skips accumulate.
+        assert!(cache.exclude_write_target(&degraded), "still excluded");
+        assert_eq!(cache.write_skips.get(), 2, "second write skip counted");
     }
 
     #[test]

@@ -518,10 +518,6 @@ pub struct Node {
     /// seal pipeline records write/fsync signals into it; the g2 health
     /// monitor consumes snapshots. Held for tests/observability.
     pub(crate) io_observer: Arc<oceanfs_storage::io::IoObserver>,
-    /// The g2 `node_unavailable` flag: set when the **metadata** pool is
-    /// Dead (ADR-0029 §D3 — the node serves nothing; g3 announces it,
-    /// g6's S3/read path rejects).
-    node_unavailable: Arc<std::sync::atomic::AtomicBool>,
     /// The seal-time segment replicator (sealed-segment-replication) —
     /// held so tests can observe the replication pipeline.
     pub(crate) segment_replicator: Arc<crate::segment_replicator::SegmentReplicator>,
@@ -1817,7 +1813,11 @@ impl Node {
             // Peer-side routing hint (ADR-0029 §D5): replica candidates
             // with zero Healthy data pools are excluded from the gRPC
             // fetch path; Phase A all-healthy = neutral.
-            .with_routing_hint(manifest_cache.clone()),
+            .with_routing_hint(manifest_cache.clone())
+            // Local-availability gate (g6): the SAME pool registry the
+            // write coordinator consults — a Dead metadata pool rejects
+            // reads with 503 (single source of truth).
+            .with_pool_registry(pool_registry.clone()),
         );
 
         // Router handles request forwarding to correct coordinator nodes.
@@ -2436,8 +2436,10 @@ impl Node {
         // each pool every `detection_window_secs` (f1 per-pool knobs),
         // drives registry status + wal write_degraded, and emits bounded
         // status events; the applier maps role → consequences
-        // (metadata → node_unavailable, data Dead → affected segments)
-        // and re-declares the manifest so peers see the change.
+        // (metadata Dead → the node serves nothing, surfaced lazily via
+        // PoolRegistry::node_serves_requests — g6's gates; data Dead →
+        // affected segments) and re-declares the manifest so peers see
+        // the change.
         let (health_monitor, health_events) = oceanfs_storage::pool::health::HealthMonitor::new(
             pool_registry.clone(),
             io_observer.clone(),
@@ -2451,10 +2453,6 @@ impl Node {
         });
         background.health_monitor = Some(health_handle);
         background.health_cancel = health_cancel;
-        // The node_unavailable flag: set when the metadata pool is Dead
-        // (g3 announces it; g6's read/S3 path rejects). Exposed for
-        // tests/observability.
-        let node_unavailable = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // g3 `loss-announcement` fan-out (ADR-0029 §D4 fast path): when a
         // data pool is confirmed Dead, announce the affected segment set
         // to `union(storage_locations − self)` over the set — bounded
@@ -2542,7 +2540,6 @@ impl Node {
             NodeId::new(&config.node_id),
             announce_incarnation,
             manifest_cache.clone(),
-            node_unavailable.clone(),
             loss_announcer,
         );
         background.health_consequences = Some(consequences_handle);
@@ -2788,7 +2785,6 @@ impl Node {
             wal_writer: wal_writer.clone(),
             pool_registry,
             io_observer,
-            node_unavailable,
             segment_replicator,
             remap_alias,
             repair_dispatcher,
@@ -2851,9 +2847,10 @@ impl Node {
         self.io_observer.clone()
     }
 
-    /// Returns whether the node has declared itself unavailable (the
-    /// **metadata** pool is Dead — ADR-0029 §D3). g3 announces this;
-    /// g6's S3/read path rejects while it is set.
+    /// Returns whether the node is unavailable (the **metadata** pool
+    /// is Dead — ADR-0029 §D3): it serves nothing. Derived from the pool
+    /// registry — the single source of truth both the read and write
+    /// coordinators' gates consult (`PoolRegistry::node_serves_requests`).
     ///
     /// # Examples
     ///
@@ -2875,7 +2872,7 @@ impl Node {
     /// # }
     /// ```
     pub fn node_unavailable(&self) -> bool {
-        self.node_unavailable.load(std::sync::atomic::Ordering::Relaxed)
+        !self.pool_registry.node_serves_requests()
     }
 
     /// Returns the seal-time segment replicator
