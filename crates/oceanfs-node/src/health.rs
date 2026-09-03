@@ -82,6 +82,12 @@ pub fn derive_affected_segments(
     affected
 }
 
+// [review][architecture][critical]
+// this functionnality could benefit from a reactor implementation.
+// rather than spawning a worker just to keep track of the health consequences, this could react to the events and keep the state within a more generic reactor.
+// as a matter of fact, losts of handlers in the project could. their state could be ram, rocksdb or disk backed, does not matter, we would have a cleaner way of updating
+// a state. worker pattern would remain for the real workers, handling workload.
+// [end]
 /// The g3 loss-announcement fan-out closure: `(pool_id, affected
 /// segments)` → announce to the affected segments' replica holders
 /// (ADR-0029 §D4 fast path).

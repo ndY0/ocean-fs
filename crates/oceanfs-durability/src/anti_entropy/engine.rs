@@ -77,6 +77,8 @@ pub struct AntiEntropy {
     mismatches_found_total: Counter,
 }
 
+// HERE
+
 impl AntiEntropy {
     /// Creates a new anti-entropy service.
     ///
@@ -179,6 +181,10 @@ impl AntiEntropy {
         // Step 1: Gather all sealed segments from the machine (the
         // `segments` CF is removed — ADR-0025 Decision 3).
         let mut sealed_segments: Vec<SegmentMetadata> = Vec::new();
+        // [review][algorithmic][high]
+        // on millions of segments, wouldnt this be very expensive ?
+        // maybe we should maintain whithin the registry the sealed only list. to be discussed
+        // [end]
         self.registry.for_each(|_id, entry| {
             if entry.state == oceanfs_storage::segment::lifecycle::SegmentState::Sealed {
                 sealed_segments.push(entry.metadata.clone());
@@ -190,6 +196,12 @@ impl AntiEntropy {
             return Ok(stats);
         }
 
+        // [review][algorithmic][critical]
+        // this is essentially reading terabytes of data, unbounded.
+        // this cannot remain as is, we need a better strategy than this.
+        // also, it appear we have two divergent data readers, for the server and for the durability side,
+        // this should not stand as is, and must be resolved
+        // [end]
         // Step 1.5: Build local Merkle trees from segment data
         let local_trees: HashMap<SegmentId, (MerkleTree, MerkleRoot)> = sealed_segments
             .iter()
@@ -211,7 +223,12 @@ impl AntiEntropy {
                 );
             }
         }
-
+        // [review][algorithmic][critical]
+        // node dont necessarily replicate each other data, this is especially true since the data
+        // pool re-replication mechanism.
+        // we need to rely on the manifest to be able to determine wich peer to compare against.
+        // acctually, this should be the entry point of the algorithm, not the segments.
+        // [end]
         // Step 3: Select random alive peers
         let peer_ids = self.select_alive_peers();
 
@@ -612,7 +629,9 @@ impl AntiEntropy {
             }
         }
     }
-
+    // [review][algorithmic][medium]
+    // this is a pointless exercice, we must get ride of this approach
+    // [end]
     /// Compares local Merkle roots against stored seal-time roots.
     ///
     /// Used as fallback when the gRPC peer exchange is unavailable.
@@ -641,6 +660,10 @@ impl AntiEntropy {
         Ok(())
     }
 
+    // [review][structure][high]
+    // if this is a test method, it should be conditional to the test module specifically.
+    // we do not allow dead code in the repository, period. 
+    // [end]
     /// Repairs a segment using Erasure Coding reconstruction.
     ///
     /// This method is retained for backward compatibility and testing.
@@ -781,6 +804,11 @@ impl AntiEntropy {
         Ok(repaired_count)
     }
 
+    // [review][structure][high]
+    // if this is a test method, it should be conditional to the test module specifically.
+    // we do not allow dead code in the repository, period.
+    // also : we do not have to support backward compatibility, this is hallucinated need, never specified.
+    // [end]
     /// Repairs diverged leaves using Merkle tree diff without EC.
     ///
     /// Retained for backward compatibility. New code should use the heal
@@ -920,6 +948,9 @@ impl AntiEntropy {
     }
 }
 
+// [review][structure][high]
+// if this is not used, clean it up. no dead code policy, strict rule
+// [end]
 // ---------------------------------------------------------------------------
 // MerkleExchangeProtocol
 // ---------------------------------------------------------------------------

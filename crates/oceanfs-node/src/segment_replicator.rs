@@ -347,6 +347,12 @@ impl SegmentReplicator {
         }
     }
 
+    // [review][architectural][critical]
+    // we hold replication needs in memory : if for whatever reason the node restart, we loose the replication need, that will only be caught next full scan
+    // i think we should iterate on the event wall and complete the state machine with a replicated state.
+    // now that i think about it, compaction is also part of the segment lyfecylcle, should we also merge the compaction state
+    // machine within the lifecycle one ? this require a proper brainstorm.
+    // [end]
     /// Returns the event sender for the seal worker / compactor
     /// (`enqueue` — non-blocking `try_send`; a full channel routes the
     /// segment into `needs_replication`, never blocks the seal path).

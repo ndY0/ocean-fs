@@ -73,6 +73,9 @@ impl MultiChunkAssembler {
         }
     }
 
+    // [review][implementation][high]
+    // why a default 64Mb buffer ?
+    // [end]
     /// Creates a new assembler without hash verification.
     ///
     /// Used when the object metadata has no stored BLAKE3 hash.
@@ -86,7 +89,10 @@ impl MultiChunkAssembler {
             verify: false,
         }
     }
-
+    // [review][implementation][critical]
+    // when we will introduce multi-part uploads, client payloads could be Gb in size.
+    // we cannot afford to accumulate, we will need a end to end streaming approach.
+    // [end]
     /// Pushes a chunk of data into the assembler.
     ///
     /// Chunks must be pushed in order (index `0, 1, 2, ...`).

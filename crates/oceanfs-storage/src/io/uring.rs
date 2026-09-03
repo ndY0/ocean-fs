@@ -21,7 +21,9 @@
 //! this backend implements it in its default state (pool 0, no-op
 //! observer), and the pool-aware [`ObservedIo`](crate::io::ObservedIo)
 //! wrapper composes it with a pool id + observer.
-
+// [review][implementation][critical]
+// this io performance critical implementation is missing
+// [end]
 #[cfg(feature = "io-uring")]
 use std::path::PathBuf;
 use std::{io, path::Path};

@@ -12,6 +12,16 @@
 //! Per performance guideline §2.6 (bounded channels), §4.5 (adaptive
 //! timeouts), and §9.3 (pre-compute key hash once).
 
+// [review][algorithmic][high]
+// should the response await the replication ? replication is a durability concern,
+// but should it be part of the acknoxwledgment to the user ? this touch the subject of
+// what an acknoledgement garantees, and i tend to believe awaiting replication is a very costly and
+// congestionning operation, that does not add a lot for the user. durability is an internal process, acknoledgement
+// basically says "the data has been processed with the minimal garantee for serving".
+// one thing to be certain about before : do we need the full replication for serving data ?
+// this is the only eventual barrier in my opinion.
+// [end]
+
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -106,6 +116,10 @@ pub struct WriteRequest {
     pub policy: Option<Arc<crate::BucketPolicy>>,
 }
 
+// [review][cleanup][high]
+// if shard_small and shard_standard are effectively unused, remove them.
+// i believe they are now superseded by the pool mechanism
+// [end]
 /// Coordinates distributed blob writes with quorum replication.
 ///
 /// Routes writes to the correct replica set, appends to the local
@@ -361,6 +375,10 @@ impl WriteCoordinator {
         self
     }
 
+    // [review][architecture][high]
+    // again, could probably benefit from a global reactor pattern, instead of per-struct notifiers
+    // to be discussed, i need to weigh the pros and cons with you
+    // [end]
     /// Registers a notifier invoked after every successful seal.
     ///
     /// The composition root wires this to the anti-entropy engine's
@@ -447,7 +465,10 @@ impl WriteCoordinator {
         self.hint_inline_threshold_bytes = bytes;
         self
     }
-
+    // [review][implementation][critical]
+    // immediately, their is a missing forward write to replica set.
+    // this is a critical gap in the implementation, and must be resolved with high priority
+    // [end]
     /// Executes a distributed write through the segment pipeline.
     ///
     /// # Algorithm
@@ -941,6 +962,9 @@ impl WriteCoordinator {
         })
     }
 
+    // [review][factorization][high]
+    // could benefit from factorization with the put logic
+    // [end]
     /// Applies a hinted object to the LOCAL store — the hinted-handoff
     /// receiver's write path. The hint IS the replication, so there is
     /// no fan-out, no quorum, no re-hinting: the data is appended to a
@@ -1442,6 +1466,9 @@ impl WriteCoordinator {
         self.segment_entries.entry(segment_id).or_default().push(entry);
     }
 
+    // [review][implementation][critical]
+    // why is the seal worker part of the write coordinator ? that does not make any sense.
+    // [end]
     /// Starts a background seal worker that drains seal queues from both
     /// segment pools and calls the sealer for each filled segment.
     ///

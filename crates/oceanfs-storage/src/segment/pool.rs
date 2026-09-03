@@ -591,6 +591,9 @@ impl SegmentPool {
                     None
                 }
             };
+            // [review][algorithmic][critical]
+            // same remarks regarding the use of a callback + signaling (oneshot or Notify), to avoid using arbitrary timers
+            // [end]
             // Await queue space — a dropped seal work item would orphan
             // the segment's data (the WAL is truncated after replay).
             self.finish_seal_handoff_async(
@@ -694,6 +697,10 @@ impl SegmentPool {
         }
     }
 
+    // [review][cleanup][high]
+    // this function is only ever used in tests, if not used, should be discarded and pruned for any test usage.
+    // carefull, the inner function is also a single use
+    // [end]
     /// Appends data to the current active segment.
     ///
     /// If the current segment is full after the append, it triggers a
@@ -752,6 +759,9 @@ impl SegmentPool {
         self.slots.iter().filter(|slot| slot.is_appending()).count()
     }
 
+    // [review][cleanup][medium]
+    // remove dead code if never used. if only used in test, use a conditionnal test directive
+    // [end]
     /// Returns the number of pool slots.
     #[allow(dead_code)]
     pub(crate) fn slot_count(&self) -> usize {
@@ -874,6 +884,10 @@ impl SegmentPool {
         Err(Error::InvalidConfig("no appending segment available in pool".into()))
     }
 
+    // [review][architecture][criticial]
+    // this approach should be the standard for any call site trying to append data to the pool,
+    // the backpressure avoid using any kind of arbitrary timer
+    // [end]
     /// Appends data with asynchronous backpressure: never fails on a
     /// transiently exhausted pool, never blocks a runtime worker, and
     /// **never drops a seal work item** — the filled segment's enqueue

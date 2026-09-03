@@ -5,6 +5,17 @@
 //! injects dependencies via `Arc`, spawns background tasks, and binds the
 //! HTTP + gRPC servers.
 
+// [review][architectural][critical]
+// this is the placement for broader remarks, improvement axis discussions.
+// - we may need an adaptative strategy for sub-systems doing full scans of spaces (metadata or data) : above a certain threshold, or a certain proportionnal load,
+//   switch to a different strategy (round-robin, random subset, ...)
+// - background tasks, submodules could benefit from implementing a startup module trait, making wiring easier (to be discussed, i am not sure)
+// - compile time Dependency injection : reduce complexity on composition pattern, make module composition clearer
+// - cleaner durability crate architecture : the scrub service has not its own folder, reconciliation neither
+// - using a dependency injection make it impossible to use the with_* incremental composition on most modules
+// - we construct large in memory data (see reconcile comments), we should discuss mitigation approaches.
+// [end]
+
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::Bytes;
@@ -149,6 +160,15 @@ impl oceanfs_storage_api::MetadataStore for PrefetchStoreAdapter {
 // Node leave handler — implements GracefulLeaveHandler for WAL + shard handoff
 // ---------------------------------------------------------------------------
 
+// [review][architecture][critical]
+// read the whole data dir, wich is potentially terabytes of data. Data pool refactor omitted this part
+// it is still consuming directly a unique segment data dir. more broadly, since data is replicated, there is not point
+// in handing over the whole data to an another node. at shutdown, the node should stop accepting new request, and try best effort to
+// finish the wwork in progress. other nodes sharing replicas should detect the under replication after the end of the grace period
+// (node is marked dead), elect a new primary holder, and the holder should start re-replication. this is a rather complicated mechanism,
+// but i think it is more realistic than waiting terabytes of transfer during a node shutdown. moreover, we implicitely rely on the node
+// gracefully shutting down, wich could very well be forcelfully killed instead.
+// [end]
 /// Handles WAL sealing and segment shard streaming during graceful leave.
 struct NodeLeaveHandler {
     /// WAL writer for flushing pending entries.
@@ -179,6 +199,9 @@ impl NodeLeaveHandler {
         Ok(ids)
     }
 
+    // [review][correctness][critical]
+    // read a fixed 76 byte offset for the headers. since we introduced compression, headers are variable size.
+    // [end]
     /// Reads segment data, skipping the 76-byte header.
     fn read_segment_data(
         &self,
@@ -343,7 +366,17 @@ impl NodeLeaveHandler {
 // ---------------------------------------------------------------------------
 // BackgroundTasks
 // ---------------------------------------------------------------------------
-
+// [review][architecture][critical]
+// we are running a lot of background tasks, each independently managing the following :
+// - concurrency
+// - scheduling
+// - event binding
+// this approach doesnt allow use to be able to manage the concurrency of background tasks at a global level.
+// i think we need a global task scheduler approach, with a semaphore driven global concurrency for background tasks.
+// this trully ensure the tasks cannot hurt the performance beyond a certain defined threshold.
+// also, we could integrate a reactor approach for the event driven communication between subsystems. this would simplify a few of them
+// i need an honest and torough discussion about this topic, since it is structurally very significant.
+// [end]
 /// Aggregated join handles and cancellation tokens for background loops.
 pub struct BackgroundTasks {
     /// Gossip protocol task handle (Membership drives gossip internally;
@@ -514,6 +547,17 @@ pub struct Node {
     pub(crate) reconciliation: Arc<oceanfs_durability::ReconciliationLoop>,
 }
 
+// [review][architectural][critical]
+// the startup function is more than a thousand of lines. i would like
+// to consider using compile time Dependency injection, to decompose the responsibilities of setup to the modules themselves,
+// and to properly be able to compose the application. for this, i would like you to reviez the shaku crate,
+// and we should have a discussion about it.
+// this should also be a good point to discuss module organisation / distribution : right now, it seems we construct analogous
+// or equal constructs for different submodules, because of the initial layout and incremental nature of the construction
+// of the start method.
+// i believe that maintainability will necessary stem from a clear dependency module graph,
+// a rationalisation of the abstractions we currently use, and the use of a proper composability helper crate
+// [end]
 impl Node {
     /// Starts an OceanFS node: wires all subsystems, binds servers,
     /// spawns background tasks, and returns a running [`Node`].
@@ -525,6 +569,10 @@ impl Node {
     pub async fn start(config: NodeConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let config = Arc::new(Self::validate_config(config)?);
 
+        // [review][cleanup]
+        // we ditched rayon in favor of a unified design around a unique tokio thread executor.
+        // if this is never used anywhere, it should be discarded. otherwise, the consumer side should also be refactored out of rayon.
+        // [end]
         // Configure the rayon global thread pool for EC encode/decode.
         // Leave 2 cores for tokio's async runtime to avoid CPU oversubscription
         // when both compute (EC) and I/O (gRPC, RocksDB) run concurrently.
@@ -547,6 +595,10 @@ impl Node {
             "Starting OceanFS node"
         );
 
+        // [review][cleanup][high]
+        // pool registration : we handle legacy behaviour inside an unpublished software. this is not a public facing api, nor should wwe espect customers to use
+        // the former unique data_dir. we should not complexify the data pool with legacy behaviour, because there is none to begin with.
+        // [end]
         // ---- 0. Storage pool registry (ADR-0029) + role-pinned paths ----
         // The registry probes every configured pool root at boot: the
         // `Fatal` policy refuses to start on an unprobeable root, the
@@ -564,13 +616,19 @@ impl Node {
             crate::pool_paths::pool_paths(&pool_registry, &config.data_dir, &config.hint_wal_dir);
 
         // ---- 1. Open metadata store ----
+        // [review][config][high]
+        // metadata config : the configuration is mostly default hardcoded values, without any inputed user config.
+        // the metadata store must be configurable, a part of the configuration is dedicated to it.
+        // [end]
         let metadata_config =
             MetadataConfig { data_dir: paths.metadata.clone(), ..Default::default() };
         let metadata_store = Arc::new(
             oceanfs_storage::RocksDbMetadataStore::open(&metadata_config)
                 .map_err(|e| format!("failed to open metadata store: {e}"))?,
         );
-
+        // [review][config][high]
+        // acceleration config : same comment that of the metadata store. what is the point of config if static
+        // [end]
         // ---- 2. Probe acceleration hardware ----
         let accel_config = AccelConfig::default();
         let accel = Arc::new(oceanfs_accel::AccelDispatcher::new(accel_config));
@@ -618,6 +676,12 @@ impl Node {
         // rejoins as the same identity with a bumped incarnation (D1) and
         // can re-contact the cluster when configured seeds are unreachable
         // or empty (D3).
+        // [review][config][critical]
+        // membership persistante across restart information follow the old one data dir approach.
+        // this is incompatible with the pooled data dirs approach.
+        // moreover, loosing the data drive means loosing the ability to rejoin at restart. this should not be possible.
+        // a safer approach, using a foreign config store for cluster critical informations should be considered instead.
+        // [end]
         let membership_state_store =
             MembershipStateStore::new(default_state_path(&config.data_dir));
         let durable_state = membership_state_store.load().map_err(|e| {
@@ -652,6 +716,9 @@ impl Node {
         // neutral — the structure and metrics land for Phase B.
         let manifest_cache = Arc::new(crate::routing_cache::ManifestCache::new());
 
+        // [review][config][high]
+        // no rpc config from config is operational, only the default values are used. rpc should be configurable
+        // [end]
         // ---- 5. Construct connection pools ----
         let rpc_config = RpcConfig::default();
         let quickack = rpc_config.quickack;
@@ -666,8 +733,14 @@ impl Node {
         let pool = Arc::new(oceanfs_network::ConnectionPool::new(rpc_config));
         membership.set_pool(membership_pool.clone());
 
+        // [review][config][critical]
+        // segment tiers sizes should be configurable by the end user too
+        // [end]
         // ---- 6. Construct storage components ----
         let segment_size = SegmentSizeConfig::default();
+        // [review][config][critical]
+        // wal configuration should be configurable by the end user too
+        // [end]
         let wal_config = WalConfig { data_dir: paths.wal.clone(), ..WalConfig::default() };
         let wal_writer = Arc::new(
             oceanfs_storage::WalWriter::open(&wal_config)
@@ -705,10 +778,16 @@ impl Node {
         let shard_small_metrics = Arc::clone(&shard_small);
         let shard_standard_metrics = Arc::clone(&shard_standard);
 
+        // [review][config][critical]
+        // pools configurations should be configurable by the end user
+        // [end]
         // Segment pools for pipeline parallelism (perf rule §2.7).
         // Created before WAL replay so that replayed entries can be
         // reconstructed into active segments (C4-storage, D6).
         let pool_config = PoolConfig::default();
+        // [review][config][critical]
+        // pools configurations should be configurable by the end user
+        // [end]
         // EC codec for the segment pools: work items carry (k, m, strip)
         // so the seal worker computes and persists per-segment parity at
         // seal time (single scheduler — the parallel encode runs on the
@@ -752,6 +831,10 @@ impl Node {
             .map_err(|e| format!("failed to create standard segment pool: {e}"))?,
         );
 
+        // [review][architecture][high]
+        // a node without a data pool should not be permitted to start, since their is not legacy mode to consider.
+        // also, a silent fallback to an arcane legacy mode is big bark pattern, an should never take place
+        // [end]
         // ADR-0001: tiered segment sizing driven by SegmentSizeConfig.
         // ---- f5: pool-aware segment placement + resolution ----
         // Sealed segments spread across the node's data pools: the sealer
@@ -783,6 +866,10 @@ impl Node {
         let io_observer = Arc::new(oceanfs_storage::io::IoObserver::new());
         pool_registry.observe_into(&io_observer);
         let io_backend = Arc::new(oceanfs_storage::io::IoBackend::new());
+        // [review][implementation][critical]
+        // seal config must be unique per pool path : write and read mode could differ
+        // between each mount, since they depend on the nature of the FS
+        // [end]
         let seal_config = oceanfs_storage::SealConfig {
             data_pools: data_pools.clone(),
             // f8 runtime attach: the sealer refreshes the data-pool list
@@ -791,12 +878,20 @@ impl Node {
             // restart). Pool mode only — legacy mode keeps the boot-time
             // empty list (registry: None) so the byte-for-byte layout is
             // untouched.
+            // [review][config][high]
+            // consequence here : the registry cannot be none, since pool is not
+            // allpwed empty.
+            // [end]
             registry: if config.storage.pools.is_empty() {
                 None
             } else {
                 Some(pool_registry.clone())
             },
             target_size_bytes: segment_size.default_target_size,
+            // [review][config][high]
+            // seal timeout should be allowed to be user configured since
+            // and its default value cannot be a magic constant
+            // [end]
             seal_timeout_ms: 5000,
             data_dir: segment_legacy_dir.clone(),
             io_mode: oceanfs_storage::io::IoReadMode::from_config(config.read_cache_segments),
@@ -810,6 +905,10 @@ impl Node {
             fsync_batch_timeout_ms: config.seal_fsync_batch_timeout_ms,
             fsync_max_waiters: config.seal_fsync_max_waiters,
         };
+        // [review][cleanup][medium]
+        // since roots are now handled within the pool registry, this part is probably
+        // useless. if not, it is part of the legacy we must remove.
+        // [end]
         // SegmentSealer is the authoritative persistence path. Sealed
         // segments are written to {data_dir}/segments/ (legacy) or the
         // selected data pool root (pool mode, ADR-0029 f5) with the
@@ -891,6 +990,9 @@ impl Node {
             wal_writer.clone(),
             lifecycle.clone(),
         ));
+        // [review][config][high]
+        // segment relicator config shoudl be fully configurable by the end user
+        // [end]
         // ---- 6c. Seal-time segment replicator (sealed-segment-replication) ----
         // The data-replication backbone: after a segment seals on this
         // node, its full data section is pushed to the segment's ring
@@ -968,7 +1070,13 @@ impl Node {
             membership.clone(),
             Arc::new(config.operation_timeouts),
         ));
+        // [review][code smell][medium]
+        // pointless cloning.
+        // [end]
         let repair_sink = repair_dispatcher.clone();
+        // [review][config][high]
+        // reconciliation configuration should be fully configurable by the end user
+        // [end]
         // The periodic reconciliation loop (g4 `reconciliation` — the
         // ADR-0029 §D4 pull safety net): event-driven wake (a node died /
         // its pools died → exactly the affected segments via the holder
@@ -1104,6 +1212,9 @@ impl Node {
                 }),
         );
 
+        // [review][config][high]
+        // as previously stated, any config should be possibly driven by the end user
+        // [end]
         // Construct IncrementalMerkleTree for anti-entropy by scanning
         // the machine's Sealed entries — supersedes ADR-0018 Decision
         // 1's segments-CF scan (ADR-0025 Decision 3).
@@ -1123,6 +1234,11 @@ impl Node {
             )
         };
 
+        // [review][architecture][critical]
+        // the anti antropy worker create it's own data store.
+        // since a data store is responsible to write to disk, we are running the risk of concurrency.
+        // there should only be one data store. need some investigation and discussion.
+        // [end]
         let ae_worker = Arc::new(oceanfs_durability::AntiEntropy::new(
             oceanfs_durability::AntiEntropyConfig::new(
                 config.ae_interval_sec,
@@ -1145,12 +1261,18 @@ impl Node {
             )),
             merkle_tree.clone(),
         ));
+        // [review][config][high]
+        // scrub config is not fully customizable
+        // [end]
         let mut scrub_config = oceanfs_durability::ScrubConfig::default();
         scrub_config.set_interval_sec(config.scrub_interval_sec);
         scrub_config.set_parallel_nodes(config.scrub_parallel_nodes);
         let scrub_worker = Arc::new(oceanfs_durability::ScrubCoordinator::new(scrub_config));
         // OrphanReaper deletes segment data files from disk when reclaiming
         // orphaned segments after GC compaction.
+        // [review][architecture][critical]
+        // again, we are instanciating a lot of stores. this is not a good architectural decision.
+        // [end]
         let reaper_shard_store: Arc<dyn oceanfs_durability::SegmentShardStore> =
             Arc::new(oceanfs_durability::DiskSegmentShardStore::new(
                 data_pools.clone(),
@@ -1164,6 +1286,9 @@ impl Node {
             gc_config,
         ));
 
+        // [review][architecture][high]
+        // same remark about the store duplication
+        // [end]
         // ---- 7b. Construct segment data store (shared by heal and gRPC) ----
         // DiskSegmentStore reads/writes the authoritative segment files.
         let heal_data_store: Arc<dyn oceanfs_durability::SegmentDataStore> =
@@ -1249,12 +1374,18 @@ impl Node {
                 tracing::warn!(
                     "Adaptive eviction policy not yet implemented; falling back to TTL-LRU for L2"
                 );
+                // [review][config][high]
+                // missing config from userland
+                // [end]
                 Box::new(oceanfs_cache::eviction::TtlLruPolicy::new(
                     oceanfs_cache::eviction::TtlLruConfig::default(),
                 ))
             }
             _ => {
                 tracing::warn!("Unknown L2 eviction policy; falling back to TTL-LRU");
+                // [review][config][high]
+                // same remark
+                // [end]
                 Box::new(oceanfs_cache::eviction::TtlLruPolicy::new(
                     oceanfs_cache::eviction::TtlLruConfig::default(),
                 ))
@@ -1320,7 +1451,10 @@ impl Node {
         } else {
             None
         };
-
+        // [review][architecture][critical]
+        // we have 3 abstractions to access disk : DiskSegmentStore, DiskSegmentShardStore and DiskSegmentReader.
+        // each independently implements optimisations or not, without unified logic. this is awfull, and must be resolved.
+        // [end]
         // Disk-backed segment reader: reads sealed segment files from disk
         // via the configured I/O mode (mmap / O_DIRECT / buffered).
         // Replaces the previous InMemorySegmentReader — segment data is read
@@ -1368,9 +1502,17 @@ impl Node {
                     config
                         .grpc_listen_addr
                         .parse::<std::net::SocketAddr>()
+                        // [review][configuration][critical]
+                        // we cannot take any default network adresses : a missing protocol means the system cannot work.
+                        // as a guideline rule : a missing essential configuration, that cannot be defaulted, must halt the startup with
+                        // an explicit error
+                        // [end]
                         .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 9001))),
                 ),
         );
+        // [review][config][fhigh]
+        // no magic constants, user should be able to configure the subsystem
+        // [end]
         let hint_config = HintedHandoffConfig {
             wal_dir: hints_dir.clone(),
             inline_threshold_bytes: config.hint_inline_threshold_bytes,
@@ -1424,6 +1566,10 @@ impl Node {
             let gate_membership = membership.clone();
             let gate = ready_gate.clone();
             let gate_timeout_secs = config.cluster_ready_timeout_sec.max(1);
+            // [review][architecture][critical]
+            // minimal quorum definition should be derived from actual config, not from a hardcoded
+            // w=2 estimation. this is very dangerous
+            // [end]
             tokio::spawn(async move {
                 // Open the gate when the ring reaches 2 nodes (enough
                 // for w=2 semantics) or after the configured bound —
@@ -1447,6 +1593,10 @@ impl Node {
         } else {
             ready_gate.store(true, std::sync::atomic::Ordering::Release);
         }
+
+        // HERE
+        // TODO : finish node startup sequence, then ocean durability, then server and quorum functionnalities
+
         let write_coordinator = Arc::new(
             WriteCoordinator::new(
                 ring_cache.clone(),
@@ -1491,6 +1641,9 @@ impl Node {
             // incremental Merkle tree (with its seal-time root) so
             // recently-written segments participate in the root exchange
             // without waiting for the next startup rebuild.
+            // [review][architectural][high]
+            // this is also a proper 
+            // [end]
             .with_segment_sealed_notifier({
                 let replicator = Arc::clone(&segment_replicator);
                 Arc::new(move |segment_id, merkle_root| {
@@ -1776,6 +1929,11 @@ impl Node {
         // Spawn a background poller for process-level metrics (every 15s).
         // RocksDB metrics are polled separately by metadata_store.start_metrics_task().
         let wal_dir = wal_config.data_dir.clone();
+        // [review][implementation][high]
+        // the metric poller cannot be cancelled, unkink other background tasks
+        // on an another topic : we seems to make the start function bear the initialisation logic of every module.
+        // a good implementation approach would be to rather make dedicated modules hide the implementation behind a setup method
+        // [end]
         let _process_poller = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(15));
             loop {
@@ -2195,6 +2353,10 @@ impl Node {
             warn!(error = %e, "initial cluster join failed; retrying in the background");
         }
 
+        // [review][implementation][critical]
+        // waiting for 2 nodes accomodate for a specific case only. the number of nodes to be present should be derived from the minimums
+        // extracted from the config, not this heuristic
+        // [end]
         // Background rejoin: retry the (idempotent) join every 3s until
         // the ring reaches 2 nodes. Covers the seedless-restart path
         // (fallback seeds) and fleet nodes that boot before their seed
@@ -2439,6 +2601,9 @@ impl Node {
         background.rep_dispatcher = Some(rep_dispatcher_handle);
         background.rep_dispatcher_cancel = rep_dispatcher_cancel;
 
+
+        // HERE
+
         // ---- 17. Spawn hinted handoff delivery watcher ----
         // Watches for membership events and drains the handoff buffer
         // for nodes that are (or return to) ALIVE. Any Alive event —
@@ -2456,6 +2621,12 @@ impl Node {
         let mut sweep_interval = tokio::time::interval(std::time::Duration::from_secs(
             config.hint_delivery_sweep_sec.max(1),
         ));
+        // [review][architecture][high]
+        // at multiple points during the startup phase, we define submodules using inner function and spawn + handle pattern directly inside the
+        // startup function. this bloats the function out, an blurs the responsibilities.
+        // as a matter of principle, any submodules should have it's own dedicated file / module and expose
+        // its startup sequence.
+        // [end]
         let delivery_handle = tokio::spawn(async move {
             // Bounded retry helper shared by the event path and the sweep
             // path. The returning node's gRPC listener may still be
@@ -2971,6 +3142,10 @@ impl Node {
         self.background.rep_worker_cancel.cancel();
         self.background.rep_dispatcher_cancel.cancel();
 
+        // [review][config][high]
+        // the shutdown grace period should be configurable, since it's dimensions is the product
+        // of the queues sizes, and expected system load.
+        // [end]
         // ---- 5. Wait for background tasks with a timeout ----
         let _ = tokio::time::timeout(Duration::from_secs(10), async {
             let _ = tokio::try_join!(

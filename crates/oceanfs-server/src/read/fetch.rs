@@ -15,6 +15,11 @@
 //! data+parity shards and reconstructs missing data via
 //! `EcRecoveryParams::decode_shards()`.
 
+// [review][structure][high]
+// this modules is called fetch, and yet half of it is about segment recovery with EC decoding.
+// a split should be considered zfor better clarity
+// [end]
+
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};

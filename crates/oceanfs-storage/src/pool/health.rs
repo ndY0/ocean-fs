@@ -479,6 +479,9 @@ impl PoolState {
     }
 }
 
+// [review][structure][low]
+// usually wrapping an object in a smart pointer is done by the caller, not the constructor
+// [end]
 impl HealthMonitor {
     /// Creates a monitor plus its bounded status-event channel.
     ///
@@ -640,6 +643,11 @@ impl HealthMonitor {
         entry.next_tick = Instant::now();
     }
 
+    // [review][configuration][high]
+    // the tick rate should be configurable by the end user.
+    // also, one second is  a very fast tick rate, disk health doesnt merely move that fast,
+    // it should be mush slower.
+    // [end]
     /// Runs the per-node monitor loop until `shutdown` is cancelled.
     ///
     /// A coarse 1s base ticker drives the per-pool cadence (each pool
@@ -663,6 +671,11 @@ impl HealthMonitor {
         }
     }
 
+    // [review][algorithmic][critical]
+    // as of now, the pools health status are memory resident only.
+    // meaning after every node restart, we might accept a dead pool,
+    // and try writing to it.
+    // [end]
     /// Ticks one pool: snapshot → trend → decide → apply.
     fn tick_pool(&self, pool: &Arc<crate::pool::StoragePool>, now: Instant) {
         let config = pool.health_config();

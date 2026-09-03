@@ -56,7 +56,10 @@ pub(crate) struct MembershipStateStore {
     /// Path of the state file.
     path: PathBuf,
 }
-
+// [review][architecture][high]
+// if ever, for whatever reason, the file get corrupted, we have no mean of reconnecting a node to
+// the cluster, we should discuss a fallback approach, maybe gossip based ? i need your honest input on this.
+// [end]
 impl MembershipStateStore {
     /// Creates a store bound to the given file path.
     ///

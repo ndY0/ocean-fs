@@ -102,6 +102,10 @@ impl<'a> ParitySection<'a> {
     }
 }
 
+// [review][architecture][critical]
+// small tier payload skip erasure coding altogether. this approach does not offer the level of
+// security the system is aiming for. data should be padded to  accomodate the stripe threshold if necessary
+// [end]
 /// Builds the parity section bytes for a sealed segment.
 ///
 /// `parity` holds `m` shards per completed stripe in

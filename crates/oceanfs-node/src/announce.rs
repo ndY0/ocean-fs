@@ -132,7 +132,11 @@ pub fn derive_fan_out_targets(
     }
     targets
 }
-
+// [review][implementation][medium]
+// i just noticed that we sparcely use the retry mechanism throughout the project.
+// most if not every internal grpc messsaging should be retried, with the same approach as follow.
+// we should generalize the pattern and apply it everywhere else
+// [end]
 /// Delivers one unary RPC to `target` with bounded retries.
 ///
 /// Returns `Ok(())` when the target acked (or explicitly declined —

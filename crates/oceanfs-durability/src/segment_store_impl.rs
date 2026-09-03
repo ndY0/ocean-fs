@@ -13,6 +13,9 @@ use oceanfs_storage::Error;
 
 use crate::anti_entropy::SegmentDataStore;
 
+// [review][cleanup][high]
+// no legacy mode
+// [end]
 /// A `SegmentDataStore` backed by segment files under the legacy
 /// segments dir or a data pool root.
 ///
@@ -86,6 +89,12 @@ impl SegmentDataStore for DiskSegmentStore {
         Ok(Bytes::from(data[hdr_size..data_end].to_vec()))
     }
 
+    // [review][architecture][critical]
+    // this does not use the disk optmimisations.
+    // also, this only handle the v1 format (format not carrying the processed payload real size, for exemple after decompression),
+    // what happens when we write a compressed segment after compaction ? we need to stop the versionning approach, this does not feet the problem :
+    // we are no in production yet : we do not version, we refactor. if we need to carry more information, we need to factor it in previous code, no shortcut..
+    // [end]
     fn write_segment_data(
         &self,
         segment_id: &SegmentId,

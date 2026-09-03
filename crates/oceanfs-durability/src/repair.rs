@@ -449,6 +449,12 @@ impl ReRepWorker {
         // byte-identical); the merkle root is the verified seal-time
         // root (or the recomputed root when the request carried none).
 
+        // [review][implementation][critical]
+        // this is not acceptable : replication should propagate the level of security expected from the erasure coding layer.
+        // we should either : fetch the metadata from the peer, optionally make the data enpoint return metadata infos,
+        // or make the replication command carry this informations. i prefer the later, because it is the simplest,
+        // and thoses inforamtions are not subjected to changes.
+        // [end]
         // The fetched segment's tier/ec shape: the fetch returns only
         // the data section; the request does not carry shape today. Use
         // the standard defaults (the segment store writes a v1 header

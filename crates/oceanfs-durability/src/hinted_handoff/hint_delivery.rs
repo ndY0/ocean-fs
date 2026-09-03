@@ -357,6 +357,12 @@ impl crate::healing_service::HintObjectFetcher for GrpcHintObjectFetcher {
     }
 }
 
+// [review][implementation][high]
+// i am skeptical of the utility of using an in memory representation of hints, since we have the wal files,
+// and once a node is available again, we serve it all sequentially anyway.
+// plus, the size of that memory item is very loosely bounded (only ttl).
+// [end]
+
 impl HintedHandoffManager {
     /// Creates a new hinted handoff manager.
     ///

@@ -755,7 +755,7 @@ impl EventWal {
     ///
     /// Returns an I/O error if the directory cannot be created, the
     /// current file cannot be opened, or the tail scan fails.
-    pub async fn open(dir: PathBuf, config: &EventWalConfig) -> Result<Self> {
+    pub async fn open(dir: PathBuf, config: &EventWadelConfig) -> Result<Self> {
         tokio::fs::create_dir_all(&dir).await?;
 
         // Scan existing files, computing per-file cumulative bases and
@@ -1576,6 +1576,9 @@ mod tests {
         assert_eq!(decoded, evt);
     }
 
+    // [review][pool][high]
+    // the below test target a legacy feature that should be discarded. their is no legacy mode, only data pools
+    // [end]
     /// ADR-0029 f5: legacy seal records (written before pool_id existed —
     /// the 48-byte payload without the pool flag) decode with pool_id 0,
     /// and pool_id-0 records stay byte-identical to the pre-f5 format.

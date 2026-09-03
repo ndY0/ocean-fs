@@ -26,6 +26,9 @@ use crate::{Error, Result};
 // GarbageCollector
 // ---------------------------------------------------------------------------
 
+// [review][architecture][critical]
+// data store and shard store are the same abstraction, this discrepency must be resolved
+// [end]
 /// Garbage collector for tombstone-based deletion and segment compaction.
 ///
 /// # Examples
@@ -154,6 +157,9 @@ impl GarbageCollector {
         self
     }
 
+    // [review][architecture][high]
+    // this binding could benefit from a proper reactor implementation
+    // [end]
     /// Wires the sealed-segment notifier (sealed-segment-replication):
     /// fired with each repacked segment's NEW id after its `SealEvent`
     /// is durable, so the node's segment replicator can fan the fresh
@@ -183,6 +189,9 @@ impl GarbageCollector {
         self
     }
 
+    // [review][architecture][high]
+    // this binding could benefit from a proper reactor implementation
+    // [end]
     /// Wires the compaction-remap notifier (g3 `loss-announcement`
     /// Option A): fired with `(old, new, chunk_table)` after the owner's
     /// metadata remap commits, so peers re-point their own object rows.
@@ -256,7 +265,11 @@ impl GarbageCollector {
         if candidates.is_empty() {
             return Ok(stats);
         }
-
+        // [review][architecture][critical]
+        // why do we have the segment store write side outside of the segment lifecycle coordinator ?
+        // segments persistence to disk is not effectively driven by the coordinator, this is britle in my opinion.
+        // we need a discussion on this
+        // [end]
         // Compaction needs a data store: repacking reads the old segment's
         // bytes and writes the new segment's `.dat` BEFORE the metadata
         // swap (a metadata-only remap would point objects at a segment
@@ -532,6 +545,10 @@ impl GarbageCollector {
     }
 }
 
+// [review][architectural][critical]
+// same remark about the multiplication of abstraction of segment data access
+// we need an unification
+// [end]
 // ---------------------------------------------------------------------------
 // SegmentShardStore — trait for deleting segment shards from disk
 // ---------------------------------------------------------------------------
@@ -579,6 +596,10 @@ pub trait SegmentShardStore: Send + Sync {
     fn list_segment_files(&self) -> Result<Vec<(SegmentId, i64, u32)>>;
 }
 
+// [review][code smell][high]
+// if this is only used in tests, it should be guarded with a cfg macro
+// otherwise it bloats the production binary for no reason
+// [end]
 /// An in-memory mock segment shard store for testing.
 ///
 /// Tracks which segments have been "deleted" from disk. Used in
@@ -589,6 +610,13 @@ pub struct InMemorySegmentShardStore {
     bytes_per_segment: u64,
 }
 
+// [review][duplication][critcal]
+// this struct is verbatim the same as the one in 'segment_store_impl'
+// this duplication hurts code quality a lot, and must be resolved with a very high priority.
+// on an another topic, no disk io abstraction is used, greatly reducing the interest of having taken the time
+// of constructing optimized io access. this must also be resolved with high priority.
+// finally, we must get ride of the legacy support
+// [end]
 /// Production segment shard store that deletes segment data files
 /// from the filesystem.
 ///

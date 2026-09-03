@@ -450,6 +450,12 @@ struct LegacySegmentMetadata {
     sealed_at: Option<i64>,
 }
 
+// [review][cleanup][high]
+// remove the legacy cases handling the pre-pools, no legacy behaviour.
+// [end]
+// [review][codesmell][medium]
+// usage of magic constants. name constantes, then use them as boundaries for readability
+// [end]
 /// Deserializes a snapshot into a fresh registry; `None` on any framing
 /// error (bad magic, unsupported version, CRC mismatch, truncated
 /// entries, unknown state).
