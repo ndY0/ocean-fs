@@ -755,7 +755,7 @@ impl EventWal {
     ///
     /// Returns an I/O error if the directory cannot be created, the
     /// current file cannot be opened, or the tail scan fails.
-    pub async fn open(dir: PathBuf, config: &EventWadelConfig) -> Result<Self> {
+    pub async fn open(dir: PathBuf, config: &EventWalConfig) -> Result<Self> {
         tokio::fs::create_dir_all(&dir).await?;
 
         // Scan existing files, computing per-file cumulative bases and
