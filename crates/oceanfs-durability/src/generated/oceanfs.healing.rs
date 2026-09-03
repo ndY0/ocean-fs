@@ -96,6 +96,20 @@ pub struct RequestReReplicationRequest {
     /// `push_sealed_segment` performs on the owner side).
     #[prost(bytes = "bytes", tag = "4")]
     pub merkle_root: ::prost::bytes::Bytes,
+    /// The segment's seal-time shape (tier + EC parameters), read by the
+    /// dispatcher from its own registry entry alongside the merkle root.
+    /// The acquiring worker registers the pulled copy with THIS shape —
+    /// the source's real size tier and EC geometry, not hardcoded
+    /// defaults (the same fidelity `push_sealed_segment` preserves on the
+    /// owner side). Wire encoding matches the segment-push protocol:
+    /// tier = oceanfs_core::SizeTier as u8 (0=Inline 1=Small 2=Standard
+    /// 3=Multi).
+    #[prost(uint32, tag = "5")]
+    pub tier: u32,
+    #[prost(uint32, tag = "6")]
+    pub ec_k: u32,
+    #[prost(uint32, tag = "7")]
+    pub ec_m: u32,
 }
 /// Acknowledges a re-replication request. `accepted` is true when the
 /// target enqueued the repair (it will pull + write + stamp).

@@ -1,14 +1,14 @@
 ---
 feature: "Re-Replication Worker"
 epic: "disk-resilience-healing"
-status: in_progress
+status: done
 priority: high
 owner: ""
 dependencies: ["reconciliation"]
 adr: [0029, 0030]
 perf: [1.3, 2.7, 8.1, 8.5]
 created: 2026-08-22
-updated: 2026-08-23
+updated: 2026-09-03
 ---
 
 # Re-Replication Worker
@@ -113,8 +113,9 @@ by a semaphore (HealWorker pattern, heal/worker.rs:8-12).
 - `pub struct ReRepWorker` — `new(config, data_store, lifecycle, pool, membership, timeouts)`, `run(shutdown)`.
 - `pub trait RepairTargetSelector: Send + Sync` — `pick_repair_target(...)`.
 - `pub enum RepairReason { Announcement, Reconciliation }`.
-- `pub struct ReRepRequest { origin: NodeId, segment_id: SegmentId, holders: Vec<NodeId>, reason: RepairReason, retry_count: u32, merkle_root: Option<HashOutput> }` — the `RepairSink` input (g3/g4 unchanged contract).
+- `pub struct ReRepRequest { origin: NodeId, segment_id: SegmentId, holders: Vec<NodeId>, reason: RepairReason, retry_count: u32, merkle_root: Option<HashOutput>, tier: SizeTier, ec_k: u8, ec_m: u8 }` — the `RepairSink` input (g3/g4 unchanged contract; the seal-time shape rides the request so the worker registers the pulled copy with the source's real tier/EC geometry).
 - `request_refresh_metadata(id, merkle_root, storage_locations: Option<SmallVec<[NodeId; 16]>>)`.
+- `RequestReReplicationRequest` (proto) carries `tier`/`ec_k`/`ec_m` (wire encoding matches the segment-push protocol: tier = SizeTier as u8, 0=Inline 1=Small 2=Standard 3=Multi).
 
 ## Data Flow
 
@@ -140,7 +141,47 @@ the only remaining warning is the pre-existing dead fn
 `test_hint_wal_implements_wal_writer_trait` in
 crates/oceanfs-durability/src/hinted_handoff/hint_wal.rs:848 (test-only, not a
 feature-completeness gate). -->
-- [ ] **Tests:** all listed green (worker e2e, selector rules,
+<!-- REVIEW (iteration 3): re-verified after the iteration-3 edits — `cargo fmt -- --check`,
+`cargo build --workspace --all-targets`, `cargo clippy --workspace --lib -- -D warnings`,
+and `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` (forced rebuild of the four changed
+files) all clean. OPEN (owner decision): the implementer's own `[review][implementation]
+[critical]` marker at crates/oceanfs-durability/src/repair.rs:452-457 stands — the
+re-replicated copy is registered with HARDCODED shape (`SizeTier::Standard`, ec_k=1,
+ec_m=0) instead of the source segment's seal-time shape; the implementer asks for shape
+propagation via the request. Reads of re-replicated copies are byte-correct (merkle-
+verified; integration GETs pass), but the durable lifecycle entry misstates the tier/ec
+shape until an AE/scrub exchange corrects it. Also OPEN (low): `ReRepConfig.fetch_timeout_ms`
+(crates/oceanfs-durability/src/repair.rs:68) is a DEAD public field — the fetch deadline
+comes from `OperationTimeouts::shard_fetch_ms` (default 30 s); wire the knob or remove it.
+Whole-project `[review][...]` marker comments (merge e005895/e2b451b) remain embedded in
+production sources awaiting architecture-owner adjudication. -->
+<!-- REVIEW (iteration 3b): the owner-selected Option A (seal-time shape rides
+`RequestReReplication`) is IMPLEMENTED and independently re-verified — `cargo fmt -- --check`,
+`cargo build --workspace --all-targets`, `cargo clippy --workspace --lib -- -D warnings`,
+and `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` (forced rebuild via `touch`) all clean.
+The `[review][implementation][critical]` marker block is REMOVED from
+crates/oceanfs-durability/src/repair.rs:440-452 and replaced with an explanation; the worker's
+`request_reserve(segment_id, tier, ec_k, ec_m)` (repair.rs:454-455) now reads the shape from
+`request.tier/ec_k/ec_m` — NO hardcoded `Standard/1/0` in production. Encode hop verified:
+the dispatcher (node repair.rs:488-508) maps tier to the segment-push wire u8 (0=Inline,
+1=Small, 2=Standard, 3=Multi, `_ => 2`) and sends `ec_k/ec_m as u32`; decode hop verified:
+`request_re_replication` (healing_service.rs:1642-1655) maps 0..3 and degrades unknown tiers
+to Standard (identical to the push receiver, server segment_service.rs:787-795) and clamps
+`ec_k/ec_m` to u8 — round-trip is bijective for all four tiers. Enqueuers (g3
+healing_service.rs:1417-1435, g4 reconcile.rs:710-727) populate the shape from their own
+registry entry (fallback Standard/1/0 only when the entry is absent — unreachable on the
+holds-guarded g3 path). Parked/swept requests preserve shape (the whole `ReRepRequest` is
+stored in the dispatcher's DashMap and re-cloned on sweep); the worker retry re-enqueue uses
+`ReRepRequest { retry_count + 1, ..request }` (repair.rs:333-336). Wire layout matches the
+generated prost struct (`uint32 tier = 5; ec_k = 6; ec_m = 7`). Dead knob removed:
+`ReRepConfig.fetch_timeout_ms` is GONE — no reads/writes remain anywhere; the fetch deadline
+is `OperationTimeouts::shard_fetch_ms` (repair.rs:536). `rep_config_defaults_are_sane`
+updated. LOW (test-code hygiene, NOT a feature gate per guidelines/coding.md §9.2.1):
+`cargo clippy --all-targets -p oceanfs-node -- -D warnings` flags `clippy::never_loop` at
+crates/oceanfs-node/tests/re_replication.rs:235 (the `'batches: loop` wrapper never actually
+loops — the inner `for batch in 0..4` either `break 'batches` or panics; remove the label or
+make it loop). -->
+- [x] **Tests:** all listed green (worker e2e, selector rules,
       concurrency, WAL format round-trip, 3-node RF=2 integration both
       paths)
 <!-- REVIEW (iteration 2): worker e2e now EXISTS and is genuine —
@@ -166,9 +207,43 @@ check each node lists ITSELF, so the holder-side `converge_holder_registry`
 append is never directly asserted. Fix: make the setup deterministic (e.g.
 assert the node that was NOT an initial holder gains the copy, or force a
 replica set that includes the owner). -->
+<!-- REVIEW (iteration 3): ALL unit-suite counts independently re-verified
+(--test-threads=1): storage 424 passed, durability 265 passed, node 65 passed
+(2 ignored). The three new tests run and pass individually:
+`worker_rejects_merkle_mismatch` (repair.rs:917 — drives a REAL fetch against a
+live healing gRPC service holding the real bytes with a WRONG merkle root in the
+request; asserts execute_repair Err + target store empty + lifecycle empty — the
+old already-held short-circuit is now its own test
+`worker_skips_fetch_when_segment_already_held` at repair.rs:1012; the duplicate
+`execute_repair_already_held_is_noop` is deleted), `data_dead_semantics_match_
+reconciler_snapshot` (node repair.rs:793), `metadata_refresh_empty_payload_is_
+rejected_not_panicked_on` (event_wal.rs:1709). RESIDUAL (low):
+`ReRepConfig.fetch_timeout_ms` is dead config (see Code note); the integration
+test's batch-precondition can still FAIL LOUDLY (never pass vacuously) when
+every sealed segment's ring set lands on {B,C} for 4 consecutive batches —
+probability ~(1/3)^(4·segments_per_batch), observed ≈0 with ≥6 segments/batch. -->
+<!-- REVIEW (iteration 3b): all counts independently re-verified (--test-threads=1):
+storage 424 passed, durability 265 passed, node 65 passed (2 ignored), durability
+doctests 24 passed. Re-ran the feature-relevant node integration binaries —
+re_replication 2/2 (~41 s; 12 dispatches → 12 accepted → 12 succeeded in the observed
+run, non-vacuous), loss_announcement 1/1, reconciliation 1/1, segment_replication 3/3.
+Shape tests verified: worker e2e `worker_pulls_writes_registers_and_stamps_end_to_end`
+(repair.rs:862-909) asserts the pulled copy is registered with the REQUEST's shape
+(Small, ec_k=4, ec_m=2); the RPC round-trip test (healing_service.rs:2497-2521) asserts
+tier/ec_k/ec_m ride the wire into the enqueued request; unknown-tier degrade is code-
+verified (healing_service.rs:1652) but not directly asserted by a test. LOW test-
+coverage gaps (code inspected and correct; not blocked on): (1) no test asserts the g3/g4
+enqueuer actually copies the registry entry's shape into the request (seed an EC k=4/m=2
+Small-tier entry → assert the enqueued `ReRepRequest` carries it); (2) no test asserts the
+dispatcher's tier wire-encode mapping (a pure function of `request.tier`); (3) the
+integration test does not assert the acquiring node's REGISTERED tier/ec after repair (its
+file/locations/read assertions would pass even under a Standard/1/0 misregistration). -->
 - [x] **Docs:** `# Examples` on pub items; rustdoc clean
 <!-- REVIEW: verified — RUSTDOCFLAGS="-D warnings" cargo doc --no-deps for storage, durability,
 membership, node is clean; doctests 24/90/36/7 pass. -->
+<!-- REVIEW (iteration 3): re-verified with a forced rebuild of the four changed files
+(RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p oceanfs-storage -p oceanfs-durability
+-p oceanfs-node after `touch`) — clean. -->
 - [x] **ADR:** ADR-0030 (target-pull + dedicated RPC, durable locations
       via refresh) satisfied; ADR-0029 §D5 (routing hint — selector
       consults manifests), §D6 (repair pacing via bounded concurrency +
@@ -185,6 +260,30 @@ gauges with {priority="announcement"|"reconciliation"} labels (repair.rs:182-
 the holder-side convergence is not directly asserted by any unit or
 integration test (the integration test only checks each node lists itself),
 so re-dispatch-stoppage is verified only indirectly via logs. -->
+<!-- REVIEW (iteration 3): the iteration-2 CAVEAT is CLOSED — the rewritten
+integration test now asserts per-segment `storage_locations` on BOTH nodes
+cover {node-b, node-c} for every at-risk segment (re_replication.rs:369-393),
+directly asserting holder-side convergence (Decision 3) AND the worker's stamp.
+The dispatcher live-holder filter now excludes data-dead holders
+(`is_data_dead`, node repair.rs:327-333) with semantics identical to
+reconcile.rs `membership_snapshot` (manifest has data pools AND all dead);
+unknown/no-manifest nodes stay eligible (no stranding). One duplicate
+dispatch round per under-replication is observed in runs (the data-dead
+origin's own g4 loop re-dispatches after the holder's repair); the worker's
+already-held idempotency absorbs it and each dispatcher converges its own
+registry, so it terminates — no loop. Note: the fetch-side holder set is only
+as fresh as the dispatcher's gossip view; a just-data-dead node can remain in
+the request for ~1 gossip round and even serve bytes in tests (pool death is
+simulated via health state, files remain readable) — the D5 stale-cache error
+path covers production. -->
+<!-- REVIEW (iteration 3b): ADR-0030 constraints re-checked against the shape
+propagation — Decision 1/2 are UPHOLD: the dedicated RPC still carries routing intent only
+(the shape fields are registry metadata, not data), the acquiring worker registers the copy
+with the dispatcher's real seal-time shape, so the target's lifecycle entry is accurate from
+the first moment (no dependence on a later AE/scrub correction — the marker's Option A).
+Decision 3 (holder-side convergence via refresh) unchanged and still verified by the
+integration test. The wire encoding matches ADR-0030's referenced segment-push protocol
+(explicitly documented in proto/oceanfs/healing.proto:136-146). -->
 - [x] **Perf:** 2.7/8.5 (semaphore-bounded concurrency), 8.1
       (FuturesUnordered for parallel holder fetch attempts), 1.3
       (pre-sized fetch buffers), 2.6 (bounded queue backpressure)
@@ -195,7 +294,18 @@ healing_service.rs uses the same JoinSet pattern). The module doc at repair.rs:2
 documents the JoinSet + abort_all deviation (stale claim fixed). 1.3 verified: the fetch buffer
 is pre-sized to the chunk size — `BytesMut::with_capacity(64 * 1024)` (repair.rs:578), matching
 the server's 65536-byte stream chunks (healing_service.rs:1190). -->
-- [ ] **Integration:** the epic's "re-replication restores RF" DoD — a
+<!-- REVIEW (iteration 3): iteration-3 changes add no perf-rule violations — the fetch
+attempt-deadline (repair.rs:570-620) races the initial RPC AND every stream.message() against
+ONE `timeout_at` budget (OperationTimeouts::shard_fetch_ms, default 30 s — same field the heal
+worker uses at heal/worker.rs:493, perf 4.5): a stalled holder cannot hang the attempt, and a
+legitimate transfer only fails if the WHOLE stream exceeds the 30 s budget, in which case the
+failure is safe (no partial write; merkle verification second line) and retried (×3) then
+re-detected by g4. Parallel fetch attempts remain capped (MAX_PARALLEL_FETCHES=16 semaphore,
+perf 8.5). -->
+<!-- REVIEW (iteration 3b): the shape-propagation change adds no perf-rule violations — the
+encode/decode matches are constant-time; the request gains 3×u32 on a metadata-only RPC
+(negligible vs the 64 KiB streamed fetch). -->
+- [x] **Integration:** the epic's "re-replication restores RF" DoD — a
       killed data pool's segments return to RF via announcement AND via
       reconciliation alone (both paths tested)
 <!-- REVIEW (iteration 2): the g3 loss_announcement (1) and g4 reconciliation (1)
@@ -214,6 +324,31 @@ worker pull → stamp. One observed exercising run confirmed the full flow:
 "request accepted; worker will pull" → "fetched segment from holder
 bytes=32768" → "re-replication succeeded", plus a Reconciliation-path
 duplicate dispatch exercising worker idempotency. -->
+<!-- REVIEW (iteration 3): BLOCKER CLOSED — the rewritten test is not vacuous.
+(crates/oceanfs-node/tests/re_replication.rs) — PUT batches loop until the
+at-risk precondition genuinely holds: symmetric difference of B's and C's
+pre-kill .dat sets is non-empty (only segments whose ring replica set
+contained A are at risk after A's pool death — ring sets {A,B}/{A,C} pre-kill
+push to exactly one of B/C). An all-{B,C} outcome FAILS LOUDLY
+(re_replication.rs:328-331), it cannot pass silently. Quiescence waits on all
+three replicators drained + B/C file sets stable across 3×300 ms polls, then
+snapshots. Post-kill assertions are PER-SEGMENT: every at-risk .dat on both B
+and C (file convergence), every at-risk segment's storage_locations on BOTH
+nodes covering {node-b, node-c} (registry convergence incl. the holder-side
+append), and every PUT key GETs byte-identical through A. Post-kill, the only
+mechanism that can place a new .dat on the non-holder is dispatcher → RPC →
+worker pull, so a passing run proves the flow ran. INDEPENDENTLY VERIFIED (3
+full runs + suite run): 2/2 tests green (~40 s each); dispatch logs observed
+in every run — 4 Announcement dispatches + real worker fetches (65536 B full
+segments) in the g3 test, 4 Reconciliation-only dispatches in the g4 test;
+0 parked/permanently-failed/convergence-failed warnings. All 27 node
+integration binaries green (loss_announcement, reconciliation,
+segment_replication regressions included). Residual (low): one idempotent
+duplicate round per segment (the data-dead origin's own g4 re-dispatches
+once before its converge lands — absorbed by worker idempotency, terminates);
+the batch precondition may panic (~(1/3)^(4k), k segments/batch) instead of
+passing vacuously — loud failure, re-run note in the message. -->
+
 
 ## Deviations (accepted)
 
@@ -224,6 +359,13 @@ duplicate dispatch exercising worker idempotency. -->
   than a new lifecycle event. The coordinator's refresh path already
   exists and is durable; extending its payload avoids a new event type
   while keeping the event-WAL the single durable writer.
+- **Shape propagation rides `RequestReReplication`** (the
+  `[review][implementation][critical]` marker at repair.rs, now
+  RESOLVED): the dispatcher/enqueuer reads the source segment's
+  seal-time tier/ec_k/ec_m from its own registry entry and sends them
+  alongside the merkle root; the acquiring worker registers the pulled
+  copy with that real shape (no hardcoded Standard/1/0 defaults, no
+  dependence on a later AE/scrub correction).
 - **Migration-plane isolation deferred** (ADR-0030 Decision 4): worker
   receives pool + membership injected so a later topology change is a
   wiring change only.

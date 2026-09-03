@@ -69,8 +69,11 @@ impl Default for ReplicationConfig {
     }
 }
 
-/// Maps a `SizeTier` to its wire `u32` (must match the receiver's decode).
-fn tier_to_u32(tier: SizeTier) -> u32 {
+/// Maps a `SizeTier` to its wire `u32` (must match the receiver's decode:
+/// 0=Inline 1=Small 2=Standard 3=Multi; unknown future tiers degrade to
+/// Standard — the same fallback the segment-push receiver and the
+/// re-replication dispatcher use).
+pub(crate) fn tier_to_u32(tier: SizeTier) -> u32 {
     match tier {
         SizeTier::Inline => 0,
         SizeTier::Small => 1,

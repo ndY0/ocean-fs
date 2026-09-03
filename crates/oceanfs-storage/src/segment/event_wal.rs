@@ -557,9 +557,9 @@ fn decode_payload(kind: u8, segment_id: SegmentId, payload: &[u8]) -> Option<Seg
         // Extended refresh (ADR-0030): flags byte bit 1 = locations
         // present. Layout: [flags][merkle_root(32) if bit 0][count(1)]
         // [(len(1) + utf8)*count]. The payload length is bounds-checked
-        // BEFORE any slice so a crafted (CRC-valid) short record is
-        // rejected, never panicked on.
-        KIND_METADATA_REFRESH if payload[0] & 2 != 0 => {
+        // BEFORE any slice or index so a crafted (CRC-valid) short — or
+        // empty — record is rejected as invalid, never panicked on.
+        KIND_METADATA_REFRESH if !payload.is_empty() && payload[0] & 2 != 0 => {
             let locs_start = 1 + if payload[0] & 1 != 0 { REFRESH_ROOT_SIZE } else { 0 };
             if payload.len() < locs_start {
                 return None;
@@ -1698,6 +1698,26 @@ mod tests {
         let crc = crc32fast::hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
         assert!(SegmentEvent::from_record_bytes(&buf).is_none(), "over-long id must be rejected");
+    }
+
+    /// ADR-0030: a CRC-valid metadata-refresh record with an EMPTY
+    /// payload is rejected as invalid — the extended-refresh decoder
+    /// must not index `payload[0]` before checking the length (a crafted
+    /// or legacy zero-length record must surface the bad-record path,
+    /// never a panic).
+    #[test]
+    fn metadata_refresh_empty_payload_is_rejected_not_panicked_on() {
+        let id = SegmentId::new();
+        let mut buf = Vec::with_capacity(EVENT_RECORD_HEADER_SIZE + 4);
+        buf.extend_from_slice(&EVENT_RECORD_MAGIC);
+        buf.push(EVENT_RECORD_VERSION);
+        buf.push(KIND_METADATA_REFRESH);
+        buf.extend_from_slice(&[0u8; 2]);
+        buf.extend_from_slice(&0u32.to_le_bytes()); // payload_len = 0
+        buf.extend_from_slice(id.as_uuid().as_bytes());
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        assert!(SegmentEvent::from_record_bytes(&buf).is_none(), "empty payload must be rejected");
     }
 
     #[test]

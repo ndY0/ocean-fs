@@ -133,6 +133,17 @@ message RequestReReplicationRequest {
   // self-consistent-but-wrong copy (the same integrity check
   // `push_sealed_segment` performs on the owner side).
   bytes merkle_root = 4;
+  // The segment's seal-time shape (tier + EC parameters), read by the
+  // dispatcher from its own registry entry alongside the merkle root.
+  // The acquiring worker registers the pulled copy with THIS shape —
+  // the source's real size tier and EC geometry, not hardcoded
+  // defaults (the same fidelity `push_sealed_segment` preserves on the
+  // owner side). Wire encoding matches the segment-push protocol:
+  // tier = oceanfs_core::SizeTier as u8 (0=Inline 1=Small 2=Standard
+  // 3=Multi).
+  uint32 tier = 5;
+  uint32 ec_k = 6;
+  uint32 ec_m = 7;
 }
 
 // Acknowledges a re-replication request. `accepted` is true when the

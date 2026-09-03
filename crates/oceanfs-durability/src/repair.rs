@@ -33,7 +33,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use oceanfs_core::{
     proto::common::SegmentId as ProtoSegmentId, NodeId, OperationTimeouts, SegmentId,
-    SegmentMetadata, SizeTier,
+    SegmentMetadata,
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
@@ -64,20 +64,13 @@ pub struct ReRepConfig {
     pub queue_capacity: usize,
     /// Maximum concurrent repair operations (perf 2.7/8.5).
     pub max_concurrent_repairs: usize,
-    /// Per-fetch timeout in milliseconds (perf 4.5 — segment transfer).
-    pub fetch_timeout_ms: u64,
     /// Maximum retry attempts for a single repair before giving up.
     pub retry_limit: u32,
 }
 
 impl Default for ReRepConfig {
     fn default() -> Self {
-        Self {
-            queue_capacity: 1024,
-            max_concurrent_repairs: 16,
-            fetch_timeout_ms: 30_000,
-            retry_limit: 3,
-        }
+        Self { queue_capacity: 1024, max_concurrent_repairs: 16, retry_limit: 3 }
     }
 }
 
@@ -445,9 +438,11 @@ impl ReRepWorker {
             .map_err(|e| Error::Storage(format!("re-replication write failed: {e}")))?;
 
         // Step 5: register in the lifecycle (reserve + seal). The
-        // target's metadata mirrors the holder's shape (the fetch is
-        // byte-identical); the merkle root is the verified seal-time
-        // root (or the recomputed root when the request carried none).
+        // target's metadata mirrors the holder's shape — the request
+        // CARRIES the source's seal-time shape (tier + EC geometry),
+        // read by the dispatcher/enqueuer from its own registry entry
+        // alongside the merkle root (ADR-0030). The pulled copy is
+        // registered with that real shape, never a hardcoded default.
 
         // [review][implementation][critical]
         // this is not acceptable : replication should propagate the level of security expected from the erasure coding layer.
@@ -455,14 +450,15 @@ impl ReRepWorker {
         // or make the replication command carry this informations. i prefer the later, because it is the simplest,
         // and thoses inforamtions are not subjected to changes.
         // [end]
-        // The fetched segment's tier/ec shape: the fetch returns only
-        // the data section; the request does not carry shape today. Use
-        // the standard defaults (the segment store writes a v1 header
-        // and the read path resolves chunk lengths from metadata; the
-        // shape is corrected by the first AE/scrub exchange).
-        let tier = SizeTier::Standard;
-        let ec_k = 1;
-        let ec_m = 0;
+        // [resolved] 2026-09-03 (ADR-0030 shape propagation): the
+        // replication command now CARRIES the information — the source's
+        // seal-time tier/ec_k/ec_m ride RequestReReplication (proto
+        // fields tier=5/ec_k=6/ec_m=7); the enqueuer reads them from its
+        // own registry entry, the dispatcher forwards them, and the
+        // worker registers the pulled copy with the real shape below.
+        let tier = request.tier;
+        let ec_k = request.ec_k;
+        let ec_m = request.ec_m;
 
         lifecycle
             .request_reserve(segment_id, tier, ec_k, ec_m)
@@ -563,6 +559,12 @@ impl ReRepWorker {
                 let channel = pooled.channel().clone();
                 drop(pooled);
 
+                // ONE deadline bounds the whole attempt: the RPC's
+                // initial response AND every stream message (a holder
+                // that stalls mid-stream after sending headers must not
+                // hang the attempt forever — same budget, single clock).
+                let attempt_deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
                 let proto_sid: ProtoSegmentId = segment_id.into();
                 let mut client = HealingRpcClient::new(channel);
                 let request = tonic::Request::new(GprcFetchShardRequest {
@@ -571,11 +573,8 @@ impl ReRepWorker {
                     offset: 0,
                     length: 0, // full-segment mode (ADR-0030)
                 });
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_millis(timeout_ms),
-                    client.fetch_shard(request),
-                )
-                .await;
+                let result =
+                    tokio::time::timeout_at(attempt_deadline, client.fetch_shard(request)).await;
                 match result {
                     Ok(Ok(response)) => {
                         let mut stream = response.into_inner();
@@ -590,15 +589,26 @@ impl ReRepWorker {
                         // holder's attempt (None → try the next).
                         let mut stream_ok = true;
                         loop {
-                            match stream.message().await {
-                                Ok(Some(chunk)) => {
+                            // Each message read races the SAME attempt
+                            // deadline — a stalled (headers-only) holder
+                            // is rejected, never awaited forever.
+                            let msg =
+                                tokio::time::timeout_at(attempt_deadline, stream.message()).await;
+                            match msg {
+                                Ok(Ok(Some(chunk))) => {
                                     if chunk.data.is_empty() {
                                         break;
                                     }
                                     buf.extend_from_slice(&chunk.data);
                                 }
-                                Ok(None) => break,
-                                Err(_) => {
+                                Ok(Ok(None)) => break,
+                                Ok(Err(_)) => {
+                                    stream_ok = false;
+                                    break;
+                                }
+                                Err(_elapsed) => {
+                                    // The holder stalled mid-stream —
+                                    // treat as a failed attempt.
                                     stream_ok = false;
                                     break;
                                 }
@@ -691,7 +701,7 @@ mod tests {
         let config = ReRepConfig::default();
         assert_eq!(config.max_concurrent_repairs, 16);
         assert_eq!(config.queue_capacity, 1024);
-        assert!(config.fetch_timeout_ms >= 1000);
+        assert_eq!(config.retry_limit, 3);
     }
 
     #[test]
@@ -721,49 +731,6 @@ mod tests {
             test_membership("n1"),
             Arc::new(OperationTimeouts::default()),
         );
-    }
-
-    /// Idempotency: a request for an already-held segment is a no-op
-    /// success (duplicate `RequestReReplication` convergence).
-    #[tokio::test]
-    async fn execute_repair_already_held_is_noop() {
-        let store = Arc::new(InMemorySegmentStore::new());
-        let lifecycle =
-            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
-                &oceanfs_core::LifecycleConfig::default(),
-            ));
-        let segment_id = SegmentId::new();
-        let meta = SegmentMetadata {
-            pool_id: 0,
-            segment_id,
-            ec_k: 1,
-            ec_m: 0,
-            size_tier: SizeTier::Standard,
-            merkle_root: Some(oceanfs_core::HashOutput::from_bytes([0x11; 32])),
-            storage_locations: smallvec::smallvec![],
-            sealed_at: Some(1),
-        };
-        lifecycle.registry().reserve(segment_id, meta.clone()).unwrap();
-        lifecycle.registry().seal(segment_id, meta).unwrap();
-
-        let request = ReRepRequest {
-            origin: NodeId::new("a"),
-            segment_id,
-            holders: vec![NodeId::new("a")],
-            reason: RepairReason::Reconciliation,
-            retry_count: 0,
-            merkle_root: None,
-        };
-        let result = ReRepWorker::execute_repair(
-            &request,
-            &*store,
-            &*lifecycle,
-            &Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default())),
-            &test_membership("n1"),
-            &OperationTimeouts::default(),
-        )
-        .await;
-        assert!(result.is_ok(), "already-held is a no-op success");
     }
 
     /// The fetch returns an error when no holder is reachable.
@@ -904,6 +871,9 @@ mod tests {
         let lifecycle = make_lifecycle().await;
         let pool = Arc::new(Pool::new(oceanfs_core::RpcConfig::default()));
 
+        // The request carries the SOURCE's real seal-time shape (a
+        // Small-tier, EC k=4/m=2 segment) — the worker must register the
+        // pulled copy with THIS shape, never a hardcoded default.
         let request = ReRepRequest {
             origin: NodeId::new("holder"),
             segment_id,
@@ -911,6 +881,9 @@ mod tests {
             reason: RepairReason::Reconciliation,
             retry_count: 0,
             merkle_root: Some(expected_root),
+            tier: oceanfs_core::SizeTier::Small,
+            ec_k: 4,
+            ec_m: 2,
         };
         let result = ReRepWorker::execute_repair(
             &request,
@@ -928,18 +901,129 @@ mod tests {
         assert_eq!(&got[..], &data[..], "target store must hold the pulled segment");
 
         // The lifecycle entry exists and lists the target (self) in
-        // storage_locations — the durable stamp.
+        // storage_locations — the durable stamp — AND carries the
+        // request's shape (the source's real tier/EC geometry, not the
+        // pre-change hardcoded Standard/1/0).
         let entry = lifecycle.registry().get(segment_id).expect("registered");
         assert!(
             entry.metadata.storage_locations.iter().any(|loc| loc == membership.node_id()),
             "storage_locations must include the acquiring node (self)"
         );
+        assert_eq!(
+            entry.metadata.size_tier,
+            oceanfs_core::SizeTier::Small,
+            "the pulled copy must be registered with the source's tier"
+        );
+        assert_eq!(entry.metadata.ec_k, 4, "the pulled copy must carry the source's ec_k");
+        assert_eq!(entry.metadata.ec_m, 2, "the pulled copy must carry the source's ec_m");
     }
 
     /// A corrupted/truncated fetch (merkle mismatch) is rejected — the
     /// worker must NOT materialize a self-consistent-but-wrong copy.
+    /// Unlike the idempotency no-op above, this drives the REAL fetch
+    /// path: a healing service serves the segment's bytes while the
+    /// request carries a WRONG seal-time root; the worker must reject
+    /// the transfer and leave the target store + lifecycle untouched.
     #[tokio::test]
     async fn worker_rejects_merkle_mismatch() {
+        use oceanfs_core::{HlcClock, NodeState};
+        use oceanfs_network::ConnectionPool as Pool;
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        use crate::{
+            healing_rpc::healing_rpc_server::HealingRpcServer, healing_service::HealingGrpcService,
+        };
+
+        // ---- Holder side: real service serving the REAL segment bytes ----
+        let segment_id = SegmentId::new();
+        let data: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+        // The request carries a WRONG root (the real root is derived
+        // below and never sent) — a truncated/corrupt transfer proxy.
+        let _real_root = crate::MerkleTree::build(&data, 0).unwrap().root().hash();
+        let wrong_root = oceanfs_core::HashOutput::from_bytes([0xFF; 32]);
+        assert_ne!(_real_root, wrong_root, "the wrong root must actually differ");
+
+        let holder_store = Arc::new(InMemorySegmentStore::new());
+        holder_store.write_segment_data(&segment_id, &data).unwrap();
+        let holder_service = HealingGrpcService::new(
+            Arc::new(crate::HintedHandoff::new()),
+            Arc::new(
+                oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                    data_dir: std::env::temp_dir()
+                        .join(format!("oceanfs-test-rep-holder-mm-{}", std::process::id())),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            )),
+            holder_store,
+            Arc::new(HlcClock::new()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let holder_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(HealingRpcServer::new(holder_service))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // ---- Target side: empty store + lifecycle, wrong-root request ----
+        let membership = test_membership("n1");
+        membership.upsert_node(
+            NodeId::new("holder"),
+            NodeState::Alive,
+            oceanfs_core::Incarnation::new(1),
+            Some(holder_addr),
+        );
+
+        let target_store = Arc::new(InMemorySegmentStore::new());
+        let lifecycle = make_lifecycle().await;
+        let pool = Arc::new(Pool::new(oceanfs_core::RpcConfig::default()));
+
+        let request = ReRepRequest {
+            origin: NodeId::new("holder"),
+            segment_id,
+            holders: vec![NodeId::new("holder")],
+            reason: RepairReason::Announcement,
+            retry_count: 0,
+            merkle_root: Some(wrong_root),
+            tier: oceanfs_core::SizeTier::Standard,
+            ec_k: 1,
+            ec_m: 0,
+        };
+        let result = ReRepWorker::execute_repair(
+            &request,
+            &*target_store,
+            &*lifecycle,
+            &pool,
+            &membership,
+            &OperationTimeouts { shard_fetch_ms: 5_000, ..Default::default() },
+        )
+        .await;
+        assert!(result.is_err(), "the wrong-root fetch must be rejected, got: {result:?}");
+
+        // No partial/wrong copy was materialized: the store is empty and
+        // the lifecycle has no entry for the segment.
+        assert!(
+            target_store.read_segment_data(&segment_id).is_err(),
+            "target store must NOT hold a merkle-rejected segment"
+        );
+        assert!(
+            lifecycle.registry().get(segment_id).is_none(),
+            "lifecycle must NOT register a merkle-rejected segment"
+        );
+    }
+
+    /// An already-held segment short-circuits BEFORE the fetch and the
+    /// merkle verification (idempotent no-op — duplicate dispatches and
+    /// the g4 re-enqueue overlap are safe).
+    #[tokio::test]
+    async fn worker_skips_fetch_when_segment_already_held() {
         let store = Arc::new(InMemorySegmentStore::new());
         let lifecycle =
             Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
@@ -955,7 +1039,7 @@ mod tests {
             segment_id,
             ec_k: 1,
             ec_m: 0,
-            size_tier: SizeTier::Standard,
+            size_tier: oceanfs_core::SizeTier::Standard,
             merkle_root: Some(oceanfs_core::HashOutput::from_bytes([0x11; 32])),
             storage_locations: smallvec::SmallVec::new(),
             sealed_at: Some(1),
@@ -970,6 +1054,9 @@ mod tests {
             reason: RepairReason::Announcement,
             retry_count: 0,
             merkle_root: Some(oceanfs_core::HashOutput::from_bytes([0xFF; 32])),
+            tier: oceanfs_core::SizeTier::Standard,
+            ec_k: 1,
+            ec_m: 0,
         };
         let result = ReRepWorker::execute_repair(
             &request,

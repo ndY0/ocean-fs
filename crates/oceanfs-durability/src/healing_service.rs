@@ -111,7 +111,7 @@ pub trait HintObjectApplier: Send + Sync {
 /// # Examples
 ///
 /// ```
-/// use oceanfs_core::NodeId;
+/// use oceanfs_core::{NodeId, SizeTier};
 /// use oceanfs_durability::healing_service::{ReRepRequest, RepairReason};
 ///
 /// let req = ReRepRequest {
@@ -121,9 +121,13 @@ pub trait HintObjectApplier: Send + Sync {
 ///     reason: RepairReason::Announcement,
 ///     retry_count: 0,
 ///     merkle_root: None,
+///     tier: SizeTier::Standard,
+///     ec_k: 1,
+///     ec_m: 0,
 /// };
 /// assert_eq!(req.origin, NodeId::new("node-a"));
 /// assert_eq!(req.reason, RepairReason::Announcement);
+/// assert_eq!(req.tier, SizeTier::Standard);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReRepRequest {
@@ -145,6 +149,14 @@ pub struct ReRepRequest {
     /// against it — a truncated/corrupt transfer is rejected (ADR-0030).
     /// `None` (tests / legacy enqueuers) skips the verification.
     pub merkle_root: Option<oceanfs_core::HashOutput>,
+    /// The segment's seal-time size tier (the enqueuer reads it from its
+    /// own registry entry). The acquiring worker registers the pulled
+    /// copy with THIS tier — the source's real shape, not a default.
+    pub tier: oceanfs_core::SizeTier,
+    /// The segment's seal-time EC data-shard count (same provenance).
+    pub ec_k: u8,
+    /// The segment's seal-time EC parity-shard count (same provenance).
+    pub ec_m: u8,
 }
 
 /// Which detector drove a re-replication repair (ADR-0029 §D6 — the
@@ -1402,6 +1414,13 @@ impl HealingRpc for HealingGrpcService {
                 .map(|entry| entry.metadata.storage_locations.to_vec())
                 .unwrap_or_default();
             let merkle_root = entry.as_ref().and_then(|e| e.metadata.merkle_root);
+            // The seal-time shape rides the request (ADR-0030): the
+            // acquiring worker registers the pulled copy with the
+            // SOURCE's tier/EC geometry, not hardcoded defaults.
+            let (tier, ec_k, ec_m) = entry
+                .as_ref()
+                .map(|e| (e.metadata.size_tier, e.metadata.ec_k, e.metadata.ec_m))
+                .unwrap_or((oceanfs_core::SizeTier::Standard, 1, 0));
             match sink
                 .enqueue(ReRepRequest {
                     origin: origin.clone(),
@@ -1410,6 +1429,9 @@ impl HealingRpc for HealingGrpcService {
                     reason: RepairReason::Announcement,
                     retry_count: 0,
                     merkle_root,
+                    tier,
+                    ec_k,
+                    ec_m,
                 })
                 .await
             {
@@ -1617,6 +1639,20 @@ impl HealingRpc for HealingGrpcService {
             Ok(_) => RepairReason::Reconciliation,
             Err(_) => RepairReason::Reconciliation,
         };
+        // The seal-time shape (the dispatcher read it from its own
+        // registry entry): tier encodes as the SizeTier wire u8 (0 =
+        // Inline, 1 = Small, 2 = Standard, 3 = Multi), matching the
+        // segment-push protocol. Unknown tiers degrade to Standard (the
+        // same fallback the push receiver uses).
+        let tier = match req.tier {
+            0 => oceanfs_core::SizeTier::Inline,
+            1 => oceanfs_core::SizeTier::Small,
+            2 => oceanfs_core::SizeTier::Standard,
+            3 => oceanfs_core::SizeTier::Multi,
+            _ => oceanfs_core::SizeTier::Standard,
+        };
+        let ec_k = req.ec_k.min(u8::MAX as u32) as u8;
+        let ec_m = req.ec_m.min(u8::MAX as u32) as u8;
 
         let Some(sink) = &self.replication_request_sink else {
             // No worker queue wired (tests / minimal embedding): ack
@@ -1637,6 +1673,9 @@ impl HealingRpc for HealingGrpcService {
             reason,
             retry_count: 0,
             merkle_root,
+            tier,
+            ec_k,
+            ec_m,
         };
         let holder_count = req.holders.len();
         match sink.enqueue(req).await {
@@ -2460,6 +2499,9 @@ mod tests {
             holders: vec![holder_a.clone().into(), holder_b.clone().into()],
             reason: crate::healing_rpc::RepairReason::Announcement as i32,
             merkle_root: bytes::Bytes::copy_from_slice(root.as_bytes()),
+            tier: 1, // Small (SizeTier wire u8)
+            ec_k: 4,
+            ec_m: 2,
         });
 
         let response = service.request_re_replication(request).await.unwrap();
@@ -2470,6 +2512,13 @@ mod tests {
         assert_eq!(recorded[0].holders, vec![holder_a, holder_b]);
         assert_eq!(recorded[0].reason, RepairReason::Announcement);
         assert_eq!(recorded[0].merkle_root, Some(root), "the seal-time root rides the request");
+        assert_eq!(
+            recorded[0].tier,
+            oceanfs_core::SizeTier::Small,
+            "the seal-time tier rides the request"
+        );
+        assert_eq!(recorded[0].ec_k, 4, "the seal-time ec_k rides the request");
+        assert_eq!(recorded[0].ec_m, 2, "the seal-time ec_m rides the request");
     }
 
     /// Without a local worker queue wired, the handler acks nothing
@@ -2501,6 +2550,9 @@ mod tests {
             holders: vec![NodeId::new("node-a").into()],
             reason: crate::healing_rpc::RepairReason::Reconciliation as i32,
             merkle_root: bytes::Bytes::new(),
+            tier: 2, // Standard (default when absent)
+            ec_k: 0,
+            ec_m: 0,
         });
 
         let response = service.request_re_replication(request).await.unwrap();

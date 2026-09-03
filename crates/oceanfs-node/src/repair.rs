@@ -317,6 +317,21 @@ impl RepairDispatcher {
         self.parked.len()
     }
 
+    /// Returns `true` when `node`'s manifest reports it data-dead: it
+    /// has data pools and every one is `dead`. A data-dead node cannot
+    /// serve the fetch the acquiring worker will make, so it must not
+    /// count as a live holder. A node with no manifest (unknown — the
+    /// gossip view has not caught up) is NOT data-dead: excluding it
+    /// could strand a repairable segment until the next sweep, while
+    /// including it only costs a failed fetch attempt.
+    fn is_data_dead(&self, node: &NodeId) -> bool {
+        let Some(manifest) = self.membership.manifest_of(node) else {
+            return false;
+        };
+        let data_pools: Vec<_> = manifest.pools().iter().filter(|p| p.role() == "data").collect();
+        !data_pools.is_empty() && data_pools.iter().all(|p| p.status() == "dead")
+    }
+
     /// Removes and returns one parked repair (the g5 observability /
     /// test drain). Returns `None` when nothing is parked.
     pub fn parked_remove_one(&self) -> Option<ReRepRequest> {
@@ -402,7 +417,14 @@ impl RepairDispatcher {
     /// there), `false` when no target is eligible or the RPC failed.
     async fn try_dispatch(&self, request: &ReRepRequest) -> bool {
         // Filter to LIVE holders (the request may carry a stale full
-        // set — e.g. the dead origin is still listed).
+        // set — e.g. the dead origin is still listed). Live means:
+        // node Alive/Suspect AND not data-dead (its manifest reports
+        // every data pool Dead — it can no longer serve the fetch the
+        // acquiring node will make). A node with a DEAD data pool but
+        // an Alive node state stays in the holder set ONLY if it still
+        // has a servable data pool; otherwise it is a location that
+        // cannot serve bytes and must not count as a holder (the same
+        // semantics reconcile.rs::membership_snapshot applies).
         let live_holders: Vec<NodeId> = request
             .holders
             .iter()
@@ -411,7 +433,7 @@ impl RepairDispatcher {
                     self.membership.state_of(h),
                     Some(NodeState::Alive | NodeState::Suspect)
                 );
-                alive
+                alive && !self.is_data_dead(h)
             })
             .cloned()
             .collect();
@@ -463,11 +485,19 @@ impl RepairDispatcher {
             .merkle_root
             .map(|r| bytes::Bytes::copy_from_slice(r.as_bytes()))
             .unwrap_or_default();
+        // The seal-time shape rides the request (ADR-0030): the
+        // acquiring worker registers the pulled copy with the SOURCE's
+        // tier/EC geometry. Tier encodes via the shared wire mapping
+        // (the segment-push encoding; see
+        // `segment_replicator::tier_to_u32`).
         let rpc_request = tonic::Request::new(RequestReReplicationRequest {
             segment_id: Some(proto_sid),
             holders: proto_holders,
             reason: proto_reason,
             merkle_root: merkle_bytes,
+            tier: crate::segment_replicator::tier_to_u32(request.tier),
+            ec_k: request.ec_k as u32,
+            ec_m: request.ec_m as u32,
         });
 
         let mut client = HealingRpcClient::new(channel);
@@ -613,6 +643,9 @@ mod tests {
             reason: oceanfs_durability::healing_service::RepairReason::Reconciliation,
             retry_count: 0,
             merkle_root: None,
+            tier: oceanfs_core::SizeTier::Standard,
+            ec_k: 1,
+            ec_m: 0,
         }
     }
 
@@ -760,5 +793,62 @@ mod tests {
             NodeId::new("n1"),
         );
         assert!(dispatcher.enqueue(request(SegmentId::new(), vec![])).await.is_ok());
+    }
+
+    /// The dispatcher's holder filter treats a node whose manifest
+    /// reports every data pool Dead as NOT a live holder (it cannot
+    /// serve the acquiring node's fetch), while an unknown node (no
+    /// manifest yet) stays eligible — excluding it could strand a
+    /// repairable segment until the next sweep.
+    #[test]
+    fn data_dead_semantics_match_reconciler_snapshot() {
+        use oceanfs_membership::manifest::{NodeManifest, PoolManifest};
+
+        let membership = make_membership("n1");
+        upsert(&membership, "n2");
+        let dispatcher = RepairDispatcher::new(
+            Arc::new(SmallestId),
+            Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default())),
+            membership.clone(),
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            )),
+            NodeId::new("n1"),
+        );
+
+        // No manifest → not data-dead (the gossip view has not caught
+        // up; the node may still serve).
+        let n2 = NodeId::new("n2");
+        assert!(!dispatcher.is_data_dead(&n2), "unknown node is not data-dead");
+
+        // A manifest with a Healthy data pool → servable.
+        membership.set_peer_manifest(
+            n2.clone(),
+            NodeManifest::from_pools(
+                1,
+                &[PoolManifest::new(0, "data", "healthy", false, 100 << 30, 1)],
+            ),
+        );
+        assert!(!dispatcher.is_data_dead(&n2), "healthy data pool is servable");
+
+        // All data pools Dead → data-dead (the pool-loss case: the node
+        // is still Alive in membership but its bytes are gone).
+        membership.set_peer_manifest(
+            n2.clone(),
+            NodeManifest::from_pools(1, &[PoolManifest::new(0, "data", "dead", false, 0, 1)]),
+        );
+        assert!(dispatcher.is_data_dead(&n2), "all data pools dead = data-dead");
+
+        // No data pools at all (metadata/wal-only node) → not a data
+        // holder, therefore not "data-dead" in the holder sense (it
+        // would simply never appear in a holder set).
+        membership.set_peer_manifest(
+            n2.clone(),
+            NodeManifest::from_pools(
+                1,
+                &[PoolManifest::new(0, "wal", "healthy", false, 10 << 30, 1)],
+            ),
+        );
+        assert!(!dispatcher.is_data_dead(&n2), "wal-only node is not data-dead");
     }
 }

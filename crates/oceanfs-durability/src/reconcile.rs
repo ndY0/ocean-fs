@@ -363,6 +363,9 @@ pub struct ReconciliationLoop {
 ///     reason: RepairReason::Announcement,
 ///     retry_count: 0,
 ///     merkle_root: None,
+///     tier: oceanfs_core::SizeTier::Standard,
+///     ec_k: 1,
+///     ec_m: 0,
 /// };
 /// let rt = tokio::runtime::Runtime::new().expect("runtime");
 /// assert!(rt.block_on(sink.enqueue(req)).is_ok());
@@ -704,6 +707,13 @@ impl ReconciliationLoop {
                 .map(|entry| entry.metadata.storage_locations.to_vec())
                 .unwrap_or_default();
             let merkle_root = entry.as_ref().and_then(|e| e.metadata.merkle_root);
+            // The seal-time shape rides the request (ADR-0030): the
+            // acquiring worker registers the pulled copy with the
+            // SOURCE's tier/EC geometry.
+            let (tier, ec_k, ec_m) = entry
+                .as_ref()
+                .map(|e| (e.metadata.size_tier, e.metadata.ec_k, e.metadata.ec_m))
+                .unwrap_or((oceanfs_core::SizeTier::Standard, 1, 0));
             let request = ReRepRequest {
                 origin: self.self_id.clone(),
                 segment_id,
@@ -711,6 +721,9 @@ impl ReconciliationLoop {
                 reason: RepairReason::Reconciliation,
                 retry_count: 0,
                 merkle_root,
+                tier,
+                ec_k,
+                ec_m,
             };
             match self.repair_sink.enqueue(request).await {
                 Ok(()) => {
@@ -832,6 +845,9 @@ mod tests {
             reason: RepairReason::Reconciliation,
             retry_count: 0,
             merkle_root: None,
+            tier: oceanfs_core::SizeTier::Standard,
+            ec_k: 1,
+            ec_m: 0,
         };
         assert!(sink.enqueue(req).await.is_ok());
     }

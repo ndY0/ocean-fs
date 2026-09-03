@@ -3,21 +3,21 @@
 //! dispatcher → `RequestReReplication` RPC → acquiring node's
 //! `ReRepWorker` (pull + write + register + stamp).
 //!
-//! Scenario (RF=2, 3 nodes): each sealed segment's ring replica set is
-//! 2 of the 3 nodes. When A's data pool dies:
-//!   - a segment whose replica set included A loses one copy → it is
-//!     held by exactly ONE surviving node (the other replica holder);
-//!     that holder dispatches to the non-holder, which pulls + writes +
-//!     registers + stamps;
-//!   - a segment whose replica set was {B, C} is untouched (still 2
-//!     live copies).
+//! Scenario (RF=2, 3 nodes): each sealed segment's ring replica set is a
+//! hash-derived 2 of the 3 nodes. When A's data pool dies, a segment
+//! whose replica set contained A loses one copy → it is held by exactly
+//! ONE surviving node pre-kill; that holder dispatches to the
+//! non-holder, which pulls + writes + registers + stamps. Segments whose
+//! replica set was {B, C} are untouched (still 2 live copies).
 //!
-//! The test tracks the pre-kill holder set per segment, REQUIRES the
-//! at-risk subset (held by exactly one of B/C) to be non-empty — so a
-//! run that happens to place every segment's replicas on {B, C} FAILS
-//! loudly instead of passing vacuously — and asserts every at-risk
-//! segment converges to both B and C (file + registry) after the repair.
-//! Reads of the affected keys serve without data loss.
+//! The test waits for all replication to SETTLE (every node's replicator
+//! drained + stable file sets), snapshots the pre-kill holder sets, and
+//! derives the at-risk subset — segments held by exactly one of B/C
+//! (their A-copy's death drops them below RF). It REQUIRES the subset to
+//! be non-empty — a run that happens to place every segment's replicas
+//! on {B, C} FAILS loudly instead of passing vacuously — and asserts
+//! every at-risk segment converges to both B and C (file + registry)
+//! after the repair. Reads of the affected keys serve without data loss.
 //!
 //! Two paths (the epic's "re-replication restores RF" DoD):
 //!   1. announcement path — `announcements_enabled = true` (g3);
@@ -180,23 +180,6 @@ async fn segment_file_count(dir: &std::path::Path) -> usize {
     segment_ids_in(dir).len()
 }
 
-/// Waits until the node's segment directory holds `expected` `.dat`
-/// files (the re-replication landed on this node's store).
-async fn wait_for_segment_files(dir: &std::path::Path, expected: usize) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let count = segment_file_count(dir).await;
-        if count >= expected {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "target store must receive {expected} segments within 60s (has {count})"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
 /// One end-to-end scenario shared by both paths.
 ///
 /// `announcements` selects the detector: true → g3 fast path,
@@ -237,83 +220,115 @@ async fn run_repair_scenario(announcements: bool) {
         reqwest::Client::builder().timeout(Duration::from_secs(15)).build().expect("client");
     let addr_a = node_a.server_addr();
 
-    // ---- PUT 12 × 32 KiB objects concurrently on A ----
-    // Enough segments that at least one has A in its ring replica set
-    // (the at-risk precondition below) — the test FAILS loudly if the
-    // under-replicated subset is empty, so a pass always exercises the
-    // target-pull flow.
+    // ---- PUT objects on A in batches until the at-risk precondition holds ----
+    // A segment's ring replica set is hash-derived from its (random)
+    // segment id — per segment, P(excludes A) ≈ 1/3. A single batch can
+    // therefore land every segment on {B, C} (nothing at risk — the old
+    // vacuous pass). Instead of failing, keep adding batches until at
+    // least one segment is held by exactly one of B/C (the loud
+    // precondition below), capped at a few batches.
     let body: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
-    let keys: Vec<String> = (0..12).map(|i| format!("obj-{i:02}")).collect();
-    let mut handles = Vec::new();
-    for key in &keys {
-        let client = client.clone();
-        let body = body.clone();
-        let key = key.clone();
-        handles.push(tokio::spawn(async move {
-            let resp = client
-                .put(format!("http://{addr_a}/durability/{key}"))
-                .body(body)
-                .send()
-                .await
-                .expect("PUT must succeed");
-            assert_eq!(resp.status(), 200, "PUT {key} returns 200");
-        }));
-    }
-    for h in handles {
-        h.await.expect("PUT task");
-    }
-
-    // ---- Wait for seals + replication to land on the RF=2 replicas ----
-    // In pool mode, segment files live under the DATA POOL ROOT
-    // (`nvme0`), not `data/segments`.
+    let mut keys: Vec<String> = Vec::new();
     let segments_dir_a = tmp_a.path().join("nvme0");
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    let owner_segment_count = loop {
-        let count = segment_file_count(&segments_dir_a).await;
-        if count >= 2 {
-            break count;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "owner must seal at least 2 segments within 60s (has {count})"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
-    // The owner's replicator drained → the RF=2 replica set is stamped.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        if node_a.segment_replicator().needs_len() == 0 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "replicator must drain before the pool is killed"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    assert!(owner_segment_count >= 2);
-
-    // ---- Track the pre-kill holder set per segment ----
-    // A segment whose ring replica set was {A, X} (X = B or C) is held
-    // by exactly one of B/C pre-kill; killing A leaves it with ONE live
-    // copy → it must be re-replicated onto the OTHER of B/C. A segment
-    // whose replica set was {B, C} is held by both pre-kill → untouched.
     let segments_dir_b = tmp_b.path().join("nvme0");
     let segments_dir_c = tmp_c.path().join("nvme0");
-    wait_for_segment_files(&segments_dir_b, owner_segment_count).await;
-    wait_for_segment_files(&segments_dir_c, owner_segment_count).await;
-    let held_by_b = segment_ids_in(&segments_dir_b);
-    let held_by_c = segment_ids_in(&segments_dir_c);
-    // The at-risk subset: segments NOT held by both B and C pre-kill
-    // (held by exactly one) → they lose a copy when A dies.
-    let at_risk: Vec<oceanfs_core::SegmentId> =
-        held_by_b.symmetric_difference(&held_by_c).copied().collect();
+    // First batch with a non-empty at-risk set wins; later batches are
+    // only added while every segment's ring set landed on {B, C}
+    // (nothing at risk — the old vacuous pass).
+    let mut at_risk: Vec<oceanfs_core::SegmentId> = Vec::new();
+    for batch in 0..4 {
+        let batch_keys: Vec<String> = (0..12).map(|i| format!("obj-{batch}-{i:02}")).collect();
+        let mut handles = Vec::new();
+        for key in &batch_keys {
+            let client = client.clone();
+            let body = body.clone();
+            let key = key.clone();
+            handles.push(tokio::spawn(async move {
+                let resp = client
+                    .put(format!("http://{addr_a}/durability/{key}"))
+                    .body(body)
+                    .send()
+                    .await
+                    .expect("PUT must succeed");
+                assert_eq!(resp.status(), 200, "PUT {key} returns 200");
+            }));
+        }
+        for h in handles {
+            h.await.expect("PUT task");
+        }
+        keys.extend(batch_keys);
+
+        // ---- Wait for seals + replication to land ----
+        // In pool mode, segment files live under the DATA POOL ROOT
+        // (`nvme0`), not `data/segments`. A must hold at least one
+        // sealed segment for the kill to be meaningful.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if segment_file_count(&segments_dir_a).await >= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owner must seal at least 1 segment within 30s"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        // ---- Replication SETTLE, then snapshot ----
+        // With RF=2 the ring places each segment on a hash-derived 2 of
+        // 3 nodes: A's segments are NOT all pushed to both B and C. The
+        // honest pre-kill snapshot waits for quiescence — every node's
+        // replicator drained AND the B/C file sets stable across
+        // consecutive polls — then records whatever the ring delivered.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut prev_snapshot: Option<(
+            HashSet<oceanfs_core::SegmentId>,
+            HashSet<oceanfs_core::SegmentId>,
+        )> = None;
+        let mut stable_polls = 0u32;
+        loop {
+            let drained = node_a.segment_replicator().needs_len() == 0
+                && node_b.segment_replicator().needs_len() == 0
+                && node_c.segment_replicator().needs_len() == 0;
+            let snapshot = (segment_ids_in(&segments_dir_b), segment_ids_in(&segments_dir_c));
+            if drained && prev_snapshot.as_ref() == Some(&snapshot) {
+                stable_polls += 1;
+                if stable_polls >= 3 {
+                    break;
+                }
+            } else {
+                stable_polls = 0;
+                prev_snapshot = Some(snapshot);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replication must settle within 60s (B: {} files, C: {} files, \
+                 drains: a={} b={} c={})",
+                segment_file_count(&segments_dir_b).await,
+                segment_file_count(&segments_dir_c).await,
+                node_a.segment_replicator().needs_len(),
+                node_b.segment_replicator().needs_len(),
+                node_c.segment_replicator().needs_len(),
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        let held_by_b = segment_ids_in(&segments_dir_b);
+        let held_by_c = segment_ids_in(&segments_dir_c);
+        // The at-risk subset: segments NOT held by both B and C (held by
+        // exactly one) → their A-copy's death drops them below RF and
+        // the surviving holder must re-replicate them onto the other.
+        at_risk = held_by_b.symmetric_difference(&held_by_c).copied().collect();
+        if !at_risk.is_empty() {
+            break;
+        }
+        tracing::info!(
+            "batch {batch}: every segment's ring set landed on {{B, C}}; adding another batch"
+        );
+    }
     assert!(
         !at_risk.is_empty(),
-        "test precondition failed: every segment's ring replica set landed on {{B, C}}; \
-         re-run (the flow was not exercised). Held by B only: {} / C only: {}",
-        held_by_b.difference(&held_by_c).count(),
-        held_by_c.difference(&held_by_b).count(),
+        "test precondition failed: no segment held by exactly one of B/C after 4 batches; \
+         re-run (the flow was not exercised)"
     );
 
     // ---- Kill A's data pool (pool id 0) ----
@@ -324,10 +339,26 @@ async fn run_repair_scenario(announcements: bool) {
 
     // ---- The holder's dispatcher → RPC → acquiring node's worker ----
     // Each at-risk segment is re-replicated onto the node that did NOT
-    // hold it pre-kill. Assert both B and C converge to hold every
-    // segment (RF=2 live copies: the pre-existing holder + the target).
-    wait_for_segment_files(&segments_dir_b, owner_segment_count).await;
-    wait_for_segment_files(&segments_dir_c, owner_segment_count).await;
+    // hold it pre-kill. Assert BOTH nodes converge to hold every
+    // at-risk segment's file (per-segment — a plain count can pass with
+    // the wrong files when B/C hold unrelated local segments).
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let b_now = segment_ids_in(&segments_dir_b);
+        let c_now = segment_ids_in(&segments_dir_c);
+        if at_risk.iter().all(|sid| b_now.contains(sid) && c_now.contains(sid)) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "every at-risk segment must land on both B and C within 60s (missing from B: {} / \
+             C: {} / at-risk: {})",
+            at_risk.iter().filter(|sid| !b_now.contains(sid)).count(),
+            at_risk.iter().filter(|sid| !c_now.contains(sid)).count(),
+            at_risk.len(),
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
 
     // ---- `storage_locations` converges ----
     // The acquiring node's registry entry for each at-risk segment lists
