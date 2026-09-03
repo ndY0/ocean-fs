@@ -1130,7 +1130,7 @@ impl SegmentLifecycleRegistry {
 
 // [review][strategy][critcial]
 // topic to discuss : with the strategy of sealing we established, a segment end up been sealed when the last writer exit,
-// wich is fine under contention, since there is a lot of concurrent writers. but under low or scarse load, 
+// wich is fine under contention, since there is a lot of concurrent writers. but under low or scarse load,
 // we will end up waisting a load of disk space. i am wondering : considering we have the data wal + event wal, wont it be possible
 // now to switch to a seal-on-full mode ? we are not really at risk of loosing any data i think. i need your opinion on that.
 // [end]

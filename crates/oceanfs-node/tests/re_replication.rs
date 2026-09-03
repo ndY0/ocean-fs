@@ -25,8 +25,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::HashSet;
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use oceanfs_core::{
     MissingRootPolicy, NodeConfig, PoolHealthConfig, PoolRole, PoolTech, StorageConfig,
@@ -307,10 +306,8 @@ async fn run_repair_scenario(announcements: bool) {
     let held_by_c = segment_ids_in(&segments_dir_c);
     // The at-risk subset: segments NOT held by both B and C pre-kill
     // (held by exactly one) → they lose a copy when A dies.
-    let at_risk: Vec<oceanfs_core::SegmentId> = held_by_b
-        .symmetric_difference(&held_by_c)
-        .copied()
-        .collect();
+    let at_risk: Vec<oceanfs_core::SegmentId> =
+        held_by_b.symmetric_difference(&held_by_c).copied().collect();
     assert!(
         !at_risk.is_empty(),
         "test precondition failed: every segment's ring replica set landed on {{B, C}}; \

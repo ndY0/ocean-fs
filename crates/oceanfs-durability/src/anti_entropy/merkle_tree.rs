@@ -23,7 +23,7 @@ pub(crate) const DEFAULT_LEAF_SIZE: usize = 64 * 1024;
 // since the refactor, segment are never written directly by subsystems, and always go throught the pooled segment
 // writer. either this is dead  code, or code must be refactored to not use this abstraction. also, this is a very weird placement in this module,
 // it does not makes sense.
-// 
+//
 // [end]
 // ---------------------------------------------------------------------------
 // SegmentDataStore — data access trait for anti-entropy repair

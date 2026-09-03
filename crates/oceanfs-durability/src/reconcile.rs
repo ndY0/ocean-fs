@@ -147,8 +147,8 @@ pub fn live_copy_count(
 
 // [review][architecture][critical]
 // this potentially holds every segment ids from the whole replication set within the cluster.
-// this could become a very large list, shouldnt this better fit in the metadata store rather than in 
-// a plain in memory structure ? this remark holds for every plain in memory strcutures potentially holding large data sets. 
+// this could become a very large list, shouldnt this better fit in the metadata store rather than in
+// a plain in memory structure ? this remark holds for every plain in memory strcutures potentially holding large data sets.
 // [end]
 // ---------------------------------------------------------------------------
 // HolderIndex

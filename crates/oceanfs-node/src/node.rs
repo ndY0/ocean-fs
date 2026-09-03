@@ -1642,7 +1642,7 @@ impl Node {
             // recently-written segments participate in the root exchange
             // without waiting for the next startup rebuild.
             // [review][architectural][high]
-            // this is also a proper 
+            // this is also a proper
             // [end]
             .with_segment_sealed_notifier({
                 let replicator = Arc::clone(&segment_replicator);
@@ -2600,7 +2600,6 @@ impl Node {
         });
         background.rep_dispatcher = Some(rep_dispatcher_handle);
         background.rep_dispatcher_cancel = rep_dispatcher_cancel;
-
 
         // HERE
 

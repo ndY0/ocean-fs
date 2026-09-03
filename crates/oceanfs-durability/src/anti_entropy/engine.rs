@@ -662,7 +662,7 @@ impl AntiEntropy {
 
     // [review][structure][high]
     // if this is a test method, it should be conditional to the test module specifically.
-    // we do not allow dead code in the repository, period. 
+    // we do not allow dead code in the repository, period.
     // [end]
     /// Repairs a segment using Erasure Coding reconstruction.
     ///

@@ -96,7 +96,7 @@ pub struct HealWorker {
 
 // [review][architecture][critical]
 // use the store that do not use the optimised read/write, neither respect the authoritative single xwriter from the segment pipeline.
-// this is a catastrophy waiting to happen : 
+// this is a catastrophy waiting to happen :
 // [end]
 impl HealWorker {
     /// Creates a new heal worker.
