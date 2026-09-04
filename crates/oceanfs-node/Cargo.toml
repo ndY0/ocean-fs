@@ -45,6 +45,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde_json = "1"
 toml.workspace = true
 blake3.workspace = true
+crc32fast = "1"
 
 [lints]
 workspace = true

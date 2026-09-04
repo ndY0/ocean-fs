@@ -1503,7 +1503,9 @@ impl SegmentLifecycleCoordinator {
                         sealed_at: Some(0), // deterministic sentinel — the event carries no timestamp
                     };
                     // The durable segment→pool mapping (ADR-0029 f5):
-                    // legacy events carry pool_id = 0 (the legacy root).
+                    // every decoded Seal event carries a real pool id —
+                    // value 0 = the first configured pool (pre-pool
+                    // records never decode; ADR-0031 D3).
                     let mut meta = meta;
                     meta.pool_id = evt.pool_id;
                     self.registry.seal_with(evt.segment_id, meta, evt.repacked_from)

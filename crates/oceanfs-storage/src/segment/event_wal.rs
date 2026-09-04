@@ -34,6 +34,7 @@
 //!   segment_id   [16]
 //!   payload      [payload_len]   tier(1) + ec_k(1) + ec_m(1) + flags(1)
 //!                                | + merkle_root(32) + data_wal_pos(12)
+//!                                | + pool_id(4)          — Seal always
 //!                                | + [repacked_from(16)] for Seal
 //!                                | merkle_flag(1) + [merkle_root(32)]
 //!                                |   for MetadataRefresh
@@ -41,16 +42,24 @@
 //! ```
 //!
 //! Header is 28 bytes (4+1+1+2+4+16); Reserve payload is 4 bytes, Seal
-//! payload 48 bytes (4+32+12) or 64 bytes with the compaction
-//! `repacked_from` marker, Delete payload 0 bytes, MetadataRefresh
-//! payload 1 or 33 bytes. `data_wal_pos` is `file_seq(4, LE) +
-//! offset(8, LE)`.
+//! payload 52 bytes (4+32+12+4 — the pool id is ALWAYS present since
+//! ADR-0031 D3) or 68 bytes with the compaction `repacked_from` marker,
+//! Delete payload 0 bytes, MetadataRefresh payload 1 or 33 bytes.
+//! `data_wal_pos` is `file_seq(4, LE) + offset(8, LE)`.
 //!
 //! The Seal payload's flags byte (payload\[3\], was reserved): bit 0 set
 //! means the compaction `repacked_from` segment id follows the position
-//! (`+16` bytes) — ADR-0025 Decision 4's compaction marker. Records
-//! written before the marker existed (flags = 0, 48-byte payload) decode
-//! unchanged to `repacked_from: None`.
+//! (`+16` bytes) — ADR-0025 Decision 4's compaction marker; bit 1 set
+//! means the `pool_id` follows — **always set** (ADR-0031 D3: even a
+//! `pool_id = 0` Seal carries the flag and its 4 bytes, so pre-pool
+//! 48-byte records are distinguishable from pools-enabled ones).
+//! Pre-pool (pool_id-less) records are refused at boot as an
+//! unsupported pre-pool data directory — never decoded.
+//!
+//! The MetadataRefresh payload's flags byte (payload\[0\]): bit 0 set
+//! means a merkle root follows, bit 1 set means a `storage_locations`
+//! section follows (ADR-0030). Records written before the marker flags
+//! existed keep their exact byte layout.
 
 use std::{
     io::{Read, Seek, SeekFrom, Write},
@@ -84,7 +93,9 @@ pub(crate) const EVENT_RECORD_HEADER_SIZE: usize = 28;
 /// Payload size of a `ReserveEvent`: tier(1) + ec_k(1) + ec_m(1) + reserved(1).
 pub(crate) const RESERVE_PAYLOAD_SIZE: usize = 4;
 
-/// Payload size of a `SealEvent`: 4 + merkle_root(32) + data_wal_pos(12).
+/// Payload size of a `SealEvent`: 4 + merkle_root(32) + data_wal_pos(12)
+/// — the base section WITHOUT the mandatory pool id (see
+/// [`SEAL_POOL_ID_SIZE`]).
 pub(crate) const SEAL_PAYLOAD_SIZE: usize = 48;
 
 /// Extra payload bytes of a `SealEvent` carrying the compaction
@@ -92,12 +103,17 @@ pub(crate) const SEAL_PAYLOAD_SIZE: usize = 48;
 pub(crate) const SEAL_REPACKED_FROM_SIZE: usize = 16;
 
 /// Extra payload bytes of a `SealEvent` carrying the storage pool id
-/// (4 — u32 LE; ADR-0029 f5, the durable segment→pool mapping).
+/// (4 — u32 LE; ADR-0029 f5, the durable segment→pool mapping). The
+/// pool id is ALWAYS present since ADR-0031 D3: a `pool_id = 0` Seal
+/// still encodes the flag + 4 bytes, so pre-pool (pool_id-less) records
+/// are refused at boot, never decoded.
 pub(crate) const SEAL_POOL_ID_SIZE: usize = 4;
 
 /// Flags byte of the Seal payload: bit 0 set → `repacked_from` present;
-/// bit 1 set → `pool_id` present (ADR-0029 f5). Flags are never combined
-/// with a legacy length: a payload length mismatch rejects the record.
+/// bit 1 set → `pool_id` present (ADR-0029 f5). Since ADR-0031 D3 the
+/// pool-id flag is always set on write; a record without it is a
+/// pre-pool record refused at boot. Flags are never combined with an
+/// inconsistent payload length: a length mismatch rejects the record.
 pub(crate) const SEAL_FLAG_REPACKED_FROM: u8 = 1;
 pub(crate) const SEAL_FLAG_POOL_ID: u8 = 2;
 
@@ -218,9 +234,10 @@ pub struct SealEvent {
     pub repacked_from: Option<SegmentId>,
     /// The storage pool holding this segment's `.dat` (ADR-0029 f5).
     ///
-    /// `0` = the legacy `{data_dir}/segments` root. Legacy event records
-    /// (written before this field existed) decode with `pool_id = 0` —
-    /// the flags byte + payload length discriminate the variants.
+    /// `0` = the first configured pool (config-order scheme — a real
+    /// registered pool, never a legacy root). The id is ALWAYS encoded
+    /// on disk since ADR-0031 D3 (flag + 4 bytes, value 0 included);
+    /// pre-pool records without the id are refused at boot.
     pub pool_id: u32,
 }
 
@@ -313,22 +330,20 @@ impl SegmentEvent {
                 (KIND_RESERVE, payload)
             }
             SegmentEvent::Seal(evt) => {
-                // Backward-compatible extension: the pool_id is appended
-                // only when non-zero, flagged in the flags byte — legacy
-                // logs (no pool id) keep their exact byte layout, and
-                // new records with pool_id = 0 stay byte-identical too.
+                // ADR-0031 D3: the pool id is ALWAYS encoded — the flag
+                // and its 4 bytes are written even when `pool_id = 0`.
+                // Pre-pool (pool_id-less) 48/64-byte shapes are never
+                // produced; a boot over such records refuses loudly
+                // instead of decoding them.
                 let extra = if evt.repacked_from.is_some() { SEAL_REPACKED_FROM_SIZE } else { 0 }
-                    + if evt.pool_id != 0 { SEAL_POOL_ID_SIZE } else { 0 };
+                    + SEAL_POOL_ID_SIZE;
                 let mut payload = Vec::with_capacity(SEAL_PAYLOAD_SIZE + extra);
                 payload.push(tier_to_u8(evt.tier));
                 payload.push(evt.ec_k);
                 payload.push(evt.ec_m);
-                let mut flags = 0u8;
+                let mut flags = SEAL_FLAG_POOL_ID;
                 if evt.repacked_from.is_some() {
                     flags |= SEAL_FLAG_REPACKED_FROM;
-                }
-                if evt.pool_id != 0 {
-                    flags |= SEAL_FLAG_POOL_ID;
                 }
                 payload.push(flags);
                 payload.extend_from_slice(evt.merkle_root.as_bytes());
@@ -337,9 +352,7 @@ impl SegmentEvent {
                 if let Some(old) = evt.repacked_from {
                     payload.extend_from_slice(old.as_uuid().as_bytes());
                 }
-                if evt.pool_id != 0 {
-                    payload.extend_from_slice(&evt.pool_id.to_le_bytes());
-                }
+                payload.extend_from_slice(&evt.pool_id.to_le_bytes());
                 (KIND_SEAL, payload)
             }
             SegmentEvent::Delete(_) => (KIND_DELETE, Vec::new()),
@@ -450,6 +463,13 @@ fn tier_from_u8(value: u8) -> Option<SizeTier> {
 }
 
 /// Decodes an event payload for the given kind and header `segment_id`.
+///
+/// Returns `None` for unknown kinds and shape mismatches. Since
+/// ADR-0031 D3 the Seal decoder requires the pool-id flag — a
+/// `pool_id`-less (pre-pool) 48/64-byte Seal payload decodes to `None`;
+/// the boot reader classifies that exact shape as an unsupported
+/// pre-pool data directory ([`Error::UnsupportedPrePoolDataDir`]) via
+/// [`is_pre_pool_seal`].
 fn decode_payload(kind: u8, segment_id: SegmentId, payload: &[u8]) -> Option<SegmentEvent> {
     match kind {
         KIND_RESERVE if payload.len() == RESERVE_PAYLOAD_SIZE => {
@@ -458,23 +478,6 @@ fn decode_payload(kind: u8, segment_id: SegmentId, payload: &[u8]) -> Option<Seg
                 tier: tier_from_u8(payload[0])?,
                 ec_k: payload[1],
                 ec_m: payload[2],
-            }))
-        }
-        KIND_SEAL
-            if payload.len() == SEAL_PAYLOAD_SIZE && payload[3] & !SEAL_FLAG_REPACKED_FROM == 0 =>
-        {
-            Some(SegmentEvent::Seal(SealEvent {
-                segment_id,
-                tier: tier_from_u8(payload[0])?,
-                ec_k: payload[1],
-                ec_m: payload[2],
-                merkle_root: HashOutput::from_bytes(payload[4..36].try_into().ok()?),
-                data_wal_pos: DataWalPos {
-                    file_seq: u32::from_le_bytes(payload[36..40].try_into().ok()?),
-                    offset: u64::from_le_bytes(payload[40..48].try_into().ok()?),
-                },
-                repacked_from: None,
-                pool_id: 0,
             }))
         }
         KIND_SEAL
@@ -494,25 +497,6 @@ fn decode_payload(kind: u8, segment_id: SegmentId, payload: &[u8]) -> Option<Seg
                 },
                 repacked_from: None,
                 pool_id: u32::from_le_bytes(payload[48..52].try_into().ok()?),
-            }))
-        }
-        KIND_SEAL
-            if payload.len() == SEAL_PAYLOAD_SIZE + SEAL_REPACKED_FROM_SIZE
-                && payload[3] & !SEAL_FLAG_REPACKED_FROM == 0
-                && payload[3] & SEAL_FLAG_REPACKED_FROM != 0 =>
-        {
-            Some(SegmentEvent::Seal(SealEvent {
-                segment_id,
-                tier: tier_from_u8(payload[0])?,
-                ec_k: payload[1],
-                ec_m: payload[2],
-                merkle_root: HashOutput::from_bytes(payload[4..36].try_into().ok()?),
-                data_wal_pos: DataWalPos {
-                    file_seq: u32::from_le_bytes(payload[36..40].try_into().ok()?),
-                    offset: u64::from_le_bytes(payload[40..48].try_into().ok()?),
-                },
-                repacked_from: Some(SegmentId::from_uuid_bytes(payload[48..64].try_into().ok()?)),
-                pool_id: 0,
             }))
         }
         KIND_SEAL
@@ -598,6 +582,26 @@ fn decode_payload(kind: u8, segment_id: SegmentId, payload: &[u8]) -> Option<Seg
             }))
         }
         _ => None,
+    }
+}
+
+/// True when a CRC-valid record has the **pre-pool** Seal shape: the
+/// 48-byte (or 64-byte repacked) payload WITHOUT the pool-id flag
+/// (ADR-0031 D3). Pre-pool writers never set bit 1 — the flag and the 4
+/// pool-id bytes did not exist — so this shape identifies a data
+/// directory written before pools, which boot refuses as unsupported
+/// (never corruption, never decoded). The kind guard keeps other record
+/// families (whose bytes can coincidentally reach 48/64) out.
+fn is_pre_pool_seal(kind: u8, payload: &[u8]) -> bool {
+    kind == KIND_SEAL && payload.len() >= 4 && {
+        let flags = payload[3];
+        // Unknown flag bits would make even a pre-pool record
+        // corrupt; the pool-id bit (bit 1) is exactly what pre-pool
+        // records lack.
+        flags & !(SEAL_FLAG_REPACKED_FROM | SEAL_FLAG_POOL_ID) == 0
+            && flags & SEAL_FLAG_POOL_ID == 0
+            && (payload.len() == SEAL_PAYLOAD_SIZE
+                || payload.len() == SEAL_PAYLOAD_SIZE + SEAL_REPACKED_FROM_SIZE)
     }
 }
 
@@ -1350,6 +1354,22 @@ impl Iterator for EventWalReader {
         let evt = match decode_payload(kind, segment_id, &tail[..payload_len]) {
             Some(evt) => evt,
             None => {
+                // A CRC-valid record in the pre-pool Seal shape is NOT
+                // corruption — it is a data directory written before
+                // storage pools existed. Boot refuses it explicitly
+                // (ADR-0031 D3): no migration, no continued decode, and
+                // critically no open-time truncation of the "torn tail"
+                // (the pre-pool shape is a complete, well-formed record
+                // that must not be silently discarded).
+                if is_pre_pool_seal(kind, &tail[..payload_len]) {
+                    return Some(Err(Error::UnsupportedPrePoolDataDir {
+                        detail: format!(
+                            "event-WAL record at {pos:?} is a pre-pool (pool_id-less) Seal — \
+                             boot onto a pre-pool data directory is refused (ADR-0031 D3)",
+                            pos = self.next,
+                        ),
+                    }));
+                }
                 return self.bad_record(
                     "invalid event payload",
                     self.next.offset + (EVENT_RECORD_HEADER_SIZE + payload_len + 4) as u64,
@@ -1466,9 +1486,9 @@ mod tests {
     use crate::wal::WalSyncGroup;
 
     /// Record sizes used by rotation tests (bytes):
-    /// reserve = 36, seal = 80, delete = 32.
+    /// reserve = 36, seal = 84, delete = 32.
     const RESERVE_RECORD_SIZE: u64 = 36;
-    const SEAL_RECORD_SIZE: u64 = 80;
+    const SEAL_RECORD_SIZE: u64 = 84;
     const DELETE_RECORD_SIZE: u64 = 32;
 
     fn test_config(dir: &Path) -> EventWalConfig {
@@ -1561,8 +1581,8 @@ mod tests {
         assert_eq!(decoded, evt, "pool_id must round-trip");
     }
 
-    /// ADR-0029 f5: seal events carrying `repacked_from` + pool_id both
-    /// survive (the longest payload variant).
+    /// ADR-0029 f5 + ADR-0031 D3: seal events carrying `repacked_from` +
+    /// pool_id both survive (the longest payload variant).
     #[test]
     fn seal_event_repacked_with_pool_id_roundtrips() {
         let id = SegmentId::new();
@@ -1576,23 +1596,30 @@ mod tests {
         assert_eq!(decoded, evt);
     }
 
-    /// ADR-0029 f5: legacy seal records (written before pool_id existed —
-    /// the 48-byte payload without the pool flag) decode with pool_id 0,
-    /// and pool_id-0 records stay byte-identical to the pre-f5 format.
+    /// ADR-0031 D3: a `pool_id = 0` Seal — the FIRST configured pool —
+    /// is encoded with the pool-id flag and its 4 bytes (52-byte
+    /// payload, 84-byte record), and round-trips byte-exact. The
+    /// pre-pool 48-byte shape is never produced.
     #[test]
-    fn legacy_seal_record_decodes_pool_id_zero() {
+    fn pool_zero_seal_roundtrips_with_the_always_flagged_layout() {
         let id = SegmentId::new();
-        // A pool_id-0 event serializes exactly like the pre-f5 format.
-        let evt = seal_event(id);
+        let evt = seal_event(id); // helper: pool_id = 0
         let bytes = evt.to_record_bytes();
-        // 28 header + 48 payload + 4 crc = 80 — the legacy record size.
-        assert_eq!(bytes.len(), EVENT_RECORD_HEADER_SIZE + SEAL_PAYLOAD_SIZE + 4);
-        let decoded = SegmentEvent::from_record_bytes(&bytes).expect("legacy record decodes");
+        assert_eq!(
+            bytes.len(),
+            EVENT_RECORD_HEADER_SIZE + SEAL_PAYLOAD_SIZE + SEAL_POOL_ID_SIZE + 4,
+            "pool-0 seals carry the flag + 4 pool-id bytes (52-byte payload)"
+        );
+        let payload_flags = bytes[EVENT_RECORD_HEADER_SIZE + 3];
+        assert_eq!(
+            payload_flags & SEAL_FLAG_POOL_ID,
+            SEAL_FLAG_POOL_ID,
+            "the pool-id flag is always set, pool 0 included"
+        );
+        let decoded = SegmentEvent::from_record_bytes(&bytes).expect("record decodes");
+        assert_eq!(decoded, evt, "pool-0 seal must round-trip byte-exact");
         match decoded {
-            SegmentEvent::Seal(seal) => {
-                assert_eq!(seal.pool_id, 0, "legacy records default to the legacy root");
-                assert_eq!(seal.repacked_from, None);
-            }
+            SegmentEvent::Seal(seal) => assert_eq!(seal.pool_id, 0),
             other => panic!("expected Seal, got {other:?}"),
         }
     }
@@ -1741,11 +1768,16 @@ mod tests {
         let old = SegmentId::new();
         let evt = seal_event_with_repacked(id, old);
         let bytes = evt.to_record_bytes();
-        // The marked payload is exactly SEAL_REPACKED_FROM_SIZE longer.
+        // The marked payload is SEAL_REPACKED_FROM_SIZE longer than the
+        // plain always-flagged seal (pool-id included — ADR-0031 D3).
         assert_eq!(
             bytes.len(),
-            EVENT_RECORD_HEADER_SIZE + SEAL_PAYLOAD_SIZE + SEAL_REPACKED_FROM_SIZE + 4,
-            "the repacked_from marker must extend the record by 16 bytes"
+            EVENT_RECORD_HEADER_SIZE
+                + SEAL_PAYLOAD_SIZE
+                + SEAL_REPACKED_FROM_SIZE
+                + SEAL_POOL_ID_SIZE
+                + 4,
+            "the repacked_from marker must extend the record by 16 bytes (pool id always present)"
         );
         let decoded = SegmentEvent::from_record_bytes(&bytes).expect("record decodes");
         assert_eq!(decoded, evt, "the marker must round-trip byte-exact");
@@ -1755,20 +1787,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unmarked_seal_records_still_decode_with_the_marker_absent() {
-        // The payload layout before the compaction marker existed
-        // (flags byte = 0, 48-byte payload) must decode unchanged — old
-        // records in an existing event log are readable.
+    /// Crafts a full on-disk record in the given Seal payload shape
+    /// (frame + crc32). Used to build the pre-pool (pool_id-less)
+    /// 48/64-byte layouts a pre-pools-era writer would have produced.
+    fn craft_seal_record(payload: Vec<u8>) -> Vec<u8> {
         let id = SegmentId::new();
-        let mut payload = Vec::with_capacity(SEAL_PAYLOAD_SIZE);
-        payload.push(tier_to_u8(SizeTier::Standard));
-        payload.push(4);
-        payload.push(2);
-        payload.push(0); // flags — no repacked_from
-        payload.extend_from_slice(&[0xAB; 32]);
-        payload.extend_from_slice(&3u32.to_le_bytes());
-        payload.extend_from_slice(&4096u64.to_le_bytes());
         let mut buf = Vec::with_capacity(EVENT_RECORD_HEADER_SIZE + payload.len() + 4);
         buf.extend_from_slice(&EVENT_RECORD_MAGIC);
         buf.push(EVENT_RECORD_VERSION);
@@ -1779,11 +1802,97 @@ mod tests {
         buf.extend_from_slice(&payload);
         let crc = crc32fast::hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
-        let decoded = SegmentEvent::from_record_bytes(&buf).expect("legacy record decodes");
-        match decoded {
-            SegmentEvent::Seal(seal) => assert_eq!(seal.repacked_from, None),
-            other => panic!("expected seal event, got {other:?}"),
-        }
+        buf
+    }
+
+    /// ADR-0031 D3: a CRC-valid pre-pool Seal record (48-byte payload,
+    /// flags byte 0 — no pool-id flag) no longer decodes; the public
+    /// `from_record_bytes` returns `None` and the boot reader refuses it
+    /// as an unsupported pre-pool data directory instead of treating it
+    /// as corruption (or truncating it as a "torn tail" at open).
+    #[tokio::test]
+    async fn prepool_seal_record_is_refused_not_decoded() {
+        // The pre-pool 48-byte Seal shape (no compaction marker).
+        let mut plain = Vec::with_capacity(SEAL_PAYLOAD_SIZE);
+        plain.push(tier_to_u8(SizeTier::Standard));
+        plain.push(4);
+        plain.push(2);
+        plain.push(0); // flags — pre-pool records have no pool-id bit
+        plain.extend_from_slice(&[0xAB; 32]);
+        plain.extend_from_slice(&3u32.to_le_bytes());
+        plain.extend_from_slice(&4096u64.to_le_bytes());
+        let plain_record = craft_seal_record(plain);
+        assert!(
+            SegmentEvent::from_record_bytes(&plain_record).is_none(),
+            "the pre-pool 48-byte shape must not decode"
+        );
+
+        // The pre-pool 64-byte repacked Seal shape (marker, no pool id).
+        let mut repacked = Vec::with_capacity(SEAL_PAYLOAD_SIZE + SEAL_REPACKED_FROM_SIZE);
+        repacked.push(tier_to_u8(SizeTier::Standard));
+        repacked.push(4);
+        repacked.push(2);
+        repacked.push(SEAL_FLAG_REPACKED_FROM);
+        repacked.extend_from_slice(&[0xAB; 32]);
+        repacked.extend_from_slice(&3u32.to_le_bytes());
+        repacked.extend_from_slice(&4096u64.to_le_bytes());
+        let old_id = SegmentId::new();
+        repacked.extend_from_slice(old_id.as_uuid().as_bytes());
+        let repacked_record = craft_seal_record(repacked);
+        assert!(
+            SegmentEvent::from_record_bytes(&repacked_record).is_none(),
+            "the pre-pool 64-byte repacked shape must not decode"
+        );
+
+        // The boot seam: EventWal::open scans the last file (the torn-
+        // tail self-heal). A pre-pool record must surface the explicit
+        // refusal — never a truncation.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("evl_00000000.log"), &plain_record).unwrap();
+        let err = match EventWal::open(dir.path().to_path_buf(), &test_config(dir.path())).await {
+            Ok(_) => panic!("pre-pool record must refuse open"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, Error::UnsupportedPrePoolDataDir { .. }),
+            "expected the pre-pool refusal, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("unsupported pre-pool data directory"),
+            "the error must carry the explicit pre-pool message: {err}"
+        );
+        // The file must NOT have been truncated by the open-time scan.
+        let after = std::fs::read(dir.path().join("evl_00000000.log")).unwrap();
+        assert_eq!(after.len(), plain_record.len(), "the pre-pool record must survive open");
+
+        // Same refusal for the repacked variant.
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::write(dir2.path().join("evl_00000000.log"), &repacked_record).unwrap();
+        let err2 = match EventWal::open(dir2.path().to_path_buf(), &test_config(dir2.path())).await
+        {
+            Ok(_) => panic!("pre-pool repacked record must refuse open"),
+            Err(err) => err,
+        };
+        assert!(matches!(err2, Error::UnsupportedPrePoolDataDir { .. }), "got: {err2}");
+
+        // A pre-pool record in an OLDER file (with a clean last file)
+        // refuses at the recovery fold: open succeeds (it only scans
+        // the last file), then `read_from` hits the same reader
+        // classifier and terminates with the pre-pool error.
+        let dir3 = tempfile::tempdir().unwrap();
+        std::fs::write(dir3.path().join("evl_00000000.log"), &plain_record).unwrap();
+        std::fs::write(dir3.path().join("evl_00000001.log"), &[]).unwrap();
+        let wal = EventWal::open(dir3.path().to_path_buf(), &test_config(dir3.path()))
+            .await
+            .expect("open only scans the last (clean) file");
+        let fold_events = wal
+            .read_from(EventWalPos { file_seq: 0, offset: 0 })
+            .collect::<crate::Result<Vec<_>>>();
+        let err3 = fold_events.expect_err("the fold must refuse the older pre-pool record");
+        assert!(
+            matches!(err3, Error::UnsupportedPrePoolDataDir { .. }),
+            "the fold must surface the pre-pool refusal, got: {err3}"
+        );
     }
 
     #[test]
@@ -1967,7 +2076,7 @@ mod tests {
             }
         });
 
-        // Writer: appends that force rotations (seal records are 80
+        // Writer: appends that force rotations (seal records are 84
         // bytes > 64-byte files) while the reader samples.
         let id = SegmentId::new();
         for _ in 0..20 {
@@ -2000,7 +2109,7 @@ mod tests {
     async fn rotation_opens_new_file_at_threshold() {
         let dir = tempfile::tempdir().unwrap();
         // File size 64: reserve (36) fits in file 0 at offset 36; the
-        // seal (80) no longer fits and rotates; the next seal (80) also
+        // seal (84) no longer fits and rotates; the next seal (84) also
         // rotates.
         let config = EventWalConfig {
             event_wal_dir: dir.path().to_path_buf(),
@@ -2014,11 +2123,11 @@ mod tests {
         let p1 = wal.append(reserve_event(id)).await.unwrap();
         assert_eq!(p1.file_seq, 0, "first record lands in file 0");
         assert_eq!(p1.offset, 0);
-        // The seal must rotate: 36 + 80 > 64.
+        // The seal must rotate: 36 + 84 > 64.
         let p2 = wal.append(seal_event(id)).await.unwrap();
         assert_eq!(p2.file_seq, 1, "seal rotates to file 1");
         assert_eq!(p2.offset, 0, "rotated file starts at offset 0");
-        // The next seal rotates again: 0 + 80 > 64.
+        // The next seal rotates again: 0 + 84 > 64.
         let p3 = wal.append(seal_event(id)).await.unwrap();
         assert_eq!(p3.file_seq, 2, "third record rotates to file 2");
 
@@ -2048,7 +2157,7 @@ mod tests {
         }
         let reopened = EventWal::open(dir.path().to_path_buf(), &config).await.unwrap();
         assert_eq!(reopened.latest_pos().file_seq, 1, "reopen resumes at the newest file");
-        // The resumed file (80 bytes) already exceeds the 64-byte
+        // The resumed file (84 bytes) already exceeds the 64-byte
         // threshold, so the next record rotates immediately.
         let p = reopened.append(delete_event(id)).await.unwrap();
         assert_eq!(p.file_seq, 2);
@@ -2220,7 +2329,7 @@ mod tests {
         let start = EventWalPos { file_seq: 0, offset: 0 };
         wal.append(reserve_event(id)).await.unwrap(); // file 0, offset 0
         let p2 = wal.append(seal_event(id)).await.unwrap(); // file 1, offset 0
-        wal.append(delete_event(id)).await.unwrap(); // file 1, offset 80
+        wal.append(delete_event(id)).await.unwrap(); // file 1, offset 84
 
         // The total since the start equals the sum of all record sizes.
         assert_eq!(

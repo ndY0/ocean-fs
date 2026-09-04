@@ -127,6 +127,17 @@ pub enum Error {
         /// The transition rejection reason.
         detail: String,
     },
+
+    /// The node booted onto a directory written by a **pre-pool** node
+    /// (ADR-0031 D3): a `pool_id`-less Seal record in the event WAL or a
+    /// v2 checkpoint. Pre-pool data directories are refused — there is
+    /// no migration and no continued decode; the operator must start on
+    /// a fresh pools-enabled layout.
+    #[error("unsupported pre-pool data directory: {detail}")]
+    UnsupportedPrePoolDataDir {
+        /// Why the directory was classified as pre-pool.
+        detail: String,
+    },
 }
 
 /// Convenience alias for `std::result::Result<T, Error>`.

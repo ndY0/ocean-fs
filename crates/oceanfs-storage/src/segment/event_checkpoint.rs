@@ -20,8 +20,8 @@
 //! ```text
 //! checkpoint-{file_seq:08}-{offset}:
 //!   magic        [4]   = b"CHK\1"
-//!   version      [1]   = 3 (2 = legacy: 7-field metadata, no pool_id —
-//!                      decoded as pool_id 0, ADR-0029 f5)
+//!   version      [1]   = 3 (2 = pre-pool: 7-field metadata, no pool_id —
+//!                      refused at boot since ADR-0031 D3)
 //!   covered_pos  [12]  file_seq(4 LE) + offset(8 LE) — the EventWalPos
 //!                      covered by this snapshot (the fold starts after it)
 //!   entry_count  [4]   LE
@@ -33,10 +33,9 @@
 //!                      (extension over the ADR sketch: the bincode payload
 //!                      is variable-length and needs a length prefix)
 //!     metadata   [meta_len]  bincode(SegmentMetadata) — the full metadata
-//!                      incl. merkle_root for Sealed entries; v3 adds
-//!                      `pool_id` (ADR-0029 f5, the durable segment→pool
-//!                      mapping); v2 blobs decode via the 7-field legacy
-//!                      shape → pool_id 0
+//!                      incl. merkle_root for Sealed entries; the
+//!                      metadata always carries `pool_id` (ADR-0029 f5,
+//!                      the durable segment→pool mapping)
 //!     data_wal_pos [12]  file_seq(4 LE) + offset(8 LE) — Sealed entries
 //!                      only (retention needs it to survive checkpointing)
 //!     repacked_flag [1]  0/1 — Sealed entries only (the compaction
@@ -48,8 +47,10 @@
 //!
 //! Version 2 adds the compaction marker to Sealed entries (version 1
 //! snapshots without the flag byte are rejected — none exist in the
-//! field); version 3 adds `pool_id` to the metadata. v2 files are the
-//! pre-f5 legacy format and decode with `pool_id = 0` (the legacy root).
+//! field); version 3 adds `pool_id` to the metadata. A v2 (pre-pool)
+//! checkpoint is refused at boot with an explicit "unsupported pre-pool
+//! data directory" error (ADR-0031 D3) — never decoded, never silently
+//! replaced by an older snapshot or an empty registry.
 
 use std::{
     io::Write,
@@ -61,8 +62,7 @@ use std::{
 };
 
 use oceanfs_core::{
-    Counter, EventWalConfig, HashOutput, LabelSet, MetricRegistrar, NodeId, SegmentId,
-    SegmentMetadata, SizeTier,
+    Counter, EventWalConfig, LabelSet, MetricRegistrar, SegmentId, SegmentMetadata,
 };
 
 use crate::{
@@ -78,15 +78,10 @@ pub(crate) const CHECKPOINT_MAGIC: [u8; 4] = [b'C', b'H', b'K', 1];
 
 /// On-disk format version of checkpoint files.
 /// Checkpoint format version. v3 (current): `SegmentMetadata` carries
-/// `pool_id` (ADR-0029 f5). v2 (`LEGACY_CHECKPOINT_VERSION`): the pre-f5
-/// 7-field metadata — decoded into `pool_id = 0` (the legacy root) so
-/// pre-f5 checkpoints load without migration (f5 deviation).
+/// `pool_id` (ADR-0029 f5). v2 — the pre-pool 7-field metadata without
+/// `pool_id` — is refused at boot (ADR-0031 D3); the literal version
+/// byte appears only in the pre-pool classifier below.
 pub(crate) const CHECKPOINT_VERSION: u8 = 3;
-
-/// The pre-f5 checkpoint format (7-field `SegmentMetadata`, no `pool_id`).
-/// bincode does not apply serde defaults to missing trailing fields, so
-/// legacy blobs must be decoded through the explicit legacy shape.
-pub(crate) const LEGACY_CHECKPOINT_VERSION: u8 = 2;
 
 /// Fixed header size of a checkpoint file: magic(4) + version(1) +
 /// covered_pos(12) + entry_count(4) = 21.
@@ -265,6 +260,20 @@ impl EventCheckpoint {
                         covered = ?pos,
                         "checkpoint body covered position disagrees with its name; skipping"
                     );
+                } else if is_pre_pool_checkpoint(&raw) {
+                    // A v2 (pre-pool) checkpoint is not corruption and
+                    // not an older-format snapshot to fall back past: it
+                    // proves the directory was written before pools.
+                    // Boot refuses explicitly (ADR-0031 D3) — never a
+                    // silent start from an older snapshot or from
+                    // scratch over a pre-pool directory.
+                    return Err(Error::UnsupportedPrePoolDataDir {
+                        detail: format!(
+                            "checkpoint {} is a pre-pool (v2) snapshot — \
+                             boot onto a pre-pool data directory is refused (ADR-0031 D3)",
+                            path.display(),
+                        ),
+                    });
                 } else {
                     tracing::warn!(
                         covered = ?pos,
@@ -435,30 +444,41 @@ fn encode_snapshot(registry: &SegmentLifecycleRegistry, up_to: EventWalPos) -> R
     Ok(buf)
 }
 
-/// The pre-f5 `SegmentMetadata` shape (7 fields, no `pool_id`) — legacy
-/// checkpoint entries (version 2) decode through this shape, then map to
-/// `pool_id = 0`. Field order and types must mirror the committed struct
-/// exactly (bincode is positional).
-#[derive(serde::Serialize, serde::Deserialize)]
-struct LegacySegmentMetadata {
-    segment_id: SegmentId,
-    ec_k: u8,
-    ec_m: u8,
-    size_tier: SizeTier,
-    merkle_root: Option<HashOutput>,
-    storage_locations: smallvec::SmallVec<[NodeId; 16]>,
-    sealed_at: Option<i64>,
-}
-
-// [review][cleanup][high]
-// remove the legacy cases handling the pre-pools, no legacy behaviour.
-// [end]
 // [review][codesmell][medium]
 // usage of magic constants. name constantes, then use them as boundaries for readability
 // [end]
+/// True when a well-framed checkpoint has the **pre-pool** v2 shape:
+/// the checkpoint magic + version byte 2 + a valid trailing CRC
+/// (ADR-0031 D3). v2 snapshots carry 7-field metadata without `pool_id`;
+/// boot refuses such directories as unsupported — never corruption,
+/// never an older snapshot to fall back past.
+fn is_pre_pool_checkpoint(bytes: &[u8]) -> bool {
+    if bytes.len() < CHECKPOINT_HEADER_SIZE + 4 {
+        return false;
+    }
+    if bytes[0..4] != CHECKPOINT_MAGIC {
+        return false;
+    }
+    if bytes[4] != 2 {
+        // Literal pre-pool version byte (the named const was deleted
+        // with the v2 decode — ADR-0031 D3).
+        return false;
+    }
+    let stored_crc = match bytes[bytes.len() - 4..].try_into() {
+        Ok(tail) => u32::from_le_bytes(tail),
+        Err(_) => return false,
+    };
+    stored_crc == crc32fast::hash(&bytes[..bytes.len() - 4])
+}
+
 /// Deserializes a snapshot into a fresh registry; `None` on any framing
 /// error (bad magic, unsupported version, CRC mismatch, truncated
 /// entries, unknown state).
+///
+/// Only the current v3 layout decodes. A v2 (pre-pool) checkpoint is
+/// detected by the caller ([`EventCheckpoint::load_checkpoint`]) and
+/// refused as an unsupported pre-pool data directory (ADR-0031 D3) —
+/// it never reaches this function's decode arms.
 fn decode_snapshot(bytes: &[u8]) -> Option<(EventWalPos, SegmentLifecycleRegistry)> {
     if bytes.len() < CHECKPOINT_HEADER_SIZE + 4 {
         return None;
@@ -466,8 +486,7 @@ fn decode_snapshot(bytes: &[u8]) -> Option<(EventWalPos, SegmentLifecycleRegistr
     if bytes[0..4] != CHECKPOINT_MAGIC {
         return None;
     }
-    let version = bytes[4];
-    if version != CHECKPOINT_VERSION && version != LEGACY_CHECKPOINT_VERSION {
+    if bytes[4] != CHECKPOINT_VERSION {
         return None;
     }
     let stored_crc = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().ok()?);
@@ -497,28 +516,9 @@ fn decode_snapshot(bytes: &[u8]) -> Option<(EventWalPos, SegmentLifecycleRegistr
         if cursor + meta_len > bytes.len() - 4 {
             return None;
         }
-        let meta: SegmentMetadata = if version == LEGACY_CHECKPOINT_VERSION {
-            // Pre-f5 blob: the 7-field shape without `pool_id`. bincode
-            // does not honor `#[serde(default)]` for the missing trailing
-            // field, so decode through the explicit legacy shape and map
-            // to pool_id 0 (the legacy root — f5 deviation).
-            let legacy: LegacySegmentMetadata =
-                bincode::deserialize(&bytes[cursor..cursor + meta_len]).ok()?;
-            SegmentMetadata {
-                segment_id: legacy.segment_id,
-                ec_k: legacy.ec_k,
-                ec_m: legacy.ec_m,
-                size_tier: legacy.size_tier,
-                merkle_root: legacy.merkle_root,
-                storage_locations: legacy.storage_locations,
-                sealed_at: legacy.sealed_at,
-                pool_id: 0,
-            }
-        } else {
-            match bincode::deserialize(&bytes[cursor..cursor + meta_len]) {
-                Ok(meta) => meta,
-                Err(_) => return None,
-            }
+        let meta: SegmentMetadata = match bincode::deserialize(&bytes[cursor..cursor + meta_len]) {
+            Ok(meta) => meta,
+            Err(_) => return None,
         };
         cursor += meta_len;
         match state_byte {
@@ -639,54 +639,44 @@ mod tests {
     // Snapshot encode/decode round trip
     // ------------------------------------------------------------------
 
-    /// ADR-0029 f5: a pre-f5 (v2) checkpoint — whose metadata blobs lack
-    /// `pool_id` — decodes with `pool_id = 0` (the legacy root). bincode
-    /// does not apply serde defaults to missing trailing fields, so the
-    /// legacy shape is decoded explicitly. Without this, a pre-f5
-    /// checkpoint would fail to load and every segment it covered would
-    /// silently vanish from the rebuilt registry (the log is already
-    /// truncated at the checkpoint).
-    #[test]
-    fn legacy_v2_checkpoint_decodes_with_pool_id_zero() {
+    /// ADR-0031 D3: a v2 (pre-pool) checkpoint — whose metadata blobs
+    /// lack `pool_id` — no longer decodes and no longer falls back to
+    /// an older snapshot or an empty registry: it proves the directory
+    /// was written before pools, and boot refuses it explicitly.
+    #[tokio::test]
+    async fn v2_checkpoint_is_refused_not_decoded() {
         let id = SegmentId::new();
-        let legacy_meta = LegacySegmentMetadata {
-            segment_id: id,
-            ec_k: 4,
-            ec_m: 2,
-            size_tier: SizeTier::Standard,
-            merkle_root: Some(HashOutput::from_bytes([0xAB; 32])),
-            storage_locations: smallvec::SmallVec::new(),
-            sealed_at: Some(1_700_000_000_000),
-        };
-        let meta_bytes = bincode::serialize(&legacy_meta).unwrap();
 
-        // Craft a v2 snapshot with one sealed entry: header + entry
-        // (id + state + meta_len + legacy meta + sealed extras) + crc.
+        // Craft a minimal v2 snapshot: magic + version 2 + covered pos +
+        // zero entries + crc (a v2 writer emits this exact frame).
         let covered = EventWalPos { file_seq: 3, offset: 4096 };
         let mut buf = Vec::new();
         buf.extend_from_slice(&CHECKPOINT_MAGIC);
-        buf.push(LEGACY_CHECKPOINT_VERSION);
+        buf.push(2); // pre-pool checkpoint version (ADR-0031 D3)
         buf.extend_from_slice(&covered.file_seq.to_le_bytes());
         buf.extend_from_slice(&covered.offset.to_le_bytes());
-        buf.extend_from_slice(&1u32.to_le_bytes());
-        buf.extend_from_slice(id.as_uuid().as_bytes());
-        buf.push(STATE_SEALED);
-        buf.extend_from_slice(&(meta_bytes.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&meta_bytes);
-        // Sealed extras: data_wal_pos (4 + 8) + repacked flag (1).
-        buf.extend_from_slice(&0u32.to_le_bytes());
-        buf.extend_from_slice(&0u64.to_le_bytes());
-        buf.push(0);
+        buf.extend_from_slice(&0u32.to_le_bytes()); // entry_count = 0
         let crc = crc32fast::hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
 
-        let (loaded_covered, registry) = decode_snapshot(&buf).expect("legacy snapshot decodes");
-        assert_eq!(loaded_covered, covered);
-        let entry = registry.get(id).expect("legacy entry restored");
-        assert_eq!(entry.metadata.pool_id, 0, "legacy checkpoints map to the legacy root");
-        assert_eq!(entry.metadata.ec_k, 4);
-        assert_eq!(entry.metadata.ec_m, 2);
-        assert_eq!(entry.metadata.merkle_root, Some(HashOutput::from_bytes([0xAB; 32])));
+        // The decoder itself refuses the v2 shape.
+        assert!(decode_snapshot(&buf).is_none(), "v2 snapshots must not decode");
+
+        // The boot seam: load_checkpoint surfaces the explicit pre-pool
+        // error instead of returning None (falling back to scratch).
+        let (dir, wal) = test_env().await;
+        let ckpt_dir = wal.dir().to_path_buf();
+        std::fs::write(ckpt_dir.join("checkpoint-00000003-4096"), &buf).unwrap();
+        let checkpoint = EventCheckpoint::open(ckpt_dir.clone(), wal.clone()).unwrap();
+        let err = match checkpoint.load_checkpoint() {
+            Ok(_) => panic!("v2 checkpoint must refuse load_checkpoint"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("unsupported pre-pool data directory"),
+            "the error must carry the explicit pre-pool message: {err}"
+        );
+        let _ = (dir, id);
     }
 
     #[test]
@@ -955,7 +945,7 @@ mod tests {
         .unwrap(); // rotates to file 1
                    // The covered boundary: the write position after the seal.
         let boundary = wal.latest_pos();
-        assert_eq!(boundary, EventWalPos { file_seq: 1, offset: 80 });
+        assert_eq!(boundary, EventWalPos { file_seq: 1, offset: 84 });
 
         // A later append rotates the straddling file away.
         wal.append(crate::segment::event_wal::SegmentEvent::Seal(
@@ -976,7 +966,7 @@ mod tests {
         let removed = wal.truncate_before(boundary).await.unwrap();
         assert!(removed > 0);
         // File 0 (below the covered file) and file 1 (rotated and fully
-        // covered: size 80 == boundary.offset) are deleted.
+        // covered: size 84 == boundary.offset) are deleted.
         assert!(!wal.dir().join("evl_00000000.log").exists(), "covered file deleted");
         assert!(
             !wal.dir().join("evl_00000001.log").exists(),
@@ -991,7 +981,7 @@ mod tests {
         assert_eq!(events[0].0, EventWalPos { file_seq: 2, offset: 0 });
 
         // The writer's accounting is consistent: appends continue (the
-        // delete rotates: file 2 at 80 + 32 > 64) and bytes_since stays
+        // delete rotates: file 2 at 84 + 32 > 64) and bytes_since stays
         // exact.
         let p = wal
             .append(crate::segment::event_wal::SegmentEvent::Delete(
@@ -1041,7 +1031,7 @@ mod tests {
         ))
         .await
         .unwrap(); // rotates to file 1
-        let boundary = wal.latest_pos(); // (1, 80)
+        let boundary = wal.latest_pos(); // (1, 84)
 
         // Appends land AFTER the snapshot's covered point (the async
         // checkpoint window): the delete → file 2, seal3 → file 3.
@@ -1063,7 +1053,7 @@ mod tests {
             },
         ))
         .await
-        .unwrap(); // file 3 [0..80)
+        .unwrap(); // file 3 [0..84)
 
         // CORRECT truncation at the covered boundary: file 0 and the
         // fully-covered rotated straddling file 1 are deleted; the file

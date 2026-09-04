@@ -1,7 +1,7 @@
 ---
 feature: "f3: On-Disk Format Break & Test/Fixture Rework"
 epic: "refactoring/legacy-mode-removal"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies:
@@ -170,11 +170,17 @@ Pools-enabled node, pool_id = 0 (first data pool)
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` passes; `grep -rn
+- [x] **Code:** `cargo build --all-targets` passes; `grep -rn
       "LEGACY_CHECKPOINT_VERSION" crates --include=*.rs` returns nothing;
       `grep -rn "SEAL_FLAG_POOL_ID" crates/oceanfs-storage/src/segment/event_wal.rs`
       shows the flag is always set in the Seal encoder.
-- [ ] **Tests:** pool-0 Seal round-trips byte-exact; a crafted no-flag Seal
+      <!-- REVIEW: verified statically (2026-09-04 review): zero hits for
+      LEGACY_CHECKPOINT_VERSION/LegacySegmentMetadata/deleted-test names
+      across crates; encoder always sets SEAL_FLAG_POOL_ID + appends the 4
+      pool-id bytes (event_wal.rs:332-357). Build --all-targets clean —
+      implementer-executed; reviewers do not run tests locally (PIPELINE.md
+      §6), see Implementation Notes for the runtime record. -->
+- [x] **Tests:** pool-0 Seal round-trips byte-exact; a crafted no-flag Seal
       record and a crafted v2 checkpoint each fail with the pre-pool error;
       `Node::start` refuses a pre-seeded legacy `event-wal` dir. Deleted:
       `legacy_seal_record_decodes_pool_id_zero`,
@@ -184,14 +190,92 @@ Pools-enabled node, pool_id = 0 (first data pool)
       -p oceanfs-node --lib -- --test-threads=1` (RocksDB caveat, PIPELINE.md
       §4.6), `cargo test -p oceanfs-node --test e2e_single_node --
       --test-threads=1`, `cargo test -p oceanfs-core`.
-- [ ] **Docs:** `#![deny(missing_docs)]` passes; the event-WAL framing doc and
+      <!-- REVIEW: verified statically: pool_zero_seal_roundtrips_with_the_
+      always_flagged_layout (event_wal.rs:1604, len+flag+equality asserts),
+      prepool_seal_record_is_refused_not_decoded (event_wal.rs:1814 — both
+      48/64 shapes: from_record_bytes None + EventWal::open Err + message +
+      file-not-truncated; plus the LOW-2 fold-refusal scenario: pre-pool
+      record in evl_00000000.log beside a clean evl_00000001.log → the
+      read_from recovery fold refuses, :1879-1892),
+      v2_checkpoint_is_refused_not_decoded (event_checkpoint.rs:647, decode
+      None + load_checkpoint Err), node integration pre_pool_dir_refusal.rs
+      2/2 (real Node::start, correct framing, refusal before any fixed-port
+      bind). Test runs implementer-executed — reviewers do not run tests
+      locally (PIPELINE.md §6), see Implementation Notes. -->
+- [x] **Docs:** `#![deny(missing_docs)]` passes; the event-WAL framing doc and
       `SealEvent.pool_id` doc describe the always-flagged pool-id layout.
-- [ ] **ADR:** ADR-0031 D3/D4 satisfied — no no-flag Seal shape, no v2
+      <!-- REVIEW: verified by reading: framing doc event_wal.rs:44-62 (52/68
+      byte payloads, bit-1 always set), SealEvent.pool_id doc event_wal.rs:234-
+      241 ("0 = the first configured pool"), checkpoint module doc
+      event_checkpoint.rs:18-53, CHECKPOINT_VERSION doc :79-84, error.rs:131-
+      140 variant documented. rustdoc clean executed by the implementer. -->
+- [x] **ADR:** ADR-0031 D3/D4 satisfied — no no-flag Seal shape, no v2
       checkpoint decode, explicit pre-pool boot refusal, `pool_id = 0`
       preserved for pools-enabled nodes, legacy tests gone.
-- [ ] **Perf:** layout remains byte-explicit and fixed-size per variant
+      <!-- REVIEW: verified statically: decode_payload has only the two
+      pool-id-flag-requiring Seal arms (event_wal.rs:483-521); decode_snapshot
+      accepts only version 3 (event_checkpoint.rs:489); is_pre_pool_seal /
+      is_pre_pool_checkpoint classify CRC-valid shapes only; load_checkpoint
+      refuses a v2 candidate before any fallback (event_checkpoint.rs:263-276);
+      EventWal::open propagates the refusal from truncate_torn_tail
+      (event_wal.rs:862-868) — never truncated; Reserve/Delete/MetadataRefresh
+      arms untouched; pool-id-carrying arms untouched. -->
+- [x] **Perf:** layout remains byte-explicit and fixed-size per variant
       (perf 6.3); the added pre-pool classification is boot-time only, not on
       the append path.
-- [ ] **Integration:** a fresh pools-enabled node writes, seals, restarts, and
+      <!-- REVIEW: verified statically: classification runs only in the
+      reader's decode-None branch (boot scan / fold / open-time torn-tail
+      scan); the append path (to_record_bytes / append) gained no branches —
+      the Seal arm now writes 4 unconditional bytes; record sizes stay
+      constant per variant (52/68 payloads). -->
+- [x] **Integration:** a fresh pools-enabled node writes, seals, restarts, and
       reads back (pool 0 included); boot over a pre-pool directory refuses
       with the explicit message.
+      <!-- REVIEW: pools-enabled suites (crash_restart, wal_recovery,
+      segment_lifecycle, cluster_lifecycle, cluster_write_path,
+      garbage_collection, e2e_single_node) executed green by the implementer
+      (reviewers do not run tests locally — PIPELINE.md §6, see
+      Implementation Notes for the runtime record); the pre-pool refusal
+      reaches operators via modules/storage.rs:348/535/556 context strings
+      ("failed to open segment event WAL", "failed to load event WAL
+      checkpoint", "event-WAL recovery failed"), each embedding the
+      "unsupported pre-pool data directory" display text. -->
+
+## Implementation Notes (2026-09-04)
+
+Review outcome: **PASS** — one independent review iteration; 2 LOW items
+raised, both fixed by the implementer, storage lib re-verified green. The
+review was **static only**: per PIPELINE.md §6 reviewers do not execute
+tests locally, so all runtime verification was executed by the implementer
+under the §6 e2e allowlist (quick functional suites only — **never**
+`load_*` suites locally). Final state recorded at close:
+
+- **Static review evidence (independent reviewer):** every DoD item carries
+  an in-place `<!-- REVIEW -->` annotation with file:line evidence; no
+  blocking gaps. Frontmatter `status: done` as of 2026-09-04.
+- **Runtime verification (implementer-executed, PIPELINE.md §6 allowlist):**
+  `cargo build --all-targets`; storage lib 426 + doc 92; node lib 64 +
+  doc 38 + the full node `tests/` integration suite including the new
+  `pre_pool_dir_refusal` 2/2; durability lib 265; core 232; server 244; e2e
+  functional allowlist `crash_restart`, `wal_recovery`,
+  `segment_lifecycle`, `cluster_lifecycle`, `cluster_write_path`,
+  `garbage_collection` — all green.
+- **LOW-1 (fixed):** stale "80-byte" payload comments in the `event_wal.rs`
+  rotation tests updated to "84-byte" to match the always-flagged pool-id
+  record layout (e.g. `event_wal.rs:1601, 2160`).
+- **LOW-2 (fixed):** `prepool_seal_record_is_refused_not_decoded`
+  (`event_wal.rs:1814`) extended with the **older-file fold-refusal
+  scenario**: a pre-pool record in `evl_00000000.log` beside a clean
+  `evl_00000001.log` — `EventWal::open` succeeds (it only scans the last
+  file), then `read_from`'s recovery fold hits the same reader classifier
+  and terminates with `UnsupportedPrePoolDataDir` (`:1879-1892`); previously
+  only the open-time scan path was covered.
+- **PIPELINE.md §6 (incident record — no code change):** after a reviewer
+  agent started `load_cluster_churn` on the dev laptop (2026-09-04),
+  PIPELINE.md gained the new "§6 NEVER Run Load Tests on the Development
+  Machine" section (hard prohibition). Reviewer/implementer prompts must
+  carry explicit e2e `--test` allowlists; a generic "run the tests"
+  instruction is not permission to run load suites.
+- Residual legacy hits outside this feature's scope (theme-1
+  reader/sealer arms, repair/reconcile predicates, the `validate` refusal
+  itself) — enumerated in f1's REVIEW notes; unchanged by f3.

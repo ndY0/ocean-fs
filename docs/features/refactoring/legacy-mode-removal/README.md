@@ -1,7 +1,7 @@
 ---
 feature: "Legacy-Mode Removal — Program Coordination"
 epic: "refactoring/legacy-mode-removal"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -23,6 +23,11 @@ updated: 2026-09-04
 > tells you where your work sits in the whole (wave 2 ⑤), what must exist
 > before you start, and what must not regress while you work. The per-feature
 > docs are the authority for your feature; this document is the map.
+
+> **STATUS: EPIC COMPLETE (2026-09-04).** c1, f1, f2, and f3 all landed with
+> independent review PASS — see the Landing order and the Epic Definition of
+> Done below for the per-item gate record. This document is retained as the
+> coordination record; nothing here is pending.
 
 ## Summary
 
@@ -122,7 +127,15 @@ so fixture work can land *before* the enforcement:
    marker (topics owned by ADR-0032 — only the legacy clause was removed).
 5. **f3 format removal** — event-WAL/checkpoint legacy shape removal +
    boot-refusal tests + legacy-test deletion (green last).
-   **PENDING (not started).**
+   **LANDED 2026-09-04 (review PASS, 1 iteration — 2 LOW items, both
+   fixed).** LOW-1: stale "80-byte" comments updated to 84 across the
+   `event_wal.rs` rotation tests. LOW-2: the older-file fold-refusal
+   scenario added to `prepool_seal_record_is_refused_not_decoded` (pre-pool
+   record in `evl_00000000.log` + clean `evl_00000001.log` → `read_from`
+   fold refuses with `UnsupportedPrePoolDataDir`). Storage lib re-verified
+   green after the fixes. Runtime verification was implementer-executed
+   under the PIPELINE.md §6 e2e allowlist (reviewer static-only); the full
+   record is in the f3 doc's Implementation Notes.
 
 ## What must not regress
 
@@ -153,29 +166,49 @@ so fixture work can land *before* the enforcement:
 
 ## Epic Definition of Done
 
-- [ ] `cargo build --all-targets` passes across the workspace.
-- [ ] No `config.storage.pools.is_empty()` branch remains in production code
+All nine boxes checked at the epic gate on 2026-09-04, after f3 landed
+(review PASS) on top of c1/f1/f2. Evidence: the per-feature DoD REVIEW
+annotations (c1 in the composition-root epic, f1/f2/f3 in this epic) plus
+implementer-executed runtime runs under the PIPELINE.md §6 e2e allowlist
+(reviewers are static-only; no `load_*` suites run locally).
+
+- [x] `cargo build --all-targets` passes across the workspace.
+- [x] No `config.storage.pools.is_empty()` branch remains in production code
       (`grep -rn "pools.is_empty()" crates --include=*.rs` returns nothing
       outside `#[cfg(test)]` fixture builders that must assert refusal).
-- [ ] An empty `[storage.pools]` fails `StorageConfig::validate`,
+      <!-- Gate note: under the LITERAL pattern the grep still returns
+      residuals — none is the config legacy branch (that is what the item
+      means; the f1 REVIEW note flagged the same over-claim). Exact residual
+      as of 2026-09-04: storage.rs:417 = the validate refusal itself
+      (enforcement), storage.rs:649 = its #[cfg(test)] assertion;
+      io/segment_reader.rs:342 + segment/sealer.rs:386 = theme-1 internal
+      legacy arms, explicitly out of this epic (wave 2 ②);
+      node repair.rs:332 + durability reconcile.rs:510,571 = peer-manifest
+      data-deadness predicates over registered pools (not a legacy branch). -->
+- [x] An empty `[storage.pools]` fails `StorageConfig::validate`,
       `PoolRegistry::from_config`, and `Node::start` with an explicit error
       naming the required roles.
-- [ ] `DiskSegmentStore`, `DiskSegmentShardStore`, and `pool_paths` carry no
+- [x] `DiskSegmentStore`, `DiskSegmentShardStore`, and `pool_paths` carry no
       `legacy_dir` / empty-pool fallback; role-pinned dirs resolve from pools
       only.
-- [ ] The event-WAL no-flag Seal shape and the v2 checkpoint decode are gone;
+- [x] The event-WAL no-flag Seal shape and the v2 checkpoint decode are gone;
       a node booting onto a directory with pre-pool event-WAL/checkpoint files
       fails startup with "unsupported pre-pool data directory", and
       `pool_id = 0` records from pools-enabled nodes round-trip byte-exact.
-- [ ] Legacy-pinning tests deleted; replacement tests (no-pools refusal,
+- [x] Legacy-pinning tests deleted; replacement tests (no-pools refusal,
       pool-only resolution, pool-0 round-trip, pre-pool boot refusal) exist.
-- [ ] Dev/test/e2e configs all declare pools; deploy scripts unchanged.
-- [ ] Regression gate: `cargo test -p oceanfs-core`, and
+- [x] Dev/test/e2e configs all declare pools; deploy scripts unchanged.
+- [x] Regression gate: `cargo test -p oceanfs-core`, and
       `cargo test -p oceanfs-storage --lib -- --test-threads=1`,
       `cargo test -p oceanfs-node --lib -- --test-threads=1`,
       `cargo test -p oceanfs-durability --lib -- --test-threads=1` pass;
       e2e single-node write/read green.
-- [ ] c1 coordination: the composition-root storage builder constructs stores
+      <!-- Gate note: implementer-executed at f3 close (allowlist, §6): core
+      232, storage lib 426 + doc 92, node lib 64 + doc 38 + full tests/ suite
+      incl. pre_pool_dir_refusal 2/2, durability 265, server 244; e2e
+      allowlist crash_restart / wal_recovery / segment_lifecycle /
+      cluster_lifecycle / cluster_write_path / garbage_collection green. -->
+- [x] c1 coordination: the composition-root storage builder constructs stores
       with pools-only signatures (no legacy branch moved into
       `modules/storage.rs`).
       **DISPOSITION (approved 2026-09-04, c1 plan review Q1):** c1 lands as a
@@ -185,6 +218,11 @@ so fixture work can land *before* the enforcement:
       prep → f1 → f2), so the builder never *stays* legacy; c1's
       pools-mandatory refusal test ships with f1. The epic DoD bullet is
       satisfied at the epic gate, not at c1's merge.
+      **CLOSED at the epic gate (2026-09-04):** c1 landed as a pure move
+      (review PASS); f1 deleted both `modules/storage.rs` branches
+      (`data_pools` → `registry.data_pools()`; `registry:
+      Some(registry.clone())`); f2 deleted the `legacy_dir` store args; the
+      builder is pools-only with no legacy branch ever resident.
 
 ## References
 

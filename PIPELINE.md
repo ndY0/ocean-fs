@@ -216,3 +216,35 @@ cargo test -p oceanfs-durability --lib -- --test-threads=1
 **Reviewers:** do **not** flag `SIGABRT` under parallel test execution as
 a defect — it is a known RocksDB C++ limitation, not an OceanFS bug.
 Only flag test failures that reproduce under `--test-threads=1`.
+
+## 6. NEVER Run Load Tests on the Development Machine (Hard Prohibition)
+
+**Load/perf tests run ONLY on the cloud test infrastructure — never on
+the dev laptop, by any agent, under any circumstances.** The SUT/harness
+VMs exist precisely so sustained load cannot destabilize the developer's
+machine (memory pressure, disk churn, CPU saturation).
+
+- The e2e suites `e2e/tests/load_sustained.rs`,
+  `e2e/tests/load_cluster_churn.rs`, `e2e/tests/load_concurrency.rs`
+  (CI-only), `e2e/tests/load_*`, and any test that drives a sustained
+  multi-node workload belong to the cloud harness:
+  `vm-up` → `vm-deploy` → `vm-test-phase` (skills under
+  `.opencode/skills/`). The only sanctioned local runs are the quick
+  functional suites (`crash_restart`, `wal_recovery`,
+  `segment_lifecycle`, `cluster_lifecycle`, `cluster_write_path`,
+  `cluster_read_path`, `garbage_collection`, `rewrite_leak_test`,
+  etc.).
+- **Never** invoke `cargo test -p e2e` without an explicit `--test`
+  allowlist, and never add `--test load_cluster_churn` /
+  `--test load_sustained` / `--test load_concurrency` to any local
+  command.
+- **Implementer/reviewer/explore prompts must carry the allowlist
+  explicitly** when they involve e2e verification; a generic "run the
+  tests" instruction is not permission to run load suites.
+- A reviewer or subagent that attempts a load run locally must be
+  killed immediately (cancel the task, `pkill` the test binary) and the
+  incident reported to the user.
+
+Violating this rule risks the host machine (the 2026-09-04 incident:
+`load_cluster_churn` was started on the dev laptop by a reviewer agent).
+
