@@ -135,6 +135,8 @@ before g7's catch-up enumeration at scale.
 
 ## References
 
+- **Next session:** `session-handoff-2026-09-04.md` (what landed, decisions,
+  next step = legacy-mode-removal f2)
 - Triage: `docs/features/refactoring/review-2026-09-roadmap.md`
 - ADRs: 0017, 0031, 0032, 0033
 - In-flight healing: `docs/features/disk-resilience-healing/`
