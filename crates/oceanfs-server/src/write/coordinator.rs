@@ -1931,9 +1931,10 @@ impl WriteCoordinator {
 }
 
 /// Adapter exposing [`WriteCoordinator::apply_hinted_object`] through
-/// the healing service's [`HintObjectApplier`] trait (the composition
-/// root wires it — the hint receiver's data lands in a LOCAL segment
-/// via the node's own pipeline).
+/// the healing service's
+/// [`HintObjectApplier`](oceanfs_durability::healing_service::HintObjectApplier)
+/// trait (the composition root wires it — the hint receiver's data
+/// lands in a LOCAL segment via the node's own pipeline).
 pub struct WriteCoordinatorHintObjectApplier {
     coordinator: Arc<WriteCoordinator>,
 }

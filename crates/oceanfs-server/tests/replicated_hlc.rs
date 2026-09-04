@@ -121,6 +121,27 @@ struct Coord {
     membership: Arc<Membership>,
 }
 
+/// Re-points a membership entry's data-plane address with a fresh
+/// locally-observed ALIVE fact.
+///
+/// ADR-0028 D3: `make_coordinator` registers every node as a
+/// same-origin (self), version-0 observation; a later plain
+/// `upsert_node` replay is an IDEMPOTENT ECHO and is dropped — the
+/// address would stay at the placeholder and remote replication would
+/// dial nothing. Address updates must ride a strictly higher version
+/// (exactly like real topology updates from the detector/gossip).
+fn repoint_address(membership: &Arc<Membership>, origin: &NodeId, node: NodeId, addr: SocketAddr) {
+    membership.upsert_node_attributed(
+        node,
+        NodeState::Alive,
+        Incarnation::new(1),
+        Some(addr),
+        1,
+        origin.clone(),
+        None,
+    );
+}
+
 fn test_registry() -> Arc<oceanfs_storage::SegmentLifecycleRegistry> {
     Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(
         &oceanfs_core::LifecycleConfig::default(),
@@ -276,18 +297,11 @@ async fn replicated_put_persists_coordinator_hlc_on_replica() {
     // Spawn real replica servers for n2 and n3.
     let (addr2, replica2) = spawn_replica().await;
     let (addr3, _replica3) = spawn_replica().await;
-    coord.membership.upsert_node(
-        NodeId::new("n2"),
-        NodeState::Alive,
-        Incarnation::new(1),
-        Some(addr2),
-    );
-    coord.membership.upsert_node(
-        NodeId::new("n3"),
-        NodeState::Alive,
-        Incarnation::new(1),
-        Some(addr3),
-    );
+    // Re-point the placeholder entries at the real listeners (versioned
+    // attributed upserts — see `repoint_address`).
+    let origin = NodeId::new("n1");
+    repoint_address(&coord.membership, &origin, NodeId::new("n2"), addr2);
+    repoint_address(&coord.membership, &origin, NodeId::new("n3"), addr3);
 
     let result = coord.coord.put(write_request("hlc-obj", b"replicated payload", 2)).await.unwrap();
     let stamped = result.hlc;
@@ -342,12 +356,20 @@ async fn concurrent_same_key_writes_stamp_deterministic_lww_winner() {
     let (addr1, _replica1) = spawn_replica_with_store(store1.clone()).await;
     let (addr2, _replica2) = spawn_replica_with_store(store2.clone()).await;
     let (addr3, _replica3) = spawn_replica_with_store(store3.clone()).await;
-    for (member, addr) in [
-        (&coord1.membership, [(NodeId::new("n2"), addr2), (NodeId::new("n3"), addr3)]),
-        (&coord2.membership, [(NodeId::new("n1"), addr1), (NodeId::new("n3"), addr3)]),
+    for (member, origins, addr) in [
+        (
+            &coord1.membership,
+            NodeId::new("n1"),
+            [(NodeId::new("n2"), addr2), (NodeId::new("n3"), addr3)],
+        ),
+        (
+            &coord2.membership,
+            NodeId::new("n2"),
+            [(NodeId::new("n1"), addr1), (NodeId::new("n3"), addr3)],
+        ),
     ] {
         for (node, addr) in addr {
-            member.upsert_node(node, NodeState::Alive, Incarnation::new(1), Some(addr));
+            repoint_address(member, &origins, node, addr);
         }
     }
 

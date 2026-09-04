@@ -185,8 +185,16 @@ async fn write_triggers_hlc_advance() {
 
 #[tokio::test]
 async fn write_with_quorum_capped_to_replica_count() {
-    // 1 node in ring, but requested quorum of 3 — capped to 1, succeeds.
-    let coord = make_coordinator("n1", &["n1"]).await;
+    // 1 node in ring, but requested quorum of 3. A SINGLE-NODE
+    // deployment (the production composition root's
+    // `quorum_requires_ring = false` switch — no seeds, ring
+    // permanently 1 node, the default bucket policy w=2 must not reject
+    // every write) caps the quorum at the replica count: 3 → 1,
+    // succeeds. The coordinator's honest default (ring view must
+    // satisfy the requested quorum) is exercised by
+    // `write_quorum_unmet_on_single_node_ring_is_rejected`-style tests
+    // elsewhere — this test pins the single-node exemption.
+    let coord = make_coordinator("n1", &["n1"]).await.with_quorum_requires_ring(false);
     let mut req = write_request("capped", b"x", 3);
     req.write_quorum = 3;
     let result = coord.put(req).await;

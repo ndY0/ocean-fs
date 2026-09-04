@@ -583,9 +583,17 @@ async fn three_node_cluster_with_node_kill() {
 // Test 2: SWIM death detection
 // ---------------------------------------------------------------------------
 
-/// Tests the SWIM failure detection logic: registers a node as ALIVE, then
-/// simulates its failure by marking it SUSPECT (as would happen after failed
-/// pings), and verifies the DEAD state transition via MembershipEvent.
+/// Tests the SWIM failure detection semantics end to end: registers a
+/// node as ALIVE, then simulates the failure detector's suspicion
+/// (SUSPECT after failed pings), then DEAD after the suspicion timeout,
+/// verifying each MembershipEvent transition.
+///
+/// The transitions are driven through `upsert_node_attributed` with the
+/// ADR-0028 D3 authority classes: the target's own ALIVE announcement
+/// (class 1) is overridden by the local detector's SUSPECT/DEAD facts
+/// (class 3, higher version). A bare `upsert_node` replay of the same
+/// state would be an idempotent same-origin echo and MUST NOT emit an
+/// event — that invariant is what makes the gossip loops converge.
 #[tokio::test]
 async fn swim_death_detection_within_timeout() {
     // Create a short-timeout gossip config for fast test execution.
@@ -605,15 +613,21 @@ async fn swim_death_detection_within_timeout() {
 
     let membership =
         Arc::new(Membership::new(NodeId::new("detector-node"), addr, addr, config, ring_cache));
+    let self_id = NodeId::new("detector-node");
+    let target = NodeId::new("target-node");
+    let target_addr = "127.0.0.1:9002".parse().unwrap();
 
     let mut event_rx = membership.subscribe();
 
-    // Register a target node as ALIVE.
-    membership.upsert_node(
-        NodeId::new("target-node"),
+    // The target announces itself ALIVE (its own announcement, class 1).
+    membership.upsert_node_attributed(
+        target.clone(),
         NodeState::Alive,
         Incarnation::new(1),
-        Some("127.0.0.1:9002".parse().unwrap()),
+        Some(target_addr),
+        1,
+        target.clone(),
+        None,
     );
 
     // Consume the initial ALIVE event. Use recv with a timeout instead
@@ -626,15 +640,19 @@ async fn swim_death_detection_within_timeout() {
         .expect("event channel should be open");
 
     // Verify node is ALIVE.
-    assert_eq!(membership.state_of(&NodeId::new("target-node")), Some(NodeState::Alive));
+    assert_eq!(membership.state_of(&target), Some(NodeState::Alive));
 
-    // Simulate SWIM: after failed pings, a node is marked SUSPECT.
-    // This is what the failure detector does when pings time out.
-    membership.upsert_node(
-        NodeId::new("target-node"),
+    // Simulate SWIM: after failed pings, MY detector marks the node
+    // SUSPECT — a class-3 fact (higher version) overrides the target's
+    // own class-1 Alive at the same incarnation.
+    membership.upsert_node_attributed(
+        target.clone(),
         NodeState::Suspect,
         Incarnation::new(1),
-        Some("127.0.0.1:9002".parse().unwrap()),
+        Some(target_addr),
+        2,
+        self_id.clone(),
+        None,
     );
 
     // Verify the SUSPECT event was emitted.
@@ -647,15 +665,19 @@ async fn swim_death_detection_within_timeout() {
     assert_eq!(suspect_event.new_state, NodeState::Suspect);
 
     // Verify node is now SUSPECT.
-    assert_eq!(membership.state_of(&NodeId::new("target-node")), Some(NodeState::Suspect));
+    assert_eq!(membership.state_of(&target), Some(NodeState::Suspect));
 
-    // After more failed pings (or suspicion timeout expiry), the failure
-    // detector transitions SUSPECT → DEAD.
-    membership.upsert_node(
-        NodeId::new("target-node"),
+    // After more failed pings (or suspicion timeout expiry), MY detector
+    // transitions SUSPECT → DEAD (higher version of the same class-3
+    // fact).
+    membership.upsert_node_attributed(
+        target.clone(),
         NodeState::Dead,
         Incarnation::new(1),
-        Some("127.0.0.1:9002".parse().unwrap()),
+        Some(target_addr),
+        3,
+        self_id,
+        None,
     );
 
     let dead_event = tokio::time::timeout(Duration::from_millis(500), event_rx.recv())
@@ -672,7 +694,7 @@ async fn swim_death_detection_within_timeout() {
     // evicted Dead nodes, which silently shrank the replica set and
     // left returning nodes unhinted — the churn 404/404/200
     // divergence.)
-    assert_eq!(membership.state_of(&NodeId::new("target-node")), Some(NodeState::Dead));
+    assert_eq!(membership.state_of(&target), Some(NodeState::Dead));
 }
 
 /// T5.2: `SegmentGrpcService` uses `BufferPool` for segment data buffers.

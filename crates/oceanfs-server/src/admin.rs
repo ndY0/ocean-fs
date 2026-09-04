@@ -322,7 +322,8 @@ pub struct RingView {
 /// One probe's successor list.
 #[derive(Debug, Clone, Serialize)]
 pub struct RingProbe {
-    /// Probe index (0..8, see [`RING_PROBE_HASHES`]).
+    /// Probe index (0..8, the fixed probe-hash table used by the admin
+    /// ring view; see the private `RING_PROBE_HASHES` constant).
     pub probe: usize,
     /// Successor node IDs for this hash, in ring order.
     pub successors: Vec<String>,
