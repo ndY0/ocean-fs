@@ -45,7 +45,10 @@ This epic is the concrete work behind roadmap wave 2 ⑤. It is a
 `StorageModule::build` must consolidate today's eight `DiskSegmentStore` /
 `DiskSegmentShardStore` constructions into ONE instance each, and that
 consolidation only makes sense on pools-only constructors. Sequence the two
-epics so c1 never moves a legacy branch it will have to delete.
+epics so c1 never *keeps* a legacy branch it will have to delete — c1 lands
+first as a pure move (the two `config.storage.pools.is_empty()` branches
+pass through `modules/storage.rs` verbatim), and f1/f2 delete them in the
+same landing train (see the c1-coordination DoD bullet below).
 
 ## Critical nuance (do not break pool 0)
 
@@ -87,8 +90,10 @@ Dependency edges:
 - **c1 → f1/f2/f3** — roadmap wave 2 ① precedes ⑤; c1 extracts
   `StorageModule` from `Node::start`. Because c1's store consolidation must
   build on pools-only constructors, this epic's PRs land immediately after (or
-  interleaved with) c1 so the builder never inherits legacy branches. f2's
-  constructor deletions are the exact surface c1 consumes.
+  interleaved with) c1 so the builder never *keeps* legacy branches — c1's
+  pure move carries the two `is_empty()` branches into `modules/storage.rs`
+  verbatim; f1 deletes them there. f2's constructor deletions are the exact
+  surface c1 consumes.
 - **f1 → f2** — f2 makes role-pinned resolution pools-only, which presumes the
   pools-mandatory validation f1 adds.
 - **f1 → f3** — f3's boot-refusal tests and fixture rework describe a
@@ -161,11 +166,19 @@ so fixture work can land *before* the enforcement:
 - [ ] c1 coordination: the composition-root storage builder constructs stores
       with pools-only signatures (no legacy branch moved into
       `modules/storage.rs`).
+      **DISPOSITION (approved 2026-09-04, c1 plan review Q1):** c1 lands as a
+      pure move — the two `config.storage.pools.is_empty()` branches and the
+      `legacy_dir` store args pass through `modules/storage.rs` verbatim and
+      are deleted by THIS epic's f1/f2 (landing order step 1 → f3 fixture
+      prep → f1 → f2), so the builder never *stays* legacy; c1's
+      pools-mandatory refusal test ships with f1. The epic DoD bullet is
+      satisfied at the epic gate, not at c1's merge.
 
 ## References
 
 - ADR-0031 (the decision), ADR-0029 §D8 (the topology this amends)
-- Review anchors: `node.rs:830`, `pool/mod.rs:783`, `segment_store_impl.rs:16`,
+- Review anchors: `modules/storage.rs:240` (the moved `node.rs:830`
+  marker), `pool/mod.rs:783`, `segment_store_impl.rs:16`,
   `pool_paths.rs:44`, `gc/garbage_collector.rs:613`
 - Triage program: `features/refactoring/review-2026-09-roadmap.md` wave 2 ⑤
 - Companion: `features/refactoring/composition-root-decomposition/README.md`

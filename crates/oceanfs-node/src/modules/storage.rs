@@ -1,0 +1,798 @@
+//! Storage subsystem construction module (c1 of the composition-root
+//! decomposition).
+//!
+//! Extracted from `Node::start()` (feature
+//! `docs/features/refactoring/composition-root-decomposition/c1-split-storage-builder.md`):
+//! one plain builder returns the [`StorageModule`] bundle owning every
+//! storage-side component the rest of the composition root consumes.
+//!
+//! This is a **pure move** — construction order and behavior are identical
+//! to the inline code it replaces; the ADR-0017 scheduler and the
+//! store-unification epic (ADR-0032) land later on top of this module.
+
+use std::sync::Arc;
+
+use oceanfs_core::{
+    shard, NodeConfig, NodeId, PoolConfig, SegmentId, SegmentSizeConfig, SizeTier, WalConfig,
+};
+use oceanfs_durability::{
+    recover_incomplete_compactions, CompactionRecoveryAction, StoreObjectLookup,
+};
+use oceanfs_storage::{BufferPool, SegmentPool, SegmentShard};
+use tracing::{info, warn};
+
+use crate::{
+    pool_paths::PoolPaths,
+    segment_replicator::{ReplicationConfig, SegmentReplicator},
+};
+
+/// Storage subsystem bundle produced by [`StorageModule::build`].
+///
+/// Owns the pool registry, metadata store, WAL writer, segment lifecycle
+/// machinery (registry, coordinator, event WAL + checkpoint), sealer, the
+/// **two shared** segment store instances (one `DiskSegmentStore`, one
+/// `DiskSegmentShardStore` — the c1 consolidation of the former eight
+/// inline constructions), the seal-time segment replicator, the segment
+/// reader, the I/O observer, and the write-path pools the inline write
+/// coordinator + metrics code consumes.
+pub(crate) struct StorageModule {
+    /// The live storage-pool registry (ADR-0029) — constructed from
+    /// `config.storage` before the builder runs; every role-pinned path
+    /// and pool-aware component resolves through it.
+    pub(crate) registry: Arc<oceanfs_storage::PoolRegistry>,
+    /// Role-pinned directories for the node's non-segment data paths
+    /// (metadata, data WAL, event WAL, hint WAL).
+    pub(crate) paths: PoolPaths,
+    /// The metadata store (RocksDB) — held for recovery, the reaper, the
+    /// gRPC services, and the shutdown flush.
+    pub(crate) metadata_store: Arc<oceanfs_storage::RocksDbMetadataStore>,
+    /// The acceleration dispatcher probed at startup (ADR-0006) — shared
+    /// by the pools' EC encoder, the heal decoder, the segment reader and
+    /// the server-side compressors.
+    pub(crate) accel: Arc<oceanfs_accel::AccelDispatcher>,
+    /// The data-WAL writer — the durable write-ahead log the sealer and
+    /// recovery consume; held for the shutdown sync.
+    pub(crate) wal_writer: Arc<oceanfs_storage::WalWriter>,
+    /// The segment lifecycle registry (ADR-0025 Decision 2) — the
+    /// coordinator's in-memory state; constructed first and shared by the
+    /// pools, the GC/AE/scrub workers and the gRPC services.
+    pub(crate) lifecycle_registry: Arc<oceanfs_storage::SegmentLifecycleRegistry>,
+    /// The segment lifecycle event WAL (ADR-0024) — the coordinator's
+    /// durable side-effect.
+    pub(crate) event_wal: Arc<oceanfs_storage::EventWal>,
+    /// The event WAL checkpoint manager (ADR-0024 Decision 3) — bounded
+    /// snapshots of the folded registry.
+    pub(crate) event_checkpoint: Arc<oceanfs_storage::EventCheckpoint>,
+    /// The segment lifecycle coordinator (ADR-0025) — the single writer
+    /// of segment lifecycle state.
+    pub(crate) lifecycle: Arc<oceanfs_storage::SegmentLifecycleCoordinator>,
+    /// The segment sealer — the authoritative persistence path for sealed
+    /// segments (pool-aware placement, ADR-0029 f5).
+    pub(crate) sealer: Arc<oceanfs_storage::SegmentSealer>,
+    /// The shared segment data store — the ONE `DiskSegmentStore`
+    /// instance shared by the replicator, GC, AE, heal, scrub, admin,
+    /// segment-service and repair paths (reviews #57/#59/#60).
+    pub(crate) data_store: Arc<dyn oceanfs_durability::SegmentDataStore>,
+    /// The shared segment shard store — the ONE `DiskSegmentShardStore`
+    /// instance shared by GC compaction, the reaper, healing-service and
+    /// startup recovery.
+    pub(crate) shard_store: Arc<dyn oceanfs_durability::SegmentShardStore>,
+    /// The seal-time segment replicator (sealed-segment-replication) —
+    /// pushes sealed segments to their ring replicas off the seal path.
+    pub(crate) segment_replicator: Arc<SegmentReplicator>,
+    /// The segment reader (mmap / O_DIRECT / buffered, pool-aware) —
+    /// consumed by the read coordinator.
+    pub(crate) segment_reader: Arc<dyn oceanfs_storage::io::SegmentReader>,
+    /// The compaction-remap alias (g3 `loss-announcement` Option A) —
+    /// shared by the append handler and the healing service's remap
+    /// handler.
+    pub(crate) remap_alias: Arc<oceanfs_core::SegmentRemapAlias>,
+    /// The g1 shared per-pool I/O signal observer (ADR-0029 §D3) — the
+    /// seal pipeline records into it; the health monitor consumes it.
+    pub(crate) io_observer: Arc<oceanfs_storage::io::IoObserver>,
+    /// The write-path shard buffer pool (perf rule §2.5) — shared by the
+    /// segment shards and the gRPC segment service.
+    pub(crate) shard_buffer_pool: Arc<BufferPool>,
+    /// The small-tier segment shard (write concurrency, perf §2.5).
+    pub(crate) shard_small: Arc<SegmentShard>,
+    /// The standard-tier segment shard (write concurrency, perf §2.5).
+    pub(crate) shard_standard: Arc<SegmentShard>,
+    /// The small-tier segment pool (pipeline parallelism, perf §2.7).
+    pub(crate) segment_pool_small: Arc<SegmentPool>,
+    /// The standard-tier segment pool (pipeline parallelism, perf §2.7).
+    pub(crate) segment_pool_standard: Arc<SegmentPool>,
+    /// The active segment pools — retained for the live
+    /// `segment_active_count` metric poller.
+    pub(crate) active_pools: Vec<Arc<SegmentPool>>,
+    /// Startup-rebuild duration gauge: records the startup recovery
+    /// duration (checkpoint + fold + data-WAL pass + compaction
+    /// recovery); registered with the central metrics registry by the
+    /// server-side metrics block after recovery runs.
+    pub(crate) startup_rebuild_gauge: oceanfs_core::Gauge,
+}
+
+impl StorageModule {
+    /// Builds the storage subsystem bundle.
+    ///
+    /// Owns the construction previously inline in `Node::start()` §6–§6c
+    /// (segment pools + shards, WAL writer, lifecycle registry +
+    /// coordinator + event WAL/checkpoint, sealer, the two shared segment
+    /// stores, the seal-time replicator, the I/O reader) plus the
+    /// compaction-remap alias. Purely sequential object construction with
+    /// the same side effects (directory creation, WAL open) as the inline
+    /// code it replaces.
+    ///
+    /// # Parameters
+    ///
+    /// `config` and `paths` come from the validated node config and the
+    /// role-pinned path resolution; `registry`, `metadata_store` and
+    /// `accel` are constructed before the builder call in `Node::start()`
+    /// §0–§2 and owned by the returned module afterwards; `ring_cache`,
+    /// `membership` and `pool` are network-side handles the replicator
+    /// needs (still owned by `Node::start()` — c4 re-homes them).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL writer, event WAL or checkpoint cannot
+    /// be opened, a shard/pool construction fails, or the segment
+    /// directory cannot be created.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn build(
+        config: &NodeConfig,
+        paths: &PoolPaths,
+        registry: Arc<oceanfs_storage::PoolRegistry>,
+        metadata_store: Arc<oceanfs_storage::RocksDbMetadataStore>,
+        accel: Arc<oceanfs_accel::AccelDispatcher>,
+        ring_cache: Arc<oceanfs_routing::RingCache>,
+        membership: Arc<oceanfs_membership::Membership>,
+        pool: Arc<oceanfs_network::ConnectionPool>,
+    ) -> Result<Self, String> {
+        // ---- 6. Construct storage components ----
+        let segment_size = SegmentSizeConfig::default();
+        // [review][config][critical]
+        // wal configuration should be configurable by the end user too
+        // [end]
+        let wal_config = WalConfig { data_dir: paths.wal.clone(), ..WalConfig::default() };
+        let wal_writer = Arc::new(
+            oceanfs_storage::WalWriter::open(&wal_config)
+                .await
+                .map_err(|e| format!("failed to open WAL writer: {e}"))?,
+        );
+
+        // Per-core segment shards for write concurrency (perf rule §2.5).
+        let shard_count =
+            shard::derive_shard_count(config.segment_shard_count, config.segment_shard_count_max);
+        // Scale buffer pool max chunks by shard count (Item 8, D8.5).
+        let total_pool_chunks = config.buffer_pool_max_chunks * shard_count;
+        // Validate memory budget (Item 8, D8.3). The budget is the real
+        // buffer-pool memory: per-shard pool bytes (chunk bytes × max
+        // chunks) × shard count. The old call multiplied by segment size
+        // as well, producing a 2.2 TB false positive on every boot (F5).
+        let _ = crate::startup::validate_shard_memory_budget(
+            shard_count,
+            config.buffer_pool_chunk_bytes * config.buffer_pool_max_chunks,
+        );
+        let shard_buffer_pool =
+            Arc::new(BufferPool::new(config.buffer_pool_chunk_bytes, total_pool_chunks));
+        let shard_small = Arc::new(
+            SegmentShard::new(shard_count, SizeTier::Small, &segment_size, &shard_buffer_pool)
+                .map_err(|e| format!("failed to create small segment shard: {e}"))?,
+        );
+        let shard_standard = Arc::new(
+            SegmentShard::new(shard_count, SizeTier::Standard, &segment_size, &shard_buffer_pool)
+                .map_err(|e| format!("failed to create standard segment shard: {e}"))?,
+        );
+
+        // [review][config][critical]
+        // pools configurations should be configurable by the end user
+        // [end]
+        // Segment pools for pipeline parallelism (perf rule §2.7).
+        // Created before WAL replay so that replayed entries can be
+        // reconstructed into active segments (C4-storage, D6).
+        let pool_config = PoolConfig::default();
+        // [review][config][critical]
+        // pools configurations should be configurable by the end user
+        // [end]
+        // EC codec for the segment pools: work items carry (k, m, strip)
+        // so the seal worker computes and persists per-segment parity at
+        // seal time (single scheduler — the parallel encode runs on the
+        // blocking pool). Matches the heal codec configuration.
+        let pool_ec_config = oceanfs_core::CodecConfig::default();
+        // The pools consume `pool_ec_config` below (the machine's
+        // seal-on-zero freeze uses the same codec).
+        // Seal-time EC parity routes through the accel dispatcher so the
+        // encode is observable (accel_encode_ops_total, duration
+        // histograms, fallbacks) — the accel tier is exercised on the
+        // write path, not just in isolation.
+        let pool_ec_encoder: Option<Arc<dyn oceanfs_ec::Encoder>> = Some(accel.clone());
+        // The lifecycle registry is constructed FIRST (ADR-0025
+        // Decision 2): the pools hold it for the read path and the
+        // in-flight attach, and the coordinator wraps the same instance
+        // (construction order: registry → pools → coordinator).
+        let lifecycle_registry =
+            Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(&config.lifecycle));
+        let segment_pool_small = Arc::new(
+            SegmentPool::new(
+                pool_config.clone(),
+                SizeTier::Small,
+                &segment_size,
+                shard_buffer_pool.clone(),
+                Some(pool_ec_config.clone()),
+                pool_ec_encoder.clone(),
+                Arc::clone(&lifecycle_registry),
+            )
+            .map_err(|e| format!("failed to create small segment pool: {e}"))?,
+        );
+        let segment_pool_standard = Arc::new(
+            SegmentPool::new(
+                pool_config,
+                SizeTier::Standard,
+                &segment_size,
+                shard_buffer_pool.clone(),
+                Some(pool_ec_config),
+                pool_ec_encoder,
+                Arc::clone(&lifecycle_registry),
+            )
+            .map_err(|e| format!("failed to create standard segment pool: {e}"))?,
+        );
+
+        // [review][architecture][high]
+        // a node without a data pool should not be permitted to start, since their is not legacy mode to consider.
+        // also, a silent fallback to an arcane legacy mode is big bark pattern, an should never take place
+        // [end]
+        // ADR-0001: tiered segment sizing driven by SegmentSizeConfig.
+        // ---- f5: pool-aware segment placement + resolution ----
+        // Sealed segments spread across the node's data pools: the sealer
+        // selects the target once per segment (PlacementPolicy over the
+        // registry snapshot) and stamps `pool_id` on the metadata; every
+        // reader/GC store resolves the owning root through this resolver
+        // (the lifecycle registry's `SegmentMetadata.pool_id`, durable via
+        // the event WAL + checkpoint).
+        // Legacy mode (no pools configured) must pass an EMPTY pool list:
+        // the registry's implicit data pool (root = data_dir) is a
+        // runtime fallback, not a placement target — the sealer's legacy
+        // branch (empty `data_pools` → `data_dir`, pool_id 0) keeps
+        // today's byte-for-byte layout.
+        let data_pools =
+            if config.storage.pools.is_empty() { Vec::new() } else { registry.data_pools() };
+        let segment_legacy_dir = config.data_dir.join("segments");
+        let pool_id_for: oceanfs_storage::PoolIdResolver = {
+            let registry = Arc::clone(&lifecycle_registry);
+            Arc::new(move |segment_id: &SegmentId| {
+                registry.get(*segment_id).map(|entry| entry.metadata.pool_id)
+            })
+        };
+        // g1 `disk-io-observability` (ADR-0029 §D3): the shared per-pool
+        // I/O signal observer. The seal pipeline records write/fsync
+        // latency + errors per pool through it immediately; the health
+        // monitor (g2) consumes `snapshot`s. Every boot pool's signal
+        // state is registered with its `oceanfs_pool_io_errors_total`
+        // counter bound.
+        let io_observer = Arc::new(oceanfs_storage::io::IoObserver::new());
+        registry.observe_into(&io_observer);
+        let io_backend = Arc::new(oceanfs_storage::io::IoBackend::new());
+        // [review][implementation][critical]
+        // seal config must be unique per pool path : write and read mode could differ
+        // between each mount, since they depend on the nature of the FS
+        // [end]
+        let seal_config = oceanfs_storage::SealConfig {
+            data_pools: data_pools.clone(),
+            // f8 runtime attach: the sealer refreshes the data-pool list
+            // from the LIVE registry at each seal, so a pool attached via
+            // POST /admin/pools is a placement target immediately (no
+            // restart). Pool mode only — legacy mode keeps the boot-time
+            // empty list (registry: None) so the byte-for-byte layout is
+            // untouched.
+            // [review][config][high]
+            // consequence here : the registry cannot be none, since pool is not
+            // allpwed empty.
+            // [end]
+            registry: if config.storage.pools.is_empty() { None } else { Some(registry.clone()) },
+            target_size_bytes: segment_size.default_target_size,
+            // [review][config][high]
+            // seal timeout should be allowed to be user configured since
+            // and its default value cannot be a magic constant
+            // [end]
+            seal_timeout_ms: 5000,
+            data_dir: segment_legacy_dir.clone(),
+            io_mode: oceanfs_storage::io::IoReadMode::from_config(config.read_cache_segments),
+            write_mode: oceanfs_storage::io::SegmentWriteMode::probe(segment_legacy_dir.clone()),
+            // g1: the seal pipeline performs its writes/fsyncs through
+            // the observed DiskIo (per-pool signals).
+            io_backend: io_backend.clone(),
+            observer: io_observer.clone(),
+            // Seal pipeline batching (userland-configurable): the fsync
+            // group-commit window and the early-flush trigger size.
+            fsync_batch_timeout_ms: config.seal_fsync_batch_timeout_ms,
+            fsync_max_waiters: config.seal_fsync_max_waiters,
+        };
+        // [review][cleanup][medium]
+        // since roots are now handled within the pool registry, this part is probably
+        // useless. if not, it is part of the legacy we must remove.
+        // [end]
+        // SegmentSealer is the authoritative persistence path. Sealed
+        // segments are written to {data_dir}/segments/ (legacy) or the
+        // selected data pool root (pool mode, ADR-0029 f5) with the
+        // configured I/O mode (O_DIRECT or buffered). The shared segment
+        // data store is used by anti-entropy and healing below.
+        let segment_dir = segment_legacy_dir.clone();
+        // The seal worker runs BEFORE the WAL replay (replayed segments
+        // seal during replay), so the segment directory must already
+        // exist when the first replay seal fires.
+        if let Err(e) = std::fs::create_dir_all(&segment_dir) {
+            return Err(format!("cannot create segments directory {:?}: {e}", segment_dir));
+        }
+
+        // ---- 6b. Segment lifecycle coordinator (ADR-0025 phase 2) ----
+        // The ONLY writer of segment lifecycle state. The write path
+        // reserves through it before the first WAL entry of each
+        // segment; the seal path (via the flush coordinator) seals
+        // through it; the orphan reaper deletes through it. The
+        // registry is seeded from the segments CF so the coordinator
+        // is the complete single writer over EXISTING data too (the
+        // reaper's request_delete validates against it) — a pure
+        // registry fold, no CF writes.
+        //
+        // The event WAL (ADR-0024) is the coordinator's durable
+        // side-effect: every transition appends its event first; the CF
+        // write becomes a derived mirror performed after the event
+        // (dual-read verification surface — the event log is the source
+        // of truth for segment lifecycle).
+        // The event WAL dir is composed from `{data_dir}/event-wal` in
+        // legacy mode exactly like every other data path (data WAL at
+        // `{data_dir}/wal`, metadata at `{data_dir}/metadata`); in pool
+        // mode it rides the pinned wal pool root (`{wal pool}/event-wal`,
+        // ADR-0024 + ADR-0029 §D8 role pinning). The crate-level default
+        // (`/var/lib/oceanfs/event-wal`) is the system-layout default, and
+        // the node always overrides it — the same pattern applied to
+        // `WalConfig` above. Without this, any non-root run (dev, e2e,
+        // tests) fails to open the event WAL with permission denied.
+        let event_wal_config = oceanfs_core::EventWalConfig {
+            event_wal_dir: paths.event_wal.clone(),
+            ..config.event_wal.clone()
+        };
+        let event_wal = Arc::new(
+            oceanfs_storage::EventWal::open(
+                event_wal_config.event_wal_dir.clone(),
+                &event_wal_config,
+            )
+            .await
+            .map_err(|e| format!("failed to open segment event WAL: {e}"))?,
+        );
+        // The event log's own GC (ADR-0024 Decision 3): byte-threshold
+        // snapshots of the folded registry + truncation of covered
+        // events. Checkpoint files live beside the event WAL files.
+        let event_checkpoint = Arc::new(
+            oceanfs_storage::EventCheckpoint::open(
+                event_wal_config.event_wal_dir.clone(),
+                event_wal.clone(),
+            )
+            .map_err(|e| format!("failed to open event WAL checkpoint manager: {e}"))?,
+        );
+        let lifecycle = Arc::new(
+            oceanfs_storage::SegmentLifecycleCoordinator::with_registry(Arc::clone(
+                &lifecycle_registry,
+            ))
+            // Phase 2: event appends become the durable side-effect;
+            // the CF write is demoted to a derived mirror.
+            .with_event_wal(event_wal.clone())
+            // Checkpoint trigger: threshold-only, off the append path.
+            .with_checkpoint(event_checkpoint.clone(), event_wal_config.clone())
+            // The seal pools: the pending-seal drain freezes partial
+            // segments through them (seal-on-zero — no idle timer).
+            .with_seal_pools(vec![segment_pool_small.clone(), segment_pool_standard.clone()]),
+        );
+        let sealer = Arc::new(oceanfs_storage::SegmentSealer::new(
+            seal_config,
+            wal_writer.clone(),
+            lifecycle.clone(),
+        ));
+
+        // ---- c1 store consolidation (reviews #57/#59/#60) ----
+        // ONE shared `DiskSegmentStore` + ONE shared `DiskSegmentShardStore`
+        // replace the eight per-consumer instances the inline code created
+        // (replicator, re-rep worker, GC, AE, reaper, heal, healing-service,
+        // segment-service). All consumers receive clones of these two Arcs.
+        let data_store: Arc<dyn oceanfs_durability::SegmentDataStore> =
+            Arc::new(oceanfs_durability::DiskSegmentStore::new(
+                data_pools.clone(),
+                segment_legacy_dir.clone(),
+                pool_id_for.clone(),
+            ));
+        let shard_store: Arc<dyn oceanfs_durability::SegmentShardStore> =
+            Arc::new(oceanfs_durability::DiskSegmentShardStore::new(
+                data_pools.clone(),
+                segment_legacy_dir.clone(),
+                pool_id_for.clone(),
+            ));
+
+        // [review][config][high]
+        // segment relicator config shoudl be fully configurable by the end user
+        // [end]
+        // ---- 6c. Seal-time segment replicator (sealed-segment-replication) ----
+        // The data-replication backbone: after a segment seals on this
+        // node, its full data section is pushed to the segment's ring
+        // replicas (segment_replica_set − self) — the exact set the read
+        // path's gRPC fallback fetches from. Seal itself never makes a
+        // network call: the seal worker / compactor only `enqueue` (one
+        // atomic channel send); the decoupled `run` task does the pushes.
+        // The replicator shares the module's single data store (pool
+        // resolution via the lifecycle registry).
+        let segment_replicator = Arc::new(SegmentReplicator::new(
+            ring_cache.clone(),
+            membership.clone(),
+            pool.clone(),
+            data_store.clone(),
+            lifecycle.clone(),
+            NodeId::new(&config.node_id),
+            ReplicationConfig {
+                throttle_bytes_sec: config.replication_throttle_bytes_sec,
+                ..Default::default()
+            },
+        ));
+
+        // The compaction-remap alias (g3 `loss-announcement` Option A):
+        // a single shared map consulted by the append handler (late
+        // metadata) and the healing service's remap handler (records
+        // old→new + chunk table).
+        let remap_alias: Arc<oceanfs_core::SegmentRemapAlias> =
+            Arc::new(oceanfs_core::SegmentRemapAlias::new());
+
+        // ---- I/O infrastructure: disk-backed segment reader ----
+        // [review][architecture][critical]
+        // we have 3 abstractions to access disk : DiskSegmentStore, DiskSegmentShardStore and DiskSegmentReader.
+        // each independently implements optimisations or not, without unified logic. this is awfull, and must be resolved.
+        // [end]
+        // Disk-backed segment reader: reads sealed segment files from disk
+        // via the configured I/O mode (mmap / O_DIRECT / buffered).
+        // Replaces the previous InMemorySegmentReader — segment data is read
+        // on demand from the filesystem. No startup preload, no unbounded
+        // HashMap growth.
+        let io_mode = oceanfs_storage::io::IoReadMode::from_config(config.read_cache_segments);
+        // Build the mmap segment cache when read-optimised mode is enabled.
+        let mmap_cache = if io_mode == oceanfs_storage::io::IoReadMode::Mmap {
+            Some(Arc::new(oceanfs_storage::io::SegmentFileCache::new(
+                config.segment_cache_max_entries,
+            )))
+        } else {
+            None
+        };
+        let segment_reader: Arc<dyn oceanfs_storage::io::SegmentReader> = Arc::new(
+            oceanfs_storage::io::DiskSegmentReader::new(
+                io_mode,
+                io_backend.clone(),
+                mmap_cache,
+                segment_dir.clone(),
+                Some(accel.clone()),
+                Some(accel.clone()),
+            )
+            // Pool-aware resolution (ADR-0029 f5): sealed segments read
+            // from the owning data pool root. f8 runtime attach: the
+            // live registry is wired so a pool attached mid-run resolves
+            // (the resolved root is cached per segment — no registry
+            // lock on the steady-state read path; legacy mode
+            // short-circuits to legacy_dir before touching the registry).
+            .with_data_pools(data_pools, segment_legacy_dir, pool_id_for)
+            .with_registry(registry.clone())
+            .with_evict_after_read(!config.read_cache_segments),
+        );
+        // Clone pool Arcs for the read path — the originals are retained
+        // by this module; the write coordinator receives its own clones
+        // below. PoolFallbackReader checks active (unsealed) segments
+        // before falling back to DiskSegmentReader, closing the
+        // read-after-write gap for recently-written data.
+        let active_pools = vec![segment_pool_small.clone(), segment_pool_standard.clone()];
+        let segment_reader = Arc::new(oceanfs_storage::io::PoolFallbackReader::new(
+            active_pools.clone(),
+            segment_reader,
+        ));
+
+        Ok(Self {
+            registry,
+            paths: paths.clone(),
+            metadata_store,
+            accel,
+            wal_writer,
+            lifecycle_registry,
+            event_wal,
+            event_checkpoint,
+            lifecycle,
+            sealer,
+            data_store,
+            shard_store,
+            segment_replicator,
+            segment_reader,
+            remap_alias,
+            io_observer,
+            shard_buffer_pool,
+            shard_small,
+            shard_standard,
+            segment_pool_small,
+            segment_pool_standard,
+            active_pools,
+            startup_rebuild_gauge: oceanfs_core::Gauge::new(
+                "oceanfs_startup_rebuild_ms".into(),
+                "Startup rebuild duration (checkpoint + fold + data-WAL pass + compaction recovery), ms"
+                    .into(),
+                oceanfs_core::LabelSet::empty(),
+            ),
+        })
+    }
+
+    /// Runs startup recovery: the machine path (ADR-0025 phase 2).
+    ///
+    /// Deterministic recovery — fold the event log into the registry
+    /// (state = fold(events)), rebuild Reserved-unsealed segments from the
+    /// data WAL, resolve incomplete compaction units (rows 7-9), then run
+    /// the startup replication pass for sealed segments whose
+    /// `storage_locations` was never stamped. The startup cost is bounded
+    /// by the checkpoint threshold, never by lifetime event volume.
+    ///
+    /// Must be called after every component that consumes the recovery
+    /// output (the AE merkle rebuild etc.) is constructed — i.e. at the
+    /// position the inline §6a/§6b blocks used to occupy in `start()`.
+    /// Records the rebuild duration on [`Self::startup_rebuild_gauge`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the event-WAL fold, data-WAL replay or the
+    /// incomplete-compaction recovery pass fails.
+    pub(crate) async fn run_startup_recovery(&self) -> Result<(), String> {
+        let rebuild_start = std::time::Instant::now();
+        let wal_config = WalConfig { data_dir: self.paths.wal.clone(), ..WalConfig::default() };
+        let wal_reader = oceanfs_storage::wal::WalReader::open(&wal_config)
+            .map_err(|e| format!("failed to open WAL reader: {e}"))?;
+        // Load the latest checkpoint (ADR-0024 Decision 3): its snapshot
+        // seeds the registry; the fold starts at its covered position —
+        // startup replay is bounded by the byte threshold, not by
+        // lifetime event volume. Without a checkpoint the fold starts at
+        // the earliest retained event.
+        let fold_start = match self
+            .event_checkpoint
+            .load_checkpoint()
+            .map_err(|e| format!("failed to load event WAL checkpoint: {e}"))?
+        {
+            Some((snapshot, covered)) => {
+                self.lifecycle.seed_from_checkpoint(&snapshot);
+                info!(covered = ?covered, "event WAL checkpoint loaded; folding events after it");
+                covered
+            }
+            None => oceanfs_storage::EventWalPos { file_seq: 0, offset: 0 },
+        };
+        let recovery_outcome = self
+            .lifecycle
+            .rebuild_with_data_wal(
+                self.event_wal.read_from(fold_start),
+                &wal_reader,
+                &self.sealer,
+                |data| {
+                    oceanfs_durability::MerkleTree::build(data, 0).map(|tree| tree.root().hash())
+                },
+                &self.wal_writer,
+            )
+            .await
+            .map_err(|e| format!("event-WAL recovery failed: {e}"))?;
+        info!(
+            folded = recovery_outcome.folded_segments,
+            dropped_empty = recovery_outcome.dropped_empty_reserves,
+            re_sealed = recovery_outcome.re_sealed_segments,
+            adopted = recovery_outcome.adopted_segments,
+            swept = recovery_outcome.swept_entries,
+            "event-WAL recovery complete (ADR-0025 phase 2)"
+        );
+        // Rows 7-9: incomplete compaction units — the folded registry's
+        // `repacked_from` markers, one objects-CF read per unit. Each
+        // action deletes through the coordinator (durable before
+        // unlink) and sweeps the `.dat` (idempotent).
+        let compaction_actions = recover_incomplete_compactions(
+            self.lifecycle.registry(),
+            &StoreObjectLookup(
+                Arc::clone(&self.metadata_store) as Arc<dyn oceanfs_storage_api::MetadataStore>
+            ),
+        )
+        .map_err(|e| format!("compaction recovery failed: {e}"))?;
+        for action in &compaction_actions {
+            let (segment_id, label) = match action {
+                CompactionRecoveryAction::FinishOldDeletion(id) => (*id, "finish_old_deletion"),
+                CompactionRecoveryAction::SweepNewOrphan(id) => (*id, "sweep_new_orphan"),
+                CompactionRecoveryAction::SweepOldDat(id) => (*id, "sweep_old_dat"),
+            };
+            if !matches!(action, CompactionRecoveryAction::SweepOldDat(_)) {
+                if let Err(e) = self.lifecycle.request_delete(segment_id).await {
+                    warn!(
+                        segment_id = %segment_id,
+                        error = %e,
+                        "compaction recovery delete failed (startup continues; the reaper retries)"
+                    );
+                }
+            }
+            // Sweep the `.dat` through the pool-aware shard store (the
+            // segment's pool id resolves to its root; ADR-0029 f5).
+            // Idempotent; a residue the resolver cannot place (an
+            // unregistered orphan on a non-zero pool) is backstopped by
+            // the orphan reaper's multi-root listing.
+            if let Err(e) = self.shard_store.delete_shards(segment_id) {
+                warn!(
+                    segment_id = %segment_id,
+                    error = %e,
+                    "compaction recovery sweep failed (startup continues; the reaper retries)"
+                );
+            }
+            info!(segment_id = %segment_id, action = label, "compaction recovery action applied");
+        }
+        let rebuild_ms = rebuild_start.elapsed().as_millis() as u64;
+        self.startup_rebuild_gauge.set(rebuild_ms);
+        info!(rebuild_ms, "startup rebuild complete");
+        // Retention liveness is machine-backed (ADR-0024 §Retention): an
+        // entry at position p of segment S is garbage iff S is sealed
+        // with data_wal_pos ≥ p, or deleted. Entries whose segment has
+        // no registry entry are unreachable (the reserve-before-entry
+        // invariant) — sweepable.
+        {
+            let registry = Arc::clone(&self.lifecycle_registry);
+            self.wal_writer.set_liveness(Arc::new(move |id, pos| match registry.get(id) {
+                Some(entry) => oceanfs_storage::entry_is_garbage(&entry, &pos),
+                None => true,
+            }));
+        }
+
+        // ---- Startup replication pass (sealed-segment-replication) ----
+        // Segments whose storage_locations was never stamped (sealed but
+        // the replicator never completed a push — a crash between the
+        // SealEvent and the first ack, or a segment adopted/replayed by
+        // recovery) must be re-published so the replicator fans them out.
+        // Non-empty storage_locations = fully acked, skip. One pass, off
+        // the hot path; the replicator's channel is bounded (overflow
+        // routes to its needs set).
+        {
+            let mut pending = 0u64;
+            self.lifecycle.registry().for_each(|segment_id, entry| {
+                if entry.state == oceanfs_storage::SegmentState::Sealed
+                    && entry.metadata.storage_locations.is_empty()
+                {
+                    self.segment_replicator.enqueue(segment_id);
+                    pending += 1;
+                }
+            });
+            if pending > 0 {
+                info!(pending, "startup replication pass enqueued sealed segments");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    /// Builds the pre-builder prelude exactly as `Node::start()` §0–§5
+    /// does (registry + paths + metadata + accel + ring + membership +
+    /// pool) and runs `StorageModule::build`. Legacy mode (empty
+    /// `[storage.pools]`) — the same mode every node test boots until the
+    /// legacy-mode-removal f1 fixture prep lands.
+    async fn build_module(tmp: &TempDir) -> StorageModule {
+        let data_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let config = NodeConfig {
+            data_dir: data_dir.clone(),
+            // The event WAL lives under the temp data dir (the default
+            // /var/lib/oceanfs/event-wal is not writable in tests).
+            event_wal: oceanfs_core::EventWalConfig {
+                event_wal_dir: tmp.path().join("event-wal"),
+                ..Default::default()
+            },
+            ..NodeConfig::default()
+        };
+        let registry = Arc::new(
+            oceanfs_storage::PoolRegistry::from_config(&config.storage, &data_dir)
+                .expect("pool registry"),
+        );
+        let paths = crate::pool_paths::pool_paths(&registry, &data_dir, &config.hint_wal_dir);
+        let metadata_store = Arc::new(
+            oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: paths.metadata.clone(),
+                ..Default::default()
+            })
+            .expect("metadata store"),
+        );
+        let accel =
+            Arc::new(oceanfs_accel::AccelDispatcher::new(oceanfs_core::AccelConfig::default()));
+        let ring_cache = Arc::new(oceanfs_routing::RingCache::new(oceanfs_routing::Ring::new(
+            oceanfs_core::RingConfig::default(),
+        )));
+        let membership = Arc::new(oceanfs_membership::Membership::new(
+            oceanfs_core::NodeId::new("test-node"),
+            "127.0.0.1:0".parse().expect("addr"),
+            "127.0.0.1:0".parse().expect("addr"),
+            oceanfs_core::GossipConfig::default(),
+            ring_cache.clone(),
+        ));
+        let pool =
+            Arc::new(oceanfs_network::ConnectionPool::new(oceanfs_core::RpcConfig::default()));
+        StorageModule::build(
+            &config,
+            &paths,
+            registry,
+            metadata_store,
+            accel,
+            ring_cache,
+            membership,
+            pool,
+        )
+        .await
+        .expect("storage module build")
+    }
+
+    /// c1 DoD: the builder returns a consistent `StorageModule` whose
+    /// store surface is exactly TWO shared instances — one
+    /// `DiskSegmentStore` (`data_store`) and one `DiskSegmentShardStore`
+    /// (`shard_store`). The construction-site count itself is a grep
+    /// invariant (`DiskSegmentStore::new` / `DiskSegmentShardStore::new`
+    /// appear exactly once each, both here in `build`); this test proves
+    /// the instances are live and operate on the same layout.
+    #[tokio::test]
+    async fn build_returns_module_with_two_shared_store_instances() {
+        let tmp = TempDir::new().expect("tempdir");
+        let module = build_module(&tmp).await;
+
+        // Registry is the boot-time one; the module owns it.
+        assert!(module.registry.pool_count() >= 1, "registry must be populated");
+
+        // The two shared instances are distinct objects.
+        let data_ptr = Arc::as_ptr(&module.data_store) as *const ();
+        let shard_ptr = Arc::as_ptr(&module.shard_store) as *const ();
+        assert_ne!(data_ptr, shard_ptr, "data_store and shard_store must be distinct");
+
+        // The data store is a working DiskSegmentStore: write → read
+        // round-trips through the same .dat file it manages.
+        let segment_id = SegmentId::new();
+        let payload = b"c1 shared data store round-trip payload";
+        module
+            .data_store
+            .write_segment_data(&segment_id, payload)
+            .expect("write through shared data store");
+        let back = module
+            .data_store
+            .read_segment_data(&segment_id)
+            .expect("read back through shared data store");
+        assert_eq!(&back[..], payload, "shared data store round-trip");
+
+        // The shard store deletes the same .dat the data store wrote
+        // (same resolver/layout); afterwards the data store must no
+        // longer find it.
+        module.shard_store.delete_shards(segment_id).expect("delete through shared shard store");
+        assert!(
+            module.data_store.read_segment_data(&segment_id).is_err(),
+            "segment must be gone after shard-store delete"
+        );
+
+        // Recovery on an empty (post-build) store completes.
+        module.run_startup_recovery().await.expect("empty startup recovery");
+    }
+
+    /// The module exposes the write-path pools + reader the inline
+    /// coordinator/metrics code consumes after `build`.
+    #[tokio::test]
+    async fn build_exposes_write_path_pools_and_reader() {
+        let tmp = TempDir::new().expect("tempdir");
+        let module = build_module(&tmp).await;
+
+        assert_eq!(module.active_pools.len(), 2, "one small + one standard pool");
+        assert!(Arc::ptr_eq(&module.active_pools[0], &module.segment_pool_small));
+        assert!(Arc::ptr_eq(&module.active_pools[1], &module.segment_pool_standard));
+        // Reader and replicator are constructed against the boot ring
+        // (empty in this test — no nodes registered).
+        let _ = &module.segment_reader;
+        assert_eq!(
+            module.segment_replicator.ring_node_count(),
+            0,
+            "replicator present, reading the empty boot ring"
+        );
+    }
+}

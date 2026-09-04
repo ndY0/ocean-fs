@@ -11,11 +11,10 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use bytes::Bytes;
 use oceanfs_core::{
-    shard, AccelConfig, BucketId, Hlc, HlcClock, Incarnation, MetadataConfig, MetricRegistrar,
-    NodeConfig, NodeId, ObjectKey, ObjectMetadata, PoolConfig, RingConfig, RpcConfig, SegmentId,
-    SegmentSizeConfig, SizeTier, Tombstone, WalConfig,
+    AccelConfig, BucketId, Hlc, HlcClock, Incarnation, MetadataConfig, MetricRegistrar, NodeConfig,
+    NodeId, ObjectKey, ObjectMetadata, RingConfig, RpcConfig, SegmentId, SegmentSizeConfig,
+    Tombstone, WalConfig,
 };
 // ---------------------------------------------------------------------------
 // RepairSinkChannel — g3 → g5 re-replication repair queue adapter
@@ -23,15 +22,13 @@ use oceanfs_core::{
 /// A re-replication repair request (g5 ReRepWorker input).
 pub use oceanfs_durability::healing_service::ReRepRequest as RepairRequest;
 use oceanfs_durability::{
-    recover_incomplete_compactions, CompactionRecoveryAction, GrpcHintDeliveryClient,
-    HintedHandoff, HintedHandoffConfig, HintedHandoffManager, StoreObjectLookup,
+    GrpcHintDeliveryClient, HintedHandoff, HintedHandoffConfig, HintedHandoffManager,
 };
 use oceanfs_network::{apply_opts_to_fd, create_reuseport_listener};
 use oceanfs_server::{
     auth::AuthMiddleware, metadata_ops::MetadataOps, AdminHandler, BucketConfigStore,
     ReadCoordinator, Router, S3Handler, WriteCoordinator,
 };
-use oceanfs_storage::{SegmentPool, SegmentShard};
 use tokio::{sync::broadcast, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -146,213 +143,6 @@ impl oceanfs_storage_api::MetadataStore for PrefetchStoreAdapter {
 
     fn delete_object(&self, bucket: &BucketId, key: &ObjectKey, hlc: Hlc) -> std::io::Result<()> {
         self.store.delete_object(bucket, key, hlc).map_err(|e| std::io::Error::other(e.to_string()))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Node leave handler — implements GracefulLeaveHandler for WAL + shard handoff
-// ---------------------------------------------------------------------------
-
-// [review][architecture][critical]
-// read the whole data dir, wich is potentially terabytes of data. Data pool refactor omitted this part
-// it is still consuming directly a unique segment data dir. more broadly, since data is replicated, there is not point
-// in handing over the whole data to an another node. at shutdown, the node should stop accepting new request, and try best effort to
-// finish the wwork in progress. other nodes sharing replicas should detect the under replication after the end of the grace period
-// (node is marked dead), elect a new primary holder, and the holder should start re-replication. this is a rather complicated mechanism,
-// but i think it is more realistic than waiting terabytes of transfer during a node shutdown. moreover, we implicitely rely on the node
-// gracefully shutting down, wich could very well be forcelfully killed instead.
-// [end]
-/// Handles WAL sealing and segment shard streaming during graceful leave.
-struct NodeLeaveHandler {
-    /// WAL writer for flushing pending entries.
-    wal_writer: Arc<oceanfs_storage::WalWriter>,
-    /// Directory containing authoritative segment files.
-    segment_dir: std::path::PathBuf,
-    /// Connection pool for gRPC data transfer.
-    pool: Arc<oceanfs_network::ConnectionPool>,
-    /// Membership for resolving successor node addresses.
-    membership: Arc<oceanfs_membership::Membership>,
-}
-
-impl NodeLeaveHandler {
-    /// Lists segment IDs from the segments directory.
-    fn list_segments(&self) -> std::io::Result<Vec<oceanfs_core::SegmentId>> {
-        let mut ids = Vec::new();
-        for entry in std::fs::read_dir(&self.segment_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().map(|e| e == "dat").unwrap_or(false) {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if let Ok(parsed) = uuid::Uuid::parse_str(stem) {
-                        ids.push(oceanfs_core::SegmentId::from_uuid_bytes(*parsed.as_bytes()));
-                    }
-                }
-            }
-        }
-        Ok(ids)
-    }
-
-    // [review][correctness][critical]
-    // read a fixed 76 byte offset for the headers. since we introduced compression, headers are variable size.
-    // [end]
-    /// Reads segment data, skipping the 76-byte header.
-    fn read_segment_data(
-        &self,
-        seg_id: &oceanfs_core::SegmentId,
-    ) -> std::io::Result<Option<bytes::Bytes>> {
-        let path = self.segment_dir.join(format!("{seg_id}.dat"));
-        match std::fs::read(&path) {
-            Ok(data) if data.len() >= 76 => Ok(Some(bytes::Bytes::from(data[76..].to_vec()))),
-            Ok(_) => Ok(None),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl oceanfs_membership::GracefulLeaveHandler for NodeLeaveHandler {
-    async fn handoff_wal_to(&self, successor: &oceanfs_core::NodeId) -> oceanfs_core::Result<()> {
-        // Seal: flush pending WAL entries to disk.
-        self.wal_writer
-            .sync()
-            .await
-            .map_err(|e| oceanfs_core::Error::Leave(format!("WAL sync failed: {e}")))?;
-
-        info!(
-            successor = %successor,
-            "WAL flushed to disk for graceful leave handoff"
-        );
-
-        // Push: transfer WAL-protected segment data to the successor.
-        // Segments in the blob store represent data that was previously
-        // WAL-protected and has been sealed. Transferring them completes
-        // the WAL handoff.
-        let segments = self
-            .list_segments()
-            .map_err(|e| oceanfs_core::Error::Leave(format!("segment list failed: {e}")))?;
-
-        let mut transferred = 0usize;
-        for seg_id in &segments {
-            if let Some(data) = self
-                .read_segment_data(seg_id)
-                .map_err(|e| oceanfs_core::Error::Leave(format!("segment read failed: {e}")))?
-            {
-                if self.push_data_to_node(successor, seg_id, &data).await.is_ok() {
-                    transferred += 1;
-                }
-            }
-        }
-        info!(
-            successor = %successor,
-            transferred,
-            total = segments.len(),
-            "WAL-protected segments handed off to successor"
-        );
-        Ok(())
-    }
-
-    async fn transfer_segment_shards_to(
-        &self,
-        successor: &oceanfs_core::NodeId,
-    ) -> oceanfs_core::Result<usize> {
-        // Enumerate owned segments.
-        let segments = self
-            .list_segments()
-            .map_err(|e| oceanfs_core::Error::Leave(format!("segment list failed: {e}")))?;
-
-        if segments.is_empty() {
-            info!(successor = %successor, "no segments to transfer");
-            return Ok(0);
-        }
-
-        info!(
-            successor = %successor,
-            count = segments.len(),
-            "transferring segment shards to successor"
-        );
-
-        let mut transferred: usize = 0;
-
-        // Transfer each segment via hinted handoff gRPC.
-        for seg_id in &segments {
-            let data = self
-                .read_segment_data(seg_id)
-                .map_err(|e| oceanfs_core::Error::Leave(format!("segment read failed: {e}")))?;
-
-            let data = match data {
-                Some(d) => d,
-                None => continue,
-            };
-
-            // Push segment data to successor via hinted handoff.
-            if let Err(e) = self.push_data_to_node(successor, seg_id, &data).await {
-                warn!(
-                    successor = %successor,
-                    segment_id = %seg_id,
-                    error = %e,
-                    "failed to transfer segment shard"
-                );
-                continue;
-            }
-            transferred += 1;
-        }
-
-        Ok(transferred)
-    }
-}
-
-impl NodeLeaveHandler {
-    /// Pushes segment data to a remote node via `HealingRpcClient::hinted_handoff`.
-    async fn push_data_to_node(
-        &self,
-        node: &oceanfs_core::NodeId,
-        segment_id: &oceanfs_core::SegmentId,
-        data: &[u8],
-    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let addr = self
-            .membership
-            .address_of(node)
-            .ok_or_else(|| format!("no address for node {node}"))?;
-
-        let channel = {
-            let pooled = self
-                .pool
-                .get_channel(addr)
-                .await
-                .map_err(|e| format!("connection pool error for {node}: {e}"))?;
-
-            pooled.channel().clone()
-        };
-
-        use oceanfs_core::Hlc;
-        use oceanfs_durability::{healing_rpc::HintRequest, HealingRpcClient};
-
-        let mut client = HealingRpcClient::new(channel);
-        let proto_seg: oceanfs_core::proto::common::SegmentId = (*segment_id).into();
-        let proto_node: oceanfs_core::proto::common::NodeId = node.clone().into();
-
-        let request = tonic::Request::new(HintRequest {
-            intended_for: Some(proto_node),
-            segment_id: Some(proto_seg),
-            data: Bytes::copy_from_slice(data),
-            hlc: Some(Hlc::zero().into()),
-        });
-
-        let timeout_ms = 5000u64;
-        let response = tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
-            client.hinted_handoff_single(request),
-        )
-        .await
-        .map_err(|_| format!("gRPC hinted_handoff to {node} timed out after {timeout_ms}ms"))?
-        .map_err(|s| format!("gRPC hinted_handoff to {node} failed: {s}"))?;
-
-        if !response.into_inner().accepted {
-            return Err(format!("node {node} rejected hinted handoff").into());
-        }
-
-        Ok(())
     }
 }
 
@@ -493,14 +283,12 @@ fn property_as_u64(store: &oceanfs_storage::RocksDbMetadataStore, name: &str) ->
 /// A running OceanFS node.
 ///
 /// Owns live references to all subsystem components so they remain
-/// alive for the lifetime of the node. The acceleration dispatcher
-/// is probed at startup per ADR-0006 and cached here for consumers
-/// (encoders, decoders, hash accelerators).
+/// alive for the lifetime of the node. Storage-side components live in
+/// `crate::modules::storage::StorageModule` (c1); the durability workers
+/// still held directly here move to a `DurabilityModule` in c2.
 pub struct Node {
     /// Node configuration.
     config: Arc<NodeConfig>,
-    /// Acceleration dispatcher probed at startup (ADR-0006).
-    pub(crate) accel: Arc<oceanfs_accel::AccelDispatcher>,
     /// Bound HTTP server socket address.
     server_addr: SocketAddr,
     /// Bound gRPC server socket address.
@@ -511,28 +299,12 @@ pub struct Node {
     grpc_shutdown: CancellationToken,
     /// Background task handles and cancellation tokens.
     background: BackgroundTasks,
-    /// Graceful leave handler for WAL and segment handoff.
-    leave_handler: Arc<NodeLeaveHandler>,
-    /// Cluster membership for leave signaling.
+    /// Cluster membership for leave signaling and observability.
     membership: Arc<oceanfs_membership::Membership>,
-    /// Metadata store (held for graceful shutdown flush).
-    metadata_store: Arc<oceanfs_storage::RocksDbMetadataStore>,
-    /// WAL writer (held for graceful shutdown sync).
-    wal_writer: Arc<oceanfs_storage::WalWriter>,
-    /// The live storage-pool registry (ADR-0029) — held so the admin
-    /// attach surface and tests can observe the pool set.
-    pub(crate) pool_registry: Arc<oceanfs_storage::PoolRegistry>,
-    /// The g1 shared per-pool I/O signal observer (ADR-0029 §D3) — the
-    /// seal pipeline records write/fsync signals into it; the g2 health
-    /// monitor consumes snapshots. Held for tests/observability.
-    pub(crate) io_observer: Arc<oceanfs_storage::io::IoObserver>,
-    /// The seal-time segment replicator (sealed-segment-replication) —
-    /// held so tests can observe the replication pipeline.
-    pub(crate) segment_replicator: Arc<crate::segment_replicator::SegmentReplicator>,
-    /// The compaction-remap alias (g3 `loss-announcement` Option A) —
-    /// shared by the append handler (late metadata) and the healing
-    /// service's remap handler. Held for tests/observability.
-    pub(crate) remap_alias: Arc<oceanfs_core::SegmentRemapAlias>,
+    /// The storage subsystem bundle (c1 — `modules/storage.rs`): pool
+    /// registry, metadata store, WAL, lifecycle machinery, the two shared
+    /// segment stores, the replicator, and the write-path pools.
+    storage: crate::modules::storage::StorageModule,
     /// The re-replication dispatcher (g5, ADR-0030 target-pull) — the
     /// `RepairSink` g3/g4 enqueue into. It selects an acquiring target
     /// and sends the `RequestReReplication` RPC; requests with no
@@ -542,9 +314,6 @@ pub struct Node {
     /// The re-replication worker (g5) — the ACQUIRING-side executor.
     /// Held so the node can spawn it and tests can observe it.
     pub(crate) rep_worker: Arc<oceanfs_durability::ReRepWorker>,
-    /// The lifecycle coordinator — the node's segment lifecycle
-    /// machine. Held for g5 observability (`segment_locations`).
-    pub(crate) lifecycle: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
     /// The periodic reconciliation loop (g4 `reconciliation` — the
     /// ADR-0029 §D4 pull safety net). Held so tests can observe its
     /// pending-queue depth and holder index.
@@ -740,288 +509,19 @@ impl Node {
         // [review][config][critical]
         // segment tiers sizes should be configurable by the end user too
         // [end]
-        // ---- 6. Construct storage components ----
-        let segment_size = SegmentSizeConfig::default();
-        // [review][config][critical]
-        // wal configuration should be configurable by the end user too
-        // [end]
-        let wal_config = WalConfig { data_dir: paths.wal.clone(), ..WalConfig::default() };
-        let wal_writer = Arc::new(
-            oceanfs_storage::WalWriter::open(&wal_config)
-                .await
-                .map_err(|e| format!("failed to open WAL writer: {e}"))?,
-        );
-
-        // Per-core segment shards for write concurrency (perf rule §2.5).
-        let shard_count =
-            shard::derive_shard_count(config.segment_shard_count, config.segment_shard_count_max);
-        // Scale buffer pool max chunks by shard count (Item 8, D8.5).
-        let total_pool_chunks = config.buffer_pool_max_chunks * shard_count;
-        // Validate memory budget (Item 8, D8.3). The budget is the real
-        // buffer-pool memory: per-shard pool bytes (chunk bytes × max
-        // chunks) × shard count. The old call multiplied by segment size
-        // as well, producing a 2.2 TB false positive on every boot (F5).
-        let _ = crate::startup::validate_shard_memory_budget(
-            shard_count,
-            config.buffer_pool_chunk_bytes * config.buffer_pool_max_chunks,
-        );
-        let shard_buffer_pool = Arc::new(oceanfs_storage::BufferPool::new(
-            config.buffer_pool_chunk_bytes,
-            total_pool_chunks,
-        ));
-        let shard_small = Arc::new(
-            SegmentShard::new(shard_count, SizeTier::Small, &segment_size, &shard_buffer_pool)
-                .map_err(|e| format!("failed to create small segment shard: {e}"))?,
-        );
-        let shard_standard = Arc::new(
-            SegmentShard::new(shard_count, SizeTier::Standard, &segment_size, &shard_buffer_pool)
-                .map_err(|e| format!("failed to create standard segment shard: {e}"))?,
-        );
-        // Keep clones for metric registration — the originals are moved
-        // into the write coordinator below.
-        let shard_small_metrics = Arc::clone(&shard_small);
-        let shard_standard_metrics = Arc::clone(&shard_standard);
-
-        // [review][config][critical]
-        // pools configurations should be configurable by the end user
-        // [end]
-        // Segment pools for pipeline parallelism (perf rule §2.7).
-        // Created before WAL replay so that replayed entries can be
-        // reconstructed into active segments (C4-storage, D6).
-        let pool_config = PoolConfig::default();
-        // [review][config][critical]
-        // pools configurations should be configurable by the end user
-        // [end]
-        // EC codec for the segment pools: work items carry (k, m, strip)
-        // so the seal worker computes and persists per-segment parity at
-        // seal time (single scheduler — the parallel encode runs on the
-        // blocking pool). Matches the heal codec configuration.
-        let pool_ec_config = oceanfs_core::CodecConfig::default();
-        // The pools consume `pool_ec_config` below (the machine's
-        // seal-on-zero freeze uses the same codec).
-        // Seal-time EC parity routes through the accel dispatcher so the
-        // encode is observable (accel_encode_ops_total, duration
-        // histograms, fallbacks) — the accel tier is exercised on the
-        // write path, not just in isolation.
-        let pool_ec_encoder: Option<std::sync::Arc<dyn oceanfs_ec::Encoder>> = Some(accel.clone());
-        // The lifecycle registry is constructed FIRST (ADR-0025
-        // Decision 2): the pools hold it for the read path and the
-        // in-flight attach, and the coordinator wraps the same instance
-        // (construction order: registry → pools → coordinator).
-        let lifecycle_registry =
-            Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(&config.lifecycle));
-        let segment_pool_small = Arc::new(
-            SegmentPool::new(
-                pool_config.clone(),
-                SizeTier::Small,
-                &segment_size,
-                shard_buffer_pool.clone(),
-                Some(pool_ec_config.clone()),
-                pool_ec_encoder.clone(),
-                Arc::clone(&lifecycle_registry),
-            )
-            .map_err(|e| format!("failed to create small segment pool: {e}"))?,
-        );
-        let segment_pool_standard = Arc::new(
-            SegmentPool::new(
-                pool_config,
-                SizeTier::Standard,
-                &segment_size,
-                shard_buffer_pool.clone(),
-                Some(pool_ec_config),
-                pool_ec_encoder,
-                Arc::clone(&lifecycle_registry),
-            )
-            .map_err(|e| format!("failed to create standard segment pool: {e}"))?,
-        );
-
-        // [review][architecture][high]
-        // a node without a data pool should not be permitted to start, since their is not legacy mode to consider.
-        // also, a silent fallback to an arcane legacy mode is big bark pattern, an should never take place
-        // [end]
-        // ADR-0001: tiered segment sizing driven by SegmentSizeConfig.
-        // ---- f5: pool-aware segment placement + resolution ----
-        // Sealed segments spread across the node's data pools: the sealer
-        // selects the target once per segment (PlacementPolicy over the
-        // registry snapshot) and stamps `pool_id` on the metadata; every
-        // reader/GC store resolves the owning root through this resolver
-        // (the lifecycle registry's `SegmentMetadata.pool_id`, durable via
-        // the event WAL + checkpoint).
-        // Legacy mode (no pools configured) must pass an EMPTY pool list:
-        // the registry's implicit data pool (root = data_dir) is a
-        // runtime fallback, not a placement target — the sealer's legacy
-        // branch (empty `data_pools` → `data_dir`, pool_id 0) keeps
-        // today's byte-for-byte layout.
-        let data_pools =
-            if config.storage.pools.is_empty() { Vec::new() } else { pool_registry.data_pools() };
-        let segment_legacy_dir = config.data_dir.join("segments");
-        let pool_id_for: oceanfs_storage::PoolIdResolver = {
-            let registry = Arc::clone(&lifecycle_registry);
-            Arc::new(move |segment_id: &oceanfs_core::SegmentId| {
-                registry.get(*segment_id).map(|entry| entry.metadata.pool_id)
-            })
-        };
-        // g1 `disk-io-observability` (ADR-0029 §D3): the shared per-pool
-        // I/O signal observer. The seal pipeline records write/fsync
-        // latency + errors per pool through it immediately; the health
-        // monitor (g2) consumes `snapshot`s. Every boot pool's signal
-        // state is registered with its `oceanfs_pool_io_errors_total`
-        // counter bound.
-        let io_observer = Arc::new(oceanfs_storage::io::IoObserver::new());
-        pool_registry.observe_into(&io_observer);
-        let io_backend = Arc::new(oceanfs_storage::io::IoBackend::new());
-        // [review][implementation][critical]
-        // seal config must be unique per pool path : write and read mode could differ
-        // between each mount, since they depend on the nature of the FS
-        // [end]
-        let seal_config = oceanfs_storage::SealConfig {
-            data_pools: data_pools.clone(),
-            // f8 runtime attach: the sealer refreshes the data-pool list
-            // from the LIVE registry at each seal, so a pool attached via
-            // POST /admin/pools is a placement target immediately (no
-            // restart). Pool mode only — legacy mode keeps the boot-time
-            // empty list (registry: None) so the byte-for-byte layout is
-            // untouched.
-            // [review][config][high]
-            // consequence here : the registry cannot be none, since pool is not
-            // allpwed empty.
-            // [end]
-            registry: if config.storage.pools.is_empty() {
-                None
-            } else {
-                Some(pool_registry.clone())
-            },
-            target_size_bytes: segment_size.default_target_size,
-            // [review][config][high]
-            // seal timeout should be allowed to be user configured since
-            // and its default value cannot be a magic constant
-            // [end]
-            seal_timeout_ms: 5000,
-            data_dir: segment_legacy_dir.clone(),
-            io_mode: oceanfs_storage::io::IoReadMode::from_config(config.read_cache_segments),
-            write_mode: oceanfs_storage::io::SegmentWriteMode::probe(segment_legacy_dir.clone()),
-            // g1: the seal pipeline performs its writes/fsyncs through
-            // the observed DiskIo (per-pool signals).
-            io_backend: io_backend.clone(),
-            observer: io_observer.clone(),
-            // Seal pipeline batching (userland-configurable): the fsync
-            // group-commit window and the early-flush trigger size.
-            fsync_batch_timeout_ms: config.seal_fsync_batch_timeout_ms,
-            fsync_max_waiters: config.seal_fsync_max_waiters,
-        };
-        // [review][cleanup][medium]
-        // since roots are now handled within the pool registry, this part is probably
-        // useless. if not, it is part of the legacy we must remove.
-        // [end]
-        // SegmentSealer is the authoritative persistence path. Sealed
-        // segments are written to {data_dir}/segments/ (legacy) or the
-        // selected data pool root (pool mode, ADR-0029 f5) with the
-        // configured I/O mode (O_DIRECT or buffered). The shared segment
-        // data store is used by anti-entropy and healing below.
-        let segment_dir = segment_legacy_dir.clone();
-        // The seal worker runs BEFORE the WAL replay (replayed segments
-        // seal during replay), so the segment directory must already
-        // exist when the first replay seal fires.
-        if let Err(e) = std::fs::create_dir_all(&segment_dir) {
-            return Err(std::io::Error::other(format!(
-                "cannot create segments directory {:?}: {e}",
-                segment_dir
-            ))
-            .into());
-        }
-
-        // ---- 6b. Segment lifecycle coordinator (ADR-0025 phase 2) ----
-        // The ONLY writer of segment lifecycle state. The write path
-        // reserves through it before the first WAL entry of each
-        // segment; the seal path (via the flush coordinator) seals
-        // through it; the orphan reaper deletes through it. The
-        // registry is seeded from the segments CF so the coordinator
-        // is the complete single writer over EXISTING data too (the
-        // reaper's request_delete validates against it) — a pure
-        // registry fold, no CF writes.
-        //
-        // The event WAL (ADR-0024) is the coordinator's durable
-        // side-effect: every transition appends its event first; the CF
-        // write becomes a derived mirror performed after the event
-        // (dual-read verification surface — the event log is the source
-        // of truth for segment lifecycle).
-        // The event WAL dir is composed from `{data_dir}/event-wal` in
-        // legacy mode exactly like every other data path (data WAL at
-        // `{data_dir}/wal`, metadata at `{data_dir}/metadata`); in pool
-        // mode it rides the pinned wal pool root (`{wal pool}/event-wal`,
-        // ADR-0024 + ADR-0029 §D8 role pinning). The crate-level default
-        // (`/var/lib/oceanfs/event-wal`) is the system-layout default, and
-        // the node always overrides it — the same pattern applied to
-        // `WalConfig` above. Without this, any non-root run (dev, e2e,
-        // tests) fails to open the event WAL with permission denied.
-        let event_wal_config = oceanfs_core::EventWalConfig {
-            event_wal_dir: paths.event_wal.clone(),
-            ..config.event_wal.clone()
-        };
-        let event_wal = Arc::new(
-            oceanfs_storage::EventWal::open(
-                event_wal_config.event_wal_dir.clone(),
-                &event_wal_config,
-            )
-            .await
-            .map_err(|e| format!("failed to open segment event WAL: {e}"))?,
-        );
-        // The event log's own GC (ADR-0024 Decision 3): byte-threshold
-        // snapshots of the folded registry + truncation of covered
-        // events. Checkpoint files live beside the event WAL files.
-        let event_checkpoint = Arc::new(
-            oceanfs_storage::EventCheckpoint::open(
-                event_wal_config.event_wal_dir.clone(),
-                event_wal.clone(),
-            )
-            .map_err(|e| format!("failed to open event WAL checkpoint manager: {e}"))?,
-        );
-        let lifecycle = Arc::new(
-            oceanfs_storage::SegmentLifecycleCoordinator::with_registry(Arc::clone(
-                &lifecycle_registry,
-            ))
-            // Phase 2: event appends become the durable side-effect;
-            // the CF write is demoted to a derived mirror.
-            .with_event_wal(event_wal.clone())
-            // Checkpoint trigger: threshold-only, off the append path.
-            .with_checkpoint(event_checkpoint.clone(), event_wal_config.clone())
-            // The seal pools: the pending-seal drain freezes partial
-            // segments through them (seal-on-zero — no idle timer).
-            .with_seal_pools(vec![segment_pool_small.clone(), segment_pool_standard.clone()]),
-        );
-        let sealer = Arc::new(oceanfs_storage::SegmentSealer::new(
-            seal_config,
-            wal_writer.clone(),
-            lifecycle.clone(),
-        ));
-        // [review][config][high]
-        // segment relicator config shoudl be fully configurable by the end user
-        // [end]
-        // ---- 6c. Seal-time segment replicator (sealed-segment-replication) ----
-        // The data-replication backbone: after a segment seals on this
-        // node, its full data section is pushed to the segment's ring
-        // replicas (segment_replica_set − self) — the exact set the read
-        // path's gRPC fallback fetches from. Seal itself never makes a
-        // network call: the seal worker / compactor only `enqueue` (one
-        // atomic channel send); the decoupled `run` task does the pushes.
-        // The replicator's own data store mirrors the heal/GC store (pool
-        // resolution via the lifecycle registry).
-        let segment_replicator = Arc::new(crate::segment_replicator::SegmentReplicator::new(
+        // ---- 6. Construct storage subsystem (c1: modules/storage.rs) ----
+        let storage = crate::modules::storage::StorageModule::build(
+            &config,
+            &paths,
+            pool_registry,
+            metadata_store,
+            accel,
             ring_cache.clone(),
             membership.clone(),
             pool.clone(),
-            Arc::new(oceanfs_durability::DiskSegmentStore::new(
-                data_pools.clone(),
-                segment_legacy_dir.clone(),
-                pool_id_for.clone(),
-            )),
-            lifecycle.clone(),
-            NodeId::new(&config.node_id),
-            crate::segment_replicator::ReplicationConfig {
-                throttle_bytes_sec: config.replication_throttle_bytes_sec,
-                ..Default::default()
-            },
-        ));
+        )
+        .await?;
+
         // ---- 7. Construct durability workers ----
         let gc_config = oceanfs_durability::GcConfig::new(
             config.gc_interval_sec,
@@ -1030,12 +530,6 @@ impl Node {
             config.gc_max_concurrent_compactions,
             config.gc_compaction_queue_capacity,
         );
-        // The compaction-remap alias (g3 `loss-announcement` Option A):
-        // a single shared map consulted by the append handler (late
-        // metadata) and the healing service's remap handler (records
-        // old→new + chunk table).
-        let remap_alias: Arc<oceanfs_core::SegmentRemapAlias> =
-            Arc::new(oceanfs_core::SegmentRemapAlias::new());
         // Announcement transmit metrics (g3 — ADR-0029 §D4
         // observability). Shared by the loss-announcer and the compactor
         // remap closures; registered with the central metrics registry.
@@ -1056,7 +550,7 @@ impl Node {
             repair_selector,
             pool.clone(),
             membership.clone(),
-            lifecycle.clone(),
+            storage.lifecycle.clone(),
             NodeId::new(&config.node_id),
         ));
         // The acquiring-side worker (bound to THIS node's pool-aware
@@ -1064,12 +558,8 @@ impl Node {
         // plane-agnostically, ADR-0030 Decision 4).
         let rep_worker = Arc::new(oceanfs_durability::ReRepWorker::new(
             oceanfs_durability::ReRepConfig::default(),
-            Arc::new(oceanfs_durability::DiskSegmentStore::new(
-                data_pools.clone(),
-                segment_legacy_dir.clone(),
-                pool_id_for.clone(),
-            )),
-            lifecycle.clone(),
+            storage.data_store.clone(),
+            storage.lifecycle.clone(),
             pool.clone(),
             membership.clone(),
             Arc::new(config.operation_timeouts),
@@ -1086,7 +576,7 @@ impl Node {
         // announcement — the complete safety net when announcements are
         // suppressed.
         let reconciliation = Arc::new(oceanfs_durability::ReconciliationLoop::new(
-            Arc::clone(&lifecycle_registry),
+            Arc::clone(&storage.lifecycle_registry),
             membership.clone(),
             repair_sink.clone(),
             NodeId::new(&config.node_id),
@@ -1096,7 +586,7 @@ impl Node {
         // Wire the holder-index notifier: the reconciliation loop's
         // reverse index is maintained incrementally from the SINGLE
         // choke point where a segment's storage_locations is written.
-        lifecycle.set_storage_locations_notifier({
+        storage.lifecycle.set_storage_locations_notifier({
             let reconciliation = Arc::clone(&reconciliation);
             Arc::new(move |segment_id, locations| {
                 reconciliation.on_storage_locations(segment_id, locations);
@@ -1114,24 +604,16 @@ impl Node {
         // only after the durable delete.
         let gc_worker = Arc::new(
             oceanfs_durability::GarbageCollector::new(gc_config.clone())
-                .with_data_store(Arc::new(oceanfs_durability::DiskSegmentStore::new(
-                    data_pools.clone(),
-                    segment_legacy_dir.clone(),
-                    pool_id_for.clone(),
-                )))
-                .with_lifecycle(lifecycle.clone())
-                .with_shard_store(Arc::new(oceanfs_durability::DiskSegmentShardStore::new(
-                    data_pools.clone(),
-                    segment_legacy_dir.clone(),
-                    pool_id_for.clone(),
-                )))
+                .with_data_store(storage.data_store.clone())
+                .with_lifecycle(storage.lifecycle.clone())
+                .with_shard_store(storage.shard_store.clone())
                 // The repacked segment is a NEW owner-side seal that
                 // bypasses the write-path seal worker: publish it so the
                 // segment replicator fans it out to its ring replicas
                 // (sealed-segment-replication — without this hook,
                 // post-compaction objects silently have zero replicas).
                 .with_segment_sealed_notifier({
-                    let replicator = Arc::clone(&segment_replicator);
+                    let replicator = Arc::clone(&storage.segment_replicator);
                     Arc::new(move |segment_id| {
                         replicator.enqueue(segment_id);
                     })
@@ -1145,7 +627,7 @@ impl Node {
                 .with_compaction_remap_notifier({
                     let membership = Arc::clone(&membership);
                     let pool = Arc::clone(&pool);
-                    let lifecycle_registry = Arc::clone(&lifecycle_registry);
+                    let lifecycle_registry = Arc::clone(&storage.lifecycle_registry);
                     let self_id = NodeId::new(&config.node_id);
                     let announce_metrics = Arc::clone(&announce_metrics);
                     Arc::new(move |old_segment_id, new_segment_id, chunk_table| {
@@ -1224,7 +706,7 @@ impl Node {
         let merkle_tree = {
             Arc::new(
                 oceanfs_durability::merkle::IncrementalMerkleTree::rebuild_from_segment_scan(
-                    &lifecycle_registry,
+                    &storage.lifecycle_registry,
                     &merkle_tree_config,
                 )
                 .map_err(|e| {
@@ -1236,9 +718,12 @@ impl Node {
         };
 
         // [review][architecture][critical]
-        // the anti antropy worker create it's own data store.
-        // since a data store is responsible to write to disk, we are running the risk of concurrency.
-        // there should only be one data store. need some investigation and discussion.
+        // AE no longer creates its own data store — c1 (composition-root
+        // decomposition) wired it to the module's single shared
+        // DiskSegmentStore (one store instance, no concurrent writers).
+        // The remaining 3-abstraction read/write unification
+        // (DiskSegmentStore/DiskSegmentShardStore/DiskSegmentReader) is
+        // store-unification f3 (ADR-0032).
         // [end]
         let ae_worker = Arc::new(oceanfs_durability::AntiEntropy::new(
             oceanfs_durability::AntiEntropyConfig::new(
@@ -1253,13 +738,9 @@ impl Node {
                 sampling_fraction: config.anti_entropy.sampling_fraction,
             }),
             membership.clone(),
-            Arc::clone(&lifecycle_registry),
+            Arc::clone(&storage.lifecycle_registry),
             pool.clone(),
-            Arc::new(oceanfs_durability::DiskSegmentStore::new(
-                data_pools.clone(),
-                segment_legacy_dir.clone(),
-                pool_id_for.clone(),
-            )),
+            storage.data_store.clone(),
             merkle_tree.clone(),
         ));
         // [review][config][high]
@@ -1271,33 +752,12 @@ impl Node {
         let scrub_worker = Arc::new(oceanfs_durability::ScrubCoordinator::new(scrub_config));
         // OrphanReaper deletes segment data files from disk when reclaiming
         // orphaned segments after GC compaction.
-        // [review][architecture][critical]
-        // again, we are instanciating a lot of stores. this is not a good architectural decision.
-        // [end]
-        let reaper_shard_store: Arc<dyn oceanfs_durability::SegmentShardStore> =
-            Arc::new(oceanfs_durability::DiskSegmentShardStore::new(
-                data_pools.clone(),
-                segment_legacy_dir.clone(),
-                pool_id_for.clone(),
-            ));
         let reaper = Arc::new(oceanfs_durability::OrphanReaper::new(
-            metadata_store.clone(),
-            lifecycle.clone(),
-            reaper_shard_store.clone(),
+            storage.metadata_store.clone(),
+            storage.lifecycle.clone(),
+            storage.shard_store.clone(),
             gc_config,
         ));
-
-        // [review][architecture][high]
-        // same remark about the store duplication
-        // [end]
-        // ---- 7b. Construct segment data store (shared by heal and gRPC) ----
-        // DiskSegmentStore reads/writes the authoritative segment files.
-        let heal_data_store: Arc<dyn oceanfs_durability::SegmentDataStore> =
-            Arc::new(oceanfs_durability::DiskSegmentStore::new(
-                data_pools.clone(),
-                segment_legacy_dir.clone(),
-                pool_id_for.clone(),
-            ));
 
         // ---- 7c. Construct heal dispatch pipeline ----
         let heal_config = oceanfs_durability::HealConfig::default()
@@ -1311,7 +771,7 @@ impl Node {
         // The heal decoder routes through the accel dispatcher so decode
         // repair work is observable (accel_decode_ops_total, duration
         // histograms) and the tier is consistent across sites.
-        let heal_decoder: Arc<dyn oceanfs_ec::Decoder> = accel.clone();
+        let heal_decoder: Arc<dyn oceanfs_ec::Decoder> = storage.accel.clone();
         // Clone before move into HealWorker — used by ReadCoordinator as well.
         let ec_decoder = heal_decoder.clone();
 
@@ -1324,8 +784,8 @@ impl Node {
             heal_config,
             heal_queue.clone(),
             heal_decoder,
-            lifecycle.clone(),
-            heal_data_store.clone(),
+            storage.lifecycle.clone(),
+            storage.data_store.clone(),
         )
         .with_timeouts(op_timeouts.clone());
 
@@ -1427,7 +887,7 @@ impl Node {
             ..Default::default()
         };
         let prefetch_store: Arc<dyn oceanfs_storage_api::MetadataStore> =
-            Arc::new(PrefetchStoreAdapter { store: metadata_store.clone() });
+            Arc::new(PrefetchStoreAdapter { store: storage.metadata_store.clone() });
         let prefetch_engine = Arc::new(oceanfs_cache::PrefetchEngine::new(
             prefetch_config,
             metadata_cache.clone(),
@@ -1437,50 +897,10 @@ impl Node {
 
         // ---- 10. Construct bridge adapter ----
         let metadata_ops: Arc<dyn MetadataOps> =
-            Arc::new(MetadataStoreAdapter::new(metadata_store.clone()));
+            Arc::new(MetadataStoreAdapter::new(storage.metadata_store.clone()));
 
         // ---- 11. Construct I/O infrastructure ----
         let hlc_clock = Arc::new(HlcClock::new());
-        let disk_io = io_backend.clone();
-        let io_mode = oceanfs_storage::io::IoReadMode::from_config(config.read_cache_segments);
-
-        // Build the mmap segment cache when read-optimised mode is enabled.
-        let mmap_cache = if io_mode == oceanfs_storage::io::IoReadMode::Mmap {
-            Some(Arc::new(oceanfs_storage::io::SegmentFileCache::new(
-                config.segment_cache_max_entries,
-            )))
-        } else {
-            None
-        };
-        // [review][architecture][critical]
-        // we have 3 abstractions to access disk : DiskSegmentStore, DiskSegmentShardStore and DiskSegmentReader.
-        // each independently implements optimisations or not, without unified logic. this is awfull, and must be resolved.
-        // [end]
-        // Disk-backed segment reader: reads sealed segment files from disk
-        // via the configured I/O mode (mmap / O_DIRECT / buffered).
-        // Replaces the previous InMemorySegmentReader — segment data is read
-        // on demand from the filesystem. No startup preload, no unbounded
-        // HashMap growth.
-        let segment_reader: Arc<dyn oceanfs_storage::io::SegmentReader> = Arc::new(
-            oceanfs_storage::io::DiskSegmentReader::new(
-                io_mode,
-                disk_io.clone(),
-                mmap_cache,
-                segment_dir.clone(),
-                Some(accel.clone()),
-                Some(accel.clone()),
-            )
-            // Pool-aware resolution (ADR-0029 f5): sealed segments read
-            // from the owning data pool root. f8 runtime attach: the
-            // live registry is wired so a pool attached mid-run resolves
-            // (the resolved root is cached per segment — no registry
-            // lock on the steady-state read path; legacy mode
-            // short-circuits to legacy_dir before touching the registry).
-            .with_data_pools(data_pools.clone(), segment_legacy_dir.clone(), pool_id_for.clone())
-            .with_registry(pool_registry.clone())
-            .with_evict_after_read(!config.read_cache_segments),
-        );
-
         let hinted_handoff = Arc::new(
             HintedHandoff::new_with_pool(pool.clone())
                 .with_membership(membership.clone())
@@ -1526,19 +946,6 @@ impl Node {
 
         // Replay existing hints from the WAL into in-memory queues.
         let _replayed = hinted_handoff_manager.replay_and_enqueue().await?;
-
-        // Clone pool Arcs for the read path — the originals are consumed
-        // by WriteCoordinator below. PoolFallbackReader checks active
-        // (unsealed) segments before falling back to DiskSegmentReader,
-        // closing the read-after-write gap for recently-written data.
-        let active_pools: Vec<Arc<SegmentPool>> =
-            vec![segment_pool_small.clone(), segment_pool_standard.clone()];
-        // Retained for the live `segment_active_count` metric poller.
-        let active_pools_for_metrics = active_pools.clone();
-        let segment_reader = Arc::new(oceanfs_storage::io::PoolFallbackReader::new(
-            active_pools,
-            segment_reader.clone(),
-        ));
 
         // Clone for the seal notifier closure (the engine itself is
         // consumed by the background-task spawn later).
@@ -1603,21 +1010,21 @@ impl Node {
                 pool.clone(),
                 NodeId::new(&config.node_id),
                 hlc_clock.clone(),
-                metadata_store.clone(),
-                segment_size.clone(),
-                shard_small,
-                shard_standard,
-                segment_pool_small.clone(),
-                segment_pool_standard.clone(),
-                sealer.clone(),
-                lifecycle.clone(),
+                storage.metadata_store.clone(),
+                SegmentSizeConfig::default(),
+                storage.shard_small.clone(),
+                storage.shard_standard.clone(),
+                storage.segment_pool_small.clone(),
+                storage.segment_pool_standard.clone(),
+                storage.sealer.clone(),
+                storage.lifecycle.clone(),
                 hinted_handoff_manager.clone(),
             )
             .with_timeouts(op_timeouts.clone())
             // Per-bucket compression: buckets opting in via
             // `compression.tier != None` compress chunks on the write
             // path through the accel dispatcher (blocking pool).
-            .with_compressor(Some(accel.clone()))
+            .with_compressor(Some(storage.accel.clone()))
             // Cluster-readiness gate: while the ring is still converging
             // after (re)join, writes fail with 503 instead of
             // under-replicating (see the gate task above).
@@ -1635,7 +1042,7 @@ impl Node {
             .with_routing_hint(manifest_cache.clone())
             // g2 (ADR-0029 §D3): the hint enqueue path rejects new debt
             // while the hints pool is Dead.
-            .with_pool_registry(pool_registry.clone())
+            .with_pool_registry(storage.registry.clone())
             // Continuous anti-entropy: every successful seal updates the
             // incremental Merkle tree (with its seal-time root) so
             // recently-written segments participate in the root exchange
@@ -1644,7 +1051,7 @@ impl Node {
             // this is also a proper
             // [end]
             .with_segment_sealed_notifier({
-                let replicator = Arc::clone(&segment_replicator);
+                let replicator = Arc::clone(&storage.segment_replicator);
                 Arc::new(move |segment_id, merkle_root| {
                     ae_worker_notifier.on_segment_sealed(segment_id, merkle_root);
                     // Seal-time segment replication (sealed-segment-replication):
@@ -1662,138 +1069,9 @@ impl Node {
         // into the S3 handler state below).
         let write_coordinator_for_applier = Arc::clone(&write_coordinator);
 
-        // ---- 6a. Startup recovery: the machine path (ADR-0025 phase 2) ----
-        // Deterministic recovery: fold the event log into the registry
-        // (state = fold(events)) — the event log is the ONLY durable
-        // writer (ADR-0025 Decision 3 final form; the CF mirror is
-        // removed) — then rebuild Reserved-unsealed segments from the
-        // data WAL (adopt the durable `.dat` or replay the entries),
-        // then resolve incomplete compaction units (rows 7-9). The
-        // startup cost is bounded by the checkpoint threshold, never by
-        // lifetime event volume.
-        let startup_rebuild_gauge = oceanfs_core::Gauge::new(
-            "oceanfs_startup_rebuild_ms".into(),
-            "Startup rebuild duration (checkpoint + fold + data-WAL pass + compaction recovery), ms"
-                .into(),
-            oceanfs_core::LabelSet::empty(),
-        );
-        let rebuild_start = std::time::Instant::now();
-        let wal_reader = oceanfs_storage::wal::WalReader::open(&wal_config)
-            .map_err(|e| format!("failed to open WAL reader: {e}"))?;
-        // Load the latest checkpoint (ADR-0024 Decision 3): its snapshot
-        // seeds the registry; the fold starts at its covered position —
-        // startup replay is bounded by the byte threshold, not by
-        // lifetime event volume. Without a checkpoint the fold starts at
-        // the earliest retained event.
-        let fold_start = match event_checkpoint
-            .load_checkpoint()
-            .map_err(|e| format!("failed to load event WAL checkpoint: {e}"))?
-        {
-            Some((snapshot, covered)) => {
-                lifecycle.seed_from_checkpoint(&snapshot);
-                info!(covered = ?covered, "event WAL checkpoint loaded; folding events after it");
-                covered
-            }
-            None => oceanfs_storage::EventWalPos { file_seq: 0, offset: 0 },
-        };
-        let recovery_outcome = lifecycle
-            .rebuild_with_data_wal(
-                event_wal.read_from(fold_start),
-                &wal_reader,
-                &sealer,
-                |data| {
-                    oceanfs_durability::MerkleTree::build(data, 0).map(|tree| tree.root().hash())
-                },
-                &wal_writer,
-            )
-            .await
-            .map_err(|e| format!("event-WAL recovery failed: {e}"))?;
-        info!(
-            folded = recovery_outcome.folded_segments,
-            dropped_empty = recovery_outcome.dropped_empty_reserves,
-            re_sealed = recovery_outcome.re_sealed_segments,
-            adopted = recovery_outcome.adopted_segments,
-            swept = recovery_outcome.swept_entries,
-            "event-WAL recovery complete (ADR-0025 phase 2)"
-        );
-        // Rows 7-9: incomplete compaction units — the folded registry's
-        // `repacked_from` markers, one objects-CF read per unit. Each
-        // action deletes through the coordinator (durable before
-        // unlink) and sweeps the `.dat` (idempotent).
-        let compaction_actions = recover_incomplete_compactions(
-            lifecycle.registry(),
-            &StoreObjectLookup(
-                Arc::clone(&metadata_store) as Arc<dyn oceanfs_storage_api::MetadataStore>
-            ),
-        )
-        .map_err(|e| format!("compaction recovery failed: {e}"))?;
-        for action in &compaction_actions {
-            let (segment_id, label) = match action {
-                CompactionRecoveryAction::FinishOldDeletion(id) => (*id, "finish_old_deletion"),
-                CompactionRecoveryAction::SweepNewOrphan(id) => (*id, "sweep_new_orphan"),
-                CompactionRecoveryAction::SweepOldDat(id) => (*id, "sweep_old_dat"),
-            };
-            if !matches!(action, CompactionRecoveryAction::SweepOldDat(_)) {
-                if let Err(e) = lifecycle.request_delete(segment_id).await {
-                    warn!(
-                        segment_id = %segment_id,
-                        error = %e,
-                        "compaction recovery delete failed (startup continues; the reaper retries)"
-                    );
-                }
-            }
-            // Sweep the `.dat` through the pool-aware shard store (the
-            // segment's pool id resolves to its root; ADR-0029 f5).
-            // Idempotent; a residue the resolver cannot place (an
-            // unregistered orphan on a non-zero pool) is backstopped by
-            // the orphan reaper's multi-root listing.
-            if let Err(e) = reaper_shard_store.delete_shards(segment_id) {
-                warn!(
-                    segment_id = %segment_id,
-                    error = %e,
-                    "compaction recovery sweep failed (startup continues; the reaper retries)"
-                );
-            }
-            info!(segment_id = %segment_id, action = label, "compaction recovery action applied");
-        }
-        let rebuild_ms = rebuild_start.elapsed().as_millis() as u64;
-        startup_rebuild_gauge.set(rebuild_ms);
-        info!(rebuild_ms, "startup rebuild complete");
-        // Retention liveness is machine-backed (ADR-0024 §Retention): an
-        // entry at position p of segment S is garbage iff S is sealed
-        // with data_wal_pos ≥ p, or deleted. Entries whose segment has
-        // no registry entry are unreachable (the reserve-before-entry
-        // invariant) — sweepable.
-        {
-            let registry = Arc::clone(&lifecycle_registry);
-            wal_writer.set_liveness(Arc::new(move |id, pos| match registry.get(id) {
-                Some(entry) => oceanfs_storage::entry_is_garbage(&entry, &pos),
-                None => true,
-            }));
-        }
-
-        // ---- 6b. Startup replication pass (sealed-segment-replication) ----
-        // Segments whose storage_locations was never stamped (sealed but
-        // the replicator never completed a push — a crash between the
-        // SealEvent and the first ack, or a segment adopted/replayed by
-        // recovery) must be re-published so the replicator fans them out.
-        // Non-empty storage_locations = fully acked, skip. One pass, off
-        // the hot path; the replicator's channel is bounded (overflow
-        // routes to its needs set).
-        {
-            let mut pending = 0u64;
-            lifecycle.registry().for_each(|segment_id, entry| {
-                if entry.state == oceanfs_storage::SegmentState::Sealed
-                    && entry.metadata.storage_locations.is_empty()
-                {
-                    segment_replicator.enqueue(segment_id);
-                    pending += 1;
-                }
-            });
-            if pending > 0 {
-                info!(pending, "startup replication pass enqueued sealed segments");
-            }
-        }
+        // ---- 6a/6b. Startup recovery + startup replication pass ----
+        // (c1: moved to modules/storage.rs — run_startup_recovery)
+        storage.run_startup_recovery().await?;
 
         let read_coordinator = Arc::new(
             ReadCoordinator::new_with_metadata(
@@ -1802,14 +1080,14 @@ impl Node {
                 None,
                 metadata_ops.clone(),
             )
-            .with_segment_reader(segment_reader.clone())
+            .with_segment_reader(storage.segment_reader.clone())
             .with_connection_pool(pool.clone())
             .with_membership(membership.clone())
             .with_decoder(ec_decoder.clone())
             .with_ec_codec(heal_codec_config.data_shards, heal_codec_config.parity_shards)
             // Read-path decompression for compressed chunks (paired
             // with the write path's per-bucket compression).
-            .with_compressor(Some(accel.clone()))
+            .with_compressor(Some(storage.accel.clone()))
             .with_timeouts(op_timeouts.clone())
             .with_default_fetch_strategy(config.default_fetch_strategy)
             .with_hlc_clock(hlc_clock.clone())
@@ -1820,7 +1098,7 @@ impl Node {
             // Local-availability gate (g6): the SAME pool registry the
             // write coordinator consults — a Dead metadata pool rejects
             // reads with 503 (single source of truth).
-            .with_pool_registry(pool_registry.clone()),
+            .with_pool_registry(storage.registry.clone()),
         );
 
         // Router handles request forwarding to correct coordinator nodes.
@@ -1861,13 +1139,13 @@ impl Node {
         let metrics_for_late_registration = Arc::clone(&metrics);
 
         // Register subsystem metrics into the central registry.
-        metrics.register_gauge(startup_rebuild_gauge);
+        metrics.register_gauge(storage.startup_rebuild_gauge.clone());
         object_cache.register_metrics(&*metrics);
         metadata_cache.register_metrics(&*metrics);
         negative_cache.register_metrics(&*metrics);
-        accel.register_metrics(&*metrics);
+        storage.accel.register_metrics(&*metrics);
         heal_worker.register_metrics(&*metrics);
-        shard_buffer_pool.register_metrics(&*metrics);
+        storage.shard_buffer_pool.register_metrics(&*metrics);
         s3_handler.register_metrics(&*metrics);
 
         // Phase D: durability subsystem counters.
@@ -1890,31 +1168,31 @@ impl Node {
         pool.register_metrics(&*metrics);
         // Segment shard gauges (`segment_active_count` — Phase 2
         // asserts the segment pipeline is producing segments).
-        shard_small_metrics.register_metrics(&*metrics);
-        shard_standard_metrics.register_metrics(&*metrics);
-        wal_writer.register_metrics(&*metrics);
-        sealer.register_metrics(&*metrics);
+        storage.shard_small.register_metrics(&*metrics);
+        storage.shard_standard.register_metrics(&*metrics);
+        storage.wal_writer.register_metrics(&*metrics);
+        storage.sealer.register_metrics(&*metrics);
         // Lifecycle registry-size gauges (ADR-0025 Decision 5 — the
         // registry's O(live segments) memory cost is metric-visible).
-        lifecycle.register_metrics(&*metrics);
+        storage.lifecycle.register_metrics(&*metrics);
         // Event WAL metrics (ADR-0024 — bytes, files, append count).
-        event_wal.register_metrics(&*metrics);
+        storage.event_wal.register_metrics(&*metrics);
         // Checkpoint metrics (checkpoint bytes written, bytes truncated).
-        event_checkpoint.register_metrics(&*metrics);
+        storage.event_checkpoint.register_metrics(&*metrics);
         // Storage pool metrics (ADR-0029 — status, bytes free/total,
         // I/O error counter per pool).
-        pool_registry.register_metrics(&*metrics);
+        storage.registry.register_metrics(&*metrics);
         // Routing-cache metrics (ADR-0029 §D5 — cache misses,
         // error-driven failovers).
         manifest_cache.register_metrics(&*metrics);
         // Seal-time segment replication metrics (pushed/bytes/retries/
         // failures/needs gauge).
-        segment_replicator.register_metrics(&*metrics);
+        storage.segment_replicator.register_metrics(&*metrics);
 
         // Register RocksDB property gauges into the central metrics registry.
-        metadata_store.metrics().register(&*metrics);
+        storage.metadata_store.metrics().register(&*metrics);
         // Start the background RocksDB metrics polling task (every 30s).
-        metadata_store.start_metrics_task();
+        storage.metadata_store.start_metrics_task();
 
         // Register process-level gauges.
         let proc_mem_gauge =
@@ -1931,7 +1209,10 @@ impl Node {
 
         // Spawn a background poller for process-level metrics (every 15s).
         // RocksDB metrics are polled separately by metadata_store.start_metrics_task().
-        let wal_dir = wal_config.data_dir.clone();
+        let wal_dir = paths.wal.clone();
+        // Active pools snapshot for the poller — cloned before the spawn
+        // (the module field stays owned by `storage`).
+        let active_pools_for_metrics = storage.active_pools.clone();
         // [review][implementation][high]
         // the metric poller cannot be cancelled, unkink other background tasks
         // on an another topic : we seems to make the start function bear the initialisation logic of every module.
@@ -1960,7 +1241,7 @@ impl Node {
         // cache's self entry (f7). The incarnation tracks the CURRENT
         // one (a rejoin bumps it) with the boot value as the fallback.
         let attach_membership = membership.clone();
-        let attach_registry = pool_registry.clone();
+        let attach_registry = storage.registry.clone();
         let attach_cache = manifest_cache.clone();
         let attach_self_id = NodeId::new(&config.node_id);
         let attach_boot_incarnation = announce_incarnation;
@@ -1987,15 +1268,19 @@ impl Node {
             membership.clone(),
             ring_cache.clone(),
         )
-        .with_scrub(scrub_worker.clone(), metadata_store.clone(), heal_data_store.clone())
-        .with_lifecycle_registry(Arc::clone(&lifecycle_registry))
+        .with_scrub(
+            scrub_worker.clone(),
+            storage.metadata_store.clone(),
+            storage.data_store.clone(),
+        )
+        .with_lifecycle_registry(Arc::clone(&storage.lifecycle_registry))
         .with_caches(
             Some(object_cache.clone()),
             Some(metadata_cache.clone()),
             Some(negative_cache.clone()),
         )
-        .with_accel(accel.clone())
-        .with_pool_attach(pool_registry.clone(), on_pool_attached);
+        .with_accel(storage.accel.clone())
+        .with_pool_attach(storage.registry.clone(), on_pool_attached);
 
         // ---- 13. Build axum router ----
         // Auth middleware is config-driven: when `s3_auth_enabled = true`,
@@ -2081,20 +1366,20 @@ impl Node {
 
         // Build gRPC service implementations.
         let segment_service = oceanfs_server::grpc::segment_service::SegmentGrpcService::new(
-            heal_data_store.clone(),
-            Some(metadata_store.clone()),
-            shard_buffer_pool.clone(),
+            storage.data_store.clone(),
+            Some(storage.metadata_store.clone()),
+            storage.shard_buffer_pool.clone(),
             hlc_clock.clone(),
         )
         // Replica appends register their segments in the lifecycle
         // machine: without registration the GC and the orphan reaper
         // never see the receiver's .dat files (the fleet disk-fill
         // root cause).
-        .with_lifecycle(lifecycle.clone())
+        .with_lifecycle(storage.lifecycle.clone())
         // Late metadata appends referencing a locally compacted-away
         // segment are translated through the remap alias (g3 Option A —
         // GAP-1 closure).
-        .with_remap_alias(Arc::clone(&remap_alias));
+        .with_remap_alias(Arc::clone(&storage.remap_alias));
         // ADR-0028 D1: the membership services (gossip + probe) move to
         // the membership plane — the data-plane server below hosts only
         // Segment/Healing/Cache/Scrub.
@@ -2109,9 +1394,9 @@ impl Node {
 
         let mut healing_service = oceanfs_durability::healing_service::HealingGrpcService::new(
             hinted_handoff.clone(),
-            metadata_store.clone(),
-            Arc::clone(&lifecycle_registry),
-            heal_data_store.clone(),
+            storage.metadata_store.clone(),
+            Arc::clone(&storage.lifecycle_registry),
+            storage.data_store.clone(),
             hlc_clock.clone(),
         )
         .with_local_node_id(NodeId::new(&config.node_id))
@@ -2140,13 +1425,9 @@ impl Node {
         // handler records the alias + chunk table so the append handler
         // translates late chunk refs, re-points local rows, and deletes
         // the stale replica through the machine + shard store.
-        .with_remap_alias(Arc::clone(&remap_alias))
-        .with_lifecycle_coordinator(lifecycle.clone())
-        .with_shard_store(Arc::new(oceanfs_durability::DiskSegmentShardStore::new(
-            data_pools.clone(),
-            segment_legacy_dir.clone(),
-            pool_id_for.clone(),
-        )))
+        .with_remap_alias(Arc::clone(&storage.remap_alias))
+        .with_lifecycle_coordinator(storage.lifecycle.clone())
+        .with_shard_store(storage.shard_store.clone())
         // g3 `loss-announcement` (data-pool death): verified held
         // segments enqueue re-replication repairs — the repair sink is
         // the HOLDER-side dispatcher (ADR-0030 target-pull).
@@ -2169,8 +1450,8 @@ impl Node {
             Some(metadata_cache.clone()),
         );
         let scrub_service = oceanfs_durability::scrub_service::ScrubGrpcService::new(
-            metadata_store.clone(),
-            heal_data_store.clone(),
+            storage.metadata_store.clone(),
+            storage.data_store.clone(),
         );
 
         // Build tonic Server with all services registered. The default
@@ -2297,7 +1578,7 @@ impl Node {
         // on pool set changes. The join() below carries the manifest in
         // its self-announcement, so seeds learn it immediately.
         let node_manifest =
-            crate::pool_manifest::build_node_manifest(announce_incarnation, &pool_registry);
+            crate::pool_manifest::build_node_manifest(announce_incarnation, &storage.registry);
         membership.set_self_manifest(node_manifest.clone());
         // Seed the routing cache with the self manifest so the node's
         // own pool state is visible to the exclusion filters (and the
@@ -2419,14 +1700,14 @@ impl Node {
         // ---- 16. Spawn background tasks ----
         let mut background = Self::spawn_background_tasks(
             gc_worker,
-            metadata_store.clone(),
-            Arc::clone(&lifecycle_registry),
+            storage.metadata_store.clone(),
+            Arc::clone(&storage.lifecycle_registry),
             ae_worker,
             scrub_worker,
             reaper,
             prefetch_engine,
             heal_worker,
-            heal_data_store.clone(),
+            storage.data_store.clone(),
             hinted_handoff_manager.clone(),
             &config,
         );
@@ -2443,8 +1724,8 @@ impl Node {
         // affected segments) and re-declares the manifest so peers see
         // the change.
         let (health_monitor, health_events) = oceanfs_storage::pool::health::HealthMonitor::new(
-            pool_registry.clone(),
-            io_observer.clone(),
+            storage.registry.clone(),
+            storage.io_observer.clone(),
             oceanfs_storage::pool::health::HealthMonitorConfig::default(),
         );
         let health_cancel = CancellationToken::new();
@@ -2463,7 +1744,7 @@ impl Node {
         // g4 reconciliation loop is proven to be the independent safety
         // net.
         let loss_announcer: Option<crate::health::LossAnnouncer> = if config.announcements_enabled {
-            let lifecycle_registry = Arc::clone(&lifecycle_registry);
+            let lifecycle_registry = Arc::clone(&storage.lifecycle_registry);
             let membership = Arc::clone(&membership);
             let pool = Arc::clone(&pool);
             let self_id = NodeId::new(&config.node_id);
@@ -2536,9 +1817,9 @@ impl Node {
         };
         let consequences_handle = crate::health::spawn_health_consequences(
             health_events,
-            pool_registry.clone(),
+            storage.registry.clone(),
             membership.clone(),
-            Arc::clone(&lifecycle_registry),
+            Arc::clone(&storage.lifecycle_registry),
             NodeId::new(&config.node_id),
             announce_incarnation,
             manifest_cache.clone(),
@@ -2553,7 +1834,7 @@ impl Node {
         // retries the needs set. Runs until shutdown.
         let replicator_cancel = CancellationToken::new();
         let replicator_token = replicator_cancel.clone();
-        let replicator_for_spawn = Arc::clone(&segment_replicator);
+        let replicator_for_spawn = Arc::clone(&storage.segment_replicator);
         let replicator_handle = tokio::spawn(async move {
             replicator_for_spawn.run(replicator_token).await;
             info!("Segment replicator stopped");
@@ -2765,33 +2046,17 @@ impl Node {
             "OceanFS node started"
         );
 
-        // ---- 18. Construct graceful leave handler ----
-        let leave_handler = Arc::new(NodeLeaveHandler {
-            wal_writer: wal_writer.clone(),
-            segment_dir: segment_dir.clone(),
-            pool: pool.clone(),
-            membership: membership.clone(),
-        });
-
         Ok(Node {
             config,
-            accel,
             server_addr,
             grpc_addr,
             http_shutdown,
             grpc_shutdown: background.grpc_shutdown.clone(),
             background,
-            leave_handler,
             membership,
-            metadata_store,
-            wal_writer: wal_writer.clone(),
-            pool_registry,
-            io_observer,
-            segment_replicator,
-            remap_alias,
+            storage,
             repair_dispatcher,
             rep_worker,
-            lifecycle,
             reconciliation,
         })
     }
@@ -2819,7 +2084,7 @@ impl Node {
     /// # }
     /// ```
     pub fn pool_registry(&self) -> Arc<oceanfs_storage::PoolRegistry> {
-        self.pool_registry.clone()
+        self.storage.registry.clone()
     }
 
     /// Returns the g1 per-pool I/O signal observer (ADR-0029 §D3) the
@@ -2846,7 +2111,7 @@ impl Node {
     /// # }
     /// ```
     pub fn io_observer(&self) -> Arc<oceanfs_storage::io::IoObserver> {
-        self.io_observer.clone()
+        self.storage.io_observer.clone()
     }
 
     /// Returns whether the node is unavailable (the **metadata** pool
@@ -2874,7 +2139,7 @@ impl Node {
     /// # }
     /// ```
     pub fn node_unavailable(&self) -> bool {
-        !self.pool_registry.node_serves_requests()
+        !self.storage.registry.node_serves_requests()
     }
 
     /// Returns the seal-time segment replicator
@@ -2901,7 +2166,7 @@ impl Node {
     /// # }
     /// ```
     pub fn segment_replicator(&self) -> Arc<crate::segment_replicator::SegmentReplicator> {
-        self.segment_replicator.clone()
+        self.storage.segment_replicator.clone()
     }
 
     /// Returns the compaction-remap alias map (g3 `loss-announcement`
@@ -2928,7 +2193,7 @@ impl Node {
     /// # }
     /// ```
     pub fn remap_alias(&self) -> Arc<oceanfs_core::SegmentRemapAlias> {
-        self.remap_alias.clone()
+        self.storage.remap_alias.clone()
     }
 
     /// Returns the periodic reconciliation loop (g4 `reconciliation` —
@@ -3022,7 +2287,8 @@ impl Node {
     /// # }
     /// ```
     pub fn segment_locations(&self, segment_id: &SegmentId) -> Option<Vec<NodeId>> {
-        self.lifecycle
+        self.storage
+            .lifecycle
             .registry()
             .get(*segment_id)
             .map(|entry| entry.metadata.storage_locations.to_vec())
@@ -3085,7 +2351,7 @@ impl Node {
     /// Consumers (encoders, decoders, hash accelerators) acquire the
     /// dispatcher to submit work to the best available hardware tier.
     pub fn accel(&self) -> &Arc<oceanfs_accel::AccelDispatcher> {
-        &self.accel
+        &self.storage.accel
     }
 
     /// Returns the bound HTTP server address.
@@ -3109,10 +2375,15 @@ impl Node {
     pub async fn shutdown(self) -> Result<(), Box<dyn std::error::Error>> {
         info!(node_id = %self.config.node_id, "Shutting down OceanFS node");
 
-        // ---- 1. Graceful leave: handoff WAL and segment shards to successor ----
-        let leave_result = self.membership.leave(Some(self.leave_handler.as_ref())).await;
+        // ---- 1. Graceful leave ----
+        // The NodeLeaveHandler (whole-datadir WAL+shard handoff to the ring
+        // successor) was deleted in c1 (reviews #34/#35, B1): data is
+        // replicated, so a leaving node drains in-flight work and announces
+        // LEFT; replica holders detect under-replication and re-replicate
+        // (ADR-0030). `leave(None)` runs the drain + announcement.
+        let leave_result = self.membership.leave(None).await;
         if let Err(e) = leave_result {
-            warn!(error = %e, "graceful leave handoff failed; continuing shutdown");
+            warn!(error = %e, "graceful leave failed; continuing shutdown");
         }
 
         // ---- 2. Cancel gRPC server (stop accepting new RPCs, drain in-flight) ----
@@ -3198,12 +2469,12 @@ impl Node {
         }
 
         // ---- 6. Flush WAL writer to disk ----
-        if let Err(e) = self.wal_writer.sync().await {
+        if let Err(e) = self.storage.wal_writer.sync().await {
             warn!(error = %e, "WAL sync failed during shutdown");
         }
 
         // ---- 7. Close metadata store (flush RocksDB) ----
-        if let Err(e) = self.metadata_store.close() {
+        if let Err(e) = self.storage.metadata_store.close() {
             warn!(error = %e, "metadata store close failed during shutdown");
         }
 
@@ -4133,172 +3404,6 @@ mod tests {
         cancel.cancel();
     }
 
-    // ── Graceful Leave Handler (4.5) ──────────────────────────────
-
-    /// Verifies that the `NodeLeaveHandler` correctly implements
-    /// `GracefulLeaveHandler::handoff_wal_to()` by flushing the WAL.
-    #[tokio::test]
-    #[ignore = "requires running gRPC server"]
-    async fn leave_handler_handoff_wal_flushes_and_reports_success() {
-        use std::sync::Arc;
-
-        use oceanfs_core::{NodeId, WalConfig};
-        use oceanfs_membership::{GracefulLeaveHandler, Membership};
-        use oceanfs_network::ConnectionPool;
-
-        // Setup: real WAL in temp dir.
-        let dir = tempfile::tempdir().unwrap();
-        let wal_writer = Arc::new(
-            oceanfs_storage::WalWriter::open(&WalConfig {
-                data_dir: dir.path().join("wal"),
-                max_file_size_bytes: 1024 * 1024,
-                fsync_batch_timeout_ms: 5,
-                ..Default::default()
-            })
-            .await
-            .unwrap(),
-        );
-
-        let ring = oceanfs_routing::Ring::new(oceanfs_core::RingConfig::default());
-        let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
-        let membership = Arc::new(Membership::new(
-            NodeId::new("leave-test"),
-            "127.0.0.1:9100".parse().unwrap(),
-            "127.0.0.1:9100".parse().unwrap(),
-            oceanfs_core::GossipConfig::default(),
-            ring_cache,
-        ));
-        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
-
-        let handler = super::NodeLeaveHandler {
-            wal_writer,
-            segment_dir: dir.path().join("segments"),
-            pool,
-            membership,
-        };
-
-        // handoff_wal_to should sync and succeed even without a real successor.
-        let result =
-            GracefulLeaveHandler::handoff_wal_to(&handler, &NodeId::new("successor")).await;
-        assert!(result.is_ok(), "WAL handoff should succeed");
-    }
-
-    /// Verifies that `transfer_segment_shards_to` handles an empty blob store.
-    #[tokio::test]
-    #[ignore = "requires running gRPC server"]
-    async fn leave_handler_transfer_empty_blob_store_returns_zero() {
-        use std::sync::Arc;
-
-        use oceanfs_core::NodeId;
-        use oceanfs_membership::{GracefulLeaveHandler, Membership};
-        use oceanfs_network::ConnectionPool;
-
-        let dir = tempfile::tempdir().unwrap();
-        let wal_writer = Arc::new(
-            oceanfs_storage::WalWriter::open(&oceanfs_core::WalConfig {
-                data_dir: dir.path().join("wal"),
-                max_file_size_bytes: 1024 * 1024,
-                fsync_batch_timeout_ms: 5,
-                ..Default::default()
-            })
-            .await
-            .unwrap(),
-        );
-
-        let ring = oceanfs_routing::Ring::new(oceanfs_core::RingConfig::default());
-        let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
-        let membership = Arc::new(Membership::new(
-            NodeId::new("empty-blob"),
-            "127.0.0.1:9200".parse().unwrap(),
-            "127.0.0.1:9200".parse().unwrap(),
-            oceanfs_core::GossipConfig::default(),
-            ring_cache,
-        ));
-        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
-
-        let handler = super::NodeLeaveHandler {
-            wal_writer,
-            segment_dir: dir.path().join("segments"),
-            pool,
-            membership,
-        };
-
-        let transferred =
-            GracefulLeaveHandler::transfer_segment_shards_to(&handler, &NodeId::new("successor"))
-                .await
-                .unwrap();
-        assert_eq!(transferred, 0, "empty blob store transfers 0 segments");
-    }
-
-    /// Verifies that `transfer_segment_shards_to` enumerates segments
-    /// and handles gRPC failure gracefully (all transfers fail without
-    /// a server running → 0 transferred).
-    #[tokio::test]
-    async fn leave_handler_transfer_segments_handles_grpc_failure() {
-        use std::sync::Arc;
-
-        use oceanfs_core::{NodeId, SegmentId};
-        use oceanfs_membership::{GracefulLeaveHandler, Membership};
-        use oceanfs_network::ConnectionPool;
-
-        let dir = tempfile::tempdir().unwrap();
-        let wal_writer = Arc::new(
-            oceanfs_storage::WalWriter::open(&oceanfs_core::WalConfig {
-                data_dir: dir.path().join("wal"),
-                max_file_size_bytes: 1024 * 1024,
-                fsync_batch_timeout_ms: 5,
-                ..Default::default()
-            })
-            .await
-            .unwrap(),
-        );
-
-        // Write some segments to the segments directory.
-        let seg_dir = dir.path().join("segments");
-        std::fs::create_dir_all(&seg_dir).unwrap();
-        for i in 0..3 {
-            let id = SegmentId::new();
-            let mut data = vec![0u8; 76]; // header
-            data.extend_from_slice(&[i as u8; 64]);
-            std::fs::write(seg_dir.join(format!("{id}.dat")), &data).unwrap();
-        }
-
-        let ring = oceanfs_routing::Ring::new(oceanfs_core::RingConfig::default());
-        let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
-        let addr: std::net::SocketAddr = "127.0.0.1:9300".parse().unwrap();
-        let membership = Arc::new(Membership::new(
-            NodeId::new("blob-test"),
-            addr,
-            addr,
-            oceanfs_core::GossipConfig::default(),
-            ring_cache,
-        ));
-        // Register the successor in membership so address resolution works.
-        membership.upsert_node(
-            NodeId::new("successor"),
-            oceanfs_core::NodeState::Alive,
-            oceanfs_core::Incarnation::new(1),
-            Some(addr),
-        );
-        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
-
-        let handler = super::NodeLeaveHandler {
-            wal_writer,
-            segment_dir: dir.path().join("segments"),
-            pool,
-            membership,
-        };
-
-        // Transfer: gRPC to successor will fail (no server), but we verify
-        // the enumeration happened and attempts were made.
-        let transferred =
-            GracefulLeaveHandler::transfer_segment_shards_to(&handler, &NodeId::new("successor"))
-                .await
-                .unwrap();
-        // All transfers fail because no gRPC server — count is 0.
-        assert_eq!(transferred, 0, "transfers fail without gRPC server");
-    }
-
     /// Verifies that `Membership::leave()` with a handler calls the handler
     /// instead of sleeping. Uses a mock handler that records calls.
     #[tokio::test]
@@ -4365,135 +3470,5 @@ mod tests {
 
         assert!(handler.wal_called.load(Ordering::SeqCst), "WAL handoff was called");
         assert!(handler.shard_called.load(Ordering::SeqCst), "shard transfer was called");
-    }
-
-    // ── gRPC segment transfer integration test ────────────────────
-
-    /// Verifies that `transfer_segment_shards_to` successfully pushes
-    /// segment data to a real gRPC healing service and the recipient
-    /// stores the received hints.
-    #[tokio::test]
-    async fn leave_handler_transfer_via_grpc_received_by_successor() {
-        use std::sync::Arc;
-
-        use oceanfs_core::{Incarnation, NodeId, NodeState, SegmentId};
-        use oceanfs_durability::{
-            anti_entropy::InMemorySegmentStore, healing_service::HealingGrpcService,
-            HealingRpcServer, HintedHandoff, SegmentDataStore,
-        };
-        use oceanfs_membership::{GracefulLeaveHandler, Membership};
-        use oceanfs_network::ConnectionPool;
-        use tonic::transport::Server;
-
-        // ---- Setup server (successor) ----
-        let server_handoff = Arc::new(HintedHandoff::new());
-        let server_store: Arc<dyn SegmentDataStore> = Arc::new(InMemorySegmentStore::new());
-        let server_meta = Arc::new(
-            oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
-                data_dir: {
-                    let d = tempfile::tempdir().unwrap();
-                    let p = d.path().to_path_buf();
-                    // Keep tempdir alive
-                    std::mem::forget(d);
-                    p.join("meta")
-                },
-                block_cache_size: 1024,
-                memtable_size: 1024,
-                ..Default::default()
-            })
-            .unwrap(),
-        );
-        // Use a fixed port for the test gRPC server.
-        let bound_addr: std::net::SocketAddr = "127.0.0.1:15550".parse().unwrap();
-        let healing_svc = HealingGrpcService::new(
-            server_handoff.clone(),
-            server_meta.clone(),
-            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
-                &oceanfs_core::LifecycleConfig::default(),
-            )),
-            server_store,
-            Arc::new(HlcClock::new()),
-        );
-
-        let server_task = tokio::spawn(async move {
-            Server::builder()
-                .add_service(HealingRpcServer::new(healing_svc))
-                .serve(bound_addr)
-                .await
-                .unwrap();
-        });
-
-        // Give the server a moment to start.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // ---- Setup client (leaving node) ----
-        let dir = tempfile::tempdir().unwrap();
-        let wal_writer = Arc::new(
-            oceanfs_storage::WalWriter::open(&oceanfs_core::WalConfig {
-                data_dir: dir.path().join("wal"),
-                max_file_size_bytes: 1024 * 1024,
-                fsync_batch_timeout_ms: 5,
-                ..Default::default()
-            })
-            .await
-            .unwrap(),
-        );
-
-        // Write test segments to the segments directory.
-        let seg_dir = dir.path().join("segments");
-        std::fs::create_dir_all(&seg_dir).unwrap();
-        let seg_a = SegmentId::new();
-        let seg_b = SegmentId::new();
-        let mut data_a = vec![0u8; 76];
-        data_a.extend_from_slice(b"segment A data for graceful leave");
-        std::fs::write(seg_dir.join(format!("{seg_a}.dat")), &data_a).unwrap();
-        let mut data_b = vec![0u8; 76];
-        data_b.extend_from_slice(b"segment B data for graceful leave");
-        std::fs::write(seg_dir.join(format!("{seg_b}.dat")), &data_b).unwrap();
-
-        // Build ring with successor node.
-        let mut ring = oceanfs_routing::Ring::new(oceanfs_core::RingConfig::default());
-        ring.add_node(NodeId::new("leaver"));
-        ring.add_node(NodeId::new("successor"));
-        let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
-
-        let membership = Arc::new(Membership::new(
-            NodeId::new("leaver"),
-            "127.0.0.1:9999".parse().unwrap(),
-            "127.0.0.1:9999".parse().unwrap(),
-            oceanfs_core::GossipConfig::default(),
-            ring_cache.clone(),
-        ));
-        // Register successor with the actual bound address for gRPC.
-        membership.upsert_node(
-            NodeId::new("successor"),
-            NodeState::Alive,
-            Incarnation::new(1),
-            Some(bound_addr),
-        );
-        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
-
-        let handler = super::NodeLeaveHandler {
-            wal_writer: wal_writer.clone(),
-            segment_dir: dir.path().join("segments"),
-            pool,
-            membership,
-        };
-
-        // ---- Execute transfer ----
-        let transferred =
-            GracefulLeaveHandler::transfer_segment_shards_to(&handler, &NodeId::new("successor"))
-                .await
-                .unwrap();
-
-        assert_eq!(transferred, 2, "both segments should transfer successfully via gRPC");
-
-        // ---- Verify successor received the hints ----
-        let pending = server_handoff.pending_count(&NodeId::new("successor"));
-        assert_eq!(pending, 2, "successor should have 2 pending hints");
-        assert_eq!(server_handoff.total_pending_count(), 2, "total hints should match");
-
-        // Drop server and clean up.
-        server_task.abort();
     }
 }

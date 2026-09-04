@@ -25,6 +25,7 @@ pub mod announce;
 pub mod health;
 mod membership_state;
 mod metadata_adapter;
+mod modules;
 mod node;
 pub mod pool_manifest;
 pub mod pool_paths;

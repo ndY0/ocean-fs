@@ -38,6 +38,14 @@ the authoritative close for B1 — the buggy reader (and its `[review]`
 marker) is removed with the handler. The dependency is recorded in both
 docs (here + `composition-root-decomposition/c1-split-storage-builder.md`).
 
+**CLOSED 2026-09-04 by c1** (`composition-root-decomposition/
+c1-split-storage-builder.md`): `NodeLeaveHandler` (struct, impls, §18
+construction, `Node.leave_handler` field, and the four leave-handler test
+groups incl. the gRPC transfer e2e) is deleted; `Node::shutdown()` step 1
+now calls `membership.leave(None)` (drain + LEFT announcement — replicas +
+re-replication cover the data, review #34). B1's buggy reader no longer
+exists.
+
 ### B2 — Silent default network address (review #64)
 **Location:** `node.rs:1501-1506` — `.with_self_grpc_addr(parse().unwrap_or_else(127.0.0.1:9001))`.
 **Bug:** an unparseable `grpc_listen_addr` silently falls back to

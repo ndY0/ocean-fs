@@ -26,11 +26,13 @@ Make storage pools mandatory at the config boundary (ADR-0031 D1): an empty
 silently booting the implicit single-`data_dir` pool. Concretely:
 `StorageConfig::validate` stops accepting the empty list and enforces the
 role-pinning topology; `PoolRegistry::from_config` deletes the implicit-pool
-fallback branch (`pool/mod.rs:787-806`); `Node::start` stops branching on
-`config.storage.pools.is_empty()` (`node.rs:847-848`, `881-885`). After this
-feature, every booting node has declared pools; the code still compiles with
-the (now unreachable) legacy fallbacks in the data-access layer, which f2
-deletes.
+fallback branch (`pool/mod.rs:787-806`); the storage builder (c1's
+`modules/storage.rs`) stops branching on `config.storage.pools.is_empty()`
+(`modules/storage.rs:256-257` `data_pools`, `:290` `SealConfig.registry` —
+the branches moved there verbatim with the c1 pure-move and die here). After
+this feature, every booting node has declared pools; the code still compiles
+with the (now unreachable) legacy fallbacks in the data-access layer, which
+f2 deletes.
 
 ## Scope
 
@@ -88,16 +90,24 @@ deletes.
     pool), and the g6 availability tests (~`:1784`) likewise: the role
     presence check now runs before the probe.
 
-- `oceanfs-node` `crates/oceanfs-node/src/node.rs` (ADR-0031 D1):
-  - `node.rs:847-848`: `let data_pools = pool_registry.data_pools();` — no
-    empty-list conditional.
-  - `node.rs:881-885`: `registry: Some(pool_registry.clone())` — drop the
-    `None` arm; update the surrounding comment block (`:874-880`) that
-    documents the legacy empty list.
+- `oceanfs-node` — `crates/oceanfs-node/src/modules/storage.rs`
+  (`StorageModule::build`, the c1 home of the moved §6/§f5 material;
+  ADR-0031 D1):
+  - `modules/storage.rs:256-257`: `let data_pools = if
+    config.storage.pools.is_empty() { Vec::new() } else {
+    registry.data_pools() };` — drop the empty-list conditional.
+  - `modules/storage.rs:290`: `registry: if
+    config.storage.pools.is_empty() { None } else {
+    Some(registry.clone()) }` — drop the `None` arm; update the
+    surrounding comment blocks (`:251-255` legacy empty-list paragraph and
+    the f8-attach comment above `:290`) that document the legacy empty
+    list.
   - The pools-mandatory error now surfaces through the existing
-    `storage pool registry: {e}` map (`node.rs:607-610`); keep that mapping.
-  - Update the `// ---- 0.` section comment (`:594-606`) that describes legacy
-    mode and the Degraded→legacy bridge (the bridge itself dies in f2).
+    `storage pool registry: {e}` map in `Node::start` (`node.rs:385-387`);
+    keep that mapping.
+  - Update the `// ---- 0.` section comment in `node.rs` (`:375-386`) that
+    describes legacy mode and the Degraded→legacy bridge (the bridge
+    itself dies in f2).
 
 ### Out of Scope
 
@@ -117,7 +127,7 @@ deletes.
 |---|---|
 | `oceanfs-core` | `config/storage.rs`: `StorageConfig::validate` rejects empty and role-incomplete pool lists; docs + unit tests updated |
 | `oceanfs-storage` | `pool/mod.rs`: implicit-pool fallback deleted from `PoolRegistry::from_config`; docs + doc examples updated |
-| `oceanfs-node` | `node.rs`: empty-pool branches removed (`data_pools`, `SealConfig.registry`) |
+| `oceanfs-node` | `modules/storage.rs` (`StorageModule::build`): empty-pool branches removed (`data_pools`, `SealConfig.registry`) |
 
 ## Interface (Public API)
 
@@ -135,11 +145,11 @@ deletes.
 
 ```
 oceanfs.toml (no [storage.pools])
-  → Node::start (node.rs:565)
-  → StorageConfig::validate        → Err("at least one 'data', 'wal',
-  → PoolRegistry::from_config        'metadata', and 'hints' pool is
-        (no implicit pool branch)    required … storage pools are
-                                     mandatory (ADR-0031)")
+  → Node::start (node.rs:342) → StorageModule::build (modules/storage.rs)
+  → StorageConfig::validate → Err("at least one 'data', 'wal',
+  → PoolRegistry::from_config      'metadata', and 'hints' pool is
+        (no implicit pool branch)  required … storage pools are
+                                   mandatory (ADR-0031)")
   → boot aborts, explicit message; node never serves
 
 oceanfs.toml (declared pools)

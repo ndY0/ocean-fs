@@ -124,8 +124,8 @@ before g7's catch-up enumeration at scale.
 
 | Epic | Status |
 |---|---|
-| review-wave-0-1 | **done (2026-09-04)** — f0+f1 implemented, review PASS; B1 deferred to composition-root c1's leave-handler deletion |
-| composition-root-decomposition | c1–c5 docs, not started |
+| review-wave-0-1 | **done (2026-09-04)** — f0+f1 implemented, review PASS; B1 closed by composition-root c1's leave-handler deletion (2026-09-04) |
+| composition-root-decomposition | **c1 done (2026-09-04, review PASS)** — StorageModule extracted, stores consolidated 8→2, leave handler deleted; c2–c5 not started |
 | store-unification | f1–f3 docs, not started |
 | legacy-mode-removal | f1–f3 docs, not started |
 | durability-scheduler | f1–f4 docs, not started |
