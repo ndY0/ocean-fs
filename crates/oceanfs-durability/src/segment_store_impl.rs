@@ -1,6 +1,5 @@
 //! Trait impl bridge: implements `SegmentDataStore` using segment files
-//! from the authoritative segments directory — the legacy `segments/`
-//! dir or a data pool root (ADR-0029 f5).
+//! from the owning data pool root (ADR-0029 f5, ADR-0031 pools-only).
 //!
 //! Replaces the previous `BlobStore` bridge (`blob_store_impl.rs`) which
 //! read from a redundant `blobs/` directory.
@@ -13,58 +12,58 @@ use oceanfs_storage::Error;
 
 use crate::anti_entropy::SegmentDataStore;
 
-// [review][cleanup][high]
-// no legacy mode
-// [end]
-/// A `SegmentDataStore` backed by segment files under the legacy
-/// segments dir or a data pool root.
+/// A `SegmentDataStore` backed by segment files under a data pool root.
 ///
-/// Reads the full raw segment data (skipping the 76-byte header).
-/// Writes include a minimal 76-byte header for compatibility. The pool
-/// root is resolved per segment from its durable `pool_id` (injected
-/// resolver backed by the lifecycle registry); pool_id 0 / unknown ids
-/// resolve to the legacy dir.
+/// Reads the full raw segment data (skipping the header). Writes include
+/// a minimal v1 header for compatibility. The pool root is resolved per
+/// segment from its durable `pool_id` (injected resolver backed by the
+/// lifecycle registry).
 pub struct DiskSegmentStore {
-    /// Data pool roots (ADR-0029 f5). Empty = legacy mode.
+    /// Data pool roots (ADR-0029 f5). Pools are mandatory since f1
+    /// (ADR-0031) — never empty.
     data_pools: Vec<Arc<oceanfs_storage::StoragePool>>,
-    /// Legacy segments directory (pool_id 0 / no pools).
-    legacy_dir: std::path::PathBuf,
-    /// Resolves a segment's durable pool id; `None`/0 → legacy dir.
+    /// Resolves a segment's durable pool id.
     pool_id_for: oceanfs_storage::PoolIdResolver,
 }
 
 impl DiskSegmentStore {
-    /// Creates a pool-aware store rooted at `legacy_dir` with the node's
-    /// data pools and the pool-id resolver (ADR-0029 f5).
+    /// Creates a pools-only store over the node's data pools and the
+    /// pool-id resolver (ADR-0029 f5).
     ///
-    /// `legacy_dir` is the directory containing `{segment_id}.dat` files
-    /// written by the legacy path; in pool mode each segment resolves to
-    /// the root of the pool its metadata names.
+    /// Every segment resolves to the root of the pool its metadata
+    /// names. A segment whose `pool_id` no registered pool carries is
+    /// surfaced as an explicit `InvalidConfig` data-integrity error —
+    /// there is no legacy `data_dir` fallback (ADR-0031 D2).
     pub fn new(
         data_pools: Vec<Arc<oceanfs_storage::StoragePool>>,
-        legacy_dir: std::path::PathBuf,
         pool_id_for: oceanfs_storage::PoolIdResolver,
     ) -> Self {
-        Self { data_pools, legacy_dir, pool_id_for }
+        Self { data_pools, pool_id_for }
     }
 
     /// Resolves the directory holding a segment's `.dat` (f5): the
-    /// owning pool root, or the legacy dir when pool_id is 0/unknown or
-    /// no pools are configured. Plain join over the pool snapshot — no
-    /// locks, no I/O (f5 perf 2.3/7.2).
-    fn resolve(&self, segment_id: &SegmentId) -> std::path::PathBuf {
-        let pool_id = if self.data_pools.is_empty() {
-            0
-        } else {
-            (self.pool_id_for)(segment_id).unwrap_or(0)
-        };
-        oceanfs_storage::resolve_pool_root(&self.data_pools, pool_id, &self.legacy_dir)
+    /// owning pool root. Plain join over the pool snapshot — no locks,
+    /// no I/O (f5 perf 2.3/7.2).
+    ///
+    /// A missing resolver mapping (a segment not yet registered in the
+    /// lifecycle) defaults to pool 0 — the first configured pool. This
+    /// is the **write-before-register bridge**: the sealed-segment push
+    /// receiver and the re-rep worker persist a replica's `.dat` before
+    /// `request_reserve`/`request_seal` and stamp `pool_id: 0` in the
+    /// durable metadata (sealed-segment-replication, ADR-0030). The
+    /// bridge disappears with those flows when store-unification f2
+    /// (ADR-0032 D3) serializes and lifecycle-routes every `.dat` write.
+    fn resolve(&self, segment_id: &SegmentId) -> std::result::Result<std::path::PathBuf, Error> {
+        let pool_id = (self.pool_id_for)(segment_id).unwrap_or(0);
+        oceanfs_storage::resolve_pool_root(&self.data_pools, pool_id).ok_or_else(|| {
+            Error::InvalidConfig(format!("segment {segment_id} references unknown pool {pool_id}"))
+        })
     }
 }
 
 impl SegmentDataStore for DiskSegmentStore {
     fn read_segment_data(&self, segment_id: &SegmentId) -> std::result::Result<Bytes, Error> {
-        let path = self.resolve(segment_id).join(format!("{segment_id}.dat"));
+        let path = self.resolve(segment_id)?.join(format!("{segment_id}.dat"));
         // Preserve the original io::Error (including its ErrorKind): scrub
         // distinguishes NotFound (shard not yet sealed / already reclaimed —
         // NOT corruption) from genuine I/O failures by matching the kind.
@@ -100,7 +99,7 @@ impl SegmentDataStore for DiskSegmentStore {
         segment_id: &SegmentId,
         data: &[u8],
     ) -> std::result::Result<(), Error> {
-        let dir = self.resolve(segment_id);
+        let dir = self.resolve(segment_id)?;
         let path = dir.join(format!("{segment_id}.dat"));
         // Ensure the segment directory exists — the gRPC append_segment
         // handler must be able to write segments even if no local segment
@@ -133,14 +132,62 @@ mod tests {
 
     use super::*;
 
-    fn legacy_store(dir: &std::path::Path) -> DiskSegmentStore {
-        DiskSegmentStore::new(Vec::new(), dir.to_path_buf(), Arc::new(|_| None))
+    /// A pools-only store backed by one data pool (config-order id 0)
+    /// plus the mandatory wal/metadata/hints siblings; returns the store
+    /// and the data pool root.
+    fn pools_store(tmp: &tempfile::TempDir) -> (DiskSegmentStore, std::path::PathBuf) {
+        let data_root = tmp.path().join("nvme0");
+        let storage = oceanfs_core::StorageConfig {
+            pools: vec![
+                oceanfs_core::StoragePoolConfig {
+                    name: "pool-a".into(),
+                    role: oceanfs_core::PoolRole::Data,
+                    root: data_root.clone(),
+                    weight: Some(1),
+                    tech: oceanfs_core::PoolTech::Auto,
+                    health: Default::default(),
+                },
+                oceanfs_core::StoragePoolConfig {
+                    name: "journal".into(),
+                    role: oceanfs_core::PoolRole::Wal,
+                    root: tmp.path().join("optane0"),
+                    weight: Some(1),
+                    tech: oceanfs_core::PoolTech::Auto,
+                    health: Default::default(),
+                },
+                oceanfs_core::StoragePoolConfig {
+                    name: "meta".into(),
+                    role: oceanfs_core::PoolRole::Metadata,
+                    root: tmp.path().join("optane1"),
+                    weight: Some(1),
+                    tech: oceanfs_core::PoolTech::Auto,
+                    health: Default::default(),
+                },
+                oceanfs_core::StoragePoolConfig {
+                    name: "hints".into(),
+                    role: oceanfs_core::PoolRole::Hints,
+                    root: tmp.path().join("hints0"),
+                    weight: Some(1),
+                    tech: oceanfs_core::PoolTech::Auto,
+                    health: Default::default(),
+                },
+            ],
+            missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+        };
+        let registry =
+            oceanfs_storage::PoolRegistry::from_config(&storage, &tmp.path().join("data"))
+                .expect("registry");
+        let pools = registry.data_pools();
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].id(), 0, "config-order id");
+        let store = DiskSegmentStore::new(pools, Arc::new(|_| Some(0)));
+        (store, data_root)
     }
 
     #[test]
     fn write_then_read_roundtrip_is_header_valid() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = legacy_store(dir.path());
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, data_root) = pools_store(&tmp);
         let id = SegmentId::new();
         let data: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
 
@@ -149,90 +196,47 @@ mod tests {
         assert_eq!(&read_back[..], &data[..], "heal-written data must round-trip");
 
         // The file must be a valid v1 segment (the read path's strict
-        // header verification accepts it).
-        let file = std::fs::read(dir.path().join(format!("{id}.dat"))).unwrap();
+        // header verification accepts it), living on the pool root.
+        let file = std::fs::read(data_root.join(format!("{id}.dat"))).unwrap();
         let header = oceanfs_storage::SegmentHeader::from_bytes(&file).expect("valid header");
         assert_eq!(header.version, 1);
         assert_eq!(header.data_end() as usize, 76 + data.len());
     }
 
-    /// Pool mode: a known pool id resolves to that pool's root; an
-    /// unknown id and the no-pools case fall back to the legacy dir
-    /// (ADR-0029 f5 resolve — the f2 config-order id scheme: 0 names the
-    /// first data pool, never the legacy root, when pools exist).
+    /// Pools-only resolution: a registered pool id resolves to that
+    /// pool's root (f2 config-order id scheme: 0 names the first data
+    /// pool); an id no registered pool carries is an explicit
+    /// `InvalidConfig` error — never a legacy `data_dir` fallback
+    /// (ADR-0031 D2).
     #[test]
     fn resolve_uses_pool_id_to_pick_root() {
         let tmp = tempfile::tempdir().unwrap();
-        let legacy = tmp.path().join("segments");
-        let pool_root = tmp.path().join("pool-1");
-        std::fs::create_dir_all(&pool_root).unwrap();
-
-        // Build the pool through the public registry API (probe + capacity).
-        let data_dir = tmp.path().join("data");
-        let registry = oceanfs_storage::PoolRegistry::from_config(
-            &oceanfs_core::StorageConfig {
-                pools: vec![
-                    oceanfs_core::StoragePoolConfig {
-                        name: "pool-1".into(),
-                        role: oceanfs_core::PoolRole::Data,
-                        root: pool_root.clone(),
-                        weight: Some(1),
-                        tech: oceanfs_core::PoolTech::Auto,
-                        health: Default::default(),
-                    },
-                    oceanfs_core::StoragePoolConfig {
-                        name: "journal".into(),
-                        role: oceanfs_core::PoolRole::Wal,
-                        root: tmp.path().join("optane0"),
-                        weight: Some(1),
-                        tech: oceanfs_core::PoolTech::Auto,
-                        health: Default::default(),
-                    },
-                    oceanfs_core::StoragePoolConfig {
-                        name: "meta".into(),
-                        role: oceanfs_core::PoolRole::Metadata,
-                        root: tmp.path().join("optane1"),
-                        weight: Some(1),
-                        tech: oceanfs_core::PoolTech::Auto,
-                        health: Default::default(),
-                    },
-                    oceanfs_core::StoragePoolConfig {
-                        name: "hints".into(),
-                        role: oceanfs_core::PoolRole::Hints,
-                        root: tmp.path().join("hints0"),
-                        weight: Some(1),
-                        tech: oceanfs_core::PoolTech::Auto,
-                        health: Default::default(),
-                    },
-                ],
-                missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
-            },
-            &data_dir,
-        )
-        .expect("registry");
-        let pools = registry.data_pools();
-        assert_eq!(pools.len(), 1);
-        assert_eq!(pools[0].id(), 0, "config-order id");
-
-        let store = DiskSegmentStore::new(pools.clone(), legacy.clone(), Arc::new(|_| Some(0)));
+        let (store, data_root) = pools_store(&tmp);
         let id = SegmentId::new();
+
+        let store_mapped = DiskSegmentStore::new(store.data_pools.clone(), Arc::new(|_| Some(0)));
         assert_eq!(
-            store.resolve(&id),
-            pool_root,
+            store_mapped.resolve(&id).unwrap(),
+            data_root,
             "a registered segment must resolve to its pool root"
         );
 
-        // Unknown pool id (stale mapping) → the legacy dir.
-        let store_unknown =
-            DiskSegmentStore::new(pools.clone(), legacy.clone(), Arc::new(|_| Some(99)));
-        assert_eq!(
-            store_unknown.resolve(&id),
-            legacy,
-            "an unknown pool id falls back to the legacy dir"
+        // An unknown pool id (stale mapping) is a data-integrity error.
+        let store_unknown = DiskSegmentStore::new(store.data_pools.clone(), Arc::new(|_| Some(99)));
+        let err = store_unknown.resolve(&id).expect_err("unknown pool id must error");
+        assert!(
+            err.to_string().contains("unknown pool 99"),
+            "error must name the missing pool: {err}"
         );
 
-        // No pools configured (legacy mode) → the legacy dir for every id.
-        let store_legacy = DiskSegmentStore::new(Vec::new(), legacy.clone(), Arc::new(|_| None));
-        assert_eq!(store_legacy.resolve(&id), legacy);
+        // No resolver mapping (unregistered segment — the
+        // write-before-register bridge) defaults to pool 0: the first
+        // configured data pool.
+        let store_unmapped = DiskSegmentStore::new(store.data_pools.clone(), Arc::new(|_| None));
+        assert_eq!(
+            store_unmapped.resolve(&id).unwrap(),
+            data_root,
+            "unmapped segments land on pool 0 (bridge until store-unification f2)"
+        );
     }
 }

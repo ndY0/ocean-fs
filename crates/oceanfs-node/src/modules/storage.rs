@@ -381,18 +381,12 @@ impl StorageModule {
         // replace the eight per-consumer instances the inline code created
         // (replicator, re-rep worker, GC, AE, reaper, heal, healing-service,
         // segment-service). All consumers receive clones of these two Arcs.
-        let data_store: Arc<dyn oceanfs_durability::SegmentDataStore> =
-            Arc::new(oceanfs_durability::DiskSegmentStore::new(
-                data_pools.clone(),
-                segment_legacy_dir.clone(),
-                pool_id_for.clone(),
-            ));
-        let shard_store: Arc<dyn oceanfs_durability::SegmentShardStore> =
-            Arc::new(oceanfs_durability::DiskSegmentShardStore::new(
-                data_pools.clone(),
-                segment_legacy_dir.clone(),
-                pool_id_for.clone(),
-            ));
+        let data_store: Arc<dyn oceanfs_durability::SegmentDataStore> = Arc::new(
+            oceanfs_durability::DiskSegmentStore::new(data_pools.clone(), pool_id_for.clone()),
+        );
+        let shard_store: Arc<dyn oceanfs_durability::SegmentShardStore> = Arc::new(
+            oceanfs_durability::DiskSegmentShardStore::new(data_pools.clone(), pool_id_for.clone()),
+        );
 
         // [review][config][high]
         // segment relicator config shoudl be fully configurable by the end user
@@ -706,7 +700,7 @@ mod tests {
             oceanfs_storage::PoolRegistry::from_config(&config.storage, &data_dir)
                 .expect("pool registry"),
         );
-        let paths = crate::pool_paths::pool_paths(&registry, &data_dir, &config.hint_wal_dir);
+        let paths = crate::pool_paths::pool_paths(&registry);
         let metadata_store = Arc::new(
             oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
                 data_dir: paths.metadata.clone(),

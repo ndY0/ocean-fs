@@ -127,7 +127,7 @@ before g7's catch-up enumeration at scale.
 | review-wave-0-1 | **done (2026-09-04)** — f0+f1 implemented, review PASS; B1 closed by composition-root c1's leave-handler deletion (2026-09-04) |
 | composition-root-decomposition | **c1 done (2026-09-04, review PASS)** — StorageModule extracted, stores consolidated 8→2, leave handler deleted; c2–c5 not started |
 | store-unification | f1–f3 docs, not started |
-| legacy-mode-removal | **f1 done (2026-09-04, review PASS)** — pools mandatory at boot, implicit fallback deleted, fixtures pool-only; f2/f3 not started |
+| legacy-mode-removal | **f1 done (2026-09-04, review PASS); f2 done (2026-09-04, review PASS, iter 1 — 0 blocking gaps)** — pools mandatory at boot, store/path resolution pools-only (2 user-approved deviations in f2 doc: write-None→pool-0 bridge, GC marker retention); f3 pending |
 | durability-scheduler | f1–f4 docs, not started |
 | manifest-aware-repair | f1–f3 docs, not started |
 | bounded-metadata-scans | f1–f4 docs, not started (ADR-0034 accepted) |

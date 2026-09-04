@@ -104,13 +104,25 @@ Dependency edges:
 so fixture work can land *before* the enforcement:
 
 1. c1 (composition-root) — pure move, legacy behavior preserved.
+   **LANDED 2026-09-04 (review PASS)** — see the composition-root epic.
 2. **f3 fixture prep commit** — dev/test/e2e configs + doc examples gain
    minimal pool blocks while legacy is still accepted (harmless, green).
+   **LANDED 2026-09-04 — merged into f1's fixture rework** (f1 Implementation
+   Notes: harness `spawn_inner` appends the four-role block; configs/doc
+   examples declare pools).
 3. **f1** — boot enforcement + the core/registry unit tests it invalidates
    (green: every booting fixture now declares pools).
+   **LANDED 2026-09-04 (review PASS, iter 2).**
 4. **f2** — store/path legacy deletion (green: fixtures are pools-only).
+   **LANDED 2026-09-04 (review PASS, iter 1 — 0 blocking gaps).** Two
+   deviations were user-approved before implementation and are recorded in
+   the f2 doc's Accepted Deviations: D1 keeps a temporary write-None→pool-0
+   bridge in `resolve()` (deleted by store-unification f2, ADR-0032 D3); D2
+   retains the `gc/garbage_collector.rs:614` `[review][duplication][critcal]`
+   marker (topics owned by ADR-0032 — only the legacy clause was removed).
 5. **f3 format removal** — event-WAL/checkpoint legacy shape removal +
    boot-refusal tests + legacy-test deletion (green last).
+   **PENDING (not started).**
 
 ## What must not regress
 
@@ -178,7 +190,9 @@ so fixture work can land *before* the enforcement:
 
 - ADR-0031 (the decision), ADR-0029 §D8 (the topology this amends)
 - Review anchors: `modules/storage.rs:240` (the moved `node.rs:830`
-  marker), `pool/mod.rs:783`, `segment_store_impl.rs:16`,
-  `pool_paths.rs:44`, `gc/garbage_collector.rs:613`
+  marker), `pool/mod.rs:783`, `segment_store_impl.rs:16` (legacy marker —
+  **removed by f2**), `pool_paths.rs:44`, `gc/garbage_collector.rs:613`
+  (marker retained by f2 at `:614`; duplication/no-I/O-abstraction topics
+  owned by store-unification ADR-0032)
 - Triage program: `features/refactoring/review-2026-09-roadmap.md` wave 2 ⑤
 - Companion: `features/refactoring/composition-root-decomposition/README.md`

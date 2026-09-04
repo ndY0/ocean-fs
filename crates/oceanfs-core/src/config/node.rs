@@ -383,10 +383,9 @@ pub struct NodeConfig {
     pub default_fetch_strategy: crate::FetchStrategy,
 
     // ── Hinted handoff configuration ──
-    /// Directory for per-node hinted handoff WAL files. When `None`, defaults to
-    /// `"{data_dir}/hints"`.
-    #[serde(default)]
-    pub hint_wal_dir: Option<PathBuf>,
+    // (The legacy `hint_wal_dir` override was removed by ADR-0031 D2:
+    // the hints WAL always lives on the pinned hints pool root,
+    // resolved by `pool_paths`.)
     /// Maximum blob size stored inline in hinted handoff WAL (bytes).
     /// Blobs above this threshold are stored as segment references.
     /// Default: 4096 (4 KB).
@@ -721,7 +720,6 @@ impl Default for NodeConfig {
             // Item 10: Fetch strategy
             default_fetch_strategy: crate::FetchStrategy::default(),
             // Hinted handoff
-            hint_wal_dir: None,
             hint_inline_threshold_bytes: 4096,
             hint_max_batch_size: 256,
             hint_ttl_sec: 604800,

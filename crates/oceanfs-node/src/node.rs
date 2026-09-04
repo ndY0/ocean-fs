@@ -380,8 +380,7 @@ impl Node {
             oceanfs_storage::PoolRegistry::from_config(&config.storage, &config.data_dir)
                 .map_err(|e| format!("storage pool registry: {e}"))?,
         );
-        let paths =
-            crate::pool_paths::pool_paths(&pool_registry, &config.data_dir, &config.hint_wal_dir);
+        let paths = crate::pool_paths::pool_paths(&pool_registry);
 
         // ---- 1. Open metadata store ----
         // [review][config][high]
@@ -904,9 +903,9 @@ impl Node {
 
         // Construct the persistent per-node HintWAL directory and
         // HintedHandoffManager for durable hinted handoff (ADR-0018 Decision 2).
-        // The hints WAL lives on the pinned hints pool root when
-        // configured; the legacy `hint_wal_dir` override (or
-        // `{data_dir}/hints`) applies otherwise (resolved in pool_paths).
+        // The hints WAL lives on the pinned hints pool root (resolved in
+        // pool_paths; the legacy `hint_wal_dir` override was removed by
+        // ADR-0031 D2).
         let hints_dir = paths.hints.clone();
         let hint_delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> = Arc::new(
             GrpcHintDeliveryClient::new(pool.clone())

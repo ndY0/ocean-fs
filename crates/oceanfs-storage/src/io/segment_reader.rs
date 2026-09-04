@@ -360,7 +360,13 @@ impl DiskSegmentReader {
                         Some(registry) => registry.data_pools(),
                         None => self.data_pools.clone(),
                     };
-                    let root = crate::pool::resolve_pool_root(&pools, pool_id, &self.legacy_dir);
+                    // `resolve_pool_root` is pools-only since legacy f2
+                    // (ADR-0031 D2): an id no registered pool carries
+                    // falls back to this reader's own legacy dir — the
+                    // reader's internal legacy branch is theme-1 store
+                    // unification territory, not removed here.
+                    let root = crate::pool::resolve_pool_root(&pools, pool_id)
+                        .unwrap_or_else(|| self.legacy_dir.clone());
                     self.pool_root_cache.lock().insert(*segment_id, root.clone());
                     root
                 }

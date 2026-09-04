@@ -130,14 +130,63 @@ impl Harness {
             SegmentLifecycleCoordinator::with_registry(Arc::clone(&registry))
                 .with_event_wal(event_wal.clone()),
         );
+        // Pools-only harness (ADR-0031): one data pool whose root IS the
+        // segments dir — stores, sealer and the `.dat` path assertions
+        // all keep resolving to `dir/segments` unchanged. The data pool
+        // is configured first (config-order id 0).
         let segments_dir = dir.join("segments");
-        let data_store =
-            Arc::new(DiskSegmentStore::new(Vec::new(), segments_dir.clone(), Arc::new(|_| None)));
-        let shard_store = Arc::new(DiskSegmentShardStore::new(
-            Vec::new(),
+        for pool_root in [
             segments_dir.clone(),
-            Arc::new(|_| None),
-        ));
+            dir.join("pool-wal"),
+            dir.join("pool-meta"),
+            dir.join("pool-hints"),
+        ] {
+            std::fs::create_dir_all(pool_root).expect("pool root");
+        }
+        let storage = oceanfs_core::StorageConfig {
+            pools: vec![
+                oceanfs_core::StoragePoolConfig {
+                    name: "data-0".into(),
+                    role: oceanfs_core::PoolRole::Data,
+                    root: segments_dir.clone(),
+                    weight: Some(1),
+                    tech: oceanfs_core::PoolTech::Auto,
+                    health: Default::default(),
+                },
+                oceanfs_core::StoragePoolConfig {
+                    name: "wal-0".into(),
+                    role: oceanfs_core::PoolRole::Wal,
+                    root: dir.join("pool-wal"),
+                    weight: Some(1),
+                    tech: oceanfs_core::PoolTech::Auto,
+                    health: Default::default(),
+                },
+                oceanfs_core::StoragePoolConfig {
+                    name: "meta-0".into(),
+                    role: oceanfs_core::PoolRole::Metadata,
+                    root: dir.join("pool-meta"),
+                    weight: Some(1),
+                    tech: oceanfs_core::PoolTech::Auto,
+                    health: Default::default(),
+                },
+                oceanfs_core::StoragePoolConfig {
+                    name: "hints-0".into(),
+                    role: oceanfs_core::PoolRole::Hints,
+                    root: dir.join("pool-hints"),
+                    weight: Some(1),
+                    tech: oceanfs_core::PoolTech::Auto,
+                    health: Default::default(),
+                },
+            ],
+            missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+        };
+        let pool_registry = oceanfs_storage::PoolRegistry::from_config(&storage, &dir.join("data"))
+            .expect("pool registry");
+        let data_pools = pool_registry.data_pools();
+        assert_eq!(data_pools[0].id(), 0, "data-first config-order id");
+        let data_store = Arc::new(DiskSegmentStore::new(data_pools.clone(), Arc::new(|_| Some(0))));
+        let shard_store =
+            Arc::new(DiskSegmentShardStore::new(data_pools.clone(), Arc::new(|_| Some(0))));
         let sealer = Arc::new(SegmentSealer::new(
             SealConfig { data_dir: segments_dir.clone(), ..Default::default() },
             data_wal.clone(),

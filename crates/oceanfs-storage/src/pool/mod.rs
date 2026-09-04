@@ -66,35 +66,44 @@ const GIB: u64 = 1024 * 1024 * 1024;
 const POOL_PROBE_MARKER: &[u8] = b"oceanfs pool probe";
 
 /// Resolves a segment's durable pool id (the node backs it with the
-/// lifecycle registry's `SegmentMetadata.pool_id`). `None`/unknown ids
-/// fall back to the legacy dir (f5).
+/// lifecycle registry's `SegmentMetadata.pool_id`).
 pub type PoolIdResolver = Arc<dyn Fn(&oceanfs_core::SegmentId) -> Option<u32> + Send + Sync>;
 
 /// Resolves a segment's pool root from its durable `pool_id`.
 ///
-/// Pools are mandatory since f1 (ADR-0031) and every segment carries a
-/// real pool id (config-order scheme: 0 = the first data pool), so
-/// `pool_id` names that pool's root; `legacy_dir` remains only as the
-/// unknown-id fallback until f2 deletes it. Pure lookup over the pool
-/// snapshot — no locks, no I/O (f5 perf: 2.3/7.2).
+/// Pools are mandatory (ADR-0031) and every segment carries a real pool
+/// id (config-order scheme: 0 = the first configured pool), so `pool_id`
+/// names that pool's root. `None` when no registered pool carries the
+/// id — callers surface that as an explicit data-integrity error (the
+/// legacy `data_dir` fallback was deleted by ADR-0031 D2). Pure lookup
+/// over the pool snapshot — no locks, no I/O (f5 perf: 2.3/7.2).
 ///
 /// # Examples
 ///
 /// ```
 /// use oceanfs_storage::resolve_pool_root;
+/// # use std::sync::Arc;
+/// # let tmp = tempfile::tempdir().expect("tempdir");
+/// # let data_dir = tmp.path().join("data");
+/// # let storage = oceanfs_core::StorageConfig {
+/// #     pools: vec![
+/// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+/// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+/// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+/// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+/// #     ],
+/// #     missing_root_policy: Default::default(),
+/// # };
+/// # let registry = oceanfs_storage::PoolRegistry::from_config(&storage, &data_dir).expect("registry");
+/// # let pools = registry.data_pools();
+/// let root = resolve_pool_root(&pools, 0).expect("pool 0 is registered");
+/// assert_eq!(root, tmp.path().join("pool-data"));
 ///
-/// // No pool carries the id: the caller's fallback dir is returned.
-/// assert_eq!(
-///     resolve_pool_root(&[], 0, std::path::Path::new("/fallback/segments")),
-///     std::path::PathBuf::from("/fallback/segments")
-/// );
+/// // An id no registered pool carries resolves to `None`.
+/// assert_eq!(resolve_pool_root(&pools, 99), None);
 /// ```
-pub fn resolve_pool_root(pools: &[Arc<StoragePool>], pool_id: u32, legacy_dir: &Path) -> PathBuf {
-    pools
-        .iter()
-        .find(|pool| pool.id() == pool_id)
-        .map(|pool| pool.root().to_path_buf())
-        .unwrap_or_else(|| legacy_dir.to_path_buf())
+pub fn resolve_pool_root(pools: &[Arc<StoragePool>], pool_id: u32) -> Option<PathBuf> {
+    pools.iter().find(|pool| pool.id() == pool_id).map(|pool| pool.root().to_path_buf())
 }
 
 // ---------------------------------------------------------------------------

@@ -130,8 +130,9 @@ impl OrphanReaper {
         let ttl_ms = (self.config.tombstone_ttl_sec * 1000) as i64;
 
         // (segment_id, pool_id) — the pool id names the root holding the
-        // `.dat` (0 = legacy), so the unlink lands on the right root
-        // (ADR-0029 f5).
+        // `.dat`: every listed id is a real registered pool id, so the
+        // unlink lands on the right root (ADR-0029 f5; ADR-0031 D2 —
+        // there is no legacy dir).
         let mut orphan_ids: Vec<(SegmentId, u32)> = Vec::new();
         self.lifecycle.registry().for_each(|segment_id, entry| {
             stats.segments_scanned += 1;
@@ -731,22 +732,65 @@ mod tests {
 
         // Simulate the receiver's raw write: a .dat file with NO
         // registry entry and NO object-row reference. The InMemory
-        // store's listing is empty, so use the DISK store directly.
+        // store's listing is empty, so use the DISK store directly
+        // (pools-only since ADR-0031 D2: one data pool whose root is
+        // the scan directory).
         let dir = tempfile::tempdir().unwrap();
+        let data_root = dir.path().join("pool-data");
+        std::fs::create_dir_all(&data_root).unwrap();
+        let storage = oceanfs_core::StorageConfig {
+            pools: vec![
+                oceanfs_core::StoragePoolConfig {
+                    name: "data-0".into(),
+                    role: oceanfs_core::PoolRole::Data,
+                    root: data_root.clone(),
+                    weight: Some(1),
+                    tech: oceanfs_core::PoolTech::Auto,
+                    health: Default::default(),
+                },
+                oceanfs_core::StoragePoolConfig {
+                    name: "wal-0".into(),
+                    role: oceanfs_core::PoolRole::Wal,
+                    root: dir.path().join("pool-wal"),
+                    weight: Some(1),
+                    tech: oceanfs_core::PoolTech::Auto,
+                    health: Default::default(),
+                },
+                oceanfs_core::StoragePoolConfig {
+                    name: "meta-0".into(),
+                    role: oceanfs_core::PoolRole::Metadata,
+                    root: dir.path().join("pool-meta"),
+                    weight: Some(1),
+                    tech: oceanfs_core::PoolTech::Auto,
+                    health: Default::default(),
+                },
+                oceanfs_core::StoragePoolConfig {
+                    name: "hints-0".into(),
+                    role: oceanfs_core::PoolRole::Hints,
+                    root: dir.path().join("pool-hints"),
+                    weight: Some(1),
+                    tech: oceanfs_core::PoolTech::Auto,
+                    health: Default::default(),
+                },
+            ],
+            missing_root_policy: oceanfs_core::MissingRootPolicy::Degraded,
+        };
+        let registry_from_config =
+            oceanfs_storage::PoolRegistry::from_config(&storage, &dir.path().join("data"))
+                .expect("registry");
         let disk_store = Arc::new(DiskSegmentShardStore::new(
-            Vec::new(),
-            dir.path().to_path_buf(),
+            registry_from_config.data_pools(),
             Arc::new(|_| None),
         ));
         let unregistered = SegmentId::new();
         let mtime =
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64 - 60_000; // older than the 5s TTL
-        std::fs::write(dir.path().join(format!("{unregistered}.dat")), vec![0xAB; 100]).unwrap();
+        std::fs::write(data_root.join(format!("{unregistered}.dat")), vec![0xAB; 100]).unwrap();
         // Set the mtime to the past so the TTL gate passes.
         let past = SystemTime::now() - std::time::Duration::from_secs(60);
         let _ = std::fs::File::options()
             .write(true)
-            .open(dir.path().join(format!("{unregistered}.dat")))
+            .open(data_root.join(format!("{unregistered}.dat")))
             .and_then(|f| f.set_modified(past));
         let _ = mtime;
 
@@ -775,7 +819,7 @@ mod tests {
         assert_eq!(stats.orphans_found, 1, "the unregistered .dat must be found");
         assert_eq!(stats.orphans_deleted, 1);
         assert!(
-            !dir.path().join(format!("{unregistered}.dat")).exists(),
+            !data_root.join(format!("{unregistered}.dat")).exists(),
             "the unregistered .dat must be swept"
         );
     }

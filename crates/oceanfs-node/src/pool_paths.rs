@@ -1,18 +1,20 @@
-//! Role-pinned path resolution (ADR-0029 §D8).
+//! Role-pinned path resolution (ADR-0029 §D8, pools-only — ADR-0031).
 //!
-//! When storage pools are configured, the node's non-segment data paths
-//! move off `data_dir` onto their role-pinned pool roots: metadata store →
-//! `metadata` pool, data WAL → `wal` pool, event WAL → `wal` pool +
-//! `event-wal` subdir, hint WAL → `hints` pool. In legacy mode (no pools)
-//! every path resolves exactly as before — byte-for-byte.
+//! The node's non-segment data paths live on their role-pinned pool
+//! roots: metadata store → `metadata` pool, data WAL → `wal` pool, event
+//! WAL → `wal` pool + `event-wal` subdir, hint WAL → `hints` pool.
+//! Pools are mandatory since f1 and every pinned role exists by
+//! construction, so resolution is total: a Degraded pool still owns its
+//! root (Phase B semantics arrive later) and the legacy `data_dir`
+//! fallback arms are deleted (ADR-0031 D2).
 //!
 //! Resolution is a boot-time operation (perf guidelines 3.4/7.1: nothing
 //! here runs on the write path).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use oceanfs_core::PoolRole;
-use oceanfs_storage::{PoolRegistry, PoolStatus};
+use oceanfs_storage::PoolRegistry;
 
 /// Resolved role-pinned directories for the node's non-segment data paths.
 ///
@@ -41,81 +43,52 @@ pub struct PoolPaths {
     pub hints: PathBuf,
 }
 
-// [review][implementation][high]
-// we need to get ride of the legacy mode
-// [end]
 /// Resolves the role-pinned data paths from the pool registry.
 ///
-/// Precedence rule (pinned): each role resolves to its `Healthy` pinned
-/// pool root when the registry has one; the legacy fallback (`data_dir`
-/// arithmetic) is used only when the registry has no pool of that role —
-/// i.e. legacy mode (no pools configured) or a topology that did not pin
-/// the role. When a pinned pool exists but is not `Healthy` (Degraded
-/// startup policy — Phase A bridge), the role falls back to its legacy
-/// path with a prominent WARN: real degraded semantics arrive in Phase B.
+/// Pools are mandatory (f1 boot enforcement, ADR-0031 D1): a pool of
+/// every pinned role exists, so each path resolves to that role's pool
+/// root unconditionally — health status is ignored (a Degraded pool
+/// still owns its root; real degraded semantics arrive in Phase B) and
+/// there is no legacy `data_dir` / `hint_wal_dir` fallback (ADR-0031
+/// D2).
 ///
-/// - `metadata` → metadata pool root, else `data_dir/metadata`;
-/// - `wal` → wal pool root, else `data_dir/wal`;
+/// - `metadata` → metadata pool root;
+/// - `wal` → wal pool root;
 /// - `event-wal` → wal pool root + `event-wal` (the event log rides the
-///   journal device, ADR-0024), else `data_dir/event-wal`;
-/// - `hints` → hints pool root, else `hint_wal_dir` override, else
-///   `data_dir/hints` (the legacy `hint_wal_dir` override is honored only
-///   when no hints pool is pinned).
-pub(crate) fn pool_paths(
-    registry: &PoolRegistry,
-    data_dir: &Path,
-    hint_wal_dir: &Option<PathBuf>,
-) -> PoolPaths {
-    PoolPaths {
-        metadata: resolve_pinned(registry, PoolRole::Metadata, data_dir.join("metadata")),
-        wal: resolve_pinned(registry, PoolRole::Wal, data_dir.join("wal")),
-        // The event log rides the journal device (ADR-0024): the pinned
-        // wal pool root + `event-wal` subdir; legacy keeps
-        // `data_dir/event-wal` untouched (no extra join).
-        event_wal: match pinned_root(registry, PoolRole::Wal) {
-            Some(root) => root.join("event-wal"),
-            None => data_dir.join("event-wal"),
-        },
-        hints: resolve_pinned(
-            registry,
-            PoolRole::Hints,
-            hint_wal_dir.clone().unwrap_or_else(|| data_dir.join("hints")),
-        ),
-    }
-}
-
-/// The `Healthy` pinned pool root for a role, if any (warns when a pool of
-/// the role exists but is Degraded — Phase A bridge).
-fn pinned_root(registry: &PoolRegistry, role: PoolRole) -> Option<PathBuf> {
-    // A pool of the role exists but is not Healthy → the Degraded-policy
-    // fallback path: keep the node bootable, but say so loudly (Phase A
-    // bridge; Phase B turns this into real degraded semantics).
-    if let Some(pool) = registry.pool_by_role(role) {
-        if pool.status() != PoolStatus::Healthy {
-            tracing::warn!(
-                pool = %pool.name(),
-                role = %role.as_str(),
-                "role pool is not Healthy; falling back to the legacy path \
-                 (Degraded startup policy — Phase A bridge)"
-            );
+///   journal device, ADR-0024);
+/// - `hints` → hints pool root.
+pub(crate) fn pool_paths(registry: &PoolRegistry) -> PoolPaths {
+    // Pools are mandatory (f1 boot enforcement, ADR-0031 D1): a pool of
+    // every pinned role exists on any validated config. Each role below
+    // is resolved through `pool_by_role` and matched explicitly — the
+    // `None` arm is unreachable by construction and must never silently
+    // invent a fallback path (ADR-0031 D2).
+    fn role_root(registry: &PoolRegistry, role: PoolRole) -> PathBuf {
+        match registry.pool_by_role(role) {
+            Some(pool) => pool.root().to_path_buf(),
+            None => unreachable!(
+                "no {} pool: f1 boot enforcement requires every pinned role \
+                 (validate refuses role-incomplete [storage.pools])",
+                role.as_str()
+            ),
         }
     }
-    registry
-        .pool_by_role(role)
-        .filter(|pool| pool.status() == PoolStatus::Healthy)
-        .map(|pool| pool.root().to_path_buf())
-}
-
-/// Resolves one role's path: the pinned pool root when a `Healthy` pool of
-/// that role exists, else `fallback`.
-fn resolve_pinned(registry: &PoolRegistry, role: PoolRole, fallback: PathBuf) -> PathBuf {
-    pinned_root(registry, role).unwrap_or(fallback)
+    let metadata = role_root(registry, PoolRole::Metadata);
+    let wal = role_root(registry, PoolRole::Wal);
+    PoolPaths {
+        metadata,
+        wal: wal.clone(),
+        // The event log rides the journal device (ADR-0024): the pinned
+        // wal pool root + `event-wal` subdir.
+        event_wal: wal.join("event-wal"),
+        hints: role_root(registry, PoolRole::Hints),
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::sync::Arc;
+    use std::{path::Path, sync::Arc};
 
     // NOTE: the storage-pool definition type is exported from the core
     // facade as `StoragePoolConfig` (f1 naming deviation — `PoolConfig`
@@ -167,11 +140,11 @@ mod tests {
             .expect("role root")
     }
 
-    /// Explicit mode: every pinned role resolves to its pool root.
+    /// Pools-only: every pinned role resolves to its pool root — the
+    /// legacy `data_dir`/`hint_wal_dir` fallbacks are gone (ADR-0031 D2).
     #[test]
-    fn explicit_mode_resolves_to_pool_roots() {
+    fn four_role_registry_resolves_exact_pool_roots() {
         let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
         let (registry, roots) = pinned_registry(
             &tmp,
             &[
@@ -181,43 +154,51 @@ mod tests {
                 (PoolRole::Hints, "hints"),
             ],
         );
-        let paths = pool_paths(&registry, &data_dir, &None);
+        let paths = pool_paths(&registry);
 
         assert_eq!(paths.metadata, root_for(&roots, PoolRole::Metadata));
         assert_eq!(paths.wal, root_for(&roots, PoolRole::Wal));
         // The event log rides the journal device, under the wal pool root.
         assert_eq!(paths.event_wal, root_for(&roots, PoolRole::Wal).join("event-wal"));
         assert_eq!(paths.hints, root_for(&roots, PoolRole::Hints));
-
-        // The legacy hint_wal_dir override is ignored when a hints pool is
-        // pinned — the pool topology is the authoritative layout.
-        let custom_hints = tmp.path().join("custom-hints");
-        let paths = pool_paths(&registry, &data_dir, &Some(custom_hints));
-        assert_eq!(paths.hints, root_for(&roots, PoolRole::Hints));
+        // No role dir resolves under a `data_dir` anymore.
+        let data_dir = tmp.path().join("data");
+        assert!(!paths.metadata.starts_with(&data_dir));
+        assert!(!paths.wal.starts_with(&data_dir));
+        assert!(!paths.hints.starts_with(&data_dir));
     }
 
-    /// A Degraded pinned pool (startup policy bridge) falls back with the
-    /// role's legacy path.
+    /// A Degraded pinned pool still owns its root: health status is
+    /// ignored by resolution (Phase B semantics arrive later) and no
+    /// WARN is emitted — the Degraded→legacy bridge is gone
+    /// (ADR-0031 D2).
     #[test]
-    fn degraded_pinned_pool_falls_back_to_legacy_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        let (registry, roots) = pinned_registry(
-            &tmp,
-            &[
-                (PoolRole::Data, "pool-a"),
-                (PoolRole::Wal, "journal"),
-                (PoolRole::Metadata, "meta"),
-                (PoolRole::Hints, "hints"),
-            ],
-        );
-        // Mark the wal pool Degraded (as the Degraded startup policy does
-        // when the root probe fails).
-        registry.set_status(1, PoolStatus::Degraded);
+    fn degraded_pool_resolves_to_its_own_root_without_warn() {
+        use tracing::subscriber::with_default;
 
-        let paths = pool_paths(&registry, &data_dir, &None);
-        assert_eq!(paths.wal, data_dir.join("wal"), "Degraded wal pool falls back");
-        assert_ne!(paths.wal, root_for(&roots, PoolRole::Wal));
+        let subscriber = RecordingSubscriber::default();
+        with_default(subscriber.clone(), || {
+            let tmp = tempfile::tempdir().unwrap();
+            let (registry, roots) = pinned_registry(
+                &tmp,
+                &[
+                    (PoolRole::Data, "pool-a"),
+                    (PoolRole::Wal, "journal"),
+                    (PoolRole::Metadata, "meta"),
+                    (PoolRole::Hints, "hints"),
+                ],
+            );
+            // Mark the wal pool Degraded (as the Degraded startup policy
+            // does when the root probe fails).
+            registry.set_status(1, PoolStatus::Degraded);
+
+            let paths = pool_paths(&registry);
+            assert_eq!(paths.wal, root_for(&roots, PoolRole::Wal));
+            assert_eq!(paths.event_wal, root_for(&roots, PoolRole::Wal).join("event-wal"));
+        });
+
+        let events = subscriber.events.lock();
+        assert!(events.is_empty(), "Degraded pool resolution must not WARN, got: {events:?}");
     }
 
     /// A subscriber that records WARN+ event messages for assertion.
@@ -264,67 +245,5 @@ mod tests {
                 self.message = value.to_string();
             }
         }
-    }
-
-    /// The Degraded-pinned-pool fallback emits the prominent WARN.
-    #[test]
-    fn degraded_pinned_pool_fallback_emits_warn() {
-        use tracing::subscriber::with_default;
-
-        let subscriber = RecordingSubscriber::default();
-        with_default(subscriber.clone(), || {
-            let tmp = tempfile::tempdir().unwrap();
-            let data_dir = tmp.path().join("data");
-            let (registry, _roots) = pinned_registry(
-                &tmp,
-                &[
-                    (PoolRole::Data, "pool-a"),
-                    (PoolRole::Wal, "journal"),
-                    (PoolRole::Metadata, "meta"),
-                    (PoolRole::Hints, "hints"),
-                ],
-            );
-            registry.set_status(1, PoolStatus::Degraded);
-
-            let paths = pool_paths(&registry, &data_dir, &None);
-            assert_eq!(paths.wal, data_dir.join("wal"));
-        });
-
-        let events = subscriber.events.lock();
-        assert!(
-            events.iter().any(|message| message.contains("role pool is not Healthy")),
-            "the Degraded fallback must WARN, got: {events:?}"
-        );
-    }
-
-    /// Healthy pinned resolution is silent (the WARN is reserved for an
-    /// existing-but-Degraded pinned pool).
-    #[test]
-    fn healthy_pinned_resolution_is_silent() {
-        use tracing::subscriber::with_default;
-
-        let subscriber = RecordingSubscriber::default();
-        with_default(subscriber.clone(), || {
-            let tmp = tempfile::tempdir().unwrap();
-            let data_dir = tmp.path().join("data");
-            let (registry, _roots) = pinned_registry(
-                &tmp,
-                &[
-                    (PoolRole::Data, "pool-a"),
-                    (PoolRole::Wal, "journal"),
-                    (PoolRole::Metadata, "meta"),
-                    (PoolRole::Hints, "hints"),
-                ],
-            );
-            let _ = pool_paths(&registry, &data_dir, &None);
-
-            // The legacy hint_wal_dir override is silently ignored when a
-            // hints pool is pinned (pool topology is authoritative).
-            let custom_hints = tmp.path().join("custom-hints");
-            let _ = pool_paths(&registry, &data_dir, &Some(custom_hints));
-        });
-
-        let events = subscriber.events.lock();
-        assert!(events.is_empty(), "healthy pinned resolution must not WARN, got: {events:?}");
     }
 }

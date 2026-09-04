@@ -1477,9 +1477,10 @@ mod tests {
                 "restart must preserve the durable segment→pool mapping"
             );
             // The rebuilt mapping resolves to the same pool root that
-            // holds the `.dat`.
-            let root =
-                crate::pool::resolve_pool_root(&data_pools, *pool_id, &dir.path().join("segments"));
+            // holds the `.dat` (pools-only since legacy f2 / ADR-0031 D2;
+            // every sealed id names a registered pool here).
+            let root = crate::pool::resolve_pool_root(&data_pools, *pool_id)
+                .expect("sealed pool id must be registered");
             assert!(
                 root.join(format!("{segment_id}.dat")).exists(),
                 "segment {segment_id} (pool {pool_id}) must resolve to {root:?}"
