@@ -1,6 +1,6 @@
 # ADR-0017: Durability Task Abstraction — `DurabilityTask` Trait and Scheduler
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-08-09
 **Deciders:** OceanFS design team
 
