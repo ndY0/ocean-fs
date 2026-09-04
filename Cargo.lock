@@ -1824,6 +1824,7 @@ dependencies = [
  "blake3",
  "bytes",
  "crc32fast",
+ "dashmap",
  "http",
  "http-body",
  "http-body-util",

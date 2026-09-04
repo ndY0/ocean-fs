@@ -17,6 +17,7 @@ blake3.workspace = true
 async-trait = "0.1"
 bytes.workspace = true
 crc32fast = "1"
+dashmap.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
 num_cpus.workspace = true

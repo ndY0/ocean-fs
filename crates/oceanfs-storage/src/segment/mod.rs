@@ -16,6 +16,7 @@ pub(crate) mod parity_section;
 pub(crate) mod pool;
 pub(crate) mod repair;
 pub(crate) mod route_write;
+pub mod seal_pipeline;
 pub mod sealer;
 pub mod shard;
 pub mod splitter;
@@ -36,6 +37,7 @@ pub use lifecycle::{
     TransitionError,
 };
 pub use pool::{SealingWork, SegmentPool};
+pub use seal_pipeline::{spawn_seal_pipeline, SealMerkleBuilder, SealedSegmentNotifier};
 pub use sealer::{SealConfig, SegmentSealer};
 pub use shard::SegmentShard;
 pub use splitter::SegmentSplitter;

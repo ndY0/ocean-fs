@@ -523,6 +523,28 @@ impl Node {
         )
         .await?;
 
+        // ---- 7b. Start the seal pipeline (storage-side) + 6a/6b
+        // recovery — both run BEFORE any server construction. The seal
+        // pipeline drains the pools' seal queues (relocated from the
+        // write coordinator, c3-Option-A): startup recovery's replayed
+        // re-seals complete asynchronously through it and recovery waits
+        // on their `.dat` files — recovery must never depend on a server
+        // object. The sealed-segment notifier (continuous anti-entropy +
+        // seal-time replication fan-out) rides the pipeline.
+        let ae_for_seal_notify = Arc::clone(&durability.ae);
+        let replicator_for_seal_notify = Arc::clone(&storage.segment_replicator);
+        let sealed_segment_notifier: oceanfs_storage::segment::seal_pipeline::SealedSegmentNotifier =
+            Arc::new(move |segment_id, merkle_root| {
+                ae_for_seal_notify.on_segment_sealed(segment_id, merkle_root);
+                // Seal-time segment replication (sealed-segment-replication):
+                // publish the sealed segment for the replicator — a single
+                // non-blocking channel send, NO network on the seal path.
+                replicator_for_seal_notify.enqueue(segment_id);
+            });
+        storage.start_seal_pipeline(Some(sealed_segment_notifier));
+        // (c1: moved to modules/storage.rs — run_startup_recovery)
+        storage.run_startup_recovery().await?;
+
         // ---- 8. Construct caches ----
         let l1_policy: Box<dyn oceanfs_cache::eviction::EvictionPolicy> = match config
             .eviction_policy_l1
@@ -681,9 +703,6 @@ impl Node {
         // Replay existing hints from the WAL into in-memory queues.
         let _replayed = hinted_handoff_manager.replay_and_enqueue().await?;
 
-        // Clone for the seal notifier closure (the engine itself is
-        // consumed by the background-task spawn later).
-        let ae_worker_notifier = Arc::clone(&durability.ae);
         // Cluster-readiness gate (phase-3 churn fix): a node that just
         // (re)joined a cluster has a ring containing only itself until
         // its membership pull converges; with the adaptive quorum such a
@@ -776,36 +795,12 @@ impl Node {
             .with_routing_hint(manifest_cache.clone())
             // g2 (ADR-0029 §D3): the hint enqueue path rejects new debt
             // while the hints pool is Dead.
-            .with_pool_registry(storage.registry.clone())
-            // Continuous anti-entropy: every successful seal updates the
-            // incremental Merkle tree (with its seal-time root) so
-            // recently-written segments participate in the root exchange
-            // without waiting for the next startup rebuild.
-            // [review][architectural][high]
-            // this is also a proper
-            // [end]
-            .with_segment_sealed_notifier({
-                let replicator = Arc::clone(&storage.segment_replicator);
-                Arc::new(move |segment_id, merkle_root| {
-                    ae_worker_notifier.on_segment_sealed(segment_id, merkle_root);
-                    // Seal-time segment replication (sealed-segment-replication):
-                    // publish the sealed segment for the replicator — a single
-                    // non-blocking channel send, NO network on the seal path.
-                    replicator.enqueue(segment_id);
-                })
-            }),
+            .with_pool_registry(storage.registry.clone()),
         );
 
-        // Start background seal worker — drains filled segments from both
-        // pools and writes them to disk via the segment sealer (Epic 3).
-        let _seal_handle = write_coordinator.start_seal_worker();
         // Clone for the hint-applier adapter (the coordinator is moved
         // into the S3 handler state below).
         let write_coordinator_for_applier = Arc::clone(&write_coordinator);
-
-        // ---- 6a/6b. Startup recovery + startup replication pass ----
-        // (c1: moved to modules/storage.rs — run_startup_recovery)
-        storage.run_startup_recovery().await?;
 
         let read_coordinator = Arc::new(
             ReadCoordinator::new_with_metadata(

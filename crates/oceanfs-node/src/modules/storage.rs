@@ -501,6 +501,34 @@ impl StorageModule {
         })
     }
 
+    /// Starts the storage-side seal pipeline draining the active pools'
+    /// seal queues (c3-Option-A: relocated from the write coordinator —
+    /// recovery's replayed re-seals complete through it, so startup no
+    /// longer depends on a server object).
+    ///
+    /// The merkle-root builder is wired to the durability crate's
+    /// `MerkleTree` (injected — storage cannot depend on durability);
+    /// `sealed_notifier` carries the node's continuous-anti-entropy +
+    /// seal-time-replication fan-out. The returned handle is detached by
+    /// the caller (the loop exits when the pools' seal queues close).
+    pub(crate) fn start_seal_pipeline(
+        &self,
+        sealed_notifier: Option<oceanfs_storage::segment::seal_pipeline::SealedSegmentNotifier>,
+    ) -> tokio::task::JoinHandle<()> {
+        let merkle: oceanfs_storage::segment::seal_pipeline::SealMerkleBuilder =
+            Arc::new(|data: &[u8]| {
+                oceanfs_durability::MerkleTree::build(data, 0).map(|tree| tree.root().hash())
+            });
+        oceanfs_storage::segment::seal_pipeline::spawn_seal_pipeline(
+            self.segment_pool_small.clone(),
+            self.segment_pool_standard.clone(),
+            self.sealer.clone(),
+            self.lifecycle.clone(),
+            merkle,
+            sealed_notifier,
+        )
+    }
+
     /// Runs startup recovery: the machine path (ADR-0025 phase 2).
     ///
     /// Deterministic recovery — fold the event log into the registry
@@ -511,8 +539,9 @@ impl StorageModule {
     /// by the checkpoint threshold, never by lifetime event volume.
     ///
     /// Must be called after every component that consumes the recovery
-    /// output (the AE merkle rebuild etc.) is constructed — i.e. at the
-    /// position the inline §6a/§6b blocks used to occupy in `start()`.
+    /// output (the AE merkle rebuild etc.) is constructed — and after
+    /// [`Self::start_seal_pipeline`] (the replayed re-seals complete on
+    /// the seal pipeline; recovery waits on their `.dat` files).
     /// Records the rebuild duration on [`Self::startup_rebuild_gauge`].
     ///
     /// # Errors

@@ -25,12 +25,10 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use dashmap::DashMap;
 use oceanfs_cache::CacheRpcClient;
 use oceanfs_core::{
     BucketId, ChunkRef, HashKey, HashOutput, Hlc, HlcClock, NodeId, ObjectKey, ObjectMetadata,
-    OperationTimeouts, SegmentId, SegmentIndexEntry, SegmentSizeConfig, SizeTier, WriteAck,
-    WriteResult,
+    OperationTimeouts, SegmentId, SegmentSizeConfig, SizeTier, WriteAck, WriteResult,
 };
 use oceanfs_durability::HintedHandoffManager;
 use oceanfs_membership::Membership;
@@ -40,7 +38,6 @@ use oceanfs_storage::{
     SegmentLifecycleCoordinator, SegmentPool, SegmentRpcClient, SegmentSealer, SegmentShard,
     SegmentSplitter, TierRouter, TransitionError, WalEntry,
 };
-use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -200,17 +197,8 @@ pub struct WriteCoordinator {
     /// spawn_blocking threads (perf §2.7).
     #[cfg(feature = "accel")]
     compress_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Accumulated blob index entries per segment, keyed by segment ID.
-    /// Entries are drained when the segment is sealed.
-    segment_entries: DashMap<SegmentId, Vec<SegmentIndexEntry>>,
     /// Per-operation timeout configuration.
     timeouts: Arc<OperationTimeouts>,
-    /// Optional notifier invoked after every successful seal, carrying
-    /// the segment id and its seal-time Merkle root. Wired by the
-    /// composition root to the anti-entropy engine so the incremental
-    /// Merkle tree covers segments sealed after startup (continuous
-    /// anti-entropy).
-    segment_sealed_notifier: Option<Arc<dyn Fn(SegmentId, HashOutput) + Send + Sync>>,
     /// Peer-side routing hint source (ADR-0029 §D5): the node's cached
     /// storage-pool manifests, consulted as a hint when selecting
     /// replica targets for replication. `None` (default) disables the
@@ -352,9 +340,7 @@ impl WriteCoordinator {
             compress_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 std::thread::available_parallelism().map_or(4, |n| n.get().saturating_mul(2)),
             )),
-            segment_entries: DashMap::new(),
             timeouts: Arc::new(OperationTimeouts::default()),
-            segment_sealed_notifier: None,
             routing_hint: None,
         }
     }
@@ -376,24 +362,6 @@ impl WriteCoordinator {
         compressor: Option<Arc<dyn oceanfs_accel::Compressor>>,
     ) -> Self {
         self.compressor = compressor;
-        self
-    }
-
-    // [review][architecture][high]
-    // again, could probably benefit from a global reactor pattern, instead of per-struct notifiers
-    // to be discussed, i need to weigh the pros and cons with you
-    // [end]
-    /// Registers a notifier invoked after every successful seal.
-    ///
-    /// The composition root wires this to the anti-entropy engine's
-    /// `on_segment_sealed` so the incremental Merkle tree is updated
-    /// continuously instead of only at the startup rebuild.
-    #[must_use]
-    pub fn with_segment_sealed_notifier(
-        mut self,
-        notifier: Arc<dyn Fn(SegmentId, HashOutput) + Send + Sync>,
-    ) -> Self {
-        self.segment_sealed_notifier = Some(notifier);
         self
     }
 
@@ -678,16 +646,16 @@ impl WriteCoordinator {
                 // unchanged).
                 let write_deadline = std::time::Instant::now()
                     + std::time::Duration::from_millis(self.timeouts.write_queue_ms);
-                let (segment_id, offset, length, sealed) = self
-                    .segment_pool_small
+                let seal_pool = self.segment_pool_small.clone();
+                let (segment_id, offset, length, sealed) = seal_pool
                     .append_with_hook_async(
                         &stored[..],
                         |seg_id, off, len| {
                             // Recorded under the slot lock, before any
-                            // fill-triggered seal enqueue: the seal worker
-                            // (another thread) can never drain the entries
-                            // map before this entry exists.
-                            self.record_blob_entry(seg_id, off, len, blake3_hash);
+                            // fill-triggered seal enqueue: the pool drains
+                            // the entries into the seal work item at
+                            // enqueue, so it can never miss an entry.
+                            seal_pool.record_blob_entry(seg_id, off, len, blake3_hash);
                         },
                         std::time::Duration::from_millis(self.timeouts.write_queue_ms),
                     )
@@ -734,13 +702,13 @@ impl WriteCoordinator {
                     compress_chunk(&compression_ctx, &wal_data).await?;
                 let write_deadline = std::time::Instant::now()
                     + std::time::Duration::from_millis(self.timeouts.write_queue_ms);
-                let (segment_id, offset, length, sealed) = self
-                    .segment_pool_standard
+                let seal_pool = self.segment_pool_standard.clone();
+                let (segment_id, offset, length, sealed) = seal_pool
                     .append_with_hook_async(
                         &stored[..],
                         |seg_id, off, len| {
                             // Same airtight ordering as the Small tier above.
-                            self.record_blob_entry(seg_id, off, len, blake3_hash);
+                            seal_pool.record_blob_entry(seg_id, off, len, blake3_hash);
                         },
                         std::time::Duration::from_millis(self.timeouts.write_queue_ms),
                     )
@@ -789,8 +757,8 @@ impl WriteCoordinator {
                             .await?;
                     let write_deadline = std::time::Instant::now()
                         + std::time::Duration::from_millis(self.timeouts.write_queue_ms);
-                    let (seg_id, seg_offset, length, sealed) = self
-                        .segment_pool_standard
+                    let seal_pool = self.segment_pool_standard.clone();
+                    let (seg_id, seg_offset, length, sealed) = seal_pool
                         .append_with_hook_async(
                             &stored[..],
                             |seg_id, off, len| {
@@ -798,9 +766,10 @@ impl WriteCoordinator {
                                 // fill-triggered seal enqueue (Defect 2).
                                 // Without this, a segment filled entirely by
                                 // multi-tier chunks has no index entries when
-                                // the seal worker drains it, so the seal is
-                                // skipped and the segment never reaches disk.
-                                self.record_blob_entry(seg_id, off, len, blake3_hash);
+                                // the pool drains them into the seal work
+                                // item, so the seal is skipped and the
+                                // segment never reaches disk.
+                                seal_pool.record_blob_entry(seg_id, off, len, blake3_hash);
                             },
                             std::time::Duration::from_millis(self.timeouts.write_queue_ms),
                         )
@@ -1064,12 +1033,12 @@ impl WriteCoordinator {
                     compress_chunk(&compression_ctx, &wal_data).await?;
                 let write_deadline = std::time::Instant::now()
                     + std::time::Duration::from_millis(self.timeouts.write_queue_ms);
-                let (segment_id, offset, length, sealed) = self
-                    .segment_pool_small
+                let seal_pool = self.segment_pool_small.clone();
+                let (segment_id, offset, length, sealed) = seal_pool
                     .append_with_hook_async(
                         &stored[..],
                         |seg_id, off, len| {
-                            self.record_blob_entry(seg_id, off, len, blake3_hash);
+                            seal_pool.record_blob_entry(seg_id, off, len, blake3_hash);
                         },
                         std::time::Duration::from_millis(self.timeouts.write_queue_ms),
                     )
@@ -1100,12 +1069,12 @@ impl WriteCoordinator {
                     compress_chunk(&compression_ctx, &wal_data).await?;
                 let write_deadline = std::time::Instant::now()
                     + std::time::Duration::from_millis(self.timeouts.write_queue_ms);
-                let (segment_id, offset, length, sealed) = self
-                    .segment_pool_standard
+                let seal_pool = self.segment_pool_standard.clone();
+                let (segment_id, offset, length, sealed) = seal_pool
                     .append_with_hook_async(
                         &stored[..],
                         |seg_id, off, len| {
-                            self.record_blob_entry(seg_id, off, len, blake3_hash);
+                            seal_pool.record_blob_entry(seg_id, off, len, blake3_hash);
                         },
                         std::time::Duration::from_millis(self.timeouts.write_queue_ms),
                     )
@@ -1485,265 +1454,6 @@ impl WriteCoordinator {
         })
     }
 
-    /// Records a blob index entry for an append to the segment.
-    ///
-    /// Accumulated entries are consumed by the seal worker when
-    /// the segment is sealed.
-    fn record_blob_entry(&self, segment_id: SegmentId, offset: u64, length: u32, hash: HashOutput) {
-        let entry = SegmentIndexEntry { offset, length, blob_key_hash: *hash.as_bytes() };
-        self.segment_entries.entry(segment_id).or_default().push(entry);
-    }
-
-    // [review][implementation][critical]
-    // why is the seal worker part of the write coordinator ? that does not make any sense.
-    // [end]
-    /// Starts a background seal worker that drains seal queues from both
-    /// segment pools and calls the sealer for each filled segment.
-    ///
-    /// The seal worker acquires a permit from the pool's seal semaphore
-    /// before processing each work item, enforcing bounded concurrency.
-    /// On successful seal, accumulated blob index entries are removed
-    /// from the tracking map.
-    ///
-    /// # Returns
-    ///
-    /// A `JoinHandle` for the spawned sealing task.
-    pub fn start_seal_worker(self: &Arc<Self>) -> JoinHandle<()> {
-        let self_small = Arc::clone(self);
-        let self_standard = Arc::clone(self);
-
-        // Take seal receivers from both pools.
-        let rx_small = self.segment_pool_small.take_seal_rx();
-        let rx_standard = self.segment_pool_standard.take_seal_rx();
-
-        tokio::spawn(async move {
-            // Merge both receivers into a single stream using select.
-            match (rx_small, rx_standard) {
-                (Some(mut small_rx), Some(mut standard_rx)) => {
-                    loop {
-                        let work = tokio::select! {
-                            maybe_work = small_rx.recv() => maybe_work,
-                            maybe_work = standard_rx.recv() => maybe_work,
-                        };
-                        let work = match work {
-                            Some(w) => w,
-                            None => {
-                                // Both channels closed — nothing left to seal.
-                                info!("seal worker shutting down: both seal queues closed");
-                                break;
-                            }
-                        };
-
-                        let sealer_arc = Arc::clone(&self_small.sealer);
-                        let entries_map = &self_small.segment_entries;
-                        let sem = if work.tier == SizeTier::Small {
-                            self_small.segment_pool_small.seal_semaphore()
-                        } else {
-                            self_standard.segment_pool_standard.seal_semaphore()
-                        };
-
-                        // Drain the blob index entries synchronously — the
-                        // writer's append_with_hook guarantees they are
-                        // already recorded when the work item was enqueued.
-                        let segment_id = work.segment_id;
-                        let tier = work.tier;
-                        let entries =
-                            entries_map.remove(&segment_id).map(|(_, v)| v).unwrap_or_default();
-
-                        // NOTE: an empty entry list is LEGITIMATE — a
-                        // segment rebuilt by WAL replay carries data that
-                        // was never appended through this coordinator (no
-                        // blob entries were recorded for it). Sealing it
-                        // with an empty index is correct: the data bytes
-                        // are the drained buffer, readers locate chunks
-                        // via the object metadata's ChunkRefs, and the
-                        // seal makes the segment durable (and its WAL
-                        // files sweepable). Skipping the seal left such
-                        // segments registered-unsealed forever, pinning
-                        // their WAL files indefinitely (2.5 GB leak).
-                        if entries.is_empty() {
-                            tracing::debug!(
-                                segment_id = %segment_id,
-                                "sealing segment with empty blob index (WAL-replayed data)"
-                            );
-                        }
-
-                        // Acquire a permit to enforce bounded concurrency
-                        // (perf §2.7/8.5), then seal on a spawned task so
-                        // the worker keeps draining the queues. Sealing
-                        // serially here let the bounded queue overflow
-                        // under write bursts (try_send dropped data);
-                        // concurrent seals keep the drain rate above the
-                        // fill rate (read-path-integrity-under-load).
-                        let self_small = Arc::clone(&self_small);
-                        let self_standard = Arc::clone(&self_standard);
-                        tokio::spawn(async move {
-                            let permit = sem.acquire().await;
-
-                            // Race-closing reserve: the write path
-                            // reserves the segment BEFORE its first WAL
-                            // entry, but the fill-triggered seal work
-                            // item is enqueued DURING the append — a
-                            // seal can drain before that reserve lands,
-                            // and the flush path's Reserved-only
-                            // validation would reject it as Missing.
-                            // Reserving here (idempotent, through the
-                            // coordinator — still the only writer) only
-                            // when the registry has no entry yet closes
-                            // the race; the common case (the write
-                            // path's reserve already folded) skips the
-                            // extra durable write.
-                            if self_small.lifecycle.registry().get(segment_id).is_none() {
-                                match self_small
-                                    .lifecycle
-                                    .request_reserve(segment_id, tier, work.ec_k, work.ec_m)
-                                    .await
-                                {
-                                    Ok(())
-                                    | Err(TransitionError::AlreadySealed)
-                                    | Err(TransitionError::AlreadyDeleted) => {}
-                                    Err(e) => {
-                                        warn!(
-                                            segment_id = %segment_id,
-                                            error = %e,
-                                            "seal-time reserve failed; seal deferred to replay"
-                                        );
-                                        // The segment's data remains
-                                        // readable via the sealing-data
-                                        // set and the WAL still holds its
-                                        // entries — crash recovery
-                                        // replays it. Do not seal: the
-                                        // flush path would reject it.
-                                        return;
-                                    }
-                                }
-                            }
-
-                            // The seal-time EC parity is computed inside
-                            // `seal_from_data` on the blocking pool
-                            // (single scheduler — the write path never
-                            // touches a second thread pool).
-                            // Compute the seal-time Merkle root over the
-                            // data section (64 KiB leaves — the shared
-                            // default used by scrub and anti-entropy) and
-                            // persist it in the segment metadata: it is
-                            // the trusted anchor for scrub verification,
-                            // anti-entropy's local-vs-stored comparison,
-                            // and the startup rebuild of the incremental
-                            // Merkle tree. Without it, every segment is
-                            // "missing merkle root" (scrub inert,
-                            // anti-entropy flags every segment).
-                            //
-                            // The build is CPU-bound (hashing the full
-                            // segment data) — it runs on the blocking
-                            // pool, never on a runtime worker.
-                            let merkle_data = work.segment_data.clone();
-                            let merkle_root = match tokio::task::spawn_blocking(move || {
-                                oceanfs_durability::MerkleTree::build(
-                                    &merkle_data,
-                                    0, // 0 selects the shared 64 KiB default
-                                )
-                                .map(|tree| tree.root().hash())
-                            })
-                            .await
-                            {
-                                Ok(root) => root,
-                                Err(e) => {
-                                    warn!(
-                                        segment_id = %segment_id,
-                                        error = %e,
-                                        "merkle build task failed; sealing without merkle root"
-                                    );
-                                    None
-                                }
-                            };
-
-                            let result = sealer_arc
-                                .seal_from_data(
-                                    segment_id,
-                                    tier,
-                                    work.segment_data.clone(),
-                                    &entries,
-                                    work.ec_k,
-                                    work.ec_m,
-                                    work.strip_size_bytes,
-                                    work.ec_encoder.clone(),
-                                    merkle_root,
-                                )
-                                .await;
-
-                            match result {
-                                Ok(_handle) => {
-                                    // The in-flight read window is closed
-                                    // by the seal transition itself (the
-                                    // coordinator's fold cleared the
-                                    // entry's in_flight — the `.dat` is
-                                    // durable), so no cross-crate
-                                    // remove_seal_buffer call exists any
-                                    // more (lifecycle-read-path).
-                                    // Notify the anti-entropy engine so the
-                                    // incremental Merkle tree covers this
-                                    // segment without waiting for the next
-                                    // startup rebuild (continuous AE).
-                                    if let Some(notifier) = &self_small.segment_sealed_notifier {
-                                        if let Some(root) = merkle_root {
-                                            notifier(segment_id, root);
-                                        }
-                                    }
-                                    // Recycle the segment's backing buffer.
-                                    // The sealing-data clone was just dropped
-                                    // and seal_from_data's clone went out of
-                                    // scope, so the work item now holds the
-                                    // last reference to the original BytesMut
-                                    // allocation: try_into_mut recovers it
-                                    // zero-copy for the next activation
-                                    // (pool-backpressure-and-buffer-recycling).
-                                    match work.segment_data.try_into_mut() {
-                                        Ok(buf) => {
-                                            if tier == SizeTier::Small {
-                                                self_small.segment_pool_small.release_buffer(buf);
-                                            } else {
-                                                self_standard
-                                                    .segment_pool_standard
-                                                    .release_buffer(buf);
-                                            }
-                                        }
-                                        // Still referenced (e.g. an in-flight
-                                        // read of the sealing set): drop.
-                                        Err(bytes) => drop(bytes),
-                                    }
-                                    info!(
-                                        segment_id = %segment_id,
-                                        tier = ?tier,
-                                        blob_count = entries.len(),
-                                        "segment sealed successfully"
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        segment_id = %segment_id,
-                                        error = %e,
-                                        "segment seal failed"
-                                    );
-                                    // The in-memory entries were drained above
-                                    // and are dropped. The segment's bytes
-                                    // remain readable via the pool's sealing
-                                    // set, and the WAL still holds the append
-                                    // entries, so crash recovery replays this
-                                    // segment on restart.
-                                }
-                            }
-                            drop(permit); // permit released
-                        });
-                    }
-                }
-                _ => {
-                    info!("seal worker: seal queues unavailable");
-                }
-            }
-        })
-    }
-
     /// Deletes an object by replicating the deletion to all replicas.
     ///
     /// 1. Looks up the replica set from the ring.
@@ -1984,6 +1694,27 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
+
+    /// Spawns the storage-side seal pipeline for a test coordinator (the
+    /// historic `start_seal_worker` — relocated to oceanfs-storage; the
+    /// coordinator's pools/sealer/lifecycle are the inputs). `notifier`
+    /// mirrors the removed coordinator-level sealed-segment notifier.
+    fn spawn_test_seal_pipeline(
+        coord: &Arc<WriteCoordinator>,
+        notifier: Option<oceanfs_storage::segment::seal_pipeline::SealedSegmentNotifier>,
+    ) -> tokio::task::JoinHandle<()> {
+        let merkle: oceanfs_storage::segment::seal_pipeline::SealMerkleBuilder = Arc::new(|data| {
+            oceanfs_durability::MerkleTree::build(data, 0).map(|tree| tree.root().hash())
+        });
+        oceanfs_storage::segment::seal_pipeline::spawn_seal_pipeline(
+            coord.segment_pool_small.clone(),
+            coord.segment_pool_standard.clone(),
+            coord.sealer.clone(),
+            coord.lifecycle.clone(),
+            merkle,
+            notifier,
+        )
+    }
 
     /// Creates a test coordinator with a fully wired segment pipeline.
     async fn make_write_coordinator(node_id: &str, ring_nodes: &[&str]) -> WriteCoordinator {
@@ -2843,7 +2574,7 @@ mod tests {
         // verify that the seal worker starts and drain cycles don't panic.
 
         // Start the seal worker.
-        let _seal_handle = coord.start_seal_worker();
+        let _seal_handle = spawn_test_seal_pipeline(&coord, None);
 
         // Write a blob > inline threshold (4KB) to hit Small tier.
         let data = vec![0xABu8; 5000];
@@ -2896,7 +2627,7 @@ mod tests {
                 .unwrap_or(true)
         }));
 
-        let _seal_handle = coord.start_seal_worker();
+        let _seal_handle = spawn_test_seal_pipeline(&coord, None);
 
         let wal_config = WalConfig {
             data_dir: dir.path().join("wal"),
@@ -2958,7 +2689,7 @@ mod tests {
         // Inline writes produce no segment work; the seal worker must
         // drain without error.
         let coord = Arc::new(make_write_coordinator("n1", &["n1"]).await);
-        let _seal_handle = coord.start_seal_worker();
+        let _seal_handle = spawn_test_seal_pipeline(&coord, None);
 
         // Write data exactly at inline threshold to hit inline (no segment).
         let data = vec![0xABu8; 128]; // 128 bytes, well below 4KB inline threshold
@@ -2996,7 +2727,7 @@ mod tests {
         let (coord, dir) =
             make_write_coordinator_with_delivery("n1", &["n1"], dir, pool, delivery_client).await;
         let coord = Arc::new(coord);
-        let _seal_handle = coord.start_seal_worker();
+        let _seal_handle = spawn_test_seal_pipeline(&coord, None);
 
         // Rebuild a segment through the replay path: 64 KiB chunks until
         // the pool has no empty slot left (each fill enqueues a seal
@@ -3594,6 +3325,21 @@ mod tests {
         }
     }
 
+    impl MultiTierFixture {
+        /// Spawns the storage-side seal pipeline for the fixture, wiring the
+        /// sealed-segment notifier to the fixture's `sealed_events` recorder
+        /// (the historic coordinator `with_segment_sealed_notifier` contract,
+        /// now a pipeline input).
+        fn spawn_seal_pipeline(&self) -> tokio::task::JoinHandle<()> {
+            let events = Arc::clone(&self.sealed_events);
+            let notifier: oceanfs_storage::segment::seal_pipeline::SealedSegmentNotifier =
+                Arc::new(move |segment_id, merkle_root| {
+                    events.lock().push((segment_id, merkle_root));
+                });
+            spawn_test_seal_pipeline(&self.coord, Some(notifier))
+        }
+    }
+
     /// Builds a coordinator + read path wired to a single-slot standard
     /// pool. The single slot makes consecutive appends accumulate in one
     /// segment, so multi-tier chunks land at non-zero segment offsets —
@@ -3729,28 +3475,22 @@ mod tests {
 
         let sealed_events: Arc<Mutex<Vec<(SegmentId, oceanfs_core::HashOutput)>>> =
             Arc::new(Mutex::new(Vec::new()));
-        let sealed_events_notifier = Arc::clone(&sealed_events);
-        let coord = Arc::new(
-            WriteCoordinator::new(
-                ring_cache.clone(),
-                membership,
-                pool,
-                NodeId::new("n1"),
-                hlc_clock,
-                metadata.clone(),
-                size_config.clone(),
-                shard_small,
-                shard_standard,
-                segment_pool_small,
-                standard_pool.clone(),
-                sealer,
-                lifecycle.clone(),
-                hinted_handoff,
-            )
-            .with_segment_sealed_notifier(Arc::new(move |segment_id, merkle_root| {
-                sealed_events_notifier.lock().push((segment_id, merkle_root));
-            })),
-        );
+        let coord = Arc::new(WriteCoordinator::new(
+            ring_cache.clone(),
+            membership,
+            pool,
+            NodeId::new("n1"),
+            hlc_clock,
+            metadata.clone(),
+            size_config.clone(),
+            shard_small,
+            shard_standard,
+            segment_pool_small,
+            standard_pool.clone(),
+            sealer,
+            lifecycle.clone(),
+            hinted_handoff,
+        ));
 
         let metadata_ops: Arc<dyn crate::metadata_ops::MetadataOps> =
             Arc::new(RocksDbMetadataOps { store: metadata.clone() });
@@ -3952,7 +3692,7 @@ mod tests {
 
         // Start the seal worker and wait for both chunk segments to be
         // sealed to disk.
-        let _seal_handle = fx.coord.start_seal_worker();
+        let _seal_handle = fx.spawn_seal_pipeline();
         let sealed_ids: Vec<SegmentId> = put.chunks.iter().map(|c| c.segment_id).collect();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -4082,7 +3822,7 @@ mod tests {
         // machine (the only durable segment-state store — ADR-0025
         // Decision 3). The PUT's segment is below the fill target, so it
         // seals via the coordinator's idle-seal driver.
-        let _seal_handle = fx.coord.start_seal_worker();
+        let _seal_handle = fx.spawn_seal_pipeline();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             let registry_sealed = fx
@@ -4124,7 +3864,7 @@ mod tests {
         // attempt on a Sealed id is rejected without mutating either
         // store.
         let fx = make_multi_tier_fixture().await;
-        let _seal_handle = fx.coord.start_seal_worker();
+        let _seal_handle = fx.spawn_seal_pipeline();
 
         let coord = Arc::clone(&fx.coord);
         let metadata = Arc::clone(&fx.metadata);
@@ -4255,7 +3995,8 @@ mod tests {
 
         // (c) Sealed: start the seal worker, wait for the Sealed state,
         // and GET from disk through the composite's fallback.
-        let _seal_handle = fx.coord.start_seal_worker();
+        let seal_coord = Arc::clone(&fx.coord);
+        let _seal_handle = spawn_test_seal_pipeline(&seal_coord, None);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             let sealed = fx
@@ -4539,7 +4280,7 @@ mod tests {
             lifecycle,
             hinted_handoff,
         ));
-        let _seal_handle = coord.start_seal_worker();
+        let _seal_handle = spawn_test_seal_pipeline(&coord, None);
 
         let ops: Arc<dyn crate::metadata_ops::MetadataOps> =
             Arc::new(StressMetadataOps { store: metadata.clone() });

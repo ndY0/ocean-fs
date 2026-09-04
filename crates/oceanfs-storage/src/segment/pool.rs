@@ -99,6 +99,12 @@ pub struct SealingWork {
     /// wires the AccelDispatcher so seal encodes are observable through
     /// the accel metrics; `None` falls back to the plain Cauchy encoder.
     pub ec_encoder: Option<std::sync::Arc<dyn oceanfs_ec::Encoder>>,
+    /// The blob index entries recorded for this segment (ADR-0031 era:
+    /// the seal pipeline drains them from the pool at enqueue — the
+    /// entries were complete when the segment froze). Replay/retry
+    /// work items legitimately carry an empty list (readers locate
+    /// chunks via object metadata ChunkRefs).
+    pub entries: Vec<oceanfs_core::SegmentIndexEntry>,
 }
 
 impl std::fmt::Debug for SealingWork {
@@ -403,6 +409,13 @@ pub struct SegmentPool {
     config: PoolConfig,
     /// Reference to the buffer pool for creating new active segments.
     buffer_pool: Arc<BufferPool>,
+    /// Blob index entries recorded by the write path per segment (the
+    /// coordinator's append hooks record here under the slot lock,
+    /// BEFORE any fill-triggered seal enqueue — the seal pipeline
+    /// drains them when it builds the work item, so every enqueue
+    /// provenance (write path, slot recovery, idle driver) carries the
+    /// full index).
+    blob_entries: dashmap::DashMap<oceanfs_core::SegmentId, Vec<oceanfs_core::SegmentIndexEntry>>,
     /// The lifecycle registry — the machine that owns the read path
     /// resolution and the in-flight read window (ADR-0025 Decision 2).
     /// The fill transition attaches the frozen buffer to the registry
@@ -510,6 +523,7 @@ impl SegmentPool {
             registry,
             config,
             buffer_pool: Arc::clone(&buffer_pool),
+            blob_entries: dashmap::DashMap::new(),
             slot_activation: (Mutex::new(()), Condvar::new()),
             slot_activation_notify: tokio::sync::Notify::new(),
             #[cfg(test)]
@@ -1185,18 +1199,10 @@ impl SegmentPool {
             return Err(Error::WriteBackpressureTimeout);
         }
 
-        let (ec_k, ec_m, strip_size_bytes) = self.ec_params();
-        let work = SealingWork {
-            segment_id,
-            segment_data: payload.data,
-            tier: payload.tier,
-            ec_k,
-            ec_m,
-            strip_size_bytes,
-            ec_encoder: self.ec_encoder.clone(),
-        };
+        let work = self.seal_work(segment_id, payload.data, payload.tier);
         match tokio::time::timeout(remaining, self.seal_tx.send(work)).await {
             Ok(Ok(())) => {
+                self.clear_entries(segment_id);
                 self.registry.mark_seal_queued(segment_id);
                 Ok(())
             }
@@ -1336,26 +1342,35 @@ impl SegmentPool {
             .unwrap_or((0, 0, 0))
     }
 
-    /// Enqueues a filled segment for sealing on the bounded work channel.
-    ///
-    /// Uses `try_send` for non-blocking enqueue. If the channel is full,
-    /// the seal is deferred and will be retried later by the pool
-    /// rotation logic. This avoids blocking the caller in async contexts.
-    /// The production (async) path uses [`finish_seal_handoff_async`]
-    /// instead, which never drops an enqueue.
-    /// Enqueues a filled segment for sealing on the bounded work
-    /// channel. Returns whether the work item was accepted.
-    ///
-    /// Uses `try_send` for non-blocking enqueue; when the channel is
-    /// full, `blocking_send` applies backpressure to the caller instead
-    /// of losing the segment (a dropped seal leaves the segment
-    /// registered-unsealed forever). The production (async) path uses
-    /// [`finish_seal_handoff_async`] instead, which never drops an
-    /// enqueue. A `Closed` queue (shutdown) returns `false` — the
-    /// registry entry keeps the in-flight window.
-    fn enqueue_seal(&self, segment_id: SegmentId, segment_data: Bytes, tier: SizeTier) -> bool {
+    /// Records a blob index entry for an append to a segment of this
+    /// pool (called by the write coordinator's append hook — under the
+    /// slot lock, before any fill-triggered seal enqueue, so the drain
+    /// at enqueue time can never miss an entry).
+    pub fn record_blob_entry(
+        &self,
+        segment_id: oceanfs_core::SegmentId,
+        offset: u64,
+        length: u32,
+        hash: oceanfs_core::HashOutput,
+    ) {
+        let entry =
+            oceanfs_core::SegmentIndexEntry { offset, length, blob_key_hash: *hash.as_bytes() };
+        self.blob_entries.entry(segment_id).or_default().push(entry);
+    }
+
+    /// Builds the seal work item for a frozen segment, copying the
+    /// pool's recorded blob-index entries onto the item (complete at
+    /// freeze time — no further appends can reach the segment). The map
+    /// entry is cleared only when the enqueue SUCCEEDS
+    /// ([`Self::clear_entries`]): a failed enqueue (queue full past the
+    /// deadline) must leave the entries for the idle driver's retry —
+    /// draining at build time would seal the retry with an empty index
+    /// (the pre-relocation invariant: entries were consumed when the
+    /// seal worker processed the item).
+    fn seal_work(&self, segment_id: SegmentId, segment_data: Bytes, tier: SizeTier) -> SealingWork {
         let (ec_k, ec_m, strip_size_bytes) = self.ec_params();
-        let work = SealingWork {
+        let entries = self.blob_entries.get(&segment_id).map(|e| e.clone()).unwrap_or_default();
+        SealingWork {
             segment_id,
             segment_data,
             tier,
@@ -1363,16 +1378,44 @@ impl SegmentPool {
             ec_m,
             strip_size_bytes,
             ec_encoder: self.ec_encoder.clone(),
-        };
+            entries,
+        }
+    }
+
+    /// Clears the recorded blob-index entries for a segment whose seal
+    /// work item was ACCEPTED by the queue (the item carries the copy;
+    /// the map entry is consumed exactly once, on success).
+    fn clear_entries(&self, segment_id: SegmentId) {
+        self.blob_entries.remove(&segment_id);
+    }
+
+    /// Enqueues a filled segment for sealing on the bounded work
+    /// channel. Returns whether the work item was accepted.
+    ///
+    /// Uses `try_send` for non-blocking enqueue; when the channel is
+    /// full, `blocking_send` applies backpressure to the caller instead
+    /// of losing the segment (a dropped seal leaves the segment
+    /// registered-unsealed forever). The production (async) path uses
+    /// `finish_seal_handoff_async` instead, which never drops an
+    /// enqueue. A `Closed` queue (shutdown) returns `false` — the
+    /// registry entry keeps the in-flight window.
+    fn enqueue_seal(&self, segment_id: SegmentId, segment_data: Bytes, tier: SizeTier) -> bool {
+        let work = self.seal_work(segment_id, segment_data, tier);
         match self.seal_tx.try_send(work) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.clear_entries(segment_id);
+                true
+            }
             Err(mpsc::error::TrySendError::Full(work)) => {
                 // The sync path runs on blocking contexts (never a
                 // runtime worker), so blocking_send applies
                 // backpressure to the caller instead of losing the
                 // segment.
                 match self.seal_tx.blocking_send(work) {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        self.clear_entries(segment_id);
+                        true
+                    }
                     Err(e) => {
                         tracing::warn!(
                             segment_id = %segment_id,
@@ -1407,17 +1450,15 @@ impl SegmentPool {
         tier: SizeTier,
         data: Bytes,
     ) -> bool {
-        let (ec_k, ec_m, strip_size_bytes) = self.ec_params();
-        let work = SealingWork {
-            segment_id,
-            segment_data: data,
-            tier,
-            ec_k,
-            ec_m,
-            strip_size_bytes,
-            ec_encoder: self.ec_encoder.clone(),
-        };
-        tokio::time::timeout(INFLIGHT_RETRY_ENQUEUE_DEADLINE, self.seal_tx.send(work)).await.is_ok()
+        let work = self.seal_work(segment_id, data, tier);
+        let accepted =
+            tokio::time::timeout(INFLIGHT_RETRY_ENQUEUE_DEADLINE, self.seal_tx.send(work))
+                .await
+                .is_ok();
+        if accepted {
+            self.clear_entries(segment_id);
+        }
+        accepted
     }
 
     /// Returns the storage tier this pool serves.
@@ -3014,5 +3055,77 @@ mod tests {
         let (new_seg_id, new_offset, _) = pool.append(b"more").unwrap();
         assert_eq!(new_offset, 0, "fresh segment starts at offset 0");
         assert_ne!(new_seg_id, seg_id, "old segment must be sealed, new append uses a new one");
+    }
+
+    /// G1 regression (seal-pipeline relocation): a seal enqueue that
+    /// FAILS (queue full past the deadline) must keep the recorded blob
+    /// entries — the idle driver's retry then seals the segment with its
+    /// full index (the pre-relocation invariant: entries were consumed
+    /// only when the seal worker processed an item, never at build).
+    #[tokio::test]
+    async fn failed_enqueue_keeps_entries_for_the_retry() {
+        let pool_cfg =
+            PoolConfig { active_pool_size: 1, encode_queue_capacity: 1, ..PoolConfig::default() };
+        let size_cfg = SegmentSizeConfig {
+            default_target_size: 4 * 1024 * 1024, // no fills via appends in this test
+            ..SegmentSizeConfig::default()
+        };
+        let registry = test_registry();
+        let pool = SegmentPool::new(
+            pool_cfg,
+            SizeTier::Standard,
+            &size_cfg,
+            test_pool(),
+            None,
+            None,
+            Arc::clone(&registry),
+        )
+        .unwrap();
+        let hash = oceanfs_core::HashOutput::from_bytes([0xAB; 32]);
+        let id = SegmentId::new();
+        pool.record_blob_entry(id, 0, 100, hash);
+        pool.record_blob_entry(id, 100, 200, hash);
+
+        // Occupy the single-slot seal queue with another segment's work.
+        let other = SegmentId::new();
+        pool.record_blob_entry(other, 0, 50, hash);
+        assert!(
+            pool.enqueue_inflight_work(other, SizeTier::Standard, Bytes::from(vec![0u8; 64])).await,
+            "first enqueue accepted"
+        );
+
+        // The failing enqueue for `id`: the queue cannot accept it within
+        // the short deadline -> WriteBackpressureTimeout.
+        let sealed = SealedSegment {
+            segment_id: id,
+            tier: SizeTier::Standard,
+            data: Bytes::from(vec![0u8; 64]),
+        };
+        let short = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        let err = pool.enqueue_seal_handoff(Some(sealed), short).await;
+        assert!(
+            matches!(err, Err(Error::WriteBackpressureTimeout)),
+            "queue-full enqueue must time out, got: {err:?}"
+        );
+
+        // The idle driver's retry succeeds once the queue drains — and
+        // must carry BOTH recorded entries for the segment.
+        let mut rx = pool.take_seal_rx().expect("seal receiver");
+        let first = rx.recv().await.expect("queued other item");
+        assert_eq!(first.entries.len(), 1, "the other item carries its own entry");
+        assert!(
+            pool.enqueue_inflight_work(id, SizeTier::Standard, Bytes::from(vec![0u8; 64])).await,
+            "retry enqueue accepted"
+        );
+        let retried = rx.recv().await.expect("retried item");
+        assert_eq!(
+            retried.entries.len(),
+            2,
+            "a failed enqueue must keep its entries for the retry (G1)"
+        );
+        assert_eq!(retried.entries[0].offset, 0);
+        assert_eq!(retried.entries[0].length, 100);
+        assert_eq!(retried.entries[1].offset, 100);
+        assert_eq!(retried.entries[1].length, 200);
     }
 }
