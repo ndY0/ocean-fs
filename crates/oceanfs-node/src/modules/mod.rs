@@ -7,4 +7,5 @@
 //! framework: the explicit construction graph stays visible at the call
 //! site, per architecture.md §4.1.
 
+pub(crate) mod durability;
 pub(crate) mod storage;

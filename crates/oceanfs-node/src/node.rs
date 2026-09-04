@@ -284,8 +284,10 @@ fn property_as_u64(store: &oceanfs_storage::RocksDbMetadataStore, name: &str) ->
 ///
 /// Owns live references to all subsystem components so they remain
 /// alive for the lifetime of the node. Storage-side components live in
-/// `crate::modules::storage::StorageModule` (c1); the durability workers
-/// still held directly here move to a `DurabilityModule` in c2.
+/// `crate::modules::storage::StorageModule` (c1); the durability
+/// workers (GC/AE/scrub/reaper/heal/reconciliation/re-rep) live in
+/// `crate::modules::durability::DurabilityModule` (c2); c3–c5 extract
+/// the server/handlers, network, and background-spawn surfaces.
 pub struct Node {
     /// Node configuration.
     config: Arc<NodeConfig>,
@@ -305,19 +307,11 @@ pub struct Node {
     /// registry, metadata store, WAL, lifecycle machinery, the two shared
     /// segment stores, the replicator, and the write-path pools.
     storage: crate::modules::storage::StorageModule,
-    /// The re-replication dispatcher (g5, ADR-0030 target-pull) — the
-    /// `RepairSink` g3/g4 enqueue into. It selects an acquiring target
-    /// and sends the `RequestReReplication` RPC; requests with no
-    /// eligible target are parked (the honest cannot-reach-RF state).
-    /// Held for tests/observability (`pending_repairs`).
-    pub(crate) repair_dispatcher: Arc<crate::repair::RepairDispatcher>,
-    /// The re-replication worker (g5) — the ACQUIRING-side executor.
-    /// Held so the node can spawn it and tests can observe it.
-    pub(crate) rep_worker: Arc<oceanfs_durability::ReRepWorker>,
-    /// The periodic reconciliation loop (g4 `reconciliation` — the
-    /// ADR-0029 §D4 pull safety net). Held so tests can observe its
-    /// pending-queue depth and holder index.
-    pub(crate) reconciliation: Arc<oceanfs_durability::ReconciliationLoop>,
+    /// The durability subsystem bundle (c2 — `modules/durability.rs`):
+    /// GC/AE/scrub/reaper/heal workers, the reconciliation loop, the
+    /// re-replication worker + dispatcher, op timeouts. Kept alive by
+    /// the node; the worker task handles live in `BackgroundTasks`.
+    durability: crate::modules::durability::DurabilityModule,
 }
 
 // [review][architectural][critical]
@@ -516,272 +510,18 @@ impl Node {
         )
         .await?;
 
-        // ---- 7. Construct durability workers ----
-        let gc_config = oceanfs_durability::GcConfig::new(
-            config.gc_interval_sec,
-            config.tombstone_ttl_sec,
-            config.gc_compact_threshold,
-            config.gc_max_concurrent_compactions,
-            config.gc_compaction_queue_capacity,
-        );
-        // Announcement transmit metrics (g3 — ADR-0029 §D4
-        // observability). Shared by the loss-announcer and the compactor
-        // remap closures; registered with the central metrics registry.
-        let announce_metrics = Arc::new(crate::announce::AnnounceMetrics::new());
-        // ---- Re-replication (g5, ADR-0030 target-pull) ----
-        // The HOLDER side dispatches (selects a target + sends the
-        // RequestReReplication RPC); the ACQUIRING node's ReRepWorker
-        // pulls + writes + stamps. The `RepairSink` that g3's
-        // announce_loss and g4's reconciliation enqueue into is the
-        // dispatcher; the target-side worker queue is fed by the
-        // healing service's `request_re_replication` handler.
-        let repair_selector: Arc<dyn oceanfs_durability::RepairTargetSelector> =
-            Arc::new(crate::repair::ManifestRepairTargetSelector::new(
-                membership.clone(),
-                NodeId::new(&config.node_id),
-            ));
-        let repair_dispatcher = Arc::new(crate::repair::RepairDispatcher::new(
-            repair_selector,
+        // ---- 7. Construct durability workers (c2: modules/durability.rs) ----
+        // GC/AE/scrub/reaper/heal/reconciliation/re-rep + op timeouts are
+        // built by the module against the c1 storage bundle's single shared
+        // stores + lifecycle; metrics register through one module call at
+        // §12. (Hinted handoff + its manager stay in §11 — c5 territory.)
+        let durability = crate::modules::durability::DurabilityModule::build(
+            &config,
+            &storage,
+            membership.clone(),
             pool.clone(),
-            membership.clone(),
-            storage.lifecycle.clone(),
-            NodeId::new(&config.node_id),
-        ));
-        // The acquiring-side worker (bound to THIS node's pool-aware
-        // store + lifecycle; the migration pool/membership are injected
-        // plane-agnostically, ADR-0030 Decision 4).
-        let rep_worker = Arc::new(oceanfs_durability::ReRepWorker::new(
-            oceanfs_durability::ReRepConfig::default(),
-            storage.data_store.clone(),
-            storage.lifecycle.clone(),
-            pool.clone(),
-            membership.clone(),
-            Arc::new(config.operation_timeouts),
-        ));
-        let repair_sink = repair_dispatcher.clone();
-        // [review][config][high]
-        // reconciliation configuration should be fully configurable by the end user
-        // [end]
-        // The periodic reconciliation loop (g4 `reconciliation` — the
-        // ADR-0029 §D4 pull safety net): event-driven wake (a node died /
-        // its pools died → exactly the affected segments via the holder
-        // index), bounded risk-prioritized queue processing per tick, and
-        // an hourly full drift scan. It runs INDEPENDENTLY of any
-        // announcement — the complete safety net when announcements are
-        // suppressed.
-        let reconciliation = Arc::new(oceanfs_durability::ReconciliationLoop::new(
-            Arc::clone(&storage.lifecycle_registry),
-            membership.clone(),
-            repair_sink.clone(),
-            NodeId::new(&config.node_id),
-            config.replication_factor as usize,
-            oceanfs_durability::ReconcileConfig::default(),
-        ));
-        // Wire the holder-index notifier: the reconciliation loop's
-        // reverse index is maintained incrementally from the SINGLE
-        // choke point where a segment's storage_locations is written.
-        storage.lifecycle.set_storage_locations_notifier({
-            let reconciliation = Arc::clone(&reconciliation);
-            Arc::new(move |segment_id, locations| {
-                reconciliation.on_storage_locations(segment_id, locations);
-            })
-        });
-        // GC compaction repacks live blobs into new segments — it must
-        // persist the repacked data through the segment data store (the
-        // compactor reads the old segment's bytes and writes the new
-        // segment's .dat before the metadata swap; without the store, a
-        // metadata-only remap would leave objects pointing at a segment
-        // with no on-disk data).
-        // GC compaction is a state machine (ADR-0025 Decision 4): the
-        // compactor requests every transition from the lifecycle
-        // coordinator and unlinks the old .dat through the shard store
-        // only after the durable delete.
-        let gc_worker = Arc::new(
-            oceanfs_durability::GarbageCollector::new(gc_config.clone())
-                .with_data_store(storage.data_store.clone())
-                .with_lifecycle(storage.lifecycle.clone())
-                .with_shard_store(storage.shard_store.clone())
-                // The repacked segment is a NEW owner-side seal that
-                // bypasses the write-path seal worker: publish it so the
-                // segment replicator fans it out to its ring replicas
-                // (sealed-segment-replication — without this hook,
-                // post-compaction objects silently have zero replicas).
-                .with_segment_sealed_notifier({
-                    let replicator = Arc::clone(&storage.segment_replicator);
-                    Arc::new(move |segment_id| {
-                        replicator.enqueue(segment_id);
-                    })
-                })
-                // The compaction remap (g3 `loss-announcement` Option A):
-                // after the owner's metadata remap commits, tell the OLD
-                // segment's holders so they re-point their own object
-                // rows. Targets = `storage_locations(old) − self` (the
-                // pinned fan-out). The announcement is a bounded-retry
-                // best-effort push; g4's reconciliation is the failsafe.
-                .with_compaction_remap_notifier({
-                    let membership = Arc::clone(&membership);
-                    let pool = Arc::clone(&pool);
-                    let lifecycle_registry = Arc::clone(&storage.lifecycle_registry);
-                    let self_id = NodeId::new(&config.node_id);
-                    let announce_metrics = Arc::clone(&announce_metrics);
-                    Arc::new(move |old_segment_id, new_segment_id, chunk_table| {
-                        let lifecycle_registry = Arc::clone(&lifecycle_registry);
-                        let membership = Arc::clone(&membership);
-                        let pool = Arc::clone(&pool);
-                        let self_id = self_id.clone();
-                        let announce_metrics = Arc::clone(&announce_metrics);
-                        tokio::spawn(async move {
-                            // Resolve the old segment's holders — the
-                            // remap goes to exactly the nodes that hold a
-                            // stale copy referencing the old id.
-                            let targets: Vec<NodeId> = lifecycle_registry
-                                .get(old_segment_id)
-                                .map(|entry| {
-                                    entry
-                                        .metadata
-                                        .storage_locations
-                                        .iter()
-                                        .filter(|n| *n != &self_id)
-                                        .cloned()
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            if targets.is_empty() {
-                                tracing::debug!(
-                                    old_segment_id = %old_segment_id,
-                                    "compaction remap: no peer holders to notify"
-                                );
-                                return;
-                            }
-                            match crate::announce::announce_segment_remap(
-                                &self_id,
-                                old_segment_id,
-                                new_segment_id,
-                                &chunk_table,
-                                &targets,
-                                &pool,
-                                &membership,
-                                None,
-                                None,
-                                Some(&announce_metrics),
-                            )
-                            .await
-                            {
-                                Ok(()) => {
-                                    tracing::info!(
-                                        old_segment_id = %old_segment_id,
-                                        new_segment_id = %new_segment_id,
-                                        targets = targets.len(),
-                                        "compaction remap announced"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        old_segment_id = %old_segment_id,
-                                        new_segment_id = %new_segment_id,
-                                        error = %e,
-                                        "compaction remap not fully delivered (g4 failsafe)"
-                                    );
-                                }
-                            }
-                        });
-                    })
-                }),
-        );
-
-        // [review][config][high]
-        // as previously stated, any config should be possibly driven by the end user
-        // [end]
-        // Construct IncrementalMerkleTree for anti-entropy by scanning
-        // the machine's Sealed entries — supersedes ADR-0018 Decision
-        // 1's segments-CF scan (ADR-0025 Decision 3).
-        let merkle_tree_config = oceanfs_durability::merkle::MerkleTreeConfig::default();
-
-        let merkle_tree = {
-            Arc::new(
-                oceanfs_durability::merkle::IncrementalMerkleTree::rebuild_from_segment_scan(
-                    &storage.lifecycle_registry,
-                    &merkle_tree_config,
-                )
-                .map_err(|e| {
-                    std::io::Error::other(format!(
-                        "failed to rebuild Merkle tree from the machine scan: {e}"
-                    ))
-                })?,
-            )
-        };
-
-        // [review][architecture][critical]
-        // AE no longer creates its own data store — c1 (composition-root
-        // decomposition) wired it to the module's single shared
-        // DiskSegmentStore (one store instance, no concurrent writers).
-        // The remaining 3-abstraction read/write unification
-        // (DiskSegmentStore/DiskSegmentShardStore/DiskSegmentReader) is
-        // store-unification f3 (ADR-0032).
-        // [end]
-        let ae_worker = Arc::new(oceanfs_durability::AntiEntropy::new(
-            oceanfs_durability::AntiEntropyConfig::new(
-                config.ae_interval_sec,
-                config.ae_peer_count,
-            )
-            .with_core(oceanfs_core::AntiEntropyConfig {
-                continuous_enabled: config.anti_entropy.continuous_enabled,
-                continuous_max_segments: config.anti_entropy.continuous_max_segments,
-                sampling_enabled: config.anti_entropy.sampling_enabled,
-                sampling_interval_sec: config.anti_entropy.sampling_interval_sec,
-                sampling_fraction: config.anti_entropy.sampling_fraction,
-            }),
-            membership.clone(),
-            Arc::clone(&storage.lifecycle_registry),
-            pool.clone(),
-            storage.data_store.clone(),
-            merkle_tree.clone(),
-        ));
-        // [review][config][high]
-        // scrub config is not fully customizable
-        // [end]
-        let mut scrub_config = oceanfs_durability::ScrubConfig::default();
-        scrub_config.set_interval_sec(config.scrub_interval_sec);
-        scrub_config.set_parallel_nodes(config.scrub_parallel_nodes);
-        let scrub_worker = Arc::new(oceanfs_durability::ScrubCoordinator::new(scrub_config));
-        // OrphanReaper deletes segment data files from disk when reclaiming
-        // orphaned segments after GC compaction.
-        let reaper = Arc::new(oceanfs_durability::OrphanReaper::new(
-            storage.metadata_store.clone(),
-            storage.lifecycle.clone(),
-            storage.shard_store.clone(),
-            gc_config,
-        ));
-
-        // ---- 7c. Construct heal dispatch pipeline ----
-        let heal_config = oceanfs_durability::HealConfig::default()
-            .with_max_concurrent_heals(config.heal_parallel_segments)
-            .with_heal_throttle_bytes_sec(config.heal_throttle_bytes_sec);
-        let heal_queue = Arc::new(oceanfs_durability::HealQueue::new(heal_config.queue_capacity()));
-        // Initialize the global heal sender so scrub and anti-entropy can
-        // call enqueue_heal() without direct queue access.
-        oceanfs_durability::heal::init_global_queue(heal_queue.sender());
-        let heal_codec_config = oceanfs_core::CodecConfig::default();
-        // The heal decoder routes through the accel dispatcher so decode
-        // repair work is observable (accel_decode_ops_total, duration
-        // histograms) and the tier is consistent across sites.
-        let heal_decoder: Arc<dyn oceanfs_ec::Decoder> = storage.accel.clone();
-        // Clone before move into HealWorker — used by ReadCoordinator as well.
-        let ec_decoder = heal_decoder.clone();
-
-        // ---- 7d. Construct per-operation timeouts (Item 4) ----
-        // Must be constructed before heal, hinted_handoff, write_coordinator,
-        // and read_coordinator so they can accept it via their with_timeouts() setters.
-        let op_timeouts = Arc::new(config.operation_timeouts);
-
-        let heal_worker = oceanfs_durability::HealWorker::new(
-            heal_config,
-            heal_queue.clone(),
-            heal_decoder,
-            storage.lifecycle.clone(),
-            storage.data_store.clone(),
         )
-        .with_timeouts(op_timeouts.clone());
+        .await?;
 
         // ---- 8. Construct caches ----
         let l1_policy: Box<dyn oceanfs_cache::eviction::EvictionPolicy> = match config
@@ -898,7 +638,7 @@ impl Node {
         let hinted_handoff = Arc::new(
             HintedHandoff::new_with_pool(pool.clone())
                 .with_membership(membership.clone())
-                .with_timeouts(op_timeouts.clone()),
+                .with_timeouts(durability.op_timeouts.clone()),
         );
 
         // Construct the persistent per-node HintWAL directory and
@@ -930,12 +670,12 @@ impl Node {
         let hinted_handoff_manager = Arc::new(
             HintedHandoffManager::new(hints_dir.clone(), hint_delivery_client, hint_config.clone())
                 .with_membership(membership.clone())
-                .with_timeouts(op_timeouts.clone()), // Delivery contract (ADR-0027 as amended): hints are
-                                                     // NEVER dropped at the sender — deliver everything, the
-                                                     // receiver's HLC-LWW apply is the single gate. The old
-                                                     // obsolete pre-check dropped hints based on the sender's
-                                                     // view of distributed state, which could diverge from
-                                                     // the truth (the churn residual class).
+                .with_timeouts(durability.op_timeouts.clone()), // Delivery contract (ADR-0027 as amended): hints are
+                                                                // NEVER dropped at the sender — deliver everything, the
+                                                                // receiver's HLC-LWW apply is the single gate. The old
+                                                                // obsolete pre-check dropped hints based on the sender's
+                                                                // view of distributed state, which could diverge from
+                                                                // the truth (the churn residual class).
         );
 
         // Replay existing hints from the WAL into in-memory queues.
@@ -943,7 +683,7 @@ impl Node {
 
         // Clone for the seal notifier closure (the engine itself is
         // consumed by the background-task spawn later).
-        let ae_worker_notifier = Arc::clone(&ae_worker);
+        let ae_worker_notifier = Arc::clone(&durability.ae);
         // Cluster-readiness gate (phase-3 churn fix): a node that just
         // (re)joined a cluster has a ring containing only itself until
         // its membership pull converges; with the adaptive quorum such a
@@ -1014,7 +754,7 @@ impl Node {
                 storage.lifecycle.clone(),
                 hinted_handoff_manager.clone(),
             )
-            .with_timeouts(op_timeouts.clone())
+            .with_timeouts(durability.op_timeouts.clone())
             // Per-bucket compression: buckets opting in via
             // `compression.tier != None` compress chunks on the write
             // path through the accel dispatcher (blocking pool).
@@ -1077,12 +817,15 @@ impl Node {
             .with_segment_reader(storage.segment_reader.clone())
             .with_connection_pool(pool.clone())
             .with_membership(membership.clone())
-            .with_decoder(ec_decoder.clone())
-            .with_ec_codec(heal_codec_config.data_shards, heal_codec_config.parity_shards)
+            .with_decoder(durability.ec_decoder.clone())
+            .with_ec_codec(
+                durability.codec_config.data_shards,
+                durability.codec_config.parity_shards,
+            )
             // Read-path decompression for compressed chunks (paired
             // with the write path's per-bucket compression).
             .with_compressor(Some(storage.accel.clone()))
-            .with_timeouts(op_timeouts.clone())
+            .with_timeouts(durability.op_timeouts.clone())
             .with_default_fetch_strategy(config.default_fetch_strategy)
             .with_hlc_clock(hlc_clock.clone())
             // Peer-side routing hint (ADR-0029 §D5): replica candidates
@@ -1138,21 +881,11 @@ impl Node {
         metadata_cache.register_metrics(&*metrics);
         negative_cache.register_metrics(&*metrics);
         storage.accel.register_metrics(&*metrics);
-        heal_worker.register_metrics(&*metrics);
         storage.shard_buffer_pool.register_metrics(&*metrics);
         s3_handler.register_metrics(&*metrics);
 
-        // Phase D: durability subsystem counters.
-        gc_worker.register_metrics(&*metrics);
-        reaper.register_metrics(&*metrics);
-        scrub_worker.register_metrics(&*metrics);
-        ae_worker.register_metrics(&*metrics);
-        // g3 announcements (ADR-0029 §D4 observability).
-        announce_metrics.register_metrics(&*metrics);
-        // g4 reconciliation (ADR-0029 §D4 observability).
-        reconciliation.register_metrics(&*metrics);
-        // g5 re-replication (ADR-0030 observability).
-        repair_dispatcher.register_metrics(&*metrics);
+        // Phase D: durability subsystem counters (c2: one module call).
+        durability.register_metrics(&*metrics);
         // The manager is the component that actually stores and delivers
         // hints; its counters are the authoritative
         // hinted_handoff_hints_{stored,delivered,expired}_total series.
@@ -1263,7 +996,7 @@ impl Node {
             ring_cache.clone(),
         )
         .with_scrub(
-            scrub_worker.clone(),
+            durability.scrub.clone(),
             storage.metadata_store.clone(),
             storage.data_store.clone(),
         )
@@ -1425,13 +1158,14 @@ impl Node {
         // g3 `loss-announcement` (data-pool death): verified held
         // segments enqueue re-replication repairs — the repair sink is
         // the HOLDER-side dispatcher (ADR-0030 target-pull).
-        .with_repair_sink(repair_sink);
+        .with_repair_sink(durability.repair_dispatcher.clone());
         // g5 `request_re_replication` (ADR-0030): the acquiring node's
         // healing service routes incoming re-replication requests into
         // the LOCAL ReRepWorker queue (the worker pulls + writes +
         // stamps). The worker queue sender is guaranteed present before
         // `run` is spawned (the worker is constructed above).
-        let rep_worker_queue = rep_worker
+        let rep_worker_queue = durability
+            .rep_worker
             .sender()
             .ok_or_else(|| std::io::Error::other("re-replication worker queue unavailable"))?;
         healing_service =
@@ -1693,14 +1427,14 @@ impl Node {
 
         // ---- 16. Spawn background tasks ----
         let mut background = Self::spawn_background_tasks(
-            gc_worker,
+            durability.gc.clone(),
             storage.metadata_store.clone(),
             Arc::clone(&storage.lifecycle_registry),
-            ae_worker,
-            scrub_worker,
-            reaper,
+            durability.ae.clone(),
+            durability.scrub.clone(),
+            durability.reaper.clone(),
             prefetch_engine,
-            heal_worker,
+            durability.heal.clone(),
             storage.data_store.clone(),
             hinted_handoff_manager.clone(),
             &config,
@@ -1742,7 +1476,7 @@ impl Node {
             let membership = Arc::clone(&membership);
             let pool = Arc::clone(&pool);
             let self_id = NodeId::new(&config.node_id);
-            let announce_metrics = Arc::clone(&announce_metrics);
+            let announce_metrics = Arc::clone(&durability.announce_metrics);
             Some(Arc::new(move |pool_id, affected| {
                 let lifecycle_registry = Arc::clone(&lifecycle_registry);
                 let membership = Arc::clone(&membership);
@@ -1842,7 +1576,7 @@ impl Node {
         // of announcements — the complete safety net.
         let reconciliation_cancel = CancellationToken::new();
         let reconciliation_token = reconciliation_cancel.clone();
-        let reconciliation_for_spawn = Arc::clone(&reconciliation);
+        let reconciliation_for_spawn = Arc::clone(&durability.reconciliation);
         let reconciliation_handle = tokio::spawn(async move {
             reconciliation_for_spawn.run(reconciliation_token).await;
             info!("Reconciliation loop stopped");
@@ -1857,7 +1591,7 @@ impl Node {
         // requests that had no eligible target.
         let rep_worker_cancel = CancellationToken::new();
         let rep_worker_token = rep_worker_cancel.clone();
-        let rep_worker_for_spawn = Arc::clone(&rep_worker);
+        let rep_worker_for_spawn = Arc::clone(&durability.rep_worker);
         let rep_worker_handle = tokio::spawn(async move {
             rep_worker_for_spawn.run(rep_worker_token).await;
             info!("Re-replication worker stopped");
@@ -1867,7 +1601,7 @@ impl Node {
 
         let rep_dispatcher_cancel = CancellationToken::new();
         let rep_dispatcher_token = rep_dispatcher_cancel.clone();
-        let rep_dispatcher_for_spawn = Arc::clone(&repair_dispatcher);
+        let rep_dispatcher_for_spawn = Arc::clone(&durability.repair_dispatcher);
         let rep_dispatcher_handle = tokio::spawn(async move {
             rep_dispatcher_for_spawn.run(rep_dispatcher_token).await;
             info!("Re-replication dispatcher stopped");
@@ -2049,9 +1783,7 @@ impl Node {
             background,
             membership,
             storage,
-            repair_dispatcher,
-            rep_worker,
-            reconciliation,
+            durability,
         })
     }
 
@@ -2346,20 +2078,20 @@ impl Node {
     /// # }
     /// ```
     pub fn reconciliation(&self) -> Arc<oceanfs_durability::ReconciliationLoop> {
-        self.reconciliation.clone()
+        self.durability.reconciliation.clone()
     }
 
     /// Removes one parked re-replication repair from the dispatcher's
     /// awaiting-target set (g5 observability / tests). Returns `None`
     /// when nothing is parked.
     pub fn try_recv_repair(&self) -> Option<RepairRequest> {
-        self.repair_dispatcher.parked_remove_one()
+        self.durability.repair_dispatcher.parked_remove_one()
     }
 
     /// Returns the number of pending re-replication repair requests
     /// (g3/g4 observability — the dispatcher's awaiting-target set).
     pub fn pending_repairs(&self) -> usize {
-        self.repair_dispatcher.pending_len()
+        self.durability.repair_dispatcher.pending_len()
     }
 
     /// Returns the re-replication worker (g5, ADR-0030) — the
@@ -2407,7 +2139,7 @@ impl Node {
     /// # }
     /// ```
     pub fn rep_worker(&self) -> Arc<oceanfs_durability::ReRepWorker> {
-        self.rep_worker.clone()
+        self.durability.rep_worker.clone()
     }
 
     /// Returns the `storage_locations` holder set for a segment on THIS
@@ -2757,7 +2489,7 @@ impl Node {
         scrub_worker: Arc<oceanfs_durability::ScrubCoordinator>,
         reaper: Arc<oceanfs_durability::OrphanReaper>,
         prefetch_engine: Arc<oceanfs_cache::PrefetchEngine>,
-        heal_worker: oceanfs_durability::HealWorker,
+        heal_worker: Arc<oceanfs_durability::HealWorker>,
         data_store: Arc<dyn oceanfs_durability::SegmentDataStore>,
         hinted_handoff_manager: Arc<HintedHandoffManager>,
         config: &oceanfs_core::NodeConfig,
@@ -3366,13 +3098,13 @@ mod tests {
         let heal_lifecycle = Arc::new(oceanfs_storage::SegmentLifecycleCoordinator::new(
             &oceanfs_core::LifecycleConfig::default(),
         ));
-        let heal_worker = oceanfs_durability::HealWorker::new(
+        let heal_worker = Arc::new(oceanfs_durability::HealWorker::new(
             heal_config,
             heal_queue,
             heal_decoder,
             heal_lifecycle,
             heal_data_store,
-        );
+        ));
 
         let hints_dir = tmp.path().join("bg_hints");
         let hint_delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =

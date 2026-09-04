@@ -21,6 +21,10 @@ updated: 2026-09-04
 > start, and what must not regress while you work. The per-feature docs
 > are the authority for your feature; this document is the map.
 
+> **STATUS (2026-09-04): c1 and c2 LANDED — both with independent review
+> PASS; c3–c5 pending.** See the Landing order under Feature DAG for the
+> per-feature gate record.
+
 ---
 
 ## Summary
@@ -99,7 +103,24 @@ Ordering: **c1 → c2 → c3 → c4 → c5**. Each is a pure-move refactor: the
 builder returns the same `Arc`s the inline code produced; behavior is
 identical; the regression bar is "node boots, e2e write/read passes,
 existing node tests pass." `c5` (the final `start()` slimming + guideline
-update) only makes sense once all four builders exist. `c1` includes the `NodeLeaveHandler` supersession — the handler is
+update) only makes sense once all four builders exist.
+
+**Landing order (per-feature gate record):**
+
+- **c1 split-storage-builder — LANDED 2026-09-04 (review PASS,
+  iteration 3).** `StorageModule` extracted; stores consolidated 8 → 2;
+  `NodeLeaveHandler` deleted (B1 closed). Approved plan dispositions
+  recorded in the c1 doc (Scope DISPOSITION + deviations note).
+- **c2 split-durability-builder — LANDED 2026-09-04 (review PASS — 0
+  blocking gaps; 2 LOW items, both fixed by the implementer; node lib
+  re-verified 66 passed).** `DurabilityModule` extracted (§7; 12-handle
+  bundle); user-approved deviations D1–D5 recorded once in the c2 doc's
+  Accepted Deviations.
+- **c3 split-server-builder — pending.**
+- **c4 split-network-builder — pending.**
+- **c5 background-spawn-extraction + `start()` slimming — pending.**
+
+`c1` includes the `NodeLeaveHandler` supersession — the handler is
 **deleted** (review #34), which closes wave-0/1 f1 B1 (review #35; B1 was
 deferred to this deletion by DECISION 2026-09-04, see
 `review-wave-0-1/f1-correctness-bug-batch.md`) — and the `start()`

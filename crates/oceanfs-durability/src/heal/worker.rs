@@ -166,6 +166,12 @@ impl HealWorker {
 
     /// Runs the heal worker loop until the shutdown token is cancelled.
     ///
+    /// `&self` so the worker can be driven from behind an `Arc` (c2: the
+    /// `DurabilityModule` owns the worker; the node spawns the loop from
+    /// a clone). The queue receiver is taken once through the queue's
+    /// interior mutability; a second concurrent `run` observes `None`
+    /// and exits.
+    ///
     /// Continuously drains the bounded queue. Each request:
     ///
     /// 1. Waits for a semaphore permit (perf rules 2.7/8.5).
@@ -175,7 +181,7 @@ impl HealWorker {
     ///    and updates metadata.
     /// 4. On failure with remaining retries, re-enqueues with
     ///    incremented retry count.
-    pub async fn run(self, shutdown: CancellationToken) {
+    pub async fn run(&self, shutdown: CancellationToken) {
         let mut rx = match self.queue.take_receiver() {
             Some(rx) => rx,
             None => {

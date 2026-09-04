@@ -125,7 +125,7 @@ before g7's catch-up enumeration at scale.
 | Epic | Status |
 |---|---|
 | review-wave-0-1 | **done (2026-09-04)** — f0+f1 implemented, review PASS; B1 closed by composition-root c1's leave-handler deletion (2026-09-04) |
-| composition-root-decomposition | **c1 done (2026-09-04, review PASS)** — StorageModule extracted, stores consolidated 8→2, leave handler deleted; c2–c5 not started |
+| composition-root-decomposition | **c1 + c2 done (2026-09-04, both review PASS)** — c1: StorageModule extracted, stores consolidated 8→2, leave handler deleted (B1 closed); c2: DurabilityModule extracted (§7, 12-handle bundle; user-approved deviations D1–D5; 2 LOW items fixed, node lib re-verified 66 passed); c3–c5 pending |
 | store-unification | f1–f3 docs, not started |
 | legacy-mode-removal | **EPIC COMPLETE (2026-09-04)** — c1 + f1 + f2 + f3 all landed, each review PASS (f1 iter 2; f2 iter 1, 0 blocking; f3 iter 1, 2 LOWs fixed — 80→84-byte rotation-test comments, older-file fold-refusal scenario). Pools mandatory at boot; store/path resolution and the event-WAL/checkpoint formats are pools-only; pre-pool data dirs refuse boot; all dev/test/e2e fixtures declare pools (2 user-approved f2 deviations: write-None→pool-0 bridge, GC marker retention; deploy scripts untouched) |
 | durability-scheduler | f1–f4 docs, not started |

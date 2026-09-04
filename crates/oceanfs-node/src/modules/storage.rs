@@ -644,20 +644,41 @@ impl StorageModule {
     }
 }
 
+/// Shared module-test prelude (c2): the pre-builder environment
+/// `Node::start()` §0–§5 composes — config, role-pinned paths, pool
+/// registry, metadata store, accel, ring, membership, pool — plus the
+/// built [`StorageModule`]. Used by this module's tests and by
+/// `modules/durability.rs` tests (the durability builder consumes the
+/// storage bundle).
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
+pub(crate) mod test_support {
     use std::sync::Arc;
 
+    use oceanfs_core::NodeConfig;
+    use oceanfs_membership::Membership;
+    use oceanfs_network::ConnectionPool;
     use tempfile::TempDir;
 
-    use super::*;
+    use super::StorageModule;
+
+    /// The §0–§5 prelude + the built storage module.
+    pub(crate) struct StoragePrelude {
+        /// The validated four-role node config the modules were built
+        /// from (ADR-0031 f1 topology: data first = pool id 0).
+        pub(crate) config: NodeConfig,
+        /// The c1 storage bundle (the durability builder's input).
+        pub(crate) module: StorageModule,
+        /// The membership handle passed into the builders.
+        pub(crate) membership: Arc<Membership>,
+        /// The connection pool passed into the builders.
+        pub(crate) pool: Arc<ConnectionPool>,
+    }
 
     /// Builds the pre-builder prelude exactly as `Node::start()` §0–§5
     /// does (registry + paths + metadata + accel + ring + membership +
     /// pool) and runs `StorageModule::build`. ADR-0031 (f1): the config
     /// declares the mandatory four-role topology.
-    async fn build_module(tmp: &TempDir) -> StorageModule {
+    pub(crate) async fn build_storage_prelude(tmp: &TempDir) -> StoragePrelude {
         // Pool roots are siblings under the tempdir, so `data_dir` is a
         // subdir (disjointness rule).
         let data_dir = tmp.path().join("data");
@@ -713,27 +734,46 @@ mod tests {
         let ring_cache = Arc::new(oceanfs_routing::RingCache::new(oceanfs_routing::Ring::new(
             oceanfs_core::RingConfig::default(),
         )));
-        let membership = Arc::new(oceanfs_membership::Membership::new(
+        let membership = Arc::new(Membership::new(
             oceanfs_core::NodeId::new("test-node"),
             "127.0.0.1:0".parse().expect("addr"),
             "127.0.0.1:0".parse().expect("addr"),
             oceanfs_core::GossipConfig::default(),
             ring_cache.clone(),
         ));
-        let pool =
-            Arc::new(oceanfs_network::ConnectionPool::new(oceanfs_core::RpcConfig::default()));
-        StorageModule::build(
+        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
+        let module = StorageModule::build(
             &config,
             &paths,
             registry,
             metadata_store,
             accel,
             ring_cache,
-            membership,
-            pool,
+            membership.clone(),
+            pool.clone(),
         )
         .await
-        .expect("storage module build")
+        .expect("storage module build");
+        StoragePrelude { config, module, membership, pool }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::modules::storage::test_support::build_storage_prelude;
+
+    /// Builds the pre-builder prelude exactly as `Node::start()` §0–§5
+    /// does (registry + paths + metadata + accel + ring + membership +
+    /// pool) and runs `StorageModule::build`. ADR-0031 (f1): the config
+    /// declares the mandatory four-role topology.
+    async fn build_module(tmp: &TempDir) -> StorageModule {
+        build_storage_prelude(tmp).await.module
     }
 
     /// c1 DoD: the builder returns a consistent `StorageModule` whose
