@@ -72,6 +72,7 @@ impl SegmentHandle {
 ///             merkle_root: None,
 ///             storage_locations: vec![NodeId::new("n1")].into(),
 ///             sealed_at: None,
+///             pool_id: 0,
 ///         })
 ///     }
 ///

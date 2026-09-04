@@ -56,23 +56,62 @@ struct PrefetchTask {
 /// ```
 /// use std::sync::Arc;
 /// use oceanfs_cache::{PrefetchConfig, PrefetchEngine, MetadataCache, MetadataCacheConfig};
-/// use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata, MetadataStore};
+/// use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata, Tombstone};
+/// use oceanfs_storage_api::{BatchOp, MetadataStore};
 ///
 /// struct MockStore;
 /// impl MetadataStore for MockStore {
-///     fn list_object_keys(&self, _bucket: &BucketId)
-///         -> std::io::Result<Vec<(BucketId, ObjectKey)>>
-///     {
+///     fn list_object_keys(
+///         &self,
+///         _bucket: &BucketId,
+///     ) -> std::io::Result<Vec<(BucketId, ObjectKey)>> {
 ///         Ok(vec![])
 ///     }
-///     fn get_object_metadata(&self, _bucket: &BucketId, _key: &ObjectKey)
-///         -> std::io::Result<Option<ObjectMetadata>>
-///     {
+///     fn get_object_metadata(
+///         &self,
+///         _bucket: &BucketId,
+///         _key: &ObjectKey,
+///     ) -> std::io::Result<Option<ObjectMetadata>> {
 ///         Ok(None)
+///     }
+///     fn list_objects(
+///         &self,
+///         _bucket: &BucketId,
+///         _prefix: &str,
+///     ) -> Vec<std::io::Result<ObjectMetadata>> {
+///         vec![]
+///     }
+///     fn list_tombstones(
+///         &self,
+///         _bucket: &BucketId,
+///     ) -> Vec<std::io::Result<(ObjectKey, Tombstone)>> {
+///         vec![]
+///     }
+///     fn delete_tombstone(&self, _bucket: &BucketId, _key: &ObjectKey) -> std::io::Result<()> {
+///         Ok(())
+///     }
+///     fn put_object(&self, _bucket: &BucketId, _meta: ObjectMetadata) -> std::io::Result<()> {
+///         Ok(())
+///     }
+///     fn delete_object(
+///         &self,
+///         _bucket: &BucketId,
+///         _key: &ObjectKey,
+///         _hlc: oceanfs_core::Hlc,
+///     ) -> std::io::Result<()> {
+///         Ok(())
+///     }
+///     fn batch_write(&self, _ops: Vec<BatchOp>) -> std::io::Result<()> {
+///         Ok(())
 ///     }
 /// }
 ///
-/// let metadata_cache = Arc::new(MetadataCache::new(MetadataCacheConfig::default()));
+/// let metadata_cache = Arc::new(MetadataCache::new(
+///     MetadataCacheConfig::default(),
+///     Box::new(oceanfs_cache::eviction::TtlLruPolicy::new(
+///         oceanfs_cache::eviction::TtlLruConfig::default(),
+///     )),
+/// ));
 /// let store: Arc<dyn MetadataStore> = Arc::new(MockStore);
 ///
 /// let engine = PrefetchEngine::new(
