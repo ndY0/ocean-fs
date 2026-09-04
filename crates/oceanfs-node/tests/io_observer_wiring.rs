@@ -24,16 +24,46 @@ use oceanfs_storage::io::IoOp;
 #[tokio::test]
 async fn seal_pipeline_feeds_the_io_observer() {
     let tmp = tempfile::tempdir().expect("tempdir");
+    /// ADR-0031 (f1): mandatory role-complete pool topology for tests — one
+    /// data (id 0), one wal, one metadata, one hints pool on sibling roots.
+    fn storage_pools(tmp: &tempfile::TempDir) -> oceanfs_core::StorageConfig {
+        fn pool(
+            name: &str,
+            role: oceanfs_core::PoolRole,
+            root: std::path::PathBuf,
+        ) -> oceanfs_core::StoragePoolConfig {
+            oceanfs_core::StoragePoolConfig {
+                name: name.into(),
+                role,
+                root,
+                weight: None,
+                tech: Default::default(),
+                health: Default::default(),
+            }
+        }
+        oceanfs_core::StorageConfig {
+            pools: vec![
+                pool("data-0", oceanfs_core::PoolRole::Data, tmp.path().join("pool-data")),
+                pool("wal-0", oceanfs_core::PoolRole::Wal, tmp.path().join("pool-wal")),
+                pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.path().join("pool-meta")),
+                pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.path().join("pool-hints")),
+            ],
+            missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+        }
+    }
+
     let config = NodeConfig {
         data_dir: tmp.path().join("data"),
         listen_addr: "127.0.0.1:0".into(),
         grpc_listen_addr: "127.0.0.1:0".into(),
         membership_listen_addr: "127.0.0.1:0".into(),
+        storage: storage_pools(&tmp),
         ..NodeConfig::default()
     };
-    let node = Node::start(config).await.expect("legacy node boots");
+    let node = Node::start(config).await.expect("node boots");
     let observer = node.io_observer();
-    // Legacy mode registers the implicit pool 0 with the observer.
+    // ADR-0031 (f1): the boot pools are registered with the observer;
+    // pool 0 is the data pool (configured first).
     assert!(observer.snapshot(0).is_some(), "boot pools must be registered");
 
     // A real write cycle: PUT a 64 KiB body (the node e2e convention —

@@ -46,14 +46,19 @@ const MIN_FREE_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
 ///
 /// # let tmp = tempfile::tempdir().expect("tempdir");
 /// # let data_dir = tmp.path().join("data");
-/// let registry = PoolRegistry::from_config(
-///     &oceanfs_core::StorageConfig::default(),
-///     &data_dir,
-/// )
-/// .expect("legacy registry");
+/// # let storage = oceanfs_core::StorageConfig {
+/// #     pools: vec![
+/// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+/// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+/// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+/// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+/// #     ],
+/// #     missing_root_policy: Default::default(),
+/// # };
+/// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
 ///
 /// let policy = PlacementPolicy::new();
-/// let pool = policy.select_data_pool(&registry).expect("implicit data pool");
+/// let pool = policy.select_data_pool(&registry).expect("a data pool");
 /// assert_eq!(pool.role(), oceanfs_core::PoolRole::Data);
 /// ```
 pub struct PlacementPolicy;
@@ -69,12 +74,18 @@ impl PlacementPolicy {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
     /// let policy = PlacementPolicy::new();
-    /// let registry = oceanfs_storage::PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// let registry =
+    ///     oceanfs_storage::PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// assert!(policy.select_pinned_pool(&registry, PoolRole::Data).is_some());
     /// ```
     pub fn new() -> Self {
@@ -100,11 +111,16 @@ impl PlacementPolicy {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     ///
     /// let policy = PlacementPolicy::new();
     /// assert!(policy.select_data_pool(&registry).is_some());
@@ -134,11 +150,16 @@ impl PlacementPolicy {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     ///
     /// let policy = PlacementPolicy::new();
     /// let pools = registry.data_pools();
@@ -190,15 +211,20 @@ impl PlacementPolicy {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     ///
     /// let policy = PlacementPolicy::new();
-    /// // Legacy registry has no wal pool configured.
-    /// assert!(policy.select_pinned_pool(&registry, PoolRole::Wal).is_none());
+    /// // The registry pins a wal pool (ADR-0031 role pinning).
+    /// assert!(policy.select_pinned_pool(&registry, PoolRole::Wal).is_some());
     /// ```
     pub fn select_pinned_pool(
         &self,
@@ -235,6 +261,17 @@ mod tests {
     ) -> (tempfile::TempDir, PoolRegistry) {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
+        // ADR-0031: pools are mandatory — append any pinned role the
+        // caller's list lacks (placement only ever selects `data` pools,
+        // so the appended roles do not alter the scenarios under test).
+        let mut pools = pools.to_vec();
+        for (name, role) in
+            [("journal", PoolRole::Wal), ("meta", PoolRole::Metadata), ("hints", PoolRole::Hints)]
+        {
+            if !pools.iter().any(|(_, r, _)| *r == role) {
+                pools.push((name, role, 1));
+            }
+        }
         let storage = oceanfs_core::StorageConfig {
             pools: pools
                 .iter()
@@ -412,12 +449,14 @@ mod tests {
 
         assert_eq!(policy.select_pinned_pool(&registry, PoolRole::Wal).unwrap().id(), 1);
         assert_eq!(policy.select_pinned_pool(&registry, PoolRole::Metadata).unwrap().id(), 2);
-        // Hints not configured → None.
-        assert!(policy.select_pinned_pool(&registry, PoolRole::Hints).is_none());
+        // The hints role is auto-appended by the helper (id 3).
+        assert_eq!(policy.select_pinned_pool(&registry, PoolRole::Hints).unwrap().id(), 3);
 
         // Degraded pinned pool → None.
         registry.set_status(1, PoolStatus::Degraded);
         assert!(policy.select_pinned_pool(&registry, PoolRole::Wal).is_none());
+        registry.set_status(3, PoolStatus::Degraded);
+        assert!(policy.select_pinned_pool(&registry, PoolRole::Hints).is_none());
     }
 
     #[test]

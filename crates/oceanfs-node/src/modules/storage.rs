@@ -236,10 +236,6 @@ impl StorageModule {
             .map_err(|e| format!("failed to create standard segment pool: {e}"))?,
         );
 
-        // [review][architecture][high]
-        // a node without a data pool should not be permitted to start, since their is not legacy mode to consider.
-        // also, a silent fallback to an arcane legacy mode is big bark pattern, an should never take place
-        // [end]
         // ADR-0001: tiered segment sizing driven by SegmentSizeConfig.
         // ---- f5: pool-aware segment placement + resolution ----
         // Sealed segments spread across the node's data pools: the sealer
@@ -248,13 +244,10 @@ impl StorageModule {
         // reader/GC store resolves the owning root through this resolver
         // (the lifecycle registry's `SegmentMetadata.pool_id`, durable via
         // the event WAL + checkpoint).
-        // Legacy mode (no pools configured) must pass an EMPTY pool list:
-        // the registry's implicit data pool (root = data_dir) is a
-        // runtime fallback, not a placement target — the sealer's legacy
-        // branch (empty `data_pools` → `data_dir`, pool_id 0) keeps
-        // today's byte-for-byte layout.
-        let data_pools =
-            if config.storage.pools.is_empty() { Vec::new() } else { registry.data_pools() };
+        // ADR-0031 (f1): pools are mandatory — the registry always holds
+        // the declared data pools; the legacy empty-list branch was
+        // removed here with the boot enforcement.
+        let data_pools = registry.data_pools();
         let segment_legacy_dir = config.data_dir.join("segments");
         let pool_id_for: oceanfs_storage::PoolIdResolver = {
             let registry = Arc::clone(&lifecycle_registry);
@@ -280,14 +273,9 @@ impl StorageModule {
             // f8 runtime attach: the sealer refreshes the data-pool list
             // from the LIVE registry at each seal, so a pool attached via
             // POST /admin/pools is a placement target immediately (no
-            // restart). Pool mode only — legacy mode keeps the boot-time
-            // empty list (registry: None) so the byte-for-byte layout is
-            // untouched.
-            // [review][config][high]
-            // consequence here : the registry cannot be none, since pool is not
-            // allpwed empty.
-            // [end]
-            registry: if config.storage.pools.is_empty() { None } else { Some(registry.clone()) },
+            // restart). ADR-0031 (f1): the registry is always present —
+            // the legacy `None` arm was removed with boot enforcement.
+            registry: Some(registry.clone()),
             target_size_bytes: segment_size.default_target_size,
             // [review][config][high]
             // seal timeout should be allowed to be user configured since
@@ -673,14 +661,39 @@ mod tests {
 
     /// Builds the pre-builder prelude exactly as `Node::start()` §0–§5
     /// does (registry + paths + metadata + accel + ring + membership +
-    /// pool) and runs `StorageModule::build`. Legacy mode (empty
-    /// `[storage.pools]`) — the same mode every node test boots until the
-    /// legacy-mode-removal f1 fixture prep lands.
+    /// pool) and runs `StorageModule::build`. ADR-0031 (f1): the config
+    /// declares the mandatory four-role topology.
     async fn build_module(tmp: &TempDir) -> StorageModule {
-        let data_dir = tmp.path().to_path_buf();
+        // Pool roots are siblings under the tempdir, so `data_dir` is a
+        // subdir (disjointness rule).
+        let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).expect("create data dir");
+        fn pool(
+            name: &str,
+            role: oceanfs_core::PoolRole,
+            root: std::path::PathBuf,
+        ) -> oceanfs_core::StoragePoolConfig {
+            oceanfs_core::StoragePoolConfig {
+                name: name.into(),
+                role,
+                root,
+                weight: None,
+                tech: Default::default(),
+                health: Default::default(),
+            }
+        }
         let config = NodeConfig {
             data_dir: data_dir.clone(),
+            // ADR-0031: pools are mandatory (data first = pool id 0).
+            storage: oceanfs_core::StorageConfig {
+                pools: vec![
+                    pool("data-0", oceanfs_core::PoolRole::Data, tmp.path().join("pool-data")),
+                    pool("wal-0", oceanfs_core::PoolRole::Wal, tmp.path().join("pool-wal")),
+                    pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.path().join("pool-meta")),
+                    pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.path().join("pool-hints")),
+                ],
+                missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+            },
             // The event WAL lives under the temp data dir (the default
             // /var/lib/oceanfs/event-wal is not writable in tests).
             event_wal: oceanfs_core::EventWalConfig {

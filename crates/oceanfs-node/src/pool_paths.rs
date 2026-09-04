@@ -167,26 +167,6 @@ mod tests {
             .expect("role root")
     }
 
-    /// Legacy mode: resolution equals today's paths byte-for-byte.
-    #[test]
-    fn legacy_mode_resolves_exactly_as_before() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        let registry = PoolRegistry::from_config(&StorageConfig::default(), &data_dir).unwrap();
-
-        let paths = pool_paths(&registry, &data_dir, &None);
-        assert_eq!(paths.metadata, data_dir.join("metadata"));
-        assert_eq!(paths.wal, data_dir.join("wal"));
-        assert_eq!(paths.event_wal, data_dir.join("event-wal"));
-        assert_eq!(paths.hints, data_dir.join("hints"));
-
-        // The legacy hint_wal_dir override is honored when no hints pool
-        // is pinned.
-        let custom_hints = tmp.path().join("custom-hints");
-        let paths = pool_paths(&registry, &data_dir, &Some(custom_hints.clone()));
-        assert_eq!(paths.hints, custom_hints);
-    }
-
     /// Explicit mode: every pinned role resolves to its pool root.
     #[test]
     fn explicit_mode_resolves_to_pool_roots() {
@@ -216,29 +196,21 @@ mod tests {
         assert_eq!(paths.hints, root_for(&roots, PoolRole::Hints));
     }
 
-    /// Pool mode without a metadata pool: the role falls back to legacy.
-    #[test]
-    fn pool_mode_without_role_pool_falls_back_to_legacy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        let (registry, roots) =
-            pinned_registry(&tmp, &[(PoolRole::Data, "pool-a"), (PoolRole::Wal, "journal")]);
-        let paths = pool_paths(&registry, &data_dir, &None);
-
-        // Wal pinned, metadata not configured → legacy fallback.
-        assert_eq!(paths.wal, root_for(&roots, PoolRole::Wal));
-        assert_eq!(paths.metadata, data_dir.join("metadata"));
-        assert_eq!(paths.hints, data_dir.join("hints"));
-    }
-
     /// A Degraded pinned pool (startup policy bridge) falls back with the
     /// role's legacy path.
     #[test]
     fn degraded_pinned_pool_falls_back_to_legacy_path() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
-        let (registry, roots) =
-            pinned_registry(&tmp, &[(PoolRole::Data, "pool-a"), (PoolRole::Wal, "journal")]);
+        let (registry, roots) = pinned_registry(
+            &tmp,
+            &[
+                (PoolRole::Data, "pool-a"),
+                (PoolRole::Wal, "journal"),
+                (PoolRole::Metadata, "meta"),
+                (PoolRole::Hints, "hints"),
+            ],
+        );
         // Mark the wal pool Degraded (as the Degraded startup policy does
         // when the root probe fails).
         registry.set_status(1, PoolStatus::Degraded);
@@ -303,8 +275,15 @@ mod tests {
         with_default(subscriber.clone(), || {
             let tmp = tempfile::tempdir().unwrap();
             let data_dir = tmp.path().join("data");
-            let (registry, _roots) =
-                pinned_registry(&tmp, &[(PoolRole::Data, "pool-a"), (PoolRole::Wal, "journal")]);
+            let (registry, _roots) = pinned_registry(
+                &tmp,
+                &[
+                    (PoolRole::Data, "pool-a"),
+                    (PoolRole::Wal, "journal"),
+                    (PoolRole::Metadata, "meta"),
+                    (PoolRole::Hints, "hints"),
+                ],
+            );
             registry.set_status(1, PoolStatus::Degraded);
 
             let paths = pool_paths(&registry, &data_dir, &None);
@@ -318,26 +297,34 @@ mod tests {
         );
     }
 
-    /// Legacy mode and pool-mode-without-role fallbacks are silent (the
-    /// WARN is reserved for an existing-but-Degraded pinned pool).
+    /// Healthy pinned resolution is silent (the WARN is reserved for an
+    /// existing-but-Degraded pinned pool).
     #[test]
-    fn legacy_fallback_is_silent() {
+    fn healthy_pinned_resolution_is_silent() {
         use tracing::subscriber::with_default;
 
         let subscriber = RecordingSubscriber::default();
         with_default(subscriber.clone(), || {
             let tmp = tempfile::tempdir().unwrap();
             let data_dir = tmp.path().join("data");
-            let registry = PoolRegistry::from_config(&StorageConfig::default(), &data_dir).unwrap();
+            let (registry, _roots) = pinned_registry(
+                &tmp,
+                &[
+                    (PoolRole::Data, "pool-a"),
+                    (PoolRole::Wal, "journal"),
+                    (PoolRole::Metadata, "meta"),
+                    (PoolRole::Hints, "hints"),
+                ],
+            );
             let _ = pool_paths(&registry, &data_dir, &None);
 
-            // Pool mode without a metadata pool: also silent.
-            let (registry, _roots) =
-                pinned_registry(&tmp, &[(PoolRole::Data, "pool-a"), (PoolRole::Wal, "journal")]);
-            let _ = pool_paths(&registry, &data_dir, &None);
+            // The legacy hint_wal_dir override is silently ignored when a
+            // hints pool is pinned (pool topology is authoritative).
+            let custom_hints = tmp.path().join("custom-hints");
+            let _ = pool_paths(&registry, &data_dir, &Some(custom_hints));
         });
 
         let events = subscriber.events.lock();
-        assert!(events.is_empty(), "legacy / no-role fallbacks must not WARN, got: {events:?}");
+        assert!(events.is_empty(), "healthy pinned resolution must not WARN, got: {events:?}");
     }
 }

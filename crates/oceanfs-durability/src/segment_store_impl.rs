@@ -171,20 +171,46 @@ mod tests {
         let data_dir = tmp.path().join("data");
         let registry = oceanfs_storage::PoolRegistry::from_config(
             &oceanfs_core::StorageConfig {
-                pools: vec![oceanfs_core::StoragePoolConfig {
-                    name: "pool-1".into(),
-                    role: oceanfs_core::PoolRole::Data,
-                    root: pool_root.clone(),
-                    weight: Some(1),
-                    tech: oceanfs_core::PoolTech::Auto,
-                    health: Default::default(),
-                }],
+                pools: vec![
+                    oceanfs_core::StoragePoolConfig {
+                        name: "pool-1".into(),
+                        role: oceanfs_core::PoolRole::Data,
+                        root: pool_root.clone(),
+                        weight: Some(1),
+                        tech: oceanfs_core::PoolTech::Auto,
+                        health: Default::default(),
+                    },
+                    oceanfs_core::StoragePoolConfig {
+                        name: "journal".into(),
+                        role: oceanfs_core::PoolRole::Wal,
+                        root: tmp.path().join("optane0"),
+                        weight: Some(1),
+                        tech: oceanfs_core::PoolTech::Auto,
+                        health: Default::default(),
+                    },
+                    oceanfs_core::StoragePoolConfig {
+                        name: "meta".into(),
+                        role: oceanfs_core::PoolRole::Metadata,
+                        root: tmp.path().join("optane1"),
+                        weight: Some(1),
+                        tech: oceanfs_core::PoolTech::Auto,
+                        health: Default::default(),
+                    },
+                    oceanfs_core::StoragePoolConfig {
+                        name: "hints".into(),
+                        role: oceanfs_core::PoolRole::Hints,
+                        root: tmp.path().join("hints0"),
+                        weight: Some(1),
+                        tech: oceanfs_core::PoolTech::Auto,
+                        health: Default::default(),
+                    },
+                ],
                 missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
             },
             &data_dir,
         )
         .expect("registry");
-        let pools = registry.pools();
+        let pools = registry.data_pools();
         assert_eq!(pools.len(), 1);
         assert_eq!(pools[0].id(), 0, "config-order id");
 

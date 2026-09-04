@@ -368,19 +368,14 @@ impl Node {
             "Starting OceanFS node"
         );
 
-        // [review][cleanup][high]
-        // pool registration : we handle legacy behaviour inside an unpublished software. this is not a public facing api, nor should wwe espect customers to use
-        // the former unique data_dir. we should not complexify the data pool with legacy behaviour, because there is none to begin with.
-        // [end]
         // ---- 0. Storage pool registry (ADR-0029) + role-pinned paths ----
         // The registry probes every configured pool root at boot: the
         // `Fatal` policy refuses to start on an unprobeable root, the
-        // `Degraded` policy registers the pool as Degraded (f4 falls back
-        // to the legacy path for that role with a WARN). The role-pinned
-        // dirs resolve ONCE here — the write path never re-resolves them
-        // (perf guidelines 3.4/7.1: boot-time only, no locks in the hot
-        // path). Legacy mode (no pools) resolves byte-for-byte to today's
-        // `{data_dir}/{metadata,wal,event-wal,hints}` layout.
+        // `Degraded` policy registers the pool as Degraded. Pools are
+        // mandatory (ADR-0031): an empty `[storage.pools]` fails startup
+        // here with the role-listing error. The role-pinned dirs resolve
+        // ONCE here — the write path never re-resolves them (perf
+        // guidelines 3.4/7.1: boot-time only, no locks in the hot path).
         let pool_registry = Arc::new(
             oceanfs_storage::PoolRegistry::from_config(&config.storage, &config.data_dir)
                 .map_err(|e| format!("storage pool registry: {e}"))?,
@@ -2071,11 +2066,33 @@ impl Node {
     /// use oceanfs_core::NodeConfig;
     /// use oceanfs_node::Node;
     /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # fn storage_pools(tmp: &std::path::Path) -> oceanfs_core::StorageConfig {
+    /// #     fn pool(name: &str, role: oceanfs_core::PoolRole, root: std::path::PathBuf) -> oceanfs_core::StoragePoolConfig {
+    /// #         oceanfs_core::StoragePoolConfig {
+    /// #             name: name.into(),
+    /// #             role,
+    /// #             root,
+    /// #             weight: None,
+    /// #             tech: Default::default(),
+    /// #             health: Default::default(),
+    /// #         }
+    /// #     }
+    /// #     oceanfs_core::StorageConfig {
+    /// #         pools: vec![
+    /// #             pool("data-0", oceanfs_core::PoolRole::Data, tmp.join("pool-data")),
+    /// #             pool("wal-0", oceanfs_core::PoolRole::Wal, tmp.join("pool-wal")),
+    /// #             pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.join("pool-meta")),
+    /// #             pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.join("pool-hints")),
+    /// #         ],
+    /// #         missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+    /// #     }
+    /// # }
     /// # let config = NodeConfig {
     /// #     data_dir: tmp.path().join("data"),
     /// #     listen_addr: "127.0.0.1:0".into(),
     /// #     grpc_listen_addr: "127.0.0.1:0".into(),
     /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     storage: storage_pools(&tmp.path()),
     /// #     ..NodeConfig::default()
     /// # };
     /// let node = Node::start(config).await.expect("node");
@@ -2097,11 +2114,33 @@ impl Node {
     /// use oceanfs_core::NodeConfig;
     /// use oceanfs_node::Node;
     /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # fn storage_pools(tmp: &std::path::Path) -> oceanfs_core::StorageConfig {
+    /// #     fn pool(name: &str, role: oceanfs_core::PoolRole, root: std::path::PathBuf) -> oceanfs_core::StoragePoolConfig {
+    /// #         oceanfs_core::StoragePoolConfig {
+    /// #             name: name.into(),
+    /// #             role,
+    /// #             root,
+    /// #             weight: None,
+    /// #             tech: Default::default(),
+    /// #             health: Default::default(),
+    /// #         }
+    /// #     }
+    /// #     oceanfs_core::StorageConfig {
+    /// #         pools: vec![
+    /// #             pool("data-0", oceanfs_core::PoolRole::Data, tmp.join("pool-data")),
+    /// #             pool("wal-0", oceanfs_core::PoolRole::Wal, tmp.join("pool-wal")),
+    /// #             pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.join("pool-meta")),
+    /// #             pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.join("pool-hints")),
+    /// #         ],
+    /// #         missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+    /// #     }
+    /// # }
     /// # let config = NodeConfig {
     /// #     data_dir: tmp.path().join("data"),
     /// #     listen_addr: "127.0.0.1:0".into(),
     /// #     grpc_listen_addr: "127.0.0.1:0".into(),
     /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     storage: storage_pools(&tmp.path()),
     /// #     ..NodeConfig::default()
     /// # };
     /// let node = Node::start(config).await.expect("node");
@@ -2126,11 +2165,33 @@ impl Node {
     /// use oceanfs_core::NodeConfig;
     /// use oceanfs_node::Node;
     /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # fn storage_pools(tmp: &std::path::Path) -> oceanfs_core::StorageConfig {
+    /// #     fn pool(name: &str, role: oceanfs_core::PoolRole, root: std::path::PathBuf) -> oceanfs_core::StoragePoolConfig {
+    /// #         oceanfs_core::StoragePoolConfig {
+    /// #             name: name.into(),
+    /// #             role,
+    /// #             root,
+    /// #             weight: None,
+    /// #             tech: Default::default(),
+    /// #             health: Default::default(),
+    /// #         }
+    /// #     }
+    /// #     oceanfs_core::StorageConfig {
+    /// #         pools: vec![
+    /// #             pool("data-0", oceanfs_core::PoolRole::Data, tmp.join("pool-data")),
+    /// #             pool("wal-0", oceanfs_core::PoolRole::Wal, tmp.join("pool-wal")),
+    /// #             pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.join("pool-meta")),
+    /// #             pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.join("pool-hints")),
+    /// #         ],
+    /// #         missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+    /// #     }
+    /// # }
     /// # let config = NodeConfig {
     /// #     data_dir: tmp.path().join("data"),
     /// #     listen_addr: "127.0.0.1:0".into(),
     /// #     grpc_listen_addr: "127.0.0.1:0".into(),
     /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     storage: storage_pools(&tmp.path()),
     /// #     ..NodeConfig::default()
     /// # };
     /// let node = Node::start(config).await.expect("node");
@@ -2153,11 +2214,33 @@ impl Node {
     /// use oceanfs_core::NodeConfig;
     /// use oceanfs_node::Node;
     /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # fn storage_pools(tmp: &std::path::Path) -> oceanfs_core::StorageConfig {
+    /// #     fn pool(name: &str, role: oceanfs_core::PoolRole, root: std::path::PathBuf) -> oceanfs_core::StoragePoolConfig {
+    /// #         oceanfs_core::StoragePoolConfig {
+    /// #             name: name.into(),
+    /// #             role,
+    /// #             root,
+    /// #             weight: None,
+    /// #             tech: Default::default(),
+    /// #             health: Default::default(),
+    /// #         }
+    /// #     }
+    /// #     oceanfs_core::StorageConfig {
+    /// #         pools: vec![
+    /// #             pool("data-0", oceanfs_core::PoolRole::Data, tmp.join("pool-data")),
+    /// #             pool("wal-0", oceanfs_core::PoolRole::Wal, tmp.join("pool-wal")),
+    /// #             pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.join("pool-meta")),
+    /// #             pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.join("pool-hints")),
+    /// #         ],
+    /// #         missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+    /// #     }
+    /// # }
     /// # let config = NodeConfig {
     /// #     data_dir: tmp.path().join("data"),
     /// #     listen_addr: "127.0.0.1:0".into(),
     /// #     grpc_listen_addr: "127.0.0.1:0".into(),
     /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     storage: storage_pools(&tmp.path()),
     /// #     ..NodeConfig::default()
     /// # };
     /// let node = Node::start(config).await.expect("node");
@@ -2180,11 +2263,33 @@ impl Node {
     /// use oceanfs_core::NodeConfig;
     /// use oceanfs_node::Node;
     /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # fn storage_pools(tmp: &std::path::Path) -> oceanfs_core::StorageConfig {
+    /// #     fn pool(name: &str, role: oceanfs_core::PoolRole, root: std::path::PathBuf) -> oceanfs_core::StoragePoolConfig {
+    /// #         oceanfs_core::StoragePoolConfig {
+    /// #             name: name.into(),
+    /// #             role,
+    /// #             root,
+    /// #             weight: None,
+    /// #             tech: Default::default(),
+    /// #             health: Default::default(),
+    /// #         }
+    /// #     }
+    /// #     oceanfs_core::StorageConfig {
+    /// #         pools: vec![
+    /// #             pool("data-0", oceanfs_core::PoolRole::Data, tmp.join("pool-data")),
+    /// #             pool("wal-0", oceanfs_core::PoolRole::Wal, tmp.join("pool-wal")),
+    /// #             pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.join("pool-meta")),
+    /// #             pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.join("pool-hints")),
+    /// #         ],
+    /// #         missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+    /// #     }
+    /// # }
     /// # let config = NodeConfig {
     /// #     data_dir: tmp.path().join("data"),
     /// #     listen_addr: "127.0.0.1:0".into(),
     /// #     grpc_listen_addr: "127.0.0.1:0".into(),
     /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     storage: storage_pools(&tmp.path()),
     /// #     ..NodeConfig::default()
     /// # };
     /// let node = Node::start(config).await.expect("node");
@@ -2207,11 +2312,33 @@ impl Node {
     /// use oceanfs_core::NodeConfig;
     /// use oceanfs_node::Node;
     /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # fn storage_pools(tmp: &std::path::Path) -> oceanfs_core::StorageConfig {
+    /// #     fn pool(name: &str, role: oceanfs_core::PoolRole, root: std::path::PathBuf) -> oceanfs_core::StoragePoolConfig {
+    /// #         oceanfs_core::StoragePoolConfig {
+    /// #             name: name.into(),
+    /// #             role,
+    /// #             root,
+    /// #             weight: None,
+    /// #             tech: Default::default(),
+    /// #             health: Default::default(),
+    /// #         }
+    /// #     }
+    /// #     oceanfs_core::StorageConfig {
+    /// #         pools: vec![
+    /// #             pool("data-0", oceanfs_core::PoolRole::Data, tmp.join("pool-data")),
+    /// #             pool("wal-0", oceanfs_core::PoolRole::Wal, tmp.join("pool-wal")),
+    /// #             pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.join("pool-meta")),
+    /// #             pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.join("pool-hints")),
+    /// #         ],
+    /// #         missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+    /// #     }
+    /// # }
     /// # let config = NodeConfig {
     /// #     data_dir: tmp.path().join("data"),
     /// #     listen_addr: "127.0.0.1:0".into(),
     /// #     grpc_listen_addr: "127.0.0.1:0".into(),
     /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     storage: storage_pools(&tmp.path()),
     /// #     ..NodeConfig::default()
     /// # };
     /// let node = Node::start(config).await.expect("node");
@@ -2246,11 +2373,33 @@ impl Node {
     /// use oceanfs_core::NodeConfig;
     /// use oceanfs_node::Node;
     /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # fn storage_pools(tmp: &std::path::Path) -> oceanfs_core::StorageConfig {
+    /// #     fn pool(name: &str, role: oceanfs_core::PoolRole, root: std::path::PathBuf) -> oceanfs_core::StoragePoolConfig {
+    /// #         oceanfs_core::StoragePoolConfig {
+    /// #             name: name.into(),
+    /// #             role,
+    /// #             root,
+    /// #             weight: None,
+    /// #             tech: Default::default(),
+    /// #             health: Default::default(),
+    /// #         }
+    /// #     }
+    /// #     oceanfs_core::StorageConfig {
+    /// #         pools: vec![
+    /// #             pool("data-0", oceanfs_core::PoolRole::Data, tmp.join("pool-data")),
+    /// #             pool("wal-0", oceanfs_core::PoolRole::Wal, tmp.join("pool-wal")),
+    /// #             pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.join("pool-meta")),
+    /// #             pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.join("pool-hints")),
+    /// #         ],
+    /// #         missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+    /// #     }
+    /// # }
     /// # let config = NodeConfig {
     /// #     data_dir: tmp.path().join("data"),
     /// #     listen_addr: "127.0.0.1:0".into(),
     /// #     grpc_listen_addr: "127.0.0.1:0".into(),
     /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     storage: storage_pools(&tmp.path()),
     /// #     ..NodeConfig::default()
     /// # };
     /// let node = Node::start(config).await.expect("node");
@@ -2273,11 +2422,33 @@ impl Node {
     /// use oceanfs_core::{NodeConfig, SegmentId};
     /// use oceanfs_node::Node;
     /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # fn storage_pools(tmp: &std::path::Path) -> oceanfs_core::StorageConfig {
+    /// #     fn pool(name: &str, role: oceanfs_core::PoolRole, root: std::path::PathBuf) -> oceanfs_core::StoragePoolConfig {
+    /// #         oceanfs_core::StoragePoolConfig {
+    /// #             name: name.into(),
+    /// #             role,
+    /// #             root,
+    /// #             weight: None,
+    /// #             tech: Default::default(),
+    /// #             health: Default::default(),
+    /// #         }
+    /// #     }
+    /// #     oceanfs_core::StorageConfig {
+    /// #         pools: vec![
+    /// #             pool("data-0", oceanfs_core::PoolRole::Data, tmp.join("pool-data")),
+    /// #             pool("wal-0", oceanfs_core::PoolRole::Wal, tmp.join("pool-wal")),
+    /// #             pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.join("pool-meta")),
+    /// #             pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.join("pool-hints")),
+    /// #         ],
+    /// #         missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+    /// #     }
+    /// # }
     /// # let config = NodeConfig {
     /// #     data_dir: tmp.path().join("data"),
     /// #     listen_addr: "127.0.0.1:0".into(),
     /// #     grpc_listen_addr: "127.0.0.1:0".into(),
     /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     storage: storage_pools(&tmp.path()),
     /// #     ..NodeConfig::default()
     /// # };
     /// let node = Node::start(config).await.expect("node");
@@ -2304,15 +2475,37 @@ impl Node {
     /// use oceanfs_core::NodeConfig;
     /// use oceanfs_node::Node;
     /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # fn storage_pools(tmp: &std::path::Path) -> oceanfs_core::StorageConfig {
+    /// #     fn pool(name: &str, role: oceanfs_core::PoolRole, root: std::path::PathBuf) -> oceanfs_core::StoragePoolConfig {
+    /// #         oceanfs_core::StoragePoolConfig {
+    /// #             name: name.into(),
+    /// #             role,
+    /// #             root,
+    /// #             weight: None,
+    /// #             tech: Default::default(),
+    /// #             health: Default::default(),
+    /// #         }
+    /// #     }
+    /// #     oceanfs_core::StorageConfig {
+    /// #         pools: vec![
+    /// #             pool("data-0", oceanfs_core::PoolRole::Data, tmp.join("pool-data")),
+    /// #             pool("wal-0", oceanfs_core::PoolRole::Wal, tmp.join("pool-wal")),
+    /// #             pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.join("pool-meta")),
+    /// #             pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.join("pool-hints")),
+    /// #         ],
+    /// #         missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+    /// #     }
+    /// # }
     /// # let config = NodeConfig {
     /// #     data_dir: tmp.path().join("data"),
     /// #     listen_addr: "127.0.0.1:0".into(),
     /// #     grpc_listen_addr: "127.0.0.1:0".into(),
     /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     storage: storage_pools(&tmp.path()),
     /// #     ..NodeConfig::default()
     /// # };
     /// let node = Node::start(config).await.expect("node");
-    /// // The boot-time manifest declares at least the implicit pool.
+    /// // The boot-time manifest declares the node's pools.
     /// assert!(node.self_manifest().is_some());
     /// node.shutdown().await.expect("shutdown");
     /// # }
@@ -2330,11 +2523,33 @@ impl Node {
     /// use oceanfs_core::NodeConfig;
     /// use oceanfs_node::Node;
     /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # fn storage_pools(tmp: &std::path::Path) -> oceanfs_core::StorageConfig {
+    /// #     fn pool(name: &str, role: oceanfs_core::PoolRole, root: std::path::PathBuf) -> oceanfs_core::StoragePoolConfig {
+    /// #         oceanfs_core::StoragePoolConfig {
+    /// #             name: name.into(),
+    /// #             role,
+    /// #             root,
+    /// #             weight: None,
+    /// #             tech: Default::default(),
+    /// #             health: Default::default(),
+    /// #         }
+    /// #     }
+    /// #     oceanfs_core::StorageConfig {
+    /// #         pools: vec![
+    /// #             pool("data-0", oceanfs_core::PoolRole::Data, tmp.join("pool-data")),
+    /// #             pool("wal-0", oceanfs_core::PoolRole::Wal, tmp.join("pool-wal")),
+    /// #             pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.join("pool-meta")),
+    /// #             pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.join("pool-hints")),
+    /// #         ],
+    /// #         missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+    /// #     }
+    /// # }
     /// # let config = NodeConfig {
     /// #     data_dir: tmp.path().join("data"),
     /// #     listen_addr: "127.0.0.1:0".into(),
     /// #     grpc_listen_addr: "127.0.0.1:0".into(),
     /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     storage: storage_pools(&tmp.path()),
     /// #     ..NodeConfig::default()
     /// # };
     /// let node = Node::start(config).await.expect("node");
@@ -2870,14 +3085,47 @@ mod tests {
 
     use super::*;
 
+    /// A role-complete `[storage]` topology for tests: one data, one wal,
+    /// one metadata, one hints pool on sibling tempdir roots (ADR-0031
+    /// mandatory roles; the data pool is id 0).
+    fn test_storage_pools(tmp: &TempDir) -> oceanfs_core::StorageConfig {
+        fn pool(
+            name: &str,
+            role: oceanfs_core::PoolRole,
+            root: std::path::PathBuf,
+        ) -> oceanfs_core::StoragePoolConfig {
+            oceanfs_core::StoragePoolConfig {
+                name: name.into(),
+                role,
+                root,
+                weight: None,
+                tech: Default::default(),
+                health: Default::default(),
+            }
+        }
+        oceanfs_core::StorageConfig {
+            pools: vec![
+                pool("data-0", oceanfs_core::PoolRole::Data, tmp.path().join("pool-data")),
+                pool("wal-0", oceanfs_core::PoolRole::Wal, tmp.path().join("pool-wal")),
+                pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.path().join("pool-meta")),
+                pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.path().join("pool-hints")),
+            ],
+            missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+        }
+    }
+
     fn test_config(tmp: &TempDir) -> NodeConfig {
         NodeConfig {
-            data_dir: tmp.path().to_path_buf(),
+            // Pool roots are siblings under the tempdir (see
+            // `test_storage_pools`), so `data_dir` is a subdir.
+            data_dir: tmp.path().join("data"),
             listen_addr: "127.0.0.1:0".into(),
             grpc_listen_addr: "127.0.0.1:0".into(),
             // Ephemeral membership plane port — the default 0.0.0.0:9002
             // conflicts across parallel test nodes (ADR-0028 D1).
             membership_listen_addr: "127.0.0.1:0".into(),
+            // ADR-0031: pools are mandatory in tests too.
+            storage: test_storage_pools(tmp),
             // The event WAL lives under the temp data dir (the default
             // /var/lib/oceanfs/event-wal is not writable in tests).
             event_wal: oceanfs_core::EventWalConfig {
@@ -2925,6 +3173,23 @@ mod tests {
         );
         // Clean shutdown.
         result.unwrap().shutdown().await.expect("shutdown");
+    }
+
+    /// ADR-0031 (f1): a node whose config has no `[storage.pools]` is
+    /// refused at boot with the role-listing error.
+    #[tokio::test]
+    async fn node_start_without_pools_refuses_with_role_error() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut config = test_config(&tmp);
+        config.storage = oceanfs_core::StorageConfig::default();
+        let result = Node::start(config).await;
+        assert!(result.is_err(), "boot without pools must fail");
+        let err_msg = result.err().unwrap().to_string();
+        assert!(err_msg.contains("'data'"), "message: {err_msg}");
+        assert!(err_msg.contains("'wal'"), "message: {err_msg}");
+        assert!(err_msg.contains("'metadata'"), "message: {err_msg}");
+        assert!(err_msg.contains("'hints'"), "message: {err_msg}");
+        assert!(err_msg.contains("mandatory"), "message: {err_msg}");
     }
 
     #[tokio::test]

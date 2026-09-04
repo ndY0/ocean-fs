@@ -9,8 +9,6 @@
 //! - after DELETE + GC cycles the segment `.dat` is unlinked from its
 //!   pool root (the GC unlink passes the pool id held in the metadata).
 //!
-//! Regression: the legacy node (no pools) passes the same write+read on
-//! `data_dir/segments`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
@@ -183,10 +181,10 @@ async fn two_data_pool_node_roundtrip_gc() {
     drop(tmp);
 }
 
-/// Regression: the legacy node (no pools) passes the same write+read on
-/// `data_dir/segments`.
+/// ADR-0031 (f1): a node whose config has no `[storage.pools]` is refused
+/// at boot with the role-listing error — the legacy fallback is gone.
 #[tokio::test]
-async fn legacy_node_roundtrip_on_data_dir_segments() {
+async fn node_without_pools_refuses_to_boot() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = NodeConfig {
         data_dir: tmp.path().join("data"),
@@ -195,47 +193,15 @@ async fn legacy_node_roundtrip_on_data_dir_segments() {
         membership_listen_addr: "127.0.0.1:0".into(),
         ..NodeConfig::default()
     };
-    let data_dir = config.data_dir.clone();
 
-    let node = Node::start(config).await.expect("legacy node must boot");
-    let addr = node.server_addr();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .expect("client");
-
-    let objects = put_objects(&client, addr, 3).await;
-    for (key, body) in &objects {
-        get_object(&client, addr, key, body).await;
-    }
-
-    // Legacy: sealed segments live under data_dir/segments (poll for the
-    // async seal).
-    let seal_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let count = std::fs::read_dir(data_dir.join("segments"))
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter(|e| e.file_name().to_string_lossy().ends_with(".dat"))
-                    .count()
-            })
-            .unwrap_or(0);
-        if count > 0 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < seal_deadline,
-            "legacy segments must land on data_dir/segments within 30s"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-    let segment_dats: Vec<_> = std::fs::read_dir(data_dir.join("segments"))
-        .expect("legacy segments dir")
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".dat"))
-        .collect();
-    assert!(!segment_dats.is_empty(), "legacy segments must land on data_dir/segments");
-    node.shutdown().await.expect("graceful shutdown");
-    drop(tmp);
+    let err = match Node::start(config).await {
+        Ok(_) => panic!("boot without pools must fail"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("'data'"), "message: {msg}");
+    assert!(msg.contains("'wal'"), "message: {msg}");
+    assert!(msg.contains("'metadata'"), "message: {msg}");
+    assert!(msg.contains("'hints'"), "message: {msg}");
+    assert!(msg.contains("mandatory"), "message: {msg}");
 }

@@ -46,20 +46,46 @@ struct NodeAddrs {
 async fn boot_node(id: &str, seed: Option<&str>, addrs: &NodeAddrs) -> (Node, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let storage = StorageConfig {
-        pools: vec![StoragePoolConfig {
-            name: "data-a".to_string(),
-            role: PoolRole::Data,
-            root: tmp.path().join("nvme0"),
-            weight: None,
-            tech: PoolTech::Auto,
-            // Fast detection: any error spikes, one clean tick recovers.
-            health: PoolHealthConfig {
-                min_errors: 1,
-                detection_window_secs: 1,
-                recovery_window_secs: 1,
-                ..PoolHealthConfig::default()
+        pools: vec![
+            StoragePoolConfig {
+                name: "data-a".to_string(),
+                role: PoolRole::Data,
+                root: tmp.path().join("nvme0"),
+                weight: None,
+                tech: PoolTech::Auto,
+                // Fast detection: any error spikes, one clean tick recovers.
+                health: PoolHealthConfig {
+                    min_errors: 1,
+                    detection_window_secs: 1,
+                    recovery_window_secs: 1,
+                    ..PoolHealthConfig::default()
+                },
             },
-        }],
+            StoragePoolConfig {
+                name: "journal".to_string(),
+                role: PoolRole::Wal,
+                root: tmp.path().join("optane0"),
+                weight: None,
+                tech: PoolTech::Auto,
+                health: PoolHealthConfig::default(),
+            },
+            StoragePoolConfig {
+                name: "meta".to_string(),
+                role: PoolRole::Metadata,
+                root: tmp.path().join("optane1"),
+                weight: None,
+                tech: PoolTech::Auto,
+                health: PoolHealthConfig::default(),
+            },
+            StoragePoolConfig {
+                name: "hints".to_string(),
+                role: PoolRole::Hints,
+                root: tmp.path().join("hints0"),
+                weight: None,
+                tech: PoolTech::Auto,
+                health: PoolHealthConfig::default(),
+            },
+        ],
         missing_root_policy: MissingRootPolicy::Fatal,
     };
     let config = NodeConfig {

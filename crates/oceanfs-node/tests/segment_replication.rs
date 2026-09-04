@@ -1,7 +1,7 @@
 //! Integration test (sealed-segment-replication DoD): the multi-node
 //! durability test that should have existed since phase 2.
 //!
-//! A 3-node local cluster (legacy mode, RF=3): concurrent PUTs on the
+//! A 3-node local cluster (pool mode, RF=3): concurrent PUTs on the
 //! owner (A) pack multiple objects per small segment (32 KiB bodies into
 //! 64 KiB-target segments — so mid-segment objects exist, the case the
 //! old offset-0 fragment never covered). After seals fire, A's segment
@@ -59,12 +59,41 @@ async fn boot_node(
     fast_gc: bool,
 ) -> (Node, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("tempdir");
+    /// ADR-0031 (f1): mandatory role-complete pool topology for tests — one
+    /// data (id 0), one wal, one metadata, one hints pool on sibling roots.
+    fn storage_pools(tmp: &tempfile::TempDir) -> oceanfs_core::StorageConfig {
+        fn pool(
+            name: &str,
+            role: oceanfs_core::PoolRole,
+            root: std::path::PathBuf,
+        ) -> oceanfs_core::StoragePoolConfig {
+            oceanfs_core::StoragePoolConfig {
+                name: name.into(),
+                role,
+                root,
+                weight: None,
+                tech: Default::default(),
+                health: Default::default(),
+            }
+        }
+        oceanfs_core::StorageConfig {
+            pools: vec![
+                pool("data-0", oceanfs_core::PoolRole::Data, tmp.path().join("pool-data")),
+                pool("wal-0", oceanfs_core::PoolRole::Wal, tmp.path().join("pool-wal")),
+                pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.path().join("pool-meta")),
+                pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.path().join("pool-hints")),
+            ],
+            missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+        }
+    }
+
     let config = NodeConfig {
         node_id: id.to_string(),
         data_dir: tmp.path().join("data"),
         listen_addr: "127.0.0.1:0".into(),
         grpc_listen_addr: addrs.grpc.clone(),
         membership_listen_addr: addrs.membership.clone(),
+        storage: storage_pools(&tmp),
         gossip: oceanfs_core::GossipConfig {
             // Fast convergence for the test.
             interval_ms: 250,
@@ -231,9 +260,9 @@ async fn data_survives_owner_disk_death_via_segment_replicas() {
     // The owner sealed N small segments; each was pushed to the segment's
     // ring replicas (B and C). Assert the replicas' stores actually hold
     // the .dat files.
-    let segments_dir_a = tmp_a.path().join("data/segments");
-    let segments_dir_b = tmp_b.path().join("data/segments");
-    let segments_dir_c = tmp_c.path().join("data/segments");
+    let segments_dir_a = tmp_a.path().join("pool-data");
+    let segments_dir_b = tmp_b.path().join("pool-data");
+    let segments_dir_c = tmp_c.path().join("pool-data");
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let owner_segment_count = loop {
         let count = std::fs::read_dir(&segments_dir_a)
@@ -365,9 +394,9 @@ async fn compacted_segments_are_readable_from_every_node() {
     }
 
     // ---- Wait for initial seals + replication to land on B/C ----
-    let segments_dir_a = tmp_a.path().join("data/segments");
-    let segments_dir_b = tmp_b.path().join("data/segments");
-    let segments_dir_c = tmp_c.path().join("data/segments");
+    let segments_dir_a = tmp_a.path().join("pool-data");
+    let segments_dir_b = tmp_b.path().join("pool-data");
+    let segments_dir_c = tmp_c.path().join("pool-data");
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let initial_ids = loop {
         let ids = segment_ids(&segments_dir_a);
@@ -556,9 +585,9 @@ async fn repacked_segments_are_replicated_to_ring_replicas() {
     }
 
     // ---- Wait for initial seals + replication to land on B/C ----
-    let segments_dir_a = tmp_a.path().join("data/segments");
-    let segments_dir_b = tmp_b.path().join("data/segments");
-    let segments_dir_c = tmp_c.path().join("data/segments");
+    let segments_dir_a = tmp_a.path().join("pool-data");
+    let segments_dir_b = tmp_b.path().join("pool-data");
+    let segments_dir_c = tmp_c.path().join("pool-data");
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let initial_ids = loop {
         let ids = segment_ids(&segments_dir_a);

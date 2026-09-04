@@ -430,9 +430,17 @@ impl Default for HealthMonitorConfig {
 ///
 /// # let tmp = tempfile::tempdir().expect("tempdir");
 /// # let data_dir = tmp.path().join("data");
+/// # let storage = oceanfs_core::StorageConfig {
+/// #     pools: vec![
+/// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: None, tech: Default::default(), health: Default::default() },
+/// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+/// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+/// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+/// #     ],
+/// #     missing_root_policy: Default::default(),
+/// # };
 /// let registry = Arc::new(
-///     PoolRegistry::from_config(&oceanfs_core::StorageConfig::default(), &data_dir)
-///         .expect("registry"),
+///     PoolRegistry::from_config(&storage, &data_dir).expect("registry"),
 /// );
 /// let observer = Arc::new(IoObserver::new());
 /// registry.observe_into(&observer);
@@ -498,15 +506,23 @@ impl HealthMonitor {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
     /// let registry = Arc::new(
-    ///     PoolRegistry::from_config(&oceanfs_core::StorageConfig::default(), &data_dir)
-    ///         .expect("registry"),
+    ///     PoolRegistry::from_config(&storage, &data_dir).expect("registry"),
     /// );
     /// let observer = Arc::new(IoObserver::new());
     /// registry.observe_into(&observer);
     /// let (monitor, _events) =
     ///     HealthMonitor::new(registry, observer, HealthMonitorConfig::default());
-    /// assert_eq!(monitor.pool_count(), 1);
+    /// assert_eq!(monitor.pool_count(), 4);
     /// ```
     pub fn new(
         registry: Arc<PoolRegistry>,
@@ -538,15 +554,23 @@ impl HealthMonitor {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
     /// let registry = Arc::new(
-    ///     PoolRegistry::from_config(&oceanfs_core::StorageConfig::default(), &data_dir)
-    ///         .expect("registry"),
+    ///     PoolRegistry::from_config(&storage, &data_dir).expect("registry"),
     /// );
     /// let observer = Arc::new(IoObserver::new());
     /// registry.observe_into(&observer);
     /// let (monitor, _events) =
     ///     HealthMonitor::new(registry, observer, HealthMonitorConfig::default());
-    /// assert_eq!(monitor.pool_count(), 1);
+    /// assert_eq!(monitor.pool_count(), 4);
     /// ```
     pub fn pool_count(&self) -> usize {
         self.registry.pool_count()
@@ -569,9 +593,17 @@ impl HealthMonitor {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
     /// let registry = Arc::new(
-    ///     PoolRegistry::from_config(&oceanfs_core::StorageConfig::default(), &data_dir)
-    ///         .expect("registry"),
+    ///     PoolRegistry::from_config(&storage, &data_dir).expect("registry"),
     /// );
     /// let observer = Arc::new(IoObserver::new());
     /// registry.observe_into(&observer);
@@ -624,9 +656,17 @@ impl HealthMonitor {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
     /// let registry = Arc::new(
-    ///     PoolRegistry::from_config(&oceanfs_core::StorageConfig::default(), &data_dir)
-    ///         .expect("registry"),
+    ///     PoolRegistry::from_config(&storage, &data_dir).expect("registry"),
     /// );
     /// let observer = Arc::new(IoObserver::new());
     /// registry.observe_into(&observer);
@@ -1309,6 +1349,8 @@ mod tests {
             pools: vec![
                 pool_config("data-a", PoolRole::Data, &tmp.path().join("nvme0")),
                 pool_config("journal", PoolRole::Wal, &tmp.path().join("optane0")),
+                pool_config("meta", PoolRole::Metadata, &tmp.path().join("optane1")),
+                pool_config("hints", PoolRole::Hints, &tmp.path().join("hints0")),
             ],
             missing_root_policy: MissingRootPolicy::Fatal,
         };

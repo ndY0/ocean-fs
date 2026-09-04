@@ -458,10 +458,39 @@ impl NodeProcess {
             .replace("{grpc_port}", &grpc_addr.port().to_string())
             .replace("{membership_port}", &membership_addr.port().to_string());
 
+        // ADR-0031 (f1): storage pools are mandatory. The caller's `data_dir`
+        // is the node BASE: the node's actual data directory is
+        // `{base}/data` and the minimal role-complete pool topology (one
+        // data, one wal, one metadata, one hints pool) sits on SIBLING
+        // roots `{base}/pool-*` — the validate disjointness rule forbids
+        // pool roots nested inside `data_dir`. Callers that reuse the
+        // same base across restarts get the same layout (ports file and
+        // RocksDB data included). Configs that already declare
+        // `[storage]` (fleet/SUT targets) are untouched.
+        let node_data_dir = data_dir.join("data");
+        let pools_block = if resolved_config.contains("[storage]") {
+            String::new()
+        } else {
+            let mut block = String::from("\n[storage]\nmissing_root_policy = \"fatal\"\n");
+            for (name, role, root) in [
+                ("data-0", "data", data_dir.join("pool-data")),
+                ("wal-0", "wal", data_dir.join("pool-wal")),
+                ("meta-0", "metadata", data_dir.join("pool-meta")),
+                ("hints-0", "hints", data_dir.join("pool-hints")),
+            ] {
+                block.push_str(&format!(
+                    "\n[[storage.pools]]\nname = \"{name}\"\nrole = \"{role}\"\nroot = \"{}\"\n",
+                    root.display()
+                ));
+            }
+            block
+        };
+
         let full_config = format!(
-            "data_dir = \"{data_dir_path}\"\n{resolved_config}",
-            data_dir_path = data_dir.display(),
-            resolved_config = resolved_config
+            "data_dir = \"{data_dir_path}\"\n{resolved_config}{pools_block}",
+            data_dir_path = node_data_dir.display(),
+            resolved_config = resolved_config,
+            pools_block = pools_block,
         );
 
         let config_path = data_dir.join("oceanfs.toml");

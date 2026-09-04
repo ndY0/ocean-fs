@@ -1270,12 +1270,36 @@ mod tests {
                     tech: oceanfs_core::PoolTech::Auto,
                     health: Default::default(),
                 },
+                oceanfs_core::StoragePoolConfig {
+                    name: "journal".into(),
+                    role: oceanfs_core::PoolRole::Wal,
+                    root: tmp.path().join("optane0"),
+                    weight: Some(1),
+                    tech: oceanfs_core::PoolTech::Auto,
+                    health: Default::default(),
+                },
+                oceanfs_core::StoragePoolConfig {
+                    name: "meta".into(),
+                    role: oceanfs_core::PoolRole::Metadata,
+                    root: tmp.path().join("optane1"),
+                    weight: Some(1),
+                    tech: oceanfs_core::PoolTech::Auto,
+                    health: Default::default(),
+                },
+                oceanfs_core::StoragePoolConfig {
+                    name: "hints".into(),
+                    role: oceanfs_core::PoolRole::Hints,
+                    root: tmp.path().join("hints0"),
+                    weight: Some(1),
+                    tech: oceanfs_core::PoolTech::Auto,
+                    health: Default::default(),
+                },
             ],
             missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
         };
         let registry = oceanfs_storage::PoolRegistry::from_config(&storage, &data_dir).unwrap();
-        let pools = registry.pools();
-        // Note: the config-order ids are 0 and 1 (the f2 scheme).
+        // The shard store scopes to DATA pools only (config-order ids 0/1).
+        let pools = registry.data_pools();
         let store = DiskSegmentShardStore::new(pools, legacy.clone(), Arc::new(|_| Some(0)));
         (store, roots)
     }

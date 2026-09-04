@@ -90,11 +90,12 @@ pub struct NodeConfig {
     /// Directory for all persistent data (RocksDB, WAL, segments).
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
-    /// Storage-pool topology (ADR-0029 §D8).
+    /// Storage-pool topology (ADR-0029 §D8, ADR-0031).
     ///
-    /// Empty `pools` = legacy single-`data_dir` mode, byte-for-byte today's
-    /// behavior. Non-empty = one `StoragePool` per pool entry, consumed by
-    /// the pool registry (feature f2).
+    /// Pools are mandatory: an empty `[storage.pools]` list is refused at
+    /// validation/boot with an error naming the required roles (`data`,
+    /// `wal`, `metadata`, `hints`). Each entry becomes one `StoragePool`
+    /// in the pool registry.
     #[serde(default)]
     pub storage: crate::StorageConfig,
     /// Address the S3 HTTP API listens on.

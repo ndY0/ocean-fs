@@ -44,6 +44,9 @@ async fn faulty_io_write_cycle_counts_errors_per_pool() {
         pools: vec![
             pool("pool-a", PoolRole::Data, &root_a),
             pool("pool-b", PoolRole::Data, &root_b),
+            pool("journal", PoolRole::Wal, &tmp.path().join("optane0")),
+            pool("meta", PoolRole::Metadata, &tmp.path().join("optane1")),
+            pool("hints", PoolRole::Hints, &tmp.path().join("hints0")),
         ],
         missing_root_policy: MissingRootPolicy::Fatal,
     };

@@ -6,8 +6,9 @@
 //! placement weight, a device-tech hint, and per-pool health tuning knobs
 //! (carried now, consumed by Phase B's health monitor).
 //!
-//! The zero-config fallback is preserved: an empty `[storage.pools]` list
-//! means "single `data_dir`", byte-for-byte today's behavior. Migration to
+//! Storage pools are mandatory (ADR-0031): an empty `[storage.pools]` list
+//! is rejected at validation with an error naming the required roles. The
+//! legacy single-`data_dir` zero-config fallback was removed — migration to
 //! pools is explicit, never automatic.
 //!
 //! ## Configuration shape
@@ -46,7 +47,8 @@ use std::{
 /// durability-critical paths, and a failed role pool triggers role-specific
 /// cluster consequences (see ADR-0029 §D3).
 ///
-/// At most one `wal`, `metadata`, and `hints` pool may be configured; any
+/// Exactly one `wal`, `metadata`, and `hints` pool must be configured
+/// (role pinning, ADR-0031 — a node without them is refused at boot); any
 /// number of `data` pools may be configured (each is a distinct failure
 /// domain).
 ///
@@ -293,24 +295,60 @@ pub struct PoolConfig {
 
 /// The `[storage]` section of `NodeConfig`: the node's storage-pool topology.
 ///
-/// An empty `pools` list is the zero-config fallback (ADR-0029 §D8): the
-/// node behaves exactly as before, using the legacy single `data_dir` for
-/// everything. Migration to pools is explicit and never automatic.
+/// Storage pools are **mandatory** (ADR-0031): an empty `pools` list fails
+/// [`StorageConfig::validate`] with an error naming the required roles —
+/// the legacy single-`data_dir` fallback was removed.
 ///
 /// # Examples
 ///
 /// ```
-/// use oceanfs_core::StorageConfig;
+/// use oceanfs_core::{MissingRootPolicy, PoolRole, PoolTech, StorageConfig, StoragePoolConfig};
+/// use std::path::{Path, PathBuf};
 ///
-/// // Legacy mode: no pools configured.
-/// let config = StorageConfig::default();
-/// assert!(config.pools.is_empty());
-/// assert!(config.validate(std::path::Path::new("/var/lib/oceanfs")).is_ok());
+/// let config = StorageConfig {
+///     pools: vec![
+///         StoragePoolConfig {
+///             name: "fast-nvme-0".into(),
+///             role: PoolRole::Data,
+///             root: PathBuf::from("/mnt/nvme0"),
+///             weight: Some(2),
+///             tech: PoolTech::Nvme,
+///             health: Default::default(),
+///         },
+///         StoragePoolConfig {
+///             name: "journal".into(),
+///             role: PoolRole::Wal,
+///             root: PathBuf::from("/mnt/optane0"),
+///             weight: None,
+///             tech: PoolTech::Auto,
+///             health: Default::default(),
+///         },
+///         StoragePoolConfig {
+///             name: "meta".into(),
+///             role: PoolRole::Metadata,
+///             root: PathBuf::from("/mnt/optane1"),
+///             weight: None,
+///             tech: PoolTech::Auto,
+///             health: Default::default(),
+///         },
+///         StoragePoolConfig {
+///             name: "hints".into(),
+///             role: PoolRole::Hints,
+///             root: PathBuf::from("/mnt/hints0"),
+///             weight: None,
+///             tech: PoolTech::Auto,
+///             health: Default::default(),
+///         },
+///     ],
+///     missing_root_policy: MissingRootPolicy::Fatal,
+/// };
+/// assert!(config.validate(Path::new("/var/lib/oceanfs")).is_ok());
 /// ```
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
-    /// Configured storage pools. Empty = legacy single-`data_dir` mode.
+    /// Configured storage pools. Must declare at least one `data` pool and
+    /// exactly one `wal`, `metadata`, and `hints` pool each (ADR-0031).
     pub pools: Vec<PoolConfig>,
     /// Startup policy for a pool whose root is missing or unprobeable.
     /// Default: `Fatal`.
@@ -318,55 +356,72 @@ pub struct StorageConfig {
 }
 
 impl StorageConfig {
-    /// Validates the storage topology against the ADR-0029 §D8 rules.
+    /// Validates the storage topology against the ADR-0029 §D8 + ADR-0031
+    /// rules.
     ///
-    /// The empty-pool list is the legacy fallback and validates nothing —
-    /// every existing config stays valid. A non-empty list must satisfy:
+    /// Every node must declare a pool topology (the legacy empty-list
+    /// fallback is gone). The list must satisfy:
     ///
     /// - at least one `data` pool;
+    /// - exactly one `wal`, exactly one `metadata`, and exactly one
+    ///   `hints` pool (role pinning, ADR-0029 §D8);
     /// - pool names non-empty and unique;
     /// - pool roots absolute and unique (one root per pool — the schema
     ///   itself only carries one `root` field);
-    /// - at most one `wal`, `metadata`, and `hints` pool each;
     /// - `weight > 0` when set;
     /// - health knobs sane: `error_rate_threshold` in `(0, 1)`, all windows
     ///   `> 0`;
-    /// - no pool root overlaps the legacy `data_dir` (pool mode and legacy
-    ///   mode are mutually exclusive layouts; overlap would silently mix
-    ///   pool-managed paths with legacy-managed ones).
+    /// - no pool root overlaps `data_dir` (pool roots must be disjoint from
+    ///   the node's data directory).
     ///
     /// # Errors
     ///
-    /// Returns a human-readable message describing the first rule violated.
+    /// Returns a human-readable message describing the first rule violated;
+    /// an empty pool list names the required roles.
     ///
     /// # Examples
     ///
     /// ```
-    /// use oceanfs_core::{PoolRole, StorageConfig, StoragePoolConfig};
+    /// use oceanfs_core::{MissingRootPolicy, PoolRole, StorageConfig, StoragePoolConfig};
     /// use std::path::{Path, PathBuf};
     ///
-    /// let config = StorageConfig {
-    ///     pools: vec![StoragePoolConfig {
-    ///         name: "fast-nvme-0".into(),
-    ///         role: PoolRole::Data,
-    ///         root: PathBuf::from("/mnt/nvme0"),
+    /// fn pool(name: &str, role: PoolRole, root: &str) -> StoragePoolConfig {
+    ///     StoragePoolConfig {
+    ///         name: name.into(),
+    ///         role,
+    ///         root: PathBuf::from(root),
     ///         weight: None,
     ///         tech: Default::default(),
     ///         health: Default::default(),
-    ///     }],
-    ///     missing_root_policy: Default::default(),
+    ///     }
+    /// }
+    ///
+    /// let config = StorageConfig {
+    ///     pools: vec![
+    ///         pool("fast-nvme-0", PoolRole::Data, "/mnt/nvme0"),
+    ///         pool("journal", PoolRole::Wal, "/mnt/optane0"),
+    ///         pool("meta", PoolRole::Metadata, "/mnt/optane1"),
+    ///         pool("hints", PoolRole::Hints, "/mnt/hints0"),
+    ///     ],
+    ///     missing_root_policy: MissingRootPolicy::Fatal,
     /// };
     /// assert!(config.validate(Path::new("/var/lib/oceanfs")).is_ok());
+    ///
+    /// // An empty list is refused with a role-listing error (ADR-0031).
+    /// assert!(StorageConfig::default().validate(Path::new("/var/lib/oceanfs")).is_err());
     /// ```
     pub fn validate(&self, data_dir: &Path) -> Result<(), String> {
-        // Legacy zero-config fallback: no pools = single data_dir (today's
-        // behavior, byte-for-byte). Nothing to validate.
+        // Storage pools are mandatory (ADR-0031 D1): the legacy
+        // single-`data_dir` fallback is removed. Every node must declare
+        // at least one `data` pool and exactly one of each pinned role.
         if self.pools.is_empty() {
-            return Ok(());
+            return Err("at least one 'data', 'wal', 'metadata', and 'hints' pool is required; \
+                 storage pools are mandatory (ADR-0031)"
+                .to_string());
         }
 
-        // At least one data pool must exist when pools are configured, so
-        // placement has somewhere to spread segments.
+        // At least one data pool must exist so placement has somewhere to
+        // spread segments.
         if !self.pools.iter().any(|pool| pool.role == PoolRole::Data) {
             return Err("at least one 'data' pool is required when storage pools are configured"
                 .to_string());
@@ -402,7 +457,7 @@ impl StorageConfig {
                 return Err(format!("duplicate pool root: '{}'", pool.root.display()));
             }
 
-            // Role cardinality: wal/metadata/hints are at most one each.
+            // Count pinned roles for the post-loop exactly-one check.
             match pool.role {
                 PoolRole::Data => {}
                 PoolRole::Wal => wal_pools += 1,
@@ -435,9 +490,9 @@ impl StorageConfig {
                 ));
             }
 
-            // Pool roots must be disjoint from the legacy data_dir: pool mode
-            // and legacy mode are mutually exclusive layouts, and overlap
-            // would silently mix pool-managed paths with legacy-managed ones.
+            // Pool roots must be disjoint from the node's data_dir: an
+            // overlapping root would silently mix pool-managed paths with
+            // node-managed ones.
             if paths_overlap(&pool.root, data_dir) {
                 return Err(format!(
                     "pool '{}' root '{}' overlaps the legacy data_dir '{}'; \
@@ -449,6 +504,10 @@ impl StorageConfig {
             }
         }
 
+        // Role pinning (ADR-0029 §D8 + ADR-0031): exactly one of each
+        // pinned role. The ">1" checks run first so a config with two
+        // `hints` pools reports the cardinality violation, not a missing
+        // `wal`.
         if wal_pools > 1 {
             return Err("at most one 'wal' pool is allowed per node".to_string());
         }
@@ -457,6 +516,22 @@ impl StorageConfig {
         }
         if hints_pools > 1 {
             return Err("at most one 'hints' pool is allowed per node".to_string());
+        }
+        if wal_pools == 0 {
+            return Err("exactly one 'wal' pool is required per node (role pinning, ADR-0029 §D8)"
+                .to_string());
+        }
+        if metadata_pools == 0 {
+            return Err(
+                "exactly one 'metadata' pool is required per node (role pinning, ADR-0029 §D8)"
+                    .to_string(),
+            );
+        }
+        if hints_pools == 0 {
+            return Err(
+                "exactly one 'hints' pool is required per node (role pinning, ADR-0029 §D8)"
+                    .to_string(),
+            );
         }
 
         Ok(())
@@ -557,24 +632,37 @@ mod tests {
             root = "/mnt/nvme2"
             tech = "nvme"
             health = { error_rate_threshold = 0.001, min_errors = 3, latency_factor = 5.0, trend_window_secs = 300, detection_window_secs = 30, recovery_window_secs = 300 }
+
+            [[pools]]
+            name = "hints"
+            role = "hints"
+            root = "/mnt/nvme3"
         "#;
         toml::from_str(toml_str).expect("ADR §D8 example must deserialize")
     }
 
-    // -- Defaults / legacy fallback --
+    // -- Defaults / mandatory pools (ADR-0031 D1) --
 
     #[test]
-    fn default_storage_config_is_legacy_mode() {
+    fn default_storage_config_has_no_pools() {
         let config = StorageConfig::default();
         assert!(config.pools.is_empty());
         assert_eq!(config.missing_root_policy, MissingRootPolicy::Fatal);
     }
 
     #[test]
-    fn legacy_fallback_validate_accepts_any_data_dir() {
+    fn empty_pools_rejected_with_role_listing_error() {
+        // ADR-0031 D1: no silent legacy fallback — the empty list is
+        // refused with an explicit role-listing error for any data dir.
         let config = StorageConfig::default();
-        assert!(config.validate(Path::new("/var/lib/oceanfs")).is_ok());
-        assert!(config.validate(Path::new("/")).is_ok());
+        for dir in [Path::new("/var/lib/oceanfs"), Path::new("/")] {
+            let err = config.validate(dir).unwrap_err();
+            assert!(err.contains("'data'"), "message: {err}");
+            assert!(err.contains("'wal'"), "message: {err}");
+            assert!(err.contains("'metadata'"), "message: {err}");
+            assert!(err.contains("'hints'"), "message: {err}");
+            assert!(err.contains("mandatory"), "message: {err}");
+        }
     }
 
     #[test]
@@ -716,11 +804,12 @@ mod tests {
     #[test]
     fn adr_d8_example_deserializes_and_validates() {
         let config = adr_d8_example();
-        assert_eq!(config.pools.len(), 4);
+        assert_eq!(config.pools.len(), 5);
         assert_eq!(config.pools[0].name, "fast-nvme-0");
         assert_eq!(config.pools[1].role, PoolRole::Wal);
         assert_eq!(config.pools[2].role, PoolRole::Metadata);
         assert_eq!(config.pools[3].name, "hot-nvme");
+        assert_eq!(config.pools[4].role, PoolRole::Hints);
 
         assert!(config.validate(Path::new("/var/lib/oceanfs")).is_ok());
     }
@@ -741,10 +830,26 @@ mod tests {
             root = "/mnt/nvme0"
             weight = 2
             tech = "nvme"
+
+            [[storage.pools]]
+            name = "journal"
+            role = "wal"
+            root = "/mnt/optane0"
+
+            [[storage.pools]]
+            name = "meta"
+            role = "metadata"
+            root = "/mnt/optane1"
+
+            [[storage.pools]]
+            name = "hints"
+            role = "hints"
+            root = "/mnt/nvme3"
         "#;
         let config: NodeConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.storage.pools.len(), 1);
+        assert_eq!(config.storage.pools.len(), 4);
         assert_eq!(config.storage.pools[0].name, "fast-nvme-0");
+        assert_eq!(config.storage.pools[3].role, PoolRole::Hints);
         assert!(config.storage.validate(&config.data_dir).is_ok());
     }
 
@@ -804,13 +909,28 @@ mod tests {
     }
 
     #[test]
-    fn validate_missing_wal_pool_is_allowed() {
-        // wal/metadata/hints are optional; only data is mandatory.
+    fn data_only_topology_rejected_missing_pinned_roles() {
+        // ADR-0031: wal/metadata/hints are mandatory (role pinning).
         let config = StorageConfig {
             pools: vec![data_pool("pool-a", "/mnt/a", None)],
             missing_root_policy: MissingRootPolicy::Fatal,
         };
-        assert!(config.validate(Path::new("/var/lib/oceanfs")).is_ok());
+        let err = config.validate(Path::new("/var/lib/oceanfs")).unwrap_err();
+        assert!(err.contains("'wal' pool is required"), "message: {err}");
+    }
+
+    #[test]
+    fn topology_missing_hints_pool_rejected() {
+        let config = StorageConfig {
+            pools: vec![
+                data_pool("pool-a", "/mnt/a", None),
+                wal_pool("journal", "/mnt/wal"),
+                metadata_pool("meta", "/mnt/meta"),
+            ],
+            missing_root_policy: MissingRootPolicy::Fatal,
+        };
+        let err = config.validate(Path::new("/var/lib/oceanfs")).unwrap_err();
+        assert!(err.contains("'hints' pool is required"), "message: {err}");
     }
 
     #[test]
@@ -962,6 +1082,9 @@ mod tests {
             pools: vec![
                 data_pool("pool-a", "/mnt/a", Some(2)),
                 data_pool("pool-b", "/mnt/b", None),
+                wal_pool("journal", "/mnt/wal"),
+                metadata_pool("meta", "/mnt/meta"),
+                hints_pool("hints", "/mnt/hints"),
             ],
             missing_root_policy: MissingRootPolicy::Degraded,
         };

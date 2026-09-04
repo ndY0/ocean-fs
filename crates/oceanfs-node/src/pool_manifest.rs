@@ -29,19 +29,23 @@ use oceanfs_storage::{PoolRegistry, PoolStatus, StoragePool};
 /// use oceanfs_membership::manifest::NodeManifest;
 /// use oceanfs_node::pool_manifest::build_node_manifest;
 /// use oceanfs_storage::PoolRegistry;
-/// use oceanfs_core::StorageConfig;
 ///
 /// # let tmp = tempfile::tempdir().expect("tempdir");
 /// # let data_dir = tmp.path().join("data");
-/// let registry = PoolRegistry::from_config(
-///     &StorageConfig::default(),
-///     &data_dir,
-/// )
-/// .expect("legacy single-pool registry");
+/// # let storage = oceanfs_core::StorageConfig {
+/// #     pools: vec![
+/// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: None, tech: Default::default(), health: Default::default() },
+/// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+/// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+/// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+/// #     ],
+/// #     missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+/// # };
+/// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
 ///
 /// let manifest = build_node_manifest(3, &registry);
 /// assert_eq!(manifest.incarnation(), 3);
-/// assert_eq!(manifest.pools().len(), 1);
+/// assert_eq!(manifest.pools().len(), 4);
 /// assert_eq!(manifest.pools()[0].role(), "data");
 /// assert_eq!(manifest.pools()[0].status(), "healthy");
 /// ```
@@ -109,6 +113,7 @@ mod tests {
             tmp.path().join("nvme1"),
             tmp.path().join("optane0"),
             tmp.path().join("optane1"),
+            tmp.path().join("hints0"),
         ];
         let storage = StorageConfig {
             pools: vec![
@@ -116,6 +121,7 @@ mod tests {
                 pool("fast-nvme-1", PoolRole::Data, &roots[1]),
                 pool("journal", PoolRole::Wal, &roots[2]),
                 pool("meta", PoolRole::Metadata, &roots[3]),
+                pool("hints", PoolRole::Hints, &roots[4]),
             ],
             missing_root_policy: MissingRootPolicy::Fatal,
         };
@@ -127,12 +133,13 @@ mod tests {
         registry.set_pool_capacity(1, 2 << 30, 700 << 20);
         registry.set_pool_capacity(2, 1 << 30, 200 << 20);
         registry.set_pool_capacity(3, 1 << 30, 100 << 20);
+        registry.set_pool_capacity(4, 1 << 30, 100 << 20);
 
         let manifest = build_node_manifest(11, &registry);
 
         assert_eq!(manifest.incarnation(), 11);
         let pools = manifest.pools();
-        assert_eq!(pools.len(), 4, "one PoolManifest per registered pool");
+        assert_eq!(pools.len(), 5, "one PoolManifest per registered pool");
 
         // Pool 0: data, healthy, weight from auto-detect, free set above.
         assert_eq!(pools[0].id(), 0);
@@ -157,22 +164,10 @@ mod tests {
         assert_eq!(pools[3].id(), 3);
         assert_eq!(pools[3].role(), "metadata");
         assert_eq!(pools[3].capacity_free_bytes(), 100 << 20);
-    }
 
-    /// Legacy mode (no pools): the registry's single implicit data pool
-    /// at `data_dir` appears as one PoolManifest so legacy nodes
-    /// participate in capacity-aware routing uniformly.
-    #[test]
-    fn manifest_in_legacy_mode_has_single_implicit_data_pool() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let data_dir = tmp.path().join("data");
-        let registry =
-            PoolRegistry::from_config(&StorageConfig::default(), &data_dir).expect("registry");
-
-        let manifest = build_node_manifest(1, &registry);
-        assert_eq!(manifest.pools().len(), 1);
-        assert_eq!(manifest.pools()[0].id(), 0);
-        assert_eq!(manifest.pools()[0].role(), "data");
-        assert_eq!(manifest.pools()[0].status(), "healthy");
+        // Pool 4: the hints role.
+        assert_eq!(pools[4].id(), 4);
+        assert_eq!(pools[4].role(), "hints");
+        assert_eq!(pools[4].status(), "healthy");
     }
 }

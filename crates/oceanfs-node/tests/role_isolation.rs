@@ -99,10 +99,10 @@ async fn four_pool_node_boots_with_role_pinned_paths() {
     node.shutdown().await.expect("graceful shutdown");
 }
 
-/// Regression: a node with no pools resolves byte-for-byte to the legacy
-/// `data_dir/{metadata,wal,event-wal,hints}` layout.
+/// ADR-0031 (f1): a node whose config has no `[storage.pools]` is refused
+/// at boot with the role-listing error — the legacy fallback is gone.
 #[tokio::test]
-async fn legacy_node_boots_with_unchanged_layout() {
+async fn node_without_pools_refuses_to_boot() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = NodeConfig {
         data_dir: tmp.path().join("data"),
@@ -111,17 +111,14 @@ async fn legacy_node_boots_with_unchanged_layout() {
         membership_listen_addr: "127.0.0.1:0".into(),
         ..NodeConfig::default()
     };
-    let data_dir = config.data_dir.clone();
 
-    let node = Node::start(config).await.expect("legacy node must boot");
-
-    assert!(data_dir.join("metadata").join("CURRENT").exists(), "metadata at data_dir/metadata");
-    assert!(data_dir.join("wal").exists(), "wal at data_dir/wal");
-    assert!(data_dir.join("event-wal").exists(), "event-wal at data_dir/event-wal");
-    assert!(data_dir.join("hints").exists(), "hints at data_dir/hints");
-    assert!(data_dir.join("segments").exists(), "segments at data_dir/segments");
-
-    node.shutdown().await.expect("graceful shutdown");
+    let err = match Node::start(config).await {
+        Ok(_) => panic!("boot without pools must fail"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("'data'"), "message: {msg}");
+    assert!(msg.contains("'hints'"), "message: {msg}");
 }
 
 /// The 4-pool node serves an S3 PUT+GET, and the write lands on the pinned

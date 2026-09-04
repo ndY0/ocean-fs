@@ -1871,6 +1871,14 @@ mod tests {
                     tech: PoolTech::Auto,
                     health: Default::default(),
                 },
+                StoragePoolConfig {
+                    name: "hints".into(),
+                    role: PoolRole::Hints,
+                    root: dir.path().join("hints0"),
+                    weight: None,
+                    tech: PoolTech::Auto,
+                    health: Default::default(),
+                },
             ],
             missing_root_policy: MissingRootPolicy::Fatal,
         };

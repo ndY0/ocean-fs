@@ -599,11 +599,16 @@ impl AdminHandler {
     /// use oceanfs_storage::PoolRegistry;
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// let handler = AdminHandler::new(
     ///     Arc::new(BucketConfigStore::new()),
     ///     Arc::new(MetricsRegistry::new()),

@@ -72,29 +72,21 @@ pub type PoolIdResolver = Arc<dyn Fn(&oceanfs_core::SegmentId) -> Option<u32> + 
 
 /// Resolves a segment's pool root from its durable `pool_id`.
 ///
-/// With pools configured, every pool-mode segment carries a real pool id
-/// (the f2 config-order scheme: 0 = the first data pool), so `pool_id`
-/// names that pool's root; the legacy `legacy_dir` is used only when no
-/// pools are configured or the id is unknown (a stale mapping). Pure
-/// lookup over the pool snapshot — no locks, no I/O (f5 perf: 2.3/7.2).
+/// Pools are mandatory since f1 (ADR-0031) and every segment carries a
+/// real pool id (config-order scheme: 0 = the first data pool), so
+/// `pool_id` names that pool's root; `legacy_dir` remains only as the
+/// unknown-id fallback until f2 deletes it. Pure lookup over the pool
+/// snapshot — no locks, no I/O (f5 perf: 2.3/7.2).
 ///
 /// # Examples
 ///
 /// ```
-/// use oceanfs_storage::{resolve_pool_root, PoolRegistry};
+/// use oceanfs_storage::resolve_pool_root;
 ///
-/// # let tmp = tempfile::tempdir().expect("tempdir");
-/// # let data_dir = tmp.path().join("data");
-/// let registry = PoolRegistry::from_config(
-///     &oceanfs_core::StorageConfig::default(),
-///     &data_dir,
-/// )
-/// .expect("registry");
-///
-/// // No pools configured: any id resolves to the legacy segments dir.
+/// // No pool carries the id: the caller's fallback dir is returned.
 /// assert_eq!(
-///     resolve_pool_root(&[], 0, std::path::Path::new("/legacy/segments")),
-///     std::path::PathBuf::from("/legacy/segments")
+///     resolve_pool_root(&[], 0, std::path::Path::new("/fallback/segments")),
+///     std::path::PathBuf::from("/fallback/segments")
 /// );
 /// ```
 pub fn resolve_pool_root(pools: &[Arc<StoragePool>], pool_id: u32, legacy_dir: &Path) -> PathBuf {
@@ -201,18 +193,23 @@ struct PoolCapacity {
 ///
 /// # let tmp = tempfile::tempdir().expect("tempdir");
 /// # let data_dir = tmp.path().join("data");
-/// let registry = PoolRegistry::from_config(
-///     &oceanfs_core::StorageConfig::default(),
-///     &data_dir,
-/// )
-/// .expect("legacy single-pool registry");
+/// # let storage = oceanfs_core::StorageConfig {
+/// #     pools: vec![
+/// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+/// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+/// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+/// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+/// #     ],
+/// #     missing_root_policy: Default::default(),
+/// # };
+/// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
 ///
-/// let pool = registry.pool_by_role(PoolRole::Data).expect("implicit data pool");
+/// let pool = registry.pool_by_role(PoolRole::Data).expect("the data pool");
 /// assert_eq!(pool.role(), PoolRole::Data);
 /// assert!(pool.weight() >= 1);
 /// ```
 pub struct StoragePool {
-    /// Stable pool id — the config-order index (0..n). Legacy mode: 0.
+    /// Stable pool id — the config-order index (0..n).
     id: u32,
     /// Human-readable pool name from the topology config.
     name: String,
@@ -282,11 +279,16 @@ impl StoragePool {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// assert_eq!(registry.pools()[0].id(), 0);
     /// ```
     pub fn id(&self) -> u32 {
@@ -302,12 +304,17 @@ impl StoragePool {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
-    /// assert_eq!(registry.pools()[0].name(), "legacy");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
+    /// assert_eq!(registry.pools()[0].name(), "data-0");
     /// ```
     pub fn name(&self) -> &str {
         &self.name
@@ -323,11 +330,16 @@ impl StoragePool {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// assert_eq!(registry.pools()[0].role(), PoolRole::Data);
     /// ```
     pub fn role(&self) -> PoolRole {
@@ -343,12 +355,17 @@ impl StoragePool {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
-    /// assert_eq!(registry.pools()[0].root(), data_dir);
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
+    /// assert_eq!(registry.pools()[0].root(), tmp.path().join("pool-data"));
     /// ```
     pub fn root(&self) -> &Path {
         &self.root
@@ -363,12 +380,17 @@ impl StoragePool {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
-    /// // Legacy mode: the implicit pool carries weight 1.
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
+    /// // The data pool explicit config weight (Some(1)) is honored.
     /// assert_eq!(registry.pools()[0].weight(), 1);
     /// ```
     pub fn weight(&self) -> u32 {
@@ -385,11 +407,16 @@ impl StoragePool {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// // `Auto` resolves to the Phase A `Nvme` placeholder.
     /// assert_eq!(registry.pools()[0].tech(), PoolTech::Nvme);
     /// ```
@@ -407,11 +434,16 @@ impl StoragePool {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// assert_eq!(registry.pools()[0].health_config().detection_window_secs, 30);
     /// ```
     pub fn health_config(&self) -> PoolHealthConfig {
@@ -427,11 +459,16 @@ impl StoragePool {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// assert_eq!(registry.pools()[0].status(), PoolStatus::Healthy);
     /// ```
     pub fn status(&self) -> PoolStatus {
@@ -448,11 +485,16 @@ impl StoragePool {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// assert!(!registry.pools()[0].write_degraded());
     /// ```
     pub fn write_degraded(&self) -> bool {
@@ -468,11 +510,16 @@ impl StoragePool {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// assert!(registry.pools()[0].total_bytes() > 0);
     /// ```
     pub fn total_bytes(&self) -> u64 {
@@ -488,11 +535,16 @@ impl StoragePool {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// assert!(registry.pools()[0].free_bytes() > 0);
     /// ```
     pub fn free_bytes(&self) -> u64 {
@@ -697,9 +749,9 @@ impl PoolMetrics {
 
 /// The node's pool set: the lookup API placement and routing consume.
 ///
-/// Built by [`PoolRegistry::from_config`] from the topology config (f1).
-/// Legacy mode (no pools configured) yields a single implicit `data` pool
-/// at `data_dir`, so nothing downstream changes behavior.
+/// Built by [`PoolRegistry::from_config`] from the topology config.
+/// Storage pools are mandatory (ADR-0031): the legacy implicit single
+/// `data`-pool-at-`data_dir` mode was removed.
 ///
 /// # Examples
 ///
@@ -709,13 +761,18 @@ impl PoolMetrics {
 ///
 /// # let tmp = tempfile::tempdir().expect("tempdir");
 /// # let data_dir = tmp.path().join("data");
-/// let registry = PoolRegistry::from_config(
-///     &oceanfs_core::StorageConfig::default(),
-///     &data_dir,
-/// )
-/// .expect("legacy registry");
+/// # let storage = oceanfs_core::StorageConfig {
+/// #     pools: vec![
+/// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+/// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+/// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+/// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+/// #     ],
+/// #     missing_root_policy: Default::default(),
+/// # };
+/// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
 ///
-/// assert_eq!(registry.pools().len(), 1);
+/// assert_eq!(registry.pools().len(), 4);
 /// assert!(registry.pool_by_role(PoolRole::Data).is_some());
 /// ```
 pub struct PoolRegistry {
@@ -733,26 +790,23 @@ pub struct PoolRegistry {
     /// failure resolves (`Fatal` → `Err`, `Degraded` → pool registered as
     /// Degraded). Captured at construction from the topology config.
     missing_root_policy: MissingRootPolicy,
-    /// The node's legacy `data_dir`: a pool root must stay disjoint from
-    /// it (f1 rule) — checked at attach time too, not just at boot.
+    /// The node's `data_dir`: a pool root must stay disjoint from it
+    /// (checked at attach time too, not just at boot). Kept for the
+    /// disjointness check only — the registry no longer creates an
+    /// implicit pool there.
     data_dir: PathBuf,
 }
 
 impl PoolRegistry {
     /// Builds the registry from the topology config, probing every root.
     ///
-    /// - Re-validates the config via [`StorageConfig::validate`] (role
-    ///   cardinality, one-root-per-pool, weights, health knobs).
-    /// - Legacy mode (empty pool list): one implicit `data` pool at
-    ///   `data_dir`, weight 1, tech `Nvme` (Auto placeholder). The root is
-    ///   probed with `Fatal` semantics — today's node refuses to start when
-    ///   `data_dir` cannot be created, and the `MissingRootPolicy` applies
-    ///   to configured pools only.
-    /// - Explicit mode: one `StoragePool` per `PoolConfig`, ids in config
-    ///   order (0..n). Probe failure resolves against
-    ///   `MissingRootPolicy`: `Fatal` → `Err`, `Degraded` → pool registered
-    ///   with status `Degraded` (Phase A: treated as Healthy by consumers
-    ///   until Phase B).
+    /// - Re-validates the config via [`StorageConfig::validate`] (mandatory
+    ///   roles, one-root-per-pool, weights, health knobs) — an empty or
+    ///   role-incomplete pool list is refused here (ADR-0031).
+    /// - One `StoragePool` per `PoolConfig`, ids in config order (0..n).
+    ///   Probe failure resolves against `MissingRootPolicy`: `Fatal` →
+    ///   `Err`, `Degraded` → pool registered with status `Degraded`
+    ///   (Phase A: treated as Healthy by consumers until Phase B).
     /// - Weight resolution: explicit config weight wins; `None` →
     ///   `max(1, total / 1 GiB)` from the probe-time capacity snapshot.
     ///
@@ -768,84 +822,65 @@ impl PoolRegistry {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// );
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir);
     /// assert!(registry.is_ok());
     /// ```
     pub fn from_config(storage: &StorageConfig, data_dir: &Path) -> Result<PoolRegistry, String> {
         storage.validate(data_dir).map_err(|e| format!("invalid storage config: {e}"))?;
 
-        let mut pools: Vec<Arc<StoragePool>> = Vec::with_capacity(storage.pools.len().max(1));
-        let mut metrics: Vec<PoolMetrics> = Vec::with_capacity(storage.pools.len().max(1));
+        let mut pools: Vec<Arc<StoragePool>> = Vec::with_capacity(storage.pools.len());
+        let mut metrics: Vec<PoolMetrics> = Vec::with_capacity(storage.pools.len());
 
-        // [review][architecture][high]
-        // since we do not support legacy behaviour, the applicatin should not be allowed to start
-        // without declared pools
-        // [end]
-        if storage.pools.is_empty() {
-            // Legacy zero-config fallback: single implicit data pool at
-            // data_dir, probed with Fatal semantics (today's behavior).
-            probe_root(data_dir).map_err(|e| {
-                format!("legacy data_dir '{}' probe failed: {e}", data_dir.display())
-            })?;
-            let capacity = statvfs_capacity(data_dir).unwrap_or_default();
+        // ADR-0031 D1: pools are mandatory — `validate` already refused an
+        // empty or role-incomplete list, so every pool here is a configured
+        // one (no implicit legacy pool, no `data_dir` probing).
+        for (index, config) in storage.pools.iter().enumerate() {
+            let id = index as u32;
+            let (status, capacity) = match probe_root(&config.root) {
+                Ok(()) => (PoolStatus::Healthy, statvfs_capacity(&config.root).unwrap_or_default()),
+                Err(e) if storage.missing_root_policy == MissingRootPolicy::Degraded => {
+                    tracing::warn!(
+                        pool = %config.name,
+                        error = %e,
+                        "pool root probe failed; registering pool as Degraded \
+                         (Phase A: treated as Healthy by consumers until Phase B)"
+                    );
+                    (PoolStatus::Degraded, PoolCapacity::default())
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "pool '{}' root '{}' probe failed: {e}",
+                        config.name,
+                        config.root.display()
+                    ));
+                }
+            };
+            let weight = match config.weight {
+                Some(weight) => weight,
+                None => auto_weight(capacity.total_bytes),
+            };
             let pool = Arc::new(StoragePool::new(
-                0,
-                "legacy".into(),
-                PoolRole::Data,
-                data_dir.to_path_buf(),
-                1,
-                resolve_tech(PoolTech::Auto),
-                PoolStatus::Healthy,
+                id,
+                config.name.clone(),
+                config.role,
+                config.root.clone(),
+                weight,
+                resolve_tech(config.tech),
+                status,
                 capacity,
-                PoolHealthConfig::default(),
+                config.health,
             ));
             metrics.push(PoolMetrics::new(&pool));
             pools.push(pool);
-        } else {
-            for (index, config) in storage.pools.iter().enumerate() {
-                let id = index as u32;
-                let (status, capacity) = match probe_root(&config.root) {
-                    Ok(()) => {
-                        (PoolStatus::Healthy, statvfs_capacity(&config.root).unwrap_or_default())
-                    }
-                    Err(e) if storage.missing_root_policy == MissingRootPolicy::Degraded => {
-                        tracing::warn!(
-                            pool = %config.name,
-                            error = %e,
-                            "pool root probe failed; registering pool as Degraded \
-                             (Phase A: treated as Healthy by consumers until Phase B)"
-                        );
-                        (PoolStatus::Degraded, PoolCapacity::default())
-                    }
-                    Err(e) => {
-                        return Err(format!(
-                            "pool '{}' root '{}' probe failed: {e}",
-                            config.name,
-                            config.root.display()
-                        ));
-                    }
-                };
-                let weight = match config.weight {
-                    Some(weight) => weight,
-                    None => auto_weight(capacity.total_bytes),
-                };
-                let pool = Arc::new(StoragePool::new(
-                    id,
-                    config.name.clone(),
-                    config.role,
-                    config.root.clone(),
-                    weight,
-                    resolve_tech(config.tech),
-                    status,
-                    capacity,
-                    config.health,
-                ));
-                metrics.push(PoolMetrics::new(&pool));
-                pools.push(pool);
-            }
         }
 
         // Publish the initial capacity/status to the metric series.
@@ -865,8 +900,7 @@ impl PoolRegistry {
         })
     }
 
-    /// Returns a snapshot copy of all pools (config order; legacy mode:
-    /// exactly one).
+    /// Returns a snapshot copy of all pools (config order).
     ///
     /// The returned `Arc` handles share the pools' live state, so capacity
     /// and status read current values without any further locking.
@@ -878,12 +912,17 @@ impl PoolRegistry {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
-    /// assert_eq!(registry.pools().len(), 1);
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
+    /// assert_eq!(registry.pools().len(), 4);
     /// ```
     pub fn pools(&self) -> Vec<Arc<StoragePool>> {
         self.pools.read().clone()
@@ -898,13 +937,18 @@ impl PoolRegistry {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// assert!(registry.pool_by_id(0).is_some());
-    /// assert!(registry.pool_by_id(1).is_none());
+    /// assert!(registry.pool_by_id(99).is_none());
     /// ```
     pub fn pool_by_id(&self, id: u32) -> Option<Arc<StoragePool>> {
         self.pools.read().iter().find(|pool| pool.id() == id).cloned()
@@ -924,13 +968,18 @@ impl PoolRegistry {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// assert!(registry.pool_by_role(PoolRole::Data).is_some());
-    /// assert!(registry.pool_by_role(PoolRole::Hints).is_none());
+    /// assert!(registry.pool_by_role(PoolRole::Hints).is_some());
     /// ```
     pub fn pool_by_role(&self, role: PoolRole) -> Option<Arc<StoragePool>> {
         self.pools.read().iter().find(|pool| pool.role() == role).cloned()
@@ -946,11 +995,16 @@ impl PoolRegistry {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// let data_pools = registry.data_pools();
     /// assert_eq!(data_pools.len(), 1);
     /// assert_eq!(data_pools[0].role(), PoolRole::Data);
@@ -975,11 +1029,16 @@ impl PoolRegistry {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// registry.refresh_capacity();
     /// assert!(registry.pools()[0].total_bytes() > 0);
     /// ```
@@ -1008,11 +1067,16 @@ impl PoolRegistry {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// registry.set_status(0, PoolStatus::Degraded);
     /// assert_eq!(registry.pool_by_id(0).expect("pool").status(), PoolStatus::Degraded);
     /// ```
@@ -1037,11 +1101,16 @@ impl PoolRegistry {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// registry.set_write_degraded(0, true);
     /// assert!(registry.pool_by_id(0).expect("pool").write_degraded());
     /// ```
@@ -1057,8 +1126,9 @@ impl PoolRegistry {
     /// Whether this node can serve requests at all (g6, ADR-0029 §D3):
     /// the metadata pool is NOT Dead. A node whose metadata pool is Dead
     /// has lost its object index — it can serve neither reads nor writes
-    /// (g2's `node_unavailable` consequence). No metadata pool configured
-    /// (the legacy single-data-pool topology) → available.
+    /// (g2's `node_unavailable` consequence). The registry always has a
+    /// metadata pool (ADR-0031); the `unwrap_or(true)` arm guards the
+    /// attach-less edge only.
     ///
     /// This is the SINGLE availability derivation the read and write
     /// paths consult (a node-level gate on top of the peer-side manifest
@@ -1073,12 +1143,17 @@ impl PoolRegistry {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
-    /// assert!(registry.node_serves_requests(), "no metadata pool → available");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
+    /// assert!(registry.node_serves_requests(), "healthy metadata pool → available");
     /// ```
     pub fn node_serves_requests(&self) -> bool {
         self.pool_by_role(PoolRole::Metadata)
@@ -1089,7 +1164,8 @@ impl PoolRegistry {
     /// Whether this node can accept NEW writes (g6, ADR-0029 §D3): the
     /// node serves requests AND no wal pool is `write_degraded` (a Dead
     /// wal pool cannot journal — new writes must be rejected, not
-    /// silently lost). No wal pool configured → not write-degraded.
+    /// silently lost). The registry always has a wal pool (ADR-0031); the
+    /// `unwrap_or(true)` arm guards the attach-less edge only.
     ///
     /// # Examples
     ///
@@ -1098,12 +1174,17 @@ impl PoolRegistry {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
-    /// assert!(registry.accepts_writes(), "no wal pool → not write_degraded");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
+    /// assert!(registry.accepts_writes(), "healthy wal pool → accepts writes");
     /// ```
     pub fn accepts_writes(&self) -> bool {
         if !self.node_serves_requests() {
@@ -1128,11 +1209,16 @@ impl PoolRegistry {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// registry.set_pool_capacity(0, 100 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024);
     /// let pool = registry.pool_by_id(0).expect("pool");
     /// assert_eq!(pool.total_bytes(), 100 * 1024 * 1024 * 1024);
@@ -1151,9 +1237,9 @@ impl PoolRegistry {
     /// Attaches a new pool at runtime (ADR-0029 §D8, f8) — no restart.
     ///
     /// The admin path calls this for `POST /admin/pools`: validate the
-    /// single pool against the LIVE registry (f1 rules: non-empty unique
+    /// single pool against the LIVE registry (rules: non-empty unique
     /// name, absolute unique root, role cardinality, weight/health knobs,
-    /// root disjoint from the legacy `data_dir`), probe the root (the
+    /// root disjoint from `data_dir`), probe the root (the
     /// node's `MissingRootPolicy` decides `Fatal` → `Err` vs `Degraded`),
     /// resolve weight/tech, and register under the registry's write lock
     /// (perf 7.1: a short critical section held only for registration —
@@ -1176,11 +1262,16 @@ impl PoolRegistry {
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
     /// # let attach_root = tmp.path().join("nvme-attach");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// let id = registry
     ///     .attach(StoragePoolConfig {
     ///         name: "fast-nvme-0".into(),
@@ -1191,7 +1282,7 @@ impl PoolRegistry {
     ///         health: Default::default(),
     ///     })
     ///     .expect("attach must succeed");
-    /// assert_eq!(registry.pool_count(), 2);
+    /// assert_eq!(registry.pool_count(), 5);
     /// assert!(registry.pool_by_id(id).is_some());
     /// ```
     pub fn attach(&self, pool: oceanfs_core::StoragePoolConfig) -> Result<u32, String> {
@@ -1271,11 +1362,10 @@ impl PoolRegistry {
         Ok(id)
     }
 
-    /// Validates a single pool definition against a registry snapshot
-    /// (f1 rules): non-empty unique name, absolute unique root, role
-    /// cardinality, weight/health knobs, root disjoint from the legacy
-    /// `data_dir`. Shared by the attach read-lock fast-fail and the
-    /// write-lock TOCTOU re-check.
+    /// Validates a single pool definition against a registry snapshot:
+    /// non-empty unique name, absolute unique root, role cardinality,
+    /// weight/health knobs, root disjoint from `data_dir`. Shared by the
+    /// attach read-lock fast-fail and the write-lock TOCTOU re-check.
     fn validate_attach(
         &self,
         pool: &oceanfs_core::StoragePoolConfig,
@@ -1326,8 +1416,7 @@ impl PoolRegistry {
                 pool.name
             ));
         }
-        // The pool root must stay disjoint from the legacy data_dir (pool
-        // mode and legacy mode are mutually exclusive layouts).
+        // The pool root must stay disjoint from the node's data_dir.
         let overlaps = pool.root == self.data_dir
             || pool.root.starts_with(&self.data_dir)
             || self.data_dir.starts_with(&pool.root);
@@ -1352,12 +1441,17 @@ impl PoolRegistry {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
-    /// assert_eq!(registry.pool_count(), 1);
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
+    /// assert_eq!(registry.pool_count(), 4);
     /// ```
     pub fn pool_count(&self) -> usize {
         self.pools.read().len()
@@ -1376,11 +1470,16 @@ impl PoolRegistry {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// // No-op registrar: registration must not panic on any registry.
     /// struct Noop;
     /// impl oceanfs_core::MetricRegistrar for Noop {
@@ -1419,11 +1518,16 @@ impl PoolRegistry {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// let counter = registry.io_error_counter(0).expect("pool 0 series");
     /// counter.inc();
     /// assert_eq!(counter.get(), 1);
@@ -1449,11 +1553,16 @@ impl PoolRegistry {
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
-    /// let registry = PoolRegistry::from_config(
-    ///     &oceanfs_core::StorageConfig::default(),
-    ///     &data_dir,
-    /// )
-    /// .expect("registry");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// let observer = IoObserver::new();
     /// registry.observe_into(&observer);
     /// assert!(observer.snapshot(0).is_some());
@@ -1487,9 +1596,8 @@ mod tests {
 
     use super::*;
 
-    /// A tempdir whose `data/` subdir is the legacy data_dir and whose
-    /// other subdirs are pool roots (siblings, so the f1 disjointness rule
-    /// holds).
+    /// A tempdir whose `data/` subdir is the node data_dir and whose other
+    /// subdirs are pool roots (siblings, so the disjointness rule holds).
     fn layout() -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
@@ -1507,16 +1615,23 @@ mod tests {
         }
     }
 
-    /// A 4-pool topology (data×2, wal, metadata) with sibling roots.
-    fn four_pool_config(tmp: &Path) -> (StorageConfig, [PathBuf; 4]) {
-        let roots =
-            [tmp.join("nvme0"), tmp.join("nvme1"), tmp.join("optane0"), tmp.join("optane1")];
+    /// The full role-complete topology (ADR-0031): data×2, wal, metadata,
+    /// hints — with sibling roots.
+    fn full_pool_config(tmp: &Path) -> (StorageConfig, [PathBuf; 5]) {
+        let roots = [
+            tmp.join("nvme0"),
+            tmp.join("nvme1"),
+            tmp.join("optane0"),
+            tmp.join("optane1"),
+            tmp.join("hints0"),
+        ];
         let storage = StorageConfig {
             pools: vec![
                 pool("fast-nvme-0", PoolRole::Data, &roots[0], None),
                 pool("fast-nvme-1", PoolRole::Data, &roots[1], Some(3)),
                 pool("journal", PoolRole::Wal, &roots[2], None),
                 pool("meta", PoolRole::Metadata, &roots[3], None),
+                pool("hints", PoolRole::Hints, &roots[4], None),
             ],
             missing_root_policy: MissingRootPolicy::Fatal,
         };
@@ -1532,40 +1647,34 @@ mod tests {
 
     // -- Construction --
 
+    /// ADR-0031 D1: an empty pool list is refused at construction with the
+    /// role-listing error — no implicit legacy pool is synthesized.
     #[test]
-    fn legacy_mode_creates_single_implicit_data_pool() {
+    fn empty_pools_refused_at_from_config() {
         let (tmp, data_dir) = layout();
-        let registry = PoolRegistry::from_config(&StorageConfig::default(), &data_dir).unwrap();
-
-        let pools = registry.pools();
-        assert_eq!(pools.len(), 1);
-        assert_eq!(pools[0].id(), 0);
-        assert_eq!(pools[0].name(), "legacy");
-        assert_eq!(pools[0].role(), PoolRole::Data);
-        assert_eq!(pools[0].root(), data_dir);
-        assert_eq!(pools[0].weight(), 1);
-        assert_eq!(pools[0].status(), PoolStatus::Healthy);
-        assert!(!pools[0].write_degraded());
-        // Auto tech resolves to the Phase A Nvme placeholder.
-        assert_eq!(pools[0].tech(), PoolTech::Nvme);
-        assert!(data_dir.exists(), "legacy probe must create data_dir");
+        let err = PoolRegistry::from_config(&StorageConfig::default(), &data_dir).unwrap_err();
+        assert!(err.contains("'data'"), "message: {err}");
+        assert!(err.contains("'wal'"), "message: {err}");
+        assert!(err.contains("'metadata'"), "message: {err}");
+        assert!(err.contains("'hints'"), "message: {err}");
         drop(tmp);
     }
 
     #[test]
     fn explicit_mode_assigns_ids_in_config_order() {
         let (tmp, data_dir) = layout();
-        let (storage, _roots) = four_pool_config(tmp.path());
+        let (storage, _roots) = full_pool_config(tmp.path());
         let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
 
         let pools = registry.pools();
-        assert_eq!(pools.len(), 4);
+        assert_eq!(pools.len(), 5);
         let ids: Vec<u32> = pools.iter().map(|p| p.id()).collect();
-        assert_eq!(ids, vec![0, 1, 2, 3]);
+        assert_eq!(ids, vec![0, 1, 2, 3, 4]);
         assert_eq!(pools[0].name(), "fast-nvme-0");
         assert_eq!(pools[2].name(), "journal");
         assert_eq!(pools[2].role(), PoolRole::Wal);
         assert_eq!(pools[3].role(), PoolRole::Metadata);
+        assert_eq!(pools[4].role(), PoolRole::Hints);
         drop(tmp);
     }
 
@@ -1590,7 +1699,7 @@ mod tests {
     #[test]
     fn probe_creates_roots_and_leaves_no_probe_files() {
         let (tmp, data_dir) = layout();
-        let (storage, roots) = four_pool_config(tmp.path());
+        let (storage, roots) = full_pool_config(tmp.path());
         PoolRegistry::from_config(&storage, &data_dir).unwrap();
 
         for root in &roots {
@@ -1610,7 +1719,12 @@ mod tests {
         let (tmp, data_dir) = layout();
         let root = uncreatable_root(tmp.path());
         let storage = StorageConfig {
-            pools: vec![pool("doomed", PoolRole::Data, &root, None)],
+            pools: vec![
+                pool("doomed", PoolRole::Data, &root, None),
+                pool("journal", PoolRole::Wal, &tmp.path().join("optane0"), None),
+                pool("meta", PoolRole::Metadata, &tmp.path().join("optane1"), None),
+                pool("hints", PoolRole::Hints, &tmp.path().join("hints0"), None),
+            ],
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let err = PoolRegistry::from_config(&storage, &data_dir).unwrap_err();
@@ -1623,7 +1737,12 @@ mod tests {
         let (tmp, data_dir) = layout();
         let root = uncreatable_root(tmp.path());
         let storage = StorageConfig {
-            pools: vec![pool("degraded-pool", PoolRole::Data, &root, None)],
+            pools: vec![
+                pool("degraded-pool", PoolRole::Data, &root, None),
+                pool("journal", PoolRole::Wal, &tmp.path().join("optane0"), None),
+                pool("meta", PoolRole::Metadata, &tmp.path().join("optane1"), None),
+                pool("hints", PoolRole::Hints, &tmp.path().join("hints0"), None),
+            ],
             missing_root_policy: MissingRootPolicy::Degraded,
         };
         let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
@@ -1642,7 +1761,7 @@ mod tests {
     #[test]
     fn explicit_weight_wins_over_auto() {
         let (tmp, data_dir) = layout();
-        let (storage, roots) = four_pool_config(tmp.path());
+        let (storage, roots) = full_pool_config(tmp.path());
         let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
 
         // pool 0: weight None → auto; pool 1: explicit Some(3).
@@ -1656,7 +1775,7 @@ mod tests {
     #[test]
     fn auto_weight_is_at_least_one() {
         let (tmp, data_dir) = layout();
-        let (storage, _roots) = four_pool_config(tmp.path());
+        let (storage, _roots) = full_pool_config(tmp.path());
         let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
         assert!(registry.pool_by_id(0).unwrap().weight() >= 1);
         drop(tmp);
@@ -1676,6 +1795,9 @@ mod tests {
                     tech: PoolTech::Ssd,
                     health: Default::default(),
                 },
+                pool("journal", PoolRole::Wal, &tmp.path().join("optane0"), None),
+                pool("meta", PoolRole::Metadata, &tmp.path().join("optane1"), None),
+                pool("hints", PoolRole::Hints, &tmp.path().join("hints0"), None),
             ],
             missing_root_policy: MissingRootPolicy::Fatal,
         };
@@ -1690,7 +1812,7 @@ mod tests {
     #[test]
     fn capacity_refresh_reflects_written_file() {
         let (tmp, data_dir) = layout();
-        let (storage, roots) = four_pool_config(tmp.path());
+        let (storage, roots) = full_pool_config(tmp.path());
         let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
 
         let pool = registry.pool_by_id(0).unwrap();
@@ -1711,7 +1833,7 @@ mod tests {
     #[test]
     fn lookups_by_id_role_and_data_pools() {
         let (tmp, data_dir) = layout();
-        let (storage, _roots) = four_pool_config(tmp.path());
+        let (storage, _roots) = full_pool_config(tmp.path());
         let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
 
         assert_eq!(registry.pool_by_id(2).unwrap().name(), "journal");
@@ -1719,7 +1841,7 @@ mod tests {
 
         assert_eq!(registry.pool_by_role(PoolRole::Wal).unwrap().id(), 2);
         assert_eq!(registry.pool_by_role(PoolRole::Metadata).unwrap().id(), 3);
-        assert!(registry.pool_by_role(PoolRole::Hints).is_none());
+        assert_eq!(registry.pool_by_role(PoolRole::Hints).unwrap().id(), 4);
 
         let data_pools = registry.data_pools();
         assert_eq!(data_pools.len(), 2);
@@ -1733,7 +1855,7 @@ mod tests {
     #[test]
     fn set_status_and_write_degraded_update_pool_state() {
         let (tmp, data_dir) = layout();
-        let (storage, _roots) = four_pool_config(tmp.path());
+        let (storage, _roots) = full_pool_config(tmp.path());
         let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
 
         registry.set_status(0, PoolStatus::Degraded);
@@ -1758,7 +1880,7 @@ mod tests {
     #[test]
     fn availability_derives_from_metadata_and_wal_pools() {
         let (tmp, data_dir) = layout();
-        let (storage, _roots) = four_pool_config(tmp.path());
+        let (storage, _roots) = full_pool_config(tmp.path());
         let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
         let wal_id = registry.pool_by_role(PoolRole::Wal).unwrap().id();
         let meta_id = registry.pool_by_role(PoolRole::Metadata).unwrap().id();
@@ -1781,21 +1903,33 @@ mod tests {
         drop(tmp);
     }
 
-    /// g6: no metadata/wal pool configured (the legacy single-data-pool
-    /// topology) → the node is available and accepts writes.
+    /// g6 availability with a Degraded-start topology: a data pool that
+    /// failed its probe registers Degraded, and the role-complete registry
+    /// still serves (the healthy metadata/wal pools govern availability).
     #[test]
-    fn availability_defaults_open_without_role_pools() {
+    fn availability_open_with_degraded_data_pool() {
         let (tmp, data_dir) = layout();
-        let registry = PoolRegistry::from_config(&StorageConfig::default(), &data_dir).unwrap();
-        assert!(registry.node_serves_requests(), "no metadata pool → available");
-        assert!(registry.accepts_writes(), "no wal pool → accepts writes");
+        let root = uncreatable_root(tmp.path());
+        let storage = StorageConfig {
+            pools: vec![
+                pool("degraded-data", PoolRole::Data, &root, None),
+                pool("journal", PoolRole::Wal, &tmp.path().join("optane0"), None),
+                pool("meta", PoolRole::Metadata, &tmp.path().join("optane1"), None),
+                pool("hints", PoolRole::Hints, &tmp.path().join("hints0"), None),
+            ],
+            missing_root_policy: MissingRootPolicy::Degraded,
+        };
+        let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
+        assert_eq!(registry.pool_by_id(0).unwrap().status(), PoolStatus::Degraded);
+        assert!(registry.node_serves_requests(), "healthy metadata pool → available");
+        assert!(registry.accepts_writes(), "healthy wal pool → accepts writes");
         drop(tmp);
     }
 
     #[test]
     fn set_pool_capacity_overrides_snapshot_and_metrics() {
         let (tmp, data_dir) = layout();
-        let (storage, _roots) = four_pool_config(tmp.path());
+        let (storage, _roots) = full_pool_config(tmp.path());
         let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
 
         registry.set_pool_capacity(0, 100 * GIB, 10 * GIB);
@@ -1831,7 +1965,7 @@ mod tests {
     #[test]
     fn register_metrics_registers_per_pool_series() {
         let (tmp, data_dir) = layout();
-        let (storage, _roots) = four_pool_config(tmp.path());
+        let (storage, _roots) = full_pool_config(tmp.path());
         let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
 
         let registrar = TestRegistrar::default();
@@ -1839,15 +1973,15 @@ mod tests {
 
         let gauges = registrar.gauges.lock();
         let counters = registrar.counters.lock();
-        // 4 pools × (status + bytes_free + bytes_total + write_degraded)
+        // 5 pools × (status + bytes_free + bytes_total + write_degraded)
         // gauges (g2 added the write_degraded series).
-        assert_eq!(gauges.len(), 16);
-        // 4 pools × io_errors counter.
-        assert_eq!(counters.len(), 4);
+        assert_eq!(gauges.len(), 20);
+        // 5 pools × io_errors counter.
+        assert_eq!(counters.len(), 5);
 
         let status_names: Vec<&str> =
             gauges.iter().filter(|g| g.name() == "oceanfs_pool_status").map(|g| g.name()).collect();
-        assert_eq!(status_names.len(), 4, "one status gauge per pool");
+        assert_eq!(status_names.len(), 5, "one status gauge per pool");
 
         // Status gauges carry pool_id + role labels; pool 2 is the wal pool.
         let wal_status = gauges
@@ -1886,20 +2020,21 @@ mod tests {
     #[test]
     fn attach_assigns_sequential_ids() {
         let (tmp, data_dir) = layout();
-        let registry = PoolRegistry::from_config(&StorageConfig::default(), &data_dir).unwrap();
-        assert_eq!(registry.pool_count(), 1);
+        let (storage, _roots) = full_pool_config(tmp.path());
+        let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
+        assert_eq!(registry.pool_count(), 5);
 
         let first = registry
             .attach(pool("attach-0", PoolRole::Data, &tmp.path().join("root-a"), None))
             .unwrap();
-        assert_eq!(first, 1, "first attach id = current pool count");
-        assert_eq!(registry.pool_count(), 2);
+        assert_eq!(first, 5, "first attach id = current pool count");
+        assert_eq!(registry.pool_count(), 6);
 
         let second = registry
             .attach(pool("attach-1", PoolRole::Data, &tmp.path().join("root-b"), None))
             .unwrap();
-        assert_eq!(second, 2);
-        assert_eq!(registry.pool_count(), 3);
+        assert_eq!(second, 6);
+        assert_eq!(registry.pool_count(), 7);
 
         // The attached pools are visible to lookups and carry their root.
         assert_eq!(registry.pool_by_id(first).unwrap().root(), tmp.path().join("root-a"));
@@ -1911,8 +2046,9 @@ mod tests {
     #[test]
     fn attach_rejects_duplicate_name_and_root() {
         let (tmp, data_dir) = layout();
+        let (storage, _roots) = full_pool_config(tmp.path());
+        let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
         let root = tmp.path().join("root-a");
-        let registry = PoolRegistry::from_config(&StorageConfig::default(), &data_dir).unwrap();
 
         let id = registry.attach(pool("dup", PoolRole::Data, &root, None)).unwrap();
         assert!(registry.pool_by_id(id).is_some());
@@ -1929,7 +2065,7 @@ mod tests {
         assert!(dup_root.unwrap_err().contains("duplicate pool root"));
 
         // Nothing was registered by the rejected attaches.
-        assert_eq!(registry.pool_count(), 2);
+        assert_eq!(registry.pool_count(), 6);
     }
 
     /// f8: role cardinality is enforced against live pools — a second
@@ -1937,25 +2073,22 @@ mod tests {
     #[test]
     fn attach_enforces_role_cardinality() {
         let (tmp, data_dir) = layout();
-        let registry = PoolRegistry::from_config(&StorageConfig::default(), &data_dir).unwrap();
+        let (storage, _roots) = full_pool_config(tmp.path());
+        let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
 
-        let wal_id = registry
-            .attach(pool("journal", PoolRole::Wal, &tmp.path().join("optane0"), None))
-            .unwrap();
-        assert!(registry.pool_by_id(wal_id).is_some());
-
-        // Second wal pool → rejected.
+        // The boot topology already has a wal pool (id 2): a second wal
+        // pool is rejected.
         let second_wal =
-            registry.attach(pool("journal-2", PoolRole::Wal, &tmp.path().join("optane1"), None));
+            registry.attach(pool("journal-2", PoolRole::Wal, &tmp.path().join("optane-b"), None));
         assert!(second_wal.is_err(), "at most one wal pool");
         assert!(second_wal.unwrap_err().contains("wal"));
 
         // A second data pool is allowed (placement spread).
         let data2 = registry
-            .attach(pool("data-2", PoolRole::Data, &tmp.path().join("nvme1"), None))
+            .attach(pool("data-2", PoolRole::Data, &tmp.path().join("nvme2"), None))
             .unwrap();
-        assert_eq!(data2, 2);
-        assert_eq!(registry.pool_count(), 3);
+        assert_eq!(data2, 5);
+        assert_eq!(registry.pool_count(), 6);
     }
 
     /// f8: a probe failure under the Fatal policy rejects the attach; the
@@ -1964,14 +2097,8 @@ mod tests {
     fn attach_probe_failure_under_fatal_policy_rejects() {
         let (tmp, data_dir) = layout();
         // Fatal policy: a root that cannot be probed fails the attach.
-        let registry = PoolRegistry::from_config(
-            &StorageConfig {
-                missing_root_policy: MissingRootPolicy::Fatal,
-                ..StorageConfig::default()
-            },
-            &data_dir,
-        )
-        .unwrap();
+        let (storage, _roots) = full_pool_config(tmp.path());
+        let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
 
         // A root path that cannot be created (a regular file in the way).
         let blocked = tmp.path().join("blocked");
@@ -1979,7 +2106,7 @@ mod tests {
         let attach = registry.attach(pool("bad", PoolRole::Data, &blocked, None));
         assert!(attach.is_err(), "Fatal policy must reject an unprobeable root");
         assert!(attach.unwrap_err().contains("probe failed"));
-        assert_eq!(registry.pool_count(), 1, "the failed attach must not register");
+        assert_eq!(registry.pool_count(), 5, "the failed attach must not register");
     }
 
     /// f8: the Degraded policy registers an unprobeable root as Degraded
@@ -1987,14 +2114,13 @@ mod tests {
     #[test]
     fn attach_probe_failure_under_degraded_policy_registers_degraded() {
         let (tmp, data_dir) = layout();
-        let registry = PoolRegistry::from_config(
-            &StorageConfig {
-                missing_root_policy: MissingRootPolicy::Degraded,
-                ..StorageConfig::default()
-            },
-            &data_dir,
-        )
-        .unwrap();
+        let mut storage_config = StorageConfig {
+            missing_root_policy: MissingRootPolicy::Degraded,
+            ..StorageConfig::default()
+        };
+        let (full, _roots) = full_pool_config(tmp.path());
+        storage_config.pools = full.pools;
+        let registry = PoolRegistry::from_config(&storage_config, &data_dir).unwrap();
 
         let blocked = tmp.path().join("blocked");
         std::fs::write(&blocked, b"file").unwrap();
@@ -2002,15 +2128,15 @@ mod tests {
         assert_eq!(registry.pool_by_id(id).unwrap().status(), PoolStatus::Degraded);
     }
 
-    /// f8: the attached pool's root must stay disjoint from the legacy
+    /// f8: the attached pool's root must stay disjoint from the node's
     /// data_dir.
     #[test]
     fn attach_rejects_root_overlapping_data_dir() {
-        let (_tmp, data_dir) = layout();
-        let registry = PoolRegistry::from_config(&StorageConfig::default(), &data_dir).unwrap();
+        let (tmp, data_dir) = layout();
+        let (storage, _roots) = full_pool_config(tmp.path());
+        let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
 
-        // data_dir itself is already the implicit pool's root (duplicate
-        // root); a nested path trips the overlap rule.
+        // data_dir itself and a nested path trip the overlap rule.
         let direct = registry.attach(pool("bad-0", PoolRole::Data, &data_dir, None));
         assert!(direct.is_err(), "a root equal to data_dir must be rejected");
 
@@ -2019,7 +2145,7 @@ mod tests {
         assert!(nested.is_err(), "a root nested in data_dir must be rejected");
         assert!(nested.unwrap_err().contains("overlaps the legacy data_dir"));
 
-        assert_eq!(registry.pool_count(), 1);
+        assert_eq!(registry.pool_count(), 5, "no rejected attach may register");
     }
 
     /// f8: after attach, placement selection sees the new pool
@@ -2030,24 +2156,21 @@ mod tests {
         use crate::pool::placement::PlacementPolicy;
 
         let (tmp, data_dir) = layout();
-        let registry = PoolRegistry::from_config(&StorageConfig::default(), &data_dir).unwrap();
+        let (storage, _roots) = full_pool_config(tmp.path());
+        let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
         let policy = PlacementPolicy::new();
 
-        // Only the implicit pool initially.
-        assert_eq!(registry.data_pools().len(), 1);
+        // The boot data pools only.
+        assert_eq!(registry.data_pools().len(), 2);
         let before = policy.select_data_pool(&registry);
-        assert_eq!(before.unwrap().id(), 0);
+        assert!(before.unwrap().id() <= 1);
 
-        // Attach a second data pool; selection may now return it.
+        // Attach a third data pool; selection may now return it.
         registry
             .attach(pool("attached", PoolRole::Data, &tmp.path().join("nvme-a"), None))
             .unwrap();
-        assert_eq!(registry.data_pools().len(), 2);
+        assert_eq!(registry.data_pools().len(), 3);
         let after = policy.select_data_pool(&registry).expect("a data pool");
-        assert!(
-            after.id() == 0 || after.id() == 1,
-            "selection must see the attached pool, got {}",
-            after.id()
-        );
+        assert!(after.id() <= 2, "selection must see the attached pool, got {}", after.id());
     }
 }
