@@ -629,9 +629,6 @@ impl AntiEntropy {
             }
         }
     }
-    // [review][algorithmic][medium]
-    // this is a pointless exercice, we must get ride of this approach
-    // [end]
     /// Compares local Merkle roots against stored seal-time roots.
     ///
     /// Used as fallback when the gRPC peer exchange is unavailable.

@@ -6,7 +6,7 @@ priority: critical
 owner: ""
 dependencies:
   - feature: none (first in epic)
-    reason: No composition-root dependencies; carries the legacy-mode precondition from ADR-0031 (bug fixes #35/#64 are owned by wave-0/1 f1)
+    reason: No composition-root dependencies; carries the legacy-mode precondition from ADR-0031. Review #64 (B2) is fixed in wave-0/1 f1; review #35 (B1) is DEFERRED from wave-0/1 and closed by this feature's NodeLeaveHandler deletion (DECISION 2026-09-04).
 adr:
   - 0031-remove-single-datadir-legacy-mode
   - 0025-segment-lifecycle-state-machine
@@ -69,9 +69,12 @@ impl StorageModule {
   builder; pools are mandatory. (The legacy removal *epic* `legacy-mode-removal`
   owns the deep delegacy of the store structs; sequence its f2 before
   store-unification f2 per roadmap §4.)
-- The leave handler: c1 supersedes `NodeLeaveHandler` per review #34 (the
-  fixed-76-byte header bug #35 is owned by wave-0/1 f1 B1 and already fixed
-  there; if this epic lands first, note B1's disposition).
+- The leave handler: c1 supersedes `NodeLeaveHandler` per review #34 —
+  **delete the handler**. That deletion is the authoritative close for
+  wave-0/1 f1 B1 (the fixed-76-byte-header bug, review #35), which
+  wave-0/1 **deferred** to this deletion (DECISION 2026-09-04; see
+  `review-wave-0-1/f1-correctness-bug-batch.md`). c1 must record B1's
+  closure in both docs.
 - Keep the accel probe, ring/routing construction, lifecycle registry,
   pools, sealer, event-WAL + checkpoint, I/O reader construction.
 
@@ -79,7 +82,9 @@ impl StorageModule {
 - Durability worker construction (c2), server/handler construction (c3),
   network/gRPC construction (c4) — later features in this epic.
 - ADR-0017 scheduler — separate epic after this epic.
-- Review #35/#64 fixes — owned by wave-0/1 f1 (B1/B2).
+- Review #64 (B2) — fixed in wave-0/1 f1, not here. Review #35 (B1) —
+  closed by THIS feature's `NodeLeaveHandler` deletion (deferred from
+  wave-0/1, DECISION 2026-09-04; see the leave-handler note in Scope).
 - Merging the two store impls — store-unification epic (ADR-0032).
 - Any subsystem behavior change beyond store consolidation.
 
@@ -120,7 +125,9 @@ Node::start
       `[storage.pools]` (ADR-0031).
 - [ ] **Docs:** `#![deny(missing_docs)]` passes; builder fields documented.
 - [ ] **ADR:** ADR-0031 satisfied (no legacy branches in the builder);
-      review #35/#64 owned by wave-0/1 f1, not here.
+      review #64 (B2) owned by wave-0/1 f1, not here; review #35 (B1)
+      closed by this feature's `NodeLeaveHandler` deletion (deferred from
+      wave-0/1, DECISION 2026-09-04).
 - [ ] **Perf:** no new locks on hot paths; the 8→2 store consolidation
       removes duplicate fs layers (single read/write path per type).
 - [ ] **Integration:** `cargo test -p oceanfs-node --lib -- --test-threads=1`

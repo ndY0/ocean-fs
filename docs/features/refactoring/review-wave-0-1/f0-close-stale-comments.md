@@ -1,7 +1,7 @@
 ---
 feature: "f0: Close Stale Review Comments"
 epic: "refactoring/review-wave-0-1"
-status: proposed
+status: in_progress
 priority: high
 owner: ""
 dependencies: []
@@ -57,7 +57,7 @@ reviewable.
 
 ## Definition of Done
 
-- [ ] Grep for the deleted anchors: none of the 11 remain.
-- [ ] `cargo build --all-targets` passes.
-- [ ] No code behavior change (only comments removed; if a comment removal
+- [x] Grep for the deleted anchors: none of the 11 remain.
+- [x] `cargo build --all-targets` passes.
+- [x] No code behavior change (only comments removed; if a comment removal
       requires touching code, that code change belongs to f1/wave 4).

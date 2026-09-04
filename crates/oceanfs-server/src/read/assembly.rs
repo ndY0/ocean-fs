@@ -73,9 +73,6 @@ impl MultiChunkAssembler {
         }
     }
 
-    // [review][implementation][high]
-    // why a default 64Mb buffer ?
-    // [end]
     /// Creates a new assembler without hash verification.
     ///
     /// Used when the object metadata has no stored BLAKE3 hash.

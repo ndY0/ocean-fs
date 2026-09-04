@@ -1576,9 +1576,6 @@ mod tests {
         assert_eq!(decoded, evt);
     }
 
-    // [review][pool][high]
-    // the below test target a legacy feature that should be discarded. their is no legacy mode, only data pools
-    // [end]
     /// ADR-0029 f5: legacy seal records (written before pool_id existed —
     /// the 48-byte payload without the pool flag) decode with pool_id 0,
     /// and pool_id-0 records stay byte-identical to the pre-f5 format.

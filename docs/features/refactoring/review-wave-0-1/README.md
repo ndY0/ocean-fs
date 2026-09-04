@@ -1,7 +1,7 @@
 ---
 feature: "Wave 0+1: Stale-Comment Closure & Correctness Bug Batch"
 epic: "refactoring/review-wave-0-1"
-status: proposed
+status: in_progress
 priority: critical
 owner: ""
 dependencies: []
@@ -40,8 +40,11 @@ f0-close-stale-comments
 
 ## Acceptance bar (epic DoD)
 
-- [ ] Every comment listed in f0 is removed from the tree.
-- [ ] Every bug listed in f1 is fixed with a regression test.
-- [ ] Full workspace build + tests green (RocksDB crates with
-      `--test-threads=1`, PIPELINE.md §4.6).
-- [ ] Review roadmap wave 0/1 items marked closed.
+- [x] Every comment listed in f0 is removed from the tree.
+- [x] Every bug listed in f1 is fixed with a regression test (B1
+      excepted — deferred to composition-root c1's `NodeLeaveHandler`
+      deletion, DECISION 2026-09-04; disposition recorded in f1 + c1).
+- [x] Full workspace build + tests green (RocksDB crates with
+      `--test-threads=1`, PIPELINE.md §4.6). Pre-existing failures
+      outside this epic's control are recorded in f1's Deviations note.
+- [x] Review roadmap wave 0/1 items marked closed.

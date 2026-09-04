@@ -1,7 +1,7 @@
 ---
 feature: "f1: Correctness Bug Batch"
 epic: "refactoring/review-wave-0-1"
-status: proposed
+status: in_progress
 priority: critical
 owner: ""
 dependencies:
@@ -31,12 +31,12 @@ carry them.
 sealer writes v2 **92-byte** headers (`SegmentHeader::with_parity`,
 `oceanfs-storage/src/segment/sealer.rs`). The graceful-leave push would
 truncate/corrupt v2 segment payloads.
-**Fix:** route the leave handler's segment read through the shared store /
-header-aware read, or parse the header version and slice by
-`header_size(version)`. **Ownership: this epic owns B1.** If
-composition-root c1 deletes `NodeLeaveHandler` (review #34) before this
-lands, B1 is closed by that deletion — record the dependency in both docs.
-Do NOT defer B1 to c1 as an unfixed live bug while the handler still exists.
+**Fix — DISPOSITION (DECISION 2026-09-04): DEFERRED, closed by c1.**
+No in-place fix in this epic. `NodeLeaveHandler` is deleted by
+composition-root c1 (review #34) in the next session, and that deletion is
+the authoritative close for B1 — the buggy reader (and its `[review]`
+marker) is removed with the handler. The dependency is recorded in both
+docs (here + `composition-root-decomposition/c1-split-storage-builder.md`).
 
 ### B2 — Silent default network address (review #64)
 **Location:** `node.rs:1501-1506` — `.with_self_grpc_addr(parse().unwrap_or_else(127.0.0.1:9001))`.
@@ -82,26 +82,67 @@ single-node dev deployments; keep `cluster_ready_timeout_sec` as the bound.
 ## Scope
 
 ### In Scope
-- B1, B2, B3, B4, B5, B6 as described, with regression tests.
-- B1's disposition is authoritative here (closed by this epic's fix, or by
-  c1's leave-handler deletion if c1 lands first — record which).
+- B2, B3, B4, B5, B6 as described, with regression tests.
+- B1's disposition is authoritative here: **deferred to composition-root
+  c1's `NodeLeaveHandler` deletion** (DECISION 2026-09-04, next session).
+  No in-place fix; recorded in this doc and in c1's doc.
 
 ### Out of Scope
 - ACK semantics (review #105) — dropped by decision 2026-09-04.
 - Any architectural change.
 
+## Implementation decisions (2026-09-04)
+
+- **B1** — deferred to c1's leave-handler deletion (see above); no
+  regression test in this epic.
+- **B2** — fail `Node::start` with an explicit error on an unparseable
+  `grpc_listen_addr` (missing essential config halts startup).
+- **B3** — `fetch_shard` resolves `ec_k`/`ec_m` from the segment's
+  lifecycle-registry entry. A segment with **no** registry entry (or a
+  service without a lifecycle) is **rejected** with an explicit error —
+  no fallback geometry, no silent legacy slicing.
+- **B4** — hard rejection of **missing and all-zero HLC** applies to both
+  `put_object_metadata` AND `append_segment` (no-legacy-mode policy);
+  the zero-HLC tombstone/LWW tolerance is removed.
+- **B5** — validation of the pushed metadata (real `segment_id`,
+  recognized tier, non-degenerate EC params) happens BEFORE the first
+  data write; reserve-after-write ordering is otherwise preserved.
+- **B6** — new `NodeConfig.cluster_min_quorum_nodes` field (default 2),
+  used by the cluster-readiness gate and the background rejoin loop;
+  `cluster_ready_timeout_sec` remains the time bound. Single-node
+  deployments (no seeds) still skip the gate entirely.
+
 ## Crate Impact
 
 | Crate | Change |
 |---|---|
-| `oceanfs-node` | B1 (or defer to c1), B2, B6 |
+| `oceanfs-node` | B1 (deferred to c1), B2, B6 |
 | `oceanfs-server` | B3, B4, B5 |
 
 ## Definition of Done
 
-- [ ] Each bug has a regression test that fails before / passes after.
-- [ ] `cargo build --all-targets` passes.
-- [ ] `cargo test -p oceanfs-node --lib -- --test-threads=1` green
+- [x] Each bug has a regression test that fails before / passes after
+      (B1 excepted — deferred to c1's leave-handler deletion, disposition
+      recorded below).
+- [x] `cargo build --all-targets` passes.
+- [x] `cargo test -p oceanfs-node --lib -- --test-threads=1` green
       (PIPELINE.md §4.6).
-- [ ] `cargo test -p oceanfs-server --lib -- --test-threads=1` green.
-- [ ] B1 disposition recorded (fixed here or superseded by c1).
+- [x] `cargo test -p oceanfs-server --lib -- --test-threads=1` green.
+- [x] B1 disposition recorded (DECISION 2026-09-04: **superseded by c1's
+      `NodeLeaveHandler` deletion** — recorded here and in c1's doc).
+
+## Deviations
+
+- **B1 (fixed 76-byte header slice in `NodeLeaveHandler`, review #35) is
+  NOT fixed in this epic.** DECISION 2026-09-04: deferred; closed by
+  composition-root c1's `NodeLeaveHandler` deletion (review #34) in the
+  next session. Disposition recorded in f1,
+  `composition-root-decomposition/c1-split-storage-builder.md`,
+  composition-root README, roadmap, and orchestration. No regression test
+  for B1 (the code is deleted, not fixed).
+- **Pre-existing failures outside this epic's control** (verified
+  identical on clean HEAD `83dd5ce`): 4 server integration tests
+  (`replicated_hlc` ×2, `write_quorum` ×1, `grpc_services`
+  `swim_death_detection` ×1) and 2 `oceanfs-server` rustdoc errors
+  (`admin.rs` `RING_PROBE_HASHES`, `write/coordinator.rs`
+  `HintObjectApplier`).

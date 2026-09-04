@@ -64,7 +64,7 @@ which are scheduled across **6 waves** (§3).
 | `features/refactoring/manifest-aware-repair/` | proposed | Wave 2 ④ — AE/scrub holder-aware selection (ADR-0033) |
 | `features/refactoring/legacy-mode-removal/` | proposed | Wave 2 ⑤ — pools mandatory (ADR-0031) |
 | `features/refactoring/bounded-metadata-scans/` | proposed | Wave 2 ⑥ — scan elimination (ADR-0034) |
-| `features/refactoring/review-wave-0-1/` | proposed | Wave 0+1 combined: stale-comment closure + bug batch |
+| `features/refactoring/review-wave-0-1/` | **implemented (2026-09-04)** | Wave 0+1 combined: stale-comment closure + bug batch (f0/f1 landed; B1 deferred to composition-root c1) |
 | `features/refactoring/review-wave-4/` | proposed | Mechanical hygiene: config plumbing, dead-code purge, folders, docs/graphs |
 | `features/refactoring/review-wave-5/` | proposed | Deferred design ADRs (D1–D6) |
 | `features/refactoring/review-2026-09-orchestration.md` | proposed | Implementer navigation map: global order, gates, status board |
@@ -92,6 +92,12 @@ which are scheduled across **6 waves** (§3).
 > `refactoring/review-wave-0-1` (`f0-close-stale-comments`,
 > `f1-correctness-bug-batch`). Stale comments are **deleted**, not
 > annotated.
+>
+> **STATUS (implemented 2026-09-04):** all rows in the wave-0 table that
+> are marked stale/wrong/resolved were deleted by f0 (see the authoritative
+> per-comment list there). The `route_write.rs:15,51` and
+> `event_checkpoint.rs:453` rows are NOT deletions — they stay as wave-4
+> cleanup markers (dead code / live-compat notes).
 
 The following comments are **stale / wrong / already resolved** in today's
 code. They are **deleted** (not annotated) — see
@@ -116,10 +122,29 @@ authoritative per-comment list:
 ### Wave 1 — Bug batch (independent, no design)
 
 > **UPDATE 2026-09-04:** folded into `refactoring/review-wave-0-1`/`f1`.
+>
+> **STATUS (implemented 2026-09-04):** B2 (#64) fixed in f1 with a
+> regression test; B3/B4/B5/B6 fixed in f1 with regression tests. B1
+> (#35, `node.rs:202`) is **deferred** to composition-root c1's
+> `NodeLeaveHandler` deletion (see the row above).
+>
+> **Follow-ups from wave 0/1 (same bug classes at locations f1 did not
+> list — track in wave 2/4, do not lose):**
+> - `durability/healing_service.rs` `fetch_shard` (~:1198) still hard-codes
+>   `total_shards = 6` (same class as f1 B3) and the healing hint paths
+>   still zero-fill missing HLCs (~:735,823,881,969,1263; same class as
+>   B4). Fix under store-unification / hinted-handoff work (ADR-0032 /
+>   ADR-0031).
+> - `server/grpc/segment_service.rs` `delete_object` handler zero-fills a
+>   missing HLC (~:404-407; same class as B4).
+> - membership crate defaults unparseable addresses to `127.0.0.1:9001`
+>   (`gossip.rs:721,725`, `gossip_service.rs:119,124`,
+>   `manager.rs:539,543,1244,1247`; same class as B2) — config theme,
+>   wave 4.
 
 | Anchor | Bug |
 |---|---|---|
-| `node.rs:202` (`NodeLeaveHandler::read_segment_data`) | Unconditional `data[76..]` slice; sealer writes 92-byte v2 headers. Real corruption on leave handoff. **Owned by wave-0/1 f1 B1** (fix here); c1 later supersedes the leave handler per review #34 |
+| `node.rs:202` (`NodeLeaveHandler::read_segment_data`) | Unconditional `data[76..]` slice; sealer writes 92-byte v2 headers. Real corruption on leave handoff. **Owned by wave-0/1 f1 B1 — DEFERRED (DECISION 2026-09-04):** no in-place fix; closed by composition-root c1's `NodeLeaveHandler` deletion (review #34). Disposition recorded in f1 + c1 docs |
 | `node.rs:1501` | Silent `127.0.0.1:9001` fallback on unparseable gRPC addr → must halt |
 | `grpc/segment_service.rs:467` residual | `total_shards = 6` hard-coded; use per-segment `ec_k/ec_m` |
 | `grpc/segment_service.rs:627` | Missing HLC silently zeroed → reject |
@@ -177,8 +202,10 @@ state ADR from review #30 (`segment_replicator.rs:353`).
 ## 4. Sequencing rules
 
 - Wave 0/1 (combined epic `review-wave-0-1`) is independent of everything;
-  land first. It owns the #35/#64 bug fixes (f1 B1/B2); later epics must
-  NOT re-claim them.
+  land first. It fixes #64 (f1 B2). #35 (f1 B1) is **deferred** to
+  composition-root c1's `NodeLeaveHandler` deletion (DECISION 2026-09-04)
+  — the disposition is recorded in f1 and c1; later epics must NOT
+  re-claim #64 or re-open B1 as a live unfixed bug.
 - Wave 2 ordering within the gate:
   - **① c1** (composition root storage builder) lands first — single
     wiring point for everything below.

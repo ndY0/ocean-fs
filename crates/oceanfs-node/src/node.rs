@@ -4,17 +4,10 @@
 //! subsystem crates per architecture.md §4.1. It constructs every component,
 //! injects dependencies via `Arc`, spawns background tasks, and binds the
 //! HTTP + gRPC servers.
-
-// [review][architectural][critical]
-// this is the placement for broader remarks, improvement axis discussions.
-// - we may need an adaptative strategy for sub-systems doing full scans of spaces (metadata or data) : above a certain threshold, or a certain proportionnal load,
-//   switch to a different strategy (round-robin, random subset, ...)
-// - background tasks, submodules could benefit from implementing a startup module trait, making wiring easier (to be discussed, i am not sure)
-// - compile time Dependency injection : reduce complexity on composition pattern, make module composition clearer
-// - cleaner durability crate architecture : the scrub service has not its own folder, reconciliation neither
-// - using a dependency injection make it impossible to use the with_* incremental composition on most modules
-// - we construct large in memory data (see reconcile comments), we should discuss mitigation approaches.
-// [end]
+//!
+//! Broader design remarks formerly kept in this header (adaptive scan
+//! strategies, DI/composition, durability layout, in-memory scans) are
+//! tracked in `docs/features/refactoring/review-2026-09-roadmap.md`.
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -366,6 +359,21 @@ impl NodeLeaveHandler {
 // ---------------------------------------------------------------------------
 // BackgroundTasks
 // ---------------------------------------------------------------------------
+/// Whether the cluster-readiness gate opens for the given ring view
+/// (B6, review #66/#69).
+///
+/// The gate opens when the ring holds at least the configured minimum
+/// quorum node count (`cluster_min_quorum_nodes`) or when the
+/// configured deadline has elapsed (the bound keeps a node whose seeds
+/// are unreachable from stalling writes forever). Single-node
+/// deployments never consult this — they skip the gate entirely.
+fn cluster_ready_gate_opens(
+    ring_nodes: usize,
+    min_quorum_nodes: u64,
+    deadline_elapsed: bool,
+) -> bool {
+    ring_nodes as u64 >= min_quorum_nodes || deadline_elapsed
+}
 // [review][architecture][critical]
 // we are running a lot of background tasks, each independently managing the following :
 // - concurrency
@@ -1066,9 +1074,6 @@ impl Node {
             membership.clone(),
             Arc::new(config.operation_timeouts),
         ));
-        // [review][code smell][medium]
-        // pointless cloning.
-        // [end]
         let repair_sink = repair_dispatcher.clone();
         // [review][config][high]
         // reconciliation configuration should be fully configurable by the end user
@@ -1493,18 +1498,11 @@ impl Node {
                 // The hint receiver fetches segment-ref data back
                 // from THIS node's gRPC listener (remote_addr on the
                 // receiver is the ephemeral source port — dead by
-                // fetch time).
-                .with_self_grpc_addr(
-                    config
-                        .grpc_listen_addr
-                        .parse::<std::net::SocketAddr>()
-                        // [review][configuration][critical]
-                        // we cannot take any default network adresses : a missing protocol means the system cannot work.
-                        // as a guideline rule : a missing essential configuration, that cannot be defaulted, must halt the startup with
-                        // an explicit error
-                        // [end]
-                        .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 9001))),
-                ),
+                // fetch time). The self address is the parsed
+                // `grpc_listen_addr` from section 4 — startup already
+                // failed if that address was unparseable (B2: no silent
+                // default network address).
+                .with_self_grpc_addr(grpc_addr),
         );
         // [review][config][fhigh]
         // no magic constants, user should be able to configure the subsystem
@@ -1562,24 +1560,29 @@ impl Node {
             let gate_membership = membership.clone();
             let gate = ready_gate.clone();
             let gate_timeout_secs = config.cluster_ready_timeout_sec.max(1);
-            // [review][architecture][critical]
-            // minimal quorum definition should be derived from actual config, not from a hardcoded
-            // w=2 estimation. this is very dangerous
-            // [end]
+            // B6 (review #66/#69): the minimum ring node count comes
+            // from config (`cluster_min_quorum_nodes`), not a hard-coded
+            // w=2 estimate. Derivation is documented on the field.
+            let min_quorum_nodes = config.cluster_min_quorum_nodes;
             tokio::spawn(async move {
-                // Open the gate when the ring reaches 2 nodes (enough
-                // for w=2 semantics) or after the configured bound —
-                // the rejoin pull takes seconds; the bound keeps a node
-                // whose seeds are unreachable from stalling writes
-                // forever (it would serve stale data anyway — the 503s
-                // it emits while gated are the safer failure mode).
-                // The timeout is config (`cluster_ready_timeout_sec`)
-                // because convergence scales with the gossip profile.
+                // Open the gate when the ring reaches the configured
+                // minimum quorum node count or after the configured
+                // bound — the rejoin pull takes seconds; the bound
+                // keeps a node whose seeds are unreachable from
+                // stalling writes forever (it would serve stale data
+                // anyway — the 503s it emits while gated are the safer
+                // failure mode). The timeout is config
+                // (`cluster_ready_timeout_sec`) because convergence
+                // scales with the gossip profile.
                 let deadline =
                     tokio::time::Instant::now() + std::time::Duration::from_secs(gate_timeout_secs);
                 loop {
                     let ring_nodes = gate_membership.ring().snapshot().node_count();
-                    if ring_nodes >= 2 || tokio::time::Instant::now() >= deadline {
+                    if cluster_ready_gate_opens(
+                        ring_nodes,
+                        min_quorum_nodes,
+                        tokio::time::Instant::now() >= deadline,
+                    ) {
                         gate.store(true, std::sync::atomic::Ordering::Release);
                         break;
                     }
@@ -2353,23 +2356,22 @@ impl Node {
             warn!(error = %e, "initial cluster join failed; retrying in the background");
         }
 
-        // [review][implementation][critical]
-        // waiting for 2 nodes accomodate for a specific case only. the number of nodes to be present should be derived from the minimums
-        // extracted from the config, not this heuristic
-        // [end]
         // Background rejoin: retry the (idempotent) join every 3s until
-        // the ring reaches 2 nodes. Covers the seedless-restart path
-        // (fallback seeds) and fleet nodes that boot before their seed
-        // comes up. Exits once joined.
+        // the ring reaches the configured minimum quorum node count
+        // (`cluster_min_quorum_nodes`, B6 — review #66/#69). Covers the
+        // seedless-restart path (fallback seeds) and fleet nodes that
+        // boot before their seed comes up. Exits once joined.
         if is_cluster_node {
             let retry_membership = membership.clone();
             let retry_incarnation = join_incarnation;
             let retry_fallback = join_fallback_seeds.clone();
+            let min_quorum_nodes = config.cluster_min_quorum_nodes;
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
                 loop {
                     interval.tick().await;
-                    if retry_membership.ring().snapshot().node_count() >= 2 {
+                    let ring_nodes = retry_membership.ring().snapshot().node_count();
+                    if cluster_ready_gate_opens(ring_nodes, min_quorum_nodes, false) {
                         return;
                     }
                     if let Err(e) = retry_membership.join(retry_incarnation, &retry_fallback).await
@@ -3669,6 +3671,45 @@ mod tests {
             err_msg.contains("HTTP server") || err_msg.contains("bind"),
             "error should mention bind failure: {err_msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn node_start_with_invalid_grpc_addr_errors() {
+        // B2 (review #64): an unparseable `grpc_listen_addr` must halt
+        // startup with an explicit error — no silent fallback to a
+        // default self address.
+        let tmp = TempDir::new().expect("tempdir");
+        let config_invalid = NodeConfig {
+            listen_addr: "127.0.0.1:0".into(),
+            grpc_listen_addr: "not-a-valid-socket-addr".into(),
+            ..test_config(&tmp)
+        };
+        let result = Node::start(config_invalid).await;
+        assert!(result.is_err(), "invalid grpc_listen_addr should error");
+        let err_msg = result.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("grpc_listen_addr"),
+            "error should mention the offending config key: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn cluster_ready_gate_opens_at_configured_minimum_quorum() {
+        // B6 (review #66/#69): the gate threshold derives from
+        // `cluster_min_quorum_nodes`, not the hard-coded `ring >= 2`.
+        // Default (2): a 2-node ring opens the gate, a 1-node ring
+        // does not.
+        assert!(cluster_ready_gate_opens(2, 2, false));
+        assert!(!cluster_ready_gate_opens(1, 2, false));
+        // A deployment requiring 3 nodes stays gated at 2 nodes — the
+        // historical code would have opened here.
+        assert!(!cluster_ready_gate_opens(2, 3, false));
+        assert!(cluster_ready_gate_opens(3, 3, false));
+        // The deadline bound still opens the gate regardless of ring
+        // size (cluster_ready_timeout_sec semantics preserved).
+        assert!(cluster_ready_gate_opens(1, 3, true));
+        // A min-quorum <= 1 opens as soon as the node has a ring view.
+        assert!(cluster_ready_gate_opens(1, 1, false));
     }
 
     #[tokio::test]

@@ -422,9 +422,6 @@ impl SegmentLifecycleRegistry {
         Self { shards: shards.into_boxed_slice(), config: config.clone() }
     }
 
-    // [review][algo][medium]
-    // are we sure this hashing converge to a uniform distribution of segment ids over the index span ?
-    // [end]
     /// Returns the shard index for a segment id.
     fn shard_for(&self, id: SegmentId) -> usize {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();

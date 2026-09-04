@@ -469,10 +469,6 @@ impl WriteCoordinator {
         self.hint_inline_threshold_bytes = bytes;
         self
     }
-    // [review][implementation][critical]
-    // immediately, their is a missing forward write to replica set.
-    // this is a critical gap in the implementation, and must be resolved with high priority
-    // [end]
     /// Executes a distributed write through the segment pipeline.
     ///
     /// # Algorithm

@@ -23,8 +23,12 @@ use oceanfs_network::gossip::{
 };
 use oceanfs_routing::{Ring, RingCache};
 use oceanfs_server::grpc::segment_service::SegmentGrpcService;
-use oceanfs_storage::{BufferPool, Error as StorageError, SegmentRpcClient, SegmentRpcServer};
+use oceanfs_storage::{
+    segment::{event_wal::EventWal, lifecycle::SegmentLifecycleCoordinator},
+    BufferPool, Error as StorageError, SegmentRpcClient, SegmentRpcServer,
+};
 use parking_lot::Mutex;
+use tempfile::TempDir;
 use tokio_stream::StreamExt;
 use tonic::transport::Server;
 
@@ -70,6 +74,9 @@ struct RunningNode {
     addr: SocketAddr,
     #[allow(dead_code)]
     store: Arc<dyn SegmentDataStore>,
+    /// Keeps the node's lifecycle coordinator + event-WAL directory alive
+    /// (the segment service registers pushed segments through it — B3).
+    _scaffold: NodeScaffold,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -79,15 +86,75 @@ impl RunningNode {
     }
 }
 
+/// Keeps a node's lifecycle coordinator and its event-WAL temp dir
+/// alive for the duration of the test.
+struct NodeScaffold {
+    #[allow(dead_code)]
+    lifecycle: Arc<SegmentLifecycleCoordinator>,
+    _tmp: TempDir,
+}
+
+/// Builds an event-WAL-armed lifecycle coordinator (the production
+/// composition-root shape used by the segment service).
+async fn make_lifecycle() -> (Arc<SegmentLifecycleCoordinator>, TempDir) {
+    let tmp = tempfile::tempdir().expect("tempdir for event WAL");
+    let lifecycle = Arc::new(
+        SegmentLifecycleCoordinator::new(&oceanfs_core::LifecycleConfig::default()).with_event_wal(
+            Arc::new(
+                EventWal::open(
+                    tmp.path().join("event-wal"),
+                    &oceanfs_core::EventWalConfig {
+                        event_wal_dir: tmp.path().join("event-wal"),
+                        event_wal_file_size_bytes: 1024 * 1024,
+                        event_wal_fsync_batch_timeout_ms: 10,
+                        event_wal_checkpoint_bytes: 1024 * 1024,
+                    },
+                )
+                .await
+                .expect("event WAL opens"),
+            ),
+        ),
+    );
+    (lifecycle, tmp)
+}
+
+/// Registers a sealed segment directly in the lifecycle registry
+/// (in-memory pure transitions) — used by tests that seed the store
+/// without going through `push_sealed_segment`.
+fn register_sealed(
+    lifecycle: &SegmentLifecycleCoordinator,
+    seg_id: oceanfs_core::SegmentId,
+    ec_k: u8,
+    ec_m: u8,
+    data: &[u8],
+) {
+    let root = oceanfs_durability::MerkleTree::build(data, 0).unwrap().root().hash();
+    let mut meta = oceanfs_core::SegmentMetadata {
+        pool_id: 0,
+        segment_id: seg_id,
+        ec_k,
+        ec_m,
+        size_tier: oceanfs_core::SizeTier::Standard,
+        merkle_root: None,
+        storage_locations: smallvec::SmallVec::new(),
+        sealed_at: Some(0),
+    };
+    lifecycle.registry().reserve(seg_id, meta.clone()).expect("reserve succeeds");
+    meta.merkle_root = Some(root);
+    lifecycle.registry().seal(seg_id, meta).expect("seal succeeds");
+}
+
 /// Starts a segment gRPC server that can be killed later.
 async fn start_killable_node(store: Arc<dyn SegmentDataStore>) -> RunningNode {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (lifecycle, tmp) = make_lifecycle().await;
     let service = SegmentGrpcService::new(
         store.clone(),
         None,
         Arc::new(oceanfs_storage::BufferPool::new(65536, 1024)),
         Arc::new(oceanfs_core::HlcClock::new()),
-    );
+    )
+    .with_lifecycle(Arc::clone(&lifecycle));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let server_addr = listener.local_addr().unwrap();
 
@@ -102,20 +169,29 @@ async fn start_killable_node(store: Arc<dyn SegmentDataStore>) -> RunningNode {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client = SegmentRpcClient::connect(format!("http://{server_addr}")).await.unwrap();
-    RunningNode { client, addr: server_addr, store, _task: task }
+    RunningNode {
+        client,
+        addr: server_addr,
+        store,
+        _scaffold: NodeScaffold { lifecycle, _tmp: tmp },
+        _task: task,
+    }
 }
 
-/// Starts a segment gRPC server and returns a client + the shared data store.
+/// Starts a segment gRPC server (with a lifecycle coordinator attached)
+/// and returns a client + the shared data store + the node scaffold.
 async fn start_segment_server(
     store: Arc<dyn SegmentDataStore>,
-) -> (SegmentRpcClient<tonic::transport::Channel>, SocketAddr) {
+) -> (SegmentRpcClient<tonic::transport::Channel>, SocketAddr, NodeScaffold) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (lifecycle, tmp) = make_lifecycle().await;
     let service = SegmentGrpcService::new(
         store,
         None,
         Arc::new(oceanfs_storage::BufferPool::new(65536, 1024)),
         Arc::new(oceanfs_core::HlcClock::new()),
-    );
+    )
+    .with_lifecycle(Arc::clone(&lifecycle));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let server_addr = listener.local_addr().unwrap();
 
@@ -130,7 +206,7 @@ async fn start_segment_server(
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client = SegmentRpcClient::connect(format!("http://{server_addr}")).await.unwrap();
-    (client, server_addr)
+    (client, server_addr, NodeScaffold { lifecycle, _tmp: tmp })
 }
 
 /// Starts a gossip gRPC server and returns a client.
@@ -214,7 +290,7 @@ async fn fetch_from_node(
 #[tokio::test]
 async fn two_node_push_and_fetch_roundtrip() {
     let store1: Arc<dyn SegmentDataStore> = Arc::new(TestStore::new());
-    let (mut client1, _addr1) = start_segment_server(store1.clone()).await;
+    let (mut client1, _addr1, _keep1) = start_segment_server(store1.clone()).await;
 
     let seg_id = SegmentId::new();
     let test_data = b"two-node segment push roundtrip test data";
@@ -314,9 +390,9 @@ async fn three_node_write_with_w2_via_grpc() {
     let store2: Arc<dyn SegmentDataStore> = Arc::new(TestStore::new());
     let store3: Arc<dyn SegmentDataStore> = Arc::new(TestStore::new());
 
-    let (mut client1, _addr1) = start_segment_server(store1.clone()).await;
-    let (mut client2, _addr2) = start_segment_server(store2.clone()).await;
-    let (mut client3, _addr3) = start_segment_server(store3.clone()).await;
+    let (mut client1, _addr1, _keep1) = start_segment_server(store1.clone()).await;
+    let (mut client2, _addr2, _keep2) = start_segment_server(store2.clone()).await;
+    let (mut client3, _addr3, _keep3) = start_segment_server(store3.clone()).await;
 
     let seg_id = SegmentId::new();
     let test_data = b"three-node W=2 replication test data payload".to_vec();
@@ -364,9 +440,16 @@ async fn futures_unordered_fastest_2_of_3() {
     store2.write_segment_data(&seg_id, &test_data).unwrap();
     store3.write_segment_data(&seg_id, &test_data).unwrap();
 
-    let (client1, _) = start_segment_server(store1).await;
-    let (client2, _) = start_segment_server(store2).await;
-    let (client3, _) = start_segment_server(store3).await;
+    let (client1, _, keep1) = start_segment_server(store1).await;
+    let (client2, _, keep2) = start_segment_server(store2).await;
+    let (client3, _, keep3) = start_segment_server(store3).await;
+
+    // Register the segment on every node (B3: fetch resolves shard
+    // geometry from the lifecycle registry — an unregistered segment is
+    // rejected even when its data exists).
+    register_sealed(&keep1.lifecycle, seg_id, 4, 2, &test_data);
+    register_sealed(&keep2.lifecycle, seg_id, 4, 2, &test_data);
+    register_sealed(&keep3.lifecycle, seg_id, 4, 2, &test_data);
 
     let fetch_req = oceanfs_core::proto::segment::FetchShardRequest {
         segment_id: Some(proto_sid),

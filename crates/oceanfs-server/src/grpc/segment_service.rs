@@ -229,15 +229,6 @@ impl SegmentRpc for SegmentGrpcService {
                 chunk_offsets = chunk.chunk_offsets.clone();
                 chunk_lengths = chunk.chunk_lengths.clone();
                 first_hlc = chunk.hlc.as_ref().map(|p| Hlc::new(p.wall_time, p.logical));
-                if first_hlc.is_none() {
-                    // A sender that omits the HLC is a bug (every fixed
-                    // coordinator stamps it); make it visible.
-                    tracing::warn!(
-                        object_key = %chunk.object_key,
-                        "append_segment: metadata-bearing chunk has no HLC — \
-                         persisting zero timestamp (legacy sender?)"
-                    );
-                }
             }
             let chunk_len = chunk.data.len() as u64;
             segment_data.extend_from_slice(&chunk.data);
@@ -282,10 +273,20 @@ impl SegmentRpc for SegmentGrpcService {
             }
         };
         {
-            // G3: the coordinator's HLC travels with the request and is
-            // persisted — replicated metadata must carry the original
-            // version, not zero. Zero only for legacy senders.
-            let hlc = first_hlc.unwrap_or_else(Hlc::zero);
+            // G3 + B4 (review #102): the coordinator's HLC travels with
+            // the request and is persisted — replicated metadata must
+            // carry the original version, never a zero substitute. An
+            // append whose metadata lacks an HLC (or carries an all-zero
+            // HLC) is a malformed/legacy sender: reject loudly instead
+            // of persisting a zero timestamp (no-legacy-mode policy).
+            let hlc = match first_hlc {
+                Some(hlc) if hlc != Hlc::zero() => hlc,
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "append_segment requires a non-zero HLC on the metadata chunk",
+                    ));
+                }
+            };
             // Receive rule (G2): merge the remote timestamp into the
             // local clock before persisting.
             self.hlc_clock.update(hlc);
@@ -297,10 +298,6 @@ impl SegmentRpc for SegmentGrpcService {
                 let segment_id = SegmentId::from_uuid_bytes(seg_bytes);
                 let offset = chunk_offsets[i];
                 let length = chunk_lengths[i];
-                // [review][logical][high]
-                // isnt the remap alias initilased once at the grpc service creation ?
-                // if so, it does not keep up with the compaction work, and keeps a stale mapping isnt it ?
-                // [end]
                 // g3 Option A: translate a chunk ref that references a
                 // segment the LOCAL GC already compacted away (a late
                 // metadata append that raced the compaction remap). The
@@ -452,6 +449,32 @@ impl SegmentRpc for SegmentGrpcService {
             .and_then(|sid| SegmentId::try_from(sid).ok())
             .ok_or_else(|| Status::invalid_argument("missing or invalid segment_id"))?;
 
+        // B3 (review #101 residue): shard geometry is PER-SEGMENT, not a
+        // hard-coded default. Resolve the seal-time ec_k/ec_m from the
+        // lifecycle registry BEFORE reading any data (fail fast). A
+        // segment without a registry entry has no attributable geometry
+        // — serving it with a guessed layout would return wrong bytes,
+        // so reject it instead of silently falling back (no-legacy-mode
+        // policy; unregistered `.dat` files are legacy leftovers).
+        let lifecycle = self.lifecycle.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "segment service has no lifecycle registry; cannot resolve shard geometry",
+            )
+        })?;
+        let entry = lifecycle.registry().get(segment_id).ok_or_else(|| {
+            Status::not_found(format!(
+                "segment {segment_id} is not registered in the lifecycle registry \
+                 (cannot resolve EC geometry)"
+            ))
+        })?;
+        let total_shards = entry.metadata.ec_k as usize + entry.metadata.ec_m as usize;
+        if total_shards == 0 {
+            return Err(Status::failed_precondition(format!(
+                "segment {segment_id} carries no EC geometry (ec_k={}, ec_m={})",
+                entry.metadata.ec_k, entry.metadata.ec_m
+            )));
+        }
+
         // Read the full segment data from the store once.
         let segment_data = self
             .data_store
@@ -463,13 +486,6 @@ impl SegmentRpc for SegmentGrpcService {
         }
 
         let segment_bytes = segment_data;
-
-        // [review][implementation][critical]
-        // this is a placeholder, real data is carried by the metadata store,
-        // we must finish the implementation properly
-        // [end]
-        // Determine total shards from known configuration (k+m).
-        let total_shards = 6; // default k=4, m=2
 
         // Batched mode (Item 9): iterate over repeated shard ranges.
         if !req.shards.is_empty() {
@@ -624,13 +640,18 @@ impl SegmentRpc for SegmentGrpcService {
             .metadata_store
             .as_ref()
             .ok_or_else(|| Status::unimplemented("no metadata store configured"))?;
-        // [review][implementation][high]
-        // no legacy support during the build phase. there cannot be no hlc, if so, this is a bug and should be completely discarded
-        // [end]
-        let hlc = match req.hlc {
-            Some(ref hlc_proto) => Hlc::new(hlc_proto.wall_time, hlc_proto.logical),
-            None => Hlc::zero(),
-        };
+        // B4 (review #102): the HLC is mandatory. A push without one —
+        // or with an all-zero one — is a malformed/legacy sender; reject
+        // loudly instead of silently persisting `Hlc::zero()` (the
+        // no-legacy-mode policy; there is no tolerated legacy case).
+        let hlc_proto = req
+            .hlc
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("put_object_metadata requires an HLC"))?;
+        let hlc = Hlc::new(hlc_proto.wall_time, hlc_proto.logical);
+        if hlc == Hlc::zero() {
+            return Err(Status::invalid_argument("put_object_metadata rejects an all-zero HLC"));
+        }
 
         // Receive rule (G2): merge the remote timestamp into the local
         // clock before acting on it.
@@ -640,16 +661,15 @@ impl SegmentRpc for SegmentGrpcService {
         // rejects the repair push only when the incoming write did NOT
         // happen after the delete. A strictly newer HLC legitimately
         // resurrects the object (the write happened after the delete,
-        // on some node); a zero HLC (legacy sender, un-migrated hint)
-        // never resurrects. The lookup and the write are not atomic,
-        // but the residual window is a delete racing a repair push on
-        // the same key — the sender-side re-validation in
+        // on some node). The lookup and the write are not atomic, but
+        // the residual window is a delete racing a repair push on the
+        // same key — the sender-side re-validation in
         // `run_read_repair` shrinks it to near zero.
         if let Some(tombstone) =
             oceanfs_storage_api::MetadataStore::get_tombstone(md_store.as_ref(), &bucket, &key)
                 .map_err(|e| Status::internal(format!("tombstone lookup failed: {e}")))?
         {
-            if hlc == Hlc::zero() || hlc <= tombstone.hlc {
+            if hlc <= tombstone.hlc {
                 tracing::warn!(
                     bucket = %bucket,
                     key = %key,
@@ -743,10 +763,6 @@ impl SegmentRpc for SegmentGrpcService {
         Ok(Response::new(PutObjectMetadataResponse { written: true }))
     }
 
-    // [review][implementation][critical]
-    // there could not be "default" metadata for a segment. either they are present,
-    // or we must drop the process, we cannot silently degrade the information.
-    // [end]
     /// Handles a sealed-segment push from the owner's segment replicator.
     ///
     /// Assembles the full data section from the stream, verifies the
@@ -763,10 +779,14 @@ impl SegmentRpc for SegmentGrpcService {
         request: Request<Streaming<PushSealedSegmentRequest>>,
     ) -> Result<Response<PushSealedSegmentResponse>, Status> {
         let mut stream = request.into_inner();
-        let mut segment_id = SegmentId::default();
-        let mut tier = SizeTier::Standard;
-        let mut ec_k = 1u8;
-        let mut ec_m = 0u8;
+        // B5 (review #103): there is no "default" segment metadata. The
+        // stream must carry a real segment id, a known data tier, and
+        // in-range EC params; anything else is rejected BEFORE the first
+        // write (a malformed push must never persist under defaults).
+        let mut segment_id: Option<SegmentId> = None;
+        let mut wire_tier: Option<u32> = None;
+        let mut ec_k_raw: Option<u32> = None;
+        let mut ec_m_raw: Option<u32> = None;
         let mut merkle_root = Bytes::new();
         let mut storage_locations: Vec<oceanfs_core::proto::common::NodeId> = Vec::new();
         let mut total_bytes: u64 = 0;
@@ -777,28 +797,71 @@ impl SegmentRpc for SegmentGrpcService {
             .await
             .map_err(|e| Status::internal(format!("push stream error: {e}")))?
         {
-            // Capture metadata from the first chunk that carries it.
+            // Capture the segment id from the first chunk carrying a
+            // parseable one; an id that fails to parse is NOT silently
+            // skipped — the final validation rejects the push.
             if let Some(ref proto_sid) = chunk.segment_id {
                 if let Ok(sid) = SegmentId::try_from(proto_sid.clone()) {
-                    segment_id = sid;
+                    segment_id = Some(sid);
                 }
             }
+            // Capture metadata from the first chunk that carries a
+            // merkle root (the seal-time anchor). The raw wire values
+            // are kept for validation: the tier byte and the u32 EC
+            // params are NOT cast/defaulted here.
             if merkle_root.is_empty() && !chunk.merkle_root.is_empty() {
-                tier = match chunk.tier {
-                    0 => SizeTier::Inline,
-                    1 => SizeTier::Small,
-                    2 => SizeTier::Standard,
-                    3 => SizeTier::Multi,
-                    _ => SizeTier::Standard,
-                };
-                ec_k = chunk.ec_k as u8;
-                ec_m = chunk.ec_m as u8;
+                wire_tier = Some(chunk.tier);
+                ec_k_raw = Some(chunk.ec_k);
+                ec_m_raw = Some(chunk.ec_m);
                 merkle_root = chunk.merkle_root.clone();
                 storage_locations = chunk.storage_locations.clone();
             }
             let chunk_len = chunk.data.len() as u64;
             segment_data.extend_from_slice(&chunk.data);
             total_bytes += chunk_len;
+        }
+
+        // B5 validation — all BEFORE any data is persisted.
+        let segment_id = segment_id.ok_or_else(|| {
+            Status::invalid_argument("push without a segment id (missing or unparseable)")
+        })?;
+        // A sealed-segment push carries a DATA tier (Small/Standard/
+        // Multi). Tier 0 (Inline) never produces a `.dat`; unknown bytes
+        // used to degrade silently to Standard.
+        let tier = match wire_tier {
+            Some(1) => SizeTier::Small,
+            Some(2) => SizeTier::Standard,
+            Some(3) => SizeTier::Multi,
+            Some(t) => {
+                return Err(Status::invalid_argument(format!(
+                    "push carries unsupported tier byte {t} for a sealed segment"
+                )));
+            }
+            None => {
+                return Err(Status::invalid_argument(
+                    "push without segment metadata (missing tier/EC/merkle root)",
+                ));
+            }
+        };
+        let (ec_k_raw, ec_m_raw) = match (ec_k_raw, ec_m_raw) {
+            (Some(k), Some(m)) => (k, m),
+            _ => {
+                return Err(Status::invalid_argument(
+                    "push without EC geometry (missing ec_k/ec_m)",
+                ));
+            }
+        };
+        if ec_k_raw > u8::MAX as u32 || ec_m_raw > u8::MAX as u32 {
+            return Err(Status::invalid_argument(format!(
+                "push carries out-of-range EC params (ec_k={ec_k_raw}, ec_m={ec_m_raw})"
+            )));
+        }
+        let ec_k = ec_k_raw as u8;
+        let ec_m = ec_m_raw as u8;
+        if ec_k == 0 && ec_m != 0 {
+            return Err(Status::invalid_argument(
+                "push carries parity shards without data shards (ec_k=0, ec_m>0)",
+            ));
         }
 
         if total_bytes == 0 {
@@ -1176,10 +1239,15 @@ mod tests {
         assert!(store.read_segment_data(&seg_id).is_err(), "rejected append must not write data");
     }
 
+    /// B3: a segment that is NOT registered in the lifecycle registry has
+    /// no attributable EC geometry — fetch is rejected (NotFound) even
+    /// when the segment does not exist anywhere.
     #[tokio::test]
     async fn fetch_nonexistent_segment_returns_not_found() {
         let store = Arc::new(TestSegmentStore::new());
-        let mut client = test_server(store).await;
+        let metadata: Arc<dyn oceanfs_storage_api::MetadataStore> =
+            Arc::new(TombstoneMockMetadata::new());
+        let (mut client, _lifecycle) = test_server_with_lifecycle(store, metadata).await;
 
         let seg_id = SegmentId::new();
         let proto_sid: ProtoSegmentId = seg_id.into();
@@ -1198,21 +1266,79 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
+    /// B3 regression: a `.dat` present on disk but WITHOUT a lifecycle
+    /// entry (a legacy leftover) must be rejected — the old hard-coded
+    /// geometry would have served it with wrong shard boundaries.
+    #[tokio::test]
+    async fn fetch_unregistered_segment_rejected_despite_data() {
+        let store = Arc::new(TestSegmentStore::new());
+        let seg_id = SegmentId::new();
+        let test_data: Vec<u8> = (0..6144).map(|v| (v % 256) as u8).collect();
+        // Data exists — but nothing registered the segment.
+        store.write_segment_data(&seg_id, &test_data).unwrap();
+
+        let metadata: Arc<dyn oceanfs_storage_api::MetadataStore> =
+            Arc::new(TombstoneMockMetadata::new());
+        let (mut client, _lifecycle) = test_server_with_lifecycle(store, metadata).await;
+
+        let request = tonic::Request::new(FetchShardRequest {
+            segment_id: Some(ProtoSegmentId::from(seg_id)),
+            shard_index: 0,
+            offset: 0,
+            length: 0,
+            shards: vec![],
+        });
+        let result = client.fetch_shard(request).await;
+        let err = result.expect_err("an unregistered segment must be rejected");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert!(
+            err.message().contains("not registered"),
+            "error must explain the missing registration: {err}"
+        );
+    }
+
+    /// Pushes a sealed segment (registering it in the lifecycle) and
+    /// fetches it back — the production composition-root shape.
+    async fn push_and_register(
+        client: &mut SegmentRpcClient<tonic::transport::Channel>,
+        seg_id: SegmentId,
+        tier: u32,
+        ec_k: u32,
+        ec_m: u32,
+        data: &[u8],
+    ) {
+        let root = oceanfs_durability::MerkleTree::build(data, 0).unwrap().root().hash();
+        let chunk = PushSealedSegmentRequest {
+            segment_id: Some(ProtoSegmentId::from(seg_id)),
+            tier,
+            ec_k,
+            ec_m,
+            merkle_root: Bytes::copy_from_slice(root.as_bytes()),
+            storage_locations: vec![],
+            data: Bytes::copy_from_slice(data),
+        };
+        let response = client
+            .push_sealed_segment(tonic::Request::new(tokio_stream::iter(vec![chunk])))
+            .await
+            .unwrap();
+        assert!(response.into_inner().acked, "push must ack");
+    }
+
     #[tokio::test]
     async fn fetch_existing_segment_returns_data() {
         let store = Arc::new(TestSegmentStore::new());
         let seg_id = SegmentId::new();
 
-        // Write test data where total_shards=6, so each shard is data.len()/6.
-        // (The previous version cast the byte count to u8, which truncated
-        // 6144 to 0 and produced an empty segment — the server correctly
-        // answered NotFound, masking the test's own bug.)
+        // Geometry k=4/m=2 → total_shards=6, so each shard is len/6.
         let total_shards = 6;
         let shard_size = 1024;
         let test_data: Vec<u8> = (0..shard_size * total_shards).map(|v| (v % 256) as u8).collect();
-        store.write_segment_data(&seg_id, &test_data).unwrap();
 
-        let mut client = test_server(store).await;
+        let metadata: Arc<dyn oceanfs_storage_api::MetadataStore> =
+            Arc::new(TombstoneMockMetadata::new());
+        let (mut client, _lifecycle) = test_server_with_lifecycle(store, metadata).await;
+        push_and_register(&mut client, seg_id, 2, 4, 2, &test_data).await;
+
         let proto_sid: ProtoSegmentId = seg_id.into();
 
         let request = tonic::Request::new(FetchShardRequest {
@@ -1246,18 +1372,60 @@ mod tests {
         assert_eq!(&received_bytes[..], &test_data[..shard_size]);
     }
 
+    /// B3 regression: the shard geometry comes from the REGISTERED
+    /// ec_k/ec_m, not a hard-coded k=4/m=2. A k=2/m=1 segment (3 shards)
+    /// is sliced in thirds.
+    #[tokio::test]
+    async fn fetch_shard_uses_registered_geometry() {
+        let store = Arc::new(TestSegmentStore::new());
+        let seg_id = SegmentId::new();
+
+        let total_shards = 3; // ec_k=2 + ec_m=1
+        let shard_size = 500;
+        let test_data: Vec<u8> = (0..shard_size * total_shards).map(|v| (v % 256) as u8).collect();
+
+        let metadata: Arc<dyn oceanfs_storage_api::MetadataStore> =
+            Arc::new(TombstoneMockMetadata::new());
+        let (mut client, _lifecycle) = test_server_with_lifecycle(store, metadata).await;
+        push_and_register(&mut client, seg_id, 2, 2, 1, &test_data).await;
+
+        // Fetch shard 0 fully (length 0 → to the shard boundary).
+        let request = tonic::Request::new(FetchShardRequest {
+            segment_id: Some(ProtoSegmentId::from(seg_id)),
+            shard_index: 0,
+            offset: 0,
+            length: 0,
+            shards: vec![],
+        });
+        let mut response_stream = client.fetch_shard(request).await.unwrap().into_inner();
+        let mut received_bytes: Vec<u8> = Vec::new();
+        while let Some(chunk_result) = response_stream.message().await.unwrap() {
+            if chunk_result.data.is_empty() {
+                break;
+            }
+            received_bytes.extend_from_slice(&chunk_result.data);
+        }
+        assert_eq!(
+            received_bytes.len(),
+            shard_size,
+            "a k=2/m=1 segment must be sliced into 3 shards, not the hard-coded 6"
+        );
+        assert_eq!(&received_bytes[..], &test_data[..shard_size]);
+    }
+
     #[tokio::test]
     async fn fetch_shard_with_offset_returns_correct_slice() {
         let store = Arc::new(TestSegmentStore::new());
         let seg_id = SegmentId::new();
         let total_shards = 6;
         let shard_size = 500;
-        // Same u8-truncation bug class as `fetch_existing_segment_returns_data`:
-        // 3000 as u8 would truncate to 184. Generate the full 3000 bytes.
         let test_data: Vec<u8> = (0..shard_size * total_shards).map(|v| (v % 256) as u8).collect();
-        store.write_segment_data(&seg_id, &test_data).unwrap();
 
-        let mut client = test_server(store).await;
+        let metadata: Arc<dyn oceanfs_storage_api::MetadataStore> =
+            Arc::new(TombstoneMockMetadata::new());
+        let (mut client, _lifecycle) = test_server_with_lifecycle(store, metadata).await;
+        push_and_register(&mut client, seg_id, 2, 4, 2, &test_data).await;
+
         let proto_sid: ProtoSegmentId = seg_id.into();
 
         // Fetch shard 0 with offset 100 and explicit length 50.
@@ -1426,8 +1594,10 @@ mod tests {
     async fn put_object_metadata_rejects_tombstoned_key() {
         let metadata: Arc<dyn oceanfs_storage_api::MetadataStore> =
             Arc::new(TombstoneMockMetadata::new());
-        // Tombstone the key first.
-        metadata.delete_object(&BucketId::new("b"), &ObjectKey::new("k"), Hlc::zero()).unwrap();
+        // Tombstone the key first, stamped at (1000, 0).
+        metadata
+            .delete_object(&BucketId::new("b"), &ObjectKey::new("k"), Hlc::new(1000, 0))
+            .unwrap();
 
         let service = SegmentGrpcService::new(
             Arc::new(TestSegmentStore::new()),
@@ -1436,9 +1606,13 @@ mod tests {
             Arc::new(HlcClock::new()),
         );
 
-        let result = service
-            .put_object_metadata(tonic::Request::new(make_put_metadata_request("b", "k")))
-            .await;
+        // A push OLDER than the tombstone (500, 0) is rejected.
+        let request = make_put_metadata_request_with_hlc(
+            "b",
+            "k",
+            Some(oceanfs_core::proto::common::HlcTimestamp { wall_time: 500, logical: 0 }),
+        );
+        let result = service.put_object_metadata(tonic::Request::new(request)).await;
         assert!(result.is_err(), "tombstoned key must reject read-repair pushes");
         assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
     }
@@ -1457,10 +1631,63 @@ mod tests {
             Arc::new(HlcClock::new()),
         );
 
+        let request = make_put_metadata_request_with_hlc(
+            "b",
+            "k",
+            Some(oceanfs_core::proto::common::HlcTimestamp { wall_time: 1000, logical: 0 }),
+        );
+        let result = service.put_object_metadata(tonic::Request::new(request)).await;
+        assert!(result.is_ok(), "clean key must accept read-repair push");
+    }
+
+    /// B4 (review #102): a push WITHOUT an HLC is a malformed/legacy
+    /// sender — rejected loudly, nothing persisted (no zero-timestamp
+    /// tolerance).
+    #[tokio::test]
+    async fn put_object_metadata_without_hlc_rejected() {
+        let metadata = Arc::new(TombstoneMockMetadata::new());
+        let service = SegmentGrpcService::new(
+            Arc::new(TestSegmentStore::new()),
+            Some(metadata.clone() as Arc<dyn oceanfs_storage_api::MetadataStore>),
+            Arc::new(BufferPool::new(65536, 4)),
+            Arc::new(HlcClock::new()),
+        );
+
         let result = service
             .put_object_metadata(tonic::Request::new(make_put_metadata_request("b", "k")))
             .await;
-        assert!(result.is_ok(), "clean key must accept read-repair push");
+        assert_eq!(
+            result.unwrap_err().code(),
+            tonic::Code::InvalidArgument,
+            "a push without HLC must be rejected",
+        );
+        assert!(metadata.last_put().is_none(), "nothing must be persisted");
+    }
+
+    /// B4 (review #102): an ALL-ZERO HLC is equally degenerate — reject
+    /// it instead of treating zero as a tolerated legacy case.
+    #[tokio::test]
+    async fn put_object_metadata_with_zero_hlc_rejected() {
+        let metadata = Arc::new(TombstoneMockMetadata::new());
+        let service = SegmentGrpcService::new(
+            Arc::new(TestSegmentStore::new()),
+            Some(metadata.clone() as Arc<dyn oceanfs_storage_api::MetadataStore>),
+            Arc::new(BufferPool::new(65536, 4)),
+            Arc::new(HlcClock::new()),
+        );
+
+        let request = make_put_metadata_request_with_hlc(
+            "b",
+            "k",
+            Some(oceanfs_core::proto::common::HlcTimestamp { wall_time: 0, logical: 0 }),
+        );
+        let result = service.put_object_metadata(tonic::Request::new(request)).await;
+        assert_eq!(
+            result.unwrap_err().code(),
+            tonic::Code::InvalidArgument,
+            "an all-zero HLC must be rejected",
+        );
+        assert!(metadata.last_put().is_none(), "nothing must be persisted");
     }
 
     /// G6: a repair push newer than the tombstone is a legitimate
@@ -1765,61 +1992,44 @@ mod tests {
         );
     }
 
-    /// G3: a legacy append without an HLC degrades to zero with a warning.
-    #[test]
-    fn append_segment_without_hlc_persists_zero_and_warns() {
-        // Capture WARN+ events emitted by the service into a buffer.
-        struct CaptureWriter(Arc<parking_lot::Mutex<Vec<u8>>>);
-        impl std::io::Write for CaptureWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
-            type Writer = CaptureWriter;
-            fn make_writer(&'a self) -> Self::Writer {
-                CaptureWriter(Arc::clone(&self.0))
-            }
-        }
-
-        let log_buf = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(CaptureWriter(Arc::clone(&log_buf)))
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-
+    /// B4 (review #102): an append whose metadata carries no HLC — or an
+    /// all-zero HLC — is a malformed/legacy sender. Reject it loudly;
+    /// nothing is persisted (the old zero-timestamp degradation is gone).
+    #[tokio::test]
+    async fn append_segment_without_hlc_rejected() {
         let recorded = Arc::new(RecordingMetadata::new());
         let metadata: Arc<dyn oceanfs_storage_api::MetadataStore> = recorded.clone();
+        let service = SegmentGrpcService::new(
+            Arc::new(TestSegmentStore::new()),
+            Some(metadata),
+            Arc::new(BufferPool::new(65536, 4)),
+            Arc::new(HlcClock::new()),
+        );
+        let (_addr, mut client) = start_server_with(service).await;
 
-        tracing::subscriber::with_default(subscriber, || {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            rt.block_on(async {
-                let service = SegmentGrpcService::new(
-                    Arc::new(TestSegmentStore::new()),
-                    Some(metadata),
-                    Arc::new(BufferPool::new(65536, 4)),
-                    Arc::new(HlcClock::new()),
-                );
-                let (_addr, mut client) = start_server_with(service).await;
-                let response = client
-                    .append_segment(tonic::Request::new(tokio_stream::iter(vec![
-                        make_append_chunk(None),
-                    ])))
-                    .await
-                    .unwrap();
-                assert_eq!(response.into_inner().ack, AckStatus::Ok as i32);
-            });
-        });
-
-        let put = recorded.last_put().expect("replicated metadata must be persisted");
-        assert_eq!(put.hlc, Hlc::zero(), "missing HLC must degrade to zero");
-        let logs = String::from_utf8(log_buf.lock().clone()).unwrap();
-        assert!(logs.contains("has no HLC"), "expected a warning about the missing HLC: {logs}");
+        for (label, hlc) in [
+            ("missing", None),
+            (
+                "all-zero",
+                Some(oceanfs_core::proto::common::HlcTimestamp { wall_time: 0, logical: 0 }),
+            ),
+        ] {
+            let err = client
+                .append_segment(tonic::Request::new(tokio_stream::iter(vec![make_append_chunk(
+                    hlc,
+                )])))
+                .await
+                .expect_err("append must be rejected");
+            assert_eq!(
+                err.code(),
+                tonic::Code::InvalidArgument,
+                "{label}-HLC append must be rejected with InvalidArgument: {err}"
+            );
+        }
+        assert!(
+            recorded.last_put().is_none(),
+            "a rejected append must not persist replicated metadata"
+        );
     }
 
     /// G4/G8: a remote delete carries the coordinator's HLC to the store.
@@ -2002,5 +2212,137 @@ mod tests {
         assert_eq!(entry.state, oceanfs_storage::SegmentState::Sealed);
         let stored = store.read_segment_data(&segment_id).unwrap();
         assert_eq!(&stored[..], &data[..], "duplicate push must converge to one copy");
+    }
+
+    /// B5 regression (review #103): a push whose segment id is missing
+    /// or unparseable is rejected BEFORE any write — a malformed push
+    /// must never persist under the all-zero default id.
+    #[tokio::test]
+    async fn push_without_segment_id_rejected() {
+        let store: Arc<dyn SegmentDataStore> = Arc::new(TestSegmentStore::new());
+        let mut client = test_server(store.clone()).await;
+
+        let data = vec![0xCDu8; 4096];
+        let root = oceanfs_durability::MerkleTree::build(&data, 0).unwrap().root().hash();
+        let chunk = PushSealedSegmentRequest {
+            segment_id: None, // missing — must not fall back to SegmentId::default()
+            tier: 2,
+            ec_k: 4,
+            ec_m: 2,
+            merkle_root: Bytes::copy_from_slice(root.as_bytes()),
+            storage_locations: vec![],
+            data: Bytes::from(data.clone()),
+        };
+        let result = client
+            .push_sealed_segment(tonic::Request::new(tokio_stream::iter(vec![chunk])))
+            .await
+            .expect_err("rpc completes");
+        assert_eq!(
+            result.code(),
+            tonic::Code::InvalidArgument,
+            "a push without a segment id must be rejected"
+        );
+        assert_eq!(store.read_segment_data(&SegmentId::default()).ok(), None);
+    }
+
+    /// B5: a push carrying an unknown tier byte (or the inline tier,
+    /// which never produces a `.dat`) must not silently degrade to
+    /// Standard.
+    #[tokio::test]
+    async fn push_with_unknown_tier_rejected() {
+        for tier in [0u32, 9u32] {
+            let store: Arc<dyn SegmentDataStore> = Arc::new(TestSegmentStore::new());
+            let mut client = test_server(store.clone()).await;
+
+            let segment_id = SegmentId::new();
+            let data = vec![0xCDu8; 4096];
+            let root = oceanfs_durability::MerkleTree::build(&data, 0).unwrap().root().hash();
+            let chunk = PushSealedSegmentRequest {
+                segment_id: Some(ProtoSegmentId::from(segment_id)),
+                tier,
+                ec_k: 4,
+                ec_m: 2,
+                merkle_root: Bytes::copy_from_slice(root.as_bytes()),
+                storage_locations: vec![],
+                data: Bytes::from(data.clone()),
+            };
+            let result = client
+                .push_sealed_segment(tonic::Request::new(tokio_stream::iter(vec![chunk])))
+                .await
+                .expect_err("rpc completes");
+            assert_eq!(result.code(), tonic::Code::InvalidArgument, "tier {tier} must be rejected");
+            assert!(
+                store.read_segment_data(&segment_id).is_err(),
+                "rejected push must not persist data (tier {tier})"
+            );
+        }
+    }
+
+    /// B5: out-of-range wire EC params (u32 > u8) must be rejected, not
+    /// silently truncated (256 → 0 would register a degenerate replica).
+    #[tokio::test]
+    async fn push_with_out_of_range_ec_params_rejected() {
+        let store: Arc<dyn SegmentDataStore> = Arc::new(TestSegmentStore::new());
+        let mut client = test_server(store.clone()).await;
+
+        let segment_id = SegmentId::new();
+        let data = vec![0xCDu8; 4096];
+        let root = oceanfs_durability::MerkleTree::build(&data, 0).unwrap().root().hash();
+        let chunk = PushSealedSegmentRequest {
+            segment_id: Some(ProtoSegmentId::from(segment_id)),
+            tier: 2,
+            ec_k: 256, // truncates to 0 under the old `as u8` cast
+            ec_m: 2,
+            merkle_root: Bytes::copy_from_slice(root.as_bytes()),
+            storage_locations: vec![],
+            data: Bytes::from(data.clone()),
+        };
+        let result = client
+            .push_sealed_segment(tonic::Request::new(tokio_stream::iter(vec![chunk])))
+            .await
+            .expect_err("rpc completes");
+        assert_eq!(
+            result.code(),
+            tonic::Code::InvalidArgument,
+            "out-of-range ec_k must be rejected"
+        );
+        assert!(
+            store.read_segment_data(&segment_id).is_err(),
+            "rejected push must not persist data"
+        );
+    }
+
+    /// B5: parity shards without data shards (ec_k=0, ec_m>0) is not a
+    /// representable geometry — rejected.
+    #[tokio::test]
+    async fn push_with_parity_but_no_data_shards_rejected() {
+        let store: Arc<dyn SegmentDataStore> = Arc::new(TestSegmentStore::new());
+        let mut client = test_server(store.clone()).await;
+
+        let segment_id = SegmentId::new();
+        let data = vec![0xCDu8; 4096];
+        let root = oceanfs_durability::MerkleTree::build(&data, 0).unwrap().root().hash();
+        let chunk = PushSealedSegmentRequest {
+            segment_id: Some(ProtoSegmentId::from(segment_id)),
+            tier: 2,
+            ec_k: 0,
+            ec_m: 2,
+            merkle_root: Bytes::copy_from_slice(root.as_bytes()),
+            storage_locations: vec![],
+            data: Bytes::from(data.clone()),
+        };
+        let result = client
+            .push_sealed_segment(tonic::Request::new(tokio_stream::iter(vec![chunk])))
+            .await
+            .expect_err("rpc completes");
+        assert_eq!(
+            result.code(),
+            tonic::Code::InvalidArgument,
+            "parity-without-data geometry must be rejected"
+        );
+        assert!(
+            store.read_segment_data(&segment_id).is_err(),
+            "rejected push must not persist data"
+        );
     }
 }

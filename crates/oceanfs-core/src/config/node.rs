@@ -423,8 +423,9 @@ pub struct NodeConfig {
     /// until its membership pull converges; with the adaptive quorum
     /// that window would ACK writes with a single durable copy (silent
     /// under-replication). While the gate is closed, writes fail with
-    /// 503. The gate opens when the ring reaches 2 nodes or this many
-    /// seconds elapse (the bound keeps a node whose seeds are
+    /// 503. The gate opens when the ring reaches
+    /// [`cluster_min_quorum_nodes`](Self::cluster_min_quorum_nodes) or
+    /// this many seconds elapse (the bound keeps a node whose seeds are
     /// unreachable from stalling writes forever — the 503s it emits
     /// while gated are the safer failure mode).
     ///
@@ -435,6 +436,22 @@ pub struct NodeConfig {
     /// with 30s gossip intervals.
     #[serde(default = "default_cluster_ready_timeout_sec")]
     pub cluster_ready_timeout_sec: u64,
+
+    /// Minimum ring node count before the cluster-readiness gate opens
+    /// (default 2, behavior-compatible with the historical hard-coded
+    /// `w=2` estimate — B6, review #66/#69).
+    ///
+    /// The readiness gate (and the background rejoin loop) wait until
+    /// the ring view holds at least this many nodes or
+    /// [`cluster_ready_timeout_sec`](Self::cluster_ready_timeout_sec)
+    /// elapses. The value is the node's configured minimum quorum
+    /// proxy — it must be derived from the deployment's replication
+    /// expectations, not guessed in code. Values `<= 1` open the gate
+    /// as soon as the node's own ring view exists. Single-node
+    /// deployments (no configured seeds, no persisted fallback seeds)
+    /// skip the gate entirely.
+    #[serde(default = "default_cluster_min_quorum_nodes")]
+    pub cluster_min_quorum_nodes: u64,
 }
 
 fn default_node_id() -> String {
@@ -620,6 +637,9 @@ fn default_hint_delivery_sweep_sec() -> u64 {
 fn default_cluster_ready_timeout_sec() -> u64 {
     30
 }
+fn default_cluster_min_quorum_nodes() -> u64 {
+    2
+}
 
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -707,6 +727,7 @@ impl Default for NodeConfig {
             hint_prune_interval_sec: 3600,
             hint_delivery_sweep_sec: 5,
             cluster_ready_timeout_sec: 30,
+            cluster_min_quorum_nodes: 2,
         }
     }
 }
@@ -721,6 +742,15 @@ mod tests {
     fn default_config_has_expected_listen_addr() {
         let config = NodeConfig::default();
         assert_eq!(config.listen_addr, "0.0.0.0:9000");
+    }
+
+    #[test]
+    fn cluster_min_quorum_nodes_defaults_to_two() {
+        // B6 (review #66/#69): the readiness gate threshold must be a
+        // documented config default (2 = historical w=2 estimate), not a
+        // hard-coded constant.
+        let config = NodeConfig::default();
+        assert_eq!(config.cluster_min_quorum_nodes, 2);
     }
 
     /// ADR-0028 D1: the membership plane defaults to its own port,

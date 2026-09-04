@@ -1092,16 +1092,25 @@ mod tests {
         }
     }
 
-    /// Starts a segment gRPC server over `store`; returns its address.
-    async fn serve_segment(store: Arc<dyn SegmentDataStore>) -> SocketAddr {
+    /// Starts a segment gRPC server over `store` with a lifecycle
+    /// coordinator attached (the production shape — B3: fetch resolves
+    /// shard geometry from the registry); returns its address.
+    async fn serve_segment(
+        store: Arc<dyn SegmentDataStore>,
+    ) -> (SocketAddr, Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let lifecycle =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
         let service = SegmentGrpcService::new(
             store,
             None,
             Arc::new(BufferPool::new(65536, 1024)),
             Arc::new(HlcClock::new()),
-        );
+        )
+        .with_lifecycle(Arc::clone(&lifecycle));
         tokio::spawn(async move {
             Server::builder()
                 .add_service(SegmentRpcServer::new(service))
@@ -1110,7 +1119,7 @@ mod tests {
                 .unwrap();
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        addr
+        (addr, lifecycle)
     }
 
     /// A counting routing hint: never excludes, counts failovers.
@@ -1158,8 +1167,29 @@ mod tests {
 
         let ring_cache = Arc::new(RingCache::new(ring));
 
-        let failing_addr = serve_segment(failing_store).await;
-        let serving_addr = serve_segment(serving_store).await;
+        // The FAILING replica holds no lifecycle entry for the segment
+        // (its FetchShard errors NotFound); the SERVING replica has the
+        // data AND a registered entry so fetch resolves its geometry.
+        let (failing_addr, _failing_lifecycle) = serve_segment(failing_store).await;
+        let (serving_addr, serving_lifecycle) = serve_segment(serving_store).await;
+
+        // Register the segment on the serving replica (in-memory pure
+        // transitions — geometry k=4/m=2, the fetch path reads it to
+        // compute shard boundaries).
+        let root = oceanfs_durability::MerkleTree::build(&test_data, 0).unwrap().root().hash();
+        let mut meta = oceanfs_core::SegmentMetadata {
+            pool_id: 0,
+            segment_id: seg_id,
+            ec_k: 4,
+            ec_m: 2,
+            size_tier: oceanfs_core::SizeTier::Standard,
+            merkle_root: None,
+            storage_locations: smallvec::SmallVec::new(),
+            sealed_at: Some(0),
+        };
+        serving_lifecycle.registry().reserve(seg_id, meta.clone()).expect("reserve succeeds");
+        meta.merkle_root = Some(root);
+        serving_lifecycle.registry().seal(seg_id, meta).expect("seal succeeds");
 
         // Membership resolving both replicas to the test servers.
         let membership = Arc::new(Membership::new(

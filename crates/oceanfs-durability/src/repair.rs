@@ -443,19 +443,6 @@ impl ReRepWorker {
         // read by the dispatcher/enqueuer from its own registry entry
         // alongside the merkle root (ADR-0030). The pulled copy is
         // registered with that real shape, never a hardcoded default.
-
-        // [review][implementation][critical]
-        // this is not acceptable : replication should propagate the level of security expected from the erasure coding layer.
-        // we should either : fetch the metadata from the peer, optionally make the data enpoint return metadata infos,
-        // or make the replication command carry this informations. i prefer the later, because it is the simplest,
-        // and thoses inforamtions are not subjected to changes.
-        // [end]
-        // [resolved] 2026-09-03 (ADR-0030 shape propagation): the
-        // replication command now CARRIES the information — the source's
-        // seal-time tier/ec_k/ec_m ride RequestReReplication (proto
-        // fields tier=5/ec_k=6/ec_m=7); the enqueuer reads them from its
-        // own registry entry, the dispatcher forwards them, and the
-        // worker registers the pulled copy with the real shape below.
         let tier = request.tier;
         let ec_k = request.ec_k;
         let ec_m = request.ec_m;

@@ -99,8 +99,10 @@ Ordering: **c1 → c2 → c3 → c4 → c5**. Each is a pure-move refactor: the
 builder returns the same `Arc`s the inline code produced; behavior is
 identical; the regression bar is "node boots, e2e write/read passes,
 existing node tests pass." `c5` (the final `start()` slimming + guideline
-update) only makes sense once all four builders exist. `c1` includes the
-`NodeLeaveHandler`/`data[76..]` bug fix (review #35) and the `start()`
+update) only makes sense once all four builders exist. `c1` includes the `NodeLeaveHandler` supersession — the handler is
+**deleted** (review #34), which closes wave-0/1 f1 B1 (review #35; B1 was
+deferred to this deletion by DECISION 2026-09-04, see
+`review-wave-0-1/f1-correctness-bug-batch.md`) — and the `start()`
 store-consolidation precondition (one shared `DiskSegmentStore`, review
 #57/#59/#60) because the builder is where the 8 store instances become 1.
 
@@ -127,9 +129,10 @@ store-consolidation precondition (one shared `DiskSegmentStore`, review
       final **one** unified store (review #57/#59/#60 closure) is the
       store-unification epic's f3 end state (ADR-0032), NOT this epic.
       See `refactoring/store-unification/` and roadmap §4 sequencing.
-- [ ] Bug fixes from review #35/#64 ride in the wave-0/1 epic, NOT here
-      (wave-0/1 f1 B1/B2 owns them; c1 only supersedes the leave handler
-      per review #34).
+- [ ] Review #64 (B2) is fixed in the wave-0/1 epic, NOT here. Review
+      #35 (B1) was **deferred to this epic** (DECISION 2026-09-04): c1's
+      `NodeLeaveHandler` deletion closes it — the disposition is recorded
+      in wave-0/1 f1 and in c1's doc.
 - [ ] All existing node tests + e2e write/read green; no behavior delta.
 - [ ] Guideline update: "composition root §4.1 — no `tokio::spawn` in
       `start()`; modules expose their own `spawn`."
