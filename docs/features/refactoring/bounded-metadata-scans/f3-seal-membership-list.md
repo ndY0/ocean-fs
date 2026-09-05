@@ -1,7 +1,7 @@
 ---
 feature: "f3: Seal-Time Per-Segment Record (total_bytes + contained-objects)"
 epic: "refactoring/bounded-metadata-scans"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -248,7 +248,7 @@ Replica holder (segment_service.rs push; healing-service push)
 - [x] **Code:** `cargo build --all-targets` succeeds in `oceanfs-storage`,
       `oceanfs-core`, `oceanfs-server`, `oceanfs-durability`, `oceanfs-node`.
 <!-- REVIEW: re-verified post-fix — `cargo build --all-targets` PASSES on the five DoD crates (3m02s, exit 0) and on `oceanfs` + `e2e` (exit 0). The grpc_services.rs E0063 is fixed (crates/oceanfs-server/tests/grpc_services.rs:289 now carries `contained_objects: vec![]`). -->
-- [ ] **Tests:** `cargo test -p oceanfs-storage --lib -- --test-threads=1`
+- [x] **Tests:** `cargo test -p oceanfs-storage --lib -- --test-threads=1`
       passes with new coverage:
       - a sealed segment's `total_bytes` equals its data-section length and
         its contained-objects list round-trips through the SealEvent record
@@ -268,12 +268,12 @@ Replica holder (segment_service.rs push; healing-service push)
       Then `cargo test -p oceanfs-durability --lib -- --test-threads=1`,
       `cargo test -p oceanfs-server --lib -- --test-threads=1`, `cargo test
       -p oceanfs-node --lib -- --test-threads=1` (PIPELINE.md §4.6).
-<!-- REVIEW: re-verified post-fix — suites PASS: storage 457/457, durability 263/263, server 245/245, node 66/66 (--test-threads=1); core lib 233/233 + doc 63/63. Previously flagged coverage gaps now CLOSED: (1) seal_worker_seals_replayed_segment_with_empty_entries (coordinator.rs:2858-2863) now asserts entry.contained_objects == None after the re-seal; (2) contained_object_sorted_dedup_is_deterministic_and_dedupes (core types/metadata.rs:382) pins the 3-chunk dedupe + sorted determinism; (3) the stale comments moved below are fixed. Accepted deviation (documented, safe): CHECKPOINT_VERSION stays 1 (event_checkpoint.rs:93) instead of the doc's bump-to-4 — a v2 pre-pool checkpoint is refused with the explicit UnsupportedPrePoolDataDir error (event_checkpoint.rs:274-287; test v2_checkpoint_is_refused_not_decoded :717), and other stale versions are rejected by decode_snapshot (:528); the v3/v4 sub-bullet text above is superseded by that directive. ONE SUB-BULLET STILL UNCOVERED (LOW): no test asserts a sealer-produced metadata.total_bytes equals the data-section length (sealer.rs:316 `size = data.len()`; :461 `meta.total_bytes = size`) — only event/checkpoint round-trip literals (4096/2048) pin the field. Add the assert in sealer.rs::seal_from_data_with_parity_writes_v2_section (:1105, 512-byte data; header already read at :1141) or in the coordinator write→seal path. -->
+<!-- REVIEW: FINAL re-verified on 526eb86 — `cargo test -p oceanfs-storage --lib -- --test-threads=1` 457/457 PASS and `cargo test -p oceanfs-durability --test gc_compaction -- --test-threads=1` 5/5 PASS. All previously flagged coverage gaps are now CLOSED and independently verified: (1) seal_worker_seals_replayed_segment_with_empty_entries (coordinator.rs:2858-2863) asserts entry.contained_objects == None after the re-seal; (2) contained_object_sorted_dedup_is_deterministic_and_dedupes (core types/metadata.rs:382) pins the 3-chunk dedupe + sorted determinism; (3) sealer.rs::seal_from_data_with_parity_writes_v2_section (:1146-1151) now asserts hdr.size == 512 AND entry.metadata.total_bytes == 512, pinning total_bytes == data-section length at seal; (4) the stale event_wal.rs record-size comments are corrected to 92 (:1606, :2309); (5) gc_compaction.rs::full_gc_cycle_compacts_segment's throwaway first registry is removed — a single fresh registry is reserved and sealed-with-membership at :214/:237. Suites: storage 457/457, durability 263/263 + gc_compaction 5/5, server 245/245, node 66/66 + gc_compaction 7/7 + segment_replication 3/3, core lib 233/233 + doc 63/63 (--test-threads=1). Accepted deviation (documented, safe): CHECKPOINT_VERSION stays 1 (event_checkpoint.rs:93) instead of the doc's bump-to-4 — a v2 pre-pool checkpoint is refused with the explicit UnsupportedPrePoolDataDir error (event_checkpoint.rs:274-287; test v2_checkpoint_is_refused_not_decoded :717), and other stale versions are rejected by decode_snapshot (:528); the v3/v4 sub-bullet text above is superseded by that directive. -->
 - [x] **Docs:** `#![deny(missing_docs)]` passes; the event-WAL framing doc,
       checkpoint snapshot doc, and `LifecycleEntry`/`SegmentMetadata` docs
       describe the new fields; `find_objects_in_segment`'s review note
       (`segment_compactor.rs:537-540`) is removed with the function.
-      <!-- REVIEW: re-verified — RUSTDOCFLAGS="-D warnings" cargo doc --no-deps is clean on all six f3 crates; core doctests 63/63 pass; event-checkpoint + event-WAL framing docs describe the version-1 layout + total_bytes + contained tail. LOW stale test-module comments remain (non-gating, in cfg(test)): event_wal.rs:1605-1606 still says "seal = 84" while SEAL_RECORD_SIZE = 92 (:1608), and event_wal.rs:2309 still says "The resumed file (84 bytes)" (the seal record is 92 bytes). The previously flagged event_checkpoint.rs:517 and event_wal.rs:1746-1752 comments are now corrected. -->
+      <!-- REVIEW: FINAL re-verified on 526eb86 — RUSTDOCFLAGS="-D warnings" cargo doc --no-deps is clean on all six f3 crates; core doctests 63/63 pass; event-checkpoint + event-WAL framing docs describe the version-1 layout + total_bytes + contained tail. The last stale test-module comments were corrected in 526eb86: event_wal.rs:1606 now reads "seal = 92" matching SEAL_RECORD_SIZE = 92 (:1608), and event_wal.rs:2309 now reads "The resumed file (92 bytes)". No remaining doc gaps. -->
 - [x] **ADR:** ADR-0034 D1 (total at seal) and D5/2a (membership at seal on
       the metadata/checkpoint path, not in the `.dat`) satisfied; the
       membership list is written once at seal and dies with the segment's
@@ -292,7 +292,7 @@ Replica holder (segment_service.rs push; healing-service push)
       `cargo test -p oceanfs-node --test gc_compaction -- --test-threads=1`
       and `cargo test -p oceanfs-node --test segment_replication --
       --test-threads=1`.
-<!-- REVIEW: re-verified post-fix — `cargo test -p oceanfs-node --test gc_compaction -- --test-threads=1` 7/7 and `--test segment_replication` 3/3 PASS; `cargo test -p oceanfs-durability --test gc_compaction -- --test-threads=1` 5/5 PASS — full_gc_cycle_compacts_segment (gc_compaction.rs:165) now seeds the Sealed candidate with seal-time membership via registry.seal_with(seg_id, meta, None, Some(obj0..obj4)) (:220-242) and asserts segments_compacted == 1. oceanfs-durability compaction_crash + oceanfs-storage crash_matrix unit suites still cover restart → membership → compaction. LOW cleanup (optional): gc_compaction.rs:174-175 reserves + seals seg_id on a throwaway first registry that is immediately shadowed by the fresh Arc<registry> at :216-219 — dead setup, harmless. -->
+<!-- REVIEW: FINAL re-verified on 526eb86 — `cargo test -p oceanfs-node --test gc_compaction -- --test-threads=1` 7/7 and `--test segment_replication` 3/3 PASS; `cargo test -p oceanfs-durability --test gc_compaction -- --test-threads=1` 5/5 PASS — full_gc_cycle_compacts_segment (gc_compaction.rs:165) seeds the Sealed candidate with seal-time membership via registry.seal_with(seg_id, meta, None, Some(obj0..obj4)) on a single fresh registry (:211-237, no throwaway first registry — the dead setup removed in 526eb86) and asserts segments_compacted == 1. oceanfs-durability compaction_crash + oceanfs-storage crash_matrix unit suites cover restart → membership → compaction. -->
 
 > **Lint & Doc Examples (non-gating):** `cargo clippy --lib -- -D warnings`
 > on production code. Test-code clippy warnings and `ignore`-tagged doc
