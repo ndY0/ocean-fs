@@ -217,7 +217,29 @@ async fn full_gc_cycle_compacts_segment() {
         &oceanfs_core::LifecycleConfig::default(),
     ));
     registry.reserve(seg_id, seg_meta.clone()).unwrap();
-    registry.seal(seg_id, seg_meta.clone()).unwrap();
+    let members: std::sync::Arc<[oceanfs_core::ContainedObject]> = std::sync::Arc::from(vec![
+        oceanfs_core::ContainedObject {
+            bucket: BucketId::new("default"),
+            key: ObjectKey::new("obj0.txt"),
+        },
+        oceanfs_core::ContainedObject {
+            bucket: BucketId::new("default"),
+            key: ObjectKey::new("obj1.txt"),
+        },
+        oceanfs_core::ContainedObject {
+            bucket: BucketId::new("default"),
+            key: ObjectKey::new("obj2.txt"),
+        },
+        oceanfs_core::ContainedObject {
+            bucket: BucketId::new("default"),
+            key: ObjectKey::new("obj3.txt"),
+        },
+        oceanfs_core::ContainedObject {
+            bucket: BucketId::new("default"),
+            key: ObjectKey::new("obj4.txt"),
+        },
+    ]);
+    registry.seal_with(seg_id, seg_meta.clone(), None, Some(members)).unwrap();
     let event_wal = Arc::new(
         oceanfs_storage::segment::event_wal::EventWal::open(
             std::env::temp_dir().join(format!("gc-compaction-{}", std::process::id())),

@@ -378,6 +378,19 @@ mod tests {
     use super::*;
     use crate::Hlc;
 
+    #[test]
+    fn contained_object_sorted_dedup_is_deterministic_and_dedupes() {
+        // ADR-0034 D5: an object split across three chunks in one segment
+        // appears exactly once, and the serialization order is sorted.
+        let a = ContainedObject { bucket: BucketId::new("b2"), key: ObjectKey::new("z") };
+        let b = ContainedObject { bucket: BucketId::new("b1"), key: ObjectKey::new("m") };
+        let c = ContainedObject { bucket: BucketId::new("b1"), key: ObjectKey::new("a") };
+        // Three duplicate appends of `b` (one per chunk) plus a and c.
+        let mut list = vec![b.clone(), b.clone(), b.clone(), a.clone(), c.clone()];
+        let dedup = ContainedObject::sorted_dedup(std::mem::take(&mut list));
+        assert_eq!(dedup, vec![c, b, a], "sorted by (bucket, key) with duplicates removed");
+    }
+
     // -- ChunkRef --
 
     #[test]

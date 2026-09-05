@@ -247,6 +247,7 @@ Replica holder (segment_service.rs push; healing-service push)
 
 - [ ] **Code:** `cargo build --all-targets` succeeds in `oceanfs-storage`,
       `oceanfs-core`, `oceanfs-server`, `oceanfs-durability`, `oceanfs-node`.
+<!-- REVIEW: `cargo build --all-targets` FAILS on oceanfs-server test "grpc_services": crates/oceanfs-server/tests/grpc_services.rs:282 — struct literal PushSealedSegmentRequest is missing the `contained_objects` field added to the proto in d8ca796 (E0063). Passes once `contained_objects: vec![]` is added (the src/#[cfg(test)] literals in segment_service.rs were updated; only this tests/ helper was missed). -->
 - [ ] **Tests:** `cargo test -p oceanfs-storage --lib -- --test-threads=1`
       passes with new coverage:
       - a sealed segment's `total_bytes` equals its data-section length and
@@ -267,19 +268,23 @@ Replica holder (segment_service.rs push; healing-service push)
       Then `cargo test -p oceanfs-durability --lib -- --test-threads=1`,
       `cargo test -p oceanfs-server --lib -- --test-threads=1`, `cargo test
       -p oceanfs-node --lib -- --test-threads=1` (PIPELINE.md §4.6).
-- [ ] **Docs:** `#![deny(missing_docs)]` passes; the event-WAL framing doc,
+<!-- REVIEW: the four lib suites PASS (storage 457, durability 263, server 245, node 66). Coverage gaps remain against the sub-bullets: (1) no assertion pins "WAL-replayed segment (empty entries) seals with None membership" — seal_worker_seals_replayed_segment_with_empty_entries (coordinator.rs:2808) and crash_matrix row2 re-seal exercise the path but never assert entry.contained_objects.is_none(); add an assert after the re-seal. (2) dedupe/sort determinism is only pinned by the ContainedObject::sorted_dedup doc example (metadata.rs:204-233), not by a 3-chunk write-path test. (3) no test asserts a sealer-produced meta.total_bytes == header size/data length (sealer.rs:316/461); only event-level round-trip asserts a literal 4096. Also note: checkpoint version stays 1 (user directive; pre-production formats don't accumulate) instead of the doc's bump-to-4/v3-explicit-error — v2 pre-pool is refused with the explicit UnsupportedPrePoolDataDir error (event_checkpoint.rs:274-287, test :717) and other stale versions are rejected/skipped. -->
+- [x] **Docs:** `#![deny(missing_docs)]` passes; the event-WAL framing doc,
       checkpoint snapshot doc, and `LifecycleEntry`/`SegmentMetadata` docs
       describe the new fields; `find_objects_in_segment`'s review note
       (`segment_compactor.rs:537-540`) is removed with the function.
-- [ ] **ADR:** ADR-0034 D1 (total at seal) and D5/2a (membership at seal on
+      <!-- REVIEW: verified RUSTDOCFLAGS="-D warnings" cargo doc --no-deps on all six crates (clean); core doctests 63/63 pass. Minor stale comments remain (LOW, non-gating): event_checkpoint.rs:517 decode_snapshot doc still says "the current v3 layout" (CHECKPOINT_VERSION is 1), and event_wal.rs test-module comment (line ~1606) + pool_zero test comment (:1748) still quote the old 84-byte/52-byte-payload seal size while asserting the correct 92/60 values. -->
+- [x] **ADR:** ADR-0034 D1 (total at seal) and D5/2a (membership at seal on
       the metadata/checkpoint path, not in the `.dat`) satisfied; the
       membership list is written once at seal and dies with the segment's
       DeleteEvent. No reverse-index CF (ADR-0034 Alternatives). No `.dat`
       format change.
-- [ ] **Perf:** the compactor's per-segment discovery is O(objects-per-segment)
+      <!-- REVIEW: verified — total_bytes on SegmentMetadata + SealEvent fixed fields + checkpoint meta payload; ContainedObject tail on SealEvent (SEAL_FLAG_CONTAINED_OBJECTS) + checkpoint Sealed entries; RocksDB CFs remain objects+deletions only (store.rs:314-315); header.rs/index.rs untouched in the f3 diff (no .dat change); ADR-0031 D3 pool-id-always-encoded invariant and the pre-pool boot classifier are preserved. -->
+- [x] **Perf:** the compactor's per-segment discovery is O(objects-per-segment)
       point lookups — no objects-CF scan; GC spawn loop skips membership-less
       candidates before any store call; the membership Vec is `SmallVec`-friendly
       (perf 1.4) and registry lock holds stay per-entry (perf 7.1).
+      <!-- REVIEW: verified — find_objects_in_segment deleted; compact_segment enumerates membership + get_object_metadata point lookups (segment_compactor.rs:199-211) and refuses membership-less (:190-195); GC skips membership-less candidates pre-spawn before any store call (garbage_collector.rs:331-340); checkpoint encode copies entries under short read guards then serializes lock-free (event_checkpoint.rs:390-411). -->
 - [ ] **Integration:** a node writes objects spanning multiple segments,
       restarts, and compacts a low-liveness segment using only its
       membership list + point lookups; a replica pushed to a second node
@@ -287,6 +292,7 @@ Replica holder (segment_service.rs push; healing-service push)
       `cargo test -p oceanfs-node --test gc_compaction -- --test-threads=1`
       and `cargo test -p oceanfs-node --test segment_replication --
       --test-threads=1`.
+<!-- REVIEW: the two listed node commands PASS (gc_compaction 7, segment_replication 3) and oceanfs-durability compaction_crash + oceanfs-storage crash_matrix unit suites cover restart→membership→compaction. However the pre-existing durability integration test `full_gc_cycle_compacts_segment` (crates/oceanfs-durability/tests/gc_compaction.rs:165) now FAILS: it seeds the Sealed candidate via registry.seal (membership-less) and asserts segments_compacted==1, but f3's GC correctly skips membership-less candidates → 0. The test was only given the total_bytes:0 field fill (+1 line in the f3 diff) and never reseeded with membership. Fix: seed through request_seal_with_contained with the object keys (like compaction_crash.rs::seed_sealed_old_with_contained) so `cargo test -p oceanfs-durability --test gc_compaction -- --test-threads=1` passes. This file is a regression gate for any future full-workspace CI run. -->
 
 > **Lint & Doc Examples (non-gating):** `cargo clippy --lib -- -D warnings`
 > on production code. Test-code clippy warnings and `ignore`-tagged doc

@@ -514,7 +514,7 @@ fn is_pre_pool_checkpoint(bytes: &[u8]) -> bool {
 /// error (bad magic, unsupported version, CRC mismatch, truncated
 /// entries, unknown state).
 ///
-/// Only the current v3 layout decodes. A v2 (pre-pool) checkpoint is
+/// Only the current version 1 layout decodes. A v2 (pre-pool) checkpoint is
 /// detected by the caller ([`EventCheckpoint::load_checkpoint`]) and
 /// refused as an unsupported pre-pool data directory (ADR-0031 D3) —
 /// it never reaches this function's decode arms.

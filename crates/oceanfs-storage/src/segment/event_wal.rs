@@ -1744,10 +1744,11 @@ mod tests {
         assert_eq!(decoded, evt, "contained-objects tail + total_bytes round-trip");
     }
 
-    /// ADR-0031 D3: a `pool_id = 0` Seal — the FIRST configured pool —
-    /// is encoded with the pool-id flag and its 4 bytes (52-byte
-    /// payload, 84-byte record), and round-trips byte-exact. The
-    /// pre-pool 48-byte shape is never produced.
+    /// ADR-0031 D3 + ADR-0034 D1: a `pool_id = 0` Seal — the FIRST
+    /// configured pool — is encoded with the pool-id flag and its 4 bytes
+    /// and the fixed total_bytes field (60-byte payload, 92-byte record),
+    /// and round-trips byte-exact. The pre-pool 48-byte shape is never
+    /// produced.
     #[test]
     fn pool_zero_seal_roundtrips_with_the_always_flagged_layout() {
         let id = SegmentId::new();
@@ -1756,7 +1757,7 @@ mod tests {
         assert_eq!(
             bytes.len(),
             EVENT_RECORD_HEADER_SIZE + SEAL_PAYLOAD_SIZE + SEAL_POOL_ID_SIZE + 4,
-            "pool-0 seals carry the flag + 4 pool-id bytes (52-byte payload)"
+            "pool-0 seals carry the pool flag + total_bytes (60-byte payload)"
         );
         let payload_flags = bytes[EVENT_RECORD_HEADER_SIZE + 3];
         assert_eq!(

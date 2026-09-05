@@ -1785,6 +1785,14 @@ impl SegmentLifecycleCoordinator {
         //    I/O. The owning pool id of the directory that held the file
         //    is stamped on the adopted metadata (the interrupted seal's
         //    durable selection, ADR-0029 f5).
+        //
+        //    total_bytes is left 0 ("unknown") here: the adopt probe reads
+        //    only the header root + pool id, not the data length, and an
+        //    adopted segment has no contained-objects membership (it never
+        //    passed through the coordinator's append hooks). Accounting
+        //    consumers treat a 0-total Sealed entry as unknown — never as
+        //    fully-dead — so this is a safe "re-readable, reapable,
+        //    non-compactable" degradation, not a leak.
         for &id in &adopt {
             let Some(entry) = self.registry.get(id) else { continue };
             let Some((root, pool_id)) = read_segment_data_root(&segments_dirs, id, merkle_root_fn)

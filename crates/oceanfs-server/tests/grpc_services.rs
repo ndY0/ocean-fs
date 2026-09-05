@@ -286,6 +286,7 @@ async fn push_to_node(
         ec_m: 0,
         merkle_root: Bytes::copy_from_slice(root.as_bytes()),
         storage_locations: vec![],
+        contained_objects: vec![],
         data: Bytes::from(data.to_vec()),
     };
     let stream = tokio_stream::iter(vec![chunk]);

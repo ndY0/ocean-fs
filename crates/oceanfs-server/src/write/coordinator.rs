@@ -2852,6 +2852,15 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+        // ADR-0034 D5: a WAL-replayed segment (no append hooks ever
+        // fired) seals with NO contained-objects membership — re-readable
+        // and reapable, but not a compaction candidate.
+        let entry =
+            coord.lifecycle.registry().get(replayed_id).expect("replayed segment registered");
+        assert_eq!(
+            entry.contained_objects, None,
+            "WAL-replayed seals must carry no contained-objects membership"
+        );
     }
 
     // ── Replication fan-out test ──────────────────────────────────
