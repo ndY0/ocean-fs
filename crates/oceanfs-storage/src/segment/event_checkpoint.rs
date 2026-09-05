@@ -805,6 +805,46 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_round_trip_preserves_contained_objects() {
+        let registry = SegmentLifecycleRegistry::new(&LifecycleConfig {
+            lifecycle_registry_shards: 8,
+            delete_grace_ms: 0,
+        });
+        let id = SegmentId::new();
+        let meta = SegmentMetadata {
+            pool_id: 0,
+            total_bytes: 2048,
+            segment_id: id,
+            ec_k: 4,
+            ec_m: 2,
+            size_tier: SizeTier::Standard,
+            merkle_root: Some(HashOutput::from_bytes([0xAB; 32])),
+            storage_locations: smallvec::SmallVec::new(),
+            sealed_at: Some(1_700_000_000_000),
+        };
+        let contained = Arc::from(vec![ContainedObject {
+            bucket: oceanfs_core::BucketId::new("b"),
+            key: oceanfs_core::ObjectKey::new("k"),
+        }]);
+        registry
+            .reserve(id, SegmentMetadata { merkle_root: None, sealed_at: None, ..meta.clone() })
+            .unwrap();
+        registry.seal_with(id, meta, None, Some(contained)).unwrap();
+
+        let bytes = encode_snapshot(&registry, EventWalPos { file_seq: 3, offset: 4096 }).unwrap();
+        let (_, loaded) = decode_snapshot(&bytes).expect("snapshot decodes");
+        let entry = loaded.get(id).expect("entry present after round trip");
+        assert_eq!(entry.state, SegmentState::Sealed);
+        assert_eq!(entry.metadata.total_bytes, 2048, "total_bytes survives checkpointing");
+        assert_eq!(
+            entry.contained_objects.as_deref().map(|c| c.len()),
+            Some(1),
+            "the contained-objects list survives checkpointing"
+        );
+        assert_eq!(entry.contained_objects.as_deref().map(|c| c[0].key.as_str()), Some("k"));
+    }
+
+    #[test]
     fn snapshot_deleted_entries_are_absent() {
         let registry = SegmentLifecycleRegistry::new(&LifecycleConfig {
             lifecycle_registry_shards: 8,

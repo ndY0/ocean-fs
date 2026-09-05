@@ -1719,6 +1719,31 @@ mod tests {
         assert_eq!(decoded, evt);
     }
 
+    /// ADR-0034 D5: a Seal carrying the contained-objects tail + a real
+    /// total_bytes round-trips byte-exact, preserving both.
+    #[test]
+    fn seal_roundtrip_preserves_contained_objects_and_total_bytes() {
+        let id = SegmentId::new();
+        let contained = std::sync::Arc::from(vec![
+            oceanfs_core::ContainedObject {
+                bucket: oceanfs_core::BucketId::new("b1"),
+                key: oceanfs_core::ObjectKey::new("k1"),
+            },
+            oceanfs_core::ContainedObject {
+                bucket: oceanfs_core::BucketId::new("b2"),
+                key: oceanfs_core::ObjectKey::new("k2"),
+            },
+        ]);
+        let mut evt = seal_event(id);
+        if let SegmentEvent::Seal(seal) = &mut evt {
+            seal.total_bytes = 4096;
+            seal.contained_objects = Some(contained);
+        }
+        let bytes = evt.to_record_bytes();
+        let decoded = SegmentEvent::from_record_bytes(&bytes).expect("record decodes");
+        assert_eq!(decoded, evt, "contained-objects tail + total_bytes round-trip");
+    }
+
     /// ADR-0031 D3: a `pool_id = 0` Seal — the FIRST configured pool —
     /// is encoded with the pool-id flag and its 4 bytes (52-byte
     /// payload, 84-byte record), and round-trips byte-exact. The
