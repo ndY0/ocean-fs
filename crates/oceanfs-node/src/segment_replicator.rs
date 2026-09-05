@@ -158,6 +158,7 @@ async fn push_to_target(
     ec_m: u8,
     merkle_root: Bytes,
     storage_locations: &[NodeId],
+    contained: Vec<oceanfs_core::proto::segment::ContainedObject>,
     data: &Bytes,
     timeout_ms: u64,
 ) -> Result<(), String> {
@@ -196,6 +197,7 @@ async fn push_to_target(
             // leave the metadata fields empty.
             merkle_root: if first { merkle_root.clone() } else { Bytes::new() },
             storage_locations: if first { proto_locations.clone() } else { Vec::new() },
+            contained_objects: if first { contained.clone() } else { Vec::new() },
             data: slice,
         });
         if end >= data.len() {
@@ -574,6 +576,24 @@ impl SegmentReplicator {
         self.throttle.acquire(data.len() as u64).await;
 
         let merkle_bytes = Bytes::copy_from_slice(merkle_root.as_bytes());
+        // The seal-time membership (ADR-0034 D5) rides the push so a
+        // replica holder can compact its copy of this segment.
+        let contained: Vec<oceanfs_core::proto::segment::ContainedObject> = entry
+            .contained_objects
+            .as_deref()
+            .map(|objs| {
+                objs.iter()
+                    .map(|co| oceanfs_core::proto::segment::ContainedObject {
+                        bucket: Some(oceanfs_core::proto::common::BucketId {
+                            name: co.bucket.as_str().to_string(),
+                        }),
+                        key: Some(oceanfs_core::proto::common::ObjectKey {
+                            key: co.key.as_str().to_string(),
+                        }),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         // Bound concurrent pushes (perf 2.7).
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.config.max_concurrent_pushes));
         let mut handles = Vec::with_capacity(targets.len());
@@ -585,6 +605,7 @@ impl SegmentReplicator {
             let target = target.clone();
             let data = data.clone();
             let locations = locations.clone();
+            let contained = contained.clone();
             let timeout = self.config.push_timeout_ms;
             let tier = meta.size_tier;
             let ec_k = meta.ec_k;
@@ -602,6 +623,7 @@ impl SegmentReplicator {
                     ec_m,
                     merkle_bytes,
                     &locations,
+                    contained,
                     &data,
                     timeout,
                 )

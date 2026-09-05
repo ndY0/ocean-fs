@@ -155,6 +155,15 @@ message PushSealedSegmentRequest {
   bytes merkle_root = 5;              // 32 bytes BLAKE3 over the data section
   repeated oceanfs.common.NodeId storage_locations = 6;
   bytes data = 7;                     // slice of the segment data section
+  repeated ContainedObject contained_objects = 8;  // ADR-0034 D5 membership
+}
+
+// One object contained in a sealed segment (ADR-0034 D5): the owner's
+// seal-time membership list rides the push so a replica holder's registry
+// entry carries it and the holder can compact its copy of the segment.
+message ContainedObject {
+  oceanfs.common.BucketId bucket = 1;
+  oceanfs.common.ObjectKey key = 2;
 }
 
 // Response to a sealed-segment push.

@@ -800,6 +800,7 @@ impl SegmentRpc for SegmentGrpcService {
         let mut ec_m_raw: Option<u32> = None;
         let mut merkle_root = Bytes::new();
         let mut storage_locations: Vec<oceanfs_core::proto::common::NodeId> = Vec::new();
+        let mut contained_proto: Vec<oceanfs_core::proto::segment::ContainedObject> = Vec::new();
         let mut total_bytes: u64 = 0;
         let mut segment_data = self.buffer_pool.acquire();
 
@@ -826,6 +827,7 @@ impl SegmentRpc for SegmentGrpcService {
                 ec_m_raw = Some(chunk.ec_m);
                 merkle_root = chunk.merkle_root.clone();
                 storage_locations = chunk.storage_locations.clone();
+                contained_proto = chunk.contained_objects.clone();
             }
             let chunk_len = chunk.data.len() as u64;
             segment_data.extend_from_slice(&chunk.data);
@@ -879,6 +881,32 @@ impl SegmentRpc for SegmentGrpcService {
             return Err(Status::invalid_argument("push of an empty segment"));
         }
 
+        // The pushed ADR-0034 D5 membership (carried on the first chunk):
+        // empty (a peer on an older binary, or a membership-less seal) →
+        // None, so this holder copy stays re-readable/reapable but is not
+        // a compaction candidate.
+        let contained: Option<Arc<[oceanfs_core::ContainedObject]>> = if contained_proto.is_empty()
+        {
+            None
+        } else {
+            let list: Vec<oceanfs_core::ContainedObject> = contained_proto
+                .iter()
+                .filter_map(|co| {
+                    let bucket = co.bucket.as_ref()?;
+                    let key = co.key.as_ref()?;
+                    Some(oceanfs_core::ContainedObject {
+                        bucket: oceanfs_core::BucketId::new(&bucket.name),
+                        key: oceanfs_core::ObjectKey::new(&key.key),
+                    })
+                })
+                .collect();
+            if list.is_empty() {
+                None
+            } else {
+                Some(Arc::from(list))
+            }
+        };
+
         // The pushed root is the seal-time anchor (64 KiB leaves — the
         // shared seal/scrub/AE default). A mismatch means the bytes are
         // corrupt (torn push, wrong segment) — reject rather than
@@ -927,7 +955,7 @@ impl SegmentRpc for SegmentGrpcService {
                 .as_millis() as i64;
             let mut meta = oceanfs_core::SegmentMetadata {
                 pool_id: 0,
-                total_bytes: 0,
+                total_bytes,
                 segment_id,
                 ec_k,
                 ec_m,
@@ -943,8 +971,11 @@ impl SegmentRpc for SegmentGrpcService {
             };
             match lifecycle.request_reserve(segment_id, tier, ec_k, ec_m).await {
                 Ok(()) => {
-                    registration =
-                        Some(PushRegistration::Fresh { lifecycle: Arc::clone(lifecycle), meta });
+                    registration = Some(PushRegistration::Fresh {
+                        lifecycle: Arc::clone(lifecycle),
+                        meta,
+                        contained: contained.clone(),
+                    });
                 }
                 Err(e) => {
                     // Already registered — either this is a duplicate
@@ -998,8 +1029,16 @@ impl SegmentRpc for SegmentGrpcService {
         // becomes the g4 holder set).
         if let Some(registration) = registration {
             match registration {
-                PushRegistration::Fresh { lifecycle, meta } => {
-                    if let Err(e) = lifecycle.request_seal(segment_id, meta.clone(), None).await {
+                PushRegistration::Fresh { lifecycle, meta, contained } => {
+                    if let Err(e) = lifecycle
+                        .request_seal_with_contained(
+                            segment_id,
+                            meta.clone(),
+                            None,
+                            contained.as_deref(),
+                        )
+                        .await
+                    {
                         tracing::warn!(
                             segment_id = %segment_id,
                             error = ?e,
@@ -1059,6 +1098,9 @@ enum PushRegistration {
         lifecycle: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
         /// The metadata the seal stamps (pool 0 = replica placement).
         meta: oceanfs_core::SegmentMetadata,
+        /// The pushed contained-objects membership (ADR-0034 D5), so the
+        /// replica copy is a compaction candidate on this holder.
+        contained: Option<Arc<[oceanfs_core::ContainedObject]>>,
     },
     /// The segment was already registered: converge the data copy and
     /// stamp the holder set; never touch the existing lifecycle state.
@@ -1425,6 +1467,7 @@ mod tests {
             ec_m,
             merkle_root: Bytes::copy_from_slice(root.as_bytes()),
             storage_locations: vec![],
+            contained_objects: vec![],
             data: Bytes::copy_from_slice(data),
         };
         let response = client
@@ -2202,6 +2245,7 @@ mod tests {
                 ec_m: 0,
                 merkle_root: if first { merkle_root.clone() } else { Bytes::new() },
                 storage_locations: if first { proto_locations.clone() } else { Vec::new() },
+                contained_objects: vec![],
                 data: slice,
             });
             if end >= data.len() {
@@ -2343,6 +2387,7 @@ mod tests {
             ec_m: 2,
             merkle_root: Bytes::copy_from_slice(root.as_bytes()),
             storage_locations: vec![],
+            contained_objects: vec![],
             data: Bytes::from(data.clone()),
         };
         let result = client
@@ -2376,6 +2421,7 @@ mod tests {
                 ec_m: 2,
                 merkle_root: Bytes::copy_from_slice(root.as_bytes()),
                 storage_locations: vec![],
+                contained_objects: vec![],
                 data: Bytes::from(data.clone()),
             };
             let result = client
@@ -2407,6 +2453,7 @@ mod tests {
             ec_m: 2,
             merkle_root: Bytes::copy_from_slice(root.as_bytes()),
             storage_locations: vec![],
+            contained_objects: vec![],
             data: Bytes::from(data.clone()),
         };
         let result = client
@@ -2441,6 +2488,7 @@ mod tests {
             ec_m: 2,
             merkle_root: Bytes::copy_from_slice(root.as_bytes()),
             storage_locations: vec![],
+            contained_objects: vec![],
             data: Bytes::from(data.clone()),
         };
         let result = client

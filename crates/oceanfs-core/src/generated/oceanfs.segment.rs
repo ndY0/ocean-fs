@@ -211,6 +211,19 @@ pub struct PushSealedSegmentRequest {
     /// slice of the segment data section
     #[prost(bytes = "bytes", tag = "7")]
     pub data: ::prost::bytes::Bytes,
+    /// ADR-0034 D5 membership
+    #[prost(message, repeated, tag = "8")]
+    pub contained_objects: ::prost::alloc::vec::Vec<ContainedObject>,
+}
+/// One object contained in a sealed segment (ADR-0034 D5): the owner's
+/// seal-time membership list rides the push so a replica holder's registry
+/// entry carries it and the holder can compact its copy of the segment.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ContainedObject {
+    #[prost(message, optional, tag = "1")]
+    pub bucket: ::core::option::Option<super::common::BucketId>,
+    #[prost(message, optional, tag = "2")]
+    pub key: ::core::option::Option<super::common::ObjectKey>,
 }
 /// Response to a sealed-segment push.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]

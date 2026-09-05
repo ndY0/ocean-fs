@@ -244,8 +244,9 @@ impl SegmentSealer {
     }
 
     /// Seals a segment without a contained-objects membership list
-    /// (legacy/test callers). See
-    /// [`seal_from_data_with_contained`](Self::seal_from_data_with_contained).
+    /// (legacy/test callers). The write path uses the crate-internal
+    /// `seal_from_data_with_contained` variant to attach the ADR-0034 D5
+    /// membership.
     ///
     /// # Errors
     ///
