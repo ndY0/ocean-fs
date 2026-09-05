@@ -31,9 +31,9 @@ use crate::{
 ///
 /// Owns the pool registry, metadata store, WAL writer, segment lifecycle
 /// machinery (registry, coordinator, event WAL + checkpoint), sealer, the
-/// **two shared** segment store instances (one `DiskSegmentStore`, one
-/// `DiskSegmentShardStore` — the c1 consolidation of the former eight
-/// inline constructions), the seal-time segment replicator, the segment
+/// **one shared** unified segment store (ADR-0032 — the c1-era two-store
+/// pair collapsed into a single `oceanfs_storage::DiskSegmentStore`
+/// shared by both roles), the seal-time segment replicator, the segment
 /// reader, the I/O observer, and the write-path pools the inline write
 /// coordinator + metrics code consumes.
 pub(crate) struct StorageModule {
@@ -74,7 +74,7 @@ pub(crate) struct StorageModule {
     /// instance shared by the replicator, GC, AE, heal, scrub, admin,
     /// segment-service and repair paths (reviews #57/#59/#60).
     pub(crate) data_store: Arc<dyn oceanfs_storage_api::SegmentDataStore>,
-    /// The shared segment shard store — the ONE `DiskSegmentShardStore`
+    /// The shared shard-store role — served by the one unified store
     /// instance shared by GC compaction, the reaper, healing-service and
     /// startup recovery.
     pub(crate) shard_store: Arc<dyn oceanfs_storage_api::SegmentDataStore>,
@@ -377,43 +377,9 @@ impl StorageModule {
             lifecycle.clone(),
         ));
 
-        // ---- c1 store consolidation (reviews #57/#59/#60) ----
-        // ONE shared `DiskSegmentStore` + ONE shared `DiskSegmentShardStore`
-        // replace the eight per-consumer instances the inline code created
-        // (replicator, re-rep worker, GC, AE, reaper, heal, healing-service,
-        // segment-service). All consumers receive clones of these two Arcs.
-        let data_store: Arc<dyn oceanfs_storage_api::SegmentDataStore> = Arc::new(
-            oceanfs_durability::DiskSegmentStore::new(data_pools.clone(), pool_id_for.clone()),
-        );
-        let shard_store: Arc<dyn oceanfs_storage_api::SegmentDataStore> = Arc::new(
-            oceanfs_durability::DiskSegmentShardStore::new(data_pools.clone(), pool_id_for.clone()),
-        );
-
         // [review][config][high]
         // segment relicator config shoudl be fully configurable by the end user
         // [end]
-        // ---- 6c. Seal-time segment replicator (sealed-segment-replication) ----
-        // The data-replication backbone: after a segment seals on this
-        // node, its full data section is pushed to the segment's ring
-        // replicas (segment_replica_set − self) — the exact set the read
-        // path's gRPC fallback fetches from. Seal itself never makes a
-        // network call: the seal worker / compactor only `enqueue` (one
-        // atomic channel send); the decoupled `run` task does the pushes.
-        // The replicator shares the module's single data store (pool
-        // resolution via the lifecycle registry).
-        let segment_replicator = Arc::new(SegmentReplicator::new(
-            ring_cache.clone(),
-            membership.clone(),
-            pool.clone(),
-            data_store.clone(),
-            lifecycle.clone(),
-            NodeId::new(&config.node_id),
-            ReplicationConfig {
-                throttle_bytes_sec: config.replication_throttle_bytes_sec,
-                ..Default::default()
-            },
-        ));
-
         // The compaction-remap alias (g3 `loss-announcement` Option A):
         // a single shared map consulted by the append handler (late
         // metadata) and the healing service's remap handler (records
@@ -422,10 +388,6 @@ impl StorageModule {
             Arc::new(oceanfs_core::SegmentRemapAlias::new());
 
         // ---- I/O infrastructure: disk-backed segment reader ----
-        // [review][architecture][critical]
-        // we have 3 abstractions to access disk : DiskSegmentStore, DiskSegmentShardStore and DiskSegmentReader.
-        // each independently implements optimisations or not, without unified logic. this is awfull, and must be resolved.
-        // [end]
         // Disk-backed segment reader: reads sealed segment files from disk
         // via the configured I/O mode (mmap / O_DIRECT / buffered).
         // Replaces the previous InMemorySegmentReader — segment data is read
@@ -440,7 +402,7 @@ impl StorageModule {
         } else {
             None
         };
-        let segment_reader: Arc<dyn oceanfs_storage::io::SegmentReader> = Arc::new(
+        let disk_segment_reader: Arc<dyn oceanfs_storage::io::SegmentReader> = Arc::new(
             oceanfs_storage::io::DiskSegmentReader::new(
                 io_mode,
                 io_backend.clone(),
@@ -453,8 +415,7 @@ impl StorageModule {
             // from the owning data pool root. f8 runtime attach: the
             // live registry is wired so a pool attached mid-run resolves
             // (the resolved root is cached per segment — no registry
-            // lock on the steady-state read path; legacy mode
-            // short-circuits to legacy_dir before touching the registry).
+            // lock on the steady-state read path).
             .with_data_pools(data_pools, segment_legacy_dir, pool_id_for)
             .with_registry(registry.clone())
             .with_evict_after_read(!config.read_cache_segments),
@@ -467,7 +428,60 @@ impl StorageModule {
         let active_pools = vec![segment_pool_small.clone(), segment_pool_standard.clone()];
         let segment_reader = Arc::new(oceanfs_storage::io::PoolFallbackReader::new(
             active_pools.clone(),
-            segment_reader,
+            disk_segment_reader,
+        ));
+
+        // ---- f2 store unification (ADR-0032 D2/D3) ----
+        // ONE unified `oceanfs_storage::DiskSegmentStore` replaces the
+        // durability crate's twin impls (reviews #57/#59/#60/#425): all
+        // consumers (replicator, re-rep worker, GC, AE, reaper, heal,
+        // healing-service, segment-service) receive clones of this one
+        // Arc. The store reads through the same io file core as the
+        // server reader above and purges its per-segment caches after
+        // every whole-file rewrite.
+        let unified_store = Arc::new(oceanfs_storage::DiskSegmentStore::new(
+            Arc::clone(&registry),
+            Arc::clone(&lifecycle_registry),
+            Arc::clone(&segment_reader) as Arc<dyn oceanfs_storage::io::SegmentReader>,
+            io_mode,
+            Arc::clone(&io_backend),
+            Arc::clone(&io_observer),
+        ));
+        // The f1-era `data_store`/`shard_store` field pair: both roles
+        // are served by the one unified store until f3 collapses the
+        // fields (ADR-0032 D4).
+        let data_store: Arc<dyn oceanfs_storage_api::SegmentDataStore> = unified_store.clone();
+        let shard_store: Arc<dyn oceanfs_storage_api::SegmentDataStore> = unified_store;
+
+        // [review][architecture][critical][resolved]
+        // we have 3 abstractions to access disk : the durability data store,
+        // the durability shard store and the disk reader.
+        // each independently implements optimisations or not, without unified logic. this is awfull, and must be resolved.
+        // RESOLVED by store-unification f2 (ADR-0032 D2): the durability
+        // twin impls are deleted; the ONE unified store reads through the
+        // same io file core as the reader and writes through the seal
+        // pipeline's atomic observed discipline.
+        // [end]
+        // ---- 6c. Seal-time segment replicator (sealed-segment-replication) ----
+        // The data-replication backbone: after a segment seals on this
+        // node, its full data section is pushed to the segment's ring
+        // replicas (segment_replica_set − self) — the exact set the read
+        // path's gRPC fallback fetches from. Seal itself never makes a
+        // network call: the seal worker / compactor only `enqueue` (one
+        // atomic channel send); the decoupled `run` task does the pushes.
+        // The replicator shares the module's single unified store (pool
+        // resolution via the lifecycle registry).
+        let segment_replicator = Arc::new(SegmentReplicator::new(
+            ring_cache.clone(),
+            membership.clone(),
+            pool.clone(),
+            data_store.clone(),
+            lifecycle.clone(),
+            NodeId::new(&config.node_id),
+            ReplicationConfig {
+                throttle_bytes_sec: config.replication_throttle_bytes_sec,
+                ..Default::default()
+            },
         ));
 
         Ok(Self {
@@ -609,6 +623,14 @@ impl StorageModule {
                 CompactionRecoveryAction::SweepNewOrphan(id) => (*id, "sweep_new_orphan"),
                 CompactionRecoveryAction::SweepOldDat(id) => (*id, "sweep_old_dat"),
             };
+            // The sweep's pool id: captured from the registry entry
+            // BEFORE the durable delete (the delete evicts the entry —
+            // the unified store's delete_shards is registry-resolved,
+            // ADR-0032 D2). Pure-residue actions (SweepOldDat — the
+            // entry is already gone) cannot resolve a pool here; the
+            // orphan reaper's per-root sweep backstops the residue.
+            let sweep_pool =
+                self.lifecycle_registry.get(segment_id).map(|entry| entry.metadata.pool_id);
             if !matches!(action, CompactionRecoveryAction::SweepOldDat(_)) {
                 if let Err(e) = self.lifecycle.request_delete(segment_id).await {
                     warn!(
@@ -618,16 +640,23 @@ impl StorageModule {
                     );
                 }
             }
-            // Sweep the `.dat` through the pool-aware shard store (the
-            // segment's pool id resolves to its root; ADR-0029 f5).
-            // Idempotent; a residue the resolver cannot place (an
-            // unregistered orphan on a non-zero pool) is backstopped by
-            // the orphan reaper's multi-root listing.
-            if let Err(e) = self.shard_store.delete_shards(&segment_id).await {
-                warn!(
+            // Sweep the `.dat` (ADR-0029 f5): explicit pool when the
+            // entry carried one; residue-only sweeps are left to the
+            // reaper's per-root listing.
+            if let Some(pool_id) = sweep_pool {
+                if let Err(e) = self.shard_store.delete_shards_with_pool(&segment_id, pool_id).await
+                {
+                    warn!(
+                        segment_id = %segment_id,
+                        error = %e,
+                        "compaction recovery sweep failed (startup continues; the reaper retries)"
+                    );
+                }
+            } else {
+                tracing::debug!(
                     segment_id = %segment_id,
-                    error = %e,
-                    "compaction recovery sweep failed (startup continues; the reaper retries)"
+                    action = label,
+                    "compaction recovery residue has no registry entry; the reaper's per-root sweep reclaims it"
                 );
             }
             info!(segment_id = %segment_id, action = label, "compaction recovery action applied");
@@ -879,30 +908,67 @@ mod tests {
         build_storage_prelude(tmp).await.module
     }
 
-    /// c1 DoD: the builder returns a consistent `StorageModule` whose
-    /// store surface is exactly TWO shared instances — one
-    /// `DiskSegmentStore` (`data_store`) and one `DiskSegmentShardStore`
-    /// (`shard_store`). The construction-site count itself is a grep
-    /// invariant (`DiskSegmentStore::new` / `DiskSegmentShardStore::new`
-    /// appear exactly once each, both here in `build`); this test proves
-    /// the instances are live and operate on the same layout.
+    /// f2 DoD: the builder returns a consistent `StorageModule` whose
+    /// store surface is ONE unified `oceanfs_storage::DiskSegmentStore`
+    /// (ADR-0032 D2/D3), shared by both the `data_store` and
+    /// `shard_store` fields (f3 collapses the field pair). The
+    /// construction-site count is a grep invariant — exactly one
+    /// construction, in `build`. This test proves the shared instance
+    /// is live and its write/read/delete paths operate on the same
+    /// layout under lifecycle-routed semantics (unregistered writes are
+    /// rejected).
     #[tokio::test]
-    async fn build_returns_module_with_two_shared_store_instances() {
+    async fn build_returns_module_with_one_shared_unified_store() {
         let tmp = TempDir::new().expect("tempdir");
         let module = build_module(&tmp).await;
 
         // Registry is the boot-time one; the module owns it.
         assert!(module.registry.pool_count() >= 1, "registry must be populated");
 
-        // The two shared instances are distinct objects.
+        // ONE unified store instance backs both fields.
         let data_ptr = Arc::as_ptr(&module.data_store) as *const ();
         let shard_ptr = Arc::as_ptr(&module.shard_store) as *const ();
-        assert_ne!(data_ptr, shard_ptr, "data_store and shard_store must be distinct");
+        assert_eq!(data_ptr, shard_ptr, "data_store and shard_store share one unified store");
 
-        // The data store is a working DiskSegmentStore: write → read
-        // round-trips through the same .dat file it manages.
+        // An unregistered write is rejected (ADR-0032 D3 — the
+        // write-before-register bridge is gone).
         let segment_id = SegmentId::new();
-        let payload = b"c1 shared data store round-trip payload";
+        let payload = b"f2 unified store round-trip payload";
+        let err = module
+            .data_store
+            .write_segment_data(&segment_id, payload)
+            .await
+            .expect_err("write-before-register must be rejected");
+        assert!(err.to_string().contains("not registered"), "{err}");
+
+        // Register (reserve + seal through the module's coordinator —
+        // the event-WAL-armed lifecycle), then write → read round-trips
+        // through the shared store.
+        module
+            .lifecycle
+            .request_reserve(segment_id, oceanfs_core::SizeTier::Standard, 1, 0)
+            .await
+            .expect("reserve");
+        module
+            .lifecycle
+            .request_seal(
+                segment_id,
+                oceanfs_core::SegmentMetadata {
+                    pool_id: 0,
+                    segment_id,
+                    ec_k: 1,
+                    ec_m: 0,
+                    size_tier: oceanfs_core::SizeTier::Standard,
+                    merkle_root: Some(oceanfs_core::HashOutput::from_bytes(
+                        *blake3::hash(payload).as_bytes(),
+                    )),
+                    storage_locations: smallvec::smallvec![],
+                    sealed_at: Some(1_700_000_000_000),
+                },
+                None,
+            )
+            .await
+            .expect("seal");
         module
             .data_store
             .write_segment_data(&segment_id, payload)
@@ -916,9 +982,8 @@ mod tests {
             .expect("segment present after write");
         assert_eq!(&back.data[..], &payload[..], "shared data store round-trip");
 
-        // The shard store deletes the same .dat the data store wrote
-        // (same resolver/layout); afterwards the data store must no
-        // longer find it.
+        // The shard role deletes the same .dat the data role wrote;
+        // afterwards the store must no longer find it.
         module
             .shard_store
             .delete_shards(&segment_id)

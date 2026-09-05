@@ -1,7 +1,7 @@
 ---
 feature: "f2: Single DiskSegmentStore in oceanfs-storage with Coordinated, Optimized-I/O Writes"
 epic: "refactoring/store-unification"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -22,7 +22,7 @@ perf:
   - "1.1 bytes::Bytes for blob data (SegmentFile.data)"
   - "7.1 minimize lock hold duration (per-segment write lock)"
 created: 2026-09-04
-updated: 2026-09-04
+updated: 2026-09-05
 ---
 
 # f2: Single DiskSegmentStore in oceanfs-storage with Coordinated, Optimized-I/O Writes
@@ -180,11 +180,12 @@ callers after f1's migration.
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds;
+- [x] **Code:** `cargo build --all-targets` succeeds;
       `grep -rn "segment_store_impl\|DiskSegmentShardStore" crates
       --include=*.rs` is empty; `oceanfs-durability` has no disk impl of
       the data trait.
-- [ ] **Tests:** `cargo test -p oceanfs-storage --lib --
+<!-- REVIEW: verified 2026-09-05 (iteration 2 re-run) — `cargo build --all-targets` EXIT 0; the only warning is the pre-existing hint_wal.rs:848 cfg(test) dead-code warning (untouched by this diff — the iteration-1 unused-import warning at gc/compaction_crash.rs was removed in iteration 2). Grep gates: `segment_store_impl|DiskSegmentShardStore|SegmentShardStore` across crates/*.rs = 0 hits; durability lib.rs re-exports only the in-memory doubles (InMemorySegmentStore, InMemoryShardStore); the only disk impl of the trait is crates/oceanfs-storage/src/segment/data_store.rs:340 (`impl SegmentDataStore for DiskSegmentStore`). segment_store_impl.rs deleted (421 lines, staged). One `DiskSegmentStore::new` in crates/oceanfs-node (modules/storage.rs:442) serves both data_store + shard_store fields. -->
+- [x] **Tests:** `cargo test -p oceanfs-storage --lib --
       --test-threads=1` green, including NEW tests:
       io-layer write→read round-trip produces a header-valid v1/v2 file
       readable by `SegmentHeader::from_bytes`; missing `.dat` reads as
@@ -199,25 +200,31 @@ callers after f1's migration.
       `-p oceanfs-node --lib -- --test-threads=1`,
       `-p oceanfs-server --lib -- --test-threads=1` green
       (PIPELINE.md §4.6).
-- [ ] **Docs:** `#![deny(missing_docs)]` passes; the new
+<!-- REVIEW: verified 2026-09-05 — storage lib 435/435 (iteration 2: 433 + the two new guard tests below), durability lib 263/263 (incl. all 9 compaction_crash matrix rows: kill_before_dat_write / kill_between_dat_write_and_seal / row7 / row8 / row9 / fully_dead / repacked-digest), node lib 66/66, server lib 244/244, all under --test-threads=1; storage-api 6/6 doc tests. Integration (iteration 2 re-run): durability --test gc_compaction 5/5, orphan_reaper 7/7, segment_data_roundtrip 2/2, anti_entropy 14/14, distributed_scrub 5/5, merkle_recovery 3/3; node --test durability_wiring 4/4, orphan_reaper 8/8, re_replication 2/2 (announcement + reconciliation — the reconciliation run exercises the registered-pool-gone → Ok(None) replica-fallback contract at data_store.rs:343-355). NEW tests at segment/data_store.rs:600-714: io_layer_write_read_roundtrip_is_header_valid_v1 (asserts SegmentHeader::from_bytes parse + data_end), missing_dat_reads_ok_none (registered + unregistered), registry_pool_id_selects_the_pool_root, unregistered_write_is_rejected (D3), concurrent_writers_serialize_exactly_one_payload_survives (8×4096B distinct payloads), delete_and_list_work_per_pool_root. Multi-pool per-root list/delete also re-covered at durability gc/garbage_collector.rs:1190 shard_store_lists_and_unlinks_across_pool_roots (now against the storage impl). -->
+<!-- REVIEW: RESOLVED iteration 2 (2026-09-05) — the iteration-1 HIGH deadlock gap is fixed and verified: `write_segment_data` (data_store.rs:389-394) acquires the per-segment lock and delegates to the lock-free private `write_unlocked` (data_store.rs:230-286); the new public `write_segment_data_guarded` (data_store.rs:209-222) rewrites through `write_unlocked` WITHOUT re-acquiring the mutex (rejects a guard for a different segment with Error::InvalidArgument at data_store.rs:215-220; `SegmentWriteGuard` carries its segment_id + accessor at data_store.rs:78-85). Grep-verified: `lock_segment`/`write_segment_data_guarded`/`write_unlocked` appear ONLY inside data_store.rs — no production path calls the plain trait write while holding a guard (all production writers hold `Arc<dyn SegmentDataStore>` and call only the trait write). Guard doc (data_store.rs:58-72) documents the non-reentrant mutex and shows the guarded entry. Tests: guarded_rewrite_serializes_against_concurrent_plain_writer (data_store.rs:770-806) + guarded_write_rejects_wrong_segment (data_store.rs:812-828) — both pass (2/2 filtered run). -->
+- [x] **Docs:** `#![deny(missing_docs)]` passes; the new
       `DiskSegmentStore`/`SegmentWriteGuard` items have `# Examples`
       (in-memory or tempdir-based).
-- [ ] **ADR:** ADR-0032 D2/D3 satisfied: one impl in `oceanfs-storage`
+<!-- REVIEW: verified 2026-09-05 (iteration 2 re-run) — RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p oceanfs-storage-api -p oceanfs-storage -p oceanfs-durability -p oceanfs-node -p oceanfs-server EXIT 0; #![deny(missing_docs)] present in all five crates; DiskSegmentStore + SegmentWriteGuard carry `# Examples` (ignore-tagged — non-gating per the doc note); the guard's example now shows the guarded rewrite entry (data_store.rs:63-73) and its doc states the per-segment mutex is not reentrant (data_store.rs:58-61). `io::segment_file::SegmentFileReader` is pub(crate) throughout (io/mod.rs:51 `pub(crate) mod segment_file`) — no public leak; the only public additions are the sanctioned `SegmentReader::purge_cache` default method (io/segment_reader.rs:90, overridden by DiskSegmentReader:407 and forwarded by PoolFallbackReader:540) and the f2-doc-sanctioned DiskSegmentStore/SegmentWriteGuard/lock_segment/write_segment_data_guarded exports. -->
+- [x] **ADR:** ADR-0032 D2/D3 satisfied: one impl in `oceanfs-storage`
       beside the coordinator; no legacy branches (ADR-0031 — no
       `legacy_dir` field, no empty-`data_pools` resolution, pools
       mandatory at boot already enforced); no `std::fs` whole-file
       `.dat` writes in durability paths.
-- [ ] **Perf:** perf rules in frontmatter followed — reads/writes go
+<!-- REVIEW: verified 2026-09-05 (iteration 2 re-run) — D2: single disk impl at crates/oceanfs-storage/src/segment/data_store.rs beside the lifecycle registry/coordinator (segment/lifecycle.rs); durability twin impls + DiskSegmentShardStore deleted; node constructs exactly one `oceanfs_storage::DiskSegmentStore::new` (modules/storage.rs:442) serving both data_store + shard_store fields (f3 collapses). D3: write path = reserve-before-write in every flow (server push_sealed_segment segment_service.rs:930-1045 with Fresh/Existing arms + write-failure reservation cleanup via request_delete; re-rep repair.rs:450-470 with cleanup; compactor segment_compactor.rs:327-345 with cleanup_reserved_new; heal/AE target already-registered segments); every `.dat` write routes through write_dat_atomic (data_store.rs:466-525) — atomic temp+fsync+finalize through pool-aware ObservedIo, no std::fs whole-file .dat write anywhere in durability production paths (grep re-verified iteration 2; remaining fs::write hits on `.dat` paths are #[cfg(test)] seeders only); purge-on-write after rewrite (data_store.rs:284 → reader.purge_cache). No legacy branches: resolve_pool (data_store.rs:292-307) is registry-only, no legacy_dir field, unknown-pool = Internal error; unregistered_write_is_rejected covers the f1 write-before-register bridge removal. Keyed per-segment locks: write_locks map data_store.rs:134 + lock_segment:185; concurrent writers to one .dat serialize (byte-interleaving unrepresentable). ADR-0031 D1 (pools mandatory at boot) is exercised by the storage tests' pools-only fixture (data_store.rs:551-626). -->
+- [x] **Perf:** perf rules in frontmatter followed — reads/writes go
       through `io` (`O_DIRECT`/mmap per `IoReadMode`); data carried as
       `Bytes` (no extra copies); the per-segment lock is held only across
       the file mutation (perf §7.1) — never across network I/O or EC
       decode.
-- [ ] **Integration:** the ADR-0025 compaction crash-window matrix
+<!-- REVIEW: verified 2026-09-05 — rule 3.2/3.3: the store reads through the shared path-agnostic core io/segment_file.rs (SegmentFileReader: Mmap→mmap-cache get_or_map, Direct→DirectIoBuf with the >2MiB short-read loop at segment_file.rs:177-194, Buffered→tokio::fs read_exact); node wiring passes the configured io_mode. Iteration 2 (reader-core extraction): `verify_header` (segment_file.rs:86-102) now returns the parsed `SegmentHeader` and `read_range` (segment_file.rs:115-198) carries the verbatim mode dispatch — the DiskSegmentReader semantics preserved 1:1 (diff-verified: u32::MAX whole-segment sentinel resolved at segment_reader.rs:386; sources MmapBacked/DirectIo per serves_from_mmap_cache; evict_after_read retained via SegmentFileReader.evict_after_read). The store read path is now ONE sync header-only open (verify_header, data_store.rs:362) + the ranged read — the iteration-1 triple-open gap reduced as claimed. Rule 1.1: read payload is Bytes (read_range), write payload copy is the single whole-file copy on spawn_blocking (data_store.rs:258); DiskSegmentStore fields hold Bytes-free slices. Rule 7.1: the per-segment lock spans only the file mutation + purge — never network I/O or EC decode (decode precedes the store call in heal/AE flows). Residual note (non-blocking): the sync 128-byte header open+read executes on the runtime worker (std::fs, data_store.rs:362→segment_file.rs:92-96) — inherent to the shared core and identical to the pre-f2 DiskSegmentReader first-touch behavior. -->
+- [x] **Integration:** the ADR-0025 compaction crash-window matrix
       harness (`crates/oceanfs-durability/src/gc/compaction_crash.rs`)
       runs against the storage impl (or in-memory substitute) and stays
       green; `cargo test -p oceanfs-durability --test gc_compaction --
       --test-threads=1` and `--test orphan_reaper` pass; e2e write/read
       green.
+<!-- REVIEW: verified 2026-09-05 — the matrix now constructs the unified storage impl (compaction_crash.rs:199-211, shard_store = clone of data_store) and adds the recovery-first ordering (`let (_, _) = self.recover().await;` before each drive_to_milestone at compaction_crash.rs:326-327 — the registry fold precedes compactor reads, matching production boot order); all 9 matrix rows pass under --test-threads=1 (iteration 2 re-run); gc_compaction + orphan_reaper integration green (see Tests evidence). Node startup recovery sweep captures the registry pool_id BEFORE the durable delete and sweeps explicit-pool (modules/storage.rs:626-661); pure-residue SweepOldDat is left to the reaper's per-root listing — matches the delete_shards registry-only + explicit-pool sweeps + reaper-backstop semantics decision. Iteration 2: row7/row8/row9 dispatch their post-delete `.dat` sweeps via `delete_shards_with_pool(&id, 0)` (compaction_crash.rs:545, 604, 659) — the entry is evicted with the durable delete, so the explicit-pool fast path + reaper backstop is the production-shape sweep. E2e write/read (iteration 2 independent run, release binary at target/release/oceanfs 19:03 — staleness-checked newer than every source file): crash_restart 4/4, wal_recovery 5/5, segment_lifecycle 6/6, cluster_write_path 1/1, cluster_read_path 1/1, garbage_collection 1/1, rewrite_leak_test 1/1, cluster_lifecycle 1/1 — 20/20 green; no load suites run locally (PIPELINE.md §6). -->
 
 > **Lint & Doc Examples (non-gating):** `cargo clippy --lib -- -D warnings`
 > should pass on production code. Test-code clippy warnings (`.unwrap()`,
@@ -237,3 +244,64 @@ cloned instance; either compiles because both fields are the unified
 trait type. The durability crate's unit tests that previously built
 `DiskSegmentStore::new(Vec::new(), ...)` (no-pools legacy shape) are
 rewritten to the pools-mandatory construction.
+
+## Implementation notes (accepted)
+
+Status: independent review **PASS**, iteration 2 (2026-09-05). Iteration 1
+**FAIL** was a single HIGH finding — a guard self-deadlock in the write
+path — fixed and re-verified in iteration 2; all DoD items are verified
+and ticked with evidence comments above. The notes below record the
+accepted decisions and behavior notes so the document reflects what was
+built.
+
+- **RESOLVED (iteration 1, HIGH) — guard self-deadlock.** Calling the
+  plain trait `write_segment_data` while holding the explicit per-segment
+  guard would re-acquire the same mutex and deadlock. Fix: the public
+  `write_segment_data` now splits into lock acquisition + the lock-free
+  private `write_unlocked` (data_store.rs:230-286), and the new public
+  `write_segment_data_guarded` (data_store.rs:209-222) rewrites through
+  `write_unlocked` **without** re-acquiring the mutex. A guard for a
+  different segment is rejected with `Error::InvalidArgument`
+  (data_store.rs:215-220), and `SegmentWriteGuard` carries its
+  `segment_id` (data_store.rs:78-85). Two new tests lock the behavior in:
+  `guarded_rewrite_serializes_against_concurrent_plain_writer`
+  (data_store.rs:770-806) and `guarded_write_rejects_wrong_segment`
+  (data_store.rs:812-828) — both pass (see Tests evidence).
+- **DEC-1 — read semantics for a registered segment whose pool is gone.**
+  Kept from the original design: a registered segment whose pool is gone
+  (f8 detach / dead pool) reads as `Ok(None)` — the read coordinator
+  treats a missing local copy as replica-fallback, and the `re_replication`
+  dead-pool integration test depends on this contract (exercised at
+  data_store.rs:343-355). `delete_shards` is registry-resolved only
+  (unregistered → `Ok(0)`); residue sweeps are explicit-pool
+  (`delete_shards_with_pool`), and the orphan reaper's per-root sweep is
+  the backstop — documented at the call sites (see Integration evidence).
+- **DEC-2 — write-mode degradation for existing `.dat` rewrites.**
+  `O_TMPFILE` + `linkat` cannot overwrite an existing file, so rewrites of
+  an existing `.dat` degrade to the rename-based temp path (atomic
+  `rename(2)`); fresh files keep the `O_TMPFILE` path. Both arms funnel
+  through `write_dat_atomic` (data_store.rs:466-525) — temp + fsync +
+  finalize, recorded on the pool's `IoObserver`.
+- **Crash-harness ordering — startup recovery first.** The compaction
+  crash harness's `drive_to_milestone` now runs startup recovery before
+  each milestone (compaction_crash.rs:326-327): production ordering,
+  because the unified store resolves segments through the lifecycle
+  registry, which is folded at startup. This is what lets the row7/row8/
+  row9 post-delete sweeps take their registry-evicted, explicit-pool
+  shape (compaction_crash.rs:545, 604, 659).
+- **Renamed in-memory double — `InMemoryShardStore`.** The durability
+  in-memory delete/list double is now `InMemoryShardStore`: the epic grep
+  gate bans the `SegmentShardStore` identifier (the f1-deleted trait's
+  name), so durability `lib.rs` re-exports only the in-memory doubles
+  (`InMemorySegmentStore`, `InMemoryShardStore`). The double's distinct
+  delete-tracking semantics are preserved unchanged.
+- **Guard reachability — production flows use the internally-locked
+  path.** Production RMW flows (heal / AE / repair) hold
+  `Arc<dyn SegmentDataStore>` and can only reach the trait write, which
+  acquires the per-segment lock internally; whole-file writes are
+  additionally atomic (temp + fsync + finalize), so torn or interleaved
+  writes are unrepresentable on that path. The explicit guard
+  (`lock_segment` / `write_segment_data_guarded`) is the concrete-store
+  API for flows needing read → decode → write serialization across
+  multiple store calls.
+

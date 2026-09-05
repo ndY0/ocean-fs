@@ -48,6 +48,7 @@ pub mod direct;
 pub mod disk_io;
 pub mod mmap;
 pub mod sched;
+pub(crate) mod segment_file;
 pub mod segment_flush;
 pub mod segment_reader;
 #[cfg(feature = "sendfile")]

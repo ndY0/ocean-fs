@@ -240,7 +240,7 @@ async fn full_gc_cycle_compacts_segment() {
     let gc = GarbageCollector::new(GcConfig::new(3600, 0, 0.5, 2, 16))
         .with_data_store(store)
         .with_lifecycle(lifecycle)
-        .with_shard_store(Arc::new(oceanfs_durability::InMemorySegmentShardStore::new(0)));
+        .with_shard_store(Arc::new(oceanfs_durability::InMemoryShardStore::new(0)));
 
     let stats = gc.run_cycle(metadata.clone(), &registry).await.unwrap();
 

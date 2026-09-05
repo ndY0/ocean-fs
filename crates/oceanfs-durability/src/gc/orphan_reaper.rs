@@ -365,7 +365,7 @@ mod tests {
     };
 
     use super::super::{
-        config::tier_target_size, garbage_collector::InMemorySegmentShardStore,
+        config::tier_target_size, garbage_collector::InMemoryShardStore,
         liveness_tracker::LivenessTracker, *,
     };
 
@@ -379,8 +379,8 @@ mod tests {
         }
     }
 
-    fn test_shard_store() -> Arc<InMemorySegmentShardStore> {
-        Arc::new(InMemorySegmentShardStore::new(tier_target_size(SizeTier::Standard)))
+    fn test_shard_store() -> Arc<InMemoryShardStore> {
+        Arc::new(InMemoryShardStore::new(tier_target_size(SizeTier::Standard)))
     }
 
     /// Constructs a reaper whose coordinator is seeded from the store
@@ -389,7 +389,7 @@ mod tests {
     /// `request_delete` validation.
     async fn make_reaper(
         metadata: Arc<RocksDbMetadataStore>,
-        store: Arc<InMemorySegmentShardStore>,
+        store: Arc<InMemoryShardStore>,
         config: GcConfig,
         registry: Arc<SegmentLifecycleRegistry>,
     ) -> OrphanReaper {
@@ -611,7 +611,7 @@ mod tests {
         let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1000000000000);
         registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
         registry.seal(seg_meta.segment_id, seg_meta).unwrap();
-        let store = Arc::new(InMemorySegmentShardStore::new(4194304));
+        let store = Arc::new(InMemoryShardStore::new(4194304));
         let reaper =
             make_reaper(metadata, store.clone(), GcConfig::default(), Arc::clone(&registry)).await;
         let stats = reaper.run_cycle().await.unwrap();
@@ -808,12 +808,28 @@ mod tests {
             ],
             missing_root_policy: oceanfs_core::MissingRootPolicy::Degraded,
         };
-        let registry_from_config =
+        let pool_registry = Arc::new(
             oceanfs_storage::PoolRegistry::from_config(&storage, &dir.path().join("data"))
-                .expect("registry");
-        let data_pools = registry_from_config.data_pools();
-        let disk_store =
-            Arc::new(DiskSegmentShardStore::new(data_pools.clone(), Arc::new(|_| None)));
+                .expect("registry"),
+        );
+        let data_pools = pool_registry.data_pools();
+        // The unified store (ADR-0032 D2): per-root listing + explicit-
+        // pool unlink need no registry entries — exactly the reaper's
+        // sweep shape for registry-UNKNOWN files.
+        let lifecycle_registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
+        let observer = Arc::new(oceanfs_storage::io::IoObserver::new());
+        observer.register_pool(0, None);
+        let disk_store = Arc::new(oceanfs_storage::DiskSegmentStore::new(
+            pool_registry,
+            lifecycle_registry,
+            Arc::new(oceanfs_storage::io::InMemorySegmentReader::new()),
+            oceanfs_storage::io::IoReadMode::Buffered,
+            Arc::new(oceanfs_storage::io::IoBackend::default()),
+            observer,
+        ));
         let unregistered = SegmentId::new();
         let mtime =
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64 - 60_000; // older than the 5s TTL

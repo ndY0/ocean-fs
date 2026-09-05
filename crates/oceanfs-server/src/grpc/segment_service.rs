@@ -895,30 +895,20 @@ impl SegmentRpc for SegmentGrpcService {
         // [review][architecture][high]
         // couldn't there be other task running in parallel also writing to this precise segment ?
         // [end]
-        // Persist the full data section (the existing store writes a
-        // valid v1 header — the heal-worker precedent; the replica serves
-        // the same data section the owner sealed).
+        // Lifecycle-routed write (ADR-0032 D3): the reserve comes FIRST,
+        // so the unified store resolves the segment's pool from its
+        // registry entry — the write-before-register bridge (pool-0
+        // fallback) is gone. A crash between the reserve and the write
+        // leaves a Reserved entry the data-WAL recovery pass drops (row
+        // 1 — the same window the compactor relies on).
         //
         // Option A (sealed-segment-replication): the push is the SOLE
-        // writer of `{segment_id}.dat`. The object-ring append path is
-        // metadata-only (the offset-0 fragment writer was removed), so
-        // there is no second writer to serialize against — no lock, no
-        // write-path interference with replication.
-        self.data_store
-            .write_segment_data(&segment_id, &segment_data)
-            .await
-            .map_err(|e| Status::internal(format!("segment write failed: {e}")))?;
-
-        tracing::debug!(
-            segment_id = %segment_id,
-            total_bytes = total_bytes,
-            "push_sealed_segment: wrote {} bytes",
-            total_bytes
-        );
-
-        // Register idempotently (the append_segment registration
-        // precedent): the registry drives the GC and the orphan reaper,
-        // and the pushed `storage_locations` becomes the g4 holder set.
+        // writer of `{segment_id}.dat`; the object-ring append path is
+        // metadata-only (the offset-0 fragment writer was removed). The
+        // unified store serializes any residual concurrent writer per
+        // segment (ADR-0032 D3), so there is no second writer to race
+        // against.
+        let mut registration: Option<PushRegistration> = None;
         if let Some(lifecycle) = &self.lifecycle {
             let mut locations = smallvec::SmallVec::new();
             for loc in &storage_locations {
@@ -945,6 +935,62 @@ impl SegmentRpc for SegmentGrpcService {
             };
             match lifecycle.request_reserve(segment_id, tier, ec_k, ec_m).await {
                 Ok(()) => {
+                    registration =
+                        Some(PushRegistration::Fresh { lifecycle: Arc::clone(lifecycle), meta });
+                }
+                Err(e) => {
+                    // Already registered — either this is a duplicate
+                    // push or the object-ring append registered the
+                    // segment first. The data write below still
+                    // converges the copy; the holder set must land (see
+                    // the seal arm below).
+                    registration = Some(PushRegistration::Existing {
+                        lifecycle: Arc::clone(lifecycle),
+                        meta,
+                        error: e,
+                    });
+                }
+            }
+        }
+
+        // Persist the full data section (the store writes a valid v1
+        // header — the heal-worker precedent; the replica serves the
+        // same data section the owner sealed).
+        let write_result = self
+            .data_store
+            .write_segment_data(&segment_id, &segment_data)
+            .await
+            .map_err(|e| Status::internal(format!("segment write failed: {e}")));
+
+        if let Err(e) = write_result {
+            // Best-effort cleanup of the reservation this flow made: a
+            // failed write must not leave a Reserved entry that later
+            // blocks a retry (the compactor's cleanup_reserved_new
+            // precedent). Already-registered arms are left untouched.
+            if let Some(PushRegistration::Fresh { lifecycle, .. }) = &registration {
+                if let Err(cleanup_err) = lifecycle.request_delete(segment_id).await {
+                    tracing::warn!(
+                        segment_id = %segment_id,
+                        error = ?cleanup_err,
+                        "push_sealed_segment: write failed; reservation cleanup delete failed"
+                    );
+                }
+            }
+            return Err(e);
+        }
+        tracing::debug!(
+            segment_id = %segment_id,
+            total_bytes = total_bytes,
+            "push_sealed_segment: wrote {} bytes",
+            total_bytes
+        );
+
+        // Registration completion (idempotent — the registry drives the
+        // GC and the orphan reaper, and the pushed `storage_locations`
+        // becomes the g4 holder set).
+        if let Some(registration) = registration {
+            match registration {
+                PushRegistration::Fresh { lifecycle, meta } => {
                     if let Err(e) = lifecycle.request_seal(segment_id, meta.clone(), None).await {
                         tracing::warn!(
                             segment_id = %segment_id,
@@ -969,12 +1015,8 @@ impl SegmentRpc for SegmentGrpcService {
                         }
                     }
                 }
-                Err(e) => {
-                    // Already registered — either this is a duplicate
-                    // push (data overwritten above with the same bytes)
-                    // or the object-ring append registered the segment
-                    // first. Either way the pushed holder set must
-                    // still land: without it, g4's live-copy count on
+                PushRegistration::Existing { lifecycle, meta, error } => {
+                    // Without the holder set, g4's live-copy count on
                     // this node would see an empty set and compute
                     // live=0 → a re-replication storm.
                     if let Err(stamp_err) =
@@ -982,14 +1024,14 @@ impl SegmentRpc for SegmentGrpcService {
                     {
                         tracing::warn!(
                             segment_id = %segment_id,
-                            error = ?e,
+                            error = ?error,
                             stamp_error = ?stamp_err,
                             "push_sealed_segment: already registered; storage_locations stamp failed"
                         );
                     }
                     tracing::debug!(
                         segment_id = %segment_id,
-                        error = ?e,
+                        error = ?error,
                         "push_sealed_segment: replica segment already registered; locations stamped"
                     );
                 }
@@ -998,6 +1040,28 @@ impl SegmentRpc for SegmentGrpcService {
 
         Ok(Response::new(PushSealedSegmentResponse { acked: true }))
     }
+}
+
+/// The outcome of a push's reserve-before-write registration step.
+enum PushRegistration {
+    /// This flow made the reservation: seal after the data write, or
+    /// clean the reservation up if the write fails.
+    Fresh {
+        /// The lifecycle coordinator the reservation was made through.
+        lifecycle: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
+        /// The metadata the seal stamps (pool 0 = replica placement).
+        meta: oceanfs_core::SegmentMetadata,
+    },
+    /// The segment was already registered: converge the data copy and
+    /// stamp the holder set; never touch the existing lifecycle state.
+    Existing {
+        /// The lifecycle coordinator (for the locations stamp).
+        lifecycle: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
+        /// The metadata carrying the pushed holder set.
+        meta: oceanfs_core::SegmentMetadata,
+        /// The reserve error that revealed the existing registration.
+        error: oceanfs_storage::segment::lifecycle::TransitionError,
+    },
 }
 
 #[cfg(test)]

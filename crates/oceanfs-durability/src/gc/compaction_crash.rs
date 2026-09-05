@@ -46,6 +46,7 @@ use oceanfs_core::{
     ObjectMetadata, SegmentId, SegmentMetadata, SizeTier, WalConfig,
 };
 use oceanfs_storage::{
+    io::{InMemorySegmentReader, IoBackend, IoObserver, IoReadMode},
     metadata::RocksDbMetadataStore,
     segment::{
         event_wal::{EventWal, EventWalPos},
@@ -53,16 +54,14 @@ use oceanfs_storage::{
         TierRouter,
     },
     wal::{WalReader, WalWriter},
-    SealConfig, SegmentSealer,
+    DiskSegmentStore, SealConfig, SegmentSealer,
 };
 use oceanfs_storage_api::SegmentDataStore;
 
 use super::{
     compaction_recovery::{recover_incomplete_compactions, CompactionRecoveryAction, ObjectLookup},
-    garbage_collector::DiskSegmentShardStore,
     segment_compactor::{stall_seam, SegmentCompactor},
 };
-use crate::segment_store_impl::DiskSegmentStore;
 
 /// The deterministic merkle-root builder shared by the compactor (its
 /// seal-time root), the seed helper, and the recovery pass: the
@@ -88,8 +87,10 @@ struct Harness {
     registry: Arc<SegmentLifecycleRegistry>,
     lifecycle: Arc<SegmentLifecycleCoordinator>,
     sealer: Arc<SegmentSealer>,
+    /// The unified disk store (ADR-0032 D2) serving both the data and
+    /// delete/list roles (f2 — the durability impls are gone).
     data_store: Arc<DiskSegmentStore>,
-    shard_store: Arc<DiskSegmentShardStore>,
+    shard_store: Arc<DiskSegmentStore>,
     compactor: Arc<SegmentCompactor>,
     segments_dir: PathBuf,
     wal_dir: PathBuf,
@@ -181,13 +182,29 @@ impl Harness {
             ],
             missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
         };
-        let pool_registry = oceanfs_storage::PoolRegistry::from_config(&storage, &dir.join("data"))
-            .expect("pool registry");
-        let data_pools = pool_registry.data_pools();
-        assert_eq!(data_pools[0].id(), 0, "data-first config-order id");
-        let data_store = Arc::new(DiskSegmentStore::new(data_pools.clone(), Arc::new(|_| Some(0))));
-        let shard_store =
-            Arc::new(DiskSegmentShardStore::new(data_pools.clone(), Arc::new(|_| Some(0))));
+        let pool_registry = Arc::new(
+            oceanfs_storage::PoolRegistry::from_config(&storage, &dir.join("data"))
+                .expect("pool registry"),
+        );
+        assert_eq!(
+            pool_registry.pool_by_id(0).expect("pool 0").id(),
+            0,
+            "data-first config-order id"
+        );
+        // The unified store (ADR-0032 D2): registry-only resolution (the
+        // harness's segments are all reserved/sealed before writes — the
+        // compactor + seed helper order reserve→write→seal).
+        let observer = Arc::new(IoObserver::new());
+        observer.register_pool(0, None);
+        let data_store = Arc::new(DiskSegmentStore::new(
+            Arc::clone(&pool_registry),
+            Arc::clone(&registry),
+            Arc::new(InMemorySegmentReader::new()),
+            IoReadMode::Buffered,
+            Arc::new(IoBackend::default()),
+            observer,
+        ));
+        let shard_store = Arc::clone(&data_store);
         let sealer = Arc::new(SegmentSealer::new(
             SealConfig { data_dir: segments_dir.clone(), ..Default::default() },
             data_wal.clone(),
@@ -304,6 +321,12 @@ impl Harness {
         old_meta: SegmentMetadata,
         milestone: u8,
     ) -> tokio::task::JoinHandle<()> {
+        // Production ordering: startup recovery (the event-WAL fold)
+        // precedes GC cycles. The unified store (ADR-0032 D2) resolves
+        // every read/write through the lifecycle registry, so the
+        // seeded old segment must be folded in before the compactor
+        // reads it.
+        let (_, _) = self.recover().await;
         stall_seam::arm(milestone);
         let compactor = Arc::clone(&self.compactor);
         let handle = tokio::spawn(async move {
@@ -514,7 +537,12 @@ async fn row7_kill_between_new_sealed_and_objects_moved() {
     // the unit: the replacement is deleted durably and its .dat swept;
     // reads still resolve to the old segment.
     h2.lifecycle.request_delete(new_id).await.unwrap();
-    h2.shard_store.delete_shards(&new_id).await.unwrap();
+    // The registry entry is evicted with the durable delete (grace 0),
+    // so the .dat sweep is explicit-pool — the unified store's
+    // registry-resolved delete_shards covers only live entries; the
+    // orphan reaper's per-root sweep is the residue backstop
+    // (ADR-0032 D2).
+    h2.shard_store.delete_shards_with_pool(&new_id, 0).await.unwrap();
     assert!(h2.lifecycle.registry().get(new_id).is_none(), "orphan deleted durably");
     assert!(
         !h2.segments_dir.join(format!("{new_id}.dat")).exists(),
@@ -569,9 +597,11 @@ async fn row8_kill_between_objects_moved_and_old_deleted() {
         "row 8: old sealed-orphan → reaper request_delete"
     );
 
-    // Dispatch: the old segment's durable deletion, then its .dat sweep.
+    // Dispatch: the old segment's durable deletion, then its .dat sweep
+    // (explicit pool — the entry is evicted with the delete; the reaper
+    // is the residue backstop, ADR-0032 D2).
     h2.lifecycle.request_delete(old_id).await.unwrap();
-    h2.shard_store.delete_shards(&old_id).await.unwrap();
+    h2.shard_store.delete_shards_with_pool(&old_id, 0).await.unwrap();
     assert!(h2.lifecycle.registry().get(old_id).is_none(), "old deleted durably");
     assert!(!h2.segments_dir.join(format!("{old_id}.dat")).exists(), "old .dat swept");
     assert_eq!(h2.object_chunk("a.txt").segment_id, new_id, "reads resolve to the new segment");
@@ -623,8 +653,10 @@ async fn row9_kill_between_old_deleted_and_old_removed() {
         "row 9: old .dat orphan → sweep"
     );
 
-    // Dispatch: the idempotent sweep.
-    h2.shard_store.delete_shards(&old_id).await.unwrap();
+    // Dispatch: the idempotent residue sweep — explicit pool (the
+    // entry is gone; the reaper's per-root sweep is the production
+    // backstop, ADR-0032 D2).
+    h2.shard_store.delete_shards_with_pool(&old_id, 0).await.unwrap();
     assert!(!h2.segments_dir.join(format!("{old_id}.dat")).exists(), "old .dat swept");
     assert_eq!(h2.object_chunk("a.txt").segment_id, new_id, "reads resolve to the new segment");
 }

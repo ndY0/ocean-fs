@@ -433,22 +433,15 @@ impl ReRepWorker {
             }
         }
 
-        // Step 4: write through the pool-aware store.
-        // NOTE (store-unification f2, ADR-0032 D3): this write currently
-        // precedes the lifecycle reserve (the resolver's pool-0
-        // write-before-register bridge); f2 reorders reserve-before-write
-        // and routes the write through the storage io layer.
-        data_store
-            .write_segment_data(&segment_id, &data)
-            .await
-            .map_err(|e| Error::Storage(format!("re-replication write failed: {e}")))?;
-
-        // Step 5: register in the lifecycle (reserve + seal). The
-        // target's metadata mirrors the holder's shape — the request
-        // CARRIES the source's seal-time shape (tier + EC geometry),
-        // read by the dispatcher/enqueuer from its own registry entry
-        // alongside the merkle root (ADR-0030). The pulled copy is
-        // registered with that real shape, never a hardcoded default.
+        // Step 4: register in the lifecycle FIRST (ADR-0032 D3 — the
+        // reserve precedes the write so the unified store resolves the
+        // segment's pool from its registry entry; the write-before-
+        // register bridge is gone). The target's metadata mirrors the
+        // holder's shape — the request CARRIES the source's seal-time
+        // shape (tier + EC geometry), read by the dispatcher/enqueuer
+        // from its own registry entry alongside the merkle root
+        // (ADR-0030). The pulled copy is registered with that real
+        // shape, never a hardcoded default.
         let tier = request.tier;
         let ec_k = request.ec_k;
         let ec_m = request.ec_m;
@@ -457,6 +450,26 @@ impl ReRepWorker {
             .request_reserve(segment_id, tier, ec_k, ec_m)
             .await
             .map_err(|e| Error::Storage(format!("re-replication reserve failed: {e}")))?;
+
+        // Step 5: write through the pool-aware store. A failure cleans
+        // up its own reservation (the compactor's cleanup precedent) —
+        // a Reserved entry without data is dropped by the next recovery
+        // anyway, but the clean delete lets an immediate retry re-reserve.
+        if let Err(write_err) = data_store
+            .write_segment_data(&segment_id, &data)
+            .await
+            .map_err(|e| Error::Storage(format!("re-replication write failed: {e}")))
+        {
+            if let Err(cleanup_err) = lifecycle.request_delete(segment_id).await {
+                tracing::warn!(
+                    segment_id = %segment_id,
+                    cleanup_error = ?cleanup_err,
+                    "re-replication: write failed; reservation cleanup delete failed"
+                );
+            }
+            return Err(write_err);
+        }
+
         let mut meta = SegmentMetadata {
             pool_id: 0,
             segment_id,
@@ -481,7 +494,7 @@ impl ReRepWorker {
             return Err(Error::Storage(format!("re-replication seal failed: {e}")));
         }
 
-        // Step 5: stamp storage_locations durably. The new holder set
+        // Step 6: stamp storage_locations durably. The new holder set
         // is the request's (already live-filtered) holders plus self.
         let mut locations = smallvec::SmallVec::with_capacity(request.holders.len() + 1);
         for h in &request.holders {

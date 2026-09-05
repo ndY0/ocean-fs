@@ -78,6 +78,16 @@ pub trait SegmentReader: Send + Sync {
     fn last_read_source(&self, _segment_id: &SegmentId) -> SegmentReadSource {
         SegmentReadSource::Memory
     }
+
+    /// Purges per-segment read caches after the segment's `.dat` has
+    /// been rewritten (ADR-0032 D2 purge-on-write).
+    ///
+    /// A whole-file rewrite (heal, re-replication, GC repack, replica
+    /// push) invalidates every cached fact about the old file — the
+    /// resolved root, the verified header/data sizes, the mmap mapping
+    /// and the last-read source. The default implementation is a no-op;
+    /// cache-holding readers override it.
+    fn purge_cache(&self, _segment_id: &SegmentId) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -136,12 +146,10 @@ pub enum SegmentReadSource {
 /// segment size) plus temporary `DirectIoBuf` allocations (per-read,
 /// returned to pool). There is no unbounded HashMap.
 pub struct DiskSegmentReader {
-    /// The configured read mode, resolved at construction.
-    read_mode: IoReadMode,
-    /// The disk I/O backend (io_uring or tokio::fs).
-    disk_io: Arc<IoBackend>,
-    /// Optional LRU cache of memory-mapped segment files.
-    mmap_cache: Option<Arc<SegmentFileCache>>,
+    /// The shared path-agnostic read core: mode dispatch, backend and
+    /// mmap LRU (ADR-0032 D2 — the unified store reads through the same
+    /// core; resolution and caching stay here).
+    file: super::segment_file::SegmentFileReader,
     /// Data pool roots sealed segments are spread across (ADR-0029 f5).
     /// Empty = legacy mode: every segment resolves to `legacy_dir`.
     data_pools: Vec<Arc<crate::pool::StoragePool>>,
@@ -172,12 +180,6 @@ pub struct DiskSegmentReader {
     ec_decoder: Option<std::sync::Arc<dyn oceanfs_ec::Decoder>>,
     /// Injected EC encoder for parity re-encode during repair.
     ec_encoder: Option<std::sync::Arc<dyn oceanfs_ec::Encoder>>,
-    /// When `true`, call `madvise(MADV_DONTNEED)` after reading from mmap
-    /// to eagerly evict segment data from the page cache. Set to `true`
-    /// when `read_cache_segments = false` (write-optimised profile) so
-    /// large segment reads don't pollute the page cache and evict hot
-    /// metadata/WAL pages. No-op on non-Linux.
-    evict_after_read: bool,
 }
 
 impl DiskSegmentReader {
@@ -196,9 +198,9 @@ impl DiskSegmentReader {
         ec_encoder: Option<std::sync::Arc<dyn oceanfs_ec::Encoder>>,
     ) -> Self {
         Self {
-            read_mode,
-            disk_io,
-            mmap_cache,
+            file: super::segment_file::SegmentFileReader::new(
+                read_mode, disk_io, mmap_cache, false,
+            ),
             data_pools: Vec::new(),
             registry: None,
             legacy_dir: segment_dir,
@@ -208,7 +210,6 @@ impl DiskSegmentReader {
             ec_encoder,
             last_source: Mutex::new(HashMap::new()),
             verified_headers: Mutex::new(HashMap::new()),
-            evict_after_read: false,
         }
     }
 
@@ -281,7 +282,7 @@ impl DiskSegmentReader {
     /// profile). When `false` (read-optimised profile), segment data
     /// remains in the page cache for subsequent reads.
     pub fn with_evict_after_read(mut self, evict: bool) -> Self {
-        self.evict_after_read = evict;
+        self.file.evict_after_read = evict;
         self
     }
 
@@ -306,28 +307,18 @@ impl DiskSegmentReader {
         if repaired > 0 {
             // The mmap cache (if any) may hold the pre-repair mapping;
             // invalidate it so subsequent reads see the repaired bytes.
-            if let Some(cache) = &self.mmap_cache {
+            if let Some(cache) = &self.file.mmap_cache {
                 cache.invalidate(segment_id);
             }
         }
         // Parse the header (the repair already validated the file) to
-        // learn the format version's data offset. Header-only read: the
-        // previous std::fs::read loaded the whole segment just for the
-        // 76-92 byte header — on first touches under load that was a
-        // second full-file buffer per segment read (multi-GB anon bursts).
-        use std::io::Read;
-        let mut file =
-            std::fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let mut header_buf = [0u8; 128];
-        let got =
-            file.read(&mut header_buf).map_err(|e| format!("read {}: {e}", path.display()))?;
-        if got < crate::segment::header::SegmentHeader::header_size(1) {
-            return Err(format!("segment file {segment_id} too short for header"));
-        }
-        let header = crate::segment::header::SegmentHeader::from_bytes(&header_buf)
-            .ok_or_else(|| format!("bad segment header for {segment_id}"))?;
-        let hdr_size = header.serialized_size();
-        let data_size = header.size;
+        // learn the format version's data offset. The header-only read
+        // lives in the shared read core (ADR-0032 D2): the previous
+        // std::fs::read loaded the whole segment just for the 76-92
+        // byte header — on first touches under load that was a second
+        // full-file buffer per segment read (multi-GB anon bursts).
+        let header = self.file.verify_header(&segment_id, &path)?;
+        let (hdr_size, data_size) = (header.serialized_size(), header.size);
         self.verified_headers.lock().insert(segment_id, (hdr_size, data_size));
         Ok((hdr_size, data_size))
     }
@@ -395,86 +386,14 @@ impl SegmentReader for DiskSegmentReader {
         let length = if length == u32::MAX { data_size as u32 } else { length };
         let file_offset = offset + hdr_size as u64;
 
-        let (data, source) = match self.read_mode {
-            IoReadMode::Mmap => {
-                if let Some(ref cache) = self.mmap_cache {
-                    match cache.get_or_map(*segment_id, &path) {
-                        Ok(mmap) => {
-                            let start = file_offset as usize;
-                            let end = start.saturating_add(length as usize).min(mmap.len());
-                            #[cfg(target_os = "linux")]
-                            {
-                                // Tell the kernel this is a sequential forward scan
-                                // so it can do aggressive read-ahead.
-                                let _ = madvise_sequential(mmap.as_ptr(), mmap.len());
-                            }
-                            #[cfg(not(target_os = "linux"))]
-                            {
-                                let _ = mmap.len(); // suppress unused warning
-                            }
-                            let slice = &mmap[start..end];
-                            let data = Bytes::copy_from_slice(slice);
-                            #[cfg(target_os = "linux")]
-                            {
-                                // Eagerly evict pages from the page cache so segment
-                                // reads don't push hot metadata/WAL data out of cache.
-                                // Only when the write-optimised profile is in use
-                                // (read_cache_segments=false). When caching is enabled,
-                                // we want pages to stay resident.
-                                if self.evict_after_read {
-                                    let _ = madvise_dontneed(mmap.as_ptr(), mmap.len());
-                                }
-                            }
-                            let source = SegmentReadSource::MmapBacked {
-                                segment_id: *segment_id,
-                                file_path: path.clone(),
-                            };
-                            (data, source)
-                        }
-                        Err(e) => {
-                            return Err(format!("mmap read failed for {segment_id}: {e}"));
-                        }
-                    }
-                } else {
-                    // Mmap mode but no cache configured — fall back to buffered.
-                    read_buffered(segment_id, &path, file_offset, length).await?
-                }
-            }
-            IoReadMode::Direct => {
-                let len = length as usize;
-                let mut buf = crate::io::DirectIoBuf::new(len)
-                    .map_err(|e| format!("DirectIoBuf allocation failed for {segment_id}: {e}"))?;
-                // `IoBackend::read` performs a single read syscall per call.
-                // `tokio::fs::File` caps a single read at 2 MiB, so a
-                // larger request returns short — loop until the buffer
-                // is full (read-path-integrity-under-load: the ignored
-                // short read previously zero-padded every >2 MiB chunk,
-                // producing BadDigest on every multi-tier read).
-                let mut filled: usize = 0;
-                while filled < len {
-                    let n = self
-                        .disk_io
-                        .read(&path, &mut buf.as_bytes_mut()[filled..], file_offset + filled as u64)
-                        .await
-                        .map_err(|e| format!("Direct read failed for {segment_id}: {e}"))?;
-                    if n == 0 {
-                        break;
-                    }
-                    filled += n;
-                }
-                if filled < len {
-                    return Err(format!(
-                        "Direct read short for {segment_id}: got {filled} of {len} bytes"
-                    ));
-                }
-                let data = Bytes::copy_from_slice(&buf.as_bytes()[..len]);
-                let source = SegmentReadSource::DirectIo {
-                    segment_id: *segment_id,
-                    file_path: path.clone(),
-                };
-                (data, source)
-            }
-            IoReadMode::Buffered => read_buffered(segment_id, &path, file_offset, length).await?,
+        // The mode-dispatched ranged read lives in the shared read core
+        // (ADR-0032 D2 — the unified store reads through the same
+        // implementation).
+        let data = self.file.read_range(segment_id, &path, file_offset, length).await?;
+        let source = if self.file.serves_from_mmap_cache() {
+            SegmentReadSource::MmapBacked { segment_id: *segment_id, file_path: path }
+        } else {
+            SegmentReadSource::DirectIo { segment_id: *segment_id, file_path: path }
         };
 
         self.last_source.lock().insert(*segment_id, source);
@@ -484,30 +403,19 @@ impl SegmentReader for DiskSegmentReader {
     fn last_read_source(&self, segment_id: &SegmentId) -> SegmentReadSource {
         self.last_source.lock().get(segment_id).cloned().unwrap_or(SegmentReadSource::Memory)
     }
-}
 
-/// Buffered read fallback using `tokio::fs`.
-async fn read_buffered(
-    segment_id: &SegmentId,
-    path: &std::path::Path,
-    offset: u64,
-    length: u32,
-) -> std::result::Result<(Bytes, SegmentReadSource), String> {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .map_err(|e| format!("failed to open segment file {segment_id}: {e}"))?;
-    file.seek(std::io::SeekFrom::Start(offset))
-        .await
-        .map_err(|e| format!("seek failed for {segment_id}: {e}"))?;
-    let mut buf = vec![0u8; length as usize];
-    file.read_exact(&mut buf)
-        .await
-        .map_err(|e| format!("buffered read failed for {segment_id}: {e}"))?;
-    let source =
-        SegmentReadSource::DirectIo { segment_id: *segment_id, file_path: path.to_path_buf() };
-    Ok((Bytes::from(buf), source))
+    fn purge_cache(&self, segment_id: &SegmentId) {
+        // A whole-file rewrite invalidates every cached fact about the
+        // old `.dat` (ADR-0032 D2 purge-on-write): the resolved root,
+        // the verified header/data sizes, the mmap mapping and the
+        // last-read source.
+        self.verified_headers.lock().remove(segment_id);
+        self.pool_root_cache.lock().remove(segment_id);
+        self.last_source.lock().remove(segment_id);
+        if let Some(cache) = &self.file.mmap_cache {
+            cache.invalidate(*segment_id);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +536,14 @@ impl SegmentReader for PoolFallbackReader {
     fn last_read_source(&self, segment_id: &SegmentId) -> SegmentReadSource {
         self.fallback.last_read_source(segment_id)
     }
+
+    fn purge_cache(&self, segment_id: &SegmentId) {
+        // Forward to the disk-backed reader: an active-pool entry holds
+        // in-memory bytes (never stale after a rewrite — the pool write
+        // updates it), but the fallback reader's per-segment caches must
+        // drop the old `.dat` facts (ADR-0032 D2 purge-on-write).
+        self.fallback.purge_cache(segment_id);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -636,9 +552,10 @@ impl SegmentReader for PoolFallbackReader {
 
 /// Calls `madvise(addr, len, MADV_SEQUENTIAL)` to hint that the mapped
 /// region will be accessed sequentially — the kernel can do aggressive
-/// read-ahead. No-op on non-Linux.
+/// read-ahead. No-op on non-Linux. Shared with the read core
+/// (`io::segment_file`, ADR-0032 D2).
 #[cfg(target_os = "linux")]
-fn madvise_sequential(addr: *const u8, len: usize) -> std::io::Result<()> {
+pub(crate) fn madvise_sequential(addr: *const u8, len: usize) -> std::io::Result<()> {
     // SAFETY: `addr` points to a valid memory-mapped region of `len` bytes.
     // `MADV_SEQUENTIAL` is a pure hint — it cannot cause UB even if the
     // addresses are invalid (the kernel may ignore the hint).
@@ -653,9 +570,10 @@ fn madvise_sequential(addr: *const u8, len: usize) -> std::io::Result<()> {
 
 /// Calls `madvise(addr, len, MADV_DONTNEED)` to hint that the mapped
 /// region will not be accessed again soon — the kernel can eagerly evict
-/// these pages from the page cache. No-op on non-Linux.
+/// these pages from the page cache. No-op on non-Linux. Shared with the
+/// read core (`io::segment_file`, ADR-0032 D2).
 #[cfg(target_os = "linux")]
-fn madvise_dontneed(addr: *const u8, len: usize) -> std::io::Result<()> {
+pub(crate) fn madvise_dontneed(addr: *const u8, len: usize) -> std::io::Result<()> {
     // SAFETY: `addr` points to a valid memory-mapped region of `len` bytes.
     // `MADV_DONTNEED` is advisory — it tells the kernel to drop these pages
     // from the page cache. If the address is invalid, the kernel returns

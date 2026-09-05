@@ -12,7 +12,7 @@ use oceanfs_core::{MetadataConfig, NodeId, RpcConfig};
 use oceanfs_durability::{
     merkle::{IncrementalMerkleTree, MerkleTreeConfig},
     AntiEntropy, AntiEntropyConfig, GarbageCollector, GcConfig, HealConfig, HealQueue,
-    InMemorySegmentShardStore, InMemorySegmentStore, OrphanReaper, ScrubConfig, ScrubCoordinator,
+    InMemorySegmentStore, InMemoryShardStore, OrphanReaper, ScrubConfig, ScrubCoordinator,
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
@@ -99,7 +99,7 @@ async fn durability_components_are_wireable_and_spawnable() {
     let _reaper = Arc::new(OrphanReaper::new(
         metadata_store.clone(),
         lifecycle,
-        Arc::new(InMemorySegmentShardStore::new(4194304)),
+        Arc::new(InMemoryShardStore::new(4194304)),
         vec![], // in-memory store lists nothing; no pool roots needed
         GcConfig::new(3600, 86400, 0.5, 4, 64),
     ));

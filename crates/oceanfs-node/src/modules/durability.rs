@@ -309,7 +309,7 @@ impl DurabilityModule {
         // decomposition) wired it to the module's single shared
         // DiskSegmentStore (one store instance, no concurrent writers).
         // The remaining 3-abstraction read/write unification
-        // (DiskSegmentStore/DiskSegmentShardStore/DiskSegmentReader) is
+        // (data store, shard store, disk reader) is
         // store-unification f3 (ADR-0032).
         // [end]
         let ae_worker = Arc::new(AntiEntropy::new(

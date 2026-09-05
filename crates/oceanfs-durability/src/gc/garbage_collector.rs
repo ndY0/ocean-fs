@@ -552,15 +552,16 @@ impl GarbageCollector {
 // we need an unification
 // [end]
 // ---------------------------------------------------------------------------
-// SegmentShardStore — folded into oceanfs_storage_api::SegmentDataStore
+// In-memory delete/list double — test-local, ADR-0032 D1 shape
 // ---------------------------------------------------------------------------
 //
-// The delete/list-only `SegmentShardStore` trait is GONE since
+// The delete/list-only shard-store trait is GONE since
 // store-unification f1 (ADR-0032 D1): delete/list folded into the
-// unified `oceanfs_storage_api::SegmentDataStore` trait. The two
-// transition-window impls below (the in-memory test double and the
-// disk-backed shard store) now implement the unified trait; the disk
-// impl merge into `oceanfs_storage::DiskSegmentStore` is f2.
+// unified `oceanfs_storage_api::SegmentDataStore` trait. The production
+// disk impls (the durability `DiskSegmentStore` twin pair) were merged
+// into `oceanfs_storage::DiskSegmentStore` by f2 — only this in-memory
+// delete/list-tracking double remains, test-local (review #17/#26
+// precedent).
 
 // [review][code smell][high]
 // if this is only used in tests, it should be guarded with a cfg macro
@@ -574,205 +575,12 @@ impl GarbageCollector {
 /// trait (ADR-0032 D1) for GC/reaper tests that do not touch data.
 /// Used in unit and integration tests where an on-disk segment store is
 /// not needed.
-pub struct InMemorySegmentShardStore {
+pub struct InMemoryShardStore {
     deleted: parking_lot::Mutex<std::collections::HashSet<SegmentId>>,
     bytes_per_segment: u64,
 }
 
-// [review][duplication][critcal]
-// this struct is verbatim the same as the one in 'segment_store_impl'
-// this duplication hurts code quality a lot, and must be resolved with a very high priority.
-// on an another topic, no disk io abstraction is used, greatly reducing the interest of having taken the time
-// of constructing optimized io access. this must also be resolved with high priority.
-// [end]
-/// Production segment data store that deletes segment data files
-/// from the filesystem.
-///
-/// Used by the orphan reaper to physically remove orphaned segment
-/// `.dat` files from the owning data pool root (ADR-0029 f5). Pools
-/// only — the legacy `data_dir` surface was deleted by ADR-0031 D2.
-/// This is the transition-window twin of
-/// `crate::segment_store_impl::DiskSegmentStore` (same fields, same
-/// responsibilities); store-unification f2 merges both into
-/// `oceanfs_storage::DiskSegmentStore`.
-pub struct DiskSegmentShardStore {
-    /// Data pool roots (ADR-0029 f5). Pools are mandatory since f1
-    /// (ADR-0031) — never empty.
-    data_pools: Vec<Arc<oceanfs_storage::StoragePool>>,
-    /// Resolves a segment's durable pool id.
-    pool_id_for: oceanfs_storage::PoolIdResolver,
-}
-
-impl DiskSegmentShardStore {
-    /// Creates a pools-only disk-backed shard store.
-    ///
-    /// Every segment resolves to the root of the pool its metadata
-    /// names (via `pool_id_for`); an id no registered pool carries is
-    /// surfaced as an explicit error — there is no legacy `data_dir`
-    /// fallback (ADR-0031 D2).
-    pub fn new(
-        data_pools: Vec<Arc<oceanfs_storage::StoragePool>>,
-        pool_id_for: oceanfs_storage::PoolIdResolver,
-    ) -> Self {
-        Self { data_pools, pool_id_for }
-    }
-
-    /// Resolves a segment's file path through the pool-id resolver.
-    ///
-    /// A missing resolver mapping (a segment not yet registered in the
-    /// lifecycle) defaults to pool 0 — the first configured pool. This
-    /// is the **write-before-register bridge**: writers persist a
-    /// replica's `.dat` before `request_reserve`/`request_seal` and
-    /// stamp `pool_id: 0` in the durable metadata. The bridge
-    /// disappears with those flows when store-unification f2 (ADR-0032
-    /// D3) serializes and lifecycle-routes every `.dat` write.
-    fn resolve(&self, segment_id: &oceanfs_core::SegmentId) -> ApiResult<std::path::PathBuf> {
-        let pool_id = (self.pool_id_for)(segment_id).unwrap_or(0);
-        oceanfs_storage::resolve_pool_root(&self.data_pools, pool_id)
-            .map(|root| root.join(format!("{segment_id}.dat")))
-            .ok_or_else(|| {
-                oceanfs_storage_api::error::Error::Internal(format!(
-                    "segment {segment_id} references unknown pool {pool_id}"
-                ))
-            })
-    }
-
-    /// Resolves a segment's directory from a caller-held pool id — the
-    /// GC fast path (no resolver call; f5 perf 1.3). The pool id must
-    /// name a registered pool; an unknown id is an explicit error.
-    fn resolve_with_pool(
-        &self,
-        pool_id: u32,
-        segment_id: &oceanfs_core::SegmentId,
-    ) -> ApiResult<std::path::PathBuf> {
-        oceanfs_storage::resolve_pool_root(&self.data_pools, pool_id)
-            .map(|root| root.join(format!("{segment_id}.dat")))
-            .ok_or_else(|| {
-                oceanfs_storage_api::error::Error::InvalidArgument(format!(
-                    "segment {segment_id} references unknown pool {pool_id}"
-                ))
-            })
-    }
-
-    /// Unlinks one `.dat` file and returns the reclaimed bytes.
-    fn unlink(&self, path: &std::path::Path) -> ApiResult<u64> {
-        let metadata = match std::fs::metadata(path) {
-            Ok(m) => m.len(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(oceanfs_storage_api::error::Error::Io(e)),
-        };
-        std::fs::remove_file(path).map_err(oceanfs_storage_api::error::Error::Io)?;
-        Ok(metadata)
-    }
-}
-
-#[async_trait::async_trait]
-impl oceanfs_storage_api::SegmentDataStore for DiskSegmentShardStore {
-    async fn read_segment_data(
-        &self,
-        segment_id: &oceanfs_core::SegmentId,
-    ) -> ApiResult<Option<oceanfs_storage_api::SegmentFile>> {
-        let path = self.resolve(segment_id)?;
-        // Missing `.dat` is Ok(None) — the unified trait's NotFound
-        // contract (a value, not an error).
-        let data = match std::fs::read(&path) {
-            Ok(data) => data,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(oceanfs_storage_api::error::Error::Io(e)),
-        };
-        let header = oceanfs_storage::SegmentHeader::from_bytes(&data).ok_or_else(|| {
-            oceanfs_storage_api::error::Error::Internal(format!(
-                "segment file {segment_id} has a bad header"
-            ))
-        })?;
-        let hdr_size = oceanfs_storage::SegmentHeader::header_size(header.version);
-        let data_end = header.data_end() as usize;
-        if data.len() < hdr_size || data_end > data.len() {
-            return Err(oceanfs_storage_api::error::Error::Internal(format!(
-                "segment file {segment_id} too short: {} bytes",
-                data.len()
-            )));
-        }
-        Ok(Some(oceanfs_storage_api::SegmentFile {
-            segment_id: *segment_id,
-            version: header.version,
-            header_len: hdr_size,
-            data_end: header.data_end(),
-            data: bytes::Bytes::from(data[hdr_size..data_end].to_vec()),
-        }))
-    }
-
-    async fn write_segment_data(
-        &self,
-        segment_id: &oceanfs_core::SegmentId,
-        data: &[u8],
-    ) -> ApiResult<()> {
-        let dir = self
-            .resolve(segment_id)?
-            .parent()
-            .ok_or_else(|| {
-                oceanfs_storage_api::error::Error::Internal(format!(
-                    "cannot resolve directory for {segment_id}"
-                ))
-            })?
-            .to_path_buf();
-        let path = dir.join(format!("{segment_id}.dat"));
-        std::fs::create_dir_all(&dir).map_err(|e| {
-            oceanfs_storage_api::error::Error::Io(std::io::Error::other(format!("{e}")))
-        })?;
-        // A valid v1 segment file (see the twin impl in
-        // `segment_store_impl.rs` for the layout rationale).
-        let mut file_data = vec![0u8; 76];
-        file_data[0..4].copy_from_slice(b"OFSG");
-        file_data[4..6].copy_from_slice(&1u16.to_le_bytes());
-        file_data[22..30].copy_from_slice(&(data.len() as u64).to_le_bytes());
-        file_data[30..34].copy_from_slice(&0u32.to_le_bytes()); // blob_count
-        file_data[34..42].copy_from_slice(&((76 + data.len()) as u64).to_le_bytes());
-        let checksum = *blake3::hash(data).as_bytes();
-        file_data[42..74].copy_from_slice(&checksum);
-        file_data.extend_from_slice(data);
-        std::fs::write(&path, &file_data).map_err(|e| {
-            oceanfs_storage_api::error::Error::Io(std::io::Error::other(format!("{e}")))
-        })?;
-        Ok(())
-    }
-
-    async fn delete_shards(&self, segment_id: &oceanfs_core::SegmentId) -> ApiResult<u64> {
-        let path = self.resolve(segment_id)?;
-        self.unlink(&path)
-    }
-
-    async fn delete_shards_with_pool(
-        &self,
-        segment_id: &oceanfs_core::SegmentId,
-        pool_id: u32,
-    ) -> ApiResult<u64> {
-        let path = self.resolve_with_pool(pool_id, segment_id)?;
-        self.unlink(&path)
-    }
-
-    fn list_segment_files(&self, root: &std::path::Path) -> ApiResult<Vec<std::path::PathBuf>> {
-        // Per-root sweep (ADR-0032 D1 shape): the caller lists each
-        // candidate pool root; the returned paths name `.dat` files
-        // directly under it. Orphan detection then stats + parses each
-        // path (mtime TTL gate, uuid from the file name).
-        let entries = match std::fs::read_dir(root) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(oceanfs_storage_api::error::Error::Io(e)),
-        };
-        let mut out = Vec::new();
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".dat") {
-                out.push(entry.path());
-            }
-        }
-        Ok(out)
-    }
-}
-
-impl InMemorySegmentShardStore {
+impl InMemoryShardStore {
     /// Creates a new in-memory shard store that reports `bytes_per_segment`
     /// as reclaimed for each deleted segment.
     pub fn new(bytes_per_segment: u64) -> Self {
@@ -789,7 +597,7 @@ impl InMemorySegmentShardStore {
 }
 
 #[async_trait::async_trait]
-impl oceanfs_storage_api::SegmentDataStore for InMemorySegmentShardStore {
+impl oceanfs_storage_api::SegmentDataStore for InMemoryShardStore {
     async fn read_segment_data(
         &self,
         _segment_id: &oceanfs_core::SegmentId,
@@ -1292,7 +1100,7 @@ mod tests {
         let gc = GarbageCollector::new(GcConfig { compact_threshold: 0.5, ..GcConfig::default() })
             .with_data_store(store)
             .with_lifecycle(lifecycle)
-            .with_shard_store(Arc::new(InMemorySegmentShardStore::new(0)));
+            .with_shard_store(Arc::new(InMemoryShardStore::new(0)));
         let stats = gc.run_cycle(metadata.clone(), &registry).await.unwrap();
 
         assert_eq!(stats.dead_bytes, 900, "dead bytes must come from the tombstone chunks");
@@ -1314,14 +1122,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     // -----------------------------------------------------------------------
-    // Pool-aware shard store (ADR-0029 f5)
+    // Pool-aware unified store — per-root list + explicit-pool unlink
+    // (ADR-0032 D1/D2; the production impl lives in oceanfs-storage)
     // -----------------------------------------------------------------------
 
-    /// Builds a 2-data-pool registry and writes `.dat` files into both
-    /// pool roots (pools-only — ADR-0031 D2).
-    fn pool_shard_store(
+    /// Builds a 2-data-pool registry-backed unified store and returns it
+    /// with the two data pool roots (pools-only — ADR-0031 D2).
+    fn pool_store(
         tmp: &tempfile::TempDir,
-    ) -> (DiskSegmentShardStore, Vec<std::path::PathBuf>) {
+    ) -> (oceanfs_storage::DiskSegmentStore, Vec<std::path::PathBuf>) {
         let data_dir = tmp.path().join("data");
         let roots = vec![tmp.path().join("nvme0"), tmp.path().join("nvme1")];
         let storage = oceanfs_core::StorageConfig {
@@ -1369,20 +1178,33 @@ mod tests {
             ],
             missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
         };
-        let registry = oceanfs_storage::PoolRegistry::from_config(&storage, &data_dir).unwrap();
-        // The shard store scopes to DATA pools only (config-order ids 0/1).
-        let pools = registry.data_pools();
-        let store = DiskSegmentShardStore::new(pools, Arc::new(|_| Some(0)));
+        let pool_registry =
+            Arc::new(oceanfs_storage::PoolRegistry::from_config(&storage, &data_dir).unwrap());
+        let lifecycle_registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
+        let observer = Arc::new(oceanfs_storage::io::IoObserver::new());
+        observer.register_pool(0, None);
+        observer.register_pool(1, None);
+        let store = oceanfs_storage::DiskSegmentStore::new(
+            pool_registry,
+            lifecycle_registry,
+            Arc::new(oceanfs_storage::io::InMemorySegmentReader::new()),
+            oceanfs_storage::io::IoReadMode::Buffered,
+            Arc::new(oceanfs_storage::io::IoBackend::default()),
+            observer,
+        );
         (store, roots)
     }
 
-    /// The pool-aware shard store lists files per pool root (ADR-0032 D1
-    /// shape) and unlinks from the pool root named by the caller-held
-    /// pool id (ADR-0029 f5, pools-only — ADR-0031 D2).
+    /// The unified store lists files per pool root (ADR-0032 D1 shape)
+    /// and unlinks from the pool root named by the caller-held pool id
+    /// (ADR-0029 f5, pools-only — ADR-0031 D2).
     #[tokio::test]
     async fn shard_store_lists_and_unlinks_across_pool_roots() {
         let tmp = tempfile::tempdir().unwrap();
-        let (store, roots) = pool_shard_store(&tmp);
+        let (store, roots) = pool_store(&tmp);
 
         let id_a = SegmentId::new();
         let id_b = SegmentId::new();
@@ -1407,15 +1229,8 @@ mod tests {
         assert!(roots[0].join(format!("{id_a}.dat")).exists(), "other pool untouched");
         assert_eq!(store.list_segment_files(&roots[1]).unwrap().len(), 0);
 
-        // The resolver-based delete finds the segment by its registered
-        // pool id.
-        let reclaimed = store.delete_shards(&id_a).await.unwrap();
-        assert_eq!(reclaimed, 100);
-        assert!(!roots[0].join(format!("{id_a}.dat")).exists());
-
-        // An unknown pool id (stale mapping) is an explicit
-        // data-integrity error — never a silent legacy fallback
-        // (ADR-0031 D2).
+        // An unknown pool id (stale mapping) is an explicit error — never
+        // a silent legacy fallback (ADR-0031 D2).
         let ghost = SegmentId::new();
         let err =
             store.delete_shards_with_pool(&ghost, 99).await.expect_err("unknown pool must error");

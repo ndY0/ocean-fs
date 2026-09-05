@@ -18,8 +18,6 @@ pub use compaction_recovery::{
     ObjectLookup, StoreObjectLookup,
 };
 pub use config::GcConfig;
-pub use garbage_collector::{
-    CompactionRemapFn, DiskSegmentShardStore, GarbageCollector, InMemorySegmentShardStore,
-};
+pub use garbage_collector::{CompactionRemapFn, GarbageCollector, InMemoryShardStore};
 pub use orphan_reaper::{OrphanReaper, OrphanStats};
 pub use stats::GcStats;

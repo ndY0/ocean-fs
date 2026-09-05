@@ -680,7 +680,7 @@ mod tests {
             TierRouter::new(oceanfs_core::SegmentSizeConfig::default()),
             store,
             lifecycle.clone(),
-            Arc::new(InMemorySegmentShardStore::new(0)),
+            Arc::new(InMemoryShardStore::new(0)),
         );
         (compactor, lifecycle)
     }
@@ -792,7 +792,7 @@ mod tests {
             TierRouter::new(oceanfs_core::SegmentSizeConfig::default()),
             compactor.data_store(),
             lifecycle.clone(),
-            Arc::new(InMemorySegmentShardStore::new(0)),
+            Arc::new(InMemoryShardStore::new(0)),
         )
         .with_compaction_remap_notifier({
             let fired = Arc::clone(&fired);
@@ -1037,7 +1037,7 @@ mod tests {
         })
         .with_data_store(store)
         .with_lifecycle(lifecycle)
-        .with_shard_store(Arc::new(InMemorySegmentShardStore::new(0)));
+        .with_shard_store(Arc::new(InMemoryShardStore::new(0)));
         let stats = gc_trigger.run_cycle(metadata.clone(), &registry).await.unwrap();
 
         assert!(stats.segments_scanned >= 1);

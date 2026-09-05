@@ -36,7 +36,6 @@ pub mod merkle;
 pub mod reconcile;
 pub mod repair;
 pub mod scrub;
-mod segment_store_impl;
 
 // gRPC service stubs — moved from oceanfs-server
 pub mod healing_service;
@@ -49,8 +48,8 @@ pub use anti_entropy::{
 pub use error::{Error, Result};
 pub use gc::{
     recover_incomplete_compactions, CompactionRecoveryAction, CompactionState, CompactionUnit,
-    DiskSegmentShardStore, GarbageCollector, GcConfig, GcStats, InMemorySegmentShardStore,
-    ObjectLookup, OrphanReaper, OrphanStats, StoreObjectLookup,
+    GarbageCollector, GcConfig, GcStats, InMemoryShardStore, ObjectLookup, OrphanReaper,
+    OrphanStats, StoreObjectLookup,
 };
 pub use heal::{
     enqueue_heal, HealConfig, HealQueue, HealQueueSender, HealRequest, HealStats, HealWorker,
@@ -65,7 +64,6 @@ pub use reconcile::{
 };
 pub use repair::{ReRepConfig, ReRepWorker, RepairTargetSelector};
 pub use scrub::{ScrubConfig, ScrubCoordinator, ScrubReport, ScrubReportBuilder};
-pub use segment_store_impl::DiskSegmentStore;
 
 // ---------------------------------------------------------------------------
 // Generated gRPC service stubs

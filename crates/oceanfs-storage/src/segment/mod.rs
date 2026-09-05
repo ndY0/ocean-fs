@@ -6,6 +6,7 @@
 pub mod buffer;
 #[cfg(test)]
 pub(crate) mod crash_matrix;
+pub mod data_store;
 pub mod event_checkpoint;
 pub mod event_wal;
 pub mod handle;
@@ -23,6 +24,7 @@ pub mod splitter;
 pub mod tier;
 
 pub use buffer::ActiveSegment;
+pub use data_store::{DiskSegmentStore, SegmentWriteGuard};
 pub use event_checkpoint::{CheckpointInfo, EventCheckpoint};
 pub use event_wal::{
     DataWalPos, DeleteEvent, EventWal, EventWalPos, EventWalReader, ReserveEvent, SealEvent,

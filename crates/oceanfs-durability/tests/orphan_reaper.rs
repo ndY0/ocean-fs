@@ -9,7 +9,7 @@ use std::sync::Arc;
 use oceanfs_core::{
     ChunkRef, HashOutput, Hlc, MetadataConfig, ObjectKey, ObjectMetadata, SizeTier,
 };
-use oceanfs_durability::{GcConfig, InMemorySegmentShardStore, OrphanReaper};
+use oceanfs_durability::{GcConfig, InMemoryShardStore, OrphanReaper};
 use oceanfs_storage::{
     metadata::RocksDbMetadataStore,
     segment::lifecycle::{SegmentLifecycleCoordinator, SegmentLifecycleRegistry},
@@ -104,7 +104,7 @@ async fn segment_with_live_object_not_reclaimed() {
     };
     metadata.put_object(obj).unwrap();
 
-    let store = Arc::new(InMemorySegmentShardStore::new(4194304));
+    let store = Arc::new(InMemoryShardStore::new(4194304));
     let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
         &oceanfs_core::LifecycleConfig::default(),
     ));
@@ -126,7 +126,7 @@ async fn unreferenced_segment_identified_as_orphan() {
     seed_sealed(&registry, make_segment(seg_id, 1000000000000));
     // No object references this segment
 
-    let store = Arc::new(InMemorySegmentShardStore::new(4194304));
+    let store = Arc::new(InMemoryShardStore::new(4194304));
     let reaper = make_reaper(metadata, store, GcConfig::default(), Arc::clone(&registry)).await;
     let stats = reaper.run_cycle().await.unwrap();
     assert_eq!(stats.orphans_found, 1);
@@ -147,7 +147,7 @@ async fn recently_sealed_not_reclaimed() {
     seed_sealed(&registry, make_segment(seg_id, now_ms));
     // No object references this segment
 
-    let store = Arc::new(InMemorySegmentShardStore::new(4194304));
+    let store = Arc::new(InMemoryShardStore::new(4194304));
     let reaper = make_reaper(metadata, store, GcConfig::default(), Arc::clone(&registry)).await;
     let stats = reaper.run_cycle().await.unwrap();
     assert_eq!(stats.orphans_found, 0); // Too young to be orphan
@@ -156,7 +156,7 @@ async fn recently_sealed_not_reclaimed() {
 #[tokio::test]
 async fn empty_store_no_orphans() {
     let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
-    let store = Arc::new(InMemorySegmentShardStore::new(4194304));
+    let store = Arc::new(InMemoryShardStore::new(4194304));
     let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
         &oceanfs_core::LifecycleConfig::default(),
     ));
@@ -178,7 +178,7 @@ async fn orphan_deletion_removes_segment_from_metadata() {
     // Verify segment exists before reaper
     assert!(registry.get(seg_id).is_some());
 
-    let store = Arc::new(InMemorySegmentShardStore::new(4194304));
+    let store = Arc::new(InMemoryShardStore::new(4194304));
     let reaper =
         make_reaper(metadata.clone(), store, GcConfig::default(), Arc::clone(&registry)).await;
     let stats = reaper.run_cycle().await.unwrap();
@@ -199,7 +199,7 @@ async fn orphan_deletion_deletes_shards_from_disk() {
     ));
     seed_sealed(&registry, make_segment(seg_id, 1000000000000));
 
-    let store = Arc::new(InMemorySegmentShardStore::new(4194304));
+    let store = Arc::new(InMemoryShardStore::new(4194304));
     let reaper =
         make_reaper(metadata, store.clone(), GcConfig::default(), Arc::clone(&registry)).await;
     let stats = reaper.run_cycle().await.unwrap();
@@ -220,7 +220,7 @@ async fn double_check_prevents_concurrent_write_race() {
     ));
     seed_sealed(&registry, make_segment(seg_id, 1000000000000));
 
-    let store = Arc::new(InMemorySegmentShardStore::new(4194304));
+    let store = Arc::new(InMemoryShardStore::new(4194304));
     let reaper =
         make_reaper(metadata.clone(), store, GcConfig::default(), Arc::clone(&registry)).await;
 
@@ -244,7 +244,7 @@ async fn double_check_prevents_concurrent_write_race() {
     // The in-memory store tracks deleted segments. Run cycle again.
     let reaper2 = make_reaper(
         metadata.clone(),
-        Arc::new(InMemorySegmentShardStore::new(4194304)),
+        Arc::new(InMemoryShardStore::new(4194304)),
         GcConfig::default(),
         Arc::clone(&registry),
     )

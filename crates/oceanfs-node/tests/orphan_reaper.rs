@@ -14,7 +14,7 @@ use oceanfs_core::{
     ChunkRef, HashOutput, Hlc, MetadataConfig, ObjectKey, ObjectMetadata, SegmentId,
     SegmentMetadata, SizeTier,
 };
-use oceanfs_durability::{GcConfig, InMemorySegmentShardStore, OrphanReaper};
+use oceanfs_durability::{GcConfig, InMemoryShardStore, OrphanReaper};
 use oceanfs_storage::{
     metadata::RocksDbMetadataStore, segment::lifecycle::SegmentLifecycleCoordinator,
 };
@@ -61,8 +61,8 @@ async fn make_reaper(
 }
 
 /// Helper: create a test shard store.
-fn make_shard_store() -> Arc<InMemorySegmentShardStore> {
-    Arc::new(InMemorySegmentShardStore::new(4194304))
+fn make_shard_store() -> Arc<InMemoryShardStore> {
+    Arc::new(InMemoryShardStore::new(4194304))
 }
 
 /// Helper: create a segment metadata with the given sealed timestamp.
@@ -306,7 +306,7 @@ async fn reaper_reports_bytes_reclaimed_correctly() {
     }
 
     let shard_size = 4194304u64;
-    let shard_store = Arc::new(InMemorySegmentShardStore::new(shard_size));
+    let shard_store = Arc::new(InMemoryShardStore::new(shard_size));
     let reaper =
         make_reaper(metadata, shard_store, GcConfig::default(), Arc::clone(&registry)).await;
 

@@ -1,10 +1,9 @@
 //! Segment data store trait — whole-file `.dat` data access.
 //!
 //! ADR-0032 D1: this is the **only** segment data-access abstraction.
-//! The historical split — a read/write-only `SegmentDataStore`
-//! (`oceanfs-durability::anti_entropy`) plus a delete/list-only
-//! `SegmentShardStore` (`oceanfs-durability::gc`) — folded into this
-//! single trait. Implementations live in `oceanfs-storage`
+//! The historical split — a read/write-only data trait plus a
+//! delete/list-only shard-store trait (both in `oceanfs-durability`)
+//! — folded into this single trait. Implementations live in `oceanfs-storage`
 //! (production, `DiskSegmentStore`) or in test crates (in-memory
 //! doubles).
 
