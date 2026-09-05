@@ -10,7 +10,7 @@ dependencies:
 adr:
   - 0031-remove-single-datadir-legacy-mode
 created: 2026-09-04
-updated: 2026-09-04
+updated: 2026-09-05
 ---
 
 # Composition-Root Decomposition — Program Coordination
@@ -21,9 +21,10 @@ updated: 2026-09-04
 > start, and what must not regress while you work. The per-feature docs
 > are the authority for your feature; this document is the map.
 
-> **STATUS (2026-09-04): c1 and c2 LANDED — both with independent review
-> PASS; c3–c5 pending.** See the Landing order under Feature DAG for the
-> per-feature gate record.
+> **STATUS (2026-09-05): c1, c2, and the c3a prerequisite seam
+> (seal-pipeline relocation storage-side, commit `489397a`) LANDED — each
+> with independent review PASS; c3–c5 pending.** See the Landing order
+> under Feature DAG for the per-feature gate record.
 
 ---
 
@@ -94,16 +95,21 @@ background → return `Node`. Shutdown (`node.rs:3107-3213`) stays on
 ```
 c1 split-storage-builder
  └── c2 split-durability-builder
-      └── c3 split-server-builder
-           └── c4 split-network-builder
-                └── c5 background-spawn-extraction + start() slimming
+      └── c3a seal-pipeline relocation storage-side (c3 Option-A prerequisite)
+           └── c3 split-server-builder
+                └── c4 split-network-builder
+                     └── c5 background-spawn-extraction + start() slimming
 ```
 
-Ordering: **c1 → c2 → c3 → c4 → c5**. Each is a pure-move refactor: the
-builder returns the same `Arc`s the inline code produced; behavior is
-identical; the regression bar is "node boots, e2e write/read passes,
-existing node tests pass." `c5` (the final `start()` slimming + guideline
-update) only makes sense once all four builders exist.
+Ordering: **c1 → c2 → c3a → c3 → c4 → c5**. Each c1–c5 builder step is a
+pure-move refactor: the builder returns the same `Arc`s the inline code
+produced; behavior is identical; the regression bar is "node boots, e2e
+write/read passes, existing node tests pass." `c5` (the final `start()`
+slimming + guideline update) only makes sense once all four builders
+exist. `c3a` is the user-approved Option-A prerequisite seam for c3 (c3
+planning, 2026-09-04): the seal pipeline had to move storage-side so
+`run_startup_recovery()` no longer depends on a server object — it is NOT
+one of the c1–c5 builder steps and does not change what c3 extracts.
 
 **Landing order (per-feature gate record):**
 
@@ -116,7 +122,16 @@ update) only makes sense once all four builders exist.
   re-verified 66 passed).** `DurabilityModule` extracted (§7; 12-handle
   bundle); user-approved deviations D1–D5 recorded once in the c2 doc's
   Accepted Deviations.
-- **c3 split-server-builder — pending.**
+- **c3a seal-pipeline relocation (c3 Option-A prerequisite) — LANDED
+  2026-09-05 (review PASS, iteration 2; commit `489397a`).** Storage-side
+  seal pipeline (`oceanfs-storage::segment::seal_pipeline`); `SealingWork`
+  carries entries cleared only on successful enqueue; node order storage →
+  durability → seal pipeline → recovery → server construction. Full
+  details in its own doc (`c3a-seal-pipeline-relocation.md`). c3 remains
+  pending and now has its prerequisite seam.
+- **c3 split-server-builder — pending.** Its Option-A prerequisite seam
+  (c3a) LANDED 2026-09-05 — the seal worker and the coordinator's notifier
+  field are gone, so this extraction moves the remaining server sections.
 - **c4 split-network-builder — pending.**
 - **c5 background-spawn-extraction + `start()` slimming — pending.**
 

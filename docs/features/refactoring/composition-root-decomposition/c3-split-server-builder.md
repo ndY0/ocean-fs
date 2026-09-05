@@ -11,7 +11,7 @@ dependencies:
 adr: []
 perf: []
 created: 2026-09-04
-updated: 2026-09-04
+updated: 2026-09-05
 ---
 
 # c3: Extract ServerModule Builder
@@ -34,6 +34,32 @@ pub struct ServerModule {
     pub metrics: Arc<MetricsRegistry>,
 }
 ```
+
+## Prerequisite — c3a seal-pipeline relocation (LANDED 2026-09-05)
+
+c3's Option-A prerequisite seam — moving the seal pipeline storage-side —
+landed 2026-09-05 as commit `489397a` (review PASS, iteration 2); it is
+recorded in its own feature doc:
+[`c3a-seal-pipeline-relocation.md`](./c3a-seal-pipeline-relocation.md)
+(status: done). Consequences for this feature:
+
+- The seal-worker drain loop no longer lives in `WriteCoordinator`: the
+  pipeline is spawned storage-side via `StorageModule::start_seal_pipeline()`
+  **before** `run_startup_recovery()` and all server construction.
+- The sealed-segment notifier wiring (which this feature's Summary
+  attributed to the write coordinator's `with_*` chain) is now the
+  AE-continuous + replicator fan-out closure built at the pipeline spawn
+  point and injected into `oceanfs-storage::segment::seal_pipeline` as a
+  `SealedSegmentNotifier` — the coordinator's `segment_sealed_notifier`
+  field/setter is deleted.
+- c3's extraction therefore moves the **remaining** server sections
+  (caches/policies, prefetch, adapters, coordinators, S3/admin handlers,
+  gRPC services — node.rs sections 8–15 as scoped below) with no
+  seal-worker or notifier-field surface to carry over from the
+  coordinator.
+
+This feature's status stays `proposed` and its Scope/DoD are unchanged;
+c3a was a prerequisite only, not a c3 slice.
 
 ## Scope
 
