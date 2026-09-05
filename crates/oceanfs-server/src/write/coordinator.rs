@@ -3085,7 +3085,7 @@ mod tests {
     /// (plus the rest of the data plane) on an ephemeral port.
     /// Returns the bound address; the server runs until the test ends.
     async fn spawn_segment_server(fail_deletes: bool) -> SocketAddr {
-        let data_store: Arc<dyn oceanfs_durability::SegmentDataStore> =
+        let data_store: Arc<dyn oceanfs_storage_api::SegmentDataStore> =
             Arc::new(oceanfs_durability::anti_entropy::InMemorySegmentStore::new());
         let metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore> =
             Arc::new(MockDeleteMetadata { fail_deletes });

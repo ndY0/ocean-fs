@@ -7,14 +7,12 @@
 use std::sync::Arc;
 
 use oceanfs_core::{NodeId, SegmentId};
+use oceanfs_storage_api::SegmentDataStore;
 use tonic::{Request, Response, Status};
 
-use crate::{
-    scrub_rpc::{
-        scrub_rpc_server::ScrubRpc, AssignPartitionRequest, AssignPartitionResponse,
-        ReportPartitionResultRequest, ReportPartitionResultResponse,
-    },
-    SegmentDataStore,
+use crate::scrub_rpc::{
+    scrub_rpc_server::ScrubRpc, AssignPartitionRequest, AssignPartitionResponse,
+    ReportPartitionResultRequest, ReportPartitionResultResponse,
 };
 
 /// gRPC service for distributed scrub operations.

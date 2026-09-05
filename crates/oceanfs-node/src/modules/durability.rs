@@ -338,11 +338,14 @@ impl DurabilityModule {
         scrub_config.set_parallel_nodes(config.scrub_parallel_nodes);
         let scrub_worker = Arc::new(ScrubCoordinator::new(scrub_config));
         // OrphanReaper deletes segment data files from disk when reclaiming
-        // orphaned segments after GC compaction.
+        // orphaned segments after GC compaction. The reaper sweeps the
+        // data pool roots (ADR-0032 D1 per-root listing) — the registry's
+        // live data pools.
         let reaper = Arc::new(OrphanReaper::new(
             storage.metadata_store.clone(),
             storage.lifecycle.clone(),
             storage.shard_store.clone(),
+            storage.registry.data_pools(),
             gc_config,
         ));
 

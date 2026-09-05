@@ -14,11 +14,12 @@ use std::sync::Arc;
 use oceanfs_core::{HashOutput, NodeId, SegmentId, SegmentMetadata, SizeTier};
 use oceanfs_durability::{
     merkle::{IncrementalMerkleTree, MerkleTreeConfig},
-    AntiEntropy, AntiEntropyConfig, InMemorySegmentStore, MerkleTree, SegmentDataStore,
+    AntiEntropy, AntiEntropyConfig, InMemorySegmentStore, MerkleTree,
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::{Ring, RingCache};
+use oceanfs_storage_api::SegmentDataStore;
 
 /// Creates a test IncrementalMerkleTree.
 fn make_test_tree() -> Arc<IncrementalMerkleTree> {
@@ -96,7 +97,7 @@ async fn ae_sealed_segment_with_matching_root_no_mismatch() {
     // Create test data and write it to the in-memory store
     let data = make_test_data(65536); // 64 KB
     let seg_id = SegmentId::new();
-    data_store.write_segment_data(&seg_id, &data).expect("write segment data");
+    data_store.write_segment_data(&seg_id, &data).await.expect("write segment data");
 
     // Compute the Merkle root and seed the machine with it
     let tree = MerkleTree::build(&data, 0).expect("build Merkle tree");
@@ -133,7 +134,7 @@ async fn ae_sealed_segment_with_mismatched_root_detected() {
     // Create test data
     let data = make_test_data(65536);
     let seg_id = SegmentId::new();
-    data_store.write_segment_data(&seg_id, &data).expect("write segment data");
+    data_store.write_segment_data(&seg_id, &data).await.expect("write segment data");
 
     // Store a deliberately WRONG merkle root
     let wrong_hash = HashOutput::from_bytes([0xAAu8; 32]);
@@ -168,7 +169,7 @@ async fn ae_sealed_segment_without_merkle_root_is_flagged() {
 
     let data = make_test_data(4096);
     let seg_id = SegmentId::new();
-    data_store.write_segment_data(&seg_id, &data).expect("write segment data");
+    data_store.write_segment_data(&seg_id, &data).await.expect("write segment data");
 
     // Segment with no stored Merkle root
     let seg_meta = make_sealed_segment(seg_id, None);
@@ -203,7 +204,7 @@ async fn ae_multiple_segments_all_compared() {
     for i in 0..5u32 {
         let data = make_test_data(1024 * (i + 1) as usize);
         let seg_id = SegmentId::new();
-        data_store.write_segment_data(&seg_id, &data).expect("write segment data");
+        data_store.write_segment_data(&seg_id, &data).await.expect("write segment data");
 
         let tree = MerkleTree::build(&data, 0).expect("build Merkle tree");
         let root_hash = tree.root().hash();

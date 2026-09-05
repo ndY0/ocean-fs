@@ -55,13 +55,14 @@ use oceanfs_storage::{
     wal::{WalReader, WalWriter},
     SealConfig, SegmentSealer,
 };
+use oceanfs_storage_api::SegmentDataStore;
 
 use super::{
     compaction_recovery::{recover_incomplete_compactions, CompactionRecoveryAction, ObjectLookup},
-    garbage_collector::{DiskSegmentShardStore, SegmentShardStore},
+    garbage_collector::DiskSegmentShardStore,
     segment_compactor::{stall_seam, SegmentCompactor},
 };
-use crate::{anti_entropy::SegmentDataStore, segment_store_impl::DiskSegmentStore};
+use crate::segment_store_impl::DiskSegmentStore;
 
 /// The deterministic merkle-root builder shared by the compactor (its
 /// seal-time root), the seed helper, and the recovery pass: the
@@ -219,7 +220,7 @@ impl Harness {
     /// write path produces: reserve → data → fsync → seal).
     async fn seed_sealed_old(&self, id: SegmentId, data: &[u8]) {
         self.lifecycle.request_reserve(id, SizeTier::Standard, 4, 2).await.unwrap();
-        self.data_store.write_segment_data(&id, data).unwrap();
+        self.data_store.write_segment_data(&id, data).await.unwrap();
         let meta = SegmentMetadata {
             pool_id: 0,
             segment_id: id,
@@ -513,7 +514,7 @@ async fn row7_kill_between_new_sealed_and_objects_moved() {
     // the unit: the replacement is deleted durably and its .dat swept;
     // reads still resolve to the old segment.
     h2.lifecycle.request_delete(new_id).await.unwrap();
-    h2.shard_store.delete_shards(new_id).unwrap();
+    h2.shard_store.delete_shards(&new_id).await.unwrap();
     assert!(h2.lifecycle.registry().get(new_id).is_none(), "orphan deleted durably");
     assert!(
         !h2.segments_dir.join(format!("{new_id}.dat")).exists(),
@@ -570,7 +571,7 @@ async fn row8_kill_between_objects_moved_and_old_deleted() {
 
     // Dispatch: the old segment's durable deletion, then its .dat sweep.
     h2.lifecycle.request_delete(old_id).await.unwrap();
-    h2.shard_store.delete_shards(old_id).unwrap();
+    h2.shard_store.delete_shards(&old_id).await.unwrap();
     assert!(h2.lifecycle.registry().get(old_id).is_none(), "old deleted durably");
     assert!(!h2.segments_dir.join(format!("{old_id}.dat")).exists(), "old .dat swept");
     assert_eq!(h2.object_chunk("a.txt").segment_id, new_id, "reads resolve to the new segment");
@@ -623,7 +624,7 @@ async fn row9_kill_between_old_deleted_and_old_removed() {
     );
 
     // Dispatch: the idempotent sweep.
-    h2.shard_store.delete_shards(old_id).unwrap();
+    h2.shard_store.delete_shards(&old_id).await.unwrap();
     assert!(!h2.segments_dir.join(format!("{old_id}.dat")).exists(), "old .dat swept");
     assert_eq!(h2.object_chunk("a.txt").segment_id, new_id, "reads resolve to the new segment");
 }
@@ -724,7 +725,13 @@ async fn repacked_compressed_chunk_reads_back_with_matching_digest() {
     assert_eq!(chunk.logical_length, logical.len() as u32, "logical_length preserved");
     assert_eq!(chunk.length, on_disk.len() as u32, "the compressed size is preserved");
 
-    let new_data = h2.data_store.read_segment_data(&chunk.segment_id).unwrap();
+    let new_data = h2
+        .data_store
+        .read_segment_data(&chunk.segment_id)
+        .await
+        .unwrap()
+        .expect("repacked segment present")
+        .data;
     let start = chunk.offset as usize;
     let end = start + chunk.length as usize;
     assert!(end <= new_data.len(), "chunk fits in the new segment's data section");
@@ -793,7 +800,7 @@ async fn post_compaction_segment_scrubs_healthy_against_the_machine_root() {
     assert_eq!(entry.state, oceanfs_storage::segment::lifecycle::SegmentState::Sealed);
     let scrubber =
         crate::scrub::ScrubWorker::new(Arc::clone(&h2.registry), h2.data_store.clone(), 0);
-    let result = scrubber.scrub_segment(&entry.metadata);
+    let result = scrubber.scrub_segment(&entry.metadata).await;
     assert!(
         result.healthy && !result.merkle_mismatch && !result.skipped,
         "the repacked segment scrubs healthy against the machine's root: {result:?}"
@@ -802,7 +809,13 @@ async fn post_compaction_segment_scrubs_healthy_against_the_machine_root() {
 
     // Read-back resolves through the new segment with a matching digest.
     let chunk = h2.object_chunk("a.txt");
-    let new_data = h2.data_store.read_segment_data(&chunk.segment_id).unwrap();
+    let new_data = h2
+        .data_store
+        .read_segment_data(&chunk.segment_id)
+        .await
+        .unwrap()
+        .expect("repacked segment present")
+        .data;
     let start = chunk.offset as usize;
     let end = start + chunk.length as usize;
     assert_eq!(&new_data[start..end], old_data.as_slice(), "uncompressed bytes verbatim");
@@ -849,7 +862,13 @@ async fn repacked_uncompressed_chunk_reads_back_with_matching_digest() {
     assert_ne!(chunk.segment_id, old_id, "the chunk was repacked");
     assert!(!chunk.compressed);
     assert_eq!(chunk.logical_length, logical.len() as u32);
-    let new_data = h2.data_store.read_segment_data(&chunk.segment_id).unwrap();
+    let new_data = h2
+        .data_store
+        .read_segment_data(&chunk.segment_id)
+        .await
+        .unwrap()
+        .expect("repacked segment present")
+        .data;
     let start = chunk.offset as usize;
     let end = start + chunk.length as usize;
     let stored = &new_data[start..end];

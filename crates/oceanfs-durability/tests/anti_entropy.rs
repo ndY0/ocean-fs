@@ -14,11 +14,12 @@ use oceanfs_core::{
 };
 use oceanfs_durability::{
     merkle::{IncrementalMerkleTree, MerkleTreeConfig},
-    AntiEntropy, AntiEntropyConfig, InMemorySegmentStore, MerkleTree, SegmentDataStore,
+    AntiEntropy, AntiEntropyConfig, InMemorySegmentStore, MerkleTree,
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::{Ring, RingCache};
+use oceanfs_storage_api::SegmentDataStore;
 
 /// Creates a test IncrementalMerkleTree.
 fn make_test_tree() -> Arc<IncrementalMerkleTree> {
@@ -373,7 +374,7 @@ async fn real_two_node_anti_entropy_cycle() {
     let segment_data = vec![0x5Au8; 65536 * 4]; // 256 KB, 4 leaves
 
     // Node A: store data and metadata
-    segment_store_a.write_segment_data(&seg_id, &segment_data).unwrap();
+    segment_store_a.write_segment_data(&seg_id, &segment_data).await.unwrap();
     let tree_a = MerkleTree::build(&segment_data, 65536).unwrap();
     let root_a = tree_a.root().hash();
     let seg_meta_a = SegmentMetadata {
@@ -389,7 +390,7 @@ async fn real_two_node_anti_entropy_cycle() {
     registry_a.reserve(seg_id, seg_meta_a.clone()).unwrap();
     registry_a.seal(seg_id, seg_meta_a).unwrap();
     // Node B: store data and metadata
-    segment_store_b.write_segment_data(&seg_id, &segment_data).unwrap();
+    segment_store_b.write_segment_data(&seg_id, &segment_data).await.unwrap();
     let tree_b = MerkleTree::build(&segment_data, 65536).unwrap();
     let root_b = tree_b.root().hash();
     let seg_meta_b = SegmentMetadata {
@@ -412,7 +413,7 @@ async fn real_two_node_anti_entropy_cycle() {
     let mut corrupted_data = segment_data.clone();
     // Corrupt leaf index 2 (bytes 131072..196608)
     corrupted_data[2 * 65536 + 100] ^= 0x01;
-    segment_store_a.write_segment_data(&seg_id, &corrupted_data).unwrap();
+    segment_store_a.write_segment_data(&seg_id, &corrupted_data).await.unwrap();
 
     // Verify the Merkle tree now produces a different root
     let corrupted_tree = MerkleTree::build(&corrupted_data, 65536).unwrap();
@@ -445,13 +446,19 @@ async fn real_two_node_anti_entropy_cycle() {
     assert!(alive_peers.iter().any(|p| p.as_str() == "node-b"));
 
     // --- Simulate repair: Node A gets correct data from Node B ---
-    let correct_data = segment_store_b.read_segment_data(&seg_id).unwrap();
-    assert_eq!(correct_data, segment_data); // Node B has correct data
+    let correct_data = segment_store_b
+        .read_segment_data(&seg_id)
+        .await
+        .unwrap()
+        .expect("node B holds the segment")
+        .data;
+    assert_eq!(&correct_data[..], &segment_data[..]); // Node B has correct data
 
     // Repair Node A's data from peer
-    segment_store_a.write_segment_data(&seg_id, &correct_data).unwrap();
-    let repaired_data = segment_store_a.read_segment_data(&seg_id).unwrap();
-    assert_eq!(repaired_data, segment_data);
+    segment_store_a.write_segment_data(&seg_id, &correct_data).await.unwrap();
+    let repaired_data =
+        segment_store_a.read_segment_data(&seg_id).await.unwrap().expect("node A repaired").data;
+    assert_eq!(&repaired_data[..], &segment_data[..]);
 
     // Verify Merkle tree matches again
     let repaired_tree = MerkleTree::build(&repaired_data, 65536).unwrap();
@@ -485,7 +492,7 @@ async fn anti_entropy_handles_unreachable_peer() {
         ..RpcConfig::default()
     }));
     let segment_store = Arc::new(InMemorySegmentStore::new());
-    segment_store.write_segment_data(&seg_id, &segment_data).unwrap();
+    segment_store.write_segment_data(&seg_id, &segment_data).await.unwrap();
 
     let seg = SegmentMetadata {
         pool_id: 0,
@@ -527,7 +534,7 @@ async fn anti_entropy_with_no_alive_peers() {
     let segment_data = vec![0xFFu8; 65536];
     let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
     let segment_store = Arc::new(InMemorySegmentStore::new());
-    segment_store.write_segment_data(&seg_id, &segment_data).unwrap();
+    segment_store.write_segment_data(&seg_id, &segment_data).await.unwrap();
 
     let tree = MerkleTree::build(&segment_data, 65536).unwrap();
     let seg = SegmentMetadata {

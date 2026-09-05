@@ -417,7 +417,7 @@ pub(crate) struct AdminState {
         Option<Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry>>,
     /// Segment data store for scrub (storage feature only).
     #[cfg(feature = "storage")]
-    pub data_store: Option<Arc<dyn oceanfs_durability::SegmentDataStore>>,
+    pub data_store: Option<Arc<dyn oceanfs_storage_api::SegmentDataStore>>,
     /// The live storage-pool registry (ADR-0029, f8): `POST /admin/pools`
     /// attaches a pool at runtime without a restart. `None` when the
     /// pool surface is not wired.
@@ -534,7 +534,7 @@ impl AdminHandler {
         mut self,
         coordinator: Arc<oceanfs_durability::ScrubCoordinator>,
         metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
-        data_store: Arc<dyn oceanfs_durability::SegmentDataStore>,
+        data_store: Arc<dyn oceanfs_storage_api::SegmentDataStore>,
     ) -> Self {
         self.state.scrub_coordinator = Some(coordinator);
         self.state.metadata_store = Some(metadata);

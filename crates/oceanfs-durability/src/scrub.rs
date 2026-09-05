@@ -13,12 +13,10 @@ use oceanfs_core::{
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
+use oceanfs_storage_api::SegmentDataStore;
 use tokio::sync::Semaphore;
 
-use crate::{
-    anti_entropy::{MerkleTree, SegmentDataStore},
-    Error, Result,
-};
+use crate::{anti_entropy::MerkleTree, Error, Result};
 
 // ---------------------------------------------------------------------------
 // ScrubConfig
@@ -326,40 +324,36 @@ impl ScrubWorker {
     ///
     /// If the segment data cannot be read from the data store, the
     /// result is marked as unhealthy with `merkle_mismatch = true`.
-    pub(crate) fn scrub_segment(&self, segment_meta: &SegmentMetadata) -> ScrubResult {
+    pub(crate) async fn scrub_segment(&self, segment_meta: &SegmentMetadata) -> ScrubResult {
         // Read the raw segment data from the backing store.
-        let data = match self.data_store.read_segment_data(&segment_meta.segment_id) {
-            Ok(data) => data,
+        let data = match self.data_store.read_segment_data(&segment_meta.segment_id).await {
+            Ok(Some(file)) => file.data,
+            Ok(None) => {
+                // A missing `.dat` (Ok(None)) is NOT corruption: the
+                // segment may have been sealed concurrently with this
+                // scrub cycle and the .dat finalized after the metadata
+                // scan, or (single-node crash recovery) the orphan reaper
+                // may have deleted the shard between the metadata scan and
+                // this read. Report it as skipped so the cycle does not
+                // emit false corruption alarms (the previous behaviour
+                // counted every read error as a Merkle mismatch and
+                // enqueued heal requests for segments that were never
+                // corrupt).
+                tracing::debug!(
+                    segment_id = %segment_meta.segment_id,
+                    "segment shard not found during scrub; skipping (seal/GC race)"
+                );
+                return ScrubResult {
+                    segment_id: segment_meta.segment_id,
+                    healthy: true,
+                    corrupt_shard_indices: Vec::new(),
+                    merkle_mismatch: false,
+                    bytes_scanned: 0,
+                    enqueued_heal: false,
+                    skipped: true,
+                };
+            }
             Err(e) => {
-                // A NotFound read is NOT corruption: the segment may have
-                // been sealed concurrently with this scrub cycle and the
-                // .dat finalized after the metadata scan, or (single-node
-                // crash recovery) the orphan reaper may have deleted the
-                // shard between the metadata scan and this read. Report it
-                // as skipped so the cycle does not emit false corruption
-                // alarms (the previous behaviour counted every read error
-                // as a Merkle mismatch and enqueued heal requests for
-                // segments that were never corrupt).
-                let not_found = matches!(
-                    &e,
-                    oceanfs_storage::Error::Io(io_err)
-                        if io_err.kind() == std::io::ErrorKind::NotFound
-                ) || matches!(&e, oceanfs_storage::Error::SegmentNotFound(_));
-                if not_found {
-                    tracing::debug!(
-                        segment_id = %segment_meta.segment_id,
-                        "segment shard not found during scrub; skipping (seal/GC race)"
-                    );
-                    return ScrubResult {
-                        segment_id: segment_meta.segment_id,
-                        healthy: true,
-                        corrupt_shard_indices: Vec::new(),
-                        merkle_mismatch: false,
-                        bytes_scanned: 0,
-                        enqueued_heal: false,
-                        skipped: true,
-                    };
-                }
                 tracing::warn!(
                     error = %e,
                     segment_id = %segment_meta.segment_id,
@@ -495,7 +489,7 @@ impl ScrubWorker {
     ///
     /// Iterates through each segment in the partition, reads its metadata
     /// from the metadata store, and verifies it via [`scrub_segment`].
-    pub(crate) fn scrub_partition(&self, partition: &SegmentPartition) -> Vec<ScrubResult> {
+    pub(crate) async fn scrub_partition(&self, partition: &SegmentPartition) -> Vec<ScrubResult> {
         tracing::debug!(
             node_id = %partition.node_id,
             segment_count = partition.segment_ids.len(),
@@ -506,7 +500,7 @@ impl ScrubWorker {
         for seg_id in &partition.segment_ids {
             match self.registry.get(*seg_id) {
                 Some(entry) => {
-                    let result = self.scrub_segment(&entry.metadata);
+                    let result = self.scrub_segment(&entry.metadata).await;
                     results.push(result);
                 }
                 None => {
@@ -771,12 +765,20 @@ impl ScrubCoordinator {
                     .map_err(|e| Error::Internal(format!("semaphore acquire failed: {e}")))?;
 
                 let partition = SegmentPartition { node_id, segment_ids: batch };
-                // Perform the actual verification on a blocking thread
-                // to avoid blocking the async runtime.
-                let results =
-                    tokio::task::spawn_blocking(move || worker.scrub_partition(&partition))
-                        .await
-                        .map_err(|e| Error::Internal(format!("spawn_blocking failed: {e}")))?;
+                // Verify the batch on the async runtime — the unified
+                // store's reads are async (the durability crate's other
+                // cycles — heal/repair/GC — follow the same pattern);
+                // the semaphore bounds concurrent verification.
+                //
+                // NOTE (f1 review LOW, deferred to f2): the store's
+                // reads are blocking fs calls inside async fns, so each
+                // in-flight batch occupies a runtime worker thread.
+                // Pre-f1 scrub ran on the blocking pool via
+                // `spawn_blocking`; restoring that (or moving reads to
+                // the storage io layer) is a f2 decision — the io-layer
+                // work settles where store I/O executes for every
+                // consumer at once.
+                let results = worker.scrub_partition(&partition).await;
 
                 Ok::<Vec<ScrubResult>, Error>(results)
             });
@@ -932,10 +934,12 @@ mod tests {
 
     /// Creates an in-memory segment data store pre-populated with the given
     /// segment ID → data mapping.
-    fn segment_store_with_data(entries: Vec<(SegmentId, Vec<u8>)>) -> Arc<InMemorySegmentStore> {
+    async fn segment_store_with_data(
+        entries: Vec<(SegmentId, Vec<u8>)>,
+    ) -> Arc<InMemorySegmentStore> {
         let store = Arc::new(InMemorySegmentStore::new());
         for (id, data) in entries {
-            store.write_segment_data(&id, &data).unwrap();
+            store.write_segment_data(&id, &data).await.unwrap();
         }
         store
     }
@@ -1061,8 +1065,8 @@ mod tests {
     // ScrubWorker — healthy segments
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn scrub_worker_healthy_segment_no_merkle_root() {
+    #[tokio::test]
+    async fn scrub_worker_healthy_segment_no_merkle_root() {
         let seg_id = SegmentId::new();
         let test_data = b"data present but no merkle root stored".to_vec();
 
@@ -1070,7 +1074,7 @@ mod tests {
             Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
                 &oceanfs_core::LifecycleConfig::default(),
             ));
-        let data_store = segment_store_with_data(vec![(seg_id, test_data.clone())]);
+        let data_store = segment_store_with_data(vec![(seg_id, test_data.clone())]).await;
         let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
@@ -1084,7 +1088,7 @@ mod tests {
             sealed_at: Some(1700000000000),
         };
 
-        let result = worker.scrub_segment(&seg_meta);
+        let result = worker.scrub_segment(&seg_meta).await;
         // Without a stored Merkle root, we cannot verify integrity,
         // but the data is present and readable.
         assert!(result.healthy);
@@ -1092,8 +1096,8 @@ mod tests {
         assert_eq!(result.bytes_scanned, test_data.len() as u64);
     }
 
-    #[test]
-    fn scrub_worker_segment_with_data_and_correct_merkle_root() {
+    #[tokio::test]
+    async fn scrub_worker_segment_with_data_and_correct_merkle_root() {
         let seg_id = SegmentId::new();
         let test_data = b"hello world this is test segment data for scrub verification".to_vec();
         let merkle_root = MerkleTree::build(&test_data, 0).unwrap().root().hash();
@@ -1102,7 +1106,7 @@ mod tests {
             Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
                 &oceanfs_core::LifecycleConfig::default(),
             ));
-        let data_store = segment_store_with_data(vec![(seg_id, test_data.clone())]);
+        let data_store = segment_store_with_data(vec![(seg_id, test_data.clone())]).await;
         let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
@@ -1116,24 +1120,24 @@ mod tests {
             sealed_at: Some(1700000000000),
         };
 
-        let result = worker.scrub_segment(&seg_meta);
+        let result = worker.scrub_segment(&seg_meta).await;
         assert!(result.healthy);
         assert!(!result.merkle_mismatch);
         assert_eq!(result.bytes_scanned, test_data.len() as u64);
     }
 
-    #[test]
-    fn scrub_worker_empty_partition() {
+    #[tokio::test]
+    async fn scrub_worker_empty_partition() {
         let registry =
             Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
                 &oceanfs_core::LifecycleConfig::default(),
             ));
-        let data_store = segment_store_with_data(vec![]);
+        let data_store = segment_store_with_data(vec![]).await;
         let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let partition = SegmentPartition { node_id: NodeId::new("test"), segment_ids: Vec::new() };
 
-        let results = worker.scrub_partition(&partition);
+        let results = worker.scrub_partition(&partition).await;
         assert!(results.is_empty());
     }
 
@@ -1141,8 +1145,8 @@ mod tests {
     // ScrubWorker — corruption detection
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn scrub_worker_detects_bit_flip_corruption() {
+    #[tokio::test]
+    async fn scrub_worker_detects_bit_flip_corruption() {
         let seg_id = SegmentId::new();
         let original_data = vec![0xAB; 65536]; // 64 KB of known data
 
@@ -1159,7 +1163,7 @@ mod tests {
                 &oceanfs_core::LifecycleConfig::default(),
             ));
         // Store the CORRUPTED data (simulating disk corruption)
-        let data_store = segment_store_with_data(vec![(seg_id, corrupted_data)]);
+        let data_store = segment_store_with_data(vec![(seg_id, corrupted_data)]).await;
         let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
@@ -1173,14 +1177,14 @@ mod tests {
             sealed_at: Some(1700000000000),
         };
 
-        let result = worker.scrub_segment(&seg_meta);
+        let result = worker.scrub_segment(&seg_meta).await;
         assert!(!result.healthy, "corruption should be detected");
         assert!(result.merkle_mismatch, "Merkle root should mismatch");
         assert_eq!(result.bytes_scanned, corrupted_len);
     }
 
-    #[test]
-    fn scrub_worker_detects_merkle_mismatch_when_data_is_different() {
+    #[tokio::test]
+    async fn scrub_worker_detects_merkle_mismatch_when_data_is_different() {
         let seg_id = SegmentId::new();
         let original_data = b"this is the original correct segment data".to_vec();
         let different_data = b"this is completely different segment content".to_vec();
@@ -1193,7 +1197,7 @@ mod tests {
                 &oceanfs_core::LifecycleConfig::default(),
             ));
         // Store DIFFERENT data (simulating accidental overwrite)
-        let data_store = segment_store_with_data(vec![(seg_id, different_data)]);
+        let data_store = segment_store_with_data(vec![(seg_id, different_data)]).await;
         let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
@@ -1207,13 +1211,13 @@ mod tests {
             sealed_at: Some(1700000000000),
         };
 
-        let result = worker.scrub_segment(&seg_meta);
+        let result = worker.scrub_segment(&seg_meta).await;
         assert!(!result.healthy, "different data should be detected");
         assert!(result.merkle_mismatch);
     }
 
-    #[test]
-    fn scrub_worker_healthy_segment_matches_stored_merkle() {
+    #[tokio::test]
+    async fn scrub_worker_healthy_segment_matches_stored_merkle() {
         let seg_id = SegmentId::new();
         let test_data = b"this segment data is correct and verified by scrubbing".to_vec();
         let merkle_root = MerkleTree::build(&test_data, 0).unwrap().root().hash();
@@ -1222,7 +1226,7 @@ mod tests {
             Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
                 &oceanfs_core::LifecycleConfig::default(),
             ));
-        let data_store = segment_store_with_data(vec![(seg_id, test_data.clone())]);
+        let data_store = segment_store_with_data(vec![(seg_id, test_data.clone())]).await;
         let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
@@ -1236,7 +1240,7 @@ mod tests {
             sealed_at: Some(1700000000000),
         };
 
-        let result = worker.scrub_segment(&seg_meta);
+        let result = worker.scrub_segment(&seg_meta).await;
         assert!(result.healthy);
         assert!(!result.merkle_mismatch);
         assert!(result.corrupt_shard_indices.is_empty());
@@ -1246,8 +1250,8 @@ mod tests {
     // ScrubWorker — error handling
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn scrub_worker_missing_data_skips_not_corrupt() {
+    #[tokio::test]
+    async fn scrub_worker_missing_data_skips_not_corrupt() {
         let seg_id = SegmentId::new();
         let test_data = b"data that exists in metadata but not in store".to_vec();
         let merkle_root = MerkleTree::build(&test_data, 0).unwrap().root().hash();
@@ -1257,7 +1261,7 @@ mod tests {
                 &oceanfs_core::LifecycleConfig::default(),
             ));
         // Empty store — the segment data is NOT present
-        let data_store = segment_store_with_data(vec![]);
+        let data_store = segment_store_with_data(vec![]).await;
         let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
@@ -1271,7 +1275,7 @@ mod tests {
             sealed_at: Some(1700000000000),
         };
 
-        let result = worker.scrub_segment(&seg_meta);
+        let result = worker.scrub_segment(&seg_meta).await;
         assert!(
             result.skipped,
             "missing shard is a seal/GC race, not corruption — must be skipped"
@@ -1281,13 +1285,13 @@ mod tests {
         assert!(!result.enqueued_heal, "missing shard must not trigger a heal request");
     }
 
-    #[test]
-    fn scrub_worker_reports_segment_id() {
+    #[tokio::test]
+    async fn scrub_worker_reports_segment_id() {
         let registry =
             Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
                 &oceanfs_core::LifecycleConfig::default(),
             ));
-        let data_store = segment_store_with_data(vec![]);
+        let data_store = segment_store_with_data(vec![]).await;
         let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_id = SegmentId::new();
@@ -1302,12 +1306,12 @@ mod tests {
             sealed_at: Some(1700000000000),
         };
 
-        let result = worker.scrub_segment(&seg_meta);
+        let result = worker.scrub_segment(&seg_meta).await;
         assert_eq!(result.segment_id, seg_id);
     }
 
-    #[test]
-    fn scrub_worker_large_data_verification() {
+    #[tokio::test]
+    async fn scrub_worker_large_data_verification() {
         let seg_id = SegmentId::new();
         // 128 KB = 2 Merkle leaves
         let large_data = vec![0xCD; 131072];
@@ -1317,7 +1321,7 @@ mod tests {
             Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
                 &oceanfs_core::LifecycleConfig::default(),
             ));
-        let data_store = segment_store_with_data(vec![(seg_id, large_data.clone())]);
+        let data_store = segment_store_with_data(vec![(seg_id, large_data.clone())]).await;
         let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
@@ -1331,7 +1335,7 @@ mod tests {
             sealed_at: Some(1700000000000),
         };
 
-        let result = worker.scrub_segment(&seg_meta);
+        let result = worker.scrub_segment(&seg_meta).await;
         assert!(result.healthy);
         assert_eq!(result.bytes_scanned, 131072);
     }
@@ -1346,7 +1350,7 @@ mod tests {
             Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
                 &oceanfs_core::LifecycleConfig::default(),
             ));
-        let data_store = segment_store_with_data(vec![]);
+        let data_store = segment_store_with_data(vec![]).await;
         let coord = ScrubCoordinator::new(ScrubConfig::default());
         let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
         assert_eq!(report.segments_total, 0);
@@ -1417,7 +1421,7 @@ mod tests {
             )
             .unwrap();
 
-        let data_store = segment_store_with_data(stored_data);
+        let data_store = segment_store_with_data(stored_data).await;
         let coord = ScrubCoordinator::new(ScrubConfig::default());
         let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
 
@@ -1458,7 +1462,7 @@ mod tests {
             registry.seal(seg_id, seg_meta).unwrap();
         }
 
-        let data_store = segment_store_with_data(stored_data);
+        let data_store = segment_store_with_data(stored_data).await;
         let coord = ScrubCoordinator::new(ScrubConfig::default());
         let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
 
@@ -1497,7 +1501,7 @@ mod tests {
         registry.seal(seg_id, seg_meta).unwrap();
 
         // Data store has the CORRUPTED data
-        let data_store = segment_store_with_data(vec![(seg_id, corrupted_data)]);
+        let data_store = segment_store_with_data(vec![(seg_id, corrupted_data)]).await;
 
         let coord = ScrubCoordinator::new(ScrubConfig::default());
         let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
@@ -1513,7 +1517,7 @@ mod tests {
             Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
                 &oceanfs_core::LifecycleConfig::default(),
             ));
-        let data_store = segment_store_with_data(vec![]);
+        let data_store = segment_store_with_data(vec![]).await;
         let coord = ScrubCoordinator::new(ScrubConfig::default());
         let result = coord.trigger_manual(Arc::clone(&registry), data_store).await;
         assert!(result.is_ok());
@@ -1527,7 +1531,7 @@ mod tests {
             Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
                 &oceanfs_core::LifecycleConfig::default(),
             ));
-        let data_store = segment_store_with_data(vec![]);
+        let data_store = segment_store_with_data(vec![]).await;
         let mut config = ScrubConfig::default();
         config.set_interval_sec(3600); // Long interval so it doesn't fire in test
 
@@ -1586,15 +1590,15 @@ mod tests {
         assert_eq!(config.interval_sec(), 604800);
     }
 
-    #[test]
-    fn scrub_segment_empty_data_is_healthy() {
+    #[tokio::test]
+    async fn scrub_segment_empty_data_is_healthy() {
         let seg_id = SegmentId::new();
 
         let registry =
             Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
                 &oceanfs_core::LifecycleConfig::default(),
             ));
-        let data_store = segment_store_with_data(vec![(seg_id, vec![])]);
+        let data_store = segment_store_with_data(vec![(seg_id, vec![])]).await;
         let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         let seg_meta = SegmentMetadata {
@@ -1608,7 +1612,7 @@ mod tests {
             sealed_at: Some(1700000000000),
         };
 
-        let result = worker.scrub_segment(&seg_meta);
+        let result = worker.scrub_segment(&seg_meta).await;
         assert!(result.healthy);
         assert_eq!(result.bytes_scanned, 0);
     }
@@ -1616,13 +1620,13 @@ mod tests {
     // Tests that scrub_partition handles non-existent segments in metadata gracefully.
     // The worker asks the metadata store for a segment that was never put,
     // which triggers the Ok(None) branch.
-    #[test]
-    fn scrub_partition_handles_missing_segment() {
+    #[tokio::test]
+    async fn scrub_partition_handles_missing_segment() {
         let registry =
             Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
                 &oceanfs_core::LifecycleConfig::default(),
             ));
-        let data_store = segment_store_with_data(vec![]);
+        let data_store = segment_store_with_data(vec![]).await;
         let worker = ScrubWorker::new(Arc::clone(&registry), data_store, 0);
 
         // Create a segment ID that was never stored in metadata
@@ -1630,7 +1634,7 @@ mod tests {
         let partition =
             SegmentPartition { node_id: NodeId::new("test"), segment_ids: vec![missing_id] };
 
-        let results = worker.scrub_partition(&partition);
+        let results = worker.scrub_partition(&partition).await;
         // No scrub results should be produced for a missing segment
         assert!(results.is_empty());
     }
@@ -1641,7 +1645,7 @@ mod tests {
             Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
                 &oceanfs_core::LifecycleConfig::default(),
             ));
-        let data_store = segment_store_with_data(vec![]);
+        let data_store = segment_store_with_data(vec![]).await;
         let mut config = ScrubConfig::default();
         // Use a very short interval so the cycle fires quickly
         config.set_interval_sec(0);
@@ -1730,7 +1734,7 @@ mod tests {
             registry.seal(seg_id, seg_meta).unwrap();
         }
 
-        let data_store = segment_store_with_data(stored_data);
+        let data_store = segment_store_with_data(stored_data).await;
         // Use parallel_nodes=2 to test the non-zero branch
         let mut config = ScrubConfig::default();
         config.set_parallel_nodes(2);

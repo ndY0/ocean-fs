@@ -9,11 +9,12 @@ use std::sync::Arc;
 use oceanfs_core::{
     ChunkRef, HashOutput, Hlc, MetadataConfig, ObjectKey, ObjectMetadata, SizeTier,
 };
-use oceanfs_durability::{GcConfig, InMemorySegmentShardStore, OrphanReaper, SegmentShardStore};
+use oceanfs_durability::{GcConfig, InMemorySegmentShardStore, OrphanReaper};
 use oceanfs_storage::{
     metadata::RocksDbMetadataStore,
     segment::lifecycle::{SegmentLifecycleCoordinator, SegmentLifecycleRegistry},
 };
+use oceanfs_storage_api::SegmentDataStore;
 
 fn test_config() -> MetadataConfig {
     let dir = tempfile::tempdir().unwrap();
@@ -30,7 +31,7 @@ fn test_config() -> MetadataConfig {
 /// the event WAL is its only durable writer.
 async fn make_reaper(
     metadata: Arc<RocksDbMetadataStore>,
-    store: Arc<dyn SegmentShardStore>,
+    store: Arc<dyn SegmentDataStore>,
     config: GcConfig,
     registry: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry>,
 ) -> OrphanReaper {
@@ -51,7 +52,7 @@ async fn make_reaper(
     let lifecycle = Arc::new(
         SegmentLifecycleCoordinator::with_registry(Arc::clone(&registry)).with_event_wal(event_wal),
     );
-    OrphanReaper::new(metadata, lifecycle, store, config)
+    OrphanReaper::new(metadata, lifecycle, store, vec![], config)
 }
 
 /// Seeds a sealed segment through the machine.

@@ -21,11 +21,12 @@ use oceanfs_core::{
 use oceanfs_ec::Decoder;
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
+use oceanfs_storage_api::SegmentDataStore;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use super::queue::HealQueue;
-use crate::{anti_entropy::SegmentDataStore, Error, HealingRpcClient, Result};
+use crate::{Error, HealingRpcClient, Result};
 
 // ---------------------------------------------------------------------------
 // HealWorker
@@ -329,8 +330,15 @@ impl HealWorker {
 
         let total_shards = (ec_k + ec_m) as usize;
 
-        // Step 2: Read all shards from local data store.
-        let full_data = data_store.read_segment_data(segment_id).unwrap_or_default();
+        // Step 2: Read all shards from local data store. A missing
+        // `.dat` (Ok(None)) is "no local data" — the remote-fetch
+        // fallback below decides; a genuine read error propagates
+        // (previously `unwrap_or_default()` collapsed both).
+        let full_data = match data_store.read_segment_data(segment_id).await {
+            Ok(Some(file)) => file.data,
+            Ok(None) => bytes::Bytes::new(),
+            Err(e) => return Err(e.into()),
+        };
 
         // H3: Distributed shard fetch — if local data is empty and we have
         // membership + pool, try to fetch the segment from a remote replica.
@@ -414,7 +422,7 @@ impl HealWorker {
                 let end = (start + shard_data.len()).min(updated_data.len());
                 updated_data.splice(start..end, shard_data.iter().copied());
 
-                data_store.write_segment_data(segment_id, &updated_data)?;
+                data_store.write_segment_data(segment_id, &updated_data).await?;
                 total_repaired += shard_data.len() as u64;
             }
         }
@@ -735,7 +743,7 @@ mod tests {
 
         let segment_id = SegmentId::new();
         let data: Vec<u8> = (0..40).collect();
-        data_store.write_segment_data(&segment_id, &data).unwrap();
+        data_store.write_segment_data(&segment_id, &data).await.unwrap();
 
         let segment_meta = SegmentMetadata {
             pool_id: 0,
@@ -780,7 +788,12 @@ mod tests {
             "merkle root should be invalidated after repair"
         );
 
-        let repaired_data = data_store.read_segment_data(&segment_id).unwrap();
+        let repaired_data = data_store
+            .read_segment_data(&segment_id)
+            .await
+            .unwrap()
+            .expect("repaired data exists")
+            .data;
         assert!(!repaired_data.is_empty(), "repaired data should exist");
     }
 
@@ -790,7 +803,7 @@ mod tests {
         let lifecycle = make_lifecycle().await;
 
         let segment_id = SegmentId::new();
-        data_store.write_segment_data(&segment_id, &[1, 2, 3]).unwrap();
+        data_store.write_segment_data(&segment_id, &[1, 2, 3]).await.unwrap();
 
         let segment_meta = SegmentMetadata {
             pool_id: 0,
@@ -861,7 +874,7 @@ mod tests {
 
         let segment_id = SegmentId::new();
         let data: Vec<u8> = (0..40).collect();
-        data_store.write_segment_data(&segment_id, &data).unwrap();
+        data_store.write_segment_data(&segment_id, &data).await.unwrap();
 
         let segment_meta = SegmentMetadata {
             pool_id: 0,
@@ -926,7 +939,7 @@ mod tests {
 
         let segment_id = SegmentId::new();
         let data: Vec<u8> = (0..40).collect();
-        data_store.write_segment_data(&segment_id, &data).unwrap();
+        data_store.write_segment_data(&segment_id, &data).await.unwrap();
 
         let segment_meta = SegmentMetadata {
             pool_id: 0,
@@ -1001,7 +1014,7 @@ mod tests {
         // Create a segment with k=3, m=1 → 4 shards, 40 bytes
         let segment_id = SegmentId::new();
         let data: Vec<u8> = (0..40).collect(); // shards: [0..10, 10..20, 20..30, 30..40]
-        data_store.write_segment_data(&segment_id, &data).unwrap();
+        data_store.write_segment_data(&segment_id, &data).await.unwrap();
 
         let segment_meta = SegmentMetadata {
             pool_id: 0,
@@ -1028,10 +1041,11 @@ mod tests {
         for b in corrupted.iter_mut().take(20).skip(10) {
             *b = 0;
         }
-        data_store.write_segment_data(&segment_id, &corrupted).unwrap();
+        data_store.write_segment_data(&segment_id, &corrupted).await.unwrap();
 
-        let original_data = data_store.read_segment_data(&segment_id).unwrap();
-        assert_ne!(original_data, data, "data should be corrupted");
+        let original_data =
+            data_store.read_segment_data(&segment_id).await.unwrap().expect("segment present").data;
+        assert_ne!(&original_data[..], &data[..], "data should be corrupted");
 
         // Enqueue a heal request (simulating Scrub/AntiEntropy detection).
         let config = HealConfig::default().with_max_concurrent_heals(2);
@@ -1061,7 +1075,12 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
 
         // Verify the segment was repaired.
-        let repaired_data = data_store.read_segment_data(&segment_id).unwrap();
+        let repaired_data = data_store
+            .read_segment_data(&segment_id)
+            .await
+            .unwrap()
+            .expect("segment present after repair")
+            .data;
         assert!(!repaired_data.is_empty(), "segment should have data after repair");
 
         // The StubDecoder fills missing shards with zeros, so the repaired
@@ -1080,7 +1099,7 @@ mod tests {
 
         let segment_id = SegmentId::new();
         let data: Vec<u8> = (0..40).collect();
-        data_store.write_segment_data(&segment_id, &data).unwrap();
+        data_store.write_segment_data(&segment_id, &data).await.unwrap();
 
         let segment_meta = SegmentMetadata {
             pool_id: 0,
@@ -1126,7 +1145,7 @@ mod tests {
 
         let segment_id = SegmentId::new();
         let data: Vec<u8> = (0..40).collect();
-        data_store.write_segment_data(&segment_id, &data).unwrap();
+        data_store.write_segment_data(&segment_id, &data).await.unwrap();
 
         let segment_meta = SegmentMetadata {
             pool_id: 0,
@@ -1155,7 +1174,7 @@ mod tests {
         // Enqueue a request that will fail (ec_k=0 causes failure).
         // Actually, use a failing decoder for a clearer test.
         let segment_fail_id = SegmentId::new();
-        data_store.write_segment_data(&segment_fail_id, &data).unwrap();
+        data_store.write_segment_data(&segment_fail_id, &data).await.unwrap();
         lifecycle.request_reserve(segment_fail_id, SizeTier::Standard, 3, 1).await.unwrap();
 
         let decoder: Arc<dyn Decoder> = Arc::new(FailingDecoder);

@@ -37,11 +37,12 @@ use oceanfs_core::{
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
+use oceanfs_storage_api::SegmentDataStore;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::{Error, HealingRpcClient, Result, SegmentDataStore};
+use crate::{Error, HealingRpcClient, Result};
 
 // ---------------------------------------------------------------------------
 // ReRepConfig
@@ -433,8 +434,13 @@ impl ReRepWorker {
         }
 
         // Step 4: write through the pool-aware store.
+        // NOTE (store-unification f2, ADR-0032 D3): this write currently
+        // precedes the lifecycle reserve (the resolver's pool-0
+        // write-before-register bridge); f2 reorders reserve-before-write
+        // and routes the write through the storage io layer.
         data_store
             .write_segment_data(&segment_id, &data)
+            .await
             .map_err(|e| Error::Storage(format!("re-replication write failed: {e}")))?;
 
         // Step 5: register in the lifecycle (reserve + seal). The
@@ -817,7 +823,7 @@ mod tests {
         let expected_root = crate::MerkleTree::build(&data, 0).unwrap().root().hash();
 
         let holder_store = Arc::new(InMemorySegmentStore::new());
-        holder_store.write_segment_data(&segment_id, &data).unwrap();
+        holder_store.write_segment_data(&segment_id, &data).await.unwrap();
         let holder_service = HealingGrpcService::new(
             Arc::new(crate::HintedHandoff::new()),
             Arc::new(
@@ -884,7 +890,12 @@ mod tests {
         assert!(result.is_ok(), "worker must pull+write+register+stamp: {result:?}");
 
         // The target's store holds the byte-identical data.
-        let got = target_store.read_segment_data(&segment_id).unwrap();
+        let got = target_store
+            .read_segment_data(&segment_id)
+            .await
+            .unwrap()
+            .expect("target store holds the pulled segment")
+            .data;
         assert_eq!(&got[..], &data[..], "target store must hold the pulled segment");
 
         // The lifecycle entry exists and lists the target (self) in
@@ -931,7 +942,7 @@ mod tests {
         assert_ne!(_real_root, wrong_root, "the wrong root must actually differ");
 
         let holder_store = Arc::new(InMemorySegmentStore::new());
-        holder_store.write_segment_data(&segment_id, &data).unwrap();
+        holder_store.write_segment_data(&segment_id, &data).await.unwrap();
         let holder_service = HealingGrpcService::new(
             Arc::new(crate::HintedHandoff::new()),
             Arc::new(
@@ -997,7 +1008,7 @@ mod tests {
         // No partial/wrong copy was materialized: the store is empty and
         // the lifecycle has no entry for the segment.
         assert!(
-            target_store.read_segment_data(&segment_id).is_err(),
+            target_store.read_segment_data(&segment_id).await.unwrap().is_none(),
             "target store must NOT hold a merkle-rejected segment"
         );
         assert!(

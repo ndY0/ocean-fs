@@ -28,8 +28,8 @@ use oceanfs_core::{
     },
     BucketId, ChunkRef, Hlc, HlcClock, ObjectKey, ObjectMetadata, SegmentId, SizeTier,
 };
-use oceanfs_durability::SegmentDataStore;
 use oceanfs_storage::{BufferPool, SegmentRpc};
+use oceanfs_storage_api::SegmentDataStore;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -475,11 +475,18 @@ impl SegmentRpc for SegmentGrpcService {
             )));
         }
 
-        // Read the full segment data from the store once.
-        let segment_data = self
-            .data_store
-            .read_segment_data(&segment_id)
-            .map_err(|e| Status::not_found(format!("segment {} not found: {}", segment_id, e)))?;
+        // Read the full segment data from the store once. A missing
+        // `.dat` (Ok(None)) is a not-found fetch, matching the pre-f1
+        // NotFound read-error mapping.
+        let segment_data = match self.data_store.read_segment_data(&segment_id).await {
+            Ok(Some(file)) => file.data,
+            Ok(None) => {
+                return Err(Status::not_found(format!("segment {} not found", segment_id)));
+            }
+            Err(e) => {
+                return Err(Status::not_found(format!("segment {} not found: {}", segment_id, e)));
+            }
+        };
 
         if segment_data.is_empty() {
             return Err(Status::not_found(format!("segment {} has no data", segment_id)));
@@ -899,6 +906,7 @@ impl SegmentRpc for SegmentGrpcService {
         // write-path interference with replication.
         self.data_store
             .write_segment_data(&segment_id, &segment_data)
+            .await
             .map_err(|e| Status::internal(format!("segment write failed: {e}")))?;
 
         tracing::debug!(
@@ -998,9 +1006,8 @@ mod tests {
     use std::{collections::HashMap, net::SocketAddr};
 
     use oceanfs_core::{proto::common::SegmentId as ProtoSegmentId, SegmentId, Tombstone};
-    use oceanfs_durability::SegmentDataStore;
     use oceanfs_storage::{SegmentRpcClient, SegmentRpcServer};
-    use oceanfs_storage_api::MetadataStore;
+    use oceanfs_storage_api::{MetadataStore, SegmentDataStore};
     use parking_lot::Mutex;
     use tonic::transport::Server;
 
@@ -1017,25 +1024,53 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl SegmentDataStore for TestSegmentStore {
-        fn write_segment_data(
+        async fn write_segment_data(
             &self,
             segment_id: &SegmentId,
             data: &[u8],
-        ) -> Result<(), oceanfs_storage::Error> {
+        ) -> Result<(), oceanfs_storage_api::error::Error> {
             self.data.lock().insert(*segment_id, Bytes::copy_from_slice(data));
             Ok(())
         }
 
-        fn read_segment_data(
+        async fn read_segment_data(
             &self,
             segment_id: &SegmentId,
-        ) -> Result<Bytes, oceanfs_storage::Error> {
-            self.data
-                .lock()
-                .get(segment_id)
-                .cloned()
-                .ok_or(oceanfs_storage::Error::SegmentNotFound(*segment_id))
+        ) -> Result<Option<oceanfs_storage_api::SegmentFile>, oceanfs_storage_api::error::Error>
+        {
+            Ok(self.data.lock().get(segment_id).cloned().map(|data| {
+                oceanfs_storage_api::SegmentFile {
+                    segment_id: *segment_id,
+                    version: 1,
+                    header_len: 76,
+                    data_end: (76 + data.len()) as u64,
+                    data,
+                }
+            }))
+        }
+
+        async fn delete_shards(
+            &self,
+            segment_id: &SegmentId,
+        ) -> Result<u64, oceanfs_storage_api::error::Error> {
+            Ok(self.data.lock().remove(segment_id).map(|removed| removed.len() as u64).unwrap_or(0))
+        }
+
+        async fn delete_shards_with_pool(
+            &self,
+            segment_id: &SegmentId,
+            _pool_id: u32,
+        ) -> Result<u64, oceanfs_storage_api::error::Error> {
+            self.delete_shards(segment_id).await
+        }
+
+        fn list_segment_files(
+            &self,
+            _root: &std::path::Path,
+        ) -> Result<Vec<std::path::PathBuf>, oceanfs_storage_api::error::Error> {
+            Ok(Vec::new())
         }
     }
 
@@ -1182,7 +1217,7 @@ mod tests {
             "append must NOT register the segment (push owns registration)"
         );
         assert!(
-            store.read_segment_data(&segment_id).is_err(),
+            store.read_segment_data(&segment_id).await.unwrap().is_none(),
             "append must NOT write segment data (push owns the .dat)"
         );
     }
@@ -1236,7 +1271,10 @@ mod tests {
             tonic::Code::InvalidArgument,
             "metadata-less append → InvalidArgument"
         );
-        assert!(store.read_segment_data(&seg_id).is_err(), "rejected append must not write data");
+        assert!(
+            store.read_segment_data(&seg_id).await.unwrap().is_none(),
+            "rejected append must not write data"
+        );
     }
 
     /// B3: a segment that is NOT registered in the lifecycle registry has
@@ -1275,7 +1313,7 @@ mod tests {
         let seg_id = SegmentId::new();
         let test_data: Vec<u8> = (0..6144).map(|v| (v % 256) as u8).collect();
         // Data exists — but nothing registered the segment.
-        store.write_segment_data(&seg_id, &test_data).unwrap();
+        store.write_segment_data(&seg_id, &test_data).await.unwrap();
 
         let metadata: Arc<dyn oceanfs_storage_api::MetadataStore> =
             Arc::new(TombstoneMockMetadata::new());
@@ -2137,7 +2175,8 @@ mod tests {
         assert!(resp.into_inner().acked, "valid push must ack");
 
         // Data persisted + registered + sealed with the pushed metadata.
-        let stored = store.read_segment_data(&segment_id).unwrap();
+        let stored =
+            store.read_segment_data(&segment_id).await.unwrap().expect("segment present").data;
         assert_eq!(&stored[..], &data[..], "the full data section must be stored");
         let entry = lifecycle.registry().get(segment_id).expect("segment registered");
         assert_eq!(entry.state, oceanfs_storage::SegmentState::Sealed);
@@ -2169,7 +2208,7 @@ mod tests {
             "corrupt push → InvalidArgument"
         );
         assert!(
-            store.read_segment_data(&segment_id).is_err(),
+            store.read_segment_data(&segment_id).await.unwrap().is_none(),
             "rejected push must not persist data"
         );
     }
@@ -2210,7 +2249,8 @@ mod tests {
 
         let entry = lifecycle.registry().get(segment_id).expect("segment registered once");
         assert_eq!(entry.state, oceanfs_storage::SegmentState::Sealed);
-        let stored = store.read_segment_data(&segment_id).unwrap();
+        let stored =
+            store.read_segment_data(&segment_id).await.unwrap().expect("segment present").data;
         assert_eq!(&stored[..], &data[..], "duplicate push must converge to one copy");
     }
 
@@ -2242,7 +2282,7 @@ mod tests {
             tonic::Code::InvalidArgument,
             "a push without a segment id must be rejected"
         );
-        assert_eq!(store.read_segment_data(&SegmentId::default()).ok(), None);
+        assert!(store.read_segment_data(&SegmentId::default()).await.unwrap().is_none());
     }
 
     /// B5: a push carrying an unknown tier byte (or the inline tier,
@@ -2272,7 +2312,7 @@ mod tests {
                 .expect_err("rpc completes");
             assert_eq!(result.code(), tonic::Code::InvalidArgument, "tier {tier} must be rejected");
             assert!(
-                store.read_segment_data(&segment_id).is_err(),
+                store.read_segment_data(&segment_id).await.unwrap().is_none(),
                 "rejected push must not persist data (tier {tier})"
             );
         }
@@ -2307,7 +2347,7 @@ mod tests {
             "out-of-range ec_k must be rejected"
         );
         assert!(
-            store.read_segment_data(&segment_id).is_err(),
+            store.read_segment_data(&segment_id).await.unwrap().is_none(),
             "rejected push must not persist data"
         );
     }
@@ -2341,7 +2381,7 @@ mod tests {
             "parity-without-data geometry must be rejected"
         );
         assert!(
-            store.read_segment_data(&segment_id).is_err(),
+            store.read_segment_data(&segment_id).await.unwrap().is_none(),
             "rejected push must not persist data"
         );
     }

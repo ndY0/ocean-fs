@@ -1,7 +1,7 @@
 ---
 feature: "f1: Unify SegmentDataStore Trait in oceanfs-storage-api"
 epic: "refactoring/store-unification"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -13,7 +13,7 @@ adr:
   - 0025-segment-lifecycle-state-machine
 perf: []
 created: 2026-09-04
-updated: 2026-09-04
+updated: 2026-09-05
 ---
 
 # f1: Unify SegmentDataStore Trait in oceanfs-storage-api
@@ -237,12 +237,13 @@ adds the per-`.dat` serialization underneath).
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds; the only
+- [x] **Code:** `cargo build --all-targets` succeeds; the only
       `SegmentDataStore`/data-access trait in the workspace is
       `oceanfs_storage_api::SegmentDataStore`
       (`grep -rn "trait SegmentShardStore" crates --include=*.rs` is
       empty; `merkle_tree.rs` no longer defines a trait).
-- [ ] **Tests:** `cargo test -p oceanfs-storage-api` (new trait doc
+<!-- REVIEW: verified 2026-09-05 — cargo build --all-targets EXIT 0; repo-wide grep for `trait SegmentShardStore` = 0 hits; single `pub trait SegmentDataStore` at crates/oceanfs-storage-api/src/segment_data_store.rs:107; merkle_tree.rs defines only the InMemorySegmentStore impl. One pre-existing (untouched-file) warning remains: hint_wal.rs:848 dead-code on a cfg(test) helper — not f1-introduced. -->
+- [x] **Tests:** `cargo test -p oceanfs-storage-api` (new trait doc
       tests) passes; `cargo test -p oceanfs-durability --lib --
       --test-threads=1`, `cargo test -p oceanfs-server --lib --
       --test-threads=1`, `cargo test -p oceanfs-node --lib --
@@ -251,20 +252,26 @@ adds the per-`.dat` serialization underneath).
       covers v1 (76-byte) and v2 (92-byte) headers; a read of a missing
       `.dat` returns `Ok(None)` (regression for the scrub NotFound
       contract).
-- [ ] **Docs:** `#![deny(missing_docs)]` passes in `oceanfs-storage-api`
+<!-- REVIEW: verified 2026-09-05 — storage-api 6 doc tests pass; durability lib 270/270, server lib 244/244, node lib 66/66 (all --test-threads=1); durability integration green (anti_entropy 14, distributed_scrub 5, gc_compaction 5, merkle_recovery 3, orphan_reaper 7, segment_data_roundtrip 2); v1/v2/Ok(None) coverage at segment_store_impl.rs tests (write_then_read_roundtrip_is_header_valid:264, read_parses_v2_header_data_section:301, read_missing_dat_returns_ok_none:291) + merkle_tree.rs:867 in-memory Ok(None). -->
+- [x] **Docs:** `#![deny(missing_docs)]` passes in `oceanfs-storage-api`
       (new public items have docs + `# Examples`).
-- [ ] **ADR:** ADR-0032 D1 satisfied (single trait, storage-api home);
+<!-- REVIEW: verified 2026-09-05 — RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p oceanfs-storage-api -p oceanfs-durability -p oceanfs-node -p oceanfs-server EXIT 0; SegmentFile + SegmentDataStore each carry `# Examples` (both doc tests run green). -->
+- [x] **ADR:** ADR-0032 D1 satisfied (single trait, storage-api home);
       ADR-0031 respected (no legacy branches introduced);
       ADR-0025 state transitions untouched (reserve/seal/delete remain
       coordinator-routed).
-- [ ] **Perf:** no perf rules newly violated — the trait move itself adds
+<!-- REVIEW: verified 2026-09-05 — D1 method set/signatures match the feature-doc rendering (async read → Option<SegmentFile>, write(&SegmentId,&[u8]), delete_shards → Result<u64>, delete_shards_with_pool(&SegmentId, u32) id-first, sync list_segment_files(&Path)); error type = oceanfs_storage_api::error::Error; no new crate deps (no Cargo.toml changes); ADR-0031: no legacy_dir/data_dir branches added (resolve tests assert unknown-pool errors at segment_store_impl.rs:334); ADR-0025: all reserve/seal/delete/refresh calls remain coordinator-routed (diff review). -->
+- [x] **Perf:** no perf rules newly violated — the trait move itself adds
       no I/O; `Option<SegmentFile>` avoids a heap copy only where the impl
       already slices (f2's impl owns that).
-- [ ] **Integration:** a `oceanfs-durability` integration test
+<!-- REVIEW: verified 2026-09-05 — frontmatter perf: [] ; no io-layer calls added; both disk impls remain raw-std::fs transition-window code (unchanged shape, f2 scope). -->
+- [x] **Integration:** a `oceanfs-durability` integration test
       (`crates/oceanfs-durability/tests/`) drives one complete
       repair→write→read round-trip through the migrated trait;
       `cargo test -p oceanfs-node --test durability_wiring -- --test-threads=1`
       is green.
+<!-- REVIEW: verified 2026-09-05 — tests/segment_data_roundtrip.rs (2 tests: repair_write_read_roundtrip_through_unified_trait, unmapped_segment_write_lands_on_first_pool) green; node --test durability_wiring 4/4 green under --test-threads=1. -->
+<!-- REVIEW: LOW (not a DoD gap) — scrub.rs now awaits partition verification on runtime threads (scrub.rs:772-778) instead of spawn_blocking; the unified disk impls perform std::fs reads inside async fns, so each in-flight batch occupies a runtime thread (bounded by scrub parallel_nodes semaphore). Consistent with the crate's other cycles but a change from pre-f1 scrub; revisit when f2 routes reads through the io layer. -->
 
 > **Lint & Doc Examples (non-gating):** `cargo clippy --lib -- -D warnings`
 > should pass on production code. Test-code clippy warnings (`.unwrap()`,
@@ -283,3 +290,34 @@ on that crate). The two durability impl structs keep compiling through
 f1 as dual impls of the unified trait, so `node.rs` / `modules/storage.rs`
 need only a type-import update — this is what lets f1 and f2 land
 sequentially green.
+
+## Implementation notes (accepted)
+
+Status: independent review **PASS**, iteration 1 (2026-09-05). All DoD
+items verified and ticked with evidence comments above; the notes below
+record accepted deviations and decisions so the document reflects what
+was built.
+
+- **Accepted LOW (deferred to f2) — scrub verification runs on the async
+  runtime.** Scrub partition verification now awaits on runtime threads
+  (`scrub.rs` partition tasks, ~`scrub.rs:772-778`) instead of
+  `spawn_blocking`, because the unified trait is async. Blocking store
+  I/O inside async fns is the crate-wide status quo for
+  heal/repair/GC/anti-entropy cycles, so this is not f1-specific
+  regression; each in-flight batch is bounded by the scrub
+  `parallel_nodes` semaphore. Restoring blocking-pool execution (or
+  moving these reads to the io layer) is an f2 decision — tracked in a
+  code comment at `scrub.rs`.
+- **DEC-1 — error mapping for data-integrity conditions.** Conditions
+  that previously surfaced as `InvalidConfig` (bad/unparseable `.dat`
+  header, unknown pool during resolve) now map to
+  `oceanfs_storage_api::error::Error::Internal` / `InvalidArgument`.
+  `oceanfs_durability::Error` gained
+  `From<oceanfs_storage_api::error::Error>`: `SegmentNotFound` and `Io`
+  map 1:1 to their durability counterparts; all remaining variants are
+  Display-wrapped.
+- **Dual impls during the transition window (per ADR-0032).** The two
+  durability disk impl structs remain in place as dual impls of the
+  unified trait through f1; the impl merge is f2 and the single-instance
+  wiring is f3. Review markers left in the impl files stay open until
+  f2/f3 deletes/closes them — that is epic-level DoD, not f1.

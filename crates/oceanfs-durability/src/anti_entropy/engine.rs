@@ -13,12 +13,13 @@ use oceanfs_core::{
 use oceanfs_ec::{CauchyEncoder, Decoder, Encoder};
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
+use oceanfs_storage_api::SegmentDataStore;
 use rand::seq::SliceRandom;
 
 use super::{
     config::AntiEntropyConfig,
     merkle_root::MerkleRoot,
-    merkle_tree::{MerkleTree, SegmentDataStore, DEFAULT_LEAF_SIZE},
+    merkle_tree::{MerkleTree, DEFAULT_LEAF_SIZE},
 };
 use crate::{merkle::IncrementalMerkleTree, Error, Result};
 // ---------------------------------------------------------------------------
@@ -202,16 +203,18 @@ impl AntiEntropy {
         // also, it appear we have two divergent data readers, for the server and for the durability side,
         // this should not stand as is, and must be resolved
         // [end]
-        // Step 1.5: Build local Merkle trees from segment data
-        let local_trees: HashMap<SegmentId, (MerkleTree, MerkleRoot)> = sealed_segments
-            .iter()
-            .filter_map(|seg| {
-                let segment_data = self.segment_store.read_segment_data(&seg.segment_id).ok()?;
-                let tree = MerkleTree::build(&segment_data, DEFAULT_LEAF_SIZE)?;
-                let root = tree.root();
-                Some((seg.segment_id, (tree, root)))
-            })
-            .collect();
+        // Step 1.5: Build local Merkle trees from segment data. A missing
+        // `.dat` (Ok(None)) or unbuildable tree skips the segment (the
+        // same filter semantics as the pre-f1 `.ok()?` chain).
+        let mut local_trees: HashMap<SegmentId, (MerkleTree, MerkleRoot)> = HashMap::new();
+        for seg in &sealed_segments {
+            let Ok(Some(file)) = self.segment_store.read_segment_data(&seg.segment_id).await else {
+                continue;
+            };
+            let Some(tree) = MerkleTree::build(&file.data, DEFAULT_LEAF_SIZE) else { continue };
+            let root = tree.root();
+            local_trees.insert(seg.segment_id, (tree, root));
+        }
 
         // Step 2: Warn about segments without Merkle roots.
         // Missing roots are counted as mismatches during local_merkle_verify below.
@@ -586,11 +589,13 @@ impl AntiEntropy {
 
                             if let Some(peer_tree) = MerkleTree::build_from_hashes(&peer_leaves) {
                                 // Build local tree from segment data to diff.
-                                if let Ok(segment_data) =
-                                    self.segment_store.read_segment_data(&seg.segment_id)
+                                // A missing local `.dat` (Ok(None)) skips
+                                // the descent (no local data to diff).
+                                if let Ok(Some(file)) =
+                                    self.segment_store.read_segment_data(&seg.segment_id).await
                                 {
                                     if let Some(local_tree) =
-                                        MerkleTree::build(&segment_data, DEFAULT_LEAF_SIZE)
+                                        MerkleTree::build(&file.data, DEFAULT_LEAF_SIZE)
                                     {
                                         let diverged = local_tree.descend_diff(&peer_tree);
                                         if !diverged.is_empty() {
@@ -683,7 +688,7 @@ impl AntiEntropy {
     /// 6. Rebuild data from reconstructed shards
     /// 7. If reconstructed tree root matches stored root → repair succeeded
     /// 8. Write corrected data back to store
-    fn ec_repair_segment(
+    async fn ec_repair_segment(
         segment_id: SegmentId,
         current_data: &[u8],
         ec_k: u8,
@@ -784,7 +789,7 @@ impl AntiEntropy {
 
         if repaired_tree.root().hash() == *stored_root_hash {
             // Repair succeeded — write corrected data
-            store.write_segment_data(&segment_id, &reconstructed_data)?;
+            store.write_segment_data(&segment_id, &reconstructed_data).await?;
 
             tracing::info!(
                 segment_id = %segment_id,
@@ -1091,11 +1096,12 @@ mod tests {
     use oceanfs_membership::Membership;
     use oceanfs_network::ConnectionPool;
     use oceanfs_routing::{Ring, RingCache};
+    use oceanfs_storage_api::SegmentDataStore;
 
     use super::super::{
         config::AntiEntropyConfig,
         engine::{AntiEntropy, MerkleExchangeProtocol},
-        merkle_tree::{InMemorySegmentStore, MerkleTree, SegmentDataStore, DEFAULT_LEAF_SIZE},
+        merkle_tree::{InMemorySegmentStore, MerkleTree, DEFAULT_LEAF_SIZE},
         *,
     };
 
@@ -1306,7 +1312,7 @@ mod tests {
         // Write segment data to store
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let segment_store = Arc::new(InMemorySegmentStore::new());
-        segment_store.write_segment_data(&seg_id, &segment_data).unwrap();
+        segment_store.write_segment_data(&seg_id, &segment_data).await.unwrap();
 
         let ae = AntiEntropy::new(
             AntiEntropyConfig::default(),
@@ -1733,8 +1739,8 @@ mod tests {
         assert_eq!(recovered[3], data_shards[3]);
     }
 
-    #[test]
-    fn ec_repair_segment_repairs_corrupted_shard() {
+    #[tokio::test]
+    async fn ec_repair_segment_repairs_corrupted_shard() {
         // Full anti-entropy EC repair flow:
         // 1. Original data is EC-encoded at seal time (k=4, m=2)
         // 2. Parity shards stored on peer nodes
@@ -1756,12 +1762,12 @@ mod tests {
         let root_hash = tree.root().hash();
 
         // Write data to store
-        store.write_segment_data(&segment_id, &segment_data).unwrap();
+        store.write_segment_data(&segment_id, &segment_data).await.unwrap();
 
         // --- Corruption: flip a byte in shard index 2 ---
         let mut corrupted = segment_data.clone();
         corrupted[2 * leaf_size + 500] ^= 0xFF;
-        store.write_segment_data(&segment_id, &corrupted).unwrap();
+        store.write_segment_data(&segment_id, &corrupted).await.unwrap();
 
         // Verify corruption is detected
         let bad_tree = MerkleTree::build(&corrupted, leaf_size).unwrap();
@@ -1805,15 +1811,15 @@ mod tests {
             .copy_from_slice(&recovered[2][..copy_len]);
 
         // Write repaired data back
-        store.write_segment_data(&segment_id, &repaired_data).unwrap();
+        store.write_segment_data(&segment_id, &repaired_data).await.unwrap();
 
         // Verify: Merkle tree now matches original
         let repaired_tree = MerkleTree::build(&repaired_data, leaf_size).unwrap();
         assert_eq!(repaired_tree.root().hash(), root_hash);
     }
 
-    #[test]
-    fn ec_repair_without_ec_params_falls_back_to_merkle_detection() {
+    #[tokio::test]
+    async fn ec_repair_without_ec_params_falls_back_to_merkle_detection() {
         let segment_id = SegmentId::new();
         let store = InMemorySegmentStore::new();
 
@@ -1821,12 +1827,12 @@ mod tests {
         let tree = MerkleTree::build(&data, 65536).unwrap();
         let root_hash = tree.root().hash();
 
-        store.write_segment_data(&segment_id, &data).unwrap();
+        store.write_segment_data(&segment_id, &data).await.unwrap();
 
         // Corrupt a byte
         let mut corrupted = data.clone();
         corrupted[65536] ^= 0x01;
-        store.write_segment_data(&segment_id, &corrupted).unwrap();
+        store.write_segment_data(&segment_id, &corrupted).await.unwrap();
 
         // Build tree from corrupted data — root differs from stored
         let bad_tree = MerkleTree::build(&corrupted, 65536).unwrap();
@@ -1842,8 +1848,8 @@ mod tests {
         assert!(diverged > 0, "should detect diverged leaves, got {diverged}");
     }
 
-    #[test]
-    fn ec_repair_intact_data_returns_zero() {
+    #[tokio::test]
+    async fn ec_repair_intact_data_returns_zero() {
         let segment_id = SegmentId::new();
         let store = InMemorySegmentStore::new();
 
@@ -1853,10 +1859,11 @@ mod tests {
         let tree = MerkleTree::build(&data, 65536).unwrap();
         let root_hash = tree.root().hash();
 
-        store.write_segment_data(&segment_id, &data).unwrap();
+        store.write_segment_data(&segment_id, &data).await.unwrap();
 
         let repaired =
             AntiEntropy::ec_repair_segment(segment_id, &data, k, m, 65536, &root_hash, &store)
+                .await
                 .unwrap();
 
         // Intact data should require no repair

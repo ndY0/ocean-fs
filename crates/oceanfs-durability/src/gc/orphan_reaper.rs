@@ -13,8 +13,9 @@ use std::{
 
 use oceanfs_core::{Counter, LabelSet, MetricRegistrar, SegmentId};
 use oceanfs_storage::{Result, SegmentLifecycleCoordinator, TransitionError};
+use oceanfs_storage_api::SegmentDataStore;
 
-use super::{config::GcConfig, garbage_collector::SegmentShardStore};
+use super::config::GcConfig;
 
 // ---------------------------------------------------------------------------
 // OrphanStats
@@ -62,7 +63,14 @@ pub struct OrphanReaper {
     /// state; the reaper requests `delete` through it before unlinking
     /// shards.
     lifecycle: Arc<SegmentLifecycleCoordinator>,
-    store: Arc<dyn SegmentShardStore>,
+    /// The unified segment data store (ADR-0032 D1): per-root
+    /// `list_segment_files` for the disk sweep + `delete_shards_with_pool`
+    /// for the reclaim.
+    store: Arc<dyn SegmentDataStore>,
+    /// The data pool roots the reaper sweeps for registry-unknown
+    /// `.dat` orphans (ADR-0032 D1 per-root listing). Each root carries
+    /// the pool id the reclaim unlinks under.
+    pool_roots: Vec<Arc<oceanfs_storage::StoragePool>>,
     config: GcConfig,
     orphans_deleted_total: Counter,
     bytes_reclaimed_total: Counter,
@@ -79,13 +87,15 @@ impl OrphanReaper {
     pub fn new(
         metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
         lifecycle: Arc<SegmentLifecycleCoordinator>,
-        store: Arc<dyn SegmentShardStore>,
+        store: Arc<dyn SegmentDataStore>,
+        pool_roots: Vec<Arc<oceanfs_storage::StoragePool>>,
         config: GcConfig,
     ) -> Self {
         Self {
             metadata,
             lifecycle,
             store,
+            pool_roots,
             config,
             orphans_deleted_total: Counter::new(
                 "orphan_segments_reaped_total".into(),
@@ -162,17 +172,40 @@ impl OrphanReaper {
             });
             set
         };
-        let on_disk = self
-            .store
-            .list_segment_files()
-            .map_err(|e| oceanfs_storage::Error::Io(std::io::Error::other(e.to_string())))?;
-        for (segment_id, file_mtime, pool_id) in on_disk {
-            if registered.contains(&segment_id) || referenced.contains(&segment_id) {
-                continue;
-            }
-            if file_mtime > 0 && now_ms - file_mtime > ttl_ms {
-                orphan_ids.push((segment_id, pool_id));
-                stats.orphans_found += 1;
+        // Per-root sweep (ADR-0032 D1): `list_segment_files(root)` names
+        // the `.dat` files under one pool root; the pool id for a listed
+        // orphan is the root's own id (no more store-wide
+        // `(id, mtime, pool)` tuples). The file's mtime stands in for
+        // `sealed_at` (the TTL grace gate) and the segment id is parsed
+        // from the `{uuid}.dat` file name.
+        for pool in &self.pool_roots {
+            let root = pool.root();
+            let pool_id = pool.id();
+            let listed = self
+                .store
+                .list_segment_files(root)
+                .map_err(|e| oceanfs_storage::Error::Io(std::io::Error::other(e.to_string())))?;
+            for path in listed {
+                let Some(id_str) =
+                    path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".dat"))
+                else {
+                    continue;
+                };
+                let Ok(uuid) = uuid::Uuid::parse_str(id_str) else { continue };
+                let segment_id = SegmentId::from_uuid_bytes(*uuid.as_bytes());
+                if registered.contains(&segment_id) || referenced.contains(&segment_id) {
+                    continue;
+                }
+                let file_mtime = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                if file_mtime > 0 && now_ms - file_mtime > ttl_ms {
+                    orphan_ids.push((segment_id, pool_id));
+                    stats.orphans_found += 1;
+                }
             }
         }
 
@@ -228,7 +261,7 @@ impl OrphanReaper {
                 // Delete shard data from disk after the deletion is
                 // durable — from the root the file was listed in (or the
                 // registry entry's pool id; ADR-0029 f5).
-                match self.store.delete_shards_with_pool(*pool_id, *segment_id) {
+                match self.store.delete_shards_with_pool(segment_id, *pool_id).await {
                     Ok(bytes) => {
                         tracing::info!(
                             segment_id = %segment_id,
@@ -378,7 +411,7 @@ mod tests {
             SegmentLifecycleCoordinator::with_registry(Arc::clone(&registry))
                 .with_event_wal(event_wal),
         );
-        OrphanReaper::new(metadata, lifecycle, store, config)
+        OrphanReaper::new(metadata, lifecycle, store, vec![], config)
     }
 
     fn make_object_meta(key: &str, size: u64, chunk: ChunkRef) -> ObjectMetadata {
@@ -778,10 +811,9 @@ mod tests {
         let registry_from_config =
             oceanfs_storage::PoolRegistry::from_config(&storage, &dir.path().join("data"))
                 .expect("registry");
-        let disk_store = Arc::new(DiskSegmentShardStore::new(
-            registry_from_config.data_pools(),
-            Arc::new(|_| None),
-        ));
+        let data_pools = registry_from_config.data_pools();
+        let disk_store =
+            Arc::new(DiskSegmentShardStore::new(data_pools.clone(), Arc::new(|_| None)));
         let unregistered = SegmentId::new();
         let mtime =
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64 - 60_000; // older than the 5s TTL
@@ -814,7 +846,10 @@ mod tests {
         // Load-profile-like config: a 5s tombstone TTL (the default is
         // 3 days — the file-scan's mtime gate would never pass).
         let config = GcConfig::new(10, 5, 0.5, 4, 64);
-        let reaper = OrphanReaper::new(metadata, lifecycle, disk_store.clone(), config);
+        // The reaper sweeps the data pool roots it is injected with
+        // (ADR-0032 D1 per-root listing) — the same pool Arcs the disk
+        // store resolves through.
+        let reaper = OrphanReaper::new(metadata, lifecycle, disk_store.clone(), data_pools, config);
         let stats = reaper.run_cycle().await.unwrap();
         assert_eq!(stats.orphans_found, 1, "the unregistered .dat must be found");
         assert_eq!(stats.orphans_deleted, 1);

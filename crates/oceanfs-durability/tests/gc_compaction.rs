@@ -14,8 +14,9 @@ use oceanfs_core::{
     BucketId, ChunkRef, HashOutput, Hlc, MetadataConfig, ObjectKey, ObjectMetadata, SegmentId,
     SegmentMetadata, SizeTier, Tombstone,
 };
-use oceanfs_durability::{GarbageCollector, GcConfig, SegmentDataStore};
+use oceanfs_durability::{GarbageCollector, GcConfig};
 use oceanfs_storage::RocksDbMetadataStore;
+use oceanfs_storage_api::SegmentDataStore;
 
 fn test_config() -> MetadataConfig {
     let dir = tempfile::tempdir().unwrap();
@@ -210,7 +211,7 @@ async fn full_gc_cycle_compacts_segment() {
     // coordinator + shard store, and seed the candidate through the
     // machine (the only writer of lifecycle state).
     let store = Arc::new(oceanfs_durability::InMemorySegmentStore::new());
-    store.write_segment_data(&seg_id, &vec![0x55; 1000]).unwrap();
+    store.write_segment_data(&seg_id, &vec![0x55; 1000]).await.unwrap();
     let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
         &oceanfs_core::LifecycleConfig::default(),
     ));

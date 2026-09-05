@@ -2,15 +2,17 @@
 //!
 //! Built at seal time over 64 KB leaves. Leaves are BLAKE3 hashes of
 //! contiguous chunks of data. Used for peer-to-peer integrity verification
-//! during anti-entropy exchange. Includes `SegmentDataStore` trait for
-//! abstracting data access during tree building and repair.
+//! during anti-entropy exchange. The `SegmentDataStore` data-access trait
+//! this module historically defined moved to `oceanfs-storage-api`
+//! (ADR-0032 D1); the in-memory test double stays here (review #17/#26
+//! precedent — test doubles live test-local, they do not ship in the
+//! storage-api crate).
 
 use std::collections::HashMap;
 
 use bytes::Bytes;
 use oceanfs_core::{HashOutput, SegmentId};
 use oceanfs_hash::{Blake3Hasher, Hasher as _};
-use oceanfs_storage::Result;
 
 use super::{
     merkle_proof::{LeafRange, MerkleProof},
@@ -20,42 +22,21 @@ use super::{
 /// Default leaf size for Merkle tree construction (64 KB).
 pub(crate) const DEFAULT_LEAF_SIZE: usize = 64 * 1024;
 // ---------------------------------------------------------------------------
-// SegmentDataStore — data access trait for anti-entropy repair
+// InMemorySegmentStore — test double for oceanfs_storage_api::SegmentDataStore
 // ---------------------------------------------------------------------------
 
-/// Provides access to raw segment data for Merkle tree reconstruction
-/// and leaf repair.
-///
-/// The anti-entropy protocol reads segment data to rebuild Merkle trees
-/// for comparison, and writes corrected leaf data during repair.
-///
-/// In production this is backed by the on-disk segment store; tests use
-/// an in-memory implementation.
-pub trait SegmentDataStore: Send + Sync {
-    /// Reads the full raw data for the given segment.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the segment data cannot be read (e.g., segment
-    /// not found, I/O error).
-    fn read_segment_data(&self, segment_id: &SegmentId) -> Result<Bytes>;
-
-    /// Writes the raw data for the given segment, replacing any existing data.
-    ///
-    /// Used during anti-entropy leaf repair to overwrite corrupted shards
-    /// with corrected data fetched from a peer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the segment data cannot be written.
-    fn write_segment_data(&self, segment_id: &SegmentId, data: &[u8]) -> Result<()>;
-}
-
-/// An in-memory segment data store for testing anti-entropy.
+/// An in-memory segment data store for testing anti-entropy and the
+/// other durability consumers of the unified `SegmentDataStore` trait.
 ///
 /// Stores segment data in a `HashMap<SegmentId, Bytes>` protected by
 /// a `parking_lot::RwLock`. Suitable for unit and integration tests
-/// where an on-disk segment store is not needed.
+/// where an on-disk segment store is not needed. Reads of segments
+/// that were never written return `Ok(None)` — the trait's NotFound
+/// contract (a missing `.dat` is a value, not an error).
+///
+/// Delete/list bookkeeping: `delete_shards[_with_pool]` remove the
+/// entry and report its byte length as reclaimed; `list_segment_files`
+/// lists nothing (this double has no notion of disk roots).
 pub struct InMemorySegmentStore {
     data: parking_lot::RwLock<HashMap<SegmentId, Bytes>>,
 }
@@ -73,18 +54,63 @@ impl Default for InMemorySegmentStore {
     }
 }
 
-impl SegmentDataStore for InMemorySegmentStore {
-    fn read_segment_data(&self, segment_id: &SegmentId) -> Result<Bytes> {
-        self.data
+/// Synthesizes the `SegmentFile` a real store would have parsed from a
+/// v1 on-disk header for `data` (ADR-0032 D1: `read` returns parsed
+/// header + payload, never raw bytes).
+fn synthetic_v1_file(segment_id: SegmentId, data: Bytes) -> oceanfs_storage_api::SegmentFile {
+    const V1_HEADER_LEN: usize = 76;
+    oceanfs_storage_api::SegmentFile {
+        segment_id,
+        version: 1,
+        header_len: V1_HEADER_LEN,
+        data_end: (V1_HEADER_LEN + data.len()) as u64,
+        data,
+    }
+}
+
+#[async_trait::async_trait]
+impl oceanfs_storage_api::SegmentDataStore for InMemorySegmentStore {
+    async fn read_segment_data(
+        &self,
+        segment_id: &SegmentId,
+    ) -> oceanfs_storage_api::error::Result<Option<oceanfs_storage_api::SegmentFile>> {
+        Ok(self
+            .data
             .read()
             .get(segment_id)
             .cloned()
-            .ok_or(oceanfs_storage::Error::SegmentNotFound(*segment_id))
+            .map(|data| synthetic_v1_file(*segment_id, data)))
     }
 
-    fn write_segment_data(&self, segment_id: &SegmentId, data: &[u8]) -> Result<()> {
+    async fn write_segment_data(
+        &self,
+        segment_id: &SegmentId,
+        data: &[u8],
+    ) -> oceanfs_storage_api::error::Result<()> {
         self.data.write().insert(*segment_id, Bytes::copy_from_slice(data));
         Ok(())
+    }
+
+    async fn delete_shards(
+        &self,
+        segment_id: &SegmentId,
+    ) -> oceanfs_storage_api::error::Result<u64> {
+        Ok(self.data.write().remove(segment_id).map(|removed| removed.len() as u64).unwrap_or(0))
+    }
+
+    async fn delete_shards_with_pool(
+        &self,
+        segment_id: &SegmentId,
+        _pool_id: u32,
+    ) -> oceanfs_storage_api::error::Result<u64> {
+        self.delete_shards(segment_id).await
+    }
+
+    fn list_segment_files(
+        &self,
+        _root: &std::path::Path,
+    ) -> oceanfs_storage_api::error::Result<Vec<std::path::PathBuf>> {
+        Ok(Vec::new())
     }
 }
 // ---------------------------------------------------------------------------
@@ -465,7 +491,7 @@ impl MerkleTree {
 mod tests {
 
     use oceanfs_core::{HashOutput, SegmentId};
-    use oceanfs_storage::Error;
+    use oceanfs_storage_api::SegmentDataStore;
 
     use super::{super::*, DEFAULT_LEAF_SIZE};
 
@@ -826,23 +852,26 @@ mod tests {
     // InMemorySegmentStore
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn in_memory_segment_store_read_write() {
+    #[tokio::test]
+    async fn in_memory_segment_store_read_write() {
         let store = InMemorySegmentStore::new();
         let seg_id = SegmentId::new();
         let data = vec![1u8, 2, 3];
 
-        store.write_segment_data(&seg_id, &data).unwrap();
-        let read = store.read_segment_data(&seg_id).unwrap();
-        assert_eq!(read, data);
+        store.write_segment_data(&seg_id, &data).await.unwrap();
+        let read = store.read_segment_data(&seg_id).await.unwrap().expect("written segment");
+        assert_eq!(&read.data[..], &data[..]);
+        assert_eq!(read.header_len, 76, "synthetic v1 file");
     }
 
-    #[test]
-    fn in_memory_segment_store_not_found() {
+    #[tokio::test]
+    async fn in_memory_segment_store_not_found_is_ok_none() {
+        // The unified trait's NotFound contract: a missing `.dat` reads
+        // as Ok(None), never as an error.
         let store = InMemorySegmentStore::new();
-        let result = store.read_segment_data(&SegmentId::new());
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::SegmentNotFound(_)));
+        let result = store.read_segment_data(&SegmentId::new()).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 
     // -----------------------------------------------------------------------

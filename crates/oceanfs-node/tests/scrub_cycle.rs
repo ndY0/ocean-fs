@@ -10,9 +10,8 @@
 use std::sync::Arc;
 
 use oceanfs_core::{SegmentId, SegmentMetadata, SizeTier};
-use oceanfs_durability::{
-    InMemorySegmentStore, MerkleTree, ScrubConfig, ScrubCoordinator, SegmentDataStore,
-};
+use oceanfs_durability::{InMemorySegmentStore, MerkleTree, ScrubConfig, ScrubCoordinator};
+use oceanfs_storage_api::SegmentDataStore;
 
 /// Helper: create test data with the given size.
 fn make_test_data(size: usize) -> Vec<u8> {
@@ -24,10 +23,10 @@ fn make_test_data(size: usize) -> Vec<u8> {
 }
 
 /// Helper: create a data store with pre-populated segment data.
-fn make_data_store(entries: Vec<(SegmentId, Vec<u8>)>) -> Arc<dyn SegmentDataStore> {
+async fn make_data_store(entries: Vec<(SegmentId, Vec<u8>)>) -> Arc<dyn SegmentDataStore> {
     let store = Arc::new(InMemorySegmentStore::new());
     for (id, data) in entries {
-        store.write_segment_data(&id, &data).expect("write segment data");
+        store.write_segment_data(&id, &data).await.expect("write segment data");
     }
     store
 }
@@ -73,7 +72,7 @@ async fn scrub_single_healthy_segment_report() {
     registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
     registry.seal(seg_meta.segment_id, seg_meta).unwrap();
 
-    let data_store = make_data_store(vec![(seg_id, data)]);
+    let data_store = make_data_store(vec![(seg_id, data)]).await;
     let coord = ScrubCoordinator::new(ScrubConfig::default());
 
     let report = coord.run_cycle(Arc::clone(&registry), data_store).await.expect("scrub cycle");
@@ -99,7 +98,7 @@ async fn scrub_corrupt_segment_detected() {
     // But put CORRUPT data in the data store (flip a byte)
     let mut corrupt_data = original_data.clone();
     corrupt_data[100] ^= 0xFF;
-    let data_store = make_data_store(vec![(seg_id, corrupt_data)]);
+    let data_store = make_data_store(vec![(seg_id, corrupt_data)]).await;
 
     let coord = ScrubCoordinator::new(ScrubConfig::default());
     let report = coord.run_cycle(Arc::clone(&registry), data_store).await.expect("scrub cycle");
@@ -136,7 +135,7 @@ async fn scrub_multiple_segments_mixed_health() {
     corrupt_data[0] ^= 0xFF;
     entries.push((corrupt_id, corrupt_data));
 
-    let data_store = make_data_store(entries);
+    let data_store = make_data_store(entries).await;
     let coord = ScrubCoordinator::new(ScrubConfig::default());
 
     let report = coord.run_cycle(Arc::clone(&registry), data_store).await.expect("scrub cycle");
@@ -157,7 +156,7 @@ async fn scrub_report_includes_duration_and_bytes() {
     registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
     registry.seal(seg_meta.segment_id, seg_meta).unwrap();
 
-    let data_store = make_data_store(vec![(seg_id, data)]);
+    let data_store = make_data_store(vec![(seg_id, data)]).await;
     let coord = ScrubCoordinator::new(ScrubConfig::default());
 
     let report = coord.run_cycle(Arc::clone(&registry), data_store).await.expect("scrub cycle");
@@ -188,7 +187,7 @@ async fn scrub_without_merkle_root_still_scans_bytes() {
     registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
     registry.seal(seg_meta.segment_id, seg_meta).unwrap();
 
-    let data_store = make_data_store(vec![(seg_id, data)]);
+    let data_store = make_data_store(vec![(seg_id, data)]).await;
     let coord = ScrubCoordinator::new(ScrubConfig::default());
 
     let report = coord.run_cycle(Arc::clone(&registry), data_store).await.expect("scrub cycle");
@@ -213,7 +212,7 @@ async fn test_scrub_config_interval_affects_cycle() {
     registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
     registry.seal(seg_meta.segment_id, seg_meta).unwrap();
 
-    let data_store = make_data_store(vec![(seg_id, data)]);
+    let data_store = make_data_store(vec![(seg_id, data)]).await;
 
     // Custom config: non-default values read from NodeConfig fields.
     let mut config = ScrubConfig::default();

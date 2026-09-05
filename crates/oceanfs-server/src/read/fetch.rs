@@ -1046,11 +1046,11 @@ mod tests {
     use std::{net::SocketAddr, sync::atomic::AtomicU64};
 
     use oceanfs_core::{GossipConfig, HlcClock, NodeId, RingConfig, SegmentId};
-    use oceanfs_durability::SegmentDataStore;
     use oceanfs_membership::Membership;
     use oceanfs_network::ConnectionPool;
     use oceanfs_routing::{Ring, RingCache};
     use oceanfs_storage::{BufferPool, SegmentRpcServer};
+    use oceanfs_storage_api::SegmentDataStore;
     use parking_lot::Mutex;
     use tonic::transport::Server;
 
@@ -1071,24 +1071,49 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl SegmentDataStore for TestSegmentStore {
-        fn write_segment_data(
+        async fn write_segment_data(
             &self,
             segment_id: &SegmentId,
             data: &[u8],
-        ) -> Result<(), oceanfs_storage::Error> {
+        ) -> Result<(), oceanfs_storage_api::error::Error> {
             self.data.lock().insert(*segment_id, Bytes::copy_from_slice(data));
             Ok(())
         }
-        fn read_segment_data(
+        async fn read_segment_data(
             &self,
             segment_id: &SegmentId,
-        ) -> Result<Bytes, oceanfs_storage::Error> {
-            self.data
-                .lock()
-                .get(segment_id)
-                .cloned()
-                .ok_or(oceanfs_storage::Error::SegmentNotFound(*segment_id))
+        ) -> Result<Option<oceanfs_storage_api::SegmentFile>, oceanfs_storage_api::error::Error>
+        {
+            Ok(self.data.lock().get(segment_id).cloned().map(|data| {
+                oceanfs_storage_api::SegmentFile {
+                    segment_id: *segment_id,
+                    version: 1,
+                    header_len: 76,
+                    data_end: (76 + data.len()) as u64,
+                    data,
+                }
+            }))
+        }
+        async fn delete_shards(
+            &self,
+            segment_id: &SegmentId,
+        ) -> Result<u64, oceanfs_storage_api::error::Error> {
+            Ok(self.data.lock().remove(segment_id).map(|removed| removed.len() as u64).unwrap_or(0))
+        }
+        async fn delete_shards_with_pool(
+            &self,
+            segment_id: &SegmentId,
+            _pool_id: u32,
+        ) -> Result<u64, oceanfs_storage_api::error::Error> {
+            self.delete_shards(segment_id).await
+        }
+        fn list_segment_files(
+            &self,
+            _root: &std::path::Path,
+        ) -> Result<Vec<std::path::PathBuf>, oceanfs_storage_api::error::Error> {
+            Ok(Vec::new())
         }
     }
 
@@ -1163,7 +1188,7 @@ mod tests {
                 break candidate;
             }
         };
-        serving_store.write_segment_data(&seg_id, &test_data).unwrap();
+        serving_store.write_segment_data(&seg_id, &test_data).await.unwrap();
 
         let ring_cache = Arc::new(RingCache::new(ring));
 

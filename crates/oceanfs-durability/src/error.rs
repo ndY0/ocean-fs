@@ -48,5 +48,19 @@ impl From<oceanfs_storage::Error> for Error {
     }
 }
 
+impl From<oceanfs_storage_api::error::Error> for Error {
+    fn from(e: oceanfs_storage_api::error::Error) -> Self {
+        match e {
+            oceanfs_storage_api::error::Error::SegmentNotFound(id) => Error::SegmentNotFound(id),
+            oceanfs_storage_api::error::Error::Io(io) => Error::Io(io),
+            // The unified SegmentDataStore trait (ADR-0032 D1) speaks
+            // oceanfs_storage_api::error::Error; remaining variants (NotFound,
+            // InvalidArgument, Internal) surface here as storage
+            // failures, mirroring the oceanfs_storage::Error mapping.
+            other => Error::Storage(other.to_string()),
+        }
+    }
+}
+
 /// Convenience alias for `std::result::Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;

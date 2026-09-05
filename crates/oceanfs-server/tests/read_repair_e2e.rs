@@ -24,11 +24,9 @@ use oceanfs_core::{
     },
     BucketId, ObjectKey, SegmentId,
 };
-use oceanfs_durability::SegmentDataStore;
 use oceanfs_server::grpc::segment_service::SegmentGrpcService;
-use oceanfs_storage::{
-    BufferPool, Error as StorageError, RocksDbMetadataStore, SegmentRpcClient, SegmentRpcServer,
-};
+use oceanfs_storage::{BufferPool, RocksDbMetadataStore, SegmentRpcClient, SegmentRpcServer};
+use oceanfs_storage_api::SegmentDataStore;
 use tonic::transport::Server;
 
 // In-memory segment data store for testing.
@@ -42,14 +40,50 @@ impl InMemorySegments {
     }
 }
 
+#[async_trait::async_trait]
 impl SegmentDataStore for InMemorySegments {
-    fn write_segment_data(&self, segment_id: &SegmentId, data: &[u8]) -> Result<(), StorageError> {
+    async fn write_segment_data(
+        &self,
+        segment_id: &SegmentId,
+        data: &[u8],
+    ) -> Result<(), oceanfs_storage_api::error::Error> {
         self.data.lock().insert(*segment_id, Bytes::from(data.to_vec()));
         Ok(())
     }
 
-    fn read_segment_data(&self, segment_id: &SegmentId) -> Result<Bytes, StorageError> {
-        self.data.lock().get(segment_id).cloned().ok_or(StorageError::SegmentNotFound(*segment_id))
+    async fn read_segment_data(
+        &self,
+        segment_id: &SegmentId,
+    ) -> Result<Option<oceanfs_storage_api::SegmentFile>, oceanfs_storage_api::error::Error> {
+        Ok(self.data.lock().get(segment_id).cloned().map(|data| oceanfs_storage_api::SegmentFile {
+            segment_id: *segment_id,
+            version: 1,
+            header_len: 76,
+            data_end: (76 + data.len()) as u64,
+            data,
+        }))
+    }
+
+    async fn delete_shards(
+        &self,
+        segment_id: &SegmentId,
+    ) -> Result<u64, oceanfs_storage_api::error::Error> {
+        Ok(self.data.lock().remove(segment_id).map(|removed| removed.len() as u64).unwrap_or(0))
+    }
+
+    async fn delete_shards_with_pool(
+        &self,
+        segment_id: &SegmentId,
+        _pool_id: u32,
+    ) -> Result<u64, oceanfs_storage_api::error::Error> {
+        self.delete_shards(segment_id).await
+    }
+
+    fn list_segment_files(
+        &self,
+        _root: &std::path::Path,
+    ) -> Result<Vec<std::path::PathBuf>, oceanfs_storage_api::error::Error> {
+        Ok(Vec::new())
     }
 }
 

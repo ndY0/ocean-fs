@@ -8,19 +8,18 @@
 use std::sync::Arc;
 
 use oceanfs_core::{SegmentId, SegmentMetadata, SizeTier};
-use oceanfs_durability::{
-    InMemorySegmentStore, MerkleTree, ScrubConfig, ScrubCoordinator, SegmentDataStore,
-};
+use oceanfs_durability::{InMemorySegmentStore, MerkleTree, ScrubConfig, ScrubCoordinator};
 use oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry;
+use oceanfs_storage_api::SegmentDataStore;
 
 fn make_registry() -> Arc<SegmentLifecycleRegistry> {
     Arc::new(SegmentLifecycleRegistry::new(&oceanfs_core::LifecycleConfig::default()))
 }
 
-fn segment_store_with_data(entries: Vec<(SegmentId, Vec<u8>)>) -> Arc<InMemorySegmentStore> {
+async fn segment_store_with_data(entries: Vec<(SegmentId, Vec<u8>)>) -> Arc<InMemorySegmentStore> {
     let store = Arc::new(InMemorySegmentStore::new());
     for (id, data) in entries {
-        store.write_segment_data(&id, &data).unwrap();
+        store.write_segment_data(&id, &data).await.unwrap();
     }
     store
 }
@@ -33,7 +32,7 @@ fn seed_sealed(registry: &SegmentLifecycleRegistry, seg: SegmentMetadata) {
 #[tokio::test]
 async fn scrub_cycle_on_empty_store() {
     let registry = make_registry();
-    let data_store = segment_store_with_data(vec![]);
+    let data_store = segment_store_with_data(vec![]).await;
     let coord = ScrubCoordinator::new(ScrubConfig::default());
     let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
     assert_eq!(report.segments_total(), 0);
@@ -66,7 +65,7 @@ async fn scrub_cycle_verifies_healthy_segments() {
         seed_sealed(&registry, seg);
     }
 
-    let data_store = segment_store_with_data(stored_data);
+    let data_store = segment_store_with_data(stored_data).await;
     let coord = ScrubCoordinator::new(ScrubConfig::default());
     let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
     assert_eq!(report.segments_total(), 3);
@@ -100,7 +99,7 @@ async fn scrub_cycle_detects_corruption() {
     seed_sealed(&registry, seg);
 
     // Store the corrupt data
-    let data_store = segment_store_with_data(vec![(seg_id, bad_data)]);
+    let data_store = segment_store_with_data(vec![(seg_id, bad_data)]).await;
 
     let coord = ScrubCoordinator::new(ScrubConfig::default());
     let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
@@ -113,7 +112,7 @@ async fn scrub_cycle_detects_corruption() {
 #[tokio::test]
 async fn manual_scrub_trigger_does_not_error() {
     let registry = make_registry();
-    let data_store = segment_store_with_data(vec![]);
+    let data_store = segment_store_with_data(vec![]).await;
     let coord = ScrubCoordinator::new(ScrubConfig::default());
     let result = coord.trigger_manual(Arc::clone(&registry), data_store).await;
     assert!(result.is_ok());
@@ -147,7 +146,7 @@ async fn run_cycle_with_missing_data_skips_not_corrupt() {
     // scan and the read). Missing shards are SKIPPED, not counted corrupt:
     // counting them corrupt produced false corruption alarms + spurious
     // heal requests for segments that were never corrupt.
-    let data_store = segment_store_with_data(vec![]);
+    let data_store = segment_store_with_data(vec![]).await;
 
     let coord = ScrubCoordinator::new(ScrubConfig::default());
     let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();

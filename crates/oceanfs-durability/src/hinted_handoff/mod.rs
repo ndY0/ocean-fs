@@ -855,7 +855,7 @@ mod tests {
 
         // Live healing gRPC server on an ephemeral port = the fresh address.
         let server_handoff = Arc::new(HintedHandoff::new());
-        let server_store: Arc<dyn crate::SegmentDataStore> =
+        let server_store: Arc<dyn oceanfs_storage_api::SegmentDataStore> =
             Arc::new(crate::anti_entropy::InMemorySegmentStore::new());
         let server_meta: Arc<dyn oceanfs_storage_api::MetadataStore> = Arc::new(F2eMockMetadata);
         let healing_service = crate::healing_service::HealingGrpcService::new(

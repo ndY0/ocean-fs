@@ -15,7 +15,6 @@ use oceanfs_core::{
     },
     GossipConfig, Incarnation, NodeId, NodeState, RingConfig, SegmentId,
 };
-use oceanfs_durability::SegmentDataStore;
 use oceanfs_membership::{grpc::probe_service::ProbeHandler, Membership};
 use oceanfs_network::gossip::{
     gossip_rpc_client::GossipRpcClient, gossip_rpc_server::GossipRpcServer, GossipMessage,
@@ -25,8 +24,9 @@ use oceanfs_routing::{Ring, RingCache};
 use oceanfs_server::grpc::segment_service::SegmentGrpcService;
 use oceanfs_storage::{
     segment::{event_wal::EventWal, lifecycle::SegmentLifecycleCoordinator},
-    BufferPool, Error as StorageError, SegmentRpcClient, SegmentRpcServer,
+    BufferPool, SegmentRpcClient, SegmentRpcServer,
 };
+use oceanfs_storage_api::SegmentDataStore;
 use parking_lot::Mutex;
 use tempfile::TempDir;
 use tokio_stream::StreamExt;
@@ -47,14 +47,50 @@ impl TestStore {
     }
 }
 
+#[async_trait::async_trait]
 impl SegmentDataStore for TestStore {
-    fn write_segment_data(&self, segment_id: &SegmentId, data: &[u8]) -> Result<(), StorageError> {
+    async fn write_segment_data(
+        &self,
+        segment_id: &SegmentId,
+        data: &[u8],
+    ) -> Result<(), oceanfs_storage_api::error::Error> {
         self.data.lock().insert(*segment_id, Bytes::from(data.to_vec()));
         Ok(())
     }
 
-    fn read_segment_data(&self, segment_id: &SegmentId) -> Result<Bytes, StorageError> {
-        self.data.lock().get(segment_id).cloned().ok_or(StorageError::SegmentNotFound(*segment_id))
+    async fn read_segment_data(
+        &self,
+        segment_id: &SegmentId,
+    ) -> Result<Option<oceanfs_storage_api::SegmentFile>, oceanfs_storage_api::error::Error> {
+        Ok(self.data.lock().get(segment_id).cloned().map(|data| oceanfs_storage_api::SegmentFile {
+            segment_id: *segment_id,
+            version: 1,
+            header_len: 76,
+            data_end: (76 + data.len()) as u64,
+            data,
+        }))
+    }
+
+    async fn delete_shards(
+        &self,
+        segment_id: &SegmentId,
+    ) -> Result<u64, oceanfs_storage_api::error::Error> {
+        Ok(self.data.lock().remove(segment_id).map(|removed| removed.len() as u64).unwrap_or(0))
+    }
+
+    async fn delete_shards_with_pool(
+        &self,
+        segment_id: &SegmentId,
+        _pool_id: u32,
+    ) -> Result<u64, oceanfs_storage_api::error::Error> {
+        self.delete_shards(segment_id).await
+    }
+
+    fn list_segment_files(
+        &self,
+        _root: &std::path::Path,
+    ) -> Result<Vec<std::path::PathBuf>, oceanfs_storage_api::error::Error> {
+        Ok(Vec::new())
     }
 }
 
@@ -406,11 +442,13 @@ async fn three_node_write_with_w2_via_grpc() {
     assert_eq!(s1, seg_id);
     assert_eq!(s2, seg_id);
 
-    let stored1 = store1.read_segment_data(&seg_id).unwrap();
-    let stored2 = store2.read_segment_data(&seg_id).unwrap();
-    assert_eq!(stored1, test_data);
-    assert_eq!(stored2, test_data);
-    assert!(store3.read_segment_data(&seg_id).is_err());
+    let stored1 =
+        store1.read_segment_data(&seg_id).await.unwrap().expect("node 1 holds the segment").data;
+    let stored2 =
+        store2.read_segment_data(&seg_id).await.unwrap().expect("node 2 holds the segment").data;
+    assert_eq!(&stored1[..], &test_data[..]);
+    assert_eq!(&stored2[..], &test_data[..]);
+    assert!(store3.read_segment_data(&seg_id).await.unwrap().is_none());
 
     let fetch_req = tonic::Request::new(oceanfs_core::proto::segment::FetchShardRequest {
         segment_id: Some(proto_sid),
@@ -436,9 +474,9 @@ async fn futures_unordered_fastest_2_of_3() {
     let proto_sid: ProtoSegmentId = seg_id.into();
     let test_data = b"fastest-k FuturesUnordered concurrency test".to_vec();
 
-    store1.write_segment_data(&seg_id, &test_data).unwrap();
-    store2.write_segment_data(&seg_id, &test_data).unwrap();
-    store3.write_segment_data(&seg_id, &test_data).unwrap();
+    store1.write_segment_data(&seg_id, &test_data).await.unwrap();
+    store2.write_segment_data(&seg_id, &test_data).await.unwrap();
+    store3.write_segment_data(&seg_id, &test_data).await.unwrap();
 
     let (client1, _, keep1) = start_segment_server(store1).await;
     let (client2, _, keep2) = start_segment_server(store2).await;
@@ -571,12 +609,13 @@ async fn three_node_cluster_with_node_kill() {
     assert_eq!(got3, blob2);
 
     // Verify blob2 is NOT on node-3's store (it was killed before the write).
-    let on_node3 = store3.read_segment_data(&seg2);
-    assert!(on_node3.is_err(), "node-3 should not have blob2");
+    let on_node3 = store3.read_segment_data(&seg2).await.unwrap();
+    assert!(on_node3.is_none(), "node-3 should not have blob2");
 
     // Verify blob1 IS still on node-2 after node-3 kill.
-    let on_node2_still = store2.read_segment_data(&seg1).unwrap();
-    assert_eq!(on_node2_still, blob1);
+    let on_node2_still =
+        store2.read_segment_data(&seg1).await.unwrap().expect("node 2 still holds blob1").data;
+    assert_eq!(&on_node2_still[..], &blob1[..]);
 }
 
 // ---------------------------------------------------------------------------

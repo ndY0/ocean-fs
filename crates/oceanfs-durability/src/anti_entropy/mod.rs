@@ -20,4 +20,4 @@ pub use config::AntiEntropyConfig;
 pub use engine::{AntiEntropy, AntiEntropyStats};
 pub use merkle_proof::{LeafRange, MerkleProof};
 pub use merkle_root::MerkleRoot;
-pub use merkle_tree::{InMemorySegmentStore, MerkleTree, SegmentDataStore};
+pub use merkle_tree::{InMemorySegmentStore, MerkleTree};

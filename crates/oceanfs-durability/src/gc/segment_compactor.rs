@@ -11,13 +11,12 @@ use oceanfs_storage::{
     segment::{lifecycle::SegmentLifecycleCoordinator, TierRouter},
     Result,
 };
+use oceanfs_storage_api::SegmentDataStore;
 
 use super::{
     compaction_recovery::{CompactionState, CompactionUnit},
     config::tier_target_size,
-    garbage_collector::SegmentShardStore,
 };
-use crate::anti_entropy::SegmentDataStore;
 
 // ---------------------------------------------------------------------------
 // SegmentCompactor
@@ -63,8 +62,11 @@ pub(crate) struct SegmentCompactor {
     lifecycle: Arc<SegmentLifecycleCoordinator>,
     /// The shard store: the `OldRemoved` milestone unlinks the old
     /// `.dat` **only after** `request_delete` returns durable
-    /// (ADR-0024 invariant 3: delete before unlink).
-    shard_store: Arc<dyn SegmentShardStore>,
+    /// (ADR-0024 invariant 3: delete before unlink). A second
+    /// `Arc<dyn SegmentDataStore>` during the f1/f2 transition window —
+    /// the unified trait covers delete/list too (ADR-0032 D1); f3
+    /// collapses the pair to one shared instance.
+    shard_store: Arc<dyn SegmentDataStore>,
     /// Optional sealed-segment notifier (sealed-segment-replication).
     ///
     /// Fired with the NEW segment id once its `SealEvent` is durable —
@@ -103,7 +105,7 @@ impl SegmentCompactor {
         tier_router: TierRouter,
         data_store: Arc<dyn SegmentDataStore>,
         lifecycle: Arc<SegmentLifecycleCoordinator>,
-        shard_store: Arc<dyn SegmentShardStore>,
+        shard_store: Arc<dyn SegmentDataStore>,
     ) -> Self {
         Self {
             metadata,
@@ -209,7 +211,8 @@ impl SegmentCompactor {
             self.request_old_deletion(segment_id).await?;
             self.stall_at(5).await; // seam: after the DeleteEvent(old) (fully-dead path)
             self.shard_store
-                .delete_shards_with_pool(segment_meta.pool_id, segment_id)
+                .delete_shards_with_pool(&segment_id, segment_meta.pool_id)
+                .await
                 .map_err(|e| oceanfs_storage::Error::Io(std::io::Error::other(e.to_string())))?;
             tracing::info!(
                 segment_id = %segment_id,
@@ -218,12 +221,25 @@ impl SegmentCompactor {
             return Ok(segment_size);
         }
 
-        // Read the old segment's data section (header already stripped by
-        // the store; chunk offsets are relative to the data region).
+        // Read the old segment's data section (header already parsed by
+        // the store — `SegmentFile.data` is the data section; chunk
+        // offsets are relative to it).
         let old_data = self
             .data_store
             .read_segment_data(&segment_id)
-            .map_err(|e| oceanfs_storage::Error::Io(std::io::Error::other(e.to_string())))?;
+            .await
+            .map_err(|e| oceanfs_storage::Error::Io(std::io::Error::other(e.to_string())))?
+            .ok_or_else(|| {
+                // A compactor-chosen segment whose `.dat` is absent is a
+                // genuine anomaly (the liveness scan saw the registry
+                // entry): surface it as a NotFound read error so the
+                // cycle reports the compaction failure.
+                oceanfs_storage::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("segment {segment_id} data not present at compaction time"),
+                ))
+            })?;
+        let old_data = old_data.data;
 
         // Create a new segment for repacking the live blobs.
         let new_segment_id = SegmentId::new();
@@ -326,6 +342,7 @@ impl SegmentCompactor {
         let write_result = self
             .data_store
             .write_segment_data(&new_segment_id, &repacked)
+            .await
             .map_err(|e| oceanfs_storage::Error::Io(std::io::Error::other(e.to_string())));
         if let Err(e) = write_result {
             self.cleanup_reserved_new(new_segment_id).await;
@@ -465,7 +482,8 @@ impl SegmentCompactor {
         state = CompactionState::OldRemoved;
         tracing::debug!(?state, "compaction milestone: old .dat unlinked");
         self.shard_store
-            .delete_shards_with_pool(segment_meta.pool_id, segment_id)
+            .delete_shards_with_pool(&segment_id, segment_meta.pool_id)
+            .await
             .map_err(|e| oceanfs_storage::Error::Io(std::io::Error::other(e.to_string())))?;
 
         tracing::info!(
@@ -509,9 +527,10 @@ impl SegmentCompactor {
         // The new segment's `.dat` was written via `write_segment_data`
         // (resolver-based): for a not-yet-registered segment the resolver
         // yields None → pool_id 0 → the first data pool root when pools
-        // are configured, else the legacy dir — consistent with this
-        // unlink (Phase A compaction placement, ADR-0029 f5).
-        let _ = self.shard_store.delete_shards_with_pool(0, new_segment_id);
+        // are configured (the write-before-register bridge, gone in
+        // store-unification f2) — consistent with this unlink (Phase A
+        // compaction placement, ADR-0029 f5).
+        let _ = self.shard_store.delete_shards_with_pool(&new_segment_id, 0).await;
     }
 
     /// Test seam for the compaction crash-window matrix (rows 7–9):
@@ -576,12 +595,12 @@ mod tests {
             TierRouter,
         },
     };
+    use oceanfs_storage_api::SegmentDataStore;
 
     use super::super::{
         garbage_collector::GarbageCollector, liveness_tracker::LivenessTracker,
         segment_compactor::SegmentCompactor, *,
     };
-    use crate::anti_entropy::SegmentDataStore;
 
     fn test_config() -> MetadataConfig {
         let dir = tempfile::tempdir().unwrap();
@@ -635,7 +654,7 @@ mod tests {
     ) -> (SegmentCompactor, Arc<SegmentLifecycleCoordinator>) {
         let store = Arc::new(crate::anti_entropy::InMemorySegmentStore::new());
         for (id, data) in entries {
-            store.write_segment_data(&id, &data).unwrap();
+            store.write_segment_data(&id, &data).await.unwrap();
         }
         let tmp = tempfile::TempDir::new().unwrap();
         let event_wal = Arc::new(
@@ -986,7 +1005,7 @@ mod tests {
 
         // Use a threshold that will trigger (liveness 0.25 < 0.5)
         let store = Arc::new(crate::anti_entropy::InMemorySegmentStore::new());
-        store.write_segment_data(&seg_id, &vec![0x11; 800]).unwrap();
+        store.write_segment_data(&seg_id, &vec![0x11; 800]).await.unwrap();
         let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
         // Seed the candidate through the machine (the only writer of
         // lifecycle state) so the compactor's transitions validate.

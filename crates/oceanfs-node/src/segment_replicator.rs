@@ -31,11 +31,11 @@ use oceanfs_core::{
     proto::segment::PushSealedSegmentRequest, Counter, Gauge, LabelSet, MetricRegistrar, NodeId,
     SegmentId, SizeTier,
 };
-use oceanfs_durability::SegmentDataStore;
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_routing::{segment_replica_set, RingCache};
 use oceanfs_storage::SegmentRpcClient;
+use oceanfs_storage_api::SegmentDataStore;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -512,9 +512,14 @@ impl SegmentReplicator {
         };
 
         // Read the full data section locally (the `.dat` is durable by
-        // the time the notifier fires).
-        let data = match self.data_store.read_segment_data(&segment_id) {
-            Ok(d) => d,
+        // the time the notifier fires). A missing `.dat` (Ok(None)) is a
+        // skipped replication — same log-and-return as a read error.
+        let data = match self.data_store.read_segment_data(&segment_id).await {
+            Ok(Some(file)) => file.data,
+            Ok(None) => {
+                warn!(segment_id = %segment_id, "replication: segment data absent locally");
+                return Err(vec![]);
+            }
             Err(e) => {
                 warn!(segment_id = %segment_id, error = %e, "replication: local read failed");
                 return Err(vec![]);
@@ -859,13 +864,13 @@ mod tests {
 
     /// Seeds a Sealed segment (with data + merkle root) in the lifecycle
     /// and store so `replicate_segment` has something to push.
-    fn seed_sealed_segment(
+    async fn seed_sealed_segment(
         lifecycle: &Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
         store: &Arc<InMemorySegmentStore>,
         id: SegmentId,
         data: &[u8],
     ) {
-        store.write_segment_data(&id, data).expect("seed store");
+        store.write_segment_data(&id, data).await.expect("seed store");
         let root = oceanfs_durability::MerkleTree::build(data, 0).expect("merkle").root().hash();
         let meta = oceanfs_core::SegmentMetadata {
             pool_id: 0,
@@ -920,7 +925,7 @@ mod tests {
         ));
 
         let id = SegmentId::new();
-        seed_sealed_segment(&lifecycle, &store, id, &vec![0xABu8; 4096]);
+        seed_sealed_segment(&lifecycle, &store, id, &vec![0xABu8; 4096]).await;
 
         let result = replicator.replicate_segment(id).await;
         assert!(result.is_err(), "empty targets → parked in needs (gossip-race guard)");
@@ -942,7 +947,7 @@ mod tests {
     async fn unacked_push_lands_in_needs_set() {
         let env = make_env("n1");
         let id = SegmentId::new();
-        seed_sealed_segment(&env.lifecycle, &env.store, id, &vec![0xABu8; 4096]);
+        seed_sealed_segment(&env.lifecycle, &env.store, id, &vec![0xABu8; 4096]).await;
 
         let result = env.replicator.replicate_segment(id).await;
         // Targets = n2, n3 — neither has a gRPC server; connection fails.
@@ -990,7 +995,7 @@ mod tests {
     async fn deleted_segment_is_dropped_from_needs_set() {
         let env = make_env("n1");
         let id = SegmentId::new();
-        seed_sealed_segment(&env.lifecycle, &env.store, id, &vec![0xABu8; 4096]);
+        seed_sealed_segment(&env.lifecycle, &env.store, id, &vec![0xABu8; 4096]).await;
         // Simulate a compaction that repacked this segment away: the
         // durable delete folds the entry to Deleted and the compactor
         // unlinks the `.dat` (the in-memory store's data is irrelevant

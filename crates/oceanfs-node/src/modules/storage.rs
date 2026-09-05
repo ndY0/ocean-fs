@@ -73,11 +73,11 @@ pub(crate) struct StorageModule {
     /// The shared segment data store — the ONE `DiskSegmentStore`
     /// instance shared by the replicator, GC, AE, heal, scrub, admin,
     /// segment-service and repair paths (reviews #57/#59/#60).
-    pub(crate) data_store: Arc<dyn oceanfs_durability::SegmentDataStore>,
+    pub(crate) data_store: Arc<dyn oceanfs_storage_api::SegmentDataStore>,
     /// The shared segment shard store — the ONE `DiskSegmentShardStore`
     /// instance shared by GC compaction, the reaper, healing-service and
     /// startup recovery.
-    pub(crate) shard_store: Arc<dyn oceanfs_durability::SegmentShardStore>,
+    pub(crate) shard_store: Arc<dyn oceanfs_storage_api::SegmentDataStore>,
     /// The seal-time segment replicator (sealed-segment-replication) —
     /// pushes sealed segments to their ring replicas off the seal path.
     pub(crate) segment_replicator: Arc<SegmentReplicator>,
@@ -382,10 +382,10 @@ impl StorageModule {
         // replace the eight per-consumer instances the inline code created
         // (replicator, re-rep worker, GC, AE, reaper, heal, healing-service,
         // segment-service). All consumers receive clones of these two Arcs.
-        let data_store: Arc<dyn oceanfs_durability::SegmentDataStore> = Arc::new(
+        let data_store: Arc<dyn oceanfs_storage_api::SegmentDataStore> = Arc::new(
             oceanfs_durability::DiskSegmentStore::new(data_pools.clone(), pool_id_for.clone()),
         );
-        let shard_store: Arc<dyn oceanfs_durability::SegmentShardStore> = Arc::new(
+        let shard_store: Arc<dyn oceanfs_storage_api::SegmentDataStore> = Arc::new(
             oceanfs_durability::DiskSegmentShardStore::new(data_pools.clone(), pool_id_for.clone()),
         );
 
@@ -623,7 +623,7 @@ impl StorageModule {
             // Idempotent; a residue the resolver cannot place (an
             // unregistered orphan on a non-zero pool) is backstopped by
             // the orphan reaper's multi-root listing.
-            if let Err(e) = self.shard_store.delete_shards(segment_id) {
+            if let Err(e) = self.shard_store.delete_shards(&segment_id).await {
                 warn!(
                     segment_id = %segment_id,
                     error = %e,
@@ -906,19 +906,26 @@ mod tests {
         module
             .data_store
             .write_segment_data(&segment_id, payload)
+            .await
             .expect("write through shared data store");
         let back = module
             .data_store
             .read_segment_data(&segment_id)
-            .expect("read back through shared data store");
-        assert_eq!(&back[..], payload, "shared data store round-trip");
+            .await
+            .expect("read back through shared data store")
+            .expect("segment present after write");
+        assert_eq!(&back.data[..], &payload[..], "shared data store round-trip");
 
         // The shard store deletes the same .dat the data store wrote
         // (same resolver/layout); afterwards the data store must no
         // longer find it.
-        module.shard_store.delete_shards(segment_id).expect("delete through shared shard store");
+        module
+            .shard_store
+            .delete_shards(&segment_id)
+            .await
+            .expect("delete through shared shard store");
         assert!(
-            module.data_store.read_segment_data(&segment_id).is_err(),
+            module.data_store.read_segment_data(&segment_id).await.unwrap().is_none(),
             "segment must be gone after shard-store delete"
         );
 

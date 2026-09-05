@@ -100,6 +100,7 @@ async fn durability_components_are_wireable_and_spawnable() {
         metadata_store.clone(),
         lifecycle,
         Arc::new(InMemorySegmentShardStore::new(4194304)),
+        vec![], // in-memory store lists nothing; no pool roots needed
         GcConfig::new(3600, 86400, 0.5, 4, 64),
     ));
     let reaper_cancel = CancellationToken::new();
@@ -157,7 +158,7 @@ async fn test_scrub_accepts_trait_object() {
     let _store: Arc<dyn MetadataStore> =
         Arc::new(RocksDbMetadataStore::open(&metadata_config).expect("open metadata store"));
 
-    let data_store: Arc<dyn oceanfs_durability::SegmentDataStore> =
+    let data_store: Arc<dyn oceanfs_storage_api::SegmentDataStore> =
         Arc::new(InMemorySegmentStore::new());
     let coord = ScrubCoordinator::new(ScrubConfig::default());
     let scrub_registry =
@@ -188,7 +189,7 @@ async fn test_anti_entropy_accepts_trait_object() {
         ring_cache.clone(),
     ));
     let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
-    let data_store: Arc<dyn oceanfs_durability::SegmentDataStore> =
+    let data_store: Arc<dyn oceanfs_storage_api::SegmentDataStore> =
         Arc::new(InMemorySegmentStore::new());
 
     // AntiEntropy::new accepts the machine's registry.

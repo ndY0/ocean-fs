@@ -44,13 +44,13 @@ pub mod scrub_service;
 
 pub use anti_entropy::{
     AntiEntropy, AntiEntropyConfig, AntiEntropyStats, InMemorySegmentStore, LeafRange, MerkleProof,
-    MerkleRoot, MerkleTree, SegmentDataStore,
+    MerkleRoot, MerkleTree,
 };
 pub use error::{Error, Result};
 pub use gc::{
     recover_incomplete_compactions, CompactionRecoveryAction, CompactionState, CompactionUnit,
     DiskSegmentShardStore, GarbageCollector, GcConfig, GcStats, InMemorySegmentShardStore,
-    ObjectLookup, OrphanReaper, OrphanStats, SegmentShardStore, StoreObjectLookup,
+    ObjectLookup, OrphanReaper, OrphanStats, StoreObjectLookup,
 };
 pub use heal::{
     enqueue_heal, HealConfig, HealQueue, HealQueueSender, HealRequest, HealStats, HealWorker,

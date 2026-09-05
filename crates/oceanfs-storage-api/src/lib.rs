@@ -1,7 +1,8 @@
 //! Storage API crate — interface contracts for OceanFS storage backends.
 //!
 //! This crate defines the traits that every storage backend must implement:
-//! [`SegmentStore`], [`MetadataStore`], [`BlobStore`], and [`WalWriter`].
+//! [`SegmentStore`], [`MetadataStore`], [`BlobStore`], [`WalWriter`], and
+//! [`SegmentDataStore`] (whole-file segment `.dat` access — ADR-0032).
 //! It depends only on [`oceanfs_core`] and serves as the common interface
 //! between coordinators/durability tasks and concrete storage implementations.
 //!
@@ -39,6 +40,7 @@
 mod blob_store;
 pub mod error;
 mod metadata_store;
+mod segment_data_store;
 mod segment_store;
 mod wal_writer;
 
@@ -46,5 +48,6 @@ pub use blob_store::BlobStore;
 pub use metadata_store::{BatchOp, MetadataStore};
 // Re-export relevant oceanfs-core types used in trait signatures.
 pub use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata, SegmentId, SegmentMetadata};
+pub use segment_data_store::{SegmentDataStore, SegmentFile};
 pub use segment_store::{SegmentHandle, SegmentStore};
 pub use wal_writer::WalWriter;

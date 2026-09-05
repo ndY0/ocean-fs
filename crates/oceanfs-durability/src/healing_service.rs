@@ -7,13 +7,14 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use bytes::Bytes;
 use oceanfs_core::{Hlc, HlcClock, NodeId, RemappedChunk, SegmentId, SegmentRemapAlias};
+use oceanfs_storage_api::SegmentDataStore;
+use tonic::{Request, Response, Status};
 
 /// Converts a core [`Hlc`] to the proto timestamp for the hint fetch
 /// response header.
 fn proto_hlc(hlc: Hlc) -> oceanfs_core::proto::common::HlcTimestamp {
     oceanfs_core::proto::common::HlcTimestamp { wall_time: hlc.wall_time(), logical: hlc.logical() }
 }
-use tonic::{Request, Response, Status};
 
 use crate::{
     healing_rpc::{
@@ -23,7 +24,6 @@ use crate::{
         RemapAck, RequestReReplicationRequest, RequestReReplicationResponse, SegmentRemap,
     },
     hinted_handoff_rpc::{hint_record::Record, HintedHandoffRequest, HintedHandoffResponse},
-    SegmentDataStore, SegmentShardStore,
 };
 
 /// Fetches an object's CURRENT state from an origin node.
@@ -281,8 +281,10 @@ pub struct HealingGrpcService {
         Option<Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>>,
     /// Shard store for unlinking the stale replica's `.dat` after the
     /// durable delete (ADR-0024 invariant 3). `None` (tests) skips the
-    /// unlink.
-    shard_store: Option<Arc<dyn SegmentShardStore>>,
+    /// unlink. A second `Arc<dyn SegmentDataStore>` during the f1/f2
+    /// transition window — the unified trait covers delete/list too
+    /// (ADR-0032 D1); f3 collapses the pair to one shared instance.
+    shard_store: Option<Arc<dyn SegmentDataStore>>,
     /// Re-replication repair sink (g3 → g5). `None` (tests) verifies +
     /// acks but enqueues nothing.
     repair_sink: Option<Arc<dyn RepairSink>>,
@@ -402,7 +404,7 @@ impl HealingGrpcService {
     /// Installs the shard store used to unlink a stale replica's `.dat`
     /// after its durable delete (composition root).
     #[must_use]
-    pub fn with_shard_store(mut self, shard_store: Arc<dyn SegmentShardStore>) -> Self {
+    pub fn with_shard_store(mut self, shard_store: Arc<dyn SegmentDataStore>) -> Self {
         self.shard_store = Some(shard_store);
         self
     }
@@ -1110,8 +1112,11 @@ impl HealingRpc for HealingGrpcService {
             };
 
             // Try to read the segment data to compute the Merkle tree.
-            let segment_data = match self.data_store.read_segment_data(&sid) {
-                Ok(data) => data,
+            // A missing `.dat` (Ok(None)) or a read error skips the
+            // candidate (the peer keeps looking for a holder).
+            let segment_data = match self.data_store.read_segment_data(&sid).await {
+                Ok(Some(file)) => file.data,
+                Ok(None) => continue,
                 Err(_) => continue,
             };
 
@@ -1180,9 +1185,23 @@ impl HealingRpc for HealingGrpcService {
         let shard_index = req.shard_index as usize;
 
         // Read the full segment data and extract the requested shard.
-        let data = self.data_store.read_segment_data(&segment_id).map_err(|e| {
-            Status::internal(format!("failed to read segment data for shard fetch: {e}"))
-        })?;
+        // A missing `.dat` (Ok(None)) is surfaced exactly like the
+        // pre-f1 NotFound read error (internal status, same as every
+        // read failure here) — a fetch of a segment this node does not
+        // hold must fail so the caller tries another holder.
+        let data = match self.data_store.read_segment_data(&segment_id).await {
+            Ok(Some(file)) => file.data,
+            Ok(None) => {
+                return Err(Status::internal(format!(
+                    "failed to read segment data for shard fetch: segment {segment_id} not found"
+                )));
+            }
+            Err(e) => {
+                return Err(Status::internal(format!(
+                    "failed to read segment data for shard fetch: {e}"
+                )));
+            }
+        };
 
         // Full-segment mode (ADR-0030 target-pull; g5): when offset 0 +
         // length 0, stream the ENTIRE data section — the re-replication
@@ -1330,7 +1349,7 @@ impl HealingRpc for HealingGrpcService {
         // [end]
         // Write the repaired shard into the data store.
         // In production this would merge the shard into the correct position.
-        match self.data_store.write_segment_data(&segment_id, &req.data) {
+        match self.data_store.write_segment_data(&segment_id, &req.data).await {
             Ok(()) => {
                 tracing::info!(
                     segment_id = %segment_id,
@@ -1558,7 +1577,7 @@ impl HealingRpc for HealingGrpcService {
                     if let Some(shard_store) = &self.shard_store {
                         // The stale replica was registered with pool_id 0
                         // (replica placement is pool-0/legacy).
-                        if let Err(e) = shard_store.delete_shards_with_pool(0, old_sid) {
+                        if let Err(e) = shard_store.delete_shards_with_pool(&old_sid, 0).await {
                             tracing::warn!(
                                 old_segment_id = %old_sid,
                                 error = %e,
@@ -1714,9 +1733,7 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
-    use crate::{
-        healing_rpc::RemappedChunk as ProtoRemappedChunk, HintedHandoff, SegmentDataStore,
-    };
+    use crate::{healing_rpc::RemappedChunk as ProtoRemappedChunk, HintedHandoff};
 
     /// In-memory store for healing tests.
     struct TestHealStore {
@@ -1729,25 +1746,52 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl SegmentDataStore for TestHealStore {
-        fn write_segment_data(
+        async fn write_segment_data(
             &self,
             segment_id: &SegmentId,
             data: &[u8],
-        ) -> Result<(), oceanfs_storage::Error> {
+        ) -> oceanfs_storage_api::error::Result<()> {
             self.data.lock().insert(*segment_id, Bytes::copy_from_slice(data));
             Ok(())
         }
 
-        fn read_segment_data(
+        async fn read_segment_data(
             &self,
             segment_id: &SegmentId,
-        ) -> Result<Bytes, oceanfs_storage::Error> {
-            self.data
-                .lock()
-                .get(segment_id)
-                .cloned()
-                .ok_or(oceanfs_storage::Error::SegmentNotFound(*segment_id))
+        ) -> oceanfs_storage_api::error::Result<Option<oceanfs_storage_api::SegmentFile>> {
+            Ok(self.data.lock().get(segment_id).cloned().map(|data| {
+                oceanfs_storage_api::SegmentFile {
+                    segment_id: *segment_id,
+                    version: 1,
+                    header_len: 76,
+                    data_end: (76 + data.len()) as u64,
+                    data,
+                }
+            }))
+        }
+
+        async fn delete_shards(
+            &self,
+            segment_id: &SegmentId,
+        ) -> oceanfs_storage_api::error::Result<u64> {
+            Ok(self.data.lock().remove(segment_id).map(|removed| removed.len() as u64).unwrap_or(0))
+        }
+
+        async fn delete_shards_with_pool(
+            &self,
+            segment_id: &SegmentId,
+            _pool_id: u32,
+        ) -> oceanfs_storage_api::error::Result<u64> {
+            self.delete_shards(segment_id).await
+        }
+
+        fn list_segment_files(
+            &self,
+            _root: &std::path::Path,
+        ) -> oceanfs_storage_api::error::Result<Vec<std::path::PathBuf>> {
+            Ok(Vec::new())
         }
     }
 
@@ -2087,7 +2131,7 @@ mod tests {
         // Write known data to the store so the Merkle tree can be built.
         let seg_id = SegmentId::new();
         let data: Vec<u8> = vec![0xAB; 65536 * 2]; // 128 KB = 2 leaves of 64 KB
-        test_store.write_segment_data(&seg_id, &data).unwrap();
+        test_store.write_segment_data(&seg_id, &data).await.unwrap();
 
         let data_store: Arc<dyn SegmentDataStore> = test_store;
         let service = HealingGrpcService::new(
@@ -2566,7 +2610,7 @@ mod tests {
         let store = TestHealStore::new();
         let segment_id = SegmentId::new();
         let data: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
-        store.write_segment_data(&segment_id, &data).unwrap();
+        store.write_segment_data(&segment_id, &data).await.unwrap();
 
         let service = HealingGrpcService::new(
             Arc::new(HintedHandoff::new()),
@@ -2612,7 +2656,7 @@ mod tests {
         let store = TestHealStore::new();
         let segment_id = SegmentId::new();
         let data: Vec<u8> = (0..60_000).map(|i| (i % 251) as u8).collect();
-        store.write_segment_data(&segment_id, &data).unwrap();
+        store.write_segment_data(&segment_id, &data).await.unwrap();
 
         let service = HealingGrpcService::new(
             Arc::new(HintedHandoff::new()),
