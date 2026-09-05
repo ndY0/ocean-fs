@@ -11,7 +11,7 @@
 //! machine (`SegmentLifecycleRegistry`) through the consuming crate's
 //! own boundary.
 
-use oceanfs_core::{BucketId, Hlc, ObjectKey, ObjectMetadata, Tombstone};
+use oceanfs_core::{BucketId, DeadChunkRecord, Hlc, ObjectKey, ObjectMetadata, Tombstone};
 
 /// A single batch operation for atomic metadata writes.
 ///
@@ -142,6 +142,28 @@ pub trait MetadataStore: Send + Sync {
     /// The default implementation returns an empty list; stores that
     /// support cross-bucket scans override it.
     fn list_tombstones_all(&self) -> Vec<std::io::Result<(BucketId, ObjectKey, Tombstone)>> {
+        Vec::new()
+    }
+
+    /// Lists every captured dead-chunk record across all buckets.
+    ///
+    /// Returns plain tombstones (`kind: Tombstone`) AND versioned
+    /// supersedes (`kind: Supersede`, ADR-0034 D2) as the typed accounting
+    /// feed GC liveness and orphan detection consume (f2): live bytes are
+    /// `logical_total − dead`, where `dead` sums the `chunks` of aged
+    /// records over each referenced segment.
+    ///
+    /// The record's `kind` is derived from the store's deletions-CF key
+    /// classification, so a supersede record is never surfaced as a plain
+    /// tombstone of its (live) key. This is the only enumeration that
+    /// exposes supersedes; [`Self::list_tombstones`] and
+    /// [`Self::list_tombstones_all`] keep returning plain tombstones only.
+    ///
+    /// The default implementation returns an empty list so in-memory test
+    /// doubles stay minimal; the RocksDB store overrides it.
+    fn list_dead_chunk_records_all(
+        &self,
+    ) -> Vec<std::io::Result<(BucketId, ObjectKey, DeadChunkRecord)>> {
         Vec::new()
     }
 

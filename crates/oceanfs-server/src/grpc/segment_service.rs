@@ -672,6 +672,13 @@ impl SegmentRpc for SegmentGrpcService {
         // the residual window is a delete racing a repair push on the
         // same key — the sender-side re-validation in
         // `run_read_repair` shrinks it to near zero.
+        //
+        // On legitimate resurrection we do NOT clear the tombstone here:
+        // `put_object_in_bucket` (below) clears the plain tombstone and
+        // atomically migrates its captured dead chunks into a versioned
+        // supersede record in the SAME WriteBatch as the row write
+        // (ADR-0034 D2) — pre-clearing would drop the delete's dead-byte
+        // capture entirely.
         if let Some(tombstone) =
             oceanfs_storage_api::MetadataStore::get_tombstone(md_store.as_ref(), &bucket, &key)
                 .map_err(|e| Status::internal(format!("tombstone lookup failed: {e}")))?
@@ -688,15 +695,12 @@ impl SegmentRpc for SegmentGrpcService {
                 );
                 return Err(Status::failed_precondition("object is tombstoned"));
             }
-            // The write happened after the delete: legitimate
-            // resurrection. Clear the tombstone so the object is live.
-            oceanfs_storage_api::MetadataStore::delete_tombstone(md_store.as_ref(), &bucket, &key)
-                .map_err(|e| Status::internal(format!("tombstone clear failed: {e}")))?;
             tracing::info!(
                 bucket = %bucket,
                 key = %key,
                 push_wall = hlc.wall_time(),
-                "read-repair push newer than tombstone; clearing tombstone (legitimate resurrection)"
+                "read-repair push newer than tombstone: legitimate resurrection \
+                 (choke point clears the tombstone and migrates its capture)"
             );
         }
 

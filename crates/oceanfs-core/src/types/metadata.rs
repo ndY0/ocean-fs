@@ -204,6 +204,79 @@ pub struct Tombstone {
 }
 
 // ---------------------------------------------------------------------------
+// Dead-chunk records
+// ---------------------------------------------------------------------------
+
+/// The kind of a captured dead-chunk record in the `deletions` column
+/// family (ADR-0034 D2).
+///
+/// Every chunk reference that stops being referenced by a live object row
+/// is captured into a dead-chunk record **atomically with the row change**
+/// — either a delete (`Tombstone`) or an overwrite of a superseded version
+/// (`Supersede`). GC and the orphan reaper read both kinds through the
+/// [`DeadChunkRecord`] enumeration; the two kinds differ only in how they
+/// were produced, never in how their bytes are accounted.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::DeadChunkKind;
+///
+/// assert_ne!(DeadChunkKind::Tombstone, DeadChunkKind::Supersede);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeadChunkKind {
+    /// A chunk set captured by `delete_object` (a plain `deletions`-CF
+    /// tombstone record at the exact `{bucket}\0{key}` key).
+    Tombstone,
+    /// A chunk set captured by an overwrite at `put_object_in_bucket`
+    /// (a versioned supersede record keyed with the superseded version's
+    /// HLC, so it coexists with the new live row, ages under the tombstone
+    /// TTL discipline, and is never interpreted as a delete of the key).
+    Supersede,
+}
+
+/// Typed read-side view of a captured dead-chunk record.
+///
+/// Returned by `MetadataStore::list_dead_chunk_records_all` (f2's
+/// accounting feed). It is **not** a new on-disk format: the stored value
+/// keeps the [`Tombstone`] shape (`deletion_time` = `captured_at`, `hlc` =
+/// the superseded version's HLC for supersedes / the delete HLC for plain
+/// tombstones), and the `kind` is derived from the deletions-CF key
+/// classification.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::{ChunkRef, DeadChunkKind, DeadChunkRecord, Hlc};
+///
+/// let record = DeadChunkRecord {
+///     kind: DeadChunkKind::Supersede,
+///     captured_at: 1_700_000_000_000,
+///     hlc: Hlc::new(1_700_000_000_000, 3),
+///     chunks: smallvec::SmallVec::new(),
+/// };
+/// assert!(record.chunks.is_empty());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadChunkRecord {
+    /// Whether this record came from a delete or an overwrite supersede.
+    pub kind: DeadChunkKind,
+    /// When the dead bytes were captured (milliseconds since epoch);
+    /// drives TTL aging (`now_ms - captured_at > tombstone_ttl`).
+    pub captured_at: i64,
+    /// The superseded version's HLC (supersedes) or the delete's HLC
+    /// (plain tombstones). For supersedes this is also the version
+    /// discriminator that reconstructs the stored key.
+    pub hlc: Hlc,
+    /// The chunk references whose bytes became dead. For a supersede this
+    /// is the superseded version's chunk set, attributed to the segments it
+    /// referenced; empty for inline objects and legacy records.
+    pub chunks: smallvec::SmallVec<[ChunkRef; 4]>,
+}
+
+// ---------------------------------------------------------------------------
 // SegmentIndexEntry
 // ---------------------------------------------------------------------------
 

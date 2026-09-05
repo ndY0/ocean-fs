@@ -1754,14 +1754,18 @@ mod tests {
             &oceanfs_core::LifecycleConfig::default(),
         ))
     }
-    /// Creates a test coordinator with a caller-provided hint delivery client.
+    /// Creates a test coordinator with a caller-provided hint delivery
+    /// client, returning the concrete [`RocksDbMetadataStore`] alongside so
+    /// tests can assert store-level effects (e.g. ADR-0034 D2 supersede
+    /// capture) that are invisible through the async trait surface.
+    #[allow(clippy::type_complexity)]
     async fn make_write_coordinator_with_delivery(
         node_id: &str,
         ring_nodes: &[&str],
         dir: tempfile::TempDir,
         pool: Arc<ConnectionPool>,
         delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient>,
-    ) -> (WriteCoordinator, tempfile::TempDir) {
+    ) -> (WriteCoordinator, tempfile::TempDir, Arc<RocksDbMetadataStore>) {
         let mut ring = Ring::new(RingConfig { vnodes_per_node: 8, replication_factor: 3 });
         for node in ring_nodes {
             ring.add_node(NodeId::new(*node));
@@ -1875,6 +1879,10 @@ mod tests {
         let hinted_handoff =
             Arc::new(HintedHandoffManager::new(hints_dir, delivery_client, hint_config.clone()));
 
+        // Keep a handle on the concrete store for store-level assertions
+        // (the coordinator consumes the Arc into its async adapter).
+        let concrete_store = Arc::clone(&metadata);
+
         (
             WriteCoordinator::new(
                 ring_cache,
@@ -1893,6 +1901,7 @@ mod tests {
                 hinted_handoff,
             ),
             dir,
+            concrete_store,
         )
     }
 
@@ -2247,7 +2256,7 @@ mod tests {
     /// scan — the fleet disk-fill root cause).
     #[tokio::test]
     async fn apply_hinted_object_stores_chunk_refs_and_hlc() {
-        let (coord, _dir) = {
+        let (coord, _dir, _store) = {
             use oceanfs_durability::GrpcHintDeliveryClient;
             let dir = tempfile::tempdir().unwrap();
             let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
@@ -2316,6 +2325,77 @@ mod tests {
         assert!(meta.chunks.is_empty());
         assert!(meta.inline_data.is_some());
         assert_eq!(meta.hlc, hlc);
+    }
+
+    /// D6 "Hint-apply that supersedes an existing key": a hinted-handoff
+    /// apply for a key that already holds a live row must route through
+    /// the ADR-0034 D2 choke point and capture the superseded version's
+    /// chunks — the hint path is one of the four production funnels into
+    /// `put_object_in_bucket`.
+    #[tokio::test]
+    async fn hinted_apply_that_supersedes_existing_row_captures() {
+        let (coord, _dir, store) = {
+            use oceanfs_durability::GrpcHintDeliveryClient;
+            let dir = tempfile::tempdir().unwrap();
+            let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
+            let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
+                Arc::new(GrpcHintDeliveryClient::new(pool.clone()));
+            make_write_coordinator_with_delivery("n1", &["n1"], dir, pool, delivery_client).await
+        };
+        let bucket = BucketId::new("test");
+        let key = ObjectKey::new("hinted-supersede");
+        let seg_a = SegmentId::new();
+
+        // Seed a live segment-stored row on segment A (older HLC), written
+        // directly through the concrete store the coordinator wraps.
+        let v1 = ObjectMetadata {
+            object_key: key.clone(),
+            size: 100,
+            blake3_hash: None,
+            chunks: std::iter::once(ChunkRef {
+                segment_id: seg_a,
+                offset: 0,
+                length: 100,
+                compressed: false,
+                logical_length: 100,
+            })
+            .collect(),
+            inline_data: None,
+            created_at: 0,
+            hlc: Hlc::new(1_000_000, 1),
+        };
+        store.put_object_in_bucket(&bucket, v1.clone()).unwrap();
+
+        // Hint apply with a NEWER HLC for the same key (Standard tier so it
+        // stores REAL chunk refs on a new segment).
+        let hint_hlc = Hlc::new(1_700_000_000_000, 99);
+        let data = Bytes::from(vec![0xCDu8; 500_000]);
+        let applied = coord
+            .apply_hinted_object(&bucket, &key, data, hint_hlc, 0)
+            .await
+            .expect("apply must succeed");
+        assert_eq!(applied.hlc, hint_hlc);
+        assert_eq!(applied.chunks.len(), 1, "Standard tier stores real chunk refs");
+        assert_ne!(applied.chunks[0].segment_id, seg_a);
+
+        // Exactly one supersede holds the seeded version's chunks; the live
+        // row survives referencing the applied segment.
+        let records: Vec<_> = store
+            .list_dead_chunk_records_all()
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+            .collect();
+        let sups: Vec<_> = records
+            .iter()
+            .filter(|(_, k, r)| k == &key && r.kind == oceanfs_core::DeadChunkKind::Supersede)
+            .collect();
+        assert_eq!(sups.len(), 1, "capture must fire on the hint-apply path");
+        assert_eq!(sups[0].2.hlc, v1.hlc, "supersede version = superseded version's HLC");
+        assert_eq!(sups[0].2.chunks[0].segment_id, seg_a);
+
+        let live = store.get_object(&bucket, &key).unwrap().unwrap();
+        assert_eq!(live.hlc, hint_hlc);
+        assert_ne!(live.chunks[0].segment_id, seg_a);
     }
 
     #[tokio::test]
@@ -2613,7 +2693,7 @@ mod tests {
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
             Arc::new(oceanfs_durability::GrpcHintDeliveryClient::new(pool.clone()));
-        let (coord, dir) =
+        let (coord, dir, _store) =
             make_write_coordinator_with_delivery("n1", &["n1"], dir, pool, delivery_client).await;
         let coord = Arc::new(coord);
 
@@ -2724,7 +2804,7 @@ mod tests {
         let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
         let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
             Arc::new(oceanfs_durability::GrpcHintDeliveryClient::new(pool.clone()));
-        let (coord, dir) =
+        let (coord, dir, _store) =
             make_write_coordinator_with_delivery("n1", &["n1"], dir, pool, delivery_client).await;
         let coord = Arc::new(coord);
         let _seal_handle = spawn_test_seal_pipeline(&coord, None);

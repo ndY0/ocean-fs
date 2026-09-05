@@ -22,11 +22,16 @@
 //!
 //! `max_open_files = -1` lets RocksDB keep all SST file descriptors open,
 //! avoiding repeated open/close overhead.
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::hash_map::RandomState,
+    hash::{BuildHasher, Hasher},
+    sync::Arc,
+    time::Duration,
+};
 
 use oceanfs_core::{
-    BucketId, ChunkRef, Gauge, Hlc, LabelSet, MetadataConfig, MetricRegistrar, ObjectKey,
-    ObjectMetadata, Tombstone,
+    BucketId, ChunkRef, Counter, DeadChunkKind, DeadChunkRecord, Gauge, Hlc, LabelSet,
+    MetadataConfig, MetricRegistrar, ObjectKey, ObjectMetadata, Tombstone,
 };
 use rocksdb::{ColumnFamilyDescriptor, Options, DB};
 
@@ -34,6 +39,44 @@ use crate::{
     error::{Error, Result},
     metadata::cf,
 };
+
+/// Assumed worst-case number of metadata writers concurrently inside
+/// [`RocksDbMetadataStore::put_object_in_bucket`].
+///
+/// The server-side `AsyncMetadataOps` adapter bounds its own writers at 16
+/// (its default), but this store is also reached synchronously by the
+/// segment-service replica-apply and prefetch paths, which are not under
+/// that semaphore. 4× the adapter bound is a generous ceiling; the actual
+/// in-flight writer count at the store stays in the tens even under load
+/// because nothing feeds it from an unbounded pool.
+///
+/// This is the single knob to change when metadata-write concurrency
+/// becomes config-driven: replace it with the configured bound and pass it
+/// to [`stripe_count_for_writers`].
+const ASSUMED_CONCURRENT_METADATA_WRITERS: usize = 64;
+
+/// Returns the power-of-two stripe count that keeps the expected number of
+/// cross-key collisions below one for `max_concurrent_writers` simultaneous
+/// distinct-key writers.
+///
+/// Collision model (birthday bound): with C concurrent distinct-key
+/// writers hashed uniformly into N stripes, the expected number of
+/// colliding pairs is ~C²/2N. Keeping that below one needs N > C²/2, so we
+/// take `next_power_of_two(C²)` (for C = 64 that is 4096 → ~0.5 expected
+/// collisions per in-flight window). Memory is not a constraint (each
+/// stripe is a ~4-byte `parking_lot::Mutex<()>`, so 4096 stripes ≈ 16 KiB),
+/// so we size for the generous ceiling, not today's 16-op adapter bound.
+fn stripe_count_for_writers(max_concurrent_writers: usize) -> usize {
+    max_concurrent_writers.saturating_mul(max_concurrent_writers).next_power_of_two().max(256)
+}
+
+/// Current wall-clock time in milliseconds since the Unix epoch.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
 
 /// RocksDB property gauges exposed for Prometheus / `/admin/metrics`.
 ///
@@ -72,6 +115,12 @@ pub struct RocksDbMetrics {
     pub live_sst_files_size: Gauge,
     /// Estimated memory used by table readers (bytes).
     pub estimate_table_readers_mem: Gauge,
+    /// Number of supersede dead-chunk records captured on overwrite
+    /// (ADR-0034 D2; the "capture rule is firing" signal).
+    pub supersede_captured_total: Counter,
+    /// Total dead bytes captured by supersede records on overwrite
+    /// (ADR-0034 D2).
+    pub supersede_dead_bytes_total: Counter,
 }
 
 impl RocksDbMetrics {
@@ -124,6 +173,16 @@ impl RocksDbMetrics {
                 "Estimated memory used by table readers".into(),
                 empty.clone(),
             ),
+            supersede_captured_total: Counter::new(
+                "metadata_supersede_captured_total".into(),
+                "Supersede dead-chunk records captured on overwrite (ADR-0034 D2)".into(),
+                empty.clone(),
+            ),
+            supersede_dead_bytes_total: Counter::new(
+                "metadata_supersede_dead_bytes_total".into(),
+                "Total dead bytes captured by supersede records on overwrite (ADR-0034 D2)".into(),
+                empty.clone(),
+            ),
         }
     }
 
@@ -152,6 +211,8 @@ impl RocksDbMetrics {
         registrar.register_gauge(self.num_files_at_level_0.clone());
         registrar.register_gauge(self.live_sst_files_size.clone());
         registrar.register_gauge(self.estimate_table_readers_mem.clone());
+        registrar.register_counter(self.supersede_captured_total.clone());
+        registrar.register_counter(self.supersede_dead_bytes_total.clone());
     }
 }
 
@@ -178,6 +239,17 @@ pub struct RocksDbMetadataStore {
     db: Arc<DB>,
     /// RocksDB property gauges for observability.
     pub metrics: Arc<RocksDbMetrics>,
+    /// Per-key overwrite stripes (ADR-0034 D2 capture).
+    ///
+    /// Serializes the read→decide→WriteBatch critical section of
+    /// [`Self::put_object_in_bucket`] per `(bucket, key)`: concurrent
+    /// same-key overwrites share a stripe, so a superseded version's chunks
+    /// are captured exactly once instead of twice (or never). Distinct keys
+    /// almost never share a stripe (see [`stripe_count_for_writers`]).
+    key_locks: Box<[parking_lot::Mutex<()>]>,
+    /// Per-store random hash seed so client-chosen object keys cannot be
+    /// deliberately aligned onto a single stripe (SipHash via `RandomState`).
+    key_lock_hasher: RandomState,
 }
 
 fn io_err(e: impl std::error::Error) -> std::io::Error {
@@ -248,6 +320,13 @@ impl RocksDbMetadataStore {
 
         let db = Arc::new(db);
         let metrics = Arc::new(RocksDbMetrics::default());
+
+        // Per-key overwrite lock: sized by the documented collision model
+        // for the assumed writer ceiling (see `stripe_count_for_writers`).
+        let shard_count = stripe_count_for_writers(ASSUMED_CONCURRENT_METADATA_WRITERS);
+        debug_assert!(shard_count.is_power_of_two());
+        let key_locks = (0..shard_count).map(|_| parking_lot::Mutex::new(())).collect::<Box<[_]>>();
+        let key_lock_hasher = RandomState::new();
 
         // Attempt to mlock the RocksDB block cache in physical RAM as
         // swap defense (perf rule §3.4, Feature 6). The Rust rocksdb crate
@@ -362,7 +441,25 @@ impl RocksDbMetadataStore {
             }
         }
 
-        Ok(Self { db, metrics })
+        Ok(Self { db, metrics, key_locks, key_lock_hasher })
+    }
+
+    /// Runs `f` with the per-key overwrite lock for `(bucket, key)` held.
+    ///
+    /// The lock is held only across the read→decide→single-WriteBatch
+    /// critical section of [`Self::put_object_in_bucket`] — no I/O outside
+    /// the RocksDB batch, no other store lock is acquired while it is held
+    /// (LOCK ORDER: the metadata store has no other internal locks).
+    fn with_key_lock<R>(&self, bucket: &BucketId, key: &ObjectKey, f: impl FnOnce() -> R) -> R {
+        let mut hasher = self.key_lock_hasher.build_hasher();
+        hasher.write(bucket.as_str().as_bytes());
+        hasher.write_u8(0);
+        hasher.write(key.as_str().as_bytes());
+        // `key_locks.len()` is a power of two (see `open`), so the mask
+        // replaces a modulo.
+        let shard = (hasher.finish() as usize) & (self.key_locks.len() - 1);
+        let _guard = self.key_locks[shard].lock();
+        f()
     }
 
     // ------------------------------------------------------------------
@@ -391,28 +488,115 @@ impl RocksDbMetadataStore {
 
     /// Stores object metadata with an explicit bucket.
     ///
-    /// A fresh write supersedes any prior deletion of this key: the
-    /// deletion tombstone is cleared so that later read-repair pushes
-    /// for the new version are not rejected by the tombstone gate
-    /// (membership-stability-fixes F3/t19).
+    /// This is the single concrete choke point behind the `MetadataStore`
+    /// trait (S3 PUT, write-coordinator inline writes, hint-apply,
+    /// replica-apply, and the node `MetadataStoreAdapter` all funnel here),
+    /// and it is where the ADR-0034 D2 **capture rule** is enforced: every
+    /// chunk reference that stops being referenced by a live object row is
+    /// captured into a dead-chunk record **in the same WriteBatch** as the
+    /// row change.
+    ///
+    /// Two capture cases, both decided on the read **before** the batch:
+    ///
+    /// - **Overwrite of a live row** (`meta.hlc > existing.hlc`): the
+    ///   superseded version's chunks are folded into a versioned
+    ///   **supersede** record keyed with the superseded version's HLC, so
+    ///   the record coexists with the new live row, ages under the
+    ///   tombstone TTL discipline, is attributable to the segments it
+    ///   references, and is never interpreted as a delete of the key.
+    /// - **Re-PUT over a tombstoned key** (no live row, plain tombstone
+    ///   with chunks): the delete's chunks are **migrated** into a
+    ///   supersede record (preserving the original `deletion_time` so TTL
+    ///   aging does not reset) before the plain tombstone is cleared — a
+    ///   plain `(bucket, key)` tombstone would otherwise be wiped by this
+    ///   write and its dead bytes silently lost.
+    ///
+    /// A fresh write clears any stale tombstone so later read-repair
+    /// pushes for the new version are not rejected by the tombstone gate
+    /// (membership-stability-fixes F3/t19). A **same- or older-HLC write**
+    /// (e.g. a read-repair physical re-point of the same logical version)
+    /// and an inline→inline no-op overwrite never capture: the predecessor
+    /// is still the winning logical version, so its bytes are not dead.
+    ///
+    /// Compaction-remap and healing re-points do NOT route through this
+    /// method — they use [`Self::batch_write`] (`BatchOp::PutObject`), which
+    /// performs the same-version physical re-point without capturing.
     ///
     /// # Errors
     ///
-    /// Returns an error if the objects column family is not found, serialization
-    /// fails, or the RocksDB write fails.
+    /// Returns an error if the objects or deletions column family is not
+    /// found, serialization fails, or the RocksDB batch write fails.
     pub fn put_object_in_bucket(&self, bucket: &BucketId, meta: ObjectMetadata) -> Result<()> {
-        let cf = self
+        let key = meta.object_key.clone();
+        self.with_key_lock(bucket, &key, || self.put_object_in_bucket_locked(bucket, meta))
+    }
+
+    /// Read→decide→single-`WriteBatch` body of [`Self::put_object_in_bucket`],
+    /// invoked with the per-key lock held so concurrent same-key writers
+    /// cannot double- or lose-capture.
+    fn put_object_in_bucket_locked(&self, bucket: &BucketId, meta: ObjectMetadata) -> Result<()> {
+        let key = &meta.object_key;
+        let objects_cf = self
             .db
             .cf_handle(cf::CF_OBJECTS)
             .ok_or_else(|| Error::InvalidConfig("objects CF not found".into()))?;
+        let deletions_cf = self
+            .db
+            .cf_handle(cf::CF_DELETIONS)
+            .ok_or_else(|| Error::InvalidConfig("deletions CF not found".into()))?;
 
-        let key = cf::encode_object_key(bucket.as_str(), meta.object_key.as_str());
+        let row_key = cf::encode_object_key(bucket.as_str(), key.as_str());
+
+        // The capture reads happen BEFORE the batch; the batch itself
+        // carries supersede-write + tombstone-clear + row-put, so a crash
+        // between row write and capture is impossible by construction
+        // (ADR-0034 D6 "Crash between row write and capture").
+        //
+        // The reads are tolerant: a predecessor row or tombstone value that
+        // fails to decode is treated as absent (no capture) rather than
+        // erroring the write. Pre-accounting, `put_object_in_bucket` never
+        // read the predecessor and an overwrite always won over a corrupt
+        // row; treat-unreadable-as-absent preserves that behavior.
+        let existing = self.get_object(bucket, key).ok().flatten();
+        let plain_tombstone = self.get_tombstone(bucket, key).ok().flatten();
+
+        let mut batch = rocksdb::WriteBatch::default();
+
+        // V2 capture decision. Tuple: (chunks, hlc, captured_at).
+        let capture: Option<(smallvec::SmallVec<[ChunkRef; 4]>, Hlc, i64)> =
+            match (&existing, &plain_tombstone) {
+                // Overwrite of a live, segment-stored predecessor by a
+                // strictly-newer version: capture its bytes as dead.
+                (Some(prev), _) if prev.is_segment_stored() && meta.hlc > prev.hlc => {
+                    Some((prev.chunks.clone(), prev.hlc, now_ms()))
+                }
+                // Re-PUT over a tombstoned key with no live row: migrate the
+                // delete's capture into a supersede, preserving the original
+                // deletion time so the record keeps its TTL age.
+                (None, Some(ts)) if !ts.chunks.is_empty() => {
+                    Some((ts.chunks.clone(), ts.hlc, ts.deletion_time))
+                }
+                _ => None,
+            };
+
+        if let Some((chunks, hlc, captured_at)) = capture {
+            let dead_bytes: u64 = chunks.iter().map(|c| u64::from(c.length)).sum();
+            let supersede_key = cf::encode_supersede_key(bucket.as_str(), key.as_str(), hlc);
+            let value = bincode::serialize(&Tombstone { deletion_time: captured_at, hlc, chunks })
+                .map_err(|e| Error::Io(io_err(e)))?;
+            batch.put_cf(&deletions_cf, supersede_key, value);
+            self.metrics.supersede_captured_total.inc();
+            self.metrics.supersede_dead_bytes_total.add(dead_bytes);
+        }
+
+        // Clear any stale plain tombstone: the object is alive again.
+        batch.delete_cf(&deletions_cf, &row_key);
+
+        // The new live row.
         let value = bincode::serialize(&meta).map_err(|e| Error::Io(io_err(e)))?;
+        batch.put_cf(&objects_cf, &row_key, value);
 
-        self.db.put_cf(&cf, key, value).map_err(|e| Error::Io(io_err(e)))?;
-
-        // Clear any stale tombstone: the object is alive again.
-        self.delete_tombstone(bucket, &meta.object_key)?;
+        self.db.write(batch).map_err(|e| Error::Io(io_err(e)))?;
 
         Ok(())
     }
@@ -453,15 +637,31 @@ impl RocksDbMetadataStore {
     /// originating node's clock — hlc-causality-closure G4) so that
     /// delete-vs-write LWW is decidable across replicas.
     ///
+    /// Runs under the same per-key overwrite lock as
+    /// [`Self::put_object_in_bucket`], and the row delete + tombstone
+    /// write commit in one WriteBatch: a concurrent same-key overwrite
+    /// can never interleave between the chunk capture and the row removal
+    /// in a way that double- or loses the dead-byte capture (ADR-0034 D2).
+    ///
     /// # Errors
     ///
     /// Returns an error if the objects or deletions column family is not found,
-    /// or if the RocksDB delete/write fails.
+    /// or if the RocksDB batch write fails.
     pub fn delete_object(&self, bucket: &BucketId, key: &ObjectKey, hlc: Hlc) -> Result<()> {
-        let cf = self
+        self.with_key_lock(bucket, key, || self.delete_object_locked(bucket, key, hlc))
+    }
+
+    /// Row-delete + tombstone-write body of [`Self::delete_object`],
+    /// invoked with the per-key lock held.
+    fn delete_object_locked(&self, bucket: &BucketId, key: &ObjectKey, hlc: Hlc) -> Result<()> {
+        let objects_cf = self
             .db
             .cf_handle(cf::CF_OBJECTS)
             .ok_or_else(|| Error::InvalidConfig("objects CF not found".into()))?;
+        let deletions_cf = self
+            .db
+            .cf_handle(cf::CF_DELETIONS)
+            .ok_or_else(|| Error::InvalidConfig("deletions CF not found".into()))?;
 
         let db_key = cf::encode_object_key(bucket.as_str(), key.as_str());
 
@@ -470,24 +670,23 @@ impl RocksDbMetadataStore {
         // hold this object's bytes, and GC marks them dead from the
         // tombstone. Without this, GC could never detect dead bytes for
         // deleted objects (the row is gone, so the old object-scan
-        // matching could never fire).
+        // matching could never fire). A row that cannot be decoded is
+        // treated as absent (chunks empty) so a delete never fails on a
+        // corrupt predecessor.
         let chunks: smallvec::SmallVec<[ChunkRef; 4]> =
             self.get_object(bucket, key).ok().flatten().map(|meta| meta.chunks).unwrap_or_default();
 
-        self.db.delete_cf(&cf, &db_key).map_err(|e| Error::Io(io_err(e)))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete_cf(&objects_cf, &db_key);
 
         // Write a deletion tombstone so that GC can compact this key
         // across replicas. Without this, cross-node deletion compaction
         // is non-functional.
-        let tombstone = Tombstone {
-            deletion_time: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64,
-            hlc,
-            chunks,
-        };
-        self.put_tombstone(bucket, key, tombstone)?;
+        let tombstone = Tombstone { deletion_time: now_ms(), hlc, chunks };
+        let value = bincode::serialize(&tombstone).map_err(|e| Error::Io(io_err(e)))?;
+        batch.put_cf(&deletions_cf, &db_key, value);
+
+        self.db.write(batch).map_err(|e| Error::Io(io_err(e)))?;
 
         Ok(())
     }
@@ -674,6 +873,11 @@ impl RocksDbMetadataStore {
     }
 
     /// Lists all deletion tombstones for a bucket.
+    ///
+    /// Supersede dead-chunk records (ADR-0034 D2) are structurally
+    /// invisible here: every pre-f2 consumer (GC, caches, the read-repair
+    /// tombstone gate) sees byte-identical output to the pre-accounting
+    /// store, which contained only plain tombstones.
     pub fn list_tombstones(&self, bucket: &BucketId) -> Vec<Result<(ObjectKey, Tombstone)>> {
         let cf = self.db.cf_handle(cf::CF_DELETIONS);
         let Some(cf_handle) = cf else {
@@ -698,14 +902,21 @@ impl RocksDbMetadataStore {
         )
         .filter_map(|item| match item {
             Ok((key, value)) => {
-                let (bucket_str, key_str) = cf::decode_object_key(&key)?;
+                // Route the decode through `decode_deletions_key` and skip
+                // supersede records: their versioned keys must never be
+                // surfaced as a plain tombstone for the (now-live) key.
+                let cf::DeletionsKey::Plain { bucket: bucket_str, key: key_str } =
+                    cf::decode_deletions_key(&key)?
+                else {
+                    return None;
+                };
                 if bucket_str != bucket.as_str() {
                     return None;
                 }
                 match bincode::deserialize::<Tombstone>(&value)
                     .or_else(|_| serde_json::from_slice::<Tombstone>(&value))
                 {
-                    Ok(tombstone) => Some(Ok((ObjectKey::new(key_str), tombstone))),
+                    Ok(tombstone) => Some(Ok((ObjectKey::new(&key_str), tombstone))),
                     Err(_) => None,
                 }
             }
@@ -719,6 +930,10 @@ impl RocksDbMetadataStore {
     /// Scans the deletions CF from the start, decoding each key into its
     /// owning bucket + object key. Used by GC liveness tracking so that
     /// tombstones in ANY bucket (not just "default") drive compaction.
+    ///
+    /// Supersede dead-chunk records (ADR-0034 D2) are skipped: they are
+    /// live keys and must not reach the GC tombstone path (f2 consumes
+    /// them through [`Self::list_dead_chunk_records_all`] instead).
     pub fn list_tombstones_all(&self) -> Vec<Result<(BucketId, ObjectKey, Tombstone)>> {
         let cf = self.db.cf_handle(cf::CF_DELETIONS);
         let Some(cf_handle) = cf else {
@@ -729,15 +944,70 @@ impl RocksDbMetadataStore {
 
         iter.filter_map(|item| match item {
             Ok((key, value)) => {
-                let (bucket_str, key_str) = cf::decode_object_key(&key)?;
+                let cf::DeletionsKey::Plain { bucket, key } = cf::decode_deletions_key(&key)?
+                else {
+                    return None;
+                };
                 match bincode::deserialize::<Tombstone>(&value)
                     .or_else(|_| serde_json::from_slice::<Tombstone>(&value))
                 {
                     Ok(tombstone) => {
-                        Some(Ok((BucketId::new(bucket_str), ObjectKey::new(key_str), tombstone)))
+                        Some(Ok((BucketId::new(&bucket), ObjectKey::new(&key), tombstone)))
                     }
                     Err(_) => None,
                 }
+            }
+            Err(e) => Some(Err(Error::Io(io_err(e)))),
+        })
+        .collect()
+    }
+
+    /// Lists every captured dead-chunk record across all buckets — plain
+    /// tombstones (`kind: Tombstone`) and versioned supersedes (`kind:
+    /// Supersede`) — as the typed accounting feed f2 consumes (ADR-0034
+    /// D2/D3).
+    ///
+    /// Unlike [`Self::list_tombstones_all`], supersede records ARE
+    /// returned. Unlike the plain-tombstone enumerations, the record's
+    /// `kind` is derived from the deletions-CF key classification, so a
+    /// supersede key is never surfaced as a plain tombstone of its key and
+    /// a plain tombstone is never surfaced as a supersede.
+    pub fn list_dead_chunk_records_all(
+        &self,
+    ) -> Vec<Result<(BucketId, ObjectKey, DeadChunkRecord)>> {
+        let cf = self.db.cf_handle(cf::CF_DELETIONS);
+        let Some(cf_handle) = cf else {
+            return vec![];
+        };
+
+        let iter = self.db.iterator_cf(&cf_handle, rocksdb::IteratorMode::Start);
+
+        iter.filter_map(|item| match item {
+            Ok((key, value)) => {
+                let decoded = cf::decode_deletions_key(&key)?;
+                // The stored value keeps the `Tombstone` shape for both
+                // kinds; `kind` comes from the key classification.
+                let tombstone: Tombstone = match bincode::deserialize(&value)
+                    .or_else(|_| serde_json::from_slice(&value))
+                {
+                    Ok(t) => t,
+                    Err(_) => return None,
+                };
+                let (bucket, key, kind) = match decoded {
+                    cf::DeletionsKey::Plain { bucket, key } => {
+                        (bucket, key, DeadChunkKind::Tombstone)
+                    }
+                    cf::DeletionsKey::Supersede { bucket, key, .. } => {
+                        (bucket, key, DeadChunkKind::Supersede)
+                    }
+                };
+                let record = DeadChunkRecord {
+                    kind,
+                    captured_at: tombstone.deletion_time,
+                    hlc: tombstone.hlc,
+                    chunks: tombstone.chunks,
+                };
+                Some(Ok((BucketId::new(&bucket), ObjectKey::new(&key), record)))
             }
             Err(e) => Some(Err(Error::Io(io_err(e)))),
         })
@@ -1200,6 +1470,15 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
             .collect()
     }
 
+    fn list_dead_chunk_records_all(
+        &self,
+    ) -> Vec<std::io::Result<(BucketId, ObjectKey, DeadChunkRecord)>> {
+        self.list_dead_chunk_records_all()
+            .into_iter()
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+            .collect()
+    }
+
     fn delete_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<()> {
         self.delete_tombstone(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
     }
@@ -1249,7 +1528,7 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_types)]
 mod tests {
-    use oceanfs_core::{HashOutput, Hlc};
+    use oceanfs_core::{HashOutput, Hlc, SegmentId};
 
     use super::*;
 
@@ -1277,6 +1556,39 @@ mod tests {
             created_at: 1700000000000,
             hlc: Hlc::new(1700000000000, 0),
         }
+    }
+
+    /// Builds a chunk reference on `segment_id` (no compression).
+    fn make_chunk(segment_id: SegmentId, offset: u64, length: u32) -> ChunkRef {
+        ChunkRef { segment_id, offset, length, compressed: false, logical_length: length }
+    }
+
+    /// Builds a segment-stored object whose `chunks` reference the given
+    /// segments.
+    fn make_segment_stored_meta(key: &str, hlc: Hlc, chunks: Vec<ChunkRef>) -> ObjectMetadata {
+        let size = chunks.iter().map(|c| u64::from(c.length)).sum();
+        ObjectMetadata {
+            object_key: ObjectKey::new(key),
+            size,
+            blake3_hash: Some(HashOutput::from_bytes([1u8; 32])),
+            chunks: chunks.into_iter().collect(),
+            inline_data: None,
+            created_at: 1700000000000,
+            hlc,
+        }
+    }
+
+    /// Reads all dead-chunk records, failing on decode errors.
+    fn dead_records(store: &RocksDbMetadataStore) -> Vec<(BucketId, ObjectKey, DeadChunkRecord)> {
+        store.list_dead_chunk_records_all().into_iter().collect::<Result<Vec<_>>>().unwrap()
+    }
+
+    /// Reads only the `Supersede` dead-chunk records.
+    fn supersedes(store: &RocksDbMetadataStore) -> Vec<(BucketId, ObjectKey, DeadChunkRecord)> {
+        dead_records(store)
+            .into_iter()
+            .filter(|(_, _, r)| r.kind == DeadChunkKind::Supersede)
+            .collect()
     }
 
     #[test]
@@ -1610,5 +1922,516 @@ mod tests {
             unresolved.is_empty(),
             "unresolvable RocksDB properties (gauges would pin at 0): {unresolved:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-0034 D2 supersede-capture tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn overwrite_captures_superseded_version_chunks() {
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        let bucket = BucketId::new("bucket");
+        let seg_a = SegmentId::new();
+        let seg_b = SegmentId::new();
+        let key = ObjectKey::new("obj");
+
+        // v1 chunked on segment A; v2 (overwrite) chunked on segment B.
+        let v1 =
+            make_segment_stored_meta("obj", Hlc::new(1000, 1), vec![make_chunk(seg_a, 0, 100)]);
+        let v2 =
+            make_segment_stored_meta("obj", Hlc::new(2000, 1), vec![make_chunk(seg_b, 0, 100)]);
+        store.put_object_in_bucket(&bucket, v1.clone()).unwrap();
+        store.put_object_in_bucket(&bucket, v2.clone()).unwrap();
+
+        // Live row references B only.
+        let live = store.get_object(&bucket, &key).unwrap().unwrap();
+        assert_eq!(live.chunks.len(), 1);
+        assert_eq!(live.chunks[0].segment_id, seg_b, "live row references B only");
+
+        // A's bytes captured: exactly one Supersede holding v1's chunk ref.
+        let sups = supersedes(&store);
+        assert_eq!(sups.len(), 1, "exactly one supersede for the overwrite");
+        let (_, _, rec) = &sups[0];
+        assert_eq!(rec.kind, DeadChunkKind::Supersede);
+        assert_eq!(rec.hlc, v1.hlc, "supersede version = superseded version's HLC");
+        assert_eq!(rec.chunks.len(), 1);
+        assert_eq!(rec.chunks[0].segment_id, seg_a);
+
+        // No plain tombstone for the live key.
+        assert!(!store.has_tombstone(&bucket, &key).unwrap());
+    }
+
+    #[test]
+    fn delete_then_reput_migrates_tombstone_capture_exactly_once() {
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        let bucket = BucketId::new("bucket");
+        let key = ObjectKey::new("obj");
+        let seg_a = SegmentId::new();
+        let seg_b = SegmentId::new();
+
+        // v1 chunked on A; delete captures v1's chunks into the tombstone.
+        let v1 =
+            make_segment_stored_meta("obj", Hlc::new(1000, 1), vec![make_chunk(seg_a, 0, 100)]);
+        store.put_object_in_bucket(&bucket, v1).unwrap();
+        store.delete_object(&bucket, &key, Hlc::new(2000, 1)).unwrap();
+        assert!(store.has_tombstone(&bucket, &key).unwrap());
+        let tombstone = store.get_tombstone(&bucket, &key).unwrap().unwrap();
+
+        // re-PUT v2 on B (newer version).
+        let v2 =
+            make_segment_stored_meta("obj", Hlc::new(3000, 1), vec![make_chunk(seg_b, 0, 100)]);
+        store.put_object_in_bucket(&bucket, v2.clone()).unwrap();
+
+        // Plain tombstone cleared; exactly one Supersede migrated the v1
+        // chunks with the delete HLC as version and the ORIGINAL deletion
+        // time preserved (TTL aging must not reset).
+        assert!(!store.has_tombstone(&bucket, &key).unwrap());
+        let sups = supersedes(&store);
+        assert_eq!(sups.len(), 1, "re-PUT migrates the capture, no double-dead");
+        let (_, _, rec) = &sups[0];
+        assert_eq!(rec.kind, DeadChunkKind::Supersede);
+        assert_eq!(rec.hlc, Hlc::new(2000, 1), "version stays the delete's HLC");
+        assert_eq!(rec.captured_at, tombstone.deletion_time, "captured_at preserved");
+        assert_eq!(rec.chunks.len(), 1);
+        assert_eq!(rec.chunks[0].segment_id, seg_a);
+
+        // Live row survives (v2 on B).
+        let live = store.get_object(&bucket, &key).unwrap().unwrap();
+        assert_eq!(live.hlc, v2.hlc);
+        assert_eq!(live.chunks[0].segment_id, seg_b);
+    }
+
+    #[test]
+    fn multipart_overwrite_captures_every_segment_exactly_once() {
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        let bucket = BucketId::new("bucket");
+        let seg_a = SegmentId::new();
+        let seg_b = SegmentId::new();
+        let seg_c = SegmentId::new();
+        let seg_d = SegmentId::new();
+
+        // v1 is a multipart object spanning three segments.
+        let v1 = make_segment_stored_meta(
+            "multi",
+            Hlc::new(1000, 1),
+            vec![make_chunk(seg_a, 0, 100), make_chunk(seg_b, 100, 50), make_chunk(seg_c, 0, 200)],
+        );
+        store.put_object_in_bucket(&bucket, v1.clone()).unwrap();
+
+        // v2 (overwrite) lives on a single segment.
+        let v2 =
+            make_segment_stored_meta("multi", Hlc::new(2000, 1), vec![make_chunk(seg_d, 0, 350)]);
+        store.put_object_in_bucket(&bucket, v2.clone()).unwrap();
+
+        let sups = supersedes(&store);
+        assert_eq!(sups.len(), 1);
+        let (_, _, rec) = &sups[0];
+        // Every segment of v1 appears exactly once (dedupe by chunk ref).
+        let mut segments: Vec<_> = rec.chunks.iter().map(|c| c.segment_id).collect();
+        segments.sort();
+        let mut expected = vec![seg_a, seg_b, seg_c];
+        expected.sort();
+        assert_eq!(segments, expected, "all N segments captured exactly once");
+    }
+
+    #[test]
+    fn same_or_older_hlc_repair_write_does_not_capture() {
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        let bucket = BucketId::new("bucket");
+        let seg_a = SegmentId::new();
+        let seg_b = SegmentId::new();
+
+        let v1 =
+            make_segment_stored_meta("obj", Hlc::new(2000, 1), vec![make_chunk(seg_a, 0, 100)]);
+        store.put_object_in_bucket(&bucket, v1.clone()).unwrap();
+
+        // A read-repair physical re-point carries the SAME logical HLC; it
+        // must not capture A's bytes (they are still the winning version).
+        let repaired =
+            make_segment_stored_meta("obj", Hlc::new(2000, 1), vec![make_chunk(seg_b, 0, 100)]);
+        store.put_object_in_bucket(&bucket, repaired.clone()).unwrap();
+        assert!(supersedes(&store).is_empty(), "same-HLC physical re-point must not capture");
+
+        // An out-of-order STALE write (older HLC) also must not capture the
+        // newer version it physically overwrites (V2 guard).
+        let stale =
+            make_segment_stored_meta("obj", Hlc::new(1000, 1), vec![make_chunk(seg_b, 0, 100)]);
+        store.put_object_in_bucket(&bucket, stale.clone()).unwrap();
+        assert!(
+            supersedes(&store).is_empty(),
+            "older-HLC write must not capture the newer version"
+        );
+    }
+
+    #[test]
+    fn inline_overwrite_does_not_capture() {
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        let bucket = BucketId::new("bucket");
+
+        // Inline objects have no segment bytes; overwrites capture nothing.
+        store.put_object_in_bucket(&bucket, make_object_meta("obj", 5, Some(b"hello"))).unwrap();
+        let mut newer = make_object_meta("obj", 6, Some(b"hello!"));
+        newer.hlc = Hlc::new(2000, 1);
+        store.put_object_in_bucket(&bucket, newer).unwrap();
+
+        assert!(supersedes(&store).is_empty());
+    }
+
+    #[test]
+    fn supersede_records_invisible_to_plain_tombstone_enumeration() {
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        let bucket = BucketId::new("bucket");
+        let seg_a = SegmentId::new();
+        let seg_b = SegmentId::new();
+
+        // Plain tombstone for key "deleted" (delete of a segment-stored v1).
+        let deleted =
+            make_segment_stored_meta("deleted", Hlc::new(1000, 1), vec![make_chunk(seg_a, 0, 50)]);
+        store.put_object_in_bucket(&bucket, deleted).unwrap();
+        store.delete_object(&bucket, &ObjectKey::new("deleted"), Hlc::new(2000, 1)).unwrap();
+
+        // Supersede for key "overwritten".
+        let old = make_segment_stored_meta(
+            "overwritten",
+            Hlc::new(1000, 1),
+            vec![make_chunk(seg_b, 0, 100)],
+        );
+        store.put_object_in_bucket(&bucket, old).unwrap();
+        let new = make_segment_stored_meta(
+            "overwritten",
+            Hlc::new(3000, 1),
+            vec![make_chunk(seg_a, 0, 100)],
+        );
+        store.put_object_in_bucket(&bucket, new).unwrap();
+
+        // Both dead-chunk kinds visible through the typed enumeration.
+        let records = dead_records(&store);
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .any(|(_, k, r)| k.as_str() == "deleted" && r.kind == DeadChunkKind::Tombstone),
+            "plain tombstone must enumerate as Tombstone kind"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|(_, k, r)| k.as_str() == "overwritten" && r.kind == DeadChunkKind::Supersede),
+            "supersede must enumerate as Supersede kind"
+        );
+
+        // The plain-tombstone enumerations see ONLY the plain tombstone —
+        // pre-f2 consumers stay byte-identical.
+        let all = store.list_tombstones_all().into_iter().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].1.as_str(), "deleted");
+
+        let per_bucket =
+            store.list_tombstones(&bucket).into_iter().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(per_bucket.len(), 1);
+        assert_eq!(per_bucket[0].0.as_str(), "deleted");
+    }
+
+    #[test]
+    fn overwrite_increments_supersede_counters() {
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        let bucket = BucketId::new("bucket");
+        let seg_a = SegmentId::new();
+        let seg_b = SegmentId::new();
+
+        assert_eq!(store.metrics().supersede_captured_total.get(), 0);
+        assert_eq!(store.metrics().supersede_dead_bytes_total.get(), 0);
+
+        let v1 =
+            make_segment_stored_meta("obj", Hlc::new(1000, 1), vec![make_chunk(seg_a, 0, 100)]);
+        let v2 = make_segment_stored_meta("obj", Hlc::new(2000, 1), vec![make_chunk(seg_b, 0, 60)]);
+        store.put_object_in_bucket(&bucket, v1).unwrap();
+        store.put_object_in_bucket(&bucket, v2).unwrap();
+
+        assert_eq!(store.metrics().supersede_captured_total.get(), 1);
+        assert_eq!(store.metrics().supersede_dead_bytes_total.get(), 100);
+    }
+
+    #[test]
+    fn concurrent_same_key_overwrites_capture_each_version_once() {
+        use std::sync::Arc;
+
+        let store = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let bucket = BucketId::new("bucket");
+        let key = ObjectKey::new("hot");
+        let seg_v0 = SegmentId::new();
+
+        // Seed v0.
+        store
+            .put_object_in_bucket(
+                &bucket,
+                make_segment_stored_meta("hot", Hlc::new(0, 0), vec![make_chunk(seg_v0, 0, 100)]),
+            )
+            .unwrap();
+
+        // W writers all overwrite with the SAME strictly-newer HLC. Under
+        // the per-key lock the first commit captures v0; every later writer
+        // finds `existing.hlc == meta.hlc` and captures nothing — exactly
+        // ONE supersede. Without the lock, several writers read v0 before
+        // any commit and double-capture it (multiple supersedes with
+        // version v0), so this assertion is a reliable lock regression test.
+        const WRITERS: usize = 16;
+        let barrier = Arc::new(std::sync::Barrier::new(WRITERS));
+        std::thread::scope(|scope| {
+            for _ in 0..WRITERS {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                let bucket = BucketId::new("bucket");
+                scope.spawn(move || {
+                    let seg = SegmentId::new();
+                    let meta = make_segment_stored_meta(
+                        "hot",
+                        Hlc::new(9_000, 0),
+                        vec![make_chunk(seg, 0, 100)],
+                    );
+                    barrier.wait();
+                    store.put_object_in_bucket(&bucket, meta).unwrap();
+                });
+            }
+        });
+
+        let sups = supersedes(&store);
+        assert_eq!(sups.len(), 1, "v0 must be captured exactly once across W writers");
+        let (_, _, rec) = &sups[0];
+        assert_eq!(rec.hlc, Hlc::new(0, 0), "only v0 is superseded");
+        assert_eq!(rec.chunks[0].segment_id, seg_v0);
+
+        // Live row survives and references one of the writers' segments.
+        let live = store.get_object(&bucket, &key).unwrap().expect("live row must survive");
+        assert!(live.hlc >= Hlc::new(9_000, 0));
+    }
+
+    #[test]
+    fn with_key_lock_serializes_same_key_critical_sections() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let store = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let inside = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+
+        let workers = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(workers));
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let store = Arc::clone(&store);
+                let inside = Arc::clone(&inside);
+                let max_seen = Arc::clone(&max_seen);
+                let barrier = Arc::clone(&barrier);
+                let bucket = BucketId::new("bucket");
+                let key = ObjectKey::new("k");
+                scope.spawn(move || {
+                    barrier.wait();
+                    store.with_key_lock(&bucket, &key, || {
+                        let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_seen.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                    });
+                });
+            }
+        });
+
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "same-key critical sections must be mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn replica_metadata_apply_overwrite_captures_through_trait() {
+        // The gRPC segment-service replica-apply seam
+        // (`segment_service.rs` `put_object_metadata`) calls the storage-api
+        // `MetadataStore::put_object` trait method with the pushed row's
+        // HLC — the same funnel as S3 PUT. Driving the trait directly proves
+        // D6 "Replica metadata apply overwriting a row": capture fires on
+        // the replica path, not just on the concrete method.
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        let bucket = BucketId::new("bucket");
+        let seg_a = SegmentId::new();
+        let seg_b = SegmentId::new();
+
+        let v1 =
+            make_segment_stored_meta("repobj", Hlc::new(1000, 1), vec![make_chunk(seg_a, 0, 100)]);
+        let v2 =
+            make_segment_stored_meta("repobj", Hlc::new(2000, 1), vec![make_chunk(seg_b, 0, 100)]);
+
+        let md: &dyn oceanfs_storage_api::MetadataStore = &store;
+        md.put_object(&bucket, v1.clone()).unwrap();
+        md.put_object(&bucket, v2.clone()).unwrap();
+
+        let sups = supersedes(&store);
+        assert_eq!(sups.len(), 1, "capture must fire through the trait (replica-apply path)");
+        assert_eq!(sups[0].2.hlc, v1.hlc);
+        assert_eq!(sups[0].2.chunks[0].segment_id, seg_a);
+
+        let live = store.get_object(&bucket, &ObjectKey::new("repobj")).unwrap().unwrap();
+        assert_eq!(live.chunks[0].segment_id, seg_b);
+    }
+
+    #[test]
+    fn plain_tombstone_only_store_enumeration_unchanged() {
+        // A store holding ONLY plain tombstones must enumerate byte-identically
+        // to the pre-accounting store through list_tombstones / list_tombstones_all,
+        // and the typed enumeration classifies every record as Tombstone.
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        let bucket = BucketId::new("bucket");
+        for i in 0..3u64 {
+            let seg = SegmentId::new();
+            let key = format!("del-{i}");
+            let meta = make_segment_stored_meta(
+                &key,
+                Hlc::new(1_000 + i, 1),
+                vec![make_chunk(seg, 0, 100)],
+            );
+            store.put_object_in_bucket(&bucket, meta).unwrap();
+            store.delete_object(&bucket, &ObjectKey::new(&key), Hlc::new(2_000 + i, 1)).unwrap();
+        }
+
+        let all = store.list_tombstones_all().into_iter().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(all.len(), 3, "plain-only store: all tombstones surfaced unchanged");
+
+        let per_bucket =
+            store.list_tombstones(&bucket).into_iter().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(per_bucket.len(), 3);
+
+        let records = dead_records(&store);
+        assert_eq!(records.len(), 3);
+        assert!(
+            records.iter().all(|(_, _, r)| r.kind == DeadChunkKind::Tombstone),
+            "no supersede may exist in a plain-only store"
+        );
+    }
+
+    #[test]
+    fn exact_key_tombstone_ops_ignore_coexisting_supersede() {
+        // `has_tombstone` / `get_tombstone` / `delete_tombstone` operate on
+        // the exact plain key; a coexisting versioned supersede for the same
+        // (bucket, key) must be structurally invisible to all three.
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        let bucket = BucketId::new("bucket");
+        let key = ObjectKey::new("k");
+        let seg_a = SegmentId::new();
+        let seg_b = SegmentId::new();
+
+        store
+            .put_object_in_bucket(
+                &bucket,
+                make_segment_stored_meta("k", Hlc::new(1000, 1), vec![make_chunk(seg_a, 0, 100)]),
+            )
+            .unwrap();
+        store
+            .put_object_in_bucket(
+                &bucket,
+                make_segment_stored_meta("k", Hlc::new(2000, 1), vec![make_chunk(seg_b, 0, 100)]),
+            )
+            .unwrap();
+        assert_eq!(supersedes(&store).len(), 1, "supersede for the key exists");
+
+        // Exact-key reads never observe the supersede.
+        assert!(!store.has_tombstone(&bucket, &key).unwrap());
+        assert!(store.get_tombstone(&bucket, &key).unwrap().is_none());
+
+        // delete_tombstone on the exact plain key removes nothing (no plain
+        // tombstone exists); the supersede survives untouched.
+        store.delete_tombstone(&bucket, &key).unwrap();
+        assert_eq!(supersedes(&store).len(), 1, "delete_tombstone must not see supersedes");
+    }
+
+    #[test]
+    fn concurrent_delete_and_overwrite_never_double_capture_a_version() {
+        // Deletes (tombstones) and overwrites (supersedes) racing on the same
+        // key must never capture the same predecessor version twice. Both
+        // paths run under the per-key stripe and commit atomically, so each
+        // version's bytes are captured at most once regardless of schedule.
+        use std::sync::Arc;
+
+        let store = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let bucket = BucketId::new("bucket");
+        store
+            .put_object_in_bucket(
+                &bucket,
+                make_segment_stored_meta(
+                    "k",
+                    Hlc::new(1, 0),
+                    vec![make_chunk(SegmentId::new(), 0, 100)],
+                ),
+            )
+            .unwrap();
+
+        const THREADS: usize = 6;
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                let bucket = BucketId::new("bucket");
+                let key = ObjectKey::new("k");
+                scope.spawn(move || {
+                    barrier.wait();
+                    for i in 0..10u32 {
+                        let seq = t as u32 * 100 + i + 1;
+                        if t % 2 == 0 {
+                            // Delete whatever row is live with a stamped HLC.
+                            let _ = store.delete_object(
+                                &bucket,
+                                &key,
+                                Hlc::new(1_000_000 + u64::from(seq), 0),
+                            );
+                        } else {
+                            // Overwrite with a strictly newer version.
+                            let seg = SegmentId::new();
+                            let meta = make_segment_stored_meta(
+                                "k",
+                                Hlc::new(2_000_000 + u64::from(seq), 0),
+                                vec![make_chunk(seg, 0, 100)],
+                            );
+                            let _ = store.put_object_in_bucket(&bucket, meta);
+                        }
+                    }
+                });
+            }
+        });
+
+        // Double-capture detector: every writer stamps a UNIQUE fresh
+        // segment, so the chunk-set carried by a dead-chunk record uniquely
+        // identifies the version it captured. A tombstone's hlc is the
+        // *delete* stamp and a supersede's hlc is the *superseded row's*
+        // hlc, so keying on hlc alone cannot detect a tombstone + supersede
+        // both capturing the same predecessor. Keying on the chunk-set
+        // does: two records sharing a non-empty chunk-set for the same key
+        // means the predecessor's bytes were captured twice. Empty captures
+        // (deleting an absent row) carry no bytes and are skipped.
+        let records = dead_records(&store);
+        let mut seen_chunk_sets: std::collections::HashSet<(
+            BucketId,
+            ObjectKey,
+            Vec<(SegmentId, u64)>,
+        )> = std::collections::HashSet::new();
+        for (b, k, r) in &records {
+            if r.chunks.is_empty() {
+                continue;
+            }
+            let mut chunk_ids: Vec<(SegmentId, u64)> =
+                r.chunks.iter().map(|c| (c.segment_id, c.offset)).collect();
+            chunk_ids.sort_unstable();
+            assert!(
+                seen_chunk_sets.insert((b.clone(), k.clone(), chunk_ids)),
+                "a predecessor version's bytes were captured more than once \
+                 under delete/overwrite races (bucket={}, key={}, hlc={:?})",
+                b.as_str(),
+                k.as_str(),
+                r.hlc
+            );
+        }
     }
 }

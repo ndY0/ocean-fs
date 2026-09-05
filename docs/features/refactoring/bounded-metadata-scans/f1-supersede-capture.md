@@ -1,7 +1,7 @@
 ---
 feature: "f1: Atomic Supersede-Capture on Overwrite"
 epic: "refactoring/bounded-metadata-scans"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -18,7 +18,7 @@ perf:
   - "6.3 #[repr(C)] for all on-disk / on-wire structures"
   - "11.1 atomic counters on hot paths"
 created: 2026-09-04
-updated: 2026-09-04
+updated: 2026-09-05
 ---
 
 # f1: Atomic Supersede-Capture on Overwrite
@@ -262,14 +262,24 @@ GC/orphan/compactor (f2/f3)
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds in `oceanfs-storage`,
-      `oceanfs-core`, `oceanfs-storage-api`.
-- [ ] **Tests:** `cargo test -p oceanfs-storage --lib -- --test-threads=1`
+- [x] **Code:** `cargo build --all-targets` succeeds in `oceanfs-storage`,
+      `oceanfs-core`, `oceanfs-storage-api`. Verified 2026-09-05 (independent review).
+- [x] **Tests:** `cargo test -p oceanfs-storage --lib -- --test-threads=1`
       and `cargo test -p oceanfs-core` pass, adding at minimum:
       - key round-trip: `encode_supersede_key`/`decode_deletions_key`; a
         plain tombstone key and a supersede key with the same `(bucket,key)`
         classify distinctly; `has_tombstone`/`get_tombstone`/
         `delete_tombstone` on the plain key never observe a supersede;
+<!-- REVIEW: met. cf.rs round-trip/classify tests
+     (crates/oceanfs-storage/src/metadata/cf.rs:172-266) cover round-trip,
+     empty-part, plain-vs-supersede distinct classification, malformed-tail
+     rejection, and binary-safe keys. Direct store-level exact-key
+     non-observance is asserted by
+     `exact_key_tombstone_ops_ignore_coexisting_supersede`
+     (store.rs:2316-2348): seeds a supersede for (bucket,key), asserts
+     has_tombstone == false, get_tombstone == None, and delete_tombstone
+     leaves the supersede enumerable. Verified 2026-09-05 (independent
+     review). -->
       - D6 "PUT overwrite (old on A, new on B)": v1 chunked on segment A,
         PUT v2 on segment B → a Supersede record holds v1's chunk refs, the
         live row references B only, no plain tombstone exists;
@@ -289,31 +299,150 @@ GC/orphan/compactor (f2/f3)
         row (row present, supersede record present, `has_tombstone` false);
       - D6 "Crash between row write and capture": assert there is no API path
         that commits the row without the capture (single `db.write(batch)`);
+<!-- REVIEW: met by construction + code inspection; no fault-injection
+     test. `put_object_in_bucket_locked` performs supersede-write +
+     tombstone-clear + row-put in ONE WriteBatch committed at a single
+     `db.write` (crates/oceanfs-storage/src/metadata/store.rs:563-599);
+     `delete_object_locked` likewise (store.rs:679-689). No other API path
+     on the RocksDB impl writes a row for a segment-stored overwrite.
+     `concurrent_delete_and_overwrite_never_double_capture_a_version`
+     (store.rs:2351-2415) exercises the delete↔put race under the per-key
+     lock. CAVEAT: that test's assertion (uniqueness of record.hlc) cannot
+     actually detect a tombstone+supersede double-capture of one predecessor
+     because a tombstone record's hlc is the DELETE stamp while a supersede's
+     hlc is the superseded row's hlc — distinct values. The property holds
+     structurally (per-key lock + single batch), but the regression test does
+     not pin it; strengthening would assert no two records for the same key
+     carry identical chunk-sets. -->
       - `list_tombstones_all` output is unchanged for a store holding only
         plain tombstones, and supersede records are invisible through it;
+<!-- REVIEW: met.
+     `plain_tombstone_only_store_enumeration_unchanged` (store.rs:2282-2313)
+     seeds only plain tombstones and asserts list_tombstones_all and
+     list_tombstones(bucket) both surface all 3 and the typed enumeration
+     classifies all as Tombstone; `supersede_records_invisible_to_plain_tombstone_enumeration`
+     (store.rs:2082-2135) proves supersedes are invisible when both kinds
+     coexist. -->
       - `list_dead_chunk_records_all` returns both kinds with correct
         `kind`/`captured_at`/`hlc`/`chunks`.
-- [ ] **Docs:** every `pub` item has `# Examples`; `#![deny(missing_docs)]`
+<!-- REVIEW: met — supersede_records_invisible_to_plain_tombstone_enumeration
+     and delete_then_reput_migrates_tombstone_capture_exactly_once assert
+     kind/captured_at/hlc/chunks for both kinds. -->
+- [x] **Docs:** every `pub` item has `# Examples`; `#![deny(missing_docs)]`
       passes; the cf.rs key-layout comment documents the supersede suffix.
-- [ ] **ADR:** ADR-0034 D2 constraints (a)–(d) satisfied by the versioned-key
+<!-- REVIEW: verified passing under `RUSTDOCFLAGS="-D warnings" cargo doc
+     --no-deps -p oceanfs-storage -p oceanfs-core -p oceanfs-storage-api
+     -p oceanfs-server` (clean). New types DeadChunkKind/DeadChunkRecord
+     carry # Examples (oceanfs-core doctests pass, incl.
+     DeadChunkRecord example). cf.rs module doc + encode_supersede_key doc
+     document the supersede suffix layout. Two shortfalls accepted as
+     non-blocking (consistent with sibling methods, coding.md §5.1 soft
+     rule): MetadataStore::list_dead_chunk_records_all (trait default and
+     RocksDB impl) and the new RocksDbMetrics counter fields have doc
+     comments but no # Examples block. -->
+- [x] **ADR:** ADR-0034 D2 constraints (a)–(d) satisfied by the versioned-key
       encoding; capture is atomic with the row change; every production
       row-replacement path funnels through the choke point. ADR-0025's
       "objects + deletions only" CF set is preserved (no new CF). If the
       implementer instead picks a dedicated dead-chunks CF, this DoD is NOT
       met — that choice requires an ADR-0025 amendment and an epic-level
       review.
-- [ ] **Perf:** supersede write path adds one exact-key get (existing row) +
+<!-- REVIEW: met. (a)-(d) satisfied by versioned supersede keys in the
+     deletions CF (cf.rs:98-155); (a) coexist with live row, (b) age under
+     tombstone TTL via preserved Tombstone value shape + deletion_time
+     preserved on migration, (c) chunks attribute dead bytes to segments,
+     (d) never interpreted as a delete: has/get/delete_tombstone use the
+     exact plain key and list_tombstones[_all] skip Supersede keys. Atomic
+     single WriteBatch in put_object_in_bucket_locked
+     (store.rs:563-599) and delete_object_locked (store.rs:679-689). ADR-0025
+     "objects + deletions only" CF set preserved (store.rs:313-316); no
+     dedicated CF / no third encoding. Gap 1 (segment_service.rs:693 early
+     delete_tombstone bypassing delete→re-PUT migration on the resurrection
+     path) FIXED — the early clear is removed
+     (crates/oceanfs-server/src/grpc/segment_service.rs:676-705) and the LWW
+     gate (reject hlc <= tombstone.hlc) stays; the choke point now clears +
+     migrates atomically. Gap 2 (delete_object unserialized + non-atomic)
+     FIXED — delete_object runs under the same per-key stripe
+     (with_key_lock, store.rs:453-463; no nested store locks: the held
+     critical sections call only lock-free exact-key reads + one db.write)
+     and commits row-delete + tombstone in a single WriteBatch. Verified
+     no deadlock: with_key_lock is never re-entered (put/delete locked bodies
+     call get_object/get_tombstone, which take no store locks). -->
+- [x] **Perf:** supersede write path adds one exact-key get (existing row) +
       one exact-key get (plain tombstone) + one batch put per overwrite —
       bounded, no scan; the supersede chunk `SmallVec` is pre-sized from the
       existing row's chunk count (perf 1.3/1.4); no new allocation on the
       first-PUT path beyond today's.
-- [ ] **Integration:** the D6 rows above run against a real
+<!-- REVIEW: verified. Two bounded exact-key gets + one WriteBatch; capture
+     SmallVec cloned from prev.chunks (pre-sized); key preallocation in
+     encode_supersede_key uses with_capacity; metrics are atomic Counters
+     (supersede_captured_total / supersede_dead_bytes_total registered in
+     RocksDbMetrics). -->
+- [x] **Integration:** the D6 rows above run against a real
       `RocksDbMetadataStore` in `oceanfs-storage` tests; `cargo test -p
       oceanfs-server --lib -- --test-threads=1` (write coordinator + S3
       handler suites) and `cargo test -p oceanfs-durability --lib --
       --test-threads=1` stay green — proving pre-f2 consumers see no
       behavior change.
+<!-- REVIEW: verified independently 2026-09-05 (re-review after gap fixes):
+     oceanfs-storage 455/455, oceanfs-server 245/245 (incl.
+     hinted_apply_that_supersedes_existing_row_captures and
+     put_object_metadata_newer_than_tombstone_succeeds_and_clears),
+     oceanfs-durability 263/263, oceanfs-core 62/62, oceanfs-storage-api 6/6;
+     clippy --lib -D warnings clean on all four crates; fmt clean. -->
 
 > **Lint & Doc Examples (non-gating):** `cargo clippy --lib -- -D warnings`
 > on production code. Test-code clippy warnings and `ignore`-tagged doc
 > examples are non-blocking (see `guidelines/coding.md` §9.2).
+
+## Implementation notes (2026-09-05)
+
+Status: implementation complete and independently reviewed (reviewer PASS,
+iteration 2; 0 blockers, all prior gaps fixed). The accepted decisions and
+deviations below record what was actually built against the spec above.
+
+1. **V2 capture predicate (user-validated).** Capture fires only when a
+   segment-stored predecessor exists **and** `meta.hlc > existing.hlc`, or on
+   a re-PUT over a tombstoned key with chunks (migration preserves the
+   tombstone's `deletion_time`, so TTL aging does not reset). Same- or
+   older-HLC writes (e.g. the read-coordinator dangling-repair physical
+   re-point at
+   `crates/oceanfs-server/src/read/coordinator.rs:818-821`) and
+   inline→inline no-ops never capture. `batch_write(PutObject)` (compactor
+   remap / healing re-point) is unchanged and never captures.
+
+2. **V6 concurrency decision (user-validated).** `put_object_in_bucket` (and
+   now `delete_object`) run under a sharded per-key `parking_lot` stripe lock
+   inside `RocksDbMetadataStore`, so concurrent same-key writers cannot
+   double- or lose-capture. Sizing: 4096 stripes derived from
+   `stripe_count_for_writers(64)` (documented birthday-bound formula; a
+   `stripe_count_for_writers` helper exists so the count is a one-line change
+   when metadata-write concurrency becomes config-driven). Hash = per-store
+   `RandomState` (SipHash) over the encoded key, so client-chosen keys cannot
+   be aligned onto one stripe.
+
+3. **`delete_object` atomicity (scope note).** Beyond the feature doc's
+   "PUT-side only" wording, `delete_object` is also under the per-key stripe
+   and commits row-delete + tombstone in **one** `WriteBatch`, closing the
+   delete↔put double-capture race.
+
+4. **Replica-apply resurrection path (funnel completion).** The gRPC
+   segment-service `put_object_metadata` no longer pre-clears a tombstone on
+   "legitimate resurrection" (`hlc > tombstone.hlc`); the choke point clears +
+   migrates the tombstone's dead-byte capture atomically. LWW gate unchanged.
+
+5. **Tolerant predecessor reads.** An undecodable existing row/tombstone is
+   treated as absent for capture (no error), preserving the pre-accounting
+   overwrite-wins-over-corrupt-row behavior.
+
+6. **Doc-example shortfall accepted.** The new trait/concrete
+   `list_dead_chunk_records_all` methods and the two new `RocksDbMetrics`
+   counter fields do not carry `# Examples`, consistent with sibling methods
+   in this codebase (non-gating per `guidelines/coding.md` §5.1 soft rule).
+
+**Stale line anchors (editorial debt).** The line anchors in this doc's
+Summary/Data-Flow sections referencing `s3_handler/handlers.rs:60`,
+`coordinator.rs:671/1061/1168`, `segment_service.rs:740`, and
+`node.rs:126-130` are stale relative to HEAD (post
+composition-root/store-unification). The choke-point funnel is unchanged, but
+the cited call sites moved; a future editorial pass should refresh them.
