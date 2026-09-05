@@ -1603,7 +1603,7 @@ mod tests {
     use crate::wal::WalSyncGroup;
 
     /// Record sizes used by rotation tests (bytes):
-    /// reserve = 36, seal = 84, delete = 32.
+    /// reserve = 36, seal = 92, delete = 32.
     const RESERVE_RECORD_SIZE: u64 = 36;
     const SEAL_RECORD_SIZE: u64 = 92;
     const DELETE_RECORD_SIZE: u64 = 32;
@@ -2306,7 +2306,7 @@ mod tests {
         }
         let reopened = EventWal::open(dir.path().to_path_buf(), &config).await.unwrap();
         assert_eq!(reopened.latest_pos().file_seq, 1, "reopen resumes at the newest file");
-        // The resumed file (84 bytes) already exceeds the 64-byte
+        // The resumed file (92 bytes) already exceeds the 64-byte
         // threshold, so the next record rotates immediately.
         let p = reopened.append(delete_event(id)).await.unwrap();
         assert_eq!(p.file_seq, 2);

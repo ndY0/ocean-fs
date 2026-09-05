@@ -168,11 +168,6 @@ async fn full_gc_cycle_compacts_segment() {
 
     let seg_id = SegmentId::new();
     let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
-    let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
-        &oceanfs_core::LifecycleConfig::default(),
-    );
-    registry.reserve(seg_id, seg_meta.clone()).unwrap();
-    registry.seal(seg_id, seg_meta.clone()).unwrap();
 
     // Write 5 objects
     let live_keys = vec!["obj3.txt", "obj4.txt"];

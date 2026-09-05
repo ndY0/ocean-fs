@@ -1141,6 +1141,14 @@ mod tests {
         let hdr = SegmentHeader::from_bytes(&file).expect("valid header");
         assert!(hdr.parity_offset > 0, "v2 file must record the parity section");
         assert_eq!(hdr.version, crate::segment::header::SEGMENT_VERSION);
+        // ADR-0034 D1: the sealed metadata's total_bytes equals the data
+        // section length (and the header `size`).
+        assert_eq!(hdr.size, 512, "header data size equals the sealed data length");
+        let entry = lifecycle.registry().get(id).expect("sealed entry");
+        assert_eq!(
+            entry.metadata.total_bytes, 512,
+            "registry total_bytes equals the sealed data length"
+        );
         let section_end = (hdr.parity_offset + hdr.parity_size) as usize;
         let section = ParitySection::parse(&file[hdr.parity_offset as usize..section_end])
             .expect("valid section");
