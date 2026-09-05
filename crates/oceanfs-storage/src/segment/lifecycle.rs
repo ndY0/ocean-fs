@@ -2283,20 +2283,22 @@ impl SegmentLifecycleCoordinator {
     ///
     /// # Errors
     ///
-    /// Each element is `Ok` on success, or a [`TransitionError`] for
-    /// that segment.
-    pub(crate) async fn seal_finalized_batch(
+    /// Seals a batch of finalized segments, each with its optional
+    /// contained-objects membership list (ADR-0034 D5). Each element is
+    /// `Ok` on success, or a [`TransitionError`] for that segment.
+    pub(crate) async fn seal_finalized_batch_with_contained(
         &self,
-        metas: Vec<SegmentMetadata>,
+        seals: Vec<(SegmentMetadata, Option<Arc<[ContainedObject]>>)>,
     ) -> Vec<std::result::Result<(), TransitionError>> {
         // Phase 1 — validate every id (read-only shard visits; the
         // shard locks are released before any durable I/O).
         let mut out: Vec<std::result::Result<(), TransitionError>> =
-            std::iter::repeat_with(|| Ok(())).take(metas.len()).collect();
-        let mut accepted: Vec<(usize, SegmentMetadata)> = Vec::with_capacity(metas.len());
-        for (i, meta) in metas.into_iter().enumerate() {
+            std::iter::repeat_with(|| Ok(())).take(seals.len()).collect();
+        let mut accepted: Vec<(usize, SegmentMetadata, Option<Arc<[ContainedObject]>>)> =
+            Vec::with_capacity(seals.len());
+        for (i, (meta, contained)) in seals.into_iter().enumerate() {
             match self.registry.validate_seal(meta.segment_id) {
-                Ok(()) => accepted.push((i, meta)),
+                Ok(()) => accepted.push((i, meta, contained)),
                 Err(e) => out[i] = Err(e),
             }
         }
@@ -2309,7 +2311,7 @@ impl SegmentLifecycleCoordinator {
         // fails only that id. The event log is the only durable writer
         // (ADR-0025 Decision 3 final form — the CF mirror is removed).
         let Some(event_wal) = &self.event_wal else {
-            for (i, _) in accepted {
+            for (i, _, _) in accepted {
                 out[i] = Err(TransitionError::DurableWriteFailed(
                     "no event WAL wired (the CF fallback is removed; the event log is the only durable writer)"
                         .into(),
@@ -2317,7 +2319,7 @@ impl SegmentLifecycleCoordinator {
             }
             return out;
         };
-        for (i, meta) in accepted {
+        for (i, meta, contained) in accepted {
             let id = meta.segment_id;
             let Some(merkle_root) = meta.merkle_root else {
                 out[i] = Err(TransitionError::DurableWriteFailed(
@@ -2339,11 +2341,11 @@ impl SegmentLifecycleCoordinator {
                 total_bytes: meta.total_bytes,
                 repacked_from: None,
                 pool_id: meta.pool_id,
-                contained_objects: None,
+                contained_objects: contained.clone(),
             });
             match event_wal.append(evt).await {
                 Ok(pos) => {
-                    if let Err(e) = self.registry.fold_seal(id, meta, None, None) {
+                    if let Err(e) = self.registry.fold_seal(id, meta, None, contained) {
                         // A fold can lose a race only to a concurrent
                         // delete of the same segment (unreachable: the
                         // reaper deletes only unreferenced segments, and
@@ -2366,6 +2368,18 @@ impl SegmentLifecycleCoordinator {
         self.maybe_checkpoint().await;
         self.update_gauges();
         out
+    }
+
+    /// Seals a batch of finalized segments without a contained-objects
+    /// membership list. Test-only convenience; production calls
+    /// [`seal_finalized_batch_with_contained`](Self::seal_finalized_batch_with_contained).
+    #[cfg(test)]
+    pub(crate) async fn seal_finalized_batch(
+        &self,
+        metas: Vec<SegmentMetadata>,
+    ) -> Vec<std::result::Result<(), TransitionError>> {
+        self.seal_finalized_batch_with_contained(metas.into_iter().map(|m| (m, None)).collect())
+            .await
     }
 
     /// Writes a segment's writer-count join through the coordinator —

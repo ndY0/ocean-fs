@@ -38,7 +38,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use oceanfs_core::SegmentMetadata;
+use oceanfs_core::{ContainedObject, SegmentMetadata};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
@@ -67,6 +67,9 @@ struct FlushRegistration {
     /// Segment metadata persisted by the lifecycle coordinator in the
     /// batch after the file is durable.
     meta: SegmentMetadata,
+    /// The seal-time contained-objects membership list (ADR-0034 D5);
+    /// `None` for WAL-replayed/pre-feature seals.
+    contained: Option<Arc<[ContainedObject]>>,
     /// Target directory the file is finalized into — the selected pool
     /// root (ADR-0029 f5) or the legacy segments dir (pool_id 0).
     dir: PathBuf,
@@ -228,6 +231,10 @@ impl SegmentFlushGroup {
     ///
     /// Returns an error if the coordinator is shut down, the sync or
     /// finalize fails, or the batch metadata write fails.
+    /// Registers a sealed segment without a contained-objects membership
+    /// list. Test-only convenience; production calls
+    /// [`submit_with_contained`](Self::submit_with_contained).
+    #[cfg(test)]
     pub(crate) async fn submit(
         &self,
         file: std::fs::File,
@@ -237,9 +244,24 @@ impl SegmentFlushGroup {
         dir: PathBuf,
         io: Arc<dyn crate::io::DiskIo>,
     ) -> Result<()> {
+        self.submit_with_contained(file, filename, op, meta, None, dir, io).await
+    }
+
+    /// Like [`Self::submit`], additionally carrying the seal-time
+    /// contained-objects membership list (ADR-0034 D5).
+    pub(crate) async fn submit_with_contained(
+        &self,
+        file: std::fs::File,
+        filename: String,
+        op: FinalizeOp,
+        meta: SegmentMetadata,
+        contained: Option<Arc<[ContainedObject]>>,
+        dir: PathBuf,
+        io: Arc<dyn crate::io::DiskIo>,
+    ) -> Result<()> {
         let (done_tx, done_rx) = oneshot::channel();
         self.tx
-            .send(FlushRegistration { file, filename, op, meta, dir, io, done: done_tx })
+            .send(FlushRegistration { file, filename, op, meta, contained, dir, io, done: done_tx })
             .await
             .map_err(|_| Error::Io(io::Error::other("segment flush coordinator is shut down")))?;
         done_rx.await.map_err(|_| {
@@ -284,7 +306,8 @@ fn flush_batch(
 
     // Phase 2: per-file barrier + finalize. Collect metadata only for
     // files whose sync AND finalize succeeded.
-    let mut metas: Vec<SegmentMetadata> = Vec::with_capacity(batch.len());
+    let mut seals: Vec<(SegmentMetadata, Option<Arc<[ContainedObject]>>)> =
+        Vec::with_capacity(batch.len());
     let mut ok_waiters: Vec<oneshot::Sender<Result<()>>> = Vec::with_capacity(batch.len());
 
     for reg in batch {
@@ -303,7 +326,7 @@ fn flush_batch(
             continue;
         }
 
-        let FlushRegistration { file, filename, op, meta, dir, io, done } = reg;
+        let FlushRegistration { file, filename, op, meta, contained, dir, io, done } = reg;
         // g1: the per-file fsync barrier runs through the seal's
         // pool-aware observed DiskIo — EIO-on-fsync (the ADR-0029 §D3
         // Dead-confirming signal) is recorded per pool on the observer.
@@ -318,7 +341,7 @@ fn flush_batch(
 
         match finalize_result {
             Ok(()) => {
-                metas.push(meta);
+                seals.push((meta, contained));
                 ok_waiters.push(done);
             }
             Err(e) => {
@@ -352,10 +375,10 @@ fn flush_batch(
     // (spawn_blocking); the future is driven on the runtime handle —
     // the blocking thread is not an async context, so block_on is
     // legal here.
-    if !metas.is_empty() {
+    if !seals.is_empty() {
         stats.metadata_batches_total.inc();
         let handle = tokio::runtime::Handle::current();
-        let results = handle.block_on(lifecycle.seal_finalized_batch(metas));
+        let results = handle.block_on(lifecycle.seal_finalized_batch_with_contained(seals));
         for (done, result) in ok_waiters.into_iter().zip(results) {
             let _ = done.send(result.map_err(|e| Error::Io(io::Error::other(e.to_string()))));
         }

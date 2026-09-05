@@ -9,7 +9,7 @@ use std::{path::PathBuf, sync::Arc};
 use bytes::Bytes;
 #[cfg(test)]
 use oceanfs_core::SegmentSizeConfig;
-use oceanfs_core::{Counter, LabelSet, SegmentId, SegmentMetadata, SizeTier};
+use oceanfs_core::{ContainedObject, Counter, LabelSet, SegmentId, SegmentMetadata, SizeTier};
 use oceanfs_hash::{Blake3Hasher, Hasher};
 
 use crate::{
@@ -243,21 +243,9 @@ impl SegmentSealer {
         self.seal_from_data(segment_id, tier, data, entries, 0, 0, 0, None, merkle_root).await
     }
 
-    /// Seals a segment from raw data bytes, without requiring an `ActiveSegment`.
-    ///
-    /// This is the primary sealing entry point — works with segments that have
-    /// already been extracted from the pool. Accepts the segment's identity,
-    /// data bytes, tier, blob index entries, EC parameters (k, m, strip) and
-    /// the seal-time Merkle root (computed by the caller over the data
-    /// section with the durability crate's `MerkleTree`, 64 KiB leaves). When
-    /// EC parameters are non-zero, the segment's complete stripes are encoded
-    /// on the blocking pool (`spawn_blocking` — single scheduler) and the
-    /// shards are persisted in a v2 parity section (with a per-shard hash
-    /// table) so EC recovery can repair corrupt data shards; segments smaller
-    /// than one stripe carry no parity. The Merkle root is persisted in the
-    /// segment metadata so scrub and anti-entropy can verify the segment
-    /// against a trusted seal-time anchor. Writes the segment file to disk,
-    /// persists metadata, and truncates the WAL past the sealed boundary.
+    /// Seals a segment without a contained-objects membership list
+    /// (legacy/test callers). See
+    /// [`seal_from_data_with_contained`](Self::seal_from_data_with_contained).
     ///
     /// # Errors
     ///
@@ -278,6 +266,51 @@ impl SegmentSealer {
         strip_size_bytes: usize,
         ec_encoder: Option<std::sync::Arc<dyn oceanfs_ec::Encoder>>,
         merkle_root: Option<oceanfs_core::HashOutput>,
+    ) -> Result<SegmentHandle> {
+        self.seal_from_data_with_contained(
+            segment_id,
+            tier,
+            data,
+            entries,
+            ec_k,
+            ec_m,
+            strip_size_bytes,
+            ec_encoder,
+            merkle_root,
+            None,
+        )
+        .await
+    }
+
+    /// Seals a segment from raw data bytes with its contained-objects
+    /// membership list (ADR-0034 D5), without requiring an `ActiveSegment`.
+    ///
+    /// Same contract as [`seal_from_data`](Self::seal_from_data); `contained`
+    /// is `Some` for write-path seals that recorded `(bucket, key)` per
+    /// append, `None` for WAL-replayed / pre-feature seals (re-readable,
+    /// reapable, but not compaction candidates).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if disk I/O fails, metadata persistence fails, or
+    /// WAL truncation fails.
+    // Ten parameters: all are distinct pieces of the sealed segment's
+    // on-disk identity (id, tier, data, blob index, EC params, parity,
+    // merkle root, membership) — bundling them would obscure the seal
+    // call sites.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn seal_from_data_with_contained(
+        &self,
+        segment_id: SegmentId,
+        tier: SizeTier,
+        data: Bytes,
+        entries: &[SegmentIndexEntry],
+        ec_k: u8,
+        ec_m: u8,
+        strip_size_bytes: usize,
+        ec_encoder: Option<std::sync::Arc<dyn oceanfs_ec::Encoder>>,
+        merkle_root: Option<oceanfs_core::HashOutput>,
+        contained: Option<Arc<[ContainedObject]>>,
     ) -> Result<SegmentHandle> {
         let size = data.len() as u64;
         let blob_count = entries.len() as u32;
@@ -422,6 +455,9 @@ impl SegmentSealer {
         // checkpoint, ADR-0024/25 — the only durable segment-state path).
         let mut meta = meta;
         meta.pool_id = pool_id;
+        // The logical total (ADR-0034 D1): the metadata records the data
+        // section's byte length at seal (= the header `size` field above).
+        meta.total_bytes = size;
 
         // Design A — write/flush split: write the data to a temp file
         // (no fsync yet) on the blocking pool, then register with the
@@ -480,7 +516,17 @@ impl SegmentSealer {
             ))
         })?;
 
-        self.flush_group().submit(file, filename, finalize_op, meta, submit_dir, flush_io).await?;
+        self.flush_group()
+            .submit_with_contained(
+                file,
+                filename,
+                finalize_op,
+                meta,
+                contained,
+                submit_dir,
+                flush_io,
+            )
+            .await?;
 
         // WAL entries for sealed segments are cleaned up at file rotation time.
         Ok(SegmentHandle::new(segment_id, vec![]))
