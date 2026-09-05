@@ -19,7 +19,7 @@ perf:
   - "6.3 #[repr(C)] for all on-disk / on-wire structures"
   - "7.1 minimize lock hold duration"
 created: 2026-09-04
-updated: 2026-09-06
+updated: 2026-09-05
 ---
 
 # f3: Seal-Time Per-Segment Record (total_bytes + contained-objects)
@@ -297,3 +297,47 @@ Replica holder (segment_service.rs push; healing-service push)
 > **Lint & Doc Examples (non-gating):** `cargo clippy --lib -- -D warnings`
 > on production code. Test-code clippy warnings and `ignore`-tagged doc
 > examples are non-blocking (see `guidelines/coding.md` §9.2).
+
+## Implementation notes (2026-09-05)
+
+Final implemented state — reviewer PASS, iteration 3, 0 gaps. Recorded
+accepted decisions/deviations that supersede or refine the prose above.
+
+- **Checkpoint version is 1, not a bumped v4.** The pre-production stance
+  is that formats do not accumulate: `CHECKPOINT_VERSION` stays `1`
+  (`segment/event_checkpoint.rs:93`) and any checkpoint whose version
+  differs is refused with the explicit unsupported-version error (v2
+  pre-pool dirs → `UnsupportedPrePoolDataDir`, `:274-287`; other stale
+  versions rejected by `decode_snapshot`, `:528`) rather than decoded with
+  defaults. This supersedes the doc's "v3 → v4" wording in §Scope-B and the
+  DoD "checkpoint v4" references.
+- **`total_bytes` rides BOTH `SegmentMetadata` and the `SealEvent` fixed
+  fields** (user-approved option 1 of §Scope-B's "record it once" split).
+  Checkpoint-only storage would lose the total on event replay after a
+  checkpoint — the fixed field (`event_wal.rs:270`, framed `:423`) closes
+  that crash window; the replay fold reconstructs the checkpointed
+  metadata's total from the event (`lifecycle.rs:1537-1539`).
+- **Seal pipeline location — the doc's write-path anchors are stale.** The
+  per-append `(bucket, key)` capture lives in `SegmentPool::record_object_key`
+  (`segment/pool.rs:1382`, alongside `record_blob_entry`), NOT in
+  `write/coordinator.rs`. It is drained by `segment/seal_pipeline.rs`
+  (which builds the sorted/deduped membership — `:224-237`), which calls
+  `sealer.rs::seal_from_data_with_contained` (`:303`) to thread membership
+  through the flush registration into
+  `request_seal_with_contained`. WAL-replayed / empty-entries seals carry
+  `None` membership (`seal_pipeline.rs:224-225`).
+- **Repair/heal replica-rebuild fetch paths register membership-less.**
+  `repair.rs::execute_repair` (`:489`) and the heal worker
+  (`heal/worker.rs`) seal their holder copies via `request_seal(id, meta,
+  None)`: those copies stay re-readable/reapable but are not compaction
+  candidates — safe degradation per ADR-0034, and GC skips them pre-spawn.
+  By contrast the owner→holder **`PushSealedSegmentRequest` push carries
+  membership** (`segment.proto:158` `repeated ContainedObject
+  contained_objects`, wired through the segment replicator, and seeded on
+  the receiver via `request_seal_with_contained`,
+  `grpc/segment_service.rs:830/:1034`).
+- **Row-3 adopt seals record `total_bytes = 0` ("unknown").** The adopt
+  probe reads only the header root + pool id, not the data length
+  (`lifecycle.rs:1789-1791`), and adopted copies carry no contained-objects
+  membership — sealed with `request_seal(id, meta, None)` at `:1823`. Both
+  facts are consistent with the membership-less degradation above.
