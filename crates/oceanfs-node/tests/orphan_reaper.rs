@@ -36,7 +36,7 @@ fn open_temp_metadata() -> Arc<RocksDbMetadataStore> {
 /// (mirroring the node's startup seed).
 async fn make_reaper(
     metadata: Arc<RocksDbMetadataStore>,
-    shard_store: Arc<dyn oceanfs_storage_api::SegmentDataStore>,
+    store: Arc<dyn oceanfs_storage_api::SegmentDataStore>,
     config: GcConfig,
     registry: Arc<oceanfs_storage::SegmentLifecycleRegistry>,
 ) -> OrphanReaper {
@@ -57,7 +57,7 @@ async fn make_reaper(
     let lifecycle = Arc::new(
         SegmentLifecycleCoordinator::with_registry(Arc::clone(&registry)).with_event_wal(event_wal),
     );
-    OrphanReaper::new(metadata, lifecycle, shard_store, vec![], config)
+    OrphanReaper::new(metadata, lifecycle, store, vec![], config)
 }
 
 /// Helper: create a test shard store.

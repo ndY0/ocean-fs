@@ -87,10 +87,9 @@ struct Harness {
     registry: Arc<SegmentLifecycleRegistry>,
     lifecycle: Arc<SegmentLifecycleCoordinator>,
     sealer: Arc<SegmentSealer>,
-    /// The unified disk store (ADR-0032 D2) serving both the data and
-    /// delete/list roles (f2 — the durability impls are gone).
+    /// The unified disk store (ADR-0032 D2/D4) serving the data, the
+    /// delete/list and the recovery-sweep roles.
     data_store: Arc<DiskSegmentStore>,
-    shard_store: Arc<DiskSegmentStore>,
     compactor: Arc<SegmentCompactor>,
     segments_dir: PathBuf,
     wal_dir: PathBuf,
@@ -204,7 +203,6 @@ impl Harness {
             Arc::new(IoBackend::default()),
             observer,
         ));
-        let shard_store = Arc::clone(&data_store);
         let sealer = Arc::new(SegmentSealer::new(
             SealConfig { data_dir: segments_dir.clone(), ..Default::default() },
             data_wal.clone(),
@@ -215,7 +213,6 @@ impl Harness {
             TierRouter::new(oceanfs_core::SegmentSizeConfig::default()),
             data_store.clone(),
             lifecycle.clone(),
-            shard_store.clone(),
         ));
 
         Harness {
@@ -226,7 +223,6 @@ impl Harness {
             lifecycle,
             sealer,
             data_store,
-            shard_store,
             compactor,
             segments_dir,
             wal_dir: wal_config.data_dir,
@@ -542,7 +538,7 @@ async fn row7_kill_between_new_sealed_and_objects_moved() {
     // registry-resolved delete_shards covers only live entries; the
     // orphan reaper's per-root sweep is the residue backstop
     // (ADR-0032 D2).
-    h2.shard_store.delete_shards_with_pool(&new_id, 0).await.unwrap();
+    h2.data_store.delete_shards_with_pool(&new_id, 0).await.unwrap();
     assert!(h2.lifecycle.registry().get(new_id).is_none(), "orphan deleted durably");
     assert!(
         !h2.segments_dir.join(format!("{new_id}.dat")).exists(),
@@ -601,7 +597,7 @@ async fn row8_kill_between_objects_moved_and_old_deleted() {
     // (explicit pool — the entry is evicted with the delete; the reaper
     // is the residue backstop, ADR-0032 D2).
     h2.lifecycle.request_delete(old_id).await.unwrap();
-    h2.shard_store.delete_shards_with_pool(&old_id, 0).await.unwrap();
+    h2.data_store.delete_shards_with_pool(&old_id, 0).await.unwrap();
     assert!(h2.lifecycle.registry().get(old_id).is_none(), "old deleted durably");
     assert!(!h2.segments_dir.join(format!("{old_id}.dat")).exists(), "old .dat swept");
     assert_eq!(h2.object_chunk("a.txt").segment_id, new_id, "reads resolve to the new segment");
@@ -656,7 +652,7 @@ async fn row9_kill_between_old_deleted_and_old_removed() {
     // Dispatch: the idempotent residue sweep — explicit pool (the
     // entry is gone; the reaper's per-root sweep is the production
     // backstop, ADR-0032 D2).
-    h2.shard_store.delete_shards_with_pool(&old_id, 0).await.unwrap();
+    h2.data_store.delete_shards_with_pool(&old_id, 0).await.unwrap();
     assert!(!h2.segments_dir.join(format!("{old_id}.dat")).exists(), "old .dat swept");
     assert_eq!(h2.object_chunk("a.txt").segment_id, new_id, "reads resolve to the new segment");
 }

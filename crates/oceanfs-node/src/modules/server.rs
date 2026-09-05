@@ -643,7 +643,6 @@ impl ServerModule {
         // the stale replica through the machine + shard store.
         .with_remap_alias(Arc::clone(&storage.remap_alias))
         .with_lifecycle_coordinator(storage.lifecycle.clone())
-        .with_shard_store(storage.shard_store.clone())
         // g3 `loss-announcement` (data-pool death): verified held
         // segments enqueue re-replication repairs — the repair sink is
         // the HOLDER-side dispatcher (ADR-0030 target-pull).

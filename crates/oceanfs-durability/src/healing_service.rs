@@ -279,12 +279,6 @@ pub struct HealingGrpcService {
     /// own GC to reclaim (fully-dead path).
     lifecycle_coordinator:
         Option<Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>>,
-    /// Shard store for unlinking the stale replica's `.dat` after the
-    /// durable delete (ADR-0024 invariant 3). `None` (tests) skips the
-    /// unlink. A second `Arc<dyn SegmentDataStore>` during the f1/f2
-    /// transition window — the unified trait covers delete/list too
-    /// (ADR-0032 D1); f3 collapses the pair to one shared instance.
-    shard_store: Option<Arc<dyn SegmentDataStore>>,
     /// Re-replication repair sink (g3 → g5). `None` (tests) verifies +
     /// acks but enqueues nothing.
     repair_sink: Option<Arc<dyn RepairSink>>,
@@ -320,7 +314,6 @@ impl HealingGrpcService {
             hint_object_applier: None,
             remap_alias: None,
             lifecycle_coordinator: None,
-            shard_store: None,
             repair_sink: None,
             replication_request_sink: None,
             announce_rx_total: oceanfs_core::Counter::new(
@@ -398,14 +391,6 @@ impl HealingGrpcService {
         coordinator: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
     ) -> Self {
         self.lifecycle_coordinator = Some(coordinator);
-        self
-    }
-
-    /// Installs the shard store used to unlink a stale replica's `.dat`
-    /// after its durable delete (composition root).
-    #[must_use]
-    pub fn with_shard_store(mut self, shard_store: Arc<dyn SegmentDataStore>) -> Self {
-        self.shard_store = Some(shard_store);
         self
     }
 
@@ -1343,9 +1328,13 @@ impl HealingRpc for HealingGrpcService {
         let req = request.into_inner();
         let segment_id =
             req.segment_id.and_then(|sid| SegmentId::try_from(sid).ok()).unwrap_or_default();
-        // [review][architecture][critical]
+        // [review][architecture][critical][resolved]
         // again, we have a lot of concurrent tasks writing to disk through the store, potentially conflicting.
         // this is a huge architectural oversight in my opinion, and must be discussed with high priority
+        // RESOLVED by store-unification f2 (ADR-0032 D3): one shared
+        // store serializes writers per `.dat` (per-segment exclusive
+        // locks + atomic whole-file writes) — concurrent writers to one
+        // segment are unrepresentable.
         // [end]
         // Write the repaired shard into the data store.
         // In production this would merge the shard into the correct position.
@@ -1574,16 +1563,15 @@ impl HealingRpc for HealingGrpcService {
                 Ok(())
                 | Err(oceanfs_storage::segment::lifecycle::TransitionError::AlreadyDeleted)
                 | Err(oceanfs_storage::segment::lifecycle::TransitionError::Missing) => {
-                    if let Some(shard_store) = &self.shard_store {
-                        // The stale replica was registered with pool_id 0
-                        // (replica placement is pool-0/legacy).
-                        if let Err(e) = shard_store.delete_shards_with_pool(&old_sid, 0).await {
-                            tracing::warn!(
-                                old_segment_id = %old_sid,
-                                error = %e,
-                                "remap: stale replica .dat unlink failed; GC will reclaim"
-                            );
-                        }
+                    // The stale replica was registered with pool_id 0
+                    // (replica placement is pool-0/legacy) — unlink
+                    // through the shared unified store (ADR-0032 D4).
+                    if let Err(e) = self.data_store.delete_shards_with_pool(&old_sid, 0).await {
+                        tracing::warn!(
+                            old_segment_id = %old_sid,
+                            error = %e,
+                            "remap: stale replica .dat unlink failed; GC will reclaim"
+                        );
                     }
                 }
                 Err(e) => {

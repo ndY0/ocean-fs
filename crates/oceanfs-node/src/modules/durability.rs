@@ -191,13 +191,12 @@ impl DurabilityModule {
         // with no on-disk data).
         // GC compaction is a state machine (ADR-0025 Decision 4): the
         // compactor requests every transition from the lifecycle
-        // coordinator and unlinks the old .dat through the shard store
+        // coordinator and unlinks the old .dat through the shared store
         // only after the durable delete.
         let gc_worker = Arc::new(
             oceanfs_durability::GarbageCollector::new(gc_config.clone())
                 .with_data_store(storage.data_store.clone())
                 .with_lifecycle(storage.lifecycle.clone())
-                .with_shard_store(storage.shard_store.clone())
                 // The repacked segment is a NEW owner-side seal that
                 // bypasses the write-path seal worker: publish it so the
                 // segment replicator fans it out to its ring replicas
@@ -304,13 +303,13 @@ impl DurabilityModule {
             )
         };
 
-        // [review][architecture][critical]
+        // [review][architecture][critical][resolved]
         // AE no longer creates its own data store — c1 (composition-root
-        // decomposition) wired it to the module's single shared
-        // DiskSegmentStore (one store instance, no concurrent writers).
-        // The remaining 3-abstraction read/write unification
-        // (data store, shard store, disk reader) is
-        // store-unification f3 (ADR-0032).
+        // decomposition) wired it to the module's single shared store.
+        // RESOLVED by store-unification f2/f3 (ADR-0032): the twin disk
+        // impls are deleted, reads/writes share the io file core with
+        // the server reader, and StorageModule constructs exactly ONE
+        // unified store instance wired into every consumer.
         // [end]
         let ae_worker = Arc::new(AntiEntropy::new(
             oceanfs_durability::AntiEntropyConfig::new(
@@ -344,7 +343,7 @@ impl DurabilityModule {
         let reaper = Arc::new(OrphanReaper::new(
             storage.metadata_store.clone(),
             storage.lifecycle.clone(),
-            storage.shard_store.clone(),
+            storage.data_store.clone(),
             storage.registry.data_pools(),
             gc_config,
         ));

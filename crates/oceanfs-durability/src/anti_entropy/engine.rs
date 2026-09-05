@@ -200,8 +200,12 @@ impl AntiEntropy {
         // [review][algorithmic][critical]
         // this is essentially reading terabytes of data, unbounded.
         // this cannot remain as is, we need a better strategy than this.
+        // (The unbounded-scan half is bounded-metadata-scans, ADR-0034.)
         // also, it appear we have two divergent data readers, for the server and for the durability side,
         // this should not stand as is, and must be resolved
+        // [resolved-half] the two-reader divergence is RESOLVED by
+        // store-unification f2 (ADR-0032 D2): durability whole-file
+        // reads and the server chunk path share one io file core.
         // [end]
         // Step 1.5: Build local Merkle trees from segment data. A missing
         // `.dat` (Ok(None)) or unbuildable tree skips the segment (the

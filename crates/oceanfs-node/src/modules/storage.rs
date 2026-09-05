@@ -70,14 +70,13 @@ pub(crate) struct StorageModule {
     /// The segment sealer — the authoritative persistence path for sealed
     /// segments (pool-aware placement, ADR-0029 f5).
     pub(crate) sealer: Arc<oceanfs_storage::SegmentSealer>,
-    /// The shared segment data store — the ONE `DiskSegmentStore`
-    /// instance shared by the replicator, GC, AE, heal, scrub, admin,
-    /// segment-service and repair paths (reviews #57/#59/#60).
+    /// The ONE shared segment data store (ADR-0032 D4) — a single
+    /// `oceanfs_storage::DiskSegmentStore` instance constructed exactly
+    /// here, shared by the replicator, GC, orphan reaper, AE, heal,
+    /// scrub, re-replication, the healing/segment gRPC services and
+    /// startup recovery (reviews #57/#59/#60/#425). Both the data and
+    /// delete/list roles run through it.
     pub(crate) data_store: Arc<dyn oceanfs_storage_api::SegmentDataStore>,
-    /// The shared shard-store role — served by the one unified store
-    /// instance shared by GC compaction, the reaper, healing-service and
-    /// startup recovery.
-    pub(crate) shard_store: Arc<dyn oceanfs_storage_api::SegmentDataStore>,
     /// The seal-time segment replicator (sealed-segment-replication) —
     /// pushes sealed segments to their ring replicas off the seal path.
     pub(crate) segment_replicator: Arc<SegmentReplicator>,
@@ -447,11 +446,9 @@ impl StorageModule {
             Arc::clone(&io_backend),
             Arc::clone(&io_observer),
         ));
-        // The f1-era `data_store`/`shard_store` field pair: both roles
-        // are served by the one unified store until f3 collapses the
-        // fields (ADR-0032 D4).
-        let data_store: Arc<dyn oceanfs_storage_api::SegmentDataStore> = unified_store.clone();
-        let shard_store: Arc<dyn oceanfs_storage_api::SegmentDataStore> = unified_store;
+        // The ONE instance (ADR-0032 D4): `StorageModule.data_store` is
+        // the only construction site in the node crate.
+        let data_store: Arc<dyn oceanfs_storage_api::SegmentDataStore> = unified_store;
 
         // [review][architecture][critical][resolved]
         // we have 3 abstractions to access disk : the durability data store,
@@ -496,7 +493,6 @@ impl StorageModule {
             lifecycle,
             sealer,
             data_store,
-            shard_store,
             segment_replicator,
             segment_reader,
             remap_alias,
@@ -644,7 +640,7 @@ impl StorageModule {
             // entry carried one; residue-only sweeps are left to the
             // reaper's per-root listing.
             if let Some(pool_id) = sweep_pool {
-                if let Err(e) = self.shard_store.delete_shards_with_pool(&segment_id, pool_id).await
+                if let Err(e) = self.data_store.delete_shards_with_pool(&segment_id, pool_id).await
                 {
                     warn!(
                         segment_id = %segment_id,
@@ -908,32 +904,32 @@ mod tests {
         build_storage_prelude(tmp).await.module
     }
 
-    /// f2 DoD: the builder returns a consistent `StorageModule` whose
-    /// store surface is ONE unified `oceanfs_storage::DiskSegmentStore`
-    /// (ADR-0032 D2/D3), shared by both the `data_store` and
-    /// `shard_store` fields (f3 collapses the field pair). The
-    /// construction-site count is a grep invariant — exactly one
-    /// construction, in `build`. This test proves the shared instance
-    /// is live and its write/read/delete paths operate on the same
-    /// layout under lifecycle-routed semantics (unregistered writes are
-    /// rejected).
+    /// f3 DoD: the builder returns a consistent `StorageModule` whose
+    /// store surface is exactly ONE `oceanfs_storage::DiskSegmentStore`
+    /// instance (ADR-0032 D4) — the only construction site in the node
+    /// crate (grep invariant). The replicator (the module's own
+    /// store consumer) holds the SAME Arc; this test proves the shared
+    /// instance is live under lifecycle-routed semantics (unregistered
+    /// writes are rejected).
     #[tokio::test]
-    async fn build_returns_module_with_one_shared_unified_store() {
+    async fn build_returns_module_with_single_shared_store() {
         let tmp = TempDir::new().expect("tempdir");
         let module = build_module(&tmp).await;
 
         // Registry is the boot-time one; the module owns it.
         assert!(module.registry.pool_count() >= 1, "registry must be populated");
 
-        // ONE unified store instance backs both fields.
-        let data_ptr = Arc::as_ptr(&module.data_store) as *const ();
-        let shard_ptr = Arc::as_ptr(&module.shard_store) as *const ();
-        assert_eq!(data_ptr, shard_ptr, "data_store and shard_store share one unified store");
+        // The module's one store is the replicator's store (pointer
+        // identity — the module constructs once and clones everywhere).
+        assert!(
+            Arc::ptr_eq(&module.data_store, &module.segment_replicator.data_store()),
+            "the replicator must share the module's single store instance"
+        );
 
         // An unregistered write is rejected (ADR-0032 D3 — the
         // write-before-register bridge is gone).
         let segment_id = SegmentId::new();
-        let payload = b"f2 unified store round-trip payload";
+        let payload = b"f3 unified store round-trip payload";
         let err = module
             .data_store
             .write_segment_data(&segment_id, payload)
@@ -943,7 +939,8 @@ mod tests {
 
         // Register (reserve + seal through the module's coordinator —
         // the event-WAL-armed lifecycle), then write → read round-trips
-        // through the shared store.
+        // through the shared store; the delete role runs on the same
+        // instance.
         module
             .lifecycle
             .request_reserve(segment_id, oceanfs_core::SizeTier::Standard, 1, 0)
@@ -973,25 +970,25 @@ mod tests {
             .data_store
             .write_segment_data(&segment_id, payload)
             .await
-            .expect("write through shared data store");
+            .expect("write through the shared store");
         let back = module
             .data_store
             .read_segment_data(&segment_id)
             .await
-            .expect("read back through shared data store")
+            .expect("read back through the shared store")
             .expect("segment present after write");
-        assert_eq!(&back.data[..], &payload[..], "shared data store round-trip");
+        assert_eq!(&back.data[..], &payload[..], "shared store round-trip");
 
-        // The shard role deletes the same .dat the data role wrote;
-        // afterwards the store must no longer find it.
+        // Delete role on the same store; afterwards it must no longer
+        // find the segment.
         module
-            .shard_store
+            .data_store
             .delete_shards(&segment_id)
             .await
-            .expect("delete through shared shard store");
+            .expect("delete through the shared store");
         assert!(
             module.data_store.read_segment_data(&segment_id).await.unwrap().is_none(),
-            "segment must be gone after shard-store delete"
+            "segment must be gone after delete"
         );
 
         // Recovery on an empty (post-build) store completes.

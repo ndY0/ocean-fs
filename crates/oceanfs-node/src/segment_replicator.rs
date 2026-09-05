@@ -423,6 +423,13 @@ impl SegmentReplicator {
         self.needs.len()
     }
 
+    /// Returns the shared segment data store this replicator pushes from
+    /// (composition-root wiring tests — single-instance identity).
+    #[cfg(test)]
+    pub(crate) fn data_store(&self) -> Arc<dyn SegmentDataStore> {
+        Arc::clone(&self.data_store)
+    }
+
     /// Returns the number of nodes in the current ring view (tests —
     /// convergence polling).
     pub fn ring_node_count(&self) -> usize {

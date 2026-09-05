@@ -12,7 +12,7 @@ use oceanfs_core::{MetadataConfig, NodeId, RpcConfig};
 use oceanfs_durability::{
     merkle::{IncrementalMerkleTree, MerkleTreeConfig},
     AntiEntropy, AntiEntropyConfig, GarbageCollector, GcConfig, HealConfig, HealQueue,
-    InMemorySegmentStore, InMemoryShardStore, OrphanReaper, ScrubConfig, ScrubCoordinator,
+    InMemorySegmentStore, OrphanReaper, ScrubConfig, ScrubCoordinator,
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
@@ -48,9 +48,18 @@ async fn durability_components_are_wireable_and_spawnable() {
     ));
 
     // --- Construct durability components ---
+    // f3 shape (ADR-0032 D4): every consumer receives clones of ONE
+    // shared store — the composition root constructs once in
+    // StorageModule and wires the same Arc into GC, AE, heal, the
+    // reaper and scrub.
+    let shared_store: Arc<dyn oceanfs_storage_api::SegmentDataStore> =
+        Arc::new(InMemorySegmentStore::new());
 
     // GC
-    let _gc_worker = Arc::new(GarbageCollector::new(GcConfig::new(3600, 86400, 0.5, 4, 64)));
+    let _gc_worker = Arc::new(
+        GarbageCollector::new(GcConfig::new(3600, 86400, 0.5, 4, 64))
+            .with_data_store(Arc::clone(&shared_store)),
+    );
     let gc_cancel = CancellationToken::new();
     let _gc_handle = tokio::spawn({
         let cancel = gc_cancel.clone();
@@ -69,7 +78,7 @@ async fn durability_components_are_wireable_and_spawnable() {
         membership.clone(),
         Arc::clone(&wiring_registry),
         pool.clone(),
-        Arc::new(InMemorySegmentStore::new()),
+        Arc::clone(&shared_store),
         make_test_tree(),
     ));
     let ae_cancel = CancellationToken::new();
@@ -99,7 +108,7 @@ async fn durability_components_are_wireable_and_spawnable() {
     let _reaper = Arc::new(OrphanReaper::new(
         metadata_store.clone(),
         lifecycle,
-        Arc::new(InMemoryShardStore::new(4194304)),
+        Arc::clone(&shared_store),
         vec![], // in-memory store lists nothing; no pool roots needed
         GcConfig::new(3600, 86400, 0.5, 4, 64),
     ));

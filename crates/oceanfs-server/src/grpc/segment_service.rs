@@ -892,8 +892,11 @@ impl SegmentRpc for SegmentGrpcService {
                 "pushed merkle root does not match segment data for {segment_id}"
             )));
         }
-        // [review][architecture][high]
+        // [review][architecture][high][resolved]
         // couldn't there be other task running in parallel also writing to this precise segment ?
+        // RESOLVED by store-unification f2 (ADR-0032 D3): the unified
+        // store serializes writers per `.dat`; the push reserves before
+        // writing and any concurrent writer is lock-serialized.
         // [end]
         // Lifecycle-routed write (ADR-0032 D3): the reserve comes FIRST,
         // so the unified store resolves the segment's pool from its

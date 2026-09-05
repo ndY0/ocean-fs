@@ -27,8 +27,11 @@ use crate::{Error, Result};
 // GarbageCollector
 // ---------------------------------------------------------------------------
 
-// [review][architecture][critical]
+// [review][architecture][critical][resolved]
 // data store and shard store are the same abstraction, this discrepency must be resolved
+// RESOLVED by store-unification f1/f3 (ADR-0032 D1/D4): one unified
+// trait, one impl, one shared instance — this collector holds a single
+// store for the data and delete/list roles.
 // [end]
 /// Garbage collector for tombstone-based deletion and segment compaction.
 ///
@@ -58,14 +61,6 @@ pub struct GarbageCollector {
     /// minimal embeddings) means compaction candidates are identified but
     /// NOT compacted. See [`Self::with_lifecycle`].
     lifecycle: Option<Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>>,
-    /// The shard store: the compactor unlinks the old `.dat` only after
-    /// the durable delete. A second `Arc<dyn SegmentDataStore>` during
-    /// the f1/f2 transition window — the unified trait (ADR-0032 D1)
-    /// covers delete/list too, so both GC store fields share the trait
-    /// type; store-unification f3 collapses them to one shared instance.
-    /// `None` means compaction is not wired. See
-    /// [`Self::with_shard_store`].
-    shard_store: Option<Arc<dyn SegmentDataStore>>,
     /// Optional sealed-segment notifier (sealed-segment-replication):
     /// fired with each repacked segment's NEW id once its `SealEvent` is
     /// durable, so the segment replicator fans the fresh segment out to
@@ -117,7 +112,6 @@ impl GarbageCollector {
             ),
             data_store: None,
             lifecycle: None,
-            shard_store: None,
             sealed_notifier: None,
             compaction_remap_notifier: None,
         }
@@ -146,16 +140,6 @@ impl GarbageCollector {
         lifecycle: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
     ) -> Self {
         self.lifecycle = Some(lifecycle);
-        self
-    }
-
-    /// Attaches the shard store used to unlink the old segment's `.dat`
-    /// after its durable deletion (`OldRemoved` — delete before unlink).
-    ///
-    /// Without it, compaction candidates are identified and reported but
-    /// not compacted.
-    pub fn with_shard_store(mut self, shard_store: Arc<dyn SegmentDataStore>) -> Self {
-        self.shard_store = Some(shard_store);
         self
     }
 
@@ -285,7 +269,9 @@ impl GarbageCollector {
         };
         // ... and the machine: the compactor requests every transition
         // from the coordinator (ADR-0025 Decision 4) and unlinks the old
-        // `.dat` through the shard store after the durable delete.
+        // `.dat` through the same store after the durable delete
+        // (ADR-0032 D4 — one shared store for the data and delete/list
+        // roles).
         let Some(lifecycle) = self.lifecycle.clone() else {
             tracing::warn!(
                 candidates = candidates.len(),
@@ -293,24 +279,11 @@ impl GarbageCollector {
             );
             return Ok(stats);
         };
-        let Some(shard_store) = self.shard_store.clone() else {
-            tracing::warn!(
-                candidates = candidates.len(),
-                "GC identified compaction candidates but no shard store is attached; skipping compaction (use with_shard_store)"
-            );
-            return Ok(stats);
-        };
 
         // Phase 3: Compact candidate segments concurrency-limited
         let semaphore = Arc::new(Semaphore::new(self.config.max_concurrent_compactions));
         let tier_router = TierRouter::new(oceanfs_core::SegmentSizeConfig::default());
-        let compactor = SegmentCompactor::new(
-            metadata.clone(),
-            tier_router,
-            data_store,
-            lifecycle,
-            shard_store,
-        );
+        let compactor = SegmentCompactor::new(metadata.clone(), tier_router, data_store, lifecycle);
         let compactor = match &self.sealed_notifier {
             Some(notifier) => compactor.with_sealed_notifier(Arc::clone(notifier)),
             None => compactor,
@@ -547,9 +520,12 @@ impl GarbageCollector {
     }
 }
 
-// [review][architectural][critical]
+// [review][architectural][critical][resolved]
 // same remark about the multiplication of abstraction of segment data access
 // we need an unification
+// RESOLVED by store-unification f1/f2 (ADR-0032 D1/D2): one unified
+// trait in oceanfs-storage-api; the durability twin disk impls deleted
+// and merged into oceanfs_storage::DiskSegmentStore.
 // [end]
 // ---------------------------------------------------------------------------
 // In-memory delete/list double — test-local, ADR-0032 D1 shape
@@ -1099,8 +1075,7 @@ mod tests {
         );
         let gc = GarbageCollector::new(GcConfig { compact_threshold: 0.5, ..GcConfig::default() })
             .with_data_store(store)
-            .with_lifecycle(lifecycle)
-            .with_shard_store(Arc::new(InMemoryShardStore::new(0)));
+            .with_lifecycle(lifecycle);
         let stats = gc.run_cycle(metadata.clone(), &registry).await.unwrap();
 
         assert_eq!(stats.dead_bytes, 900, "dead bytes must come from the tombstone chunks");

@@ -55,18 +55,11 @@ pub(crate) struct SegmentCompactor {
     /// reads of repacked objects failed after restart (dormant bug: GC
     /// never compacted before tombstone-carried chunks made dead bytes
     /// detectable).
-    data_store: Arc<dyn SegmentDataStore>,
+    store: Arc<dyn SegmentDataStore>,
     /// The lifecycle coordinator — the compactor's ONLY writer of
     /// segment lifecycle state (ADR-0025 Decision 4). Every milestone
     /// transition goes through it.
     lifecycle: Arc<SegmentLifecycleCoordinator>,
-    /// The shard store: the `OldRemoved` milestone unlinks the old
-    /// `.dat` **only after** `request_delete` returns durable
-    /// (ADR-0024 invariant 3: delete before unlink). A second
-    /// `Arc<dyn SegmentDataStore>` during the f1/f2 transition window —
-    /// the unified trait covers delete/list too (ADR-0032 D1); f3
-    /// collapses the pair to one shared instance.
-    shard_store: Arc<dyn SegmentDataStore>,
     /// Optional sealed-segment notifier (sealed-segment-replication).
     ///
     /// Fired with the NEW segment id once its `SealEvent` is durable —
@@ -103,16 +96,14 @@ impl SegmentCompactor {
     pub(crate) fn new(
         metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
         tier_router: TierRouter,
-        data_store: Arc<dyn SegmentDataStore>,
+        store: Arc<dyn SegmentDataStore>,
         lifecycle: Arc<SegmentLifecycleCoordinator>,
-        shard_store: Arc<dyn SegmentDataStore>,
     ) -> Self {
         Self {
             metadata,
             tier_router,
-            data_store,
+            store,
             lifecycle,
-            shard_store,
             sealed_notifier: None,
             compaction_remap_notifier: None,
         }
@@ -148,8 +139,8 @@ impl SegmentCompactor {
     /// Returns the data store (tests only — re-wires the compactor with
     /// a remap notifier on the same store).
     #[cfg(test)]
-    pub(crate) fn data_store(&self) -> Arc<dyn SegmentDataStore> {
-        Arc::clone(&self.data_store)
+    pub(crate) fn store(&self) -> Arc<dyn SegmentDataStore> {
+        Arc::clone(&self.store)
     }
 
     /// Compacts a single segment: re-packs live blobs, updates metadata,
@@ -210,7 +201,7 @@ impl SegmentCompactor {
             // residue swept by the row-9 sweep.
             self.request_old_deletion(segment_id).await?;
             self.stall_at(5).await; // seam: after the DeleteEvent(old) (fully-dead path)
-            self.shard_store
+            self.store
                 .delete_shards_with_pool(&segment_id, segment_meta.pool_id)
                 .await
                 .map_err(|e| oceanfs_storage::Error::Io(std::io::Error::other(e.to_string())))?;
@@ -225,7 +216,7 @@ impl SegmentCompactor {
         // the store — `SegmentFile.data` is the data section; chunk
         // offsets are relative to it).
         let old_data = self
-            .data_store
+            .store
             .read_segment_data(&segment_id)
             .await
             .map_err(|e| oceanfs_storage::Error::Io(std::io::Error::other(e.to_string())))?
@@ -340,7 +331,7 @@ impl SegmentCompactor {
         // (best-effort — the durable delete keeps recovery
         // deterministic).
         let write_result = self
-            .data_store
+            .store
             .write_segment_data(&new_segment_id, &repacked)
             .await
             .map_err(|e| oceanfs_storage::Error::Io(std::io::Error::other(e.to_string())));
@@ -481,7 +472,7 @@ impl SegmentCompactor {
         // metadata the caller holds; ADR-0029 f5).
         state = CompactionState::OldRemoved;
         tracing::debug!(?state, "compaction milestone: old .dat unlinked");
-        self.shard_store
+        self.store
             .delete_shards_with_pool(&segment_id, segment_meta.pool_id)
             .await
             .map_err(|e| oceanfs_storage::Error::Io(std::io::Error::other(e.to_string())))?;
@@ -530,7 +521,7 @@ impl SegmentCompactor {
         // are configured (the write-before-register bridge, gone in
         // store-unification f2) — consistent with this unlink (Phase A
         // compaction placement, ADR-0029 f5).
-        let _ = self.shard_store.delete_shards_with_pool(&new_segment_id, 0).await;
+        let _ = self.store.delete_shards_with_pool(&new_segment_id, 0).await;
     }
 
     /// Test seam for the compaction crash-window matrix (rows 7–9):
@@ -680,7 +671,6 @@ mod tests {
             TierRouter::new(oceanfs_core::SegmentSizeConfig::default()),
             store,
             lifecycle.clone(),
-            Arc::new(InMemoryShardStore::new(0)),
         );
         (compactor, lifecycle)
     }
@@ -790,9 +780,8 @@ mod tests {
         let compactor = SegmentCompactor::new(
             metadata.clone(),
             TierRouter::new(oceanfs_core::SegmentSizeConfig::default()),
-            compactor.data_store(),
+            compactor.store(),
             lifecycle.clone(),
-            Arc::new(InMemoryShardStore::new(0)),
         )
         .with_compaction_remap_notifier({
             let fired = Arc::clone(&fired);
@@ -1036,8 +1025,7 @@ mod tests {
             ..GcConfig::default()
         })
         .with_data_store(store)
-        .with_lifecycle(lifecycle)
-        .with_shard_store(Arc::new(InMemoryShardStore::new(0)));
+        .with_lifecycle(lifecycle);
         let stats = gc_trigger.run_cycle(metadata.clone(), &registry).await.unwrap();
 
         assert!(stats.segments_scanned >= 1);

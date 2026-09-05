@@ -1,7 +1,7 @@
 ---
 feature: "Segment Store Unification (ADR-0032) — Program Coordination"
 epic: "refactoring/store-unification"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -15,7 +15,7 @@ perf:
   - "3.2 O_DIRECT for segment data files"
   - "3.3 mmap for hot segment reads"
 created: 2026-09-04
-updated: 2026-09-04
+updated: 2026-09-05
 ---
 
 # Segment Store Unification — Program Coordination
@@ -156,39 +156,51 @@ Ordering rules:
 
 ## Epic-level DoD (ADR-0032 acceptance)
 
-- [ ] **One trait:** `oceanfs_storage_api::SegmentDataStore` (async;
+- [x] **One trait:** `oceanfs_storage_api::SegmentDataStore` (async;
       read/write/delete/delete-with-pool/list) is the only segment
       data-access trait. `grep -rn "SegmentShardStore" crates --include=*.rs`
-      returns nothing.
-- [ ] **One impl:** `oceanfs_storage::DiskSegmentStore` in
+      returns nothing (f1; the durability trait definitions were deleted).
+- [x] **One impl:** `oceanfs_storage::DiskSegmentStore` in
       `crates/oceanfs-storage/src/segment/data_store.rs` is the only disk
       impl. `crates/oceanfs-durability/src/segment_store_impl.rs` and the
-      `DiskSegmentShardStore` struct are deleted;
+      `DiskSegmentShardStore` struct are deleted (f2);
       `grep -rn "DiskSegmentShardStore" crates --include=*.rs` returns
       nothing.
-- [ ] **One construction site:** `StorageModule.data_store`
+- [x] **One construction site:** `StorageModule.data_store`
       (`crates/oceanfs-node/src/modules/storage.rs`) is the only
       `DiskSegmentStore::new`/construction in the node crate
       (`grep -rn "DiskSegmentStore::new" crates/oceanfs-node --include=*.rs`
-      returns exactly one site).
-- [ ] **Single-writer + optimized I/O:** every `.dat` mutation (heal,
+      returns exactly one site — f3).
+- [x] **Single-writer + optimized I/O:** every `.dat` mutation (heal,
       re-rep, GC compaction, `push_repaired_shard`,
-      `push_sealed_segment`) is serialized per segment and routed through
-      the `oceanfs-storage::io` layer; no `std::fs::write`/`std::fs::read`
-      whole-file calls remain in the durability data paths.
-- [ ] **No legacy:** the unified store has no `legacy_dir` and no
-      empty-pools branch (ADR-0031).
-- [ ] **Green:** `cargo build --all-targets`; `cargo test -p
-      oceanfs-storage --lib -- --test-threads=1`, `-p oceanfs-durability
-      --lib -- --test-threads=1`, `-p oceanfs-server --lib --
-      --test-threads=1`, `-p oceanfs-node --lib -- --test-threads=1`; e2e
-      write/read green (node boots with pools).
-- [ ] **Review markers closed:** the `[review]` blocks at
-      `merkle_tree.rs:22`, `segment_store_impl.rs:16,92`,
-      `garbage_collector.rs:29,548,599,613`, `healing_service.rs:1327`,
-      `segment_service.rs:825`, `node.rs:1233,1269,1285,1450` are
-      annotated resolved or removed.
-- [ ] **Docs:** `#![deny(missing_docs)]` passes in all touched crates.
+      `push_sealed_segment`) is serialized per segment (per-segment
+      exclusive locks) and routed through the `oceanfs-storage::io` layer
+      (shared file core reads + atomic observed writes); no
+      `std::fs::write`/`std::fs::read` whole-file calls remain in the
+      durability data paths (f2 — the durability crate holds no disk
+      impl).
+- [x] **No legacy:** the unified store has no `legacy_dir` and no
+      empty-pools branch (ADR-0031; registry-only resolution, f2).
+- [x] **Green:** `cargo build --all-targets`; `cargo test -p
+      oceanfs-storage --lib -- --test-threads=1` (435), `-p
+      oceanfs-durability --lib -- --test-threads=1` (263), `-p
+      oceanfs-server --lib -- --test-threads=1` (244), `-p oceanfs-node
+      --lib -- --test-threads=1` (66) — all green; e2e functional
+      allowlist green (crash_restart, wal_recovery, segment_lifecycle,
+      cluster_write/read_path, garbage_collection, rewrite_leak_test,
+      cluster_lifecycle — 20/20) with the release binary.
+- [x] **Review markers closed:** the `[review]` blocks at
+      `merkle_tree.rs:22` (no marker present), `segment_store_impl.rs:16,92`
+      (file deleted in f2), `garbage_collector.rs:29,548` (annotated
+      `[resolved]`; `:599` — the test-only double's cfg-guard marker —
+      retained for the wave-4 hygiene sweep; `:613` — the duplication
+      marker — deleted with the struct in f2),
+      `healing_service.rs:1327` (`[resolved]`), `segment_service.rs:825`
+      (`[resolved]`), `node.rs:1233,1269,1285,1450` (the moved markers in
+      `modules/storage.rs` + `modules/durability.rs` are annotated
+      `[resolved]`).
+- [x] **Docs:** `#![deny(missing_docs)]` passes in all touched crates;
+      `RUSTDOCFLAGS="-D warnings" cargo doc` clean on all five crates.
 
 ## References
 
