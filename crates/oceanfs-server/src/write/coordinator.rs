@@ -656,6 +656,9 @@ impl WriteCoordinator {
                             // the entries into the seal work item at
                             // enqueue, so it can never miss an entry.
                             seal_pool.record_blob_entry(seg_id, off, len, blake3_hash);
+                            // The object identity rides the seal-time
+                            // membership (ADR-0034 D5).
+                            seal_pool.record_object_key(seg_id, &req.bucket, &req.key);
                         },
                         std::time::Duration::from_millis(self.timeouts.write_queue_ms),
                     )
@@ -709,6 +712,9 @@ impl WriteCoordinator {
                         |seg_id, off, len| {
                             // Same airtight ordering as the Small tier above.
                             seal_pool.record_blob_entry(seg_id, off, len, blake3_hash);
+                            // The object identity rides the seal-time
+                            // membership (ADR-0034 D5).
+                            seal_pool.record_object_key(seg_id, &req.bucket, &req.key);
                         },
                         std::time::Duration::from_millis(self.timeouts.write_queue_ms),
                     )
@@ -770,6 +776,9 @@ impl WriteCoordinator {
                                 // item, so the seal is skipped and the
                                 // segment never reaches disk.
                                 seal_pool.record_blob_entry(seg_id, off, len, blake3_hash);
+                                // The object identity rides the seal-time
+                                // membership (ADR-0034 D5).
+                                seal_pool.record_object_key(seg_id, &req.bucket, &req.key);
                             },
                             std::time::Duration::from_millis(self.timeouts.write_queue_ms),
                         )
@@ -1039,6 +1048,9 @@ impl WriteCoordinator {
                         &stored[..],
                         |seg_id, off, len| {
                             seal_pool.record_blob_entry(seg_id, off, len, blake3_hash);
+                            // The hinted apply records its object identity
+                            // for the seal-time membership (ADR-0034 D5).
+                            seal_pool.record_object_key(seg_id, bucket, key);
                         },
                         std::time::Duration::from_millis(self.timeouts.write_queue_ms),
                     )
@@ -1075,6 +1087,9 @@ impl WriteCoordinator {
                         &stored[..],
                         |seg_id, off, len| {
                             seal_pool.record_blob_entry(seg_id, off, len, blake3_hash);
+                            // The hinted apply records its object identity
+                            // for the seal-time membership (ADR-0034 D5).
+                            seal_pool.record_object_key(seg_id, bucket, key);
                         },
                         std::time::Duration::from_millis(self.timeouts.write_queue_ms),
                     )

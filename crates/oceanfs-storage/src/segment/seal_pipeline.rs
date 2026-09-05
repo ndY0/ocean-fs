@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use oceanfs_core::{HashOutput, SegmentId, SizeTier};
+use oceanfs_core::{ContainedObject, HashOutput, SegmentId, SizeTier};
 use tokio::task::JoinHandle;
 
 use crate::segment::{
@@ -213,19 +213,43 @@ pub fn spawn_seal_pipeline(
                                 }
                             };
 
-                        let result = sealer_arc
-                            .seal_from_data(
-                                segment_id,
-                                tier,
-                                work.segment_data.clone(),
-                                &entries,
-                                work.ec_k,
-                                work.ec_m,
-                                work.strip_size_bytes,
-                                work.ec_encoder.clone(),
-                                merkle_root,
-                            )
-                            .await;
+                        let result = {
+                            // ADR-0034 D5: build the seal-time contained
+                            // membership from the object keys the write
+                            // path recorded per append (dedup + sort for
+                            // deterministic serialization). A WAL-replayed
+                            // segment (no keys recorded) seals with `None`
+                            // — re-readable and reapable, but not a
+                            // compaction candidate.
+                            let contained = if work.object_keys.is_empty() {
+                                None
+                            } else {
+                                let objects = ContainedObject::sorted_dedup(
+                                    work.object_keys
+                                        .iter()
+                                        .map(|(b, k)| ContainedObject {
+                                            bucket: b.clone(),
+                                            key: k.clone(),
+                                        })
+                                        .collect(),
+                                );
+                                Some(Arc::from(objects))
+                            };
+                            sealer_arc
+                                .seal_from_data_with_contained(
+                                    segment_id,
+                                    tier,
+                                    work.segment_data.clone(),
+                                    &entries,
+                                    work.ec_k,
+                                    work.ec_m,
+                                    work.strip_size_bytes,
+                                    work.ec_encoder.clone(),
+                                    merkle_root,
+                                    contained,
+                                )
+                                .await
+                        };
 
                         match result {
                             Ok(_handle) => {

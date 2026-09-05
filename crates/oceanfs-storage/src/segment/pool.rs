@@ -105,6 +105,11 @@ pub struct SealingWork {
     /// work items legitimately carry an empty list (readers locate
     /// chunks via object metadata ChunkRefs).
     pub entries: Vec<oceanfs_core::SegmentIndexEntry>,
+    /// The `(bucket, key)` of every object appended to this segment
+    /// (ADR-0034 D5). Recorded by the write path alongside the blob
+    /// entries; the seal pipeline dedupes + sorts them into the
+    /// segment's contained-objects membership list at seal time.
+    pub object_keys: Vec<(oceanfs_core::BucketId, oceanfs_core::ObjectKey)>,
 }
 
 impl std::fmt::Debug for SealingWork {
@@ -416,6 +421,16 @@ pub struct SegmentPool {
     /// provenance (write path, slot recovery, idle driver) carries the
     /// full index).
     blob_entries: dashmap::DashMap<oceanfs_core::SegmentId, Vec<oceanfs_core::SegmentIndexEntry>>,
+    /// The `(bucket, key)` recorded per append (ADR-0034 D5), paralleling
+    /// `blob_entries`: the write coordinator's append hooks record here
+    /// under the same ordering invariant, and the seal pipeline drains
+    /// the map into the work item's contained-objects membership at
+    /// enqueue. An object split across chunks in one segment appears
+    /// multiple times in the map; dedupe happens at seal time.
+    object_keys: dashmap::DashMap<
+        oceanfs_core::SegmentId,
+        Vec<(oceanfs_core::BucketId, oceanfs_core::ObjectKey)>,
+    >,
     /// The lifecycle registry — the machine that owns the read path
     /// resolution and the in-flight read window (ADR-0025 Decision 2).
     /// The fill transition attaches the frozen buffer to the registry
@@ -524,6 +539,7 @@ impl SegmentPool {
             config,
             buffer_pool: Arc::clone(&buffer_pool),
             blob_entries: dashmap::DashMap::new(),
+            object_keys: dashmap::DashMap::new(),
             slot_activation: (Mutex::new(()), Condvar::new()),
             slot_activation_notify: tokio::sync::Notify::new(),
             #[cfg(test)]
@@ -1358,6 +1374,20 @@ impl SegmentPool {
         self.blob_entries.entry(segment_id).or_default().push(entry);
     }
 
+    /// Records the object identity `(bucket, key)` for an append to a
+    /// segment of this pool (ADR-0034 D5), called by the write
+    /// coordinator's append hook alongside [`Self::record_blob_entry`]
+    /// under the same ordering invariant. Duplicates (an object split
+    /// across chunks in one segment) are deduped at seal time.
+    pub fn record_object_key(
+        &self,
+        segment_id: oceanfs_core::SegmentId,
+        bucket: &oceanfs_core::BucketId,
+        key: &oceanfs_core::ObjectKey,
+    ) {
+        self.object_keys.entry(segment_id).or_default().push((bucket.clone(), key.clone()));
+    }
+
     /// Builds the seal work item for a frozen segment, copying the
     /// pool's recorded blob-index entries onto the item (complete at
     /// freeze time — no further appends can reach the segment). The map
@@ -1370,6 +1400,7 @@ impl SegmentPool {
     fn seal_work(&self, segment_id: SegmentId, segment_data: Bytes, tier: SizeTier) -> SealingWork {
         let (ec_k, ec_m, strip_size_bytes) = self.ec_params();
         let entries = self.blob_entries.get(&segment_id).map(|e| e.clone()).unwrap_or_default();
+        let object_keys = self.object_keys.get(&segment_id).map(|e| e.clone()).unwrap_or_default();
         SealingWork {
             segment_id,
             segment_data,
@@ -1379,14 +1410,16 @@ impl SegmentPool {
             strip_size_bytes,
             ec_encoder: self.ec_encoder.clone(),
             entries,
+            object_keys,
         }
     }
 
-    /// Clears the recorded blob-index entries for a segment whose seal
-    /// work item was ACCEPTED by the queue (the item carries the copy;
-    /// the map entry is consumed exactly once, on success).
+    /// Clears the recorded blob-index and object-key entries for a segment
+    /// whose seal work item was ACCEPTED by the queue (the item carries
+    /// the copies; the map entries are consumed exactly once, on success).
     fn clear_entries(&self, segment_id: SegmentId) {
         self.blob_entries.remove(&segment_id);
+        self.object_keys.remove(&segment_id);
     }
 
     /// Enqueues a filled segment for sealing on the bounded work
