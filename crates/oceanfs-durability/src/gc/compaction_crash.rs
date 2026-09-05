@@ -42,8 +42,8 @@ use std::{
 };
 
 use oceanfs_core::{
-    BucketId, ChunkRef, EventWalConfig, HashOutput, LifecycleConfig, MetadataConfig, ObjectKey,
-    ObjectMetadata, SegmentId, SegmentMetadata, SizeTier, WalConfig,
+    BucketId, ChunkRef, ContainedObject, EventWalConfig, HashOutput, LifecycleConfig,
+    MetadataConfig, ObjectKey, ObjectMetadata, SegmentId, SegmentMetadata, SizeTier, WalConfig,
 };
 use oceanfs_storage::{
     io::{InMemorySegmentReader, IoBackend, IoObserver, IoReadMode},
@@ -229,14 +229,19 @@ impl Harness {
         }
     }
 
-    /// Seeds a Sealed old segment with a durable `.dat` (the shape the
-    /// write path produces: reserve → data → fsync → seal).
-    async fn seed_sealed_old(&self, id: SegmentId, data: &[u8]) {
+    /// Seeds a Sealed old segment with a durable `.dat` and the given
+    /// contained-objects membership (ADR-0034 D5) — the shape the write
+    /// path produces: reserve → data → fsync → seal. `keys` are the
+    /// object keys (in bucket `"default"`) the test placed on the segment;
+    /// pass the empty slice for a fully-dead segment (an empty-but-`Some`
+    /// membership is what makes a membership-less segment distinguishable
+    /// from a genuinely dead one).
+    async fn seed_sealed_old_with_contained(&self, id: SegmentId, data: &[u8], keys: &[&str]) {
         self.lifecycle.request_reserve(id, SizeTier::Standard, 4, 2).await.unwrap();
         self.data_store.write_segment_data(&id, data).await.unwrap();
         let meta = SegmentMetadata {
             pool_id: 0,
-            total_bytes: 0,
+            total_bytes: data.len() as u64,
             segment_id: id,
             ec_k: 4,
             ec_m: 2,
@@ -245,7 +250,31 @@ impl Harness {
             storage_locations: smallvec::SmallVec::new(),
             sealed_at: Some(1_700_000_000_000),
         };
-        self.lifecycle.request_seal(id, meta, None).await.unwrap();
+        let contained: Vec<ContainedObject> = keys
+            .iter()
+            .map(|k| ContainedObject { bucket: BucketId::new("default"), key: ObjectKey::new(*k) })
+            .collect();
+        let contained = ContainedObject::sorted_dedup(contained);
+        self.lifecycle.request_seal_with_contained(id, meta, None, Some(&contained)).await.unwrap();
+    }
+
+    /// Seeds a membership-less Sealed old segment (the WAL-replayed shape
+    /// — not a compaction candidate).
+    async fn seed_sealed_old(&self, id: SegmentId, data: &[u8]) {
+        self.lifecycle.request_reserve(id, SizeTier::Standard, 4, 2).await.unwrap();
+        self.data_store.write_segment_data(&id, data).await.unwrap();
+        let meta = SegmentMetadata {
+            pool_id: 0,
+            total_bytes: data.len() as u64,
+            segment_id: id,
+            ec_k: 4,
+            ec_m: 2,
+            size_tier: SizeTier::Standard,
+            merkle_root: root_fn(data),
+            storage_locations: smallvec::SmallVec::new(),
+            sealed_at: Some(1_700_000_000_000),
+        };
+        self.lifecycle.request_seal_with_contained(id, meta, None, None).await.unwrap();
     }
 
     /// Puts an object with a single chunk reference.
@@ -326,8 +355,14 @@ impl Harness {
         let (_, _) = self.recover().await;
         stall_seam::arm(milestone);
         let compactor = Arc::clone(&self.compactor);
+        // The seeded old segment's membership (ADR-0034 D5): compaction
+        // enumerates from it, so it must survive the reboot fold (the
+        // SealEvent tail) and be passed to the compactor.
+        let contained = self.registry.get(old_id).and_then(|e| e.contained_objects.clone());
         let handle = tokio::spawn(async move {
-            let _ = compactor.compact_segment(old_id, &old_meta, &HashSet::new()).await;
+            let _ = compactor
+                .compact_segment(old_id, &old_meta, contained.as_deref(), &HashSet::new())
+                .await;
         });
         let deadline = Instant::now() + Duration::from_secs(10);
         while stall_seam::REACHED.load(Ordering::SeqCst) != milestone {
@@ -391,7 +426,6 @@ async fn kill_before_dat_write_folds_copying_and_drops_the_reserve() {
     let old_data = vec![0xEE; 400];
     let old_meta = {
         let h = Harness::boot(dir.path()).await;
-        h.seed_sealed_old(old_id, &old_data).await;
         h.put_object(
             "a.txt",
             ChunkRef {
@@ -402,6 +436,7 @@ async fn kill_before_dat_write_folds_copying_and_drops_the_reserve() {
                 logical_length: 400,
             },
         );
+        h.seed_sealed_old_with_contained(old_id, &old_data, &["a.txt"]).await;
         h.entry(old_id).metadata.clone()
     };
     let h = Harness::boot(dir.path()).await;
@@ -434,7 +469,6 @@ async fn kill_between_dat_write_and_seal_adopts_the_new_dat() {
     let old_data = vec![0xEE; 400];
     let old_meta = {
         let h = Harness::boot(dir.path()).await;
-        h.seed_sealed_old(old_id, &old_data).await;
         h.put_object(
             "a.txt",
             ChunkRef {
@@ -445,6 +479,7 @@ async fn kill_between_dat_write_and_seal_adopts_the_new_dat() {
                 logical_length: 400,
             },
         );
+        h.seed_sealed_old_with_contained(old_id, &old_data, &["a.txt"]).await;
         h.entry(old_id).metadata.clone()
     };
     let h = Harness::boot(dir.path()).await;
@@ -488,7 +523,6 @@ async fn row7_kill_between_new_sealed_and_objects_moved() {
     let h = Harness::boot(dir.path()).await;
     // Seed the old segment and compact in the SAME harness: the
     // coordinator's registry must hold the seed (boot does not fold).
-    h.seed_sealed_old(old_id, &old_data).await;
     h.put_object(
         "a.txt",
         ChunkRef {
@@ -499,6 +533,7 @@ async fn row7_kill_between_new_sealed_and_objects_moved() {
             logical_length: 400,
         },
     );
+    h.seed_sealed_old_with_contained(old_id, &old_data, &["a.txt"]).await;
     let old_meta = h.entry(old_id).metadata.clone();
     let handle = h.drive_to_milestone(old_id, old_meta, 3).await;
     h.kill(handle).await;
@@ -561,7 +596,6 @@ async fn row8_kill_between_objects_moved_and_old_deleted() {
     let h = Harness::boot(dir.path()).await;
     // Seed the old segment and compact in the SAME harness: the
     // coordinator's registry must hold the seed (boot does not fold).
-    h.seed_sealed_old(old_id, &old_data).await;
     h.put_object(
         "a.txt",
         ChunkRef {
@@ -572,6 +606,7 @@ async fn row8_kill_between_objects_moved_and_old_deleted() {
             logical_length: 400,
         },
     );
+    h.seed_sealed_old_with_contained(old_id, &old_data, &["a.txt"]).await;
     let old_meta = h.entry(old_id).metadata.clone();
     let handle = h.drive_to_milestone(old_id, old_meta, 3).await;
     h.advance_to(4).await;
@@ -616,7 +651,6 @@ async fn row9_kill_between_old_deleted_and_old_removed() {
     let h = Harness::boot(dir.path()).await;
     // Seed the old segment and compact in the SAME harness: the
     // coordinator's registry must hold the seed (boot does not fold).
-    h.seed_sealed_old(old_id, &old_data).await;
     h.put_object(
         "a.txt",
         ChunkRef {
@@ -627,6 +661,7 @@ async fn row9_kill_between_old_deleted_and_old_removed() {
             logical_length: 400,
         },
     );
+    h.seed_sealed_old_with_contained(old_id, &old_data, &["a.txt"]).await;
     let old_meta = h.entry(old_id).metadata.clone();
     let handle = h.drive_to_milestone(old_id, old_meta, 3).await;
     h.advance_to(4).await;
@@ -671,8 +706,11 @@ async fn fully_dead_kill_after_delete_leaves_dat_residue() {
     let old_data = vec![0xEE; 400];
     let h = Harness::boot(dir.path()).await;
     // Seed the old segment and compact in the SAME harness (boot does
-    // not fold; the coordinator's registry must hold the seed).
-    h.seed_sealed_old(old_id, &old_data).await;
+    // not fold; the coordinator's registry must hold the seed). The
+    // segment is fully dead (empty membership — a Some(empty) list, so
+    // the compactor's fully-dead path runs rather than refusing a
+    // membership-less entry).
+    h.seed_sealed_old_with_contained(old_id, &old_data, &[]).await;
     let old_meta = h.entry(old_id).metadata.clone();
     let handle = h.drive_to_milestone(old_id, old_meta, 5).await;
     h.kill(handle).await;
@@ -716,8 +754,8 @@ async fn repacked_compressed_chunk_reads_back_with_matching_digest() {
     let old_id = SegmentId::new();
     let h = Harness::boot(dir.path()).await;
     // Seed the old segment and compact in the SAME harness (boot does
-    // not fold; the coordinator's registry must hold the seed).
-    h.seed_sealed_old(old_id, &on_disk).await;
+    // not fold; the coordinator's registry must hold the seed). Put the
+    // object first so the seal-time membership (ADR-0034 D5) carries it.
     h.put_object(
         "compressed.txt",
         ChunkRef {
@@ -728,9 +766,14 @@ async fn repacked_compressed_chunk_reads_back_with_matching_digest() {
             logical_length: logical.len() as u32,
         },
     );
+    h.seed_sealed_old_with_contained(old_id, &on_disk, &["compressed.txt"]).await;
     let old_meta = h.entry(old_id).metadata.clone();
     // Full compaction (no kill).
-    h.compactor.compact_segment(old_id, &old_meta, &HashSet::new()).await.unwrap();
+    let contained = h.entry(old_id).contained_objects.clone();
+    h.compactor
+        .compact_segment(old_id, &old_meta, contained.as_deref(), &HashSet::new())
+        .await
+        .unwrap();
     drop(h);
 
     // Restart: the fold + data-WAL pass + recovery.
@@ -800,7 +843,6 @@ async fn post_compaction_segment_scrubs_healthy_against_the_machine_root() {
     let old_id = SegmentId::new();
     let old_data = vec![0xEE; 400];
     let h = Harness::boot(dir.path()).await;
-    h.seed_sealed_old(old_id, &old_data).await;
     h.put_object(
         "a.txt",
         ChunkRef {
@@ -811,9 +853,14 @@ async fn post_compaction_segment_scrubs_healthy_against_the_machine_root() {
             logical_length: 400,
         },
     );
+    h.seed_sealed_old_with_contained(old_id, &old_data, &["a.txt"]).await;
     let old_meta = h.entry(old_id).metadata.clone();
     // Full compaction (no kill).
-    h.compactor.compact_segment(old_id, &old_meta, &HashSet::new()).await.unwrap();
+    let contained = h.entry(old_id).contained_objects.clone();
+    h.compactor
+        .compact_segment(old_id, &old_meta, contained.as_deref(), &HashSet::new())
+        .await
+        .unwrap();
     drop(h);
 
     // Restart + recovery.
@@ -868,7 +915,6 @@ async fn repacked_uncompressed_chunk_reads_back_with_matching_digest() {
     let dir = tempfile::tempdir().unwrap();
     let old_id = SegmentId::new();
     let h = Harness::boot(dir.path()).await;
-    h.seed_sealed_old(old_id, &logical).await;
     h.put_object(
         "plain.txt",
         ChunkRef {
@@ -879,8 +925,13 @@ async fn repacked_uncompressed_chunk_reads_back_with_matching_digest() {
             logical_length: logical.len() as u32,
         },
     );
+    h.seed_sealed_old_with_contained(old_id, &logical, &["plain.txt"]).await;
     let old_meta = h.entry(old_id).metadata.clone();
-    h.compactor.compact_segment(old_id, &old_meta, &HashSet::new()).await.unwrap();
+    let contained = h.entry(old_id).contained_objects.clone();
+    h.compactor
+        .compact_segment(old_id, &old_meta, contained.as_deref(), &HashSet::new())
+        .await
+        .unwrap();
     drop(h);
 
     // Restart: the fold + data-WAL pass + recovery.

@@ -100,8 +100,7 @@ pub(crate) const EVENT_RECORD_HEADER_SIZE: usize = 28;
 pub(crate) const RESERVE_PAYLOAD_SIZE: usize = 4;
 
 /// Payload size of a `SealEvent`: 4 + merkle_root(32) + data_wal_pos(12)
-/// + total_bytes(8) — the base section WITHOUT the mandatory pool id (see
-/// [`SEAL_POOL_ID_SIZE`]).
+/// + total_bytes(8) — the base section WITHOUT the mandatory pool id (see [`SEAL_POOL_ID_SIZE`]).
 ///
 /// `total_bytes` (ADR-0034 D1) rides the event's fixed fields so a
 /// restart that replays a Seal after the last checkpoint reconstructs the

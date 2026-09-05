@@ -6,7 +6,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use oceanfs_core::{BucketId, ChunkRef, ObjectMetadata, RemappedChunk, SegmentId, SegmentMetadata};
+use oceanfs_core::{
+    BucketId, ChunkRef, ContainedObject, ObjectMetadata, RemappedChunk, SegmentId, SegmentMetadata,
+};
 use oceanfs_storage::{
     segment::{lifecycle::SegmentLifecycleCoordinator, TierRouter},
     Result,
@@ -177,19 +179,37 @@ impl SegmentCompactor {
         &self,
         segment_id: SegmentId,
         segment_meta: &SegmentMetadata,
+        contained_objects: Option<&[ContainedObject]>,
         dead_object_keys: &HashSet<(String, String)>,
     ) -> Result<u64> {
-        // Find all objects that reference this segment
-        let objects = self.find_objects_in_segment(segment_id)?;
+        // Enumerate the segment's objects from its seal-time membership
+        // list (ADR-0034 D5) + per-key point lookups — never a full
+        // objects-CF scan. A membership-less Sealed segment (WAL-replayed
+        // or pre-feature) is not a compaction candidate; GC filters such
+        // candidates before spawning, and this guard is the second line.
+        let Some(contained) = contained_objects else {
+            return Err(oceanfs_storage::Error::Io(std::io::Error::other(format!(
+                "compact_segment refused: segment {segment_id} has no contained-objects membership \
+                 (WAL-replayed/pre-feature segments are not compaction candidates)"
+            ))));
+        };
 
-        // Filter: only repack live (non-deleted) objects
-        let live_objects: Vec<&(BucketId, ObjectMetadata)> = objects
-            .iter()
-            .filter(|(bucket, obj)| {
-                !dead_object_keys
-                    .contains(&(bucket.as_str().to_string(), obj.object_key.as_str().to_string()))
-            })
-            .collect();
+        // Live = membership rows that are still present, not tombstoned,
+        // and reference this segment.
+        let mut found: Vec<(BucketId, ObjectMetadata)> = Vec::with_capacity(contained.len());
+        for co in contained {
+            if dead_object_keys
+                .contains(&(co.bucket.as_str().to_string(), co.key.as_str().to_string()))
+            {
+                continue;
+            }
+            if let Ok(Some(obj)) = self.metadata.get_object_metadata(&co.bucket, &co.key) {
+                if obj.chunks.iter().any(|c| c.segment_id == segment_id) {
+                    found.push((co.bucket.clone(), obj));
+                }
+            }
+        }
+        let live_objects: Vec<&(BucketId, ObjectMetadata)> = found.iter().collect();
 
         // Total segment size for reclaimed bytes tracking
         let segment_size = tier_target_size(segment_meta.size_tier);
@@ -361,7 +381,7 @@ impl SegmentCompactor {
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
         let new_seg_meta = SegmentMetadata {
             pool_id: 0,
-            total_bytes: 0,
+            total_bytes: repacked.len() as u64,
             segment_id: new_segment_id,
             ec_k: segment_meta.ec_k,
             ec_m: segment_meta.ec_m,
@@ -370,8 +390,25 @@ impl SegmentCompactor {
             storage_locations: smallvec::SmallVec::new(),
             sealed_at: Some(now_ms),
         };
-        if let Err(e) =
-            self.lifecycle.request_seal(new_segment_id, new_seg_meta, Some(segment_id)).await
+        // The repacked segment's own seal-time membership (ADR-0034 D5):
+        // the compactor knows `(bucket, key)` of every object it repacks.
+        let live_membership: Vec<ContainedObject> = live_objects
+            .iter()
+            .map(|(bucket, obj)| ContainedObject {
+                bucket: (*bucket).clone(),
+                key: obj.object_key.clone(),
+            })
+            .collect();
+        let live_membership = ContainedObject::sorted_dedup(live_membership);
+        if let Err(e) = self
+            .lifecycle
+            .request_seal_with_contained(
+                new_segment_id,
+                new_seg_meta,
+                Some(segment_id),
+                Some(&live_membership),
+            )
+            .await
         {
             self.cleanup_reserved_new(new_segment_id).await;
             return Err(oceanfs_storage::Error::Io(std::io::Error::other(format!(
@@ -482,7 +519,7 @@ impl SegmentCompactor {
             segment_id = %segment_id,
             new_segment_id = %new_segment_id,
             objects_repacked = live_objects.len(),
-            dead_objects_filtered = objects.len() - live_objects.len(),
+            dead_objects_filtered = contained.len() - live_objects.len(),
             "segment compaction complete"
         );
 
@@ -542,33 +579,6 @@ impl SegmentCompactor {
             let _ = milestone;
         }
     }
-
-    /// Finds all objects that have chunks in the given segment.
-    ///
-    /// Note: This is O(n) in number of objects. In production, a reverse
-    /// index (segment → objects) would accelerate this. The RocksDB
-    /// `objects` CF could be augmented with an index column family
-    /// mapping `segment_id → [object_key]` to avoid the full scan.
-    fn find_objects_in_segment(
-        &self,
-        segment_id: SegmentId,
-    ) -> Result<Vec<(BucketId, ObjectMetadata)>> {
-        let mut result = Vec::new();
-
-        // Scan ALL buckets (the bucket is decoded from the store key):
-        // restricting the scan to "default" would miss every object in
-        // other buckets, so compaction would never repack their segments.
-        let all_objects = self.metadata.list_objects_all_with_bucket();
-
-        for obj_result in all_objects {
-            let Ok((bucket, obj)) = obj_result else { continue };
-            if obj.chunks.iter().any(|c| c.segment_id == segment_id) {
-                result.push((bucket, obj));
-            }
-        }
-
-        Ok(result)
-    }
 }
 
 #[cfg(test)]
@@ -577,8 +587,8 @@ mod tests {
     use std::{collections::HashSet, sync::Arc};
 
     use oceanfs_core::{
-        BucketId, ChunkRef, Hlc, LifecycleConfig, MetadataConfig, ObjectKey, ObjectMetadata,
-        RemappedChunk, SegmentId, SegmentMetadata, SizeTier, Tombstone,
+        BucketId, ChunkRef, ContainedObject, Hlc, LifecycleConfig, MetadataConfig, ObjectKey,
+        ObjectMetadata, RemappedChunk, SegmentId, SegmentMetadata, SizeTier, Tombstone,
     };
     use oceanfs_storage::{
         metadata::RocksDbMetadataStore,
@@ -593,6 +603,15 @@ mod tests {
         garbage_collector::GarbageCollector, liveness_tracker::LivenessTracker,
         segment_compactor::SegmentCompactor, *,
     };
+
+    /// Builds the contained-objects membership for the given object keys
+    /// (bucket "default"), as a fixture would record it at seal time
+    /// (ADR-0034 D5).
+    fn membership(keys: &[&str]) -> Vec<ContainedObject> {
+        keys.iter()
+            .map(|k| ContainedObject { bucket: BucketId::new("default"), key: ObjectKey::new(*k) })
+            .collect()
+    }
 
     fn test_config() -> MetadataConfig {
         let dir = tempfile::tempdir().unwrap();
@@ -687,6 +706,23 @@ mod tests {
         lifecycle.request_seal(meta.segment_id, meta, None).await.unwrap();
     }
 
+    /// Seeds a sealed segment with a contained-objects membership
+    /// (ADR-0034 D5), as the write path would.
+    async fn seed_sealed_with_contained(
+        lifecycle: &SegmentLifecycleCoordinator,
+        meta: SegmentMetadata,
+        keys: &[&str],
+    ) {
+        lifecycle
+            .request_reserve(meta.segment_id, meta.size_tier, meta.ec_k, meta.ec_m)
+            .await
+            .unwrap();
+        lifecycle
+            .request_seal_with_contained(meta.segment_id, meta, None, Some(&membership(keys)))
+            .await
+            .unwrap();
+    }
+
     // SegmentCompactor
     // -----------------------------------------------------------------------
 
@@ -736,6 +772,7 @@ mod tests {
             .compact_segment(
                 seg_id,
                 &make_segment_meta(seg_id, SizeTier::Standard, 1700000000000),
+                Some(&membership(&["ref.txt"])),
                 &empty_dead_keys,
             )
             .await;
@@ -799,7 +836,14 @@ mod tests {
         });
 
         let empty_dead = HashSet::new();
-        let result = compactor.compact_segment(old_seg_id, &old_seg_meta, &empty_dead).await;
+        let result = compactor
+            .compact_segment(
+                old_seg_id,
+                &old_seg_meta,
+                Some(&membership(&["remapped.txt"])),
+                &empty_dead,
+            )
+            .await;
         assert!(result.is_ok());
 
         // The notifier fired exactly once with the right ids + table.
@@ -836,6 +880,7 @@ mod tests {
             .compact_segment(
                 seg_id,
                 &make_segment_meta(seg_id, SizeTier::Standard, 1700000000000),
+                Some(&membership(&[])),
                 &empty_dead_keys2,
             )
             .await;
@@ -927,7 +972,14 @@ mod tests {
         metadata.put_object(obj_meta).unwrap();
 
         let empty_dead = HashSet::new();
-        let result = compactor.compact_segment(old_seg_id, &old_seg_meta, &empty_dead).await;
+        let result = compactor
+            .compact_segment(
+                old_seg_id,
+                &old_seg_meta,
+                Some(&membership(&["moved.txt"])),
+                &empty_dead,
+            )
+            .await;
         assert!(result.is_ok());
         assert!(result.unwrap() > 0);
 
@@ -1018,7 +1070,12 @@ mod tests {
             SegmentLifecycleCoordinator::with_registry(Arc::clone(&registry))
                 .with_event_wal(event_wal),
         );
-        seed_sealed(&lifecycle, seg_meta.clone()).await;
+        seed_sealed_with_contained(
+            &lifecycle,
+            seg_meta.clone(),
+            &["keep0.txt", "keep1.txt", "keep2.txt", "keep3.txt"],
+        )
+        .await;
         let gc_trigger = GarbageCollector::new(GcConfig {
             tombstone_ttl_sec: 0,
             compact_threshold: 0.5,
@@ -1092,6 +1149,7 @@ mod tests {
             .compact_segment(
                 seg_id,
                 &make_segment_meta(seg_id, SizeTier::Standard, 1700000000000),
+                Some(&membership(&["live.txt", "dead.txt"])),
                 &dead_keys,
             )
             .await;

@@ -2286,6 +2286,7 @@ impl SegmentLifecycleCoordinator {
     /// Seals a batch of finalized segments, each with its optional
     /// contained-objects membership list (ADR-0034 D5). Each element is
     /// `Ok` on success, or a [`TransitionError`] for that segment.
+    #[allow(clippy::type_complexity)]
     pub(crate) async fn seal_finalized_batch_with_contained(
         &self,
         seals: Vec<(SegmentMetadata, Option<Arc<[ContainedObject]>>)>,

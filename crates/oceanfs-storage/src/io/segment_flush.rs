@@ -249,6 +249,7 @@ impl SegmentFlushGroup {
 
     /// Like [`Self::submit`], additionally carrying the seal-time
     /// contained-objects membership list (ADR-0034 D5).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn submit_with_contained(
         &self,
         file: std::fs::File,

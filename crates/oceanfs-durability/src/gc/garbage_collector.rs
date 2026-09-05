@@ -323,20 +323,34 @@ impl GarbageCollector {
             let _metadata = metadata.clone();
             let dead_keys = dead_keys.clone();
 
-            // Fetch segment metadata before spawning — from the machine
-            // (ADR-0025 Decision 3).
-            let segment_meta = match registry.get(segment_id) {
-                Some(entry) => entry.metadata.clone(),
-                None => {
-                    drop(permit);
-                    continue;
-                }
+            // Fetch the registry entry before spawning — from the machine
+            // (ADR-0025 Decision 3) — and skip candidates without a
+            // contained-objects membership list (ADR-0034 D5): a
+            // WAL-replayed/pre-feature Sealed segment is not a compaction
+            // candidate (GC never scans to recover its membership).
+            let Some(entry) = registry.get(segment_id) else {
+                drop(permit);
+                continue;
             };
+            let segment_meta = entry.metadata.clone();
+            let contained_arc = entry.contained_objects.clone();
+            if contained_arc.is_none() {
+                drop(permit);
+                continue;
+            }
             let dead_bytes = tracker.dead_bytes_for(&segment_id);
 
             let handle = tokio::spawn(async move {
                 let _permit = permit; // held until task completes
-                match compactor.compact_segment(segment_id, &segment_meta, &dead_keys).await {
+                match compactor
+                    .compact_segment(
+                        segment_id,
+                        &segment_meta,
+                        contained_arc.as_deref(),
+                        &dead_keys,
+                    )
+                    .await
+                {
                     Ok(bytes_reclaimed) => {
                         let _ = tx.send((segment_id, bytes_reclaimed + dead_bytes)).await;
                     }
@@ -1000,7 +1014,21 @@ mod tests {
         let seg_id = SegmentId::new();
         let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
         registry.reserve(seg_id, seg_meta.clone()).unwrap();
-        registry.seal(seg_id, seg_meta.clone()).unwrap();
+        // Seed the seal-time membership (ADR-0034 D5): the live object and
+        // the (row-gone, tombstoned) object both sat on this segment; the
+        // compactor enumerates via point lookups, so the absent row is
+        // skipped naturally.
+        let members: Arc<[oceanfs_core::ContainedObject]> = Arc::from(vec![
+            oceanfs_core::ContainedObject {
+                bucket: BucketId::new("default"),
+                key: ObjectKey::new("live.txt"),
+            },
+            oceanfs_core::ContainedObject {
+                bucket: BucketId::new("default"),
+                key: ObjectKey::new("deleted.txt"),
+            },
+        ]);
+        registry.seal_with(seg_id, seg_meta.clone(), None, Some(members)).unwrap();
 
         // One LIVE object (100 bytes) still referencing the segment.
         let live_obj = make_object_meta(
