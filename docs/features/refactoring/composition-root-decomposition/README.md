@@ -1,7 +1,7 @@
 ---
 feature: "Composition-Root Decomposition — Program Coordination"
 epic: "refactoring/composition-root-decomposition"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -21,11 +21,13 @@ updated: 2026-09-05
 > start, and what must not regress while you work. The per-feature docs
 > are the authority for your feature; this document is the map.
 
-> **STATUS (2026-09-05): c1, c2, the c3a prerequisite seam
-> (seal-pipeline relocation storage-side, commit `489397a`), c3, and c4
-> LANDED — each with independent review PASS; c5 pending (final `start()`
-> slimming + spawn extraction).** See the Landing order under Feature DAG
-> for the per-feature gate record.
+> **STATUS: EPIC COMPLETE (2026-09-05).** c1, c2, the c3a prerequisite
+> seam (seal-pipeline relocation storage-side, commit `489397a`), c3, c4,
+> and c5 all LANDED — each with independent review PASS (c5: iteration
+> 1, 0 blocking gaps). `Node::start()` is 122 lines with zero
+> `tokio::spawn`; `node.rs` is 1,744 lines. This document is retained as
+> the coordination record; nothing here is pending — see the Landing
+> order and the Acceptance bar below for the per-item gate record.
 
 ---
 
@@ -76,7 +78,12 @@ crates/oceanfs-node/src/
     membership.rs         # MembershipModule::build + start_plane_and_join (membership plane)
     data_plane.rs         # DataPlaneModule::build + serve (data-plane HTTP/gRPC binds)
     background.rs         # move spawn_background_tasks + task handles here
+                          # → AS LANDED (c5): bundler only — spawn_all glue
+                          #   + cancellable metric poller (see note below)
   adapters.rs             # PrefetchStoreAdapter, WorkerQueueSink, NodeLeaveHandler
+                          # → AS LANDED: no adapters.rs — the two surviving
+                          #   adapters live in modules/server.rs; NodeLeaveHandler
+                          #   deleted by c1 (see note below)
 ```
 
 | Builder | Owns (moved out of `start()`) | Produces |
@@ -96,6 +103,25 @@ membership + data plane (early module builds) → build storage + durability
 Bind-before-join is preserved as the documented serve →
 start_plane_and_join sequence. Shutdown (`node.rs:3107-3213`) stays on
 `Node` but moves its hard-coded timeouts to config (review #71).
+
+> **As landed (2026-09-05, epic close — full record in the c5 doc).**
+> The sketch above was the working target; the landed shape differs in
+> two placements: there is **no `adapters.rs`** — the two surviving
+> adapters (`PrefetchStoreAdapter`, `WorkerQueueSink`) live inside
+> `modules/server.rs` (`NodeLeaveHandler` was deleted, not moved, by c1)
+> — and **`modules/background.rs` is a bundler only**:
+> `spawn_all` (background.rs:48) glues the module-owned spawn entries
+> (`DurabilityModule::spawn_loops` durability.rs:479,
+> `StorageModule::spawn_loops` storage.rs:716,
+> `modules/server.rs::spawn_prefetch_loop` server.rs:708,
+> `MembershipModule::spawn_ready_gate` membership.rs:500,
+> `DataPlaneModule::serve`) and owns the cancellable metric poller; it
+> spawns no loops itself. Landed measures: `node.rs` **1,744 lines**;
+> `start()` **122 lines** (node.rs:327-448) with **zero `tokio::spawn`**;
+> `BackgroundTasks` holds 16 `Option<JoinHandle<()>>` handles built via
+> `new()`; shutdown (node.rs:990-1092) drains **all** handles under
+> configurable grace — `shutdown_grace_secs` (10) /
+> `shutdown_fast_grace_secs` (5), defaults preserving the old 10s/5s.
 
 ## Feature DAG
 
@@ -152,15 +178,22 @@ one of the c1–c5 builder steps and does not change what c3 extracts.
   split: `MembershipModule` (identity/rejoin/plane/gossip+probe/
   bootstrap) + `DataPlaneModule` (pool + HTTP/gRPC binds); gossip/probe
   re-seated from c3 (deviation #9); review #64 closed (strict
-  `membership_listen_addr`); node.rs 2937→2606; c5 remains pending.
-- **c5 background-spawn-extraction + `start()` slimming — pending.**
+  `membership_listen_addr`); node.rs 2937→2606.
+- **c5 background-spawn-extraction — LANDED 2026-09-05 (review PASS,
+  iteration 1 — 0 blocking).** start() 720→122 lines, no `tokio::spawn`
+  in start(); node.rs 1744; module-owned spawns + bundler; shutdown
+  drains all handles under configurable grace; reviews #68/#71 +
+  guideline §4.1 closed. **EPIC COMPLETE.**
 
 `c1` includes the `NodeLeaveHandler` supersession — the handler is
 **deleted** (review #34), which closes wave-0/1 f1 B1 (review #35; B1 was
 deferred to this deletion by DECISION 2026-09-04, see
 `review-wave-0-1/f1-correctness-bug-batch.md`) — and the `start()`
-store-consolidation precondition (one shared `DiskSegmentStore`, review
-#57/#59/#60) because the builder is where the 8 store instances become 1.
+store-consolidation precondition (one shared `DiskSegmentStore` per
+kind, review #57/#59/#60) because the builder is where the 8 store
+instances become the 2 shared ones (one `DiskSegmentStore` + one
+`DiskSegmentShardStore` — see the acceptance bar; the final one-unified-
+store state is store-unification f3, ADR-0032).
 
 ## Constraints / non-goals
 
@@ -175,23 +208,45 @@ store-consolidation precondition (one shared `DiskSegmentStore`, review
 
 ## Acceptance bar (epic DoD)
 
-- [ ] `Node::start()` under ~300 lines; every background loop spawned
+- [x] `Node::start()` under ~300 lines; every background loop spawned
       from a module, none in `start()`.
-- [ ] `node.rs` under ~2,000 lines (from 4,458); no top-of-file adapter
+      Verified (c5): `start()` = node.rs:327-448, 122 lines; 0
+      `tokio::spawn` in `start()`; loops module-owned
+      (`DurabilityModule::spawn_loops`, `StorageModule::spawn_loops`,
+      `modules/server.rs::spawn_prefetch_loop`,
+      `MembershipModule::spawn_ready_gate`, `DataPlaneModule::serve`).
+- [x] `node.rs` under ~2,000 lines (from 4,458); no top-of-file adapter
       structs (moved to `adapters.rs`).
-- [ ] **Two** shared store instances (one `DiskSegmentStore` + one
+      Verified (c5): node.rs = 1,744 lines; no adapter structs at file
+      top — `PrefetchStoreAdapter` + `WorkerQueueSink` live in
+      `modules/server.rs` (no `adapters.rs` was created;
+      `NodeLeaveHandler` deleted, not moved, by c1).
+- [x] **Two** shared store instances (one `DiskSegmentStore` + one
       `DiskSegmentShardStore`) constructed in `StorageModule` and shared by
       all durability subsystems. NOTE: this is the c1 precondition — the
       final **one** unified store (review #57/#59/#60 closure) is the
       store-unification epic's f3 end state (ADR-0032), NOT this epic.
       See `refactoring/store-unification/` and roadmap §4 sequencing.
-- [ ] Review #64 (B2) is fixed in the wave-0/1 epic, NOT here. Review
+      Verified (c1): stores consolidated 8 → 2 in `StorageModule::build`.
+- [x] Review #64 (B2) is fixed in the wave-0/1 epic, NOT here. Review
       #35 (B1) was **deferred to this epic** (DECISION 2026-09-04): c1's
       `NodeLeaveHandler` deletion closes it — the disposition is recorded
       in wave-0/1 f1 and in c1's doc.
-- [ ] All existing node tests + e2e write/read green; no behavior delta.
-- [ ] Guideline update: "composition root §4.1 — no `tokio::spawn` in
+      Verified: #35 B1 closed by c1 (2026-09-04); #64 B2 closed by
+      wave-0/1 f1 (2026-09-04) + c4's strict `membership_listen_addr`
+      parse (2026-09-05) — dispositions in the wave-0/1 f1, c1, and c4
+      docs.
+- [x] All existing node tests + e2e write/read green; no behavior delta.
+      Verified (per-feature, c1–c5): node lib 66, doc 38, all 30
+      integration suites, e2e allowlist (crash_restart, wal_recovery,
+      segment_lifecycle, cluster_lifecycle, cluster_write_path,
+      cluster_read_path, garbage_collection, rewrite_leak_test) green;
+      no load suites (PIPELINE.md §6).
+- [x] Guideline update: "composition root §4.1 — no `tokio::spawn` in
       `start()`; modules expose their own `spawn`."
+      Verified (c5): guidelines/architecture.md §4.1 updated — no
+      `tokio::spawn` in `Node::start()`; module-owned spawn entries +
+      bundler (`spawn_all`); clippy/rustdoc/fmt clean.
 
 ## References
 

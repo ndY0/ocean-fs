@@ -452,6 +452,24 @@ pub struct NodeConfig {
     /// skip the gate entirely.
     #[serde(default = "default_cluster_min_quorum_nodes")]
     pub cluster_min_quorum_nodes: u64,
+
+    /// Shutdown grace period for the main background task group, in
+    /// seconds (default 10, behavior-compatible with the historical
+    /// hard-coded bound — review #71).
+    ///
+    /// `Node::shutdown()` cancels every background loop, then waits up
+    /// to this long for the group to stop before closing the stores.
+    /// The legitimate duration of a clean shutdown is the product of
+    /// queue sizes and expected system load, so it must be tunable per
+    /// deployment rather than hard-coded.
+    #[serde(default = "default_shutdown_grace_secs")]
+    pub shutdown_grace_secs: u64,
+
+    /// Shutdown grace period for the best-effort handles (prefetch
+    /// pre-warmer, hinted-handoff delivery watcher, gRPC server), in
+    /// seconds (default 5 — review #71).
+    #[serde(default = "default_shutdown_fast_grace_secs")]
+    pub shutdown_fast_grace_secs: u64,
 }
 
 fn default_node_id() -> String {
@@ -640,6 +658,12 @@ fn default_cluster_ready_timeout_sec() -> u64 {
 fn default_cluster_min_quorum_nodes() -> u64 {
     2
 }
+fn default_shutdown_grace_secs() -> u64 {
+    10
+}
+fn default_shutdown_fast_grace_secs() -> u64 {
+    5
+}
 
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -727,6 +751,8 @@ impl Default for NodeConfig {
             hint_delivery_sweep_sec: 5,
             cluster_ready_timeout_sec: 30,
             cluster_min_quorum_nodes: 2,
+            shutdown_grace_secs: 10,
+            shutdown_fast_grace_secs: 5,
         }
     }
 }

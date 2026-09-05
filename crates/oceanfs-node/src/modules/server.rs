@@ -695,3 +695,27 @@ impl ServerModule {
         Ok(ServerModule { router, grpc, prefetch_engine })
     }
 }
+
+/// Spawns the server-owned prefetch pre-warmer keep-alive (c5 — the
+/// worker owns its startup sequence; the background bundler calls this
+/// with the engine Arc, since `ServerModule`'s other fields are moved
+/// into the data-plane binds before the bundler runs).
+///
+/// PrefetchEngine runs its own internal worker (spawned in
+/// `PrefetchEngine::new()`); this task holds the engine Arc alive and
+/// waits for cancellation — when prefetch is disabled the engine
+/// silently drops all queued tasks.
+pub(crate) fn spawn_prefetch_loop(
+    prefetch_engine: Arc<oceanfs_cache::PrefetchEngine>,
+    bg: &mut crate::node::BackgroundTasks,
+) {
+    use tracing::info;
+
+    let prefetch_token = bg.prefetch_cancel.clone();
+    bg.prefetch = Some(tokio::spawn(async move {
+        // Hold the engine alive for the lifetime of this task.
+        let _engine = prefetch_engine;
+        prefetch_token.cancelled().await;
+        info!("Prefetch task cancelled");
+    }));
+}

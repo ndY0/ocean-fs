@@ -180,4 +180,10 @@ impl DataPlaneModule {
             grpc_server_handle,
         })
     }
+
+    /// Registers the data plane's metric series (the shared pool) with
+    /// the node's central registry (c5 — replaces the §12 register line).
+    pub(crate) fn register_metrics(&self, registrar: &dyn oceanfs_core::MetricRegistrar) {
+        self.pool.register_metrics(registrar);
+    }
 }

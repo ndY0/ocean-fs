@@ -13,7 +13,8 @@
 use std::sync::Arc;
 
 use oceanfs_core::{
-    shard, NodeConfig, NodeId, PoolConfig, SegmentId, SegmentSizeConfig, SizeTier, WalConfig,
+    shard, MetricRegistrar, NodeConfig, NodeId, PoolConfig, SegmentId, SegmentSizeConfig, SizeTier,
+    WalConfig,
 };
 use oceanfs_durability::{
     recover_incomplete_compactions, CompactionRecoveryAction, StoreObjectLookup,
@@ -670,6 +671,79 @@ impl StorageModule {
             }
         }
         Ok(())
+    }
+
+    /// Registers the storage-owned metric series with the node's central
+    /// registry (c5 — replaces the §12 per-component register lines the
+    /// inline code carried) and starts the RocksDB property-gauge
+    /// polling task (every 30s).
+    pub(crate) fn register_metrics(&self, metrics: &oceanfs_server::admin::MetricsRegistry) {
+        metrics.register_gauge(self.startup_rebuild_gauge.clone());
+        self.accel.register_metrics(metrics);
+        self.shard_buffer_pool.register_metrics(metrics);
+        // Segment shard gauges (`segment_active_count` — Phase 2
+        // asserts the segment pipeline is producing segments).
+        self.shard_small.register_metrics(metrics);
+        self.shard_standard.register_metrics(metrics);
+        self.wal_writer.register_metrics(metrics);
+        self.sealer.register_metrics(metrics);
+        // Lifecycle registry-size gauges (ADR-0025 Decision 5 — the
+        // registry's O(live segments) memory cost is metric-visible).
+        self.lifecycle.register_metrics(metrics);
+        // Event WAL metrics (ADR-0024 — bytes, files, append count).
+        self.event_wal.register_metrics(metrics);
+        // Checkpoint metrics (checkpoint bytes written, bytes truncated).
+        self.event_checkpoint.register_metrics(metrics);
+        // Storage pool metrics (ADR-0029 — status, bytes free/total,
+        // I/O error counter per pool).
+        self.registry.register_metrics(metrics);
+        // Seal-time segment replication metrics (pushed/bytes/retries/
+        // failures/needs gauge).
+        self.segment_replicator.register_metrics(metrics);
+        // Register RocksDB property gauges into the central registry.
+        self.metadata_store.metrics().register(metrics);
+        // Start the background RocksDB metrics polling task (every 30s).
+        self.metadata_store.start_metrics_task();
+    }
+
+    /// Spawns the storage-owned background loops (c5 — each worker owns
+    /// its startup sequence): the pool health monitor (g2,
+    /// ADR-0029 §D3 — ticks each pool through the D3 state machine) and
+    /// the seal-time segment replicator drain loop
+    /// (sealed-segment-replication). Returns the monitor's status-event
+    /// receiver — the health-consequence applier consumes it (spawned
+    /// by the background bundler, which owns that composition).
+    pub(crate) fn spawn_loops(
+        &self,
+        bg: &mut crate::node::BackgroundTasks,
+    ) -> tokio::sync::mpsc::Receiver<oceanfs_storage::pool::health::HealthEvent> {
+        use oceanfs_storage::pool::health::{HealthMonitor, HealthMonitorConfig};
+        use tracing::info;
+
+        let (health_monitor, health_events) = HealthMonitor::new(
+            self.registry.clone(),
+            self.io_observer.clone(),
+            HealthMonitorConfig::default(),
+        );
+        let health_token = bg.health_cancel.clone();
+        bg.health_monitor = Some(tokio::spawn(async move {
+            health_monitor.run(health_token).await;
+            info!("Pool health monitor stopped");
+        }));
+
+        // Seal-time segment replicator (sealed-segment-replication). The
+        // drain loop consumes sealed-segment events (seal worker +
+        // compactor + startup pass) and pushes each segment's data to
+        // its ring replicas; the sweep retries the needs set. Runs until
+        // shutdown.
+        let replicator_token = bg.segment_replicator_cancel.clone();
+        let replicator_for_spawn = Arc::clone(&self.segment_replicator);
+        bg.segment_replicator = Some(tokio::spawn(async move {
+            replicator_for_spawn.run(replicator_token).await;
+            info!("Segment replicator stopped");
+        }));
+
+        health_events
     }
 }
 

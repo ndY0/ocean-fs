@@ -14,11 +14,12 @@
 //! into `storage.lifecycle`) and error propagation are identical to the
 //! inline code this replaces. No behavior change.
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use oceanfs_core::{CodecConfig, MetricRegistrar, NodeConfig, NodeId, OperationTimeouts};
 use oceanfs_durability::{
-    AntiEntropy, GarbageCollector, HealConfig, HealQueue, HealWorker, OrphanReaper, ReRepWorker,
+    AntiEntropy, GarbageCollector, GrpcHintDeliveryClient, HealConfig, HealQueue, HealWorker,
+    HintedHandoff, HintedHandoffConfig, HintedHandoffManager, OrphanReaper, ReRepWorker,
     ScrubConfig, ScrubCoordinator,
 };
 use oceanfs_membership::Membership;
@@ -26,7 +27,10 @@ use oceanfs_network::ConnectionPool;
 
 use crate::{
     announce::AnnounceMetrics,
+    membership_state::MembershipStateStore,
     modules::storage::StorageModule,
+    node::BackgroundTasks,
+    pool_paths::PoolPaths,
     repair::{ManifestRepairTargetSelector, RepairDispatcher},
 };
 
@@ -67,6 +71,14 @@ pub(crate) struct DurabilityModule {
     /// g3 announcement transmit counters (shared by the compactor remap
     /// closure here and the node's §16b loss-announcer closure).
     pub(crate) announce_metrics: Arc<AnnounceMetrics>,
+    /// The legacy gRPC hint receiver (`HintedHandoff`) — consumed by the
+    /// c3 healing service (c5 re-seat of node.rs §11: the hinted-handoff
+    /// machinery belongs to the durability domain).
+    pub(crate) hinted_handoff: Arc<HintedHandoff>,
+    /// The durable hinted-handoff manager (ADR-0018/ADR-0027) — the
+    /// write path enqueues through it; its prune + delivery watcher
+    /// loops are spawned by [`spawn_loops`](Self::spawn_loops).
+    pub(crate) hinted_handoff_manager: Arc<HintedHandoffManager>,
 }
 
 impl DurabilityModule {
@@ -86,8 +98,10 @@ impl DurabilityModule {
     /// `StorageModule` bundle whose single shared stores, lifecycle
     /// machinery, metadata store and segment replicator every worker is
     /// wired to; `membership` and `pool` are network-side handles the
-    /// workers and the compaction-remap closure need (still owned by
-    /// `Node::start()` — c4 re-homes them).
+    /// workers and the compaction-remap closure need (c4 re-homed them);
+    /// `paths` provides the role-pinned hints pool root and `grpc_addr`
+    /// the node's own data-plane listener address — both feed the
+    /// durable hinted-handoff machinery (c5 re-seat of node.rs §11).
     ///
     /// # Errors
     ///
@@ -99,6 +113,8 @@ impl DurabilityModule {
         storage: &StorageModule,
         membership: Arc<Membership>,
         pool: Arc<ConnectionPool>,
+        paths: &PoolPaths,
+        grpc_addr: SocketAddr,
     ) -> Result<Self, String> {
         // ---- 7. Construct durability workers ----
         let gc_config = oceanfs_durability::GcConfig::new(
@@ -360,6 +376,52 @@ impl DurabilityModule {
             .with_timeouts(op_timeouts.clone()),
         );
 
+        // ---- Hinted handoff machinery (c5 re-seat of node.rs §11) ----
+        // The legacy gRPC receiver: the hint receiver fetches
+        // segment-ref data back from THIS node's gRPC listener
+        // (remote_addr on the receiver is the ephemeral source port —
+        // dead by fetch time). The self address is the parsed
+        // `grpc_listen_addr` — startup already failed if that address
+        // was unparseable (B2: no silent default network address).
+        let hinted_handoff = Arc::new(
+            HintedHandoff::new_with_pool(pool.clone())
+                .with_membership(membership.clone())
+                .with_timeouts(op_timeouts.clone()),
+        );
+
+        // The persistent per-node HintWAL + manager for durable hinted
+        // handoff (ADR-0018 Decision 2). The hints WAL lives on the
+        // pinned hints pool root (resolved in pool_paths; the legacy
+        // `hint_wal_dir` override was removed by ADR-0031 D2).
+        let hints_dir = paths.hints.clone();
+        let hint_delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
+            Arc::new(GrpcHintDeliveryClient::new(pool.clone()).with_self_grpc_addr(grpc_addr));
+        // [review][config][fhigh]
+        // no magic constants, user should be able to configure the subsystem
+        // [end]
+        let hint_config = HintedHandoffConfig {
+            wal_dir: hints_dir.clone(),
+            inline_threshold_bytes: config.hint_inline_threshold_bytes,
+            max_batch_size: config.hint_max_batch_size,
+            max_batch_bytes: 32 * 1024 * 1024,
+        };
+        let hinted_handoff_manager = Arc::new(
+            HintedHandoffManager::new(hints_dir.clone(), hint_delivery_client, hint_config.clone())
+                .with_membership(membership.clone())
+                .with_timeouts(op_timeouts.clone()), // Delivery contract (ADR-0027 as amended): hints are
+                                                     // NEVER dropped at the sender — deliver everything, the
+                                                     // receiver's HLC-LWW apply is the single gate. The old
+                                                     // obsolete pre-check dropped hints based on the sender's
+                                                     // view of distributed state, which could diverge from
+                                                     // the truth (the churn residual class).
+        );
+
+        // Replay existing hints from the WAL into in-memory queues.
+        hinted_handoff_manager
+            .replay_and_enqueue()
+            .await
+            .map_err(|e| format!("hinted handoff WAL replay: {e}"))?;
+
         Ok(Self {
             gc: gc_worker,
             ae: ae_worker,
@@ -373,6 +435,8 @@ impl DurabilityModule {
             ec_decoder,
             codec_config,
             announce_metrics,
+            hinted_handoff,
+            hinted_handoff_manager,
         })
     }
 
@@ -391,6 +455,428 @@ impl DurabilityModule {
         self.reconciliation.register_metrics(registrar);
         // g5 re-replication (ADR-0030 observability).
         self.repair_dispatcher.register_metrics(registrar);
+        // The manager is the component that actually stores and delivers
+        // hints; its counters are the authoritative
+        // hinted_handoff_hints_{stored,delivered,expired}_total series.
+        // (The legacy HintedHandoff — the gRPC *receiver* — is not
+        // registered: its counters had inverted semantics and stayed 0.)
+        self.hinted_handoff_manager.register_metrics(registrar);
+    }
+
+    /// Spawns every durability-owned background loop (c5 — each worker
+    /// owns its startup sequence) and fills the corresponding
+    /// `BackgroundTasks` fields.
+    ///
+    /// Loops: GC, anti-entropy, scrub, orphan reaper, EC heal worker,
+    /// the hint-WAL prune loop, the hinted-handoff delivery watcher
+    /// (§17 — also records fallback seeds on Alive events, ADR-0022
+    /// D3), the periodic reconciliation loop (g4) and the re-replication
+    /// worker + dispatcher (g5). The delivery watcher needs the
+    /// membership event stream + the durable state store, so it is
+    /// spawned here and not in `build` (membership must be started
+    /// first — `spawn_all` runs after the membership plane is up).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_loops(
+        &self,
+        config: &NodeConfig,
+        storage: &StorageModule,
+        membership: Arc<Membership>,
+        membership_state_store: MembershipStateStore,
+        bg: &mut BackgroundTasks,
+    ) {
+        use std::time::Duration;
+
+        use tokio_util::sync::CancellationToken;
+        use tracing::{info, warn};
+
+        // The spawned loops hold the registry across 'static spawns.
+        let gc_registry = Arc::clone(&storage.lifecycle_registry);
+        let scrub_registry = Arc::clone(&storage.lifecycle_registry);
+
+        // GC: runs every gc_interval_sec from config.
+        let gc_cancel = CancellationToken::new();
+        let gc_token = gc_cancel.clone();
+        let gc_store = storage.metadata_store.clone();
+        let gc_interval = Duration::from_secs(config.gc_interval_sec);
+        let io_idle = config.background_io_class_idle;
+        let cpu_idle = config.background_cpu_sched_idle;
+        let gc_worker = Arc::clone(&self.gc);
+        bg.gc = Some(tokio::spawn(async move {
+            if io_idle {
+                oceanfs_storage::io::apply_background_io_class("gc");
+            }
+            if cpu_idle {
+                oceanfs_storage::io::apply_background_cpu_sched("gc");
+            }
+            let mut interval = tokio::time::interval(gc_interval);
+            loop {
+                tokio::select! {
+                    _ = gc_token.cancelled() => {
+                        info!("GC task cancelled");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        if let Err(e) = gc_worker.run_cycle(gc_store.clone(), &gc_registry).await
+                        {
+                            warn!("GC cycle error: {e}");
+                        }
+                    }
+                }
+            }
+        }));
+        bg.gc_cancel = gc_cancel;
+
+        // Anti-entropy: runs every ae_interval_sec from config.
+        // Continuous mode exchanges Merkle ROOTS with peers via the
+        // incremental tree — it never reads segment data, so per-cycle
+        // cost is O(sealed segments) metadata calls instead of reading
+        // every segment file (GBs per cycle on the phase-2 SUT, which
+        // stalled cycles for 90s+ under load and spiked RSS). The full
+        // cycle (reads all data + rebuilds trees) stays available for
+        // `continuous_enabled = false`.
+        let ae_cancel = CancellationToken::new();
+        let ae_token = ae_cancel.clone();
+        let ae_interval_secs = config.ae_interval_sec;
+        let ae_continuous = config.anti_entropy.continuous_enabled;
+        let io_idle = config.background_io_class_idle;
+        let cpu_idle = config.background_cpu_sched_idle;
+        let ae_worker = Arc::clone(&self.ae);
+        bg.anti_entropy = Some(tokio::spawn(async move {
+            if io_idle {
+                oceanfs_storage::io::apply_background_io_class("anti-entropy");
+            }
+            if cpu_idle {
+                oceanfs_storage::io::apply_background_cpu_sched("anti-entropy");
+            }
+            let mut interval = tokio::time::interval(Duration::from_secs(ae_interval_secs));
+            loop {
+                tokio::select! {
+                    _ = ae_token.cancelled() => {
+                        info!("Anti-entropy task cancelled");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        let result = if ae_continuous {
+                            ae_worker.run_continuous_cycle().await
+                        } else {
+                            ae_worker.run_cycle().await
+                        };
+                        if let Err(e) = result {
+                            warn!("Anti-entropy cycle error: {e}");
+                        }
+                    }
+                }
+            }
+        }));
+        bg.ae_cancel = ae_cancel;
+
+        // Scrub: runs every scrub_interval_sec from config.
+        let scrub_cancel = CancellationToken::new();
+        let scrub_token = scrub_cancel.clone();
+        let scrub_data = storage.data_store.clone();
+        let scrub_interval_secs = config.scrub_interval_sec;
+        let io_idle = config.background_io_class_idle;
+        let cpu_idle = config.background_cpu_sched_idle;
+        let scrub_worker = Arc::clone(&self.scrub);
+        bg.scrub = Some(tokio::spawn(async move {
+            if io_idle {
+                oceanfs_storage::io::apply_background_io_class("scrub");
+            }
+            if cpu_idle {
+                oceanfs_storage::io::apply_background_cpu_sched("scrub");
+            }
+            let mut interval = tokio::time::interval(Duration::from_secs(scrub_interval_secs));
+            loop {
+                tokio::select! {
+                    _ = scrub_token.cancelled() => {
+                        info!("Scrub task cancelled");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        match scrub_worker
+                            .run_cycle(Arc::clone(&scrub_registry), scrub_data.clone())
+                            .await
+                        {
+                            Ok(report) => {
+                                if report.segments_corrupt() > 0 {
+                                    warn!(
+                                        corrupt = report.segments_corrupt(),
+                                        "scrub detected corrupt segments"
+                                    );
+                                }
+                            }
+                            Err(e) => warn!("Scrub cycle error: {e}"),
+                        }
+                    }
+                }
+            }
+        }));
+        bg.scrub_cancel = scrub_cancel;
+
+        // Orphan reaper: runs every orphan_reaper_interval_sec from config.
+        let reaper_cancel = CancellationToken::new();
+        let reaper_token = reaper_cancel.clone();
+        let reaper_interval = Duration::from_secs(config.orphan_reaper_interval_sec);
+        let io_idle = config.background_io_class_idle;
+        let cpu_idle = config.background_cpu_sched_idle;
+        let reaper = Arc::clone(&self.reaper);
+        bg.orphan_reaper = Some(tokio::spawn(async move {
+            if io_idle {
+                oceanfs_storage::io::apply_background_io_class("orphan-reaper");
+            }
+            if cpu_idle {
+                oceanfs_storage::io::apply_background_cpu_sched("orphan-reaper");
+            }
+            let mut interval = tokio::time::interval(reaper_interval);
+            loop {
+                tokio::select! {
+                    _ = reaper_token.cancelled() => {
+                        info!("Orphan reaper task cancelled");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        if let Err(e) = reaper.run_cycle().await {
+                            warn!("Orphan reaper cycle error: {e}");
+                        }
+                    }
+                }
+            }
+        }));
+        bg.reaper_cancel = reaper_cancel;
+
+        // EC Heal worker: drains the HealQueue and repairs corrupt shards.
+        let heal_cancel = CancellationToken::new();
+        let heal_token = heal_cancel.clone();
+        let io_idle = config.background_io_class_idle;
+        let cpu_idle = config.background_cpu_sched_idle;
+        let heal_worker = Arc::clone(&self.heal);
+        bg.heal = Some(tokio::spawn(async move {
+            if io_idle {
+                oceanfs_storage::io::apply_background_io_class("heal");
+            }
+            if cpu_idle {
+                oceanfs_storage::io::apply_background_cpu_sched("heal");
+            }
+            heal_worker.run(heal_token).await;
+            info!("Heal worker task completed");
+        }));
+        bg.heal_cancel = heal_cancel;
+
+        // Hinted handoff delivery watcher token — the watcher below
+        // consumes it; both live in this method.
+        let delivery_cancel = CancellationToken::new();
+
+        // Hinted handoff WAL periodic prune — removes expired entries
+        // from all per-node WAL files to bound storage growth.
+        let hint_prune_cancel = CancellationToken::new();
+        let hint_prune_token = hint_prune_cancel.clone();
+        let hint_ttl_secs = config.hint_ttl_sec;
+        let hint_prune_interval = Duration::from_secs(config.hint_prune_interval_sec);
+        let hh_prune = Arc::clone(&self.hinted_handoff_manager);
+        bg.hinted_handoff_prune = Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(hint_prune_interval);
+            loop {
+                tokio::select! {
+                    _ = hint_prune_token.cancelled() => {
+                        info!("Hinted handoff WAL prune task cancelled");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        match hh_prune.prune_all_expired(hint_ttl_secs).await {
+                            Ok(0) => {}
+                            Ok(n) => {
+                                info!(pruned = n, "pruned expired hinted handoff entries from per-node WALs");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "hinted handoff WAL prune cycle error");
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+        bg.hint_prune_cancel = hint_prune_cancel;
+
+        // Periodic reconciliation loop (g4 — ADR-0029 §D4 pull safety
+        // net). Event-driven wake + bounded risk-prioritized queue +
+        // hourly drift scan. Runs independently of announcements — the
+        // complete safety net.
+        let reconciliation_cancel = CancellationToken::new();
+        let reconciliation_token = reconciliation_cancel.clone();
+        let reconciliation_for_spawn = Arc::clone(&self.reconciliation);
+        bg.reconciliation = Some(tokio::spawn(async move {
+            reconciliation_for_spawn.run(reconciliation_token).await;
+            info!("Reconciliation loop stopped");
+        }));
+        bg.reconciliation_cancel = reconciliation_cancel;
+
+        // Re-replication worker + dispatcher (g5, ADR-0030 target-pull).
+        // The worker drains the acquiring-side queue (fed by the
+        // request_re_replication RPC handler) and pulls + writes +
+        // stamps; the dispatcher retries parked requests that had no
+        // eligible target.
+        let rep_worker_cancel = CancellationToken::new();
+        let rep_worker_token = rep_worker_cancel.clone();
+        let rep_worker_for_spawn = Arc::clone(&self.rep_worker);
+        bg.rep_worker = Some(tokio::spawn(async move {
+            rep_worker_for_spawn.run(rep_worker_token).await;
+            info!("Re-replication worker stopped");
+        }));
+        bg.rep_worker_cancel = rep_worker_cancel;
+
+        let rep_dispatcher_cancel = CancellationToken::new();
+        let rep_dispatcher_token = rep_dispatcher_cancel.clone();
+        let rep_dispatcher_for_spawn = Arc::clone(&self.repair_dispatcher);
+        bg.rep_dispatcher = Some(tokio::spawn(async move {
+            rep_dispatcher_for_spawn.run(rep_dispatcher_token).await;
+            info!("Re-replication dispatcher stopped");
+        }));
+        bg.rep_dispatcher_cancel = rep_dispatcher_cancel;
+
+        // Hinted handoff delivery watcher (§17): watches for membership
+        // events and drains the handoff buffer for nodes that are (or
+        // return to) ALIVE. Any Alive event — including an Alive→Alive
+        // address update from a rejoin (ADR-0022, t21) — triggers
+        // delivery: `deliver_pending` is a no-op when nothing is
+        // buffered. On the same events it also records the node's
+        // address in the persisted fallback-seed list (ADR-0022 D3) —
+        // incrementally from the event itself, so the write never races
+        // the membership manager's apply step.
+        let hh = Arc::clone(&self.hinted_handoff_manager);
+        let seed_store = membership_state_store.clone();
+        let self_node_id = NodeId::new(&config.node_id);
+        let mut events = membership.subscribe();
+        let delivery_token = delivery_cancel.clone();
+        let mut sweep_interval =
+            tokio::time::interval(Duration::from_secs(config.hint_delivery_sweep_sec.max(1)));
+        let delivery_handle = tokio::spawn(async move {
+            // Bounded retry helper shared by the event path and the sweep
+            // path. The returning node's gRPC listener may still be
+            // binding when the Alive event lands; a failed batch is
+            // re-enqueued, so retries are safe (duplicates are
+            // overwritten on the receiving side).
+            //
+            // Drains the ENTIRE queue per invocation: each iteration
+            // delivers one batch (bounded by max_batch_size and
+            // max_batch_bytes). The old single-batch drain could not
+            // keep up with a full outage's hint debt — with the stable
+            // N-node topology every mutation during an outage becomes
+            // debt, and 7000 hints at 256/batch would take ~27 sweeps
+            // (~135s) to drain, longer than the test settle window.
+            // The batch cap (64) bounds one invocation so a
+            // persistently-rejected batch cannot spin forever.
+            async fn drain_hints(hh: &HintedHandoffManager, node_id: NodeId) {
+                let mut batches = 0u32;
+                while hh.pending_count(&node_id) > 0 && batches < 64 {
+                    batches += 1;
+                    match hh.deliver_pending(node_id.clone()).await {
+                        Ok(0) => {
+                            // Queue empty (or nothing deliverable this
+                            // round) — stop.
+                            break;
+                        }
+                        Ok(delivered) => {
+                            info!(
+                                node = %node_id,
+                                delivered,
+                                batch = batches,
+                                "hinted handoff delivery"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                node = %node_id,
+                                attempt = batches,
+                                error = %e,
+                                "hinted handoff delivery failed"
+                            );
+                            // A failed batch is re-enqueued at the
+                            // front; a few quick retries cover the
+                            // returning node's listener still binding,
+                            // then give up this sweep (the next sweep
+                            // retries).
+                            if batches < 5 {
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            loop {
+                tokio::select! {
+                    _ = delivery_token.cancelled() => {
+                        info!("Hinted handoff delivery watcher cancelled");
+                        break;
+                    }
+                    _ = sweep_interval.tick() => {
+                        // Periodic delivery sweep. Event-driven delivery
+                        // is missed when THIS node is down during the
+                        // recipient's Alive event, or when the event
+                        // lands before the recipient's gRPC listener is
+                        // ready. The sweep re-resolves addresses at sweep
+                        // time, so pending hints drain as soon as the
+                        // recipient is actually reachable — delivery is
+                        // eventually-convergent under churn.
+                        for node_id in hh.nodes_with_pending() {
+                            drain_hints(&hh, node_id).await;
+                        }
+                    }
+                    event = events.recv() => {
+                        match event {
+                            Ok(ev) if ev.new_state == oceanfs_core::NodeState::Alive => {
+                                info!(
+                                    node = %ev.node_id,
+                                    "node returned to cluster; delivering pending hinted handoffs"
+                                );
+                                // Only spend retries when hints are actually
+                                // buffered.
+                                if hh.pending_count(&ev.node_id) > 0 {
+                                    drain_hints(&hh, ev.node_id.clone()).await;
+                                }
+                                // Record the member address as a fallback
+                                // seed (ADR-0022 D3). Self is skipped: the
+                                // node's own old address is useless after a
+                                // restart (t43). The MEMBERSHIP PLANE
+                                // address is recorded — the join dials
+                                // fallback seeds for the gossip pull
+                                // (ADR-0028 D1); the data-plane address in
+                                // `ev.address` would dial a port that does
+                                // not serve GossipRpc (observed: persisted
+                                // data addresses made every rejoin pull
+                                // fail with Unimplemented and strand the
+                                // restarted bootstrap node). Detector
+                                // recovery events carry
+                                // membership_address=None and are skipped —
+                                // the address was recorded when the node
+                                // joined.
+                                if ev.node_id != self_node_id {
+                                    if let Some(addr) = ev.membership_address {
+                                        if let Err(e) = seed_store
+                                            .add_fallback_seed(&addr.to_string())
+                                        {
+                                            warn!(error = %e, "failed to persist fallback seed");
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                warn!(skipped = n, "hinted handoff watcher lagged");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                info!("Membership event channel closed; stopping delivery watcher");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        bg.delivery_cancel = delivery_cancel;
+        bg.hinted_handoff_delivery = Some(delivery_handle);
     }
 }
 
@@ -414,6 +900,8 @@ mod tests {
                 &prelude.module,
                 prelude.membership.clone(),
                 prelude.pool.clone(),
+                &prelude.module.paths,
+                "127.0.0.1:0".parse().expect("grpc addr"),
             )
             .await
             .expect("durability module build"),

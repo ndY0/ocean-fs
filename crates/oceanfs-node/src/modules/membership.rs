@@ -43,8 +43,16 @@ pub(crate) struct MembershipModule {
     /// The incarnation this boot announces with (§4a move).
     pub(crate) announce_incarnation: u64,
     /// Whether this node is a cluster member (seeds or persisted
-    /// fallback seeds) — consumed by the §11 ready gate.
+    /// fallback seeds) — consumed by the ready gate.
     pub(crate) is_cluster_node: bool,
+    /// The cluster-readiness gate (phase-3 churn fix): while closed the
+    /// write path returns 503 (no silent under-replication during ring
+    /// convergence). Opened immediately for single-node deployments;
+    /// for cluster nodes [`Self::spawn_ready_gate`] opens it when the
+    /// ring reaches the configured minimum quorum or the configured
+    /// bound elapses. Consumed by the c3 write coordinator
+    /// (`.with_ready_gate`).
+    pub(crate) ready_gate: Arc<std::sync::atomic::AtomicBool>,
     /// Strictly-parsed data-plane gRPC address (§4 move) — consumed by
     /// the §11 hint-delivery self address.
     pub(crate) grpc_addr: SocketAddr,
@@ -62,6 +70,8 @@ pub(crate) struct MembershipModule {
     /// B6: the configured minimum ring node count the rejoin loop waits
     /// for (review #66/#69).
     min_quorum_nodes: u64,
+    /// The ready-gate bound (`cluster_ready_timeout_sec`).
+    ready_timeout_secs: u64,
     /// Perf 4.3 socket options applied to accepted plane connections.
     quickack: bool,
     busy_poll: u32,
@@ -192,18 +202,26 @@ impl MembershipModule {
         let is_cluster_node =
             !config.gossip.seed_nodes.is_empty() || !durable_state.fallback_seeds.is_empty();
 
+        // The cluster-readiness gate. Single-node deployments never
+        // close it via the loop — it is open from boot.
+        let ready_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if !is_cluster_node {
+            ready_gate.store(true, std::sync::atomic::Ordering::Release);
+        }
         Ok(MembershipModule {
             membership,
             manifest_cache,
             membership_state_store,
             announce_incarnation,
             is_cluster_node,
+            ready_gate,
             grpc_addr,
             membership_pool,
             node_id,
             membership_addr,
             probe_timeout_ms,
             min_quorum_nodes: config.cluster_min_quorum_nodes,
+            ready_timeout_secs: config.cluster_ready_timeout_sec,
             quickack: plane_cfg.quickack,
             busy_poll: plane_cfg.busy_poll_us,
             fallback_seeds: durable_state.fallback_seeds,
@@ -471,4 +489,57 @@ pub(crate) fn cluster_ready_gate_opens(
     deadline_elapsed: bool,
 ) -> bool {
     ring_nodes as u64 >= min_quorum_nodes || deadline_elapsed
+}
+
+impl MembershipModule {
+    /// Spawns the cluster-readiness gate loop (c5 — the gate is a
+    /// membership-plane concern: it opens when the RING reaches the
+    /// configured minimum quorum node count or the configured bound
+    /// elapses). No-op for single-node deployments — their gate is
+    /// already open (see [`ready_gate`](Self::ready_gate)).
+    pub(crate) fn spawn_ready_gate(&self) {
+        if !self.is_cluster_node {
+            return;
+        }
+        use tracing::info;
+        let gate_membership = Arc::clone(&self.membership);
+        let gate = Arc::clone(&self.ready_gate);
+        let gate_timeout_secs = self.ready_timeout_secs.max(1);
+        let min_quorum_nodes = self.min_quorum_nodes;
+        tokio::spawn(async move {
+            // Open the gate when the ring reaches the configured
+            // minimum quorum node count or after the configured
+            // bound — the rejoin pull takes seconds; the bound
+            // keeps a node whose seeds are unreachable from
+            // stalling writes forever (it would serve stale data
+            // anyway — the 503s it emits while gated are the safer
+            // failure mode). The timeout is config
+            // (`cluster_ready_timeout_sec`) because convergence
+            // scales with the gossip profile.
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(gate_timeout_secs);
+            loop {
+                let ring_nodes = gate_membership.ring().snapshot().node_count();
+                if cluster_ready_gate_opens(
+                    ring_nodes,
+                    min_quorum_nodes,
+                    tokio::time::Instant::now() >= deadline,
+                ) {
+                    gate.store(true, std::sync::atomic::Ordering::Release);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            info!("Cluster-readiness gate opened");
+        });
+    }
+
+    /// Registers the membership module's metric series (the peer
+    /// routing cache — ADR-0029 §D5) with the node's central registry
+    /// (c5 — replaces the §12 register line). The gossip series
+    /// register separately inside `start_plane_and_join` (they must
+    /// follow `membership.start()`).
+    pub(crate) fn register_metrics(&self, registrar: &dyn oceanfs_core::MetricRegistrar) {
+        self.manifest_cache.register_metrics(registrar);
+    }
 }

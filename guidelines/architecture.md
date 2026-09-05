@@ -265,6 +265,19 @@ file-count reduction.
 implementations and wires them together. The system's dependency graph
 at startup is visible in one place.
 
+**No `tokio::spawn` in `Node::start()`** (composition-root c1–c5,
+2026-09-05): subsystem modules own their construction AND their startup
+sequences. Each module exposes its own spawn entry points
+(`DurabilityModule::spawn_loops`, `StorageModule::spawn_loops`,
+`MembershipModule::spawn_ready_gate`/`start_plane_and_join`,
+`DataPlaneModule::serve`, `ServerModule::spawn_prefetch_loop`); a
+background *bundler* (`modules/background.rs::spawn_all`) calls the
+module entry points in dependency order and assembles the
+`BackgroundTasks` handle set `Node` stores for shutdown. `Node::start()`
+itself is a sequence of builder + spawn-entry calls only, and every
+background loop is cancellable through a token owned by
+`BackgroundTasks` (drained under the configurable shutdown grace).
+
 `oceanfs-server` defines what the system does (S3 handlers,
 coordinators). It may import concrete crates (`oceanfs-storage`,
 `oceanfs-ec`, `oceanfs-cache`, `oceanfs-accel`) for type re-exports
