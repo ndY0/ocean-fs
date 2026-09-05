@@ -7,12 +7,12 @@ owner: ""
 dependencies:
   - feature: c4-split-network-builder
     epic: refactoring/composition-root-decomposition
-    reason: All four builders must exist before the final start() slimming and spawn extraction
+    reason: "c4 LANDED 2026-09-05 (membership + data-plane modules, one pass) — all c1–c4 module builders exist; c5 is the final extraction — start() slimming + module-owned spawn functions + the one-time // ---- renumber"
 adr:
   - 0031-remove-single-datadir-legacy-mode
 perf: []
 created: 2026-09-04
-updated: 2026-09-04
+updated: 2026-09-05
 ---
 
 # c5: Background-Spawn Extraction + start() Slimming
@@ -32,9 +32,12 @@ the ready-gate task — into module-owned `spawn` functions. Then slim
 ## Scope
 
 ### In Scope
-- Each module (storage/durability/server/network) gains its own
-  `spawn(&self, cancel: &CancellationToken) -> Vec<JoinHandle<()>>`
-  (or a `BackgroundModule` aggregator).
+- Each module (storage/durability/server/membership/data_plane) gains its
+  own `spawn(&self, cancel: &CancellationToken) -> Vec<JoinHandle<()>>`
+  (or a `BackgroundModule` aggregator). The membership module's c4 spawn
+  entry is `start_plane_and_join`; the data-plane module's is `serve`. `c5`
+  completes the picture by adding module-owned `spawn` functions for the
+  remaining background loops (see Summary).
 - `BackgroundTasks` struct + shutdown sequence (`node.rs:3107-3213`)
   simplified to aggregate module handles.
 - Configurable shutdown grace period (review #71) lands here (replaces

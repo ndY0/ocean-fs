@@ -12,8 +12,8 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use oceanfs_core::{
-    AccelConfig, Incarnation, MetadataConfig, MetricRegistrar, NodeConfig, NodeId, RingConfig,
-    RpcConfig, SegmentId, WalConfig,
+    AccelConfig, MetadataConfig, MetricRegistrar, NodeConfig, NodeId, RingConfig, SegmentId,
+    WalConfig,
 };
 #[cfg(test)]
 use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata, SegmentSizeConfig};
@@ -22,33 +22,17 @@ pub use oceanfs_durability::healing_service::ReRepRequest as RepairRequest;
 use oceanfs_durability::{
     GrpcHintDeliveryClient, HintedHandoff, HintedHandoffConfig, HintedHandoffManager,
 };
-use oceanfs_network::{apply_opts_to_fd, create_reuseport_listener};
 use tokio::{sync::broadcast, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
-use crate::membership_state::{default_state_path, MembershipStateStore};
+use crate::modules::membership::cluster_ready_gate_opens;
 #[cfg(test)]
 use crate::modules::server::PrefetchStoreAdapter;
 
 // ---------------------------------------------------------------------------
 // BackgroundTasks
 // ---------------------------------------------------------------------------
-/// Whether the cluster-readiness gate opens for the given ring view
-/// (B6, review #66/#69).
-///
-/// The gate opens when the ring holds at least the configured minimum
-/// quorum node count (`cluster_min_quorum_nodes`) or when the
-/// configured deadline has elapsed (the bound keeps a node whose seeds
-/// are unreachable from stalling writes forever). Single-node
-/// deployments never consult this — they skip the gate entirely.
-fn cluster_ready_gate_opens(
-    ring_nodes: usize,
-    min_quorum_nodes: u64,
-    deadline_elapsed: bool,
-) -> bool {
-    ring_nodes as u64 >= min_quorum_nodes || deadline_elapsed
-}
 // [review][architecture][critical]
 // we are running a lot of background tasks, each independently managing the following :
 // - concurrency
@@ -287,97 +271,30 @@ impl Node {
         let ring = oceanfs_routing::Ring::new(ring_config);
         let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
 
-        // ---- 4. Construct membership ----
-        let grpc_addr: SocketAddr = config
-            .grpc_listen_addr
-            .parse()
-            .map_err(|e| format!("invalid grpc_listen_addr: {e}"))?;
-        // ADR-0028 D1: the announced membership address is the membership
-        // plane's listen address with the data-plane's advertised IP
-        // substituted for 0.0.0.0 (the gRPC address is already the
-        // reachable IP — the deploy scripts write the node's IP there).
-        let membership_addr: SocketAddr = config
-            .membership_listen_addr
-            .parse()
-            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 9002)));
-        let membership_announce_addr = if membership_addr.ip().is_unspecified() {
-            oceanfs_membership::plane::membership_address(
-                &config.membership_listen_addr,
-                Some(&grpc_addr.ip().to_string()),
-            )
-        } else {
-            membership_addr
-        };
-        let gossip_config = config.gossip.clone();
-        let membership = Arc::new(oceanfs_membership::Membership::new(
-            NodeId::new(&config.node_id),
-            membership_announce_addr,
-            grpc_addr,
-            gossip_config,
-            ring_cache.clone(),
-        ));
-
-        // ---- 4a. Rejoin state (ADR-0022) ----
-        // Load the persisted incarnation and fallback seeds so a restart
-        // rejoins as the same identity with a bumped incarnation (D1) and
-        // can re-contact the cluster when configured seeds are unreachable
-        // or empty (D3).
-        // [review][config][critical]
-        // membership persistante across restart information follow the old one data dir approach.
-        // this is incompatible with the pooled data dirs approach.
-        // moreover, loosing the data drive means loosing the ability to rejoin at restart. this should not be possible.
-        // a safer approach, using a foreign config store for cluster critical informations should be considered instead.
-        // [end]
-        let membership_state_store =
-            MembershipStateStore::new(default_state_path(&config.data_dir));
-        let durable_state = membership_state_store.load().map_err(|e| {
-            format!(
-                "failed to load membership state at {}: {e}",
-                default_state_path(&config.data_dir).display()
-            )
-        })?;
-
-        // Announce with persisted + 1; first boot keeps 1 (spec §13.1).
-        let announce_incarnation = durable_state.self_incarnation.map_or(1, |p| p + 1);
-
-        // Write-through the bump BEFORE announcing: if the process dies
-        // after announcing but before persisting, the next restart would
-        // re-announce the same incarnation and be rejected as stale.
-        membership_state_store
-            .save_incarnation(announce_incarnation)
-            .map_err(|e| format!("failed to persist self incarnation: {e}"))?;
-        info!(
-            node_id = %config.node_id,
-            incarnation = announce_incarnation,
-            fallback_seeds = durable_state.fallback_seeds.len(),
-            "rejoin state loaded: announcing with bumped incarnation"
-        );
-
-        // ---- 4b. Peer-side routing cache (ADR-0029 §D5) ----
-        // The per-peer NodeManifest cache consulted as a routing hint by
-        // the read/write coordinators (lock-free ArcSwap reads on the
-        // hot path; populated from membership events below and seeded
-        // with the self manifest at step 15d). Phase A: every manifest
-        // is Healthy, so the exclusion filters are observationally
-        // neutral — the structure and metrics land for Phase B.
-        let manifest_cache = Arc::new(crate::routing_cache::ManifestCache::new());
-
-        // [review][config][high]
-        // no rpc config from config is operational, only the default values are used. rpc should be configurable
-        // [end]
-        // ---- 5. Construct connection pools ----
-        let rpc_config = RpcConfig::default();
-        let quickack = rpc_config.quickack;
-        let busy_poll = rpc_config.busy_poll_us;
-        // ADR-0028 D1: the membership plane has its own dedicated pool
-        // (per-peer 2, probe-derived timeouts) so probe/gossip latency is
-        // never coupled to the data plane's channel semaphore.
-        let membership_pool = oceanfs_membership::plane::membership_pool(
-            config.gossip.failure_timeout_ms / 3,
-            rpc_config.tls_cert_path.clone(),
-        );
-        let pool = Arc::new(oceanfs_network::ConnectionPool::new(rpc_config));
-        membership.set_pool(membership_pool.clone());
+        // ---- 4-5. Membership + data-plane modules (c4 — planes split) ----
+        // The membership plane (membership state + rejoin persistence +
+        // peer manifest cache + the plane's dedicated pool) and the data
+        // plane (the shared data connection pool + strictly-parsed bind
+        // addresses) are built here; their LISTENERS and bootstrap run
+        // later — `DataPlaneModule::serve` once the server module has
+        // built the router + services, then
+        // `MembershipModule::start_plane_and_join` (the join must follow
+        // the data-plane binds: peers probe and deliver hinted handoffs
+        // to our gRPC listener immediately after the join announcement).
+        // Address parsing is STRICT (review #64 — no silent default
+        // network addresses).
+        let membership_module =
+            crate::modules::membership::MembershipModule::build(&config, ring_cache.clone())?;
+        let data_plane_module = crate::modules::data_plane::DataPlaneModule::build(&config)?;
+        // Startup aliases: the rest of the sequence consumes these; the
+        // modules keep their own handles alive.
+        let membership = Arc::clone(&membership_module.membership);
+        let pool = Arc::clone(&data_plane_module.pool);
+        let manifest_cache = Arc::clone(&membership_module.manifest_cache);
+        let membership_state_store = membership_module.membership_state_store.clone();
+        let announce_incarnation = membership_module.announce_incarnation;
+        let is_cluster_node = membership_module.is_cluster_node;
+        let grpc_addr = membership_module.grpc_addr;
 
         // [review][config][critical]
         // segment tiers sizes should be configurable by the end user too
@@ -485,11 +402,8 @@ impl Node {
         // returns 503 instead. Single-node deployments (no seeds, no
         // fallback seeds) never close the gate.
         let ready_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let is_cluster_node = !config.gossip.seed_nodes.is_empty()
-            || membership_state_store
-                .load()
-                .map(|state| !state.fallback_seeds.is_empty())
-                .unwrap_or(false);
+        // (c4: `is_cluster_node` derives inside the membership module —
+        // configured seeds or persisted fallback seeds.)
         if is_cluster_node {
             let gate_membership = membership.clone();
             let gate = ready_gate.clone();
@@ -539,14 +453,12 @@ impl Node {
         // node-side series (durability, hinted handoff, pools, storage
         // WAL/pools/replicator, RocksDB) register right below.
         let metrics = Arc::new(oceanfs_server::admin::MetricsRegistry::new());
-        let metrics_for_late_registration = Arc::clone(&metrics);
         let server = crate::modules::server::ServerModule::build(
             &config,
             &storage,
             &durability,
             membership.clone(),
             pool.clone(),
-            membership_pool,
             ring_cache.clone(),
             manifest_cache.clone(),
             hinted_handoff,
@@ -639,258 +551,15 @@ impl Node {
                 active_segments_gauge.set(live as u64);
             }
         });
-        // ---- 14. Bind HTTP server ----
-        let http_listener = tokio::net::TcpListener::bind(&config.listen_addr)
-            .await
-            .map_err(|e| format!("failed to bind HTTP server on {}: {e}", config.listen_addr))?;
-        let server_addr = http_listener.local_addr()?;
-
-        let http_shutdown = CancellationToken::new();
-        let http_shutdown_signal = http_shutdown.clone();
-
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(http_listener, server.router.into_make_service())
-                .with_graceful_shutdown(http_shutdown_signal.cancelled_owned())
-                .await
-            {
-                error!("HTTP server error: {e}");
-            }
-        });
-
-        // ---- 15. Bind gRPC server ----
-        let grpc_addr: SocketAddr = config
-            .grpc_listen_addr
-            .parse()
-            .map_err(|e| format!("invalid grpc_listen_addr: {e}"))?;
-
-        // The data-plane gRPC services are constructed inside the server
-        // module (c3) with their decode caps baked into the wrapped RPC
-        // servers; the tonic router assembly lives at the bind. The
-        // membership gossip/probe services are returned unwrapped for
-        // the membership-plane bind at §15b.
-        let grpc_router = tonic::transport::Server::builder()
-            .add_service(server.grpc.segment)
-            .add_service(server.grpc.healing)
-            .add_service(server.grpc.cache)
-            .add_service(server.grpc.scrub);
-
-        // Create gRPC shutdown token before spawning so it can be used
-        // by both the gRPC server and BackgroundTasks.
-        let grpc_shutdown = CancellationToken::new();
-        let _grpc_shutdown_signal = grpc_shutdown.clone();
-
-        let grpc_server_handle = tokio::spawn(async move {
-            use std::os::unix::io::AsRawFd;
-
-            use tokio_stream::StreamExt;
-
-            let listener = match create_reuseport_listener(grpc_addr) {
-                Ok(l) => l,
-                Err(e) => {
-                    error!("gRPC listener creation failed for {grpc_addr}: {e}");
-                    return;
-                }
-            };
-
-            let stream =
-                tokio_stream::wrappers::TcpListenerStream::new(listener).map(move |conn| {
-                    if let Ok(ref stream) = conn {
-                        apply_opts_to_fd(stream.as_raw_fd(), quickack, busy_poll);
-                    }
-                    conn
-                });
-
-            if let Err(e) = grpc_router.serve_with_incoming(stream).await {
-                error!("gRPC server error: {e}");
-            }
-        });
-
-        // ---- 15b. Bind the membership plane (ADR-0028 D1) ----
-        // A separate listener on membership_listen_addr hosting ONLY the
-        // membership services: GossipRpc (push/pull) + ProbeRpc (SWIM).
-        // Isolation from the data plane is the point — probe latency must
-        // not inherit the data plane's tail (16 MiB streams, hint
-        // batches). Bound BEFORE membership.start(): peers probe and
-        // push to this listener immediately after the join announcement.
-        let membership_router = tonic::transport::Server::builder()
-            .add_service(oceanfs_network::GossipRpcServer::new(server.gossip_service))
-            .add_service(oceanfs_network::gossip::probe_rpc_server::ProbeRpcServer::new(
-                server.probe_service,
-            ));
-
-        let membership_listener = match create_reuseport_listener(membership_addr) {
-            Ok(l) => l,
-            Err(e) => {
-                error!("membership plane listener creation failed for {membership_addr}: {e}");
-                return Err(format!(
-                    "membership plane listener creation failed for {membership_addr}: {e}"
-                )
-                .into());
-            }
-        };
-
-        tokio::spawn(async move {
-            // Same socket treatment as the data plane (perf 4.3):
-            // quickack + busy-poll on accepted membership connections —
-            // probe latency is the detection bound.
-            use std::os::unix::io::AsRawFd;
-
-            use tokio_stream::StreamExt;
-
-            let stream = tokio_stream::wrappers::TcpListenerStream::new(membership_listener).map(
-                move |conn| {
-                    if let Ok(ref stream) = conn {
-                        apply_opts_to_fd(stream.as_raw_fd(), quickack, busy_poll);
-                    }
-                    conn
-                },
-            );
-            if let Err(e) = membership_router.serve_with_incoming(stream).await {
-                error!("membership plane server error: {e}");
-            }
-        });
-
-        // ---- 15c. Bootstrap membership: start failure detection +
-        // gossip, then join the ring. MUST happen after the gRPC server
-        // is bound: peers probe and deliver hinted handoffs to our gRPC
-        // listener immediately after the join announcement, and a join
-        // that precedes the bind produces join-time false Suspects and
+        // ---- 14-15. Bind the data plane + start the membership plane
+        // (c4 — planes split). Order matters: the membership plane's
+        // `start_plane_and_join` MUST follow the data-plane binds —
+        // peers probe and deliver hinted handoffs to our gRPC listener
+        // immediately after the join announcement, and a join that
+        // precedes the bind produces join-time false Suspects and
         // refused hint deliveries (t5/t21).
-        membership.start().map_err(|e| format!("failed to start membership: {e}"))?;
-        // Register the gossip metrics AFTER start(): the gossip
-        // protocol + its counters/histograms are created inside
-        // start() — an earlier registration captured None and the
-        // gossip series never appeared (the timing-metrics run
-        // queried an empty metric).
-        membership.register_membership_metrics(&*metrics_for_late_registration);
-
-        // ---- 15d. Declare the storage-pool manifest (ADR-0029 D2) ----
-        // Built once from the registry with the announce incarnation and
-        // attached to the self membership entry: the version bump the
-        // manifest triggers is all the gossip plane needs to propagate it
-        // (a pool change is not a restart — the incarnation is untouched).
-        // Phase A registers at boot only; f8 (runtime-attach) re-declares
-        // on pool set changes. The join() below carries the manifest in
-        // its self-announcement, so seeds learn it immediately.
-        let node_manifest =
-            crate::pool_manifest::build_node_manifest(announce_incarnation, &storage.registry);
-        membership.set_self_manifest(node_manifest.clone());
-        // Seed the routing cache with the self manifest so the node's
-        // own pool state is visible to the exclusion filters (and the
-        // peers' caches converge to include it via gossip).
-        manifest_cache.update(NodeId::new(&config.node_id), Arc::new(node_manifest));
-
-        // ---- 15e. Routing-cache event subscriber (ADR-0029 §D5) ----
-        // Populates the per-peer manifest cache from membership events:
-        // version-bumped entries carry the manifest (f6), Dead/Left
-        // members are evicted. The cache is a hint — a stale-but-present
-        // manifest beats absent, and the error path is the guarantee.
-        let cache_events = membership.subscribe();
-        let cache_for_events = manifest_cache.clone();
-        let cache_shutdown = membership.shutdown_token();
-        tokio::spawn(async move {
-            let mut cache_events = cache_events;
-            loop {
-                tokio::select! {
-                    event = cache_events.recv() => {
-                        match event {
-                            Ok(ev) => {
-                                match ev.new_state {
-                                    oceanfs_core::NodeState::Dead
-                                    | oceanfs_core::NodeState::Left => {
-                                        cache_for_events.remove(&ev.node_id);
-                                    }
-                                    _ => {
-                                        if let Some(manifest) = ev.manifest {
-                                            cache_for_events.update(ev.node_id, manifest);
-                                        }
-                                    }
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                tracing::warn!(skipped = n, "routing cache subscriber lagged");
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-                    _ = cache_shutdown.cancelled() => break,
-                }
-            }
-            tracing::debug!("routing cache subscriber shut down");
-        });
-
-        let join_incarnation = Incarnation::new(announce_incarnation);
-        let join_fallback_seeds = durable_state.fallback_seeds.clone();
-        if let Err(e) = membership.join(join_incarnation, &join_fallback_seeds).await {
-            // A transient seed outage at boot must not isolate the node:
-            // with configured seeds the old behavior ABORTED the process
-            // (and the unit is Restart=no, so the node stayed down); with
-            // empty configured seeds (restart path) it started as a
-            // singleton with no retry. Instead, warn and rejoin in the
-            // background — the cluster-readiness gate keeps writes
-            // refused until the ring converges.
-            warn!(error = %e, "initial cluster join failed; retrying in the background");
-        }
-
-        // Background rejoin: retry the (idempotent) join every 3s until
-        // the ring reaches the configured minimum quorum node count
-        // (`cluster_min_quorum_nodes`, B6 — review #66/#69). Covers the
-        // seedless-restart path (fallback seeds) and fleet nodes that
-        // boot before their seed comes up. Exits once joined.
-        if is_cluster_node {
-            let retry_membership = membership.clone();
-            let retry_incarnation = join_incarnation;
-            let retry_fallback = join_fallback_seeds.clone();
-            let min_quorum_nodes = config.cluster_min_quorum_nodes;
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
-                loop {
-                    interval.tick().await;
-                    let ring_nodes = retry_membership.ring().snapshot().node_count();
-                    if cluster_ready_gate_opens(ring_nodes, min_quorum_nodes, false) {
-                        return;
-                    }
-                    if let Err(e) = retry_membership.join(retry_incarnation, &retry_fallback).await
-                    {
-                        tracing::debug!(error = %e, "rejoin retry failed");
-                    }
-                }
-            });
-        }
-
-        // After a successful join, snapshot the known member addresses as
-        // fallback seeds. Events emitted during join are missed by the
-        // watcher spawned later (broadcast channels do not replay), so
-        // this write also captures members learned from the seed pull.
-        // Self is excluded: its own old address is useless after a
-        // restart (t43).
-        //
-        // A seedless singleton join (no configured seeds, all fallback
-        // seeds down at restart time) must NOT wipe the persisted list:
-        // the snapshot would contain only self → `save_fallback_seeds([])`
-        // — and every later restart would then have no seeds at all,
-        // stranding the node forever (observed in the churn run: node-0
-        // restarted at inc 2 with fallback_seeds=2, then inc 3/4/5 with
-        // fallback_seeds=0 after the wipe). The persisted list is the
-        // last-known truth; only a join that actually learned peers may
-        // replace it.
-        {
-            let self_id = NodeId::new(&config.node_id);
-            let seeds: Vec<String> = membership
-                .nodes_full()
-                .iter()
-                .filter(|(id, _, _, _, _, _, _, _)| *id != self_id)
-                .map(|(_, _, _, _, membership_addr, _, _, _)| membership_addr.to_string())
-                .collect();
-            if seeds.is_empty() {
-                tracing::debug!(
-                    node_id = %config.node_id,
-                    "join learned no peers — keeping the persisted fallback seeds"
-                );
-            } else if let Err(e) = membership_state_store.save_fallback_seeds(&seeds) {
-                warn!(error = %e, "failed to persist fallback seeds after join");
-            }
-        }
+        let bound = data_plane_module.serve(server.router, server.grpc).await?;
+        membership_module.start_plane_and_join(metrics.clone(), &storage.registry).await?;
 
         // ---- 16. Spawn background tasks ----
         let mut background = Self::spawn_background_tasks(
@@ -906,8 +575,8 @@ impl Node {
             hinted_handoff_manager.clone(),
             &config,
         );
-        background.grpc_shutdown = grpc_shutdown;
-        background.grpc_server = Some(grpc_server_handle);
+        background.grpc_shutdown = bound.grpc_shutdown;
+        background.grpc_server = Some(bound.grpc_server_handle);
 
         // ---- 16b. Spawn the pool health monitor + consequence applier ----
         // (g2 `failure-state-machine`, ADR-0029 §D3). The monitor ticks
@@ -1236,16 +905,16 @@ impl Node {
 
         info!(
             node_id = %config.node_id,
-            http_addr = %server_addr,
-            grpc_addr = %grpc_addr,
+            http_addr = %bound.server_addr,
+            grpc_addr = %bound.grpc_addr,
             "OceanFS node started"
         );
 
         Ok(Node {
             config,
-            server_addr,
-            grpc_addr,
-            http_shutdown,
+            server_addr: bound.server_addr,
+            grpc_addr: bound.grpc_addr,
+            http_shutdown: bound.http_shutdown,
             grpc_shutdown: background.grpc_shutdown.clone(),
             background,
             membership,

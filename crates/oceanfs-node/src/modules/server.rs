@@ -5,14 +5,16 @@
 //! policies, the prefetch engine (with its store adapter), the metadata
 //! bridge adapter, the shared HLC clock, the write/read coordinators +
 //! forwarding router, the S3 + admin handlers, and the axum router
-//! assembly; plus the six gRPC service implementations (data plane:
-//! segment/healing/cache/scrub with their decode caps baked into the
-//! wrapped RPC servers; membership plane: gossip/probe).
+//! assembly; plus the four data-plane gRPC service implementations
+//! (segment/healing/cache/scrub with their decode caps baked into the
+//! wrapped RPC servers). The membership-plane services (gossip/probe)
+//! were re-seated to the membership module by c4.
 //!
-//! What stays in `Node::start()` is the *binding*: HTTP/tonic listener
-//! creation and `serve` spawns (c4's network module will take them), the
-//! membership-plane bind (§15b), and the node-side metric registrations
-//! (owners outside this module).
+//! What stays in `Node::start()` is the *binding* — HTTP/tonic listener
+//! creation and `serve` spawns moved to the data-plane module by c4
+//! (`DataPlaneModule::serve`), the membership-plane bind + bootstrap
+//! moved to the membership module (`MembershipModule::start_plane_and_join`),
+//! and the node-side metric registrations (owners outside this module).
 //!
 //! The sealed-segment notifier that used to fan out of the write
 //! coordinator moved storage-side first (c3a — the seal pipeline); the
@@ -33,28 +35,34 @@ use crate::{
 
 /// The server subsystem bundle (c3).
 ///
-/// `router` feeds the HTTP bind; `grpc` feeds the data-plane tonic bind
-/// (decode caps already applied); `gossip_service`/`probe_service` feed
-/// the membership-plane bind (§15b); `prefetch_engine` is kept alive by
-/// the node's background prefetch task (§16).
+/// `router` feeds the data plane's HTTP bind; `grpc` feeds the data-plane
+/// tonic bind (decode caps already applied) — both consumed by
+/// [`crate::modules::data_plane::DataPlaneModule::serve`]. The
+/// membership-plane services (gossip/probe) were re-seated to
+/// [`crate::modules::membership::MembershipModule`] by c4 (see the NOTE
+/// below). `prefetch_engine` is kept alive by the node's background
+/// prefetch task (§16).
 pub(crate) struct ServerModule {
     /// The assembled axum router (S3 + admin merged, auth middleware,
-    /// body-limit + 413-logging layers) — moved into the HTTP serve
-    /// spawn by `Node::start()` §14.
+    /// body-limit + 413-logging layers) — moved into the data plane's
+    /// HTTP serve by `DataPlaneModule::serve` (c4).
     pub(crate) router: axum::Router,
     /// The four data-plane gRPC services, tonic-wrapped with their
-    /// message-size caps — assembled into the data-plane tonic server at
-    /// the §15 bind.
+    /// message-size caps — assembled into the data-plane tonic server by
+    /// `DataPlaneModule::serve` (c4).
     pub(crate) grpc: DataPlaneServices,
-    /// Membership-plane gossip service (ADR-0028 D1) — bound on the
-    /// membership plane listener at §15b.
-    pub(crate) gossip_service: oceanfs_membership::grpc::gossip_service::GossipGrpcService,
-    /// Membership-plane probe service (SWIM) — bound at §15b.
-    pub(crate) probe_service: oceanfs_membership::grpc::probe_service::ProbeGrpcService,
     /// The prefetch engine — the §16 background pre-warmer task holds it
     /// alive for the node's lifetime.
     pub(crate) prefetch_engine: Arc<oceanfs_cache::PrefetchEngine>,
 }
+
+// NOTE (c4 planes split): the gossip/probe membership-plane services
+// were re-seated OUT of this module into
+// `crate::modules::membership::MembershipModule::start_plane_and_join`
+// — they wrap only membership-plane inputs (membership, the plane's
+// dedicated pool, node id, gossip timeout) and belong to the membership
+// plane, not the data plane. This module serves the DATA plane only
+// (segment/healing/cache/scrub).
 
 /// The data-plane gRPC services, wrapped and capped by the module.
 ///
@@ -200,10 +208,12 @@ impl ServerModule {
     /// `config` is the validated node config; `storage` is the c1 bundle
     /// (stores, pools, sealer, lifecycle, registry, reader, accel);
     /// `durability` is the c2 bundle (timeouts, codec, scrub, repair
-    /// dispatcher + worker); `membership`/`pool`/`membership_pool` are
-    /// the node's membership and connection pools (§4–5); `ring_cache`
-    /// and `manifest_cache` are the routing (§3) and peer-manifest
-    /// (§4b) caches; `hinted_handoff` is the legacy gRPC hint receiver
+    /// dispatcher + worker); `membership` is the membership module's
+    /// membership Arc and `pool` the data-plane module's connection pool
+    /// (c4 — the planes split; `membership_pool` was re-seated with the
+    /// gossip/probe services to the membership module); `ring_cache` and
+    /// `manifest_cache` are the routing (§3) and peer-manifest (§4b)
+    /// caches; `hinted_handoff` is the legacy gRPC hint receiver
     /// (§11, node-owned) the healing service consumes; the
     /// `hinted_handoff_manager` is the durable hint manager (also
     /// node-owned — the write coordinator enqueues through it);
@@ -226,7 +236,6 @@ impl ServerModule {
         durability: &crate::modules::durability::DurabilityModule,
         membership: Arc<oceanfs_membership::Membership>,
         pool: Arc<oceanfs_network::ConnectionPool>,
-        membership_pool: Arc<oceanfs_network::ConnectionPool>,
         ring_cache: Arc<oceanfs_routing::RingCache>,
         manifest_cache: Arc<ManifestCache>,
         hinted_handoff: Arc<oceanfs_durability::HintedHandoff>,
@@ -578,9 +587,10 @@ impl ServerModule {
                 },
             ));
 
-        // ---- gRPC service construction (§15) ----
-        // ADR-0028 D1: the membership services (gossip + probe) move to
-        // the membership plane — the data-plane server hosts only
+        // ---- Data-plane gRPC service construction (§15) ----
+        // ADR-0028 D1: the membership services (gossip + probe) live on
+        // the membership plane (constructed by the membership module,
+        // c4) — the data-plane server hosts only
         // Segment/Healing/Cache/Scrub.
         let segment_service = oceanfs_server::grpc::segment_service::SegmentGrpcService::new(
             storage.data_store.clone(),
@@ -597,15 +607,6 @@ impl ServerModule {
         // segment are translated through the remap alias (g3 Option A —
         // GAP-1 closure).
         .with_remap_alias(Arc::clone(&storage.remap_alias));
-
-        let gossip_service =
-            oceanfs_membership::grpc::gossip_service::GossipGrpcService::new(membership.clone());
-        let probe_service = oceanfs_membership::grpc::probe_service::ProbeGrpcService::new(
-            self_id.clone(),
-            membership.clone(),
-            membership_pool,
-            config.gossip.failure_timeout_ms / 3,
-        );
 
         let mut healing_service = oceanfs_durability::healing_service::HealingGrpcService::new(
             hinted_handoff.clone(),
@@ -691,6 +692,6 @@ impl ServerModule {
             scrub: oceanfs_durability::ScrubRpcServer::new(scrub_service),
         };
 
-        Ok(ServerModule { router, grpc, gossip_service, probe_service, prefetch_engine })
+        Ok(ServerModule { router, grpc, prefetch_engine })
     }
 }

@@ -22,9 +22,10 @@ updated: 2026-09-05
 > are the authority for your feature; this document is the map.
 
 > **STATUS (2026-09-05): c1, c2, the c3a prerequisite seam
-> (seal-pipeline relocation storage-side, commit `489397a`), and c3
-> LANDED — each with independent review PASS; c4–c5 pending.** See the
-> Landing order under Feature DAG for the per-feature gate record.
+> (seal-pipeline relocation storage-side, commit `489397a`), c3, and c4
+> LANDED — each with independent review PASS; c5 pending (final `start()`
+> slimming + spawn extraction).** See the Landing order under Feature DAG
+> for the per-feature gate record.
 
 ---
 
@@ -72,7 +73,8 @@ crates/oceanfs-node/src/
     storage.rs            # StorageModule::build(cfg, paths) -> StorageModule
     durability.rs         # DurabilityModule::build(cfg, storage) -> DurabilityModule
     server.rs             # ServerModule::build(cfg, storage, durability) -> ServerModule
-    network.rs            # NetworkModule::build(cfg, ...) -> NetworkModule handles
+    membership.rs         # MembershipModule::build + start_plane_and_join (membership plane)
+    data_plane.rs         # DataPlaneModule::build + serve (data-plane HTTP/gRPC binds)
     background.rs         # move spawn_background_tasks + task handles here
   adapters.rs             # PrefetchStoreAdapter, WorkerQueueSink, NodeLeaveHandler
 ```
@@ -82,12 +84,17 @@ crates/oceanfs-node/src/
 | `StorageModule::build` | registry + role-pinned paths (sec 0), metadata store (1), accel (2), ring/routing (3), lifecycle registry + coordinator + event WAL/checkpoint (6b), pools + sealer (6), **single** shared segment store, replicator (6c), I/O infra + reader (11), startup recovery (6a) | `StorageModule { registry, lifecycle, sealer, event_wal, checkpoint, reader, replicator, ... }` |
 | `DurabilityModule::build` | GC, AE (+ merkle tree), scrub, reaper, heal pipeline, reconcile, re-rep worker + dispatcher (7), op timeouts (7d) — and later the ADR-0017 `DurabilityScheduler` wrapper | `DurabilityModule { gc, ae, scrub, reaper, heal, reconcile, rep_worker, ... }` |
 | `ServerModule::build` | caches + policies (8), prefetch (9), adapters (10), coordinators (write/read), S3 handler, admin handler (12-13), gRPC services (15) | `ServerModule { s3, admin, grpc_services, ... }` |
-| `NetworkModule::build` | membership + pools (4/5), HTTP bind (14), gRPC bind (15), membership plane bind (15b), bootstrap + join (15c), manifest (15d), routing-cache subscriber (15e) | `NetworkModule { http_handle, grpc_handle, membership, ... }` |
+| `MembershipModule::build` + `start_plane_and_join` | membership + rejoin state + incarnation bump (4/4a, ADR-0022), peer-side routing cache (4b), membership-plane pool + announce address (5/ADR-0028 D1), gossip/probe construction (re-seated from c3), membership-plane bind (15b), `membership.start()` + metrics, bootstrap + join/rejoin + fallback-seed snapshot (15c), manifest declaration + cache self-seed (15d), routing-cache subscriber (15e), `cluster_ready_gate_opens` | `MembershipModule { membership, manifest_cache, membership_state_store, announce_incarnation, is_cluster_node, grpc_addr }` |
+| `DataPlaneModule::build` + `serve` | data-plane `ConnectionPool` + `RpcConfig` (5), HTTP bind (14), data-plane gRPC bind + 4-line `.add_service` assembly (15) | `DataPlaneModule { pool, grpc_addr }`; `serve` → `BoundDataPlane { server_addr, grpc_addr, http_shutdown, grpc_shutdown, grpc_server_handle }` |
 | `BackgroundModule::spawn_all` | all `tokio::spawn` loops currently inline (16, 16b-e, 17) | `BackgroundTasks` |
 
-`Node::start()` shrinks to: validate config → build storage → build
-durability → build server → build network → recover/join gate → spawn
-background → return `Node`. Shutdown (`node.rs:3107-3213`) stays on
+`Node::start()` shrinks to: validate config → infra (§0-3) → build
+membership + data plane (early module builds) → build storage + durability
++ §7b recovery → §11 hinted handoff + ready gate → build server →
+`data_plane.serve` (HTTP/gRPC binds) → `membership.start_plane_and_join`
+(membership-plane bind + join) → spawn background → return `Node`.
+Bind-before-join is preserved as the documented serve →
+start_plane_and_join sequence. Shutdown (`node.rs:3107-3213`) stays on
 `Node` but moves its hard-coded timeouts to config (review #71).
 
 ## Feature DAG
@@ -97,7 +104,7 @@ c1 split-storage-builder
  └── c2 split-durability-builder
       └── c3a seal-pipeline relocation storage-side (c3 Option-A prerequisite)
            └── c3 split-server-builder
-                └── c4 split-network-builder
+                └── c4 split-network-builder → membership.rs + data_plane.rs (ONE pass)
                      └── c5 background-spawn-extraction + start() slimming
 ```
 
@@ -105,8 +112,15 @@ Ordering: **c1 → c2 → c3a → c3 → c4 → c5**. Each c1–c5 builder step 
 pure-move refactor: the builder returns the same `Arc`s the inline code
 produced; behavior is identical; the regression bar is "node boots, e2e
 write/read passes, existing node tests pass." `c5` (the final `start()`
-slimming + guideline update) only makes sense once all four builders
-exist. `c3a` is the user-approved Option-A prerequisite seam for c3 (c3
+slimming + guideline update) only makes sense once the c1–c4 extractions
+exist. **c4 implements BOTH post-c4 node-side modules —
+`MembershipModule` (`modules/membership.rs`) + `DataPlaneModule`
+(`modules/data_plane.rs`) — in one pass, split along the ADR-0028 planes;
+there is no c4a/c4b split and `modules/network.rs` is retired**
+(user-approved amendment 2026-09-05; full record in the c4 doc). The
+amendment also re-seats c3's `gossip_service`/`probe_service` (and drops
+`ServerModule`'s `membership_pool` build param) — recorded as a deviation
+on the c3 doc. `c3a` is the user-approved Option-A prerequisite seam for c3 (c3
 planning, 2026-09-04): the seal pipeline had to move storage-side so
 `run_startup_recovery()` no longer depends on a server object — it is NOT
 one of the c1–c5 builder steps and does not change what c3 extracts.
@@ -133,7 +147,12 @@ one of the c1–c5 builder steps and does not change what c3 extracts.
   1 — 0 blocking gaps).** `ServerModule` extracted (§8-13 + §15
   construction; node.rs 3465→2937, start() ~1592→~1179); binds + §15b-e
   + §16-17 stay for c4/c5; deviations recorded in the c3 doc.
-- **c4 split-network-builder — pending.**
+- **c4 split-network-builder (membership + data-plane modules) — LANDED
+  2026-09-05 (review PASS, iteration 1 — 0 blocking gaps).** Planes
+  split: `MembershipModule` (identity/rejoin/plane/gossip+probe/
+  bootstrap) + `DataPlaneModule` (pool + HTTP/gRPC binds); gossip/probe
+  re-seated from c3 (deviation #9); review #64 closed (strict
+  `membership_listen_addr`); node.rs 2937→2606; c5 remains pending.
 - **c5 background-spawn-extraction + `start()` slimming — pending.**
 
 `c1` includes the `NodeLeaveHandler` supersession — the handler is

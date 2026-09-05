@@ -150,3 +150,22 @@ precedent.
    | node lib tests | PASS (66) |
    | node integration suites | PASS (all suites) |
    | e2e write/read (allowlist: crash_restart, wal_recovery, segment_lifecycle, cluster_lifecycle, cluster_write_path, cluster_read_path, garbage_collection, rewrite_leak_test) | PASS — no load suites (PIPELINE.md §6) |
+
+9. **Post-landing follow-up (recorded by c4, 2026-09-05): the
+   `gossip_service`/`probe_service` re-seat to the membership module.**
+   c3 landed with `gossip_service` + `probe_service` constructed inside
+   `ServerModule::build` (reviewer-verified, notes 2/7 above) and with a
+   `membership_pool` build parameter. The user-approved c4 amendment
+   splits the remaining node-side wiring along the ADR-0028 planes, and c4
+   re-seats gossip/probe construction into
+   `MembershipModule::start_plane_and_join` (`modules/membership.rs`):
+   the two services wrap only membership-plane inputs (membership,
+   membership_pool, node_id, `gossip.failure_timeout_ms`) and bind on the
+   membership-plane listener, so they belong to the membership module, not
+   the server module. Net effect on this feature's landed shape:
+   `ServerModule` loses the `membership_pool` build param and the
+   `gossip_service`/`probe_service` fields; it keeps `router`,
+   `DataPlaneServices` (segment/healing/cache/scrub), and
+   `prefetch_engine`. c3's `done` status is unchanged — this is a
+   deliberate follow-up correction made by c4 for ownership reasons, not a
+   c3 rework.
