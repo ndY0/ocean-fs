@@ -931,6 +931,8 @@ async fn mid_log_corruption_aborts_the_fold_with_the_position() {
         h.event_wal
             .append(SegmentEvent::Seal(crate::segment::event_wal::SealEvent {
                 pool_id: 0,
+                total_bytes: 0,
+                contained_objects: None,
                 segment_id: id,
                 tier: SizeTier::Small,
                 ec_k: 4,
@@ -1248,6 +1250,8 @@ async fn seal_after_delete_folds_as_noop() {
             .append(crate::segment::event_wal::SegmentEvent::Seal(
                 crate::segment::event_wal::SealEvent {
                     pool_id: 0,
+                    total_bytes: 0,
+                    contained_objects: None,
                     segment_id: id,
                     tier: oceanfs_core::SizeTier::Standard,
                     ec_k: 4,

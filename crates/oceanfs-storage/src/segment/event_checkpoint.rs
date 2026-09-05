@@ -20,8 +20,11 @@
 //! ```text
 //! checkpoint-{file_seq:08}-{offset}:
 //!   magic        [4]   = b"CHK\1"
-//!   version      [1]   = 3 (2 = pre-pool: 7-field metadata, no pool_id —
-//!                      refused at boot since ADR-0031 D3)
+//!   version      [1]   = 1 (pre-production stance: every format change is
+//!                      a break; the version does not accumulate. Any
+//!                      differing version — e.g. the historical v2
+//!                      pre-pool 7-field metadata without `pool_id` — is
+//!                      refused/skipped, never decoded)
 //!   covered_pos  [12]  file_seq(4 LE) + offset(8 LE) — the EventWalPos
 //!                      covered by this snapshot (the fold starts after it)
 //!   entry_count  [4]   LE
@@ -33,24 +36,28 @@
 //!                      (extension over the ADR sketch: the bincode payload
 //!                      is variable-length and needs a length prefix)
 //!     metadata   [meta_len]  bincode(SegmentMetadata) — the full metadata
-//!                      incl. merkle_root for Sealed entries; the
-//!                      metadata always carries `pool_id` (ADR-0029 f5,
-//!                      the durable segment→pool mapping)
+//!                      incl. merkle_root and `total_bytes` (ADR-0034 D1)
+//!                      for Sealed entries; the metadata always carries
+//!                      `pool_id` (ADR-0029 f5)
 //!     data_wal_pos [12]  file_seq(4 LE) + offset(8 LE) — Sealed entries
 //!                      only (retention needs it to survive checkpointing)
 //!     repacked_flag [1]  0/1 — Sealed entries only (the compaction
 //!                      marker, ADR-0025 Decision 4 — recovery needs it to
 //!                      identify incomplete compaction units)
 //!     repacked_from [16]  segment id — present iff repacked_flag = 1
+//!     contained_flag [1]  0/1 — Sealed entries only (the ADR-0034 D5
+//!                      membership list; 0 for WAL-replayed/pre-feature
+//!                      seals)
+//!     contained_len [4]   LE — iff contained_flag = 1
+//!     contained    [contained_len]  bincode(Vec<ContainedObject>) — the
+//!                      seal-time membership list
 //!   crc32        [4]   over all preceding bytes
 //! ```
 //!
-//! Version 2 adds the compaction marker to Sealed entries (version 1
-//! snapshots without the flag byte are rejected — none exist in the
-//! field); version 3 adds `pool_id` to the metadata. A v2 (pre-pool)
-//! checkpoint is refused at boot with an explicit "unsupported pre-pool
-//! data directory" error (ADR-0031 D3) — never decoded, never silently
-//! replaced by an older snapshot or an empty registry.
+//! A v2 (pre-pool) checkpoint is refused at boot with an explicit
+//! "unsupported pre-pool data directory" error (ADR-0031 D3) — never
+//! decoded, never silently replaced by an older snapshot or an empty
+//! registry.
 
 use std::{
     io::Write,
@@ -62,13 +69,13 @@ use std::{
 };
 
 use oceanfs_core::{
-    Counter, EventWalConfig, LabelSet, MetricRegistrar, SegmentId, SegmentMetadata,
+    ContainedObject, Counter, EventWalConfig, LabelSet, MetricRegistrar, SegmentId, SegmentMetadata,
 };
 
 use crate::{
     error::{Error, Result},
     segment::{
-        event_wal::{DataWalPos, EventWal, EventWalPos},
+        event_wal::{DataWalPos, EventWal, EventWalPos, SEAL_MAX_CONTAINED_TAIL_BYTES},
         lifecycle::{SegmentLifecycleRegistry, SegmentState},
     },
 };
@@ -77,11 +84,13 @@ use crate::{
 pub(crate) const CHECKPOINT_MAGIC: [u8; 4] = [b'C', b'H', b'K', 1];
 
 /// On-disk format version of checkpoint files.
-/// Checkpoint format version. v3 (current): `SegmentMetadata` carries
-/// `pool_id` (ADR-0029 f5). v2 — the pre-pool 7-field metadata without
-/// `pool_id` — is refused at boot (ADR-0031 D3); the literal version
-/// byte appears only in the pre-pool classifier below.
-pub(crate) const CHECKPOINT_VERSION: u8 = 3;
+///
+/// Pre-production stance (no deployed base to migrate): every format
+/// change is a break, and the version stays **1**. Any checkpoint whose
+/// version byte differs (e.g. a stale dev-format v2 pre-pool snapshot)
+/// is refused or skipped — never decoded with the wrong layout. The
+/// literal `2` appears only in the pre-pool classifier below.
+pub(crate) const CHECKPOINT_VERSION: u8 = 1;
 
 /// Fixed header size of a checkpoint file: magic(4) + version(1) +
 /// covered_pos(12) + entry_count(4) = 21.
@@ -94,6 +103,8 @@ const ENTRY_FIXED_SIZE: usize = 21;
 const SEALED_EXTRA_SIZE: usize = 12;
 const REPACKED_FLAG_SIZE: usize = 1;
 const REPACKED_FROM_SIZE: usize = 16;
+const CONTAINED_FLAG_SIZE: usize = 1;
+const CONTAINED_LEN_SIZE: usize = 4;
 
 /// State bytes on disk.
 const STATE_RESERVED: u8 = 0;
@@ -379,8 +390,14 @@ fn checkpoint_file_path(dir: &Path, pos: EventWalPos) -> PathBuf {
 fn encode_snapshot(registry: &SegmentLifecycleRegistry, up_to: EventWalPos) -> Result<Vec<u8>> {
     // Collect live entries under the shard read guards (perf 7.1: the
     // copies are cheap; the serialization below is lock-free).
-    type SnapshotEntry =
-        (SegmentId, SegmentState, SegmentMetadata, Option<DataWalPos>, Option<SegmentId>);
+    type SnapshotEntry = (
+        SegmentId,
+        SegmentState,
+        SegmentMetadata,
+        Option<DataWalPos>,
+        Option<SegmentId>,
+        Option<Arc<[ContainedObject]>>,
+    );
     let mut entries: Vec<SnapshotEntry> = Vec::new();
     registry.for_each(|id, entry| {
         entries.push((
@@ -389,6 +406,7 @@ fn encode_snapshot(registry: &SegmentLifecycleRegistry, up_to: EventWalPos) -> R
             entry.metadata.clone(),
             entry.data_wal_pos,
             entry.repacked_from,
+            entry.contained_objects.clone(),
         ));
     });
 
@@ -400,7 +418,7 @@ fn encode_snapshot(registry: &SegmentLifecycleRegistry, up_to: EventWalPos) -> R
     buf.extend_from_slice(&up_to.offset.to_le_bytes());
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
 
-    for (id, state, meta, data_wal_pos, repacked_from) in entries {
+    for (id, state, meta, data_wal_pos, repacked_from, contained_objects) in entries {
         buf.extend_from_slice(id.as_uuid().as_bytes());
         let state_byte = match state {
             SegmentState::Reserved => STATE_RESERVED,
@@ -435,6 +453,27 @@ fn encode_snapshot(registry: &SegmentLifecycleRegistry, up_to: EventWalPos) -> R
                     buf.extend_from_slice(old.as_uuid().as_bytes());
                 }
                 None => buf.push(0),
+            }
+            // The ADR-0034 D5 membership list (only for Sealed entries
+            // that recorded one — WAL-replayed/pre-feature seals write
+            // flag 0). The blob is bounded by SEAL_MAX_CONTAINED_TAIL_BYTES.
+            match contained_objects {
+                Some(contained) if !contained.is_empty() => {
+                    let blob = bincode::serialize(contained.as_ref()).map_err(|e| {
+                        Error::Io(std::io::Error::other(format!(
+                            "checkpoint contained-objects serialization: {e}"
+                        )))
+                    })?;
+                    if blob.len() > SEAL_MAX_CONTAINED_TAIL_BYTES {
+                        return Err(Error::Io(std::io::Error::other(
+                            "checkpoint contained-objects tail exceeds the format cap",
+                        )));
+                    }
+                    buf.push(1);
+                    buf.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(&blob);
+                }
+                _ => buf.push(0),
             }
         }
     }
@@ -549,6 +588,35 @@ fn decode_snapshot(bytes: &[u8]) -> Option<(EventWalPos, SegmentLifecycleRegistr
                     }
                     _ => return None, // unknown repacked flag
                 };
+                // ADR-0034 D5 membership list tail (Sealed entries).
+                if cursor + CONTAINED_FLAG_SIZE > bytes.len() - 4 {
+                    return None;
+                }
+                let contained_flag = bytes[cursor];
+                cursor += CONTAINED_FLAG_SIZE;
+                let contained_objects = match contained_flag {
+                    0 => None,
+                    1 => {
+                        if cursor + CONTAINED_LEN_SIZE > bytes.len() - 4 {
+                            return None;
+                        }
+                        let blob_len = u32::from_le_bytes(
+                            bytes[cursor..cursor + CONTAINED_LEN_SIZE].try_into().ok()?,
+                        ) as usize;
+                        cursor += CONTAINED_LEN_SIZE;
+                        if blob_len > SEAL_MAX_CONTAINED_TAIL_BYTES {
+                            return None;
+                        }
+                        if cursor + blob_len > bytes.len() - 4 {
+                            return None;
+                        }
+                        let objects: Vec<ContainedObject> =
+                            bincode::deserialize(&bytes[cursor..cursor + blob_len]).ok()?;
+                        cursor += blob_len;
+                        Some(Arc::from(objects))
+                    }
+                    _ => return None, // unknown contained flag
+                };
                 // The seal transition requires a Reserved entry: reserve
                 // with the pre-seal metadata shape first (like the
                 // fold's Reserve arm), then record the position BEFORE
@@ -567,7 +635,7 @@ fn decode_snapshot(bytes: &[u8]) -> Option<(EventWalPos, SegmentLifecycleRegistr
                 };
                 registry.reserve(segment_id, reserved_meta).ok()?;
                 registry.record_data_wal_pos(segment_id, data_wal_pos);
-                registry.seal_with(segment_id, meta, repacked_from).ok()?;
+                registry.seal_with(segment_id, meta, repacked_from, contained_objects).ok()?;
             }
             _ => return None, // unknown state
         }
@@ -722,7 +790,7 @@ mod tests {
             .reserve(id, SegmentMetadata { merkle_root: None, sealed_at: None, ..meta.clone() })
             .unwrap();
         registry.record_data_wal_pos(id, DataWalPos { file_seq: 1, offset: 100 });
-        registry.seal_with(id, meta, Some(old)).unwrap();
+        registry.seal_with(id, meta, Some(old), None).unwrap();
 
         let bytes = encode_snapshot(&registry, EventWalPos { file_seq: 3, offset: 4096 }).unwrap();
         let (_, loaded) = decode_snapshot(&bytes).expect("snapshot decodes");
@@ -937,6 +1005,8 @@ mod tests {
         wal.append(crate::segment::event_wal::SegmentEvent::Seal(
             crate::segment::event_wal::SealEvent {
                 pool_id: 0,
+                total_bytes: 0,
+                contained_objects: None,
                 segment_id: id,
                 tier: SizeTier::Standard,
                 ec_k: 4,
@@ -950,12 +1020,14 @@ mod tests {
         .unwrap(); // rotates to file 1
                    // The covered boundary: the write position after the seal.
         let boundary = wal.latest_pos();
-        assert_eq!(boundary, EventWalPos { file_seq: 1, offset: 84 });
+        assert_eq!(boundary, EventWalPos { file_seq: 1, offset: 92 });
 
         // A later append rotates the straddling file away.
         wal.append(crate::segment::event_wal::SegmentEvent::Seal(
             crate::segment::event_wal::SealEvent {
                 pool_id: 0,
+                total_bytes: 0,
+                contained_objects: None,
                 segment_id: id,
                 tier: SizeTier::Standard,
                 ec_k: 4,
@@ -971,7 +1043,7 @@ mod tests {
         let removed = wal.truncate_before(boundary).await.unwrap();
         assert!(removed > 0);
         // File 0 (below the covered file) and file 1 (rotated and fully
-        // covered: size 84 == boundary.offset) are deleted.
+        // covered: size 92 == boundary.offset) are deleted.
         assert!(!wal.dir().join("evl_00000000.log").exists(), "covered file deleted");
         assert!(
             !wal.dir().join("evl_00000001.log").exists(),
@@ -986,7 +1058,7 @@ mod tests {
         assert_eq!(events[0].0, EventWalPos { file_seq: 2, offset: 0 });
 
         // The writer's accounting is consistent: appends continue (the
-        // delete rotates: file 2 at 84 + 32 > 64) and bytes_since stays
+        // delete rotates: file 2 at 92 + 32 > 64) and bytes_since stays
         // exact.
         let p = wal
             .append(crate::segment::event_wal::SegmentEvent::Delete(
@@ -1025,6 +1097,8 @@ mod tests {
         wal.append(crate::segment::event_wal::SegmentEvent::Seal(
             crate::segment::event_wal::SealEvent {
                 pool_id: 0,
+                total_bytes: 0,
+                contained_objects: None,
                 segment_id: id,
                 tier: SizeTier::Standard,
                 ec_k: 4,
@@ -1036,7 +1110,7 @@ mod tests {
         ))
         .await
         .unwrap(); // rotates to file 1
-        let boundary = wal.latest_pos(); // (1, 84)
+        let boundary = wal.latest_pos(); // (1, 92)
 
         // Appends land AFTER the snapshot's covered point (the async
         // checkpoint window): the delete → file 2, seal3 → file 3.
@@ -1048,6 +1122,8 @@ mod tests {
         wal.append(crate::segment::event_wal::SegmentEvent::Seal(
             crate::segment::event_wal::SealEvent {
                 pool_id: 0,
+                total_bytes: 0,
+                contained_objects: None,
                 segment_id: id,
                 tier: SizeTier::Standard,
                 ec_k: 4,

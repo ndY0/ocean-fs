@@ -42,17 +42,22 @@
 //! ```
 //!
 //! Header is 28 bytes (4+1+1+2+4+16); Reserve payload is 4 bytes, Seal
-//! payload 52 bytes (4+32+12+4 — the pool id is ALWAYS present since
-//! ADR-0031 D3) or 68 bytes with the compaction `repacked_from` marker,
-//! Delete payload 0 bytes, MetadataRefresh payload 1 or 33 bytes.
-//! `data_wal_pos` is `file_seq(4, LE) + offset(8, LE)`.
+//! payload 60 bytes (4+32+12+8+4 — the fixed base carries `total_bytes`
+//! (ADR-0034 D1) and the pool id is ALWAYS present since ADR-0031 D3) or
+//! 76 bytes with the compaction `repacked_from` marker, optionally
+//! followed by the ADR-0034 D5 contained-objects tail when flag bit 2 is
+//! set: `[contained_len: u32 LE][bincode(Vec<ContainedObject>)]` (blob
+//! length bounded by `SEAL_MAX_CONTAINED_TAIL_BYTES`), Delete payload 0
+//! bytes, MetadataRefresh payload 1 or 33 bytes. `data_wal_pos` is
+//! `file_seq(4, LE) + offset(8, LE)`.
 //!
 //! The Seal payload's flags byte (payload\[3\], was reserved): bit 0 set
 //! means the compaction `repacked_from` segment id follows the position
 //! (`+16` bytes) — ADR-0025 Decision 4's compaction marker; bit 1 set
 //! means the `pool_id` follows — **always set** (ADR-0031 D3: even a
 //! `pool_id = 0` Seal carries the flag and its 4 bytes, so pre-pool
-//! 48-byte records are distinguishable from pools-enabled ones).
+//! 48-byte records are distinguishable from pools-enabled ones); bit 2
+//! set means the contained-objects tail follows (ADR-0034 D5).
 //! Pre-pool (pool_id-less) records are refused at boot as an
 //! unsupported pre-pool data directory — never decoded.
 //!
@@ -71,7 +76,8 @@ use std::{
 };
 
 use oceanfs_core::{
-    Counter, EventWalConfig, Gauge, HashOutput, LabelSet, MetricRegistrar, SegmentId, SizeTier,
+    ContainedObject, Counter, EventWalConfig, Gauge, HashOutput, LabelSet, MetricRegistrar,
+    SegmentId, SizeTier,
 };
 use tokio::sync::Mutex;
 
@@ -94,9 +100,22 @@ pub(crate) const EVENT_RECORD_HEADER_SIZE: usize = 28;
 pub(crate) const RESERVE_PAYLOAD_SIZE: usize = 4;
 
 /// Payload size of a `SealEvent`: 4 + merkle_root(32) + data_wal_pos(12)
-/// — the base section WITHOUT the mandatory pool id (see
+/// + total_bytes(8) — the base section WITHOUT the mandatory pool id (see
 /// [`SEAL_POOL_ID_SIZE`]).
-pub(crate) const SEAL_PAYLOAD_SIZE: usize = 48;
+///
+/// `total_bytes` (ADR-0034 D1) rides the event's fixed fields so a
+/// restart that replays a Seal after the last checkpoint reconstructs the
+/// registry entry with its real logical total — a checkpoint-only
+/// `total_bytes` would be lost in exactly the crash window the accounting
+/// invariant must trust.
+pub(crate) const SEAL_PAYLOAD_SIZE: usize = 56;
+
+/// Payload size of a pre-pool (pool_id-less, pre-ADR-0031) Seal — the
+/// historical base WITHOUT the total_bytes field or the pool id. Used only
+/// by the boot classifier ([`is_pre_pool_seal`]): pre-pool writers produced
+/// 48-byte (and 64-byte repacked) payloads, which are refused, never
+/// decoded.
+pub(crate) const SEAL_PRE_POOL_PAYLOAD_SIZE: usize = 48;
 
 /// Extra payload bytes of a `SealEvent` carrying the compaction
 /// `repacked_from` marker (16 — a segment id).
@@ -109,13 +128,31 @@ pub(crate) const SEAL_REPACKED_FROM_SIZE: usize = 16;
 /// are refused at boot, never decoded.
 pub(crate) const SEAL_POOL_ID_SIZE: usize = 4;
 
+/// Extra payload bytes of a `SealEvent` carrying the contained-objects
+/// tail's length prefix (4 — u32 LE; the blob that follows is the bincode
+/// of `Vec<ContainedObject>`).
+pub(crate) const SEAL_CONTAINED_LEN_SIZE: usize = 4;
+
+/// Upper bound on a Seal event's contained-objects tail blob (the bincode
+/// `Vec<ContainedObject>`). A standard 4 MiB segment holds at most ~64
+/// objects at 64 KiB chunks; even a Multi-tier segment with thousands of
+/// small chunked objects stays far below 4 MiB of serialized membership.
+/// Bounds the reader's tail-buffer allocation so a corrupt `blob_len` can
+/// never allocate arbitrarily (the same discipline as `MAX_PAYLOAD_SIZE`).
+pub(crate) const SEAL_MAX_CONTAINED_TAIL_BYTES: usize = 4 * 1024 * 1024;
+
 /// Flags byte of the Seal payload: bit 0 set → `repacked_from` present;
 /// bit 1 set → `pool_id` present (ADR-0029 f5). Since ADR-0031 D3 the
 /// pool-id flag is always set on write; a record without it is a
-/// pre-pool record refused at boot. Flags are never combined with an
-/// inconsistent payload length: a length mismatch rejects the record.
+/// pre-pool record refused at boot. Bit 2 set → the contained-objects
+/// tail follows (ADR-0034 D5: the seal-time membership list; absent for
+/// WAL-replayed/pre-feature seals, which stay fully re-readable and
+/// reapable but are not compaction candidates). Flags are never combined
+/// with an inconsistent payload length: a length mismatch rejects the
+/// record.
 pub(crate) const SEAL_FLAG_REPACKED_FROM: u8 = 1;
 pub(crate) const SEAL_FLAG_POOL_ID: u8 = 2;
+pub(crate) const SEAL_FLAG_CONTAINED_OBJECTS: u8 = 4;
 
 /// Payload size of a `DeleteEvent`.
 pub(crate) const DELETE_PAYLOAD_SIZE: usize = 0;
@@ -138,14 +175,16 @@ pub(crate) const REFRESH_MAX_LOCATIONS: usize = 16;
 /// bounds the on-disk record.
 pub(crate) const REFRESH_MAX_NODE_ID_LEN: usize = 255;
 
-/// Largest possible payload size — the extended MetadataRefresh payload
-/// (merkle_flag(1) + root(32) + loc_count(1) + 16 × (len(1) + 255)) is
-/// the largest variant. Bounds the reader's allocation so a corrupt
+/// Largest possible payload size — the Seal payload with the
+/// contained-objects tail dominates the extended MetadataRefresh payload
+/// (merkle_flag(1) + root(32) + loc_count(1) + 16 × (len(1) + 255) ≈ 4 KiB
+/// vs ≈ 4 MiB for the tail). Bounds the reader's allocation so a corrupt
 /// `payload_len` can never allocate arbitrarily.
-pub(crate) const MAX_PAYLOAD_SIZE: usize = REFRESH_PAYLOAD_SIZE
-    + REFRESH_ROOT_SIZE
-    + 1
-    + REFRESH_MAX_LOCATIONS * (1 + REFRESH_MAX_NODE_ID_LEN);
+pub(crate) const MAX_PAYLOAD_SIZE: usize = SEAL_PAYLOAD_SIZE
+    + SEAL_REPACKED_FROM_SIZE
+    + SEAL_POOL_ID_SIZE
+    + SEAL_CONTAINED_LEN_SIZE
+    + SEAL_MAX_CONTAINED_TAIL_BYTES;
 
 /// Record kind bytes on disk.
 pub(crate) const KIND_RESERVE: u8 = 0;
@@ -209,7 +248,7 @@ pub struct ReserveEvent {
 /// The full repacked metadata travels through the seal: `merkle_root` and
 /// the compression-derived fields are seal inputs, not compactor
 /// afterthoughts (the BadDigest defect is impossible).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealEvent {
     /// The segment being sealed.
     pub segment_id: SegmentId,
@@ -226,6 +265,10 @@ pub struct SealEvent {
     /// data entries (replayed segments whose WAL entries were truncated
     /// away — nothing to seek or sweep).
     pub data_wal_pos: DataWalPos,
+    /// The logical byte total of the segment's data section, recorded at
+    /// seal (ADR-0034 D1). Carried in the event's fixed fields so replay
+    /// after a checkpoint reconstructs it (see `SEAL_PAYLOAD_SIZE`).
+    pub total_bytes: u64,
     /// The compaction marker (ADR-0025 Decision 4): when this segment is
     /// a GC-repacked replacement, the id of the source segment it was
     /// repacked from. `None` for ordinary sealed segments. Recovery uses
@@ -239,6 +282,16 @@ pub struct SealEvent {
     /// on disk since ADR-0031 D3 (flag + 4 bytes, value 0 included);
     /// pre-pool records without the id are refused at boot.
     pub pool_id: u32,
+    /// The seal-time contained-objects membership list (ADR-0034 D5).
+    ///
+    /// Deduplicated by `(bucket, key)` and sorted at the caller, carried
+    /// on the durable Seal record so it survives a restart whose fold
+    /// replays events after the last checkpoint. `None` for WAL-replayed
+    /// and pre-feature seals (the data WAL does not carry keys, and
+    /// reconstructing membership from the objects CF would be the very
+    /// scan being eliminated): such segments remain fully re-readable and
+    /// reapable when fully dead but are not compaction candidates.
+    pub contained_objects: Option<Arc<[ContainedObject]>>,
 }
 
 /// A segment **Delete** event — replaces the deleted-marker CF write
@@ -335,8 +388,24 @@ impl SegmentEvent {
                 // Pre-pool (pool_id-less) 48/64-byte shapes are never
                 // produced; a boot over such records refuses loudly
                 // instead of decoding them.
+                //
+                // ADR-0034 D5: a non-empty contained-objects list rides
+                // an optional tail (flag bit 2). Serialization of a
+                // bounded membership list cannot fail; if it somehow
+                // exceeds the cap the tail is dropped (the seal keeps the
+                // None semantics — re-readable, non-compactable) rather
+                // than corrupting the record.
+                let contained_blob = evt.contained_objects.as_ref().and_then(|objs| {
+                    if objs.is_empty() {
+                        return None;
+                    }
+                    bincode::serialize(objs.as_ref())
+                        .ok()
+                        .filter(|b| b.len() <= SEAL_MAX_CONTAINED_TAIL_BYTES)
+                });
                 let extra = if evt.repacked_from.is_some() { SEAL_REPACKED_FROM_SIZE } else { 0 }
-                    + SEAL_POOL_ID_SIZE;
+                    + SEAL_POOL_ID_SIZE
+                    + contained_blob.as_ref().map_or(0, |b| SEAL_CONTAINED_LEN_SIZE + b.len());
                 let mut payload = Vec::with_capacity(SEAL_PAYLOAD_SIZE + extra);
                 payload.push(tier_to_u8(evt.tier));
                 payload.push(evt.ec_k);
@@ -345,14 +414,22 @@ impl SegmentEvent {
                 if evt.repacked_from.is_some() {
                     flags |= SEAL_FLAG_REPACKED_FROM;
                 }
+                if contained_blob.is_some() {
+                    flags |= SEAL_FLAG_CONTAINED_OBJECTS;
+                }
                 payload.push(flags);
                 payload.extend_from_slice(evt.merkle_root.as_bytes());
                 payload.extend_from_slice(&evt.data_wal_pos.file_seq.to_le_bytes());
                 payload.extend_from_slice(&evt.data_wal_pos.offset.to_le_bytes());
+                payload.extend_from_slice(&evt.total_bytes.to_le_bytes());
                 if let Some(old) = evt.repacked_from {
                     payload.extend_from_slice(old.as_uuid().as_bytes());
                 }
                 payload.extend_from_slice(&evt.pool_id.to_le_bytes());
+                if let Some(blob) = contained_blob {
+                    payload.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(&blob);
+                }
                 (KIND_SEAL, payload)
             }
             SegmentEvent::Delete(_) => (KIND_DELETE, Vec::new()),
@@ -480,11 +557,70 @@ fn decode_payload(kind: u8, segment_id: SegmentId, payload: &[u8]) -> Option<Seg
                 ec_m: payload[2],
             }))
         }
-        KIND_SEAL
-            if payload.len() == SEAL_PAYLOAD_SIZE + SEAL_POOL_ID_SIZE
-                && payload[3] & !(SEAL_FLAG_REPACKED_FROM | SEAL_FLAG_POOL_ID) == 0
-                && payload[3] & SEAL_FLAG_POOL_ID != 0 =>
-        {
+        KIND_SEAL if payload.len() >= SEAL_PAYLOAD_SIZE => {
+            // Generic Seal parse: flags byte selects the optional
+            // repacked_from marker (bit 0), the ALWAYS-present pool id
+            // (bit 1), and the optional contained-objects tail (bit 2).
+            // Unknown flag bits, a missing pool id (the pre-pool shape —
+            // refused by the boot classifier, never decoded here), an
+            // over-cap tail, or trailing bytes all reject the record.
+            let flags = payload[3];
+            if flags & !(SEAL_FLAG_REPACKED_FROM | SEAL_FLAG_POOL_ID | SEAL_FLAG_CONTAINED_OBJECTS)
+                != 0
+            {
+                return None;
+            }
+            if flags & SEAL_FLAG_POOL_ID == 0 {
+                return None;
+            }
+            let mut cursor = 48usize; // after tier(1)+ec_k(1)+ec_m(1)+flags(1)+merkle(32)+pos(12)
+            if payload.len() < cursor + 8 {
+                return None;
+            }
+            let total_bytes = u64::from_le_bytes(payload[cursor..cursor + 8].try_into().ok()?);
+            cursor += 8;
+            let repacked_from = if flags & SEAL_FLAG_REPACKED_FROM != 0 {
+                if payload.len() < cursor + SEAL_REPACKED_FROM_SIZE {
+                    return None;
+                }
+                let id = SegmentId::from_uuid_bytes(
+                    payload[cursor..cursor + SEAL_REPACKED_FROM_SIZE].try_into().ok()?,
+                );
+                cursor += SEAL_REPACKED_FROM_SIZE;
+                Some(id)
+            } else {
+                None
+            };
+            if payload.len() < cursor + SEAL_POOL_ID_SIZE {
+                return None;
+            }
+            let pool_id =
+                u32::from_le_bytes(payload[cursor..cursor + SEAL_POOL_ID_SIZE].try_into().ok()?);
+            cursor += SEAL_POOL_ID_SIZE;
+            let contained_objects = if flags & SEAL_FLAG_CONTAINED_OBJECTS != 0 {
+                if payload.len() < cursor + SEAL_CONTAINED_LEN_SIZE {
+                    return None;
+                }
+                let blob_len = u32::from_le_bytes(
+                    payload[cursor..cursor + SEAL_CONTAINED_LEN_SIZE].try_into().ok()?,
+                ) as usize;
+                cursor += SEAL_CONTAINED_LEN_SIZE;
+                if blob_len > SEAL_MAX_CONTAINED_TAIL_BYTES {
+                    return None;
+                }
+                if payload.len() < cursor + blob_len {
+                    return None;
+                }
+                let objects: Vec<ContainedObject> =
+                    bincode::deserialize(&payload[cursor..cursor + blob_len]).ok()?;
+                cursor += blob_len;
+                Some(Arc::from(objects))
+            } else {
+                None
+            };
+            if cursor != payload.len() {
+                return None;
+            }
             Some(SegmentEvent::Seal(SealEvent {
                 segment_id,
                 tier: tier_from_u8(payload[0])?,
@@ -495,28 +631,10 @@ fn decode_payload(kind: u8, segment_id: SegmentId, payload: &[u8]) -> Option<Seg
                     file_seq: u32::from_le_bytes(payload[36..40].try_into().ok()?),
                     offset: u64::from_le_bytes(payload[40..48].try_into().ok()?),
                 },
-                repacked_from: None,
-                pool_id: u32::from_le_bytes(payload[48..52].try_into().ok()?),
-            }))
-        }
-        KIND_SEAL
-            if payload.len() == SEAL_PAYLOAD_SIZE + SEAL_REPACKED_FROM_SIZE + SEAL_POOL_ID_SIZE
-                && payload[3] & !(SEAL_FLAG_REPACKED_FROM | SEAL_FLAG_POOL_ID) == 0
-                && payload[3] & (SEAL_FLAG_REPACKED_FROM | SEAL_FLAG_POOL_ID)
-                    == (SEAL_FLAG_REPACKED_FROM | SEAL_FLAG_POOL_ID) =>
-        {
-            Some(SegmentEvent::Seal(SealEvent {
-                segment_id,
-                tier: tier_from_u8(payload[0])?,
-                ec_k: payload[1],
-                ec_m: payload[2],
-                merkle_root: HashOutput::from_bytes(payload[4..36].try_into().ok()?),
-                data_wal_pos: DataWalPos {
-                    file_seq: u32::from_le_bytes(payload[36..40].try_into().ok()?),
-                    offset: u64::from_le_bytes(payload[40..48].try_into().ok()?),
-                },
-                repacked_from: Some(SegmentId::from_uuid_bytes(payload[48..64].try_into().ok()?)),
-                pool_id: u32::from_le_bytes(payload[64..68].try_into().ok()?),
+                total_bytes,
+                repacked_from,
+                pool_id,
+                contained_objects,
             }))
         }
         KIND_DELETE if payload.len() == DELETE_PAYLOAD_SIZE => {
@@ -600,8 +718,8 @@ fn is_pre_pool_seal(kind: u8, payload: &[u8]) -> bool {
         // records lack.
         flags & !(SEAL_FLAG_REPACKED_FROM | SEAL_FLAG_POOL_ID) == 0
             && flags & SEAL_FLAG_POOL_ID == 0
-            && (payload.len() == SEAL_PAYLOAD_SIZE
-                || payload.len() == SEAL_PAYLOAD_SIZE + SEAL_REPACKED_FROM_SIZE)
+            && (payload.len() == SEAL_PRE_POOL_PAYLOAD_SIZE
+                || payload.len() == SEAL_PRE_POOL_PAYLOAD_SIZE + SEAL_REPACKED_FROM_SIZE)
     }
 }
 
@@ -1488,7 +1606,7 @@ mod tests {
     /// Record sizes used by rotation tests (bytes):
     /// reserve = 36, seal = 84, delete = 32.
     const RESERVE_RECORD_SIZE: u64 = 36;
-    const SEAL_RECORD_SIZE: u64 = 84;
+    const SEAL_RECORD_SIZE: u64 = 92;
     const DELETE_RECORD_SIZE: u64 = 32;
 
     fn test_config(dir: &Path) -> EventWalConfig {
@@ -1512,6 +1630,8 @@ mod tests {
     fn seal_event(id: SegmentId) -> SegmentEvent {
         SegmentEvent::Seal(SealEvent {
             pool_id: 0,
+            total_bytes: 0,
+            contained_objects: None,
             segment_id: id,
             tier: SizeTier::Standard,
             ec_k: 4,
@@ -1525,6 +1645,8 @@ mod tests {
     fn seal_event_with_repacked(id: SegmentId, old: SegmentId) -> SegmentEvent {
         SegmentEvent::Seal(SealEvent {
             pool_id: 0,
+            total_bytes: 0,
+            contained_objects: None,
             segment_id: id,
             tier: SizeTier::Standard,
             ec_k: 4,
@@ -1571,6 +1693,8 @@ mod tests {
         let id = SegmentId::new();
         let evt = SegmentEvent::Seal(SealEvent {
             pool_id: 3,
+            total_bytes: 0,
+            contained_objects: None,
             ..match seal_event(id) {
                 SegmentEvent::Seal(e) => e,
                 _ => unreachable!(),

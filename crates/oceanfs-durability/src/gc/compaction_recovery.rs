@@ -243,7 +243,7 @@ mod tests {
     /// Registers a Sealed entry carrying the compaction marker.
     fn seed_marked(registry: &SegmentLifecycleRegistry, new: SegmentId, old: SegmentId) {
         registry.reserve(new, reserved_meta(new)).unwrap();
-        registry.seal_with(new, sealed_meta(new), Some(old)).unwrap();
+        registry.seal_with(new, sealed_meta(new), Some(old), None).unwrap();
     }
 
     #[test]

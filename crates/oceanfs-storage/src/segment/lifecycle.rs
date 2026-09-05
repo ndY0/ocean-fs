@@ -72,8 +72,8 @@ use std::{
 
 use bytes::Bytes;
 use oceanfs_core::{
-    EventWalConfig, Gauge, HashOutput, LabelSet, LifecycleConfig, MetricRegistrar, SegmentId,
-    SegmentMetadata, SizeTier,
+    ContainedObject, EventWalConfig, Gauge, HashOutput, LabelSet, LifecycleConfig, MetricRegistrar,
+    SegmentId, SegmentMetadata, SizeTier,
 };
 use parking_lot::RwLock;
 
@@ -137,6 +137,13 @@ pub struct LifecycleEntry {
     /// `repacked_from`; survives checkpointing so startup recovery can
     /// identify incomplete compaction units (crash-window rows 7–9).
     pub repacked_from: Option<SegmentId>,
+    /// The seal-time contained-objects membership list (ADR-0034 D5) —
+    /// the runtime mirror of the durable Seal record's tail. `Some` for
+    /// Sealed entries that were sealed by a write path that recorded
+    /// `(bucket, key)` per append; `None` for WAL-replayed/pre-feature
+    /// Sealed entries (re-readable and reapable, but not compaction
+    /// candidates — GC never scans to recover membership).
+    pub contained_objects: Option<Arc<[ContainedObject]>>,
     /// When a `Deleted` entry's grace expires (entry eviction time).
     /// Meaningful only for `Deleted` entries; set at construction.
     evict_at: Instant,
@@ -170,6 +177,7 @@ impl LifecycleEntry {
             metadata,
             data_wal_pos: None,
             repacked_from: None,
+            contained_objects: None,
             evict_at: Instant::now(),
             in_flight: None,
             seal_queued: false,
@@ -493,7 +501,7 @@ impl SegmentLifecycleRegistry {
     ///
     /// Returns a [`TransitionError`] when the entry is not `Reserved`.
     pub fn seal(&self, id: SegmentId, metadata: SegmentMetadata) -> Result<(), TransitionError> {
-        self.seal_with(id, metadata, None)
+        self.seal_with(id, metadata, None, None)
     }
 
     /// Seals a segment with the compaction marker (ADR-0025
@@ -501,6 +509,10 @@ impl SegmentLifecycleRegistry {
     /// was repacked from, so startup recovery can identify incomplete
     /// compaction units (crash-window rows 7–9). Same transition rules
     /// and error contract as [`seal`](Self::seal).
+    ///
+    /// `contained_objects` is the seal-time membership list (ADR-0034 D5):
+    /// `Some` for write-path seals that recorded `(bucket, key)` per
+    /// append, `None` for WAL-replayed / pre-feature seals.
     ///
     /// # Errors
     ///
@@ -510,6 +522,7 @@ impl SegmentLifecycleRegistry {
         id: SegmentId,
         metadata: SegmentMetadata,
         repacked_from: Option<SegmentId>,
+        contained_objects: Option<Arc<[ContainedObject]>>,
     ) -> Result<(), TransitionError> {
         let shard = &self.shards[self.shard_for(id)];
         let mut guard = shard.write();
@@ -519,6 +532,7 @@ impl SegmentLifecycleRegistry {
                 entry.state = SegmentState::Sealed;
                 entry.metadata = metadata;
                 entry.repacked_from = repacked_from;
+                entry.contained_objects = contained_objects;
                 // The seal transition closes the read window: the `.dat`
                 // is authoritative once sealed (the in-flight buffer is
                 // released — the memory-bound test pins this).
@@ -581,6 +595,7 @@ impl SegmentLifecycleRegistry {
                 metadata: entry.metadata.clone(),
                 data_wal_pos: entry.data_wal_pos,
                 repacked_from: entry.repacked_from,
+                contained_objects: entry.contained_objects.clone(),
                 evict_at: entry.evict_at,
                 in_flight: entry.in_flight.clone(),
                 seal_queued: entry.seal_queued,
@@ -702,6 +717,7 @@ impl SegmentLifecycleRegistry {
                         metadata: meta,
                         data_wal_pos: None,
                         repacked_from: None,
+                        contained_objects: None,
                         evict_at: Instant::now(),
                         in_flight: Some(data),
                         seal_queued: true,
@@ -1021,13 +1037,16 @@ impl SegmentLifecycleRegistry {
     }
 
     /// Folds a validated `seal` into the registry: `Reserved` → `Sealed`
-    /// with the full sealed metadata and the compaction marker (the
-    /// `SealEvent`'s `repacked_from`, `None` for ordinary seals).
+    /// with the full sealed metadata, the compaction marker (the
+    /// `SealEvent`'s `repacked_from`, `None` for ordinary seals), and the
+    /// seal-time contained-objects membership (the `SealEvent`'s tail,
+    /// ADR-0034 D5).
     pub(crate) fn fold_seal(
         &self,
         id: SegmentId,
         metadata: SegmentMetadata,
         repacked_from: Option<SegmentId>,
+        contained_objects: Option<Arc<[ContainedObject]>>,
     ) -> Result<(), TransitionError> {
         let shard = &self.shards[self.shard_for(id)];
         let mut guard = shard.write();
@@ -1038,6 +1057,7 @@ impl SegmentLifecycleRegistry {
                 entry.state = SegmentState::Sealed;
                 entry.metadata = metadata;
                 entry.repacked_from = repacked_from;
+                entry.contained_objects = contained_objects;
                 // The seal transition closes the read window: once the
                 // `.dat` is durable, the in-flight buffer is released —
                 // the memory-bound test pins this, and failing to clear
@@ -1514,7 +1534,15 @@ impl SegmentLifecycleCoordinator {
                     // records never decode; ADR-0031 D3).
                     let mut meta = meta;
                     meta.pool_id = evt.pool_id;
-                    self.registry.seal_with(evt.segment_id, meta, evt.repacked_from)
+                    // The logical total rides the event's fixed fields so
+                    // replay after a checkpoint reconstructs it (ADR-0034 D1).
+                    meta.total_bytes = evt.total_bytes;
+                    self.registry.seal_with(
+                        evt.segment_id,
+                        meta,
+                        evt.repacked_from,
+                        evt.contained_objects.clone(),
+                    )
                 }
                 SegmentEvent::Delete(evt) => self.registry.delete(evt.segment_id),
                 SegmentEvent::MetadataRefresh(evt) => self.registry.fold_refresh(
@@ -1985,6 +2013,29 @@ impl SegmentLifecycleCoordinator {
         metadata: SegmentMetadata,
         repacked_from: Option<SegmentId>,
     ) -> Result<(), TransitionError> {
+        self.request_seal_with_contained(id, metadata, repacked_from, None).await
+    }
+
+    /// Durably seals a segment with its contained-objects membership list
+    /// (ADR-0034 D5).
+    ///
+    /// Same contract as [`request_seal`](Self::request_seal); `contained`
+    /// is `Some` for write-path seals that recorded `(bucket, key)` per
+    /// append, `None` for WAL-replayed / pre-feature seals (re-readable,
+    /// reapable, but not compaction candidates). `request_seal` delegates
+    /// `None` so existing callers and tests stay put.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TransitionError`] when the entry is not `Reserved`, or
+    /// when the durable event-WAL append fails.
+    pub async fn request_seal_with_contained(
+        &self,
+        id: SegmentId,
+        metadata: SegmentMetadata,
+        repacked_from: Option<SegmentId>,
+        contained: Option<&[ContainedObject]>,
+    ) -> Result<(), TransitionError> {
         self.registry.validate_seal(id)?;
         // A repack never changes the storage shape: when the seal
         // carries the compaction marker, the tier/EC parameters must
@@ -2019,6 +2070,10 @@ impl SegmentLifecycleCoordinator {
         })?;
         let data_wal_pos =
             self.registry.last_data_wal_pos(id).unwrap_or(DataWalPos { file_seq: 0, offset: 0 });
+        // Share one Arc between the durable event (its tail) and the
+        // registry entry (the runtime mirror) — the list is written once
+        // at seal and dies with the segment's DeleteEvent.
+        let contained_arc = contained.map(Arc::from);
         let evt = SegmentEvent::Seal(SealEvent {
             segment_id: id,
             tier: metadata.size_tier,
@@ -2026,14 +2081,16 @@ impl SegmentLifecycleCoordinator {
             ec_m: metadata.ec_m,
             merkle_root,
             data_wal_pos,
+            total_bytes: metadata.total_bytes,
             repacked_from,
             pool_id: metadata.pool_id,
+            contained_objects: contained_arc.clone(),
         });
         let pos = event_wal
             .append(evt)
             .await
             .map_err(|e| TransitionError::DurableWriteFailed(e.to_string()))?;
-        self.registry.fold_seal(id, metadata, repacked_from)?;
+        self.registry.fold_seal(id, metadata, repacked_from, contained_arc)?;
         self.last_folded_pos.store(pos.packed(), std::sync::atomic::Ordering::Release);
         self.maybe_checkpoint().await;
         self.update_gauges();
@@ -2279,12 +2336,14 @@ impl SegmentLifecycleCoordinator {
                 ec_m: meta.ec_m,
                 merkle_root,
                 data_wal_pos,
+                total_bytes: meta.total_bytes,
                 repacked_from: None,
                 pool_id: meta.pool_id,
+                contained_objects: None,
             });
             match event_wal.append(evt).await {
                 Ok(pos) => {
-                    if let Err(e) = self.registry.fold_seal(id, meta, None) {
+                    if let Err(e) = self.registry.fold_seal(id, meta, None, None) {
                         // A fold can lose a race only to a concurrent
                         // delete of the same segment (unreachable: the
                         // reaper deletes only unreferenced segments, and
