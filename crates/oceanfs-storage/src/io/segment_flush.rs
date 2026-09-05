@@ -404,6 +404,7 @@ mod tests {
     fn make_meta(segment_id: SegmentId) -> SegmentMetadata {
         SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id,
             ec_k: 0,
             ec_m: 0,

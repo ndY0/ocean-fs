@@ -299,6 +299,7 @@ pub struct RebuildOutcome {
 ///     storage_locations: smallvec::SmallVec::new(),
 ///     sealed_at: None,
 ///     pool_id: 0,
+///     total_bytes: 0,
 /// };
 /// registry.reserve(id, meta).unwrap();
 /// let entry = registry.get(id).unwrap();
@@ -402,6 +403,7 @@ pub fn shard_count(config: &LifecycleConfig) -> usize {
 ///     storage_locations: smallvec::SmallVec::new(),
 ///     sealed_at: None,
 ///     pool_id: 0,
+///     total_bytes: 0,
 /// };
 /// assert!(registry.reserve(id, meta).is_ok());
 /// assert_eq!(registry.len(), 1);
@@ -619,6 +621,7 @@ impl SegmentLifecycleRegistry {
     ///     storage_locations: smallvec::SmallVec::new(),
     ///     sealed_at: None,
     ///     pool_id: 0,
+    ///     total_bytes: 0,
     /// };
     /// registry.reserve(id, meta).unwrap();
     /// assert!(matches!(registry.read_source(id), SegmentReadSource::ActiveSlot));
@@ -683,6 +686,7 @@ impl SegmentLifecycleRegistry {
             None => {
                 let meta = SegmentMetadata {
                     pool_id: 0,
+                    total_bytes: 0,
                     segment_id: id,
                     ec_k,
                     ec_m,
@@ -1477,6 +1481,7 @@ impl SegmentLifecycleCoordinator {
                 SegmentEvent::Reserve(evt) => {
                     let meta = SegmentMetadata {
                         pool_id: 0,
+                        total_bytes: 0,
                         segment_id: evt.segment_id,
                         ec_k: evt.ec_k,
                         ec_m: evt.ec_m,
@@ -1494,6 +1499,7 @@ impl SegmentLifecycleCoordinator {
                     self.registry.record_data_wal_pos(evt.segment_id, evt.data_wal_pos);
                     let meta = SegmentMetadata {
                         pool_id: 0,
+                        total_bytes: 0,
                         segment_id: evt.segment_id,
                         ec_k: evt.ec_k,
                         ec_m: evt.ec_m,
@@ -1760,6 +1766,7 @@ impl SegmentLifecycleCoordinator {
             };
             let meta = SegmentMetadata {
                 pool_id: 0,
+                total_bytes: 0,
                 segment_id: id,
                 ec_k: entry.metadata.ec_k,
                 ec_m: entry.metadata.ec_m,
@@ -1906,6 +1913,7 @@ impl SegmentLifecycleCoordinator {
         self.registry.validate_reserve(id)?;
         let meta = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id: id,
             ec_k,
             ec_m,
@@ -2472,6 +2480,7 @@ mod tests {
     fn test_metadata(segment_id: SegmentId, sealed: bool) -> SegmentMetadata {
         SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id,
             ec_k: 4,
             ec_m: 2,
@@ -3260,6 +3269,7 @@ mod tests {
                     }
                     let meta = SegmentMetadata {
                         pool_id: 0,
+                        total_bytes: 0,
                         segment_id: seg_id,
                         ec_k: 2,
                         ec_m: 1,
@@ -3661,6 +3671,7 @@ mod tests {
 
         let sealed_meta = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id: id,
             ec_k: 4,
             ec_m: 2,
@@ -3714,6 +3725,7 @@ mod tests {
                 SegmentEvent::Reserve(evt) => {
                     let meta = SegmentMetadata {
                         pool_id: 0,
+                        total_bytes: 0,
                         segment_id: evt.segment_id,
                         ec_k: evt.ec_k,
                         ec_m: evt.ec_m,
@@ -3727,6 +3739,7 @@ mod tests {
                 SegmentEvent::Seal(evt) => {
                     let meta = SegmentMetadata {
                         pool_id: 0,
+                        total_bytes: 0,
                         segment_id: evt.segment_id,
                         ec_k: evt.ec_k,
                         ec_m: evt.ec_m,

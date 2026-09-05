@@ -285,6 +285,7 @@ impl Harness {
     async fn seal(&self, id: SegmentId, data: &[u8]) {
         let meta = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id: id,
             ec_k: 4,
             ec_m: 2,
@@ -992,6 +993,7 @@ fn entry_is_garbage_position_boundary() {
     let id = SegmentId::new();
     let reserved_meta = SegmentMetadata {
         pool_id: 0,
+        total_bytes: 0,
         segment_id: id,
         ec_k: 4,
         ec_m: 2,
@@ -1012,6 +1014,7 @@ fn entry_is_garbage_sealed_position_rule_and_mutation_checks() {
     let id = SegmentId::new();
     let sealed_meta = SegmentMetadata {
         pool_id: 0,
+        total_bytes: 0,
         segment_id: id,
         ec_k: 4,
         ec_m: 2,
@@ -1029,6 +1032,7 @@ fn entry_is_garbage_sealed_position_rule_and_mutation_checks() {
             id,
             SegmentMetadata {
                 pool_id: 0,
+                total_bytes: 0,
                 segment_id: id,
                 ec_k: 4,
                 ec_m: 2,
@@ -1085,6 +1089,7 @@ fn entry_is_garbage_deleted_is_always_garbage() {
             id,
             SegmentMetadata {
                 pool_id: 0,
+                total_bytes: 0,
                 segment_id: id,
                 ec_k: 4,
                 ec_m: 2,
@@ -1107,6 +1112,7 @@ fn entry_is_garbage_deleted_is_always_garbage() {
             id,
             SegmentMetadata {
                 pool_id: 0,
+                total_bytes: 0,
                 segment_id: id,
                 ec_k: 4,
                 ec_m: 2,

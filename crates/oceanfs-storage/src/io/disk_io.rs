@@ -992,6 +992,7 @@ fn observed_sync<T>(
 /// observer.register_pool(0, None);
 /// let io = ObservedIo {
 ///     pool_id: 0,
+///     total_bytes: 0,
 ///     backend: Arc::new(IoBackend::default()),
 ///     observer,
 /// };

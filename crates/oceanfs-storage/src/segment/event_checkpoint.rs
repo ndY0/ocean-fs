@@ -556,6 +556,7 @@ fn decode_snapshot(bytes: &[u8]) -> Option<(EventWalPos, SegmentLifecycleRegistr
                 // seal keeps it).
                 let reserved_meta = SegmentMetadata {
                     pool_id: 0,
+                    total_bytes: 0,
                     segment_id,
                     ec_k: meta.ec_k,
                     ec_m: meta.ec_m,
@@ -590,6 +591,7 @@ mod tests {
                     id,
                     SegmentMetadata {
                         pool_id: 0,
+                        total_bytes: 0,
                         segment_id: id,
                         ec_k: 4,
                         ec_m: 2,
@@ -608,6 +610,7 @@ mod tests {
                         id,
                         SegmentMetadata {
                             pool_id: 0,
+                            total_bytes: 0,
                             segment_id: id,
                             ec_k: 4,
                             ec_m: 2,
@@ -706,6 +709,7 @@ mod tests {
         let old = SegmentId::new();
         let meta = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id: id,
             ec_k: 4,
             ec_m: 2,
@@ -744,6 +748,7 @@ mod tests {
                 id,
                 SegmentMetadata {
                     pool_id: 0,
+                    total_bytes: 0,
                     segment_id: id,
                     ec_k: 4,
                     ec_m: 2,

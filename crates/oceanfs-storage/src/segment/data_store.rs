@@ -633,6 +633,7 @@ mod tests {
         let merkle_root = oceanfs_core::HashOutput::from_bytes(*blake3::hash(data).as_bytes());
         let meta = oceanfs_core::SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id: id,
             ec_k: 4,
             ec_m: 2,

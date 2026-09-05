@@ -54,6 +54,7 @@ async fn scrub_cycle_verifies_healthy_segments() {
 
         let seg = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id: seg_id,
             ec_k: 4,
             ec_m: 2,
@@ -88,6 +89,7 @@ async fn scrub_cycle_detects_corruption() {
 
     let seg = SegmentMetadata {
         pool_id: 0,
+        total_bytes: 0,
         segment_id: seg_id,
         ec_k: 4,
         ec_m: 2,
@@ -131,6 +133,7 @@ async fn run_cycle_with_missing_data_skips_not_corrupt() {
     // Put segment metadata with a Merkle root
     let seg = SegmentMetadata {
         pool_id: 0,
+        total_bytes: 0,
         segment_id: seg_id,
         ec_k: 4,
         ec_m: 2,

@@ -927,6 +927,7 @@ impl SegmentRpc for SegmentGrpcService {
                 .as_millis() as i64;
             let mut meta = oceanfs_core::SegmentMetadata {
                 pool_id: 0,
+                total_bytes: 0,
                 segment_id,
                 ec_k,
                 ec_m,

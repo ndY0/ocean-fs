@@ -236,6 +236,7 @@ impl Harness {
         self.data_store.write_segment_data(&id, data).await.unwrap();
         let meta = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id: id,
             ec_k: 4,
             ec_m: 2,

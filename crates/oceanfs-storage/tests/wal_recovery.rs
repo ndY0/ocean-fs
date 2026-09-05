@@ -489,6 +489,7 @@ async fn retention_sweeps_sealed_segments_with_machine_liveness() {
         }
         let meta = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id: seg_id,
             ec_k: 2,
             ec_m: 1,

@@ -83,6 +83,7 @@ async fn machine_segment_lifecycle_roundtrip() {
     // Seal with full metadata.
     let meta = SegmentMetadata {
         pool_id: 0,
+        total_bytes: 0,
         segment_id,
         ec_k: 4,
         ec_m: 2,
@@ -202,6 +203,7 @@ fn multiple_segments_all_enumerated() {
         let segment_id = SegmentId::new();
         let meta = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id,
             ec_k: 0,
             ec_m: 0,

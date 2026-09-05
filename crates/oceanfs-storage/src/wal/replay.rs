@@ -573,6 +573,7 @@ mod tests {
     fn sealed_meta(id: SegmentId) -> SegmentMetadata {
         SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id: id,
             ec_k: 1,
             ec_m: 0,

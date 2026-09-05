@@ -361,6 +361,7 @@ impl SegmentCompactor {
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
         let new_seg_meta = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id: new_segment_id,
             ec_k: segment_meta.ec_k,
             ec_m: segment_meta.ec_m,
@@ -620,6 +621,7 @@ mod tests {
     fn make_segment_meta(id: SegmentId, tier: SizeTier, sealed_at: i64) -> SegmentMetadata {
         SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id: id,
             ec_k: 4,
             ec_m: 2,

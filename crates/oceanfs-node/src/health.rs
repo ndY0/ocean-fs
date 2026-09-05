@@ -54,6 +54,7 @@ use crate::{pool_manifest::build_node_manifest, routing_cache::ManifestCache};
 ///         id,
 ///         SegmentMetadata {
 ///             pool_id: 3,
+///             total_bytes: 0,
 ///             segment_id: id,
 ///             ec_k: 0,
 ///             ec_m: 0,

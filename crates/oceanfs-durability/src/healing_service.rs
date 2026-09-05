@@ -2198,6 +2198,7 @@ mod tests {
                 segment_id,
                 oceanfs_core::SegmentMetadata {
                     pool_id: 0,
+                    total_bytes: 0,
                     segment_id,
                     ec_k: 4,
                     ec_m: 2,
@@ -2213,6 +2214,7 @@ mod tests {
                 segment_id,
                 oceanfs_core::SegmentMetadata {
                     pool_id: 0,
+                    total_bytes: 0,
                     segment_id,
                     ec_k: 4,
                     ec_m: 2,

@@ -45,6 +45,7 @@ fn make_object_meta(key: &str, size: u64, chunk: ChunkRef) -> ObjectMetadata {
 fn make_segment_meta(id: SegmentId, tier: SizeTier, sealed_at: i64) -> SegmentMetadata {
     SegmentMetadata {
         pool_id: 0,
+        total_bytes: 0,
         segment_id: id,
         ec_k: 4,
         ec_m: 2,

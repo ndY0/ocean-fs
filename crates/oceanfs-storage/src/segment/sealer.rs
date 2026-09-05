@@ -403,6 +403,7 @@ impl SegmentSealer {
         // segment lifecycle state; ADR-0025 phase 1).
         let meta = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id,
             ec_k,
             ec_m,

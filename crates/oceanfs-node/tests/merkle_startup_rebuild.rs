@@ -23,6 +23,7 @@ fn make_hash(byte: u8) -> HashOutput {
 fn make_sealed_segment(id: SegmentId, merkle_root: HashOutput) -> SegmentMetadata {
     SegmentMetadata {
         pool_id: 0,
+        total_bytes: 0,
         segment_id: id,
         ec_k: 4,
         ec_m: 2,
@@ -87,6 +88,7 @@ fn rebuild_tree_skips_unsealed_segments() {
     // Unsealed segment — should not appear in the tree.
     let unsealed = SegmentMetadata {
         pool_id: 0,
+        total_bytes: 0,
         segment_id: SegmentId::new(),
         ec_k: 4,
         ec_m: 2,
@@ -100,6 +102,7 @@ fn rebuild_tree_skips_unsealed_segments() {
     // Sealed but no merkle root — should not appear.
     let sealed_no_root = SegmentMetadata {
         pool_id: 0,
+        total_bytes: 0,
         segment_id: SegmentId::new(),
         ec_k: 4,
         ec_m: 2,
@@ -135,6 +138,7 @@ fn rebuild_tree_with_mixed_segments() {
         &registry,
         SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id: no_root_id,
             ec_k: 4,
             ec_m: 2,
@@ -155,6 +159,7 @@ fn rebuild_tree_with_mixed_segments() {
             unsealed_id,
             SegmentMetadata {
                 pool_id: 0,
+                total_bytes: 0,
                 segment_id: unsealed_id,
                 ec_k: 4,
                 ec_m: 2,

@@ -7,7 +7,7 @@
 
 use super::{
     config::SizeTier,
-    id::{NodeId, ObjectKey, SegmentId},
+    id::{BucketId, NodeId, ObjectKey, SegmentId},
 };
 use crate::{types::hash_output::HashOutput, Hlc};
 
@@ -136,6 +136,7 @@ impl ObjectMetadata {
 ///     storage_locations: smallvec::SmallVec::new(),
 ///     sealed_at: Some(1700000000000),
 ///     pool_id: 0,
+///     total_bytes: 0,
 /// };
 /// assert!(meta.is_sealed());
 /// ```
@@ -162,12 +163,73 @@ pub struct SegmentMetadata {
     /// payloads keep working — no migration pass (f5 accepted deviation).
     #[serde(default)]
     pub pool_id: u32,
+    /// Logical byte total of the segment's data section, recorded at seal
+    /// (ADR-0034 D1).
+    ///
+    /// `total_bytes` is the data-section byte length of the segment's
+    /// `.dat` at seal (= Σ blob lengths, and = the `size` field the sealer
+    /// writes into the segment header). It is the `logical_total` half of
+    /// the accounting invariant `live = logical_total − dead` that GC
+    /// liveness and orphan detection consume (f2). Defaults to `0` on
+    /// deserialize so pre-f3 JSON metadata stays readable; accounting
+    /// consumers treat a Sealed entry whose `total_bytes` is `0` as
+    /// "unknown" and never as fully-dead.
+    #[serde(default)]
+    pub total_bytes: u64,
 }
 
 impl SegmentMetadata {
     /// Returns `true` if the segment has been sealed.
     pub fn is_sealed(&self) -> bool {
         self.sealed_at.is_some()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ContainedObject
+// ---------------------------------------------------------------------------
+
+/// One object contained in a sealed segment (ADR-0034 D5).
+///
+/// The write coordinator knows the `(bucket, key)` of every chunk it
+/// appends, so at seal time the segment records a compact
+/// **contained-objects membership list** — deduplicated by `(bucket, key)`
+/// and sorted so its serialization is deterministic (an object split across
+/// chunks in one segment appears once). The list lives with the segment's
+/// metadata on the event-WAL + checkpoint path, never inside the `.dat`
+/// binary (ADR-0034 boundary; ADR-0029 D7's deferred self-description stays
+/// deferred). GC compaction enumerates a segment's objects from this list
+/// (plus point lookups) instead of scanning the whole objects column family.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::{BucketId, ContainedObject, ObjectKey};
+///
+/// let a = ContainedObject { bucket: BucketId::new("b1"), key: ObjectKey::new("k1") };
+/// let b = ContainedObject { bucket: BucketId::new("b1"), key: ObjectKey::new("k2") };
+/// let mut objs = vec![b.clone(), a.clone(), a.clone()];
+/// let dedup = ContainedObject::sorted_dedup(objs);
+/// assert_eq!(dedup, vec![a, b]);
+/// ```
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct ContainedObject {
+    /// Bucket of the contained object.
+    pub bucket: BucketId,
+    /// Key of the contained object.
+    pub key: ObjectKey,
+}
+
+impl ContainedObject {
+    /// Sorts a contained-object list by `(bucket, key)` and removes
+    /// duplicates, so its serialization is deterministic and an object
+    /// split across chunks in one segment appears exactly once.
+    pub fn sorted_dedup(mut objects: Vec<ContainedObject>) -> Vec<ContainedObject> {
+        objects.sort();
+        objects.dedup();
+        objects
     }
 }
 
@@ -424,6 +486,7 @@ mod tests {
     fn segment_metadata_is_sealed_when_sealed_at_present() {
         let meta = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id: SegmentId::new(),
             ec_k: 4,
             ec_m: 2,
@@ -446,6 +509,7 @@ mod tests {
             storage_locations: smallvec::SmallVec::new(),
             sealed_at: None,
             pool_id: 0,
+            total_bytes: 0,
         };
         assert!(!meta.is_sealed());
     }
@@ -465,6 +529,7 @@ mod tests {
             storage_locations: smallvec::SmallVec::new(),
             sealed_at: Some(1700000000000),
             pool_id: 3,
+            total_bytes: 0,
         };
 
         let json = serde_json::to_string(&meta).unwrap();

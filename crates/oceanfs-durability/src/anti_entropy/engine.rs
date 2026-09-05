@@ -1122,6 +1122,7 @@ mod tests {
     ) -> SegmentMetadata {
         SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id: id,
             ec_k: 4,
             ec_m: 2,
@@ -1299,6 +1300,7 @@ mod tests {
         // Store segment with correct root
         let seg = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id: seg_id,
             ec_k: 4,
             ec_m: 2,

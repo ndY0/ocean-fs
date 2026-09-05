@@ -851,6 +851,7 @@ mod tests {
                 seg_id,
                 oceanfs_core::SegmentMetadata {
                     pool_id: 0,
+                    total_bytes: 0,
                     segment_id: seg_id,
                     ec_k: 0,
                     ec_m: 0,

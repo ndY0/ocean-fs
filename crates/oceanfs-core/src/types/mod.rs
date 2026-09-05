@@ -48,8 +48,8 @@ pub use heal::{HealRequest, HealStats, ShardIndex};
 pub use id::{BucketId, NodeId, ObjectKey, SegmentId};
 // --- Metadata types ---
 pub use metadata::{
-    ChunkRef, DeadChunkKind, DeadChunkRecord, ObjectMetadata, SegmentIndexEntry, SegmentMetadata,
-    StorageLocation, Tombstone,
+    ChunkRef, ContainedObject, DeadChunkKind, DeadChunkRecord, ObjectMetadata, SegmentIndexEntry,
+    SegmentMetadata, StorageLocation, Tombstone,
 };
 // --- Node / cluster operation types ---
 pub use node::{

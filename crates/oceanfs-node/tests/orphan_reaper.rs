@@ -69,6 +69,7 @@ fn make_shard_store() -> Arc<InMemoryShardStore> {
 fn make_segment(id: SegmentId, sealed_at: i64) -> SegmentMetadata {
     SegmentMetadata {
         pool_id: 0,
+        total_bytes: 0,
         segment_id: id,
         ec_k: 4,
         ec_m: 2,

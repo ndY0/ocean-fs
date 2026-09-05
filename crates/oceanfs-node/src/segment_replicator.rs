@@ -881,6 +881,7 @@ mod tests {
         let root = oceanfs_durability::MerkleTree::build(data, 0).expect("merkle").root().hash();
         let meta = oceanfs_core::SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id: id,
             ec_k: 1,
             ec_m: 0,

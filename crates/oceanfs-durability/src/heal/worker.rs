@@ -747,6 +747,7 @@ mod tests {
 
         let segment_meta = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id,
             ec_k: 3,
             ec_m: 1,
@@ -807,6 +808,7 @@ mod tests {
 
         let segment_meta = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id,
             ec_k: 0,
             ec_m: 0,
@@ -878,6 +880,7 @@ mod tests {
 
         let segment_meta = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id,
             ec_k: 2,
             ec_m: 2,
@@ -943,6 +946,7 @@ mod tests {
 
         let segment_meta = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id,
             ec_k: 3,
             ec_m: 1,
@@ -1018,6 +1022,7 @@ mod tests {
 
         let segment_meta = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id,
             ec_k: 3,
             ec_m: 1,
@@ -1103,6 +1108,7 @@ mod tests {
 
         let segment_meta = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id,
             ec_k: 3,
             ec_m: 1,
@@ -1149,6 +1155,7 @@ mod tests {
 
         let segment_meta = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id,
             ec_k: 3,
             ec_m: 1,

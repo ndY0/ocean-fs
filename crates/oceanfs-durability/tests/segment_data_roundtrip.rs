@@ -135,6 +135,7 @@ async fn repair_write_read_roundtrip_through_unified_trait() {
             segment_id,
             oceanfs_core::SegmentMetadata {
                 pool_id: 0,
+                total_bytes: 0,
                 segment_id,
                 ec_k: 4,
                 ec_m: 2,

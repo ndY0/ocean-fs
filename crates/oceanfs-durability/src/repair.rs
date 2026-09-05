@@ -472,6 +472,7 @@ impl ReRepWorker {
 
         let mut meta = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id,
             ec_k,
             ec_m,
@@ -1047,6 +1048,7 @@ mod tests {
         let segment_id = SegmentId::new();
         let meta = SegmentMetadata {
             pool_id: 0,
+            total_bytes: 0,
             segment_id,
             ec_k: 1,
             ec_m: 0,
