@@ -21,10 +21,10 @@ updated: 2026-09-05
 > start, and what must not regress while you work. The per-feature docs
 > are the authority for your feature; this document is the map.
 
-> **STATUS (2026-09-05): c1, c2, and the c3a prerequisite seam
-> (seal-pipeline relocation storage-side, commit `489397a`) LANDED — each
-> with independent review PASS; c3–c5 pending.** See the Landing order
-> under Feature DAG for the per-feature gate record.
+> **STATUS (2026-09-05): c1, c2, the c3a prerequisite seam
+> (seal-pipeline relocation storage-side, commit `489397a`), and c3
+> LANDED — each with independent review PASS; c4–c5 pending.** See the
+> Landing order under Feature DAG for the per-feature gate record.
 
 ---
 
@@ -127,11 +127,12 @@ one of the c1–c5 builder steps and does not change what c3 extracts.
   seal pipeline (`oceanfs-storage::segment::seal_pipeline`); `SealingWork`
   carries entries cleared only on successful enqueue; node order storage →
   durability → seal pipeline → recovery → server construction. Full
-  details in its own doc (`c3a-seal-pipeline-relocation.md`). c3 remains
-  pending and now has its prerequisite seam.
-- **c3 split-server-builder — pending.** Its Option-A prerequisite seam
-  (c3a) LANDED 2026-09-05 — the seal worker and the coordinator's notifier
-  field are gone, so this extraction moves the remaining server sections.
+  details in its own doc (`c3a-seal-pipeline-relocation.md`); it
+  unblocked c3, which LANDED 2026-09-05 (next bullet).
+- **c3 split-server-builder — LANDED 2026-09-05 (review PASS, iteration
+  1 — 0 blocking gaps).** `ServerModule` extracted (§8-13 + §15
+  construction; node.rs 3465→2937, start() ~1592→~1179); binds + §15b-e
+  + §16-17 stay for c4/c5; deviations recorded in the c3 doc.
 - **c4 split-network-builder — pending.**
 - **c5 background-spawn-extraction + `start()` slimming — pending.**
 

@@ -12,139 +12,24 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use oceanfs_core::{
-    AccelConfig, BucketId, Hlc, HlcClock, Incarnation, MetadataConfig, MetricRegistrar, NodeConfig,
-    NodeId, ObjectKey, ObjectMetadata, RingConfig, RpcConfig, SegmentId, SegmentSizeConfig,
-    Tombstone, WalConfig,
+    AccelConfig, Incarnation, MetadataConfig, MetricRegistrar, NodeConfig, NodeId, RingConfig,
+    RpcConfig, SegmentId, WalConfig,
 };
-// ---------------------------------------------------------------------------
-// RepairSinkChannel — g3 → g5 re-replication repair queue adapter
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata, SegmentSizeConfig};
 /// A re-replication repair request (g5 ReRepWorker input).
 pub use oceanfs_durability::healing_service::ReRepRequest as RepairRequest;
 use oceanfs_durability::{
     GrpcHintDeliveryClient, HintedHandoff, HintedHandoffConfig, HintedHandoffManager,
 };
 use oceanfs_network::{apply_opts_to_fd, create_reuseport_listener};
-use oceanfs_server::{
-    auth::AuthMiddleware, metadata_ops::MetadataOps, AdminHandler, BucketConfigStore,
-    ReadCoordinator, Router, S3Handler, WriteCoordinator,
-};
 use tokio::{sync::broadcast, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::{
-    membership_state::{default_state_path, MembershipStateStore},
-    metadata_adapter::MetadataStoreAdapter,
-};
-
-/// Bounded-channel-backed [`RepairSink`](oceanfs_durability::healing_service::RepairSink)
-/// — the g5 `request_re_replication` handler's enqueue target on the
-/// acquiring node. The target's `ReRepWorker` drains the queue.
-struct WorkerQueueSink {
-    tx: tokio::sync::mpsc::Sender<RepairRequest>,
-}
-
-#[async_trait::async_trait]
-impl oceanfs_durability::healing_service::RepairSink for WorkerQueueSink {
-    async fn enqueue(&self, request: RepairRequest) -> Result<(), String> {
-        self.tx.try_send(request).map_err(|e| match e {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => "repair queue full".to_string(),
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => "repair queue closed".to_string(),
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PrefetchStoreAdapter — bridges concrete store to oceanfs_storage_api::MetadataStore
-// ---------------------------------------------------------------------------
-
-/// Minimal adapter wrapping `oceanfs_storage::RocksDbMetadataStore` to implement
-/// the `oceanfs_storage_api::MetadataStore` trait needed by `PrefetchEngine`.
-struct PrefetchStoreAdapter {
-    store: Arc<oceanfs_storage::RocksDbMetadataStore>,
-}
-
-impl oceanfs_storage_api::MetadataStore for PrefetchStoreAdapter {
-    fn list_object_keys(&self, bucket: &BucketId) -> std::io::Result<Vec<(BucketId, ObjectKey)>> {
-        let results = self.store.list_objects(bucket, "");
-        results
-            .into_iter()
-            .map(|r| {
-                r.map(|meta| (bucket.clone(), meta.object_key))
-                    .map_err(|e| std::io::Error::other(e.to_string()))
-            })
-            .collect()
-    }
-
-    fn get_object_metadata(
-        &self,
-        bucket: &BucketId,
-        key: &ObjectKey,
-    ) -> std::io::Result<Option<ObjectMetadata>> {
-        self.store.get_object(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
-    }
-
-    fn list_objects(
-        &self,
-        bucket: &BucketId,
-        prefix: &str,
-    ) -> Vec<std::io::Result<ObjectMetadata>> {
-        self.store
-            .list_objects(bucket, prefix)
-            .into_iter()
-            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
-            .collect()
-    }
-
-    fn list_tombstones(&self, bucket: &BucketId) -> Vec<std::io::Result<(ObjectKey, Tombstone)>> {
-        self.store
-            .list_tombstones(bucket)
-            .into_iter()
-            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
-            .collect()
-    }
-
-    fn delete_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<()> {
-        self.store.delete_tombstone(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
-    }
-
-    fn has_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<bool> {
-        self.store.has_tombstone(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
-    }
-
-    fn put_object(&self, bucket: &BucketId, meta: ObjectMetadata) -> std::io::Result<()> {
-        self.store
-            .put_object_in_bucket(bucket, meta)
-            .map_err(|e| std::io::Error::other(e.to_string()))
-    }
-
-    fn batch_write(&self, ops: Vec<oceanfs_storage_api::BatchOp>) -> std::io::Result<()> {
-        // Fall back to sequential writes for the adapter.
-        for op in ops {
-            match op {
-                oceanfs_storage_api::BatchOp::PutObject(bucket, key, meta) => {
-                    // The adapter's put_object writes with the caller's
-                    // bucket; replicate that here for the rewritten object.
-                    self.store
-                        .put_object_in_bucket(&bucket, meta)
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
-                    let _ = key;
-                }
-                oceanfs_storage_api::BatchOp::DeleteObject(_, _) => {}
-                oceanfs_storage_api::BatchOp::PutTombstone(_, _, _) => {}
-                oceanfs_storage_api::BatchOp::DeleteTombstone(bucket, key) => {
-                    self.delete_tombstone(&bucket, &key)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn delete_object(&self, bucket: &BucketId, key: &ObjectKey, hlc: Hlc) -> std::io::Result<()> {
-        self.store.delete_object(bucket, key, hlc).map_err(|e| std::io::Error::other(e.to_string()))
-    }
-}
+use crate::membership_state::{default_state_path, MembershipStateStore};
+#[cfg(test)]
+use crate::modules::server::PrefetchStoreAdapter;
 
 // ---------------------------------------------------------------------------
 // BackgroundTasks
@@ -545,118 +430,7 @@ impl Node {
         // (c1: moved to modules/storage.rs — run_startup_recovery)
         storage.run_startup_recovery().await?;
 
-        // ---- 8. Construct caches ----
-        let l1_policy: Box<dyn oceanfs_cache::eviction::EvictionPolicy> = match config
-            .eviction_policy_l1
-        {
-            oceanfs_core::EvictionPolicyType::Gdsf => {
-                Box::new(oceanfs_cache::eviction::GdsfPolicy::new(
-                    oceanfs_cache::eviction::GdsfConfig::default(),
-                ))
-            }
-            oceanfs_core::EvictionPolicyType::TtlLru => Box::new(
-                oceanfs_cache::eviction::TtlLruPolicy::new(oceanfs_cache::eviction::TtlLruConfig {
-                    default_ttl_ms: config.object_cache_ttl_ms,
-                }),
-            ),
-            oceanfs_core::EvictionPolicyType::Adaptive => {
-                tracing::warn!(
-                    "Adaptive eviction policy not yet implemented; falling back to GDSF for L1"
-                );
-                Box::new(oceanfs_cache::eviction::GdsfPolicy::new(
-                    oceanfs_cache::eviction::GdsfConfig::default(),
-                ))
-            }
-            _ => {
-                tracing::warn!("Unknown L1 eviction policy; falling back to GDSF");
-                Box::new(oceanfs_cache::eviction::GdsfPolicy::new(
-                    oceanfs_cache::eviction::GdsfConfig::default(),
-                ))
-            }
-        };
-        let l2_policy: Box<dyn oceanfs_cache::eviction::EvictionPolicy> = match config
-            .eviction_policy_l2
-        {
-            oceanfs_core::EvictionPolicyType::TtlLru => Box::new(
-                oceanfs_cache::eviction::TtlLruPolicy::new(oceanfs_cache::eviction::TtlLruConfig {
-                    default_ttl_ms: config.metadata_cache_ttl_ms,
-                }),
-            ),
-            oceanfs_core::EvictionPolicyType::Gdsf => {
-                Box::new(oceanfs_cache::eviction::GdsfPolicy::new(
-                    oceanfs_cache::eviction::GdsfConfig::default(),
-                ))
-            }
-            oceanfs_core::EvictionPolicyType::Adaptive => {
-                tracing::warn!(
-                    "Adaptive eviction policy not yet implemented; falling back to TTL-LRU for L2"
-                );
-                // [review][config][high]
-                // missing config from userland
-                // [end]
-                Box::new(oceanfs_cache::eviction::TtlLruPolicy::new(
-                    oceanfs_cache::eviction::TtlLruConfig::default(),
-                ))
-            }
-            _ => {
-                tracing::warn!("Unknown L2 eviction policy; falling back to TTL-LRU");
-                // [review][config][high]
-                // same remark
-                // [end]
-                Box::new(oceanfs_cache::eviction::TtlLruPolicy::new(
-                    oceanfs_cache::eviction::TtlLruConfig::default(),
-                ))
-            }
-        };
-        let object_cache = Arc::new(oceanfs_cache::ObjectCache::new(
-            oceanfs_cache::ObjectCacheConfig {
-                enabled: config.object_cache_enabled,
-                max_size_bytes: config.object_cache_size_bytes,
-                ttl_ms: config.object_cache_ttl_ms,
-                max_blob_size: config.object_cache_max_blob_size,
-                ..Default::default()
-            },
-            l1_policy,
-        ));
-        let metadata_cache = Arc::new(oceanfs_cache::MetadataCache::new(
-            oceanfs_cache::MetadataCacheConfig {
-                enabled: config.metadata_cache_enabled,
-                max_size_bytes: config.metadata_cache_size_bytes,
-                ttl_ms: config.metadata_cache_ttl_ms,
-                ..Default::default()
-            },
-            l2_policy,
-        ));
-        let negative_cache =
-            Arc::new(oceanfs_cache::NegativeCache::new(oceanfs_cache::NegativeCacheConfig {
-                enabled: config.negative_cache_enabled,
-                size_bytes: config.negative_cache_size_bytes,
-                rebuild_interval_sec: config.negative_cache_rebuild_sec,
-                ..Default::default()
-            }));
-
-        // ---- 9. Construct prefetch engine ----
-        let prefetch_config = oceanfs_cache::PrefetchConfig {
-            enabled: config.prefetch_enabled,
-            after_list: config.prefetch_after_list,
-            after_get: config.prefetch_after_get,
-            ..Default::default()
-        };
-        let prefetch_store: Arc<dyn oceanfs_storage_api::MetadataStore> =
-            Arc::new(PrefetchStoreAdapter { store: storage.metadata_store.clone() });
-        let prefetch_engine = Arc::new(oceanfs_cache::PrefetchEngine::new(
-            prefetch_config,
-            metadata_cache.clone(),
-            Some(object_cache.clone()),
-            prefetch_store,
-        ));
-
-        // ---- 10. Construct bridge adapter ----
-        let metadata_ops: Arc<dyn MetadataOps> =
-            Arc::new(MetadataStoreAdapter::new(storage.metadata_store.clone()));
-
         // ---- 11. Construct I/O infrastructure ----
-        let hlc_clock = Arc::new(HlcClock::new());
         let hinted_handoff = Arc::new(
             HintedHandoff::new_with_pool(pool.clone())
                 .with_membership(membership.clone())
@@ -755,129 +529,38 @@ impl Node {
 
         // HERE
         // TODO : finish node startup sequence, then ocean durability, then server and quorum functionnalities
-
-        let write_coordinator = Arc::new(
-            WriteCoordinator::new(
-                ring_cache.clone(),
-                membership.clone(),
-                pool.clone(),
-                NodeId::new(&config.node_id),
-                hlc_clock.clone(),
-                storage.metadata_store.clone(),
-                SegmentSizeConfig::default(),
-                storage.shard_small.clone(),
-                storage.shard_standard.clone(),
-                storage.segment_pool_small.clone(),
-                storage.segment_pool_standard.clone(),
-                storage.sealer.clone(),
-                storage.lifecycle.clone(),
-                hinted_handoff_manager.clone(),
-            )
-            .with_timeouts(durability.op_timeouts.clone())
-            // Per-bucket compression: buckets opting in via
-            // `compression.tier != None` compress chunks on the write
-            // path through the accel dispatcher (blocking pool).
-            .with_compressor(Some(storage.accel.clone()))
-            // Cluster-readiness gate: while the ring is still converging
-            // after (re)join, writes fail with 503 instead of
-            // under-replicating (see the gate task above).
-            .with_ready_gate(ready_gate)
-            // Step 1c (honest quorum): cluster nodes require the ring
-            // view to satisfy the requested write quorum; single-node
-            // deployments (no seeds) keep the adaptive capping — the
-            // default bucket policy (w=2) would otherwise reject every
-            // write on a permanently 1-node ring.
-            .with_quorum_requires_ring(is_cluster_node)
-            .with_hint_inline_threshold(config.hint_inline_threshold_bytes)
-            // Peer-side routing hint (ADR-0029 §D5): replica targets
-            // whose manifest reports write_degraded / zero Healthy data
-            // pools are excluded; Phase A all-healthy = neutral.
-            .with_routing_hint(manifest_cache.clone())
-            // g2 (ADR-0029 §D3): the hint enqueue path rejects new debt
-            // while the hints pool is Dead.
-            .with_pool_registry(storage.registry.clone()),
-        );
-
-        // Clone for the hint-applier adapter (the coordinator is moved
-        // into the S3 handler state below).
-        let write_coordinator_for_applier = Arc::clone(&write_coordinator);
-
-        let read_coordinator = Arc::new(
-            ReadCoordinator::new_with_metadata(
-                ring_cache.clone(),
-                NodeId::new(&config.node_id),
-                None,
-                metadata_ops.clone(),
-            )
-            .with_segment_reader(storage.segment_reader.clone())
-            .with_connection_pool(pool.clone())
-            .with_membership(membership.clone())
-            .with_decoder(durability.ec_decoder.clone())
-            .with_ec_codec(
-                durability.codec_config.data_shards,
-                durability.codec_config.parity_shards,
-            )
-            // Read-path decompression for compressed chunks (paired
-            // with the write path's per-bucket compression).
-            .with_compressor(Some(storage.accel.clone()))
-            .with_timeouts(durability.op_timeouts.clone())
-            .with_default_fetch_strategy(config.default_fetch_strategy)
-            .with_hlc_clock(hlc_clock.clone())
-            // Peer-side routing hint (ADR-0029 §D5): replica candidates
-            // with zero Healthy data pools are excluded from the gRPC
-            // fetch path; Phase A all-healthy = neutral.
-            .with_routing_hint(manifest_cache.clone())
-            // Local-availability gate (g6): the SAME pool registry the
-            // write coordinator consults — a Dead metadata pool rejects
-            // reads with 503 (single source of truth).
-            .with_pool_registry(storage.registry.clone()),
-        );
-
-        // Router handles request forwarding to correct coordinator nodes.
-        let router = Arc::new(Router::new(
-            ring_cache.clone(),
-            membership.clone(),
-            pool.clone(),
-            NodeId::new(&config.node_id),
-        ));
-
-        // ---- 12. Construct handlers ----
-        let bucket_store = Arc::new(BucketConfigStore::new());
-        // Bounded write queue: at most `max_inflight_writes` concurrent
-        // PUTs; requests beyond the bound wait up to `write_queue_ms`
-        // then receive 503 SlowDown (backpressure propagates to the HTTP
-        // layer instead of failing mid-write).
-        let write_queue = Arc::new(tokio::sync::Semaphore::new(config.max_inflight_writes));
-        let write_queue_timeout =
-            std::time::Duration::from_millis(config.operation_timeouts.write_queue_ms);
-        // Clone for the hint-fetch reader (the coordinator is moved into
-        // the S3 handler below).
-        let read_coordinator_for_hints = read_coordinator.clone();
-        let s3_handler = S3Handler::new_with_caches_and_backpressure(
-            write_coordinator,
-            read_coordinator,
-            metadata_ops,
-            bucket_store.clone(),
-            Some(object_cache.clone()),
-            Some(metadata_cache.clone()),
-            Some(negative_cache.clone()),
-            Some(write_queue),
-            write_queue_timeout,
-        )
-        .with_prefetch_engine(prefetch_engine.clone())
-        .with_router(router);
-
+        // ---- 8-13. Construct the server subsystem (c3: modules/server.rs) ----
+        // Caches + policies (§8), the prefetch engine (§9), the bridge
+        // adapter (§10), the write/read coordinators + forwarding router
+        // (§11 server parts), the S3 + admin handlers (§12) and the axum
+        // router (§13) are built by the module. The central metrics
+        // registry is created here FIRST: the module registers its own
+        // series (caches, S3 handler, healing service) during build; the
+        // node-side series (durability, hinted handoff, pools, storage
+        // WAL/pools/replicator, RocksDB) register right below.
         let metrics = Arc::new(oceanfs_server::admin::MetricsRegistry::new());
         let metrics_for_late_registration = Arc::clone(&metrics);
+        let server = crate::modules::server::ServerModule::build(
+            &config,
+            &storage,
+            &durability,
+            membership.clone(),
+            pool.clone(),
+            membership_pool,
+            ring_cache.clone(),
+            manifest_cache.clone(),
+            hinted_handoff,
+            hinted_handoff_manager.clone(),
+            ready_gate,
+            is_cluster_node,
+            announce_incarnation,
+            metrics.clone(),
+        )?;
 
         // Register subsystem metrics into the central registry.
         metrics.register_gauge(storage.startup_rebuild_gauge.clone());
-        object_cache.register_metrics(&*metrics);
-        metadata_cache.register_metrics(&*metrics);
-        negative_cache.register_metrics(&*metrics);
         storage.accel.register_metrics(&*metrics);
         storage.shard_buffer_pool.register_metrics(&*metrics);
-        s3_handler.register_metrics(&*metrics);
 
         // Phase D: durability subsystem counters (c2: one module call).
         durability.register_metrics(&*metrics);
@@ -956,112 +639,6 @@ impl Node {
                 active_segments_gauge.set(live as u64);
             }
         });
-
-        // Runtime pool attach (ADR-0029 §D8, f8): after `POST
-        // /admin/pools` registers a pool, re-declare the NodeManifest
-        // (f6) so peers see the new capacity and re-seed the routing
-        // cache's self entry (f7). The incarnation tracks the CURRENT
-        // one (a rejoin bumps it) with the boot value as the fallback.
-        let attach_membership = membership.clone();
-        let attach_registry = storage.registry.clone();
-        let attach_cache = manifest_cache.clone();
-        let attach_self_id = NodeId::new(&config.node_id);
-        let attach_boot_incarnation = announce_incarnation;
-        let attach_metrics = metrics.clone();
-        let on_pool_attached: Arc<dyn Fn() -> Result<(), String> + Send + Sync> =
-            Arc::new(move || {
-                let incarnation = attach_membership
-                    .incarnation_of(&attach_self_id)
-                    .map(|inc| inc.value())
-                    .unwrap_or(attach_boot_incarnation);
-                let manifest =
-                    crate::pool_manifest::build_node_manifest(incarnation, &attach_registry);
-                attach_membership.set_self_manifest(manifest.clone());
-                attach_cache.update(attach_self_id.clone(), Arc::new(manifest));
-                // Register the attached pool's metric series with the
-                // global registry (idempotent — existing series are kept).
-                attach_registry.register_metrics(&*attach_metrics);
-                Ok(())
-            });
-
-        let admin_handler = AdminHandler::new_with_cluster(
-            bucket_store,
-            metrics,
-            membership.clone(),
-            ring_cache.clone(),
-        )
-        .with_scrub(
-            durability.scrub.clone(),
-            storage.metadata_store.clone(),
-            storage.data_store.clone(),
-        )
-        .with_lifecycle_registry(Arc::clone(&storage.lifecycle_registry))
-        .with_caches(
-            Some(object_cache.clone()),
-            Some(metadata_cache.clone()),
-            Some(negative_cache.clone()),
-        )
-        .with_accel(storage.accel.clone())
-        .with_pool_attach(storage.registry.clone(), on_pool_attached);
-
-        // ---- 13. Build axum router ----
-        // Auth middleware is config-driven: when `s3_auth_enabled = true`,
-        // all S3 routes require valid SigV4 credentials. When disabled,
-        // requests pass through without authentication.
-        //
-        // Access keys are loaded from {data_dir}/access_keys.toml
-        // (TOML format: [[keys]]\naccess_key = "..."\nsecret_key = "...")
-        let auth_middleware = if config.s3_auth_enabled {
-            let keys_path = config.data_dir.join("access_keys.toml");
-            let verifier = if keys_path.exists() {
-                match oceanfs_server::auth::KeyStore::load(&keys_path) {
-                    Ok(store) => {
-                        info!(path = %keys_path.display(), "loaded access keys for S3 auth");
-                        Some(oceanfs_server::auth::SigV4Verifier::new(store))
-                    }
-                    Err(e) => {
-                        warn!(
-                            path = %keys_path.display(),
-                            error = %e,
-                            "failed to load access keys — auth will reject all requests"
-                        );
-                        None
-                    }
-                }
-            } else {
-                warn!("s3_auth_enabled but no access_keys.toml found at {}", keys_path.display());
-                None
-            };
-            AuthMiddleware::new(true, verifier)
-        } else {
-            AuthMiddleware::passthrough()
-        };
-        // `DefaultBodyLimit` rejects oversized requests before any
-        // handler runs, which historically made 413s invisible in the
-        // node log (F6). The logging middleware below is added *after*
-        // the limit layer — axum runs the last-added layer first — so it
-        // wraps the limit and observes its 413 responses. The closure
-        // captures only the `usize` value, not the whole config.
-        let max_body_size = config.max_body_size;
-        let app = axum::Router::new()
-            .merge(s3_handler.into_router_with_auth(auth_middleware))
-            .merge(admin_handler.into_router())
-            .layer(axum::extract::DefaultBodyLimit::max(max_body_size))
-            .layer(axum::middleware::from_fn(
-                move |req: axum::extract::Request, next: axum::middleware::Next| async move {
-                    let uri = req.uri().clone();
-                    let resp = next.run(req).await;
-                    if resp.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
-                        tracing::error!(
-                            uri = %uri,
-                            max_body_size,
-                            "request body rejected by max_body_size limit"
-                        );
-                    }
-                    resp
-                },
-            ));
-
         // ---- 14. Bind HTTP server ----
         let http_listener = tokio::net::TcpListener::bind(&config.listen_addr)
             .await
@@ -1072,7 +649,7 @@ impl Node {
         let http_shutdown_signal = http_shutdown.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(http_listener, app.into_make_service())
+            if let Err(e) = axum::serve(http_listener, server.router.into_make_service())
                 .with_graceful_shutdown(http_shutdown_signal.cancelled_owned())
                 .await
             {
@@ -1086,121 +663,16 @@ impl Node {
             .parse()
             .map_err(|e| format!("invalid grpc_listen_addr: {e}"))?;
 
-        // Build gRPC service implementations.
-        let segment_service = oceanfs_server::grpc::segment_service::SegmentGrpcService::new(
-            storage.data_store.clone(),
-            Some(storage.metadata_store.clone()),
-            storage.shard_buffer_pool.clone(),
-            hlc_clock.clone(),
-        )
-        // Replica appends register their segments in the lifecycle
-        // machine: without registration the GC and the orphan reaper
-        // never see the receiver's .dat files (the fleet disk-fill
-        // root cause).
-        .with_lifecycle(storage.lifecycle.clone())
-        // Late metadata appends referencing a locally compacted-away
-        // segment are translated through the remap alias (g3 Option A —
-        // GAP-1 closure).
-        .with_remap_alias(Arc::clone(&storage.remap_alias));
-        // ADR-0028 D1: the membership services (gossip + probe) move to
-        // the membership plane — the data-plane server below hosts only
-        // Segment/Healing/Cache/Scrub.
-        let gossip_service =
-            oceanfs_membership::grpc::gossip_service::GossipGrpcService::new(membership.clone());
-        let probe_service = oceanfs_membership::grpc::probe_service::ProbeGrpcService::new(
-            NodeId::new(&config.node_id),
-            membership.clone(),
-            membership_pool.clone(),
-            config.gossip.failure_timeout_ms / 3,
-        );
-
-        let mut healing_service = oceanfs_durability::healing_service::HealingGrpcService::new(
-            hinted_handoff.clone(),
-            storage.metadata_store.clone(),
-            Arc::clone(&storage.lifecycle_registry),
-            storage.data_store.clone(),
-            hlc_clock.clone(),
-        )
-        .with_local_node_id(NodeId::new(&config.node_id))
-        // Hint materialization: hints are resolved BY KEY — the
-        // receiver asks the origin for the object's CURRENT state (the
-        // metadata is the truth; a GC'd/reaped hinted version was
-        // deleted or superseded) and applies it with HLC-LWW. Hints
-        // carry no blob data, so they stay small for multipart/GB
-        // blobs.
-        .with_hint_object_fetcher(Arc::new(oceanfs_durability::GrpcHintObjectFetcher::new(
-            pool.clone(),
-        )))
-        .with_hint_object_reader(Arc::new(
-            oceanfs_server::read::ReadCoordinatorHintObjectReader::new(read_coordinator_for_hints),
-        ))
-        // Hint apply goes through the node's OWN segment pipeline (the
-        // write coordinator's local append): the hinted data lands in a
-        // local segment with REAL chunk refs instead of the historical
-        // inline-in-metadata storage — which ballooned the objects CF
-        // (16 MiB blobs) and collapsed the orphan reaper's metadata
-        // scan (the fleet disk-fill root cause).
-        .with_hint_object_applier(Arc::new(oceanfs_server::WriteCoordinatorHintObjectApplier::new(
-            write_coordinator_for_applier,
-        )))
-        // g3 `loss-announcement` Option A (compaction remap): the remap
-        // handler records the alias + chunk table so the append handler
-        // translates late chunk refs, re-points local rows, and deletes
-        // the stale replica through the machine + shard store.
-        .with_remap_alias(Arc::clone(&storage.remap_alias))
-        .with_lifecycle_coordinator(storage.lifecycle.clone())
-        .with_shard_store(storage.shard_store.clone())
-        // g3 `loss-announcement` (data-pool death): verified held
-        // segments enqueue re-replication repairs — the repair sink is
-        // the HOLDER-side dispatcher (ADR-0030 target-pull).
-        .with_repair_sink(durability.repair_dispatcher.clone());
-        // g5 `request_re_replication` (ADR-0030): the acquiring node's
-        // healing service routes incoming re-replication requests into
-        // the LOCAL ReRepWorker queue (the worker pulls + writes +
-        // stamps). The worker queue sender is guaranteed present before
-        // `run` is spawned (the worker is constructed above).
-        let rep_worker_queue = durability
-            .rep_worker
-            .sender()
-            .ok_or_else(|| std::io::Error::other("re-replication worker queue unavailable"))?;
-        healing_service =
-            healing_service.with_replication_request_sink(Arc::new(crate::node::WorkerQueueSink {
-                tx: rep_worker_queue,
-            }));
-        healing_service.register_metrics(&*metrics_for_late_registration);
-        let cache_service = oceanfs_server::grpc::cache_service::CacheGrpcService::new(
-            Some(object_cache.clone()),
-            Some(metadata_cache.clone()),
-        );
-        let scrub_service = oceanfs_durability::scrub_service::ScrubGrpcService::new(
-            storage.metadata_store.clone(),
-            storage.data_store.clone(),
-        );
-
-        // Build tonic Server with all services registered. The default
-        // gRPC message limit (4 MiB) rejects hinted-handoff batches:
-        // hints carry the blob data inline (the phase-3 churn fix), and
-        // batches can reach tens of MiB. The healing service (hint
-        // receiver) gets a 64 MiB decode limit — the client-side
-        // max_batch_bytes cap (32 MiB) keeps batches comfortably inside.
+        // The data-plane gRPC services are constructed inside the server
+        // module (c3) with their decode caps baked into the wrapped RPC
+        // servers; the tonic router assembly lives at the bind. The
+        // membership gossip/probe services are returned unwrapped for
+        // the membership-plane bind at §15b.
         let grpc_router = tonic::transport::Server::builder()
-            // The append replication receiver must accept chunks up to
-            // max_body_size (16 MiB in the load-test profile): the 4 MiB
-            // tonic default made every >4 MiB replica write fail with
-            // OutOfRange "decoded message length too large" — the write
-            // degraded to the slow hint path and replicas lagged at
-            // verify time (fleet read-quorum failures hot-15/hot-57;
-            // the 2 MiB local profile never exceeded the default).
-            .add_service(
-                oceanfs_storage::SegmentRpcServer::new(segment_service)
-                    .max_decoding_message_size(64 * 1024 * 1024),
-            )
-            .add_service(
-                oceanfs_durability::HealingRpcServer::new(healing_service)
-                    .max_decoding_message_size(64 * 1024 * 1024),
-            )
-            .add_service(oceanfs_cache::CacheRpcServer::new(cache_service))
-            .add_service(oceanfs_durability::ScrubRpcServer::new(scrub_service));
+            .add_service(server.grpc.segment)
+            .add_service(server.grpc.healing)
+            .add_service(server.grpc.cache)
+            .add_service(server.grpc.scrub);
 
         // Create gRPC shutdown token before spawning so it can be used
         // by both the gRPC server and BackgroundTasks.
@@ -1241,9 +713,9 @@ impl Node {
         // batches). Bound BEFORE membership.start(): peers probe and
         // push to this listener immediately after the join announcement.
         let membership_router = tonic::transport::Server::builder()
-            .add_service(oceanfs_network::GossipRpcServer::new(gossip_service))
+            .add_service(oceanfs_network::GossipRpcServer::new(server.gossip_service))
             .add_service(oceanfs_network::gossip::probe_rpc_server::ProbeRpcServer::new(
-                probe_service,
+                server.probe_service,
             ));
 
         let membership_listener = match create_reuseport_listener(membership_addr) {
@@ -1428,7 +900,7 @@ impl Node {
             durability.ae.clone(),
             durability.scrub.clone(),
             durability.reaper.clone(),
-            prefetch_engine,
+            server.prefetch_engine,
             durability.heal.clone(),
             storage.data_store.clone(),
             hinted_handoff_manager.clone(),

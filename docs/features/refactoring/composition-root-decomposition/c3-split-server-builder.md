@@ -1,7 +1,7 @@
 ---
 feature: "c3: Extract ServerModule Builder"
 epic: "refactoring/composition-root-decomposition"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies:
@@ -58,8 +58,10 @@ recorded in its own feature doc:
   seal-worker or notifier-field surface to carry over from the
   coordinator.
 
-This feature's status stays `proposed` and its Scope/DoD are unchanged;
-c3a was a prerequisite only, not a c3 slice.
+This feature LANDED 2026-09-05 (status: done) with the Scope and DoD
+below unchanged; c3a was a prerequisite only, not a c3 slice. The
+extraction's landed shape and reviewer-verified deviations are recorded
+in "Implementation Notes / Accepted Deviations" at the foot of this doc.
 
 ## Scope
 
@@ -81,10 +83,70 @@ c3a was a prerequisite only, not a c3 slice.
 
 ## Definition of Done
 
-- [ ] `node.rs` shrinks by the server/handler sections; construction moved
-      to `modules/server.rs`.
-- [ ] Coordinators' sealed-segment notifier still fans out to replicator +
-      AE (behavior preserved).
-- [ ] gRPC services constructed in the same order and with the same
-      message-size caps.
-- [ ] Node tests green; e2e write/read green.
+- [x] `node.rs` shrinks by the server/handler sections; construction moved
+      to `modules/server.rs` — node.rs 3465 → 2937 lines; `start()` body
+      ~1592 → ~1179.
+- [x] Coordinators' sealed-segment notifier still fans out to replicator +
+      AE (behavior preserved) — that wiring moved storage-side in the c3a
+      prerequisite (injected `SealedSegmentNotifier` at the seal-pipeline
+      spawn point); nothing to carry over from the coordinator.
+- [x] gRPC services constructed in the same order and with the same
+      message-size caps (segment + healing 64 MiB decode cap; cache/scrub
+      default).
+- [x] Node tests green: lib 66 passed, doc 38 passed, all integration
+      suites green. E2e write/read green on the sanctioned allowlist
+      (crash_restart, wal_recovery, segment_lifecycle,
+      cluster_lifecycle, cluster_write_path, cluster_read_path,
+      garbage_collection, rewrite_leak_test) — no load suites run
+      locally (PIPELINE.md §6).
+
+## Implementation Notes / Accepted Deviations
+
+Recorded at landing (2026-09-05). Reviewer-verified and behavior-neutral:
+the extraction is a pure move, and each note documents where the landed
+shape differs from the plan sketch in the Summary above or from the c1/c2
+precedent.
+
+1. **Minimal `ServerModule` bundle.** Landed fields: `router`
+   (`axum::Router`), `grpc` (`DataPlaneServices`: the four tonic-wrapped
+   data-plane services with their caps), `gossip_service`,
+   `probe_service`, `prefetch_engine`. The Summary sketch's
+   `s3_handler`/`admin_handler`/`write_coordinator`/`read_coordinator`-
+   as-fields shape is impossible — the handlers are consumed by the axum
+   `Router::merge` inside `build()`, and the coordinators/caches are
+   module internals (no post-start consumer exists; no field was added to
+   `Node`).
+2. **gRPC service wrapping/caps live in the module** (the chosen option):
+   services are wrapped and decode-capped inside `modules/server.rs`;
+   `start()` keeps only the 4-line `.add_service` tonic assembly (segment
+   /healing/cache/scrub) at the §15 bind site.
+3. **`build()` is synchronous** — `pub(crate) fn build(...) ->
+   Result<Self, String>` — unlike c1/c2's async builds: the moved span
+   contains no awaits, and the only fallible step is the re-rep worker's
+   queue-sender creation.
+4. **The metrics `Arc` is created node-side before the build call.**
+   Module-owned series (3 caches, s3_handler, healing_service) register
+   inside `build()`; the remaining node-side series register right after
+   the call returns (registry insert order is not observable).
+5. **The `on_pool_attached` closure is built inside the module**,
+   self-contained over its inputs: membership, `storage.registry`,
+   `manifest_cache`, `announce_incarnation`, and metrics.
+6. **`PrefetchStoreAdapter` and `WorkerQueueSink` moved into
+   `modules/server.rs`** alongside their uses; the root-level
+   `adapters.rs` consolidation remains c5's, per the epic README target
+   structure.
+7. **The §15 construction span's explanatory comments travelled with the
+   code** into `modules/server.rs` (hint-materialization rationale, fleet
+   disk-fill comment, gRPC message-size-cap rationale), so the
+   construction context is not lost in the move.
+8. **Reviewer PASS, iteration 1 (0 blocking gaps).** Verification matrix:
+
+   | Gate | Result |
+   |---|---|
+   | `cargo build` (workspace, `--all-targets`) | PASS |
+   | `cargo clippy --lib -- -D warnings` | PASS |
+   | rustdoc / doc tests (`#![deny(missing_docs)]`) | PASS (38 doc tests) |
+   | `cargo fmt` | PASS |
+   | node lib tests | PASS (66) |
+   | node integration suites | PASS (all suites) |
+   | e2e write/read (allowlist: crash_restart, wal_recovery, segment_lifecycle, cluster_lifecycle, cluster_write_path, cluster_read_path, garbage_collection, rewrite_leak_test) | PASS — no load suites (PIPELINE.md §6) |

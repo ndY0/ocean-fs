@@ -8,4 +8,5 @@
 //! site, per architecture.md §4.1.
 
 pub(crate) mod durability;
+pub(crate) mod server;
 pub(crate) mod storage;
