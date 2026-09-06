@@ -130,7 +130,7 @@ before g7's catch-up enumeration at scale.
 | legacy-mode-removal | **EPIC COMPLETE (2026-09-04)** — c1 + f1 + f2 + f3 all landed, each review PASS (f1 iter 2; f2 iter 1, 0 blocking; f3 iter 1, 2 LOWs fixed — 80→84-byte rotation-test comments, older-file fold-refusal scenario). Pools mandatory at boot; store/path resolution and the event-WAL/checkpoint formats are pools-only; pre-pool data dirs refuse boot; all dev/test/e2e fixtures declare pools (2 user-approved f2 deviations: write-None→pool-0 bridge, GC marker retention; deploy scripts untouched) |
 | durability-scheduler | f1–f4 docs, not started |
 | manifest-aware-repair | f1–f3 docs, not started |
-| bounded-metadata-scans | f1–f4 docs, not started (ADR-0034 accepted) |
+| bounded-metadata-scans | **EPIC COMPLETE (2026-09-06)** — f1 (atomic supersede-capture on overwrite, ADR-0034 D2, `1c38dfb`), f3 (seal-time `total_bytes` + contained-objects membership, D1/D5, `6cb7958`…`c376d5d`), f4 (compaction remap carries the object-key list, D5/2b, `facb289`), f2 (accounting-based GC liveness + fully-dead orphan reaper, D3/D4, `32b85fe`) — each independent review PASS (f1 iter 2; f3 iter 3; f4 iter 1; f2 iter 2). No O(all-objects) scan remains on the four consumer paths; `list_objects_all(_with_bucket)` absent from `gc/` + `healing_service.rs`; `build_referenced_set` deleted; the startup recovery `ObjectLookup` is membership-driven; the reaper's periodic disk sweep retired (once-per-boot registry-residue `.dat` sweep replaces the backstop). Unblocks `durability-scheduler/f3-keyspace-sharding` + g7/g8 |
 | g7 / g8 (healing) | proposed (blocked on wave 2) |
 
 ## References

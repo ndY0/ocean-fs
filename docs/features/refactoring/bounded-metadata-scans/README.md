@@ -1,7 +1,7 @@
 ---
 feature: "Bounded Metadata Accounting (ADR-0034) — Program Coordination"
 epic: "refactoring/bounded-metadata-scans"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -22,10 +22,15 @@ perf:
   - "7.1 minimize lock hold duration"
   - "11.1 atomic counters on hot paths"
 created: 2026-09-04
-updated: 2026-09-04
+updated: 2026-09-06
 ---
 
 # Bounded Metadata Accounting — Program Coordination
+
+> **EPIC COMPLETE (2026-09-06):** f1, f3, f4, and f2 all landed with
+> independent review PASS and each feature doc is `done`. The four
+> O(all-objects) consumer scans are eliminated (see the status board in
+> `review-2026-09-orchestration.md`). This document remains the map.
 
 > **This is the coordination document for the ADR-0034 epic (review triage
 > Theme 4, wave 2 ⑥).** If you are implementing any feature under
