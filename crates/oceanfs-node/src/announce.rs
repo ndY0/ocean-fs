@@ -14,7 +14,9 @@
 //!   the holders of `S` so they re-point their OWN object rows (the
 //!   owner's compaction rewrites only its RocksDB). Carries the
 //!   chunk-remap table because the repacked layout is not
-//!   offset-preserving.
+//!   offset-preserving, and the repacked object-key list (ADR-0034
+//!   D5/2b) so each holder re-points exactly those keys via point
+//!   lookups.
 //!
 //! Both are best-effort fast paths with bounded retries (3 × 500 ms,
 //! mirroring the hint delivery retry); the periodic reconciliation loop
@@ -312,7 +314,10 @@ pub async fn announce_pool_loss(
 ///
 /// `targets` is the caller-computed `storage_locations(old) − self`. The
 /// announcement carries the chunk-remap table so receivers translate
-/// their object rows (`(old_offset, length) → new_offset`).
+/// their object rows (`(old_offset, length) → new_offset`), and the
+/// repacked object-key list (`objects`, ADR-0034 D5/2b) so each receiver
+/// re-points exactly those keys via point lookups — never a local
+/// objects-CF scan.
 ///
 /// # Errors
 ///
@@ -323,7 +328,7 @@ pub async fn announce_pool_loss(
 ///
 /// ```no_run
 /// use std::sync::Arc;
-/// use oceanfs_core::{GossipConfig, NodeId, RemappedChunk, RingConfig};
+/// use oceanfs_core::{ContainedObject, GossipConfig, NodeId, RemappedChunk, RingConfig};
 /// use oceanfs_membership::Membership;
 /// use oceanfs_network::ConnectionPool;
 /// use oceanfs_node::announce::announce_segment_remap;
@@ -338,9 +343,13 @@ pub async fn announce_pool_loss(
 /// let targets = vec![NodeId::new("n2")];
 /// let old = oceanfs_core::SegmentId::new();
 /// let new = oceanfs_core::SegmentId::new();
+/// let objects = vec![ContainedObject {
+///     bucket: oceanfs_core::BucketId::new("default"),
+///     key: oceanfs_core::ObjectKey::new("k"),
+/// }];
 /// let rt = tokio::runtime::Runtime::new().expect("runtime");
 /// let _ = rt.block_on(announce_segment_remap(
-///     &NodeId::new("n1"), old, new, &[], &targets, &pool, &membership,
+///     &NodeId::new("n1"), old, new, &[], &objects, &targets, &pool, &membership,
 ///     None, None, None,
 /// ));
 /// ```
@@ -350,6 +359,7 @@ pub async fn announce_segment_remap(
     old_segment_id: SegmentId,
     new_segment_id: SegmentId,
     chunks: &[RemappedChunk],
+    objects: &[oceanfs_core::ContainedObject],
     targets: &[NodeId],
     pool: &Arc<ConnectionPool>,
     membership: &Arc<Membership>,
@@ -371,6 +381,15 @@ pub async fn announce_segment_remap(
             new_offset: c.new_offset,
         })
         .collect();
+    // The repacked object-key list (ADR-0034 D5/2b): every receiver
+    // re-points exactly these keys via point lookups.
+    let proto_objects: Vec<oceanfs_core::proto::segment::ContainedObject> = objects
+        .iter()
+        .map(|co| oceanfs_core::proto::segment::ContainedObject {
+            bucket: Some(co.bucket.clone().into()),
+            key: Some(co.key.clone().into()),
+        })
+        .collect();
     let proto_origin: oceanfs_core::proto::common::NodeId = origin.clone().into();
     let proto_old: oceanfs_core::proto::common::SegmentId = old_segment_id.into();
     let proto_new: oceanfs_core::proto::common::SegmentId = new_segment_id.into();
@@ -382,6 +401,7 @@ pub async fn announce_segment_remap(
             old_segment_id: Some(proto_old.clone()),
             new_segment_id: Some(proto_new.clone()),
             chunks: proto_chunks.clone(),
+            objects: proto_objects.clone(),
         };
         let result =
             deliver_with_retry(pool, membership, target, attempts, retry_delay, |mut client| {

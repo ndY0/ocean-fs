@@ -74,22 +74,28 @@ pub(crate) struct SegmentCompactor {
     /// Optional compaction-remap notifier (g3 `loss-announcement`,
     /// Option A — owner-authoritative compaction propagation).
     ///
-    /// Fired with `(old_segment_id, new_segment_id, chunk_table)` AFTER
-    /// the `ObjectsMoved` milestone commits: the owner's metadata is
-    /// authoritatively re-pointed to the new id, and the owner still
-    /// holds the old segment's data (the `OldDeleted` milestone has not
-    /// run yet), so a peer that has not yet processed the remap can
-    /// still fetch the old segment from the owner via the read path's
-    /// gRPC fallback. Without this hook, peers' metadata for the same
-    /// objects silently diverges from the owner's after compaction —
-    /// reads routed to a peer can reference a segment that exists
-    /// nowhere (GAP-1).
+    /// Fired with `(old_segment_id, new_segment_id, chunk_table,
+    /// object_keys)` AFTER the `ObjectsMoved` milestone commits: the
+    /// owner's metadata is authoritatively re-pointed to the new id, and
+    /// the owner still holds the old segment's data (the `OldDeleted`
+    /// milestone has not run yet), so a peer that has not yet processed
+    /// the remap can still fetch the old segment from the owner via the
+    /// read path's gRPC fallback. Without this hook, peers' metadata for
+    /// the same objects silently diverges from the owner's after
+    /// compaction — reads routed to a peer can reference a segment that
+    /// exists nowhere (GAP-1).
     ///
     /// `chunk_table` maps every live chunk repacked from the old segment
     /// into the new one (`(old_offset, length) → new_offset`): the
     /// repacked layout is NOT offset-preserving, so peers must translate
     /// chunk refs through this table rather than re-point by segment id
     /// alone.
+    ///
+    /// `object_keys` carries the `(bucket, key)` of every live object the
+    /// owner repacked (the repacked segment's own seal-time membership,
+    /// ADR-0034 D5/2b). Each peer holder re-points exactly those keys via
+    /// point lookups — it never scans its objects CF to rediscover which
+    /// of its rows referenced the old segment.
     compaction_remap_notifier: Option<crate::gc::CompactionRemapFn>,
 }
 
@@ -121,10 +127,11 @@ impl SegmentCompactor {
     }
 
     /// Wires the compaction-remap notifier (composition root; g3
-    /// `loss-announcement` Option A). Fired with `(old, new, chunks)`
-    /// after the `ObjectsMoved` metadata remap commits, so the owner's
-    /// rows are authoritative at the new id before any peer is told to
-    /// re-point.
+    /// `loss-announcement` Option A). Fired with `(old, new, chunks,
+    /// object_keys)` after the `ObjectsMoved` metadata remap commits, so
+    /// the owner's rows are authoritative at the new id before any peer
+    /// is told to re-point. `object_keys` is the live repacked object set
+    /// (ADR-0034 D5/2b) peers re-point via point lookups.
     pub(crate) fn with_compaction_remap_notifier(
         mut self,
         notifier: crate::gc::CompactionRemapFn,
@@ -482,6 +489,12 @@ impl SegmentCompactor {
         // segment into the new one — the repacked layout is not
         // offset-preserving, so peers translate `(old_offset, length) →
         // new_offset` rather than re-pointing by segment id alone.
+        //
+        // The object-key list is the repacked segment's own seal-time
+        // membership (ADR-0034 D5/2b): every live object the owner
+        // repacked, ordered + deduplicated. A peer holder re-points
+        // exactly these keys via point lookups — never an objects-CF
+        // scan. It is moved into the notifier (no later use here).
         if let Some(remap_notifier) = &self.compaction_remap_notifier {
             let mut chunk_table: Vec<RemappedChunk> = Vec::with_capacity(chunk_remap.len());
             for (key, new_chunk) in &chunk_remap {
@@ -494,7 +507,7 @@ impl SegmentCompactor {
                     new_offset: new_chunk.offset,
                 });
             }
-            remap_notifier(unit.old_segment_id, new_segment_id, chunk_table);
+            remap_notifier(unit.old_segment_id, new_segment_id, chunk_table, live_membership);
         }
 
         // OldDeleted → the DeleteEvent(old) is durable before the old
@@ -811,11 +824,13 @@ mod tests {
         );
         metadata.put_object(obj_meta).unwrap();
 
-        // Wire the remap notifier: capture (old, new, chunk_table).
+        // Wire the remap notifier: capture (old, new, chunk_table,
+        // object_keys).
         let fired = Arc::new(AtomicUsize::new(0));
         let captured_old = Arc::new(parking_lot::Mutex::new(None::<SegmentId>));
         let captured_new = Arc::new(parking_lot::Mutex::new(None::<SegmentId>));
         let captured_table = Arc::new(parking_lot::Mutex::new(Vec::<RemappedChunk>::new()));
+        let captured_objects = Arc::new(parking_lot::Mutex::new(Vec::<ContainedObject>::new()));
         let compactor = SegmentCompactor::new(
             metadata.clone(),
             TierRouter::new(oceanfs_core::SegmentSizeConfig::default()),
@@ -827,11 +842,13 @@ mod tests {
             let captured_old = Arc::clone(&captured_old);
             let captured_new = Arc::clone(&captured_new);
             let captured_table = Arc::clone(&captured_table);
-            Arc::new(move |old, new, table| {
+            let captured_objects = Arc::clone(&captured_objects);
+            Arc::new(move |old, new, table, objects| {
                 fired.fetch_add(1, Ordering::SeqCst);
                 *captured_old.lock() = Some(old);
                 *captured_new.lock() = Some(new);
                 *captured_table.lock() = table;
+                *captured_objects.lock() = objects;
             })
         });
 
@@ -860,6 +877,14 @@ mod tests {
         assert!(
             table.iter().all(|c| c.length == 400 && c.old_offset == 0),
             "only the live chunk is in the table"
+        );
+        // The object-key list carries exactly the repacked live objects
+        // (ADR-0034 D5/2b) — ordered + deduplicated membership.
+        let objects = captured_objects.lock();
+        assert_eq!(
+            objects.as_slice(),
+            membership(&["remapped.txt"]).as_slice(),
+            "remap notifier must carry the exact repacked object-key list"
         );
     }
 

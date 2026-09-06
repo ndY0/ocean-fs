@@ -4,6 +4,7 @@ package oceanfs.healing;
 
 import "oceanfs/common.proto";
 import "oceanfs/hinted_handoff.proto";
+import "oceanfs/segment.proto";
 
 // ---------------------------------------------------------------------------
 // Healing and hinted-handoff messages and service.
@@ -273,6 +274,15 @@ message SegmentRemap {
   // so a receiver cannot re-point `old → new` keeping the same offset —
   // it must translate each chunk ref through this table.
   repeated RemappedChunk chunks = 4;
+  // The object-key list of every LIVE object the owner repacked from the
+  // old segment into the new one (ADR-0034 D5/2b). Each holder re-points
+  // exactly these keys via point lookups — never a local objects-CF scan.
+  // A key this holder does not own is a no-op; an object whose chunk is
+  // absent from `chunks` (tombstoned by the compactor's dead filter) keeps
+  // its old ref. Empty on a mixed-version window (an owner on an older
+  // binary) degrades to "record the alias, re-point nothing" — the alias
+  // + g4 reconciliation cover the divergence.
+  repeated oceanfs.segment.ContainedObject objects = 5;
 }
 
 // One repacked chunk: the receiver translates every chunk ref

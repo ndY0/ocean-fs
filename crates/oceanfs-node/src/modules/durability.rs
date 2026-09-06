@@ -212,15 +212,18 @@ impl DurabilityModule {
                 // after the owner's metadata remap commits, tell the OLD
                 // segment's holders so they re-point their own object
                 // rows. Targets = `storage_locations(old) − self` (the
-                // pinned fan-out). The announcement is a bounded-retry
-                // best-effort push; g4's reconciliation is the failsafe.
+                // pinned fan-out). The announcement carries the repacked
+                // object-key list (ADR-0034 D5/2b) so each holder
+                // re-points exactly those keys via point lookups. It is a
+                // bounded-retry best-effort push; g4's reconciliation is
+                // the failsafe.
                 .with_compaction_remap_notifier({
                     let membership = Arc::clone(&membership);
                     let pool = Arc::clone(&pool);
                     let lifecycle_registry = Arc::clone(&storage.lifecycle_registry);
                     let self_id = NodeId::new(&config.node_id);
                     let announce_metrics = Arc::clone(&announce_metrics);
-                    Arc::new(move |old_segment_id, new_segment_id, chunk_table| {
+                    Arc::new(move |old_segment_id, new_segment_id, chunk_table, object_keys| {
                         let lifecycle_registry = Arc::clone(&lifecycle_registry);
                         let membership = Arc::clone(&membership);
                         let pool = Arc::clone(&pool);
@@ -254,6 +257,7 @@ impl DurabilityModule {
                                 old_segment_id,
                                 new_segment_id,
                                 &chunk_table,
+                                &object_keys,
                                 &targets,
                                 &pool,
                                 &membership,

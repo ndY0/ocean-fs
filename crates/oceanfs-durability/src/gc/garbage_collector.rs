@@ -7,15 +7,24 @@ use std::{
 };
 
 use oceanfs_core::{
-    BucketId, Counter, LabelSet, MetricRegistrar, ObjectKey, RemappedChunk, SegmentId,
+    BucketId, ContainedObject, Counter, LabelSet, MetricRegistrar, ObjectKey, RemappedChunk,
+    SegmentId,
 };
 use oceanfs_storage::segment::TierRouter;
 use oceanfs_storage_api::{error::Result as ApiResult, SegmentDataStore};
 use tokio::sync::Semaphore;
 
 /// The compaction-remap notifier signature (g3 `loss-announcement`
-/// Option A): `(old_segment_id, new_segment_id, chunk_table)`.
-pub type CompactionRemapFn = Arc<dyn Fn(SegmentId, SegmentId, Vec<RemappedChunk>) + Send + Sync>;
+/// Option A): `(old_segment_id, new_segment_id, chunk_table,
+/// object_keys)`.
+///
+/// `object_keys` is the `(bucket, key)` of every LIVE object the owner
+/// repacked from the old segment into the new one — the compactor's
+/// repacked membership, already ordered + deduplicated (ADR-0034 D5/2b).
+/// A peer holder re-points exactly those keys via point lookups; it never
+/// scans its objects CF to rediscover them.
+pub type CompactionRemapFn =
+    Arc<dyn Fn(SegmentId, SegmentId, Vec<RemappedChunk>, Vec<ContainedObject>) + Send + Sync>;
 
 use super::{
     config::GcConfig, liveness_tracker::LivenessTracker, segment_compactor::SegmentCompactor,
@@ -68,10 +77,10 @@ pub struct GarbageCollector {
     /// identical.
     sealed_notifier: Option<Arc<dyn Fn(SegmentId) + Send + Sync>>,
     /// Optional compaction-remap notifier (g3 `loss-announcement`
-    /// Option A): fired with `(old, new, chunk_table)` after the owner's
-    /// `ObjectsMoved` metadata remap commits, so peers re-point their
-    /// own object rows. `None` (default) keeps the un-wired path
-    /// identical.
+    /// Option A): fired with `(old, new, chunk_table, object_keys)`
+    /// after the owner's `ObjectsMoved` metadata remap commits, so peers
+    /// re-point their own object rows. `None` (default) keeps the
+    /// un-wired path identical.
     compaction_remap_notifier: Option<CompactionRemapFn>,
 }
 
@@ -179,11 +188,13 @@ impl GarbageCollector {
     // this binding could benefit from a proper reactor implementation
     // [end]
     /// Wires the compaction-remap notifier (g3 `loss-announcement`
-    /// Option A): fired with `(old, new, chunk_table)` after the owner's
-    /// metadata remap commits, so peers re-point their own object rows.
-    /// The repacked segment bypasses the write-path seal worker, so
-    /// without this hook peers' metadata silently diverges from the
-    /// owner's after compaction (GAP-1).
+    /// Option A): fired with `(old, new, chunk_table, object_keys)`
+    /// after the owner's metadata remap commits, so peers re-point their
+    /// own object rows. The repacked segment bypasses the write-path seal
+    /// worker, so without this hook peers' metadata silently diverges from
+    /// the owner's after compaction (GAP-1). `object_keys` carries the
+    /// live repacked object set (ADR-0034 D5/2b) so a peer re-points via
+    /// point lookups instead of scanning its objects CF.
     pub fn with_compaction_remap_notifier(mut self, notifier: CompactionRemapFn) -> Self {
         self.compaction_remap_notifier = Some(notifier);
         self

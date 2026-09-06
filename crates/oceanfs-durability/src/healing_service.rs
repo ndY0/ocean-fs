@@ -627,9 +627,16 @@ impl HealingGrpcService {
         }
     }
 
-    /// Rewrites every locally-persisted object row that references the
-    /// old (compacted) segment to reference the new one, translating
-    /// each chunk ref through the repacked chunk table.
+    /// Rewrites the locally-persisted object rows for the announced
+    /// object-key list that reference the old (compacted) segment,
+    /// translating each chunk ref through the repacked chunk table.
+    ///
+    /// `object_keys` is the ADR-0034 D5/2b payload the owner attached to
+    /// the remap: the `(bucket, key)` of every live object it repacked.
+    /// Each announced key is re-pointed via a point lookup; a key this
+    /// holder does not own is skipped without error. Rows for keys NOT in
+    /// the announced list are left untouched even when they reference the
+    /// old segment — the owner does not vouch for them.
     ///
     /// The table maps `(old_offset, length) → new_offset`. A chunk whose
     /// `(offset, length)` is absent from the table is left untouched —
@@ -643,24 +650,33 @@ impl HealingGrpcService {
         old_segment_id: SegmentId,
         new_segment_id: SegmentId,
         chunk_table: &[RemappedChunk],
+        object_keys: &[oceanfs_core::ContainedObject],
     ) -> std::io::Result<usize> {
         // Build the lookup: (old_offset, length) → new_offset.
         let mut table: HashMap<(u64, u32), u64> = HashMap::with_capacity(chunk_table.len());
         for c in chunk_table {
             table.insert((c.old_offset, c.length), c.new_offset);
         }
-        if table.is_empty() {
+        // An empty table, or an empty object-key list (a peer on an older
+        // binary in a mixed-version window — the owner sent only the
+        // chunk table), re-points nothing: the alias recorded by the
+        // `AnnounceRemap` handler still translates late chunk refs, and
+        // the g4 reconciliation is the mandatory failsafe. We NEVER fall
+        // back to scanning the objects CF.
+        if table.is_empty() || object_keys.is_empty() {
             return Ok(0);
         }
 
-        let mut ops: Vec<oceanfs_storage_api::BatchOp> = Vec::new();
+        let mut ops: Vec<oceanfs_storage_api::BatchOp> = Vec::with_capacity(object_keys.len());
         let mut rewritten = 0usize;
-        // [review][performance][critical]
-        // here also we list every single metadata for the node, wich will potentially become a problem
-        // when we will be dealing with millions of objects
-        // [end]
-        for obj_result in self.metadata_store.list_objects_all_with_bucket() {
-            let Ok((bucket, obj)) = obj_result else { continue };
+        for co in object_keys {
+            // Per-announced-key point read (bounded by objects in the
+            // repacked segment × the fan-out, ADR-0034 D5/2b) — never an
+            // objects-CF scan.
+            let Ok(Some(obj)) = self.metadata_store.get_object_metadata(&co.bucket, &co.key) else {
+                // This holder does not own the announced key — no-op.
+                continue;
+            };
             // Only rows that actually reference the old segment change.
             if !obj.chunks.iter().any(|c| c.segment_id == old_segment_id) {
                 continue;
@@ -686,11 +702,10 @@ impl HealingGrpcService {
                 new_chunks.push(*chunk);
             }
             if changed {
-                let updated_meta =
-                    oceanfs_core::ObjectMetadata { chunks: new_chunks, ..obj.clone() };
+                let updated_meta = oceanfs_core::ObjectMetadata { chunks: new_chunks, ..obj };
                 ops.push(oceanfs_storage_api::BatchOp::PutObject(
-                    bucket,
-                    obj.object_key.clone(),
+                    co.bucket.clone(),
+                    co.key.clone(),
                     updated_meta,
                 ));
                 rewritten += 1;
@@ -1479,8 +1494,9 @@ impl HealingRpc for HealingGrpcService {
     ///    legitimate holder (`storage_locations` contains origin);
     /// 2. record the alias + chunk table so the append/read-repair
     ///    handlers translate late chunk refs at write time;
-    /// 3. batch-rewrite its already-persisted object rows through the
-    ///    chunk table;
+    /// 3. batch-rewrite its already-persisted object rows for the
+    ///    ANNOUNCED object keys (ADR-0034 D5/2b) through the chunk
+    ///    table — per-key point lookups, never an objects-CF scan;
     /// 4. delete the stale replica (durable `request_delete` then
     ///    unlink — ADR-0024 invariant 3).
     ///
@@ -1515,6 +1531,23 @@ impl HealingRpc for HealingGrpcService {
             })
             .collect();
 
+        // The announced object-key list (ADR-0034 D5/2b): the `(bucket,
+        // key)` of every live object the owner repacked. Malformed
+        // entries (missing bucket/key) are skipped, mirroring the
+        // sealed-segment-push receiver's membership decoding.
+        let object_keys: Vec<oceanfs_core::ContainedObject> = req
+            .objects
+            .iter()
+            .filter_map(|co| {
+                let bucket = co.bucket.as_ref()?;
+                let key = co.key.as_ref()?;
+                Some(oceanfs_core::ContainedObject {
+                    bucket: oceanfs_core::BucketId::new(&bucket.name),
+                    key: oceanfs_core::ObjectKey::new(&key.key),
+                })
+            })
+            .collect();
+
         // Step 1: verify the receiver holds the old segment AND the
         // origin was a legitimate holder. A non-holder has nothing to
         // re-point and must not be tricked by a spoofed remap.
@@ -1541,8 +1574,9 @@ impl HealingRpc for HealingGrpcService {
             alias.insert(old_sid, new_sid, chunk_table.clone());
         }
 
-        // Step 3: batch-rewrite already-persisted object rows.
-        if let Err(e) = self.repoint_objects(old_sid, new_sid, &chunk_table) {
+        // Step 3: batch-rewrite the already-persisted object rows for the
+        // announced keys (point lookups — ADR-0034 D5/2b).
+        if let Err(e) = self.repoint_objects(old_sid, new_sid, &chunk_table, &object_keys) {
             tracing::warn!(
                 origin = %origin,
                 old_segment_id = %old_sid,
@@ -1589,6 +1623,7 @@ impl HealingRpc for HealingGrpcService {
             old_segment_id = %old_sid,
             new_segment_id = %new_sid,
             chunks = chunk_table.len(),
+            objects = object_keys.len(),
             "compaction remap applied"
         );
         self.announce_accepted_total.inc();
@@ -2344,31 +2379,52 @@ mod tests {
         let new = SegmentId::new();
         seed_sealed_with_locations(&registry, old, &origin, &self_id);
 
-        // Seed an object row whose chunk references the OLD segment.
+        // Seed helper: writes one row under `bucket` referencing the OLD
+        // segment with the given chunk geometry.
+        let seed_row = |metadata_store: &Arc<dyn oceanfs_storage_api::MetadataStore>,
+                        bucket: &oceanfs_core::BucketId,
+                        key: &oceanfs_core::ObjectKey,
+                        offset: u64,
+                        length: u32| {
+            let mut chunks = smallvec::SmallVec::new();
+            chunks.push(oceanfs_core::ChunkRef {
+                segment_id: old,
+                offset,
+                length,
+                compressed: false,
+                logical_length: length,
+            });
+            oceanfs_storage_api::MetadataStore::put_object(
+                metadata_store.as_ref(),
+                bucket,
+                oceanfs_core::ObjectMetadata {
+                    object_key: key.clone(),
+                    size: length as u64,
+                    blake3_hash: None,
+                    chunks,
+                    inline_data: None,
+                    created_at: 0,
+                    hlc: Hlc::zero(),
+                },
+            )
+            .unwrap();
+        };
+
         let bucket = oceanfs_core::BucketId::new("b");
+        // ANNOUNCED + chunk present in the chunk table → re-pointed.
         let key = oceanfs_core::ObjectKey::new("k");
-        let mut chunks = smallvec::SmallVec::new();
-        chunks.push(oceanfs_core::ChunkRef {
-            segment_id: old,
-            offset: 100,
-            length: 32,
-            compressed: false,
-            logical_length: 32,
-        });
-        oceanfs_storage_api::MetadataStore::put_object(
-            metadata_store.as_ref(),
-            &bucket,
-            oceanfs_core::ObjectMetadata {
-                object_key: key.clone(),
-                size: 32,
-                blake3_hash: None,
-                chunks,
-                inline_data: None,
-                created_at: 0,
-                hlc: Hlc::zero(),
-            },
-        )
-        .unwrap();
+        seed_row(&metadata_store, &bucket, &key, 100, 32);
+        // ANNOUNCED but chunk ABSENT from the chunk table (a tombstoned
+        // object the compactor filtered out) → keeps its old ref.
+        let stale = oceanfs_core::ObjectKey::new("stale");
+        seed_row(&metadata_store, &bucket, &stale, 400, 32);
+        // NOT ANNOUNCED but referencing the old segment with a chunk that
+        // IS in the table → must stay untouched (the owner did not vouch
+        // for it).
+        let unannounced = oceanfs_core::ObjectKey::new("unannounced");
+        seed_row(&metadata_store, &bucket, &unannounced, 100, 32);
+        // ANNOUNCED but ABSENT locally → skipped without error.
+        let absent = oceanfs_core::ObjectKey::new("absent");
 
         let alias = Arc::new(SegmentRemapAlias::new());
         let service = HealingGrpcService::new(
@@ -2381,17 +2437,24 @@ mod tests {
         .with_remap_alias(Arc::clone(&alias));
 
         let proto_origin: oceanfs_core::proto::common::NodeId = origin.into();
+        let proto_co =
+            |key: &oceanfs_core::ObjectKey| oceanfs_core::proto::segment::ContainedObject {
+                bucket: Some(bucket.clone().into()),
+                key: Some(key.clone().into()),
+            };
         let request = tonic::Request::new(SegmentRemap {
             origin: Some(proto_origin),
             old_segment_id: Some(old.into()),
             new_segment_id: Some(new.into()),
             chunks: vec![ProtoRemappedChunk { old_offset: 100, length: 32, new_offset: 0 }],
+            objects: vec![proto_co(&key), proto_co(&stale), proto_co(&absent)],
         });
 
         let response = service.announce_remap(request).await.unwrap();
         assert!(response.into_inner().applied, "verified remap must apply");
 
-        // The object row now references the NEW segment at the new offset.
+        // ANNOUNCED + in-table: the object row now references the NEW
+        // segment at the new offset.
         let meta = oceanfs_storage_api::MetadataStore::get_object_metadata(
             metadata_store.as_ref(),
             &bucket,
@@ -2403,6 +2466,46 @@ mod tests {
         assert_eq!(meta.chunks[0].segment_id, new);
         assert_eq!(meta.chunks[0].offset, 0, "chunk offset translated through the table");
         assert_eq!(meta.chunks[0].length, 32);
+
+        // ANNOUNCED but chunk absent from the table → old ref untouched.
+        let meta = oceanfs_storage_api::MetadataStore::get_object_metadata(
+            metadata_store.as_ref(),
+            &bucket,
+            &stale,
+        )
+        .unwrap()
+        .expect("stale-key object survives remap");
+        assert_eq!(meta.chunks.len(), 1);
+        assert_eq!(meta.chunks[0].segment_id, old, "chunk absent from the table keeps its old ref");
+        assert_eq!(meta.chunks[0].offset, 400);
+
+        // NOT ANNOUNCED → untouched even though it references the old
+        // segment with a chunk the table carries.
+        let meta = oceanfs_storage_api::MetadataStore::get_object_metadata(
+            metadata_store.as_ref(),
+            &bucket,
+            &unannounced,
+        )
+        .unwrap()
+        .expect("unannounced object survives remap");
+        assert_eq!(meta.chunks.len(), 1);
+        assert_eq!(
+            meta.chunks[0].segment_id, old,
+            "an unannounced key referencing the old segment is left untouched"
+        );
+        assert_eq!(meta.chunks[0].offset, 100);
+
+        // ANNOUNCED but absent locally → no error, no row created.
+        assert!(
+            oceanfs_storage_api::MetadataStore::get_object_metadata(
+                metadata_store.as_ref(),
+                &bucket,
+                &absent,
+            )
+            .unwrap()
+            .is_none(),
+            "an announced key this holder does not own is skipped without error"
+        );
 
         // The alias is recorded for late metadata writes.
         assert_eq!(alias.resolve(old, 100, 32), Some((new, 0)));
@@ -2444,6 +2547,7 @@ mod tests {
             old_segment_id: Some(old.into()),
             new_segment_id: Some(new.into()),
             chunks: vec![],
+            objects: vec![],
         });
 
         let response = service.announce_remap(request).await.unwrap();
@@ -2452,6 +2556,98 @@ mod tests {
             "a spoofed remap (origin not a holder) must be rejected"
         );
         assert!(alias.is_empty(), "no alias recorded for a rejected remap");
+    }
+
+    #[tokio::test]
+    async fn announce_remap_empty_object_keys_degrades_to_alias_only() {
+        // A peer on an OLDER binary (or an empty repack edge) sends the
+        // chunk table WITHOUT the object-key list (ADR-0034 D5/2b guard):
+        // the receiver records the alias but re-points NOTHING and never
+        // falls back to a full objects-CF scan — the g4 reconciliation
+        // covers the divergence.
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore> = Arc::new(
+            oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
+        let origin = NodeId::new("node-a");
+        let self_id = NodeId::new("node-b");
+        let old = SegmentId::new();
+        let new = SegmentId::new();
+        seed_sealed_with_locations(&registry, old, &origin, &self_id);
+
+        // Seed a row referencing the old segment with a chunk the table
+        // would translate — it must remain untouched with no key list.
+        let bucket = oceanfs_core::BucketId::new("b");
+        let key = oceanfs_core::ObjectKey::new("k");
+        let mut chunks = smallvec::SmallVec::new();
+        chunks.push(oceanfs_core::ChunkRef {
+            segment_id: old,
+            offset: 100,
+            length: 32,
+            compressed: false,
+            logical_length: 32,
+        });
+        oceanfs_storage_api::MetadataStore::put_object(
+            metadata_store.as_ref(),
+            &bucket,
+            oceanfs_core::ObjectMetadata {
+                object_key: key.clone(),
+                size: 32,
+                blake3_hash: None,
+                chunks,
+                inline_data: None,
+                created_at: 0,
+                hlc: Hlc::zero(),
+            },
+        )
+        .unwrap();
+
+        let alias = Arc::new(SegmentRemapAlias::new());
+        let service = HealingGrpcService::new(
+            Arc::new(HintedHandoff::new()),
+            metadata_store.clone(),
+            registry,
+            Arc::new(TestHealStore::new()),
+            Arc::new(HlcClock::new()),
+        )
+        .with_remap_alias(Arc::clone(&alias));
+
+        let proto_origin: oceanfs_core::proto::common::NodeId = origin.into();
+        let request = tonic::Request::new(SegmentRemap {
+            origin: Some(proto_origin),
+            old_segment_id: Some(old.into()),
+            new_segment_id: Some(new.into()),
+            chunks: vec![ProtoRemappedChunk { old_offset: 100, length: 32, new_offset: 0 }],
+            objects: vec![],
+        });
+
+        let response = service.announce_remap(request).await.unwrap();
+        assert!(response.into_inner().applied, "a holder-verified remap still applies");
+
+        // The alias is recorded (late chunk refs still translate)…
+        assert_eq!(alias.resolve(old, 100, 32), Some((new, 0)));
+        // …but the persisted row is NOT re-pointed.
+        let meta = oceanfs_storage_api::MetadataStore::get_object_metadata(
+            metadata_store.as_ref(),
+            &bucket,
+            &key,
+        )
+        .unwrap()
+        .expect("object survives remap");
+        assert_eq!(meta.chunks.len(), 1);
+        assert_eq!(
+            meta.chunks[0].segment_id, old,
+            "an empty object-key list re-points nothing (alias + g4 failsafe)"
+        );
+        assert_eq!(meta.chunks[0].offset, 100);
     }
 
     #[tokio::test]

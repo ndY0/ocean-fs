@@ -255,6 +255,18 @@ pub struct SegmentRemap {
     /// it must translate each chunk ref through this table.
     #[prost(message, repeated, tag = "4")]
     pub chunks: ::prost::alloc::vec::Vec<RemappedChunk>,
+    /// The object-key list of every LIVE object the owner repacked from the
+    /// old segment into the new one (ADR-0034 D5/2b). Each holder re-points
+    /// exactly these keys via point lookups — never a local objects-CF scan.
+    /// A key this holder does not own is a no-op; an object whose chunk is
+    /// absent from `chunks` (tombstoned by the compactor's dead filter) keeps
+    /// its old ref. Empty on a mixed-version window (an owner on an older
+    /// binary) degrades to "record the alias, re-point nothing" — the alias
+    /// + g4 reconciliation cover the divergence.
+    #[prost(message, repeated, tag = "5")]
+    pub objects: ::prost::alloc::vec::Vec<
+        ::oceanfs_core::proto::segment::ContainedObject,
+    >,
 }
 /// One repacked chunk: the receiver translates every chunk ref
 /// `(old_segment_id, old_offset, length)` it holds into
