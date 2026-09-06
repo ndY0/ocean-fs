@@ -326,7 +326,7 @@ impl DurabilityModule {
             )
         };
 
-        // [review][architecture][critical][resolved]
+        // [resolved]
         // AE no longer creates its own data store — c1 (composition-root
         // decomposition) wired it to the module's single shared store.
         // RESOLVED by store-unification f2/f3 (ADR-0032): the twin disk
@@ -334,24 +334,38 @@ impl DurabilityModule {
         // the server reader, and StorageModule constructs exactly ONE
         // unified store instance wired into every consumer.
         // [end]
-        let ae_worker = Arc::new(AntiEntropy::new(
-            oceanfs_durability::AntiEntropyConfig::new(
-                config.ae_interval_sec,
-                config.ae_peer_count,
+        // ADR-0033 D3: comparison peers are holder-driven — the node
+        // supplies a ManifestPeerSelector (membership + gossiped
+        // NodeManifest) that filters each segment's storage_locations to
+        // eligible holders. Injected via the builder so `AntiEntropy::new`
+        // stays stable for the scheduler adaptor (durability-scheduler
+        // f4 wiring constraint).
+        let ae_peer_selector: Arc<dyn oceanfs_durability::peer_selection::PeerSelector> =
+            Arc::new(crate::peer_selection::ManifestPeerSelector::new(
+                membership.clone(),
+                NodeId::new(&config.node_id),
+            ));
+        let ae_worker = Arc::new(
+            AntiEntropy::new(
+                oceanfs_durability::AntiEntropyConfig::new(
+                    config.ae_interval_sec,
+                    config.ae_peer_count,
+                )
+                .with_core(oceanfs_core::AntiEntropyConfig {
+                    continuous_enabled: config.anti_entropy.continuous_enabled,
+                    continuous_max_segments: config.anti_entropy.continuous_max_segments,
+                    sampling_enabled: config.anti_entropy.sampling_enabled,
+                    sampling_interval_sec: config.anti_entropy.sampling_interval_sec,
+                    sampling_fraction: config.anti_entropy.sampling_fraction,
+                }),
+                membership.clone(),
+                Arc::clone(&storage.lifecycle_registry),
+                pool.clone(),
+                storage.data_store.clone(),
+                merkle_tree.clone(),
             )
-            .with_core(oceanfs_core::AntiEntropyConfig {
-                continuous_enabled: config.anti_entropy.continuous_enabled,
-                continuous_max_segments: config.anti_entropy.continuous_max_segments,
-                sampling_enabled: config.anti_entropy.sampling_enabled,
-                sampling_interval_sec: config.anti_entropy.sampling_interval_sec,
-                sampling_fraction: config.anti_entropy.sampling_fraction,
-            }),
-            membership.clone(),
-            Arc::clone(&storage.lifecycle_registry),
-            pool.clone(),
-            storage.data_store.clone(),
-            merkle_tree.clone(),
-        ));
+            .with_peer_selector(ae_peer_selector),
+        );
         // [review][config][high]
         // scrub config is not fully customizable
         // [end]

@@ -14,6 +14,7 @@ use oceanfs_core::{
 };
 use oceanfs_durability::{
     merkle::{IncrementalMerkleTree, MerkleTreeConfig},
+    peer_selection::PeerSelector,
     AntiEntropy, AntiEntropyConfig, InMemorySegmentStore, MerkleTree,
 };
 use oceanfs_membership::Membership;
@@ -78,6 +79,16 @@ fn make_hash(b: u8) -> HashOutput {
     let mut bytes = [0u8; 32];
     bytes[0] = b;
     HashOutput::from_bytes(bytes)
+}
+
+/// Test selector that treats every listed holder as eligible (the real
+/// manifest-filtering rules live in `oceanfs-node`).
+struct AllEligible;
+
+impl PeerSelector for AllEligible {
+    fn eligible_holders(&self, _segment_id: &SegmentId, holders: &[NodeId]) -> Vec<NodeId> {
+        holders.to_vec()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -386,7 +397,9 @@ async fn real_two_node_anti_entropy_cycle() {
         ec_m: 2,
         size_tier: SizeTier::Standard,
         merkle_root: Some(root_a),
-        storage_locations: smallvec::SmallVec::new(),
+        // Holder-aware (ADR-0033): from node A's view node B holds this
+        // segment, so node B is the comparison peer.
+        storage_locations: smallvec::smallvec![NodeId::new("node-b")],
         sealed_at: Some(1700000000000),
     };
     registry_a.reserve(seg_id, seg_meta_a.clone()).unwrap();
@@ -403,7 +416,8 @@ async fn real_two_node_anti_entropy_cycle() {
         ec_m: 2,
         size_tier: SizeTier::Standard,
         merkle_root: Some(root_b),
-        storage_locations: smallvec::SmallVec::new(),
+        // From node B's view node A holds the segment.
+        storage_locations: smallvec::smallvec![NodeId::new("node-a")],
         sealed_at: Some(1700000000000),
     };
     registry_b.reserve(seg_id, seg_meta_b.clone()).unwrap();
@@ -430,7 +444,8 @@ async fn real_two_node_anti_entropy_cycle() {
         pool_a,
         segment_store_a.clone(),
         make_test_tree(),
-    );
+    )
+    .with_peer_selector(Arc::new(AllEligible));
 
     let stats = ae.run_cycle().await.unwrap();
 
@@ -441,12 +456,6 @@ async fn real_two_node_anti_entropy_cycle() {
     // current segment data's root (due to corruption). The anti-entropy
     // cycle flags this as a mismatch.
     assert!(stats.mismatches_found >= 1);
-
-    // --- Verify peer selection works ---
-    // Node A should see Node B as an alive peer
-    let alive_peers = ae.select_alive_peers();
-    assert!(!alive_peers.is_empty());
-    assert!(alive_peers.iter().any(|p| p.as_str() == "node-b"));
 
     // --- Simulate repair: Node A gets correct data from Node B ---
     let correct_data = segment_store_b

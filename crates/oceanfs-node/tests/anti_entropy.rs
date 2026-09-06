@@ -253,11 +253,14 @@ async fn ae_merkle_tree_build_and_compare() {
     assert!(!tree.diff(&tree3).is_empty());
 }
 
-/// T2.3: AntiEntropyConfig with custom `peer_count` is respected by
-/// `select_alive_peers()`. With a single-node cluster, 0 non-self peers
-/// exist, so the returned vec is always empty — but the config is wired.
+/// T2.3: AntiEntropyConfig with custom `peer_count` is accepted and wired
+/// through construction. Peer selection itself is holder-driven
+/// (ADR-0033) — the per-segment eligible-holder cap (`peer_count`) is
+/// unit-tested in `oceanfs-durability`'s `holder_groups_respect_peer_count_per_segment`;
+/// this single-node scenario simply proves the config flows in and a
+/// cycle runs (0 segments ⇒ 0 stats).
 #[tokio::test]
-async fn test_ae_config_peer_count_respected() {
+async fn test_ae_config_peer_count_accepted() {
     let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
         &oceanfs_core::LifecycleConfig::default(),
     ));
@@ -276,12 +279,6 @@ async fn test_ae_config_peer_count_respected() {
         make_test_tree(),
     );
 
-    // select_alive_peers should not panic; with only self node, returns empty.
-    let peers = ae.select_alive_peers();
-    assert!(peers.is_empty(), "single-node cluster has no peers");
-
-    // Verify config accessor returns the custom value.
-    // (Config is stored internally; verify via run_cycle stats.)
     let stats = ae.run_cycle().await.expect("AE cycle");
     assert_eq!(stats.segments_compared, 0);
     assert_eq!(stats.mismatches_found, 0);

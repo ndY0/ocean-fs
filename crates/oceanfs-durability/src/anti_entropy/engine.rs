@@ -1,14 +1,16 @@
 //! Anti-entropy background service.
 //!
-//! Periodically selects random peers from the membership view,
-//! exchanges Merkle roots for shared segments, and descends the
-//! tree on mismatch to identify and repair diverged leaves.
+//! Periodically compares Merkle roots for segments this node holds
+//! against the segment's *holders* — the eligible members of each
+//! segment's `storage_locations` (ADR-0033 D1/D2), never a random sample
+//! of all alive members. On mismatch it descends the tree to identify and
+//! repair diverged leaves.
 
 use std::{collections::HashMap, sync::Arc};
 
 use bytes::Bytes;
 use oceanfs_core::{
-    Counter, HashOutput, LabelSet, MetricRegistrar, NodeState, SegmentId, SegmentMetadata,
+    Counter, HashOutput, LabelSet, MetricRegistrar, NodeId, SegmentId, SegmentMetadata,
 };
 use oceanfs_ec::{CauchyEncoder, Decoder, Encoder};
 use oceanfs_membership::Membership;
@@ -21,22 +23,32 @@ use super::{
     merkle_root::MerkleRoot,
     merkle_tree::{MerkleTree, DEFAULT_LEAF_SIZE},
 };
-use crate::{merkle::IncrementalMerkleTree, Error, Result};
+use crate::{merkle::IncrementalMerkleTree, peer_selection::PeerSelector, Error, Result};
 // ---------------------------------------------------------------------------
 // AntiEntropy
 // ---------------------------------------------------------------------------
 
 /// The anti-entropy background service.
 ///
-/// Periodically selects random peers from the membership view,
-/// exchanges Merkle roots for shared segments, and descends the
-/// tree on mismatch to identify and repair diverged leaves.
+/// Compares each sealed segment this node holds against the segment's
+/// *eligible holders* — the members of `storage_locations` that pass the
+/// node layer's [`PeerSelector`] (alive + manifest-healthy, ADR-0033
+/// D1). A segment with no eligible remote holder is excluded from remote
+/// exchange and covered by the local [`local_merkle_verify`](Self::run_cycle)
+/// fallback + local scrub. The ADR-0015 Merkle protocol, incremental
+/// tree, sampling fraction/rates, and the gRPC `MerkleExchange` wire
+/// calls are unchanged; only peer/segment selection is holder-driven.
 ///
 /// Requires:
-/// - [`Membership`] for discovering alive peer nodes
+/// - [`Membership`] for address resolution of the selected holders
 /// - [`ConnectionPool`] for gRPC transport to peers
 /// - [`oceanfs_storage_api::MetadataStore`] for segment metadata (Merkle roots)
 /// - [`SegmentDataStore`] for reading/writing segment data during repair
+///
+/// The comparison-peer selection is **injected** (ADR-0033 D3) via
+/// [`with_peer_selector`](Self::with_peer_selector); without a selector
+/// every sealed segment is treated as local-only (no remote exchange) —
+/// the existing local verification fallback still runs.
 ///
 /// # Examples
 ///
@@ -72,6 +84,10 @@ pub struct AntiEntropy {
     segment_store: Arc<dyn SegmentDataStore>,
     /// Incremental Merkle tree for O(log n) updates (ADR-0015).
     merkle_tree: Arc<IncrementalMerkleTree>,
+    /// Holder→eligible-peer selection, injected from the node layer
+    /// (ADR-0033 D3). `None` (unit tests / unwired) disables remote
+    /// exchange — every segment is treated as local-only.
+    peer_selector: Option<Arc<dyn PeerSelector>>,
     /// Counter tracking segment writes for continuous AE triggering.
     write_counter: std::sync::atomic::AtomicU64,
     segments_compared_total: Counter,
@@ -107,6 +123,7 @@ impl AntiEntropy {
             pool,
             segment_store,
             merkle_tree,
+            peer_selector: None,
             write_counter: std::sync::atomic::AtomicU64::new(0),
             segments_compared_total: Counter::new(
                 "ae_segments_compared_total".into(),
@@ -119,6 +136,25 @@ impl AntiEntropy {
                 LabelSet::empty(),
             ),
         }
+    }
+
+    /// Injects the holder→eligible-peer selector (ADR-0033 D3).
+    ///
+    /// The node layer supplies the concrete [`PeerSelector`] (built over
+    /// membership + the gossiped `NodeManifest`); the durability engine
+    /// never interprets manifests. The composition root (c2) wires this
+    /// once at construction.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let ae = AntiEntropy::new(/* ... */)
+    ///     .with_peer_selector(selector);
+    /// ```
+    #[must_use]
+    pub fn with_peer_selector(mut self, peer_selector: Arc<dyn PeerSelector>) -> Self {
+        self.peer_selector = Some(peer_selector);
+        self
     }
 
     /// Registers anti-entropy counters with a metrics registrar.
@@ -162,16 +198,75 @@ impl AntiEntropy {
         &self.merkle_tree
     }
 
+    /// The eligible comparison peers of `segment` (ADR-0033 D2).
+    ///
+    /// Asks the injected [`PeerSelector`] which of the segment's
+    /// `storage_locations` holders may act as a comparison peer, then
+    /// guarantees this node is never selected. An engine without an
+    /// injected selector has no eligible remote peers — every sealed
+    /// segment is treated as local-only and the local verification
+    /// fallback covers it.
+    fn comparison_peers(&self, segment: &SegmentMetadata) -> Vec<NodeId> {
+        let Some(selector) = &self.peer_selector else {
+            return Vec::new();
+        };
+        let mut eligible =
+            selector.eligible_holders(&segment.segment_id, &segment.storage_locations);
+        eligible.retain(|id| id != self.membership.node_id());
+        eligible.sort();
+        eligible
+    }
+
+    /// Groups `segments` by eligible holder (ADR-0033 D2 entry point).
+    ///
+    /// Returns `(groups, local_only)` where `groups` maps each eligible
+    /// holder to the segment ids that holder shares with this node, and
+    /// `local_only` is the number of segments with no eligible remote
+    /// holder. A segment is added to at most `peer_count` holders' groups
+    /// (the ADR-0015 cost model — no full-mesh fan-out to every holder);
+    /// local-only segments never appear in any group and are left to the
+    /// `local_merkle_verify` fallback + local scrub.
+    fn holder_groups(
+        &self,
+        segments: &[SegmentMetadata],
+    ) -> (HashMap<NodeId, Vec<SegmentId>>, usize) {
+        let cap = self.config.peer_count.max(1);
+        let mut groups: HashMap<NodeId, Vec<SegmentId>> = HashMap::new();
+        let mut local_only = 0usize;
+
+        for segment in segments {
+            let mut eligible = self.comparison_peers(segment);
+            if eligible.is_empty() {
+                local_only += 1;
+                continue;
+            }
+            eligible.truncate(cap);
+            for peer in eligible {
+                groups.entry(peer).or_default().push(segment.segment_id);
+            }
+        }
+
+        (groups, local_only)
+    }
+
     /// Runs a single anti-entropy cycle.
     ///
     /// The cycle performs the following steps:
     ///
-    /// 1. Gathers all sealed segments from the metadata store
+    /// 1. Gathers all sealed segments this node holds (ADR-0025 D3)
     /// 2. Reads local segment data and (re)builds Merkle trees
-    /// 3. Selects random alive peers from membership
-    /// 4. For each peer, exchanges Merkle roots and compares
+    /// 3. Groups segments by their eligible holders — the injected
+    ///    [`PeerSelector`] over each segment's `storage_locations`
+    ///    (ADR-0033 D2); local-only segments are excluded from remote
+    ///    exchange
+    /// 4. For each eligible holder, exchanges Merkle roots over only the
+    ///    segments that holder shares with this node
     /// 5. On mismatch, descends the tree to find diverged leaves
     /// 6. Repairs diverged leaves by fetching correct data from the peer
+    ///
+    /// When no eligible remote holder exists (or no peer reported a
+    /// mismatch) the cycle falls back to comparing local Merkle trees
+    /// against the stored seal-time roots — the local-only coverage path.
     ///
     /// # Errors
     ///
@@ -230,18 +325,26 @@ impl AntiEntropy {
                 );
             }
         }
-        // [review][algorithmic][critical]
-        // node dont necessarily replicate each other data, this is especially true since the data
-        // pool re-replication mechanism.
-        // we need to rely on the manifest to be able to determine wich peer to compare against.
-        // acctually, this should be the entry point of the algorithm, not the segments.
-        // [end]
-        // Step 3: Select random alive peers
-        let peer_ids = self.select_alive_peers();
+        // Step 3: Group sealed segments by eligible holder. The segment →
+        // holder map is the entry point of the algorithm (ADR-0033 D2):
+        // a segment's comparison peers are the eligible members of its
+        // `storage_locations`, never a random sample of all alive members
+        // (the resolved review block — random-peer path deleted in f2).
+        let (holder_groups, local_only_count) = self.holder_groups(&sealed_segments);
+        if local_only_count > 0 {
+            tracing::debug!(
+                local_only = local_only_count,
+                "segments with no eligible remote holder excluded from remote exchange"
+            );
+        }
 
-        // Step 4-6: For each selected peer, exchange and compare Merkle trees
-        for peer_id in &peer_ids {
-            let peer_addr = match self.membership.address_of(peer_id) {
+        // Step 4-6: For each eligible holder, exchange roots over only the
+        // segments that holder shares with this node.
+        let mut exchanged_any_peer = false;
+        let mut holder_ids: Vec<NodeId> = holder_groups.keys().cloned().collect();
+        holder_ids.sort();
+        for peer_id in holder_ids {
+            let peer_addr = match self.membership.address_of(&peer_id) {
                 Some(addr) => addr,
                 None => {
                     tracing::warn!(peer = %peer_id, "no address for peer, skipping");
@@ -254,8 +357,15 @@ impl AntiEntropy {
             // For now, we perform local verification against the stored roots
             // and flag mismatches. The peer exchange wire protocol is defined
             // in MerkleExchangeProtocol below.
+            let shared_ids = &holder_groups[&peer_id];
+            let shared_segments: Vec<SegmentMetadata> = sealed_segments
+                .iter()
+                .filter(|seg| shared_ids.contains(&seg.segment_id))
+                .cloned()
+                .collect();
+            exchanged_any_peer = true;
             match self
-                .exchange_merkle_roots(peer_id, peer_addr, &sealed_segments, &local_trees)
+                .exchange_merkle_roots(&peer_id, peer_addr, &shared_segments, &local_trees)
                 .await
             {
                 Ok(peer_stats) => {
@@ -268,11 +378,13 @@ impl AntiEntropy {
             }
         }
 
-        // Step 5: When no peers are available (or no mismatches found with peers),
-        // fall back to comparing local Merkle trees against stored seal-time roots.
-        // This catches corruption caused by bit-rot, disk errors, or silent data
-        // degradation that would otherwise go undetected.
-        if peer_ids.is_empty() || stats.mismatches_found == 0 {
+        // Step 5: When no eligible holder was exchanged with (all segments
+        // local-only) or no mismatches were found with peers, fall back to
+        // comparing local Merkle trees against stored seal-time roots.
+        // This catches corruption caused by bit-rot, disk errors, or silent
+        // data degradation that would otherwise go undetected, and covers
+        // the local-only set.
+        if !exchanged_any_peer || stats.mismatches_found == 0 {
             let mut fallback_stats = AntiEntropyStats::default();
             Self::local_merkle_verify(
                 &sealed_segments,
@@ -320,28 +432,39 @@ impl AntiEntropy {
         }
 
         stats.segments_compared = segment_count as u64;
-        let peer_ids = self.select_alive_peers();
 
-        for peer_id in &peer_ids {
-            let Some(peer_addr) = self.membership.address_of(peer_id) else {
+        // Scan the machine's Sealed entries ONCE and group them by
+        // eligible holder (ADR-0033 D2). The scan is hoisted out of the
+        // per-peer loop — the pre-f2 code re-scanned the registry inside
+        // the peer loop, a per-peer O(n) repeat.
+        let mut sealed_entries: Vec<SegmentMetadata> = Vec::new();
+        self.registry.for_each(|_id, entry| {
+            if entry.state == oceanfs_storage::segment::lifecycle::SegmentState::Sealed {
+                sealed_entries.push(entry.metadata.clone());
+            }
+        });
+        let (holder_groups, local_only_count) = self.holder_groups(&sealed_entries);
+        if local_only_count > 0 {
+            tracing::debug!(
+                local_only = local_only_count,
+                "continuous anti-entropy: local-only segments excluded from remote exchange"
+            );
+        }
+
+        let mut holder_ids: Vec<NodeId> = holder_groups.keys().cloned().collect();
+        holder_ids.sort();
+        for peer_id in holder_ids {
+            let Some(peer_addr) = self.membership.address_of(&peer_id) else {
                 continue;
             };
 
-            // Compare each tracked segment's root with the peer. The
-            // machine's Sealed entries are the tracked set (ADR-0025
-            // Decision 3).
-            let mut tracked_segments: Vec<SegmentId> = Vec::new();
-            self.registry.for_each(|id, entry| {
-                if entry.state == oceanfs_storage::segment::lifecycle::SegmentState::Sealed {
-                    tracked_segments.push(id);
-                }
-            });
-
-            for segment_id in &tracked_segments {
+            // Compare each shared segment's root with the holder.
+            for segment_id in &holder_groups[&peer_id] {
                 if let Some(local_root) = self.merkle_tree.root(*segment_id) {
                     // Try gRPC root exchange.
-                    if let Ok(true) =
-                        self.exchange_single_root(*segment_id, local_root, peer_id, peer_addr).await
+                    if let Ok(true) = self
+                        .exchange_single_root(*segment_id, local_root, &peer_id, peer_addr)
+                        .await
                     {
                         // Root matched — no divergence.
                     } else {
@@ -426,21 +549,22 @@ impl AntiEntropy {
 
         // Collect tracked segments from the machine (ADR-0025
         // Decision 3).
-        let mut tracked: Vec<SegmentId> = Vec::new();
-        self.registry.for_each(|id, entry| {
+        let mut sealed_entries: Vec<SegmentMetadata> = Vec::new();
+        self.registry.for_each(|_id, entry| {
             if entry.state == oceanfs_storage::segment::lifecycle::SegmentState::Sealed {
-                tracked.push(id);
+                sealed_entries.push(entry.metadata.clone());
             }
         });
 
         let fraction = self.config.core().sampling_fraction;
-        let sample_size = ((tracked.len() as f64) * fraction).ceil() as usize;
-        let sample_size = sample_size.min(tracked.len());
+        let sample_size = ((sealed_entries.len() as f64) * fraction).ceil() as usize;
+        let sample_size = sample_size.min(sealed_entries.len());
 
         // Perform random sampling synchronously (ThreadRng is not Send).
         let sampled: Vec<SegmentId> = {
             let mut rng = rand::thread_rng();
-            let mut shuffled = tracked.clone();
+            let mut shuffled: Vec<SegmentId> =
+                sealed_entries.iter().map(|seg| seg.segment_id).collect();
             shuffled.shuffle(&mut rng);
             shuffled.truncate(sample_size);
             shuffled
@@ -448,27 +572,37 @@ impl AntiEntropy {
 
         stats.segments_compared = sampled.len() as u64;
 
-        let peer_ids = self.select_alive_peers();
+        let meta_by_id: HashMap<SegmentId, &SegmentMetadata> =
+            sealed_entries.iter().map(|seg| (seg.segment_id, seg)).collect();
 
         for segment_id in &sampled {
-            if let Some(local_root) = self.merkle_tree.root(*segment_id) {
-                for peer_id in &peer_ids {
-                    let Some(peer_addr) = self.membership.address_of(peer_id) else {
-                        continue;
-                    };
-                    match self
-                        .exchange_single_root(*segment_id, local_root, peer_id, peer_addr)
-                        .await
-                    {
-                        Ok(true) => { /* root matched — done */ }
-                        Ok(false) => {
-                            stats.mismatches_found += 1;
-                            let _ = crate::heal::enqueue_heal(*segment_id, Vec::new());
-                        }
-                        Err(_) => { /* peer unreachable — skip */ }
-                    }
-                    break; // only check one peer per segment for sampling
+            let Some(segment) = meta_by_id.get(segment_id) else {
+                continue;
+            };
+            let Some(local_root) = self.merkle_tree.root(*segment_id) else {
+                continue;
+            };
+
+            // Pick up to one eligible holder per sampled segment
+            // (ADR-0015 sampling cost model — one root exchange per
+            // sampled segment, preserving the pre-f2 `break`). A
+            // local-only sampled segment (no eligible remote holder) is
+            // counted in `segments_compared` but not exchanged remotely.
+            let eligible = self.comparison_peers(segment);
+            if eligible.is_empty() {
+                continue;
+            }
+            let peer_id = &eligible[0];
+            let Some(peer_addr) = self.membership.address_of(peer_id) else {
+                continue;
+            };
+            match self.exchange_single_root(*segment_id, local_root, peer_id, peer_addr).await {
+                Ok(true) => { /* root matched — done */ }
+                Ok(false) => {
+                    stats.mismatches_found += 1;
+                    let _ = crate::heal::enqueue_heal(*segment_id, Vec::new());
                 }
+                Err(_) => { /* peer unreachable — skip */ }
             }
         }
 
@@ -862,27 +996,6 @@ impl AntiEntropy {
         Ok(divergence_ratio)
     }
 
-    /// Selects up to `config.peer_count` random alive peers from membership.
-    ///
-    /// Excludes self and any non-alive nodes. Used internally by run_cycle
-    /// and exposed for integration testing.
-    pub fn select_alive_peers(&self) -> Vec<oceanfs_core::NodeId> {
-        let my_id = self.membership.node_id().clone();
-        let mut alive_peers: Vec<oceanfs_core::NodeId> = self
-            .membership
-            .nodes()
-            .into_iter()
-            .filter(|(id, state)| *id != my_id && *state == NodeState::Alive)
-            .map(|(id, _)| id)
-            .collect();
-
-        let mut rng = rand::thread_rng();
-        alive_peers.shuffle(&mut rng);
-        alive_peers.truncate(self.config.peer_count);
-
-        alive_peers
-    }
-
     /// Starts the anti-entropy background task.
     ///
     /// Runs cycles at the configured interval until the task is cancelled
@@ -1093,8 +1206,8 @@ mod tests {
 
     use bytes::Bytes;
     use oceanfs_core::{
-        GossipConfig, HashOutput, NodeId, NodeState, RingConfig, RpcConfig, SegmentId,
-        SegmentMetadata, SizeTier,
+        GossipConfig, HashOutput, NodeId, RingConfig, RpcConfig, SegmentId, SegmentMetadata,
+        SizeTier,
     };
     use oceanfs_ec::{CauchyEncoder, Decoder, Encoder};
     use oceanfs_membership::Membership;
@@ -1108,6 +1221,7 @@ mod tests {
         merkle_tree::{InMemorySegmentStore, MerkleTree, DEFAULT_LEAF_SIZE},
         *,
     };
+    use crate::peer_selection::PeerSelector;
 
     fn make_hash(b: u8) -> HashOutput {
         let mut bytes = [0u8; 32];
@@ -1537,118 +1651,122 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Peer selection
+    // Holder-aware grouping (ADR-0033 D2)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn select_alive_peers_excludes_self() {
-        let (membership, _ring) = make_test_membership("node-a");
-        let registry =
-            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
-                &oceanfs_core::LifecycleConfig::default(),
-            ));
-        let ae = make_anti_entropy(membership.clone(), Arc::clone(&registry));
+    /// Test selector that treats every listed holder as eligible (the
+    /// engine unit tests do not exercise the node-layer eligibility
+    /// rules — those live in `oceanfs-node/src/peer_selection.rs`).
+    struct AllEligible;
 
-        // Add a peer node
-        membership.upsert_node(
-            NodeId::new("node-b"),
-            NodeState::Alive,
-            oceanfs_core::Incarnation::new(1),
-            Some("127.0.0.1:9001".parse().unwrap()),
-        );
-
-        let peers = ae.select_alive_peers();
-        // Our config has peer_count=1, should select node-b
-        assert!(!peers.contains(membership.node_id()));
-        // With only 1 alive peer, should get node-b
-        if !peers.is_empty() {
-            assert_eq!(peers.len(), 1);
-            assert!(peers[0].as_str() == "node-b");
+    impl PeerSelector for AllEligible {
+        fn eligible_holders(&self, _segment_id: &SegmentId, holders: &[NodeId]) -> Vec<NodeId> {
+            holders.to_vec()
         }
     }
 
     #[test]
-    fn select_alive_peers_returns_empty_for_standalone_node() {
-        let (membership, _ring) = make_test_membership("standalone");
+    fn holder_groups_selector_without_peer_selector_is_local_only() {
+        // An engine constructed without with_peer_selector has no remote
+        // peers: even a holder-backed segment stays local.
+        let (membership, _ring) = make_test_membership("test-node");
         let registry =
             Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
                 &oceanfs_core::LifecycleConfig::default(),
             ));
         let ae = make_anti_entropy(membership, Arc::clone(&registry));
 
-        let peers = ae.select_alive_peers();
-        assert!(peers.is_empty());
+        let mut seg = make_segment_metadata(SegmentId::new(), true, Some(make_hash(1)));
+        seg.storage_locations = smallvec::smallvec![NodeId::new("holder-a")];
+
+        let (groups, local_only) = ae.holder_groups(&[seg.clone()]);
+        assert_eq!(local_only, 1);
+        assert!(groups.is_empty(), "no selector => no remote exchange groups");
     }
 
     #[test]
-    fn select_alive_peers_respects_peer_count() {
-        let (membership, _ring) = make_test_membership("central");
-
-        let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
-        let segment_store = Arc::new(InMemorySegmentStore::new());
-        let merkle_tree = Arc::new(crate::merkle::IncrementalMerkleTree::new(
-            crate::merkle::MerkleTreeConfig::default(),
-        ));
-        let registry =
-            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
-                &oceanfs_core::LifecycleConfig::default(),
-            ));
-        let ae = AntiEntropy::new(
-            AntiEntropyConfig {
-                interval_sec: 300,
-                peer_count: 2,
-                core: oceanfs_core::AntiEntropyConfig::default(),
-            },
-            membership.clone(),
-            Arc::clone(&registry),
-            pool,
-            segment_store,
-            merkle_tree,
-        );
-
-        // Register 5 alive peers
-        for i in 0..5 {
-            membership.upsert_node(
-                NodeId::new(format!("peer-{i}")),
-                NodeState::Alive,
-                oceanfs_core::Incarnation::new(1),
-                Some(format!("127.0.0.1:{}", 9001 + i).parse().unwrap()),
-            );
-        }
-
-        let peers = ae.select_alive_peers();
-        assert_eq!(peers.len(), 2);
-    }
-
-    #[test]
-    fn select_alive_peers_excludes_dead_nodes() {
+    fn holder_groups_local_only_produces_no_remote_group() {
+        // f2 DoD local-only handling: a segment whose storage_locations
+        // is {self} (empty here — no remote holder) is counted as
+        // local-only and produces no gRPC Merkle exchange group, while a
+        // second segment listing one eligible holder produces exactly one
+        // exchange group.
         let (membership, _ring) = make_test_membership("test-node");
         let registry =
             Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
                 &oceanfs_core::LifecycleConfig::default(),
             ));
-        let ae = make_anti_entropy(membership.clone(), Arc::clone(&registry));
+        let ae = make_anti_entropy(membership, Arc::clone(&registry))
+            .with_peer_selector(Arc::new(AllEligible));
 
-        // Register one dead and one alive peer
-        membership.upsert_node(
-            NodeId::new("dead-peer"),
-            NodeState::Dead,
-            oceanfs_core::Incarnation::new(1),
-            Some("127.0.0.1:9001".parse().unwrap()),
-        );
-        membership.upsert_node(
-            NodeId::new("alive-peer"),
-            NodeState::Alive,
-            oceanfs_core::Incarnation::new(1),
-            Some("127.0.0.1:9002".parse().unwrap()),
-        );
+        let seg_local = make_segment_metadata(SegmentId::new(), true, Some(make_hash(1)));
+        let mut seg_remote = make_segment_metadata(SegmentId::new(), true, Some(make_hash(2)));
+        seg_remote.storage_locations = smallvec::smallvec![NodeId::new("holder-a")];
 
-        let peers = ae.select_alive_peers();
-        // Should only contain the alive peer
-        assert!(!peers.iter().any(|p| p.as_str() == "dead-peer"));
-        if !peers.is_empty() {
-            assert!(peers.iter().all(|p| p.as_str() == "alive-peer"));
-        }
+        let (groups, local_only) = ae.holder_groups(&[seg_local.clone(), seg_remote.clone()]);
+        assert_eq!(local_only, 1, "the self-holder segment is local-only");
+        assert!(
+            !groups.values().any(|ids| ids.contains(&seg_local.segment_id)),
+            "local-only segment must not appear in any remote exchange group"
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[&NodeId::new("holder-a")],
+            vec![seg_remote.segment_id],
+            "the holder-backed segment produces exactly one exchange group"
+        );
+    }
+
+    #[test]
+    fn holder_groups_only_self_holder_is_local_only() {
+        // storage_locations == {self}: after self exclusion there is no
+        // eligible remote holder, so the segment is local-only.
+        let (membership, _ring) = make_test_membership("test-node");
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
+        let ae = make_anti_entropy(membership, Arc::clone(&registry))
+            .with_peer_selector(Arc::new(AllEligible));
+
+        let mut seg = make_segment_metadata(SegmentId::new(), true, Some(make_hash(3)));
+        seg.storage_locations = smallvec::smallvec![NodeId::new("test-node")];
+
+        let (groups, local_only) = ae.holder_groups(&[seg]);
+        assert_eq!(local_only, 1);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn holder_groups_respect_peer_count_per_segment() {
+        // f2 DoD grouping/cost-model: with storage_locations =
+        // [self, A, B] and peer_count = 1 (default), each segment is
+        // exchanged with at most one of {A, B} — no full-mesh fan-out to
+        // every holder (ADR-0015 cost model).
+        let (membership, _ring) = make_test_membership("test-node");
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
+        let ae = make_anti_entropy(membership, Arc::clone(&registry))
+            .with_peer_selector(Arc::new(AllEligible));
+
+        let mut seg = make_segment_metadata(SegmentId::new(), true, Some(make_hash(4)));
+        seg.storage_locations = smallvec::smallvec![
+            NodeId::new("test-node"),
+            NodeId::new("holder-a"),
+            NodeId::new("holder-b"),
+        ];
+
+        let (groups, local_only) = ae.holder_groups(&[seg.clone()]);
+        assert_eq!(local_only, 0);
+        // Self is excluded; with peer_count = 1 only one of {A,B} gets
+        // the segment (deterministic: sorted eligible, truncated).
+        assert_eq!(groups.len(), 1);
+        assert!(!groups.contains_key(&NodeId::new("test-node")));
+        let appearances: usize =
+            groups.values().map(|ids| ids.iter().filter(|id| **id == seg.segment_id).count()).sum();
+        assert_eq!(appearances, 1, "segment must be added to at most one holder");
     }
 
     // -----------------------------------------------------------------------
