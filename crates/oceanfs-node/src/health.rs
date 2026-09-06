@@ -98,8 +98,11 @@ pub type LossAnnouncer = Arc<dyn Fn(u32, Vec<SegmentId>) + Send + Sync>;
 /// (metadata Dead → the node serves nothing — surfaced to readers via
 /// `PoolRegistry::node_serves_requests`, data Dead → affected-segment
 /// derivation), then re-declares the node manifest so peers see the
-/// change. Returns the join handle (the caller holds its cancellation
-/// token).
+/// change. Returns the join handle.
+///
+/// The task exits on `shutdown` cancellation (the monitor's event
+/// sender is retained by the storage module until the node drops, so
+/// channel close alone cannot stop the applier during shutdown).
 ///
 /// `loss_announcer` (g3 `loss-announcement`, ADR-0029 §D4 fast path):
 /// when a **data** pool is confirmed Dead, the applier derives the
@@ -117,51 +120,62 @@ pub fn spawn_health_consequences(
     boot_incarnation: u64,
     manifest_cache: Arc<ManifestCache>,
     loss_announcer: Option<LossAnnouncer>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut events = events;
-        while let Some(event) = events.recv().await {
-            let HealthEvent::StatusChanged { pool_id, status } = event else {
-                // Non-exhaustive: unknown future events are ignored.
-                continue;
-            };
-            let Some(pool) = registry.pool_by_id(pool_id) else { continue };
-            match pool.role() {
-                // The metadata-Dead consequence (node serves nothing) is
-                // derived lazily from the REGISTRY by the read/write
-                // gates (`PoolRegistry::node_serves_requests`) — the
-                // monitor already set the pool Dead before this event, so
-                // there is no separate flag to maintain (one source of
-                // truth). Only the manifest re-declaration below matters.
-                PoolRole::Metadata => {
-                    tracing::info!(pool_id, "metadata pool status change observed");
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    tracing::debug!("health consequence applier cancelled");
+                    break;
                 }
-                PoolRole::Data if status == PoolStatus::Dead => {
-                    let affected = derive_affected_segments(&lifecycle, pool_id);
-                    tracing::warn!(
-                        pool_id,
-                        affected_segments = affected.len(),
-                        "data pool Dead: affected segments derived"
-                    );
-                    if let Some(announcer) = &loss_announcer {
-                        announcer(pool_id, affected);
+                event = events.recv() => {
+                    let Some(event) = event else { break };
+                    let HealthEvent::StatusChanged { pool_id, status } = event else {
+                        // Non-exhaustive: unknown future events are ignored.
+                        continue;
+                    };
+                    let Some(pool) = registry.pool_by_id(pool_id) else { continue };
+                    match pool.role() {
+                        // The metadata-Dead consequence (node serves nothing) is
+                        // derived lazily from the REGISTRY by the read/write
+                        // gates (`PoolRegistry::node_serves_requests`) — the
+                        // monitor already set the pool Dead before this event, so
+                        // there is no separate flag to maintain (one source of
+                        // truth). Only the manifest re-declaration below matters.
+                        PoolRole::Metadata => {
+                            tracing::info!(pool_id, "metadata pool status change observed");
+                        }
+                        PoolRole::Data if status == PoolStatus::Dead => {
+                            let affected = derive_affected_segments(&lifecycle, pool_id);
+                            tracing::warn!(
+                                pool_id,
+                                affected_segments = affected.len(),
+                                "data pool Dead: affected segments derived"
+                            );
+                            if let Some(announcer) = &loss_announcer {
+                                announcer(pool_id, affected);
+                            }
+                        }
+                        // wal (write_degraded is driven by the monitor) and
+                        // hints (rejection is checked at enqueue time) need no
+                        // node-level consequence here.
+                        _ => {}
                     }
+                    // Re-declare the manifest: peers must see the new status
+                    // (and write_degraded) immediately — the f6 version bump
+                    // propagates it via gossip.
+                    let incarnation = membership
+                        .incarnation_of(&self_id)
+                        .map(|inc| inc.value())
+                        .unwrap_or(boot_incarnation);
+                    let manifest: Arc<NodeManifest> =
+                        Arc::new(build_node_manifest(incarnation, &registry));
+                    membership.set_self_manifest((*manifest).clone());
+                    manifest_cache.update(self_id.clone(), manifest);
                 }
-                // wal (write_degraded is driven by the monitor) and
-                // hints (rejection is checked at enqueue time) need no
-                // node-level consequence here.
-                _ => {}
             }
-            // Re-declare the manifest: peers must see the new status
-            // (and write_degraded) immediately — the f6 version bump
-            // propagates it via gossip.
-            let incarnation = membership
-                .incarnation_of(&self_id)
-                .map(|inc| inc.value())
-                .unwrap_or(boot_incarnation);
-            let manifest: Arc<NodeManifest> = Arc::new(build_node_manifest(incarnation, &registry));
-            membership.set_self_manifest((*manifest).clone());
-            manifest_cache.update(self_id.clone(), manifest);
         }
     })
 }

@@ -18,6 +18,7 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use oceanfs_core::{NodeConfig, NodeId, RpcConfig};
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::{
@@ -254,6 +255,16 @@ impl MembershipModule {
     /// register here); `registry` is the c1 storage-pool registry the
     /// self manifest is built from.
     ///
+    /// # Returns
+    ///
+    /// The spawned membership-plane task handles ([`MembershipPlane`]):
+    /// the gossip/probe gRPC serve task, the routing-cache subscriber
+    /// and (for cluster nodes) the background rejoin loop. Every task
+    /// exits on the membership shutdown token
+    /// ([`Membership::shutdown_token`]) — the node cancels that token
+    /// during shutdown and awaits these handles so the plane's fixed
+    /// listener is released before a same-address restart.
+    ///
     /// # Errors
     ///
     /// Returns an error when the membership-plane listener cannot bind
@@ -265,7 +276,7 @@ impl MembershipModule {
         &self,
         metrics: Arc<oceanfs_server::admin::MetricsRegistry>,
         registry: &oceanfs_storage::PoolRegistry,
-    ) -> Result<(), String> {
+    ) -> Result<MembershipPlane, String> {
         // The membership services (gossip + probe) are constructed here
         // with the plane's dedicated pool: the data-plane server hosts
         // only Segment/Healing/Cache/Scrub (ADR-0028 D1).
@@ -307,7 +318,12 @@ impl MembershipModule {
 
         let quickack = self.quickack;
         let busy_poll = self.busy_poll;
-        tokio::spawn(async move {
+        // The plane's tasks all stop on the membership shutdown token:
+        // `Node::shutdown` cancels it and awaits the returned handles,
+        // so the plane's listener is released before a same-address
+        // restart (the boot-variant e2e restarts a node in-process).
+        let plane_shutdown = self.membership.shutdown_token();
+        let plane_grpc_handle = tokio::spawn(async move {
             // Same socket treatment as the data plane (perf 4.3):
             // quickack + busy-poll on accepted membership connections —
             // probe latency is the detection bound.
@@ -323,7 +339,10 @@ impl MembershipModule {
                     conn
                 },
             );
-            if let Err(e) = membership_router.serve_with_incoming(stream).await {
+            if let Err(e) = membership_router
+                .serve_with_incoming_shutdown(stream, plane_shutdown.cancelled_owned())
+                .await
+            {
                 error!("membership plane server error: {e}");
             }
         });
@@ -364,7 +383,7 @@ impl MembershipModule {
         let cache_events = self.membership.subscribe();
         let cache_for_events = Arc::clone(&self.manifest_cache);
         let cache_shutdown = self.membership.shutdown_token();
-        tokio::spawn(async move {
+        let subscriber_handle = tokio::spawn(async move {
             let mut cache_events = cache_events;
             loop {
                 tokio::select! {
@@ -412,16 +431,24 @@ impl MembershipModule {
         // the ring reaches the configured minimum quorum node count
         // (`cluster_min_quorum_nodes`, B6 — review #66/#69). Covers the
         // seedless-restart path (fallback seeds) and fleet nodes that
-        // boot before their seed comes up. Exits once joined.
-        if self.is_cluster_node {
+        // boot before their seed comes up. Exits once joined (or when
+        // the membership shutdown token fires).
+        let rejoin_handle: Option<JoinHandle<()>> = if self.is_cluster_node {
             let retry_membership = Arc::clone(&self.membership);
             let retry_incarnation = join_incarnation;
             let retry_fallback = join_fallback_seeds.clone();
             let min_quorum_nodes = self.min_quorum_nodes;
-            tokio::spawn(async move {
+            let rejoin_shutdown = self.membership.shutdown_token();
+            Some(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
                 loop {
-                    interval.tick().await;
+                    tokio::select! {
+                        _ = rejoin_shutdown.cancelled() => {
+                            tracing::debug!("background rejoin loop cancelled");
+                            return;
+                        }
+                        _ = interval.tick() => {}
+                    }
                     let ring_nodes = retry_membership.ring().snapshot().node_count();
                     if cluster_ready_gate_opens(ring_nodes, min_quorum_nodes, false) {
                         return;
@@ -431,8 +458,10 @@ impl MembershipModule {
                         tracing::debug!(error = %e, "rejoin retry failed");
                     }
                 }
-            });
-        }
+            }))
+        } else {
+            None
+        };
 
         // After a successful join, snapshot the known member addresses as
         // fallback seeds. Events emitted during join are missed by the
@@ -468,8 +497,25 @@ impl MembershipModule {
             }
         }
 
-        Ok(())
+        Ok(MembershipPlane { grpc_handle: plane_grpc_handle, subscriber_handle, rejoin_handle })
     }
+}
+
+/// The spawned membership-plane task handles returned by
+/// [`MembershipModule::start_plane_and_join`].
+///
+/// Every task exits on the membership shutdown token; `Node::shutdown`
+/// cancels that token and awaits these handles (with an abort backstop)
+/// so the plane's fixed listener is released before a same-address
+/// restart.
+pub(crate) struct MembershipPlane {
+    /// The gossip/probe gRPC serve task handle.
+    pub(crate) grpc_handle: JoinHandle<()>,
+    /// The routing-cache event subscriber task handle.
+    pub(crate) subscriber_handle: JoinHandle<()>,
+    /// The background rejoin loop handle (`None` for single-node
+    /// deployments — they never spawn the loop).
+    pub(crate) rejoin_handle: Option<JoinHandle<()>>,
 }
 
 /// Whether the cluster-readiness gate opens for the given ring view
@@ -496,17 +542,20 @@ impl MembershipModule {
     /// membership-plane concern: it opens when the RING reaches the
     /// configured minimum quorum node count or the configured bound
     /// elapses). No-op for single-node deployments — their gate is
-    /// already open (see [`ready_gate`](Self::ready_gate)).
-    pub(crate) fn spawn_ready_gate(&self) {
+    /// already open (see [`ready_gate`](Self::ready_gate)). Returns the
+    /// loop handle so shutdown can await it (the loop also exits on the
+    /// membership shutdown token).
+    pub(crate) fn spawn_ready_gate(&self) -> Option<JoinHandle<()>> {
         if !self.is_cluster_node {
-            return;
+            return None;
         }
         use tracing::info;
         let gate_membership = Arc::clone(&self.membership);
         let gate = Arc::clone(&self.ready_gate);
         let gate_timeout_secs = self.ready_timeout_secs.max(1);
         let min_quorum_nodes = self.min_quorum_nodes;
-        tokio::spawn(async move {
+        let gate_shutdown = self.membership.shutdown_token();
+        Some(tokio::spawn(async move {
             // Open the gate when the ring reaches the configured
             // minimum quorum node count or after the configured
             // bound — the rejoin pull takes seconds; the bound
@@ -519,6 +568,10 @@ impl MembershipModule {
             let deadline =
                 tokio::time::Instant::now() + std::time::Duration::from_secs(gate_timeout_secs);
             loop {
+                tokio::select! {
+                    _ = gate_shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                }
                 let ring_nodes = gate_membership.ring().snapshot().node_count();
                 if cluster_ready_gate_opens(
                     ring_nodes,
@@ -528,10 +581,9 @@ impl MembershipModule {
                     gate.store(true, std::sync::atomic::Ordering::Release);
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
             info!("Cluster-readiness gate opened");
-        });
+        }))
     }
 
     /// Registers the membership module's metric series (the peer

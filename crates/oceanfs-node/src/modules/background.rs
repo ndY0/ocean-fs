@@ -59,7 +59,7 @@ pub(crate) fn spawn_all(
     let mut bg = BackgroundTasks::new();
 
     // Cluster-readiness gate (membership-plane owned).
-    membership_module.spawn_ready_gate();
+    bg.ready_gate = membership_module.spawn_ready_gate();
 
     // Durability-owned loops: GC/AE/scrub/reaper/heal, hint prune +
     // delivery watcher, reconciliation, re-rep worker + dispatcher.
@@ -161,6 +161,7 @@ pub(crate) fn spawn_all(
         membership_module.announce_incarnation,
         Arc::clone(&membership_module.manifest_cache),
         loss_announcer,
+        bg.health_consequences_cancel.clone(),
     ));
 
     // Server-owned loop: the prefetch pre-warmer keep-alive.

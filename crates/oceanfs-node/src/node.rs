@@ -69,6 +69,21 @@ pub struct BackgroundTasks {
     pub(crate) grpc_server: Option<JoinHandle<()>>,
     /// gRPC server cancellation token.
     pub(crate) grpc_shutdown: CancellationToken,
+    /// HTTP server task handle for graceful shutdown (the axum router
+    /// holds the coordinator/store clones — it must be awaited before
+    /// the metadata store closes).
+    pub(crate) http_server: Option<JoinHandle<()>>,
+
+    /// Membership-plane gossip/probe gRPC serve task handle.
+    pub(crate) membership_grpc: Option<JoinHandle<()>>,
+    /// Membership-plane routing-cache event subscriber task handle.
+    pub(crate) membership_subscriber: Option<JoinHandle<()>>,
+    /// Membership-plane background rejoin loop handle (`None` for
+    /// single-node deployments).
+    pub(crate) membership_rejoin: Option<JoinHandle<()>>,
+    /// Cluster-readiness gate loop handle (`None` for single-node
+    /// deployments).
+    pub(crate) ready_gate: Option<JoinHandle<()>>,
 
     /// Health check loop cancellation token.
     pub(crate) health_check_cancel: CancellationToken,
@@ -81,6 +96,8 @@ pub struct BackgroundTasks {
     /// Health-consequence applier task (role matrix + manifest
     /// re-declaration). `None` before the applier is spawned.
     pub(crate) health_consequences: Option<JoinHandle<()>>,
+    /// Health-consequence applier cancellation token.
+    pub(crate) health_consequences_cancel: CancellationToken,
 
     /// Seal-time segment replicator task (sealed-segment-replication).
     /// `None` before the replicator is spawned.
@@ -130,10 +147,16 @@ impl BackgroundTasks {
             hint_prune_cancel: CancellationToken::new(),
             grpc_server: None,
             grpc_shutdown: CancellationToken::new(),
+            http_server: None,
+            membership_grpc: None,
+            membership_subscriber: None,
+            membership_rejoin: None,
+            ready_gate: None,
             health_check_cancel: CancellationToken::new(),
             health_monitor: None,
             health_cancel: CancellationToken::new(),
             health_consequences: None,
+            health_consequences_cancel: CancellationToken::new(),
             segment_replicator: None,
             segment_replicator_cancel: CancellationToken::new(),
             reconciliation: None,
@@ -179,6 +202,10 @@ pub struct Node {
     grpc_shutdown: CancellationToken,
     /// Background task handles and cancellation tokens.
     background: BackgroundTasks,
+    /// The prefetch engine (c3) — retained so shutdown can stop its
+    /// background worker (`PrefetchEngine::shutdown`) before the
+    /// metadata store closes.
+    prefetch_engine: Option<Arc<oceanfs_cache::PrefetchEngine>>,
     /// Cluster membership for leave signaling and observability.
     membership: Arc<oceanfs_membership::Membership>,
     /// The storage subsystem bundle (c1 — `modules/storage.rs`): pool
@@ -398,14 +425,15 @@ impl Node {
         // ---- 7. Bind data plane + start membership plane (c4) ----
         let crate::modules::server::ServerModule { router, grpc, prefetch_engine } = server;
         let bound = data_plane_module.serve(router, grpc).await?;
-        membership_module.start_plane_and_join(metrics.clone(), &storage.registry).await?;
+        let plane =
+            membership_module.start_plane_and_join(metrics.clone(), &storage.registry).await?;
 
         // ---- 8. Bundle + spawn background loops (c5: modules/background.rs) ----
         let mut background = crate::modules::background::spawn_all(
             &config,
             &storage,
             &durability,
-            prefetch_engine,
+            Arc::clone(&prefetch_engine),
             &membership_module,
             &data_plane_module,
             membership_module.membership_state_store.clone(),
@@ -414,6 +442,10 @@ impl Node {
         );
         background.grpc_shutdown = bound.grpc_shutdown;
         background.grpc_server = Some(bound.grpc_server_handle);
+        background.http_server = Some(bound.http_server_handle);
+        background.membership_grpc = Some(plane.grpc_handle);
+        background.membership_subscriber = Some(plane.subscriber_handle);
+        background.membership_rejoin = plane.rejoin_handle;
 
         // ---- 8b. Deferred replaced-wal recovery (g7, ADR-0035) ----
         // When the boot path detected a replaced wal pool, the durability
@@ -437,6 +469,7 @@ impl Node {
             http_shutdown: bound.http_shutdown,
             grpc_shutdown: background.grpc_shutdown.clone(),
             background,
+            prefetch_engine: Some(prefetch_engine),
             membership,
             storage,
             durability,
@@ -966,19 +999,19 @@ impl Node {
         self.grpc_addr
     }
 
-    /// Awaits an optional background-task handle, mapping a join error
-    /// to a message (used by shutdown under the configurable grace).
-    async fn await_handle(handle: Option<JoinHandle<()>>) -> Result<(), String> {
-        match handle {
-            Some(h) => h.await.map_err(|e| format!("{e}")),
-            None => Ok(()),
-        }
-    }
-
     /// Gracefully shuts down the node.
     ///
-    /// Sequence: graceful leave → cancel gRPC → cancel HTTP → cancel background
-    /// tasks → wait for tasks → flush WAL → close metadata → drop subsystems.
+    /// Sequence: graceful leave → cancel every server + background task
+    /// → wait for the task groups under their configured grace (aborting
+    /// survivors so no task outlives the node) → stop the prefetch
+    /// worker → flush WAL → stop the RocksDB metrics poller → close the
+    /// metadata store → drop subsystems.
+    ///
+    /// Every background task is cancellable and awaited so that after
+    /// this returns NO task holds the metadata store (`Arc<DB>`), the
+    /// data-plane listeners or the membership-plane listener — an
+    /// in-process restart on the same directories (same RocksDB LOCK,
+    /// same fixed addresses) is therefore possible.
     ///
     /// # Errors
     ///
@@ -997,14 +1030,22 @@ impl Node {
             warn!(error = %e, "graceful leave failed; continuing shutdown");
         }
 
-        // ---- 2. Cancel gRPC server (stop accepting new RPCs, drain in-flight) ----
+        // ---- 2. Cancel every server + background task ----
+        // Data-plane servers: the tokens are passed to
+        // `serve_with_incoming_shutdown`/`with_graceful_shutdown`, so on
+        // cancellation the listeners stop accepting and the serve tasks
+        // return once in-flight handlers complete (dropping the store
+        // clones held by the HTTP router and the gRPC services).
         self.grpc_shutdown.cancel();
-
-        // ---- 3. Signal the HTTP server to stop accepting connections and drain ----
         self.http_shutdown.cancel();
+        // Membership plane: the gossip/probe serve, routing-cache
+        // subscriber, rejoin loop, ready gate and the membership
+        // manager's internal tasks all stop on the membership shutdown
+        // token (cancelled here so their handles can be awaited).
+        self.membership.shutdown();
 
-        // ---- 4. Signal all background tasks to stop ----
-        let bg = self.background;
+        // Signal all background loops to stop.
+        let mut bg = self.background;
         bg.scheduler_cancel.cancel();
         bg.prefetch_cancel.cancel();
         bg.heal_cancel.cancel();
@@ -1017,41 +1058,59 @@ impl Node {
         bg.rep_worker_cancel.cancel();
         bg.rep_dispatcher_cancel.cancel();
         bg.metric_poller_cancel.cancel();
+        bg.health_consequences_cancel.cancel();
 
         // [review][config][high]
         // the shutdown grace period should be configurable, since it's dimensions is the product
         // of the queues sizes, and expected system load.
         // [end]
-        // ---- 5. Wait for background tasks with a timeout ----
+        // ---- 3. Wait for task groups under their grace ----
         // Grace is config-driven (review #71 — resolved in c5): the main
-        // group waits `shutdown_grace_secs`; the best-effort handles
-        // (prefetch, hint delivery, gRPC server) wait
-        // `shutdown_fast_grace_secs`.
+        // group waits `shutdown_grace_secs`; the transport/best-effort
+        // handles (servers, membership plane, prefetch, hint delivery)
+        // wait `shutdown_fast_grace_secs`. Every group is drained with an
+        // ABORT backstop: a task that exceeds its grace is aborted rather
+        // than detached, so no DB-holding or port-binding task can
+        // outlive the node (the detach-on-timeout behaviour is what kept
+        // the old data-plane gRPC serve task alive past shutdown).
         let grace = Duration::from_secs(self.config.shutdown_grace_secs.max(1));
         let fast = Duration::from_secs(self.config.shutdown_fast_grace_secs.max(1));
-        let _ = tokio::time::timeout(grace, async {
-            let _ = tokio::try_join!(
-                async { Self::await_handle(bg.durability_scheduler).await },
-                async { Self::await_handle(bg.heal).await },
-                async { Self::await_handle(bg.hinted_handoff_prune).await },
-                // The segment replicator drains its bounded channel; if it
-                // is mid-push the timeout bounds the wait (its receiver is
-                // dropped by the node drop anyway).
-                async { Self::await_handle(bg.segment_replicator).await },
-                // g4: the reconciliation loop stops on its token.
-                async { Self::await_handle(bg.reconciliation).await },
-                // g5: the worker drains its bounded queue; the dispatcher
-                // stops its sweep. Both bound the wait via the timeout.
-                async { Self::await_handle(bg.rep_worker).await },
-                async { Self::await_handle(bg.rep_dispatcher).await },
-                // g2: the pool health monitor + consequence applier stop
-                // on their tokens (c5 — drained before the stores close).
-                async { Self::await_handle(bg.health_monitor).await },
-                async { Self::await_handle(bg.health_consequences).await },
-                async { Self::await_handle(bg.metric_poller).await },
-            );
-        })
-        .await;
+
+        // Housekeeping group (grace).
+        let housekeeping = vec![
+            bg.durability_scheduler.take(),
+            bg.heal.take(),
+            bg.hinted_handoff_prune.take(),
+            // The segment replicator drains its bounded channel; if it is
+            // mid-push the grace bounds the wait (its receiver is dropped
+            // by the node drop anyway).
+            bg.segment_replicator.take(),
+            // g4: the reconciliation loop stops on its token.
+            bg.reconciliation.take(),
+            // g5: the worker drains its bounded queue; the dispatcher
+            // stops its sweep. Both bound the wait via the grace.
+            bg.rep_worker.take(),
+            bg.rep_dispatcher.take(),
+            // g2: the pool health monitor + consequence applier stop on
+            // their tokens (drained before the stores close).
+            bg.health_monitor.take(),
+            bg.health_consequences.take(),
+            bg.metric_poller.take(),
+        ];
+        Self::drain_tasks(housekeeping, grace, "housekeeping").await;
+
+        // Transport group (fast grace): the server tasks + the
+        // membership-plane tasks. These hold the DB/ports and MUST
+        // finish (or be aborted) before the store close below.
+        let transports = vec![
+            bg.grpc_server.take(),
+            bg.http_server.take(),
+            bg.membership_grpc.take(),
+            bg.membership_subscriber.take(),
+            bg.membership_rejoin.take(),
+            bg.ready_gate.take(),
+        ];
+        Self::drain_tasks(transports, fast, "transport").await;
 
         // Best-effort handles get the fast grace (they may be None).
         if let Some(pf) = bg.prefetch {
@@ -1060,16 +1119,22 @@ impl Node {
         if let Some(dh) = bg.hinted_handoff_delivery {
             let _ = tokio::time::timeout(fast, dh).await;
         }
-        if let Some(grpc_handle) = bg.grpc_server {
-            let _ = tokio::time::timeout(fast, grpc_handle).await;
+
+        // ---- 4. Stop the prefetch worker ----
+        // Cancels the engine's worker + drains in-flight prefetch tasks
+        // so their metadata-store clones are released. The engine Arc is
+        // still held here (self.prefetch_engine) and drops with `self`
+        // at the end of this method.
+        if let Some(engine) = &self.prefetch_engine {
+            engine.shutdown().await;
         }
 
-        // ---- 6. Flush WAL writer to disk ----
+        // ---- 5. Flush WAL writer to disk ----
         if let Err(e) = self.storage.wal_writer.sync().await {
             warn!(error = %e, "WAL sync failed during shutdown");
         }
 
-        // ---- 6b. Stop the RocksDB metrics poller ----
+        // ---- 6. Stop the RocksDB metrics poller ----
         // The task exits and drops its Arc<DB>, so the store close below
         // fully releases the RocksDB LOCK (a restarted node on the same
         // dir must be able to reopen it — every task is cancellable).
@@ -1080,11 +1145,52 @@ impl Node {
             warn!(error = %e, "metadata store close failed during shutdown");
         }
 
-        // ---- 8. Membership shutdown (cancels internal gossip + FD) ----
-        self.membership.shutdown();
+        // ---- 8. Drop subsystems ----
+        // `self` (config, background handles, prefetch engine Arc,
+        // storage, durability, membership) drops here, releasing the
+        // last Arc<DB> holder (the storage module) AFTER every task that
+        // held a clone has exited above.
 
         info!(node_id = %self.config.node_id, "OceanFS node shut down");
         Ok(())
+    }
+
+    /// Awaits a group of optional task handles under `grace`, aborting
+    /// any task that has not finished when the grace elapses.
+    ///
+    /// Abort (rather than detach) is deliberate: a background task that
+    /// survives shutdown can hold the RocksDB `Arc<DB>` (blocking a
+    /// same-dir reopen) or a fixed TCP listener (blocking a same-address
+    /// restart). Completed tasks are unaffected (abort is a no-op on a
+    /// finished task).
+    async fn drain_tasks(handles: Vec<Option<JoinHandle<()>>>, grace: Duration, group: &str) {
+        // Capture abort handles up front — the JoinHandles themselves
+        // are moved into the wait futures below.
+        let aborts: Vec<tokio::task::AbortHandle> =
+            handles.iter().flatten().map(|h| h.abort_handle()).collect();
+        if aborts.is_empty() {
+            return;
+        }
+        let mut waiter = tokio::task::JoinSet::new();
+        for handle in handles.into_iter().flatten() {
+            waiter.spawn(async move {
+                let _ = handle.await;
+            });
+        }
+        let timed_out =
+            tokio::time::timeout(grace, async { while waiter.join_next().await.is_some() {} })
+                .await
+                .is_err();
+        if timed_out {
+            warn!(
+                task_group = group,
+                grace_secs = grace.as_secs(),
+                "task group exceeded its shutdown grace; aborting survivors"
+            );
+            for abort in &aborts {
+                abort.abort();
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1276,6 +1382,27 @@ mod tests {
         );
         // Clean shutdown.
         result.unwrap().shutdown().await.expect("shutdown");
+    }
+
+    /// Every background task is cancellable and awaited during shutdown,
+    /// so a second node can be started IN-PROCESS on the same
+    /// directories: the RocksDB LOCK is released (no task still holds an
+    /// `Arc<DB>`) and no listener task survives. This is the prerequisite
+    /// for the g7 boot-variant e2e (out-of-band wal replacement + restart
+    /// in one test process).
+    #[tokio::test]
+    async fn node_in_process_restart_same_dirs_succeeds() {
+        let tmp = TempDir::new().expect("tempdir");
+        let first = Node::start(test_config(&tmp)).await.expect("first boot");
+        first.shutdown().await.expect("first shutdown");
+
+        // Give the OS a moment to release the ephemeral listeners.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let second = Node::start(test_config(&tmp)).await.unwrap_or_else(|e| {
+            panic!("second in-process boot on the same dirs must succeed: {e}")
+        });
+        second.shutdown().await.expect("second shutdown");
     }
 
     /// ADR-0031 (f1): a node whose config has no `[storage.pools]` is

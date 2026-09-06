@@ -9,7 +9,12 @@ use std::sync::Arc;
 
 use oceanfs_core::{BucketId, ObjectKey};
 use oceanfs_storage_api::MetadataStore;
-use tokio::sync::{mpsc, Semaphore};
+use parking_lot::Mutex;
+use tokio::{
+    sync::{mpsc, Semaphore},
+    task::JoinHandle,
+};
+use tokio_util::sync::CancellationToken;
 
 use crate::{l1_object::ObjectCache, l2_metadata::MetadataCache};
 
@@ -131,14 +136,21 @@ pub struct PrefetchEngine {
     sender: mpsc::Sender<PrefetchTask>,
     /// Metadata store for adjacent-key discovery (M8).
     metadata: Arc<dyn MetadataStore>,
+    /// Shutdown signal for the background worker ([`Self::shutdown`]).
+    shutdown: CancellationToken,
+    /// The background worker's join handle, when a tokio runtime was
+    /// active at construction. `shutdown` awaits it so the worker's
+    /// store clone is dropped before a same-directory store reopen.
+    worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl PrefetchEngine {
     /// Creates a new prefetch engine and starts the background worker.
     ///
-    /// The worker runs until `self` is dropped. If no tokio runtime is
-    /// available (e.g., in synchronous contexts), the worker is not spawned
-    /// and prefetch tasks are silently dropped.
+    /// The worker runs until [`Self::shutdown`] is called or `self` is
+    /// dropped. If no tokio runtime is available (e.g., in synchronous
+    /// contexts), the worker is not spawned and prefetch tasks are
+    /// silently dropped.
     pub fn new(
         config: PrefetchConfig,
         metadata_cache: Arc<MetadataCache>,
@@ -147,9 +159,12 @@ impl PrefetchEngine {
     ) -> Self {
         let (sender, receiver) = mpsc::channel(config.queue_capacity);
         let metadata_for_engine = Arc::clone(&metadata);
+        let shutdown = CancellationToken::new();
 
-        // Spawn the worker only if a tokio runtime is active.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        // Spawn the worker only if a tokio runtime is active. Its join
+        // handle is stored so `shutdown` can await the worker's exit
+        // (which drops the worker's `Arc<dyn MetadataStore>` clone).
+        let worker_join = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let worker = PrefetchWorker {
                 config: config.clone(),
                 receiver,
@@ -157,11 +172,71 @@ impl PrefetchEngine {
                 object_cache,
                 metadata,
             };
-            handle.spawn(worker.run());
-        }
-        // If no runtime, the worker is not spawned; tasks are silently dropped.
+            let worker_shutdown = shutdown.clone();
+            Some(handle.spawn(worker.run(worker_shutdown)))
+        } else {
+            // If no runtime, the worker is not spawned; tasks are
+            // silently dropped.
+            None
+        };
 
-        Self { config, sender, metadata: metadata_for_engine }
+        Self {
+            config,
+            sender,
+            metadata: metadata_for_engine,
+            shutdown,
+            worker: Mutex::new(worker_join),
+        }
+    }
+
+    /// Stops the background worker and waits for it to exit.
+    ///
+    /// Cancels the worker's shutdown token and awaits its join handle
+    /// (bounded by a short timeout), draining any in-flight prefetch
+    /// tasks. After this returns, the worker no longer holds the
+    /// metadata-store clone, so callers that drop the engine can safely
+    /// reopen a same-directory store. Idempotent; returns promptly when
+    /// the worker was never spawned (no tokio runtime at construction).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use oceanfs_cache::{PrefetchConfig, PrefetchEngine, MetadataCache, MetadataCacheConfig};
+    /// # use oceanfs_core::{BucketId, ObjectKey, ObjectMetadata, Tombstone};
+    /// # use oceanfs_storage_api::{BatchOp, MetadataStore};
+    /// # struct MockStore;
+    /// # impl MetadataStore for MockStore {
+    /// #     fn list_object_keys(&self, _b: &BucketId) -> std::io::Result<Vec<(BucketId, ObjectKey)>> { Ok(vec![]) }
+    /// #     fn get_object_metadata(&self, _b: &BucketId, _k: &ObjectKey) -> std::io::Result<Option<ObjectMetadata>> { Ok(None) }
+    /// #     fn list_objects(&self, _b: &BucketId, _p: &str) -> Vec<std::io::Result<ObjectMetadata>> { vec![] }
+    /// #     fn list_tombstones(&self, _b: &BucketId) -> Vec<std::io::Result<(ObjectKey, Tombstone)>> { vec![] }
+    /// #     fn delete_tombstone(&self, _b: &BucketId, _k: &ObjectKey) -> std::io::Result<()> { Ok(()) }
+    /// #     fn put_object(&self, _b: &BucketId, _m: ObjectMetadata) -> std::io::Result<()> { Ok(()) }
+    /// #     fn delete_object(&self, _b: &BucketId, _k: &ObjectKey, _h: oceanfs_core::Hlc) -> std::io::Result<()> { Ok(()) }
+    /// #     fn batch_write(&self, _ops: Vec<BatchOp>) -> std::io::Result<()> { Ok(()) }
+    /// # }
+    /// # async fn example() {
+    /// # let metadata_cache = Arc::new(MetadataCache::new(
+    /// #     MetadataCacheConfig::default(),
+    /// #     Box::new(oceanfs_cache::eviction::TtlLruPolicy::new(oceanfs_cache::eviction::TtlLruConfig::default())),
+    /// # ));
+    /// # let store: Arc<dyn MetadataStore> = Arc::new(MockStore);
+    /// let engine = PrefetchEngine::new(
+    ///     PrefetchConfig { enabled: true, ..Default::default() },
+    ///     metadata_cache,
+    ///     None,
+    ///     store,
+    /// );
+    /// engine.shutdown().await;
+    /// # }
+    /// ```
+    pub async fn shutdown(&self) {
+        self.shutdown.cancel();
+        let join = self.worker.lock().take();
+        if let Some(join) = join {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join).await;
+        }
     }
 
     /// Enqueues prefetch tasks for keys after the given cursor.
@@ -248,38 +323,63 @@ struct PrefetchWorker {
 }
 
 impl PrefetchWorker {
-    /// Runs the worker loop. Exits when the sender is dropped.
-    async fn run(mut self) {
+    /// Runs the worker loop. Exits when the shutdown token fires or the
+    /// sender is dropped, then drains the in-flight prefetch tasks
+    /// before returning so no store clone outlives the worker.
+    async fn run(mut self, shutdown: CancellationToken) {
         let semaphore = Arc::new(Semaphore::new(self.config.max_concurrency));
+        let mut in_flight = tokio::task::JoinSet::new();
 
-        while let Some(task) = self.receiver.recv().await {
-            let permit = semaphore.clone().acquire_owned().await;
+        loop {
+            let task = tokio::select! {
+                _ = shutdown.cancelled() => break,
+                task = self.receiver.recv() => match task {
+                    Some(task) => task,
+                    None => break, // sender dropped
+                },
+            };
+            let permit = tokio::select! {
+                _ = shutdown.cancelled() => break,
+                permit = semaphore.clone().acquire_owned() => permit,
+            };
             let meta_cache = self.metadata_cache.clone();
             let obj_cache = self.object_cache.clone();
             let store = self.metadata.clone();
-
-            tokio::spawn(async move {
+            in_flight.spawn(async move {
                 let _permit = permit;
-                // Look up metadata from the backing store.
-                match store.get_object_metadata(&task.bucket, &task.key) {
-                    Ok(Some(meta)) => {
-                        // Warm the L2 metadata cache.
-                        meta_cache.put(task.bucket.clone(), task.key.clone(), meta.clone());
-
-                        // Optionally warm the L1 object cache with inline data.
-                        if let (Some(ref obj), Some(inline_data)) = (&obj_cache, &meta.inline_data)
-                        {
-                            obj.put(task.bucket.clone(), task.key.clone(), inline_data.clone());
-                        }
-                    }
-                    Ok(None) => {
-                        // Key not found — nothing to warm.
-                    }
-                    Err(_) => {
-                        // Store error — silent (best-effort).
-                    }
-                }
+                run_prefetch(store, meta_cache, obj_cache, task).await;
             });
+        }
+
+        // Drain the in-flight prefetch tasks so their metadata-store
+        // clones are released before the worker returns.
+        while in_flight.join_next().await.is_some() {}
+    }
+}
+
+/// Executes one prefetch task: look up the metadata and warm the caches.
+async fn run_prefetch(
+    store: Arc<dyn MetadataStore>,
+    meta_cache: Arc<MetadataCache>,
+    obj_cache: Option<Arc<ObjectCache>>,
+    task: PrefetchTask,
+) {
+    // Look up metadata from the backing store.
+    match store.get_object_metadata(&task.bucket, &task.key) {
+        Ok(Some(meta)) => {
+            // Warm the L2 metadata cache.
+            meta_cache.put(task.bucket.clone(), task.key.clone(), meta.clone());
+
+            // Optionally warm the L1 object cache with inline data.
+            if let (Some(ref obj), Some(inline_data)) = (&obj_cache, &meta.inline_data) {
+                obj.put(task.bucket.clone(), task.key.clone(), inline_data.clone());
+            }
+        }
+        Ok(None) => {
+            // Key not found — nothing to warm.
+        }
+        Err(_) => {
+            // Store error — silent (best-effort).
         }
     }
 }

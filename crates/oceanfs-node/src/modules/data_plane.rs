@@ -49,6 +49,10 @@ pub(crate) struct BoundDataPlane {
     pub(crate) http_shutdown: CancellationToken,
     /// gRPC graceful-shutdown token.
     pub(crate) grpc_shutdown: CancellationToken,
+    /// The HTTP serve task handle (held by `BackgroundTasks` for
+    /// shutdown — the router's store clones must be released before the
+    /// metadata store closes).
+    pub(crate) http_server_handle: JoinHandle<()>,
     /// The data-plane gRPC serve task handle (held by
     /// `BackgroundTasks` for shutdown).
     pub(crate) grpc_server_handle: JoinHandle<()>,
@@ -120,7 +124,7 @@ impl DataPlaneModule {
         let http_shutdown = CancellationToken::new();
         let http_shutdown_signal = http_shutdown.clone();
 
-        tokio::spawn(async move {
+        let http_server_handle = tokio::spawn(async move {
             if let Err(e) = axum::serve(http_listener, router.into_make_service())
                 .with_graceful_shutdown(http_shutdown_signal.cancelled_owned())
                 .await
@@ -139,9 +143,12 @@ impl DataPlaneModule {
             .add_service(grpc.scrub);
 
         // Create gRPC shutdown token before spawning so it can be used
-        // by both the gRPC server and BackgroundTasks.
+        // by both the gRPC server and BackgroundTasks. The token is
+        // passed to `serve_with_incoming_shutdown`: on cancellation the
+        // server stops accepting new RPCs, drains in-flight handlers
+        // (dropping their store clones) and the serve task returns.
         let grpc_shutdown = CancellationToken::new();
-        let _grpc_shutdown_signal = grpc_shutdown.clone();
+        let grpc_shutdown_signal = grpc_shutdown.clone();
 
         let grpc_addr = self.grpc_addr;
         let quickack = self.quickack;
@@ -167,7 +174,10 @@ impl DataPlaneModule {
                     conn
                 });
 
-            if let Err(e) = grpc_router.serve_with_incoming(stream).await {
+            if let Err(e) = grpc_router
+                .serve_with_incoming_shutdown(stream, grpc_shutdown_signal.cancelled_owned())
+                .await
+            {
                 tracing::error!("gRPC server error: {e}");
             }
         });
@@ -177,6 +187,7 @@ impl DataPlaneModule {
             grpc_addr,
             http_shutdown,
             grpc_shutdown,
+            http_server_handle,
             grpc_server_handle,
         })
     }
