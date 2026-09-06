@@ -298,6 +298,15 @@ impl WalWriter {
         // Update the sync position so the sync group knows the
         // truncated range.
         self.sync_position.store(position, Ordering::Release);
+        // Rewinding below the sync group's lower bound (e.g.
+        // `verify_wal_write` truncates its probe away) must reset the
+        // lower bound too: the flusher skips fsync entirely while
+        // `current <= last_synced` (sync.rs/writer.rs range-sync), so a
+        // stale bound would let post-truncate appends be ACKed without a
+        // covering fsync. `reopen_fresh` mirrors this reset.
+        if position < self.last_synced.load(Ordering::Acquire) {
+            self.last_synced.store(position, Ordering::Release);
+        }
 
         Ok(())
     }
@@ -316,6 +325,13 @@ impl WalWriter {
     /// Returns the current global WAL position.
     pub async fn global_position(&self) -> u64 {
         *self.global_position.lock().await
+    }
+
+    /// The sync group's current lower bound (test-only: verifies that
+    /// truncation/rewind resets the bound so the next append is fsynced).
+    #[cfg(test)]
+    pub(crate) fn last_synced_for_test(&self) -> u64 {
+        self.last_synced.load(Ordering::Acquire)
     }
 
     /// Registers WAL counters with a metrics registrar.
@@ -687,5 +703,35 @@ mod tests {
         assert_eq!(pos.offset, 0);
         // sync still works through the (shared) sync group.
         writer.sync().await.unwrap();
+    }
+
+    /// Regression (g7 review gap 1): `truncate` rewinding below the sync
+    /// group's lower bound must reset `last_synced` — otherwise the
+    /// flusher would skip fsync while `current <= last_synced` and
+    /// post-truncate appends could be ACKed without a covering fsync.
+    /// `verify_wal_write` exercises exactly this: it appends its probe at
+    /// offset 0, the group flusher advances past it, then truncates it
+    /// away — the rewind must reset the bound so the NEXT append is
+    /// fsynced.
+    #[tokio::test]
+    async fn truncate_below_synced_position_resets_lower_bound() {
+        let config = test_config().await;
+        let writer = WalWriter::open(&config).await.unwrap();
+
+        // Append + fsync an entry (the group's last_synced advances past 0).
+        let pos1 = writer.append(make_entry(0, 64)).await.unwrap();
+        writer.sync().await.unwrap();
+        assert!(writer.last_synced_for_test() >= pos1.offset + 64, "group synced past the entry");
+
+        // Truncate the entry away (rewind below the synced bound).
+        writer.truncate(pos1.offset).await.unwrap();
+
+        // The lower bound must reset so the next append is covered by an
+        // fsync (not skipped as "already synced").
+        assert_eq!(
+            writer.last_synced_for_test(),
+            pos1.offset,
+            "truncate below the synced bound must reset last_synced"
+        );
     }
 }

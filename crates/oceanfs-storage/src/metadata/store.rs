@@ -727,9 +727,11 @@ impl RocksDbMetadataStore {
 
     /// Lists object metadata for every object across all buckets.
     ///
-    /// Scans the whole objects column family. Used by the orphan reaper —
-    /// a per-bucket scan would miss objects in other buckets and mark
-    /// their segments as orphans.
+    /// Scans the whole objects column family. Used by the replaced-wal
+    /// recovery's one-time candidate enumeration (ADR-0034 carve-out:
+    /// wal_recovery in oceanfs-node) — a per-bucket scan would miss
+    /// objects in other buckets, so the segment-id set it derives would
+    /// be incomplete.
     pub fn list_objects_all(&self) -> Vec<Result<ObjectMetadata>> {
         let cf = self.db.cf_handle(cf::CF_OBJECTS);
         let Some(cf_handle) = cf else {

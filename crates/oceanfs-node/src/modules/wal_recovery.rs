@@ -187,6 +187,7 @@ fn data_pools_have_dat(registry: &PoolRegistry) -> bool {
 ///     restored: 0,
 ///     missing: vec![],
 ///     caught_up: 0,
+///     dangling: vec![],
 ///     verified: false,
 /// };
 /// assert_eq!(outcome.candidates, 0);
@@ -197,10 +198,18 @@ pub struct WalRecoveryOutcome {
     pub candidates: usize,
     /// Registry entries restored from holder metadata / recomputed.
     pub restored: usize,
-    /// Segment ids that were referenced but not materialized locally.
+    /// Segment ids that were referenced but not materialized locally and
+    /// STILL keep the write gate set (unresolved holder-fold candidates +
+    /// catch-up requests that did not complete within the drain budget).
+    /// g4 re-drives these.
     pub missing: Vec<SegmentId>,
     /// Segments re-materialized through the ReRepWorker.
     pub caught_up: usize,
+    /// Referenced segment ids with NO live holder — the documented
+    /// out-of-scope residual window (ADR-0029 §D7): reads surface
+    /// `SegmentUnavailable`, nothing can pull them, and they do NOT block
+    /// the write-resume gate.
+    pub dangling: Vec<SegmentId>,
     /// Whether the fresh WAL passed the verification write.
     pub verified: bool,
 }
@@ -525,6 +534,42 @@ pub(crate) fn holder_candidates(
         .into_iter()
         .filter(|id| *id != ctx.self_id)
         .collect()
+}
+
+/// `true` when the membership plane knows at least one remote node in a
+/// servable state (Alive | Suspect). A single-node cluster has no remote
+/// peer, so an empty ring replica set genuinely means "no holder
+/// position"; with remote peers present, an empty ring set is a
+/// convergence artifact and must NOT be treated as local-only.
+fn membership_has_remote_peer(ctx: &WalRecoveryCoordinator) -> bool {
+    use oceanfs_core::NodeState;
+    ctx.membership.nodes_full().into_iter().any(|(id, state, ..)| {
+        id != ctx.self_id && matches!(state, NodeState::Alive | NodeState::Suspect)
+    })
+}
+
+/// Decides whether a present-but-unseeded candidate is a genuine
+/// local-only (ADR-0035 D3) recompute candidate, versus an unresolved
+/// segment whose live holder was merely unreachable / not yet gossiped.
+///
+/// Local-only is only ever true when:
+/// - every reachable holder answered "not held" (the segment has no live
+///   copy among its ring replicas), OR
+/// - the ring replica set is empty AND the cluster has no remote peer (a
+///   single node — no holder position can ever exist).
+///
+/// An empty ring replica set with remote peers present is a convergence
+/// artifact and must NOT be treated as local-only (the boot drain starts
+/// before gossip has fully populated the ring).
+fn is_local_only_d3_candidate(
+    ctx: &WalRecoveryCoordinator,
+    segment_id: SegmentId,
+    reachable_absent: &std::collections::HashSet<SegmentId>,
+) -> bool {
+    let no_ring_holder = holder_candidates(ctx, segment_id).is_empty();
+    let reachable_but_absent = reachable_absent.contains(&segment_id);
+    let single_node = !membership_has_remote_peer(ctx);
+    reachable_but_absent || (no_ring_holder && single_node)
 }
 
 // ---------------------------------------------------------------------------
@@ -860,18 +905,25 @@ pub(crate) async fn recompute_local_only(
 // ---------------------------------------------------------------------------
 
 /// Enqueues one re-replication request per referenced-but-not-materialized
-/// segment and returns the number enqueued.
+/// segment and returns `(enqueued, dangling)`.
 ///
 /// `missing` are segment ids the surviving objects CF references that are
 /// neither present as a local `.dat` nor restored by the holder fold.
-/// Each enqueues a [`ReRepRequest`](oceanfs_durability::healing_service::ReRepRequest)
+/// Each catchable segment enqueues a
+/// [`ReRepRequest`](oceanfs_durability::healing_service::ReRepRequest)
 /// through the ReRepWorker's bounded sender; the worker pulls full data +
 /// metadata from a live holder, writes through the pool-aware store,
 /// registers reserve + seal, and stamps `storage_locations`.
+///
+/// A referenced segment with **no live holder** is the documented
+/// residual window (ADR-0029 §D7 / the feature's out-of-scope "dangling
+/// row"): there is no copy to pull from, reads surface
+/// `SegmentUnavailable`, and it must NOT wedge the write-resume gate.
+/// Such segments are returned as `dangling` (reported, not enqueued).
 pub(crate) async fn enqueue_catch_up(
     ctx: &WalRecoveryCoordinator,
     missing: &[SegmentId],
-) -> Result<usize, String> {
+) -> Result<(usize, Vec<SegmentId>), String> {
     use oceanfs_durability::healing_service::{ReRepRequest, RepairReason};
 
     let Some(sender) = &ctx.rep_sender else {
@@ -879,6 +931,7 @@ pub(crate) async fn enqueue_catch_up(
     };
 
     let mut enqueued = 0usize;
+    let mut dangling: Vec<SegmentId> = Vec::new();
     for segment_id in missing {
         // Determine the live holders to pull from (ring replica set −
         // self). Segments with no live remote holder are the documented
@@ -892,6 +945,7 @@ pub(crate) async fn enqueue_catch_up(
                 segment_id = %segment_id,
                 "wal recovery: referenced segment has no live holder — reads surface SegmentUnavailable"
             );
+            dangling.push(*segment_id);
             continue;
         }
 
@@ -954,7 +1008,7 @@ pub(crate) async fn enqueue_catch_up(
             .map_err(|e| format!("wal recovery catch-up enqueue failed (queue closed): {e}"))?;
         enqueued += 1;
     }
-    Ok(enqueued)
+    Ok((enqueued, dangling))
 }
 
 /// Re-checks the drain completion condition for one segment: materialized
@@ -1026,7 +1080,10 @@ pub(crate) async fn run_wal_pool_recovery(
     // membership plane may not have converged yet (the drain runs right
     // after spawn_all), so retry the fold until no progress for several
     // rounds or the budget is exhausted. A segment is only declared
-    // local-only (D3) once its ring replica set is genuinely empty.
+    // local-only (D3) once its ring replica set is genuinely empty —
+    // which is only true when the cluster has no remote peer at all (a
+    // single node), never merely because gossip has not yet populated the
+    // ring.
     let fold_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut still_present: Vec<(SegmentId, u32)> = present.clone();
     let mut reachable_absent: std::collections::HashSet<SegmentId> =
@@ -1048,7 +1105,17 @@ pub(crate) async fn run_wal_pool_recovery(
         } else {
             stale_rounds += 1;
         }
-        if tokio::time::Instant::now() >= fold_deadline || stale_rounds >= 5 {
+        // Early exit only when the remaining candidates are NOT waiting on
+        // ring convergence. Candidates with an empty ring set AND live
+        // remote peers may still gain holders as gossip converges, so keep
+        // retrying them up to the fold deadline.
+        let waiting_on_ring = still_present.iter().any(|(segment_id, _)| {
+            holder_candidates(ctx, *segment_id).is_empty() && membership_has_remote_peer(ctx)
+        });
+        if !waiting_on_ring && stale_rounds >= 5 {
+            break;
+        }
+        if tokio::time::Instant::now() >= fold_deadline {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -1056,21 +1123,23 @@ pub(crate) async fn run_wal_pool_recovery(
 
     // (3) Classify what the fold could not restore, once the retry
     // budget is exhausted:
-    //   - ring replica set genuinely empty (no remote holder position),
-    //     OR every reachable holder answered "not held"  → local-only
+    //   - every reachable holder answered "not held" → local-only
     //     recompute (ADR-0035 D3);
-    //   - ring has holders but none was ever reachable → unresolved
-    //     (write_degraded stays; g4 backstop) — NOT local-only, because
-    //     a live holder may exist that was merely unreachable.
+    //   - ring replica set empty AND the cluster has no remote peer (a
+    //     single node — no holder position can ever exist) → local-only
+    //     recompute (D3);
+    //   - ring replica set empty but remote peers EXIST (the ring did not
+    //     converge in budget) OR ring has holders but none was reachable
+    //     → unresolved (write_degraded stays; g4 backstop) — NOT
+    //     local-only, because a live holder may exist that was merely
+    //     unreachable / not yet gossiped.
     let mut recomputed = 0usize;
     let mut unresolved: Vec<SegmentId> = Vec::new();
     for (segment_id, local_pool) in &still_present {
         if ctx.lifecycle_registry.get(*segment_id).is_some() {
             continue;
         }
-        let no_ring_holder = holder_candidates(ctx, *segment_id).is_empty();
-        let reachable_but_absent = reachable_absent.iter().any(|id| id == segment_id);
-        if no_ring_holder || reachable_but_absent {
+        if is_local_only_d3_candidate(ctx, *segment_id, &reachable_absent) {
             if recompute_local_only(ctx, *segment_id, *local_pool).await? {
                 recomputed += 1;
             }
@@ -1081,22 +1150,33 @@ pub(crate) async fn run_wal_pool_recovery(
 
     // (4) missing = referenced ∧ ¬present ∧ ¬already-restored. These are
     // re-materialized through the ReRepWorker catch-up path (g7 D3).
+    // Segments with no live holder (`dangling`) are the documented
+    // out-of-scope residual window: nothing can pull them, reads surface
+    // `SegmentUnavailable`, and they must NOT wedge the write-resume gate.
     let mut missing: Vec<SegmentId> = referenced
         .into_iter()
         .filter(|id| !present_ids.contains(id) && ctx.lifecycle_registry.get(*id).is_none())
         .collect();
     missing.sort();
 
-    let caught_up = enqueue_catch_up(ctx, &missing).await?;
-    // (5) drain completion: poll until every enqueued segment is
-    // materialized, bounded by a generous wall-clock budget (the worker
-    // retries internally; permanently-failed segments keep write_degraded
-    // and are re-driven by the g4 reconciliation loop).
-    let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-    let mut remaining: Vec<SegmentId> = missing.clone();
+    let (caught_up, dangling) = enqueue_catch_up(ctx, &missing).await?;
+    let catchable: std::collections::HashSet<SegmentId> =
+        missing.iter().copied().filter(|id| !dangling.contains(id)).collect();
+    // (5) drain completion: poll until every CATCHABLE segment is
+    // materialized. The loop is progress-aware — it keeps polling while
+    // the outstanding set shrinks (the worker is making progress and may
+    // still be retrying internally) and stops only when it is empty, when
+    // the set stops shrinking for several consecutive rounds (permanently
+    // failed), or after a generous hard cap (the g4 reconciliation loop
+    // is the eventual backstop).
+    let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut remaining: Vec<SegmentId> = catchable.into_iter().collect();
+    remaining.sort();
+    let mut no_progress_rounds = 0u32;
     loop {
+        let previous_len = remaining.len();
         // Re-check the whole outstanding set each round (idempotent).
-        let mut next: Vec<SegmentId> = Vec::with_capacity(remaining.len());
+        let mut next: Vec<SegmentId> = Vec::with_capacity(previous_len);
         for segment_id in remaining.drain(..) {
             if !is_materialized(ctx, segment_id).await {
                 next.push(segment_id);
@@ -1106,17 +1186,28 @@ pub(crate) async fn run_wal_pool_recovery(
         if remaining.is_empty() {
             break;
         }
-        if tokio::time::Instant::now() >= drain_deadline {
-            // Drain budget exhausted; permanently-failed segments keep
-            // write_degraded set and are re-driven by the g4 loop.
+        if remaining.len() < previous_len {
+            no_progress_rounds = 0;
+        } else {
+            no_progress_rounds += 1;
+        }
+        if no_progress_rounds >= 24 {
+            // The set has not shrunk for ~6 s (24 × 250 ms): the worker's
+            // retries for these segments are effectively exhausted. They
+            // keep write_degraded set and are re-driven by the g4 loop.
             tracing::warn!(
                 pending = remaining.len(),
-                "wal recovery catch-up drain did not complete within budget"
+                "wal recovery catch-up drain stalled (no progress); write_degraded stays set (g4 backstop)"
             );
             break;
         }
-        // No-progress guard is unnecessary: the loop re-checks after a
-        // fixed tick regardless of whether the worker made progress.
+        if tokio::time::Instant::now() >= drain_deadline {
+            tracing::warn!(
+                pending = remaining.len(),
+                "wal recovery catch-up drain exceeded the hard budget"
+            );
+            break;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 
@@ -1141,7 +1232,9 @@ pub(crate) async fn run_wal_pool_recovery(
     };
 
     // Segments that could not be materialized join the reported missing
-    // set (they keep write_degraded set; g4 re-drives them).
+    // set (they keep write_degraded set; g4 re-drives them). Dangling
+    // references (no live holder) are the documented out-of-scope
+    // residual — reported separately, never counted as gate-blocking.
     remaining.extend(unresolved);
     remaining.sort();
     remaining.dedup();
@@ -1151,6 +1244,7 @@ pub(crate) async fn run_wal_pool_recovery(
         restored: restored + recomputed,
         missing: remaining,
         caught_up,
+        dangling,
         verified,
     };
     ctx.metrics.record(&outcome, started.elapsed().as_secs_f64());
@@ -1159,6 +1253,7 @@ pub(crate) async fn run_wal_pool_recovery(
         restored = outcome.restored,
         missing = outcome.missing.len(),
         caught_up = outcome.caught_up,
+        dangling = outcome.dangling.len(),
         verified = outcome.verified,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "replaced-wal recovery drain complete"
@@ -1260,6 +1355,28 @@ impl Default for WalRecoveryMetrics {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Builds a coordinator over a real storage prelude + durability
+    /// module (the same wiring `DurabilityModule::build` performs) so the
+    /// drain's pure sub-steps are unit-testable without a live peer.
+    async fn build_coordinator(tmp: &tempfile::TempDir) -> Arc<WalRecoveryCoordinator> {
+        use crate::modules::storage::test_support::build_storage_prelude;
+
+        let prelude = build_storage_prelude(tmp).await;
+        let durability = Arc::new(
+            crate::modules::durability::DurabilityModule::build(
+                &prelude.config,
+                &prelude.module,
+                prelude.membership.clone(),
+                prelude.pool.clone(),
+                &prelude.module.paths,
+                "127.0.0.1:0".parse().expect("grpc addr"),
+            )
+            .await
+            .expect("durability module build"),
+        );
+        Arc::clone(&durability.wal_recovery)
+    }
 
     fn pool(
         name: &str,
@@ -1484,5 +1601,54 @@ mod tests {
         assert_eq!(wal_pool.status(), oceanfs_storage::PoolStatus::Healthy);
         assert!(!wal_pool.write_degraded());
         assert!(registry.accepts_writes(), "writes resume after the reset handoff");
+    }
+
+    /// The recovery candidate enumeration returns the union of the intact
+    /// data-pool `.dat` roots (each with its LOCAL pool id) and the
+    /// objects-CF chunk refs.
+    #[tokio::test]
+    async fn enumerate_candidates_unions_dat_and_objects_cf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coordinator = build_coordinator(&tmp).await;
+
+        // An intact data-pool `.dat`.
+        let data_pool = coordinator.pool_registry.data_pools()[0].clone();
+        let id = SegmentId::new();
+        std::fs::write(data_pool.root().join(format!("{id}.dat")), b"data").unwrap();
+
+        let (present, referenced) = enumerate_candidates(&coordinator);
+        assert!(
+            present.iter().any(|(sid, pool_id)| *sid == id && *pool_id == data_pool.id()),
+            "the data-pool .dat must be a present candidate with its local pool id"
+        );
+        // The objects CF is empty in a fresh prelude → no referenced ids.
+        assert!(referenced.is_empty(), "no objects → no referenced ids");
+    }
+
+    /// D3 classifier: a reachable-absent candidate (every holder answered
+    /// "not held") is local-only. The single-node shape (empty ring +
+    /// no remote peer) is also local-only.
+    #[tokio::test]
+    async fn d3_classifier_local_only_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coordinator = build_coordinator(&tmp).await;
+        let id = SegmentId::new();
+
+        // A candidate a reachable holder answered "not held".
+        let mut reachable_absent: std::collections::HashSet<SegmentId> =
+            std::collections::HashSet::new();
+        reachable_absent.insert(id);
+        assert!(
+            is_local_only_d3_candidate(&coordinator, id, &reachable_absent),
+            "reachable-but-absent must be local-only (D3)"
+        );
+
+        // Single-node shape: no reachable-absent signal, but the ring is
+        // empty AND the prelude membership has no remote peer.
+        let empty: std::collections::HashSet<SegmentId> = std::collections::HashSet::new();
+        assert!(
+            is_local_only_d3_candidate(&coordinator, id, &empty),
+            "empty ring + single node must be local-only (D3)"
+        );
     }
 }

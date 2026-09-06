@@ -3,32 +3,34 @@
 //!
 //! A 3-node local cluster (RF=3). Objects are written through the owner
 //! A; A seals and the seal-time replicator pushes each sealed segment's
-//! full data to its ring replicas (B and C). The wal pool on A then
-//! "dies" and its device is replaced:
+//! full data to its ring replicas (B and C). The wal pool on A is then
+//! driven Dead (the D3 health monitor) and its device is replaced:
 //!
-//! - **Live remount**: A's wal pool is driven Dead (the D3 health
-//!   monitor) → local writes 503. The operator replaces the journal
-//!   device (the wal root is emptied) and triggers
+//! - during the wal-pool outage, A's local writes are rejected (503) while
+//!   reads keep serving (the metadata pool and data pools are intact);
+//! - the operator empties the journal device and triggers
 //!   `POST /admin/wal-remount` — no restart. Recovery re-opens the fresh
-//!   WALs, rebuilds the lifecycle registry from holders (B/C), drains
-//!   catch-up, verifies the fresh WAL and clears the write gate.
+//!   WALs, verifies the fresh WAL and clears the write gate.
 //!
 //! Assertions:
-//! - no data-pool `.dat` is swept by recovery (the residue sweep is
-//!   suppressed on the replaced branch — audit C1);
-//! - the registry is rebuilt from holders: every pre-kill key reads back
-//!   byte-identical THROUGH A;
-//! - writes resume after recovery (the write gate clears) and the fresh
-//!   WAL accepted the post-recovery write;
-//! - reads served throughout the live outage (the metadata pool and data
-//!   pools are intact).
+//! - a local write DURING the outage is rejected (503);
+//! - reads serve throughout the outage;
+//! - no data-pool `.dat` is deleted by the remount (the residue sweep is
+//!   never run on the replaced branch — audit C1);
+//! - after remount, the write gate clears: a new write succeeds, and
+//!   every pre-outage key still reads back byte-identical THROUGH A.
 //!
-//! NOTE: the BOOT variant (restart A after an out-of-band replacement,
-//! the boot heuristic selects the rebuild branch) is covered at the unit
-//! level (detection + residue-sweep suppression in
-//! `modules::storage::tests` / `modules::wal_recovery::tests`) and is
-//! pending an e2e/process-level test — an in-process same-dir RocksDB
-//! reopen is blocked by server tasks that hold the store past shutdown.
+//! NOTE on coverage: a live remount never loses A's in-memory registry,
+//! so the holder-metadata fold / catch-up drain are a no-op here
+//! (`restored=0 missing=0 caught_up=0`) — this test proves the live
+//! remount surface + write gate, NOT the rebuild-from-holders machinery.
+//! The BOOT variant (restart A after an out-of-band replacement, where
+//! the registry is genuinely empty and the holder fold DOES run) is the
+//! path that exercises ADR-0035 D2/D3 end-to-end. It is covered at the
+//! unit level (detection, residue-sweep suppression, D3 classifier in
+//! `modules::wal_recovery::tests`) and is pending an e2e/process-level
+//! test — an in-process same-dir RocksDB reopen is blocked by server
+//! tasks that hold the store past shutdown.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -349,6 +351,20 @@ async fn live_remount_heals_without_restart() {
         .await
         .expect("GET during wal outage");
     assert_eq!(resp.status(), 200, "reads serve while the wal pool is dead");
+
+    // A LOCAL write during the outage is rejected with a retryable 503
+    // (the wal-Dead 503 gate — the DoD's "writes rejected during outage").
+    let outage_write = client
+        .put(format!("http://{addr_a}/durability/write-during-outage"))
+        .body(body.clone())
+        .send()
+        .await
+        .expect("PUT during wal outage must be reachable");
+    assert_eq!(
+        outage_write.status(),
+        503,
+        "local writes must be rejected (503) while the wal pool is dead"
+    );
 
     // ---- Replace the journal device (empty the wal root) ----
     empty_dir(&tmp_a.path().join("pool-wal"));
