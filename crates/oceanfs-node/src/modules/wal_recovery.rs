@@ -388,7 +388,13 @@ impl WalRecoveryCoordinator {
             // the marker can be safely cleared. On the boot path this is
             // harmless (the rebuilt entries are events in the fresh WAL;
             // the snapshot just makes recovery cheaper).
-            let covered = self.event_wal.latest_pos();
+            //
+            // The covered position is the coordinator's LAST FOLDED
+            // position, not the raw WAL tail (a checkpoint covering an
+            // appended-but-unfolded event would seed a snapshot missing
+            // that segment — the same contract the coordinator's own
+            // threshold checkpoint obeys).
+            let covered = self.lifecycle.last_folded_pos();
             let checkpointed =
                 self.event_checkpoint.write_checkpoint(self.lifecycle.registry(), covered);
             match checkpointed {
@@ -1743,6 +1749,132 @@ mod tests {
         assert!(
             is_local_only_d3_candidate(&coordinator, id, &empty),
             "empty ring + single node must be local-only (D3)"
+        );
+    }
+
+    /// ADR-0035 D2 fold fidelity (DoD "holder-metadata fold"): seeding a
+    /// holder's lifecycle entry must reproduce every seal-time field
+    /// byte-exact on the local registry entry — and the entry's `pool_id`
+    /// must be the LOCAL pool (the holder's own pool id is node-local and
+    /// must never be copied).
+    #[tokio::test]
+    async fn holder_fold_seeds_byte_exact_seal_time_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coordinator = build_coordinator(&tmp).await;
+        let data_pool = coordinator.pool_registry.data_pools()[0].clone();
+
+        // A synthetic holder reply describing a Standard-tier, k=4/m=2
+        // sealed segment with a merkle root, two holders, two contained
+        // objects and a nonzero byte total.
+        let segment_id = SegmentId::new();
+        let merkle_bytes = [0xABu8; 32];
+        let holder_root = oceanfs_core::HashOutput::from_bytes(merkle_bytes);
+        let holder_locations =
+            vec![oceanfs_core::NodeId::new("holder-b"), oceanfs_core::NodeId::new("holder-c")];
+        let holder_pool_id = 99u32; // must NOT leak into the local entry
+
+        let entry = oceanfs_durability::healing_rpc::SegmentLifecycleEntry {
+            segment_id: Some(segment_id.into()),
+            state: 1, // Sealed
+            tier: 2,  // Standard
+            ec_k: 4,
+            ec_m: 2,
+            merkle_root: bytes::Bytes::copy_from_slice(&merkle_bytes),
+            storage_locations: holder_locations
+                .iter()
+                .map(|n| oceanfs_core::NodeId::clone(n).into())
+                .collect(),
+            contained_objects: vec![
+                oceanfs_core::proto::segment::ContainedObject {
+                    bucket: Some(oceanfs_core::proto::common::BucketId { name: "bucket-a".into() }),
+                    key: Some(oceanfs_core::proto::common::ObjectKey { key: "obj-1".into() }),
+                },
+                oceanfs_core::proto::segment::ContainedObject {
+                    bucket: Some(oceanfs_core::proto::common::BucketId { name: "bucket-a".into() }),
+                    key: Some(oceanfs_core::proto::common::ObjectKey { key: "obj-2".into() }),
+                },
+            ],
+            total_bytes: 4096,
+            pool_id: holder_pool_id,
+            sealed_at: 1_700_000_000_000,
+        };
+
+        seed_holder_entry(&coordinator, entry, data_pool.id()).await.expect("seed");
+
+        let local = coordinator.lifecycle_registry.get(segment_id).expect("registry entry");
+        use oceanfs_storage::segment::lifecycle::SegmentState;
+        assert_eq!(local.state, SegmentState::Sealed, "folded entry is Sealed");
+        assert_eq!(local.metadata.size_tier, oceanfs_core::SizeTier::Standard);
+        assert_eq!(local.metadata.ec_k, 4);
+        assert_eq!(local.metadata.ec_m, 2);
+        assert_eq!(
+            local.metadata.merkle_root,
+            Some(holder_root),
+            "merkle root round-trips byte-exact"
+        );
+        assert_eq!(local.metadata.total_bytes, 4096);
+        assert_eq!(
+            local.metadata.pool_id,
+            data_pool.id(),
+            "the LOCAL pool id is stamped — never the holder's ({holder_pool_id})"
+        );
+        let loc: Vec<oceanfs_core::NodeId> = local.metadata.storage_locations.to_vec();
+        assert_eq!(loc, holder_locations, "holder set round-trips");
+        let contained = local.contained_objects.as_deref().expect("contained objects preserved");
+        assert_eq!(contained.len(), 2, "contained-object membership is preserved");
+        assert_eq!(contained[0].key.as_str(), "obj-1");
+        assert_eq!(contained[1].key.as_str(), "obj-2");
+    }
+
+    /// ADR-0035 D3 recompute (DoD "local-only recompute"): a locally-held
+    /// `.dat` with no live holder is re-derived from its own header+data:
+    /// the recomputed Merkle root must equal
+    /// `MerkleTree::build(data,0).root().hash()` and the entry must carry
+    /// degraded accounting (`contained_objects = None`,
+    /// `total_bytes = header.size`).
+    #[tokio::test]
+    async fn local_only_recompute_rebuilds_entry_from_dat() {
+        use oceanfs_storage::SegmentHeader;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let coordinator = build_coordinator(&tmp).await;
+        let data_pool = coordinator.pool_registry.data_pools()[0].clone();
+        let segment_id = SegmentId::new();
+
+        // Write a minimal v2 `.dat`: 92-byte header + data.
+        let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let data_len = data.len() as u64;
+        let header = SegmentHeader::new(
+            segment_id,
+            data_len,
+            1,                      // blob_count
+            92 + data.len() as u64, // index_offset (just past data)
+            [0u8; 32],              // checksum (unused by recompute)
+        );
+        let mut bytes = header.to_bytes();
+        bytes.extend_from_slice(&data);
+        let dat_path = data_pool.root().join(format!("{segment_id}.dat"));
+        std::fs::write(&dat_path, &bytes).expect("write .dat");
+
+        let restored = recompute_local_only(&coordinator, segment_id, data_pool.id())
+            .await
+            .expect("local-only recompute");
+        assert!(restored, "a locally-present .dat with no holder is recomputed");
+
+        let local = coordinator.lifecycle_registry.get(segment_id).expect("registry entry");
+        use oceanfs_storage::segment::lifecycle::SegmentState;
+        assert_eq!(local.state, SegmentState::Sealed, "recomputed entry is Sealed");
+        assert_eq!(local.metadata.pool_id, data_pool.id());
+        assert_eq!(local.metadata.total_bytes, data_len, "total_bytes = data section size");
+        assert!(local.contained_objects.is_none(), "contained-object accounting is degraded");
+        assert!(local.metadata.storage_locations.is_empty(), "no remote holders");
+
+        let expected_root =
+            oceanfs_durability::MerkleTree::build(&data, 0).expect("merkle build").root().hash();
+        assert_eq!(
+            local.metadata.merkle_root,
+            Some(expected_root),
+            "recomputed merkle root equals MerkleTree::build(data,0).root().hash()"
         );
     }
 }

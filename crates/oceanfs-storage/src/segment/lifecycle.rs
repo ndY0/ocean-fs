@@ -1420,6 +1420,18 @@ impl SegmentLifecycleCoordinator {
         &self.registry
     }
 
+    /// The position up to which every appended event's fold has landed
+    /// (the checkpoint contract's covered position).
+    ///
+    /// A checkpoint must cover this, never the raw WAL tail: the tail can
+    /// point past an appended-but-unfolded event, and a checkpoint
+    /// covering it would seed a snapshot missing that segment (its
+    /// restart fold would then hit the Seal on a missing entry and
+    /// abort). The coordinator advances it after every durable fold.
+    pub fn last_folded_pos(&self) -> EventWalPos {
+        EventWalPos::from_packed(self.last_folded_pos.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     /// Records the data-WAL position of a segment's latest data entry
     /// (ADR-0024 Decision 2).
     ///
