@@ -88,6 +88,11 @@ pub(crate) struct DurabilityModule {
     /// ADR-0017 scheduler: drives the four Tier-1 housekeeping cycles
     /// under Tier-1 permits from the shared budget.
     pub(crate) scheduler: Arc<DurabilityScheduler>,
+    /// Replaced-wal recovery coordinator (g7, ADR-0035) — owns the
+    /// registry-rebuild + catch-up drain and the write-resume gate. Lives
+    /// here (not on `Node`/`ServerModule`) because it needs the
+    /// ReRepWorker sender + AE tree this module already owns.
+    pub(crate) wal_recovery: Arc<crate::modules::wal_recovery::WalRecoveryCoordinator>,
 }
 
 impl DurabilityModule {
@@ -500,6 +505,21 @@ impl DurabilityModule {
             std::time::Duration::from_secs(config.ae_interval_sec),
         )));
 
+        // Replaced-wal recovery coordinator (g7, ADR-0035). Owned here so
+        // the composition root and server never hold per-recovery state;
+        // the ReRepWorker sender + AE tree this module owns are exactly
+        // the handles the drain needs.
+        let wal_recovery = Arc::new(crate::modules::wal_recovery::WalRecoveryCoordinator::new(
+            NodeId::new(&config.node_id),
+            storage,
+            membership,
+            pool,
+            rep_worker.sender(),
+            ae_worker.clone(),
+            storage.replaced_wal_recovery_pending.clone(),
+            paths,
+        ));
+
         Ok(Self {
             gc: gc_worker,
             ae: ae_worker,
@@ -517,6 +537,7 @@ impl DurabilityModule {
             hinted_handoff_manager,
             budget,
             scheduler: Arc::new(scheduler),
+            wal_recovery,
         })
     }
 
@@ -537,6 +558,21 @@ impl DurabilityModule {
         self.ae
             .rebuild_tree_from_registry()
             .map_err(|e| format!("failed to rebuild AE Merkle tree from the machine scan: {e}"))
+    }
+
+    /// Runs the deferred replaced-wal recovery drain (g7, ADR-0035).
+    ///
+    /// Called by the composition root AFTER `spawn_all` has started the
+    /// ReRepWorker + membership plane. A no-op unless the boot path
+    /// detected a replaced wal pool (the coordinator's pending flag). On
+    /// a fully-successful drain the write gate is cleared and the marker
+    /// removed; the AE tree is rebuilt over the restored registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the drain fails.
+    pub(crate) async fn run_deferred_wal_recovery(&self) -> Result<(), String> {
+        self.wal_recovery.run_deferred_boot_drain().await
     }
 
     /// Registers the durability workers' metrics with the node's central
@@ -563,6 +599,8 @@ impl DurabilityModule {
         // ADR-0017: the two-tier budget + scheduler cycle metrics.
         self.budget.register_metrics(registrar);
         self.scheduler.register_metrics(registrar);
+        // g7 replaced-wal recovery metrics (audit M4).
+        self.wal_recovery.register_metrics(registrar);
     }
 
     /// Spawns every durability-owned background loop (c5 — each worker

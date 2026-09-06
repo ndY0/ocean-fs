@@ -13,3 +13,4 @@ pub(crate) mod durability;
 pub(crate) mod membership;
 pub(crate) mod server;
 pub(crate) mod storage;
+pub(crate) mod wal_recovery;

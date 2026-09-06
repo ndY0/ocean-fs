@@ -533,7 +533,7 @@ impl WalWriter {
 /// clears `write_degraded` once the replacement WAL verifies).
 ///
 /// Appends a single probe [`WalEntry`] through the group-commit path
-/// (durable on return), re-opens a [`WalReader`] over the same
+/// (durable on return), re-opens a [`super::WalReader`] over the same
 /// directory and confirms the entry round-trips byte-exact, then
 /// truncates the probe away so the WAL starts clean for real appends.
 ///

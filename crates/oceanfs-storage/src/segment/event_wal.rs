@@ -969,6 +969,9 @@ impl EventWal {
     /// Returns an I/O error if the directory cannot be cleared or the
     /// fresh file cannot be opened.
     pub async fn reopen_fresh(&self) -> Result<()> {
+        // The replaced device may not have the event-wal subdirectory yet.
+        tokio::fs::create_dir_all(&self.dir).await?;
+
         // Remove every existing event file (they belong to the replaced
         // device). Checkpoint files are handled by the checkpoint
         // manager's own reset; only `evl_*` files are cleared here.

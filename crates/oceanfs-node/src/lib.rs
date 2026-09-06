@@ -36,6 +36,12 @@ pub mod segment_replicator;
 pub mod startup;
 
 pub use metadata_adapter::MetadataStoreAdapter;
+// Replaced-wal recovery public interface (g7, ADR-0035) — branch mode
+// detection and the drain outcome. The coordinator itself is owned by
+// the durability module; only the observable types are re-exported.
+pub use modules::wal_recovery::{
+    detect_wal_recovery_mode, WalRecoveryMetrics, WalRecoveryMode, WalRecoveryOutcome,
+};
 pub use node::{BackgroundTasks, Node};
 // Re-export common types used by node consumers.
 pub use oceanfs_core::NodeConfig;

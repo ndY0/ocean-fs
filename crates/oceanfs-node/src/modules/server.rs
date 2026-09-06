@@ -524,7 +524,17 @@ impl ServerModule {
             Some(negative_cache.clone()),
         )
         .with_accel(storage.accel.clone())
-        .with_pool_attach(storage.registry.clone(), on_pool_attached);
+        .with_pool_attach(storage.registry.clone(), on_pool_attached)
+        // Live wal-pool remount (g7, ADR-0035): the coordinator owns the
+        // replaced-wal drain + write-resume gate (built into the
+        // durability module, which holds the ReRepWorker + AE handles).
+        .with_wal_remount({
+            let wal_recovery = durability.wal_recovery.clone();
+            Arc::new(move || {
+                let wal_recovery = Arc::clone(&wal_recovery);
+                Box::pin(async move { wal_recovery.live_remount().await })
+            })
+        });
 
         // ---- axum router assembly (§13) ----
         // Auth middleware is config-driven: when `s3_auth_enabled = true`,

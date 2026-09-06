@@ -123,6 +123,21 @@ pub(crate) struct StorageModule {
     /// recovery); registered with the central metrics registry by the
     /// server-side metrics block after recovery runs.
     pub(crate) startup_rebuild_gauge: oceanfs_core::Gauge,
+    /// Set when the boot path detected a replaced wal pool and ran the
+    /// local replaced-branch prep (residue-sweep suppression + fresh
+    /// event/checkpoint reset + write gate). The caller (the composition
+    /// root) reads this after `spawn_all` to run the deferred
+    /// rebuild-from-holders drain.
+    pub(crate) replaced_wal_recovery_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// Cancellation token for the RocksDB metrics polling task (spawned by
+    /// [`Self::register_metrics`]). Cancelled at node shutdown so the
+    /// task exits and releases its `Arc<DB>` (the RocksDB LOCK must not
+    /// outlive the store — every spawned task is cancellable).
+    pub(crate) metadata_metrics_cancel: tokio_util::sync::CancellationToken,
+    /// Join handle of the RocksDB metrics polling task (`None` until
+    /// `register_metrics` runs). Awaited at shutdown so the DB handle is
+    /// released before the store close.
+    pub(crate) metadata_metrics_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl StorageModule {
@@ -539,6 +554,9 @@ impl StorageModule {
                     .into(),
                 oceanfs_core::LabelSet::empty(),
             ),
+            replaced_wal_recovery_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            metadata_metrics_cancel: tokio_util::sync::CancellationToken::new(),
+            metadata_metrics_task: parking_lot::Mutex::new(None),
         })
     }
 
@@ -570,6 +588,36 @@ impl StorageModule {
         )
     }
 
+    /// Runs the local prep for the replaced-wal boot branch (g7).
+    ///
+    /// - writes the replacement marker (so a crash mid-recovery re-enters
+    ///   this branch next boot);
+    /// - re-opens the data WAL, event WAL and checkpoint fresh on the
+    ///   (empty) journal device;
+    /// - sets the write gate (wal pool Dead + `write_degraded`) so local
+    ///   writes 503 while the registry is rebuilt;
+    /// - records the deferred-drain flag the composition root reads after
+    ///   `spawn_all`.
+    ///
+    /// The once-per-boot residue sweep and the event-WAL fold NEVER run
+    /// on this branch (audit C1 / ADR-0035 D4).
+    pub(crate) async fn prepare_replaced_wal_recovery(&self) -> Result<(), String> {
+        crate::modules::wal_recovery::prepare_wal_replacement(
+            &self.paths,
+            &self.wal_writer,
+            &self.event_wal,
+            &self.event_checkpoint,
+            &self.registry,
+            &self.replaced_wal_recovery_pending,
+        )
+        .await?;
+        tracing::warn!(
+            "wal pool replacement detected at boot — residue sweep suppressed; \
+             registry rebuild from holders deferred until background loops are live"
+        );
+        Ok(())
+    }
+
     /// Runs startup recovery: the machine path (ADR-0025 phase 2).
     ///
     /// Deterministic recovery — fold the event log into the registry
@@ -591,6 +639,21 @@ impl StorageModule {
     /// Returns an error if the event-WAL fold, data-WAL replay or the
     /// incomplete-compaction recovery pass fails.
     pub(crate) async fn run_startup_recovery(&self) -> Result<(), String> {
+        // ---- Branch on the boot recovery mode ----
+        // A replaced wal pool (marker or empty-journal + intact-data
+        // heuristic) selects the rebuild-from-holders branch (g7,
+        // ADR-0035 D4): the event-WAL fold is skipped (the log is gone),
+        // the once-per-boot residue sweep is SUPPRESSED (it would delete
+        // every intact data-pool `.dat` — audit C1), the WALs are opened
+        // fresh, the write gate is set, and the actual registry rebuild +
+        // catch-up drain is deferred to the composition root AFTER
+        // `spawn_all` (membership + the ReRepWorker must be live).
+        if crate::modules::wal_recovery::detect_wal_recovery_mode(&self.paths, &self.registry)
+            == crate::modules::wal_recovery::WalRecoveryMode::RebuildFromHolders
+        {
+            return self.prepare_replaced_wal_recovery().await;
+        }
+
         let rebuild_start = std::time::Instant::now();
         let wal_config = WalConfig { data_dir: self.paths.wal.clone(), ..WalConfig::default() };
         let wal_reader = oceanfs_storage::wal::WalReader::open(&wal_config)
@@ -822,7 +885,25 @@ impl StorageModule {
         // Register RocksDB property gauges into the central registry.
         self.metadata_store.metrics().register(metrics);
         // Start the background RocksDB metrics polling task (every 30s).
-        self.metadata_store.start_metrics_task();
+        // The task is cancellable — the node cancels its token during
+        // shutdown and awaits the handle so the DB handle is released
+        // (LOCK released before a same-dir restart).
+        let handle = self.metadata_store.start_metrics_task(self.metadata_metrics_cancel.clone());
+        *self.metadata_metrics_task.lock() = Some(handle);
+    }
+
+    /// Stops the RocksDB metrics polling task and waits for it to exit.
+    ///
+    /// Cancels the task's token and awaits its join handle (bounded by a
+    /// short timeout) so the task's `Arc<DB>` is dropped BEFORE the
+    /// store close — the RocksDB LOCK is then fully released and a node
+    /// restarted on the same metadata dir can reopen it.
+    pub(crate) async fn shutdown_metrics_task(&self) {
+        self.metadata_metrics_cancel.cancel();
+        let handle = self.metadata_metrics_task.lock().take();
+        if let Some(handle) = handle {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        }
     }
 
     /// Spawns the storage-owned background loops (c5 — each worker owns
@@ -844,11 +925,13 @@ impl StorageModule {
         // Arc; take the stored event receiver for the caller (the
         // health-consequence applier).
         let health_monitor = Arc::clone(&self.health_monitor);
+        // The receiver is taken exactly once (the background bundler
+        // calls spawn_loops a single time per boot).
         let health_events = self
             .health_events_rx
             .lock()
             .take()
-            .expect("health monitor event receiver already taken");
+            .unwrap_or_else(|| unreachable!("pool health monitor receiver already taken"));
         let health_token = bg.health_cancel.clone();
         bg.health_monitor = Some(tokio::spawn(async move {
             health_monitor.run(health_token).await;
@@ -1113,5 +1196,54 @@ mod tests {
             0,
             "replicator present, reading the empty boot ring"
         );
+    }
+
+    /// g7 boot branch (ADR-0035 D4): when the wal pool was replaced, the
+    /// event WAL has no recoverable content but the data pools still hold
+    /// `.dat` files — `run_startup_recovery` must select the rebuild
+    /// branch: write the marker, suppress the once-per-boot residue sweep
+    /// (the intact `.dat` survives) and record the deferred-drain flag.
+    ///
+    /// This is the unit-level stand-in for the boot-variant integration
+    /// scenario (an in-process same-dir RocksDB reopen is blocked by
+    /// server tasks that hold the store past shutdown).
+    #[tokio::test]
+    async fn replaced_wal_boot_branch_suppresses_sweep_and_sets_pending() {
+        let tmp = TempDir::new().expect("tempdir");
+        let module = build_module(&tmp).await;
+
+        // A data pool holds an intact sealed segment (a `.dat` a normal
+        // residue sweep would delete when the registry is empty).
+        let data_pool = module.registry.data_pools()[0].clone();
+        let segment_id = SegmentId::new();
+        let dat_path = data_pool.root().join(format!("{segment_id}.dat"));
+        std::fs::write(&dat_path, b"sealed-data").expect("write .dat");
+        assert!(dat_path.exists());
+
+        // The event WAL is empty (the writer only created its zero-length
+        // placeholder during build) and no checkpoint exists.
+        let paths = crate::pool_paths::pool_paths(&module.registry);
+        assert!(
+            crate::modules::wal_recovery::detect_wal_recovery_mode(&paths, &module.registry)
+                == crate::modules::wal_recovery::WalRecoveryMode::RebuildFromHolders,
+            "empty event WAL + intact data .dat must select the rebuild branch"
+        );
+
+        module.run_startup_recovery().await.expect("replaced-wal boot recovery");
+
+        // The marker was written and the deferred-drain flag is set.
+        assert!(
+            module.replaced_wal_recovery_pending.load(std::sync::atomic::Ordering::Acquire),
+            "replaced-wal boot must record the deferred-drain flag"
+        );
+        let marker = crate::modules::wal_recovery::replacement_marker_path(&paths);
+        assert!(marker.exists(), "replaced-wal boot must write the marker");
+
+        // The residue sweep was suppressed: the intact data `.dat` is NOT
+        // deleted (audit C1 — a normal fold on an empty registry would
+        // classify it as residue and unlink it).
+        assert!(dat_path.exists(), "residue sweep must be suppressed on the replaced branch");
+        // The fresh data WAL is writable (the recovery gate is up).
+        module.wal_writer.sync().await.expect("fresh WAL syncs");
     }
 }

@@ -1199,7 +1199,14 @@ impl RocksDbMetadataStore {
     ///
     /// Call this after opening the store when a Tokio runtime is available
     /// (typically at node startup). Test code may skip this.
-    pub fn start_metrics_task(self: &Arc<Self>) {
+    ///
+    /// The task is **cancellable**: it exits when `shutdown` is cancelled,
+    /// dropping its `Arc<DB>` so the RocksDB LOCK is released — a node
+    /// restart (or a clean shutdown) must not leak the DB handle.
+    pub fn start_metrics_task(
+        self: &Arc<Self>,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
         // Property-availability check: a gauge that never resolves stays
         // pinned at 0, which would silently hide real conditions (e.g.
         // `rocksdb.num-files-at-level0` masking a write stall) from the
@@ -1210,8 +1217,8 @@ impl RocksDbMetadataStore {
         let db = Arc::clone(&self.db);
         let metrics = Arc::clone(&self.metrics);
         tokio::spawn(async move {
-            poll_rocksdb_metrics(db, metrics).await;
-        });
+            poll_rocksdb_metrics(db, metrics, shutdown).await;
+        })
     }
 }
 
@@ -1284,10 +1291,21 @@ fn build_cf_opts(
 ///
 /// Runs as a `tokio::spawn`-ed background task. Properties that fail to
 /// parse are silently skipped (they may not exist on all RocksDB versions).
-async fn poll_rocksdb_metrics(db: Arc<DB>, metrics: Arc<RocksDbMetrics>) {
+///
+/// Cancellable: the loop exits when `shutdown` is cancelled, releasing
+/// its `Arc<DB>` (every spawned task must be cancellable — a leaked task
+/// keeps the RocksDB handle and its LOCK alive past shutdown).
+async fn poll_rocksdb_metrics(
+    db: Arc<DB>,
+    metrics: Arc<RocksDbMetrics>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
     let interval = Duration::from_secs(30);
     loop {
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(interval) => {}
+        }
 
         if let Some(v) = property_u64(&db, "rocksdb.block.cache.hit") {
             metrics.block_cache_hit.set(v);
@@ -2539,5 +2557,30 @@ mod tests {
         // Deleting the same record again is a no-op (idempotent).
         store.delete_dead_chunk_record(&bucket, &ObjectKey::new("a"), Hlc::new(1000, 0)).unwrap();
         assert_eq!(supersedes(&store).len(), 1);
+    }
+
+    /// The RocksDB metrics poller is cancellable: cancelling its token
+    /// makes the spawned task exit (dropping its `Arc<DB>`), so the store
+    /// can be reopened on the same directory — a leaked task would pin the
+    /// RocksDB LOCK forever (every spawned task must be cancellable).
+    #[tokio::test]
+    async fn metrics_poller_is_cancellable_and_releases_the_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = MetadataConfig { data_dir: dir.path().to_path_buf(), ..Default::default() };
+        let store = Arc::new(RocksDbMetadataStore::open(&config).unwrap());
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let handle = store.start_metrics_task(shutdown.clone());
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("poller must exit after cancellation")
+            .expect("poller join handle");
+
+        // Drop the store; with the poller gone, no Arc<DB> remains and the
+        // LOCK is released — reopening the same dir must succeed.
+        drop(store);
+        let reopened = RocksDbMetadataStore::open(&config);
+        assert!(reopened.is_ok(), "the DB LOCK must be released after shutdown");
     }
 }

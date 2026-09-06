@@ -335,11 +335,14 @@ impl EventCheckpoint {
     /// removal — a leftover file is simply superseded by the next
     /// checkpoint write).
     pub fn reset_for_fresh(&self) -> Result<()> {
-        let dir = std::fs::read_dir(&self.dir)?;
-        for entry in dir.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("checkpoint-") {
-                let _ = std::fs::remove_file(entry.path());
+        // The replaced device may not have the directory yet (or it is
+        // empty) — a missing dir means no checkpoint files to remove.
+        if let Ok(dir) = std::fs::read_dir(&self.dir) {
+            for entry in dir.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("checkpoint-") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
             }
         }
         self.last_covered.store(0, Ordering::Release);

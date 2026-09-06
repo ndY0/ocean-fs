@@ -392,6 +392,17 @@ pub struct CacheStats {
 // AppState
 // ---------------------------------------------------------------------------
 
+/// A live wal-pool remount callback (g7, ADR-0035): the composition
+/// root's async handler that runs the replaced-wal registry-rebuild +
+/// catch-up drain and clears the write gate. Boxed so `AdminState` (and
+/// the `AdminHandler` builder) stay decoupled from the node crate.
+#[cfg(feature = "storage")]
+type WalRemountCallback = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Shared state for admin handlers.
 #[derive(Clone)]
 pub(crate) struct AdminState {
@@ -428,6 +439,12 @@ pub(crate) struct AdminState {
     /// pool is registered. Errors are logged — the pool IS attached.
     #[cfg(feature = "storage")]
     pub on_pool_attached: Option<Arc<dyn Fn() -> Result<(), String> + Send + Sync>>,
+    /// Live wal-pool remount handler (g7, ADR-0035): runs the
+    /// replaced-wal registry-rebuild + catch-up drain against the
+    /// running ReRepWorker and clears the write gate. `None` when the
+    /// surface is not wired (`POST /admin/wal-remount` → 501).
+    #[cfg(feature = "storage")]
+    pub on_wal_remount: Option<WalRemountCallback>,
     /// L1 object cache for cache stats (cache feature only).
     #[cfg(feature = "cache")]
     pub object_cache: Option<Arc<ObjectCache>>,
@@ -475,6 +492,7 @@ impl AdminHandler {
                 pool_registry: None,
                 #[cfg(feature = "storage")]
                 on_pool_attached: None,
+                on_wal_remount: None,
                 #[cfg(feature = "cache")]
                 object_cache: None,
                 #[cfg(feature = "cache")]
@@ -512,6 +530,7 @@ impl AdminHandler {
                 pool_registry: None,
                 #[cfg(feature = "storage")]
                 on_pool_attached: None,
+                on_wal_remount: None,
                 #[cfg(feature = "cache")]
                 object_cache: None,
                 #[cfg(feature = "cache")]
@@ -627,6 +646,31 @@ impl AdminHandler {
         self
     }
 
+    /// Wires the live wal-pool remount surface (g7, ADR-0035).
+    ///
+    /// `on_remount` is the composition root's async handler: it runs the
+    /// replaced-wal registry-rebuild + catch-up drain against the running
+    /// `ReRepWorker` and clears the write gate. Without this, the
+    /// `POST /admin/wal-remount` route answers `501 Not Implemented`.
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// use oceanfs_server::admin::{AdminHandler, MetricsRegistry};
+    /// use oceanfs_server::BucketConfigStore;
+    /// let handler = AdminHandler::new(
+    ///     Arc::new(BucketConfigStore::new()),
+    ///     Arc::new(MetricsRegistry::new()),
+    /// )
+    /// .with_wal_remount(Arc::new(|| Box::pin(async { Ok(()) })));
+    /// # let _ = handler;
+    /// ```
+    #[cfg(feature = "storage")]
+    pub fn with_wal_remount(mut self, on_remount: WalRemountCallback) -> Self {
+        self.state.on_wal_remount = Some(on_remount);
+        self
+    }
+
     /// Consumes the handler and returns an axum `Router` for the
     /// `/admin/` prefix.
     pub fn into_router(self) -> Router {
@@ -646,6 +690,10 @@ impl AdminHandler {
         // Runtime pool attach (ADR-0029 §D8, f8) — storage feature only.
         #[cfg(feature = "storage")]
         let router = router.route("/admin/pools", post(attach_pool));
+
+        // Live wal-pool remount (g7, ADR-0035) — storage feature only.
+        #[cfg(feature = "storage")]
+        let router = router.route("/admin/wal-remount", post(remount_wal_pool));
 
         router.with_state(state)
     }
@@ -943,6 +991,33 @@ async fn attach_pool(
                 StatusCode::BAD_REQUEST
             };
             (status, Json(serde_json::json!({ "error": message }))).into_response()
+        }
+    }
+}
+
+/// `POST /admin/wal-remount` — trigger a live wal-pool remount (g7,
+/// ADR-0035): the composition root's handler re-opens fresh WALs on the
+/// replaced journal device, rebuilds the registry from holders, drains
+/// catch-up through the ReRepWorker, and clears the write gate.
+///
+/// Returns `200` on success and `501` when the surface is not wired.
+async fn remount_wal_pool(State(state): State<AdminState>) -> impl IntoResponse {
+    let Some(on_remount) = state.on_wal_remount.as_ref() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": "wal remount is not configured on this node",
+            })),
+        )
+            .into_response();
+    };
+    match on_remount().await {
+        Ok(()) => {
+            (StatusCode::OK, Json(serde_json::json!({ "status": "remounted" }))).into_response()
+        }
+        Err(message) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": message })))
+                .into_response()
         }
     }
 }

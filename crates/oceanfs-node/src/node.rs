@@ -363,10 +363,15 @@ impl Node {
         // (c1: moved to modules/storage.rs — run_startup_recovery)
         storage.run_startup_recovery().await?;
         // The AE Merkle tree is empty at construction (the registry is
-        // empty pre-recovery); rebuild it from the folded registry so
-        // continuous AE covers the machine's pre-existing Sealed
-        // segments (the segments-CF-removal ordering gap, closed).
-        durability.rebuild_ae_tree()?;
+        // empty pre-recovery). On a NORMAL boot rebuild it from the
+        // folded registry so continuous AE covers the machine's
+        // pre-existing Sealed segments (the segments-CF-removal ordering
+        // gap, closed). On a replaced-wal boot the registry is still
+        // empty here (the rebuild-from-holders drain runs after
+        // spawn_all, step 8b, which rebuilds the AE tree afterwards).
+        if !storage.replaced_wal_recovery_pending.load(std::sync::atomic::Ordering::Acquire) {
+            durability.rebuild_ae_tree()?;
+        }
 
         // ---- 6. Server subsystem (c3: modules/server.rs) ----
         let metrics = Arc::new(oceanfs_server::admin::MetricsRegistry::new());
@@ -409,6 +414,14 @@ impl Node {
         );
         background.grpc_shutdown = bound.grpc_shutdown;
         background.grpc_server = Some(bound.grpc_server_handle);
+
+        // ---- 8b. Deferred replaced-wal recovery (g7, ADR-0035) ----
+        // When the boot path detected a replaced wal pool, the durability
+        // module's wal-recovery coordinator runs the rebuild-from-holders
+        // drain now that `spawn_all` started the ReRepWorker + membership
+        // plane (the wal-Dead 503 gate holds writes throughout; reads may
+        // serve — the objects CF and data pools are intact).
+        durability.run_deferred_wal_recovery().await?;
 
         info!(
             node_id = %config.node_id,
@@ -1055,6 +1068,12 @@ impl Node {
         if let Err(e) = self.storage.wal_writer.sync().await {
             warn!(error = %e, "WAL sync failed during shutdown");
         }
+
+        // ---- 6b. Stop the RocksDB metrics poller ----
+        // The task exits and drops its Arc<DB>, so the store close below
+        // fully releases the RocksDB LOCK (a restarted node on the same
+        // dir must be able to reopen it — every task is cancellable).
+        self.storage.shutdown_metrics_task().await;
 
         // ---- 7. Close metadata store (flush RocksDB) ----
         if let Err(e) = self.storage.metadata_store.close() {
