@@ -1,7 +1,7 @@
 ---
 feature: "WAL-Pool Loss Recovery (Catch-up from Replicas)"
 epic: "disk-resilience-healing"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies: ["loss-announcement", "re-replication-worker"]
@@ -257,24 +257,48 @@ replacement (marker / live remount) ──▶ WalRecoveryMode::RebuildFromHolder
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` in `oceanfs-node`,
-      `oceanfs-durability`, `oceanfs-storage` (+ proto regen)
-- [ ] **Tests:** all listed green (detection, sweep suppression, candidate
-      enumeration, holder fold, D3 recompute, resume gate, 3-node live
-      remount + boot variants)
-- [ ] **Docs:** `# Examples` on pub items; rustdoc clean
-- [ ] **ADR:** ADR-0029 §D7 + ADR-0035 D1-D4 satisfied — registry rebuilt
+- [x] **Code:** `cargo build --all-targets` in `oceanfs-node`,
+      `oceanfs-durability`, `oceanfs-storage` (+ proto regen) — clean at
+      HEAD `166348a`; `cargo clippy --lib -- -D warnings` clean on
+      production code
+- [x] **Tests:** all listed green — replacement detection (incl. the
+      empty-placeholder audit-C1 regression), residue-sweep suppression,
+      candidate enumeration, holder-metadata fold (byte-exact), local-only
+      D3 recompute, write-resume gate, cancellable metrics poller — and
+      the 3-node **live-remount** integration passes (asserts the outage
+      503, reads served during the outage, no data-pool `.dat` swept, the
+      write gate clears, and every pre-outage key reads back
+      byte-identical). The boot-variant integration and a live
+      holder-fold/catch-up e2e are NOT present; the reviewer accepted the
+      unit-level substitute coverage (see Deviations a/c)
+- [x] **Docs:** `# Examples` on pub items; rustdoc clean
+      (`RUSTDOCFLAGS="-D warnings" cargo doc`, affected crates). One
+      PRE-EXISTING broken doctest in `oceanfs-storage`
+      (`io/disk_io.rs` ~line 995) is unrelated baseline cleanup, not a g7
+      gate — Deviations d
+- [x] **ADR:** ADR-0029 §D7 + ADR-0035 D1-D4 satisfied — registry rebuilt
       from holders (not `.dat`), residue sweep never runs against the
       rebuild-from-holders registry, ReRepWorker running before the drain,
       writes resume when caught up + verified
-- [ ] **Perf:** 1.3 (pre-sized candidate/registry vecs), 7.1 (all recovery
+- [x] **Perf:** 1.3 (pre-sized candidate/registry vecs), 7.1 (all recovery
       scans are one-time, off the hot path)
-- [ ] **Integration:** the epic's wal-pool-kill DoD — writes rejected
-      during outage, resumed after catch-up, no data loss, no data-pool
-      `.dat` swept by recovery (verified by reading every written key
-      post-recovery)
+- [x] **Integration:** the epic's wal-pool-kill DoD — the 3-node
+      live-remount test asserts writes rejected (503) during the outage,
+      reads served throughout, no data-pool `.dat` swept by recovery, the
+      write gate cleared post-remount, and every written key read back
+      byte-identical post-recovery (the deferred boot-variant e2e is
+      Deviations a)
 
 ## Deviations (accepted)
+
+Independent review: **PASS** at HEAD `166348a` (feature commits `38557c4`,
+`4ce2f33`, `aaef22b`; review-fix commits `578be9f`, `26042a3`,
+`166348a`). The first block records the design corrections from the
+pre-implementation audit (2026-08-22 spec rewrite, commit `d0dce49`),
+which the implementation follows. The lettered items (a)-(d) are the
+review-agreed coverage/behavior deltas recorded when the feature closed,
+and the last two bullets are review-hardening refinements folded in for
+accuracy.
 
 - **Registry rebuild is holder-pulled, not `.dat`-scanned.** Original
   (2026-08-22) g7 rebuilt the registry by scanning data-pool `.dat` roots.
@@ -289,7 +313,7 @@ replacement (marker / live remount) ──▶ WalRecoveryMode::RebuildFromHolder
   GC/orphan-reaper" step is insufficient: `run_startup_recovery` unlinks
   registry-unknown `.dat` once per boot (`storage.rs:658-722`), so a
   replaced wal pool with an empty fold would delete the intact data pools
-  (audit C1). The replaced branch must never run that sweep against the
+  (audit C1). The replaced branch never runs that sweep against the
   rebuild-from-holders registry.
 - **Fresh-WAL semantics are a replacement-branch decision, not a CRC
   judgment.** The original pinned "WAL files fail CRC validation → open
@@ -302,9 +326,9 @@ replacement (marker / live remount) ──▶ WalRecoveryMode::RebuildFromHolder
   listing APIs exist but have no callers (`metadata/store.rs:733-762`),
   and ADR-0034's bounded-metadata-scans discipline must be cited for the
   single catastrophic recovery enumeration (audit H3).
-- **Live remount is mandatory.** Original g7 described a startup flow plus
-  "the g2 recovery path"; there was no production reset path
-  (`HealthMonitor::reset_pool` has no caller; `PoolStatus::Dead` is
+- **Live remount is mandatory and implemented.** Original g7 described a
+  startup flow plus "the g2 recovery path"; there was no production reset
+  path (`HealthMonitor::reset_pool` has no caller; `PoolStatus::Dead` is
   absorbing — audit H2). Live remount now reuses `reset_pool` + the
   registry write gate, and boot recovery covers the restart case.
 - **Catch-up executes through the ReRepWorker with explicit boot/live
@@ -317,3 +341,65 @@ replacement (marker / live remount) ──▶ WalRecoveryMode::RebuildFromHolder
   1159-1181/480`, `store.rs:169-182/201-247` and `wal/entry.rs:52-79`
   referenced pre-composition-root locations; all anchors are now the
   module/audit locations cited inline (audit M1).
+
+**Review-agreed deltas recorded at feature close:**
+
+- **(a) The BOOT-VARIANT integration test is NOT present as an in-process
+  3-node test.** A true boot-variant e2e — process restart after an
+  out-of-band replacement, which would exercise the D2 holder fold +
+  catch-up drain end-to-end against a genuinely empty registry — is
+  deferred. An in-process same-directory RocksDB reopen is blocked because
+  the server/data-plane tasks hold the store (`Arc<DB>`) past shutdown;
+  only the RocksDB metrics poller was made cancellable (and is awaited at
+  shutdown so the DB LOCK is released). The boot branch is covered at the
+  unit level (detection incl. the empty-placeholder audit-C1 regression,
+  residue-sweep suppression, D3 classifier truth table, candidate
+  enumeration, holder fold, D3 recompute) and the live-remount integration
+  test passes; the reviewer accepted this substitute coverage.
+- **(b) There is NO out-of-band drain-completion watcher.** The catch-up
+  drain is in-band only: `run_wal_pool_recovery` polls the outstanding set
+  and stops when it empties, when it shows no progress for ~6 s (24 × 250
+  ms rounds), or at the 120 s hard cap. If the drain stalls, local writes
+  stay 503 until a restart (the retained replacement marker makes the next
+  boot re-enter the rebuild branch) or a re-remount. The g4 reconciliation
+  loop re-drives the repairs but never clears the write gate. Safe failure
+  mode: no data loss — availability only.
+- **(c) The D2 holder-fold/catch-up machinery is unit-verified but NOT
+  exercised by a live end-to-end test.** The holder-metadata fold has a
+  byte-exact unit test, and D3 recompute + the D3 classifier truth table
+  are unit-covered; but the live-remount integration exercises only the
+  remount surface, write gate, residue-sweep suppression and read-back — a
+  live remount never loses the in-memory registry, so the holder fold is a
+  no-op there (`restored=0 missing=0 caught_up=0`). The test header in
+  `crates/oceanfs-node/tests/wal_pool_recovery.rs` states this honestly. A
+  true e2e that runs the fold is the deferred boot-variant test (a).
+- **(d) (informational — separate baseline cleanup, NOT a g7 deviation)**
+  A pre-existing broken doctest at
+  `crates/oceanfs-storage/src/io/disk_io.rs` (~line 995) constructs
+  `ObservedIo` with a `total_bytes` field the struct never had (the field
+  was added to the doc example by bounded-metadata-scans commit `6cb7958`,
+  not to the struct). It fails on the base commit too and is unrelated to
+  g7; tracked as baseline cleanup.
+- **Checkpoint-before-marker-clear (review hardening).** The write-resume
+  gate now persists a checkpoint of the rebuilt registry BEFORE clearing
+  the replacement marker. On the live-remount path the in-memory registry
+  survives but is never re-journaled to the fresh event WAL (the fold
+  skips already-registered segments), so clearing the marker without a
+  snapshot would let a later restart NormalFold an almost-empty event log
+  and the residue sweep would delete every pre-remount `.dat`. The
+  checkpoint covers the coordinator's LAST FOLDED position
+  (`SegmentLifecycleCoordinator::last_folded_pos`), not the raw WAL tail —
+  the same snapshot contract the coordinator's threshold checkpoint obeys
+  (a snapshot covering an appended-but-unfolded event would seed a registry
+  missing that segment). On checkpoint failure the marker is kept so the
+  next boot re-enters the rebuild branch; on the boot path the snapshot is
+  harmless (the rebuilt entries are also events in the fresh WAL) and just
+  makes the next recovery cheaper.
+- **WAL sync lower-bound reset (review hardening).** `WalWriter::truncate`
+  and `reopen_fresh` now reset the sync group's `last_synced` lower bound
+  when the write position rewinds below it. `verify_wal_write` exercises
+  exactly this path — it appends its probe at offset 0, lets the group
+  flusher advance past it, then truncates the probe away; a stale lower
+  bound would let post-truncate appends be ACKed without a covering fsync
+  (the flusher skips fsync while `current <= last_synced`). Regression
+  test: `truncate_below_synced_position_resets_lower_bound`.
