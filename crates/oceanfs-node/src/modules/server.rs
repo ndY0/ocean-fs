@@ -643,6 +643,10 @@ impl ServerModule {
         // the stale replica through the machine + shard store.
         .with_remap_alias(Arc::clone(&storage.remap_alias))
         .with_lifecycle_coordinator(storage.lifecycle.clone())
+        // ADR-0017 amendment: inbound hint batches acquire a Tier-0
+        // (repair) permit from the shared budget — the review anchor
+        // (per-RPC Semaphore(16)) is closed by this shared cross-RPC gate.
+        .with_repair_budget(durability.budget.clone())
         // g3 `loss-announcement` (data-pool death): verified held
         // segments enqueue re-replication repairs — the repair sink is
         // the HOLDER-side dispatcher (ADR-0030 target-pull).

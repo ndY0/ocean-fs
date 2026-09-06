@@ -141,7 +141,7 @@ individual tasks do not need to implement their own metrics:
 | Metric | Type | Labels |
 |---|---|---|
 | `durability_cycle_total` | Counter | `task`, `status` (ok/error) |
-| `durability_cycle_duration_seconds` | Histogram | `task` |
+| `durability_cycle_duration_millis` | Histogram | `task` |
 | `durability_items_processed_total` | Counter | `task` |
 | `durability_cycle_skipped_total` | Counter | `task`, `reason` (concurrent/timeout) |
 | `durability_scheduler_backlog` | Gauge | — |
@@ -221,6 +221,88 @@ This replaces the per-task metrics that currently pollute constructors
 | **B. Trait in `oceanfs-core`** | Available to all crates without depending on `oceanfs-durability` | `core` becomes a dumping ground for traits that aren't cross-cutting; ADR-0005 favours trait-in-consuming-crate | Rejected: durability tasks are specific to `oceanfs-durability`; if a future crate needs to register a task, the trait can be graduated at that point |
 | **C. `tokio::sync::Notify` or channel-based scheduling** | More flexible than interval-based; tasks can be triggered on events (e.g., "segment sealed" → trigger compactor) | More complex; event-driven scheduling interacts poorly with backpressure (what if events arrive faster than tasks can process?) | Rejected: interval-based scheduling is simpler and sufficient; the incremental Merkle tree (ADR-0015) handles event-driven AE separately |
 | **D. Feature-gate each task** | Operators can compile out tasks they don't need | Adds feature-flag complexity across the workspace; tasks are lightweight when idle; compile-time gating doesn't help runtime resource management | Rejected: runtime scheduling with a semaphore is the right tool for resource management; compile-time gating is orthogonal |
+
+## Amendment 2026-09-06 — Two-Tier Durability I/O Budget
+
+**Decision (2026-09-06, stakeholder):** §2 as written is **superseded** for
+admission control. A single flat "global I/O" semaphore that only bounds the
+scheduler's interval cycles does not close review findings #19/#21's bounded-
+concurrency concern: queue/event-driven durability workers (heal, re-rep,
+inbound hint apply) perform the same `.dat`/metadata I/O as the scheduled
+cycles yet were left outside the bound, each with its own private gate — and
+the original review anchor (`healing_service.rs` per-RPC `Semaphore(16)`) was
+per-invocation and bounded nothing across calls. This amendment replaces the
+flat semaphore with a **two-tier admission budget** owned by the durability
+subsystem, and closes the anchor by putting every heavy local durability I/O
+producer on a tier.
+
+**The model (implementation-authoritative):**
+
+- Every producer of heavy local durability I/O on a node belongs to exactly
+  one of two tiers. **Tier-0 (data-layer / repair)** work is never gated
+  behind **Tier-1 (housekeeping)** work. Within a tier, admission is fair
+  (FIFO per tier; no member starves; slow cycles skip rather than backlog).
+- Tier separation is **admission-level only** — explicitly no device-level
+  (io-class) or preemption guarantee. The `apply_background_io_class` /
+  `apply_background_cpu_sched` niceness helpers are **removed**: they were
+  harmful (thread-scoped CPU on a shared runtime contaminates unrelated
+  tasks; `ioprio_set(IOPRIO_WHO_PROCESS)` demotes the whole process) and
+  ineffective (the syscalls they would classify are issued on the blocking
+  pool / RocksDB threads, not the task's runtime thread).
+- One permit = one top-level operation: one scheduled cycle = 1 Tier-1; one
+  heal op = 1 Tier-0; one re-rep pull/write = 1 Tier-0; one inbound hint
+  batch = 1 Tier-0. Within-operation parallelism (heal shard fetch, scrub
+  batch concurrency, GC `max_concurrent_compactions`) is unchanged and lives
+  inside the permit.
+
+**Tier membership:**
+
+| Producer | Tier | Reason |
+|---|---|---|
+| GC cycle, orphan cycle, scrub cycle, AE cycle(s) | 1 (housekeeping) | Clock-driven verification & space maintenance; minutes of delay are invisible to the durability contract |
+| HealWorker heal op, ReRepWorker pull/write, inbound hint apply (gRPC batch) | 0 (data-layer) | Functionally the write path / placement restoration; the durability contract is in arrears until they finish |
+| Reconciliation drift scan, hint *delivery* watcher | exempt | No heavy local `.dat`/metadata-CF I/O on this node (dispatch / outbound network) |
+
+Metering rule: the budget meters work that performs `.dat` reads/writes or
+metadata-CF batch writes on this node, plus whole-store scans. Everything
+else is un-metered.
+
+**Configuration (supersedes the §2 block):**
+
+```toml
+[durability]
+repair_max_active = 16       # Tier-0 permits (heal + re-rep + hint apply)
+housekeeping_max_active = 2  # Tier-1 permits (scheduled cycles)
+task_timeout_sec = 3600      # maximum duration for a single Tier-1 cycle (0 disables)
+```
+
+`repair_max_active` is the **single gate** replacing `HealConfig`
+`max_concurrent_heals`, `ReRepConfig` `max_concurrent_repairs`, and the
+healing service's per-RPC fetch `Semaphore(16)` — all are removed as gates.
+The former top-level `heal_parallel_segments` config field is removed; its
+semantic role is `[durability].repair_max_active`. Individual task intervals
+remain in their existing config sections (no relocation).
+
+**Metrics (supersedes the §4 table shape):** the §4 per-cycle metrics stay
+for Tier-1 scheduled cycles (`task` label). The budget adds:
+`durability_repair_active`, `durability_housekeeping_active` (gauges),
+`durability_repair_waiters`, `durability_housekeeping_waiters` (gauges), and
+per-tier wait-duration histograms. `durability_scheduler_backlog` is the
+Tier-1 waiter count.
+
+**Trait shape unchanged:** heal/re-rep/hint-apply are **not**
+`DurabilityTask`s and are not interval-scheduled (ADR §Considered-C
+unchanged — event-driven *scheduling* remains rejected). They are *budget
+clients*: they acquire a Tier-0 permit around each operation from the shared
+`DurabilityBudget` object.
+
+> **Implementation status (2026-09-06):** the amendment is **accepted and
+> implemented** — the two-tier budget + scheduler epic
+> (`docs/features/refactoring/durability-scheduler/`) is code-complete and
+> passed independent review (verdict PASS, iteration 2; see the epic README
+> for recorded accepted deviations 1–6 and the sole remaining cloud-harness
+> e2e gate). This amendment stands as accepted history and supersedes §2's
+> admission-control model as written above.
 
 ## References
 

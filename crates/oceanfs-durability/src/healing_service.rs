@@ -10,6 +10,8 @@ use oceanfs_core::{Hlc, HlcClock, NodeId, RemappedChunk, SegmentId, SegmentRemap
 use oceanfs_storage_api::SegmentDataStore;
 use tonic::{Request, Response, Status};
 
+use crate::scheduler::DurabilityBudget;
+
 /// Converts a core [`Hlc`] to the proto timestamp for the hint fetch
 /// response header.
 fn proto_hlc(hlc: Hlc) -> oceanfs_core::proto::common::HlcTimestamp {
@@ -287,6 +289,10 @@ pub struct HealingGrpcService {
     /// worker pulls + writes + stamps (ADR-0030). `None` (tests) acks but
     /// enqueues nothing.
     replication_request_sink: Option<Arc<dyn RepairSink>>,
+    /// The two-tier budget (ADR-0017 amendment). Inbound hint batches
+    /// acquire a Tier-0 (repair) permit per batch when a budget is wired
+    /// (composition root). `None` (tests) leaves the handler unbounded.
+    repair_budget: Option<Arc<DurabilityBudget>>,
     /// g3 announcement receive counters (ADR-0029 §D4 observability).
     /// Incremented by the `announce_loss` / `announce_remap` handlers.
     announce_rx_total: oceanfs_core::Counter,
@@ -316,6 +322,7 @@ impl HealingGrpcService {
             lifecycle_coordinator: None,
             repair_sink: None,
             replication_request_sink: None,
+            repair_budget: None,
             announce_rx_total: oceanfs_core::Counter::new(
                 "oceanfs_announcements_rx_total".into(),
                 "Loss/remap announcements received".into(),
@@ -340,6 +347,15 @@ impl HealingGrpcService {
     #[must_use]
     pub fn with_local_node_id(mut self, node_id: NodeId) -> Self {
         self.local_node_id = Some(node_id);
+        self
+    }
+
+    /// Wires the shared two-tier budget (ADR-0017 amendment): the
+    /// batched hinted-handoff handler acquires a Tier-0 (repair) permit
+    /// per batch. The composition root always calls this.
+    #[must_use]
+    pub fn with_repair_budget(mut self, budget: Arc<DurabilityBudget>) -> Self {
+        self.repair_budget = Some(budget);
         self
     }
 
@@ -797,6 +813,17 @@ impl HealingRpc for HealingGrpcService {
             .and_then(|s| s.parse::<SocketAddr>().ok())
             .or_else(|| request.remote_addr());
         let req = request.into_inner();
+
+        // ADR-0017 amendment: the batch is a Tier-0 (repair) operation —
+        // one permit per inbound hint batch bounds cross-RPC concurrency at
+        // the shared node-wide repair budget. The old per-RPC fetch
+        // semaphore below bounded nothing across concurrent calls (the
+        // review anchor at :1030-1036 is closed by this shared gate).
+        let _repair = match &self.repair_budget {
+            Some(budget) => Some(budget.acquire_repair().await),
+            None => None,
+        };
+
         let hint_count = req.hints.len() as u32;
         let mut accepted_count = 0u32;
         // Local segment-ref hints deferred to the parallel fetch pass
@@ -1029,10 +1056,15 @@ impl HealingRpc for HealingGrpcService {
                 }));
             };
 
-            // [review][architecture][critical]
-            // here (and in diverse submodules), we control concurrency, but since the run concurrently themselves,
-            // we dont effectively manage the maximum concurrency. that is why i suggested a global semaphore in a worker manager
-            // to be discussed
+            // [review][architecture][critical][resolved]
+            // RESOLVED by ADR-0017 amendment 2026-09-06: the per-RPC
+            // semaphore here bounded only WITHIN one batch, never across
+            // calls. The handler now acquires one Tier-0 (repair) permit
+            // from the shared `DurabilityBudget` for the whole batch (above),
+            // so concurrent inbound hint batches are bounded node-wide by
+            // `[durability].repair_max_active`. This intra-batch cap is
+            // kept as within-operation parallelism (one permit, bounded
+            // fetches inside it).
             // [end]
             const FETCH_CONCURRENCY: usize = 16;
             let semaphore = Arc::new(tokio::sync::Semaphore::new(FETCH_CONCURRENCY));

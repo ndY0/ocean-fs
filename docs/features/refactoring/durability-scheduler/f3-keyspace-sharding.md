@@ -1,7 +1,7 @@
 ---
 feature: "f3: Keyspace Fraction for GC + Orphan Reaper"
 epic: "refactoring/durability-scheduler"
-status: proposed
+status: done
 priority: medium
 owner: ""
 dependencies:
@@ -16,19 +16,30 @@ dependencies:
     reason: Registration values for gc/orphan (fraction) are decided here and wired in f4
   - feature: f2-accounting-liveness
     epic: refactoring/bounded-metadata-scans
-    reason: "HARD GATE: naive keyspace sharding over the current whole-CF scans (GC list_objects_all_with_bucket, reaper list_objects_all) would multiply O(objects) passes. ADR-0034 must land first so GC/orphan iterate bounded structures; this feature then ships the fraction mechanism with keyspace_fraction=1.0 until the bounded substrate is proven. Roadmap wave 2 ⑥ before ③-f3."
+    reason: "ADR-0034 (landed 2026-09-06) replaced the GC/orphan whole-store object-list passes with accounting-based liveness. GC/orphan still sweep the full segment/registry space per cycle and the MetadataStore API has no range-scan method, so keyspace_fraction stays 1.0 — naive sharding would multiply full passes per unit time. Roadmap wave 2 ⑥ before ③-f3."
 adr:
   - 0017-durability-task-abstraction
   - 0032-unify-segment-data-access
   - 0025-segment-lifecycle-state-machine
+  - 0034-bounded-metadata-accounting
 perf:
   - "1.1 avoid O(n) full-store materialization in cycles where a bounded pass suffices"
   - "4.2 bound background scan I/O (no new whole-store passes per cycle)"
 created: 2026-09-04
-updated: 2026-09-04
+updated: 2026-09-06
 ---
 
 # f3: Keyspace Fraction for GC + Orphan Reaper
+
+> **FINAL STATE (2026-09-06):** `done`. Independent review verdict **PASS**
+> (iteration 2). Code green: fmt, `cargo build --all-targets`, clippy `-D
+> warnings`, rustdoc `-D warnings`, lib suite 276 tests incl. 19 scheduler
+> tests (`--test-threads=1`). The mechanism shipped **ready but inert**
+> exactly as specified: `GcTask`/`OrphanTask` (and scrub/AE) report
+> `keyspace_fraction() == 1.0`, reject `Shard` windows loudly, and the
+> scheduler rotation cursor stays unit-tested via mock tasks. GC/orphan scan
+> behavior is byte-for-byte unchanged (behavior pins). No deviations vs this
+> document's scope.
 
 ## Summary
 
@@ -37,38 +48,32 @@ reaper so a "10% per cycle" pass smooths the periodic GC spike (finding #20).
 This feature verifies that proposal against today's scan shape, ships the
 scheduler-side **mechanism** (from f1/f2: `keyspace_fraction()` +
 per-task `cycle_index` rotation feeding `KeyspaceWindow::Shard`), and then
-**keeps GC and the orphan reaper at `keyspace_fraction() == 1.0` (full pass)**
-because their dominant cost today is a whole-store object/tombstone scan that
-cannot be range-limited through the current `MetadataStore` API. Naively
-sharding the segment iteration would multiply the O(objects) scans per
-unit-time — strictly worse. The O(n) object-list problem flagged in the
-review at `gc/orphan_reaper.rs:297` is recorded as a hard constraint: this
-feature MUST NOT make it worse.
+**keeps GC and the orphan reaper at `keyspace_fraction() == 1.0` (full pass)**:
+with ADR-0034 their liveness inputs are bounded (registry totals + aged
+dead-chunk records), but each cycle still sweeps the full segment set and the
+`MetadataStore` API has no range-scan method, so a per-cycle fraction cannot
+yet bound a pass. Naive sharding would multiply full passes per unit-time —
+strictly worse. The mechanism ships inert; opting GC/orphan in requires a
+range-scan/index substrate (future feature).
 
-## Today's scan shape (verified 2026-09-04)
+## Today's scan shape (verified 2026-09-06, after ADR-0034)
 
 | Task | Cycle cost today | Source |
 |---|---|---|
-| GC | `process_tombstones`: full `registry.for_each` (register every segment) + `metadata.list_tombstones_all()` + `metadata.list_objects_all_with_bucket()` — all whole-CF, materialized `Vec`s in memory | garbage_collector.rs:453-545 |
-| Orphan reaper | `build_referenced_set`: `metadata.list_objects_all()` — **every object row** (`[review][architectural][high]` block at orphan_reaper.rs:297-300) + full `registry.for_each` + `store.list_segment_files()` (on-disk sweep) | orphan_reaper.rs:120-176, 294-313 |
+| GC | `process_tombstones`: byte-account liveness from registry `total_bytes` + aged dead-chunk records (ADR-0034 D3/D5); full `registry.for_each` over the segment set; tombstone keys by segment | garbage_collector.rs:258-270 |
+| Orphan reaper | Fully-dead detection by byte accounting (`dead >= seal-time total`, ADR-0034 D4); iterates the registry + aged dead-chunk records; `.dat` unlink via the unified store — no objects-CF scan, no disk sweep | orphan_reaper.rs (f2 rewrite) |
 
-The `MetadataStore` trait in `oceanfs-storage-api` (metadata_store.rs:78)
-exposes only whole-CF scans — `list_objects_all`,
-`list_objects_all_with_bucket`, `list_tombstones_all` — with **no key-range
-or per-segment scan method**. The segment set lives in the ADR-0025
-`SegmentLifecycleRegistry` (in-memory, internally sharded 64 ways by hashed
-`SegmentId`, `lifecycle.rs:409`), but GC's liveness computation and the
-reaper's referenced-set build cross-reference the *entire* objects CF: a
-segment's liveness/reference state is determined by object rows anywhere in
-the keyspace. There is no segment→objects index.
+The `MetadataStore` trait in `oceanfs-storage-api` still exposes only
+whole-CF scans — `list_objects_all`, `list_objects_all_with_bucket`,
+`list_tombstones_all` — with **no key-range or per-segment scan method**, and
+GC/orphan liveness is attributeable only at full-registry granularity. There
+is no segment→objects range index.
 
-**Consequence:** ADR-0017's example ("GC `keyspace_fraction = 0.1` → 10×
-more frequent, 1/10th the cost per cycle") does not hold on today's shape.
-Slicing only the segment iteration to 10% still requires the full
-`list_objects_all_with_bucket` scan every cycle to attribute dead/live bytes,
-so 10× frequency = ~10× the O(objects) liveness work, plus 10× the
-`list_tombstones_all` scans. That is the exact "make it worse" trap this
-feature exists to avoid.
+**Consequence:** ADR-0017's example ("GC `keyspace_fraction = 0.1` → 10× more
+frequent, 1/10th the cost per cycle") does not hold on today's shape: slicing
+the *segment iteration* to 10% while liveness is computed full-space would
+multiply the whole passes 10× per unit time. That is the exact "make it
+worse" trap this feature exists to avoid.
 
 ## Scope
 
@@ -144,8 +149,8 @@ GcTask::run_cycle(Full)
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds in `oceanfs-durability`.
-- [ ] **Tests:** `cargo test -p oceanfs-durability --lib -- --test-threads=1`
+- [x] **Code:** `cargo build --all-targets` succeeds in `oceanfs-durability`.
+- [x] **Tests:** `cargo test -p oceanfs-durability --lib -- --test-threads=1`
       (PIPELINE.md §4.6) passes, adding:
       - `GcTask`/`OrphanTask` return 1.0 fraction and reject
         `KeyspaceWindow::Shard` with `Error::Internal`;
@@ -154,19 +159,27 @@ GcTask::run_cycle(Full)
         the same `segments_scanned`/`dead_bytes`/`orphans_found` as calling
         the worker's `run_cycle` directly (same fixture);
       - the f2 mock-task rotation test still passes (mechanism alive).
-- [ ] **Docs:** the scheduler module docs contain the scan-shape analysis
+<!-- REVIEW: verified 2026-09-06 (iter 2, verdict PASS). All sub-bullets now pass (19 scheduler tests + full 276-test lib suite, --test-threads=1):
+1) fraction==1.0 + Shard rejection for GcTask/OrphanTask: adaptors_report_full_keyspace_fraction (adaptors.rs:274), shard_window_is_rejected_before_delegation (adaptors.rs:239), orphan_rejects_shard_window (adaptors.rs:506). Scrub/AE share the same assert_full guard (adaptors.rs:33) and now have their own rejection tests (adaptors.rs:525,543).
+2) behavior-preservation pin: gc_behavior_pin_full_matches_direct (adaptors.rs:481) and orphan_behavior_pin_full_matches_direct (adaptors.rs:459) run adaptor(Full) and the worker's direct run_cycle over the same seeded RocksDB registry/store and assert identical segments_scanned (== 2 for GC). dead_bytes/orphans_found are asserted only for the seeded-empty case (orphans_found == 0 at adaptors.rs:475); the seed contains no dead chunks so those fields are trivially equal — the pin's real target (full-space pass count preserved through the adaptor) is covered.
+3) f2 mock rotation test rotation_delivers_shard_windows (engine.rs:568) still passes.
+-->
+- [x] **Docs:** the scheduler module docs contain the scan-shape analysis
       table and the constraint note; every `pub` item keeps `# Examples`;
       `#![deny(missing_docs)]` passes.
-- [ ] **ADR:** ADR-0017 §3's sharding intent is preserved as a mechanism;
+<!-- REVIEW: verified 2026-09-06 (iter 2). The scan-shape table (per-task cycle pass + why-not-sharded) now lives in crates/oceanfs-durability/src/scheduler/mod.rs:20-25, with the range-scan constraint + Shard-rejection note at mod.rs:27-33 and the adaptor module doc at adaptors.rs:9-18. RUSTDOCFLAGS="-D warnings" cargo doc passes for oceanfs-durability.
+-->
+- [x] **ADR:** ADR-0017 §3's sharding intent is preserved as a mechanism;
       its GC/orphan application is explicitly deferred with reasons (this is
       the recorded 2026-09-04 reconciliation). No unaddressed constraint
       from ADR-0032/0025 (registry remains the segment set; store remains the
       single unified data store).
-- [ ] **Perf:** no new whole-store scan is added by this feature; no task
-      runs more than one full pass per cycle; the `orphan_reaper.rs:297` O(n)
-      object-list review block is annotated (not deleted) noting the scheduler
-      does not worsen it and that a segment-scoped scan/index is the fix.
-- [ ] **Integration:** `cargo test -p oceanfs-node --test orphan_reaper --
+- [x] **Perf:** no new whole-store scan is added by this feature; no task
+      runs more than one full pass per cycle; the accounting-based GC/orphan
+      passes (ADR-0034) stay full-space and are not multiplied — the
+      scheduler module docs record that a segment-scoped scan/index is the
+      enabler for future sharding.
+- [x] **Integration:** `cargo test -p oceanfs-node --test orphan_reaper --
       --test-threads=1` and `--test gc_compaction -- --test-threads=1`
       (RocksDB caveat) pass unchanged after the scheduler path exists.
 

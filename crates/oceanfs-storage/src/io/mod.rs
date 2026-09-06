@@ -47,7 +47,6 @@ pub mod atomic_write;
 pub mod direct;
 pub mod disk_io;
 pub mod mmap;
-pub mod sched;
 pub(crate) mod segment_file;
 pub mod segment_flush;
 pub mod segment_reader;
@@ -62,7 +61,6 @@ pub use disk_io::{
     IO_ERROR_KIND_COUNT, IO_OP_COUNT,
 };
 pub use mmap::SegmentFileCache;
-pub use sched::{apply_background_cpu_sched, apply_background_io_class};
 pub use segment_reader::{
     DiskSegmentReader, InMemorySegmentReader, PoolFallbackReader, SegmentReadSource, SegmentReader,
 };

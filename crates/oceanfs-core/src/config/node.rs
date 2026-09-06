@@ -207,31 +207,17 @@ pub struct NodeConfig {
     /// Default: 64.
     #[serde(default = "default_segment_cache_max_entries")]
     pub segment_cache_max_entries: usize,
-    /// Whether to set I/O scheduling class to `IOPRIO_CLASS_IDLE` for
-    /// background task threads (GC, scrub, anti-entropy, heal, orphan
-    /// reaper) on Linux (default `true` on Linux).
-    ///
-    /// Threads with `IOPRIO_CLASS_IDLE` only receive disk I/O bandwidth
-    /// when no other thread wants it — preventing background scans from
-    /// competing with client I/O for NVMe command slots.
-    /// No-op on non-Linux platforms.
-    #[serde(default = "default_background_io_class_idle")]
-    pub background_io_class_idle: bool,
-    /// Whether to set CPU scheduling policy to `SCHED_IDLE` for background
-    /// task threads on Linux (default `true` on Linux).
-    ///
-    /// These threads only execute when no other thread wants the CPU —
-    /// they literally run in idle CPU time. Requires `CAP_SYS_NICE`
-    /// capability; gracefully degrades on `EPERM` with a log message.
-    /// No-op on non-Linux platforms.
-    #[serde(default = "default_background_cpu_sched_idle")]
-    pub background_cpu_sched_idle: bool,
     /// Anti-entropy configuration.
     ///
     /// Controls the incremental Merkle tree protocol: continuous
     /// root-only exchange and periodic sampling mode.
     #[serde(default)]
     pub anti_entropy: AntiEntropyConfig,
+    /// Scheduler/budget-level durability configuration (ADR-0017
+    /// amendment): the two-tier admission budget and the Tier-1 cycle
+    /// timeout.
+    #[serde(default)]
+    pub durability: crate::DurabilityConfig,
 
     // ── Item 1: Garbage collection tuning ──
     /// GC compaction liveness-ratio threshold (0.0–1.0, default 0.5).
@@ -251,9 +237,6 @@ pub struct NodeConfig {
     /// Anti-entropy peer count per cycle (default 1).
     #[serde(default = "default_ae_peer_count")]
     pub ae_peer_count: usize,
-    /// Maximum concurrent heal operations (default 16).
-    #[serde(default = "default_heal_parallel_segments")]
-    pub heal_parallel_segments: usize,
     /// Heal throughput throttle in bytes/sec (0 = unlimited, default 0).
     #[serde(default)]
     pub heal_throttle_bytes_sec: u64,
@@ -551,12 +534,6 @@ fn default_io_uring_enabled() -> bool {
 fn default_segment_cache_max_entries() -> usize {
     64
 }
-fn default_background_io_class_idle() -> bool {
-    cfg!(target_os = "linux")
-}
-fn default_background_cpu_sched_idle() -> bool {
-    cfg!(target_os = "linux")
-}
 
 // ── Item 1: GC default functions ──
 
@@ -574,9 +551,6 @@ fn default_gc_compaction_queue_capacity() -> usize {
 
 fn default_ae_peer_count() -> usize {
     1
-}
-fn default_heal_parallel_segments() -> usize {
-    16
 }
 
 // ── Item 3: Cache default functions ──
@@ -697,10 +671,10 @@ impl Default for NodeConfig {
             io_uring_enabled: cfg!(target_os = "linux"),
             segment_cache_max_entries: 64,
             max_inflight_writes: 64,
-            background_io_class_idle: cfg!(target_os = "linux"),
-            background_cpu_sched_idle: cfg!(target_os = "linux"),
             // Anti-entropy
             anti_entropy: AntiEntropyConfig::default(),
+            // Durability budget + scheduler (ADR-0017 amendment)
+            durability: crate::DurabilityConfig::default(),
             // Item 1: GC
             gc_compact_threshold: 0.5,
             gc_max_concurrent_compactions: 4,
@@ -708,7 +682,6 @@ impl Default for NodeConfig {
             // Item 2: Scrub / AE / heal
             scrub_parallel_nodes: 0,
             ae_peer_count: 1,
-            heal_parallel_segments: 16,
             heal_throttle_bytes_sec: 0,
             replication_throttle_bytes_sec: 0,
             // Item 3: Cache
@@ -857,15 +830,33 @@ mod tests {
     }
 
     #[test]
-    fn default_background_io_class_idle_matches_platform() {
+    fn durability_config_defaults() {
         let config = NodeConfig::default();
-        assert_eq!(config.background_io_class_idle, cfg!(target_os = "linux"));
+        assert_eq!(config.durability.repair_max_active, 16);
+        assert_eq!(config.durability.housekeeping_max_active, 2);
+        assert_eq!(config.durability.task_timeout_sec, 3600);
     }
 
     #[test]
-    fn default_background_cpu_sched_idle_matches_platform() {
-        let config = NodeConfig::default();
-        assert_eq!(config.background_cpu_sched_idle, cfg!(target_os = "linux"));
+    fn durability_config_toml_parse() {
+        // Explicit `[durability]` values flow through TOML parsing; 0 =
+        // timeout disabled.
+        let toml_str = r#"
+            node_id = "n1"
+            [durability]
+            repair_max_active = 8
+            housekeeping_max_active = 4
+            task_timeout_sec = 0
+        "#;
+        let config: NodeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.durability.repair_max_active, 8);
+        assert_eq!(config.durability.housekeeping_max_active, 4);
+        assert_eq!(config.durability.task_timeout_sec, 0, "0 disables the per-cycle timeout");
+        // Unset `[durability]` defaults apply.
+        let defaults: NodeConfig = toml::from_str("node_id = \"n2\"").unwrap();
+        assert_eq!(defaults.durability.repair_max_active, 16);
+        assert_eq!(defaults.durability.housekeeping_max_active, 2);
+        assert_eq!(defaults.durability.task_timeout_sec, 3600);
     }
 
     // ── Item 1: GC config tests ──
@@ -899,12 +890,6 @@ mod tests {
     fn ae_peer_count_default_is_1() {
         let config = NodeConfig::default();
         assert_eq!(config.ae_peer_count, 1);
-    }
-
-    #[test]
-    fn heal_parallel_segments_default_is_16() {
-        let config = NodeConfig::default();
-        assert_eq!(config.heal_parallel_segments, 16);
     }
 
     #[test]

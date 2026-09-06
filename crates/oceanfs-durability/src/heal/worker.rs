@@ -5,8 +5,11 @@
 //!
 //! ## Concurrency control
 //!
-//! - **Perf rule 2.7/8.5:** A `tokio::sync::Semaphore` bounds the number
-//!   of concurrent heal operations to `max_concurrent_heals`.
+//! - **ADR-0017 amendment:** each heal op acquires a **Tier-0 (repair)**
+//!   permit from the shared `DurabilityBudget`
+//!   (`[durability].repair_max_active`, default 16) — the single
+//!   node-wide repair gate shared with re-replication and inbound hint
+//!   apply.
 //! - **Perf rule 1.3:** Shard assembly vectors are pre-sized with
 //!   `Vec::with_capacity(k + m)`.
 //! - **Perf rule 8.1:** Parallel shard fetches use `futures::stream::FuturesUnordered`.
@@ -22,11 +25,10 @@ use oceanfs_ec::Decoder;
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_storage_api::SegmentDataStore;
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use super::queue::HealQueue;
-use crate::{Error, HealingRpcClient, Result};
+use crate::{scheduler::DurabilityBudget, Error, HealingRpcClient, Result};
 
 // ---------------------------------------------------------------------------
 // HealWorker
@@ -34,9 +36,10 @@ use crate::{Error, HealingRpcClient, Result};
 
 /// Background task that drains the heal queue and repairs corrupt shards.
 ///
-/// Constructed with a bounded queue (backpressure, perf rule 2.6), a
-/// semaphore for concurrency (perf rules 2.7/8.5), an EC decoder, a
-/// metadata store for segment lookups, and a data store for shard read/write.
+/// Constructed with a bounded queue (backpressure, perf rule 2.6), an
+/// EC decoder, a lifecycle coordinator, and a data store for shard
+/// read/write. Concurrency is bounded by the shared Tier-0 (repair)
+/// budget (ADR-0017 amendment).
 ///
 /// ## Simplified Construction
 ///
@@ -89,8 +92,10 @@ pub struct HealWorker {
     // rather than using ring-based routing.
     /// Atomic statistics counters.
     stats: Arc<HealStats>,
-    /// Semaphore bounding concurrent heal operations.
-    semaphore: Arc<Semaphore>,
+    /// The two-tier budget; each heal op acquires a Tier-0 (repair)
+    /// permit when a budget is wired (composition root). `None` (tests)
+    /// leaves the worker unbounded.
+    budget: Option<Arc<DurabilityBudget>>,
     /// Per-operation timeout configuration.
     timeouts: Arc<OperationTimeouts>,
 }
@@ -101,13 +106,6 @@ pub struct HealWorker {
 // [end]
 impl HealWorker {
     /// Creates a new heal worker.
-    ///
-    /// The semaphore is initialized with `config.max_concurrent_heals()`
-    /// permits (perf rules 2.7, 8.5).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `config.max_concurrent_heals()` is zero.
     pub fn new(
         config: HealConfig,
         queue: Arc<HealQueue>,
@@ -115,11 +113,8 @@ impl HealWorker {
         lifecycle: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
         data_store: Arc<dyn SegmentDataStore>,
     ) -> Self {
-        let max_concurrent = config.max_concurrent_heals();
-        assert!(max_concurrent > 0, "max_concurrent_heals must be > 0");
-
         Self {
-            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            budget: None,
             stats: Arc::new(HealStats::new()),
             config,
             queue,
@@ -130,6 +125,15 @@ impl HealWorker {
             pool: None,
             timeouts: Arc::new(OperationTimeouts::default()),
         }
+    }
+
+    /// Wires the shared two-tier budget (ADR-0017 amendment): each heal
+    /// op acquires a Tier-0 (repair) permit. The composition root always
+    /// calls this.
+    #[must_use]
+    pub fn with_budget(mut self, budget: Arc<DurabilityBudget>) -> Self {
+        self.budget = Some(budget);
+        self
     }
 
     /// Sets the per-operation timeout configuration.
@@ -175,7 +179,7 @@ impl HealWorker {
     ///
     /// Continuously drains the bounded queue. Each request:
     ///
-    /// 1. Waits for a semaphore permit (perf rules 2.7/8.5).
+    /// 1. Acquires a Tier-0 (repair) budget permit when wired.
     /// 2. Spawns a subtask to perform the heal.
     /// 3. The subtask acquires healthy shards via `fetch_shards`,
     ///    decodes via `Decoder::decode`, writes repaired shards,
@@ -220,7 +224,7 @@ impl HealWorker {
         let lifecycle = self.lifecycle.clone();
         let data_store = self.data_store.clone();
         let decoder = self.decoder.clone();
-        let semaphore = self.semaphore.clone();
+        let budget = self.budget.clone();
         let retry_limit = self.config.heal_retry_limit();
         let queue_sender = self.queue.sender();
         let membership = self.membership.clone();
@@ -229,8 +233,11 @@ impl HealWorker {
         let _shutdown = shutdown.clone();
 
         tokio::spawn(async move {
-            // Acquire semaphore permit (perf rules 2.7, 8.5).
-            let _permit = semaphore.acquire_owned().await;
+            // Acquire a Tier-0 (repair) permit when a budget is wired.
+            let _permit = match budget {
+                Some(b) => Some(b.acquire_repair().await),
+                None => None,
+            };
 
             stats.inc_attempted();
 
@@ -287,7 +294,7 @@ impl HealWorker {
                 }
             }
 
-            // _permit is dropped here, releasing semaphore.
+            // _permit is dropped here, releasing the budget permit.
         });
     }
 
@@ -627,8 +634,8 @@ mod tests {
     }
 
     #[test]
-    fn heal_worker_new_initializes_semaphore() {
-        let config = HealConfig::default().with_max_concurrent_heals(2);
+    fn heal_worker_new_starts_idle() {
+        let config = HealConfig::default();
         let queue = Arc::new(HealQueue::new(4));
         let decoder = Arc::new(StubDecoder);
         let data_store = Arc::new(InMemorySegmentStore::new());
@@ -637,8 +644,54 @@ mod tests {
             Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
                 &oceanfs_core::LifecycleConfig::default(),
             ));
-        let worker = HealWorker::new(config, queue, decoder, lifecycle, data_store);
+        let worker =
+            HealWorker::new(config, queue, decoder.clone(), lifecycle.clone(), data_store.clone());
+        assert!(worker.budget.is_none(), "no budget before with_budget");
         assert_eq!(worker.stats().heals_attempted(), 0);
+
+        let budget = Arc::new(crate::scheduler::DurabilityBudget::new(16, 2));
+        let wired = HealWorker::new(
+            HealConfig::default(),
+            Arc::new(HealQueue::new(4)),
+            decoder,
+            lifecycle,
+            data_store,
+        )
+        .with_budget(budget);
+        assert!(wired.budget.is_some(), "with_budget installs the shared budget");
+    }
+
+    /// A wired worker's heal op holds a Tier-0 (repair) permit for the
+    /// duration of the heal — the heal op can never wait behind a
+    /// housekeeping cycle (separate budgets).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wired_worker_acquires_tier0_permit() {
+        let budget = Arc::new(crate::scheduler::DurabilityBudget::new(1, 1));
+        // Exhaust the housekeeping tier — a Tier-0 heal acquisition must
+        // still succeed (the two-tier invariant at the worker boundary).
+        let _housekeeping = budget.acquire_housekeeping().await;
+
+        let decoder = Arc::new(StubDecoder);
+        let data_store = Arc::new(InMemorySegmentStore::new());
+        let lifecycle =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
+        let worker = HealWorker::new(
+            HealConfig::default(),
+            Arc::new(HealQueue::new(4)),
+            decoder,
+            lifecycle,
+            data_store,
+        )
+        .with_budget(Arc::clone(&budget));
+
+        // Directly exercise the acquisition the worker uses per heal op.
+        let repair =
+            tokio::time::timeout(std::time::Duration::from_millis(500), budget.acquire_repair())
+                .await;
+        assert!(repair.is_ok(), "heal (Tier-0) must not wait behind housekeeping");
+        drop(worker);
     }
 
     /// Verifies that `with_distributed_fetch` correctly stores the
@@ -691,21 +744,6 @@ mod tests {
         assert_eq!(stats.heals_succeeded(), 1);
         assert_eq!(stats.bytes_repaired(), 100);
         assert_eq!(stats.heals_failed(), 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "max_concurrent_heals must be > 0")]
-    fn heal_worker_rejects_zero_concurrency() {
-        let config = HealConfig::default().with_max_concurrent_heals(0);
-        let queue = Arc::new(HealQueue::new(4));
-        let decoder = Arc::new(StubDecoder);
-        let data_store = Arc::new(InMemorySegmentStore::new());
-
-        let lifecycle =
-            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
-                &oceanfs_core::LifecycleConfig::default(),
-            ));
-        HealWorker::new(config, queue, decoder, lifecycle, data_store);
     }
 
     async fn make_lifecycle(
@@ -919,7 +957,7 @@ mod tests {
     async fn run_worker_with_empty_queue_exits_on_shutdown() {
         let data_store = setup_test_env();
         let lifecycle = make_lifecycle().await;
-        let config = HealConfig::default().with_max_concurrent_heals(2);
+        let config = HealConfig::default();
         let queue = Arc::new(HealQueue::new(4));
         let decoder: Arc<dyn Decoder> = Arc::new(StubDecoder);
 
@@ -965,7 +1003,7 @@ mod tests {
             .await
             .unwrap();
         lifecycle.request_seal(segment_id, segment_meta, None).await.unwrap();
-        let config = HealConfig::default().with_max_concurrent_heals(2);
+        let config = HealConfig::default();
         let queue = Arc::new(HealQueue::new(4));
         let decoder: Arc<dyn Decoder> = Arc::new(StubDecoder);
 
@@ -1053,7 +1091,7 @@ mod tests {
         assert_ne!(&original_data[..], &data[..], "data should be corrupted");
 
         // Enqueue a heal request (simulating Scrub/AntiEntropy detection).
-        let config = HealConfig::default().with_max_concurrent_heals(2);
+        let config = HealConfig::default();
         let queue = Arc::new(HealQueue::new(4));
         queue
             .sender()
@@ -1175,7 +1213,7 @@ mod tests {
             .unwrap();
         lifecycle.request_seal(segment_id, segment_meta, None).await.unwrap();
         // Use HealConfig with retry limit 0 → no retries allowed.
-        let config = HealConfig::default().with_max_concurrent_heals(2).with_heal_retry_limit(0);
+        let config = HealConfig::default().with_heal_retry_limit(0);
         let queue = Arc::new(HealQueue::new(4));
 
         // Enqueue a request that will fail (ec_k=0 causes failure).

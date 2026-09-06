@@ -16,9 +16,10 @@
 //!
 //! ## Concurrency control
 //!
-//! - **Perf rule 2.7/8.5:** a `tokio::sync::Semaphore` bounds the
-//!   number of concurrent repair operations to `max_concurrent_repairs`
-//!   (default 16).
+//! - **ADR-0017 amendment:** each pull/write acquires a **Tier-0
+//!   (repair)** permit from the shared `DurabilityBudget`
+//!   (`[durability].repair_max_active`, default 16) — the single
+//!   node-wide repair gate shared with heal and inbound hint apply.
 //! - **Perf rule 2.6:** a bounded mpsc queue (backpressure).
 //! - **Perf rule 8.1:** parallel holder fetch attempts use a bounded
 //!   `tokio::task::JoinSet` with `abort_all` on the first success —
@@ -38,11 +39,10 @@ use oceanfs_core::{
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_storage_api::SegmentDataStore;
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::{Error, HealingRpcClient, Result};
+use crate::{scheduler::DurabilityBudget, Error, HealingRpcClient, Result};
 
 // ---------------------------------------------------------------------------
 // ReRepConfig
@@ -56,22 +56,19 @@ use crate::{Error, HealingRpcClient, Result};
 /// use oceanfs_durability::repair::ReRepConfig;
 ///
 /// let config = ReRepConfig::default();
-/// assert_eq!(config.max_concurrent_repairs, 16);
 /// assert_eq!(config.queue_capacity, 1024);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReRepConfig {
     /// Bounded repair-request queue capacity (perf 2.6 backpressure).
     pub queue_capacity: usize,
-    /// Maximum concurrent repair operations (perf 2.7/8.5).
-    pub max_concurrent_repairs: usize,
     /// Maximum retry attempts for a single repair before giving up.
     pub retry_limit: u32,
 }
 
 impl Default for ReRepConfig {
     fn default() -> Self {
-        Self { queue_capacity: 1024, max_concurrent_repairs: 16, retry_limit: 3 }
+        Self { queue_capacity: 1024, retry_limit: 3 }
     }
 }
 
@@ -170,8 +167,10 @@ pub struct ReRepWorker {
     pool: Arc<ConnectionPool>,
     /// Membership for holder address resolution.
     membership: Arc<Membership>,
-    /// Semaphore bounding concurrent repair operations.
-    semaphore: Arc<Semaphore>,
+    /// The two-tier budget; each pull/write acquires a Tier-0 (repair)
+    /// permit when a budget is wired (composition root). `None` (tests)
+    /// leaves the worker unbounded.
+    budget: Option<Arc<DurabilityBudget>>,
     /// Per-operation timeout configuration.
     timeouts: Arc<OperationTimeouts>,
     /// Repair queue sender (fed by the RPC handler; interior mutability
@@ -182,13 +181,6 @@ pub struct ReRepWorker {
 
 impl ReRepWorker {
     /// Creates a new re-replication worker.
-    ///
-    /// The semaphore is initialized with
-    /// `config.max_concurrent_repairs` permits (perf rules 2.7, 8.5).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `config.max_concurrent_repairs` is zero.
     pub fn new(
         config: ReRepConfig,
         data_store: Arc<dyn SegmentDataStore>,
@@ -197,10 +189,9 @@ impl ReRepWorker {
         membership: Arc<Membership>,
         timeouts: Arc<OperationTimeouts>,
     ) -> Self {
-        assert!(config.max_concurrent_repairs > 0, "max_concurrent_repairs must be > 0");
         let (tx, rx) = tokio::sync::mpsc::channel(config.queue_capacity);
         Self {
-            semaphore: Arc::new(Semaphore::new(config.max_concurrent_repairs)),
+            budget: None,
             config,
             queue: parking_lot::Mutex::new(Some(rx)),
             data_store,
@@ -210,6 +201,15 @@ impl ReRepWorker {
             timeouts,
             sender: parking_lot::Mutex::new(Some(tx)),
         }
+    }
+
+    /// Wires the shared two-tier budget (ADR-0017 amendment): each
+    /// pull/write acquires a Tier-0 (repair) permit. The composition root
+    /// always calls this.
+    #[must_use]
+    pub fn with_budget(mut self, budget: Arc<DurabilityBudget>) -> Self {
+        self.budget = Some(budget);
+        self
     }
 
     /// Returns the bounded queue sender the `RequestReReplication` RPC
@@ -249,9 +249,9 @@ impl ReRepWorker {
 
     /// Runs the worker loop until the shutdown token is cancelled.
     ///
-    /// Continuously drains the bounded queue. Each request waits for a
-    /// semaphore permit (perf rules 2.7/8.5), then performs the repair;
-    /// on failure with remaining retries, re-enqueues with an
+    /// Continuously drains the bounded queue. Each request acquires a
+    /// Tier-0 (repair) budget permit (ADR-0017 amendment) then performs
+    /// the repair; on failure with remaining retries, re-enqueues with an
     /// incremented retry count.
     pub async fn run(self: Arc<Self>, shutdown: CancellationToken) {
         let mut rx = match self.queue.lock().take() {
@@ -300,16 +300,16 @@ impl ReRepWorker {
         let lifecycle = self.lifecycle.clone();
         let pool = self.pool.clone();
         let membership = self.membership.clone();
-        let semaphore = self.semaphore.clone();
+        let budget = self.budget.clone();
         let timeouts = self.timeouts.clone();
         let retry_limit = self.config.retry_limit;
         let sender = sender.clone();
 
         tokio::spawn(async move {
-            // Acquire semaphore permit (perf rules 2.7, 8.5).
-            let _permit = match semaphore.acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => return,
+            // Acquire a Tier-0 (repair) permit when a budget is wired.
+            let _permit = match budget {
+                Some(b) => Some(b.acquire_repair().await),
+                None => None,
             };
 
             match Self::execute_repair(
@@ -706,7 +706,6 @@ mod tests {
     #[test]
     fn rep_config_defaults_are_sane() {
         let config = ReRepConfig::default();
-        assert_eq!(config.max_concurrent_repairs, 16);
         assert_eq!(config.queue_capacity, 1024);
         assert_eq!(config.retry_limit, 3);
     }
@@ -720,24 +719,6 @@ mod tests {
             Some(NodeId::new("n1"))
         );
         assert_eq!(selector.pick_repair_target(&SegmentId::new(), &[]), None);
-    }
-
-    #[test]
-    #[should_panic(expected = "max_concurrent_repairs must be > 0")]
-    fn rep_worker_rejects_zero_concurrency() {
-        let config = ReRepConfig { max_concurrent_repairs: 0, ..Default::default() };
-        let lifecycle =
-            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
-                &oceanfs_core::LifecycleConfig::default(),
-            ));
-        let _worker = ReRepWorker::new(
-            config,
-            Arc::new(InMemorySegmentStore::new()),
-            lifecycle,
-            Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default())),
-            test_membership("n1"),
-            Arc::new(OperationTimeouts::default()),
-        );
     }
 
     /// The fetch returns an error when no holder is reachable.
@@ -765,12 +746,12 @@ mod tests {
         assert!(result.is_err(), "no reachable holder → error");
     }
 
-    /// The semaphore bounds concurrent repairs to
-    /// `max_concurrent_repairs` permits (perf 2.7/8.5).
+    /// The composition root wires the shared budget; a fresh worker has
+    /// none (tests) and `with_budget` installs the shared Tier-0 gate.
     #[tokio::test]
-    async fn semaphore_bounds_concurrent_repairs() {
+    async fn worker_wires_shared_repair_budget() {
         let worker = ReRepWorker::new(
-            ReRepConfig { max_concurrent_repairs: 3, ..Default::default() },
+            ReRepConfig::default(),
             Arc::new(InMemorySegmentStore::new()),
             Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
                 &oceanfs_core::LifecycleConfig::default(),
@@ -779,13 +760,21 @@ mod tests {
             test_membership("n1"),
             Arc::new(OperationTimeouts::default()),
         );
-        // All 3 permits are available on a fresh worker.
-        assert_eq!(worker.semaphore.available_permits(), 3);
-        // Acquiring all 3 exhausts the bound; a 4th acquisition waits.
-        let _p1 = worker.semaphore.acquire().await.unwrap();
-        let _p2 = worker.semaphore.acquire().await.unwrap();
-        let _p3 = worker.semaphore.acquire().await.unwrap();
-        assert_eq!(worker.semaphore.available_permits(), 0);
+        assert!(worker.budget.is_none(), "no budget before with_budget");
+
+        let budget = Arc::new(crate::scheduler::DurabilityBudget::new(16, 2));
+        let wired = ReRepWorker::new(
+            ReRepConfig::default(),
+            Arc::new(InMemorySegmentStore::new()),
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            )),
+            Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default())),
+            test_membership("n1"),
+            Arc::new(OperationTimeouts::default()),
+        )
+        .with_budget(budget);
+        assert!(wired.budget.is_some(), "with_budget installs the shared budget");
     }
 
     /// A lifecycle coordinator with a real event WAL (the durable writer

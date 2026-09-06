@@ -467,13 +467,11 @@ impl Default for NvcompConfig {
 /// use oceanfs_core::HealConfig;
 ///
 /// let config = HealConfig::default();
-/// assert_eq!(config.max_concurrent_heals(), 4);
+/// assert_eq!(config.queue_capacity(), 256);
 /// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct HealConfig {
-    /// Maximum number of concurrent heal operations (bounded via semaphore).
-    max_concurrent_heals: usize,
     /// Maximum retry attempts for a single heal request before giving up.
     heal_retry_limit: u32,
     /// Throughput limit in bytes per second (0 = unlimited).
@@ -484,21 +482,11 @@ pub struct HealConfig {
 
 impl Default for HealConfig {
     fn default() -> Self {
-        Self {
-            max_concurrent_heals: 4,
-            heal_retry_limit: 3,
-            heal_throttle_bytes_sec: 0,
-            queue_capacity: 256,
-        }
+        Self { heal_retry_limit: 3, heal_throttle_bytes_sec: 0, queue_capacity: 256 }
     }
 }
 
 impl HealConfig {
-    /// Returns the maximum number of concurrent heal operations.
-    pub fn max_concurrent_heals(&self) -> usize {
-        self.max_concurrent_heals
-    }
-
     /// Returns the maximum retry attempts per heal request.
     pub fn heal_retry_limit(&self) -> u32 {
         self.heal_retry_limit
@@ -512,13 +500,6 @@ impl HealConfig {
     /// Returns the capacity of the bounded heal queue.
     pub fn queue_capacity(&self) -> usize {
         self.queue_capacity
-    }
-
-    /// Sets the maximum number of concurrent heal operations.
-    #[must_use]
-    pub fn with_max_concurrent_heals(mut self, value: usize) -> Self {
-        self.max_concurrent_heals = value;
-        self
     }
 
     /// Sets the maximum retry attempts per heal request.
@@ -714,7 +695,6 @@ mod tests {
     #[test]
     fn heal_config_default_values() {
         let config = HealConfig::default();
-        assert_eq!(config.max_concurrent_heals(), 4);
         assert_eq!(config.heal_retry_limit(), 3);
         assert_eq!(config.heal_throttle_bytes_sec(), 0);
         assert_eq!(config.queue_capacity(), 256);
@@ -725,26 +705,14 @@ mod tests {
     fn test_heal_config_throttled() {
         let config = HealConfig::default().with_heal_throttle_bytes_sec(1024);
         assert_eq!(config.heal_throttle_bytes_sec(), 1024);
-
-        let config = config.with_max_concurrent_heals(16);
-        assert_eq!(config.max_concurrent_heals(), 16);
-        // Other fields unchanged.
         assert_eq!(config.heal_retry_limit(), 3);
     }
 
-    /// NodeConfig→HealConfig flow: builder pattern preserves explicit values.
+    /// NodeConfig→HealConfig flow: the throttle value flows through.
     #[test]
     fn test_heal_config_from_node_config_flow() {
-        // Simulate the node.rs construction pattern:
-        //   let heal_config = HealConfig::default()
-        //       .with_max_concurrent_heals(config.heal_parallel_segments)
-        //       .with_heal_throttle_bytes_sec(config.heal_throttle_bytes_sec);
-        let heal_parallel_segments = 16;
         let heal_throttle_bytes_sec = 1048576;
-        let config = HealConfig::default()
-            .with_max_concurrent_heals(heal_parallel_segments)
-            .with_heal_throttle_bytes_sec(heal_throttle_bytes_sec);
-        assert_eq!(config.max_concurrent_heals(), 16);
+        let config = HealConfig::default().with_heal_throttle_bytes_sec(heal_throttle_bytes_sec);
         assert_eq!(config.heal_throttle_bytes_sec(), 1048576);
     }
 }

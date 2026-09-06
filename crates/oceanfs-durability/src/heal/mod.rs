@@ -12,8 +12,9 @@
 //! - [`HealWorker`]: A background task that drains the heal queue, fetches
 //!   `k` healthy shards from peer nodes via gRPC, calls
 //!   [`oceanfs_ec::Decoder::decode`] to reconstruct corrupt or missing shards,
-//!   writes the repaired data back, and updates metadata. Concurrency is
-//!   bounded by a semaphore (perf rule 2.7/8.5).
+//!   writes the repaired data back, and updates metadata. Each heal op
+//!   acquires a Tier-0 (repair) permit from the shared `DurabilityBudget`
+//!   (ADR-0017 amendment) — the single node-wide repair gate.
 //!
 //! ## Data Flow
 //!

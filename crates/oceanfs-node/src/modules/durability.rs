@@ -18,9 +18,10 @@ use std::{net::SocketAddr, sync::Arc};
 
 use oceanfs_core::{CodecConfig, MetricRegistrar, NodeConfig, NodeId, OperationTimeouts};
 use oceanfs_durability::{
-    AntiEntropy, GarbageCollector, GrpcHintDeliveryClient, HealConfig, HealQueue, HealWorker,
-    HintedHandoff, HintedHandoffConfig, HintedHandoffManager, OrphanReaper, ReRepWorker,
-    ScrubConfig, ScrubCoordinator,
+    AeTask, AntiEntropy, DurabilityBudget, DurabilityScheduler, GarbageCollector, GcTask,
+    GrpcHintDeliveryClient, HealConfig, HealQueue, HealWorker, HintedHandoff, HintedHandoffConfig,
+    HintedHandoffManager, OrphanReaper, OrphanTask, ReRepWorker, ScrubConfig, ScrubCoordinator,
+    ScrubTask,
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
@@ -39,8 +40,9 @@ use crate::{
 /// One `Arc` per background worker + the shared cross-worker handles the
 /// node's later sections (spawns, gRPC services, admin, accessors)
 /// consume. Metrics registration is centralized in
-/// [`register_metrics`](Self::register_metrics); the ADR-0017 scheduler
-/// epic will wrap this bundle later.
+/// [`register_metrics`](Self::register_metrics). ADR-0017 is built in:
+/// `budget` is the two-tier admission budget and `scheduler` drives the
+/// four Tier-1 housekeeping cycles.
 pub(crate) struct DurabilityModule {
     /// Garbage collector (compaction + reaping orchestration).
     pub(crate) gc: Arc<GarbageCollector>,
@@ -79,6 +81,13 @@ pub(crate) struct DurabilityModule {
     /// write path enqueues through it; its prune + delivery watcher
     /// loops are spawned by [`spawn_loops`](Self::spawn_loops).
     pub(crate) hinted_handoff_manager: Arc<HintedHandoffManager>,
+    /// Two-tier admission budget (ADR-0017 amendment) shared by the
+    /// scheduler (Tier-1) and heal/re-rep/hint-apply (Tier-0). Handed to
+    /// the server builder for the healing gRPC service.
+    pub(crate) budget: Arc<DurabilityBudget>,
+    /// ADR-0017 scheduler: drives the four Tier-1 housekeeping cycles
+    /// under Tier-1 permits from the shared budget.
+    pub(crate) scheduler: Arc<DurabilityScheduler>,
 }
 
 impl DurabilityModule {
@@ -124,6 +133,13 @@ impl DurabilityModule {
             config.gc_max_concurrent_compactions,
             config.gc_compaction_queue_capacity,
         );
+        // The two-tier admission budget (ADR-0017 amendment): Tier-0
+        // (repair) never gated behind Tier-1 (housekeeping); FIFO-fair
+        // within a tier. Values from `[durability]`.
+        let budget = Arc::new(DurabilityBudget::new(
+            config.durability.repair_max_active,
+            config.durability.housekeeping_max_active,
+        ));
         // Announcement transmit metrics (g3 — ADR-0029 §D4
         // observability). Shared by the loss-announcer and the compactor
         // remap closures; registered with the central metrics registry.
@@ -148,14 +164,17 @@ impl DurabilityModule {
         // The acquiring-side worker (bound to THIS node's pool-aware
         // store + lifecycle; the migration pool/membership are injected
         // plane-agnostically, ADR-0030 Decision 4).
-        let rep_worker = Arc::new(ReRepWorker::new(
-            oceanfs_durability::ReRepConfig::default(),
-            storage.data_store.clone(),
-            storage.lifecycle.clone(),
-            pool.clone(),
-            membership.clone(),
-            Arc::new(config.operation_timeouts),
-        ));
+        let rep_worker = Arc::new(
+            ReRepWorker::new(
+                oceanfs_durability::ReRepConfig::default(),
+                storage.data_store.clone(),
+                storage.lifecycle.clone(),
+                pool.clone(),
+                membership.clone(),
+                Arc::new(config.operation_timeouts),
+            )
+            .with_budget(budget.clone()),
+        );
         // [review][config][high]
         // reconciliation configuration should be fully configurable by the end user
         // [end]
@@ -353,9 +372,8 @@ impl DurabilityModule {
         ));
 
         // ---- 7c. Construct heal dispatch pipeline ----
-        let heal_config = HealConfig::default()
-            .with_max_concurrent_heals(config.heal_parallel_segments)
-            .with_heal_throttle_bytes_sec(config.heal_throttle_bytes_sec);
+        let heal_config =
+            HealConfig::default().with_heal_throttle_bytes_sec(config.heal_throttle_bytes_sec);
         let heal_queue = Arc::new(HealQueue::new(heal_config.queue_capacity()));
         // Initialize the global heal sender so scrub and anti-entropy can
         // call enqueue_heal() without direct queue access.
@@ -379,7 +397,8 @@ impl DurabilityModule {
                 storage.lifecycle.clone(),
                 storage.data_store.clone(),
             )
-            .with_timeouts(op_timeouts.clone()),
+            .with_timeouts(op_timeouts.clone())
+            .with_budget(budget.clone()),
         );
 
         // ---- Hinted handoff machinery (c5 re-seat of node.rs §11) ----
@@ -428,6 +447,36 @@ impl DurabilityModule {
             .await
             .map_err(|e| format!("hinted handoff WAL replay: {e}"))?;
 
+        // ADR-0017: construct the scheduler over the four Tier-1
+        // adaptors (f1) with their existing cadence fields. Each cycle
+        // acquires a Tier-1 permit from the shared budget.
+        let task_timeout = if config.durability.task_timeout_sec == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(config.durability.task_timeout_sec))
+        };
+        let mut scheduler = DurabilityScheduler::new(budget.clone(), task_timeout);
+        scheduler.register(std::sync::Arc::new(GcTask::new(
+            gc_worker.clone(),
+            storage.metadata_store.clone(),
+            Arc::clone(&storage.lifecycle_registry),
+            std::time::Duration::from_secs(config.gc_interval_sec),
+        )));
+        scheduler.register(std::sync::Arc::new(OrphanTask::new(
+            reaper.clone(),
+            std::time::Duration::from_secs(config.orphan_reaper_interval_sec),
+        )));
+        scheduler.register(std::sync::Arc::new(ScrubTask::new(
+            scrub_worker.clone(),
+            Arc::clone(&storage.lifecycle_registry),
+            storage.data_store.clone(),
+            std::time::Duration::from_secs(config.scrub_interval_sec),
+        )));
+        scheduler.register(std::sync::Arc::new(AeTask::new(
+            ae_worker.clone(),
+            std::time::Duration::from_secs(config.ae_interval_sec),
+        )));
+
         Ok(Self {
             gc: gc_worker,
             ae: ae_worker,
@@ -443,6 +492,8 @@ impl DurabilityModule {
             announce_metrics,
             hinted_handoff,
             hinted_handoff_manager,
+            budget,
+            scheduler: Arc::new(scheduler),
         })
     }
 
@@ -467,6 +518,9 @@ impl DurabilityModule {
         // (The legacy HintedHandoff — the gRPC *receiver* — is not
         // registered: its counters had inverted semantics and stayed 0.)
         self.hinted_handoff_manager.register_metrics(registrar);
+        // ADR-0017: the two-tier budget + scheduler cycle metrics.
+        self.budget.register_metrics(registrar);
+        self.scheduler.register_metrics(registrar);
     }
 
     /// Spawns every durability-owned background loop (c5 — each worker
@@ -485,7 +539,7 @@ impl DurabilityModule {
     pub(crate) fn spawn_loops(
         &self,
         config: &NodeConfig,
-        storage: &StorageModule,
+        _storage: &StorageModule,
         membership: Arc<Membership>,
         membership_state_store: MembershipStateStore,
         bg: &mut BackgroundTasks,
@@ -495,174 +549,27 @@ impl DurabilityModule {
         use tokio_util::sync::CancellationToken;
         use tracing::{info, warn};
 
-        // The spawned loops hold the registry across 'static spawns.
-        let gc_registry = Arc::clone(&storage.lifecycle_registry);
-        let scrub_registry = Arc::clone(&storage.lifecycle_registry);
-
-        // GC: runs every gc_interval_sec from config.
-        let gc_cancel = CancellationToken::new();
-        let gc_token = gc_cancel.clone();
-        let gc_store = storage.metadata_store.clone();
-        let gc_interval = Duration::from_secs(config.gc_interval_sec);
-        let io_idle = config.background_io_class_idle;
-        let cpu_idle = config.background_cpu_sched_idle;
-        let gc_worker = Arc::clone(&self.gc);
-        bg.gc = Some(tokio::spawn(async move {
-            if io_idle {
-                oceanfs_storage::io::apply_background_io_class("gc");
-            }
-            if cpu_idle {
-                oceanfs_storage::io::apply_background_cpu_sched("gc");
-            }
-            let mut interval = tokio::time::interval(gc_interval);
-            loop {
-                tokio::select! {
-                    _ = gc_token.cancelled() => {
-                        info!("GC task cancelled");
-                        break;
-                    }
-                    _ = interval.tick() => {
-                        if let Err(e) = gc_worker.run_cycle(gc_store.clone(), &gc_registry).await
-                        {
-                            warn!("GC cycle error: {e}");
-                        }
-                    }
-                }
-            }
+        // ADR-0017 (amended): the four scheduled housekeeping cycles
+        // (GC, orphan reaper, scrub, AE) run on the DurabilityScheduler,
+        // each cycle under a Tier-1 permit from the shared budget. The
+        // per-task interval loops that lived here are deleted (f4).
+        let scheduler_cancel = CancellationToken::new();
+        let scheduler_token = scheduler_cancel.clone();
+        let scheduler_for_spawn = Arc::clone(&self.scheduler);
+        bg.durability_scheduler = Some(tokio::spawn(async move {
+            let handle = scheduler_for_spawn.spawn(scheduler_token).await;
+            let _ = handle.await;
+            info!("Durability scheduler stopped");
         }));
-        bg.gc_cancel = gc_cancel;
-
-        // Anti-entropy: runs every ae_interval_sec from config.
-        // Continuous mode exchanges Merkle ROOTS with peers via the
-        // incremental tree — it never reads segment data, so per-cycle
-        // cost is O(sealed segments) metadata calls instead of reading
-        // every segment file (GBs per cycle on the phase-2 SUT, which
-        // stalled cycles for 90s+ under load and spiked RSS). The full
-        // cycle (reads all data + rebuilds trees) stays available for
-        // `continuous_enabled = false`.
-        let ae_cancel = CancellationToken::new();
-        let ae_token = ae_cancel.clone();
-        let ae_interval_secs = config.ae_interval_sec;
-        let ae_continuous = config.anti_entropy.continuous_enabled;
-        let io_idle = config.background_io_class_idle;
-        let cpu_idle = config.background_cpu_sched_idle;
-        let ae_worker = Arc::clone(&self.ae);
-        bg.anti_entropy = Some(tokio::spawn(async move {
-            if io_idle {
-                oceanfs_storage::io::apply_background_io_class("anti-entropy");
-            }
-            if cpu_idle {
-                oceanfs_storage::io::apply_background_cpu_sched("anti-entropy");
-            }
-            let mut interval = tokio::time::interval(Duration::from_secs(ae_interval_secs));
-            loop {
-                tokio::select! {
-                    _ = ae_token.cancelled() => {
-                        info!("Anti-entropy task cancelled");
-                        break;
-                    }
-                    _ = interval.tick() => {
-                        let result = if ae_continuous {
-                            ae_worker.run_continuous_cycle().await
-                        } else {
-                            ae_worker.run_cycle().await
-                        };
-                        if let Err(e) = result {
-                            warn!("Anti-entropy cycle error: {e}");
-                        }
-                    }
-                }
-            }
-        }));
-        bg.ae_cancel = ae_cancel;
-
-        // Scrub: runs every scrub_interval_sec from config.
-        let scrub_cancel = CancellationToken::new();
-        let scrub_token = scrub_cancel.clone();
-        let scrub_data = storage.data_store.clone();
-        let scrub_interval_secs = config.scrub_interval_sec;
-        let io_idle = config.background_io_class_idle;
-        let cpu_idle = config.background_cpu_sched_idle;
-        let scrub_worker = Arc::clone(&self.scrub);
-        bg.scrub = Some(tokio::spawn(async move {
-            if io_idle {
-                oceanfs_storage::io::apply_background_io_class("scrub");
-            }
-            if cpu_idle {
-                oceanfs_storage::io::apply_background_cpu_sched("scrub");
-            }
-            let mut interval = tokio::time::interval(Duration::from_secs(scrub_interval_secs));
-            loop {
-                tokio::select! {
-                    _ = scrub_token.cancelled() => {
-                        info!("Scrub task cancelled");
-                        break;
-                    }
-                    _ = interval.tick() => {
-                        match scrub_worker
-                            .run_cycle(Arc::clone(&scrub_registry), scrub_data.clone())
-                            .await
-                        {
-                            Ok(report) => {
-                                if report.segments_corrupt() > 0 {
-                                    warn!(
-                                        corrupt = report.segments_corrupt(),
-                                        "scrub detected corrupt segments"
-                                    );
-                                }
-                            }
-                            Err(e) => warn!("Scrub cycle error: {e}"),
-                        }
-                    }
-                }
-            }
-        }));
-        bg.scrub_cancel = scrub_cancel;
-
-        // Orphan reaper: runs every orphan_reaper_interval_sec from config.
-        let reaper_cancel = CancellationToken::new();
-        let reaper_token = reaper_cancel.clone();
-        let reaper_interval = Duration::from_secs(config.orphan_reaper_interval_sec);
-        let io_idle = config.background_io_class_idle;
-        let cpu_idle = config.background_cpu_sched_idle;
-        let reaper = Arc::clone(&self.reaper);
-        bg.orphan_reaper = Some(tokio::spawn(async move {
-            if io_idle {
-                oceanfs_storage::io::apply_background_io_class("orphan-reaper");
-            }
-            if cpu_idle {
-                oceanfs_storage::io::apply_background_cpu_sched("orphan-reaper");
-            }
-            let mut interval = tokio::time::interval(reaper_interval);
-            loop {
-                tokio::select! {
-                    _ = reaper_token.cancelled() => {
-                        info!("Orphan reaper task cancelled");
-                        break;
-                    }
-                    _ = interval.tick() => {
-                        if let Err(e) = reaper.run_cycle().await {
-                            warn!("Orphan reaper cycle error: {e}");
-                        }
-                    }
-                }
-            }
-        }));
-        bg.reaper_cancel = reaper_cancel;
+        bg.scheduler_cancel = scheduler_cancel;
 
         // EC Heal worker: drains the HealQueue and repairs corrupt shards.
+        // Each heal op acquires a Tier-0 (repair) permit from the shared
+        // budget (ADR-0017 amendment) — the queue-driven spawn stays.
         let heal_cancel = CancellationToken::new();
         let heal_token = heal_cancel.clone();
-        let io_idle = config.background_io_class_idle;
-        let cpu_idle = config.background_cpu_sched_idle;
         let heal_worker = Arc::clone(&self.heal);
         bg.heal = Some(tokio::spawn(async move {
-            if io_idle {
-                oceanfs_storage::io::apply_background_io_class("heal");
-            }
-            if cpu_idle {
-                oceanfs_storage::io::apply_background_cpu_sched("heal");
-            }
             heal_worker.run(heal_token).await;
             info!("Heal worker task completed");
         }));

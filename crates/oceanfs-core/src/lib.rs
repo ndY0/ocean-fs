@@ -57,9 +57,9 @@ pub mod proto {
 pub mod proto_convert;
 
 pub use config::{
-    shard, AccelConfig, AntiEntropyConfig, AuthConfig, CompressionConfig, EventWalConfig,
-    LifecycleConfig, MetadataConfig, MissingRootPolicy, NodeConfig, PoolHealthConfig, PoolRole,
-    PoolTech, RingConfig, StorageConfig, StoragePoolConfig, WalConfig,
+    shard, AccelConfig, AntiEntropyConfig, AuthConfig, CompressionConfig, DurabilityConfig,
+    EventWalConfig, LifecycleConfig, MetadataConfig, MissingRootPolicy, NodeConfig,
+    PoolHealthConfig, PoolRole, PoolTech, RingConfig, StorageConfig, StoragePoolConfig, WalConfig,
 };
 pub use conflict::{ConflictResolver, LwwResolver, Resolution};
 pub use error::{Error, Result};

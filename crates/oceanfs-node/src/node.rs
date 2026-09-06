@@ -28,38 +28,22 @@ use crate::modules::server::PrefetchStoreAdapter;
 // ---------------------------------------------------------------------------
 // BackgroundTasks
 // ---------------------------------------------------------------------------
-// [review][architecture][critical]
-// we are running a lot of background tasks, each independently managing the following :
-// - concurrency
-// - scheduling
-// - event binding
-// this approach doesnt allow use to be able to manage the concurrency of background tasks at a global level.
-// i think we need a global task scheduler approach, with a semaphore driven global concurrency for background tasks.
-// this trully ensure the tasks cannot hurt the performance beyond a certain defined threshold.
-// also, we could integrate a reactor approach for the event driven communication between subsystems. this would simplify a few of them
-// i need an honest and torough discussion about this topic, since it is structurally very significant.
+// [review][architecture][critical][resolved]
+// RESOLVED by ADR-0017 (accepted) + its 2026-09-06 two-tier amendment and
+// this epic: the four scheduled housekeeping cycles (GC/orphan/scrub/AE)
+// run on a single DurabilityScheduler under a shared Tier-1 budget, and the
+// data-layer repair workers (heal/re-rep/inbound hint apply) draw from a
+// Tier-0 budget that is never gated behind housekeeping. The event-driven
+// "reactor" alternative was explicitly rejected (ADR-0017 §Considered-C;
+// review-2026-09 roadmap wave 5).
 // [end]
 /// Aggregated join handles and cancellation tokens for background loops.
 pub struct BackgroundTasks {
-    /// Garbage collector task.
-    pub(crate) gc: Option<JoinHandle<()>>,
-    /// GC cancellation token.
-    pub(crate) gc_cancel: CancellationToken,
-
-    /// Anti-entropy Merkle exchange task.
-    pub(crate) anti_entropy: Option<JoinHandle<()>>,
-    /// Anti-entropy cancellation token.
-    pub(crate) ae_cancel: CancellationToken,
-
-    /// Scrub scheduler task.
-    pub(crate) scrub: Option<JoinHandle<()>>,
-    /// Scrub cancellation token.
-    pub(crate) scrub_cancel: CancellationToken,
-
-    /// Orphan reaper task.
-    pub(crate) orphan_reaper: Option<JoinHandle<()>>,
-    /// Reaper cancellation token.
-    pub(crate) reaper_cancel: CancellationToken,
+    /// Durability scheduler (ADR-0017) — drives the four Tier-1
+    /// housekeeping cycles (GC/orphan/scrub/AE) under the shared budget.
+    pub(crate) durability_scheduler: Option<JoinHandle<()>>,
+    /// Durability scheduler cancellation token.
+    pub(crate) scheduler_cancel: CancellationToken,
 
     /// Prefetch engine background pre-warmer (only if prefetch is enabled).
     pub(crate) prefetch: Option<JoinHandle<()>>,
@@ -134,14 +118,8 @@ impl BackgroundTasks {
     /// background bundler calls them and assembles this value).
     pub(crate) fn new() -> Self {
         Self {
-            gc: None,
-            gc_cancel: CancellationToken::new(),
-            anti_entropy: None,
-            ae_cancel: CancellationToken::new(),
-            scrub: None,
-            scrub_cancel: CancellationToken::new(),
-            orphan_reaper: None,
-            reaper_cancel: CancellationToken::new(),
+            durability_scheduler: None,
+            scheduler_cancel: CancellationToken::new(),
             prefetch: None,
             prefetch_cancel: CancellationToken::new(),
             heal: None,
@@ -1009,10 +987,7 @@ impl Node {
 
         // ---- 4. Signal all background tasks to stop ----
         let bg = self.background;
-        bg.gc_cancel.cancel();
-        bg.ae_cancel.cancel();
-        bg.scrub_cancel.cancel();
-        bg.reaper_cancel.cancel();
+        bg.scheduler_cancel.cancel();
         bg.prefetch_cancel.cancel();
         bg.heal_cancel.cancel();
         bg.delivery_cancel.cancel();
@@ -1038,10 +1013,7 @@ impl Node {
         let fast = Duration::from_secs(self.config.shutdown_fast_grace_secs.max(1));
         let _ = tokio::time::timeout(grace, async {
             let _ = tokio::try_join!(
-                async { Self::await_handle(bg.gc).await },
-                async { Self::await_handle(bg.anti_entropy).await },
-                async { Self::await_handle(bg.scrub).await },
-                async { Self::await_handle(bg.orphan_reaper).await },
+                async { Self::await_handle(bg.durability_scheduler).await },
                 async { Self::await_handle(bg.heal).await },
                 async { Self::await_handle(bg.hinted_handoff_prune).await },
                 // The segment replicator drains its bounded channel; if it
@@ -1403,10 +1375,7 @@ mod tests {
         let config = test_config(&tmp);
         let node = Node::start(config).await.expect("start");
         let handles = [
-            node.background.gc.as_ref(),
-            node.background.anti_entropy.as_ref(),
-            node.background.scrub.as_ref(),
-            node.background.orphan_reaper.as_ref(),
+            node.background.durability_scheduler.as_ref(),
             node.background.heal.as_ref(),
             node.background.hinted_handoff_prune.as_ref(),
             node.background.hinted_handoff_delivery.as_ref(),
