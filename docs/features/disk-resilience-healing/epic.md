@@ -3,7 +3,7 @@ epic: "disk-resilience-healing"
 status: proposed
 priority: high
 created: 2026-08-22
-updated: 2026-08-22
+updated: 2026-09-06
 ---
 
 # Disk Resilience — Phase B: Failure Semantics & Healing — Epic Plan
@@ -50,14 +50,16 @@ binding for this epic's features:
    durability). B5's capacity-aware target selection must be injected as a
    trait from the node layer (which holds the manifest cache, f7).
 5. **The objects CF cannot be rebuilt from the WAL.** `WalEntry`
-   (wal/entry.rs:52-79) carries segment position + data + HLC, but NO
+   (wal/entry.rs:76-78) carries segment position + data + HLC, but NO
    bucket/key — object→chunk mapping exists only in the objects CF
-   (store.rs:237-244: only `objects` + `deletions` CFs remain). B8 needs a
-   new peer RPC to list object rows in a ring range.
+   (metadata/store.rs:309-316: RocksDB opens only `objects` + `deletions`
+   CFs). g8 needs a new peer RPC to list object rows in a ring range.
 6. **Segment state survives metadata-pool loss.** Segment lifecycle lives in
-   the event-WAL + checkpoint + registry (ADR-0024/25; node.rs:1159-1181),
-   pinned to the WAL pool (Phase A f4). A metadata-pool death loses only
-   objects/tombstones CFs — segments and their `pool_id` mapping survive.
+   the event-WAL + checkpoint + in-memory registry (ADR-0024/25; event WAL
+   + checkpoint on `{wal}/…`, pool_paths.rs:76-83; the boot fold at
+   modules/storage.rs:562-596), pinned to the WAL pool (Phase A f4). A
+   metadata-pool death loses only the objects/deletions CFs — segments and
+   their `pool_id` mapping survive.
 
 ## Feature DAG
 
@@ -80,9 +82,14 @@ segment ring after a sealed segment's full data section is pushed to its
 replicas and `storage_locations` is stamped. g3's fan-out targets
 (`storage_locations − self`) are real only because of it. After the
 backbone, g3/g4/g6 are independent; g5 needs g4 (repair requests); g7
-needs g3 (own loss announcement) + g5 (fetch machinery); g8 needs g2
+needs g3 (own loss announcement) + g5 (fetch machinery) plus the
+replicated-lifecycle-state ADR **ADR-0035** (recovery pulls seal-time
+metadata from live holders' registry entries — the holder's push-time
+copy IS the replicated state) and a mandatory live-remount path
+(`HealthMonitor::reset_pool` + the registry write gate); g8 needs g2
 (metadata-dead detection) + g5 (reuses its fetch/worker pattern — but NO
-re-replication runs; see the feature's correction note).
+re-replication runs; segment lifecycle state is untouched; see the
+feature's correction note).
 
 | # | Feature | Touches | Depends on |
 |---|---|---|---|
@@ -93,8 +100,8 @@ re-replication runs; see the feature's correction note).
 | g4 | `reconciliation` — event-driven pull safety net + read-driven dangling-metadata repair (GAP-1 failsafe) | node, durability, server, storage | g2, sealed-segment-replication |
 | g5 | `re-replication-worker` — target-pull repair execution, capacity-aware targets (ADR-0030) | durability, node, storage | g4 |
 | g6 | `routing-manifests` — read/write path filters, hint target preference | node, server | g2, f7 (Phase A) |
-| g7 | `wal-loss-recovery` — fresh WAL, registry rebuild, catch-up from replicas | durability, node, storage | g3, g5 |
-| g8 | `metadata-loss-recovery` — unavailability, fresh store, objects rebuild (NO re-replication) | node, server, storage | g2, g5 |
+| g7 | `wal-loss-recovery` — replaced-WAL detection, holder-metadata registry rebuild, catch-up from replicas | durability, node, storage | g3, g5 (+ ADR-0035, live-remount path) |
+| g8 | `metadata-loss-recovery` — `node_unavailable` manifest flag, fresh store, objects+deletions range rebuild (NO re-replication) | node, membership, durability, storage | g2, g5 |
 
 ## Acceptance bar (epic DoD)
 
@@ -110,12 +117,15 @@ re-replication runs; see the feature's correction note).
       segments.
 - [ ] wal-pool kill: writes rejected (write_degraded) + reads continue;
       replacement with a fresh WAL resumes writes after catch-up — no data
-      loss (verified via objects-CF-driven missing-segment enumeration).
+      loss and no data-pool `.dat` swept (registry rebuilt from holders
+      under ADR-0035; the startup residue sweep is suppressed on the
+      replaced branch).
 - [ ] metadata-pool kill: node serves nothing, peers route around without
-      SWIM suspicion timeouts, fresh store rebuilds objects from peers
-      (NO re-replication — data pools + registry are intact), node
-      rejoins serving — zero cluster data loss, zero re-replication
-      traffic.
+      SWIM suspicion timeouts (the node-level `node_unavailable` manifest
+      flag), fresh store rebuilds objects AND deletions rows from peers
+      (NO re-replication — data pools + registry are intact; g8 never
+      touches segment lifecycle state), node rejoins serving — zero
+      cluster data loss, zero re-replication traffic.
 - [ ] No node eviction storm: SWIM state stays Alive throughout disk-level
       events (probes are socket-only, ADR-0028).
 - [ ] All Phase A suites stay green (regression); clippy/fmt/rustdoc clean
