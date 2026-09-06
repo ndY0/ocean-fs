@@ -74,6 +74,56 @@ pub struct MerkleResponse {
     #[prost(message, repeated, tag = "5")]
     pub internal_nodes: ::prost::alloc::vec::Vec<TreeNode>,
 }
+/// Request for the replicated-lifecycle metadata pull (ADR-0035 D2).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SegmentLifecycleQuery {
+    /// The segment ids the recovering node found in its intact data-pool
+    /// `.dat` roots (and/or referenced by its objects CF).
+    #[prost(message, repeated, tag = "1")]
+    pub segment_ids: ::prost::alloc::vec::Vec<::oceanfs_core::proto::common::SegmentId>,
+}
+/// One segment's replicated lifecycle metadata as held by the responder
+/// (ADR-0035 D1). Field semantics mirror the sealed-segment push payload
+/// (oceanfs.segment.PushSealedSegmentRequest) plus the registry-only
+/// fields the holder entry carries.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SegmentLifecycleEntry {
+    #[prost(message, optional, tag = "1")]
+    pub segment_id: ::core::option::Option<::oceanfs_core::proto::common::SegmentId>,
+    /// SegmentState as u8 (0 = Reserved, 1 = Sealed, 2 = Deleted). The
+    /// responder only streams Sealed entries.
+    #[prost(uint32, tag = "2")]
+    pub state: u32,
+    /// oceanfs_core::SizeTier as u8 (0=Inline 1=Small 2=Standard 3=Multi).
+    #[prost(uint32, tag = "3")]
+    pub tier: u32,
+    #[prost(uint32, tag = "4")]
+    pub ec_k: u32,
+    #[prost(uint32, tag = "5")]
+    pub ec_m: u32,
+    /// The seal-time BLAKE3 root over the data section (32 bytes).
+    #[prost(bytes = "bytes", tag = "6")]
+    pub merkle_root: ::prost::bytes::Bytes,
+    /// The replica holder set (the registry entry's storage_locations).
+    #[prost(message, repeated, tag = "7")]
+    pub storage_locations: ::prost::alloc::vec::Vec<
+        ::oceanfs_core::proto::common::NodeId,
+    >,
+    /// ADR-0034 D5 membership — the objects contained at seal time.
+    #[prost(message, repeated, tag = "8")]
+    pub contained_objects: ::prost::alloc::vec::Vec<
+        ::oceanfs_core::proto::segment::ContainedObject,
+    >,
+    /// The data-section byte total at seal (ADR-0034 D1).
+    #[prost(uint64, tag = "9")]
+    pub total_bytes: u64,
+    /// The storage pool owning the `.dat` (ADR-0029 §D1; 0 = legacy root).
+    #[prost(uint32, tag = "10")]
+    pub pool_id: u32,
+    /// Seal timestamp (ms since epoch).
+    #[prost(int64, tag = "11")]
+    pub sealed_at: i64,
+}
 /// A re-replication request from a holder-side dispatcher to an
 /// acquiring target node (ADR-0030 Decision 2).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -651,6 +701,43 @@ pub mod healing_rpc_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Pull the replicated lifecycle metadata for segments the caller
+        /// holds locally (ADR-0035 D1/D2 — g7 wal-pool-loss recovery). A
+        /// holder's registry entry is the segment's seal-time metadata replica
+        /// (the same fields the sealed-segment push carried,
+        /// oceanfs.segment.PushSealedSegmentRequest). Server-streaming: one
+        /// entry per requested id the holder actually holds as Sealed; ids the
+        /// holder does not hold (or has not sealed) are simply absent from the
+        /// stream — the caller's local-only recompute covers them (ADR-0035 D3).
+        pub async fn fetch_segment_lifecycle_metadata(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SegmentLifecycleQuery>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::SegmentLifecycleEntry>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/oceanfs.healing.HealingRpc/FetchSegmentLifecycleMetadata",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "oceanfs.healing.HealingRpc",
+                        "FetchSegmentLifecycleMetadata",
+                    ),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -745,6 +832,27 @@ pub mod healing_rpc_server {
             request: tonic::Request<super::RequestReReplicationRequest>,
         ) -> std::result::Result<
             tonic::Response<super::RequestReReplicationResponse>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the FetchSegmentLifecycleMetadata method.
+        type FetchSegmentLifecycleMetadataStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::SegmentLifecycleEntry, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Pull the replicated lifecycle metadata for segments the caller
+        /// holds locally (ADR-0035 D1/D2 — g7 wal-pool-loss recovery). A
+        /// holder's registry entry is the segment's seal-time metadata replica
+        /// (the same fields the sealed-segment push carried,
+        /// oceanfs.segment.PushSealedSegmentRequest). Server-streaming: one
+        /// entry per requested id the holder actually holds as Sealed; ids the
+        /// holder does not hold (or has not sealed) are simply absent from the
+        /// stream — the caller's local-only recompute covers them (ADR-0035 D3).
+        async fn fetch_segment_lifecycle_metadata(
+            &self,
+            request: tonic::Request<super::SegmentLifecycleQuery>,
+        ) -> std::result::Result<
+            tonic::Response<Self::FetchSegmentLifecycleMetadataStream>,
             tonic::Status,
         >;
     }
@@ -1229,6 +1337,56 @@ pub mod healing_rpc_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/oceanfs.healing.HealingRpc/FetchSegmentLifecycleMetadata" => {
+                    #[allow(non_camel_case_types)]
+                    struct FetchSegmentLifecycleMetadataSvc<T: HealingRpc>(pub Arc<T>);
+                    impl<
+                        T: HealingRpc,
+                    > tonic::server::ServerStreamingService<super::SegmentLifecycleQuery>
+                    for FetchSegmentLifecycleMetadataSvc<T> {
+                        type Response = super::SegmentLifecycleEntry;
+                        type ResponseStream = T::FetchSegmentLifecycleMetadataStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SegmentLifecycleQuery>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as HealingRpc>::fetch_segment_lifecycle_metadata(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = FetchSegmentLifecycleMetadataSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

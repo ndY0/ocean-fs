@@ -23,7 +23,8 @@ use crate::{
         healing_rpc_server::HealingRpc, FetchHintObjectChunk, FetchHintObjectRequest,
         FetchShardChunk, FetchShardRequest, HintRequest, HintResponse, LossAck, LossAnnouncement,
         MerkleRequest, MerkleResponse, PushRepairedShardRequest, PushRepairedShardResponse,
-        RemapAck, RequestReReplicationRequest, RequestReReplicationResponse, SegmentRemap,
+        RemapAck, RequestReReplicationRequest, RequestReReplicationResponse, SegmentLifecycleEntry,
+        SegmentLifecycleQuery, SegmentRemap,
     },
     hinted_handoff_rpc::{hint_record::Record, HintedHandoffRequest, HintedHandoffResponse},
 };
@@ -739,6 +740,8 @@ impl HealingRpc for HealingGrpcService {
     type FetchShardStream = tokio_stream::wrappers::ReceiverStream<Result<FetchShardChunk, Status>>;
     type FetchHintObjectStream =
         tokio_stream::wrappers::ReceiverStream<Result<FetchHintObjectChunk, Status>>;
+    type FetchSegmentLifecycleMetadataStream =
+        tokio_stream::wrappers::ReceiverStream<Result<SegmentLifecycleEntry, Status>>;
 
     async fn hinted_handoff_single(
         &self,
@@ -1771,6 +1774,86 @@ impl HealingRpc for HealingGrpcService {
                 Ok(Response::new(RequestReReplicationResponse { accepted: false }))
             }
         }
+    }
+
+    async fn fetch_segment_lifecycle_metadata(
+        &self,
+        request: Request<SegmentLifecycleQuery>,
+    ) -> Result<Response<Self::FetchSegmentLifecycleMetadataStream>, Status> {
+        let req = request.into_inner();
+
+        // The recovering node's candidates come from its intact data-pool
+        // `.dat` roots (+ objects-CF chunk refs). Answer only the ids this
+        // holder actually holds as Sealed; anything else is simply absent
+        // from the stream and the caller's local-only recompute covers it
+        // (ADR-0035 D3).
+        let mut entries: Vec<SegmentLifecycleEntry> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for proto_id in req.segment_ids {
+            let Ok(segment_id) = SegmentId::try_from(proto_id) else { continue };
+            if !seen.insert(segment_id) {
+                continue;
+            }
+            let Some(entry) = self.registry.get(segment_id) else { continue };
+            use oceanfs_storage::segment::lifecycle::SegmentState;
+            if entry.state != SegmentState::Sealed {
+                continue;
+            }
+            let meta = &entry.metadata;
+            let state_code = match entry.state {
+                SegmentState::Reserved => 0u32,
+                SegmentState::Sealed => 1u32,
+                SegmentState::Deleted => 2u32,
+                _ => 0u32,
+            };
+            let merkle_root: Bytes = meta
+                .merkle_root
+                .as_ref()
+                .map(|h| Bytes::copy_from_slice(h.as_bytes()))
+                .unwrap_or_default();
+            let contained: Vec<oceanfs_core::proto::segment::ContainedObject> = entry
+                .contained_objects
+                .as_deref()
+                .map(|objs| {
+                    objs.iter()
+                        .map(|co| oceanfs_core::proto::segment::ContainedObject {
+                            bucket: Some(oceanfs_core::proto::common::BucketId {
+                                name: co.bucket.as_str().to_string(),
+                            }),
+                            key: Some(oceanfs_core::proto::common::ObjectKey {
+                                key: co.key.as_str().to_string(),
+                            }),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let locations: Vec<oceanfs_core::proto::common::NodeId> = meta
+                .storage_locations
+                .iter()
+                .map(|node| node.clone().into())
+                .collect();
+            entries.push(SegmentLifecycleEntry {
+                segment_id: Some(segment_id.into()),
+                state: state_code,
+                tier: meta.size_tier as u32,
+                ec_k: meta.ec_k as u32,
+                ec_m: meta.ec_m as u32,
+                merkle_root,
+                storage_locations: locations,
+                contained_objects: contained,
+                total_bytes: meta.total_bytes,
+                pool_id: meta.pool_id,
+                sealed_at: meta.sealed_at.unwrap_or_default(),
+            });
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(entries.len().max(1));
+        for entry in entries {
+            if tx.send(Ok(entry)).await.is_err() {
+                break;
+            }
+        }
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 }
 

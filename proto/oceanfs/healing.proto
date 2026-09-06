@@ -105,6 +105,51 @@ service HealingRpc {
   // routing intent only — the data moves over FetchShard.
   rpc RequestReReplication(RequestReReplicationRequest)
       returns (RequestReReplicationResponse);
+
+  // Pull the replicated lifecycle metadata for segments the caller
+  // holds locally (ADR-0035 D1/D2 — g7 wal-pool-loss recovery). A
+  // holder's registry entry is the segment's seal-time metadata replica
+  // (the same fields the sealed-segment push carried,
+  // oceanfs.segment.PushSealedSegmentRequest). Server-streaming: one
+  // entry per requested id the holder actually holds as Sealed; ids the
+  // holder does not hold (or has not sealed) are simply absent from the
+  // stream — the caller's local-only recompute covers them (ADR-0035 D3).
+  rpc FetchSegmentLifecycleMetadata(SegmentLifecycleQuery)
+      returns (stream SegmentLifecycleEntry);
+}
+
+// Request for the replicated-lifecycle metadata pull (ADR-0035 D2).
+message SegmentLifecycleQuery {
+  // The segment ids the recovering node found in its intact data-pool
+  // `.dat` roots (and/or referenced by its objects CF).
+  repeated oceanfs.common.SegmentId segment_ids = 1;
+}
+
+// One segment's replicated lifecycle metadata as held by the responder
+// (ADR-0035 D1). Field semantics mirror the sealed-segment push payload
+// (oceanfs.segment.PushSealedSegmentRequest) plus the registry-only
+// fields the holder entry carries.
+message SegmentLifecycleEntry {
+  oceanfs.common.SegmentId segment_id = 1;
+  // SegmentState as u8 (0 = Reserved, 1 = Sealed, 2 = Deleted). The
+  // responder only streams Sealed entries.
+  uint32 state = 2;
+  // oceanfs_core::SizeTier as u8 (0=Inline 1=Small 2=Standard 3=Multi).
+  uint32 tier = 3;
+  uint32 ec_k = 4;
+  uint32 ec_m = 5;
+  // The seal-time BLAKE3 root over the data section (32 bytes).
+  bytes merkle_root = 6;
+  // The replica holder set (the registry entry's storage_locations).
+  repeated oceanfs.common.NodeId storage_locations = 7;
+  // ADR-0034 D5 membership — the objects contained at seal time.
+  repeated oceanfs.segment.ContainedObject contained_objects = 8;
+  // The data-section byte total at seal (ADR-0034 D1).
+  uint64 total_bytes = 9;
+  // The storage pool owning the `.dat` (ADR-0029 §D1; 0 = legacy root).
+  uint32 pool_id = 10;
+  // Seal timestamp (ms since epoch).
+  int64 sealed_at = 11;
 }
 
 // Why a re-replication repair was requested (ADR-0029 §D6 urgency; the
