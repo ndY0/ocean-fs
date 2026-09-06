@@ -27,6 +27,7 @@ mod membership_state;
 mod metadata_adapter;
 mod modules;
 mod node;
+pub mod peer_selection;
 pub mod pool_manifest;
 pub mod pool_paths;
 pub mod repair;

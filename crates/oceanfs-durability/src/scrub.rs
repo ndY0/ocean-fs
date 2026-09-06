@@ -269,9 +269,19 @@ pub(crate) struct ScrubResult {
 // ---------------------------------------------------------------------------
 
 /// A partition of the segment ID space assigned to a single node.
+///
+/// The unit the [`crate::peer_selection::PartitionPlanner`] returns and the
+/// [`ScrubWorker`] executes: `node_id` is the node that must scrub
+/// `segment_ids`, and every listed segment is one that `node_id` holds
+/// (a member of that segment's `storage_locations`). The local-only case
+/// (`node_id == self`) covers segments with no eligible remote holder.
+///
+/// This record is `#[doc(hidden)]` because it is a cross-crate *wire* value
+/// produced by the node-layer planner and consumed by the durability
+/// engine — not part of the stable public surface operators read.
 #[derive(Debug, Clone)]
 #[doc(hidden)]
-pub(crate) struct SegmentPartition {
+pub struct SegmentPartition {
     /// The node ID responsible for this partition.
     pub node_id: NodeId,
     /// The segment IDs in this partition.

@@ -33,6 +33,7 @@ pub mod gc;
 pub mod heal;
 pub mod hinted_handoff;
 pub mod merkle;
+pub mod peer_selection;
 pub mod reconcile;
 pub mod repair;
 pub mod scheduler;
@@ -60,6 +61,7 @@ pub use hinted_handoff::{
     HintObjectReader, HintRecord, HintWal, HintedHandoff, HintedHandoffConfig,
     HintedHandoffManager,
 };
+pub use peer_selection::{PartitionPlanner, PeerSelector};
 pub use reconcile::{
     live_copy_count, HolderIndex, NoopRepairSink, ReconcileConfig, ReconciliationLoop,
 };
@@ -68,7 +70,7 @@ pub use scheduler::{
     AeTask, DurabilityBudget, DurabilityPermit, DurabilityScheduler, DurabilityTask,
     DurabilityTier, GcTask, KeyspaceWindow, OrphanTask, ScrubTask,
 };
-pub use scrub::{ScrubConfig, ScrubCoordinator, ScrubReport, ScrubReportBuilder};
+pub use scrub::{ScrubConfig, ScrubCoordinator, ScrubReport, ScrubReportBuilder, SegmentPartition};
 
 // ---------------------------------------------------------------------------
 // Generated gRPC service stubs
