@@ -1190,9 +1190,17 @@ impl Node {
             for abort in &aborts {
                 abort.abort();
             }
+            // Bounded re-reap: an aborted task is only stopped once the
+            // runtime polls its cancellation, so join the wrappers (which
+            // await the original JoinHandles) for a short bound. This
+            // ensures the aborted tasks actually drop their Arc<DB> /
+            // listener before the group returns on the abort path.
+            let _ = tokio::time::timeout(Duration::from_millis(250), async {
+                while waiter.join_next().await.is_some() {}
+            })
+            .await;
         }
     }
-
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------

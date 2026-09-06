@@ -191,12 +191,16 @@ impl PrefetchEngine {
 
     /// Stops the background worker and waits for it to exit.
     ///
-    /// Cancels the worker's shutdown token and awaits its join handle
-    /// (bounded by a short timeout), draining any in-flight prefetch
-    /// tasks. After this returns, the worker no longer holds the
-    /// metadata-store clone, so callers that drop the engine can safely
-    /// reopen a same-directory store. Idempotent; returns promptly when
-    /// the worker was never spawned (no tokio runtime at construction).
+    /// Cancels the worker's shutdown token and awaits its join handle,
+    /// draining in-flight prefetch tasks. The await is bounded by a
+    /// short timeout (2 s): prefetch lookups are short synchronous store
+    /// reads, so a drain that exceeds the bound implies a stalled store
+    /// and the worker is detached as a best-effort backstop. On the
+    /// normal path the worker has exited and no longer holds its
+    /// metadata-store clone when this returns; callers that drop the
+    /// engine afterwards additionally release the engine's own store
+    /// clone. Idempotent; returns promptly when the worker was never
+    /// spawned (no tokio runtime at construction).
     ///
     /// # Examples
     ///
