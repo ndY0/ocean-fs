@@ -260,7 +260,9 @@ replacement (marker / live remount) ──▶ WalRecoveryMode::RebuildFromHolder
 - [x] **Code:** `cargo build --all-targets` in `oceanfs-node`,
       `oceanfs-durability`, `oceanfs-storage` (+ proto regen) — clean at
       HEAD `166348a`; `cargo clippy --lib -- -D warnings` clean on
-      production code
+      production code (re-verified at the review HEAD `0c4ac71` for
+      `oceanfs-node` + `oceanfs-cache`: lib tests 92/92, cache lib 58/58,
+      doc tests 44/44, rustdoc `-D warnings` clean)
 - [x] **Tests:** all listed green — replacement detection (incl. the
       empty-placeholder audit-C1 regression), residue-sweep suppression,
       candidate enumeration, holder-metadata fold (byte-exact), local-only
@@ -268,9 +270,15 @@ replacement (marker / live remount) ──▶ WalRecoveryMode::RebuildFromHolder
       the 3-node **live-remount** integration passes (asserts the outage
       503, reads served during the outage, no data-pool `.dat` swept, the
       write gate clears, and every pre-outage key reads back
-      byte-identical). The boot-variant integration and a live
-      holder-fold/catch-up e2e are NOT present; the reviewer accepted the
-      unit-level substitute coverage (see Deviations a/c)
+      byte-identical). The **boot-variant** integration
+      (`boot_variant_heals_after_out_of_band_wal_replacement`, added at
+      HEAD `d0e2359`) now passes and exercises the D2 holder fold +
+      catch-up drain against a genuinely empty registry end-to-end (the
+      run-time drain reports `candidates=6 restored=6 missing=0
+      caught_up=0`), so the former unit-level substitute coverage
+      recorded in Deviations a/c is superseded by a live e2e (verified
+      at the review HEAD `0c4ac71` — see the review record on
+      Deviations a/c)
 - [x] **Docs:** `# Examples` on pub items; rustdoc clean
       (`RUSTDOCFLAGS="-D warnings" cargo doc`, affected crates). One
       PRE-EXISTING broken doctest in `oceanfs-storage`
@@ -286,8 +294,16 @@ replacement (marker / live remount) ──▶ WalRecoveryMode::RebuildFromHolder
       live-remount test asserts writes rejected (503) during the outage,
       reads served throughout, no data-pool `.dat` swept by recovery, the
       write gate cleared post-remount, and every written key read back
-      byte-identical post-recovery (the deferred boot-variant e2e is
-      Deviations a)
+      byte-identical post-recovery. The **boot variant** of the same DoD
+      (out-of-band replacement + restart, previously deferred — see
+      Deviations a) is now covered by
+      `boot_variant_heals_after_out_of_band_wal_replacement`
+      (crates/oceanfs-node/tests/wal_pool_recovery.rs), which restarts A
+      in-process on the same dirs/addresses after its pool-wal is
+      emptied and asserts the replaced-branch metrics
+      (`oceanfs_wal_replaced_total ≥ 1` and
+      `oceanfs_wal_recovery_registry_rebuilt_segments ≥ 1`), write-gate
+      clearing, byte-identical read-back and no `.dat` swept
 
 ## Deviations (accepted)
 
@@ -299,6 +315,12 @@ which the implementation follows. The lettered items (a)-(d) are the
 review-agreed coverage/behavior deltas recorded when the feature closed,
 and the last two bullets are review-hardening refinements folded in for
 accuracy.
+
+Follow-up review (boot-variant closure) at HEAD `0c4ac71` (commits
+`82fec21`, `d0e2359`, `0c4ac71`, 2026-09-06): **PASS** — the
+shutdown-cancellation propagation and the boot-variant e2e close
+deviation **(a)** and upgrade deviation **(c)**; both bullets below
+carry the closure record.
 
 - **Registry rebuild is holder-pulled, not `.dat`-scanned.** Original
   (2026-08-22) g7 rebuilt the registry by scanning data-pool `.dat` roots.
@@ -356,6 +378,22 @@ accuracy.
   residue-sweep suppression, D3 classifier truth table, candidate
   enumeration, holder fold, D3 recompute) and the live-remount integration
   test passes; the reviewer accepted this substitute coverage.
+
+  **RESOLVED at the review HEAD `0c4ac71`** (closure commits `82fec21`
+  + `d0e2359`): the shutdown-cancellation work in `82fec21` propagated
+  cancellation to every node worker (data-plane HTTP/gRPC, membership-plane
+  gossip/probe serve + subscriber + rejoin + ready gate,
+  health-consequence applier, prefetch engine) with an abort backstop, and
+  `boot_variant_heals_after_out_of_band_wal_replacement` now restarts A
+  IN-PROCESS on the same directories/addresses after the out-of-band
+  pool-wal emptying. The boot branch runs the genuine holder fold against
+  the live replicas (run-time drain: `candidates=6 restored=6 missing=0
+  caught_up=0`, replacement marker cleared, write gate cleared, no `.dat`
+  swept, byte-identical read-back) — passed repeatedly (3/3 runs) at the
+  review HEAD, and the restart is a genuine one (it would fail on the
+  RocksDB LOCK if any task still pinned `Arc<DB>`).
+  `node_in_process_restart_same_dirs_succeeds` (node.rs) pins the same-dir
+  reopen prerequisite at the unit level.
 - **(b) There is NO out-of-band drain-completion watcher.** The catch-up
   drain is in-band only: `run_wal_pool_recovery` polls the outstanding set
   and stops when it empties, when it shows no progress for ~6 s (24 × 250
@@ -373,6 +411,18 @@ accuracy.
   no-op there (`restored=0 missing=0 caught_up=0`). The test header in
   `crates/oceanfs-node/tests/wal_pool_recovery.rs` states this honestly. A
   true e2e that runs the fold is the deferred boot-variant test (a).
+
+  **UPGRADED at the review HEAD `0c4ac71`** (review-verification record):
+  with (a) closed, the holder fold / catch-up machinery is now exercised
+  by a live end-to-end test — the boot-variant e2e's drain reports
+  `restored=6` pulled from the live replicas B/C over the holder-fetch RPC
+  (the registry at boot is genuinely empty because the event WAL was on
+  the emptied wal pool), which is the live-remount `restored=0` signal
+  flipped to a non-zero fold. The distinguishing assertion is meaningful,
+  not vacuous: the same binary's live-remount test still logs
+  `restored=0`, confirming the fold is genuinely exercised only on the
+  boot path. The DoD "Tests"/"Integration" bullets above record the
+  current state.
 - **(d) (informational — separate baseline cleanup, NOT a g7 deviation)**
   A pre-existing broken doctest at
   `crates/oceanfs-storage/src/io/disk_io.rs` (~line 995) constructs
