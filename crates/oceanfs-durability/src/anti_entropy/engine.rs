@@ -198,6 +198,24 @@ impl AntiEntropy {
         &self.merkle_tree
     }
 
+    /// Rebuilds the incremental Merkle tree from the lifecycle registry's
+    /// current `Sealed` entries.
+    ///
+    /// The tree is pure in-memory derived state: after startup recovery
+    /// folds the event WAL (or a replaced-wal recovery rebuilds the
+    /// registry from holders, ADR-0035), the pre-recovery tree — built
+    /// against an empty registry — no longer reflects the machine. This
+    /// re-derives it so the continuous AE cycle covers the folded /
+    /// restored segments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a leaf insertion fails.
+    pub fn rebuild_tree_from_registry(&self) -> Result<()> {
+        self.merkle_tree.rebuild_from_registry(&self.registry)?;
+        Ok(())
+    }
+
     /// The eligible comparison peers of `segment` (ADR-0033 D2).
     ///
     /// Asks the injected [`PeerSelector`] which of the segment's

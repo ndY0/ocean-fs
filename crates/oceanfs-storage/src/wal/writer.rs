@@ -90,6 +90,12 @@ pub struct WalWriter {
     /// `sync_file_range` + `fdatasync` range tracking.
     /// Updated after every append; read by the sync group flusher.
     sync_position: Arc<AtomicU64>,
+    /// The last position the sync group has fsynced (the lower bound of
+    /// the next `sync_file_range` window). Shared with the flusher
+    /// closure so [`reopen_fresh`](Self::reopen_fresh) can reset it to 0
+    /// alongside the fresh file (a stale lower bound would suppress the
+    /// range sync on the new device).
+    last_synced: Arc<AtomicU64>,
     /// Bytes written to WAL.
     bytes_written_total: Counter,
     /// WAL truncations.
@@ -114,8 +120,14 @@ impl WalWriter {
 
         let file = Arc::new(Mutex::new(file));
         let sync_position = Arc::new(AtomicU64::new(existing_size));
+        let last_synced = Arc::new(AtomicU64::new(existing_size));
 
-        let sync_group = Self::create_sync_group(config, file.clone(), sync_position.clone());
+        let sync_group = Self::create_sync_group(
+            config,
+            file.clone(),
+            sync_position.clone(),
+            last_synced.clone(),
+        );
 
         let writer = Self {
             config: config.clone(),
@@ -126,6 +138,7 @@ impl WalWriter {
             global_position: Mutex::new(existing_size),
             sync_group,
             sync_position,
+            last_synced,
             bytes_written_total: Counter::new(
                 "wal_bytes_written_total".into(),
                 "Bytes written to WAL".into(),
@@ -139,6 +152,41 @@ impl WalWriter {
         };
 
         Ok(writer)
+    }
+
+    /// Re-opens the WAL on a **replaced device** (g7 live remount): resets
+    /// the writer to a fresh file at the same configured directory.
+    ///
+    /// The wal pool was replaced out-of-band and its root now holds a new,
+    /// empty device at the same path. Existing `Arc` holders keep writing
+    /// through this same object — only the internal file handle, sequence,
+    /// positions and sync-group lower bound are reset to a fresh
+    /// `wal_00000000.log`. Old WAL files are never replayed or trusted:
+    /// they are gone by definition of the replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the fresh file cannot be opened.
+    pub async fn reopen_fresh(&self) -> Result<()> {
+        tokio::fs::create_dir_all(&self.config.data_dir).await?;
+
+        // Open a brand-new file (sequence 0), truncating whatever the
+        // fresh device holds (a replaced root is empty by definition, but
+        // truncate makes the reset explicit and idempotent).
+        let path = Self::wal_file_path(&self.config.data_dir, 0);
+        let file =
+            std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&path)?;
+
+        {
+            let mut guard = self.file.lock().await;
+            *guard = file;
+        }
+        *self.file_seq.lock().await = 0;
+        *self.position.lock().await = 0;
+        *self.global_position.lock().await = 0;
+        self.sync_position.store(0, Ordering::Release);
+        self.last_synced.store(0, Ordering::Release);
+        Ok(())
     }
 
     /// Sets the machine-backed retention liveness predicate (ADR-0024
@@ -347,6 +395,7 @@ impl WalWriter {
         config: &WalConfig,
         file: Arc<Mutex<std::fs::File>>,
         sync_position: Arc<AtomicU64>,
+        last_synced: Arc<AtomicU64>,
     ) -> WalSyncGroup {
         // Group commit with async fsync closure.
         //
@@ -370,8 +419,6 @@ impl WalWriter {
 
         #[cfg(not(feature = "io-uring"))]
         {
-            let last_synced = Arc::new(AtomicU64::new(sync_position.load(Ordering::Acquire)));
-
             WalSyncGroup::new(
                 move || {
                     let file = Arc::clone(&file);
@@ -428,8 +475,6 @@ impl WalWriter {
 
         #[cfg(feature = "io-uring")]
         {
-            let last_synced = Arc::new(AtomicU64::new(sync_position.load(Ordering::Acquire)));
-
             WalSyncGroup::new(
                 move || {
                     let file = Arc::clone(&file);
@@ -481,6 +526,63 @@ impl WalWriter {
             )
         }
     }
+}
+
+/// Probes a freshly-opened (or freshly re-opened) data WAL with one
+/// write + fsync + read-back (g7's write-resume gate — the node only
+/// clears `write_degraded` once the replacement WAL verifies).
+///
+/// Appends a single probe [`WalEntry`] through the group-commit path
+/// (durable on return), re-opens a [`WalReader`] over the same
+/// directory and confirms the entry round-trips byte-exact, then
+/// truncates the probe away so the WAL starts clean for real appends.
+///
+/// # Errors
+///
+/// Returns an I/O error if the probe append, read-back or truncation
+/// fails — the fresh WAL is not writable and the node must stay
+/// `write_degraded`.
+pub async fn verify_wal_write(wal: &WalWriter) -> Result<()> {
+    let probe_id = oceanfs_core::SegmentId::new();
+    let probe_data: bytes::Bytes = b"oceanfs-wal-verify-probe".to_vec().into();
+    let checksum = oceanfs_core::HashOutput::from_bytes(*blake3::hash(&probe_data).as_bytes());
+    let entry = WalEntry::new(
+        probe_id,
+        0,
+        probe_data.len() as u32,
+        probe_data.len() as u32,
+        0,
+        0,
+        0,
+        checksum,
+        probe_data.clone(),
+    );
+    let probe_pos = wal.append(entry).await?;
+
+    // Read back through a fresh reader over the same directory.
+    let config = WalConfig { data_dir: wal.config.data_dir.clone(), ..WalConfig::default() };
+    let reader = super::WalReader::open(&config)?;
+    let mut found = false;
+    for item in reader.replay() {
+        let replayed = item?;
+        if replayed.segment_id() == probe_id {
+            if replayed.data == probe_data {
+                found = true;
+            }
+            break;
+        }
+    }
+    if !found {
+        return Err(crate::error::Error::Io(std::io::Error::other(
+            "WAL verification probe not read back after fsync",
+        )));
+    }
+
+    // Remove the probe: truncate at its start offset so the fresh WAL
+    // starts clean for real appends (the gate runs on a fresh/re-opened
+    // WAL where the probe is the first entry, so this clears it fully).
+    wal.truncate(probe_pos.offset).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -544,6 +646,46 @@ mod tests {
         let config = test_config().await;
         let writer = WalWriter::open(&config).await.unwrap();
         writer.append(make_entry(0, 1)).await.unwrap();
+        writer.sync().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn verify_wal_write_probe_round_trips_and_leaves_no_residue() {
+        let config = test_config().await;
+        let writer = WalWriter::open(&config).await.unwrap();
+
+        super::verify_wal_write(&writer).await.unwrap();
+
+        // The probe was truncated away: a fresh reader sees no entries.
+        let reader = crate::WalReader::open(&config).unwrap();
+        let count = reader.replay().count();
+        assert_eq!(count, 0, "verification probe must leave no residue");
+    }
+
+    #[tokio::test]
+    async fn reopen_fresh_resets_to_a_clean_first_file() {
+        let config = test_config().await;
+        let writer = WalWriter::open(&config).await.unwrap();
+
+        // Write a couple of entries as the old device would hold.
+        writer.append(make_entry(0, 64)).await.unwrap();
+        writer.append(make_entry(64, 32)).await.unwrap();
+        assert!(writer.global_position().await > 0);
+
+        // Simulate the device replacement: wipe the dir contents, then
+        // reopen fresh through the SAME writer object.
+        for entry in std::fs::read_dir(&config.data_dir).unwrap() {
+            let path = entry.unwrap().path();
+            std::fs::remove_file(&path).unwrap();
+        }
+        writer.reopen_fresh().await.unwrap();
+
+        // The fresh WAL is empty and writable from offset 0.
+        assert_eq!(writer.global_position().await, 0);
+        let pos = writer.append(make_entry(0, 8)).await.unwrap();
+        assert_eq!(pos.file_seq, 0);
+        assert_eq!(pos.offset, 0);
+        // sync still works through the (shared) sync group.
         writer.sync().await.unwrap();
     }
 }

@@ -953,6 +953,53 @@ impl EventWal {
         })
     }
 
+    /// Re-opens the event WAL on a **replaced device** (g7 live remount):
+    /// clears the old `evl_*.log` files and resets the writer state to a
+    /// fresh `evl_00000000.log` at the same directory.
+    ///
+    /// The wal pool was replaced out-of-band; the old event log is gone
+    /// by definition of the replacement and is never replayed or trusted.
+    /// Existing `Arc` holders (the coordinator, checkpoint manager,
+    /// recovery) keep appending/reading through this same object — the
+    /// internal `WriteState`, position accounting and gauges are reset
+    /// to a fresh, empty log.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the directory cannot be cleared or the
+    /// fresh file cannot be opened.
+    pub async fn reopen_fresh(&self) -> Result<()> {
+        // Remove every existing event file (they belong to the replaced
+        // device). Checkpoint files are handled by the checkpoint
+        // manager's own reset; only `evl_*` files are cleared here.
+        let mut read_dir = tokio::fs::read_dir(&self.dir).await?;
+        while let Some(entry) = read_dir.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if parse_evl_name(&name).is_some() {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+
+        let path = evl_file_path(&self.dir, 0);
+        let file =
+            std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&path)?;
+
+        {
+            let mut state = self.state.lock().await;
+            state.file = file;
+            state.file_seq = 0;
+            state.position = 0;
+        }
+        self.latest_packed
+            .store(EventWalPos { file_seq: 0, offset: 0 }.packed(), Ordering::Release);
+        self.bytes_total.store(0, Ordering::Relaxed);
+        *self.file_bases.lock() = vec![(0, 0)];
+        self.file_count.store(1, Ordering::Relaxed);
+        self.bytes_gauge.set(0);
+        self.files_gauge.set(1);
+        Ok(())
+    }
+
     /// Truncates the torn tail of the last event WAL file, returning the
     /// truncated size.
     ///
@@ -2780,5 +2827,34 @@ mod tests {
         let wal = open_wal(dir.path()).await;
         wal.append(reserve_event(SegmentId::new())).await.unwrap();
         wal.register_metrics(&NoopRegistrar);
+    }
+
+    #[tokio::test]
+    async fn reopen_fresh_clears_events_and_resets_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = open_wal(dir.path()).await;
+
+        // The old device holds events.
+        wal.append(reserve_event(SegmentId::new())).await.unwrap();
+        wal.append(seal_event(SegmentId::new())).await.unwrap();
+        assert!(wal.latest_pos().offset > 0);
+
+        // Simulate the replacement: reopen fresh through the same object.
+        wal.reopen_fresh().await.unwrap();
+
+        // The fresh log is empty and appendable from position 0.
+        assert_eq!(wal.latest_pos().offset, 0);
+        let pos = wal.append(reserve_event(SegmentId::new())).await.unwrap();
+        assert_eq!(pos.file_seq, 0);
+        assert_eq!(pos.offset, 0);
+        let events: Vec<Result<(EventWalPos, SegmentEvent)>> =
+            wal.read_from(EventWalPos { file_seq: 0, offset: 0 }).collect();
+        assert_eq!(events.len(), 1, "only the fresh event remains");
+        // No stale files on disk.
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.iter().filter(|n| n.starts_with("evl_")).count(), 1);
     }
 }

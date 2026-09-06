@@ -1827,11 +1827,8 @@ impl HealingRpc for HealingGrpcService {
                         .collect()
                 })
                 .unwrap_or_default();
-            let locations: Vec<oceanfs_core::proto::common::NodeId> = meta
-                .storage_locations
-                .iter()
-                .map(|node| node.clone().into())
-                .collect();
+            let locations: Vec<oceanfs_core::proto::common::NodeId> =
+                meta.storage_locations.iter().map(|node| node.clone().into()).collect();
             entries.push(SegmentLifecycleEntry {
                 segment_id: Some(segment_id.into()),
                 state: state_code,

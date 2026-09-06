@@ -411,19 +411,62 @@ impl IncrementalMerkleTree {
         config: &MerkleTreeConfig,
     ) -> Result<Self> {
         let tree = Self::new(config.clone());
+        tree.rebuild_from_registry(registry)?;
+        Ok(tree)
+    }
 
+    /// Drops every tracked segment from the tree.
+    ///
+    /// Used before an in-place [`rebuild_from_registry`](Self::rebuild_from_registry):
+    /// a rebuild must start from an empty tree so evicted or deleted
+    /// segments do not linger as stale leaves.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_durability::merkle::{IncrementalMerkleTree, MerkleTreeConfig};
+    ///
+    /// let tree = IncrementalMerkleTree::new(MerkleTreeConfig::default());
+    /// tree.clear();
+    /// assert_eq!(tree.segment_count(), 0);
+    /// ```
+    pub fn clear(&self) {
+        self.trees.clear();
+        self.leaf_counts.clear();
+        self.insertion_order.lock().clear();
+    }
+
+    /// Rebuilds this tree in place from the machine's sealed segments.
+    ///
+    /// Drops every currently tracked leaf (via [`clear`](Self::clear)) and
+    /// re-inserts one leaf per `Sealed` registry entry carrying a
+    /// `merkle_root`. This is the runtime equivalent of
+    /// [`rebuild_from_segment_scan`](Self::rebuild_from_segment_scan) for
+    /// an already-constructed tree — used after startup recovery (and after
+    /// a replaced-wal registry rebuild) folds new Sealed entries into the
+    /// registry the tree derives from. The tree is pure in-memory derived
+    /// state; rebuilding it is always safe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if a leaf insertion fails (missing internal
+    /// state — not expected for freshly-inserted leaves).
+    pub fn rebuild_from_registry(
+        &self,
+        registry: &oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry,
+    ) -> Result<()> {
+        self.clear();
         registry.for_each(|segment_id, entry| {
             if entry.state == oceanfs_storage::segment::lifecycle::SegmentState::Sealed {
                 // Use the segment's stored BLAKE3 checksum as the leaf
                 // hash (the machine's entry is the anchor).
                 if let Some(merkle_root) = entry.metadata.merkle_root {
                     let hash_bytes = *merkle_root.as_bytes();
-                    let _ = tree.insert_leaf(segment_id, hash_bytes);
+                    let _ = self.insert_leaf(segment_id, hash_bytes);
                 }
             }
         });
-
-        Ok(tree)
+        Ok(())
     }
 }
 

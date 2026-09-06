@@ -321,6 +321,31 @@ impl EventCheckpoint {
         }
     }
 
+    /// Resets the checkpoint manager after a **replaced event WAL** (g7
+    /// live remount): removes the old `checkpoint-*` files and clears the
+    /// cached covered position, so the next checkpoint starts from the
+    /// fresh event log's beginning.
+    ///
+    /// The replaced device's checkpoint files must never seed a future
+    /// fold (they reference event positions that no longer exist).
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the directory scan fails (best-effort
+    /// removal — a leftover file is simply superseded by the next
+    /// checkpoint write).
+    pub fn reset_for_fresh(&self) -> Result<()> {
+        let dir = std::fs::read_dir(&self.dir)?;
+        for entry in dir.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("checkpoint-") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        self.last_covered.store(0, Ordering::Release);
+        Ok(())
+    }
+
     /// The threshold-only trigger (ADR-0024 Decision 3): `true` when the
     /// event log has grown at least `event_wal_checkpoint_bytes` since
     /// the last checkpoint. O(1) — the covered position is cached and
@@ -939,6 +964,37 @@ mod tests {
         // Truncation of an empty event log is a no-op.
         checkpoint.truncate_before(up_to).await.unwrap();
         assert_eq!(checkpoint.last_checkpoint_pos(), Some(up_to));
+    }
+
+    #[tokio::test]
+    async fn reset_for_fresh_clears_checkpoint_state() {
+        let (_dir, wal) = test_env().await;
+        let checkpoint = EventCheckpoint::open(wal.dir().to_path_buf(), wal.clone()).unwrap();
+
+        // Write a checkpoint (as the old device would hold), verify it is
+        // cached and on disk.
+        let registry = test_registry_with(3);
+        let up_to = EventWalPos { file_seq: 1, offset: 456 };
+        checkpoint.write_checkpoint(&registry, up_to).unwrap();
+        assert_eq!(checkpoint.last_checkpoint_pos(), Some(up_to));
+        let wal_dir = wal.dir().to_path_buf();
+        let checkpoint_files: Vec<String> = std::fs::read_dir(&wal_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("checkpoint-"))
+            .collect();
+        assert_eq!(checkpoint_files.len(), 1, "checkpoint file exists before reset");
+
+        // Reset after a replaced event WAL.
+        checkpoint.reset_for_fresh().unwrap();
+
+        assert_eq!(checkpoint.last_checkpoint_pos(), None, "cached covered position cleared");
+        let leftover: Vec<String> = std::fs::read_dir(&wal_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("checkpoint-"))
+            .collect();
+        assert_eq!(leftover.len(), 0, "old checkpoint files removed");
     }
 
     #[tokio::test]

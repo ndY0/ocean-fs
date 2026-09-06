@@ -104,6 +104,20 @@ pub(crate) struct StorageModule {
     /// The active segment pools — retained for the live
     /// `segment_active_count` metric poller.
     pub(crate) active_pools: Vec<Arc<SegmentPool>>,
+    /// The pool health monitor (g2, ADR-0029 §D3) — constructed in
+    /// [`Self::build`] and retained so the node's replaced-wal / live
+    /// remount recovery path can call [`reset_pool`] to break the
+    /// absorbing `Dead` state after a fresh store + catch-up (g7/g8;
+    /// previously the Arc was moved into the spawned task and had no
+    /// production caller).
+    pub(crate) health_monitor: Arc<oceanfs_storage::pool::health::HealthMonitor>,
+    /// The monitor's bounded status-event channel receiver — taken by
+    /// [`Self::spawn_loops`] and handed to the health-consequence
+    /// applier (crate::health). Stored here because the monitor is
+    /// constructed at build time (D4 retention).
+    health_events_rx: parking_lot::Mutex<
+        Option<tokio::sync::mpsc::Receiver<oceanfs_storage::pool::health::HealthEvent>>,
+    >,
     /// Startup-rebuild duration gauge: records the startup recovery
     /// duration (checkpoint + fold + data-WAL pass + compaction
     /// recovery); registered with the central metrics registry by the
@@ -481,6 +495,20 @@ impl StorageModule {
             },
         ));
 
+        // ---- 6d. Pool health monitor (g2, ADR-0029 §D3) ----
+        // Constructed here (not in spawn_loops) so the Arc is retained
+        // on the module: the node's replaced-wal recovery / live-remount
+        // path calls `reset_pool` to clear the monitor's internal Dead
+        // mirror after a fresh store + catch-up (g7/g8). The monitor's
+        // run loop and its event receiver are consumed by
+        // `spawn_loops` (the receiver is handed to the
+        // health-consequence applier).
+        let (health_monitor, health_events_rx) = oceanfs_storage::pool::health::HealthMonitor::new(
+            Arc::clone(&registry),
+            io_observer.clone(),
+            oceanfs_storage::pool::health::HealthMonitorConfig::default(),
+        );
+
         Ok(Self {
             registry,
             paths: paths.clone(),
@@ -503,6 +531,8 @@ impl StorageModule {
             segment_pool_small,
             segment_pool_standard,
             active_pools,
+            health_monitor,
+            health_events_rx: parking_lot::Mutex::new(Some(health_events_rx)),
             startup_rebuild_gauge: oceanfs_core::Gauge::new(
                 "oceanfs_startup_rebuild_ms".into(),
                 "Startup rebuild duration (checkpoint + fold + data-WAL pass + compaction recovery), ms"
@@ -549,10 +579,11 @@ impl StorageModule {
     /// `storage_locations` was never stamped. The startup cost is bounded
     /// by the checkpoint threshold, never by lifetime event volume.
     ///
-    /// Must be called after every component that consumes the recovery
-    /// output (the AE merkle rebuild etc.) is constructed — and after
-    /// [`Self::start_seal_pipeline`] (the replayed re-seals complete on
-    /// the seal pipeline; recovery waits on their `.dat` files).
+    /// Must be called after [`Self::start_seal_pipeline`] (the replayed
+    /// re-seals complete on the seal pipeline; recovery waits on their
+    /// `.dat` files). The AE Merkle tree is pure derived state and is
+    /// rebuilt by the caller AFTER this fold populates the registry
+    /// (the tree is constructed empty — see `DurabilityModule`).
     /// Records the rebuild duration on [`Self::startup_rebuild_gauge`].
     ///
     /// # Errors
@@ -805,14 +836,19 @@ impl StorageModule {
         &self,
         bg: &mut crate::node::BackgroundTasks,
     ) -> tokio::sync::mpsc::Receiver<oceanfs_storage::pool::health::HealthEvent> {
-        use oceanfs_storage::pool::health::{HealthMonitor, HealthMonitorConfig};
         use tracing::info;
 
-        let (health_monitor, health_events) = HealthMonitor::new(
-            self.registry.clone(),
-            self.io_observer.clone(),
-            HealthMonitorConfig::default(),
-        );
+        // The monitor was constructed at build time (D4 retention — the
+        // node's replaced-wal recovery / live-remount path needs the
+        // Arc for `reset_pool`). Spawn its run loop on the retained
+        // Arc; take the stored event receiver for the caller (the
+        // health-consequence applier).
+        let health_monitor = Arc::clone(&self.health_monitor);
+        let health_events = self
+            .health_events_rx
+            .lock()
+            .take()
+            .expect("health monitor event receiver already taken");
         let health_token = bg.health_cancel.clone();
         bg.health_monitor = Some(tokio::spawn(async move {
             health_monitor.run(health_token).await;

@@ -362,6 +362,11 @@ impl Node {
         )));
         // (c1: moved to modules/storage.rs — run_startup_recovery)
         storage.run_startup_recovery().await?;
+        // The AE Merkle tree is empty at construction (the registry is
+        // empty pre-recovery); rebuild it from the folded registry so
+        // continuous AE covers the machine's pre-existing Sealed
+        // segments (the segments-CF-removal ordering gap, closed).
+        durability.rebuild_ae_tree()?;
 
         // ---- 6. Server subsystem (c3: modules/server.rs) ----
         let metrics = Arc::new(oceanfs_server::admin::MetricsRegistry::new());

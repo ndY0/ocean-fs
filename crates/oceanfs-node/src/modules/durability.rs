@@ -311,20 +311,17 @@ impl DurabilityModule {
         // [review][config][high]
         // as previously stated, any config should be possibly driven by the end user
         // [end]
-        // Construct IncrementalMerkleTree for anti-entropy by scanning
-        // the machine's Sealed entries — supersedes ADR-0018 Decision
-        // 1's segments-CF scan (ADR-0025 Decision 3).
+        // Construct an EMPTY IncrementalMerkleTree for anti-entropy
+        // (ADR-0018 → ADR-0025 Decision 3). The tree is pure in-memory
+        // derived state over the machine's Sealed entries; it is rebuilt
+        // AFTER startup recovery folds the registry (the pre-recovery
+        // registry is empty, so a build-time scan would derive an empty
+        // tree and continuous AE would never cover pre-existing segments
+        // — the AE coverage gap, closed by `rebuild_ae_tree` in
+        // `Node::start` after `run_startup_recovery`).
         let merkle_tree_config = oceanfs_durability::merkle::MerkleTreeConfig::default();
-
-        let merkle_tree = {
-            Arc::new(
-                oceanfs_durability::merkle::IncrementalMerkleTree::rebuild_from_segment_scan(
-                    &storage.lifecycle_registry,
-                    &merkle_tree_config,
-                )
-                .map_err(|e| format!("failed to rebuild Merkle tree from the machine scan: {e}"))?,
-            )
-        };
+        let merkle_tree =
+            Arc::new(oceanfs_durability::merkle::IncrementalMerkleTree::new(merkle_tree_config));
 
         // [resolved]
         // AE no longer creates its own data store — c1 (composition-root
@@ -521,6 +518,25 @@ impl DurabilityModule {
             budget,
             scheduler: Arc::new(scheduler),
         })
+    }
+
+    /// Rebuilds the anti-entropy Merkle tree from the lifecycle
+    /// registry's current `Sealed` entries.
+    ///
+    /// The tree is pure in-memory derived state over the machine
+    /// (ADR-0025 Decision 3). It is constructed empty (the registry is
+    /// empty pre-recovery) and rebuilt here AFTER startup recovery folds
+    /// the event WAL — and again after a replaced-wal recovery rebuilds
+    /// the registry from holders (g7, ADR-0035) — so continuous AE
+    /// covers the folded/restored segments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tree rebuild fails.
+    pub(crate) fn rebuild_ae_tree(&self) -> Result<(), String> {
+        self.ae
+            .rebuild_tree_from_registry()
+            .map_err(|e| format!("failed to rebuild AE Merkle tree from the machine scan: {e}"))
     }
 
     /// Registers the durability workers' metrics with the node's central
