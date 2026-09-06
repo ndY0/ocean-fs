@@ -26,11 +26,14 @@
 //! remount surface + write gate, NOT the rebuild-from-holders machinery.
 //! The BOOT variant (restart A after an out-of-band replacement, where
 //! the registry is genuinely empty and the holder fold DOES run) is the
-//! path that exercises ADR-0035 D2/D3 end-to-end. It is covered at the
-//! unit level (detection, residue-sweep suppression, D3 classifier in
-//! `modules::wal_recovery::tests`) and is pending an e2e/process-level
-//! test — an in-process same-dir RocksDB reopen is blocked by server
-//! tasks that hold the store past shutdown.
+//! path that exercises ADR-0035 D2/D3 end-to-end:
+//! [`boot_variant_heals_after_out_of_band_wal_replacement`] below shuts
+//! A down, empties its wal device, restarts A in-process on the same
+//! directories and asserts the boot branch (registry rebuilt from
+//! holders > 0, write gate cleared, byte-identical read-back, no `.dat`
+//! swept). That test is only possible because every background worker is
+//! cancellable + awaited at shutdown (the RocksDB LOCK and the fixed
+//! data-plane/membership listeners are released before the restart).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -200,6 +203,108 @@ fn empty_dir(dir: &std::path::Path) {
     }
 }
 
+/// PUTs `body` under `key`; returns the HTTP status.
+async fn put_status(
+    client: &reqwest::Client,
+    addr: std::net::SocketAddr,
+    key: &str,
+    body: &[u8],
+) -> u16 {
+    client
+        .put(format!("http://{addr}/durability/{key}"))
+        .body(body.to_vec())
+        .send()
+        .await
+        .expect("PUT must reach the node")
+        .status()
+        .as_u16()
+}
+
+/// Writes `count` Small-tier objects through `addr_a`, waits for A to
+/// seal ≥ 1 segment and for BOTH replicas to hold the same `.dat` set.
+/// Returns the keys, body, A's data root and A's `.dat` list.
+async fn write_seal_and_replicate(
+    client: &reqwest::Client,
+    addr_a: std::net::SocketAddr,
+    count: usize,
+    data_root_a: &std::path::Path,
+    data_root_b: &std::path::Path,
+    data_root_c: &std::path::Path,
+) -> (Vec<String>, Vec<u8>, Vec<PathBuf>) {
+    let body: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
+    let keys: Vec<String> = (0..count).map(|i| format!("pre-kill-{i:02}")).collect();
+    for key in &keys {
+        put(client, addr_a, key, &body).await;
+    }
+    wait_for_dat_count(data_root_a, 1, "owner A data pool").await;
+    let owner_dats = data_dats(data_root_a);
+    assert!(!owner_dats.is_empty(), "owner sealed ≥ 1 segment before the kill");
+    wait_for_dat_count(data_root_b, owner_dats.len(), "replica B data pool").await;
+    wait_for_dat_count(data_root_c, owner_dats.len(), "replica C data pool").await;
+    (keys, body, owner_dats)
+}
+
+/// Parses a `name value` sample line from the Prometheus text exposition
+/// returned by `GET /admin/metrics`.
+fn parse_metric(text: &str, name: &str) -> u64 {
+    text.lines()
+        .find(|l| l.trim_start().starts_with(name) && !l.trim_start().starts_with('#'))
+        .and_then(|l| l.trim().strip_prefix(name).map(|rest| rest.trim_start()))
+        .and_then(|v| v.trim_end().split_whitespace().next())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Polls `GET /admin/metrics` until `name` reads ≥ `min`.
+async fn wait_for_metric(
+    client: &reqwest::Client,
+    addr: std::net::SocketAddr,
+    name: &str,
+    min: u64,
+    what: &str,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let resp = client
+            .get(format!("http://{addr}/admin/metrics"))
+            .send()
+            .await
+            .expect("GET /admin/metrics must reach the node");
+        assert_eq!(resp.status(), 200, "metrics endpoint serves");
+        let text = resp.text().await.expect("metrics body");
+        let value = parse_metric(&text, name);
+        if value >= min {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: metric {name} must reach ≥ {min} within 60s (now {value})"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Polls a PUT until it succeeds (the wal write gate cleared).
+async fn wait_for_write_resume(
+    client: &reqwest::Client,
+    addr: std::net::SocketAddr,
+    key: &str,
+    body: &[u8],
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let status = put_status(client, addr, key, body).await;
+        if status == 200 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "write gate must clear within 90s (last PUT status {status})"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// Asserts that after recovery every pre-kill key reads back byte-identical
 /// THROUGH the owner (its rebuilt registry + intact data pool serve), that
 /// a fresh write succeeds, and that the owner's data `.dat` files were NOT
@@ -285,19 +390,12 @@ async fn live_remount_heals_without_restart() {
 
     // Write 6 × 32 KiB objects (Small tier — packed, so several sealed
     // segments land on A's data pool), wait for seals + replication to B/C.
-    let body: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
-    let keys: Vec<String> = (0..6).map(|i| format!("pre-kill-{i:02}")).collect();
-    for key in &keys {
-        put(&client, addr_a, key, &body).await;
-    }
     let data_root_a = tmp_a.path().join("pool-data");
     let data_root_b = tmp_b.path().join("pool-data");
     let data_root_c = tmp_c.path().join("pool-data");
-    wait_for_dat_count(&data_root_a, 1, "owner A data pool").await;
-    let owner_dats = data_dats(&data_root_a);
-    assert!(!owner_dats.is_empty(), "owner sealed ≥ 1 segment before the kill");
-    wait_for_dat_count(&data_root_b, owner_dats.len(), "replica B data pool").await;
-    wait_for_dat_count(&data_root_c, owner_dats.len(), "replica C data pool").await;
+    let (keys, body, owner_dats) =
+        write_seal_and_replicate(&client, addr_a, 6, &data_root_a, &data_root_b, &data_root_c)
+            .await;
     // ---- Kill A's wal pool: drive it Dead through the health monitor ----
     let wal_pool_id = node_a.pool_registry().pool_by_role(PoolRole::Wal).expect("A wal pool").id();
     // Phase 1: degrade (TimedOut spike) and WAIT for Degraded.
@@ -383,6 +481,104 @@ async fn live_remount_heals_without_restart() {
     assert_post_recovery(&client, addr_a, &keys, &body, &data_root_a, &owner_dats).await;
 
     node_a.shutdown().await.expect("A shutdown");
+    node_b.shutdown().await.expect("B shutdown");
+    node_c.shutdown().await.expect("C shutdown");
+}
+
+#[tokio::test]
+async fn boot_variant_heals_after_out_of_band_wal_replacement() {
+    // g7 (ADR-0035) BOOT variant: A is shut down cleanly, its journal
+    // device is replaced out-of-band (the pool-wal root emptied while A
+    // is down) and A is restarted IN-PROCESS on the same directories.
+    // On boot the registry is genuinely empty (the event WAL that held
+    // A's segment lifecycle state is gone), so the boot branch runs the
+    // D2 holder fold + catch-up drain against the live replicas B and C.
+    //
+    // This test is only possible because every worker is cancellable and
+    // awaited at shutdown: the RocksDB LOCK and A's fixed data-plane +
+    // membership listeners are released, so the second boot reopens the
+    // same metadata dir and re-binds the same addresses.
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    let ports = free_ports(6);
+    let a_addrs = NodeAddrs {
+        grpc: format!("127.0.0.1:{}", ports[0]),
+        membership: format!("127.0.0.1:{}", ports[1]),
+    };
+    let b_addrs = NodeAddrs {
+        grpc: format!("127.0.0.1:{}", ports[2]),
+        membership: format!("127.0.0.1:{}", ports[3]),
+    };
+    let c_addrs = NodeAddrs {
+        grpc: format!("127.0.0.1:{}", ports[4]),
+        membership: format!("127.0.0.1:{}", ports[5]),
+    };
+
+    let tmp_a = tempfile::tempdir().expect("tempdir A");
+    let tmp_b = tempfile::tempdir().expect("tempdir B");
+    let tmp_c = tempfile::tempdir().expect("tempdir C");
+
+    // A is the seed; B and C join through A's membership plane. A boots
+    // with fast wal-health knobs (harmless here — recovery is boot
+    // driven, not health driven).
+    let node_a = boot_node("node-a", None, &a_addrs, &tmp_a, true).await;
+    let node_b = boot_node("node-b", Some(&a_addrs.membership), &b_addrs, &tmp_b, false).await;
+    let node_c = boot_node("node-c", Some(&a_addrs.membership), &c_addrs, &tmp_c, false).await;
+
+    wait_for_cluster_convergence(&node_a).await;
+    wait_for_cluster_convergence(&node_b).await;
+    wait_for_cluster_convergence(&node_c).await;
+
+    let client =
+        reqwest::Client::builder().timeout(Duration::from_secs(15)).build().expect("client");
+    let addr_a = node_a.server_addr();
+
+    let data_root_a = tmp_a.path().join("pool-data");
+    let data_root_b = tmp_b.path().join("pool-data");
+    let data_root_c = tmp_c.path().join("pool-data");
+    let (keys, body, owner_dats) =
+        write_seal_and_replicate(&client, addr_a, 6, &data_root_a, &data_root_b, &data_root_c)
+            .await;
+
+    // ---- Replace A's journal device out-of-band ----
+    node_a.shutdown().await.expect("A shutdown");
+    empty_dir(&tmp_a.path().join("pool-wal"));
+
+    // ---- Restart A in-process on the SAME directories/addresses ----
+    let node_a2 = boot_node("node-a", None, &a_addrs, &tmp_a, true).await;
+    let addr_a2 = node_a2.server_addr();
+    // A must rejoin the ring (B and C still hold its data).
+    wait_for_cluster_convergence(&node_a2).await;
+
+    // The boot branch must have recorded a replaced-wal recovery with a
+    // NON-EMPTY rebuilt registry (the holder fold restored A's own
+    // sealed segment entries from B/C — this is the assertion that
+    // distinguishes the boot variant from the live remount, where the
+    // registry survives in memory and `restored == 0`).
+    wait_for_metric(&client, addr_a2, "oceanfs_wal_replaced_total", 1, "boot recovery recorded")
+        .await;
+    wait_for_metric(
+        &client,
+        addr_a2,
+        "oceanfs_wal_recovery_registry_rebuilt_segments",
+        1,
+        "holder fold restored segments",
+    )
+    .await;
+
+    // The write gate clears once the drain + verification finish; then
+    // every pre-kill key reads back byte-identical THROUGH A2 and no
+    // data-pool `.dat` was swept.
+    wait_for_write_resume(&client, addr_a2, "post-restart-write", &body).await;
+    assert_post_recovery(&client, addr_a2, &keys, &body, &data_root_a, &owner_dats).await;
+
+    node_a2.shutdown().await.expect("A2 shutdown");
     node_b.shutdown().await.expect("B shutdown");
     node_c.shutdown().await.expect("C shutdown");
 }
