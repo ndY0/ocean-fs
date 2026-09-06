@@ -167,7 +167,9 @@ async fn full_gc_cycle_compacts_segment() {
     let bucket = BucketId::new("default");
 
     let seg_id = SegmentId::new();
-    let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
+    let mut seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
+    // The seal-time logical total (ADR-0034 D1): 1000 bytes on disk.
+    seg_meta.total_bytes = 1000;
 
     // Write 5 objects
     let live_keys = vec!["obj3.txt", "obj4.txt"];
@@ -187,8 +189,17 @@ async fn full_gc_cycle_compacts_segment() {
             .unwrap();
     }
 
-    // Delete 3 objects (obj0, obj1, obj2) — these have ancient timestamps (past TTL)
+    // Delete 3 objects (obj0, obj1, obj2) — the aged chunk-carrying
+    // tombstones are the f1 capture shape (dead bytes = 600).
     for i in 0..3 {
+        let mut chunks = smallvec::SmallVec::new();
+        chunks.push(ChunkRef {
+            segment_id: seg_id,
+            offset: i * 200,
+            length: 200,
+            compressed: false,
+            logical_length: 200,
+        });
         metadata
             .put_tombstone(
                 &bucket,
@@ -196,7 +207,7 @@ async fn full_gc_cycle_compacts_segment() {
                 Tombstone {
                     deletion_time: 1000000000000, // ancient
                     hlc: Hlc::new(1000000000000, 1),
-                    chunks: smallvec::SmallVec::new(),
+                    chunks,
                 },
             )
             .unwrap();

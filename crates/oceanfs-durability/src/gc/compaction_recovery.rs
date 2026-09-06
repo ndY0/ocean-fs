@@ -2,13 +2,15 @@
 //!
 //! The compactor (see `segment_compactor.rs`) is a state machine whose
 //! durable checkpoints are events; a crash can leave a compaction unit
-//! between milestones. Recovery is **fold + one objects-CF read per
-//! unit**: the folded registry tells which new segments are sealed
-//! (with their `repacked_from` marker) and which old segments are
-//! deleted; one objects-CF read per unit tells which side the objects
-//! point at. The startup dispatcher performs the returned actions
-//! (through the coordinator for deletes, through the shard store for
-//! sweeps — see `startup-rebuild-from-machine`).
+//! between milestones. Recovery is **fold + one membership-bounded
+//! reference check per unit**: the folded registry tells which new
+//! segments are sealed (with their `repacked_from` marker) and which old
+//! segments are deleted; one bounded `is_referenced` per unit — point
+//! reads over the new segment's own seal-time contained-objects list
+//! (ADR-0034 D5/f3, f2) — tells which side the objects point at. The
+//! startup dispatcher performs the returned actions (through the
+//! coordinator for deletes, through the shard store for sweeps — see
+//! `startup-rebuild-from-machine`).
 //!
 //! Crash-window rows 7–9 of ADR-0025 §Crash-window table:
 //!
@@ -71,13 +73,14 @@ pub struct CompactionUnit {
     pub ec_m: u8,
 }
 
-/// The one objects-CF read per unit — the only cross-store hop in
-/// compaction recovery (RocksDB stays the objects' store; ADR-0025
-/// Decision 4: "fold + one objects-CF read").
+/// The per-unit reference question — is any object row pointing at this
+/// segment? — as a bounded, membership-driven lookup (ADR-0034 D5/f3
+/// discipline, f2): the segment's own seal-time contained-objects list is
+/// point-read, never a full objects-CF enumeration.
 ///
-/// Production implementation wraps the metadata store's object scan;
-/// tests use an instrumented double that counts reads (the DoD asserts
-/// exactly one read per unit, no per-chunk scans).
+/// Production implementation wraps the lifecycle registry + metadata
+/// store; tests use an instrumented double that counts calls (the DoD
+/// asserts exactly one `is_referenced` per unit, no scans).
 pub trait ObjectLookup: Send + Sync {
     /// Returns whether any object references `segment_id`.
     ///
@@ -87,20 +90,63 @@ pub trait ObjectLookup: Send + Sync {
     fn is_referenced(&self, segment_id: SegmentId) -> Result<bool>;
 }
 
-/// Production [`ObjectLookup`] over the objects store: one
-/// `list_objects_all_with_bucket` scan answers the reference question
-/// in a single store call — the DoD's "one objects-CF read per unit,
-/// no per-chunk scans".
-pub struct StoreObjectLookup(pub Arc<dyn oceanfs_storage_api::MetadataStore>);
+/// Production [`ObjectLookup`]: point-reads the queried segment's own
+/// seal-time membership (ADR-0034 D5) to answer the reference question.
+///
+/// Every compactor-sealed segment carries its contained-objects list, so
+/// the recovery units' NEW side always has membership. A membership-less
+/// segment (row-3 adopt / repair copies — never a recovery unit's new
+/// side) is conservatively treated as unreferenced with a warning.
+pub struct StoreObjectLookup {
+    /// The folded lifecycle registry — the source of each segment's
+    /// seal-time membership list.
+    pub(crate) registry: Arc<SegmentLifecycleRegistry>,
+    /// The metadata store for per-key object row reads.
+    pub(crate) metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
+}
+
+impl StoreObjectLookup {
+    /// Creates a membership-driven lookup over the folded registry and
+    /// the metadata store.
+    pub fn new(
+        registry: Arc<SegmentLifecycleRegistry>,
+        metadata: Arc<dyn oceanfs_storage_api::MetadataStore>,
+    ) -> Self {
+        Self { registry, metadata }
+    }
+}
 
 impl ObjectLookup for StoreObjectLookup {
     fn is_referenced(&self, segment_id: SegmentId) -> Result<bool> {
-        Ok(self
-            .0
-            .list_objects_all_with_bucket()
-            .into_iter()
-            .flatten()
-            .any(|(_, meta)| meta.chunks.iter().any(|c| c.segment_id == segment_id)))
+        // Membership enumeration (ADR-0034 D5): point-read each object the
+        // segment sealed with; if any of those rows currently references
+        // the segment, the unit's ObjectsMoved milestone is durable.
+        let Some(entry) = self.registry.get(segment_id) else {
+            // The queried side is not registered — nothing can reference
+            // an unregistered segment id in the recovery unit set.
+            return Ok(false);
+        };
+        let Some(contained) = entry.contained_objects.as_ref() else {
+            // Unreachable for a recovery unit's NEW side (the compactor
+            // refuses to seal membership-less), but never decide
+            // destructively on a membership-less segment: report it as
+            // unreferenced so the unit is swept as a new-side orphan
+            // rather than finishing the OLD side's deletion.
+            tracing::warn!(
+                segment_id = %segment_id,
+                "compaction recovery: segment has no contained-objects membership; \
+                 treating it as unreferenced"
+            );
+            return Ok(false);
+        };
+        for co in contained.iter() {
+            if let Ok(Some(obj)) = self.metadata.get_object_metadata(&co.bucket, &co.key) {
+                if obj.chunks.iter().any(|c| c.segment_id == segment_id) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -130,15 +176,17 @@ pub enum CompactionRecoveryAction {
 ///
 /// The scan is O(marked units): every `Sealed` entry carrying the
 /// `repacked_from` marker (ADR-0025 Decision 4) is examined exactly
-/// once, with exactly **one** objects-CF read (`is_referenced`) per
-/// unit. No per-chunk scans. A unit whose `SealEvent` was truncated
-/// away before `NewSealed` has no marker and is handled by the
-/// data-WAL pass (row 3 adoption / row 1 drop) plus the orphan reaper.
+/// once, with exactly **one** `is_referenced` call per unit. The call is
+/// membership-bounded (point reads over the new segment's seal-time
+/// contained-objects list, ADR-0034 D5/f3) — never a full objects-CF
+/// scan. A unit whose `SealEvent` was truncated away before `NewSealed`
+/// has no marker and is handled by the data-WAL pass (row 3 adoption /
+/// row 1 drop) plus the orphan reaper.
 ///
 /// # Errors
 ///
-/// Returns an error if the objects-CF read fails (the caller aborts
-/// startup — a wrong action could delete live data).
+/// Returns an error if the reference check's metadata read fails (the
+/// caller aborts startup — a wrong action could delete live data).
 pub fn recover_incomplete_compactions(
     registry: &SegmentLifecycleRegistry,
     objects: &dyn ObjectLookup,
@@ -154,8 +202,10 @@ pub fn recover_incomplete_compactions(
 
     let mut actions = Vec::with_capacity(units.len());
     for (new_id, old_id) in units {
-        // The one objects-CF read per unit (the DoD's instrumented
-        // assertion): do objects point at the new segment or the old?
+        // The one membership-bounded reference check per unit (the DoD's
+        // instrumented assertion): do objects point at the new segment or
+        // the old? Point reads over the new side's contained list — never
+        // a full objects-CF scan.
         if objects.is_referenced(new_id)? {
             // ObjectsMoved is durable: the new segment is authoritative.
             // The old side decides the action: still Sealed → finish

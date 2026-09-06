@@ -603,13 +603,16 @@ impl StorageModule {
             "event-WAL recovery complete (ADR-0025 phase 2)"
         );
         // Rows 7-9: incomplete compaction units — the folded registry's
-        // `repacked_from` markers, one objects-CF read per unit. Each
-        // action deletes through the coordinator (durable before
-        // unlink) and sweeps the `.dat` (idempotent).
+        // `repacked_from` markers, one membership-bounded reference check
+        // per unit (point reads over the new side's seal-time contained
+        // list — ADR-0034 D5/f3; never an objects-CF scan). Each action
+        // deletes through the coordinator (durable before unlink) and
+        // sweeps the `.dat` (idempotent).
         let compaction_actions = recover_incomplete_compactions(
             self.lifecycle.registry(),
-            &StoreObjectLookup(
-                Arc::clone(&self.metadata_store) as Arc<dyn oceanfs_storage_api::MetadataStore>
+            &StoreObjectLookup::new(
+                Arc::clone(&self.lifecycle_registry),
+                Arc::clone(&self.metadata_store) as Arc<dyn oceanfs_storage_api::MetadataStore>,
             ),
         )
         .map_err(|e| format!("compaction recovery failed: {e}"))?;
@@ -622,9 +625,7 @@ impl StorageModule {
             // The sweep's pool id: captured from the registry entry
             // BEFORE the durable delete (the delete evicts the entry —
             // the unified store's delete_shards is registry-resolved,
-            // ADR-0032 D2). Pure-residue actions (SweepOldDat — the
-            // entry is already gone) cannot resolve a pool here; the
-            // orphan reaper's per-root sweep backstops the residue.
+            // ADR-0032 D2).
             let sweep_pool =
                 self.lifecycle_registry.get(segment_id).map(|entry| entry.metadata.pool_id);
             if !matches!(action, CompactionRecoveryAction::SweepOldDat(_)) {
@@ -637,25 +638,87 @@ impl StorageModule {
                 }
             }
             // Sweep the `.dat` (ADR-0029 f5): explicit pool when the
-            // entry carried one; residue-only sweeps are left to the
-            // reaper's per-root listing.
+            // entry carried one. Pure-residue (SweepOldDat — the entry is
+            // already gone, so the pool id is unresolvable) is reclaimed
+            // by the general startup `.dat` residue sweep below (the
+            // retired reaper phase-2b backstop, moved to startup).
             if let Some(pool_id) = sweep_pool {
                 if let Err(e) = self.data_store.delete_shards_with_pool(&segment_id, pool_id).await
                 {
                     warn!(
                         segment_id = %segment_id,
                         error = %e,
-                        "compaction recovery sweep failed (startup continues; the reaper retries)"
+                        "compaction recovery sweep failed (startup continues; the residue sweep retries)"
                     );
                 }
-            } else {
-                tracing::debug!(
-                    segment_id = %segment_id,
-                    action = label,
-                    "compaction recovery residue has no registry entry; the reaper's per-root sweep reclaims it"
-                );
             }
             info!(segment_id = %segment_id, action = label, "compaction recovery action applied");
+        }
+
+        // Registry-unknown / deleted `.dat` residue sweep (startup only).
+        //
+        // A crash between a durable delete (`request_delete` →
+        // DeleteEvent) and the `.dat` unlink — from the reaper's orphan
+        // reclaim, the compactor's fully-dead path, OR a compaction
+        // recovery action — leaves a `.dat` whose registry entry is gone
+        // (evicted after the delete grace) or `Deleted`. The retired
+        // reaper phase-2b periodic sweep used to reclaim these every
+        // cycle; this once-per-boot pass replaces it: list each data pool
+        // root and unlink any `.dat` that has no live registry entry.
+        // Bounded by the on-disk file count, no objects-CF access, no
+        // periodicity — exactly the ADR-0034 D4 shape (phase-2b retired
+        // from the reaper cycle).
+        for pool in self.registry.data_pools() {
+            let root = pool.root();
+            let pool_id = pool.id();
+            let listed = match self.data_store.list_segment_files(root) {
+                Ok(listed) => listed,
+                Err(e) => {
+                    warn!(
+                        pool_id,
+                        root = ?root,
+                        error = %e,
+                        "startup `.dat` residue listing failed (continuing)"
+                    );
+                    continue;
+                }
+            };
+            for path in listed {
+                let Some(id_str) =
+                    path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".dat"))
+                else {
+                    continue;
+                };
+                let Ok(uuid) = uuid::Uuid::parse_str(id_str) else { continue };
+                let segment_id = oceanfs_core::SegmentId::from_uuid_bytes(*uuid.as_bytes());
+                let state = self.lifecycle_registry.get(segment_id).map(|e| e.state);
+                let is_residue = match state {
+                    None => true,                                         // the registry no longer knows it
+                    Some(oceanfs_storage::SegmentState::Deleted) => true, // durable delete, unlink pending
+                    _ => false, // Sealed/Reserved — legitimately present
+                };
+                if !is_residue {
+                    continue;
+                }
+                match self.data_store.delete_shards_with_pool(&segment_id, pool_id).await {
+                    Ok(bytes) => {
+                        tracing::info!(
+                            segment_id = %segment_id,
+                            pool_id,
+                            bytes_reclaimed = bytes,
+                            "startup `.dat` residue swept"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            segment_id = %segment_id,
+                            pool_id,
+                            error = %e,
+                            "startup `.dat` residue sweep failed (continuing)"
+                        );
+                    }
+                }
+            }
         }
         let rebuild_ms = rebuild_start.elapsed().as_millis() as u64;
         self.startup_rebuild_gauge.set(rebuild_ms);

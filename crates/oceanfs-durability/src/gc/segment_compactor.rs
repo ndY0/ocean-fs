@@ -921,7 +921,8 @@ mod tests {
         let metadata = RocksDbMetadataStore::open(&test_config()).unwrap();
 
         let seg_id = SegmentId::new();
-        let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
+        let mut seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
+        seg_meta.total_bytes = 300;
         let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
         registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
         registry.seal(seg_meta.segment_id, seg_meta).unwrap();
@@ -938,8 +939,18 @@ mod tests {
         );
         metadata.put_object(obj_meta).unwrap();
 
-        // Create a tombstone with deletion_time far in the past
+        // Create an AGED tombstone that carries the deleted row's chunk —
+        // the shape `delete_object` leaves after the capture (f1), but
+        // with a deterministic ancient deletion_time.
         let bucket = BucketId::new("default");
+        let mut chunks = smallvec::SmallVec::new();
+        chunks.push(ChunkRef {
+            segment_id: seg_id,
+            offset: 0,
+            length: 300,
+            compressed: false,
+            logical_length: 300,
+        });
         metadata
             .put_tombstone(
                 &bucket,
@@ -947,7 +958,7 @@ mod tests {
                 Tombstone {
                     deletion_time: 1000000000000, // very old
                     hlc: Hlc::new(1000000000000, 1),
-                    chunks: smallvec::SmallVec::new(),
+                    chunks,
                 },
             )
             .unwrap();
@@ -957,10 +968,11 @@ mod tests {
 
         let mut tracker = LivenessTracker::new();
         let mut stats = GcStats::default();
-        let (dead_keys, _) =
+        let (dead_keys, _, _) =
             gc.process_tombstones(&metadata, &registry, &mut tracker, &mut stats).unwrap();
 
-        // The tombstone is past TTL, so it should be in the dead set
+        // The tombstone is past TTL, so it should be in the dead set and
+        // its captured chunk bytes marked dead (accounting, ADR-0034 D3).
         assert!(dead_keys.contains(&("default".to_string(), "old_deleted.txt".to_string())));
         assert_eq!(tracker.dead_bytes_for(&seg_id), 300);
     }
@@ -1034,49 +1046,16 @@ mod tests {
         let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
 
         let seg_id = SegmentId::new();
-        let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
-        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
-        registry.reserve(seg_id, seg_meta.clone()).unwrap();
-        registry.seal(seg_id, seg_meta.clone()).unwrap();
+        let mut seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
+        // The seal-time logical total (ADR-0034 D1): 4 × 200-byte objects.
+        seg_meta.total_bytes = 800;
 
-        // Put 4 objects (200 bytes each = 800 total)
-        for i in 0..4 {
-            let obj_meta = make_object_meta(
-                &format!("keep{i}.txt"),
-                200,
-                ChunkRef {
-                    segment_id: seg_id,
-                    offset: i * 200,
-                    length: 200,
-                    compressed: false,
-                    logical_length: 200,
-                },
-            );
-            metadata.put_object(obj_meta).unwrap();
-        }
-
-        // Delete 3 of the 4 objects (600 of 800 = 75% dead space → liveness 0.25)
-        let bucket = BucketId::new("default");
-        for i in 0..3 {
-            metadata
-                .put_tombstone(
-                    &bucket,
-                    &ObjectKey::new(format!("keep{i}.txt")),
-                    Tombstone {
-                        deletion_time: 1000000000000, // ancient, past any TTL
-                        hlc: Hlc::new(1000000000000, 1),
-                        chunks: smallvec::SmallVec::new(),
-                    },
-                )
-                .unwrap();
-        }
-
-        // Use a threshold that will trigger (liveness 0.25 < 0.5)
         let store = Arc::new(crate::anti_entropy::InMemorySegmentStore::new());
         store.write_segment_data(&seg_id, &vec![0x11; 800]).await.unwrap();
-        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+
         // Seed the candidate through the machine (the only writer of
         // lifecycle state) so the compactor's transitions validate.
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
         let tmp = tempfile::TempDir::new().unwrap();
         let event_wal = Arc::new(
             oceanfs_storage::segment::event_wal::EventWal::open(
@@ -1101,6 +1080,53 @@ mod tests {
             &["keep0.txt", "keep1.txt", "keep2.txt", "keep3.txt"],
         )
         .await;
+
+        // Put 4 objects (200 bytes each = 800 total).
+        for i in 0..4u64 {
+            let obj_meta = make_object_meta(
+                &format!("keep{i}.txt"),
+                200,
+                ChunkRef {
+                    segment_id: seg_id,
+                    offset: i * 200,
+                    length: 200,
+                    compressed: false,
+                    logical_length: 200,
+                },
+            );
+            metadata.put_object(obj_meta).unwrap();
+        }
+
+        // "Delete" 3 of the 4 objects the production way: remove the row
+        // via `delete_object` (which captures the chunks) and plant the
+        // deterministic AGED chunk-carrying tombstone — the f1 capture
+        // shape. 600 of 800 bytes dead → liveness 0.25 < 0.5.
+        let bucket = BucketId::new("default");
+        for i in 0..3u64 {
+            let key = ObjectKey::new(format!("keep{i}.txt"));
+            metadata.delete_object(&bucket, &key, Hlc::zero()).unwrap();
+            let mut chunks = smallvec::SmallVec::new();
+            chunks.push(ChunkRef {
+                segment_id: seg_id,
+                offset: i * 200,
+                length: 200,
+                compressed: false,
+                logical_length: 200,
+            });
+            metadata
+                .put_tombstone(
+                    &bucket,
+                    &key,
+                    Tombstone {
+                        deletion_time: 1000000000000, // ancient
+                        hlc: Hlc::zero(),
+                        chunks,
+                    },
+                )
+                .unwrap();
+        }
+
+        // Use a threshold that will trigger (liveness 0.25 < 0.5).
         let gc_trigger = GarbageCollector::new(GcConfig {
             tombstone_ttl_sec: 0,
             compact_threshold: 0.5,

@@ -1,7 +1,7 @@
 ---
 feature: "f2: Accounting-Based GC Liveness & Fully-Dead Orphan Reaper"
 epic: "refactoring/bounded-metadata-scans"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -22,7 +22,7 @@ perf:
   - "7.1 minimize lock hold duration"
   - "1.4 SmallVec for small metadata structures"
 created: 2026-09-04
-updated: 2026-09-04
+updated: 2026-09-06
 ---
 
 # f2: Accounting-Based GC Liveness & Fully-Dead Orphan Reaper
@@ -220,12 +220,17 @@ Orphan reaper cycle (orphan_reaper.rs:120)
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds in `oceanfs-durability`,
+- [x] **Code:** `cargo build --all-targets` succeeds in `oceanfs-durability`,
       `oceanfs-storage`, `oceanfs-storage-api`, `oceanfs-node`. `grep -rn
       "list_objects_all_with_bucket\|list_objects_all" crates/oceanfs-durability/src/gc
       crates/oceanfs-durability/src/healing_service.rs` shows **no** remaining
       call on the GC/reaper/remap paths; `build_referenced_set` is gone.
-- [ ] **Tests:** `cargo test -p oceanfs-durability --lib -- --test-threads=1`
+      <!-- REVIEW: verified 2026-09-06 — builds pass for all four crates;
+      the literal grep returns nothing (only the trait/impl declarations
+      remain in storage(-api), with zero callers anywhere in crates/);
+      build_referenced_set exists only as historical doc prose in
+      healing_service.rs:73 and coordinator.rs:985. -->
+- [x] **Tests:** `cargo test -p oceanfs-durability --lib -- --test-threads=1`
       and `cargo test -p oceanfs-storage --lib -- --test-threads=1`
       (PIPELINE.md §4.6) pass, adding:
       - D6 "DELETE then idle": delete an object → captured dead bytes == old
@@ -252,22 +257,148 @@ Orphan reaper cycle (orphan_reaper.rs:120)
         `orphans_found` match the pre-f2 values.
       Then `cargo test -p oceanfs-node --test orphan_reaper -- --test-threads=1`
       and `cargo test -p oceanfs-node --test gc_compaction -- --test-threads=1`.
-- [ ] **Docs:** `#![deny(missing_docs)]` passes; `LivenessTracker`,
+      <!-- REVIEW: verified 2026-09-06 (iteration 2) — durability lib
+      (258), storage lib (458), node lib (66), durability gc_compaction
+      (5), durability orphan_reaper (7), node orphan_reaper (8), node
+      gc_compaction (7), data_pool_placement
+      two_data_pool_node_roundtrip_gc (1), and segment_replication (3)
+      all pass under --test-threads=1. The formerly flaky
+      supersede_cleanup_after_compaction_deletes_record_keeps_live_row
+      (garbage_collector.rs:1183) is now deterministic: the fixture sleeps
+      5 ms after the v2 overwrite (garbage_collector.rs:1268) so the
+      now_ms()-stamped supersede capture always satisfies the strict
+      `now − captured_at > ttl` aged filter (TTL-0 config) before
+      run_cycle; re-verified 5/5 isolated and green inside two full
+      258-test lib runs. The new GC-side unknown-total pin
+      unknown_total_segment_never_a_compaction_candidate
+      (garbage_collector.rs:1332) passes: asserts dead_bytes > 0 (aged
+      capture observed) with segments_compacted == 0 and the registry
+      entry untouched. -->
+- [x] **Docs:** `#![deny(missing_docs)]` passes; `LivenessTracker`,
       `process_tombstones`, and `OrphanReaper::run_cycle` docs describe the
       accounting model (live = total − dead; orphan = dead ≥ total).
-- [ ] **ADR:** ADR-0034 D3 (no `list_objects_all` on the GC path; liveness
+      <!-- REVIEW: verified — `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+      -p oceanfs-durability -p oceanfs-node -p oceanfs-storage
+      -p oceanfs-storage-api` passes; all four lib.rs deny(missing_docs);
+      the three named items carry accounting-model doc comments
+      (liveness_tracker.rs:11-26, garbage_collector.rs:493-509,
+      orphan_reaper.rs:123-140). -->
+- [x] **ADR:** ADR-0034 D3 (no `list_objects_all` on the GC path; liveness
       from registry + aged captures) and D4 (reaper detects fully-dead from
       accounting, `build_referenced_set` deleted, phase-2b retired) satisfied;
       ADR-0025 registry remains the segment set; ADR-0032 unified store
       respected (no new store instances).
-- [ ] **Perf:** GC and the reaper are O(live segments) + O(aged dead-chunk
+      <!-- REVIEW: verified — GC registers every registry entry with
+      entry.metadata.total_bytes and consumes only the shared aged feed
+      (garbage_collector.rs:527-537); reaper derives orphanhood from the
+      same feed + registry totals and its cycle never calls
+      list_segment_files (orphan_reaper.rs:145-272); startup
+      compaction-recovery is membership-driven StoreObjectLookup
+      (compaction_recovery.rs:100-160) and both former
+      list_objects_all_with_bucket sites in gc/ are gone; no new store
+      instances (reaper consumes the injected shared data_store;
+      OrphanReaper::new lost pool_roots at all 6 sites). -->
+- [x] **Perf:** GC and the reaper are O(live segments) + O(aged dead-chunk
       records) per cycle — no objects-CF scan, no full-`Vec` materialization
       of the objects CF; registry lock holds stay per-entry (perf 7.1).
-- [ ] **Integration:** a full delete→overwrite→GC→reaper sequence on one node
+      <!-- REVIEW: verified — both cycles are registry.for_each +
+      collect_aged_dead_chunk_records (one deletions-CF enumeration,
+      bounded by aged records); the objects CF is never scanned (zero
+      list_objects_all callers in crates/); records are enumerated before
+      the registry iteration so no registry lock spans store I/O;
+      per-entry work is map arithmetic only. -->
+- [x] **Integration:** a full delete→overwrite→GC→reaper sequence on one node
       converges to the same reclaimed-bytes totals as the pre-ADR-0034 path on
       the same fixture; the D6 matrix rows owned by f2 run green with
       `--test-threads=1`.
+      <!-- REVIEW: verified 2026-09-06 (iteration 2) — node orphan_reaper
+      (8), node gc_compaction (7), durability gc_compaction (5),
+      durability orphan_reaper (7), data_pool_placement
+      two_data_pool_node_roundtrip_gc (1), and segment_replication (3)
+      all run green under --test-threads=1; the D6 overwrite row is
+      deterministic since the supersede GC pin fix (see Tests REVIEW
+      above). The former MEDIUM residue-sweep gap is closed by design: a
+      once-per-boot registry-residue `.dat` sweep in modules/storage.rs
+      startup (storage.rs:658-722), running after the compaction-recovery
+      action loop, lists each data pool root and unlinks any `.dat` whose
+      lifecycle entry is Missing or Deleted (idempotent
+      delete_shards_with_pool) — covering reaper orphan-reclaim residue,
+      compactor fully-dead residue, AND compaction-recovery residue
+      (including the SweepOldDat pure-residue case, which can no longer
+      resolve a pool id). The reaper run_cycle comment
+      (orphan_reaper.rs:211-219) states this accurately; run_cycle never
+      lists the disk (list_segment_files appears only in the startup sweep
+      and a test-local mock). -->
 
 > **Lint & Doc Examples (non-gating):** `cargo clippy --lib -- -D warnings`
 > on production code. Test-code clippy warnings and `ignore`-tagged doc
 > examples are non-blocking (see `guidelines/coding.md` §9.2).
+
+## Implementation notes (2026-09-06)
+
+Decisions and deviations recorded during implementation (ADR-0034 D3/D4).
+
+- **D1 — `OrphanReaper` drops `pool_roots`.** Phase-2b retirement (D4)
+  removes the only per-root disk-listing consumer; the constructor loses
+  the `pool_roots` argument (public-API change at 6 sites — the one
+  production caller is `crates/oceanfs-node/src/modules/durability.rs`).
+  The reclaim unlink keeps using the registry entry's `pool_id` through
+  the shared `data_store`; `run_cycle` never calls `list_segment_files`.
+- **D2 — shared accounting feed in `gc/liveness_tracker.rs`:**
+  `collect_aged_dead_chunk_records(metadata, now_ms, ttl_ms)` — the one
+  `MetadataStore::list_dead_chunk_records_all` enumeration + one TTL
+  filter (`now − captured_at > ttl`). GC's `process_tombstones` and the
+  reaper's fully-dead pass both consume it, so GC and the reaper agree on
+  what "aged/reclaimable" means.
+- **D3 — unknown-total rule:** a Sealed entry with `total_bytes == 0`
+  (row-3 adopt / repair copies, f3 notes) is registered and scanned but
+  is NEVER a compaction candidate (belt-and-braces pre-spawn skip in
+  `run_cycle` mirrors the membership filter) and NEVER an orphan. The
+  `segments_scanned` stat counts all registry entries.
+- **D4 — the reaper's double-check** is a bounded cycle-snapshot
+  re-verification (`dead ≥ total` per candidate from the same map) — no
+  store rescan. Delete-before-unlink through `request_delete` +
+  `delete_shards_with_pool` is unchanged.
+- **D5 — tests reworked to accounting fixtures.** Old-model unit tests
+  (`referenced_set_*`, `double_check_*`, `sweeps_unregistered_on_disk_segments`,
+  `process_tombstones_respects_ttl`, and the "no-capture orphan" fixtures)
+  are deleted; the reaper suites now seed real `total_bytes`, real object
+  rows, and chunk-carrying aged captures (`put_tombstone` with an ancient
+  `deletion_time` — the deterministic `delete_object`-shaped capture).
+  The node `orphan_reaper.rs`/`gc_compaction.rs` fixtures are direct-wiring
+  and were adapted the same way; real write-path gates (`data_pool_placement`,
+  `segment_replication`) pass unchanged because real seals carry totals and
+  real deletes carry chunks.
+- **D6 (revised per review) — no scan remains in `gc/`.** The startup
+  compaction-recovery `ObjectLookup` (`gc/compaction_recovery.rs`) is now
+  **membership-driven**: `StoreObjectLookup(registry, metadata)`
+  point-reads the queried segment's own seal-time contained list
+  (ADR-0034 D5/f3) instead of `list_objects_all_with_bucket`. The
+  crash-harness `StoreLookup` test impl was deleted with the scan. Both
+  earlier `list_objects_all_with_bucket` sites in `gc/` are gone — the
+  epic's literal grep over `gc/` + `healing_service.rs` returns nothing.
+- **Residue backstop moved to startup (not left to the reaper).** The
+  old phase-2b sweep was the periodic backstop for `.dat` residue whose
+  registry entry is gone or `Deleted` (a crash between `DeleteEvent` and
+  the unlink — from the reaper's orphan reclaim, the compactor's
+  fully-dead path, or a compaction recovery action). That backstop now
+  lives in `modules/storage.rs`'s startup path as a once-per-boot
+  **registry-residue `.dat` sweep**: it lists each data pool root and
+  unlinks any `.dat` whose lifecycle entry is `Missing`/`Deleted`
+  (`delete_shards_with_pool`, idempotent). Bounded by the on-disk file
+  count, no objects-CF access, no periodicity — the ADR-0034 D4 shape.
+  Reaper `run_cycle` never lists the disk.
+- **Post-compaction cleanup (D3/D6):** plain-tombstone keys keep today's
+  cleanup (`delete_tombstone` + GC row delete); aged supersede records
+  referencing a compacted segment are deleted **by version** via the new
+  `MetadataStore::delete_dead_chunk_record` (default `Ok(())`; RocksDB
+  impl reconstructs the exact versioned supersede key) — the key's LIVE
+  row is never deleted. A GC unit test
+  (`supersede_cleanup_after_compaction_deletes_record_keeps_live_row`)
+  and a store unit test
+  (`delete_dead_chunk_record_removes_only_the_versioned_supersede`) pin it.
+  On iteration 2 the GC unit test was made deterministic (it had flaked
+  under `--test-threads=1`): the fixture now sleeps 5 ms after the v2
+  overwrite (`garbage_collector.rs:1268`) so the `now_ms()`-stamped
+  supersede capture always clears the strict `now − captured_at > ttl`
+  aged filter (TTL-0 config) before `run_cycle`.

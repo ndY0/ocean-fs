@@ -202,9 +202,9 @@ async fn gc_write_delete_verify_stats() {
     }
 
     let gc = GarbageCollector::new(GcConfig::default());
-    let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
-        &oceanfs_core::LifecycleConfig::default(),
-    );
+    // Run against the SAME seeded registry (the accounting pass registers
+    // the machine's entries; there is no surviving-object scan to discover
+    // the segment from metadata anymore).
     let stats = gc.run_cycle(metadata, &registry).await.expect("GC cycle");
 
     // At least one segment scanned; the segment has ~60% dead bytes (3/5)

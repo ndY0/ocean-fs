@@ -178,6 +178,30 @@ pub trait MetadataStore: Send + Sync {
     /// Returns an I/O error if the deletion fails.
     fn delete_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<()>;
 
+    /// Deletes one versioned supersede dead-chunk record (ADR-0034 D2;
+    /// f2's post-compaction supersede cleanup).
+    ///
+    /// GC calls this after compacting a segment whose reclaimed dead bytes
+    /// included an aged supersede record's chunks: the referenced segment is
+    /// gone, so the accounting record is stale. The key's LIVE object row is
+    /// never touched — this is NOT a tombstone delete and NOT a row delete.
+    ///
+    /// The default implementation is a no-op so in-memory test doubles stay
+    /// minimal; the RocksDB store overrides it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the deletion fails.
+    fn delete_dead_chunk_record(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+        version: Hlc,
+    ) -> std::io::Result<()> {
+        let _ = (bucket, key, version);
+        Ok(())
+    }
+
     /// Checks whether a deletion tombstone exists for the given key.
     ///
     /// Used by the gRPC segment service to reject read-repair pushes that

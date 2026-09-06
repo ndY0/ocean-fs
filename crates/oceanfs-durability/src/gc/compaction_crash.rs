@@ -59,7 +59,9 @@ use oceanfs_storage::{
 use oceanfs_storage_api::SegmentDataStore;
 
 use super::{
-    compaction_recovery::{recover_incomplete_compactions, CompactionRecoveryAction, ObjectLookup},
+    compaction_recovery::{
+        recover_incomplete_compactions, CompactionRecoveryAction, StoreObjectLookup,
+    },
     segment_compactor::{stall_seam, SegmentCompactor},
 };
 
@@ -333,7 +335,10 @@ impl Harness {
             .unwrap();
         let actions = recover_incomplete_compactions(
             &self.lifecycle.registry(),
-            &StoreLookup { store: self.store.clone() },
+            &StoreObjectLookup::new(
+                Arc::clone(&self.registry),
+                self.store.clone() as Arc<dyn oceanfs_storage_api::MetadataStore>,
+            ),
         )
         .unwrap();
         (outcome, actions)
@@ -391,23 +396,6 @@ impl Harness {
 
     fn entry(&self, id: SegmentId) -> oceanfs_storage::segment::lifecycle::LifecycleEntry {
         self.lifecycle.registry().get(id).expect("registry entry present")
-    }
-}
-
-/// The production-shaped objects-CF lookup: one scan answers whether any
-/// object references a segment.
-struct StoreLookup {
-    store: Arc<RocksDbMetadataStore>,
-}
-
-impl ObjectLookup for StoreLookup {
-    fn is_referenced(&self, segment_id: SegmentId) -> crate::Result<bool> {
-        Ok(self
-            .store
-            .list_objects_all_with_bucket()
-            .into_iter()
-            .flatten()
-            .any(|(_, obj)| obj.chunks.iter().any(|c| c.segment_id == segment_id)))
     }
 }
 

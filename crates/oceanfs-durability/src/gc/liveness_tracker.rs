@@ -1,12 +1,52 @@
-//! Liveness analysis — identifies dead segments by tombstone reference counting.
+//! Liveness analysis — byte accounting over the registry + dead-chunk records.
 
 use std::collections::{HashMap, HashSet};
 
-use oceanfs_core::{ChunkRef, SegmentId};
+use oceanfs_core::{BucketId, ChunkRef, DeadChunkRecord, ObjectKey, SegmentId};
 
 // ---------------------------------------------------------------------------
 // LivenessTracker
 // ---------------------------------------------------------------------------
+
+/// Collects the AGED dead-chunk records across all buckets (ADR-0034 D3,
+/// f2): plain tombstones (`kind: Tombstone`) and versioned supersedes
+/// (`kind: Supersede`, ADR-0034 D2) whose `captured_at` is older than the
+/// tombstone TTL.
+///
+/// Both accounting consumers use this ONE enumeration + TTL filter:
+/// GC's liveness pass marks each aged record's chunks dead while
+/// classifying it (tombstone → eligible/cleanup; supersede → cleanup
+/// only), and the orphan reaper aggregates `dead_bytes` per segment from
+/// the same records. Computing live = total − dead over exactly this set
+/// keeps GC and the reaper in agreement about what "reclaimable" means.
+///
+/// Records younger than the TTL are skipped — their bytes are not
+/// reclaimable yet (the delete grace). Corrupt/undecodable records are
+/// logged and skipped (they degrade to reaper accounting, never to a full
+/// objects-CF scan).
+pub(crate) fn collect_aged_dead_chunk_records(
+    metadata: &dyn oceanfs_storage_api::MetadataStore,
+    now_ms: i64,
+    ttl_ms: i64,
+) -> Vec<(BucketId, ObjectKey, DeadChunkRecord)> {
+    metadata
+        .list_dead_chunk_records_all()
+        .into_iter()
+        .filter_map(|entry| match entry {
+            Ok((bucket, key, record)) => {
+                if now_ms - record.captured_at > ttl_ms {
+                    Some((bucket, key, record))
+                } else {
+                    None
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to read a dead-chunk record (skipped)");
+                None
+            }
+        })
+        .collect()
+}
 
 /// Tracks per-segment live/dead byte counts during a GC cycle.
 #[derive(Debug, Default)]
@@ -25,20 +65,16 @@ impl LivenessTracker {
         Self::default()
     }
 
-    /// Registers a segment with its total size.
+    /// Registers a segment with its seal-time logical total (ADR-0034
+    /// D1, f3). Live starts at `total_size`; `mark_dead` moves captured
+    /// bytes to dead.
     pub(crate) fn register_segment(&mut self, segment_id: SegmentId, total_size: u64) {
         self.known_segments.insert(segment_id);
         // Initialize live bytes to total_size — deletions will move bytes to dead
         *self.live_bytes.entry(segment_id).or_insert(0) += total_size;
     }
 
-    /// Adds live bytes to a segment (from object chunk metadata).
-    pub(crate) fn add_live_bytes(&mut self, segment_id: SegmentId, bytes: u64) {
-        self.known_segments.insert(segment_id);
-        *self.live_bytes.entry(segment_id).or_insert(0) += bytes;
-    }
-
-    /// Marks a chunk as dead (from a tombstone).
+    /// Marks a chunk as dead (from an aged dead-chunk record).
     pub(crate) fn mark_dead(&mut self, chunk: &ChunkRef) {
         let dead = chunk.length as u64;
         *self.dead_bytes.entry(chunk.segment_id).or_insert(0) += dead;

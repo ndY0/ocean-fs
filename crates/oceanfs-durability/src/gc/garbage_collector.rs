@@ -7,8 +7,8 @@ use std::{
 };
 
 use oceanfs_core::{
-    BucketId, ContainedObject, Counter, LabelSet, MetricRegistrar, ObjectKey, RemappedChunk,
-    SegmentId,
+    BucketId, ContainedObject, Counter, DeadChunkKind, Hlc, LabelSet, MetricRegistrar, ObjectKey,
+    RemappedChunk, SegmentId,
 };
 use oceanfs_storage::segment::TierRouter;
 use oceanfs_storage_api::{error::Result as ApiResult, SegmentDataStore};
@@ -84,8 +84,23 @@ pub struct GarbageCollector {
     compaction_remap_notifier: Option<CompactionRemapFn>,
 }
 
-type TombstoneResult =
-    Result<(HashSet<(String, String)>, HashMap<SegmentId, Vec<(BucketId, ObjectKey)>>)>;
+/// Per-cycle tombstone/supersede outcome (ADR-0034 D3, f2):
+///
+/// 1. `eligible_keys` — the (bucket, key) of AGED plain tombstones: the
+///    compactor's dead-object filter (a raced re-PUT row under such a key
+///    must not be repacked).
+/// 2. `tombstone_keys_by_segment` — plain-tombstone keys whose chunks
+///    reference each segment: after that segment is compacted, delete the
+///    tombstone and run the GC-driven row delete.
+/// 3. `supersedes_by_segment` — versioned supersede records
+///    `(bucket, key, version)` whose chunks reference each segment: after
+///    that segment is compacted, delete the dead-chunk record ONLY — the
+///    key is LIVE and is never a row-delete target.
+type TombstoneResult = Result<(
+    HashSet<(String, String)>,
+    HashMap<SegmentId, Vec<(BucketId, ObjectKey)>>,
+    HashMap<SegmentId, Vec<(BucketId, ObjectKey, Hlc)>>,
+)>;
 
 impl GarbageCollector {
     /// Creates a new garbage collector with unregistered counters.
@@ -240,10 +255,13 @@ impl GarbageCollector {
         let mut stats = GcStats::default();
         let mut tracker = LivenessTracker::new();
 
-        // Phase 1: Scan deletions and compute liveness.
-        // Also returns the set of dead object keys (eligible tombstones past TTL)
-        // so compaction can skip them when re-packing.
-        let (dead_keys, tombstone_keys_by_segment) =
+        // Phase 1: byte-account liveness from the registry totals + the
+        // aged dead-chunk records (ADR-0034 D3, f2). Also returns the
+        // per-segment cleanup lists: plain-tombstone keys (delete the
+        // tombstone + GC row delete after compaction) and versioned
+        // supersedes (delete the dead-chunk record only — never a row
+        // delete; the key is live).
+        let (dead_keys, tombstone_keys_by_segment, supersedes_by_segment) =
             self.process_tombstones(&*metadata, registry, &mut tracker, &mut stats)?;
 
         // Report what the pass observed even when nothing compacts, so
@@ -349,6 +367,17 @@ impl GarbageCollector {
                 drop(permit);
                 continue;
             }
+            // Unknown-total segment (total_bytes == 0 — row-3 adopt /
+            // repair copies, f3 notes): never a compaction candidate (the
+            // compactor cannot account its liveness). This pre-spawn guard
+            // is the authoritative skip — the tracker's ratio on a
+            // total-0 segment with dead captures would otherwise read as a
+            // candidate, so GC must not spawn a repack on a total it does
+            // not know.
+            if segment_meta.total_bytes == 0 {
+                drop(permit);
+                continue;
+            }
             let dead_bytes = tracker.dead_bytes_for(&segment_id);
 
             let handle = tokio::spawn(async move {
@@ -385,6 +414,10 @@ impl GarbageCollector {
             stats.segments_compacted += 1;
             stats.bytes_reclaimed += reclaimed;
 
+            // Plain-tombstone cleanup: delete the tombstone, then the
+            // GC-driven row delete (D6 "GC-driven delete of a tombstoned
+            // key"). The row delete carries no user event, so there is no
+            // delete HLC to stamp; zero preserves the pre-G4 behavior.
             if let Some(tombstone_keys) = tombstone_keys_by_segment.get(&segment_id) {
                 for (bucket, key) in tombstone_keys {
                     if let Err(e) = metadata.delete_tombstone(bucket, key) {
@@ -396,10 +429,25 @@ impl GarbageCollector {
                             "failed to delete tombstone after compaction"
                         );
                     }
-                    // GC-driven metadata removal carries no user event,
-                    // so there is no delete HLC to stamp; zero preserves
-                    // the pre-G4 behavior for this path.
                     let _ = metadata.delete_object(bucket, key, oceanfs_core::Hlc::zero());
+                }
+            }
+            // Supersede cleanup (ADR-0034 D2/f2): the aged supersede dead
+            // chunk records that referenced the compacted segment are
+            // stale (the segment's bytes are gone) — delete the accounting
+            // record ONLY, by version. The key is LIVE: never a tombstone
+            // delete, never a row delete.
+            if let Some(supersedes) = supersedes_by_segment.get(&segment_id) {
+                for (bucket, key, version) in supersedes {
+                    if let Err(e) = metadata.delete_dead_chunk_record(bucket, key, *version) {
+                        tracing::warn!(
+                            bucket = %bucket,
+                            key = %key,
+                            segment_id = %segment_id,
+                            error = %e,
+                            "failed to delete supersede dead-chunk record after compaction"
+                        );
+                    }
                 }
             }
         }
@@ -444,12 +492,23 @@ impl GarbageCollector {
         })
     }
 
-    /// Processes tombstones to update the liveness tracker.
+    /// Processes the aged dead-chunk records into the liveness tracker
+    /// (ADR-0034 D3, f2).
     ///
-    /// Scans the deletions column family, filters tombstones by TTL,
-    /// and marks the corresponding chunks as dead. Tombsones younger
-    /// than `tombstone_ttl_sec` are skipped to prevent immediate
-    /// reclamation of recently deleted objects (data-loss prevention).
+    /// This is byte ACCOUNTING, not object counting: every machine entry
+    /// is registered with its seal-time logical total (`total_bytes`,
+    /// f3), and every AGED dead-chunk record (plain tombstone OR versioned
+    /// supersede — f1) moves its captured chunk bytes to dead. There is
+    /// no surviving-object scan and no re-PUT-race arm: records younger than
+    /// `tombstone_ttl_sec` are skipped (the delete grace — same TTL semantics
+    /// as before).
+    ///
+    /// Classified outcomes feed the post-compaction cleanup:
+    /// plain-tombstone keys become eligible for the compactor's dead
+    /// filter and (after their segment is compacted) tombstone + row
+    /// deletion; supersedes NEVER become eligible (the key is live) and
+    /// their dead-chunk records are deleted after their segment is
+    /// compacted — the live row is never deleted.
     pub(crate) fn process_tombstones(
         &self,
         metadata: &dyn oceanfs_storage_api::MetadataStore,
@@ -461,87 +520,73 @@ impl GarbageCollector {
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
         let ttl_ms = (self.config.tombstone_ttl_sec * 1000) as i64;
 
-        // Register all known segments first (initialize with zero —
-        // actual bytes come from object chunk metadata). The machine's
-        // live entries are the segment set (ADR-0025 Decision 3).
+        // Register every machine entry with its seal-time logical total.
+        // Live starts at total; aged dead records move bytes to dead
+        // (live = total − dead). An entry whose total is 0 ("unknown" —
+        // row-3 adopt / repair copies, f3 notes) is registered but can
+        // never be a compaction candidate (its liveness ratio stays 1.0);
+        // GC never scans to recover an unknown total.
         registry.for_each(|id, entry| {
-            let _ = entry;
-            tracker.register_segment(id, 0);
+            tracker.register_segment(id, entry.metadata.total_bytes);
             stats.segments_scanned += 1;
         });
 
-        // Phase 1: Collect eligible tombstone keys (past TTL) and the dead
-        // chunks they carry. Tombstones are scanned across ALL buckets —
-        // restricting the scan to "default" (the historical behaviour) hid
-        // every deletion in other buckets, so GC never detected dead bytes
-        // for those buckets' segments and compaction never ran for them.
-        //
-        // The tombstone carries the deleted object's chunk refs (captured
-        // before the object row was removed — see
-        // RocksDbMetadataStore::delete_object). Marking them dead directly
-        // is the ONLY way GC can attribute dead bytes to segments: the
-        // object row no longer exists, so matching tombstone keys against
-        // surviving object rows (the pre-fix approach) could never fire.
-        // Legacy tombstones (written before chunks were captured) have an
-        // empty chunk list — their dead bytes are unreachable and fall to
-        // the orphan reaper.
-        let tombstones = metadata.list_tombstones_all();
+        // The accounting feed: aged dead-chunk records across ALL buckets
+        // (the f1 enumeration, one TTL filter — the same set the orphan
+        // reaper consumes via the shared helper). A corrupt record is
+        // logged and skipped by the helper.
+        let records =
+            super::liveness_tracker::collect_aged_dead_chunk_records(metadata, now_ms, ttl_ms);
+
         let mut eligible_keys: HashSet<(String, String)> = HashSet::new();
         let mut tombstone_keys_by_segment: HashMap<SegmentId, Vec<(BucketId, ObjectKey)>> =
             HashMap::new();
+        let mut supersedes_by_segment: HashMap<SegmentId, Vec<(BucketId, ObjectKey, Hlc)>> =
+            HashMap::new();
 
-        for tomb_result in tombstones {
-            match tomb_result {
-                Ok((bucket, key, tombstone)) => {
-                    if now_ms - tombstone.deletion_time > ttl_ms {
-                        eligible_keys
-                            .insert((bucket.as_str().to_string(), key.as_str().to_string()));
-                        for chunk in &tombstone.chunks {
-                            tracker.mark_dead(chunk);
-                            tombstone_keys_by_segment
-                                .entry(chunk.segment_id)
-                                .or_default()
-                                .push((bucket.clone(), key.clone()));
-                        }
+        for (bucket, key, record) in records {
+            match record.kind {
+                DeadChunkKind::Tombstone => {
+                    // A DELETED key: eligible for the compactor's dead
+                    // filter; after its segment is compacted the tombstone
+                    // is deleted and the GC-driven row delete runs. Legacy
+                    // tombstones (no chunks) still enter the eligible set
+                    // but attribute no bytes anywhere.
+                    eligible_keys.insert((bucket.as_str().to_string(), key.as_str().to_string()));
+                    for chunk in &record.chunks {
+                        tracker.mark_dead(chunk);
+                        tombstone_keys_by_segment
+                            .entry(chunk.segment_id)
+                            .or_default()
+                            .push((bucket.clone(), key.clone()));
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to read tombstone entry");
+                DeadChunkKind::Supersede => {
+                    // A LIVE key: never eligible (the compactor's dead
+                    // filter must not drop the live row) and never a row
+                    // delete. After its segment is compacted, the stale
+                    // supersede dead-chunk record is deleted by version.
+                    for chunk in &record.chunks {
+                        tracker.mark_dead(chunk);
+                        supersedes_by_segment.entry(chunk.segment_id).or_default().push((
+                            bucket.clone(),
+                            key.clone(),
+                            record.hlc,
+                        ));
+                    }
+                }
+                _ => {
+                    // Non-exhaustive enum (guidelines §1.5): a future kind
+                    // still marks its bytes dead but is never eligible and
+                    // never a row delete — conservative supersede-like.
+                    for chunk in &record.chunks {
+                        tracker.mark_dead(chunk);
+                    }
                 }
             }
         }
 
-        if eligible_keys.is_empty() {
-            return Ok((eligible_keys, tombstone_keys_by_segment));
-        }
-
-        // Phase 2: Scan surviving objects to accumulate live bytes per
-        // segment. Deleted objects are already gone from the store — their
-        // chunks were marked dead in Phase 1 via the tombstone. Objects
-        // whose (bucket, key) is in the eligible set are skipped (they
-        // should not exist, but a re-PUT racing a tombstone would).
-        let all_objects = metadata.list_objects_all_with_bucket();
-
-        for obj_result in all_objects {
-            let Ok((bucket, obj)) = obj_result else { continue };
-            if eligible_keys
-                .contains(&(bucket.as_str().to_string(), obj.object_key.as_str().to_string()))
-            {
-                for chunk in &obj.chunks {
-                    tracker.mark_dead(chunk);
-                    tombstone_keys_by_segment
-                        .entry(chunk.segment_id)
-                        .or_default()
-                        .push((bucket.clone(), obj.object_key.clone()));
-                }
-            } else {
-                for chunk in &obj.chunks {
-                    tracker.add_live_bytes(chunk.segment_id, chunk.length as u64);
-                }
-            }
-        }
-
-        Ok((eligible_keys, tombstone_keys_by_segment))
+        Ok((eligible_keys, tombstone_keys_by_segment, supersedes_by_segment))
     }
 }
 
@@ -1023,7 +1068,9 @@ mod tests {
         );
 
         let seg_id = SegmentId::new();
-        let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
+        let mut seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000);
+        // The seal-time logical total (ADR-0034 D1): 1000 bytes on disk.
+        seg_meta.total_bytes = 1000;
         registry.reserve(seg_id, seg_meta.clone()).unwrap();
         // Seed the seal-time membership (ADR-0034 D5): the live object and
         // the (row-gone, tombstoned) object both sat on this segment; the
@@ -1130,6 +1177,239 @@ mod tests {
             .expect("live object must survive compaction");
         assert!(!live_after.chunks.is_empty());
         assert_ne!(live_after.chunks[0].segment_id, seg_id, "live chunks repacked to new segment");
+    }
+
+    #[tokio::test]
+    async fn supersede_cleanup_after_compaction_deletes_record_keeps_live_row() {
+        // D6 / f2 supersede cleanup: a segment whose dead bytes came from an
+        // AGED SUPERSEDE (an overwrite captured the old version) is fully
+        // dead → compacted → the supersede dead-chunk record is deleted by
+        // version, and the key's LIVE row (on the new segment) survives —
+        // never a tombstone delete, never a row delete.
+        let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let bucket = BucketId::new("default");
+
+        let old_seg = SegmentId::new();
+        let new_seg = SegmentId::new();
+        let mut old_meta = make_segment_meta(old_seg, SizeTier::Standard, 1700000000000);
+        old_meta.total_bytes = 200;
+
+        // The sealed segment's seal-time membership (ADR-0034 D5) lists the
+        // object whose OLD version sat on it.
+        let members: Arc<[oceanfs_core::ContainedObject]> =
+            Arc::from(vec![oceanfs_core::ContainedObject {
+                bucket: BucketId::new("default"),
+                key: ObjectKey::new("a"),
+            }]);
+        let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+            &oceanfs_core::LifecycleConfig::default(),
+        );
+        registry.reserve(old_seg, old_meta.clone()).unwrap();
+        registry.seal_with(old_seg, old_meta.clone(), None, Some(members)).unwrap();
+        let registry = Arc::new(registry);
+
+        // v1 on the old segment, then v2 overwrites it onto a NEW segment —
+        // the overwrite captures v1's chunks as a versioned supersede
+        // (ADR-0034 D2, f1).
+        let v1_chunks = {
+            let mut c = smallvec::SmallVec::new();
+            c.push(ChunkRef {
+                segment_id: old_seg,
+                offset: 0,
+                length: 200,
+                compressed: false,
+                logical_length: 200,
+            });
+            c
+        };
+        metadata
+            .put_object_in_bucket(
+                &bucket,
+                ObjectMetadata {
+                    object_key: ObjectKey::new("a"),
+                    size: 200,
+                    blake3_hash: None,
+                    chunks: v1_chunks,
+                    inline_data: None,
+                    created_at: 0,
+                    hlc: Hlc::new(1, 0),
+                },
+            )
+            .unwrap();
+        let v2_chunks = {
+            let mut c = smallvec::SmallVec::new();
+            c.push(ChunkRef {
+                segment_id: new_seg,
+                offset: 0,
+                length: 100,
+                compressed: false,
+                logical_length: 100,
+            });
+            c
+        };
+        metadata
+            .put_object_in_bucket(
+                &bucket,
+                ObjectMetadata {
+                    object_key: ObjectKey::new("a"),
+                    size: 100,
+                    blake3_hash: None,
+                    chunks: v2_chunks,
+                    inline_data: None,
+                    created_at: 0,
+                    hlc: Hlc::new(2, 0),
+                },
+            )
+            .unwrap();
+        // The capture stamps `captured_at = now_ms()` (public API), so the
+        // record is only aged once ≥1 ms elapses under the TTL-0 config.
+        // Sleep deterministically so the cycle below sees it as aged
+        // (strict `now − captured_at > ttl`).
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert_eq!(
+            metadata.list_dead_chunk_records_all().into_iter().filter_map(|r| r.ok()).count(),
+            1,
+            "the overwrite captured exactly one supersede"
+        );
+
+        // Wire the machine and run a TTL-0 cycle: dead (200) == total
+        // (200) → the old segment is fully dead and compacted away.
+        let store = Arc::new(crate::anti_entropy::InMemorySegmentStore::new());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let event_wal = Arc::new(
+            oceanfs_storage::segment::event_wal::EventWal::open(
+                tmp.path().join("event-wal"),
+                &oceanfs_core::EventWalConfig {
+                    event_wal_dir: tmp.path().join("event-wal"),
+                    event_wal_file_size_bytes: 1024 * 1024,
+                    event_wal_fsync_batch_timeout_ms: 10,
+                    event_wal_checkpoint_bytes: 1024 * 1024,
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let lifecycle = Arc::new(
+            oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::with_registry(
+                Arc::clone(&registry),
+            )
+            .with_event_wal(event_wal),
+        );
+        let gc = GarbageCollector::new(GcConfig {
+            tombstone_ttl_sec: 0,
+            compact_threshold: 0.5,
+            max_concurrent_compactions: 1,
+            compaction_queue_capacity: 8,
+            ..GcConfig::default()
+        })
+        .with_data_store(store)
+        .with_lifecycle(lifecycle);
+        let stats = gc.run_cycle(metadata.clone(), &registry).await.unwrap();
+        assert_eq!(stats.segments_compacted, 1, "the fully-dead segment must be compacted");
+
+        // The supersede dead-chunk record was deleted by version…
+        let remaining = metadata
+            .list_dead_chunk_records_all()
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect::<Vec<_>>();
+        assert!(
+            remaining.is_empty(),
+            "the supersede dead-chunk record referencing the compacted segment is deleted"
+        );
+
+        // …and the key's LIVE row survives, still referencing the new segment.
+        let live = metadata
+            .get_object(&bucket, &ObjectKey::new("a"))
+            .unwrap()
+            .expect("the live object row survives supersede cleanup");
+        assert_eq!(live.chunks.len(), 1);
+        assert_eq!(live.chunks[0].segment_id, new_seg, "the live row is untouched");
+        assert!(registry.get(old_seg).is_none(), "the old segment is deleted");
+    }
+
+    #[tokio::test]
+    async fn unknown_total_segment_never_a_compaction_candidate() {
+        // total_bytes == 0 = "unknown" (row-3 adopt / repair copies, f3):
+        // even with membership AND an aged dead capture that would push a
+        // known-total segment below the threshold, the pre-spawn guard
+        // must skip it — GC never compacts a total it cannot account.
+        let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let bucket = BucketId::new("default");
+
+        let seg_id = SegmentId::new();
+        let seg_meta = make_segment_meta(seg_id, SizeTier::Standard, 1700000000000); // total 0
+        let members: Arc<[oceanfs_core::ContainedObject]> =
+            Arc::from(vec![oceanfs_core::ContainedObject {
+                bucket: BucketId::new("default"),
+                key: ObjectKey::new("a"),
+            }]);
+        let registry = oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+            &oceanfs_core::LifecycleConfig::default(),
+        );
+        registry.reserve(seg_id, seg_meta.clone()).unwrap();
+        registry.seal_with(seg_id, seg_meta.clone(), None, Some(members)).unwrap();
+        let registry = Arc::new(registry);
+
+        // An aged dead capture referencing the segment (bytes exist even
+        // though the total is unknown).
+        let mut chunks = smallvec::SmallVec::new();
+        chunks.push(ChunkRef {
+            segment_id: seg_id,
+            offset: 0,
+            length: 100,
+            compressed: false,
+            logical_length: 100,
+        });
+        metadata
+            .put_tombstone(
+                &bucket,
+                &ObjectKey::new("a"),
+                Tombstone {
+                    deletion_time: 1_000_000_000_000, // ancient
+                    hlc: Hlc::zero(),
+                    chunks,
+                },
+            )
+            .unwrap();
+
+        let store = Arc::new(crate::anti_entropy::InMemorySegmentStore::new());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let event_wal = Arc::new(
+            oceanfs_storage::segment::event_wal::EventWal::open(
+                tmp.path().join("event-wal"),
+                &oceanfs_core::EventWalConfig {
+                    event_wal_dir: tmp.path().join("event-wal"),
+                    event_wal_file_size_bytes: 1024 * 1024,
+                    event_wal_fsync_batch_timeout_ms: 10,
+                    event_wal_checkpoint_bytes: 1024 * 1024,
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let lifecycle = Arc::new(
+            oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::with_registry(
+                Arc::clone(&registry),
+            )
+            .with_event_wal(event_wal),
+        );
+        let gc = GarbageCollector::new(GcConfig {
+            tombstone_ttl_sec: 0,
+            compact_threshold: 0.5,
+            max_concurrent_compactions: 1,
+            compaction_queue_capacity: 8,
+            ..GcConfig::default()
+        })
+        .with_data_store(store)
+        .with_lifecycle(lifecycle);
+        let stats = gc.run_cycle(metadata.clone(), &registry).await.unwrap();
+        assert!(stats.dead_bytes > 0, "the aged capture is observed");
+        assert_eq!(
+            stats.segments_compacted, 0,
+            "an unknown-total segment is never a compaction candidate"
+        );
+        assert!(registry.get(seg_id).is_some(), "the unknown-total segment is untouched");
     }
 
     // -----------------------------------------------------------------------

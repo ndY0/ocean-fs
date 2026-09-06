@@ -1,23 +1,26 @@
-//! Integration test: Orphan segment reaper.
+//! Integration test: Orphan segment reaper (fully-dead accounting,
+//! ADR-0034 D4/f2) — node-level fixture wiring.
 //!
 //! Verifies that the orphan reaper:
-//! 1. Scans all segments and identifies unreferenced ones
-//! 2. Respects the TTL for recently-sealed segments
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+//! 1. Identifies fully-dead segments (aged dead-captures >= total) from
+//!    byte accounting — no objects-CF reference scan
+//! 2. Respects the seal TTL for recently-sealed segments
 //! 3. Deletes orphan segment metadata and shard data
 //! 4. Reports accurate statistics
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
 
 use oceanfs_core::{
-    ChunkRef, HashOutput, Hlc, MetadataConfig, ObjectKey, ObjectMetadata, SegmentId,
-    SegmentMetadata, SizeTier,
+    ChunkRef, Hlc, MetadataConfig, ObjectKey, SegmentId, SegmentMetadata, SizeTier, Tombstone,
 };
 use oceanfs_durability::{GcConfig, InMemoryShardStore, OrphanReaper};
 use oceanfs_storage::{
-    metadata::RocksDbMetadataStore, segment::lifecycle::SegmentLifecycleCoordinator,
+    metadata::RocksDbMetadataStore,
+    segment::lifecycle::{SegmentLifecycleCoordinator, SegmentLifecycleRegistry},
 };
+use oceanfs_storage_api::SegmentDataStore;
 
 /// Helper: create a temporary metadata store.
 fn open_temp_metadata() -> Arc<RocksDbMetadataStore> {
@@ -36,9 +39,9 @@ fn open_temp_metadata() -> Arc<RocksDbMetadataStore> {
 /// (mirroring the node's startup seed).
 async fn make_reaper(
     metadata: Arc<RocksDbMetadataStore>,
-    store: Arc<dyn oceanfs_storage_api::SegmentDataStore>,
+    store: Arc<dyn SegmentDataStore>,
     config: GcConfig,
-    registry: Arc<oceanfs_storage::SegmentLifecycleRegistry>,
+    registry: Arc<SegmentLifecycleRegistry>,
 ) -> OrphanReaper {
     let tmp = tempfile::TempDir::new().unwrap();
     let event_wal = Arc::new(
@@ -57,7 +60,7 @@ async fn make_reaper(
     let lifecycle = Arc::new(
         SegmentLifecycleCoordinator::with_registry(Arc::clone(&registry)).with_event_wal(event_wal),
     );
-    OrphanReaper::new(metadata, lifecycle, store, vec![], config)
+    OrphanReaper::new(metadata, lifecycle, store, config)
 }
 
 /// Helper: create a test shard store.
@@ -65,47 +68,52 @@ fn make_shard_store() -> Arc<InMemoryShardStore> {
     Arc::new(InMemoryShardStore::new(4194304))
 }
 
-/// Helper: create a segment metadata with the given sealed timestamp.
-fn make_segment(id: SegmentId, sealed_at: i64) -> SegmentMetadata {
-    SegmentMetadata {
+/// Helper: create a sealed segment with a known logical total and an
+/// ancient seal time (the grace has elapsed).
+fn seed_sealed(registry: &SegmentLifecycleRegistry, id: SegmentId, total_bytes: u64) {
+    let meta = SegmentMetadata {
         pool_id: 0,
-        total_bytes: 0,
+        total_bytes,
         segment_id: id,
         ec_k: 4,
         ec_m: 2,
         size_tier: SizeTier::Standard,
         merkle_root: None,
         storage_locations: smallvec::SmallVec::new(),
-        sealed_at: Some(sealed_at),
-    }
+        sealed_at: Some(1_000_000_000_000),
+    };
+    registry.reserve(id, meta.clone()).unwrap();
+    registry.seal(id, meta).unwrap();
 }
 
-/// Helper: create an object metadata entry.
-fn make_object(key: &str, chunk: ChunkRef) -> ObjectMetadata {
+/// Plants an AGED chunk-carrying delete capture (the `delete_object`
+/// shape) referencing `segment_id` for `length` bytes.
+fn plant_aged_delete(metadata: &RocksDbMetadataStore, segment_id: SegmentId, length: u32) {
     let mut chunks = smallvec::SmallVec::new();
-    chunks.push(chunk);
-    ObjectMetadata {
-        object_key: ObjectKey::new(key),
-        size: chunk.length as u64,
-        blake3_hash: Some(HashOutput::from_bytes([0u8; 32])),
-        chunks,
-        inline_data: None,
-        created_at: 1700000000000,
-        hlc: Hlc::new(1700000000000, 0),
-    }
+    chunks.push(ChunkRef {
+        segment_id,
+        offset: 0,
+        length,
+        compressed: false,
+        logical_length: length,
+    });
+    metadata
+        .put_tombstone(
+            &oceanfs_core::BucketId::new("default"),
+            &ObjectKey::new("gone.txt"),
+            Tombstone { deletion_time: 1_000_000_000_000, hlc: Hlc::zero(), chunks },
+        )
+        .unwrap();
 }
 
 #[tokio::test]
 async fn reaper_empty_store_produces_zero_stats() {
     let metadata = open_temp_metadata();
-    let shard_store = make_shard_store();
-    let registry = Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(
-        &oceanfs_core::LifecycleConfig::default(),
-    ));
-    let reaper =
-        make_reaper(metadata, shard_store, GcConfig::default(), Arc::clone(&registry)).await;
-
-    let stats = reaper.run_cycle().await.expect("reaper cycle");
+    let store = make_shard_store();
+    let registry =
+        Arc::new(SegmentLifecycleRegistry::new(&oceanfs_core::LifecycleConfig::default()));
+    let reaper = make_reaper(metadata, store, GcConfig::default(), registry).await;
+    let stats = reaper.run_cycle().await.unwrap();
     assert_eq!(stats.segments_scanned, 0);
     assert_eq!(stats.orphans_found, 0);
     assert_eq!(stats.orphans_deleted, 0);
@@ -114,205 +122,196 @@ async fn reaper_empty_store_produces_zero_stats() {
 #[tokio::test]
 async fn reaper_referenced_segment_not_orphan() {
     let metadata = open_temp_metadata();
-
     let seg_id = SegmentId::new();
-    let seg_meta = make_segment(seg_id, 1000000000000);
-    let registry = Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(
-        &oceanfs_core::LifecycleConfig::default(),
-    ));
-    registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
-    registry.seal(seg_meta.segment_id, seg_meta).unwrap();
+    let registry =
+        Arc::new(SegmentLifecycleRegistry::new(&oceanfs_core::LifecycleConfig::default()));
+    seed_sealed(&registry, seg_id, 1000);
 
-    // Create an object referencing this segment
-    let obj = make_object(
-        "alive.txt",
-        ChunkRef {
-            segment_id: seg_id,
-            offset: 0,
-            length: 500,
-            compressed: false,
-            logical_length: 500,
-        },
-    );
-    metadata.put_object(obj).expect("put object");
+    // A live object row references the segment → no dead capture → kept.
+    let mut chunks = smallvec::SmallVec::new();
+    chunks.push(ChunkRef {
+        segment_id: seg_id,
+        offset: 0,
+        length: 500,
+        compressed: false,
+        logical_length: 500,
+    });
+    metadata
+        .put_object(oceanfs_core::ObjectMetadata {
+            object_key: ObjectKey::new("alive.txt"),
+            size: 500,
+            blake3_hash: None,
+            chunks,
+            inline_data: None,
+            created_at: 0,
+            hlc: Hlc::zero(),
+        })
+        .unwrap();
 
-    let shard_store = make_shard_store();
     let reaper =
-        make_reaper(metadata, shard_store, GcConfig::default(), Arc::clone(&registry)).await;
-
-    let stats = reaper.run_cycle().await.expect("reaper cycle");
+        make_reaper(metadata, make_shard_store(), GcConfig::default(), Arc::clone(&registry)).await;
+    let stats = reaper.run_cycle().await.unwrap();
     assert_eq!(stats.segments_scanned, 1);
     assert_eq!(stats.orphans_found, 0);
 }
 
 #[tokio::test]
-async fn reaper_unreferenced_segment_beyond_ttl_is_orphan() {
+async fn reaper_fully_dead_segment_beyond_ttl_is_orphan() {
     let metadata = open_temp_metadata();
-
     let seg_id = SegmentId::new();
-    // Sealed very long ago (past any TTL)
-    let seg_meta = make_segment(seg_id, 1000000000000);
-    let registry = Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(
-        &oceanfs_core::LifecycleConfig::default(),
-    ));
-    registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
-    registry.seal(seg_meta.segment_id, seg_meta).unwrap();
-    // No object references this segment
+    let registry =
+        Arc::new(SegmentLifecycleRegistry::new(&oceanfs_core::LifecycleConfig::default()));
+    seed_sealed(&registry, seg_id, 1000);
+    plant_aged_delete(&metadata, seg_id, 1000);
 
-    let shard_store = make_shard_store();
+    let store = make_shard_store();
     let reaper =
-        make_reaper(metadata, shard_store, GcConfig::default(), Arc::clone(&registry)).await;
-
-    let stats = reaper.run_cycle().await.expect("reaper cycle");
+        make_reaper(metadata, store.clone(), GcConfig::default(), Arc::clone(&registry)).await;
+    let stats = reaper.run_cycle().await.unwrap();
     assert_eq!(stats.segments_scanned, 1);
     assert_eq!(stats.orphans_found, 1);
     assert_eq!(stats.orphans_deleted, 1);
+    assert!(registry.get(seg_id).is_none(), "orphan metadata deleted");
+    assert!(store.is_deleted(seg_id), "orphan shard data deleted");
 }
 
 #[tokio::test]
-async fn reaper_unreferenced_segment_within_ttl_not_orphan() {
+async fn reaper_partially_dead_segment_not_orphan() {
     let metadata = open_temp_metadata();
-
     let seg_id = SegmentId::new();
-    // Sealed very recently
+    let registry =
+        Arc::new(SegmentLifecycleRegistry::new(&oceanfs_core::LifecycleConfig::default()));
+    seed_sealed(&registry, seg_id, 2000);
+    plant_aged_delete(&metadata, seg_id, 1000);
+
+    let reaper =
+        make_reaper(metadata, make_shard_store(), GcConfig::default(), Arc::clone(&registry)).await;
+    let stats = reaper.run_cycle().await.unwrap();
+    assert_eq!(stats.orphans_found, 0, "dead < total is never an orphan");
+    assert!(registry.get(seg_id).is_some());
+}
+
+#[tokio::test]
+async fn reaper_unknown_total_segment_not_orphan() {
+    let metadata = open_temp_metadata();
+    let seg_id = SegmentId::new();
+    let registry =
+        Arc::new(SegmentLifecycleRegistry::new(&oceanfs_core::LifecycleConfig::default()));
+    seed_sealed(&registry, seg_id, 0); // unknown total (row-3 adopt shape)
+    plant_aged_delete(&metadata, seg_id, 1000);
+
+    let reaper =
+        make_reaper(metadata, make_shard_store(), GcConfig::default(), Arc::clone(&registry)).await;
+    let stats = reaper.run_cycle().await.unwrap();
+    assert_eq!(stats.segments_scanned, 1);
+    assert_eq!(stats.orphans_found, 0, "an unknown-total segment is never classified fully dead");
+    assert!(registry.get(seg_id).is_some());
+}
+
+#[tokio::test]
+async fn reaper_recently_sealed_not_orphan() {
+    let metadata = open_temp_metadata();
+    let seg_id = SegmentId::new();
     let now_ms =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
             as i64;
-    let seg_meta = make_segment(seg_id, now_ms);
-    let registry = Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(
-        &oceanfs_core::LifecycleConfig::default(),
-    ));
-    registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
-    registry.seal(seg_meta.segment_id, seg_meta).unwrap();
-    // No object references this segment, but it's too young
+    let meta = SegmentMetadata {
+        pool_id: 0,
+        total_bytes: 1000,
+        segment_id: seg_id,
+        ec_k: 4,
+        ec_m: 2,
+        size_tier: SizeTier::Standard,
+        merkle_root: None,
+        storage_locations: smallvec::SmallVec::new(),
+        sealed_at: Some(now_ms),
+    };
+    let registry =
+        Arc::new(SegmentLifecycleRegistry::new(&oceanfs_core::LifecycleConfig::default()));
+    registry.reserve(seg_id, meta.clone()).unwrap();
+    registry.seal(seg_id, meta).unwrap();
+    plant_aged_delete(&metadata, seg_id, 1000);
 
-    let shard_store = make_shard_store();
     let reaper =
-        make_reaper(metadata, shard_store, GcConfig::default(), Arc::clone(&registry)).await;
-
-    let stats = reaper.run_cycle().await.expect("reaper cycle");
+        make_reaper(metadata, make_shard_store(), GcConfig::default(), Arc::clone(&registry)).await;
+    let stats = reaper.run_cycle().await.unwrap();
     assert_eq!(stats.segments_scanned, 1);
-    assert_eq!(stats.orphans_found, 0);
-}
-
-#[tokio::test]
-async fn reaper_deletes_shard_data_and_metadata() {
-    let metadata = open_temp_metadata();
-
-    let seg_id = SegmentId::new();
-    let seg_meta = make_segment(seg_id, 1000000000000);
-    let registry = Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(
-        &oceanfs_core::LifecycleConfig::default(),
-    ));
-    registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
-    registry.seal(seg_meta.segment_id, seg_meta).unwrap();
-
-    // Verify segment metadata exists before reaping
-    assert!(registry.get(seg_id).is_some());
-
-    let shard_store = make_shard_store();
-    let reaper = make_reaper(
-        metadata.clone(),
-        shard_store.clone(),
-        GcConfig::default(),
-        Arc::clone(&registry),
-    )
-    .await;
-
-    let stats = reaper.run_cycle().await.expect("reaper cycle");
-    assert_eq!(stats.orphans_found, 1);
-    assert_eq!(stats.orphans_deleted, 1);
-
-    // Verify segment metadata was deleted
-    assert!(registry.get(seg_id).is_none());
-
-    // Verify shard data was deleted
-    assert!(shard_store.is_deleted(seg_id));
+    assert_eq!(stats.orphans_found, 0, "a too-young segment keeps the TTL grace");
 }
 
 #[tokio::test]
 async fn reaper_multiple_orphans_all_reaped() {
     let metadata = open_temp_metadata();
-    let registry = Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(
-        &oceanfs_core::LifecycleConfig::default(),
-    ));
-
-    // Create 5 orphan segments
-    for _ in 0..5u32 {
+    let registry =
+        Arc::new(SegmentLifecycleRegistry::new(&oceanfs_core::LifecycleConfig::default()));
+    let mut ids = Vec::new();
+    for i in 0..5u64 {
         let seg_id = SegmentId::new();
-        let seg_meta = make_segment(seg_id, 1000000000000);
-        registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
-        registry.seal(seg_meta.segment_id, seg_meta).unwrap();
+        seed_sealed(&registry, seg_id, 1000);
+        let mut chunks = smallvec::SmallVec::new();
+        chunks.push(ChunkRef {
+            segment_id: seg_id,
+            offset: 0,
+            length: 1000,
+            compressed: false,
+            logical_length: 1000,
+        });
+        metadata
+            .put_tombstone(
+                &oceanfs_core::BucketId::new("default"),
+                &ObjectKey::new(format!("gone{i}.txt")),
+                Tombstone { deletion_time: 1_000_000_000_000, hlc: Hlc::zero(), chunks },
+            )
+            .unwrap();
+        ids.push(seg_id);
     }
 
-    let shard_store = make_shard_store();
-    let reaper =
-        make_reaper(metadata, shard_store, GcConfig::default(), Arc::clone(&registry)).await;
-
-    let stats = reaper.run_cycle().await.expect("reaper cycle");
+    let store = make_shard_store();
+    let reaper = make_reaper(metadata, store, GcConfig::default(), Arc::clone(&registry)).await;
+    let stats = reaper.run_cycle().await.unwrap();
     assert_eq!(stats.segments_scanned, 5);
     assert_eq!(stats.orphans_found, 5);
     assert_eq!(stats.orphans_deleted, 5);
     assert!(stats.bytes_reclaimed > 0);
-}
-
-#[tokio::test]
-async fn reaper_double_check_prevents_race_condition() {
-    let metadata = open_temp_metadata();
-    let seg_id = SegmentId::new();
-
-    // Create an orphan segment
-    let seg_meta = make_segment(seg_id, 1000000000000);
-    let registry = Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(
-        &oceanfs_core::LifecycleConfig::default(),
-    ));
-    registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
-    registry.seal(seg_meta.segment_id, seg_meta).unwrap();
-
-    let shard_store = make_shard_store();
-    let reaper =
-        make_reaper(metadata.clone(), shard_store, GcConfig::default(), Arc::clone(&registry))
-            .await;
-
-    // Simulate a race: an object referencing the segment is created
-    // AFTER the scan phase but BEFORE the delete phase.
-    // In a single-threaded test, we can't simulate this exact timing,
-    // but we can verify the double-check logic exists and works.
-    // The reaper builds the referenced set BEFORE scanning,
-    // so a concurrent write would cause the double-check to catch it.
-
-    // First run: segment is orphan → reaped
-    let stats = reaper.run_cycle().await.expect("reaper cycle");
-    assert_eq!(stats.orphans_found, 1);
-    assert!(registry.get(seg_id).is_none());
-
-    // Second run on already-deleted segment → no orphans found
-    let stats2 = reaper.run_cycle().await.expect("reaper cycle 2");
-    assert_eq!(stats2.orphans_found, 0);
+    for id in ids {
+        assert!(registry.get(id).is_none());
+    }
 }
 
 #[tokio::test]
 async fn reaper_reports_bytes_reclaimed_correctly() {
     let metadata = open_temp_metadata();
-    let registry = Arc::new(oceanfs_storage::SegmentLifecycleRegistry::new(
-        &oceanfs_core::LifecycleConfig::default(),
-    ));
-
-    // Create 3 orphan segments
-    for _ in 0..3u32 {
+    let registry =
+        Arc::new(SegmentLifecycleRegistry::new(&oceanfs_core::LifecycleConfig::default()));
+    let mut ids = Vec::new();
+    for i in 0..3u64 {
         let seg_id = SegmentId::new();
-        let seg_meta = make_segment(seg_id, 1000000000000);
-        registry.reserve(seg_meta.segment_id, seg_meta.clone()).unwrap();
-        registry.seal(seg_meta.segment_id, seg_meta).unwrap();
+        seed_sealed(&registry, seg_id, 1000);
+        let mut chunks = smallvec::SmallVec::new();
+        chunks.push(ChunkRef {
+            segment_id: seg_id,
+            offset: 0,
+            length: 1000,
+            compressed: false,
+            logical_length: 1000,
+        });
+        metadata
+            .put_tombstone(
+                &oceanfs_core::BucketId::new("default"),
+                &ObjectKey::new(format!("gone{i}.txt")),
+                Tombstone { deletion_time: 1_000_000_000_000, hlc: Hlc::zero(), chunks },
+            )
+            .unwrap();
+        ids.push(seg_id);
     }
 
-    let shard_size = 4194304u64;
-    let shard_store = Arc::new(InMemoryShardStore::new(shard_size));
-    let reaper =
-        make_reaper(metadata, shard_store, GcConfig::default(), Arc::clone(&registry)).await;
-
-    let stats = reaper.run_cycle().await.expect("reaper cycle");
+    let store = Arc::new(InMemoryShardStore::new(4194304));
+    let reaper = make_reaper(metadata, store, GcConfig::default(), Arc::clone(&registry)).await;
+    let stats = reaper.run_cycle().await.unwrap();
     assert_eq!(stats.orphans_found, 3);
     assert_eq!(stats.orphans_deleted, 3);
-    assert_eq!(stats.bytes_reclaimed, shard_size * 3);
+    assert_eq!(stats.bytes_reclaimed, 4194304 * 3);
+    for id in ids {
+        assert!(registry.get(id).is_none());
+    }
 }

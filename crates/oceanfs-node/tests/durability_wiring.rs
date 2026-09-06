@@ -109,7 +109,6 @@ async fn durability_components_are_wireable_and_spawnable() {
         metadata_store.clone(),
         lifecycle,
         Arc::clone(&shared_store),
-        vec![], // in-memory store lists nothing; no pool roots needed
         GcConfig::new(3600, 86400, 0.5, 4, 64),
     ));
     let reaper_cancel = CancellationToken::new();

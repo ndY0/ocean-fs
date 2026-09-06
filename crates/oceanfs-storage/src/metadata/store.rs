@@ -822,6 +822,33 @@ impl RocksDbMetadataStore {
         Ok(())
     }
 
+    /// Deletes one versioned supersede dead-chunk record (ADR-0034 D2;
+    /// f2's post-compaction supersede cleanup).
+    ///
+    /// Reconstructs the exact versioned key (`{bucket}\0{key}` + the
+    /// supersede tail carrying `version`) and deletes that single record.
+    /// The key's LIVE object row is untouched — a supersede record is
+    /// never a tombstone of the key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the deletions column family is not found or if
+    /// the RocksDB delete operation fails.
+    pub fn delete_dead_chunk_record(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+        version: Hlc,
+    ) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(cf::CF_DELETIONS)
+            .ok_or_else(|| Error::InvalidConfig("deletions CF not found".into()))?;
+        let encoded_key = cf::encode_supersede_key(bucket.as_str(), key.as_str(), version);
+        self.db.delete_cf(&cf, &encoded_key).map_err(|e| Error::Io(io_err(e)))?;
+        Ok(())
+    }
+
     /// Checks if a deletion tombstone exists.
     ///
     /// # Errors
@@ -1481,6 +1508,16 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
 
     fn delete_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<()> {
         self.delete_tombstone(bucket, key).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn delete_dead_chunk_record(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+        version: Hlc,
+    ) -> std::io::Result<()> {
+        self.delete_dead_chunk_record(bucket, key, version)
+            .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
     fn has_tombstone(&self, bucket: &BucketId, key: &ObjectKey) -> std::io::Result<bool> {
@@ -2433,5 +2470,74 @@ mod tests {
                 r.hlc
             );
         }
+    }
+
+    #[test]
+    fn delete_dead_chunk_record_removes_only_the_versioned_supersede() {
+        // f2's post-compaction supersede cleanup deletes ONE versioned
+        // dead-chunk record by (bucket, key, version). It must never
+        // touch the key's LIVE object row and never remove a sibling
+        // supersede of the same key (a different overwritten version).
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        let bucket = BucketId::new("bucket");
+
+        // Key "a": v1 (hlc 1000) then v2 (hlc 2000) → one supersede
+        // carrying v1's chunks. Key "b": the same shape.
+        store
+            .put_object_in_bucket(
+                &bucket,
+                make_segment_stored_meta(
+                    "a",
+                    Hlc::new(1000, 0),
+                    vec![make_chunk(SegmentId::new(), 0, 10)],
+                ),
+            )
+            .unwrap();
+        store
+            .put_object_in_bucket(
+                &bucket,
+                make_segment_stored_meta(
+                    "a",
+                    Hlc::new(2000, 0),
+                    vec![make_chunk(SegmentId::new(), 0, 20)],
+                ),
+            )
+            .unwrap();
+        store
+            .put_object_in_bucket(
+                &bucket,
+                make_segment_stored_meta(
+                    "b",
+                    Hlc::new(1000, 0),
+                    vec![make_chunk(SegmentId::new(), 0, 30)],
+                ),
+            )
+            .unwrap();
+        store
+            .put_object_in_bucket(
+                &bucket,
+                make_segment_stored_meta(
+                    "b",
+                    Hlc::new(2000, 0),
+                    vec![make_chunk(SegmentId::new(), 0, 40)],
+                ),
+            )
+            .unwrap();
+        assert_eq!(supersedes(&store).len(), 2, "two keys each carry one supersede");
+
+        // Delete key "a"'s supersede (version = the superseded v1 HLC).
+        store.delete_dead_chunk_record(&bucket, &ObjectKey::new("a"), Hlc::new(1000, 0)).unwrap();
+
+        let recs = supersedes(&store);
+        assert_eq!(recs.len(), 1, "only key a's supersede is deleted");
+        assert_eq!(recs[0].1.as_str(), "b");
+
+        // Both keys' LIVE rows survive.
+        assert!(store.get_object(&bucket, &ObjectKey::new("a")).unwrap().is_some());
+        assert!(store.get_object(&bucket, &ObjectKey::new("b")).unwrap().is_some());
+
+        // Deleting the same record again is a no-op (idempotent).
+        store.delete_dead_chunk_record(&bucket, &ObjectKey::new("a"), Hlc::new(1000, 0)).unwrap();
+        assert_eq!(supersedes(&store).len(), 1);
     }
 }
