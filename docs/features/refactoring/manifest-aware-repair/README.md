@@ -1,7 +1,7 @@
 ---
 feature: "Manifest-Aware Peer Selection for AE + Scrub (ADR-0033) — Program Coordination"
 epic: "refactoring/manifest-aware-repair"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies:
@@ -18,10 +18,19 @@ adr:
   - 0025-segment-lifecycle-state-machine
 perf: []
 created: 2026-09-04
-updated: 2026-09-04
+updated: 2026-09-06
 ---
 
 # Manifest-Aware Peer Selection for AE + Scrub — Program Coordination
+
+> **EPIC COMPLETE (2026-09-06):** f1 (`b651d87`), f2 (`d50362a`), f3
+> (`4bc0914`) all landed — implemented in one pass (per-feature reviewer
+> gates intentionally skipped) and the single independent review returned
+> **PASS (iteration 2)** after the review-gap fix `ca0f7cb` (epic wiring
+> integration test + `#[doc(hidden)]` observability seams). The DoD items
+> below are checked; accepted deviations D1-A–D4-A and the process deviation
+> are recorded in Implementation notes (2026-09-06). This document remains
+> the map.
 
 > **This is the coordination document for the manifest-aware-repair epic
 > (ADR-0033, review triage Theme 5, wave 2 ④).** If you are implementing
@@ -125,39 +134,39 @@ refactoring/store-unification                (ADR-0032, wave 2 ②)
 
 ## Epic Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds for `oceanfs-durability`
+- [x] **Code:** `cargo build --all-targets` succeeds for `oceanfs-durability`
       and `oceanfs-node`.
-- [ ] **AE is holder-driven:** no path in `AntiEntropy` (`run_cycle`,
+- [x] **AE is holder-driven:** no path in `AntiEntropy` (`run_cycle`,
       `run_continuous_cycle`, `run_sampling_cycle`) selects comparison
       peers from `Membership::nodes()` / `select_alive_peers`; all three
       start from the sealed segment → `storage_locations` map and exchange
       roots only with eligible holders. Review block `engine.rs:226`
       removed; the "send full sealed list to a random peer" path
       (`engine.rs:538-547`) is gone.
-- [ ] **Local-only segments:** a segment with no eligible remote holder is
+- [x] **Local-only segments:** a segment with no eligible remote holder is
       excluded from remote exchange in all three AE modes; the
       `local_merkle_verify` fallback and local scrub cover it.
-- [ ] **Scrub partitions by holder:** `ScrubCoordinator` no longer
+- [x] **Scrub partitions by holder:** `ScrubCoordinator` no longer
       partitions the local set across all alive peers; partitions are
       computed per segment over `storage_locations` and no partition ever
       lists a segment for a node that does not hold it. Local-only
       segments stay in the local partition.
-- [ ] **No silent ack:** `ScrubGrpcService::assign_partition` executes the
+- [x] **No silent ack:** `ScrubGrpcService::assign_partition` executes the
       assigned partition through the local `ScrubWorker` (and reports a
       truthful result), or the scaffolding is deleted — there is no
       accept-and-ignore path left.
-- [ ] **Merkle + modes intact:** ADR-0015 protocol, incremental tree,
+- [x] **Merkle + modes intact:** ADR-0015 protocol, incremental tree,
       sampling fraction, continuous/sampling triggers unchanged; the only
       delta is peer/partition selection.
-- [ ] **Tests:** `cargo test -p oceanfs-durability --lib -- --test-threads=1`
+- [x] **Tests:** `cargo test -p oceanfs-durability --lib -- --test-threads=1`
       and `cargo test -p oceanfs-node --lib -- --test-threads=1` pass
       (RocksDB caveat, PIPELINE.md §4.6); new tests cover the pub trait
       surface, holder-aware grouping, and local-only handling.
-- [ ] **Docs:** every `pub` item in the new modules has `# Examples`;
+- [x] **Docs:** every `pub` item in the new modules has `# Examples`;
       `#![deny(missing_docs)]` passes in both crates.
-- [ ] **ADRs:** ADR-0033 D1–D3 satisfied; no ADR-0015 / ADR-0029 §D5
+- [x] **ADRs:** ADR-0033 D1–D3 satisfied; no ADR-0015 / ADR-0029 §D5
       constraint violated.
-- [ ] **Integration:** a node-crate test exercises the wiring: a sealed
+- [x] **Integration:** a node-crate test exercises the wiring: a sealed
       segment whose `storage_locations` names one alive+healthy holder and
       one dead holder is exchanged/scrubbed only with the eligible holder.
 
@@ -165,6 +174,49 @@ refactoring/store-unification                (ADR-0032, wave 2 ②)
 > should pass on production code. Test-code clippy warnings and
 > `ignore`-tagged doc examples are non-blocking (see
 > `guidelines/coding.md` §9.2).
+
+## Implementation notes (2026-09-06)
+
+Implementation complete and independently reviewed — reviewer **PASS
+(iteration 2)**, 0 gaps, after the review-gap fix `ca0f7cb`. The epic was
+implemented in **one pass** (three code commits `b651d87` / `d50362a` /
+`4bc0914`) with per-feature self-reports and a SINGLE independent review at
+the end; per-feature reviewer gates were intentionally skipped (process
+deviation). The accepted deviations below record what was actually built
+against the prose above (implementer + reviewer agreed; user validated
+D1-A / D2-A / D3-A / D4-A):
+
+- **D1-A — AntiEntropy keeps a stable `new()`; the PeerSelector is injected
+  via the builder.** durability-scheduler f4 already landed and
+  constructs/registers `AntiEntropy` in the same c2 builder, so f2 added
+  `with_peer_selector(Arc<dyn PeerSelector>)` (builder `with_*` style,
+  stored as `Option`) rather than a constructor parameter. When unwired
+  (unit tests / no selector), no remote exchange occurs — all segments are
+  local-only. f2's "Interface (Public API)" section is amended to the
+  builder form.
+- **D2-A — `ScrubCoordinator::new(config, planner: Arc<dyn
+  PartitionPlanner>, self_id: NodeId)`.** There is no planner-less
+  coordinator state; the old `with_distributed` scaffolding was deleted.
+- **D3-A — coordinator dispatch over gRPC is not wired, so
+  `ScrubCoordinator::run_cycle` plans the sealed inventory via
+  `plan_cycle_partitions` and executes the UNION of all planned partitions
+  locally (== the inventory; each segment exactly once), preserving the spec
+  §7.5 full-scan guarantee.** f3's DoD phrasing "self partition == sealed
+  inventory" is imprecise under this semantics and is clarified in f3's
+  Deviations.
+- **D4-A — `ScrubGrpcService::new(registry, data_store)` builds its
+  `ScrubWorker` internally** so `ScrubWorker` stays `pub(crate)`; the
+  earlier f3 doc text implying the service ctor takes `Arc<ScrubWorker>` was
+  inconsistent with that visibility — corrected in the f3 doc.
+- **Test-observability seams** (needed for the epic DoD "Integration"
+  node-crate wiring test, `ca0f7cb`): `AntiEntropy::holder_exchange_groups()`
+  is `#[doc(hidden)] pub`; `ScrubCoordinator::plan_cycle_partitions` is
+  `#[doc(hidden)] pub` (f3 Interface text had written `pub(crate)` —
+  updated to match).
+- **Optional LOW (noted, non-blocking):** f3's Data Flow/Scope text
+  originally mentioned `spawn_blocking` for `assign_partition` while the
+  code uses `tokio::task::spawn` over the async store reads (consistent
+  with `run_cycle`); the f3 doc is corrected to match.
 
 ## References
 

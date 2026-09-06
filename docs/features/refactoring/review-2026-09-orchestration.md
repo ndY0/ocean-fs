@@ -18,7 +18,7 @@ adr:
   - 0033-manifest-aware-peer-selection
   - 0034-bounded-metadata-accounting
 created: 2026-09-04
-updated: 2026-09-05
+updated: 2026-09-06
 ---
 
 # 2026-09 Review Program — Implementer Orchestration
@@ -129,7 +129,7 @@ before g7's catch-up enumeration at scale.
 | store-unification | **EPIC COMPLETE (2026-09-05)** — f1 (unified `SegmentDataStore` trait in oceanfs-storage-api, commit `a465795`), f2 (single `oceanfs_storage::DiskSegmentStore` over the shared io file core, atomic observed writes, per-segment locks, reserve-before-write push/re-rep, commit `6530d72`), f3 (single `StorageModule.data_store` construction, injected everywhere) — each independent review PASS (f1 iter 1; f2 iter 2; f3 iter 1). Wave-2-② gate passed: one trait, one impl, one instance; single-writer + io-layer `.dat` I/O; no legacy |
 | legacy-mode-removal | **EPIC COMPLETE (2026-09-04)** — c1 + f1 + f2 + f3 all landed, each review PASS (f1 iter 2; f2 iter 1, 0 blocking; f3 iter 1, 2 LOWs fixed — 80→84-byte rotation-test comments, older-file fold-refusal scenario). Pools mandatory at boot; store/path resolution and the event-WAL/checkpoint formats are pools-only; pre-pool data dirs refuse boot; all dev/test/e2e fixtures declare pools (2 user-approved f2 deviations: write-None→pool-0 bridge, GC marker retention; deploy scripts untouched) |
 | durability-scheduler | **implemented, review PASS (2026-09-06, iter 2)** — ADR-0017 amended in place (two-tier `DurabilityBudget`: Tier-0 repair/heal/re-rep/hint-apply never blocked by Tier-1 housekeeping; fairness within tier; io/cpu niceness helpers removed; internal gates deleted); f1–f4 code complete and green (build/clippy/doc/lib 276 + node 66 + integration suite all pass). **Sole remaining external gate:** cloud e2e metric-movement/boot (epic DoD #10 + f4 Boot/e2e, PIPELINE.md §6) |
-| manifest-aware-repair | f1–f3 docs, not started |
+| manifest-aware-repair | **EPIC COMPLETE (2026-09-06)** — f1 (PeerSelector/PartitionPlanner seams + node manifest impls, `b651d87`), f2 (holder-driven AE exchanges via `with_peer_selector` builder, `d50362a`), f3 (holder-aware scrub partitions + real `assign_partition`, `4bc0914`) — implemented in ONE pass (per-feature reviewer gates intentionally skipped per user instruction), single independent review **PASS (iteration 2)** after the review-gap fix `ca0f7cb` (epic wiring integration test + `#[doc(hidden)]` observability seams). Wave-2-④ gate **passed**: AE/scrub select by `storage_locations`; `select_alive_peers` and the scrub alive-peer fan-out/`with_distributed` scaffolding deleted; accepted deviations D1-A–D4-A recorded in the epic README + feature docs |
 | bounded-metadata-scans | **EPIC COMPLETE (2026-09-06)** — f1 (atomic supersede-capture on overwrite, ADR-0034 D2, `1c38dfb`), f3 (seal-time `total_bytes` + contained-objects membership, D1/D5, `6cb7958`…`c376d5d`), f4 (compaction remap carries the object-key list, D5/2b, `facb289`), f2 (accounting-based GC liveness + fully-dead orphan reaper, D3/D4, `32b85fe`) — each independent review PASS (f1 iter 2; f3 iter 3; f4 iter 1; f2 iter 2). No O(all-objects) scan remains on the four consumer paths; `list_objects_all(_with_bucket)` absent from `gc/` + `healing_service.rs`; `build_referenced_set` deleted; the startup recovery `ObjectLookup` is membership-driven; the reaper's periodic disk sweep retired (once-per-boot registry-residue `.dat` sweep replaces the backstop). Unblocks `durability-scheduler/f3-keyspace-sharding` + g7/g8 |
 | g7 / g8 (healing) | proposed (blocked on wave 2) |
 

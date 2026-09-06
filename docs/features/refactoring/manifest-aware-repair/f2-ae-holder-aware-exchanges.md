@@ -1,7 +1,7 @@
 ---
 feature: "f2: Holder-Aware Anti-Entropy Exchanges"
 epic: "refactoring/manifest-aware-repair"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -20,7 +20,7 @@ perf:
   - "2.4 lock-free reads on the hot path"
   - "2.6 bounded queues / no per-peer O(all segments) fan-out"
 created: 2026-09-04
-updated: 2026-09-04
+updated: 2026-09-06
 ---
 
 # f2: Holder-Aware Anti-Entropy Exchanges
@@ -29,12 +29,14 @@ updated: 2026-09-04
 > wires `peer_selector` into `AntiEntropy`. The durability-scheduler epic
 > (`f1` `AeTask` adaptor + `f4` wiring) also constructs/registers
 > `AntiEntropy` inside the SAME c2 durability builder. To keep the two
-> epics non-conflicting, prefer injecting the selector via a builder
+> epics non-conflicting, the selector is injected via a builder
 > `with_peer_selector(Arc<dyn PeerSelector>)` setter (the codebase's
 > `with_*` style) so `AntiEntropy::new`'s signature stays stable and the
-> scheduler adaptor is untouched. If a constructor parameter is used
+> scheduler adaptor is untouched. ~~If a constructor parameter is used
 > instead, this feature MUST land before `durability-scheduler/f4`
-> wiring.
+> wiring.~~ **RESOLVED as the builder route (D1-A, 2026-09-06):** the
+> constructor parameter was NOT used; `AntiEntropy::new` keeps its
+> signature and the setter is additive.
 
 ## Summary
 
@@ -57,8 +59,9 @@ changes. All three modes (`run_cycle`, `run_continuous_cycle`,
 ## Scope
 
 ### In Scope
-- Add `peer_selector: Arc<dyn PeerSelector>` to `AntiEntropy` (field +
-  constructor parameter at `engine.rs:94-121`); update the node wiring
+- Add `peer_selector: Option<Arc<dyn PeerSelector>>` to `AntiEntropy` (a
+  field, injected via the builder `with_peer_selector` — NOT a constructor
+  parameter; see the interface note above); update the node wiring
   (`node.rs:1238`, later the c2 durability builder).
 - **D2 entry-point flip in `run_cycle`** (`engine.rs:178-291`): after
   gathering Sealed segments from the registry (`for_each` +
@@ -105,15 +108,26 @@ changes. All three modes (`run_cycle`, `run_continuous_cycle`,
 
 | Crate | Change |
 |---|---|
-| `oceanfs-durability` | `anti_entropy/engine.rs`: new `peer_selector` field + ctor param; holder-aware grouping in all three cycles; `select_alive_peers` deleted; review block at :226 removed. `lib.rs`: unchanged exports. |
-| `oceanfs-node` | `node.rs:1238` `AntiEntropy::new(...)` gains the injected `Arc<dyn PeerSelector>` (constructed in the c2 durability builder); no other node change. |
+| `oceanfs-durability` | `anti_entropy/engine.rs`: new `peer_selector` field (Option) + `with_peer_selector` builder setter; holder-aware grouping in all three cycles; `select_alive_peers` deleted; review block at :226 removed. `lib.rs`: unchanged exports. |
+| `oceanfs-node` | `node.rs:1238`/c2 durability builder: `AntiEntropy::new(...)` is chained with `.with_peer_selector(...)` (the node's `Arc<dyn PeerSelector>`); no other node change. |
 
 ## Interface (Public API)
 
 - `AntiEntropy::new(config, membership, registry, pool, segment_store,
-  merkle_tree, peer_selector)` — **adds** one `Arc<dyn PeerSelector>`
-  argument after `merkle_tree` (mirrors the ctor shape of
-  `ReconciliationLoop::new`, which already takes injected deps).
+  merkle_tree)` — **signature unchanged** (stability required by
+  durability-scheduler f4's construction of `AntiEntropy` in the same c2
+  builder, D1-A).
+- `pub fn with_peer_selector(mut self, peer_selector: Arc<dyn PeerSelector>)
+  -> Self` — **adds** the injected `PeerSelector` via the builder (codebase
+  `with_*` style). Stored as `Option<Arc<dyn PeerSelector>>`; a `None`
+  selector means every sealed segment is treated as local-only (no remote
+  exchange) and the existing `local_merkle_verify` fallback covers it —
+  the unwired/unit-test configuration.
+- `#[doc(hidden)] pub fn holder_exchange_groups(&self) ->
+  (Vec<(NodeId, usize)>, usize)` — test-observability seam (added by the
+  review-gap fix `ca0f7cb`): exposes the holder→segment-count grouping and
+  the local-only count so the node-crate wiring test can assert the D2
+  grouping without polling internal state.
 - Removed: `AntiEntropy::select_alive_peers` (pub, `engine.rs:859`). All
   remaining pub methods (`run_cycle`, `run_continuous_cycle`,
   `run_sampling_cycle`, `start_background`, `on_segment_sealed`,
@@ -139,38 +153,38 @@ run_cycle / continuous / sampling
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds for
+- [x] **Code:** `cargo build --all-targets` succeeds for
       `oceanfs-durability` and `oceanfs-node`.
-- [ ] **No random-peer path:** a workspace grep finds no remaining
+- [x] **No random-peer path:** a workspace grep finds no remaining
       production call to `select_alive_peers` or to a peer list derived
       from `Membership::nodes()` inside `anti_entropy/engine.rs`.
-- [ ] **Entry point flip:** all three cycles derive the peer set
+- [x] **Entry point flip:** all three cycles derive the peer set
       per-segment from `metadata.storage_locations` via the injected
       `PeerSelector`; `try_grpc_merkle_exchange` is never called with a
       full sealed-segment list for a peer that is not an eligible holder
       of those segments.
-- [ ] **Modes intact:** `continuous_enabled` / `sampling_enabled` /
+- [x] **Modes intact:** `continuous_enabled` / `sampling_enabled` /
       `sampling_interval_sec` / `sampling_fraction` /
       `continuous_max_segments` semantics unchanged; `on_segment_sealed`
       unchanged.
-- [ ] **Local-only handling test:** a registry with a segment whose
+- [x] **Local-only handling test:** a registry with a segment whose
       `storage_locations == {self}` (or whose only holders are Dead) is
       counted as local-only and produces no gRPC Merkle exchange, while a
       second segment listing one eligible holder produces exactly one
       exchange group.
-- [ ] **Grouping test:** with `storage_locations = [self, A, B]` and
+- [x] **Grouping test:** with `storage_locations = [self, A, B]` and
       `peer_count = 1`, each cycle exchanges with at most one of {A, B}
       per segment (ADR-0015 cost model — no full-mesh fan-out to every
       holder).
-- [ ] **Merkle protocol regression:** `exchange_single_root` and the
+- [x] **Merkle protocol regression:** `exchange_single_root` and the
       mismatch→`crate::heal::enqueue_heal` path still covered by the
       existing mismatch tests.
-- [ ] **Tests:** `cargo test -p oceanfs-durability --lib -- --test-threads=1`
+- [x] **Tests:** `cargo test -p oceanfs-durability --lib -- --test-threads=1`
       and `cargo test -p oceanfs-node --lib -- --test-threads=1` pass
       (RocksDB caveat, PIPELINE.md §4.6).
-- [ ] **Docs:** no pub item loses its `# Examples`; `#![deny(missing_docs)]`
+- [x] **Docs:** no pub item loses its `# Examples`; `#![deny(missing_docs)]`
       passes.
-- [ ] **ADR:** ADR-0033 D1/D2 satisfied (holder-set entry point, no
+- [x] **ADR:** ADR-0033 D1/D2 satisfied (holder-set entry point, no
       exchange with non-holders, local-only excluded); ADR-0015 sampling/
       continuous + cost model preserved.
 
@@ -178,3 +192,27 @@ run_cycle / continuous / sampling
 > should pass on production code. Test-code clippy warnings and
 > `ignore`-tagged doc examples are non-blocking (see
 > `guidelines/coding.md` §9.2).
+
+## Deviations
+
+Landed (`d50362a`) with the following accepted deviation against the prose
+above (implementer + reviewer agreed; user validated D1-A):
+
+- **D1-A — builder injection, not a constructor parameter.** This doc
+  originally proposed adding an `Arc<dyn PeerSelector>` argument to
+  `AntiEntropy::new`. Because durability-scheduler f4 already landed and
+  constructs/registers `AntiEntropy` in the same c2 builder, f2 instead
+  keeps `AntiEntropy::new`'s signature stable and injects the selector via
+  `with_peer_selector(Arc<dyn PeerSelector>)`, stored as `Option`. When
+  unwired (unit tests, or a `None` selector), no remote exchange occurs —
+  all segments are treated as local-only. The Interface (Public API)
+  section above is amended to this builder form.
+- **Test-observability seam.** The epic DoD "Integration" node-crate wiring
+  test needs to assert the holder-aware grouping; `holder_exchange_groups()`
+  is `#[doc(hidden)] pub` (added in the review-gap fix `ca0f7cb`) — the
+  Interface section lists it.
+
+Epic-level process deviation only (no further f2 technical deviation):
+f2 was implemented as part of the one-pass epic (per-feature reviewer gates
+intentionally skipped) and was covered by the SINGLE independent review at
+the end (PASS, iteration 2).

@@ -1,7 +1,7 @@
 ---
 feature: "f1: PeerSelector / PartitionPlanner Trait + Node Manifest Implementations"
 epic: "refactoring/manifest-aware-repair"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -17,7 +17,7 @@ adr:
   - 0025-segment-lifecycle-state-machine
 perf: []
 created: 2026-09-04
-updated: 2026-09-04
+updated: 2026-09-06
 ---
 
 # f1: PeerSelector / PartitionPlanner Trait + Node Manifest Implementations
@@ -159,33 +159,33 @@ run-time call:
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds for
+- [x] **Code:** `cargo build --all-targets` succeeds for
       `oceanfs-durability` and `oceanfs-node`.
-- [ ] **API:** `PeerSelector` + `PartitionPlanner` exported from
+- [x] **API:** `PeerSelector` + `PartitionPlanner` exported from
       `oceanfs-durability`; `ManifestPeerSelector` +
       `ManifestPartitionPlanner` exported from `oceanfs-node`;
       `SegmentPartition` is `pub` with `pub` fields.
-- [ ] **Eligibility tests:** a holder that is Dead, or whose manifest
+- [x] **Eligibility tests:** a holder that is Dead, or whose manifest
       reports zero Healthy data pools (or `write_degraded`), is excluded;
       self is excluded; a holder with no manifest remains eligible.
       Mirror the fixture style of
       `oceanfs-node/src/repair.rs::manifest_selector_excludes_degraded_nodes`
       (`membership.upsert_node` + `membership.set_peer_manifest`,
       `oceanfs-membership/src/membership/manager.rs:843`).
-- [ ] **Planner tests:** for a segment list with mixed
+- [x] **Planner tests:** for a segment list with mixed
       `storage_locations`, every returned partition's `segment_ids` are
       all ∈ that node's `storage_locations`; a local-only segment
       (`storage_locations == {self}`) lands in the self partition; no
       partition lists a non-holder.
-- [ ] **Tests:** `cargo test -p oceanfs-durability --lib -- --test-threads=1`
+- [x] **Tests:** `cargo test -p oceanfs-durability --lib -- --test-threads=1`
       and `cargo test -p oceanfs-node --lib -- --test-threads=1` pass
       (RocksDB caveat, PIPELINE.md §4.6).
-- [ ] **Docs:** every `pub` item in both new modules has `# Examples`;
+- [x] **Docs:** every `pub` item in both new modules has `# Examples`;
       `#![deny(missing_docs)]` passes.
-- [ ] **ADR:** ADR-0033 D3 satisfied (trait in durability, impl in node,
+- [x] **ADR:** ADR-0033 D3 satisfied (trait in durability, impl in node,
       no new manifest dependency in `oceanfs-durability`); ADR-0029 §D5
       hint discipline preserved (missing manifest ≠ excluded).
-- [ ] **Integration:** a node-crate unit test constructs
+- [x] **Integration:** a node-crate unit test constructs
       `ManifestPeerSelector` over a membership with two holders (one
       healthy, one Dead) and asserts only the healthy holder is returned.
 
@@ -193,3 +193,14 @@ run-time call:
 > should pass on production code. Test-code clippy warnings and
 > `ignore`-tagged doc examples are non-blocking (see
 > `guidelines/coding.md` §9.2).
+
+## Deviations
+
+Landed as written (`b651d87`) with no technical deviation from the prose
+above. The trait surface, the `SegmentPartition` promotion, and the node
+impls match the Interface section. Epic-level process deviation only: f1 was
+implemented as part of the one-pass epic (per-feature reviewer gates
+intentionally skipped) and was covered by the SINGLE independent review at
+the end (PASS, iteration 2). The observability seams added by the review-gap
+fix `ca0f7cb` live on f2/f3 (`holder_exchange_groups`,
+`plan_cycle_partitions`), not on f1's surface.

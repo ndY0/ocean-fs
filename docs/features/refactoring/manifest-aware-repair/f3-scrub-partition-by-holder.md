@@ -1,7 +1,7 @@
 ---
 feature: "f3: Holder-Aware Scrub Partitioning + Real assign_partition Execution"
 epic: "refactoring/manifest-aware-repair"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies:
@@ -20,7 +20,7 @@ perf:
   - "2.7 bounded concurrency"
   - "2.6 no unbounded fan-out"
 created: 2026-09-04
-updated: 2026-09-04
+updated: 2026-09-06
 ---
 
 # f3: Holder-Aware Scrub Partitioning + Real assign_partition Execution
@@ -60,21 +60,24 @@ the local `ScrubCoordinator::run_cycle` are unchanged.
   `Arc<dyn PartitionPlanner>`. `ScrubCoordinator` gains the planner +
   `self_id` (constructor, `scrub.rs:548-570`); the membership/pool fields
   and `with_distributed` are deleted.
-- **`run_cycle` local partition is the self partition** (`scrub.rs:708`):
-  the existing local full scan keeps its behavior but routes its batching
-  through `plan_cycle_partitions` so the self partition is computed by the
-  same planner (a registry's Sealed set is by construction segments self
-  holds — behavior-neutral, but the local-only path becomes explicit and
-  tested). `ScrubWorker`/`SegmentPartition` stay the execution vehicle.
+- **`run_cycle` plans the inventory and executes it locally**
+  (`scrub.rs:708`): `run_cycle` gathers the registry's Sealed set, calls
+  `plan_cycle_partitions` over it, and — while coordinator dispatch over
+  gRPC is not wired — executes the UNION of all planned partitions on the
+  local `ScrubWorker` (== the sealed inventory; each segment exactly once),
+  preserving the spec §7.5 full-scan guarantee (D3-A). When dispatch
+  scheduling lands, only the self partition stays local and the rest go
+  over the wire.
 - **Wire `assign_partition` to execute** (`scrub_service.rs:43-57`):
-  `ScrubGrpcService` gains a `ScrubWorker` handle (constructor change);
-  `assign_partition` runs the assigned segment list through
-  `ScrubWorker::scrub_partition` on `spawn_blocking`, and returns
-  `accepted: true` only after the partition actually ran. An execution
-  failure returns an error `Status` (no accept-and-ignore). A small
-  in-memory last-result buffer on the service makes the executed summary
-  observable to the coordinator-side `report_partition_result` handler
-  and to tests.
+  `ScrubGrpcService` builds a `ScrubWorker` handle internally from the
+  registry + data store (constructor change — D4-A); `assign_partition`
+  runs the assigned segment list through `ScrubWorker::scrub_partition`
+  (spawned via `tokio::task::spawn` over the async store reads — NOT
+  `spawn_blocking`; see Deviations) and returns `accepted: true` only after
+  the partition actually ran. An execution failure returns an error
+  `Status` (no accept-and-ignore). A small in-memory last-result buffer on
+  the service makes the executed summary observable to the coordinator-side
+  `report_partition_result` handler and to tests.
 - **Truthful `report_partition_result`** (`scrub_service.rs:60-79`):
   keep the handler as the coordinator-side aggregator entry; log the
   executed summary and forward it to the coordinator's pending-cycle
@@ -105,78 +108,90 @@ the local `ScrubCoordinator::run_cycle` are unchanged.
 
 | Crate | Change |
 |---|---|
-| `oceanfs-durability` | `scrub.rs`: `ScrubCoordinator` fields/ctor gain `Arc<dyn PartitionPlanner>` + `self_id`; `partition_for_current_nodes`/`partition_segments`/`alive_peers`/`with_distributed` deleted; `plan_cycle_partitions` added; `run_cycle` batches via the self partition; review block :601-605 removed. `scrub_service.rs`: `ScrubGrpcService` gains a worker handle; `assign_partition` executes; last-result buffer added. `lib.rs` exports unchanged (SegmentPartition export landed in f1). |
-| `oceanfs-node` | `node.rs:1266` `ScrubCoordinator::new(...)` gains planner + self id; `node.rs:2168` `ScrubGrpcService::new(...)` gains the worker (constructed from the shared registry + data store). |
+| `oceanfs-durability` | `scrub.rs`: `ScrubCoordinator` fields/ctor gain `Arc<dyn PartitionPlanner>` + `self_id`; `partition_for_current_nodes`/`partition_segments`/`alive_peers`/`with_distributed` deleted; `plan_cycle_partitions` added (`#[doc(hidden)] pub`); `run_cycle` plans + executes the union of all planned partitions locally (== the sealed inventory); review block :601-605 removed. `scrub_service.rs`: `ScrubGrpcService` builds its `ScrubWorker` internally from registry + data store; `assign_partition` executes; last-result buffer added. `lib.rs` exports unchanged (SegmentPartition export landed in f1). |
+| `oceanfs-node` | c2 durability builder (`modules/durability.rs`) `ScrubCoordinator::new(...)` gains planner + self id; c3 server builder (`modules/server.rs`) `ScrubGrpcService::new(registry, data_store)`. |
 
 ## Interface (Public API)
 
 `ScrubCoordinator` (`scrub.rs:538`):
 - `pub fn new(config, planner: Arc<dyn PartitionPlanner>, self_id: NodeId) -> Self`
-  — replaces `ScrubCoordinator::new(config)` + `with_distributed(...)`.
-- `pub(crate) fn plan_cycle_partitions(&self, segments: &[SegmentMetadata])
-  -> Vec<SegmentPartition>` — planner-backed; no peer is ever assigned a
-  segment it does not hold; local-only segments are in the self partition.
+  — replaces `ScrubCoordinator::new(config)` + `with_distributed(...)`;
+  there is no planner-less coordinator state (D2-A).
+- `#[doc(hidden)] pub fn plan_cycle_partitions(&self, segments:
+  &[SegmentMetadata]) -> Vec<SegmentPartition>` — planner-backed; no peer is
+  ever assigned a segment it does not hold; local-only segments are in the
+  self partition. `#[doc(hidden)] pub` (NOT `pub(crate)`) so the node-crate
+  wiring test can assert the planner output (test-observability seam,
+  `ca0f7cb`).
 - Removed pub items: `with_distributed` (scrub.rs:577), `alive_peers`
   (scrub.rs:590).
 
 `ScrubGrpcService` (`scrub_service.rs:21`):
-- `pub fn new(worker: Arc<ScrubWorker>, ...)` — replaces
-  `ScrubGrpcService::new(metadata_store, data_store)`; the service holds
-  the worker that owns the registry + data store. (`ScrubWorker` and
-  `SegmentPartition` are `pub(crate)`-visible within
-  `oceanfs-durability`; no new pub type needed.)
+- `pub fn new(registry, data_store)` — builds its own `Arc<ScrubWorker>`
+  internally from the receiving node's registry + unified data store
+  (D4-A). Replaces `ScrubGrpcService::new(metadata_store, data_store)`; the
+  ctor does NOT take an `Arc<ScrubWorker>` — that earlier shape was
+  inconsistent with `ScrubWorker` staying `pub(crate)`.
+  (`ScrubWorker` remains `pub(crate)` within `oceanfs-durability`;
+  `SegmentPartition` is `pub` + `#[doc(hidden)]` via f1. No new pub type
+  needed.)
 - `assign_partition` (unchanged signature) now **executes** and returns
   `accepted: true` only on completion.
 
 ## Data Flow
 
 ```
-ScrubCoordinator (every node, per cycle)
+ScrubCoordinator (every node, per cycle)  // dispatch NOT wired (D3-A)
   registry.for_each(Sealed) → inventory: Vec<SegmentMetadata>     // self-held set
   plan_cycle_partitions(inventory)
     per segment: holders = metadata.storage_locations
                  eligible = planner.filter to alive + Healthy-data-pool holders (f1)
                  assign segment to one eligible holder; none → self partition
-  self partition → ScrubWorker::scrub_partition → ScrubReport (local scan, unchanged)
+  // until dispatch lands, the UNION of all planned partitions runs locally:
+  for batch in union(all_partitions)        // == the sealed inventory, exactly once
+    ScrubWorker::scrub_partition(batch) → ScrubReport (full-scan guarantee, spec §7.5)
 
 worker side (future dispatch path — mechanism is now truthful)
   coordinator → AssignPartition { segment_ids ⊆ receiver's storage_locations }
   ScrubGrpcService::assign_partition
-    spawn_blocking(ScrubWorker::scrub_partition(partition))     // REAL scan
+    tokio::task::spawn(ScrubWorker::scrub_partition(partition))  // REAL scan (async store)
     accepted = true  ⇔  partition executed (heals enqueued on mismatch)
   worker → ReportPartitionResult(summary)                        // aggregator entry
 ```
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds for
+- [x] **Code:** `cargo build --all-targets` succeeds for
       `oceanfs-durability` and `oceanfs-node`.
-- [ ] **No holder-blind partition:** a workspace grep finds no remaining
+- [x] **No holder-blind partition:** a workspace grep finds no remaining
       use of `partition_for_current_nodes`, `partition_segments`,
       `with_distributed`, or `alive_peers` in `scrub.rs`; partitions come
       only from `plan_cycle_partitions` / the injected `PartitionPlanner`.
-- [ ] **Planner correctness test:** a registry inventory whose segments
+- [x] **Planner correctness test:** a registry inventory whose segments
       list `storage_locations` spanning {self, A, B} plus one local-only
       segment yields partitions where every segment in peer A's partition
       lists A, peer B's partition lists B, and the local-only segment is
       in the self partition; no segment appears in more than one partition
       and no partition contains a non-holder.
-- [ ] **run_cycle regression:** the local full scan produces the same
-      healthy/corrupt/healed counts as before (self partition == sealed
-      inventory) with `ScrubWorker::scrub_partition`.
-- [ ] **assign_partition executes:** a service-level test drives
+- [x] **run_cycle regression:** the local full scan produces the same
+      healthy/corrupt/healed counts as before. (Precise semantics under
+      D3-A: `run_cycle` executes the UNION of all planned partitions
+      locally — which equals the sealed inventory, each segment exactly
+      once — NOT "the self partition" alone, since coordinator dispatch is
+      not yet wired.) Runs via `ScrubWorker::scrub_partition`.
+- [x] **assign_partition executes:** a service-level test drives
       `assign_partition` with a segment list that includes a corrupt
       segment in the receiving worker's registry; asserts the corrupt
       segment was actually scanned (heal enqueued / result recorded in the
       last-result buffer) and `accepted == true`; a worker with an
       unavailable data store returns an error Status, never a silent ack.
-- [ ] **Review marker:** the `scrub.rs:601-605` block is removed.
-- [ ] **Tests:** `cargo test -p oceanfs-durability --lib -- --test-threads=1`
+- [x] **Review marker:** the `scrub.rs:601-605` block is removed.
+- [x] **Tests:** `cargo test -p oceanfs-durability --lib -- --test-threads=1`
       and `cargo test -p oceanfs-node --lib -- --test-threads=1` pass
       (RocksDB caveat, PIPELINE.md §4.6).
-- [ ] **Docs:** changed `pub` items keep `# Examples`;
+- [x] **Docs:** changed `pub` items keep `# Examples`;
       `#![deny(missing_docs)]` passes.
-- [ ] **ADR:** ADR-0033 D1 scrub half satisfied (partitions per-segment
+- [x] **ADR:** ADR-0033 D1 scrub half satisfied (partitions per-segment
       over `storage_locations`; peers scrub only segments they hold;
       `assign_partition` is wired, no silent acks); ADR-0015 full-scan
       semantics unchanged.
@@ -185,3 +200,42 @@ worker side (future dispatch path — mechanism is now truthful)
 > should pass on production code. Test-code clippy warnings and
 > `ignore`-tagged doc examples are non-blocking (see
 > `guidelines/coding.md` §9.2).
+
+## Deviations
+
+Landed (`4bc0914`) with the following accepted deviations against the prose
+above (implementer + reviewer agreed; user validated D2-A / D3-A / D4-A):
+
+- **D2-A — coordinator ctor is planner-mandatory.** `ScrubCoordinator::new`
+  takes `(config, planner: Arc<dyn PartitionPlanner>, self_id: NodeId)` and
+  there is no planner-less coordinator state; the old `with_distributed`
+  scaffolding was deleted, not kept dormant.
+- **D3-A — run_cycle executes the union of all planned partitions locally.**
+  While coordinator dispatch over gRPC is not wired,
+  `ScrubCoordinator::run_cycle` plans the sealed inventory via
+  `plan_cycle_partitions` and executes the UNION of all planned partitions
+  on the local worker (== the inventory; each segment exactly once),
+  preserving the spec §7.5 full-scan guarantee. The DoD bullet
+  "run_cycle regression" originally read "self partition == sealed
+  inventory"; under this semantics the executed set is the union of *all*
+  planned partitions (not only the self partition), so the DoD item above
+  is clarified accordingly.
+- **D4-A — ScrubGrpcService builds its ScrubWorker internally.**
+  `ScrubGrpcService::new(registry, data_store)` constructs its
+  `Arc<ScrubWorker>` internally from the receiving node's registry + data
+  store, so `ScrubWorker` stays `pub(crate)`. The earlier doc text implying
+  the service ctor takes `Arc<ScrubWorker>` was inconsistent with that
+  visibility — the Interface (Public API) section is corrected.
+- **Observability seam.** `ScrubCoordinator::plan_cycle_partitions` is
+  `#[doc(hidden)] pub`, not `pub(crate)` (added in the review-gap fix
+  `ca0f7cb`) so the node-crate wiring test can assert the planner output;
+  the Interface section is corrected.
+- **Optional LOW (noted, non-blocking):** this doc's Scope / Data Flow
+  originally specified `spawn_blocking` for `assign_partition`, while the
+  code uses `tokio::task::spawn` over the async store reads (consistent
+  with `run_cycle`). Prose above is corrected to match; no behavior impact.
+
+Epic-level process deviation only (no further f3 technical deviation):
+f3 was implemented as part of the one-pass epic (per-feature reviewer gates
+intentionally skipped) and was covered by the SINGLE independent review at
+the end (PASS, iteration 2).
