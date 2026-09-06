@@ -633,10 +633,12 @@ impl ScrubCoordinator {
     /// partition lists, for its `node_id`, only segments that node holds;
     /// a segment with no eligible remote holder stays in the self
     /// partition. No segment appears in more than one partition.
-    pub(crate) fn plan_cycle_partitions(
-        &self,
-        segments: &[SegmentMetadata],
-    ) -> Vec<SegmentPartition> {
+    ///
+    /// `#[doc(hidden)]`: `pub` only so the node-crate wiring test can
+    /// assert the injected planner's output (the caller-facing API is the
+    /// coordinator's `run_cycle`).
+    #[doc(hidden)]
+    pub fn plan_cycle_partitions(&self, segments: &[SegmentMetadata]) -> Vec<SegmentPartition> {
         self.planner.plan_partitions(segments, &self.self_id)
     }
 

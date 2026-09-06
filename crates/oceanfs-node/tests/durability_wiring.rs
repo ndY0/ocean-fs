@@ -235,3 +235,141 @@ async fn test_anti_entropy_accepts_trait_object() {
     let stats = ae.run_cycle().await.expect("AE cycle with trait object");
     assert_eq!(stats.segments_compared, 0);
 }
+
+/// Epic README DoD (Integration): a node-crate test exercises the wiring
+/// — a sealed segment whose `storage_locations` names one alive+healthy
+/// holder and one **Dead** holder is exchanged/scrubbed only with the
+/// eligible holder.
+///
+/// Drives the real composition-root selectors (`ManifestPeerSelector` for
+/// AE, `ManifestPartitionPlanner` for scrub) attached to the real workers
+/// over a membership with exactly that shape.
+#[tokio::test]
+async fn holder_aware_wiring_excludes_dead_holder() {
+    use oceanfs_core::{Incarnation, NodeState, SegmentId, SegmentMetadata, SizeTier};
+    use oceanfs_membership::manifest::{NodeManifest, PoolManifest};
+    use oceanfs_node::peer_selection::{ManifestPartitionPlanner, ManifestPeerSelector};
+
+    // --- Membership: self + one alive/healthy holder + one Dead holder.
+    let ring = Ring::new(oceanfs_core::RingConfig::default());
+    let ring_cache = Arc::new(RingCache::new(ring));
+    let membership = Arc::new(Membership::new(
+        NodeId::new("test-node"),
+        "127.0.0.1:9003".parse().unwrap(),
+        "127.0.0.1:9003".parse().unwrap(),
+        oceanfs_core::GossipConfig::default(),
+        ring_cache.clone(),
+    ));
+    membership.upsert_node(
+        NodeId::new("alive-holder"),
+        NodeState::Alive,
+        Incarnation::new(1),
+        Some("127.0.0.1:9101".parse().unwrap()),
+    );
+    membership.upsert_node(
+        NodeId::new("dead-holder"),
+        NodeState::Dead,
+        Incarnation::new(1),
+        Some("127.0.0.1:9102".parse().unwrap()),
+    );
+    // Both carry healthy manifests — only the Dead membership state must
+    // remove dead-holder from the eligible set.
+    let healthy =
+        NodeManifest::from_pools(1, &[PoolManifest::new(0, "data", "healthy", false, 1 << 40, 1)]);
+    membership.set_peer_manifest(NodeId::new("alive-holder"), healthy.clone());
+    membership.set_peer_manifest(NodeId::new("dead-holder"), healthy);
+
+    // --- Registry: one segment shared with both holders + one local-only.
+    let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+        &oceanfs_core::LifecycleConfig::default(),
+    ));
+    let shared_id = SegmentId::new();
+    let local_id = SegmentId::new();
+    let shared_meta = SegmentMetadata {
+        pool_id: 0,
+        total_bytes: 0,
+        segment_id: shared_id,
+        ec_k: 4,
+        ec_m: 2,
+        size_tier: SizeTier::Standard,
+        merkle_root: None,
+        storage_locations: smallvec::smallvec![
+            NodeId::new("alive-holder"),
+            NodeId::new("dead-holder"),
+        ],
+        sealed_at: Some(1700000000000),
+    };
+    let local_meta = SegmentMetadata {
+        pool_id: 0,
+        total_bytes: 0,
+        segment_id: local_id,
+        ec_k: 4,
+        ec_m: 2,
+        size_tier: SizeTier::Standard,
+        merkle_root: None,
+        storage_locations: smallvec::SmallVec::new(),
+        sealed_at: Some(1700000000000),
+    };
+    registry.reserve(shared_id, shared_meta.clone()).unwrap();
+    registry.seal(shared_id, shared_meta.clone()).unwrap();
+    registry.reserve(local_id, local_meta.clone()).unwrap();
+    registry.seal(local_id, local_meta.clone()).unwrap();
+
+    // --- Anti-entropy wiring: the shared segment is exchanged only with
+    // alive-holder; the local-only segment stays local.
+    let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
+    let data_store: Arc<dyn oceanfs_storage_api::SegmentDataStore> =
+        Arc::new(InMemorySegmentStore::new());
+    let ae = AntiEntropy::new(
+        AntiEntropyConfig::default(),
+        membership.clone(),
+        Arc::clone(&registry),
+        pool,
+        data_store,
+        make_test_tree(),
+    )
+    .with_peer_selector(Arc::new(ManifestPeerSelector::new(
+        membership.clone(),
+        NodeId::new("test-node"),
+    )));
+
+    let (holder_groups, local_only) = ae.holder_exchange_groups();
+    assert_eq!(
+        holder_groups,
+        vec![(NodeId::new("alive-holder"), 1)],
+        "AE must exchange the shared segment only with the alive+healthy holder"
+    );
+    assert!(
+        !holder_groups.iter().any(|(id, _)| id.as_str() == "dead-holder"),
+        "the Dead holder must never be an AE exchange partner"
+    );
+    assert_eq!(local_only, 1, "the local-only segment is not remotely exchanged");
+
+    // --- Scrub wiring: the plan never assigns the Dead holder; the
+    // shared segment goes to alive-holder, the local-only stays in the
+    // self partition.
+    let scrub = ScrubCoordinator::new(
+        ScrubConfig::default(),
+        Arc::new(ManifestPartitionPlanner::new(membership, NodeId::new("test-node"))),
+        NodeId::new("test-node"),
+    );
+    let partitions = scrub.plan_cycle_partitions(&[shared_meta.clone(), local_meta.clone()]);
+    assert!(
+        !partitions.iter().any(|p| p.node_id.as_str() == "dead-holder"),
+        "the Dead holder must never appear as a scrub partition node"
+    );
+
+    let mut seen: Vec<SegmentId> =
+        partitions.iter().flat_map(|p| p.segment_ids.iter().copied()).collect();
+    seen.sort();
+    let mut expected = vec![shared_id, local_id];
+    expected.sort();
+    assert_eq!(seen, expected, "every sealed segment is planned exactly once");
+
+    let alive_partition =
+        partitions.iter().find(|p| p.node_id.as_str() == "alive-holder").expect("alive partition");
+    assert!(alive_partition.segment_ids.contains(&shared_id));
+    let self_partition =
+        partitions.iter().find(|p| p.node_id.as_str() == "test-node").expect("self partition");
+    assert!(self_partition.segment_ids.contains(&local_id));
+}

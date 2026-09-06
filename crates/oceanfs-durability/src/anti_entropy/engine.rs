@@ -249,6 +249,31 @@ impl AntiEntropy {
         (groups, local_only)
     }
 
+    /// Returns the holder-exchange grouping the next cycle would perform
+    /// over the current sealed registry.
+    ///
+    /// Each `(holder, count)` entry is an eligible holder and the number
+    /// of sealed segments this node would exchange roots with it over;
+    /// the second return value is the number of local-only segments (no
+    /// eligible remote holder). This is the ADR-0033 D2 entry point made
+    /// observable so the node-crate wiring test can assert that a sealed
+    /// segment whose `storage_locations` names one alive + healthy holder
+    /// and one Dead holder is exchanged only with the eligible holder.
+    #[doc(hidden)]
+    pub fn holder_exchange_groups(&self) -> (Vec<(NodeId, usize)>, usize) {
+        let mut sealed: Vec<SegmentMetadata> = Vec::new();
+        self.registry.for_each(|_id, entry| {
+            if entry.state == oceanfs_storage::segment::lifecycle::SegmentState::Sealed {
+                sealed.push(entry.metadata.clone());
+            }
+        });
+        let (groups, local_only) = self.holder_groups(&sealed);
+        let mut holder_counts: Vec<(NodeId, usize)> =
+            groups.into_iter().map(|(id, ids)| (id, ids.len())).collect();
+        holder_counts.sort_by(|a, b| a.0.cmp(&b.0));
+        (holder_counts, local_only)
+    }
+
     /// Runs a single anti-entropy cycle.
     ///
     /// The cycle performs the following steps:
