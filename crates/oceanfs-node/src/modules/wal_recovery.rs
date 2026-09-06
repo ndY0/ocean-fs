@@ -377,15 +377,50 @@ impl WalRecoveryCoordinator {
     async fn run_drain_with_gate(&self) -> Result<WalRecoveryOutcome, String> {
         let outcome = run_wal_pool_recovery(self).await?;
         if outcome.verified && outcome.missing.is_empty() {
-            if let Some(wal_pool) = self.pool_registry.pool_by_role(oceanfs_core::PoolRole::Wal) {
-                reset_wal_pool(&self.pool_registry, &self.health_monitor, wal_pool.id());
-            }
-            let marker = replacement_marker_path(&self.paths);
-            if marker.exists() {
-                let _ = std::fs::remove_file(marker);
-                tracing::info!(
-                    "wal replacement marker cleared — next boot folds the rebuilt registry"
-                );
+            // Before clearing the replacement marker, persist a checkpoint
+            // snapshot of the CURRENT registry. On the live-remount path
+            // the registry survives in memory and was NOT re-journaled to
+            // the fresh event WAL (the fold skips already-registered
+            // segments), so without this snapshot a restart would fold an
+            // (almost) empty event WAL and the residue sweep would delete
+            // every pre-remount `.dat`. With the snapshot in place the
+            // next boot seeds the full registry from the checkpoint and
+            // the marker can be safely cleared. On the boot path this is
+            // harmless (the rebuilt entries are events in the fresh WAL;
+            // the snapshot just makes recovery cheaper).
+            let covered = self.event_wal.latest_pos();
+            let checkpointed =
+                self.event_checkpoint.write_checkpoint(self.lifecycle.registry(), covered);
+            match checkpointed {
+                Ok(_) => {
+                    tracing::info!(
+                        covered = ?covered,
+                        "replaced-wal recovery checkpointed the rebuilt registry"
+                    );
+                    if let Some(wal_pool) =
+                        self.pool_registry.pool_by_role(oceanfs_core::PoolRole::Wal)
+                    {
+                        reset_wal_pool(&self.pool_registry, &self.health_monitor, wal_pool.id());
+                    }
+                    let marker = replacement_marker_path(&self.paths);
+                    if marker.exists() {
+                        let _ = std::fs::remove_file(marker);
+                        tracing::info!(
+                            "wal replacement marker cleared — next boot folds the rebuilt registry"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Without the snapshot the next boot cannot reconstruct
+                    // the pre-remount registry from the fresh (empty) event
+                    // WAL. Keep the marker so the next boot re-enters the
+                    // rebuild-from-holders branch.
+                    tracing::error!(
+                        error = %e,
+                        "failed to checkpoint the rebuilt registry — keeping the replacement \
+                         marker so the next boot rebuilds from holders"
+                    );
+                }
             }
         } else {
             tracing::warn!(
@@ -569,6 +604,17 @@ fn is_local_only_d3_candidate(
     let no_ring_holder = holder_candidates(ctx, segment_id).is_empty();
     let reachable_but_absent = reachable_absent.contains(&segment_id);
     let single_node = !membership_has_remote_peer(ctx);
+    local_only_d3_decision(no_ring_holder, reachable_but_absent, single_node)
+}
+
+/// Pure boolean D3 classification (unit-testable without membership):
+/// local-only iff reachable-but-absent OR (no ring holder AND single
+/// node). An empty ring WITH a remote peer is never local-only.
+fn local_only_d3_decision(
+    no_ring_holder: bool,
+    reachable_but_absent: bool,
+    single_node: bool,
+) -> bool {
     reachable_but_absent || (no_ring_holder && single_node)
 }
 
@@ -953,19 +999,45 @@ pub(crate) async fn enqueue_catch_up(
         // is registered with the REAL geometry (tier/ec/merkle), not
         // defaults (ADR-0030: the request carries the source shape).
         let mut shape: Option<oceanfs_durability::healing_rpc::SegmentLifecycleEntry> = None;
+        // Tracks whether ANY ring holder answered the probe (as opposed to
+        // being unreachable). A reachable holder that answers with an
+        // empty stream means "I do not hold this segment".
+        let mut any_reachable = false;
         for holder in &holders {
-            if let Ok(entries) =
-                fetch_metadata_from_holder(ctx, holder, std::slice::from_ref(segment_id), 5_000)
-                    .await
+            match fetch_metadata_from_holder(ctx, holder, std::slice::from_ref(segment_id), 5_000)
+                .await
             {
-                if let Some(entry) =
-                    entries.into_iter().find(|e| e.state == 1 && !e.merkle_root.is_empty())
-                {
-                    shape = Some(entry);
-                    break;
+                Ok(entries) => {
+                    any_reachable = true;
+                    if let Some(entry) =
+                        entries.into_iter().find(|e| e.state == 1 && !e.merkle_root.is_empty())
+                    {
+                        shape = Some(entry);
+                        break;
+                    }
+                }
+                Err(_) => {
+                    // Unreachable holder — try the next; if none is
+                    // reachable we enqueue anyway (the worker retries and
+                    // g4 re-drives; the holder may merely be down).
                 }
             }
         }
+
+        let dangling_shape = shape.is_none() && any_reachable;
+        if dangling_shape {
+            // Every reachable holder answered "not held": no live copy
+            // exists — the documented residual (reads surface
+            // SegmentUnavailable). Report as dangling, do NOT enqueue a
+            // repair against holders that just denied holding it.
+            tracing::warn!(
+                segment_id = %segment_id,
+                "wal recovery: referenced segment is held by no reachable holder — reads surface SegmentUnavailable"
+            );
+            dangling.push(*segment_id);
+            continue;
+        }
+
         let (tier, ec_k, ec_m, merkle_root) = match shape {
             Some(entry) => {
                 let tier = match entry.tier {
@@ -985,9 +1057,10 @@ pub(crate) async fn enqueue_catch_up(
                 };
                 (tier, ec_k, ec_m, merkle_root)
             }
-            // No holder answered the shape probe — request without a
-            // merkle anchor (the worker skips verification) and default
-            // geometry. The g4 loop re-drives with a shape if one exists.
+            // No holder answered the shape probe (all unreachable) —
+            // request without a merkle anchor (the worker skips
+            // verification) and default geometry. The worker retries; g4
+            // re-drives with a shape if a holder becomes reachable.
             None => (oceanfs_core::SizeTier::Standard, 1u8, 0u8, None),
         };
 
@@ -1625,11 +1698,33 @@ mod tests {
         assert!(referenced.is_empty(), "no objects → no referenced ids");
     }
 
-    /// D3 classifier: a reachable-absent candidate (every holder answered
-    /// "not held") is local-only. The single-node shape (empty ring +
-    /// no remote peer) is also local-only.
+    /// D3 classifier truth table (the regression the review gap-2 fix
+    /// targets): local-only is reachable-but-absent OR (no ring holder
+    /// AND single node). An empty ring WITH a remote peer is NEVER
+    /// local-only — the boot drain must not D3-classify replicated
+    /// segments before the ring has converged.
+    #[test]
+    fn d3_classifier_truth_table() {
+        // (no_ring_holder, reachable_but_absent, single_node) -> local_only
+        // Reachable-but-absent dominates: local-only regardless of peers.
+        assert!(local_only_d3_decision(false, true, false));
+        assert!(local_only_d3_decision(false, true, true));
+        // Empty ring + single node: no holder position can ever exist.
+        assert!(local_only_d3_decision(true, false, true));
+        // THE REGRESSION: empty ring but a remote peer exists (gossip has
+        // not yet populated the ring) → NOT local-only.
+        assert!(!local_only_d3_decision(true, false, false));
+        // Sanity: ring holder present, nothing reachable-absent → not
+        // local-only (unresolved — a live holder may merely be down).
+        assert!(!local_only_d3_decision(false, false, false));
+        assert!(!local_only_d3_decision(false, false, true));
+        // Reachable-absent + no ring holder + single node → local-only.
+        assert!(local_only_d3_decision(true, true, true));
+    }
+
+    /// The coordinator-based classifier agrees with the pure decision.
     #[tokio::test]
-    async fn d3_classifier_local_only_shapes() {
+    async fn d3_classifier_coordinator_shapes() {
         let tmp = tempfile::tempdir().unwrap();
         let coordinator = build_coordinator(&tmp).await;
         let id = SegmentId::new();
@@ -1643,8 +1738,7 @@ mod tests {
             "reachable-but-absent must be local-only (D3)"
         );
 
-        // Single-node shape: no reachable-absent signal, but the ring is
-        // empty AND the prelude membership has no remote peer.
+        // Single-node shape (the prelude membership has no remote peer).
         let empty: std::collections::HashSet<SegmentId> = std::collections::HashSet::new();
         assert!(
             is_local_only_d3_candidate(&coordinator, id, &empty),
