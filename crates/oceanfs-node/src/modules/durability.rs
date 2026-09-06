@@ -372,7 +372,19 @@ impl DurabilityModule {
         let mut scrub_config = ScrubConfig::default();
         scrub_config.set_interval_sec(config.scrub_interval_sec);
         scrub_config.set_parallel_nodes(config.scrub_parallel_nodes);
-        let scrub_worker = Arc::new(ScrubCoordinator::new(scrub_config));
+        // ADR-0033 D3 (scrub half): partition planning is injected from
+        // the node layer — ManifestPartitionPlanner assigns each segment
+        // to an eligible holder of its storage_locations.
+        let scrub_planner: Arc<dyn oceanfs_durability::peer_selection::PartitionPlanner> =
+            Arc::new(crate::peer_selection::ManifestPartitionPlanner::new(
+                membership.clone(),
+                NodeId::new(&config.node_id),
+            ));
+        let scrub_worker = Arc::new(ScrubCoordinator::new(
+            scrub_config,
+            scrub_planner,
+            NodeId::new(&config.node_id),
+        ));
         // OrphanReaper deletes fully-dead segments (aged dead captures ≥
         // their seal-time total) through the lifecycle coordinator and
         // unlinks their `.dat` through the shared store under the pool id

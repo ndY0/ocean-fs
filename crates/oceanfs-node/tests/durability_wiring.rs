@@ -8,11 +8,12 @@
 
 use std::sync::Arc;
 
-use oceanfs_core::{MetadataConfig, NodeId, RpcConfig};
+use oceanfs_core::{MetadataConfig, NodeId, RpcConfig, SegmentMetadata};
 use oceanfs_durability::{
     merkle::{IncrementalMerkleTree, MerkleTreeConfig},
+    peer_selection::PartitionPlanner,
     AntiEntropy, AntiEntropyConfig, GarbageCollector, GcConfig, HealConfig, HealQueue,
-    InMemorySegmentStore, OrphanReaper, ScrubConfig, ScrubCoordinator,
+    InMemorySegmentStore, OrphanReaper, ScrubConfig, ScrubCoordinator, SegmentPartition,
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
@@ -21,6 +22,26 @@ use oceanfs_routing::{Ring, RingCache};
 /// Creates a test IncrementalMerkleTree.
 fn make_test_tree() -> Arc<IncrementalMerkleTree> {
     Arc::new(IncrementalMerkleTree::new(MerkleTreeConfig::default()))
+}
+
+/// Test scrub planner that keeps every segment in the self partition.
+struct LocalPlanner;
+
+impl PartitionPlanner for LocalPlanner {
+    fn plan_partitions(
+        &self,
+        segments: &[SegmentMetadata],
+        self_id: &NodeId,
+    ) -> Vec<SegmentPartition> {
+        vec![SegmentPartition {
+            node_id: self_id.clone(),
+            segment_ids: segments.iter().map(|s| s.segment_id).collect(),
+        }]
+    }
+}
+
+fn make_coord(config: ScrubConfig) -> ScrubCoordinator {
+    ScrubCoordinator::new(config, Arc::new(LocalPlanner), NodeId::new("test-node"))
 }
 use oceanfs_storage::RocksDbMetadataStore;
 use oceanfs_storage_api::MetadataStore;
@@ -90,7 +111,7 @@ async fn durability_components_are_wireable_and_spawnable() {
     });
 
     // Scrub
-    let _scrub_worker = Arc::new(ScrubCoordinator::new(ScrubConfig::default()));
+    let _scrub_worker = Arc::new(make_coord(ScrubConfig::default()));
     let scrub_cancel = CancellationToken::new();
     let _scrub_handle = tokio::spawn({
         let cancel = scrub_cancel.clone();
@@ -168,7 +189,7 @@ async fn test_scrub_accepts_trait_object() {
 
     let data_store: Arc<dyn oceanfs_storage_api::SegmentDataStore> =
         Arc::new(InMemorySegmentStore::new());
-    let coord = ScrubCoordinator::new(ScrubConfig::default());
+    let coord = make_coord(ScrubConfig::default());
     let scrub_registry =
         Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
             &oceanfs_core::LifecycleConfig::default(),

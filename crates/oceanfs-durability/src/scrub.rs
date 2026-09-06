@@ -2,21 +2,26 @@
 //!
 //! Unlike anti-entropy's peer-to-peer incremental check, scrubbing is a
 //! full cluster-wide scan of every segment, verifying BLAKE3 hashes and
-//! Merkle roots. A randomly elected coordinator partitions the segment ID
-//! space across all healthy nodes. Each node scrubs its partition, reports
-//! discrepancies, and auto-heals via EC decode.
+//! Merkle roots. A coordinator partitions the segment space across the
+//! segments' *holders* (ADR-0033 D1): each segment is assigned to one of
+//! the eligible members of its `storage_locations`, never to every alive
+//! node. Each node scrubs its partition, reports discrepancies, and
+//! auto-heals via EC decode.
+//!
+//! The holder-aware partition plan is produced by the injected
+//! [`PartitionPlanner`] (the
+//! node layer implements it over membership + manifests). While
+//! coordinator dispatch over gRPC is not yet wired, a local cycle
+//! executes the union of every planned partition — the current local
+//! full-scan guarantee is unchanged.
 
 use std::sync::Arc;
 
-use oceanfs_core::{
-    Counter, LabelSet, MetricRegistrar, NodeId, NodeState, SegmentId, SegmentMetadata,
-};
-use oceanfs_membership::Membership;
-use oceanfs_network::ConnectionPool;
+use oceanfs_core::{Counter, LabelSet, MetricRegistrar, NodeId, SegmentId, SegmentMetadata};
 use oceanfs_storage_api::SegmentDataStore;
 use tokio::sync::Semaphore;
 
-use crate::{anti_entropy::MerkleTree, Error, Result};
+use crate::{anti_entropy::MerkleTree, peer_selection::PartitionPlanner, Error, Result};
 
 // ---------------------------------------------------------------------------
 // ScrubConfig
@@ -264,6 +269,24 @@ pub(crate) struct ScrubResult {
     pub skipped: bool,
 }
 
+impl ScrubResult {
+    /// Whether this result indicates a segment data-store **I/O failure**
+    /// (the read returned `Err`) rather than genuine corruption.
+    ///
+    /// The worker turns a store error into an unhealthy, non-skipped,
+    /// zero-byte result; genuine corruption scans bytes and enqueues a
+    /// heal. The gRPC service uses this to reject an assignment with an
+    /// error `Status` instead of accepting a partition it could not
+    /// execute (ADR-0033 D1 — no silent acks).
+    pub(crate) fn store_failure(&self) -> bool {
+        !self.healthy
+            && self.merkle_mismatch
+            && !self.skipped
+            && !self.enqueued_heal
+            && self.bytes_scanned == 0
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SegmentPartition
 // ---------------------------------------------------------------------------
@@ -271,7 +294,7 @@ pub(crate) struct ScrubResult {
 /// A partition of the segment ID space assigned to a single node.
 ///
 /// The unit the [`crate::peer_selection::PartitionPlanner`] returns and the
-/// [`ScrubWorker`] executes: `node_id` is the node that must scrub
+/// `ScrubWorker` executes: `node_id` is the node that must scrub
 /// `segment_ids`, and every listed segment is one that `node_id` holds
 /// (a member of that segment's `storage_locations`). The local-only case
 /// (`node_id == self`) covers segments with no eligible remote holder.
@@ -325,7 +348,7 @@ impl ScrubWorker {
     /// 2. Builds a Merkle tree over the data using 64 KB leaves.
     /// 3. Compares the computed Merkle root against the stored
     ///    `merkle_root` in the segment metadata.
-    /// 4. Returns a [`ScrubResult`] with the verification outcome.
+    /// 4. Returns a `ScrubResult` with the verification outcome.
     ///
     /// If the segment metadata has no stored Merkle root, the segment
     /// is still scanned for size but cannot be fully verified.
@@ -527,24 +550,53 @@ impl ScrubWorker {
 // ScrubCoordinator
 // ---------------------------------------------------------------------------
 
-/// Scrub coordinator — partitions segment space across nodes.
+/// Scrub coordinator — partitions segment space across the segments'
+/// holders (ADR-0033 D1, scrub half).
 ///
-/// Elected per scrub cycle. Queries all segment IDs from metadata,
-/// splits them into partitions, assigns each to a healthy node,
-/// and aggregates results.
+/// Runs a periodic integrity cycle over this node's sealed segments.
+/// Partitions are computed by the injected
+/// [`PartitionPlanner`]: each
+/// segment is assigned to one eligible member of its
+/// `storage_locations`, never to a node that does not hold it, and
+/// local-only segments stay in the self partition. The node layer wires
+/// the concrete planner (membership + manifest-aware) at construction.
 ///
 /// # Examples
 ///
 /// ```
-/// # use oceanfs_durability::{ScrubCoordinator, ScrubConfig};
-/// let coord = ScrubCoordinator::new(ScrubConfig::default());
+/// use std::sync::Arc;
+/// use oceanfs_core::{NodeId, SegmentId, SegmentMetadata};
+/// use oceanfs_durability::{
+///     peer_selection::PartitionPlanner, ScrubConfig, ScrubCoordinator,
+///     SegmentPartition,
+/// };
+///
+/// /// Test planner that keeps every segment local.
+/// struct LocalOnly;
+///
+/// impl PartitionPlanner for LocalOnly {
+///     fn plan_partitions(
+///         &self,
+///         segments: &[SegmentMetadata],
+///         self_id: &NodeId,
+///     ) -> Vec<SegmentPartition> {
+///         vec![SegmentPartition {
+///             node_id: self_id.clone(),
+///             segment_ids: segments.iter().map(|s| s.segment_id).collect(),
+///         }]
+///     }
+/// }
+///
+/// let planner: Arc<dyn PartitionPlanner> = Arc::new(LocalOnly);
+/// let coord = ScrubCoordinator::new(ScrubConfig::default(), planner, NodeId::new("n1"));
 /// ```
 pub struct ScrubCoordinator {
     config: ScrubConfig,
-    /// Optional membership for distributed partition assignment (H5).
-    membership: Option<Arc<Membership>>,
-    /// Optional connection pool for distributed partition distribution (H5).
-    pool: Option<Arc<ConnectionPool>>,
+    /// Holder-aware partition planner, injected from the node layer
+    /// (ADR-0033 D3). The durability crate never interprets manifests.
+    planner: Arc<dyn PartitionPlanner>,
+    /// This node's id — the self partition target.
+    self_id: NodeId,
     segments_checked_total: Counter,
     segments_corrupt_total: Counter,
 }
@@ -553,13 +605,14 @@ impl ScrubCoordinator {
     /// Creates a new scrub coordinator with unregistered counters.
     ///
     /// Use [`register_metrics`](Self::register_metrics) to wire them.
-    /// For distributed operation, call [`with_distributed`](Self::with_distributed)
-    /// to provide membership and connection pool.
-    pub fn new(config: ScrubConfig) -> Self {
+    /// `planner` decides which eligible holder scrubs each segment
+    /// (ADR-0033 D1/D3); `self_id` names the local node so local-only
+    /// segments land in the self partition.
+    pub fn new(config: ScrubConfig, planner: Arc<dyn PartitionPlanner>, self_id: NodeId) -> Self {
         Self {
             config,
-            membership: None,
-            pool: None,
+            planner,
+            self_id,
             segments_checked_total: Counter::new(
                 "scrub_segments_checked_total".into(),
                 "Segments checked by scrub".into(),
@@ -573,57 +626,18 @@ impl ScrubCoordinator {
         }
     }
 
-    /// Enables distributed partition assignment (H5).
+    /// Plans a holder-aware scrub assignment for `segments` (ADR-0033 D1,
+    /// scrub half).
     ///
-    /// When set, the scrub coordinator uses the membership to discover
-    /// alive nodes and distributes segment partitions across them instead
-    /// of requiring the caller to pass node IDs manually.
-    pub fn with_distributed(
-        mut self,
-        membership: Arc<Membership>,
-        pool: Arc<ConnectionPool>,
-    ) -> Self {
-        self.membership = Some(membership);
-        self.pool = Some(pool);
-        self
-    }
-
-    /// Returns the list of alive node IDs from the membership view,
-    /// excluding the current node. Returns an empty vec when membership
-    /// is not configured.
-    pub fn alive_peers(&self) -> Vec<NodeId> {
-        match &self.membership {
-            Some(m) => m
-                .nodes()
-                .into_iter()
-                .filter(|(id, state)| *id != *m.node_id() && *state == NodeState::Alive)
-                .map(|(id, _)| id)
-                .collect(),
-            None => Vec::new(),
-        }
-    }
-    // [review][implementation][critical]
-    // partitioned scrub must be delivered a tsome point : when key counts will grow, so does the scrub workload.
-    // another note : this implementation assumes that each peer holds this node segments, wich will be note true with the replication
-    // introduced with the data pools evolution. we need to brainstorm about that, maybe leverage the manifest ?
-    // [end]
-    /// Partitions all sealed segments across currently-alive nodes.
-    ///
-    /// When membership is configured, discovers alive peers automatically
-    /// and distributes the workload. When membership is `None`, falls back
-    /// to local-only operation (all segments assigned to self).
-    #[allow(dead_code)] // Infrastructure for distributed scrub (H5); called by future phases.
-    pub(crate) fn partition_for_current_nodes(
+    /// Delegates to the injected [`PartitionPlanner`]: every returned
+    /// partition lists, for its `node_id`, only segments that node holds;
+    /// a segment with no eligible remote holder stays in the self
+    /// partition. No segment appears in more than one partition.
+    pub(crate) fn plan_cycle_partitions(
         &self,
-        segment_ids: &[SegmentId],
+        segments: &[SegmentMetadata],
     ) -> Vec<SegmentPartition> {
-        let node_ids = self.alive_peers();
-        if node_ids.is_empty() {
-            // No peers: assign all segments to the local node.
-            let local = oceanfs_core::NodeId::new("local");
-            return vec![SegmentPartition { node_id: local, segment_ids: segment_ids.to_vec() }];
-        }
-        self.partition_segments(segment_ids, &node_ids)
+        self.planner.plan_partitions(segments, &self.self_id)
     }
 
     /// Registers scrub counters with a metrics registrar.
@@ -635,43 +649,6 @@ impl ScrubCoordinator {
     /// Returns the configuration.
     pub fn config(&self) -> &ScrubConfig {
         &self.config
-    }
-
-    /// Splits segment IDs into equal ranges across nodes. No gaps, no overlaps.
-    #[doc(hidden)]
-    pub(crate) fn partition_segments(
-        &self,
-        segment_ids: &[SegmentId],
-        node_ids: &[NodeId],
-    ) -> Vec<SegmentPartition> {
-        if node_ids.is_empty() || segment_ids.is_empty() {
-            return Vec::new();
-        }
-
-        // Sort segment IDs for deterministic partitioning
-        let mut sorted_ids: Vec<SegmentId> = segment_ids.to_vec();
-        sorted_ids.sort();
-
-        let node_count = node_ids.len();
-        let segment_count = sorted_ids.len();
-        let base_per_node = segment_count / node_count;
-        let remainder = segment_count % node_count;
-
-        let mut partitions = Vec::with_capacity(node_count);
-        let mut start = 0;
-
-        for (i, node_id) in node_ids.iter().enumerate() {
-            let extra = if i < remainder { 1 } else { 0 };
-            let count = base_per_node + extra;
-            let end = (start + count).min(segment_count);
-
-            let partition_ids = sorted_ids[start..end].to_vec();
-            partitions
-                .push(SegmentPartition { node_id: node_id.clone(), segment_ids: partition_ids });
-            start = end;
-        }
-
-        partitions
     }
 
     /// Computes the number of concurrent segment verifications for a
@@ -696,14 +673,16 @@ impl ScrubCoordinator {
     ///
     /// # Workflow
     ///
-    /// 1. Gathers all segment IDs from the metadata store.
-    /// 2. Partitions segments into batches based on `parallel_nodes`.
-    /// 3. Verifies each batch concurrently, bounded by a semaphore
-    ///    (perf rule 2.7: bounded concurrency).
+    /// 1. Gathers this node's sealed segments from the machine
+    ///    (ADR-0025 Decision 3).
+    /// 2. Plans a holder-aware partition assignment via the injected
+    ///    [`PartitionPlanner`] (ADR-0033 D1, scrub half).
+    /// 3. Executes the plan: while coordinator dispatch over gRPC is not
+    ///    yet wired, the union of every planned partition is verified
+    ///    locally (== the sealed inventory; no segment appears in more
+    ///    than one partition), bounded by a semaphore (perf rule 2.7:
+    ///    bounded concurrency).
     /// 4. Aggregates results into a [`ScrubReport`].
-    ///
-    /// In a multi-node cluster, step 2 would distribute batches to
-    /// remote nodes via gRPC. For now, all verification runs locally.
     ///
     /// # Errors
     ///
@@ -719,7 +698,7 @@ impl ScrubCoordinator {
         let start_time = Instant::now();
         let mut report = ScrubReport::default();
 
-        // Phase 1: Gather all segment IDs from the machine (ADR-0025
+        // Phase 1: Gather all sealed segments from the machine (ADR-0025
         // Decision 3).
         // Only SEALED segments are scrubbed: unsealed segments (phantom
         // registrations made before their WAL entry, or in-flight active
@@ -727,18 +706,34 @@ impl ScrubCoordinator {
         // them would produce false "corrupt" results (the read fails with
         // NotFound, which the worker classifies as a Merkle mismatch).
         // Sealed segments carry a stored Merkle root to verify against.
-        let mut segment_ids: Vec<SegmentId> = Vec::new();
-        registry.for_each(|id, entry| {
+        let mut sealed_segments: Vec<SegmentMetadata> = Vec::new();
+        registry.for_each(|_id, entry| {
             if entry.state == oceanfs_storage::segment::lifecycle::SegmentState::Sealed {
-                segment_ids.push(id);
+                sealed_segments.push(entry.metadata.clone());
             }
         });
 
-        report.segments_total = segment_ids.len() as u64;
+        report.segments_total = sealed_segments.len() as u64;
 
-        if segment_ids.is_empty() {
+        if sealed_segments.is_empty() {
             return Ok(report);
         }
+
+        // Phase 2: Plan the holder-aware partition assignment (ADR-0033
+        // D1). Every sealed segment appears in exactly one partition and
+        // no partition lists a node that does not hold its segments;
+        // local-only segments land in the self partition.
+        let partitions = self.plan_cycle_partitions(&sealed_segments);
+
+        // The union of all planned partitions is exactly the sealed
+        // inventory. Dispatch is not wired yet, so every partition is
+        // executed by this node's local worker — the local full-scan
+        // guarantee (spec §7.5) is preserved. When a coordinator starts
+        // dispatching partitions to their holder nodes, only the self
+        // partition stays local and the rest go over the wire.
+        let segment_ids: Vec<SegmentId> =
+            partitions.iter().flat_map(|p| p.segment_ids.iter().copied()).collect();
+        debug_assert_eq!(segment_ids.len(), sealed_segments.len());
 
         // Determine concurrency: use configured parallel_nodes, or a sane
         // bounded default. NOTE: 0 previously meant "all segments at
@@ -748,8 +743,9 @@ impl ScrubCoordinator {
         // OOM-killed 4 GB SUT VMs mid-run. The default is now capped.
         let max_concurrent = Self::scrub_concurrency(segment_ids.len(), self.config.parallel_nodes);
 
-        // Phase 2: Partition segments into batches for parallel verification.
-        // Each batch is assigned to a spawned task bounded by the semaphore.
+        // Phase 3: Split the planned segment ids into batches for parallel
+        // verification. Each batch is assigned to a spawned task bounded
+        // by the semaphore.
         let batch_size = (segment_ids.len() / max_concurrent).max(1);
         let batches: Vec<Vec<SegmentId>> =
             segment_ids.chunks(batch_size).map(|chunk| chunk.to_vec()).collect();
@@ -765,7 +761,7 @@ impl ScrubCoordinator {
         for batch in batches {
             let semaphore = Arc::clone(&semaphore);
             let worker = Arc::clone(&worker);
-            let node_id = NodeId::new("local");
+            let node_id = self.self_id.clone();
 
             let handle = tokio::spawn(async move {
                 // Acquire permit to bound concurrent verification (perf 2.7, 8.5)
@@ -796,7 +792,7 @@ impl ScrubCoordinator {
             handles.push(handle);
         }
 
-        // Phase 3: Collect results from all batches
+        // Phase 4: Collect results from all batches
         for handle in handles {
             match handle.await {
                 Ok(Ok(results)) => {
@@ -867,8 +863,10 @@ impl ScrubCoordinator {
         data_store: Arc<dyn SegmentDataStore>,
     ) -> Result<()> {
         let config = self.config.clone();
+        let planner = Arc::clone(&self.planner);
+        let self_id = self.self_id.clone();
         tokio::spawn(async move {
-            let coord = ScrubCoordinator::new(config);
+            let coord = ScrubCoordinator::new(config, planner, self_id);
             match coord.run_cycle(registry, data_store).await {
                 Ok(report) => {
                     tracing::info!(
@@ -954,6 +952,44 @@ mod tests {
         store
     }
 
+    /// Bare sealed metadata (no storage_locations — local-only shape used
+    /// by most single-node cycle tests).
+    fn segment_meta(id: SegmentId) -> SegmentMetadata {
+        SegmentMetadata {
+            pool_id: 0,
+            total_bytes: 0,
+            segment_id: id,
+            ec_k: 4,
+            ec_m: 2,
+            size_tier: SizeTier::Standard,
+            merkle_root: None,
+            storage_locations: smallvec::SmallVec::new(),
+            sealed_at: Some(1700000000000),
+        }
+    }
+
+    /// Test planner that keeps every segment in the self partition — the
+    /// single-node shape most coordinator tests need.
+    struct LocalPlanner;
+
+    impl PartitionPlanner for LocalPlanner {
+        fn plan_partitions(
+            &self,
+            segments: &[SegmentMetadata],
+            self_id: &NodeId,
+        ) -> Vec<SegmentPartition> {
+            vec![SegmentPartition {
+                node_id: self_id.clone(),
+                segment_ids: segments.iter().map(|s| s.segment_id).collect(),
+            }]
+        }
+    }
+
+    /// Coordinator with the local (self-partition) planner.
+    fn test_coord(config: ScrubConfig) -> ScrubCoordinator {
+        ScrubCoordinator::new(config, Arc::new(LocalPlanner), NodeId::new("test-node"))
+    }
+
     // -----------------------------------------------------------------------
     // ScrubConfig
     // -----------------------------------------------------------------------
@@ -1010,65 +1046,89 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Partition assignment
+    // Partition planning (ADR-0033 holder-aware)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn partition_covers_all_segments_no_gaps() {
-        let seg_ids: Vec<SegmentId> = (0..10).map(|_| SegmentId::new()).collect();
-        let node_ids: Vec<NodeId> = (0..3).map(|i| NodeId::new(format!("node-{i}"))).collect();
+    fn plan_cycle_partitions_delegates_to_injected_planner_with_self_id() {
+        // plan_cycle_partitions is the coordinator's seam to the injected
+        // planner: it passes the inventory and the coordinator's self id
+        // through, and returns exactly what the planner produced.
+        let coord = test_coord(ScrubConfig::default());
+        let segments = vec![segment_meta(SegmentId::new()), segment_meta(SegmentId::new())];
 
-        let coord = ScrubCoordinator::new(ScrubConfig::default());
-        let partitions = coord.partition_segments(&seg_ids, &node_ids);
-
-        assert_eq!(partitions.len(), 3);
-
-        let total_assigned: usize = partitions.iter().map(|p| p.segment_ids.len()).sum();
-        assert_eq!(total_assigned, 10);
+        let partitions = coord.plan_cycle_partitions(&segments);
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].node_id.as_str(), "test-node");
+        assert_eq!(partitions[0].segment_ids.len(), 2);
+        assert_eq!(partitions[0].segment_ids[0], segments[0].segment_id);
+        assert_eq!(partitions[0].segment_ids[1], segments[1].segment_id);
     }
 
     #[test]
-    fn partition_no_overlap() {
-        let seg_ids: Vec<SegmentId> = (0..5).map(|_| SegmentId::new()).collect();
-        let node_ids: Vec<NodeId> = (0..2).map(|i| NodeId::new(format!("node-{i}"))).collect();
-
-        let coord = ScrubCoordinator::new(ScrubConfig::default());
-        let partitions = coord.partition_segments(&seg_ids, &node_ids);
-
-        let mut all_ids = std::collections::HashSet::new();
-        for p in &partitions {
-            for id in &p.segment_ids {
-                assert!(all_ids.insert(*id), "segment ID appears in multiple partitions");
+    fn plan_cycle_partitions_never_overlaps_or_loses_segments() {
+        // A distributing planner: each segment goes to one of its listed
+        // holders (or self when none). The coordinator must surface the
+        // plan unchanged — every segment exactly once, no non-holders.
+        struct HolderFirst;
+        impl PartitionPlanner for HolderFirst {
+            fn plan_partitions(
+                &self,
+                segments: &[SegmentMetadata],
+                self_id: &NodeId,
+            ) -> Vec<SegmentPartition> {
+                let mut remote: Vec<SegmentPartition> = Vec::new();
+                let mut local_ids: Vec<SegmentId> = Vec::new();
+                for seg in segments {
+                    if let Some(holder) = seg.storage_locations.first() {
+                        match remote.iter_mut().find(|p| &p.node_id == holder) {
+                            Some(p) => p.segment_ids.push(seg.segment_id),
+                            None => remote.push(SegmentPartition {
+                                node_id: holder.clone(),
+                                segment_ids: vec![seg.segment_id],
+                            }),
+                        }
+                    } else {
+                        local_ids.push(seg.segment_id);
+                    }
+                }
+                if !local_ids.is_empty() {
+                    remote.push(SegmentPartition {
+                        node_id: self_id.clone(),
+                        segment_ids: local_ids,
+                    });
+                }
+                remote
             }
         }
-    }
 
-    #[test]
-    fn partition_empty_input_returns_empty() {
-        let coord = ScrubCoordinator::new(ScrubConfig::default());
-        let node_ids: Vec<NodeId> = vec![NodeId::new("n1")];
-        let partitions = coord.partition_segments(&[], &node_ids);
-        assert!(partitions.is_empty());
-    }
+        let coord = ScrubCoordinator::new(
+            ScrubConfig::default(),
+            Arc::new(HolderFirst),
+            NodeId::new("test-node"),
+        );
+        let seg_a = segment_meta(SegmentId::new());
+        let mut seg_b = segment_meta(SegmentId::new());
+        seg_b.storage_locations = smallvec::smallvec![NodeId::new("holder-b")];
+        let seg_local = segment_meta(SegmentId::new());
 
-    #[test]
-    fn partition_no_nodes_returns_empty() {
-        let seg_ids: Vec<SegmentId> = vec![SegmentId::new()];
-        let coord = ScrubCoordinator::new(ScrubConfig::default());
-        let partitions = coord.partition_segments(&seg_ids, &[]);
-        assert!(partitions.is_empty());
-    }
+        let partitions =
+            coord.plan_cycle_partitions(&[seg_a.clone(), seg_b.clone(), seg_local.clone()]);
+        let mut seen: Vec<SegmentId> =
+            partitions.iter().flat_map(|p| p.segment_ids.iter().copied()).collect();
+        assert_eq!(seen.len(), 3, "no segment may appear in more than one partition");
+        seen.sort();
+        let mut all = vec![seg_a.segment_id, seg_b.segment_id, seg_local.segment_id];
+        all.sort();
+        assert_eq!(seen, all, "every segment must be planned exactly once");
 
-    #[test]
-    fn partition_single_node_gets_all_segments() {
-        let seg_ids: Vec<SegmentId> = (0..5).map(|_| SegmentId::new()).collect();
-        let node_ids: Vec<NodeId> = vec![NodeId::new("solo")];
-
-        let coord = ScrubCoordinator::new(ScrubConfig::default());
-        let partitions = coord.partition_segments(&seg_ids, &node_ids);
-
-        assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0].segment_ids.len(), 5);
+        // The local-only segment (empty storage_locations) stayed in the
+        // self partition; the holder-b segment went to holder-b.
+        let self_partition = partitions.iter().find(|p| p.node_id.as_str() == "test-node").unwrap();
+        assert!(self_partition.segment_ids.contains(&seg_local.segment_id));
+        assert!(self_partition.segment_ids.contains(&seg_a.segment_id));
+        let b_partition = partitions.iter().find(|p| p.node_id.as_str() == "holder-b").unwrap();
+        assert!(b_partition.segment_ids.contains(&seg_b.segment_id));
     }
 
     // -----------------------------------------------------------------------
@@ -1369,7 +1429,7 @@ mod tests {
                 &oceanfs_core::LifecycleConfig::default(),
             ));
         let data_store = segment_store_with_data(vec![]).await;
-        let coord = ScrubCoordinator::new(ScrubConfig::default());
+        let coord = test_coord(ScrubConfig::default());
         let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
         assert_eq!(report.segments_total, 0);
         assert_eq!(report.segments_healthy, 0);
@@ -1443,7 +1503,7 @@ mod tests {
             .unwrap();
 
         let data_store = segment_store_with_data(stored_data).await;
-        let coord = ScrubCoordinator::new(ScrubConfig::default());
+        let coord = test_coord(ScrubConfig::default());
         let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
 
         // Only the sealed segment is scrubbed; the phantom is skipped.
@@ -1485,7 +1545,7 @@ mod tests {
         }
 
         let data_store = segment_store_with_data(stored_data).await;
-        let coord = ScrubCoordinator::new(ScrubConfig::default());
+        let coord = test_coord(ScrubConfig::default());
         let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
 
         assert_eq!(report.segments_total, 3);
@@ -1526,7 +1586,7 @@ mod tests {
         // Data store has the CORRUPTED data
         let data_store = segment_store_with_data(vec![(seg_id, corrupted_data)]).await;
 
-        let coord = ScrubCoordinator::new(ScrubConfig::default());
+        let coord = test_coord(ScrubConfig::default());
         let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
 
         assert_eq!(report.segments_total, 1);
@@ -1541,7 +1601,7 @@ mod tests {
                 &oceanfs_core::LifecycleConfig::default(),
             ));
         let data_store = segment_store_with_data(vec![]).await;
-        let coord = ScrubCoordinator::new(ScrubConfig::default());
+        let coord = test_coord(ScrubConfig::default());
         let result = coord.trigger_manual(Arc::clone(&registry), data_store).await;
         assert!(result.is_ok());
         // Give the spawned task a moment to start
@@ -1558,7 +1618,7 @@ mod tests {
         let mut config = ScrubConfig::default();
         config.set_interval_sec(3600); // Long interval so it doesn't fire in test
 
-        let coord = Arc::new(ScrubCoordinator::new(config));
+        let coord = Arc::new(test_coord(config));
         let (tx, rx) = tokio::sync::watch::channel(());
 
         let handle = coord.start_background(Arc::clone(&registry), data_store, rx).await;
@@ -1608,7 +1668,7 @@ mod tests {
 
     #[test]
     fn scrub_coordinator_config_getter() {
-        let coord = ScrubCoordinator::new(ScrubConfig::default());
+        let coord = test_coord(ScrubConfig::default());
         let config = coord.config();
         assert_eq!(config.interval_sec(), 604800);
     }
@@ -1674,7 +1734,7 @@ mod tests {
         // Use a very short interval so the cycle fires quickly
         config.set_interval_sec(0);
 
-        let coord = Arc::new(ScrubCoordinator::new(config));
+        let coord = Arc::new(test_coord(config));
         let (tx, rx) = tokio::sync::watch::channel(());
 
         let handle = coord.start_background(Arc::clone(&registry), data_store, rx).await;
@@ -1763,7 +1823,7 @@ mod tests {
         // Use parallel_nodes=2 to test the non-zero branch
         let mut config = ScrubConfig::default();
         config.set_parallel_nodes(2);
-        let coord = ScrubCoordinator::new(config);
+        let coord = test_coord(config);
         let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
 
         assert_eq!(report.segments_total(), 4);
@@ -1775,7 +1835,7 @@ mod tests {
 
     #[test]
     fn scrub_metrics_created_and_increment() {
-        let coord = ScrubCoordinator::new(ScrubConfig::default());
+        let coord = test_coord(ScrubConfig::default());
         assert_eq!(coord.segments_checked_total.get(), 0);
         assert_eq!(coord.segments_corrupt_total.get(), 0);
 

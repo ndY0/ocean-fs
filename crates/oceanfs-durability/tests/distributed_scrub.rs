@@ -7,13 +7,37 @@
 
 use std::sync::Arc;
 
-use oceanfs_core::{SegmentId, SegmentMetadata, SizeTier};
-use oceanfs_durability::{InMemorySegmentStore, MerkleTree, ScrubConfig, ScrubCoordinator};
+use oceanfs_core::{NodeId, SegmentId, SegmentMetadata, SizeTier};
+use oceanfs_durability::{
+    peer_selection::PartitionPlanner, InMemorySegmentStore, MerkleTree, ScrubConfig,
+    ScrubCoordinator, SegmentPartition,
+};
 use oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry;
 use oceanfs_storage_api::SegmentDataStore;
 
 fn make_registry() -> Arc<SegmentLifecycleRegistry> {
     Arc::new(SegmentLifecycleRegistry::new(&oceanfs_core::LifecycleConfig::default()))
+}
+
+/// Test planner that keeps every segment in the self partition (the
+/// single-node shape these coordinator tests exercise).
+struct LocalPlanner;
+
+impl PartitionPlanner for LocalPlanner {
+    fn plan_partitions(
+        &self,
+        segments: &[SegmentMetadata],
+        self_id: &NodeId,
+    ) -> Vec<SegmentPartition> {
+        vec![SegmentPartition {
+            node_id: self_id.clone(),
+            segment_ids: segments.iter().map(|s| s.segment_id).collect(),
+        }]
+    }
+}
+
+fn coord(config: ScrubConfig) -> ScrubCoordinator {
+    ScrubCoordinator::new(config, Arc::new(LocalPlanner), NodeId::new("test-node"))
 }
 
 async fn segment_store_with_data(entries: Vec<(SegmentId, Vec<u8>)>) -> Arc<InMemorySegmentStore> {
@@ -33,7 +57,7 @@ fn seed_sealed(registry: &SegmentLifecycleRegistry, seg: SegmentMetadata) {
 async fn scrub_cycle_on_empty_store() {
     let registry = make_registry();
     let data_store = segment_store_with_data(vec![]).await;
-    let coord = ScrubCoordinator::new(ScrubConfig::default());
+    let coord = coord(ScrubConfig::default());
     let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
     assert_eq!(report.segments_total(), 0);
     assert_eq!(report.segments_healthy(), 0);
@@ -67,7 +91,7 @@ async fn scrub_cycle_verifies_healthy_segments() {
     }
 
     let data_store = segment_store_with_data(stored_data).await;
-    let coord = ScrubCoordinator::new(ScrubConfig::default());
+    let coord = coord(ScrubConfig::default());
     let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
     assert_eq!(report.segments_total(), 3);
     assert_eq!(report.segments_healthy(), 3);
@@ -103,7 +127,7 @@ async fn scrub_cycle_detects_corruption() {
     // Store the corrupt data
     let data_store = segment_store_with_data(vec![(seg_id, bad_data)]).await;
 
-    let coord = ScrubCoordinator::new(ScrubConfig::default());
+    let coord = coord(ScrubConfig::default());
     let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
 
     assert_eq!(report.segments_total(), 1);
@@ -115,7 +139,7 @@ async fn scrub_cycle_detects_corruption() {
 async fn manual_scrub_trigger_does_not_error() {
     let registry = make_registry();
     let data_store = segment_store_with_data(vec![]).await;
-    let coord = ScrubCoordinator::new(ScrubConfig::default());
+    let coord = coord(ScrubConfig::default());
     let result = coord.trigger_manual(Arc::clone(&registry), data_store).await;
     assert!(result.is_ok());
     // Give the spawned task a moment
@@ -151,7 +175,7 @@ async fn run_cycle_with_missing_data_skips_not_corrupt() {
     // heal requests for segments that were never corrupt.
     let data_store = segment_store_with_data(vec![]).await;
 
-    let coord = ScrubCoordinator::new(ScrubConfig::default());
+    let coord = coord(ScrubConfig::default());
     let report = coord.run_cycle(Arc::clone(&registry), data_store).await.unwrap();
 
     assert_eq!(report.segments_total(), 1);

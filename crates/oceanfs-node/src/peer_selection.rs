@@ -563,7 +563,6 @@ mod tests {
             assert_eq!(a.segment_ids, b.segment_ids);
         }
     }
-
     /// A dead holder is never a scrub target; its segments stay local or
     /// go to a live holder.
     #[test]
@@ -587,5 +586,67 @@ mod tests {
             .find(|p| p.node_id.as_str() == "self-node")
             .expect("self partition exists for the local-only segment");
         assert!(self_partition.segment_ids.contains(&segments[0].segment_id));
+    }
+
+    // -------------------------------------------------------------------
+    // f3 scrub partition semantics (ADR-0033 D1, scrub half)
+    // -------------------------------------------------------------------
+
+    /// f3 planner correctness: an inventory whose storage_locations span
+    /// {self, A, B} plus local-only segments plans partitions where every
+    /// segment in a peer's partition lists that peer, the local-only
+    /// segment lands in the self partition, no segment appears in more
+    /// than one partition, and no partition contains a non-holder.
+    #[test]
+    fn planner_scrub_partition_distribution_is_holder_sound() {
+        let membership = make_membership("self-node");
+        upsert(&membership, "holder-a", NodeState::Alive);
+        upsert(&membership, "holder-b", NodeState::Alive);
+        membership.set_peer_manifest(NodeId::new("holder-a"), healthy_manifest());
+        membership.set_peer_manifest(NodeId::new("holder-b"), healthy_manifest());
+
+        let planner = ManifestPartitionPlanner::new(membership, NodeId::new("self-node"));
+        let segments = vec![
+            segment(&["holder-a"]),
+            segment(&["holder-b"]),
+            segment(&["self-node", "holder-a", "holder-b"]),
+            segment(&["self-node"]),
+            segment(&[]),
+        ];
+        let partitions = planner.plan_partitions(&segments, &NodeId::new("self-node"));
+
+        // Every planned segment appears in exactly one partition.
+        let mut seen: Vec<SegmentId> = segments.iter().map(|s| s.segment_id).collect();
+        for partition in &partitions {
+            for seg_id in &partition.segment_ids {
+                let seg = segments
+                    .iter()
+                    .find(|s| &s.segment_id == seg_id)
+                    .expect("partition references a planned segment");
+                let holds = seg.storage_locations.iter().any(|h| h == &partition.node_id);
+                let local_only_in_self = partition.node_id.as_str() == "self-node"
+                    && (seg.storage_locations.is_empty()
+                        || (seg.storage_locations.len() == 1
+                            && seg.storage_locations[0].as_str() == "self-node"));
+                assert!(
+                    holds || local_only_in_self,
+                    "partition node {} does not hold segment {}",
+                    partition.node_id,
+                    seg_id
+                );
+                let pos = seen.iter().position(|s| s == seg_id).expect("duplicate plan");
+                seen.swap_remove(pos);
+            }
+        }
+        assert!(seen.is_empty(), "every segment appears in exactly one partition");
+
+        // Local-only segments (self-only holder, or no locations at all)
+        // land in the self partition.
+        let self_partition = partitions
+            .iter()
+            .find(|p| p.node_id.as_str() == "self-node")
+            .expect("a self partition exists");
+        assert!(self_partition.segment_ids.contains(&segments[3].segment_id));
+        assert!(self_partition.segment_ids.contains(&segments[4].segment_id));
     }
 }

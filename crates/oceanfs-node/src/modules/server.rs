@@ -669,7 +669,7 @@ impl ServerModule {
             Some(metadata_cache),
         );
         let scrub_service = oceanfs_durability::scrub_service::ScrubGrpcService::new(
-            storage.metadata_store.clone(),
+            Arc::clone(&storage.lifecycle_registry),
             storage.data_store.clone(),
         );
 

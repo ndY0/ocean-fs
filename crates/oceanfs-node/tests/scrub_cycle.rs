@@ -9,9 +9,33 @@
 
 use std::sync::Arc;
 
-use oceanfs_core::{SegmentId, SegmentMetadata, SizeTier};
-use oceanfs_durability::{InMemorySegmentStore, MerkleTree, ScrubConfig, ScrubCoordinator};
+use oceanfs_core::{NodeId, SegmentId, SegmentMetadata, SizeTier};
+use oceanfs_durability::{
+    peer_selection::PartitionPlanner, InMemorySegmentStore, MerkleTree, ScrubConfig,
+    ScrubCoordinator, SegmentPartition,
+};
 use oceanfs_storage_api::SegmentDataStore;
+
+/// Test planner that keeps every segment in the self partition (the
+/// single-node shape these coordinator tests exercise).
+struct LocalPlanner;
+
+impl PartitionPlanner for LocalPlanner {
+    fn plan_partitions(
+        &self,
+        segments: &[SegmentMetadata],
+        self_id: &NodeId,
+    ) -> Vec<SegmentPartition> {
+        vec![SegmentPartition {
+            node_id: self_id.clone(),
+            segment_ids: segments.iter().map(|s| s.segment_id).collect(),
+        }]
+    }
+}
+
+fn coord(config: ScrubConfig) -> ScrubCoordinator {
+    ScrubCoordinator::new(config, Arc::new(LocalPlanner), NodeId::new("test-node"))
+}
 
 /// Helper: create test data with the given size.
 fn make_test_data(size: usize) -> Vec<u8> {
@@ -50,7 +74,7 @@ fn make_sealed_segment(id: SegmentId, data: &[u8]) -> SegmentMetadata {
 #[tokio::test]
 async fn scrub_empty_store_produces_zero_report() {
     let data_store: Arc<dyn SegmentDataStore> = Arc::new(InMemorySegmentStore::new());
-    let coord = ScrubCoordinator::new(ScrubConfig::default());
+    let coord = coord(ScrubConfig::default());
 
     let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
         &oceanfs_core::LifecycleConfig::default(),
@@ -74,7 +98,7 @@ async fn scrub_single_healthy_segment_report() {
     registry.seal(seg_meta.segment_id, seg_meta).unwrap();
 
     let data_store = make_data_store(vec![(seg_id, data)]).await;
-    let coord = ScrubCoordinator::new(ScrubConfig::default());
+    let coord = coord(ScrubConfig::default());
 
     let report = coord.run_cycle(Arc::clone(&registry), data_store).await.expect("scrub cycle");
     assert_eq!(report.segments_total(), 1);
@@ -101,7 +125,7 @@ async fn scrub_corrupt_segment_detected() {
     corrupt_data[100] ^= 0xFF;
     let data_store = make_data_store(vec![(seg_id, corrupt_data)]).await;
 
-    let coord = ScrubCoordinator::new(ScrubConfig::default());
+    let coord = coord(ScrubConfig::default());
     let report = coord.run_cycle(Arc::clone(&registry), data_store).await.expect("scrub cycle");
     assert_eq!(report.segments_total(), 1);
     assert_eq!(report.segments_healthy(), 0);
@@ -137,7 +161,7 @@ async fn scrub_multiple_segments_mixed_health() {
     entries.push((corrupt_id, corrupt_data));
 
     let data_store = make_data_store(entries).await;
-    let coord = ScrubCoordinator::new(ScrubConfig::default());
+    let coord = coord(ScrubConfig::default());
 
     let report = coord.run_cycle(Arc::clone(&registry), data_store).await.expect("scrub cycle");
     assert_eq!(report.segments_total(), 4);
@@ -158,7 +182,7 @@ async fn scrub_report_includes_duration_and_bytes() {
     registry.seal(seg_meta.segment_id, seg_meta).unwrap();
 
     let data_store = make_data_store(vec![(seg_id, data)]).await;
-    let coord = ScrubCoordinator::new(ScrubConfig::default());
+    let coord = coord(ScrubConfig::default());
 
     let report = coord.run_cycle(Arc::clone(&registry), data_store).await.expect("scrub cycle");
     assert!(report.duration_sec() > 0.0);
@@ -190,7 +214,7 @@ async fn scrub_without_merkle_root_still_scans_bytes() {
     registry.seal(seg_meta.segment_id, seg_meta).unwrap();
 
     let data_store = make_data_store(vec![(seg_id, data)]).await;
-    let coord = ScrubCoordinator::new(ScrubConfig::default());
+    let coord = coord(ScrubConfig::default());
 
     let report = coord.run_cycle(Arc::clone(&registry), data_store).await.expect("scrub cycle");
     assert_eq!(report.segments_total(), 1);
@@ -221,7 +245,7 @@ async fn test_scrub_config_interval_affects_cycle() {
     config.set_interval_sec(7200); // 2 hours instead of 7 days
     config.set_parallel_nodes(3); // limit to 3 parallel nodes instead of 0=all
 
-    let coord = ScrubCoordinator::new(config);
+    let coord = coord(config);
     let report = coord.run_cycle(Arc::clone(&registry), data_store).await.expect("scrub cycle");
 
     // Verify the cycle completes with the custom config.

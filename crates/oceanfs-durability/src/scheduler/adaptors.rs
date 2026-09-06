@@ -233,6 +233,30 @@ mod tests {
 
     use super::*;
 
+    /// Test scrub planner that keeps every segment in the self partition.
+    struct LocalPlanner;
+
+    impl crate::peer_selection::PartitionPlanner for LocalPlanner {
+        fn plan_partitions(
+            &self,
+            segments: &[oceanfs_core::SegmentMetadata],
+            self_id: &oceanfs_core::NodeId,
+        ) -> Vec<crate::SegmentPartition> {
+            vec![crate::SegmentPartition {
+                node_id: self_id.clone(),
+                segment_ids: segments.iter().map(|s| s.segment_id).collect(),
+            }]
+        }
+    }
+
+    fn scrub_coord() -> Arc<ScrubCoordinator> {
+        Arc::new(ScrubCoordinator::new(
+            crate::ScrubConfig::default(),
+            Arc::new(LocalPlanner),
+            oceanfs_core::NodeId::new("test-node"),
+        ))
+    }
+
     /// The `Shard` guard fires before any delegation (f3) — proven with an
     /// erroring metadata double that would be hit if delegation happened.
     #[test]
@@ -291,7 +315,7 @@ mod tests {
             Duration::from_secs(60),
         );
         let scrub_task = ScrubTask::new(
-            Arc::new(ScrubCoordinator::new(crate::ScrubConfig::default())),
+            scrub_coord(),
             Arc::new(SegmentLifecycleRegistry::new(&oceanfs_core::LifecycleConfig::default())),
             Arc::new(crate::anti_entropy::InMemorySegmentStore::new()),
             Duration::from_secs(60),
@@ -527,12 +551,7 @@ mod tests {
             Arc::new(SegmentLifecycleRegistry::new(&oceanfs_core::LifecycleConfig::default()));
         let store: Arc<dyn SegmentDataStore> =
             Arc::new(crate::anti_entropy::InMemorySegmentStore::new());
-        let task = ScrubTask::new(
-            Arc::new(ScrubCoordinator::new(crate::ScrubConfig::default())),
-            registry,
-            store,
-            Duration::from_secs(60),
-        );
+        let task = ScrubTask::new(scrub_coord(), registry, store, Duration::from_secs(60));
         let res = task.run_cycle(KeyspaceWindow::Shard { index: 1, total: 4 }).await;
         assert!(matches!(res, Err(Error::Internal(_))));
     }
@@ -581,7 +600,7 @@ mod tests {
         let registry = seeded_registry(3);
         let store: Arc<dyn SegmentDataStore> =
             Arc::new(crate::anti_entropy::InMemorySegmentStore::new());
-        let scrub = Arc::new(ScrubCoordinator::new(crate::ScrubConfig::default()));
+        let scrub = scrub_coord();
         let task = ScrubTask::new(
             Arc::clone(&scrub),
             Arc::clone(&registry),
