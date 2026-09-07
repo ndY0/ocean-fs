@@ -1,14 +1,14 @@
 ---
 feature: "Metadata-Pool Loss Recovery (Fresh Store + Range Rebuild)"
 epic: "disk-resilience-healing"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies: ["failure-state-machine", "re-replication-worker"]
 adr: [0029, 0035]
 perf: [1.3, 7.1]
 created: 2026-08-22
-updated: 2026-09-06
+updated: 2026-09-07
 ---
 
 # Metadata-Pool Loss Recovery (Fresh Store + Range Rebuild)
@@ -219,24 +219,85 @@ replacement/remount ──▶ RocksDbMetadataStore::open on the replaced root
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` in `oceanfs-node`,
+- [x] **Code:** `cargo build --all-targets` in `oceanfs-node`,
       `oceanfs-durability`, `oceanfs-membership`, `oceanfs-storage`
-      (+ proto regen)
-- [ ] **Tests:** all listed green (ranges, manifest flag + routing rule,
-      rebuild fold, byte-accounting, 3-node integration)
-- [ ] **Docs:** `# Examples` on pub items; rustdoc clean
-- [ ] **ADR:** ADR-0029 §D7 (metadata loss: catastrophic locally,
+      (+ proto regen) — clean at HEAD `fd4e451` (`-p
+      {node,durability,membership,storage,routing,core,cache}` passes; 2
+      pre-existing dead-code warnings in oceanfs-durability test-only
+      fns) and re-verified at the review-fix HEAD `636d07e`
+      (`cargo build --all-targets -p oceanfs-node` clean, `clippy
+      --lib -- -D warnings` clean, rustdoc `-D warnings` clean). Proto
+      regen committed (membership.proto field 3, healing.proto
+      `ListObjectsInRange` + messages). The single review LOW — clippy
+      `-D warnings` on the e2e TEST target (`trim_split_whitespace` at
+      `tests/metadata_pool_recovery.rs:176`, `parse_metric`, present
+      since `8c0901b`) — was resolved at the final review-fix HEAD
+      `b858076`.
+- [x] **Tests:** all listed green (ranges, manifest flag + routing rule,
+      rebuild fold, byte-accounting, 3-node integration) — verified
+      independently: `oceanfs-storage --lib` 468/468 incl.
+      `both_metadata_cfs_empty_tracks_freshness`,
+      `rebuild_fold_is_hlc_lww_and_idempotent`,
+      `rebuild_restores_deletion_rows_so_byte_accounting_is_not_blinded`
+      (re-run at HEAD `636d07e`: pass); routing
+      `ring::tests::ranges_owned_by_cover_exactly_the_lookup_replica_set`;
+      membership manifest round-trip; node
+      pool_manifest/routing_cache/repair/peer_selection exclusion tests;
+      durability 279/279, membership 58, routing 100, cache 21; node
+      `--tests` 32 binaries incl. the `metadata_pool_recovery.rs` e2e and
+      node `--lib` 97. At HEAD `636d07e` re-ran: `cargo test -p
+      oceanfs-node --lib` (97/97), `cargo test -p oceanfs-node --test
+      metadata_pool_recovery` (3/3 runs: 6.81s/4.75s/5.72s). The prior
+      "two In-Scope assertions NOT exercised" note is resolved:
+      (a) re-replication-flat is now asserted in the e2e, (c) the drain
+      gate is fixed in `run_deferred_boot_drain`; only (b) — the
+      reaper-cycle reclaim e2e — remains as a unit-level substitute,
+      recorded as an accepted deviation below.
+- [x] **Docs:** `# Examples` on pub items; rustdoc clean —
+      `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p
+      {core,routing,storage,membership,durability,node,cache}` clean;
+      doctests 92 pass; the single failure (storage
+      `io/disk_io.rs::ObservedIo:987`) is the pre-existing baseline (file
+      untouched by the g8 commits) and is not a g8 gate.
+- [x] **ADR:** ADR-0029 §D7 (metadata loss: catastrophic locally,
       cluster-safe while RF healthy) + ADR-0035 D2 boundary (g8 pulls
       object/deletion rows from a peer but never touches segment lifecycle
-      state) satisfied; the corrections below documented
-- [ ] **Perf:** 1.3 (range vec + row batching pre-sized), 7.1 (rebuild is
+      state) satisfied; the corrections below documented — the drain
+      touches metadata_store folds + the pool registry only;
+      repair.rs/peer_selection exclude `node_unavailable` peers; no
+      data/lifecycle path in metadata_recovery.rs. ADR-0029 §D7's
+      original "re-replication-in" wording is superseded by the documented
+      deviation (peers route around; NO re-replication) — deviation listed
+      below and matches user-approved Option A.
+- [x] **Perf:** 1.3 (range vec + row batching pre-sized), 7.1 (rebuild is
       a one-time recovery path; the range stream never buffers a whole
-      range in memory)
-- [ ] **Integration:** the epic's metadata-pool-kill DoD — node serves
+      range in memory) — the stream is row-by-row over a bounded(64) mpsc
+      channel (healing_service.rs `list_objects_in_range`;
+      metadata_recovery.rs `MetadataStoreRangeLister`); no whole-range
+      buffering; recovery-path only. Minor 1.3 nit only (ring.rs
+      `ranges_owned_by` builds `Vec::new` + push on a one-time boot path).
+- [x] **Integration:** the epic's metadata-pool-kill DoD — node serves
       nothing, peers route around without SWIM timeout (node-level
       `node_unavailable` flag), fresh store rebuilds objects + deletions
       from a peer, node rejoins, zero cluster data loss, zero
-      re-replication traffic
+      re-replication traffic — e2e
+      (crates/oceanfs-node/tests/metadata_pool_recovery.rs) verifies
+      503-on-A while B serves, boot detection gating, objects+deletions
+      rebuild metrics ≥1, write-gate clearing, byte-identical read-back of
+      all pre-kill keys through A2, loss-window write recovered, pre-kill
+      DELETE honored (404), and no `.dat` swept (3/3 runs at HEAD
+      `636d07e`). Prior gaps closed: (a) the e2e now samples
+      `oceanfs_ranges_re_replicated_total` on B/C before the loss window
+      and asserts it stays flat through the loss window + rebuild, and
+      asserts A2 starts at 0 (metadata_pool_recovery.rs:405-422);
+      (c) `run_deferred_boot_drain` (metadata_recovery.rs:234-263) now
+      requires ≥1 SUCCESSFUL pull per owned range and returns Err
+      otherwise, so `Node::start` fails and the node stays gated (pending
+      never cleared, pool remains Dead) — every Err path precedes the
+      pool-Healthy/pending-clear at :268-272 and no path reopens after a
+      zero-success range. Gap (b) — the reaper-cycle reclaim of the
+      rebuilt deletion's dead bytes e2e — is NOT added; accepted as a
+      unit-level substitute (see Deviations).
 
 ## Deviations (accepted)
 
@@ -264,10 +325,14 @@ replacement/remount ──▶ RocksDbMetadataStore::open on the replaced root
   RPC or handler exists (the healing surface is fixed,
   `healing.proto:67-108`); `WalEntry` carries no bucket/key, so the WAL
   cannot rebuild objects (audit H4).
-- **Runtime store reopen is new.** The fresh-open primitive
-  (`create_if_missing`, `metadata/store.rs:273-319`) exists, but the store
-  is opened once at boot (`node.rs:274-278`); wiped-root reopen and
-  live-remount reopen are untested (audit L1) — this feature adds them.
+- **Runtime store reopen is new — and implemented as restart-based, NOT a
+  live store swap (review-agreed; see the record below).** The fresh-open
+  primitive (`create_if_missing`, `metadata/store.rs:273-319`) exists, but
+  the store is opened once at boot (`node.rs:274-278`); wiped-root reopen
+  and live-remount reopen were untested (audit L1). The implemented reopen
+  runs on the node's next boot after the out-of-band root replacement (the
+  e2e restarts A in-process on the same dirs); there is no live store swap
+  in the running process.
 - **Corrected from the brainstorm: no re-replication on metadata loss.**
   Kept from the original: peers only route around the node while it
   rebuilds its index; the earlier brainstorm "re-replicate the node's
@@ -276,3 +341,64 @@ replacement/remount ──▶ RocksDbMetadataStore::open on the replaced root
   `store.rs:169-182/201-247` and `wal/entry.rs:52-79` referenced
   pre-composition-root locations; all anchors are now the module/audit
   locations cited inline (audit M1).
+
+Independent review: **PASS** at HEAD `b858076` (feature commits
+`59ca295`, `4af36f8`, `ac85f30`, `8c0901b`, `fd4e451`; review-fix commits
+`636d07e`, `b858076`). The accepted deviations below were agreed at
+feature close; the DoD above carries the independently-verified evidence.
+
+- **Recovery is restart-based — there is no live store swap (the
+  Option-A architecture decision).** The implemented recovery path runs at
+  the next boot: the metadata root is replaced out-of-band while the node
+  is down, and on restart `detect_replaced_metadata_store` (fresh CFs +
+  intact lifecycle registry) gates the node
+  (`prepare_replaced_metadata_recovery`), then the deferred drain rebuilds
+  objects + deletions and reopens the node (`node.rs:397-398`,
+  `node.rs:471`). There is deliberately NO live store swap / runtime
+  remount of the metadata store in the running process — the reopen is
+  restart-based. The rationale recorded with the Option-A decision is
+  **"no re-restart means normal boot self-healing"**: the operator does
+  not need a special recovery ceremony or a dedicated recovery restart —
+  because the boot branch re-detects a replaced store on every boot (g8
+  never writes segment lifecycle state, so a boot that finds the metadata
+  CFs empty while `.dat` + the registry are intact is unambiguous), the
+  node self-heals at any ordinary subsequent boot. This is Option A of the
+  architecture decision: peers route around via `node_unavailable`, NO
+  re-replication runs, and the node's own next normal boot performs the
+  recovery. The original "runtime reopen" / "live-remount reopen"
+  In-Scope wording (audit L1) is superseded by this boot-branch
+  implementation.
+- **The "pre-kill delete's dead bytes reclaimed by A's own reaper
+  post-rebuild" assertion is unit-level, not a 3-node e2e.** The In-Scope
+  integration sub-bullet names it, but the e2e scenario cannot produce a
+  FULLY-dead segment (its other pre-kill keys share the sealed segment and
+  must stay readable), and the default `tombstone_ttl_sec` (259200) makes
+  an aged reclaim unreachable inside the test window. The g8-specific
+  mechanism IS directly tested at the store level:
+  `rebuild_restores_deletion_rows_so_byte_accounting_is_not_blinded`
+  (store.rs:2918) folds a peer's DeletionRow into an empty store and
+  asserts the dead-chunk feed carries the captured bytes (dead_bytes
+  = 1024, not blinded); the full reaper reclaim cycle over an aged record
+  (orphans_deleted == 1) is covered by the orphan_reaper module tests
+  (orphan_reaper.rs:490/511) against a real RocksDB store; the e2e proves
+  the deletion rows are genuinely rebuilt into the recovered node
+  (rebuild_deletions_total ≥ 1) and honored (404). The composition (a
+  background reaper cycle on the recovered node reclaiming the rebuilt
+  row's segment) uses only this shared, separately-tested machinery.
+  Accepted on the g7 precedent (deviation (a) in wal-loss-recovery:
+  reviewer-accepted unit-level substitute coverage); a fast-TTL +
+  fully-dead-segment follow-up e2e would close it fully.
+- **Residual RF-window note: an empty-success range pull can reopen a
+  partial index when the ring is larger than RF.** A "successful pull" is
+  a completed, error-free RPC stream — NOT a holder-verified or non-empty
+  stream. In the N == RF topology every live peer holds every arc, so any
+  peer that answers has full coverage (the e2e's 3-node RF=3 case). In a
+  larger ring (N > RF), a live NON-holder peer answering OK-empty for a
+  range whose true co-owners are down would count as success and reopen a
+  partial index. The per-range gate (`run_deferred_boot_drain`,
+  metadata_recovery.rs:234-263) guarantees only that the node NEVER
+  reopens when NO peer answered at all; the empty-success corner is the
+  feature-doc residual RF window (the objects are unservable cluster-wide
+  until a holder recovers — availability, not data loss; consistent with
+  the Summary's RF=2 exposure). Code comment at metadata_recovery.rs:236-244
+  records the same edge.
