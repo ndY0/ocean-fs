@@ -19,7 +19,7 @@ use super::cf;
 /// # Examples
 ///
 /// ```
-/// use oceanfs_storage::metadata::codec::object_key_bytes;
+/// use oceanfs_storage::metadata::object_key_bytes;
 ///
 /// let row = b"photos\0cat.jpg";
 /// assert_eq!(object_key_bytes(row).as_deref(), Some(&b"cat.jpg"[..]));

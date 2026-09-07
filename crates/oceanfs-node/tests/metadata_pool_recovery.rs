@@ -281,11 +281,7 @@ async fn metadata_loss_rebuilds_fresh_store_from_peers() {
         .send()
         .await
         .expect("DELETE must reach A");
-    assert!(
-        del_resp.status().is_success(),
-        "pre-kill DELETE succeeds (got {})",
-        del_resp.status()
-    );
+    assert!(del_resp.status().is_success(), "pre-kill DELETE succeeds (got {})", del_resp.status());
 
     let data_root_a = tmp_a.path().join("pool-data");
     let data_root_b = tmp_b.path().join("pool-data");
