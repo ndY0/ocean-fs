@@ -1,8 +1,8 @@
 # Disk Resilience & Multi-Disk Topology — Pre-Epic Brainstorm
 
 **Author:** Implementer (design converged with stakeholder)
-**Date:** 2026-08-22 (rev. 2 — open questions resolved, Phase C in scope)
-**Status:** Pre-epic — design converged, decisions hardened; pending ADR-0029 + epic/feature breakdown
+**Date:** 2026-08-22 (rev. 2 — open questions resolved, Phase C in scope); **rev. 3 2026-09-07 — Phase C re-scoped after Phase A/B + 2026-09 review refactor (see Addendum §7)**
+**Status:** Phase A (`disk-resilience`) done · Phase B (`disk-resilience-healing`) code-complete · Phase C (`disk-resilience-scale`) re-scoped in ADR-0036 — epic/feature breakdown pending
 **Context:** OceanFS targets large scale (100s–1000s of nodes, SWIM/gossip membership).
 Today every node stores all of its data under a single `{data_dir}` root
 (`segments/`, `wal/`, `event-wal/`, `metadata/`, `hints/`). The system has no
@@ -510,3 +510,78 @@ pattern).
 
 Next step: write ADR-0029 (this design), then the epic + feature breakdown
 starting with Phase A (A1–A7).
+
+---
+
+## 7. Addendum — Rev. 3 (2026-09-07): Phase C re-scope after Phase A/B + the 2026-09 review refactor
+
+> **This addendum supersedes the Phase-C rows of §3, the §5 Q6 wording, and
+> the Phase-C mentions in §6 above.** Phase A (`disk-resilience`, f1–f8) and
+> Phase B (`disk-resilience-healing`, g1–g8) have landed, and the 2026-09
+> review refactor (ADR-0031…0035, composition-root decomposition, store
+> unification, durability scheduler, bounded-metadata scans, manifest-aware
+> repair) is complete. ADR-0036 records the full decision; this addendum is
+> the summary.
+
+### 7.1 What changed underneath the original Phase C plan
+
+1. **No legacy mode** (ADR-0031). Pools are mandatory at boot. C1's "config
+   migration path" framing and Q6's "zero-config fallback makes migration
+   non-urgent" are **obsolete**. Phase C = topology change on live,
+   pool-configured nodes.
+2. **Metadata-loss recovery no longer re-replicates** (g8). It streams object
+   + deletion rows from a peer over owned ring ranges. **C3 (segment
+   self-description) is dropped as logically wrong** after that change.
+3. **`pool_id` is immutable per segment and cached in the reader** — the
+   durable relocation path is the missing primitive.
+4. **Drain ≠ rebalance.** Operator-intent terminal drain (C1) and continuous
+   skew-chasing rebalance (the old C2 half) were split. The open-ended
+   rebalance is backlog; drain stays in scope.
+5. **Graceful leave is `leave(None)` + peer healing.** Streaming data during
+   shutdown is incompatible with large nodes (review decision). Node
+   retirement is served by a paced background drain *before* shutdown.
+6. **Background work is scheduled** (ADR-0017): drain is a `DurabilityTask`
+   under the Tier-1 budget.
+
+### 7.2 Re-scoped Phase C (ADR-0036) — the `disk-resilience-scale` epic
+
+| # | Work item | Scope | Crates |
+|---|---|---|---|
+| C1a | **Intra-node pool drain** — relocate a pool's sealed segments to sibling pools on the same node (precondition ≥ 2 data pools; workflow attach → drain → detach) | in | storage, node |
+| C1b | **Cluster drain (pool-only + node-level)** — empty a source by moving copies to other nodes via the ADR-0030 target-pull path, then source-release (self removed from `storage_locations` + local unlink). Paced, pausable, terminal. Runs *before* retirement/leave | in | node, durability, storage |
+| — | **Detach** — inverse of f8 `attach`; remove an empty pool live, drop from config/topology, re-gossip manifest | in | storage, node |
+| — | **Drain-state plumbing** — registry `Draining` state, placement exclusion, read-while-draining, blocked-reason observability, no-destructive-failure rule | in | storage, node |
+| C2a | **Capacity-derived ring ownership** — ring share tracks data-pool capacity; optional late-stage feature, difficulty measured when reached; may defer to backlog | optional | membership, routing, node |
+| C2b | **Proactive rebalance** — continuous movement of healthy segments toward an ideal distribution | **backlog** (`disk-resilience-capacity`) | — |
+| C3 | **Segment self-description** | **dropped** (logically wrong after g8) | — |
+| — | **Graceful-leave redesign** | **dropped** (leave stays `leave(None)`; retirement = C1b before shutdown) | — |
+
+### 7.3 Key mechanics (ADR-0036 D2–D6)
+
+- **Durable relocation**: extend `MetadataRefreshEvent` with an optional
+  `pool_id` payload (ADR-0030-style, event-WAL only writer) and purge the
+  reader's per-segment pool-root cache on the mutation.
+- **Crash-safe ordering**: copy `.dat` → commit `pool_id` event → unlink
+  source, all under the unified store's per-segment write lock (ADR-0032).
+- **C1b mover**: reuse `RequestReReplication` + capacity-aware target
+  selection (ADR-0030/ADR-0033); the new primitive is **source-release**
+  (registry holder-set refresh minus self + local unlink).
+- **Budgets**: configurable per-task `max_bytes_per_tick`, scheduler Tier-1.
+  No generic byte-budget framework in this epic.
+- **No wire/proto change for the intra-node half**: `pool_id` is node-local.
+  C1b adds admin/control surface only.
+
+### 7.4 Correctness notes carried forward
+
+- The old §6 bullet "C scale ops (drain/rebalance = migration path,
+  capacity-weighted vnodes, segment self-description)" is superseded by
+  §7.2.
+- The old §5 Q6 row ("Config migration… via drain/rebalance workflow (C1);
+  zero-config fallback… non-urgent") is superseded: no legacy exists
+  (ADR-0031); drain is for live topology change, not legacy migration.
+- Fleet/load-test "phase 4 (degraded mode)" (§4.3) is a test-harness concern
+  that exercises this epic's features; it is not part of the epic itself.
+
+Next step: ADR-0036 → epic `disk-resilience-scale` + feature breakdown
+(d0 regression-gate → d1 drain-state → d2 relocation → d3 intra-node drain →
+d4 cluster drain → d5 detach → optional d6 C2a → e2e).
