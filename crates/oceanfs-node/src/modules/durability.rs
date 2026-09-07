@@ -93,6 +93,11 @@ pub(crate) struct DurabilityModule {
     /// here (not on `Node`/`ServerModule`) because it needs the
     /// ReRepWorker sender + AE tree this module already owns.
     pub(crate) wal_recovery: Arc<crate::modules::wal_recovery::WalRecoveryCoordinator>,
+    /// g8 metadata-loss recovery coordinator (ADR-0029 §D7) — boot-branch
+    /// rebuild of a fresh objects+deletions store from peers over owned
+    /// ranges.
+    pub(crate) metadata_recovery:
+        Arc<crate::modules::metadata_recovery::MetadataRecoveryCoordinator>,
 }
 
 impl DurabilityModule {
@@ -505,6 +510,21 @@ impl DurabilityModule {
             std::time::Duration::from_secs(config.ae_interval_sec),
         )));
 
+        // g8 metadata-loss recovery coordinator (ADR-0029 §D7). Owned here
+        // next to the wal coordinator; the membership + pool handles the
+        // peer pulls need are cloned BEFORE the wal coordinator consumes
+        // the originals below.
+        let metadata_recovery =
+            Arc::new(crate::modules::metadata_recovery::MetadataRecoveryCoordinator::new(
+                NodeId::new(&config.node_id),
+                membership.clone(),
+                pool.clone(),
+                storage.metadata_store.clone(),
+                storage.registry.clone(),
+                storage.health_monitor.clone(),
+                storage.metadata_rebuild_pending.clone(),
+            ));
+
         // Replaced-wal recovery coordinator (g7, ADR-0035). Owned here so
         // the composition root and server never hold per-recovery state;
         // the ReRepWorker sender + AE tree this module owns are exactly
@@ -538,6 +558,7 @@ impl DurabilityModule {
             budget,
             scheduler: Arc::new(scheduler),
             wal_recovery,
+            metadata_recovery,
         })
     }
 
@@ -575,6 +596,18 @@ impl DurabilityModule {
         self.wal_recovery.run_deferred_boot_drain().await
     }
 
+    /// Runs the deferred g8 metadata rebuild (boot branch), returning
+    /// whether it ran. Called by the composition root AFTER `spawn_all`
+    /// (the healing gRPC service + membership must be live — the drain
+    /// pulls rows over `ListObjectsInRange`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the rebuild cannot proceed (no live peer).
+    pub(crate) async fn run_deferred_metadata_recovery(&self) -> Result<bool, String> {
+        self.metadata_recovery.run_deferred_boot_drain().await
+    }
+
     /// Registers the durability workers' metrics with the node's central
     /// registry (one call replaces the §12 per-worker register lines the
     /// inline code carried).
@@ -601,6 +634,8 @@ impl DurabilityModule {
         self.scheduler.register_metrics(registrar);
         // g7 replaced-wal recovery metrics (audit M4).
         self.wal_recovery.register_metrics(registrar);
+        // g8 metadata-loss recovery metrics (audit M4).
+        self.metadata_recovery.register_metrics(registrar);
     }
 
     /// Spawns every durability-owned background loop (c5 — each worker

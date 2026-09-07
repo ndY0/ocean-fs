@@ -1903,20 +1903,18 @@ impl HealingRpc for HealingGrpcService {
         request: Request<ObjectRangeRequest>,
     ) -> Result<Response<Self::ListObjectsInRangeStream>, Status> {
         let req = request.into_inner();
-        let start: [u8; 32] = req
-            .start
-            .as_ref()
-            .try_into()
-            .map_err(|_| Status::invalid_argument("ObjectRangeRequest.start must be 32 bytes"))?;
+        let start: [u8; 32] =
+            req.start.as_ref().try_into().map_err(|_| {
+                Status::invalid_argument("ObjectRangeRequest.start must be 32 bytes")
+            })?;
         let end: [u8; 32] = req
             .end
             .as_ref()
             .try_into()
             .map_err(|_| Status::invalid_argument("ObjectRangeRequest.end must be 32 bytes"))?;
-        let lister = self
-            .range_lister
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("ListObjectsInRange is not configured on this node"))?;
+        let lister = self.range_lister.as_ref().ok_or_else(|| {
+            Status::unavailable("ListObjectsInRange is not configured on this node")
+        })?;
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         Arc::clone(lister).stream_range(start, end, tx);
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))

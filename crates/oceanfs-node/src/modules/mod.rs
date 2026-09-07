@@ -11,6 +11,7 @@ pub(crate) mod background;
 pub(crate) mod data_plane;
 pub(crate) mod durability;
 pub(crate) mod membership;
+pub(crate) mod metadata_recovery;
 pub(crate) mod server;
 pub(crate) mod storage;
 pub(crate) mod wal_recovery;

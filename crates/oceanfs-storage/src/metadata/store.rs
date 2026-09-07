@@ -1478,10 +1478,7 @@ impl RocksDbMetadataStore {
     ///
     /// Returns an error if the objects column family is missing or the
     /// iterator fails mid-scan.
-    pub fn visit_objects_rows(
-        &self,
-        mut visitor: impl FnMut(&[u8], &[u8]) -> bool,
-    ) -> Result<()> {
+    pub fn visit_objects_rows(&self, mut visitor: impl FnMut(&[u8], &[u8]) -> bool) -> Result<()> {
         let cf = self
             .db
             .cf_handle(cf::CF_OBJECTS)
@@ -2923,8 +2920,7 @@ mod tests {
         let peer = RocksDbMetadataStore::open(&test_config()).unwrap();
         let meta = segment_meta("k", 10);
         peer.put_object_in_bucket(&BucketId::new("b"), meta.clone()).unwrap();
-        peer.delete_object(&BucketId::new("b"), &ObjectKey::new("k"), Hlc::new(11, 0))
-            .unwrap();
+        peer.delete_object(&BucketId::new("b"), &ObjectKey::new("k"), Hlc::new(11, 0)).unwrap();
         let (d_key, d_value) =
             capture_deletion_row(&peer, "b", "k").expect("peer holds the deletion row");
         assert!(capture_object_row(&peer, "b", "k").is_none(), "row deleted on the peer");
@@ -2958,8 +2954,7 @@ mod tests {
         // Live hlc=10 then delete hlc=11 on the peer.
         let live = put_object_in(&peer, "b", "k", 10);
         peer.delete_object(&BucketId::new("b"), &ObjectKey::new("k"), Hlc::new(11, 0)).unwrap();
-        let (d_key, d_value) =
-            capture_deletion_row(&peer, "b", "k").expect("deletion row");
+        let (d_key, d_value) = capture_deletion_row(&peer, "b", "k").expect("deletion row");
         let live_value = bincode::serialize(&live).unwrap();
 
         // Recovering store.

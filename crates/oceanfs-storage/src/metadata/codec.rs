@@ -26,9 +26,8 @@ use super::cf;
 /// ```
 pub fn object_key_bytes(row_key: &[u8]) -> Option<Vec<u8>> {
     match cf::decode_deletions_key(row_key) {
-        Some(cf::DeletionsKey::Plain { key, .. }) | Some(cf::DeletionsKey::Supersede { key, .. }) => {
-            Some(key.into_bytes())
-        }
+        Some(cf::DeletionsKey::Plain { key, .. })
+        | Some(cf::DeletionsKey::Supersede { key, .. }) => Some(key.into_bytes()),
         None => None,
     }
 }

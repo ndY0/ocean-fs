@@ -673,6 +673,12 @@ impl ServerModule {
             .map_err(|e| e.to_string())?;
         healing_service = healing_service
             .with_replication_request_sink(Arc::new(WorkerQueueSink { tx: rep_worker_queue }));
+        // g8 metadata-loss recovery: the ListObjectsInRange server side.
+        healing_service = healing_service.with_range_lister(Arc::new(
+            crate::modules::metadata_recovery::MetadataStoreRangeLister::new(
+                storage.metadata_store.clone(),
+            ),
+        ));
         healing_service.register_metrics(&*metrics);
         let cache_service = oceanfs_server::grpc::cache_service::CacheGrpcService::new(
             Some(object_cache),

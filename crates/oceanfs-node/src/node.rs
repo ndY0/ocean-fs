@@ -389,6 +389,14 @@ impl Node {
         )));
         // (c1: moved to modules/storage.rs — run_startup_recovery)
         storage.run_startup_recovery().await?;
+        // g8 metadata-loss recovery boot detection: a fresh (empty)
+        // objects+deletions store while the node already holds sealed
+        // segments means the metadata root was replaced. Gate the node
+        // (metadata pool Dead → node_unavailable) so peers route around;
+        // the rebuild runs after spawn_all.
+        if storage.detect_replaced_metadata_store()? {
+            storage.prepare_replaced_metadata_recovery()?;
+        }
         // The AE Merkle tree is empty at construction (the registry is
         // empty pre-recovery). On a NORMAL boot rebuild it from the
         // folded registry so continuous AE covers the machine's
@@ -454,6 +462,21 @@ impl Node {
         // plane (the wal-Dead 503 gate holds writes throughout; reads may
         // serve — the objects CF and data pools are intact).
         durability.run_deferred_wal_recovery().await?;
+        // ---- 8c. Deferred g8 metadata rebuild (ADR-0029 §D7) ----
+        // When the boot path detected a replaced metadata store, the
+        // coordinator rebuilds the fresh objects+deletions CFs from live
+        // peers over the owned ranges, then reopens the node. After it
+        // succeeds the healthy manifest is re-declared so peers clear the
+        // `node_unavailable` routing exclusion.
+        if durability.run_deferred_metadata_recovery().await? {
+            let incarnation = membership_module.announce_incarnation;
+            let manifest =
+                Arc::new(crate::pool_manifest::build_node_manifest(incarnation, &storage.registry));
+            membership.set_self_manifest((*manifest).clone());
+            membership_module
+                .manifest_cache
+                .update(oceanfs_core::NodeId::new(&config.node_id), manifest);
+        }
 
         info!(
             node_id = %config.node_id,

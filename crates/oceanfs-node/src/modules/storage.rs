@@ -129,6 +129,12 @@ pub(crate) struct StorageModule {
     /// root) reads this after `spawn_all` to run the deferred
     /// rebuild-from-holders drain.
     pub(crate) replaced_wal_recovery_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// Set when the boot path detected a replaced metadata store (g8:
+    /// the objects+deletions CFs are empty while the node already holds
+    /// sealed segments) and gated the node (metadata pool Dead →
+    /// `node_unavailable`). The composition root reads this after
+    /// `spawn_all` to run the deferred rebuild-from-peers drain.
+    pub(crate) metadata_rebuild_pending: Arc<std::sync::atomic::AtomicBool>,
     /// Cancellation token for the RocksDB metrics polling task (spawned by
     /// [`Self::register_metrics`]). Cancelled at node shutdown so the
     /// task exits and releases its `Arc<DB>` (the RocksDB LOCK must not
@@ -555,6 +561,7 @@ impl StorageModule {
                 oceanfs_core::LabelSet::empty(),
             ),
             replaced_wal_recovery_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            metadata_rebuild_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metadata_metrics_cancel: tokio_util::sync::CancellationToken::new(),
             metadata_metrics_task: parking_lot::Mutex::new(None),
         })
@@ -614,6 +621,43 @@ impl StorageModule {
         tracing::warn!(
             "wal pool replacement detected at boot — residue sweep suppressed; \
              registry rebuild from holders deferred until background loops are live"
+        );
+        Ok(())
+    }
+
+    /// Detects a replaced metadata store at boot (g8): the objects +
+    /// deletions CFs are empty (the store was freshly created on a wiped
+    /// root) while the node already holds sealed segments (the wal-pool
+    /// lifecycle registry survived the metadata loss). A genuinely fresh
+    /// node has both empty.
+    pub(crate) fn detect_replaced_metadata_store(&self) -> Result<bool, String> {
+        let cfs_empty = self
+            .metadata_store
+            .both_metadata_cfs_empty()
+            .map_err(|e| format!("failed to probe the metadata store: {e}"))?;
+        if !cfs_empty {
+            return Ok(false);
+        }
+        let mut sealed = 0usize;
+        self.lifecycle_registry.for_each(|_id, _entry| sealed += 1);
+        Ok(sealed > 0)
+    }
+
+    /// Prepares the g8 replaced-metadata boot branch: gates the node
+    /// (metadata pool Dead → `node_serves_requests` false → local 503 and
+    /// `node_unavailable` in the manifest peers read) and records the
+    /// deferred-rebuild flag the composition root reads after
+    /// `spawn_all`. The actual rebuild-from-peers drain runs then.
+    pub(crate) fn prepare_replaced_metadata_recovery(&self) -> Result<(), String> {
+        let meta_pool = self
+            .registry
+            .pool_by_role(oceanfs_core::PoolRole::Metadata)
+            .ok_or_else(|| "metadata pool not registered".to_string())?;
+        self.registry.set_status(meta_pool.id(), oceanfs_storage::PoolStatus::Dead);
+        self.metadata_rebuild_pending.store(true, std::sync::atomic::Ordering::Release);
+        tracing::warn!(
+            "metadata store replacement detected at boot — node gated (node_unavailable); \
+             objects+deletions rebuild from peers deferred until background loops are live"
         );
         Ok(())
     }
