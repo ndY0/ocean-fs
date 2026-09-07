@@ -232,6 +232,16 @@ impl MetadataRecoveryCoordinator {
         let mut deletions = 0u64;
         let mut range_errors = 0u64;
         for (range_idx, range) in ranges.iter().enumerate() {
+            // A "successful pull" is a completed, error-free RPC stream —
+            // NOT a holder-verified or non-empty stream. In the N == RF
+            // topology every live peer holds every arc, so any peer that
+            // answers has full coverage; in a larger ring a live NON-holder
+            // peer answering OK-empty for a range whose true co-owners are
+            // down would count as success and reopen a partial index. That
+            // corner is the feature-doc residual RF window (the objects are
+            // unservable cluster-wide until a holder recovers), and the
+            // per-range gate below at least guarantees we never reopen when
+            // NO peer answered at all.
             let mut range_ok = false;
             for peer in &peers {
                 match self.fetch_and_fold_range(peer, range).await {

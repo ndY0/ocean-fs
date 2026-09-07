@@ -173,7 +173,7 @@ fn parse_metric(text: &str, name: &str) -> u64 {
     text.lines()
         .find(|l| l.trim_start().starts_with(name) && !l.trim_start().starts_with('#'))
         .and_then(|l| l.trim().strip_prefix(name).map(|rest| rest.trim_start()))
-        .and_then(|v| v.trim_end().split_whitespace().next())
+        .and_then(|v| v.split_whitespace().next())
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)
 }
