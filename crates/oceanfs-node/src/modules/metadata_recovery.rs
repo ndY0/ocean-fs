@@ -93,7 +93,9 @@ impl MetadataRangeLister for MetadataStoreRangeLister {
 // Boot recovery coordinator
 // ---------------------------------------------------------------------------
 
-/// g8 recovery metrics (fresh names — none were registered before).
+/// g8 recovery metrics. `unavailable_seconds` records the node's
+/// unavailable WINDOW for the recovery that just completed (gate at boot
+/// → reopen); the other three count the rebuild's applied rows / errors.
 pub(crate) struct MetadataRecoveryMetrics {
     unavailable_seconds: Gauge,
     rebuilt_objects_total: Counter,
@@ -107,7 +109,8 @@ impl MetadataRecoveryMetrics {
         Self {
             unavailable_seconds: Gauge::new(
                 "oceanfs_metadata_unavailable_seconds".into(),
-                "Seconds the node has been unavailable (metadata pool Dead)".into(),
+                "Node unavailable window during the metadata rebuild (gate → reopen), seconds"
+                    .into(),
                 LabelSet::empty(),
             ),
             rebuilt_objects_total: Counter::new(
@@ -228,12 +231,14 @@ impl MetadataRecoveryCoordinator {
         let mut objects = 0u64;
         let mut deletions = 0u64;
         let mut range_errors = 0u64;
-        for range in &ranges {
+        for (range_idx, range) in ranges.iter().enumerate() {
+            let mut range_ok = false;
             for peer in &peers {
                 match self.fetch_and_fold_range(peer, range).await {
                     Ok((o, d)) => {
                         objects += o;
                         deletions += d;
+                        range_ok = true;
                     }
                     Err(e) => {
                         range_errors += 1;
@@ -244,6 +249,16 @@ impl MetadataRecoveryCoordinator {
                         );
                     }
                 }
+            }
+            if !range_ok {
+                // No peer answered for this owned range — reopening would
+                // silently serve an empty/partial index over intact
+                // `.dat`. Stay gated: fail the boot so the operator can
+                // restart when a live holder is available.
+                return Err(format!(
+                    "metadata rebuild: owned range {range_idx} had no successful pull — \
+                     node stays gated"
+                ));
             }
         }
 
@@ -278,13 +293,25 @@ impl MetadataRecoveryCoordinator {
         Ok(())
     }
 
+    /// The live peers eligible as pull sources: membership Alive/Suspect,
+    /// not self, and NOT reporting `node_unavailable` (a peer that is
+    /// itself metadata-dead streams zero/partial rows — the feature's own
+    /// hard routing exclusion applies to the rebuild too).
     fn live_peers(&self) -> Vec<NodeId> {
         use oceanfs_core::NodeState;
         self.membership
             .nodes_full()
             .into_iter()
-            .filter(|(id, state, _, _, _, _, _, _)| {
-                *id != self.self_id && matches!(state, NodeState::Alive | NodeState::Suspect)
+            .filter(|(id, state, _, _, _, _, _, manifest)| {
+                if *id == self.self_id || !matches!(state, NodeState::Alive | NodeState::Suspect) {
+                    return false;
+                }
+                // Unknown manifest stays eligible (the fallback is the
+                // range-level success gate below).
+                match manifest {
+                    Some(m) => !m.node_unavailable(),
+                    None => true,
+                }
             })
             .map(|(id, ..)| id)
             .collect()

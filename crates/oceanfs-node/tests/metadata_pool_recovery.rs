@@ -226,6 +226,16 @@ async fn wait_for_write_resume(
     }
 }
 
+async fn read_metric(client: &reqwest::Client, addr: std::net::SocketAddr, name: &str) -> u64 {
+    let resp = client
+        .get(format!("http://{addr}/admin/metrics"))
+        .send()
+        .await
+        .expect("GET /admin/metrics must reach the node");
+    assert_eq!(resp.status(), 200, "metrics endpoint serves");
+    parse_metric(&resp.text().await.expect("metrics body"), name)
+}
+
 #[tokio::test]
 async fn metadata_loss_rebuilds_fresh_store_from_peers() {
     let _guard = tracing_subscriber::fmt()
@@ -266,6 +276,7 @@ async fn metadata_loss_rebuilds_fresh_store_from_peers() {
         reqwest::Client::builder().timeout(Duration::from_secs(15)).build().expect("client");
     let addr_a = node_a.server_addr();
     let addr_b = node_b.server_addr();
+    let addr_c = node_c.server_addr();
 
     // Phase 1: write objects through A; delete one so a deletion row must
     // survive the metadata loss. RF=3 → every row replicates to B and C.
@@ -291,6 +302,12 @@ async fn metadata_loss_rebuilds_fresh_store_from_peers() {
     assert!(!owner_dats.is_empty(), "A sealed ≥ 1 segment before the kill");
     wait_for_dat_count(&data_root_b, owner_dats.len(), "replica B data pool").await;
     wait_for_dat_count(&data_root_c, owner_dats.len(), "replica C data pool").await;
+
+    // Baseline re-replication counters (the epic DoD: metadata loss must
+    // NOT re-replicate — data pools + registry are intact). The counters
+    // must stay flat through the loss window and the rebuild.
+    let rerep_base_b = read_metric(&client, addr_b, "oceanfs_ranges_re_replicated_total").await;
+    let rerep_base_c = read_metric(&client, addr_c, "oceanfs_ranges_re_replicated_total").await;
 
     // A local write from B during the (future) window will be created
     // later; capture nothing yet.
@@ -384,6 +401,25 @@ async fn metadata_loss_rebuilds_fresh_store_from_peers() {
         "deletions folded",
     )
     .await;
+
+    // Zero re-replication traffic (epic metadata-pool-kill DoD): the
+    // peers' re-replication counters stay flat and A2 started at zero —
+    // only the local index was rebuilt, nothing was re-replicated.
+    assert_eq!(
+        read_metric(&client, addr_b, "oceanfs_ranges_re_replicated_total").await,
+        rerep_base_b,
+        "B must not re-replicate during A's metadata loss/rebuild"
+    );
+    assert_eq!(
+        read_metric(&client, addr_c, "oceanfs_ranges_re_replicated_total").await,
+        rerep_base_c,
+        "C must not re-replicate during A's metadata loss/rebuild"
+    );
+    assert_eq!(
+        read_metric(&client, addr_a2, "oceanfs_ranges_re_replicated_total").await,
+        0,
+        "A2 must not re-replicate during the rebuild"
+    );
 
     wait_for_write_resume(&client, addr_a2, "post-recovery-write", &body).await;
 
