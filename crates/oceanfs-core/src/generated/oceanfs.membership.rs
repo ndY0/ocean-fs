@@ -68,6 +68,12 @@ pub struct NodeManifest {
     pub incarnation: u64,
     #[prost(message, repeated, tag = "2")]
     pub pools: ::prost::alloc::vec::Vec<PoolManifest>,
+    /// Node-level unavailability flag (g8 metadata-loss-recovery): set when
+    /// the metadata pool is Dead (the node cannot serve object operations),
+    /// cleared when the rebuilt store rejoins the read/write path. Peers
+    /// treat it as a hard routing exclusion regardless of per-pool health.
+    #[prost(bool, tag = "3")]
+    pub node_unavailable: bool,
 }
 /// Full membership list.
 #[derive(Clone, PartialEq, ::prost::Message)]

@@ -155,6 +155,13 @@ pub struct NodeManifest {
     incarnation: u64,
     /// One entry per configured pool, in topology config order.
     pools: Vec<PoolManifest>,
+    /// Node-level unavailability flag (g8 `metadata-loss-recovery`): set
+    /// while the metadata pool is Dead — the node cannot serve object
+    /// operations even though its data pools are healthy. Peers treat it
+    /// as a hard read/write routing exclusion independent of per-pool
+    /// status, so they route around the node without a SWIM suspicion
+    /// timeout (probes are socket-only and would keep it Alive).
+    node_unavailable: bool,
 }
 
 impl NodeManifest {
@@ -164,11 +171,35 @@ impl NodeManifest {
     /// `incarnation` is the announcement incarnation the node joined
     /// with (spec §13.1, ADR-0022 D1): the same value that rides the
     /// membership entry, so peers can tie the manifest to the restart
-    /// it was declared with.
+    /// it was declared with. The node starts available
+    /// (`node_unavailable == false`); [`Self::with_node_unavailable`]
+    /// flips the flag.
     pub fn from_pools(incarnation: u64, pools: &[PoolManifest]) -> Self {
         let mut owned = Vec::with_capacity(pools.len());
         owned.extend_from_slice(pools);
-        Self { incarnation, pools: owned }
+        Self { incarnation, pools: owned, node_unavailable: false }
+    }
+
+    /// Returns a copy of this manifest with the node-level unavailability
+    /// flag set to `unavailable`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_membership::manifest::NodeManifest;
+    ///
+    /// let manifest = NodeManifest::from_pools(1, &[]).with_node_unavailable(true);
+    /// assert!(manifest.node_unavailable());
+    /// ```
+    pub fn with_node_unavailable(mut self, unavailable: bool) -> Self {
+        self.node_unavailable = unavailable;
+        self
+    }
+
+    /// Whether the node reports itself unavailable (metadata pool Dead —
+    /// cannot serve object operations).
+    pub fn node_unavailable(&self) -> bool {
+        self.node_unavailable
     }
 
     /// The SWIM incarnation this manifest was declared with.
@@ -186,6 +217,7 @@ impl NodeManifest {
         proto::membership::NodeManifest {
             incarnation: self.incarnation,
             pools: self.pools.iter().map(PoolManifest::to_proto).collect(),
+            node_unavailable: self.node_unavailable,
         }
     }
 
@@ -194,6 +226,7 @@ impl NodeManifest {
         Self {
             incarnation: value.incarnation,
             pools: value.pools.iter().map(PoolManifest::from_proto).collect(),
+            node_unavailable: value.node_unavailable,
         }
     }
 }
@@ -240,5 +273,18 @@ mod tests {
         let manifest = NodeManifest::from_pools(1, &[]);
         assert_eq!(manifest.incarnation(), 1);
         assert!(manifest.pools().is_empty());
+    }
+
+    #[test]
+    fn node_unavailable_round_trips_through_proto_and_builder() {
+        // Default: available.
+        let available = NodeManifest::from_pools(1, &[]);
+        assert!(!available.node_unavailable());
+        // Builder flips it.
+        let unavailable = available.clone().with_node_unavailable(true);
+        assert!(unavailable.node_unavailable());
+        // Proto round-trip preserves the flag both ways.
+        assert_eq!(NodeManifest::from_proto(&unavailable.to_proto()), unavailable);
+        assert!(!NodeManifest::from_proto(&available.to_proto()).node_unavailable());
     }
 }

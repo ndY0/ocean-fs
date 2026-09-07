@@ -57,7 +57,13 @@ pub fn build_node_manifest(incarnation: u64, registry: &PoolRegistry) -> NodeMan
     for pool in &pools {
         pool_manifests.push(pool_manifest_from_pool(pool));
     }
-    NodeManifest::from_pools(incarnation, &pool_manifests)
+    // g8 (metadata-loss-recovery): the node-level flag mirrors the
+    // registry's service gate — unavailable exactly while the metadata
+    // pool is Dead (a restart with a replaced root keeps the pool Dead
+    // until the rebuilt store rejoins). Peers read this as a hard
+    // routing exclusion independent of the per-pool rows above.
+    let unavailable = !registry.node_serves_requests();
+    NodeManifest::from_pools(incarnation, &pool_manifests).with_node_unavailable(unavailable)
 }
 
 /// Maps one registered pool to its manifest wire form.
@@ -169,5 +175,46 @@ mod tests {
         assert_eq!(pools[4].id(), 4);
         assert_eq!(pools[4].role(), "hints");
         assert_eq!(pools[4].status(), "healthy");
+
+        // A Healthy registry yields an available manifest.
+        assert!(!manifest.node_unavailable(), "healthy node is available");
+    }
+
+    /// g8 (metadata-loss-recovery): the node-level `node_unavailable`
+    /// flag derives from the registry's service gate — a Dead metadata
+    /// pool (even with healthy data pools) marks the node unavailable;
+    /// recovering it to Healthy clears the flag.
+    #[test]
+    fn metadata_pool_dead_sets_node_unavailable_in_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path().join("data");
+        let roots = [
+            tmp.path().join("nvme0"),
+            tmp.path().join("journal"),
+            tmp.path().join("meta"),
+            tmp.path().join("hints0"),
+        ];
+        let storage = StorageConfig {
+            pools: vec![
+                pool("data-0", PoolRole::Data, &roots[0]),
+                pool("journal", PoolRole::Wal, &roots[1]),
+                pool("meta", PoolRole::Metadata, &roots[2]),
+                pool("hints", PoolRole::Hints, &roots[3]),
+            ],
+            missing_root_policy: MissingRootPolicy::Fatal,
+        };
+        let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
+        let meta_id = registry.pool_by_role(PoolRole::Metadata).expect("metadata pool").id();
+
+        // Drive the metadata pool Dead (the D3 consequence) — the data
+        // pool stays Healthy.
+        registry.set_status(meta_id, oceanfs_storage::PoolStatus::Dead);
+        let manifest = build_node_manifest(2, &registry);
+        assert!(manifest.node_unavailable(), "Dead metadata pool => unavailable");
+
+        // Clear the flag once the pool recovers.
+        registry.set_status(meta_id, oceanfs_storage::PoolStatus::Healthy);
+        let manifest = build_node_manifest(3, &registry);
+        assert!(!manifest.node_unavailable(), "recovered metadata pool => available");
     }
 }

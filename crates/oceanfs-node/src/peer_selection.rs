@@ -365,6 +365,23 @@ mod tests {
         NodeManifest::from_pools(1, &[])
     }
 
+    /// g8: `entry_is_eligible` inherits the `node_unavailable` hard
+    /// exclusion through `can_accept_writes` — an Alive node with a
+    /// healthy data pool but a set flag is NOT an eligible comparison /
+    /// scrub peer.
+    #[test]
+    fn entry_is_eligible_excludes_node_unavailable_despite_healthy_data() {
+        let healthy = healthy_manifest().with_node_unavailable(true);
+        assert!(
+            !entry_is_eligible(NodeState::Alive, Some(&healthy)),
+            "node_unavailable must exclude an otherwise-healthy peer"
+        );
+        assert!(
+            entry_is_eligible(NodeState::Alive, Some(&healthy_manifest())),
+            "available healthy peer stays eligible"
+        );
+    }
+
     fn segment(holders: &[&str]) -> SegmentMetadata {
         SegmentMetadata {
             pool_id: 0,

@@ -87,6 +87,8 @@ impl RepairTargetSelector for ManifestRepairTargetSelector {
         // Iterate the membership view once. A candidate is eligible when:
         // - alive (Alive | Suspect — Suspect is still servable);
         // - not self, not an existing holder;
+        // - NOT node_unavailable (g8: a metadata-dead node cannot
+        //   persist the new copy's object row);
         // - its manifest has at least one Healthy, non-write_degraded
         //   data pool (f7 — a node with no healthy data pool cannot
         //   hold a new copy).
@@ -102,6 +104,9 @@ impl RepairTargetSelector for ManifestRepairTargetSelector {
                 continue;
             }
             let Some(manifest) = manifest else { continue };
+            if manifest.node_unavailable() {
+                continue;
+            }
             let has_healthy_data_pool = manifest
                 .pools()
                 .iter()
@@ -724,6 +729,40 @@ mod tests {
             selector.pick_repair_target(&SegmentId::new(), &[NodeId::new("n4")]),
             None,
             "write_degraded + no-data-pool nodes are ineligible"
+        );
+    }
+
+    /// g8: the manifest selector excludes `node_unavailable` candidates
+    /// even when they report a healthy data pool (they cannot persist the
+    /// new copy's object row).
+    #[test]
+    fn manifest_selector_excludes_node_unavailable_despite_healthy_data() {
+        use oceanfs_membership::manifest::{NodeManifest, PoolManifest};
+
+        let membership = make_membership("n1");
+        upsert(&membership, "n2");
+        upsert(&membership, "n3");
+        // n2: healthy data pool BUT node_unavailable → excluded despite
+        // the most free capacity. n3: available with healthy data.
+        let unavailable = NodeManifest::from_pools(
+            1,
+            &[PoolManifest::new(0, "data", "healthy", false, 999 << 30, 1)],
+        )
+        .with_node_unavailable(true);
+        membership.set_peer_manifest(NodeId::new("n2"), unavailable);
+        membership.set_peer_manifest(
+            NodeId::new("n3"),
+            NodeManifest::from_pools(
+                1,
+                &[PoolManifest::new(0, "data", "healthy", false, 100 << 30, 1)],
+            ),
+        );
+
+        let selector = ManifestRepairTargetSelector::new(membership, NodeId::new("n1"));
+        assert_eq!(
+            selector.pick_repair_target(&SegmentId::new(), &[NodeId::new("n4")]),
+            Some(NodeId::new("n3")),
+            "the available node wins; the unavailable node is never a repair target"
         );
     }
 

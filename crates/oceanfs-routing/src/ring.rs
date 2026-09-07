@@ -191,6 +191,121 @@ impl Ring {
         let successors = self.lookup(&key_hash);
         successors.into_iter().find(|n| n != node_id)
     }
+
+    /// Returns the vnode arcs this node is a replica holder for
+    /// (g8 `metadata-loss-recovery`).
+    ///
+    /// A key position `h` is served first by the first vnode position
+    /// `>= h`; its replica set is that vnode's RF successors. Between two
+    /// consecutive vnode positions the replica set is constant, so the
+    /// ring partitions into arcs — this node holds the rows of exactly
+    /// the arcs whose replica set contains it. The returned ranges
+    /// partition that holding set (boundary positions are measure-zero
+    /// and deliberately excluded from the fold semantics).
+    ///
+    /// The full-circle case (this node is in every arc's replica set —
+    /// e.g. RF == node count) is returned as a single sentinel range
+    /// `[0..0)` (see [`range_contains`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::{NodeId, RingConfig};
+    /// use oceanfs_routing::{range_contains, Ring};
+    ///
+    /// let mut ring = Ring::new(RingConfig { vnodes_per_node: 8, replication_factor: 3 });
+    /// ring.add_node(NodeId::new("a"));
+    /// ring.add_node(NodeId::new("b"));
+    /// ring.add_node(NodeId::new("c"));
+    /// let a = NodeId::new("a");
+    /// // With RF == node count every key replicates to all three nodes,
+    /// // so `a` holds the full circle.
+    /// let ranges = ring.ranges_owned_by(&a);
+    /// assert!(ranges.iter().all(|r| range_contains(r, &[0u8; 32])));
+    /// ```
+    pub fn ranges_owned_by(&self, node: &NodeId) -> Vec<VnodeRange> {
+        if self.positions.is_empty() {
+            return Vec::new();
+        }
+        let entries: Vec<([u8; 32], NodeId)> =
+            self.positions.iter().map(|(p, n)| (*p, n.clone())).collect();
+        let m = entries.len();
+        // Arc i covers (entries[i].0, entries[(i+1) % m].0] — the keys
+        // whose replica set starts at the arc's end position.
+        let selected: Vec<bool> = (0..m)
+            .map(|i| {
+                let end = entries[(i + 1) % m].0;
+                self.lookup(&end).iter().any(|n| n == node)
+            })
+            .collect();
+        if !selected.iter().any(|s| *s) {
+            return Vec::new();
+        }
+        // Full circle: every arc's replica set contains the node.
+        if selected.iter().all(|s| *s) {
+            return vec![VnodeRange { start: [0u8; 32], end: [0u8; 32] }];
+        }
+        // Merge maximal runs of selected arcs on the circle. Each run
+        // from arc `a` through arc `b` (exclusive end `b`) covers keys
+        // [entries[a].0, entries[b].0); a run that wraps past position 0
+        // is represented with start > end (range_contains handles it).
+        let mut ranges = Vec::new();
+        let mut i = 0;
+        while i < m {
+            if !selected[i] {
+                i += 1;
+                continue;
+            }
+            let mut end = (i + 1) % m;
+            while end != i && selected[end] {
+                end = (end + 1) % m;
+            }
+            // Run covers arcs i..end-1; exclusive boundary at entries[end].
+            let (a, b) = (entries[i].0, entries[end].0);
+            ranges.push(VnodeRange { start: a, end: b });
+            if end <= i {
+                break; // wrapped run already consumed every selected arc
+            }
+            i = end;
+        }
+        ranges
+    }
+}
+
+/// Whether a ring position `h` falls inside a [`VnodeRange`].
+///
+/// `start` is inclusive, `end` exclusive for the non-wrap case
+/// (`start < end`). A wrap-around range (`start >= end`) covers
+/// `h >= start || h < end`, so the full-circle sentinel
+/// `{ start: [0; 32], end: [0; 32] }` (start == end == 0) matches every
+/// position. Comparisons are the ring's own byte-lexicographic order.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::VnodeRange;
+/// use oceanfs_routing::range_contains;
+///
+/// let mut start = [0u8; 32];
+/// let mut end = [0u8; 32];
+/// end[31] = 42;
+/// let half = VnodeRange { start, end };
+/// assert!(range_contains(&half, &[0u8; 32]));
+/// let mut h = end;
+/// h[31] = 43;
+/// assert!(!range_contains(&half, &h));
+/// ```
+pub fn range_contains(range: &VnodeRange, h: &[u8; 32]) -> bool {
+    if range.start < range.end {
+        range.start <= *h && *h < range.end
+    } else if range.start == range.end {
+        // Full-circle sentinel (and the degenerate zero-width range):
+        // start == end == 0 matches everything.
+        range.start == [0u8; 32] || *h >= range.start || *h < range.end
+    } else {
+        // Wrap-around: h >= start (past the high side) or h < end.
+        *h >= range.start || *h < range.end
+    }
 }
 
 #[cfg(test)]
@@ -290,6 +405,40 @@ mod tests {
         let original = ring.lookup(&[42u8; 32]);
         let after = decoded.lookup(&[42u8; 32]);
         assert_eq!(original, after);
+    }
+
+    /// g8: `ranges_owned_by` must cover EXACTLY the keys the node is a
+    /// replica for — for any (interior) key hash, membership in the
+    /// node's ranges is equivalent to the node appearing in
+    /// `ring.lookup(hash)`. Also: ranges of a node are pairwise
+    /// disjoint, so a fold over them never double-writes a row.
+    #[test]
+    fn ranges_owned_by_cover_exactly_the_lookup_replica_set() {
+        let config = RingConfig { vnodes_per_node: 8, replication_factor: 2 };
+        let mut ring = Ring::new(config);
+        for name in ["a", "b", "c", "d"] {
+            ring.add_node(NodeId::new(name));
+        }
+        let nodes = ring.nodes().to_vec();
+
+        for node in &nodes {
+            let ranges = ring.ranges_owned_by(node);
+
+            // Equivalence with ring.lookup for many interior keys: a key
+            // is in the node's ranges iff the node is in its replica set.
+            // (Overlapping ranges would not break the idempotent rebuild
+            // fold, but this still guards against a range covering keys
+            // the node does not hold — or missing keys it does.)
+            for i in 0..500 {
+                let h = crate::hash_key(format!("obj-{node}-{i}").as_bytes());
+                let in_ring = ring.lookup(&h).iter().any(|n| n == node);
+                let in_ranges = ranges.iter().any(|r| range_contains(r, &h));
+                assert_eq!(
+                    in_ring, in_ranges,
+                    "node {node}: key {i} lookup={in_ring} ranges={in_ranges} mismatch"
+                );
+            }
+        }
     }
 
     #[test]

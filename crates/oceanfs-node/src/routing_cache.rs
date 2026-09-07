@@ -307,11 +307,12 @@ pub fn is_write_degraded(manifest: &NodeManifest) -> bool {
 }
 
 /// Whether a node manifest reports the node as able to accept NEW
-/// writes (g6, ADR-0029 §D5): not `write_degraded` AND at least one
-/// Healthy data pool. This is the shared write-path filter — the same
-/// predicate the peer routing hint applies when selecting replica
-/// targets (a manifest miss stays eligible; the I/O error path is the
-/// guarantee).
+/// writes (g6, ADR-0029 §D5): NOT `node_unavailable` (g8: a metadata-dead
+/// node cannot persist new object rows), not `write_degraded`, AND at
+/// least one Healthy data pool. This is the shared write-path filter —
+/// the same predicate the peer routing hint applies when selecting
+/// replica targets (a manifest miss stays eligible; the I/O error path
+/// is the guarantee).
 ///
 /// # Examples
 ///
@@ -333,15 +334,29 @@ pub fn is_write_degraded(manifest: &NodeManifest) -> bool {
 ///
 /// let no_pool = NodeManifest::from_pools(1, &[]);
 /// assert!(!can_accept_writes(&no_pool));
+///
+/// // g8: a metadata-dead node reports healthy data pools but cannot
+/// // persist object rows — it is NOT a write target.
+/// let unavailable = NodeManifest::from_pools(
+///     1,
+///     &[PoolManifest::new(0, "data", "healthy", false, 1 << 40, 2)],
+/// )
+/// .with_node_unavailable(true);
+/// assert!(!can_accept_writes(&unavailable));
 /// ```
 pub fn can_accept_writes(manifest: &NodeManifest) -> bool {
-    !is_write_degraded(manifest) && healthy_data_pools(manifest) > 0
+    !manifest.node_unavailable() && !is_write_degraded(manifest) && healthy_data_pools(manifest) > 0
 }
 
 impl RoutingHint for ManifestCache {
     fn exclude_read_candidate(&self, node_id: &NodeId) -> bool {
         let excluded = match self.get(node_id) {
-            Some(manifest) => healthy_data_pools(&manifest) == 0,
+            Some(manifest) => {
+                // g8: `node_unavailable` is a HARD exclusion — a
+                // metadata-dead node cannot serve object reads even with
+                // healthy data pools (its local index is gone).
+                manifest.node_unavailable() || healthy_data_pools(&manifest) == 0
+            }
             // Unknown peer = no pool info: stay eligible; the
             // error-driven fallback is the guarantee (ADR-0029 §D5).
             None => false,
@@ -492,6 +507,44 @@ mod tests {
         );
         assert!(!cache.exclude_write_target(&healthy), "a healthy node stays a target");
         assert!(!cache.exclude_write_target(&unknown), "an unknown node stays a target");
+    }
+
+    /// g8: `node_unavailable` is a HARD routing exclusion — a node whose
+    /// manifest sets the flag is excluded as BOTH a read candidate and a
+    /// write target even when it reports healthy data pools (its local
+    /// metadata index is gone; it cannot serve object reads or persist
+    /// new rows).
+    #[test]
+    fn unavailable_flag_excludes_read_and_write_despite_healthy_data() {
+        let cache = ManifestCache::new();
+        let unavailable = NodeId::new("meta-dead");
+        let available = NodeId::new("available");
+
+        let mut manifest = data_manifest("healthy", false, 2);
+        manifest = manifest.with_node_unavailable(true);
+        cache.update(unavailable.clone(), Arc::new(manifest.clone()));
+        cache.update(available.clone(), Arc::new(data_manifest("healthy", false, 2)));
+
+        assert!(
+            cache.exclude_read_candidate(&unavailable),
+            "node_unavailable must exclude a read candidate"
+        );
+        assert!(
+            cache.exclude_write_target(&unavailable),
+            "node_unavailable must exclude a write target"
+        );
+        assert!(!can_accept_writes(&manifest), "unavailable cannot accept writes");
+
+        // The flag is independent of per-pool health: clearing it makes
+        // the SAME healthy-data manifest eligible again.
+        assert!(
+            !cache.exclude_read_candidate(&available),
+            "healthy + available stays a read candidate"
+        );
+        assert!(
+            !cache.exclude_write_target(&available),
+            "healthy + available stays a write target"
+        );
     }
 
     /// Failover metric: `on_failover` increments the failover counter.

@@ -67,6 +67,11 @@ message PoolManifest {
 message NodeManifest {
   uint64 incarnation = 1;
   repeated PoolManifest pools = 2;
+  // Node-level unavailability flag (g8 metadata-loss-recovery): set when
+  // the metadata pool is Dead (the node cannot serve object operations),
+  // cleared when the rebuilt store rejoins the read/write path. Peers
+  // treat it as a hard routing exclusion regardless of per-pool health.
+  bool node_unavailable = 3;
 }
 
 // Full membership list.

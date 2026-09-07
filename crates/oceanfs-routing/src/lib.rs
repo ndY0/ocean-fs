@@ -24,5 +24,5 @@ pub mod shard_batch;
 
 pub use error::{Error, Result};
 pub use hash::hash_key;
-pub use ring::Ring;
+pub use ring::{range_contains, Ring};
 pub use ring_cache::{segment_replica_set, RingCache};
