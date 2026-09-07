@@ -1461,6 +1461,224 @@ fn read_vmlck_kb() -> u64 {
 // MetadataStore trait implementation (Item 6: RocksDB coupling fix)
 // ---------------------------------------------------------------------------
 
+/// g8 `metadata-loss-recovery` primitives: raw range scans, a fresh-store
+/// probe, and HLC-guarded rebuild folds.
+///
+/// These are recovery-path-only (perf rule 7.1: one-time, off the hot
+/// path). The range stream must never buffer a whole range in memory —
+/// the `visit_*` methods iterate the CF row by row and stop when the
+/// visitor returns `false`.
+impl RocksDbMetadataStore {
+    /// Visits every raw `(key, value)` row of the objects column family.
+    ///
+    /// The visitor returns `false` to stop the scan early. Errors from
+    /// the RocksDB iterator surface as [`Error::Io`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the objects column family is missing or the
+    /// iterator fails mid-scan.
+    pub fn visit_objects_rows(
+        &self,
+        mut visitor: impl FnMut(&[u8], &[u8]) -> bool,
+    ) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(cf::CF_OBJECTS)
+            .ok_or_else(|| Error::InvalidConfig("objects CF not found".into()))?;
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            match item {
+                Ok((key, value)) => {
+                    if !visitor(&key, &value) {
+                        return Ok(());
+                    }
+                }
+                Err(e) => return Err(Error::Io(io_err(e))),
+            }
+        }
+        Ok(())
+    }
+
+    /// Visits every raw `(key, value)` row of the deletions column family
+    /// (plain tombstones AND supersede records).
+    ///
+    /// The visitor returns `false` to stop the scan early.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the deletions column family is missing or the
+    /// iterator fails mid-scan.
+    pub fn visit_deletions_rows(
+        &self,
+        mut visitor: impl FnMut(&[u8], &[u8]) -> bool,
+    ) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(cf::CF_DELETIONS)
+            .ok_or_else(|| Error::InvalidConfig("deletions CF not found".into()))?;
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            match item {
+                Ok((key, value)) => {
+                    if !visitor(&key, &value) {
+                        return Ok(());
+                    }
+                }
+                Err(e) => return Err(Error::Io(io_err(e))),
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether BOTH metadata column families are empty (a fresh store).
+    ///
+    /// g8 boot detection uses this: a store that opens empty while the
+    /// node already holds data (intact `.dat` / registry) was REPLACED —
+    /// the objects/deletions index must be rebuilt from peers. A
+    /// one-key peek per CF; never scans.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either column family is missing.
+    pub fn both_metadata_cfs_empty(&self) -> Result<bool> {
+        Ok(self.cf_is_empty(cf::CF_OBJECTS)? && self.cf_is_empty(cf::CF_DELETIONS)?)
+    }
+
+    fn cf_is_empty(&self, name: &str) -> Result<bool> {
+        let cf = self
+            .db
+            .cf_handle(name)
+            .ok_or_else(|| Error::InvalidConfig(format!("{name} CF not found")))?;
+        let mut iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        Ok(iter.next().is_none())
+    }
+
+    /// Applies one streamed OBJECT row to a fresh store during a
+    /// metadata rebuild (g8). HLC-LWW guarded:
+    ///
+    /// - dropped when an existing plain tombstone's HLC is `>=` the row's
+    ///   HLC (a newer delete must not be resurrected);
+    /// - dropped when the existing live row is strictly newer;
+    /// - otherwise the row is written and any older plain tombstone
+    ///   cleared — exactly the live-state a healthy peer would show.
+    ///
+    /// Returns `Ok(true)` when the row was applied, `Ok(false)` when it
+    /// was shadowed or un-decodable (skipped, never fatal).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a RocksDB read or write fails.
+    pub fn rebuild_apply_object_row(&self, row_key: &[u8], value: &[u8]) -> Result<bool> {
+        let Some(meta) = decode_metadata(value) else { return Ok(false) };
+        self.apply_object_row_locked(row_key, value, meta)
+    }
+
+    /// Applies one streamed DELETION row to a fresh store during a
+    /// metadata rebuild (g8): a plain tombstone deletes an older live row
+    /// and records the delete; a supersede record is re-written verbatim
+    /// (byte-accounting restored). HLC-LWW guarded against newer live
+    /// rows. Returns `Ok(true)` when applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a RocksDB read or write fails.
+    pub fn rebuild_apply_deletion_row(&self, row_key: &[u8], value: &[u8]) -> Result<bool> {
+        let Some(deleted) = decode_deletions_value(value) else { return Ok(false) };
+        let objects_cf = self
+            .db
+            .cf_handle(cf::CF_OBJECTS)
+            .ok_or_else(|| Error::InvalidConfig("objects CF not found".into()))?;
+        let deletions_cf = self
+            .db
+            .cf_handle(cf::CF_DELETIONS)
+            .ok_or_else(|| Error::InvalidConfig("deletions CF not found".into()))?;
+
+        // A supersede record never touches the live row — just re-write it
+        // verbatim (idempotent: identical key → identical value).
+        if let Some(cf::DeletionsKey::Supersede { .. }) = cf::decode_deletions_key(row_key) {
+            self.db.put_cf(&deletions_cf, row_key, value).map_err(|e| Error::Io(io_err(e)))?;
+            return Ok(true);
+        }
+
+        // Plain tombstone: the object row (same key bytes) must not be a
+        // strictly-newer live row.
+        let existing = self.db.get_cf(&objects_cf, row_key).map_err(|e| Error::Io(io_err(e)))?;
+        if let Some(row) = existing {
+            if let Some(meta) = decode_metadata(&row) {
+                if meta.hlc >= deleted.hlc {
+                    return Ok(false); // newer live row wins
+                }
+            }
+        }
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete_cf(&objects_cf, row_key);
+        batch.put_cf(&deletions_cf, row_key, value);
+        self.db.write(batch).map_err(|e| Error::Io(io_err(e)))?;
+        Ok(true)
+    }
+
+    fn apply_object_row_locked(
+        &self,
+        row_key: &[u8],
+        value: &[u8],
+        meta: ObjectMetadata,
+    ) -> Result<bool> {
+        let objects_cf = self
+            .db
+            .cf_handle(cf::CF_OBJECTS)
+            .ok_or_else(|| Error::InvalidConfig("objects CF not found".into()))?;
+        let deletions_cf = self
+            .db
+            .cf_handle(cf::CF_DELETIONS)
+            .ok_or_else(|| Error::InvalidConfig("deletions CF not found".into()))?;
+
+        // Shadowed by a delete that is not older than this row?
+        let tombstone = self.db.get_cf(&deletions_cf, row_key).map_err(|e| Error::Io(io_err(e)))?;
+        if let Some(ts) = tombstone {
+            if let Some(ts) = decode_deletions_value(&ts) {
+                if ts.hlc >= meta.hlc {
+                    return Ok(false);
+                }
+            } else {
+                // Undecodable tombstone: keep it (never resurrect).
+                return Ok(false);
+            }
+        }
+        // Shadowed by a strictly-newer live row?
+        let existing = self.db.get_cf(&objects_cf, row_key).map_err(|e| Error::Io(io_err(e)))?;
+        if let Some(row) = existing {
+            if let Some(existing_meta) = decode_metadata(&row) {
+                if existing_meta.hlc >= meta.hlc {
+                    return Ok(false);
+                }
+            }
+        }
+
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete_cf(&deletions_cf, row_key);
+        batch.put_cf(&objects_cf, row_key, value);
+        self.db.write(batch).map_err(|e| Error::Io(io_err(e)))?;
+        Ok(true)
+    }
+}
+
+/// Decodes an objects-CF value into [`ObjectMetadata`], tolerating the
+/// legacy serde_json fallback (the write path uses bincode).
+fn decode_metadata(value: &[u8]) -> Option<ObjectMetadata> {
+    bincode::deserialize::<ObjectMetadata>(value)
+        .or_else(|_| serde_json::from_slice::<ObjectMetadata>(value))
+        .ok()
+}
+
+/// Decodes a deletions-CF value into [`Tombstone`], tolerating the
+/// legacy serde_json fallback.
+fn decode_deletions_value(value: &[u8]) -> Option<Tombstone> {
+    bincode::deserialize::<Tombstone>(value)
+        .or_else(|_| serde_json::from_slice::<Tombstone>(value))
+        .ok()
+}
+
 impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
     fn list_object_keys(&self, bucket: &BucketId) -> std::io::Result<Vec<(BucketId, ObjectKey)>> {
         self.list_objects(bucket, "")
@@ -1585,7 +1803,7 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_types)]
 mod tests {
-    use oceanfs_core::{HashOutput, Hlc, SegmentId};
+    use oceanfs_core::{ChunkRef, HashOutput, Hlc, SegmentId};
 
     use super::*;
 
@@ -2584,5 +2802,193 @@ mod tests {
         drop(store);
         let reopened = RocksDbMetadataStore::open(&config);
         assert!(reopened.is_ok(), "the DB LOCK must be released after shutdown");
+    }
+
+    // -----------------------------------------------------------------------
+    // g8 rebuild primitives
+    // -----------------------------------------------------------------------
+
+    fn put_object_in(
+        store: &RocksDbMetadataStore,
+        bucket: &str,
+        key: &str,
+        hlc: u64,
+    ) -> ObjectMetadata {
+        let mut meta = make_object_meta(key, 64, None);
+        meta.hlc = Hlc::new(hlc, 0);
+        store.put_object_in_bucket(&BucketId::new(bucket), meta.clone()).unwrap();
+        meta
+    }
+
+    /// A metadata row whose chunks reference a real segment (so a delete
+    /// captures dead bytes the reaper can reclaim).
+    fn segment_meta(key: &str, hlc: u64) -> ObjectMetadata {
+        let mut meta = make_object_meta(key, 1024, None);
+        meta.hlc = Hlc::new(hlc, 0);
+        meta.chunks.push(ChunkRef {
+            segment_id: SegmentId::new(),
+            offset: 0,
+            length: 1024,
+            compressed: false,
+            logical_length: 1024,
+        });
+        meta
+    }
+
+    fn row_key(bucket: &str, key: &str) -> Vec<u8> {
+        format!("{bucket}\0{key}").into_bytes()
+    }
+
+    fn capture_object_row(
+        store: &RocksDbMetadataStore,
+        bucket: &str,
+        key: &str,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let want = row_key(bucket, key);
+        let mut found = None;
+        store
+            .visit_objects_rows(|k, v| {
+                if k == want {
+                    found = Some((k.to_vec(), v.to_vec()));
+                    false
+                } else {
+                    true
+                }
+            })
+            .unwrap();
+        found
+    }
+
+    fn capture_deletion_row(
+        store: &RocksDbMetadataStore,
+        bucket: &str,
+        key: &str,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let want = row_key(bucket, key);
+        let mut found = None;
+        store
+            .visit_deletions_rows(|k, v| {
+                if k == want {
+                    found = Some((k.to_vec(), v.to_vec()));
+                    false
+                } else {
+                    true
+                }
+            })
+            .unwrap();
+        found
+    }
+
+    #[test]
+    fn both_metadata_cfs_empty_tracks_freshness() {
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        assert!(store.both_metadata_cfs_empty().unwrap(), "a fresh store is empty");
+        put_object_in(&store, "b", "k", 1);
+        assert!(!store.both_metadata_cfs_empty().unwrap(), "a row makes the store non-empty");
+    }
+
+    #[test]
+    fn visit_object_rows_streams_raw_rows_and_stops_early() {
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        put_object_in(&store, "b", "k1", 1);
+        put_object_in(&store, "b", "k2", 2);
+        put_object_in(&store, "b", "k3", 3);
+
+        let mut seen = 0;
+        store
+            .visit_objects_rows(|_k, _v| {
+                seen += 1;
+                seen < 2 // stop after the second row
+            })
+            .unwrap();
+        assert_eq!(seen, 2, "the visitor stops the scan when it returns false");
+
+        let mut keys = Vec::new();
+        store
+            .visit_objects_rows(|k, _v| {
+                keys.push(String::from_utf8_lossy(k).into_owned());
+                true
+            })
+            .unwrap();
+        assert_eq!(keys.len(), 3);
+        assert!(keys.iter().all(|k| k.starts_with("b\0k")));
+    }
+
+    /// Folding a deleted object's deletion row restores the plain
+    /// tombstone AND its captured dead chunks — the byte-accounting feed
+    /// is not blinded (the reaper can reclaim the dead segment).
+    #[test]
+    fn rebuild_restores_deletion_rows_so_byte_accounting_is_not_blinded() {
+        // Peer store: a live object (segment-backed), then a delete.
+        let peer = RocksDbMetadataStore::open(&test_config()).unwrap();
+        let meta = segment_meta("k", 10);
+        peer.put_object_in_bucket(&BucketId::new("b"), meta.clone()).unwrap();
+        peer.delete_object(&BucketId::new("b"), &ObjectKey::new("k"), Hlc::new(11, 0))
+            .unwrap();
+        let (d_key, d_value) =
+            capture_deletion_row(&peer, "b", "k").expect("peer holds the deletion row");
+        assert!(capture_object_row(&peer, "b", "k").is_none(), "row deleted on the peer");
+
+        // Recovering store: starts empty, folds ONLY the deletion row.
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        assert!(store.both_metadata_cfs_empty().unwrap());
+        let applied = store.rebuild_apply_deletion_row(&d_key, &d_value).unwrap();
+        assert!(applied);
+        assert!(
+            store.get_object(&BucketId::new("b"), &ObjectKey::new("k")).unwrap().is_none(),
+            "no live row resurrected"
+        );
+        assert!(store.has_tombstone(&BucketId::new("b"), &ObjectKey::new("k")).unwrap());
+        // The dead-chunk record feed sees the captured bytes (not 0).
+        let records = store.list_dead_chunk_records_all();
+        let dead_bytes: u64 = records
+            .iter()
+            .flatten()
+            .map(|(_, _, r)| r.chunks.iter().map(|c| u64::from(c.length)).sum::<u64>())
+            .sum();
+        assert_eq!(dead_bytes, 1024, "the captured chunk is reclaimable after the fold");
+    }
+
+    /// Rebuild folds are HLC-LWW and idempotent: a live row never
+    /// resurrects a newer delete, a delete never removes a newer live
+    /// row, and a recreate after a delete converges to the live row.
+    #[test]
+    fn rebuild_fold_is_hlc_lww_and_idempotent() {
+        let peer = RocksDbMetadataStore::open(&test_config()).unwrap();
+        // Live hlc=10 then delete hlc=11 on the peer.
+        let live = put_object_in(&peer, "b", "k", 10);
+        peer.delete_object(&BucketId::new("b"), &ObjectKey::new("k"), Hlc::new(11, 0)).unwrap();
+        let (d_key, d_value) =
+            capture_deletion_row(&peer, "b", "k").expect("deletion row");
+        let live_value = bincode::serialize(&live).unwrap();
+
+        // Recovering store.
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+
+        // Delete first, then attempt to fold the OLDER live row: refused.
+        assert!(store.rebuild_apply_deletion_row(&d_key, &d_value).unwrap());
+        assert!(
+            !store.rebuild_apply_object_row(&row_key("b", "k"), &live_value).unwrap(),
+            "a delete newer than the row must not be resurrected"
+        );
+        assert!(store.get_object(&BucketId::new("b"), &ObjectKey::new("k")).unwrap().is_none());
+
+        // A NEWER recreate (hlc=12) wins over the tombstone.
+        let newer = put_object_in(&store, "b", "k2", 12);
+        let _ = newer;
+        // (fold of a newer object row after a tombstone clears it)
+        let mut recreated = live.clone();
+        recreated.hlc = Hlc::new(12, 0);
+        let recreated_value = bincode::serialize(&recreated).unwrap();
+        assert!(store.rebuild_apply_object_row(&row_key("b", "k"), &recreated_value).unwrap());
+        let got = store.get_object(&BucketId::new("b"), &ObjectKey::new("k")).unwrap().unwrap();
+        assert_eq!(got.hlc, recreated.hlc, "newer write wins over the older delete");
+        assert!(
+            !store.has_tombstone(&BucketId::new("b"), &ObjectKey::new("k")).unwrap(),
+            "the recreate clears the stale tombstone"
+        );
+
+        // Idempotent re-apply of the same row changes nothing.
+        assert!(!store.rebuild_apply_object_row(&row_key("b", "k"), &recreated_value).unwrap());
     }
 }

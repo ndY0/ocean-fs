@@ -296,16 +296,7 @@ impl Ring {
 /// assert!(!range_contains(&half, &h));
 /// ```
 pub fn range_contains(range: &VnodeRange, h: &[u8; 32]) -> bool {
-    if range.start < range.end {
-        range.start <= *h && *h < range.end
-    } else if range.start == range.end {
-        // Full-circle sentinel (and the degenerate zero-width range):
-        // start == end == 0 matches everything.
-        range.start == [0u8; 32] || *h >= range.start || *h < range.end
-    } else {
-        // Wrap-around: h >= start (past the high side) or h < end.
-        *h >= range.start || *h < range.end
-    }
+    range.contains(h)
 }
 
 #[cfg(test)]

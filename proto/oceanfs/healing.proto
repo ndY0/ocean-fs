@@ -116,6 +116,15 @@ service HealingRpc {
   // stream — the caller's local-only recompute covers them (ADR-0035 D3).
   rpc FetchSegmentLifecycleMetadata(SegmentLifecycleQuery)
       returns (stream SegmentLifecycleEntry);
+
+  // Stream a recovering node's metadata rows for a ring range
+  // (g8 `metadata-loss-recovery`, ADR-0029 §D7). The caller's owned
+  // ranges map to keys it is a replica holder for; the responder
+  // streams BOTH live object rows AND deletions-CF records whose key
+  // hash falls in the range (g8 D5/D6 — an empty deletions CF would
+  // blind the reaper's byte accounting). Server-streaming; the
+  // responder never buffers the whole range in memory.
+  rpc ListObjectsInRange(ObjectRangeRequest) returns (stream MetadataRow);
 }
 
 // Request for the replicated-lifecycle metadata pull (ADR-0035 D2).
@@ -347,4 +356,47 @@ message RemappedChunk {
 // holder) and re-pointed its metadata.
 message RemapAck {
   bool applied = 1;
+}
+
+// ---------------------------------------------------------------------------
+// ListObjectsInRange — metadata rows for a ring range (g8)
+// ---------------------------------------------------------------------------
+
+// A ring position range the recovering node is a replica holder for
+// (the node-side owned-range enumeration). `start` is inclusive and
+// `end` exclusive in the ring's byte-lexicographic order; a
+// wrap-around range (start >= end) covers `h >= start || h < end`; the
+// full circle is start == end == 0. The responder streams every row it
+// holds whose key hash (SHA-256 over the object key) falls in the
+// range.
+message ObjectRangeRequest {
+  bytes start = 1;
+  bytes end = 2;
+}
+
+// One row streamed by ListObjectsInRange. `key` is the FULL column
+// family key (`{bucket}\0{key}` for objects and plain tombstones; the
+// supersede key for overwrite dead-chunk records) and `value` is the
+// serialized row the CF stores (ObjectMetadata / Tombstone) — the fold
+// re-writes them verbatim, so the recovery is byte-faithful.
+message MetadataRow {
+  oneof row {
+    ObjectRow object = 1;
+    DeletionRow deletion = 2;
+  }
+}
+
+message ObjectRow {
+  // Full objects-CF key (`{bucket}\0{key}`).
+  bytes key = 1;
+  // Serialized ObjectMetadata (the objects-CF value).
+  bytes value = 2;
+}
+
+message DeletionRow {
+  // Full deletions-CF key (plain tombstone `{bucket}\0{key}` or a
+  // supersede record key).
+  bytes key = 1;
+  // Serialized Tombstone (the deletions-CF value).
+  bytes value = 2;
 }

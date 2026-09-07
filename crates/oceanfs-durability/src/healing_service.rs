@@ -22,9 +22,9 @@ use crate::{
     healing_rpc::{
         healing_rpc_server::HealingRpc, FetchHintObjectChunk, FetchHintObjectRequest,
         FetchShardChunk, FetchShardRequest, HintRequest, HintResponse, LossAck, LossAnnouncement,
-        MerkleRequest, MerkleResponse, PushRepairedShardRequest, PushRepairedShardResponse,
-        RemapAck, RequestReReplicationRequest, RequestReReplicationResponse, SegmentLifecycleEntry,
-        SegmentLifecycleQuery, SegmentRemap,
+        MerkleRequest, MerkleResponse, MetadataRow, ObjectRangeRequest, PushRepairedShardRequest,
+        PushRepairedShardResponse, RemapAck, RequestReReplicationRequest,
+        RequestReReplicationResponse, SegmentLifecycleEntry, SegmentLifecycleQuery, SegmentRemap,
     },
     hinted_handoff_rpc::{hint_record::Record, HintedHandoffRequest, HintedHandoffResponse},
 };
@@ -96,6 +96,29 @@ pub trait HintObjectApplier: Send + Sync {
         hlc: Hlc,
         created_at: i64,
     ) -> Result<oceanfs_core::ObjectMetadata, String>;
+}
+
+/// Streams a recovering node's metadata rows for a ring range
+/// (g8 `metadata-loss-recovery`, ADR-0029 §D7).
+///
+/// The recovering node owns a set of ring ranges (every key it is a
+/// replica holder for); this lister is the SERVER side of
+/// `ListObjectsInRange` — it scans the responder's objects + deletions
+/// column families and sends every row whose key hash falls in
+/// `[start, end)` down `tx`, then closes it. Wired by the composition
+/// root (oceanfs-node) over the concrete store + routing hash; the
+/// healing service only proxies the stream. Implementations must not
+/// buffer a whole range in memory (perf rule 7.1) and must spawn their
+/// own work — this method returns after handing `tx` to the scanner.
+pub trait MetadataRangeLister: Send + Sync {
+    /// Streams the rows whose key hash is in the range into `tx`, then
+    /// closes the channel.
+    fn stream_range(
+        &self,
+        start: [u8; 32],
+        end: [u8; 32],
+        tx: tokio::sync::mpsc::Sender<Result<MetadataRow, Status>>,
+    );
 }
 
 /// A single re-replication repair request enqueued by the loss
@@ -298,6 +321,10 @@ pub struct HealingGrpcService {
     /// Incremented by the `announce_loss` / `announce_remap` handlers.
     announce_rx_total: oceanfs_core::Counter,
     announce_accepted_total: oceanfs_core::Counter,
+    /// g8 `ListObjectsInRange` server-side scanner (wired by the
+    /// composition root over the concrete store). `None` (tests) makes
+    /// the RPC return `Unavailable`.
+    range_lister: Option<Arc<dyn MetadataRangeLister>>,
 }
 
 impl HealingGrpcService {
@@ -334,6 +361,7 @@ impl HealingGrpcService {
                 "Announced segments accepted for repair/remap".into(),
                 oceanfs_core::LabelSet::empty(),
             ),
+            range_lister: None,
         }
     }
 
@@ -348,6 +376,14 @@ impl HealingGrpcService {
     #[must_use]
     pub fn with_local_node_id(mut self, node_id: NodeId) -> Self {
         self.local_node_id = Some(node_id);
+        self
+    }
+
+    /// Wires the g8 `ListObjectsInRange` server-side scanner. Without it
+    /// the RPC answers `Unavailable`.
+    #[must_use]
+    pub fn with_range_lister(mut self, lister: Arc<dyn MetadataRangeLister>) -> Self {
+        self.range_lister = Some(lister);
         self
     }
 
@@ -742,6 +778,8 @@ impl HealingRpc for HealingGrpcService {
         tokio_stream::wrappers::ReceiverStream<Result<FetchHintObjectChunk, Status>>;
     type FetchSegmentLifecycleMetadataStream =
         tokio_stream::wrappers::ReceiverStream<Result<SegmentLifecycleEntry, Status>>;
+    type ListObjectsInRangeStream =
+        tokio_stream::wrappers::ReceiverStream<Result<MetadataRow, Status>>;
 
     async fn hinted_handoff_single(
         &self,
@@ -1850,6 +1888,37 @@ impl HealingRpc for HealingGrpcService {
                 break;
             }
         }
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+
+    /// Handles `ListObjectsInRange` (g8 `metadata-loss-recovery`).
+    ///
+    /// Proxies the node-injected [`MetadataRangeLister`]: creates a
+    /// bounded channel and hands it to the lister, which scans the
+    /// responder's objects + deletions CFs and streams the rows whose
+    /// key hash falls in the requested ring range. The lister closes the
+    /// channel when the scan finishes, ending the stream.
+    async fn list_objects_in_range(
+        &self,
+        request: Request<ObjectRangeRequest>,
+    ) -> Result<Response<Self::ListObjectsInRangeStream>, Status> {
+        let req = request.into_inner();
+        let start: [u8; 32] = req
+            .start
+            .as_ref()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("ObjectRangeRequest.start must be 32 bytes"))?;
+        let end: [u8; 32] = req
+            .end
+            .as_ref()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("ObjectRangeRequest.end must be 32 bytes"))?;
+        let lister = self
+            .range_lister
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("ListObjectsInRange is not configured on this node"))?;
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        Arc::clone(lister).stream_range(start, end, tx);
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 }

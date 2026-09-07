@@ -341,6 +341,59 @@ pub struct RemapAck {
     #[prost(bool, tag = "1")]
     pub applied: bool,
 }
+/// A ring position range the recovering node is a replica holder for
+/// (the node-side owned-range enumeration). `start` is inclusive and
+/// `end` exclusive in the ring's byte-lexicographic order; a
+/// wrap-around range (start >= end) covers `h >= start || h < end`; the
+/// full circle is start == end == 0. The responder streams every row it
+/// holds whose key hash (SHA-256 over the object key) falls in the
+/// range.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ObjectRangeRequest {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub start: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub end: ::prost::bytes::Bytes,
+}
+/// One row streamed by ListObjectsInRange. `key` is the FULL column
+/// family key (`{bucket}\0{key}` for objects and plain tombstones; the
+/// supersede key for overwrite dead-chunk records) and `value` is the
+/// serialized row the CF stores (ObjectMetadata / Tombstone) — the fold
+/// re-writes them verbatim, so the recovery is byte-faithful.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MetadataRow {
+    #[prost(oneof = "metadata_row::Row", tags = "1, 2")]
+    pub row: ::core::option::Option<metadata_row::Row>,
+}
+/// Nested message and enum types in `MetadataRow`.
+pub mod metadata_row {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Row {
+        #[prost(message, tag = "1")]
+        Object(super::ObjectRow),
+        #[prost(message, tag = "2")]
+        Deletion(super::DeletionRow),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ObjectRow {
+    /// Full objects-CF key (`{bucket}\0{key}`).
+    #[prost(bytes = "bytes", tag = "1")]
+    pub key: ::prost::bytes::Bytes,
+    /// Serialized ObjectMetadata (the objects-CF value).
+    #[prost(bytes = "bytes", tag = "2")]
+    pub value: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeletionRow {
+    /// Full deletions-CF key (plain tombstone `{bucket}\0{key}` or a
+    /// supersede record key).
+    #[prost(bytes = "bytes", tag = "1")]
+    pub key: ::prost::bytes::Bytes,
+    /// Serialized Tombstone (the deletions-CF value).
+    #[prost(bytes = "bytes", tag = "2")]
+    pub value: ::prost::bytes::Bytes,
+}
 /// Why a re-replication repair was requested (ADR-0029 §D6 urgency; the
 /// worker reports it as `oceanfs_repair_queue_depth{priority}`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -738,6 +791,39 @@ pub mod healing_rpc_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Stream a recovering node's metadata rows for a ring range
+        /// (g8 `metadata-loss-recovery`, ADR-0029 §D7). The caller's owned
+        /// ranges map to keys it is a replica holder for; the responder
+        /// streams BOTH live object rows AND deletions-CF records whose key
+        /// hash falls in the range (g8 D5/D6 — an empty deletions CF would
+        /// blind the reaper's byte accounting). Server-streaming; the
+        /// responder never buffers the whole range in memory.
+        pub async fn list_objects_in_range(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ObjectRangeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::MetadataRow>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/oceanfs.healing.HealingRpc/ListObjectsInRange",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("oceanfs.healing.HealingRpc", "ListObjectsInRange"),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -853,6 +939,26 @@ pub mod healing_rpc_server {
             request: tonic::Request<super::SegmentLifecycleQuery>,
         ) -> std::result::Result<
             tonic::Response<Self::FetchSegmentLifecycleMetadataStream>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the ListObjectsInRange method.
+        type ListObjectsInRangeStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::MetadataRow, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Stream a recovering node's metadata rows for a ring range
+        /// (g8 `metadata-loss-recovery`, ADR-0029 §D7). The caller's owned
+        /// ranges map to keys it is a replica holder for; the responder
+        /// streams BOTH live object rows AND deletions-CF records whose key
+        /// hash falls in the range (g8 D5/D6 — an empty deletions CF would
+        /// blind the reaper's byte accounting). Server-streaming; the
+        /// responder never buffers the whole range in memory.
+        async fn list_objects_in_range(
+            &self,
+            request: tonic::Request<super::ObjectRangeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::ListObjectsInRangeStream>,
             tonic::Status,
         >;
     }
@@ -1376,6 +1482,53 @@ pub mod healing_rpc_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = FetchSegmentLifecycleMetadataSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/oceanfs.healing.HealingRpc/ListObjectsInRange" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListObjectsInRangeSvc<T: HealingRpc>(pub Arc<T>);
+                    impl<
+                        T: HealingRpc,
+                    > tonic::server::ServerStreamingService<super::ObjectRangeRequest>
+                    for ListObjectsInRangeSvc<T> {
+                        type Response = super::MetadataRow;
+                        type ResponseStream = T::ListObjectsInRangeStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ObjectRangeRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as HealingRpc>::list_objects_in_range(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListObjectsInRangeSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

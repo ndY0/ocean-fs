@@ -83,16 +83,54 @@ pub enum OperationType {
 // VnodeRange
 // ---------------------------------------------------------------------------
 
-/// A key range affected by a ring topology change.
+/// A key range affected by a ring topology change, and (g8) the unit a
+/// metadata rebuild pulls from peers.
 ///
 /// When a node is added or removed from the ring, the affected key range
-/// identifies which keys need data migration.
+/// identifies which keys need data migration. g8's owned-range
+/// enumeration produces ranges a node is a replica holder for, and the
+/// range stream filters rows by [`Self::contains`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VnodeRange {
     /// Start of the affected key range (inclusive).
     pub start: [u8; 32],
     /// End of the affected key range (exclusive).
     pub end: [u8; 32],
+}
+
+impl VnodeRange {
+    /// Whether a ring position `h` falls inside this range.
+    ///
+    /// `start` is inclusive, `end` exclusive for the non-wrap case
+    /// (`start < end`). A wrap-around range (`start >= end`) covers
+    /// `h >= start || h < end`, so the full-circle sentinel
+    /// `{ start: [0; 32], end: [0; 32] }` (start == end == 0) matches
+    /// every position. Comparisons use the ring's byte-lexicographic
+    /// order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::VnodeRange;
+    ///
+    /// let mut end = [0u8; 32];
+    /// end[31] = 42;
+    /// let half = VnodeRange { start: [0u8; 32], end };
+    /// assert!(half.contains(&[0u8; 32]));
+    /// assert!(!half.contains(&[0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 43]));
+    /// ```
+    pub fn contains(&self, h: &[u8; 32]) -> bool {
+        if self.start < self.end {
+            self.start <= *h && *h < self.end
+        } else if self.start == self.end {
+            // Full-circle sentinel (and the degenerate zero-width range):
+            // start == end == 0 matches everything.
+            self.start == [0u8; 32] || *h >= self.start || *h < self.end
+        } else {
+            // Wrap-around: h >= start (past the high side) or h < end.
+            *h >= self.start || *h < self.end
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
