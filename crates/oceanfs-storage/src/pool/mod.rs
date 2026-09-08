@@ -40,10 +40,12 @@
 //! are immutable after construction (gauges/counters are
 //! interior-mutable atomics); a new series is pushed on attach.
 
+pub mod drain;
 pub mod health;
 pub mod placement;
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
@@ -110,12 +112,24 @@ pub fn resolve_pool_root(pools: &[Arc<StoragePool>], pool_id: u32) -> Option<Pat
 // PoolStatus
 // ---------------------------------------------------------------------------
 
-/// Health state of a storage pool (ADR-0029 §D3 state machine).
+/// Health state of a storage pool (ADR-0029 §D3 state machine, extended by
+/// ADR-0036 D6 for the Phase C drain lifecycle).
 ///
 /// Phase A: all pools are `Healthy`; a pool whose startup probe failed under
 /// the `Degraded` policy registers as `Degraded`. `Dead` requires *confirmed
 /// loss* (ENOENT on an owned segment, EIO on fsync, device unplug) and is
 /// only reachable once Phase B's health monitor is wired.
+///
+/// `Draining` is the operator-driven Phase C state (ADR-0036 D1/D6): the pool
+/// is being emptied and must not receive new segments. It is a *distinct*
+/// status, not a parallel flag, so every existing status consumer reasons
+/// about it in one place — placement excludes it (only `Healthy` pools are
+/// targets), reads keep serving from it (the read path is status-agnostic),
+/// and the health monitor never transitions it on degrading signals (genuine
+/// confirmed loss still beats the operator flag and moves it to `Dead`).
+/// Only `data`-role pools can be `Draining` (drain.rs `begin_drain`); the
+/// `wal`/`metadata`/`hints` roles are cardinality-1 and their replacement is
+/// the g7/g8 boot path, not drain.
 ///
 /// # Examples
 ///
@@ -125,6 +139,7 @@ pub fn resolve_pool_root(pools: &[Arc<StoragePool>], pool_id: u32) -> Option<Pat
 /// assert_eq!(PoolStatus::Healthy.as_u8(), 0);
 /// assert_eq!(PoolStatus::Degraded.as_u8(), 1);
 /// assert_eq!(PoolStatus::Dead.as_u8(), 2);
+/// assert_eq!(PoolStatus::Draining.as_u8(), 3);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -136,11 +151,16 @@ pub enum PoolStatus {
     Degraded,
     /// Confirmed loss of the pool's data. Phase B only.
     Dead,
+    /// Operator-initiated drain in progress (ADR-0036 D6). The pool is
+    /// excluded from new-segment placement, still serves reads, and stays
+    /// `Draining` until the drain worker empties it (`Detachable`, d3/d4)
+    /// or genuine confirmed loss moves it to `Dead`. Data-role only.
+    Draining,
 }
 
 impl PoolStatus {
     /// Numeric encoding used by the `oceanfs_pool_status` gauge
-    /// (0 = Healthy, 1 = Degraded, 2 = Dead).
+    /// (0 = Healthy, 1 = Degraded, 2 = Dead, 3 = Draining).
     ///
     /// # Examples
     ///
@@ -148,12 +168,14 @@ impl PoolStatus {
     /// use oceanfs_storage::PoolStatus;
     ///
     /// assert_eq!(PoolStatus::Degraded.as_u8(), 1);
+    /// assert_eq!(PoolStatus::Draining.as_u8(), 3);
     /// ```
     pub fn as_u8(self) -> u8 {
         match self {
             PoolStatus::Healthy => 0,
             PoolStatus::Degraded => 1,
             PoolStatus::Dead => 2,
+            PoolStatus::Draining => 3,
         }
     }
 }
@@ -163,6 +185,7 @@ fn pool_status_from_u8(value: u8) -> PoolStatus {
     match value {
         1 => PoolStatus::Degraded,
         2 => PoolStatus::Dead,
+        3 => PoolStatus::Draining,
         _ => PoolStatus::Healthy,
     }
 }
@@ -697,7 +720,8 @@ fn resolve_tech(tech: PoolTech) -> PoolTech {
 pub(crate) struct PoolMetrics {
     /// Pool id the series belong to (used to find the right series).
     pool_id: u32,
-    /// `oceanfs_pool_status{pool_id, role}` — 0=Healthy 1=Degraded 2=Dead.
+    /// `oceanfs_pool_status{pool_id, role}` — 0=Healthy 1=Degraded 2=Dead
+    /// 3=Draining.
     status: Gauge,
     /// `oceanfs_pool_bytes_free{pool_id}`.
     bytes_free: Gauge,
@@ -706,6 +730,14 @@ pub(crate) struct PoolMetrics {
     /// `oceanfs_pool_write_degraded{pool_id}` — 1 when the pool rejects
     /// new writes (wal pool Dead, ADR-0029 §D3; g2 drives it).
     write_degraded: Gauge,
+    /// `oceanfs_pool_drain_state{pool_id}` — 0=Idle 1=Draining
+    /// 2=Detachable (ADR-0036 D6 operator dashboard).
+    drain_state: Gauge,
+    /// `oceanfs_pool_drain_blocked_reason{pool_id}` — 1 while the pool's
+    /// drain is blocked (no eligible target); 0 otherwise. The human
+    /// reason text rides the admin pool-status JSON (a string label would
+    /// churn Prometheus series per distinct reason).
+    drain_blocked: Gauge,
     /// `oceanfs_pool_io_errors_total{pool_id}` — g1's `DiskIo` observer
     /// increments it via the bound handle (see `observe_into`).
     io_errors: Counter,
@@ -720,7 +752,7 @@ impl PoolMetrics {
             pool_id: pool.id(),
             status: Gauge::new(
                 "oceanfs_pool_status".into(),
-                "Pool health status (0=Healthy 1=Degraded 2=Dead)".into(),
+                "Pool health status (0=Healthy 1=Degraded 2=Dead 3=Draining)".into(),
                 LabelSet::new(&[("pool_id", &pool_id), ("role", &role)]),
             ),
             bytes_free: Gauge::new(
@@ -736,6 +768,16 @@ impl PoolMetrics {
             write_degraded: Gauge::new(
                 "oceanfs_pool_write_degraded".into(),
                 "Pool rejects new writes (wal pool Dead, ADR-0029 D3)".into(),
+                id_label.clone(),
+            ),
+            drain_state: Gauge::new(
+                "oceanfs_pool_drain_state".into(),
+                "Pool drain lifecycle (0=Idle 1=Draining 2=Detachable)".into(),
+                id_label.clone(),
+            ),
+            drain_blocked: Gauge::new(
+                "oceanfs_pool_drain_blocked_reason".into(),
+                "1 while the pool's drain is blocked (no eligible target); 0 otherwise".into(),
                 id_label,
             ),
             io_errors: Counter::new(
@@ -804,6 +846,22 @@ pub struct PoolRegistry {
     /// disjointness check only — the registry no longer creates an
     /// implicit pool there.
     data_dir: PathBuf,
+    /// Operator-visible drain record per pool (ADR-0036 D6). Present only
+    /// for pools whose drain lifecycle has been touched (`begin_drain` and
+    /// onward); absence reads as [`DrainState::Idle`]. The pool's *status*
+    /// stays the single source of truth for placement/health (`Draining`
+    /// is encoded in the status atomic); this map carries the drain
+    /// lifecycle (blocked reason, empty→`Detachable`) that status alone
+    /// cannot express.
+    ///
+    /// # LOCK ORDER
+    ///
+    /// Never acquire `self.pools` while holding this lock: attach pushes a
+    /// pool under the `pools` write lock and then releases it before
+    /// inserting here; every drain mutation reads pool status first
+    /// (without this lock held) and only then takes this write lock. The
+    /// reverse order would deadlock against a concurrent attach.
+    drain: RwLock<HashMap<u32, drain::DrainState>>,
 }
 
 impl PoolRegistry {
@@ -906,6 +964,8 @@ impl PoolRegistry {
             metrics: RwLock::new(metrics),
             missing_root_policy: storage.missing_root_policy,
             data_dir: data_dir.to_path_buf(),
+            // Every configured pool starts its drain lifecycle Idle.
+            drain: RwLock::new(HashMap::new()),
         })
     }
 
@@ -1360,6 +1420,10 @@ impl PoolRegistry {
             pools.push(registered);
             id
         };
+        // The attached pool starts its drain lifecycle Idle. Taken after
+        // the `pools` write lock is released (see the LOCK ORDER note on
+        // `PoolRegistry::drain`) — a new data pool is never draining.
+        self.drain.write().insert(id, drain::DrainState::Idle);
 
         tracing::info!(
             pool = %pool.name,
@@ -1504,6 +1568,8 @@ impl PoolRegistry {
             registrar.register_gauge(metric.bytes_free.clone());
             registrar.register_gauge(metric.bytes_total.clone());
             registrar.register_gauge(metric.write_degraded.clone());
+            registrar.register_gauge(metric.drain_state.clone());
+            registrar.register_gauge(metric.drain_blocked.clone());
             registrar.register_counter(metric.io_errors.clone());
         }
     }
@@ -1881,6 +1947,25 @@ mod tests {
         drop(tmp);
     }
 
+    /// d1: the status byte round-trips through `as_u8`/`pool_status_from_u8`
+    /// for all four variants — the private decode must map 3 → `Draining`
+    /// (never the silent `_ => Healthy` fallback), because the same byte is
+    /// both the pool's atomic status and the `oceanfs_pool_status` gauge
+    /// value.
+    #[test]
+    fn pool_status_byte_round_trips_all_variants() {
+        for expected in
+            [PoolStatus::Healthy, PoolStatus::Degraded, PoolStatus::Dead, PoolStatus::Draining]
+        {
+            assert_eq!(
+                pool_status_from_u8(expected.as_u8()),
+                expected,
+                "byte {} must decode to {expected:?}",
+                expected.as_u8()
+            );
+        }
+    }
+
     /// g6: the shared availability derivation — a Dead metadata pool
     /// flips `node_serves_requests` to false (the node serves nothing);
     /// wal Dead sets `write_degraded`, which flips `accepts_writes` but
@@ -1982,9 +2067,10 @@ mod tests {
 
         let gauges = registrar.gauges.lock();
         let counters = registrar.counters.lock();
-        // 5 pools × (status + bytes_free + bytes_total + write_degraded)
-        // gauges (g2 added the write_degraded series).
-        assert_eq!(gauges.len(), 20);
+        // 5 pools × (status + bytes_free + bytes_total + write_degraded +
+        // drain_state + drain_blocked) gauges (d1 added the two drain
+        // series).
+        assert_eq!(gauges.len(), 30);
         // 5 pools × io_errors counter.
         assert_eq!(counters.len(), 5);
 
@@ -2021,6 +2107,44 @@ mod tests {
         // set_status propagates to the gauge.
         registry.set_status(0, PoolStatus::Degraded);
         assert_eq!(healthy.get(), 1);
+        registry.set_status(0, PoolStatus::Healthy);
+        assert_eq!(healthy.get(), 0);
+
+        // The two drain series are registered per pool and start Idle (0).
+        let drain_state = gauges
+            .iter()
+            .find(|g| {
+                g.name() == "oceanfs_pool_drain_state"
+                    && g.labels().render().contains("pool_id=\"0\"")
+            })
+            .expect("pool 0 drain_state gauge");
+        let drain_blocked = gauges
+            .iter()
+            .find(|g| {
+                g.name() == "oceanfs_pool_drain_blocked_reason"
+                    && g.labels().render().contains("pool_id=\"0\"")
+            })
+            .expect("pool 0 drain_blocked gauge");
+        assert_eq!(drain_state.get(), 0, "Idle before begin_drain");
+        assert_eq!(drain_blocked.get(), 0, "not blocked before begin_drain");
+
+        // begin_drain (d1): the status gauge renders Draining as 3 (single
+        // source of truth — as_u8 = the atomic byte, accepted decision) and
+        // drain_state flips to 1; the blocked gauge stays 0 until
+        // set_drain_blocked.
+        registry.begin_drain(0).expect("pool 0 is a data pool");
+        assert_eq!(healthy.get(), 3, "status gauge renders Draining as 3");
+        assert_eq!(drain_state.get(), 1, "Draining after begin_drain");
+        assert_eq!(drain_blocked.get(), 0, "not blocked yet");
+
+        // set/clear of oceanfs_pool_drain_blocked_reason (DoD item 6):
+        // a blocked drain sets the gauge; Detachable clears it and moves
+        // drain_state to 2.
+        registry.set_drain_blocked(0, Some("no sibling headroom")).expect("block");
+        assert_eq!(drain_blocked.get(), 1, "blocked metric set with the reason");
+        registry.set_pool_empty(0).expect("pool drained empty");
+        assert_eq!(drain_state.get(), 2, "Detachable gauge value");
+        assert_eq!(drain_blocked.get(), 0, "blocked metric cleared on Detachable");
         drop(tmp);
     }
 

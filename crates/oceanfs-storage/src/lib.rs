@@ -45,6 +45,7 @@ pub use io::{
 };
 pub use metadata::{BatchOp, RocksDbMetadataStore, RocksDbMetrics};
 pub use pool::{
+    drain::{DrainState, DrainStateError},
     health::{
         decide_transition, evaluate_trend, ConfirmedLoss, HealthEvent, HealthMonitor,
         HealthMonitorConfig, Latency, PoolSignal, SmartCounters, TrendVerdict,

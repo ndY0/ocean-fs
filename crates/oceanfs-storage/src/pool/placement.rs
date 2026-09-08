@@ -100,6 +100,13 @@ impl PlacementPolicy {
     /// scores break by smaller pool id. Returns `None` when no pool is
     /// eligible (f5 decides the fallback).
     ///
+    /// A `Draining` data pool (ADR-0036 D6) is **excluded with no extra
+    /// rule**: `Draining != Healthy`, so the moment `begin_drain` flips a
+    /// pool's status it stops receiving new segment targets (seal-time
+    /// reservation goes through this same policy). A pool that turns
+    /// `Draining` mid-run stops receiving selections immediately — the
+    /// policy reads the live registry per selection.
+    ///
     /// Perf notes: one registry snapshot read (cloned `Arc`s — no lock held
     /// across scoring), a pre-sized candidate vec, and pure integer score
     /// math — no string work (guidelines 1.3, 7.1, 9.3).
@@ -396,6 +403,31 @@ mod tests {
 
         // Exclude pool-a by write_degraded; now nothing is eligible.
         registry.set_write_degraded(0, true);
+        assert!(policy.select_data_pool(&registry).is_none());
+    }
+
+    /// d1 (ADR-0036 D6): a `Draining` data pool is excluded immediately —
+    /// no policy change was needed (`Draining != Healthy`); this pins it.
+    #[test]
+    fn draining_pools_are_excluded() {
+        let (_tmp, registry) = registry_with_capacities(
+            &[("pool-a", PoolRole::Data, 1), ("pool-b", PoolRole::Data, 1)],
+            &[(100 * GIB, 20 * GIB), (100 * GIB, 20 * GIB)],
+        );
+        let policy = PlacementPolicy::new();
+
+        // begin_drain flips the pool's status to Draining: the healthy
+        // sibling must win from then on.
+        registry.begin_drain(1).unwrap();
+        assert_eq!(
+            policy.select_data_pool(&registry).unwrap().id(),
+            0,
+            "a draining data pool must not receive new segment targets"
+        );
+
+        // A pool that turns Draining mid-run stops receiving selections:
+        // drain the last data pool and nothing is eligible any more.
+        registry.begin_drain(0).unwrap();
         assert!(policy.select_data_pool(&registry).is_none());
     }
 

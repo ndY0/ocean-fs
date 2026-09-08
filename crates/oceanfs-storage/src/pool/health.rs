@@ -733,6 +733,15 @@ impl HealthMonitor {
         let new_status = {
             let mut state = self.state.lock();
             let entry = state.entry(pool_id).or_insert_with(|| PoolState::new(pool.status(), now));
+            // Reconcile the mirror with the registry: `begin_drain` flips a
+            // pool's status externally (the monitor never performs that
+            // transition), so a mirror seeded Healthy/Degraded must adopt
+            // `Draining` or a stale baseline would decide the pool back out
+            // of the operator's drain on the next degrading signal. Atomic
+            // read only — no lock ordering concern.
+            if pool.status() == PoolStatus::Draining && entry.status != PoolStatus::Draining {
+                entry.status = PoolStatus::Draining;
+            }
             if now < entry.next_tick {
                 return;
             }
@@ -856,6 +865,20 @@ pub fn decide_transition(
         // Dead is absorbing until replacement (g7/g8) — the node
         // explicitly resets it after a fresh WAL/store + catch-up.
         PoolStatus::Dead => (PoolStatus::Dead, clean_windows),
+        // Draining (ADR-0036 D6) is absorbing for every degrading/clean
+        // signal: the monitor must not fight the operator's drain, so
+        // drain-induced I/O can never transition the pool to Degraded/Dead.
+        // Genuine *confirmed loss* still beats the operator flag — a disk
+        // that loses data mid-drain is Dead (the drain worker observes the
+        // Dead transition and parks; the loss-announcement/heal path takes
+        // over). Recovery from Dead is the g7/g8 replacement path, as above.
+        PoolStatus::Draining => {
+            if ConfirmedLoss::from_signal(signal).is_some() {
+                (PoolStatus::Dead, 0)
+            } else {
+                (PoolStatus::Draining, clean_windows)
+            }
+        }
     }
 }
 
@@ -1319,6 +1342,57 @@ mod tests {
         assert_eq!(status, PoolStatus::Dead);
     }
 
+    // -- Draining (d1, ADR-0036 D6): absorbing for degradation, Dead on
+    // genuine confirmed loss --
+
+    #[test]
+    fn draining_stays_draining_on_degrading_signal() {
+        // An error spike well past the absolute thresholds.
+        let config = PoolHealthConfig { min_errors: 1, error_rate_threshold: 0.5, ..fast_config() };
+        let signal = signal_with_errors(5);
+        let (status, clean) = decide_transition(
+            PoolStatus::Draining,
+            &signal,
+            TrendVerdict::Degrading,
+            &config,
+            0,
+            1,
+        );
+        assert_eq!(status, PoolStatus::Draining, "the monitor must not fight the drain");
+        assert_eq!(clean, 0);
+    }
+
+    #[test]
+    fn draining_stays_draining_on_clean_window() {
+        // Even past the recovery window, a draining pool never "heals" back
+        // to Healthy — placement must keep excluding it until detach.
+        let config = PoolHealthConfig { recovery_window_secs: 2, ..fast_config() };
+        let signal = signal_with_errors(0);
+        let (status, clean) =
+            decide_transition(PoolStatus::Draining, &signal, TrendVerdict::Stable, &config, 10, 1);
+        assert_eq!(status, PoolStatus::Draining);
+        assert_eq!(clean, 10, "clean-window accumulator is preserved for a draining pool");
+    }
+
+    #[test]
+    fn draining_confirmed_loss_beats_drain_and_transitions_to_dead() {
+        let mut signal = signal_with_errors(1);
+        signal.error_kinds[IoErrorKind::NotFound.as_usize()] = 1;
+        let (status, _) = decide_transition(
+            PoolStatus::Draining,
+            &signal,
+            TrendVerdict::Stable,
+            &fast_config(),
+            0,
+            1,
+        );
+        assert_eq!(
+            status,
+            PoolStatus::Dead,
+            "genuine confirmed loss beats the operator's drain flag"
+        );
+    }
+
     // -- HealthMonitor (tick_pool drives the registry) --
 
     use oceanfs_core::{MissingRootPolicy, PoolRole, StorageConfig, StoragePoolConfig};
@@ -1554,6 +1628,89 @@ mod tests {
         assert!(matches!(
             event,
             HealthEvent::StatusChanged { pool_id: 0, status: PoolStatus::Degraded }
+        ));
+    }
+
+    // -- d1: the monitor does not fight an operator drain (ADR-0036 D6) --
+
+    /// The monitor must not transition a `Draining` pool back to
+    /// Healthy/Degraded from drain-induced I/O signals, even when the
+    /// mirror was seeded before the drain started.
+    #[test]
+    fn monitor_does_not_fight_operator_drain() {
+        let (registry, observer, monitor, mut events, _tmp) = monitor_setup();
+        let pool_id = 0;
+
+        let mut now = Instant::now();
+        // Seed the monitor mirror while the pool is Healthy (a clean tick).
+        tick_all(&monitor, &mut now);
+        assert_eq!(registry.pool_by_id(pool_id).unwrap().status(), PoolStatus::Healthy);
+
+        // The operator starts a drain (external registry mutation).
+        registry.begin_drain(pool_id).expect("begin drain");
+        assert_eq!(registry.pool_by_id(pool_id).unwrap().status(), PoolStatus::Draining);
+
+        // Degrading signals for several ticks: the mirror must be
+        // reconciled to Draining and stay there — no fight.
+        for _ in 0..5 {
+            observer.record_error(pool_id, IoErrorKind::TimedOut);
+            observer.record_latency(pool_id, IoOp::Read, Duration::from_micros(1));
+            tick_all(&monitor, &mut now);
+            assert_eq!(
+                registry.pool_by_id(pool_id).unwrap().status(),
+                PoolStatus::Draining,
+                "degrading I/O must not drag a draining pool to Degraded/Dead"
+            );
+        }
+
+        // Clean windows must not "heal" the pool back to Healthy either.
+        for _ in 0..5 {
+            tick_all(&monitor, &mut now);
+            assert_eq!(
+                registry.pool_by_id(pool_id).unwrap().status(),
+                PoolStatus::Draining,
+                "clean windows must not pull a draining pool back to Healthy"
+            );
+        }
+
+        // No status-change events were emitted for the draining pool (the
+        // monitor never performed a transition it would announce).
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(
+                event,
+                HealthEvent::StatusChanged { pool_id: 0, status: PoolStatus::Degraded }
+                    | HealthEvent::StatusChanged { pool_id: 0, status: PoolStatus::Healthy }
+            ));
+        }
+    }
+
+    /// Genuine confirmed loss mid-drain beats the operator flag: an ENOENT
+    /// kind on a draining pool confirms Dead (the drain worker observes the
+    /// Dead transition and parks).
+    #[test]
+    fn monitor_draining_confirmed_loss_transitions_to_dead() {
+        let (registry, observer, monitor, mut events, _tmp) = monitor_setup();
+        let pool_id = 0;
+
+        let mut now = Instant::now();
+        tick_all(&monitor, &mut now);
+        registry.begin_drain(pool_id).expect("begin drain");
+
+        observer.record_error(pool_id, IoErrorKind::NotFound);
+        observer.record_latency(pool_id, IoOp::Read, Duration::from_micros(1));
+        tick_all(&monitor, &mut now);
+
+        assert_eq!(
+            registry.pool_by_id(pool_id).unwrap().status(),
+            PoolStatus::Dead,
+            "confirmed loss beats Draining (do not mask a dying disk behind an operator flag)"
+        );
+        // The Dead transition is announced through the normal event path so
+        // the node re-gossips a Dead manifest and peers stop routing to it.
+        let event = events.try_recv().expect("Dead status event");
+        assert!(matches!(
+            event,
+            HealthEvent::StatusChanged { pool_id: 0, status: PoolStatus::Dead }
         ));
     }
 }
