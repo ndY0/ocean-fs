@@ -440,7 +440,7 @@ impl HealWorker {
         // `MetadataRefresh` event is durable (the event log is the only
         // durable writer) — no state change, no downgrade.
         lifecycle
-            .request_refresh_metadata(*segment_id, None, None)
+            .request_refresh_metadata(*segment_id, None, None, None) // no pool_id relocation (d2)
             .await
             .map_err(|e| Error::Storage(format!("anchor refresh failed: {e}")))?;
 

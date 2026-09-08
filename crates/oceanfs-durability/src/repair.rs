@@ -508,7 +508,12 @@ impl ReRepWorker {
         }
         meta.storage_locations = locations;
         lifecycle
-            .request_refresh_metadata(segment_id, Some(merkle_root), Some(meta.storage_locations))
+            .request_refresh_metadata(
+                segment_id,
+                Some(merkle_root),
+                Some(meta.storage_locations),
+                None, // no pool_id relocation (d2) on the re-replication stamp
+            )
             .await
             .map_err(|e| Error::Storage(format!("re-replication location stamp failed: {e}")))?;
 

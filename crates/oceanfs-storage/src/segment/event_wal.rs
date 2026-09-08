@@ -63,8 +63,11 @@
 //!
 //! The MetadataRefresh payload's flags byte (payload\[0\]): bit 0 set
 //! means a merkle root follows, bit 1 set means a `storage_locations`
-//! section follows (ADR-0030). Records written before the marker flags
-//! existed keep their exact byte layout.
+//! section follows (ADR-0030), bit 2 set means a `pool_id` section
+//! follows (d2/ADR-0036 D2 — the durable segment-relocation stamp).
+//! Sections are appended in that fixed order and the flags byte
+//! discriminates them. Records written before a marker flag existed keep
+//! their exact byte layout.
 
 use std::{
     io::{Read, Seek, SeekFrom, Write},
@@ -173,6 +176,19 @@ pub(crate) const REFRESH_MAX_LOCATIONS: usize = 16;
 /// (len(1) + utf8 bytes). Node ids are short host/container names; 255
 /// bounds the on-disk record.
 pub(crate) const REFRESH_MAX_NODE_ID_LEN: usize = 255;
+
+/// Extra payload bytes of an extended `MetadataRefreshEvent` carrying the
+/// destination `pool_id` of a segment relocation (4 — u32 LE; d2,
+/// ADR-0036 D2). Appended last, after the `storage_locations` section.
+pub(crate) const REFRESH_POOL_ID_SIZE: usize = 4;
+
+/// Refresh flags byte bits (payload[0]): bit 0 = merkle root present;
+/// bit 1 = `storage_locations` section present (ADR-0030); bit 2 =
+/// `pool_id` section present (d2, ADR-0036 D2). Sections are appended in
+/// that fixed order after the flags byte.
+pub(crate) const REFRESH_FLAG_MERKLE_ROOT: u8 = 1;
+pub(crate) const REFRESH_FLAG_LOCATIONS: u8 = 2;
+pub(crate) const REFRESH_FLAG_POOL_ID: u8 = 4;
 
 /// Largest possible payload size — the Seal payload with the
 /// contained-objects tail dominates the extended MetadataRefresh payload
@@ -318,6 +334,12 @@ pub struct DeleteEvent {
 /// set — the durable post-repair holder stamp (the re-replication
 /// worker records the target as a new holder through the event-WAL, the
 /// single durable writer). `None` keeps the legacy anchor-only shape.
+///
+/// d2 (ADR-0036 D2) adds an optional `pool_id`: the durable target stamp
+/// of a segment relocation. `pool_id` was stamped-immutable at seal (f5);
+/// this event section is its single mutation path, appended through the
+/// event-WAL (durable before the source `.dat` is unlinked). `None`
+/// leaves the registry's `pool_id` unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataRefreshEvent {
     /// The segment whose anchor is refreshed.
@@ -327,6 +349,10 @@ pub struct MetadataRefreshEvent {
     /// The new holder set (ADR-0030): `Some` replaces
     /// `storage_locations` durably; `None` leaves it untouched.
     pub storage_locations: Option<smallvec::SmallVec<[oceanfs_core::NodeId; 16]>>,
+    /// The segment's new pool (d2): `Some` mutates the registry's
+    /// `pool_id` durably (a relocation commit); `None` leaves it
+    /// unchanged.
+    pub pool_id: Option<u32>,
 }
 
 /// A segment lifecycle transition — the only record family of the event
@@ -434,21 +460,26 @@ impl SegmentEvent {
             SegmentEvent::Delete(_) => (KIND_DELETE, Vec::new()),
             SegmentEvent::MetadataRefresh(evt) => {
                 // Flags byte: bit 0 = merkle_root present, bit 1 =
-                // storage_locations present (ADR-0030). Legacy records
-                // (bits 0/1 = 0x00/0x01) keep their exact byte layout;
-                // the locations section is appended only when present.
+                // storage_locations present (ADR-0030), bit 2 = pool_id
+                // present (d2/ADR-0036 D2). Sections are appended in that
+                // fixed order after the flags byte; legacy records (bits
+                // 0/1 only) keep their exact byte layout.
                 let mut flags = 0u8;
                 if evt.merkle_root.is_some() {
-                    flags |= 1;
+                    flags |= REFRESH_FLAG_MERKLE_ROOT;
                 }
                 if evt.storage_locations.is_some() {
-                    flags |= 2;
+                    flags |= REFRESH_FLAG_LOCATIONS;
+                }
+                if evt.pool_id.is_some() {
+                    flags |= REFRESH_FLAG_POOL_ID;
                 }
                 let mut payload = Vec::with_capacity(
                     REFRESH_PAYLOAD_SIZE
                         + REFRESH_ROOT_SIZE
                         + 1
-                        + evt.storage_locations.as_ref().map_or(0, |l| l.len() * (1 + 8)),
+                        + evt.storage_locations.as_ref().map_or(0, |l| l.len() * (1 + 8))
+                        + REFRESH_POOL_ID_SIZE,
                 );
                 payload.push(flags);
                 if let Some(root) = evt.merkle_root {
@@ -461,6 +492,9 @@ impl SegmentEvent {
                         payload.push(bytes.len() as u8);
                         payload.extend_from_slice(bytes);
                     }
+                }
+                if let Some(pool_id) = evt.pool_id {
+                    payload.extend_from_slice(&pool_id.to_le_bytes());
                 }
                 (KIND_METADATA_REFRESH, payload)
             }
@@ -644,6 +678,7 @@ fn decode_payload(kind: u8, segment_id: SegmentId, payload: &[u8]) -> Option<Seg
                 segment_id,
                 merkle_root: None,
                 storage_locations: None,
+                pool_id: None,
             }))
         }
         KIND_METADATA_REFRESH
@@ -653,49 +688,91 @@ fn decode_payload(kind: u8, segment_id: SegmentId, payload: &[u8]) -> Option<Seg
                 segment_id,
                 merkle_root: Some(HashOutput::from_bytes(payload[1..33].try_into().ok()?)),
                 storage_locations: None,
+                pool_id: None,
             }))
         }
-        // Extended refresh (ADR-0030): flags byte bit 1 = locations
-        // present. Layout: [flags][merkle_root(32) if bit 0][count(1)]
-        // [(len(1) + utf8)*count]. The payload length is bounds-checked
-        // BEFORE any slice or index so a crafted (CRC-valid) short — or
-        // empty — record is rejected as invalid, never panicked on.
-        KIND_METADATA_REFRESH if !payload.is_empty() && payload[0] & 2 != 0 => {
-            let locs_start = 1 + if payload[0] & 1 != 0 { REFRESH_ROOT_SIZE } else { 0 };
-            if payload.len() < locs_start {
+        // Extended refresh (ADR-0030 + d2): any flags byte with bit 1
+        // (locations) or bit 2 (pool_id) set takes the section parser.
+        // Sections are appended in fixed order after the flags byte:
+        // [flags][merkle_root(32) if bit 0][locations section if bit 1]
+        // [pool_id(4 LE) if bit 2]. The parser walks the sections with
+        // per-length guards (a crafted short/empty record is rejected, never
+        // panicked on), rejects unknown flag bits, and requires the cursor
+        // to land exactly on the payload end — unknown trailing bytes reject
+        // the record instead of being silently ignored. Legacy bit-1-only
+        // records (ADR-0030) parse identically; their bytes are unchanged.
+        KIND_METADATA_REFRESH
+            if !payload.is_empty()
+                && (payload[0] & (REFRESH_FLAG_LOCATIONS | REFRESH_FLAG_POOL_ID)) != 0 =>
+        {
+            let flags = payload[0];
+            if flags & !(REFRESH_FLAG_MERKLE_ROOT | REFRESH_FLAG_LOCATIONS | REFRESH_FLAG_POOL_ID)
+                != 0
+            {
                 return None;
             }
-            let merkle_root = if payload[0] & 1 != 0 {
-                Some(HashOutput::from_bytes(payload[1..33].try_into().ok()?))
+            let mut cursor = 1;
+            let merkle_root = if flags & REFRESH_FLAG_MERKLE_ROOT != 0 {
+                if payload.len() < cursor + REFRESH_ROOT_SIZE {
+                    return None;
+                }
+                let root = HashOutput::from_bytes(
+                    payload[cursor..cursor + REFRESH_ROOT_SIZE].try_into().ok()?,
+                );
+                cursor += REFRESH_ROOT_SIZE;
+                Some(root)
             } else {
                 None
             };
-            if payload.len() < locs_start + 1 {
-                return None;
-            }
-            let count = payload[locs_start] as usize;
-            if count > REFRESH_MAX_LOCATIONS {
-                return None;
-            }
-            let mut storage_locations = smallvec::SmallVec::<[oceanfs_core::NodeId; 16]>::new();
-            let mut cursor = locs_start + 1;
-            for _ in 0..count {
+            let storage_locations = if flags & REFRESH_FLAG_LOCATIONS != 0 {
                 if payload.len() < cursor + 1 {
                     return None;
                 }
-                let len = payload[cursor] as usize;
+                let count = payload[cursor] as usize;
                 cursor += 1;
-                if payload.len() < cursor + len || len > REFRESH_MAX_NODE_ID_LEN {
+                if count > REFRESH_MAX_LOCATIONS {
                     return None;
                 }
-                let id = std::str::from_utf8(&payload[cursor..cursor + len]).ok()?;
-                storage_locations.push(oceanfs_core::NodeId::new(id));
-                cursor += len;
+                let mut storage_locations = smallvec::SmallVec::<[oceanfs_core::NodeId; 16]>::new();
+                for _ in 0..count {
+                    if payload.len() < cursor + 1 {
+                        return None;
+                    }
+                    let len = payload[cursor] as usize;
+                    cursor += 1;
+                    if payload.len() < cursor + len || len > REFRESH_MAX_NODE_ID_LEN {
+                        return None;
+                    }
+                    let id = std::str::from_utf8(&payload[cursor..cursor + len]).ok()?;
+                    storage_locations.push(oceanfs_core::NodeId::new(id));
+                    cursor += len;
+                }
+                Some(storage_locations)
+            } else {
+                None
+            };
+            let pool_id = if flags & REFRESH_FLAG_POOL_ID != 0 {
+                if payload.len() < cursor + REFRESH_POOL_ID_SIZE {
+                    return None;
+                }
+                let pool_id = u32::from_le_bytes(
+                    payload[cursor..cursor + REFRESH_POOL_ID_SIZE].try_into().ok()?,
+                );
+                cursor += REFRESH_POOL_ID_SIZE;
+                Some(pool_id)
+            } else {
+                None
+            };
+            if cursor != payload.len() {
+                // Trailing bytes with no declared section are not a valid
+                // refresh record.
+                return None;
             }
             Some(SegmentEvent::MetadataRefresh(MetadataRefreshEvent {
                 segment_id,
                 merkle_root,
-                storage_locations: Some(storage_locations),
+                storage_locations,
+                pool_id,
             }))
         }
         _ => None,
@@ -1715,6 +1792,7 @@ mod tests {
             segment_id: id,
             merkle_root: Some(HashOutput::from_bytes([0xCD; 32])),
             storage_locations: None,
+            pool_id: None,
         })
     }
 
@@ -1853,6 +1931,7 @@ mod tests {
             segment_id: id,
             merkle_root: None,
             storage_locations: None,
+            pool_id: None,
         });
         let decoded =
             SegmentEvent::from_record_bytes(&invalidate.to_record_bytes()).expect("record decodes");
@@ -1873,6 +1952,7 @@ mod tests {
             segment_id: id,
             merkle_root: Some(HashOutput::from_bytes([0xCD; 32])),
             storage_locations: Some(locations),
+            pool_id: None,
         });
         let bytes = evt.to_record_bytes();
         let decoded = SegmentEvent::from_record_bytes(&bytes).expect("extended record decodes");
@@ -1890,10 +1970,89 @@ mod tests {
             segment_id: id,
             merkle_root: None,
             storage_locations: Some(locations),
+            pool_id: None,
         });
         let decoded =
             SegmentEvent::from_record_bytes(&evt.to_record_bytes()).expect("record decodes");
         assert_eq!(decoded, evt);
+    }
+
+    /// d2 (ADR-0036 D2): a `MetadataRefresh` carrying the relocation
+    /// `pool_id` section round-trips byte-exact — alone and combined with
+    /// root + locations (the full extended form the relocator commits).
+    #[test]
+    fn metadata_refresh_with_pool_id_roundtrips() {
+        let id = SegmentId::new();
+
+        // pool_id only (flags = 4): the minimal relocation commit.
+        let pool_only = SegmentEvent::MetadataRefresh(MetadataRefreshEvent {
+            segment_id: id,
+            merkle_root: None,
+            storage_locations: None,
+            pool_id: Some(7),
+        });
+        let decoded = SegmentEvent::from_record_bytes(&pool_only.to_record_bytes())
+            .expect("pool_id-only record decodes");
+        assert_eq!(decoded, pool_only, "pool_id-only refresh must round-trip byte-exact");
+
+        // pool_id + locations + root (flags = 7): the full extended form.
+        let mut locations = smallvec::SmallVec::<[oceanfs_core::NodeId; 16]>::new();
+        locations.push(oceanfs_core::NodeId::new("node-c"));
+        let full = SegmentEvent::MetadataRefresh(MetadataRefreshEvent {
+            segment_id: id,
+            merkle_root: Some(HashOutput::from_bytes([0xEF; 32])),
+            storage_locations: Some(locations),
+            pool_id: Some(3),
+        });
+        let decoded =
+            SegmentEvent::from_record_bytes(&full.to_record_bytes()).expect("full record decodes");
+        assert_eq!(decoded, full, "root + locations + pool_id must round-trip byte-exact");
+    }
+
+    /// d2: an unknown refresh flag bit is rejected (not silently
+    /// ignored), and trailing bytes after a declared section reject the
+    /// record — the strict extended parser closes the previously
+    /// permissive tail.
+    #[test]
+    fn metadata_refresh_rejects_unknown_flags_and_trailing_bytes() {
+        let id = SegmentId::new();
+
+        // A CRC-valid record whose flags byte sets an unknown bit (8).
+        let craft = |payload: &[u8]| -> Vec<u8> {
+            let mut buf = Vec::with_capacity(28 + payload.len() + 4);
+            buf.extend_from_slice(&EVENT_RECORD_MAGIC);
+            buf.push(EVENT_RECORD_VERSION);
+            buf.push(KIND_METADATA_REFRESH);
+            buf.extend_from_slice(&[0u8; 2]);
+            buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            buf.extend_from_slice(id.as_uuid().as_bytes());
+            buf.extend_from_slice(payload);
+            let crc = crc32fast::hash(&buf);
+            buf.extend_from_slice(&crc.to_le_bytes());
+            buf
+        };
+
+        // Unknown flag bit 8 alone.
+        let unknown_flag = craft(&[8u8]);
+        assert!(
+            SegmentEvent::from_record_bytes(&unknown_flag).is_none(),
+            "an unknown refresh flag must be rejected"
+        );
+
+        // flags = 2 (locations, count 0) followed by a stray byte: the
+        // section parser must reject the trailing byte.
+        let trailing = craft(&[2u8, 0u8, 0xAA]);
+        assert!(
+            SegmentEvent::from_record_bytes(&trailing).is_none(),
+            "trailing bytes after a declared section must be rejected"
+        );
+
+        // flags = 4 (pool_id) with only 3 pool-id bytes.
+        let short_pool = craft(&[4u8, 0, 0, 0]);
+        assert!(
+            SegmentEvent::from_record_bytes(&short_pool).is_none(),
+            "a truncated pool_id section must be rejected"
+        );
     }
 
     /// ADR-0030: a corrupt extended refresh (node id claims more bytes

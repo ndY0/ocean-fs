@@ -581,6 +581,7 @@ impl RepairDispatcher {
                 request.segment_id,
                 entry.metadata.merkle_root,
                 Some(locations),
+                None, // no pool_id relocation (d2) on the holder-converge path
             )
             .await
         {

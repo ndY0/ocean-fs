@@ -1098,11 +1098,17 @@ impl SegmentLifecycleRegistry {
     /// rebuilt. Rejected on non-`Sealed` entries (the heal worker only
     /// refreshes sealed segments; a refresh on any other state is a
     /// corruption signal in the fold).
+    ///
+    /// The d2 (ADR-0036 D2) `pool_id` section uses the `storage_locations`
+    /// convention: `Some` durably replaces `SegmentMetadata.pool_id`
+    /// (the relocation commit — this fold is the only writer), `None`
+    /// leaves it unchanged.
     pub(crate) fn fold_refresh(
         &self,
         id: SegmentId,
         merkle_root: Option<oceanfs_core::HashOutput>,
         storage_locations: Option<smallvec::SmallVec<[oceanfs_core::NodeId; 16]>>,
+        pool_id: Option<u32>,
     ) -> Result<(), TransitionError> {
         let shard = &self.shards[self.shard_for(id)];
         let mut guard = shard.write();
@@ -1113,6 +1119,9 @@ impl SegmentLifecycleRegistry {
                 entry.metadata.merkle_root = merkle_root;
                 if let Some(locations) = storage_locations {
                     entry.metadata.storage_locations = locations;
+                }
+                if let Some(pool_id) = pool_id {
+                    entry.metadata.pool_id = pool_id;
                 }
                 Ok(())
             }
@@ -1561,6 +1570,7 @@ impl SegmentLifecycleCoordinator {
                     evt.segment_id,
                     evt.merkle_root,
                     evt.storage_locations.clone(),
+                    evt.pool_id,
                 ),
             };
             // Idempotent fold outcomes — benign race residue, not
@@ -2175,6 +2185,11 @@ impl SegmentLifecycleCoordinator {
     /// holder through this path, keeping the event-WAL the single
     /// durable writer. `None` leaves the holder set untouched.
     ///
+    /// d2 (ADR-0036 D2) extends it further with an optional `pool_id` —
+    /// the durable commit of a segment relocation (`SegmentRelocator`):
+    /// `Some` mutates the registry entry's `pool_id`; `None` leaves it
+    /// unchanged. Existing callers pass `None`.
+    ///
     /// # Errors
     ///
     /// Returns [`TransitionError::NotReserved`] /
@@ -2187,6 +2202,7 @@ impl SegmentLifecycleCoordinator {
         id: SegmentId,
         merkle_root: Option<oceanfs_core::HashOutput>,
         storage_locations: Option<smallvec::SmallVec<[oceanfs_core::NodeId; 16]>>,
+        pool_id: Option<u32>,
     ) -> Result<(), TransitionError> {
         // Sealed-only: validate through the seal validator, then reject
         // non-Sealed explicitly (the validator returns Ok only for
@@ -2209,12 +2225,13 @@ impl SegmentLifecycleCoordinator {
             segment_id: id,
             merkle_root,
             storage_locations: storage_locations.clone(),
+            pool_id,
         });
         let pos = event_wal
             .append(evt)
             .await
             .map_err(|e| TransitionError::DurableWriteFailed(e.to_string()))?;
-        self.registry.fold_refresh(id, merkle_root, storage_locations)?;
+        self.registry.fold_refresh(id, merkle_root, storage_locations, pool_id)?;
         self.last_folded_pos.store(pos.packed(), std::sync::atomic::Ordering::Release);
         self.maybe_checkpoint().await;
         self.update_gauges();
@@ -3280,16 +3297,29 @@ mod tests {
         assert_eq!(coordinator.registry().get(sealed_id).unwrap().state, SegmentState::Sealed);
     }
 
+    /// d2 (ADR-0036 D2): `fold_refresh` applies `Some(pool_id)` to a
+    /// `Sealed` entry and leaves the `pool_id` unchanged for `None`.
+    #[tokio::test]
+    async fn fold_refresh_pool_id_updates_sealed_entry_only_on_some() {
+        let (_store, _event_wal, coordinator, _dir) = test_coordinator().await;
+        let id = SegmentId::new();
+        coordinator.request_reserve(id, SizeTier::Standard, 4, 2).await.unwrap();
+        coordinator.request_seal(id, test_metadata(id, true), None).await.unwrap();
+        assert_eq!(coordinator.registry().get(id).unwrap().metadata.pool_id, 0);
+
+        // None leaves the pool untouched (the storage_locations
+        // convention, unlike merkle_root's overwrite-always).
+        coordinator.registry().fold_refresh(id, None, None, None).unwrap();
+        assert_eq!(coordinator.registry().get(id).unwrap().metadata.pool_id, 0);
+
+        // Some mutates the pool durably-in-memory (the event append +
+        // fold is exercised by the relocation commit path).
+        coordinator.registry().fold_refresh(id, None, None, Some(5)).unwrap();
+        assert_eq!(coordinator.registry().get(id).unwrap().metadata.pool_id, 5);
+    }
+
     #[tokio::test]
     async fn retention_sweeps_under_concurrent_write_seal_churn() {
-        // The production write path under concurrency: several writers
-        // reserve → append data-WAL entries (position recorded) → seal
-        // through the coordinator. The seal work item only becomes
-        // visible to the seal worker after the position record (the
-        // caller-side enqueue ordering), so the machine-backed sweep
-        // must prune every WAL file outside the retention window —
-        // concurrent churn must never pin files via a stale `(0, 0)`
-        // seal position (the `wal_not_unbounded` regression).
         let dir = tempfile::tempdir().unwrap();
         let wal_config = WalConfig {
             data_dir: dir.path().join("wal"),

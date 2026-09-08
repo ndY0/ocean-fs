@@ -867,7 +867,7 @@ async fn seed_holder_entry(
 
     // Stamp the replicated holder set (durable refresh).
     ctx.lifecycle
-        .request_refresh_metadata(segment_id, merkle_root, Some(locations))
+        .request_refresh_metadata(segment_id, merkle_root, Some(locations), None) // no pool_id relocation (d2)
         .await
         .map_err(|e| format!("recovery location stamp failed for {segment_id}: {e}"))?;
     Ok(())
