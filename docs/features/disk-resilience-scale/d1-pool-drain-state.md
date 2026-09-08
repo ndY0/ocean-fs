@@ -1,14 +1,14 @@
 ---
 feature: "Pool Drain State (Registry Draining + Observability)"
 epic: "disk-resilience-scale"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies: ["d0-regression-gate"]
 adr: [0036, 0029, 0033]
 perf: []
 created: 2026-09-07
-updated: 2026-09-07
+updated: 2026-09-08
 ---
 
 # Pool Drain State (Registry Draining + Observability)
@@ -228,10 +228,11 @@ worker emptied the pool            ──▶ set_pool_empty ──▶ DrainState
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds in
+- [x] **Code:** `cargo build --all-targets` succeeds in
       `oceanfs-storage`, `oceanfs-node`, `oceanfs-server`; the d0 baseline
       stays green for the touched crates.
-- [ ] **Tests:** `cargo test -p oceanfs-storage -p oceanfs-node
+<!-- REVIEW: verified 2026-09-08 — build --all-targets green for storage/membership/node/server; storage lib 487, membership lib 100, node lib 100, server lib 245 all pass under --test-threads=1; fmt/clippy --lib clean; rustdoc -D warnings clean. -->
+- [x] **Tests:** `cargo test -p oceanfs-storage -p oceanfs-node
       -p oceanfs-server --lib -- --test-threads=1` passes; new tests cover
       every `pub` API path, and the scenario list in Scope is green,
       **including**: (1) placement excludes a `Draining` pool immediately;
@@ -246,26 +247,32 @@ worker emptied the pool            ──▶ set_pool_empty ──▶ DrainState
       Integration test at the crate boundary exercises the full
       PUT → mark-draining → read-through-drain → blocked/no-delete
       scenario.
-- [ ] **Docs:** Every `pub` item has `# Examples`; `#![deny(missing_docs)]`
+<!-- REVIEW: verified 2026-09-08 — scenarios (1)-(6) pinned by pool/placement.rs draining_pools_are_excluded, pool/health.rs (decide_transition + monitor tests), pool_manifest.rs draining_pool_maps_to_draining_status_string, repair.rs manifest_selector_excludes_nodes_with_only_draining_data_pools, pool/mod.rs metrics test (gauge 3 + blocked set/clear), and oceanfs-node/tests/pool_drain_state.rs (3 integration scenarios). Metric encoding decision: Draining = 3 via as_u8 (oceanfs_pool_status renders 3), NOT a separate oceanfs_pool_draining series. -->
+- [x] **Docs:** Every `pub` item has `# Examples`; `#![deny(missing_docs)]`
       passes (note: `PoolStatus` gains a third variant — check its rustdoc
       example table at `pool/mod.rs:125` and the manifest status-string
       doc at `oceanfs-membership/src/manifest.rs:89`).
-- [ ] **ADR:** ADR-0036 D1 (drain-state plumbing) + D6 (state machine,
+<!-- REVIEW: verified 2026-09-08 — rustdoc with RUSTDOCFLAGS="-D warnings" clean for storage/membership/node/server; PoolStatus::Draining=3 example at pool/mod.rs:171, manifest status-string doc updated at membership/src/manifest.rs:47-48; DrainState/DrainStateError + all PoolRegistry drain methods + Node::begin_pool_drain carry # Examples. -->
+- [x] **ADR:** ADR-0036 D1 (drain-state plumbing) + D6 (state machine,
       no-destructive-failure, detach-only-on-empty precondition, blocked
       reason surfaced) satisfied; ADR-0029 §D2/D3/D5 (pool status model,
       manifest carries state, routing on manifests) and ADR-0033
       (manifest-aware target selection excludes draining) satisfied.
-- [ ] **Perf:** frontmatter `perf: []`; prose constraints followed:
+<!-- REVIEW: verified 2026-09-08 — distinct PoolStatus::Draining (not a flag); placement excludes via Healthy-only filter with no policy change; reads status-agnostic (resolve_pool/read path untouched); health decide_transition Draining arm absorbing (health.rs:875-881) + mirror reconcile (health.rs:742-744); ConfirmedLoss beats Draining → Dead (unit + monitor tests); DrainState Idle/Draining/Detachable + blocked_reason + no-delete; data-role-only begin_drain (wal/meta/hints rejected); "draining" flows through manifest + routing_cache + repair selector existing "healthy"-only seams (ADR-0029 D2/D5, ADR-0033). -->
+- [x] **Perf:** frontmatter `perf: []`; prose constraints followed:
       registry status stays an atomic (`StoragePool.status: AtomicU8`,
       `pool/mod.rs:235` — no lock on the read path); `drain_state` reads
       are lock-free/short-lock; manifest rebuild is once-per-change
       (`pool_manifest.rs` module doc, perf rule 2.4); the blocked-reason
       path is a rare admin/worker event.
-- [ ] **Integration:** integration test at the node boundary proves a
+<!-- REVIEW: verified 2026-09-08 — StoragePool.status AtomicU8 (pool/mod.rs:258), is_draining atomic-only (drain.rs:471-473), drain_state()/mutations short RwLock on drain map with documented lock order (drain.rs:32-40, mod.rs:851-860), manifest rebuilt once per transition (node.rs:618-629), no lock held across scoring (placement.rs perf note). -->
+- [x] **Integration:** integration test at the node boundary proves a
       draining pool is excluded from placement while reads keep serving,
       the manifest re-gossips `"draining"`, and a blocked drain neither
       deletes nor half-removes. **No load suite is run locally** (PIPELINE
       §6).
+<!-- REVIEW: verified 2026-09-08 — oceanfs-node/tests/pool_drain_state.rs 3/3 pass (read-through-drain + exclusion + manifest; blocked drain no-delete + admin JSON + metrics; single-last-data-pool zero-healthy-manifest). No load/e2e suites invoked. Remaining LOW notes (non-blocking): Deviations section below still says "None yet" although the four open-question resolutions are recorded only in the Implementation Report; Node::begin_pool_drain skips manifest_cache.update(self) unlike the f8/health seams; narrow begin_drain validation TOCTOU vs concurrent ConfirmedLoss→Dead; no direct pool_status_from_u8 unit test. -->
+
 
 > **Lint & Doc Examples (non-gating):** `cargo clippy --lib -- -D warnings`
 > should pass on production code. Test-code clippy warnings (`.unwrap()`,
@@ -274,43 +281,102 @@ worker emptied the pool            ──▶ set_pool_empty ──▶ DrainState
 > hygiene tracked separately (see `guidelines/coding.md` §9.2.1). Do NOT
 > include Lint or Manual items in the Definition of Done checklist.
 
-## Open Questions for the Implementer
+## Resolved Decisions
 
-- **Health monitor vs. genuine failure mid-drain.** The sketch settles
-  "monitor never transitions a Draining pool to Degraded/Dead *from
-  drain-induced activity*", but leaves open: if a draining disk genuinely
-  confirms loss (ENOENT on a held segment, fsync EIO — the `ConfirmedLoss`
-  kinds at `pool/health.rs:281-289`) mid-drain, should the pool go Dead
-  (drain aborts, loss-announcement/heal path takes over — the operator's
-  disk was dying anyway) or stay `Draining` and let the drain block on
-  unreadable segments? Recommend: genuine `ConfirmedLoss` beats `Draining`
-  (do not mask a real loss behind an operator flag), the drain worker
-  observes the Dead transition and parks; record the resolution in the
-  Deviations section.
-- **Metric encoding for draining.** `oceanfs_pool_status` is 0/1/2 today;
-  either add `Draining=3` to `as_u8` (single source of truth, but changes
-  an existing gauge's value set) or add a separate
-  `oceanfs_pool_draining` series. Both are defensible; pick one and record
-  it (the DoD "Tests" bullet includes the chosen encoding).
-- **`Draining` on the f5 sealer snapshot.** Placement reads the registry
-  per seal, but the sealer may hold a `Vec<Arc<StoragePool>>` snapshot
-  between selections; confirm a pool that becomes `Draining` between the
-  snapshot and the reservation cannot receive a new segment (worst case: a
-  sealed segment lands on the draining pool and is simply relocated by d3
-  later — correct, but wasteful; note whether the snapshot is refreshed
-  per seal).
-- **In-flight active segments on a newly-Draining pool.** A segment that
-  was reserving/appending when the pool turned `Draining` cannot be
-  mid-seal "cancelled" into another pool (its id/geometry are bound to the
-  pool). Recommended resolution (surface, do not silently decide): let it
-  finish and seal; the registry entry then has `pool_id == source` and the
-  d3 worker relocates it like any other sealed segment. Document the
-  recommended behavior in the Deviations section once confirmed.
+The four questions posed under "Open Questions for the Implementer" in the
+proposal are resolved (2026-09-08) and recorded in full in
+[Deviations (accepted)](#deviations-accepted).
+
+1. **Metric encoding for draining.** `Draining = 3` via `as_u8` — a single
+   source of truth shared by the atomic status byte and the
+   `oceanfs_pool_status` gauge; the separate `oceanfs_pool_draining` series
+   was dropped. (Deviation 1.)
+2. **Health monitor vs. genuine failure mid-drain.** Genuine `ConfirmedLoss`
+   beats `Draining`: a confirmed-loss transition takes the pool
+   `Draining → Dead`, the Dead status event is emitted, and the d3/d4 drain
+   worker observes it and parks; degrading/clean signals remain absorbing.
+   (Deviation 2.)
+3. **`Draining` on the f5 sealer snapshot.** The sealer refreshes its
+   data-pool snapshot from the live registry per seal; the all-draining
+   `data_pools[0]` fallback is preserved; local write acceptance with no
+   healthy pool is deferred to d4. (Deviation 3.)
+4. **In-flight active segments on a newly-Draining pool.** Resolved by
+   documentation, no code: the segment finishes and seals on the source
+   pool; its registry entry keeps `pool_id == source` and the d3 worker
+   relocates it like any other sealed segment. (Deviation 4.)
 
 ## Deviations (accepted)
 
-None yet — this document is proposed. Expected-deviation candidates from
-the sketch's open questions: the health-monitor-vs-genuine-failure rule,
-the draining metric encoding, the sealer-snapshot caveat, and the
-in-flight-active-segment rule. Record each here with its resolution when
-the feature is implemented.
+Recorded 2026-09-08 after implementation review (PASS). Seven accepted
+deviations/resolutions, each validated by the stakeholder before
+implementation:
+
+### 1. Metric encoding: `Draining = 3` via `as_u8`
+
+Resolves the *metric encoding for draining* open question. Chose
+`as_u8: Draining = 3` (single source of truth); the atomic status byte and
+the `oceanfs_pool_status` gauge both render `3` while a pool drains. Help
+text, the rustdoc table, and the metric-registration tests were updated. The
+alternative separate `oceanfs_pool_draining` series was dropped as redundant
+with the new `oceanfs_pool_drain_state{pool_id}` (0=Idle, 1=Draining,
+2=Detachable) gauge. No automated consumer asserted the old 0/1/2 value set
+(verified).
+
+### 2. Health monitor vs. genuine failure mid-drain: `ConfirmedLoss` beats `Draining`
+
+Resolves the *health monitor vs. genuine failure mid-drain* open question.
+Genuine `ConfirmedLoss` beats `Draining`: `decide_transition(Draining, …)`
+is absorbing for degrading/clean signals but returns `Dead` on confirmed
+loss (ENOENT/EIO/device-unplug kinds); the monitor emits the Dead status
+event so the manifest re-gossips `"dead"`; and the d3/d4 drain worker
+observes the Dead transition and parks. `tick_pool` reconciles its mirror to
+`Draining` when the registry status is `Draining`, so a stale
+`Healthy`/`Degraded` mirror can never fight the operator's drain. A `Dead`
+transition does not clear the drain record (harmless in d1; no worker
+exists yet).
+
+### 3. Sealer all-pools-draining fallback (deferred boundary)
+
+Resolves the *`Draining` on the f5 sealer snapshot* open question. The f5
+sealer refreshes its data-pool snapshot from the live registry **per seal**,
+so a pool turning `Draining` between selections cannot receive a new segment
+while a healthy sibling exists. When **every** data pool is draining,
+`sealer.rs` still falls back to `data_pools[0]` (pre-existing behavior for
+"no eligible pool"). **Deferred to d4**: d4 decides local write acceptance
+while the last pool drains (d4 expects zero new local data mid-drain); d1's
+scenarios avoid writes after the last pool drains, and placement exclusion
+is pinned by tests while a healthy sibling exists.
+
+### 4. In-flight active segment on a newly-Draining pool (documented, no code)
+
+Resolves the *in-flight active segments on a newly-Draining pool* open
+question. A segment that was reserving/appending when its pool turned
+`Draining` cannot be mid-seal "cancelled" into another pool (its id/geometry
+are bound); it finishes and seals, its registry entry has
+`pool_id == source`, and the d3 worker relocates it like any other sealed
+segment.
+
+### 5. Node-level seam shape: `Node::begin_pool_drain`
+
+d1 ships the drain mutation as a node-layer seam
+`Node::begin_pool_drain(pool_id)` — registry `begin_drain` +
+once-per-change manifest rebuild + `set_self_manifest` (re-gossip) — rather
+than a new `on_pool_drain_change` callback field on the server `AdminState`.
+An AdminState hook would be dead code in d1 because the HTTP drain-mutation
+routes (`POST /admin/pools/{id}/drain`) only land in d3/d4; the read-only
+`GET /admin/pools` status route ships as specified. Note for d3/d4:
+`begin_pool_drain` does not update the local `ManifestCache` self-entry
+(gossip reaches peers; local placement reads the registry) — align with the
+f8/health seams when the worker-driven transition path is added.
+
+### 6. `set_drain_blocked` / `set_pool_empty` return `Result<(), DrainStateError>`
+
+Richer than the doc's untyped sketch: the two setters return
+`Result<(), DrainStateError>` so workers distinguish unknown / not-draining /
+Dead pools instead of silent no-ops.
+
+### 7. Status invariant on `Detachable`
+
+After `set_pool_empty`, the pool's status stays `Draining` (never back to
+`Healthy`) so placement cannot silently refill a pool the operator is
+removing; d5's detach removes the pool from the registry.
