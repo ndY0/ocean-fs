@@ -799,10 +799,16 @@ impl StorageModule {
         // DeleteEvent) and the `.dat` unlink — from the reaper's orphan
         // reclaim, the compactor's fully-dead path, OR a compaction
         // recovery action — leaves a `.dat` whose registry entry is gone
-        // (evicted after the delete grace) or `Deleted`. The retired
-        // reaper phase-2b periodic sweep used to reclaim these every
-        // cycle; this once-per-boot pass replaces it: list each data pool
-        // root and unlink any `.dat` that has no live registry entry.
+        // (evicted after the delete grace) or `Deleted`. A d2 relocation
+        // crash (ADR-0036 D3 copy→commit→unlink) leaves the same shape in
+        // reverse: a `Sealed` entry whose authoritative pool differs from
+        // the root the leftover copy was found on (pre-commit target /
+        // post-commit source). The retired reaper phase-2b periodic sweep
+        // used to reclaim these every cycle; this once-per-boot pass
+        // replaces it: list each data pool root and unlink any `.dat`
+        // [`oceanfs_storage::is_startup_residue`] classifies as residue
+        // (registry-unknown, durably-deleted, or pool-mismatched Sealed).
+        // Reserved files are left to the data-WAL row-3 adoption path.
         // Bounded by the on-disk file count, no objects-CF access, no
         // periodicity — exactly the ADR-0034 D4 shape (phase-2b retired
         // from the reaper cycle).
@@ -829,12 +835,12 @@ impl StorageModule {
                 };
                 let Ok(uuid) = uuid::Uuid::parse_str(id_str) else { continue };
                 let segment_id = oceanfs_core::SegmentId::from_uuid_bytes(*uuid.as_bytes());
-                let state = self.lifecycle_registry.get(segment_id).map(|e| e.state);
-                let is_residue = match state {
-                    None => true,                                         // the registry no longer knows it
-                    Some(oceanfs_storage::SegmentState::Deleted) => true, // durable delete, unlink pending
-                    _ => false, // Sealed/Reserved — legitimately present
-                };
+                let entry = self.lifecycle_registry.get(segment_id);
+                let is_residue = oceanfs_storage::is_startup_residue(
+                    entry.as_ref().map(|e| e.state),
+                    entry.as_ref().map(|e| e.metadata.pool_id).unwrap_or(0),
+                    pool_id,
+                );
                 if !is_residue {
                     continue;
                 }
