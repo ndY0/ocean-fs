@@ -1,14 +1,14 @@
 ---
 feature: "Segment Relocation (Durable pool_id Mutation)"
 epic: "disk-resilience-scale"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies: ["d1-pool-drain-state"]
 adr: [0036, 0025, 0030, 0032, 0034]
 perf: []
 created: 2026-09-07
-updated: 2026-09-07
+updated: 2026-09-08
 ---
 
 # Segment Relocation (Durable pool_id Mutation)
@@ -185,8 +185,9 @@ mover and d4's source-release story build on.
 
 | Crate | Change |
 |---|---|
-| `oceanfs-storage` | `segment/event_wal.rs` optional `pool_id` refresh section + framing constants + decode; `segment/lifecycle.rs` `fold_refresh` + `request_refresh_metadata` `pool_id` parameter; new `segment/relocate.rs` (`SegmentRelocator`); `segment/data_store.rs` explicit-target copy seam + guarded unlink; `io/segment_reader.rs` `purge_pool_root` (or notifier hook) |
-| `oceanfs-node` | (none direct — wiring of the relocator into the composition root for d3/d4; a reader-purge notifier closure may be wired here if the reader lives outside the relocator) |
+| `oceanfs-storage` | `segment/event_wal.rs` optional `pool_id` refresh section + framing constants + strict section decode; `segment/lifecycle.rs` `fold_refresh` + `request_refresh_metadata` `pool_id` parameter; new `segment/relocate.rs` (`SegmentRelocator`, `RelocateError`, `is_startup_residue`); `segment/data_store.rs` explicit-target guarded writer `write_segment_data_to_pool_guarded` + store-level `purge_reader_cache`; `lib.rs` exports `SegmentRelocator`, `RelocateError`, `is_startup_residue` |
+| `oceanfs-node` | additive touch (Deviation *Node/durability additive touch*): the once-per-boot residue sweep in `modules/storage.rs` delegates its per-file decision to the shared `oceanfs_storage::is_startup_residue` (:839); `None` `pool_id` arg added at two `request_refresh_metadata` call sites (`modules/wal_recovery.rs:870`, `repair.rs:581`). Composition-root wiring of the relocator is deferred to d3 |
+| `oceanfs-durability` | `None` `pool_id` arg added at two `request_refresh_metadata` call sites (`heal/worker.rs:443`, `repair.rs:511`) |
 | `oceanfs-core` | (none — `SegmentMetadata.pool_id` already exists in `types/metadata.rs:143`) |
 
 ## Interface (Public API)
@@ -194,22 +195,29 @@ mover and d4's source-release story build on.
 - `request_refresh_metadata(id: SegmentId, merkle_root: Option<HashOutput>,
   storage_locations: Option<SmallVec<[NodeId; 16]>>, pool_id: Option<u32>)`
   — additive `pool_id` parameter on the existing coordinator method
-  (`crates/oceanfs-storage/src/segment/lifecycle.rs:2100`); existing
+  (`crates/oceanfs-storage/src/segment/lifecycle.rs:2200`); existing
   callers pass `None`.
-- `pub struct SegmentRelocator` — constructed from the lifecycle
-  coordinator + the unified store; `pub async fn relocate(&self,
-  id: SegmentId, target_pool_id: u32) -> Result<(), RelocateError>`.
-  `<!-- TODO(spec): verify anchor -->` The exact constructor/wiring seam
-  (whether the relocator lives on the coordinator, the store, or a new
-  module; whether it needs `lock_segment` exposed `pub(crate)`) is for the
-  implementer to confirm against `data_store.rs:185` and the composition
-  root's builder ordering (`crates/oceanfs-node/src/modules/storage.rs`,
-  `modules/durability.rs`).
-- `DiskSegmentReader::purge_pool_root(&self, segment_id: SegmentId)` — new
-  pub method clearing the `pool_root_cache` entry
-  (`crates/oceanfs-storage/src/io/segment_reader.rs:170`), OR a
-  `PoolIdChangedNotifier` hook in the `StorageLocationsNotifier` pattern
-  (`lifecycle.rs:1351`).
+- `pub struct SegmentRelocator` (relocate.rs:123) — constructed by
+  `SegmentRelocator::new(coordinator: Arc<SegmentLifecycleCoordinator>,
+  store: Arc<DiskSegmentStore>)` (relocate.rs:131) over the lifecycle
+  coordinator + the concrete unified store; `pub async fn
+  relocate(&self, id: SegmentId, target_pool_id: u32) -> Result<(),
+  RelocateError>` (relocate.rs:162). `lock_segment` and
+  `write_segment_data_guarded` were already `pub`; the explicit-target
+  copy uses the crate-private `write_segment_data_to_pool_guarded`, so
+  the relocator stays same-crate. Composition-root wiring is deferred to
+  d3.
+- Reader-cache purge is a store-level seam, not a new reader method:
+  `DiskSegmentStore::purge_reader_cache(id)` (data_store.rs:353,
+  `pub(crate)`) forwards to the pre-existing `SegmentReader::purge_cache`
+  trait default (io/segment_reader.rs:90); `SegmentRelocator` invokes it
+  after the durable commit (relocate.rs:220). No `purge_pool_root`, no
+  notifier hook, no direct `DiskSegmentReader` reference (Resolved
+  Decision 2 / Deviation *Reader-cache purge seam*).
+- `pub fn is_startup_residue(state: Option<SegmentState>,
+  authoritative_pool_id: u32, found_pool_id: u32) -> bool` (relocate.rs:266)
+  — exported classifier the node boot sweep calls for each `.dat` found
+  on a data-pool root.
 - `pub enum RelocateError { TargetPoolMissing, TargetNotDataRole,
   SamePool, NotSealed, NotHeldLocally, SourceFileMissing, … }` —
   deterministic, worker-visible error taxonomy so d3/d4 can block with a
@@ -235,9 +243,9 @@ reads: resolve by registry pool_id → atomic source→target switch at the comm
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds in
+- [x] **Code:** `cargo build --all-targets` succeeds in
       `oceanfs-storage` (and `oceanfs-node` if wiring lands there).
-- [ ] **Tests:** `cargo test -p oceanfs-storage --lib -- --test-threads=1`
+- [x] **Tests:** `cargo test -p oceanfs-storage --lib -- --test-threads=1`
       passes; new tests cover every `pub` API path and the scenario list
       in Scope — including the backward-compatible decode of a
       pool_id-less refresh record (byte-exact), the fold update, the
@@ -246,10 +254,12 @@ reads: resolve by registry pool_id → atomic source→target switch at the comm
       serialization, and the **crash-matrix windows** (pre-commit /
       post-commit restarts leave exactly one authoritative copy; the other
       is reaped as unregistered residue with no data loss).
-- [ ] **Docs:** Every `pub` item has `# Examples`; `#![deny(missing_docs)]`
+<!-- REVIEW (iter 2): crash windows are end-to-end restarts — `precommit_crash_restart_fold_keeps_source_and_boot_sweep_reaps_target` (relocate.rs:611) and `postcommit_crash_restart_fold_keeps_target_and_boot_sweep_reaps_source` (:660): build the crash state, drop the env, `cold_restart` (:409 — reopen EventWal on the same dirs + `rebuild_from_events` boot fold), then `run_boot_sweep` (:423 — the modules/storage.rs loop: list root → `is_startup_residue` → `delete_shards_with_pool`) and assert exactly the authoritative `.dat` survives, byte-identical. Verified: 497 lib tests, 106 doctests green; the 7 relocate/crash/fold tests (6 in relocate.rs + fold Some/None lifecycle.rs:3303) and the 2 event-encoding tests pass. The iter-1 count slip (report said 3 vs 2 new encoding #[test] fns) is corrected. -->
+- [x] **Docs:** Every `pub` item has `# Examples`; `#![deny(missing_docs)]`
       passes; the refresh-record framing docs at `event_wal.rs` (constants
       `:125-139`) are updated for the optional section.
-- [ ] **ADR:** ADR-0036 D2 (optional `pool_id` on `MetadataRefreshEvent`,
+<!-- REVIEW: verified `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` green on storage/durability/node; framing docs + REFRESH_FLAG_* / REFRESH_POOL_ID_SIZE constants documented (event_wal.rs:180-189); the two runnable new doctests (RelocateError, is_startup_residue) pass; SegmentRelocator examples are `ignore` (non-gating per Lint note). -->
+- [x] **ADR:** ADR-0036 D2 (optional `pool_id` on `MetadataRefreshEvent`,
       one durable writer, length-discriminated backward-compatible decode,
       reader cache purge) and D3 (copy→commit→unlink, both crash windows
       safe, registry-driven switch) satisfied; ADR-0025 (event-WAL is the
@@ -257,16 +267,17 @@ reads: resolve by registry pool_id → atomic source→target switch at the comm
       pattern being reused), ADR-0032 D3 (unified store per-segment write
       lock), ADR-0034 (registry enumeration only; no disk scans; the 
       residue rule is boot-sweep/orphan-reaper-only) satisfied.
-- [ ] **Perf:** frontmatter `perf: []`; prose constraints: one registry
+- [x] **Perf:** frontmatter `perf: []`; prose constraints: one registry
       snapshot/fold per relocate (rare background op, perf rule 7.1);
       reader cache purge is O(1) per segment (`HashMap` remove); the copy
       uses the existing buffered/atomic write path — no new allocation
       regime; no accounting delta.
-- [ ] **Integration:** integration test at the storage crate boundary
+- [x] **Integration:** integration test at the storage crate boundary
       exercises a complete relocate under concurrent reads (continuous
       correctness across the commit switch, byte-identical read-back),
       plus the crash-window scenario against a real event-WAL + boot
       residue sweep. **No load suite is run locally** (PIPELINE §6).
+<!-- REVIEW (iter 2): DoD integration gap CLOSED. The concurrent-read relocate test passes (crates/oceanfs-storage/tests/segment_relocate.rs:93; storage integration 11/11 binaries green). The crash-window scenario is now a genuine restart + fold + boot sweep: relocate.rs:611/:660 drop the env after a simulated pre-/post-commit crash, `cold_restart` reopens the EventWal and replays the fold via `lifecycle.rebuild_from_events`, then `run_boot_sweep` (:423) replicates the node sweep loop (list each data-pool root → `is_startup_residue(state, entry.pool_id, found_pool)` → `delete_shards_with_pool`) and asserts exactly the authoritative `.dat` survives while the mismatched copy is reaped (byte-identical read-back). The sweep exercises the same shared classifier `is_startup_residue` (relocate.rs:266) that crates/oceanfs-node/src/modules/storage.rs:839 now calls — the node loop's only d2 change is that classifier swap. Residual LOW (non-blocking): the sweep loop in the test is a storage-level replica; no node-level test boots the literal `StorageModule::run_startup_recovery` over a d2 pool-mismatch residue, but the d2-specific decision logic (the classifier) is fully exercised against real roots/files. -->
 
 > **Lint & Doc Examples (non-gating):** `cargo clippy --lib -- -D warnings`
 > should pass on production code. Test-code clippy warnings (`.unwrap()`,
@@ -275,40 +286,95 @@ reads: resolve by registry pool_id → atomic source→target switch at the comm
 > hygiene tracked separately (see `guidelines/coding.md` §9.2.1). Do NOT
 > include Lint or Manual items in the Definition of Done checklist.
 
-## Open Questions for the Implementer
+## Resolved Decisions
 
-- **Where the relocate operation lives.** The coordinator appends events
-  but has no store write-lock access; the store has the lock but no
-  coordinator. The sketch's "dedicated store method" cannot commit alone,
-  so the primitive must be an orchestration over both. Recommend a new
-  same-crate `SegmentRelocator` (this doc's Interface), but confirm the
-  seam — specifically whether `DiskSegmentStore::lock_segment` /
-  `write_segment_data_guarded` need a visibility lift to `pub(crate)` and
-  how the composition root constructs the relocator after the
-  coordinator's event-WAL is attached (`lifecycle.rs:1312`
-  `with_event_wal`).
-- **Reader-cache purge mechanism.** Purge via a direct
-  `DiskSegmentReader::purge_pool_root` call (needs the reader Arc inside
-  the relocator) vs. a notifier hook in the `StorageLocationsNotifier`
-  pattern. If the reader is node-wired, the node must pass the purge
-  callback; decide and record.
-- **Residue-reap ordering on the boot sweep.** The doc asserts pre-commit
-  target residue and post-commit source residue are both registry-unknown
-  and safely reapable. Verify the boot residue sweep's exact rule
-  (`modules/storage.rs` `run_startup_recovery`) treats an
-  event-WAL-registered-but-fileless source correctly on the post-commit
-  window (the registry says target; the source `.dat` must be reaped as
-  residue, never interpreted as a data loss for the target).
-- **`relocate` re-entry after a crash.** After a pre-commit crash the
-  drain re-runs and re-copies; confirm re-copy over a leftover target
-  residue is idempotent (the atomic write path overwrites via temp+rename).
+Recorded 2026-09-08 at final spec close. The four questions posed under
+"Open Questions for the Implementer" are resolved; where the outcome is
+also recorded under [Deviations (accepted)](#deviations-accepted), the
+cross-reference is given.
+
+1. **Where the relocate operation lives.** A same-crate `SegmentRelocator`
+   over `Arc<SegmentLifecycleCoordinator>` + concrete
+   `Arc<DiskSegmentStore>` (relocate.rs:123-136). The store seams
+   `lock_segment` (data_store.rs:185) and `write_segment_data_guarded`
+   (data_store.rs:209) were already `pub` — no visibility lift was needed;
+   the new explicit-target guarded writer
+   `write_segment_data_to_pool_guarded` (data_store.rs:321, `pub(crate)`)
+   lands the copy on the target root before the commit. The node
+   retaining the concrete store `Arc` for the composition root is
+   deferred to d3.
+2. **Reader-cache purge mechanism.** A store-level
+   `DiskSegmentStore::purge_reader_cache(id)` (data_store.rs:353)
+   forwarding to the pre-existing `SegmentReader::purge_cache` trait
+   default seam (io/segment_reader.rs:90), invoked by `SegmentRelocator`
+   after the durable commit (relocate.rs:220). No node notifier; no
+   direct `DiskSegmentReader` reference is needed. (Deviation:
+   *Reader-cache purge seam*.)
+3. **Residue-reap ordering on the boot sweep.** The sweep's rule is
+   extended so a `Sealed` `.dat` whose authoritative pool differs from the
+   root it is found on is residue — `oceanfs_storage::is_startup_residue`
+   (relocate.rs:266) — and `Reserved` files are deliberately left to the
+   data-WAL row-3 adoption path. The node boot sweep now calls the shared
+   storage classifier (modules/storage.rs:839). (Deviations:
+   *Node/durability additive touch* and *Residue-sweep loop location*.)
+4. **`relocate` re-entry after a crash.** The explicit-target copy uses
+   the store's atomic temp+rename write (`write_dat_atomic`,
+   data_store.rs:535), which idempotently overwrites a leftover target
+   residue — re-running the drain after a pre-commit crash is safe.
 
 ## Deviations (accepted)
 
-None yet — this document is proposed. Expected-deviation candidates from
-the sketch's open questions (each is recorded and resolved during
-implementation): the wire encoding of the optional section (chosen
-length-discriminated form + framing constants), the no-accounting-delta
-confirmation, and the explicit-pool-override vs. dedicated store method
-placement (the doc chooses the dedicated same-crate relocator over a
-store method because the event commit needs the coordinator).
+Recorded 2026-09-08 after implementation review (PASS) — decisions
+validated by the stakeholder before implementation.
+
+- **Node/durability additive touch.** Contrary to the proposal's Crate
+  Impact estimate "`oceanfs-node` (none direct)", d2 necessarily touches
+  `oceanfs-node/src/modules/storage.rs` (the once-per-boot residue sweep
+  now delegates its per-file decision to the shared
+  `oceanfs_storage::is_startup_residue`, storage.rs:839 — required by the
+  Scope crash-window residue rule) and adds the `None` pool_id argument at
+  four `request_refresh_metadata` call sites
+  (`oceanfs-node/src/modules/wal_recovery.rs:870`,
+  `oceanfs-node/src/repair.rs:581`,
+  `oceanfs-durability/src/heal/worker.rs:443`,
+  `oceanfs-durability/src/repair.rs:511`). This is a consequence of the
+  additive-parameter Interface (existing callers pass `None`) plus the D2
+  boot-sweep residue rule, consistent with the Scope/Interface prose.
+  The Crate Impact table above reflects this touch.
+- **Reader-cache purge seam.** The Interface's `purge_pool_root` /
+  notifier option was implemented as `DiskSegmentStore::purge_reader_cache`
+  (`data_store.rs:353`) calling the pre-existing `SegmentReader::purge_cache`
+  default seam (`io/segment_reader.rs:90`), invoked by `SegmentRelocator`
+  after the durable commit; the injected reader (`TrackingReader` in
+  relocate.rs tests) records the purge, proving the cache is invalidated.
+- **Residue-sweep loop location.** The crash-window tests run a
+  storage-level replica of the node's boot sweep loop (relocate.rs:423)
+  using the same shared classifier `is_startup_residue` + store APIs; no
+  node-level test boots `StorageModule::run_startup_recovery` over a d2
+  pool-mismatch residue. Accepted: the d2 decision logic (the classifier)
+  is what the node sweep change introduced and is fully exercised.
+- **Decoder strict-tail change.** The extended `MetadataRefresh` section
+  parser is now strict at the tail: an unknown flag bit or trailing bytes
+  after the last declared section reject the record (event_wal.rs:695-777,
+  cursor == payload-end check at :766-770; regression test
+  `metadata_refresh_rejects_unknown_flags_and_trailing_bytes`, :2016) —
+  closing the previously permissive end of the ADR-0030 extended decode,
+  which silently accepted trailing bytes after the declared sections.
+  Legacy ADR-0030 records parse identically (their bytes are unchanged),
+  so the tightening only rejects records that were malformed-but-tolerated;
+  the Scope's backward-compatible "no section decodes to `None`" promise
+  is unaffected.
+- **Copy semantics: store read path + synthesized v1 header.** The copy
+  step is not a raw `.dat` byte copy: `SegmentRelocator` reads the source
+  data section through the store trait read path
+  (`read_segment_data`, data_store.rs:411 — header-verified, data-only)
+  and writes the target through the explicit-pool atomic writer, which
+  synthesizes a fresh v1 header over the data — 76 bytes, `blob_count 0`,
+  `index_offset` at the data end, checksum over the data — rather than
+  carrying the source file's header bytes over (`write_dat_at_root`
+  data_store.rs:241 + header synthesis at :252-257; `v1_header_bytes`
+  :511; `write_dat_atomic` :535; relocate copy step relocate.rs:194-207).
+  The target is the same normalized v1 file the existing whole-file write
+  path (heal/AE/re-rep) always produces; read-back is byte-identical at
+  the segment-data layer (asserted end-to-end by the unit and crash
+  tests).
