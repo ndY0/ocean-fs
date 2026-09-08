@@ -260,25 +260,6 @@ impl Harness {
         self.lifecycle.request_seal_with_contained(id, meta, None, Some(&contained)).await.unwrap();
     }
 
-    /// Seeds a membership-less Sealed old segment (the WAL-replayed shape
-    /// — not a compaction candidate).
-    async fn seed_sealed_old(&self, id: SegmentId, data: &[u8]) {
-        self.lifecycle.request_reserve(id, SizeTier::Standard, 4, 2).await.unwrap();
-        self.data_store.write_segment_data(&id, data).await.unwrap();
-        let meta = SegmentMetadata {
-            pool_id: 0,
-            total_bytes: data.len() as u64,
-            segment_id: id,
-            ec_k: 4,
-            ec_m: 2,
-            size_tier: SizeTier::Standard,
-            merkle_root: root_fn(data),
-            storage_locations: smallvec::SmallVec::new(),
-            sealed_at: Some(1_700_000_000_000),
-        };
-        self.lifecycle.request_seal_with_contained(id, meta, None, None).await.unwrap();
-    }
-
     /// Puts an object with a single chunk reference.
     fn put_object(&self, key: &str, chunk: ChunkRef) {
         let mut chunks = smallvec::SmallVec::new();

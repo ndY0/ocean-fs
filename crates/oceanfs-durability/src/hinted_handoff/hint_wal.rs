@@ -845,6 +845,7 @@ mod tests {
         assert_eq!(records.len(), 4, "the append after the torn tail must survive");
     }
 
+    #[tokio::test]
     async fn test_hint_wal_implements_wal_writer_trait() {
         use oceanfs_storage_api::WalWriter;
 
