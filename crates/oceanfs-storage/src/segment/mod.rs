@@ -15,6 +15,7 @@ pub mod index;
 pub mod lifecycle;
 pub(crate) mod parity_section;
 pub(crate) mod pool;
+pub mod relocate;
 pub(crate) mod repair;
 pub(crate) mod route_write;
 pub mod seal_pipeline;
@@ -39,6 +40,7 @@ pub use lifecycle::{
     TransitionError,
 };
 pub use pool::{SealingWork, SegmentPool};
+pub use relocate::{is_startup_residue, RelocateError, SegmentRelocator};
 pub use seal_pipeline::{spawn_seal_pipeline, SealMerkleBuilder, SealedSegmentNotifier};
 pub use sealer::{SealConfig, SegmentSealer};
 pub use shard::SegmentShard;

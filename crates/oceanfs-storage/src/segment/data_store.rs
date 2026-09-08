@@ -229,6 +229,22 @@ impl DiskSegmentStore {
     /// call this directly without owning the `.dat`).
     async fn write_unlocked(&self, segment_id: &SegmentId, data: &[u8]) -> Result<()> {
         let (root, pool_id) = self.resolve_pool(segment_id)?;
+        self.write_dat_at_root(segment_id, root, pool_id, data).await
+    }
+
+    /// The atomic whole-file write to an **explicit pool root**.
+    ///
+    /// Shared by [`Self::write_unlocked`] (registry-resolved root) and
+    /// the d2 relocation copy (explicit target root — `resolve_pool` is
+    /// skipped so the target copy can land before the commit flips the
+    /// registry's `pool_id`). Callers MUST hold the segment's write lock.
+    async fn write_dat_at_root(
+        &self,
+        segment_id: &SegmentId,
+        root: PathBuf,
+        pool_id: u32,
+        data: &[u8],
+    ) -> Result<()> {
         std::fs::create_dir_all(&root)
             .map_err(|e| Error::Io(std::io::Error::other(format!("{e}"))))?;
         let filename = format!("{segment_id}.dat");
@@ -283,6 +299,59 @@ impl DiskSegmentStore {
         // re-verified by the next chunk read.
         self.reader.purge_cache(segment_id);
         Ok(())
+    }
+
+    /// Writes a whole `.dat` copy to an **explicit target pool root**
+    /// under an already-held per-segment guard (d2 relocation copy step,
+    /// ADR-0036 D3).
+    ///
+    /// The target pool id is explicit — `resolve_pool` is skipped so the
+    /// copy can land on the target root BEFORE the durable commit flips
+    /// the registry's `pool_id` (reads keep resolving the source until
+    /// the commit; the target file is invisible to registry-driven
+    /// consumers until then). The atomic temp+rename write makes a
+    /// re-copy over a pre-commit leftover residue idempotent.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] when the guard owns a different
+    /// segment; [`Error::Internal`] when the target pool is not
+    /// registered; otherwise the write errors of the atomic whole-file
+    /// write.
+    pub(crate) async fn write_segment_data_to_pool_guarded(
+        &self,
+        segment_id: &SegmentId,
+        target_pool_id: u32,
+        data: &[u8],
+        guard: &SegmentWriteGuard,
+    ) -> Result<()> {
+        if guard.segment_id() != *segment_id {
+            return Err(Error::InvalidArgument(format!(
+                "segment write guard held for {} but the write targets {segment_id}",
+                guard.segment_id()
+            )));
+        }
+        let root = self.pool_root(target_pool_id, segment_id)?;
+        self.write_dat_at_root(segment_id, root, target_pool_id, data).await
+    }
+
+    /// The live pool registry (d2 relocation validation: target pool
+    /// existence + `data` role).
+    pub(crate) fn pool_registry(&self) -> Arc<PoolRegistry> {
+        Arc::clone(&self.pools)
+    }
+
+    /// The lifecycle registry (d2 relocation reads the entry's current
+    /// `pool_id` / state before the copy).
+    pub(crate) fn lifecycle_registry(&self) -> Arc<SegmentLifecycleRegistry> {
+        Arc::clone(&self.lifecycle_registry)
+    }
+
+    /// Purges the shared reader's per-segment caches (d2 relocation
+    /// commit): after the registry's `pool_id` flips, the next read must
+    /// re-resolve the new root instead of serving the cached source root.
+    pub(crate) fn purge_reader_cache(&self, segment_id: &SegmentId) {
+        self.reader.purge_cache(segment_id);
     }
 
     /// Resolves the owning pool root + pool id for a registered segment.

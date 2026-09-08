@@ -53,12 +53,12 @@ pub use pool::{
     resolve_pool_root, PlacementPolicy, PoolIdResolver, PoolRegistry, PoolStatus, StoragePool,
 };
 pub use segment::{
-    entry_is_garbage, ActiveSegment, CheckpointInfo, DataWalPos, DeleteEvent, DiskSegmentStore,
-    EventCheckpoint, EventWal, EventWalPos, EventWalReader, LifecycleEntry, RebuildOutcome,
-    ReserveEvent, SealConfig, SealEvent, SealingWork, SegmentEvent, SegmentHandle, SegmentHeader,
-    SegmentIndex, SegmentLifecycle, SegmentLifecycleCoordinator, SegmentLifecycleRegistry,
-    SegmentPool, SegmentReadSource, SegmentSealer, SegmentShard, SegmentSplitter, SegmentState,
-    SegmentWriteGuard, TierRouter, TransitionError,
+    entry_is_garbage, is_startup_residue, ActiveSegment, CheckpointInfo, DataWalPos, DeleteEvent,
+    DiskSegmentStore, EventCheckpoint, EventWal, EventWalPos, EventWalReader, LifecycleEntry,
+    RebuildOutcome, RelocateError, ReserveEvent, SealConfig, SealEvent, SealingWork, SegmentEvent,
+    SegmentHandle, SegmentHeader, SegmentIndex, SegmentLifecycle, SegmentLifecycleCoordinator,
+    SegmentLifecycleRegistry, SegmentPool, SegmentReadSource, SegmentRelocator, SegmentSealer,
+    SegmentShard, SegmentSplitter, SegmentState, SegmentWriteGuard, TierRouter, TransitionError,
 };
 pub use wal::{count_wal_files, WalEntry, WalReader, WalWriter}; // ---------------------------------------------------------------------------
                                                                 // Generated gRPC service stubs
