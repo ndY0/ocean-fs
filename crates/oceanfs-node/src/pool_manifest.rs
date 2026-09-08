@@ -18,10 +18,10 @@ use oceanfs_storage::{PoolRegistry, PoolStatus, StoragePool};
 ///
 /// One [`PoolManifest`] per registered pool, in registry (config)
 /// order, with the f2 enum values encoded as the wire constants
-/// (`PoolRole::as_str`, the `Healthy`/`Degraded`/`Dead` status strings).
-/// `incarnation` is the announcement incarnation the node joined with —
-/// the value that also rides the membership entry, so peers can tie the
-/// manifest to the restart it was declared with (ADR-0022 D1).
+/// (`PoolRole::as_str`, the `Healthy`/`Degraded`/`Dead`/`Draining` status
+/// strings). `incarnation` is the announcement incarnation the node joined
+/// with — the value that also rides the membership entry, so peers can tie
+/// the manifest to the restart it was declared with (ADR-0022 D1).
 ///
 /// # Examples
 ///
@@ -76,8 +76,13 @@ fn pool_manifest_from_pool(pool: &Arc<StoragePool>) -> PoolManifest {
         PoolStatus::Healthy => "healthy",
         PoolStatus::Degraded => "degraded",
         PoolStatus::Dead => "dead",
+        // d1 (ADR-0036 D6): a draining pool is not a placement target —
+        // peers see `"draining"` and their existing manifest-aware seams
+        // (repair selector, routing cache, peer selection) already treat
+        // any non-`"healthy"` data pool as excluded.
+        PoolStatus::Draining => "draining",
         // Non-exhaustive (ADR-0029 §D3 reserves transitions): treat
-        // unknown statuses as Healthy — Phase A has no other variants.
+        // unknown statuses as Healthy.
         _ => "healthy",
     };
     PoolManifest::new(
@@ -178,6 +183,48 @@ mod tests {
 
         // A Healthy registry yields an available manifest.
         assert!(!manifest.node_unavailable(), "healthy node is available");
+    }
+
+    /// d1 (ADR-0036 D6): a `Draining` data pool maps to the `"draining"`
+    /// status string, so peers see it as not-a-placement-target through
+    /// the existing manifest-aware seams.
+    #[test]
+    fn draining_pool_maps_to_draining_status_string() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path().join("data");
+        let roots = [
+            tmp.path().join("nvme0"),
+            tmp.path().join("nvme1"),
+            tmp.path().join("optane0"),
+            tmp.path().join("optane1"),
+            tmp.path().join("hints0"),
+        ];
+        let storage = StorageConfig {
+            pools: vec![
+                pool("data-0", PoolRole::Data, &roots[0]),
+                pool("data-1", PoolRole::Data, &roots[1]),
+                pool("journal", PoolRole::Wal, &roots[2]),
+                pool("meta", PoolRole::Metadata, &roots[3]),
+                pool("hints", PoolRole::Hints, &roots[4]),
+            ],
+            missing_root_policy: MissingRootPolicy::Fatal,
+        };
+        let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
+
+        // Healthy before the drain.
+        let manifest = build_node_manifest(1, &registry);
+        assert_eq!(manifest.pools()[0].status(), "healthy");
+
+        // After begin_drain the row reads "draining"; the sibling and the
+        // pinned roles are unaffected.
+        registry.begin_drain(0).expect("begin drain");
+        let manifest = build_node_manifest(2, &registry);
+        assert_eq!(manifest.pools()[0].status(), "draining");
+        assert_eq!(manifest.pools()[1].status(), "healthy");
+        assert_eq!(manifest.pools()[2].status(), "healthy", "the wal pool is untouched");
+
+        // The node itself stays available (draining is not Dead).
+        assert!(!manifest.node_unavailable(), "a draining data pool does not take the node down");
     }
 
     /// g8 (metadata-loss-recovery): the node-level `node_unavailable`

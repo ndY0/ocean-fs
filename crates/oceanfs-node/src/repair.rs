@@ -732,6 +732,45 @@ mod tests {
         );
     }
 
+    /// d1 (ADR-0036 D6): the manifest selector excludes a node whose only
+    /// data pools are draining — `"draining"` flows through the existing
+    /// `status() == "healthy"` seam, so a retiring node is never chosen to
+    /// receive a new copy.
+    #[test]
+    fn manifest_selector_excludes_nodes_with_only_draining_data_pools() {
+        use oceanfs_membership::manifest::{NodeManifest, PoolManifest};
+
+        let membership = make_membership("n1");
+        upsert(&membership, "n2");
+        upsert(&membership, "n3");
+        // n2: two data pools, both draining (the pool is retiring and must
+        // not receive new copies). n3: healthy data pool.
+        membership.set_peer_manifest(
+            NodeId::new("n2"),
+            NodeManifest::from_pools(
+                1,
+                &[
+                    PoolManifest::new(0, "data", "draining", false, 999 << 30, 1),
+                    PoolManifest::new(1, "data", "draining", false, 999 << 30, 1),
+                ],
+            ),
+        );
+        membership.set_peer_manifest(
+            NodeId::new("n3"),
+            NodeManifest::from_pools(
+                1,
+                &[PoolManifest::new(0, "data", "healthy", false, 100 << 30, 1)],
+            ),
+        );
+
+        let selector = ManifestRepairTargetSelector::new(membership, NodeId::new("n1"));
+        assert_eq!(
+            selector.pick_repair_target(&SegmentId::new(), &[NodeId::new("n4")]),
+            Some(NodeId::new("n3")),
+            "a node whose data pools all drain is never a repair target"
+        );
+    }
+
     /// g8: the manifest selector excludes `node_unavailable` candidates
     /// even when they report a healthy data pool (they cannot persist the
     /// new copy's object row).

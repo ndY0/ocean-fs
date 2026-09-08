@@ -613,4 +613,28 @@ mod tests {
         let clean = data_manifest("healthy", false, 1);
         assert!(!is_write_degraded(&clean));
     }
+
+    /// d1 (ADR-0036 D6): a `"draining"` data pool is not counted as a
+    /// healthy data pool — a node whose data pools all drain reports zero
+    /// healthy pools and is excluded as a write target through the
+    /// existing manifest-derived gates.
+    #[test]
+    fn draining_data_pools_do_not_count_as_healthy() {
+        let all_draining = data_manifest("draining", false, 2);
+        assert_eq!(healthy_data_pools(&all_draining), 0, "draining is not healthy");
+        assert!(
+            !can_accept_writes(&all_draining),
+            "a node whose data pools all drain cannot accept new writes"
+        );
+
+        // A mixed manifest counts only the healthy pool.
+        let mixed = NodeManifest::from_pools(
+            1,
+            &[
+                PoolManifest::new(0, "data", "draining", false, 1 << 40, 1),
+                PoolManifest::new(1, "data", "healthy", false, 1 << 40, 1),
+            ],
+        );
+        assert_eq!(healthy_data_pools(&mixed), 1);
+    }
 }

@@ -256,6 +256,36 @@ pub struct SegmentReport {
     pub by_tier: HashMap<SizeTier, u64>,
 }
 
+/// Response for `GET /admin/pools` (d1, ADR-0036 D6).
+#[derive(Debug, Clone, Serialize)]
+pub struct PoolStatusView {
+    /// One entry per registered pool, in config (pool-id) order.
+    pub pools: Vec<PoolStatusEntry>,
+}
+
+/// A single pool's status + drain lifecycle in the `GET /admin/pools`
+/// view.
+#[derive(Debug, Clone, Serialize)]
+pub struct PoolStatusEntry {
+    /// Stable pool id.
+    pub pool_id: u32,
+    /// Human-readable pool name from the topology config.
+    pub name: String,
+    /// Pool purpose constant (`"data" | "wal" | "metadata" | "hints"`).
+    pub role: String,
+    /// Pool status constant (`"healthy" | "degraded" | "dead" |
+    /// "draining"`).
+    pub status: String,
+    /// Role-consequence flag (wal pool Dead rejects writes).
+    pub write_degraded: bool,
+    /// Drain lifecycle constant (`"idle" | "draining" | "detachable"`).
+    pub drain_state: String,
+    /// Whether the drain is parked on a missing eligible target.
+    pub drain_blocked: bool,
+    /// Human-readable blocked-reason text, when the drain is blocked.
+    pub blocked_reason: Option<String>,
+}
+
 /// Fixed deterministic probe hashes for the ring-consistency check.
 ///
 /// The Phase 3 load test (`e2e/tests/load_cluster_churn.rs`) queries
@@ -687,9 +717,11 @@ impl AdminHandler {
             .route("/admin/acceleration", get(acceleration_status))
             .route("/admin/buckets/{bucket}/policy", put(set_bucket_policy));
 
-        // Runtime pool attach (ADR-0029 §D8, f8) — storage feature only.
+        // Pool status view + runtime pool attach (ADR-0029 §D8, f8; d1's
+        // read-only drain-state surface, ADR-0036 D6) — storage feature
+        // only.
         #[cfg(feature = "storage")]
-        let router = router.route("/admin/pools", post(attach_pool));
+        let router = router.route("/admin/pools", get(pool_status_view).post(attach_pool));
 
         // Live wal-pool remount (g7, ADR-0035) — storage feature only.
         #[cfg(feature = "storage")]
@@ -929,6 +961,64 @@ async fn acceleration_status(State(_state): State<AdminState>) -> impl IntoRespo
     let status =
         AccelerationStatus { active_tier: "CpuSimd".into(), fallback_count: 0, healthy: true };
     Json(status).into_response()
+}
+
+/// Maps a pool's status to its wire/status constant. Mirrors the node's
+/// manifest encoding (a `Draining` pool reads `"draining"`); unknown
+/// statuses read as `"healthy"` (the enum is `#[non_exhaustive]`).
+fn pool_status_str(status: oceanfs_storage::PoolStatus) -> &'static str {
+    match status {
+        oceanfs_storage::PoolStatus::Healthy => "healthy",
+        oceanfs_storage::PoolStatus::Degraded => "degraded",
+        oceanfs_storage::PoolStatus::Dead => "dead",
+        oceanfs_storage::PoolStatus::Draining => "draining",
+        _ => "healthy",
+    }
+}
+
+/// `GET /admin/pools` — per-pool status + drain lifecycle view (d1,
+/// ADR-0036 D6).
+///
+/// Lists every registered pool with its status and drain state:
+/// `drain_state` (`"idle" | "draining" | "detachable"`),
+/// `drain_blocked`, and the human-readable `blocked_reason` (the
+/// no-destructive-failure surface — a blocked drain parks with its reason
+/// and deletes nothing). Read-only in d1: the drain *mutation* verbs
+/// (`POST /admin/pools/{id}/drain`, `/detach`) land with the d3/d4/d5
+/// features.
+///
+/// Response codes: `200` with the pool list; `501` when the pool surface
+/// is not wired (no storage feature or no `with_pool_attach`).
+#[cfg(feature = "storage")]
+#[instrument(skip(state))]
+async fn pool_status_view(State(state): State<AdminState>) -> impl IntoResponse {
+    let Some(registry) = state.pool_registry.as_ref() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": "pool status is not configured on this node",
+            })),
+        )
+            .into_response();
+    };
+
+    let pools = registry.pools();
+    let mut entries = Vec::with_capacity(pools.len());
+    for pool in pools {
+        let pool_id = pool.id();
+        let drain = registry.drain_state(pool_id);
+        entries.push(PoolStatusEntry {
+            pool_id,
+            name: pool.name().to_string(),
+            role: pool.role().as_str().to_string(),
+            status: pool_status_str(pool.status()).to_string(),
+            write_degraded: pool.write_degraded(),
+            drain_state: drain.as_str().to_string(),
+            drain_blocked: drain.is_blocked(),
+            blocked_reason: drain.blocked_reason().map(str::to_string),
+        });
+    }
+    Json(PoolStatusView { pools: entries }).into_response()
 }
 
 /// `POST /admin/pools` — attach a storage pool at runtime (ADR-0029 §D8,

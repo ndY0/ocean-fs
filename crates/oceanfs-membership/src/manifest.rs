@@ -40,9 +40,11 @@ pub struct PoolManifest {
     id: u32,
     /// Pool purpose constant: `"data" | "wal" | "metadata" | "hints"`.
     role: String,
-    /// Pool health constant: `"healthy" | "degraded" | "dead"` (Phase A
-    /// always `"healthy"`; transitions land with Phase B's health
-    /// monitor).
+    /// Pool health constant: `"healthy" | "degraded" | "dead" | "draining"`
+    /// (Phase A always `"healthy"`; transitions land with Phase B's health
+    /// monitor and Phase C's drain lifecycle — `"draining"` is the
+    /// operator-initiated ADR-0036 D6 state, excluded as a placement
+    /// target by every manifest-aware consumer).
     status: String,
     /// Role-consequence flag (ADR-0029 D3); Phase A: always `false`.
     write_degraded: bool,
@@ -86,7 +88,8 @@ impl PoolManifest {
         &self.role
     }
 
-    /// The pool health constant (`"healthy" | "degraded" | "dead"`).
+    /// The pool health constant (`"healthy" | "degraded" | "dead" |
+    /// "draining"`).
     pub fn status(&self) -> &str {
         &self.status
     }

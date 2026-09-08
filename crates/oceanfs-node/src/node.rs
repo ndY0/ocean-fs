@@ -547,6 +547,88 @@ impl Node {
         self.storage.registry.clone()
     }
 
+    /// Begins a pool drain and re-declares the node's manifest (d1,
+    /// ADR-0036 D6).
+    ///
+    /// Wraps [`PoolRegistry::begin_drain`](oceanfs_storage::PoolRegistry::begin_drain)
+    /// with the same manifest rebuild + re-gossip the f8 attach hook and
+    /// the health-consequence path perform (perf rule 2.4: once per
+    /// change), so peers see the pool's `"draining"` row immediately — a
+    /// draining pool is excluded as a placement/repair/write target by
+    /// every manifest-aware consumer. Reads keep serving from the pool
+    /// until the drain workers (d3/d4) empty it.
+    ///
+    /// This is d1's operator seam: the drain *mutation routes* (admin
+    /// `POST /admin/pools/{id}/drain`) and the mover workers of d3/d4
+    /// invoke this same path.
+    ///
+    /// # Errors
+    ///
+    /// [`oceanfs_storage::DrainStateError`]: unknown pool, non-`data`
+    /// pool, `Dead` pool (confirmed loss beats the operator flag), or a
+    /// pool that is already draining.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn example() {
+    /// use oceanfs_core::NodeConfig;
+    /// use oceanfs_node::Node;
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # fn storage_pools(tmp: &std::path::Path) -> oceanfs_core::StorageConfig {
+    /// #     fn pool(name: &str, role: oceanfs_core::PoolRole, root: std::path::PathBuf) -> oceanfs_core::StoragePoolConfig {
+    /// #         oceanfs_core::StoragePoolConfig {
+    /// #             name: name.into(),
+    /// #             role,
+    /// #             root,
+    /// #             weight: None,
+    /// #             tech: Default::default(),
+    /// #             health: Default::default(),
+    /// #         }
+    /// #     }
+    /// #     oceanfs_core::StorageConfig {
+    /// #         pools: vec![
+    /// #             pool("data-0", oceanfs_core::PoolRole::Data, tmp.join("pool-data")),
+    /// #             pool("wal-0", oceanfs_core::PoolRole::Wal, tmp.join("pool-wal")),
+    /// #             pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.join("pool-meta")),
+    /// #             pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.join("pool-hints")),
+    /// #         ],
+    /// #         missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+    /// #     }
+    /// # }
+    /// # let config = NodeConfig {
+    /// #     data_dir: tmp.path().join("data"),
+    /// #     listen_addr: "127.0.0.1:0".into(),
+    /// #     grpc_listen_addr: "127.0.0.1:0".into(),
+    /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     storage: storage_pools(&tmp.path()),
+    /// #     ..NodeConfig::default()
+    /// # };
+    /// let node = Node::start(config).await.expect("node");
+    /// let data_id = node.pool_registry().pool_by_role(oceanfs_core::PoolRole::Data)
+    ///     .expect("a data pool").id();
+    /// node.begin_pool_drain(data_id).expect("begin drain");
+    /// assert!(node.pool_registry().is_draining(data_id));
+    /// assert!(node.self_manifest()
+    ///     .expect("manifest").pools().iter()
+    ///     .any(|p| p.id() == data_id && p.status() == "draining"));
+    /// node.shutdown().await.expect("shutdown");
+    /// # }
+    /// ```
+    pub fn begin_pool_drain(&self, pool_id: u32) -> Result<(), oceanfs_storage::DrainStateError> {
+        self.storage.registry.begin_drain(pool_id)?;
+        // Re-declare the manifest once (perf rule 2.4). The incarnation
+        // mirrors the f8/health change paths: the current membership
+        // incarnation once the node has joined (the running-node case); 0
+        // only before any self entry exists.
+        let incarnation =
+            self.membership.incarnation_of(&self.node_id()).map(|inc| inc.value()).unwrap_or(0);
+        let manifest =
+            crate::pool_manifest::build_node_manifest(incarnation, &self.storage.registry);
+        self.membership.set_self_manifest(manifest);
+        Ok(())
+    }
+
     /// Returns the g1 per-pool I/O signal observer (ADR-0029 §D3) the
     /// seal pipeline records write/fsync signals into.
     ///
