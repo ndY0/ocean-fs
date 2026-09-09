@@ -73,7 +73,7 @@
 //! ```
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -834,26 +834,42 @@ async fn load_cluster_churn() {
     // For each node id, the incarnation must never decrease across the
     // recorded views (a restart bumps the incarnation — it must not go
     // backward, which would indicate HLC/incarnation clock skew).
+    //
+    // Monotonicity is checked PER OBSERVER: each poll round records one
+    // `/admin/cluster` view per node, and a view from node A is that
+    // node's OWN membership clock. Comparing views across observers on a
+    // single timeline is invalid — right after a restart, the restarted
+    // node's self view already carries the new incarnation while a peer
+    // that has not yet processed the gossip still reports the old one
+    // (transient skew, resolved within a gossip round). A real clock
+    // regression is one that a SINGLE observer sees over time (its view of
+    // a subject node going backward); that is what this assertion catches.
     let mut incarnation_violation: Option<String> = None;
     {
-        let mut seen: HashMap<String, u64> = HashMap::new();
-        let mut sorted_views = poller_state.views.clone();
-        sorted_views.sort_by(|a, b| a.t_secs.total_cmp(&b.t_secs));
-        for view in &sorted_views {
-            for (id, _state, incarnation) in &view.members_detail {
-                match seen.get(id) {
-                    Some(prev) if *prev > *incarnation => {
-                        incarnation_violation =
-                            Some(format!("node {id}: incarnation {prev} -> {incarnation}"));
-                        break;
-                    }
-                    _ => {
-                        seen.insert(id.clone(), *incarnation);
+        // Group each round's per-node views by the observer that produced
+        // them, then check each observer's own timeline independently.
+        let mut by_observer: BTreeMap<usize, Vec<&ClusterViewSnapshot>> = BTreeMap::new();
+        for view in &poller_state.views {
+            by_observer.entry(view.node_index).or_default().push(view);
+        }
+        'observer: for (observer, mut views) in by_observer {
+            views.sort_by(|a, b| a.t_secs.total_cmp(&b.t_secs));
+            let mut seen: HashMap<String, u64> = HashMap::new();
+            for view in &views {
+                for (id, _state, incarnation) in &view.members_detail {
+                    match seen.get(id) {
+                        Some(prev) if *prev > *incarnation => {
+                            incarnation_violation = Some(format!(
+                                "node {id}: incarnation {prev} -> {incarnation} \
+                                 (observer node_index {observer})"
+                            ));
+                            break 'observer;
+                        }
+                        _ => {
+                            seen.insert(id.clone(), *incarnation);
+                        }
                     }
                 }
-            }
-            if incarnation_violation.is_some() {
-                break;
             }
         }
     }
