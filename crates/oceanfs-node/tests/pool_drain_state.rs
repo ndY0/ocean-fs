@@ -59,7 +59,7 @@ fn config_with_data_pools(
     pools.push(pool("meta", PoolRole::Metadata, &tmp.path().join("optane1")));
     pools.push(pool("hints", PoolRole::Hints, &tmp.path().join("hints0")));
 
-    let config = NodeConfig {
+    let mut config = NodeConfig {
         data_dir,
         listen_addr: "127.0.0.1:0".into(),
         grpc_listen_addr: "127.0.0.1:0".into(),
@@ -67,6 +67,12 @@ fn config_with_data_pools(
         storage: StorageConfig { pools, missing_root_policy: MissingRootPolicy::Fatal },
         ..NodeConfig::default()
     };
+    // d1 is the drain-STATE feature: it asserts blocked/no-delete and
+    // static placement while a pool is Draining. Since d3 registers a live
+    // `"drain_intra"` Tier-1 task (default 1 s cadence), these scenarios
+    // pin the worker effectively off so its relocation can never race the
+    // state assertions mid-scenario.
+    config.durability.drain_interval_sec = 3600;
     (config, data_roots)
 }
 
@@ -156,7 +162,7 @@ async fn read_through_drain_placement_exclusion_and_manifest() {
     assert!(node.pool_registry().is_draining(0));
     assert_eq!(
         node.pool_registry().drain_state(0),
-        oceanfs_storage::DrainState::Draining { blocked_reason: None }
+        oceanfs_storage::DrainState::Draining { blocked_reason: None, paused: false }
     );
 
     // The node's manifest re-declared: pool 0 reads "draining", the
