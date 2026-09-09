@@ -661,7 +661,7 @@ impl SegmentReplicator {
         }
 
         if unacked.is_empty() {
-            self.stamp_locations(segment_id, &locations);
+            self.stamp_locations(segment_id, &locations).await;
             self.pushed_total.add(1);
             Ok(())
         } else {
@@ -669,15 +669,19 @@ impl SegmentReplicator {
         }
     }
 
-    /// Stamps the holder set on the registry entry (Sealed-only; a
-    /// concurrently deleted segment is left untouched).
-    fn stamp_locations(&self, segment_id: SegmentId, locations: &[NodeId]) {
+    /// Durably stamps the holder set on the registry entry (Sealed-only; a
+    /// concurrently deleted segment is left untouched). The stamp rides
+    /// the event-WAL (`MetadataRefresh`) so a restart folds it back — the
+    /// node must remember it holds the segment (g4 live-count, the read
+    /// path, and the d4 cluster drain's held-segment enumeration all
+    /// depend on it).
+    async fn stamp_locations(&self, segment_id: SegmentId, locations: &[NodeId]) {
         let mut set = smallvec::SmallVec::with_capacity(4);
         for loc in locations {
             set.push(loc.clone());
         }
-        match self.lifecycle.set_storage_locations(segment_id, set) {
-            Ok(()) => debug!(segment_id = %segment_id, "storage_locations stamped"),
+        match self.lifecycle.persist_storage_locations(segment_id, set).await {
+            Ok(()) => debug!(segment_id = %segment_id, "storage_locations stamped durably"),
             Err(e) => warn!(
                 segment_id = %segment_id,
                 error = ?e,

@@ -1045,14 +1045,15 @@ impl SegmentRpc for SegmentGrpcService {
                             "push_sealed_segment: failed to seal replica segment"
                         );
                     } else {
-                        // The seal carried the pushed holder set in the
-                        // metadata, but the g4 holder-index notifier only
-                        // fires on `set_storage_locations` — call it
-                        // explicitly so the reconciliation loop observes
-                        // the pushed locations (the fresh-registration
-                        // path).
+                        // The seal carries the pushed holder set in the
+                        // metadata, but the holder set is NOT part of the
+                        // durable SealEvent — persist it through the
+                        // event-WAL refresh so a restart folds it back,
+                        // and fire the g4 holder-index notifier (which
+                        // only runs on the storage_locations stamp).
                         if let Err(stamp_err) = lifecycle
-                            .set_storage_locations(segment_id, meta.storage_locations.clone())
+                            .persist_storage_locations(segment_id, meta.storage_locations.clone())
+                            .await
                         {
                             tracing::warn!(
                                 segment_id = %segment_id,
@@ -1065,9 +1066,11 @@ impl SegmentRpc for SegmentGrpcService {
                 PushRegistration::Existing { lifecycle, meta, error } => {
                     // Without the holder set, g4's live-copy count on
                     // this node would see an empty set and compute
-                    // live=0 → a re-replication storm.
-                    if let Err(stamp_err) =
-                        lifecycle.set_storage_locations(segment_id, meta.storage_locations.clone())
+                    // live=0 → a re-replication storm. Persist durably so
+                    // the holder knowledge survives a restart.
+                    if let Err(stamp_err) = lifecycle
+                        .persist_storage_locations(segment_id, meta.storage_locations.clone())
+                        .await
                     {
                         tracing::warn!(
                             segment_id = %segment_id,

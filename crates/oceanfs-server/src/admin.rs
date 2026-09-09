@@ -435,11 +435,20 @@ type WalRemountCallback = Arc<
         + Sync,
 >;
 
-/// A pool drain begin callback (d3, ADR-0036 C1a): the composition
-/// root's `mark-Draining` hook — registry `begin_drain` + the manifest
-/// rebuild/re-gossip the d1 `Node::begin_pool_drain` seam performs.
+/// A pool drain begin callback (d3/d4, ADR-0036 C1a/C1b): the composition
+/// root's `mark-Draining` hook — registry `begin_drain[_with_mode]` + the
+/// manifest rebuild/re-gossip the d1 `Node::begin_pool_drain` seam
+/// performs. The mode discriminator routes the pool to the intra-node
+/// (d3) or cluster (d4) mover.
 #[cfg(feature = "storage")]
-type PoolDrainBeginCallback = Arc<dyn Fn(u32) -> Result<(), String> + Send + Sync>;
+type PoolDrainBeginCallback =
+    Arc<dyn Fn(u32, oceanfs_storage::DrainMode) -> Result<(), String> + Send + Sync>;
+
+/// A node-level drain begin callback (d4, ADR-0036 C1b): marks EVERY data
+/// pool of this node `Draining` in `Cluster` mode and re-gossips the
+/// manifest once (the pre-`leave` retirement step).
+#[cfg(feature = "storage")]
+type NodeDrainBeginCallback = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 /// Shared state for admin handlers.
 #[derive(Clone)]
@@ -483,13 +492,18 @@ pub(crate) struct AdminState {
     /// surface is not wired (`POST /admin/wal-remount` → 501).
     #[cfg(feature = "storage")]
     pub on_wal_remount: Option<WalRemountCallback>,
-    /// Mark-draining hook (d3): registry `begin_drain` + manifest
-    /// rebuild/re-gossip, wired by the composition root exactly like the
-    /// d1 `Node::begin_pool_drain` seam. `None` when the surface is not
-    /// wired (`POST /admin/pools/{id}/drain` → 501). Pause/resume need no
-    /// callback — they toggle the registry drain record directly.
+    /// Mark-draining hook (d3/d4): registry `begin_drain[_with_mode]` +
+    /// manifest rebuild/re-gossip, wired by the composition root exactly
+    /// like the d1 `Node::begin_pool_drain` seam. `None` when the surface
+    /// is not wired (`POST /admin/pools/{id}/drain` → 501). Pause/resume
+    /// need no callback — they toggle the registry drain record directly.
     #[cfg(feature = "storage")]
     pub on_pool_drain_begin: Option<PoolDrainBeginCallback>,
+    /// Node-level drain begin hook (d4): marks every data pool `Draining`
+    /// in `Cluster` mode + one manifest re-gossip. `None` when the surface
+    /// is not wired (`POST /admin/nodes/{node}/drain` → 501).
+    #[cfg(feature = "storage")]
+    pub on_node_drain_begin: Option<NodeDrainBeginCallback>,
     /// L1 object cache for cache stats (cache feature only).
     #[cfg(feature = "cache")]
     pub object_cache: Option<Arc<ObjectCache>>,
@@ -540,6 +554,8 @@ impl AdminHandler {
                 on_wal_remount: None,
                 #[cfg(feature = "storage")]
                 on_pool_drain_begin: None,
+                #[cfg(feature = "storage")]
+                on_node_drain_begin: None,
                 #[cfg(feature = "cache")]
                 object_cache: None,
                 #[cfg(feature = "cache")]
@@ -580,6 +596,8 @@ impl AdminHandler {
                 on_wal_remount: None,
                 #[cfg(feature = "storage")]
                 on_pool_drain_begin: None,
+                #[cfg(feature = "storage")]
+                on_node_drain_begin: None,
                 #[cfg(feature = "cache")]
                 object_cache: None,
                 #[cfg(feature = "cache")]
@@ -695,15 +713,45 @@ impl AdminHandler {
         self
     }
 
-    /// Wires the pool drain-mutation surface (d3, ADR-0036 C1a).
+    /// Wires the pool drain-mutation surface (d3/d4, ADR-0036 C1a/C1b).
     ///
     /// `on_begin_drain` is the composition root's mark-`Draining` hook —
-    /// registry `begin_drain` + the manifest rebuild/re-gossip of the d1
-    /// `Node::begin_pool_drain` seam (peers must see the pool leave the
-    /// placement/repair target set). Without it, `POST
-    /// /admin/pools/{id}/drain` answers `501 Not Implemented`. Pause and
-    /// resume need no hook: they toggle the registry's per-pool pause flag
-    /// through the already-wired `pool_registry`.
+    /// registry `begin_drain[_with_mode]` + the manifest rebuild/re-gossip
+    /// of the d1 `Node::begin_pool_drain` seam (peers must see the pool
+    /// leave the placement/repair target set). The [`oceanfs_storage::DrainMode`]
+    /// routes the pool to the intra-node (d3) or cluster (d4) mover.
+    /// Without it, `POST /admin/pools/{id}/drain` answers `501 Not
+    /// Implemented`. Pause and resume need no hook: they toggle the
+    /// registry's per-pool pause flag through the already-wired
+    /// `pool_registry`.
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// use oceanfs_server::admin::{AdminHandler, MetricsRegistry};
+    /// use oceanfs_server::BucketConfigStore;
+    /// use oceanfs_storage::DrainMode;
+    /// let handler = AdminHandler::new(
+    ///     Arc::new(BucketConfigStore::new()),
+    ///     Arc::new(MetricsRegistry::new()),
+    /// )
+    /// .with_pool_drain_begin(Arc::new(|_pool_id, _mode| Ok(())));
+    /// # let _ = handler;
+    /// ```
+    #[cfg(feature = "storage")]
+    pub fn with_pool_drain_begin(mut self, on_begin_drain: PoolDrainBeginCallback) -> Self {
+        self.state.on_pool_drain_begin = Some(on_begin_drain);
+        self
+    }
+
+    /// Wires the node-level drain-mutation surface (d4, ADR-0036 C1b).
+    ///
+    /// `on_begin_drain` marks EVERY data pool of this node `Draining` in
+    /// `Cluster` mode and re-gossips the manifest once — the documented
+    /// pre-`leave(None)` retirement step. Without it,
+    /// `POST /admin/nodes/{node}/drain` answers `501 Not Implemented`.
+    /// Node pause/resume need no hook (they toggle the registry pause flag
+    /// on every cluster-mode draining pool).
     /// # Examples
     ///
     /// ```
@@ -714,12 +762,12 @@ impl AdminHandler {
     ///     Arc::new(BucketConfigStore::new()),
     ///     Arc::new(MetricsRegistry::new()),
     /// )
-    /// .with_pool_drain_begin(Arc::new(|_pool_id| Ok(())));
+    /// .with_node_drain_begin(Arc::new(|| Ok(())));
     /// # let _ = handler;
     /// ```
     #[cfg(feature = "storage")]
-    pub fn with_pool_drain_begin(mut self, on_begin_drain: PoolDrainBeginCallback) -> Self {
-        self.state.on_pool_drain_begin = Some(on_begin_drain);
+    pub fn with_node_drain_begin(mut self, on_begin_drain: NodeDrainBeginCallback) -> Self {
+        self.state.on_node_drain_begin = Some(on_begin_drain);
         self
     }
 
@@ -770,13 +818,16 @@ impl AdminHandler {
         #[cfg(feature = "storage")]
         let router = router.route("/admin/pools", get(pool_status_view).post(attach_pool));
 
-        // Intra-node drain mutation verbs (d3, ADR-0036 C1a): begin (mode
-        // `intra-node`), pause, resume — storage feature only.
+        // Intra-node + cluster drain mutation verbs (d3/d4, ADR-0036
+        // C1a/C1b): pool begin (mode intra-node|cluster), pause, resume.
         #[cfg(feature = "storage")]
         let router = router
             .route("/admin/pools/{id}/drain", post(begin_pool_drain))
             .route("/admin/pools/{id}/drain/pause", post(pause_pool_drain))
-            .route("/admin/pools/{id}/drain/resume", post(resume_pool_drain));
+            .route("/admin/pools/{id}/drain/resume", post(resume_pool_drain))
+            .route("/admin/nodes/{node}/drain", post(begin_node_drain))
+            .route("/admin/nodes/{node}/drain/pause", post(pause_node_drain))
+            .route("/admin/nodes/{node}/drain/resume", post(resume_node_drain));
 
         // Live wal-pool remount (g7, ADR-0035) — storage feature only.
         #[cfg(feature = "storage")]
@@ -1162,35 +1213,38 @@ fn drain_error_status(err: &oceanfs_storage::DrainStateError) -> StatusCode {
 /// Parses the `POST /admin/pools/{id}/drain` body.
 ///
 /// Body may be empty (defaults to `intra-node`) or a JSON object with an
-/// optional `"mode"` field. Only `"intra-node"` is implemented (d3);
-/// `"cluster"` is the d4 mode → 501.
+/// optional `"mode"` field. `"intra-node"` selects the d3 sibling mover,
+/// `"cluster"` the d4 off-node mover; anything else is a 400.
 #[cfg(feature = "storage")]
-fn parse_drain_mode(body: &axum::body::Bytes) -> Result<Option<&'static str>, String> {
+fn parse_drain_mode(body: &axum::body::Bytes) -> Result<oceanfs_storage::DrainMode, String> {
     if body.is_empty() || body.iter().all(u8::is_ascii_whitespace) {
-        return Ok(None);
+        return Ok(oceanfs_storage::DrainMode::IntraNode);
     }
     let value: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| format!("invalid drain body JSON: {e}"))?;
     match value.get("mode") {
-        None | Some(serde_json::Value::Null) => Ok(None),
+        None | Some(serde_json::Value::Null) => Ok(oceanfs_storage::DrainMode::IntraNode),
         Some(serde_json::Value::String(mode)) => match mode.as_str() {
-            "intra-node" => Ok(None),
-            "cluster" => Ok(Some("cluster")),
-            other => Err(format!("unknown drain mode \"{other}\" (expected \"intra-node\")")),
+            "intra-node" => Ok(oceanfs_storage::DrainMode::IntraNode),
+            "cluster" => Ok(oceanfs_storage::DrainMode::Cluster),
+            other => {
+                Err(format!("unknown drain mode \"{other}\" (expected \"intra-node\"|\"cluster\")"))
+            }
         },
         Some(_) => Err("drain mode must be a string".to_string()),
     }
 }
 
-/// `POST /admin/pools/{id}/drain` — begin an intra-node drain (d3,
-/// ADR-0036 C1a).
+/// `POST /admin/pools/{id}/drain` — begin an intra-node (d3) or cluster
+/// (d4) drain.
 ///
 /// Marks the pool `Draining` through the composition root's hook (registry
-/// `begin_drain` + the manifest re-gossip the d1
-/// [`Node::begin_pool_drain`] seam performs) and enables the
-/// `"drain_intra"` Tier-1 task's source set. Body `{"mode":
-/// "intra-node"}` (or empty — intra-node is the d3 default); `"cluster"`
-/// answers `501` (the d4 mover is a separate feature).
+/// `begin_drain[_with_mode]` + the manifest re-gossip the d1
+/// [`Node::begin_pool_drain`] seam performs) and enables the matching
+/// mover's source set. Body `{"mode": "intra-node"}` (or empty — the d3
+/// default) routes the pool to the sibling mover; `{"mode": "cluster"}`
+/// routes it to the off-node mover (valid even when this is the node's
+/// only data pool).
 ///
 /// Response codes: `202` drain begun (`{"pool_id", "mode",
 /// "drain_state"}`); `400` bad mode/body or non-data pool; `404` unknown
@@ -1212,25 +1266,15 @@ async fn begin_pool_drain(
         )
             .into_response();
     };
-    match parse_drain_mode(&body) {
+    let mode = match parse_drain_mode(&body) {
         Err(message) => {
             return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": message })))
                 .into_response();
         }
-        Ok(Some("cluster")) => {
-            return (
-                StatusCode::NOT_IMPLEMENTED,
-                Json(serde_json::json!({
-                    "error": "cluster drain (mode \"cluster\") lands in the d4 feature",
-                })),
-            )
-                .into_response();
-        }
-        Ok(None) => {} // intra-node
-        Ok(Some(_)) => unreachable!("parse_drain_mode only yields \"cluster\" or None"),
-    }
+        Ok(mode) => mode,
+    };
 
-    match on_begin(pool_id) {
+    match on_begin(pool_id, mode) {
         Ok(()) => {
             let drain_state = state
                 .pool_registry
@@ -1241,7 +1285,7 @@ async fn begin_pool_drain(
                 StatusCode::ACCEPTED,
                 Json(serde_json::json!({
                     "pool_id": pool_id,
-                    "mode": "intra-node",
+                    "mode": mode.as_str(),
                     "drain_state": drain_state,
                 })),
             )
@@ -1261,6 +1305,131 @@ async fn begin_pool_drain(
             (status, Json(serde_json::json!({ "error": message }))).into_response()
         }
     }
+}
+
+/// `POST /admin/nodes/{node}/drain` — begin a node-level drain (d4,
+/// ADR-0036 C1b): mark EVERY data pool of this node `Draining` in
+/// `Cluster` mode.
+///
+/// The documented pre-`leave(None)` retirement step. The node keeps
+/// serving reads of still-held segments until the `"drain_cluster"` task
+/// releases them; peers stop routing writes to it once its manifest shows
+/// no healthy data pool. The `{node}` path parameter is the addressed
+/// node (each node's admin surface operates on its own pools).
+///
+/// Response codes: `202` drain begun (`{"node", "mode": "cluster",
+/// "pools_draining": n}`); `409` a pool is already draining / Dead; `501`
+/// node drain not wired (no `with_node_drain_begin`).
+#[cfg(feature = "storage")]
+#[instrument(skip(state))]
+async fn begin_node_drain(
+    State(state): State<AdminState>,
+    Path(node): Path<String>,
+) -> impl IntoResponse {
+    let Some(on_begin) = state.on_node_drain_begin.as_ref() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": "node drain is not configured on this node",
+            })),
+        )
+            .into_response();
+    };
+    match on_begin() {
+        Ok(()) => {
+            let draining = state
+                .pool_registry
+                .as_ref()
+                .map(|registry| {
+                    registry
+                        .data_pools()
+                        .iter()
+                        .filter(|p| {
+                            matches!(
+                                registry.drain_state(p.id()),
+                                oceanfs_storage::DrainState::Draining { .. }
+                            )
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "node": node,
+                    "mode": "cluster",
+                    "pools_draining": draining,
+                })),
+            )
+                .into_response()
+        }
+        Err(message) => {
+            let status = if message.contains("already draining") || message.contains("is Dead") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(serde_json::json!({ "error": message }))).into_response()
+        }
+    }
+}
+
+/// `POST /admin/nodes/{node}/drain/pause` — pause every cluster-mode drain
+/// on this node (d4).
+#[cfg(feature = "storage")]
+#[instrument(skip(state))]
+async fn pause_node_drain(
+    State(state): State<AdminState>,
+    Path(node): Path<String>,
+) -> impl IntoResponse {
+    set_node_drain_paused(state, node, true).await
+}
+
+/// `POST /admin/nodes/{node}/drain/resume` — resume every paused
+/// cluster-mode drain on this node (d4).
+#[cfg(feature = "storage")]
+#[instrument(skip(state))]
+async fn resume_node_drain(
+    State(state): State<AdminState>,
+    Path(node): Path<String>,
+) -> impl IntoResponse {
+    set_node_drain_paused(state, node, false).await
+}
+
+/// Shared node-level pause/resume body: toggles the registry pause flag on
+/// every cluster-mode `Draining` pool of this node.
+#[cfg(feature = "storage")]
+async fn set_node_drain_paused(state: AdminState, node: String, paused: bool) -> impl IntoResponse {
+    let Some(registry) = state.pool_registry.as_ref() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": "pool drain is not configured on this node",
+            })),
+        )
+            .into_response();
+    };
+    let mut pools = Vec::new();
+    let mut failures = Vec::new();
+    for pool in registry.data_pools() {
+        if matches!(registry.drain_state(pool.id()), oceanfs_storage::DrainState::Draining { .. })
+            && registry.drain_mode(pool.id()) == oceanfs_storage::DrainMode::Cluster
+        {
+            match registry.set_drain_paused(pool.id(), paused) {
+                Ok(()) => pools.push(pool.id()),
+                Err(err) => failures.push(err.to_string()),
+            }
+        }
+    }
+    let mut body = serde_json::json!({
+        "node": node,
+        "drain_paused": paused,
+        "pools": pools,
+    });
+    if !failures.is_empty() {
+        body["failures"] = serde_json::json!(failures);
+    }
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// `POST /admin/pools/{id}/drain/pause` — pause an intra-node drain (d3).

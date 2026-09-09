@@ -27,8 +27,9 @@
 /// assert_eq!(config.repair_max_active, 16);
 /// assert_eq!(config.housekeeping_max_active, 2);
 /// assert_eq!(config.task_timeout_sec, 3600);
-/// assert_eq!(config.drain_max_bytes_per_tick, 256 * 1024 * 1024);
-/// assert_eq!(config.drain_interval_sec, 1);
+///     assert_eq!(config.drain_max_bytes_per_tick, 256 * 1024 * 1024);
+///     assert_eq!(config.drain_cluster_max_bytes_per_tick, 64 * 1024 * 1024);
+///     assert_eq!(config.drain_interval_sec, 1);
 /// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -46,6 +47,10 @@ pub struct DurabilityConfig {
     /// pools on the node (default 256 MiB). A single segment larger than
     /// the budget overshoots one tick.
     pub drain_max_bytes_per_tick: u64,
+    /// Bytes of **cluster** (off-node) drain re-replication dispatched per
+    /// tick (default 64 MiB — full-file copies over the network, so a more
+    /// conservative pace than the intra-node sibling copies).
+    pub drain_cluster_max_bytes_per_tick: u64,
     /// Cadence of the `"drain_intra"` Tier-1 task in seconds (default 1);
     /// the byte budget above is the real pace-setter.
     pub drain_interval_sec: u64,
@@ -58,6 +63,7 @@ impl Default for DurabilityConfig {
             housekeeping_max_active: default_housekeeping_max_active(),
             task_timeout_sec: default_task_timeout_sec(),
             drain_max_bytes_per_tick: default_drain_max_bytes_per_tick(),
+            drain_cluster_max_bytes_per_tick: default_drain_cluster_max_bytes_per_tick(),
             drain_interval_sec: default_drain_interval_sec(),
         }
     }
@@ -81,6 +87,11 @@ pub fn default_task_timeout_sec() -> u64 {
 /// Default intra-node drain byte budget per tick: 256 MiB.
 pub fn default_drain_max_bytes_per_tick() -> u64 {
     256 * 1024 * 1024
+}
+
+/// Default cluster (off-node) drain byte budget per tick: 64 MiB.
+pub fn default_drain_cluster_max_bytes_per_tick() -> u64 {
+    64 * 1024 * 1024
 }
 
 /// Default intra-node drain task cadence: one cycle per second.

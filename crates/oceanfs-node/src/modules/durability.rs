@@ -29,6 +29,7 @@ use oceanfs_storage::{IntraNodeDrain, IntraNodeDrainConfig};
 
 use crate::{
     announce::AnnounceMetrics,
+    cluster_drain::{DrainClusterConfig, DrainClusterController},
     membership_state::MembershipStateStore,
     modules::storage::StorageModule,
     node::BackgroundTasks,
@@ -43,7 +44,8 @@ use crate::{
 /// consume. Metrics registration is centralized in
 /// [`register_metrics`](Self::register_metrics). ADR-0017 is built in:
 /// `budget` is the two-tier admission budget and `scheduler` drives the
-/// five Tier-1 housekeeping cycles (GC/orphan/scrub/AE/intra-node drain).
+/// six Tier-1 housekeeping cycles (GC/orphan/scrub/AE/intra-node drain,
+/// cluster drain).
 pub(crate) struct DurabilityModule {
     /// Garbage collector (compaction + reaping orchestration).
     pub(crate) gc: Arc<GarbageCollector>,
@@ -86,13 +88,18 @@ pub(crate) struct DurabilityModule {
     /// scheduler (Tier-1) and heal/re-rep/hint-apply (Tier-0). Handed to
     /// the server builder for the healing gRPC service.
     pub(crate) budget: Arc<DurabilityBudget>,
-    /// ADR-0017 scheduler: drives the five Tier-1 housekeeping cycles
+    /// ADR-0017 scheduler: drives the six Tier-1 housekeeping cycles
     /// under Tier-1 permits from the shared budget.
     pub(crate) scheduler: Arc<DurabilityScheduler>,
     /// The d3 intra-node drain worker (ADR-0036 C1a) — retained so the
     /// composition root and node-level tests can run cycles directly; the
     /// scheduler drives it as the `"drain_intra"` Tier-1 task.
     pub(crate) drain: Arc<IntraNodeDrain>,
+    /// The d4 cluster drain controller (ADR-0036 C1b) — the off-node
+    /// mover; retained so the composition root and node-level tests can
+    /// run cycles directly; the scheduler drives it as the
+    /// `"drain_cluster"` Tier-1 task.
+    pub(crate) drain_cluster: Arc<DrainClusterController>,
     /// Replaced-wal recovery coordinator (g7, ADR-0035) — owns the
     /// registry-rebuild + catch-up drain and the write-resume gate. Lives
     /// here (not on `Node`/`ServerModule`) because it needs the
@@ -485,7 +492,7 @@ impl DurabilityModule {
             .await
             .map_err(|e| format!("hinted handoff WAL replay: {e}"))?;
 
-        // ADR-0017: construct the scheduler over the five Tier-1
+        // ADR-0017: construct the scheduler over the six Tier-1
         // adaptors (f1) with their existing cadence fields. Each cycle
         // acquires a Tier-1 permit from the shared budget.
         let task_timeout = if config.durability.task_timeout_sec == 0 {
@@ -530,6 +537,27 @@ impl DurabilityModule {
             Arc::clone(&drain),
             std::time::Duration::from_secs(config.durability.drain_interval_sec),
         )));
+        // d4 (ADR-0036 C1b): the cluster drain Tier-1 task — the off-node
+        // mover for pools begun in DrainMode::Cluster (pool-only retirement
+        // with no viable sibling, or a node-level drain before leave). It
+        // reuses the repair dispatcher (target selection + RPC) and waits
+        // for each target's durable stamp before source-releasing.
+        let drain_cluster = Arc::new(DrainClusterController::new(
+            DrainClusterConfig {
+                max_bytes_per_tick: config.durability.drain_cluster_max_bytes_per_tick,
+            },
+            NodeId::new(&config.node_id),
+            membership.clone(),
+            Arc::clone(&repair_dispatcher),
+            Arc::clone(&storage.registry),
+            Arc::clone(&storage.lifecycle_registry),
+            Arc::clone(&storage.lifecycle),
+            storage.data_store.clone(),
+            config.replication_factor,
+            std::time::Duration::from_secs(config.durability.drain_interval_sec),
+        ));
+        scheduler
+            .register(Arc::clone(&drain_cluster) as Arc<dyn oceanfs_durability::DurabilityTask>);
 
         // g8 metadata-loss recovery coordinator (ADR-0029 §D7). Owned here
         // next to the wal coordinator; the membership + pool handles the
@@ -579,6 +607,7 @@ impl DurabilityModule {
             budget,
             scheduler: Arc::new(scheduler),
             drain,
+            drain_cluster,
             wal_recovery,
             metadata_recovery,
         })

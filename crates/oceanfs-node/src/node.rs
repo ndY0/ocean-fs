@@ -39,7 +39,7 @@ use crate::modules::server::PrefetchStoreAdapter;
 // [end]
 /// Aggregated join handles and cancellation tokens for background loops.
 pub struct BackgroundTasks {
-    /// Durability scheduler (ADR-0017) — drives the five Tier-1
+    /// Durability scheduler (ADR-0017) — drives the six Tier-1
     /// housekeeping cycles (GC/orphan/scrub/AE/intra-node drain) under the
     /// shared budget.
     pub(crate) durability_scheduler: Option<JoinHandle<()>>,
@@ -679,6 +679,24 @@ impl Node {
     /// ```
     pub fn drain_worker(&self) -> Arc<oceanfs_storage::IntraNodeDrain> {
         self.durability.drain.clone()
+    }
+
+    /// Returns the d4 cluster drain controller (ADR-0036 C1b) — the
+    /// off-node mover that re-replicates a `Draining` pool's held segments
+    /// to other nodes and source-releases the local copies. Retained for
+    /// node-level tests and future admin progress surfaces; the durability
+    /// scheduler drives it as the `"drain_cluster"` task.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Requires a fully booted multi-node cluster; see the node
+    /// // integration test for the 3-node RF=2 scenario.
+    /// let node = Node::start(config).await.expect("node");
+    /// let controller = node.cluster_drain();
+    /// ```
+    pub fn cluster_drain(&self) -> Arc<crate::cluster_drain::DrainClusterController> {
+        self.durability.drain_cluster.clone()
     }
 
     /// Returns the g1 per-pool I/O signal observer (ADR-0029 §D3) the

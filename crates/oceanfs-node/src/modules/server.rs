@@ -506,11 +506,12 @@ impl ServerModule {
                 Ok(())
             });
 
-        // Intra-node drain begin (d3, ADR-0036 C1a): `POST
-        // /admin/pools/{id}/drain` marks the pool `Draining` through the
-        // exact d1 `Node::begin_pool_drain` seam — registry `begin_drain`
-        // + the manifest rebuild/re-gossip so peers stop using the pool as
-        // a placement/repair target. Pause/resume need no hook: they
+        // Pool drain begin (d3/d4, ADR-0036 C1a/C1b): `POST
+        // /admin/pools/{id}/drain` marks the pool `Draining` (mode
+        // intra-node or cluster) through the exact d1 `Node::begin_pool_drain`
+        // seam — registry `begin_drain_with_mode` + the manifest
+        // rebuild/re-gossip so peers stop using the pool as a
+        // placement/repair target. Pause/resume need no hook: they
         // toggle the registry's per-pool pause flag directly. (d1 LOW note:
         // like `Node::begin_pool_drain`, the local `ManifestCache`
         // self-entry is not updated here — peers and local placement read
@@ -519,15 +520,38 @@ impl ServerModule {
         let drain_membership = membership.clone();
         let drain_registry = storage.registry.clone();
         let drain_self_id = self_id.clone();
-        let on_pool_drain_begin: Arc<dyn Fn(u32) -> Result<(), String> + Send + Sync> =
-            Arc::new(move |pool_id| {
-                drain_registry.begin_drain(pool_id).map_err(|e| e.to_string())?;
-                let incarnation = drain_membership
-                    .incarnation_of(&drain_self_id)
+        let on_pool_drain_begin: Arc<
+            dyn Fn(u32, oceanfs_storage::DrainMode) -> Result<(), String> + Send + Sync,
+        > = Arc::new(move |pool_id, mode| {
+            drain_registry.begin_drain_with_mode(pool_id, mode).map_err(|e| e.to_string())?;
+            let incarnation =
+                drain_membership.incarnation_of(&drain_self_id).map(|inc| inc.value()).unwrap_or(0);
+            let manifest = pool_manifest::build_node_manifest(incarnation, &drain_registry);
+            drain_membership.set_self_manifest(manifest);
+            Ok(())
+        });
+
+        // Node-level cluster drain begin (d4, ADR-0036 C1b): the
+        // pre-leave retirement step marks EVERY data pool Draining in
+        // Cluster mode and re-gossips the manifest once (peers stop routing
+        // writes to a node with no healthy data pool).
+        let node_drain_membership = membership.clone();
+        let node_drain_registry = storage.registry.clone();
+        let node_drain_self_id = self_id.clone();
+        let on_node_drain_begin: Arc<dyn Fn() -> Result<(), String> + Send + Sync> =
+            Arc::new(move || {
+                for pool in node_drain_registry.data_pools() {
+                    node_drain_registry
+                        .begin_drain_with_mode(pool.id(), oceanfs_storage::DrainMode::Cluster)
+                        .map_err(|e| e.to_string())?;
+                }
+                let incarnation = node_drain_membership
+                    .incarnation_of(&node_drain_self_id)
                     .map(|inc| inc.value())
                     .unwrap_or(0);
-                let manifest = pool_manifest::build_node_manifest(incarnation, &drain_registry);
-                drain_membership.set_self_manifest(manifest);
+                let manifest =
+                    pool_manifest::build_node_manifest(incarnation, &node_drain_registry);
+                node_drain_membership.set_self_manifest(manifest);
                 Ok(())
             });
 
@@ -551,6 +575,7 @@ impl ServerModule {
         .with_accel(storage.accel.clone())
         .with_pool_attach(storage.registry.clone(), on_pool_attached)
         .with_pool_drain_begin(on_pool_drain_begin)
+        .with_node_drain_begin(on_node_drain_begin)
         // Live wal-pool remount (g7, ADR-0035): the coordinator owns the
         // replaced-wal drain + write-resume gate (built into the
         // durability module, which holds the ReRepWorker + AE handles).
