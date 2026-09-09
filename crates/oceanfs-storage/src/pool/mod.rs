@@ -43,6 +43,7 @@
 pub mod drain;
 pub mod health;
 pub mod placement;
+pub mod removed;
 
 use std::{
     collections::HashMap,
@@ -59,6 +60,7 @@ use oceanfs_core::{
 };
 use parking_lot::RwLock;
 pub use placement::PlacementPolicy;
+pub use removed::PoolRemovedRecord;
 
 /// One GiB — the unit auto-derived placement weights are scaled to
 /// (ADR-0029 §D8 "weights with capacity auto-detect default").
@@ -882,6 +884,11 @@ impl PoolRegistry {
     /// - Weight resolution: explicit config weight wins; `None` →
     ///   `max(1, total / 1 GiB)` from the probe-time capacity snapshot.
     ///
+    /// d5 (ADR-0036 D8): a node that has detached pools boots them through
+    /// [`PoolRegistry::from_config_skipping`], which applies the persistent
+    /// removed-pool overlay (`config − removed`). This plain entry point
+    /// registers every configured pool (no overlay).
+    ///
     /// # Errors
     ///
     /// Returns a human-readable message when the config fails validation or
@@ -907,6 +914,75 @@ impl PoolRegistry {
     /// assert!(registry.is_ok());
     /// ```
     pub fn from_config(storage: &StorageConfig, data_dir: &Path) -> Result<PoolRegistry, String> {
+        // d5 (ADR-0036 D8): the persistent removed-pool overlay (`config −
+        // removed`) is applied by callers that pass a removed set to
+        // `from_config_skipping`; this plain entry point registers every
+        // configured pool.
+        Self::from_config_skipping(storage, data_dir, &[])
+    }
+
+    /// Builds the registry from the topology config minus the **removed
+    /// pools** (d5, ADR-0036 D8) — the persistent detach overlay.
+    ///
+    /// Same contract as [`PoolRegistry::from_config`] with two deltas:
+    ///
+    /// - A config-declared pool is **not registered** when a removed record
+    ///   matches its name **and** root (`config − removed`). Ids stay tied
+    ///   to the *original* config order — a removed pool's slot simply goes
+    ///   vacant — so the pools that remain keep the ids their sealed
+    ///   segments are durably stamped with (a dense renumber would silently
+    ///   re-point every surviving segment's `pool_id`).
+    /// - The overlay is applied **before** role/cardinality validation of
+    ///   the remaining set: a config whose every `data` pool is removed
+    ///   refuses boot here (ADR-0031 on the post-overlay set). The
+    ///   documented retirement sequence is detach → `leave(None)`; a node
+    ///   that drained + detached its last data pool must never be restarted
+    ///   expecting zero data pools.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message when the config fails validation,
+    /// a root probe fails under the `Fatal` policy, or **no `data` pool
+    /// remains after the overlay is applied**.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_storage::{PoolRegistry, PoolRemovedRecord};
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// # let root = |name: &str| tmp.path().join(name);
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: root("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-1".into(), role: oceanfs_core::PoolRole::Data, root: root("pool-data-1"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: root("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: root("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: root("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let removed = vec![PoolRemovedRecord::new(
+    ///     "data-0".into(),
+    ///     tmp.path().join("pool-data"),
+    /// )];
+    /// let registry =
+    ///     PoolRegistry::from_config_skipping(&storage, &data_dir, &removed).expect("registry");
+    /// // "data-0" is suppressed; "data-1" keeps its original id (1).
+    /// assert_eq!(registry.data_pools().len(), 1);
+    /// assert_eq!(registry.data_pools()[0].name(), "data-1");
+    /// assert_eq!(registry.data_pools()[0].id(), 1);
+    /// ```
+    pub fn from_config_skipping(
+        storage: &StorageConfig,
+        data_dir: &Path,
+        removed: &[removed::PoolRemovedRecord],
+    ) -> Result<PoolRegistry, String> {
+        // Validate the FULL config first (mandatory roles, one root per
+        // pool, weights, health knobs) — the overlay only ever suppresses
+        // `data` pools (wal/metadata/hints detach is refused by
+        // `PoolRegistry::detach`), so the pinned-role checks run unchanged.
         storage.validate(data_dir).map_err(|e| format!("invalid storage config: {e}"))?;
 
         let mut pools: Vec<Arc<StoragePool>> = Vec::with_capacity(storage.pools.len());
@@ -916,6 +992,18 @@ impl PoolRegistry {
         // empty or role-incomplete list, so every pool here is a configured
         // one (no implicit legacy pool, no `data_dir` probing).
         for (index, config) in storage.pools.iter().enumerate() {
+            // d5 (ADR-0036 D8): a removed record matching name AND root
+            // suppresses the pool. The id stays the ORIGINAL config index
+            // (the removed slot goes vacant), so surviving pools keep the
+            // ids their sealed segments are durably stamped with.
+            if removed.iter().any(|record| record.matches(&config.name, &config.root)) {
+                tracing::info!(
+                    pool = %config.name,
+                    root = %config.root.display(),
+                    "storage pool suppressed by the removed-pool overlay (ADR-0036 D8)"
+                );
+                continue;
+            }
             let id = index as u32;
             let (status, capacity) = match probe_root(&config.root) {
                 Ok(()) => (PoolStatus::Healthy, statvfs_capacity(&config.root).unwrap_or_default()),
@@ -955,6 +1043,19 @@ impl PoolRegistry {
             pools.push(pool);
         }
 
+        // ADR-0036 D8 (post-overlay set): a config whose every `data` pool
+        // is removed refuses boot. This is the documented retirement
+        // sequence guard — detach → leave; never restart a fully-detached
+        // node expecting zero data pools (ADR-0031).
+        if !pools.iter().any(|pool| pool.role() == PoolRole::Data) {
+            return Err(
+                "no 'data' pool remains after applying the removed-pool overlay (ADR-0036 D8); \
+                 a node that drained and detached its last data pool must not restart — the \
+                 retirement sequence is detach then leave"
+                    .to_string(),
+            );
+        }
+
         // Publish the initial capacity/status to the metric series.
         for pool in &pools {
             if let Some(metric) = metrics.iter().find(|metric| metric.pool_id == pool.id()) {
@@ -969,7 +1070,7 @@ impl PoolRegistry {
             metrics: RwLock::new(metrics),
             missing_root_policy: storage.missing_root_policy,
             data_dir: data_dir.to_path_buf(),
-            // Every configured pool starts its drain lifecycle Idle.
+            // Every registered pool starts its drain lifecycle Idle.
             drain: RwLock::new(HashMap::new()),
             drain_mode: RwLock::new(HashMap::new()),
         })
@@ -1319,7 +1420,9 @@ impl PoolRegistry {
     /// resolve weight/tech, and register under the registry's write lock
     /// (perf 7.1: a short critical section held only for registration —
     /// never during placement reads, which take the read lock). The new
-    /// pool gets the next sequential id and is visible to placement
+    /// pool gets the lowest unregistered id (d5: detach frees a pool's id,
+    /// so ids are no longer dense; on a registry with no holes this is the
+    /// old sequential next-id) and is visible to placement
     /// immediately (placement reads the registry snapshot per selection).
     ///
     /// # Errors
@@ -1400,9 +1503,9 @@ impl PoolRegistry {
 
         // ---- 3. Register under the write lock (short critical section). ----
         // The pool + metric series are constructed OUTSIDE the lock (the
-        // only work inside is the pure push — perf 7.1); the id is
-        // `pools.len()` under the lock, so concurrent attaches cannot
-        // collide.
+        // only work inside is the pure push — perf 7.1); the id is the
+        // LOWEST UNUSED id computed under the lock, so concurrent attaches
+        // cannot collide and a freed slot (d5 detach) is reused.
         let tech = resolve_tech(pool.tech);
         let name = pool.name.clone();
         let role = pool.role;
@@ -1413,7 +1516,17 @@ impl PoolRegistry {
             // Re-validate under the write lock (TOCTOU: a concurrent
             // attach may have registered a duplicate since step 1).
             Self::validate_attach(self, &pool, &pools)?;
-            let id = pools.len() as u32;
+            // The lowest id not already registered (d5): detach removes a
+            // pool, so ids are no longer guaranteed dense — `pools.len()`
+            // could collide with a surviving pool's id. On a registry with
+            // no holes this is exactly `pools.len()` (the old sequential
+            // scheme), so a re-attach after a detach round-trips back to
+            // the freed slot (which matches the next boot's config order
+            // once the removed record is cleared).
+            let mut id = 0u32;
+            while pools.iter().any(|pool| pool.id() == id) {
+                id += 1;
+            }
             let registered = Arc::new(StoragePool::new(
                 id, name, role, root, weight, tech, status, capacity, health,
             ));
@@ -2311,5 +2424,63 @@ mod tests {
         assert_eq!(registry.data_pools().len(), 3);
         let after = policy.select_data_pool(&registry).expect("a data pool");
         assert!(after.id() <= 2, "selection must see the attached pool, got {}", after.id());
+    }
+
+    // -- d5 removed-pool overlay (ADR-0036 D8) --
+
+    #[test]
+    fn overlay_suppresses_matching_data_pool_and_preserves_survivor_ids() {
+        let (tmp, data_dir) = layout();
+        let (storage, roots) = full_pool_config(tmp.path());
+        // "fast-nvme-0" (id 0) was drained + detached; the config still
+        // declares it (config is untouched), so the overlay suppresses it.
+        let removed = vec![PoolRemovedRecord::new("fast-nvme-0".into(), roots[0].clone())];
+        let registry = PoolRegistry::from_config_skipping(&storage, &data_dir, &removed).unwrap();
+        let data = registry.data_pools();
+        assert_eq!(data.len(), 1, "the removed data pool must not register");
+        assert_eq!(data[0].name(), "fast-nvme-1");
+        assert_eq!(data[0].id(), 1, "survivors keep their original config-order id");
+        assert!(registry.pool_by_id(0).is_none());
+        assert_eq!(registry.pool_count(), 4, "wal/meta/hints still register");
+    }
+
+    #[test]
+    fn overlay_partial_match_does_not_suppress() {
+        let (tmp, data_dir) = layout();
+        let (storage, _roots) = full_pool_config(tmp.path());
+        // A record matches on name only (different root) → not suppressed
+        // (record must match name AND root, ADR-0036 D8).
+        let removed =
+            vec![PoolRemovedRecord::new("fast-nvme-0".into(), tmp.path().join("other-root"))];
+        let registry = PoolRegistry::from_config_skipping(&storage, &data_dir, &removed).unwrap();
+        assert_eq!(registry.data_pools().len(), 2);
+        assert_eq!(registry.pool_count(), 5);
+    }
+
+    #[test]
+    fn overlay_stale_record_is_inert() {
+        let (tmp, data_dir) = layout();
+        let (storage, _roots) = full_pool_config(tmp.path());
+        // A record matching no config pool (operator edited the config to
+        // drop the pool) suppresses nothing.
+        let removed = vec![PoolRemovedRecord::new("ghost".into(), tmp.path().join("nope"))];
+        let registry = PoolRegistry::from_config_skipping(&storage, &data_dir, &removed).unwrap();
+        assert_eq!(registry.data_pools().len(), 2);
+        assert_eq!(registry.pool_count(), 5);
+    }
+
+    #[test]
+    fn overlay_removing_every_data_pool_refuses_boot() {
+        let (tmp, data_dir) = layout();
+        let (storage, roots) = full_pool_config(tmp.path());
+        let removed = vec![
+            PoolRemovedRecord::new("fast-nvme-0".into(), roots[0].clone()),
+            PoolRemovedRecord::new("fast-nvme-1".into(), roots[1].clone()),
+        ];
+        let err = PoolRegistry::from_config_skipping(&storage, &data_dir, &removed).unwrap_err();
+        assert!(
+            err.contains("no 'data' pool remains after applying the removed-pool overlay"),
+            "{err}"
+        );
     }
 }

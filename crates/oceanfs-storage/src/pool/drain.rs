@@ -277,6 +277,34 @@ pub enum DrainStateError {
     NotDraining(u32),
 }
 
+/// Why [`PoolRegistry::detach`] rejected removing a pool (d5,
+/// ADR-0036 D6/D8).
+///
+/// Detach is the inverse of f8 `attach` and is accepted **only** on an
+/// empty (`Detachable`) `data` pool — the no-destructive-failure rule.
+/// The registry does not own the segment-count knowledge that proves a
+/// pool is empty; the node verifies emptiness (the d4 definition: no
+/// `Reserved` entry and no `Sealed` entry this node still holds on the
+/// pool) immediately before calling [`PoolRegistry::detach`] and reports a
+/// non-empty pool as a `409`-class rejection without ever touching the
+/// registry.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DetachError {
+    /// No registered pool carries this id.
+    #[error("pool {0} is not registered")]
+    UnknownPool(u32),
+
+    /// Only `data`-role pools detach (ADR-0036 D6; the wal/metadata/hints
+    /// roles are cardinality-1 and their replacement is the g7/g8 path).
+    #[error("pool {0} is not a data pool; only data pools can detach")]
+    WrongRole(u32, oceanfs_core::PoolRole),
+
+    /// The pool is not empty-and-`Detachable`; drain it to emptiness
+    /// first (ADR-0036 D6 — detach only on empty; nothing half-removed).
+    #[error("pool {0} is not Detachable; drain it to empty first (ADR-0036 D6)")]
+    NotDetachable(u32),
+}
+
 /// Refreshes a pool's two drain gauges from its drain record.
 fn update_drain_gauges(metric: &PoolMetrics, state: &DrainState) {
     metric.drain_state.set(u64::from(state.as_u8()));
@@ -689,6 +717,109 @@ impl PoolRegistry {
     pub fn is_draining(&self, pool_id: u32) -> bool {
         self.pool_by_id(pool_id).is_some_and(|pool| pool.status() == PoolStatus::Draining)
     }
+
+    /// Removes an empty (`Detachable`) `data` pool from the live registry
+    /// (d5, ADR-0036 D1/D6/D8) — the inverse of f8 [`PoolRegistry::attach`].
+    ///
+    /// The pool's `StoragePool` leaves the registry (`data_pools`,
+    /// `pool_by_role`, placement snapshots — a detached pool is immediately
+    /// invisible to new placement and root resolution), its per-pool metric
+    /// series and drain/drain-mode records are dropped, and its
+    /// id/name/root are released so a later `attach` with the same root
+    /// (hot-swap) is no longer a duplicate.
+    ///
+    /// The **root directory is not deleted** — the pool is empty, but
+    /// removing the directory/device is the operator's concern; detach
+    /// only removes the pool from the live topology. Persisting the removal
+    /// across restart (the `config − removed` overlay, ADR-0036 D8) and
+    /// re-gossiping the manifest are the node composition root's job, not
+    /// this method's.
+    ///
+    /// Preconditions (the node verifies the first two before calling):
+    /// the pool's drain record is [`DrainState::Detachable`] — set only by
+    /// a drain worker (d3/d4) that found zero registered segments on the
+    /// pool — and the pool is `data`-role. Because `Detachable` is a
+    /// terminal drain state (nothing transitions it back; only this method
+    /// consumes it), the state re-checked here under the registry write
+    /// lock cannot race a transition — a concurrent duplicate detach simply
+    /// fails with [`DetachError::UnknownPool`].
+    ///
+    /// # Errors
+    ///
+    /// [`DetachError::UnknownPool`], [`DetachError::WrongRole`],
+    /// [`DetachError::NotDetachable`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::PoolRole;
+    /// use oceanfs_storage::{DrainState, PoolRegistry};
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-1".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data-1"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
+    /// let data = registry.pool_by_role(PoolRole::Data).expect("data pool");
+    ///
+    /// // A healthy pool is not Detachable → detach is refused.
+    /// assert!(registry.detach(data.id()).is_err());
+    ///
+    /// registry.begin_drain(data.id()).expect("begin drain");
+    /// registry.set_pool_empty(data.id()).expect("worker emptied the pool");
+    /// assert_eq!(registry.drain_state(data.id()), DrainState::Detachable);
+    ///
+    /// registry.detach(data.id()).expect("detach the empty pool");
+    /// assert!(registry.pool_by_id(data.id()).is_none());
+    /// ```
+    pub fn detach(&self, pool_id: u32) -> Result<(), DetachError> {
+        // ---- 1. Fast pre-checks under a short read lock ----
+        // The pool must exist, be `data`-role, and be `Detachable`. These
+        // re-run under the write lock below (attach's TOCTOU pattern); the
+        // drain-state read happens BEFORE the write lock so no path holds
+        // the `pools` and `drain` locks at once (LOCK ORDER note above).
+        let pool = self.pool_by_id(pool_id).ok_or(DetachError::UnknownPool(pool_id))?;
+        if pool.role() != PoolRole::Data {
+            return Err(DetachError::WrongRole(pool_id, pool.role()));
+        }
+        if self.drain_state(pool_id) != DrainState::Detachable {
+            return Err(DetachError::NotDetachable(pool_id));
+        }
+
+        // ---- 2. Remove under the write lock (short critical section) ----
+        // A concurrent duplicate detach between step 1 and here sees
+        // `UnknownPool` (the pool is already gone); no other transition can
+        // consume `Detachable`, so the state re-check is stable.
+        {
+            let mut pools = self.pools.write();
+            let pool = pools
+                .iter()
+                .find(|pool| pool.id() == pool_id)
+                .ok_or(DetachError::UnknownPool(pool_id))?;
+            if pool.role() != PoolRole::Data {
+                return Err(DetachError::WrongRole(pool_id, pool.role()));
+            }
+            pools.retain(|pool| pool.id() != pool_id);
+        }
+        // Metric series + drain records are separate maps; drop the pool's
+        // entries so refresh/status paths never touch a removed pool. These
+        // locks are independent of `pools` and are taken after it is
+        // released (LOCK ORDER note).
+        self.metrics.write().retain(|metric| metric.pool_id != pool_id);
+        self.drain.write().remove(&pool_id);
+        self.drain_mode.write().remove(&pool_id);
+
+        tracing::info!(pool_id, "storage pool detached at runtime");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -930,5 +1061,79 @@ mod tests {
         assert_eq!(registry.drain_state(0).as_u8(), 1);
         assert_eq!(registry.drain_state(0).as_str(), "draining");
         assert!(registry.is_draining(0), "paused pools stay excluded from placement");
+    }
+
+    // -- detach (d5, ADR-0036 D6/D8) --
+
+    #[test]
+    fn detach_on_unknown_pool_errors() {
+        let (registry, _tmp) = registry_with_two_data_pools();
+        assert_eq!(registry.detach(99), Err(DetachError::UnknownPool(99)));
+    }
+
+    #[test]
+    fn detach_refused_on_healthy_and_draining_pool() {
+        let (registry, _tmp) = registry_with_two_data_pools();
+        // Healthy (Idle): refused.
+        assert_eq!(registry.detach(0), Err(DetachError::NotDetachable(0)));
+        // Draining (not yet empty): still refused — Detachable is the only
+        // detachable state (no-destructive-failure rule).
+        registry.begin_drain(0).unwrap();
+        assert_eq!(registry.detach(0), Err(DetachError::NotDetachable(0)));
+    }
+
+    #[test]
+    fn detach_refused_on_non_data_pool() {
+        let (registry, _tmp) = registry_with_two_data_pools();
+        // The wal pool (id 2) can never detach — replacement is the g7/g8 path.
+        assert_eq!(registry.detach(2), Err(DetachError::WrongRole(2, PoolRole::Wal)));
+    }
+
+    #[test]
+    fn detach_succeeds_on_detachable_pool_and_releases_identity() {
+        let (registry, tmp) = registry_with_two_data_pools();
+        registry.begin_drain(0).unwrap();
+        registry.set_pool_empty(0).unwrap();
+        assert_eq!(registry.drain_state(0), DrainState::Detachable);
+
+        registry.detach(0).unwrap();
+        // The pool is gone from every lookup and its drain records dropped.
+        assert!(registry.pool_by_id(0).is_none());
+        assert_eq!(registry.pool_count(), 4);
+        assert_eq!(registry.data_pools().len(), 1);
+        assert_eq!(registry.data_pools()[0].id(), 1);
+        assert_eq!(registry.drain_state(0), DrainState::Idle);
+        assert_eq!(registry.drain_mode(0), DrainMode::IntraNode);
+
+        // The released name/root is attachable again (hot-swap round-trip);
+        // the freed slot id 0 is reused (lowest-free), matching the config
+        // order the next boot assigns once the removed record is cleared.
+        let id = registry
+            .attach(oceanfs_core::StoragePoolConfig {
+                name: "data-0".into(),
+                role: PoolRole::Data,
+                root: tmp.path().join("nvme0"),
+                weight: Some(1),
+                tech: Default::default(),
+                health: Default::default(),
+            })
+            .expect("released identity is attachable");
+        assert_eq!(id, 0);
+        assert!(registry.pool_by_id(0).is_some());
+        assert_eq!(registry.pool_count(), 5);
+    }
+
+    #[test]
+    fn detach_of_middle_pool_leaves_survivor_id_unchanged() {
+        // Detach id 1 (not id 0): the survivor keeps its durable id 0 — a
+        // dense renumber would silently re-point id 0's sealed segments.
+        let (registry, _tmp) = registry_with_two_data_pools();
+        registry.begin_drain(1).unwrap();
+        registry.set_pool_empty(1).unwrap();
+        registry.detach(1).unwrap();
+        assert!(registry.pool_by_id(1).is_none());
+        let survivor = registry.pool_by_id(0).expect("pool 0 survives");
+        assert_eq!(survivor.id(), 0);
+        assert_eq!(registry.data_pools().len(), 1);
     }
 }

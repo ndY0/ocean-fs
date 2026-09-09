@@ -47,11 +47,12 @@ pub use io::{
 };
 pub use metadata::{BatchOp, RocksDbMetadataStore, RocksDbMetrics};
 pub use pool::{
-    drain::{DrainMode, DrainState, DrainStateError},
+    drain::{DetachError, DrainMode, DrainState, DrainStateError},
     health::{
         decide_transition, evaluate_trend, ConfirmedLoss, HealthEvent, HealthMonitor,
         HealthMonitorConfig, Latency, PoolSignal, SmartCounters, TrendVerdict,
     },
+    removed::PoolRemovedRecord,
     resolve_pool_root, PlacementPolicy, PoolIdResolver, PoolRegistry, PoolStatus, StoragePool,
 };
 pub use segment::{
