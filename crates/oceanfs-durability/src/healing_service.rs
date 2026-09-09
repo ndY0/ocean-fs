@@ -12,6 +12,14 @@ use tonic::{Request, Response, Status};
 
 use crate::scheduler::DurabilityBudget;
 
+/// How long a `reason == Drain` re-replication request waits for the
+/// target's durable stamp (entry `Sealed` + `storage_locations`
+/// contains self) before the handler acks `false` (d4, ADR-0036 D4 —
+/// the draining source never source-releases over an un-materialized
+/// target). 120 s bounds the RPC; a copy still in flight when the ack
+/// fires is re-dispatched by the drain's next cycle.
+pub const DRAIN_MATERIALIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Converts a core [`Hlc`] to the proto timestamp for the hint fetch
 /// response header.
 fn proto_hlc(hlc: Hlc) -> oceanfs_core::proto::common::HlcTimestamp {
@@ -204,6 +212,11 @@ pub enum RepairReason {
     Announcement,
     /// The g4 periodic reconciliation safety net.
     Reconciliation,
+    /// The d4 cluster drain (ADR-0036 C1b): an off-node re-replication
+    /// preceding a source-release. The dispatcher waits for the target's
+    /// durable stamp (see the completion signal on [`ReRepRequest`])
+    /// before releasing the local copy.
+    Drain,
 }
 
 impl From<RepairReason> for u32 {
@@ -211,6 +224,7 @@ impl From<RepairReason> for u32 {
         match reason {
             RepairReason::Announcement => 1,
             RepairReason::Reconciliation => 2,
+            RepairReason::Drain => 3,
         }
     }
 }
@@ -220,6 +234,7 @@ impl From<u32> for RepairReason {
         match value {
             1 => RepairReason::Announcement,
             2 => RepairReason::Reconciliation,
+            3 => RepairReason::Drain,
             _ => RepairReason::Reconciliation,
         }
     }
@@ -1718,6 +1733,17 @@ impl HealingRpc for HealingGrpcService {
     /// the dispatcher verified the sender is a legitimate holder before
     /// sending, and the target's worker is idempotent (a duplicate
     /// request for an already-held segment is a no-op).
+    ///
+    /// ## Drain gate (d4, ADR-0036 D4)
+    ///
+    /// When `reason == Drain` (the d4 cluster drain), `accepted` means
+    /// more than "enqueued": the handler polls THIS node's lifecycle
+    /// registry until the worker's durable stamp lands (entry `Sealed`
+    /// with `storage_locations` containing the local node id) and only
+    /// then acks true. The draining source waits for this ack before
+    /// source-releasing its local copy, so it can never release over a
+    /// target that accepted but failed to materialize. A request that is
+    /// not durable within [`DRAIN_MATERIALIZE_TIMEOUT`] acks false.
     async fn request_re_replication(
         &self,
         request: Request<RequestReReplicationRequest>,
@@ -1751,6 +1777,7 @@ impl HealingRpc for HealingGrpcService {
         // enum so an unknown value degrades to Reconciliation.
         let reason = match crate::healing_rpc::RepairReason::try_from(req.reason) {
             Ok(crate::healing_rpc::RepairReason::Announcement) => RepairReason::Announcement,
+            Ok(crate::healing_rpc::RepairReason::Drain) => RepairReason::Drain,
             Ok(_) => RepairReason::Reconciliation,
             Err(_) => RepairReason::Reconciliation,
         };
@@ -1793,6 +1820,7 @@ impl HealingRpc for HealingGrpcService {
             ec_m,
         };
         let holder_count = req.holders.len();
+        let drain_request = reason == RepairReason::Drain;
         match sink.enqueue(req).await {
             Ok(()) => {
                 tracing::info!(
@@ -1801,6 +1829,44 @@ impl HealingRpc for HealingGrpcService {
                     reason = ?reason,
                     "re-replication request accepted; worker will pull"
                 );
+
+                // d4 drain gate: for a drain dispatch the ack must mean
+                // "durable", not just "queued". Poll THIS node's registry
+                // until the worker's stamp lands (entry Sealed with
+                // storage_locations containing the local node id) or the
+                // deadline passes — a drain source never releases its
+                // copy over an un-materialized target.
+                if drain_request {
+                    let deadline = tokio::time::Instant::now() + DRAIN_MATERIALIZE_TIMEOUT;
+                    let local_id = self.local_node_id.clone();
+                    loop {
+                        let durable = self.registry.get(segment_id).is_some_and(|entry| {
+                            entry.state == oceanfs_storage::segment::lifecycle::SegmentState::Sealed
+                                && local_id.as_ref().is_some_and(|id| {
+                                    entry.metadata.storage_locations.iter().any(|loc| loc == id)
+                                })
+                        });
+                        if durable {
+                            tracing::info!(
+                                segment_id = %segment_id,
+                                "drain re-replication copy is durable on this node; acking"
+                            );
+                            break;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            tracing::warn!(
+                                segment_id = %segment_id,
+                                "drain re-replication copy not durable within \
+                                 DRAIN_MATERIALIZE_TIMEOUT; not accepted"
+                            );
+                            return Ok(Response::new(RequestReReplicationResponse {
+                                accepted: false,
+                            }));
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                }
+
                 Ok(Response::new(RequestReReplicationResponse { accepted: true }))
             }
             Err(e) => {
@@ -3059,5 +3125,18 @@ mod tests {
             }
         }
         assert_eq!(&received[..], &data[100..600], "single-shard mode returns the requested range");
+    }
+
+    #[test]
+    fn repair_reason_drain_round_trips_numerically() {
+        // d4: the drain dispatch reason rides the existing numeric wire
+        // format (3 = Drain), like Announcement (1) and Reconciliation (2).
+        assert_eq!(u32::from(RepairReason::Drain), 3);
+        assert_eq!(RepairReason::from(3), RepairReason::Drain);
+        assert_eq!(u32::from(RepairReason::Announcement), 1);
+        assert_eq!(RepairReason::from(1), RepairReason::Announcement);
+        assert_eq!(u32::from(RepairReason::Reconciliation), 2);
+        // Unknown wire values degrade to Reconciliation (backward compat).
+        assert_eq!(RepairReason::from(99), RepairReason::Reconciliation);
     }
 }

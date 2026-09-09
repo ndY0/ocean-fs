@@ -404,6 +404,10 @@ pub enum RepairReason {
     Announcement = 1,
     /// The g4 periodic reconciliation safety net.
     Reconciliation = 2,
+    /// The d4 cluster drain (ADR-0036 C1b): an off-node re-replication that
+    /// precedes a source-release; the target acks only after its copy is
+    /// durable (the drain dispatcher waits for the stamp before releasing).
+    Drain = 3,
 }
 impl RepairReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -415,6 +419,7 @@ impl RepairReason {
             Self::Unspecified => "REPAIR_REASON_UNSPECIFIED",
             Self::Announcement => "REPAIR_REASON_ANNOUNCEMENT",
             Self::Reconciliation => "REPAIR_REASON_RECONCILIATION",
+            Self::Drain => "REPAIR_REASON_DRAIN",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -423,6 +428,7 @@ impl RepairReason {
             "REPAIR_REASON_UNSPECIFIED" => Some(Self::Unspecified),
             "REPAIR_REASON_ANNOUNCEMENT" => Some(Self::Announcement),
             "REPAIR_REASON_RECONCILIATION" => Some(Self::Reconciliation),
+            "REPAIR_REASON_DRAIN" => Some(Self::Drain),
             _ => None,
         }
     }

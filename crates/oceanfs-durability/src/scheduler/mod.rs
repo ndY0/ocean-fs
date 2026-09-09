@@ -14,7 +14,7 @@
 //!
 //! ## Tier membership and scan shape
 //!
-//! The five registered tasks run full-space passes (`keyspace_fraction() ==
+//! The six registered tasks run full-space passes (`keyspace_fraction() ==
 //! 1.0`); their cycle cost (ADR-0034 accounting substrate) is:
 //!
 //! | Task | Cycle pass today | Why not sharded |

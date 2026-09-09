@@ -163,7 +163,7 @@ pub fn live_copy_count(
 /// O(|index bucket|), never by scanning all segments.
 ///
 /// Maintained incrementally (O(RF) per stamp) from the single choke point
-/// `oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::set_storage_locations`
+/// `oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::persist_storage_locations`
 /// (plain code — the storage crate is not a rustdoc dependency here),
 /// plus a boot build and a drift-scan rebuild (the completeness fallback
 /// if a notifier was missed).
@@ -439,7 +439,7 @@ impl ReconciliationLoop {
 
     /// Records a segment's holder set into the index (the composition
     /// root wires this to the lifecycle coordinator's
-    /// `set_storage_locations` notifier).
+    /// `persist_storage_locations` notifier).
     pub fn on_storage_locations(&self, segment_id: SegmentId, locations: &[NodeId]) {
         self.index.record(segment_id, locations);
     }

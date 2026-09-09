@@ -34,8 +34,80 @@ use oceanfs_network::ConnectionPool;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+/// Outcome classification of one [`RequestReReplication`] RPC (shared by
+/// the repair `try_dispatch` and the drain `dispatch_drain` paths).
+enum DispatchOutcome {
+    /// The target accepted (repair: queued; drain: durable copy).
+    Accepted,
+    /// The target explicitly did not accept.
+    NotAccepted,
+    /// The target has no routable address.
+    NoAddress,
+    /// The channel / RPC transport failed.
+    Channel,
+    /// The target returned an RPC error.
+    Rpc,
+    /// The RPC timed out.
+    TimedOut,
+}
+
 /// Per-RPC timeout for a re-replication dispatch.
 pub(crate) const REPAIR_DISPATCH_TIMEOUT_MS: u64 = 2_000;
+
+/// Per-RPC timeout for a **drain** re-replication dispatch (d4,
+/// ADR-0036 D4). A drain dispatch must return only after the target's
+/// copy is durable (the target handler polls its registry up to
+/// `DRAIN_MATERIALIZE_TIMEOUT`); this client-side bound sits above that
+/// deadline (150 s vs 120 s) so a slow-but-progressing copy is not
+/// abandoned by the RPC.
+pub(crate) const DRAIN_DISPATCH_TIMEOUT_MS: u64 = 150_000;
+
+/// Failure taxonomy for a d4 cluster-drain dispatch
+/// ([`RepairDispatcher::dispatch_drain`]).
+///
+/// Unlike a repair dispatch (which parks and is retried by the sweep), a
+/// drain dispatch is a synchronous, per-segment operation whose outcome
+/// the drain controller acts on: no eligible target ⇒ the source pool is
+/// parked with a blocked reason; a target that did not materialize the
+/// copy within the timeout is NOT released.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_node::repair::DrainDispatchError;
+///
+/// let err = DrainDispatchError::NoEligibleTarget;
+/// assert_eq!(err.to_string(), "no eligible cluster target for the re-replication");
+/// ```
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum DrainDispatchError {
+    /// The selector found no other node with a healthy data pool that is
+    /// not already a holder (single-node cluster or no capacity).
+    #[error("no eligible cluster target for the re-replication")]
+    NoEligibleTarget,
+    /// The chosen target has no routable address in the membership view.
+    #[error("drain target {0} has no routable address")]
+    NoAddress(NodeId),
+    /// The channel to the target could not be established.
+    #[error("drain channel to {target} failed: {detail}")]
+    Channel {
+        /// The target node.
+        target: NodeId,
+        /// The channel error text.
+        detail: String,
+    },
+    /// The target accepted the request but reported it could not
+    /// materialize a durable copy (its worker queue rejected the
+    /// request or the copy did not become durable in time).
+    #[error("drain target {0} did not confirm a durable copy")]
+    NotDurable(NodeId),
+    /// The re-replication RPC to the target failed.
+    #[error("drain re-replication RPC to {0} failed: {1}")]
+    Rpc(NodeId, String),
+    /// The RPC timed out waiting for the target's durable confirmation.
+    #[error("drain re-replication to {0} timed out waiting for a durable copy")]
+    TimedOut(NodeId),
+}
 
 // ---------------------------------------------------------------------------
 // ManifestRepairTargetSelector
@@ -421,28 +493,7 @@ impl RepairDispatcher {
     /// `true` when the target accepted (the repair will be executed
     /// there), `false` when no target is eligible or the RPC failed.
     async fn try_dispatch(&self, request: &ReRepRequest) -> bool {
-        // Filter to LIVE holders (the request may carry a stale full
-        // set — e.g. the dead origin is still listed). Live means:
-        // node Alive/Suspect AND not data-dead (its manifest reports
-        // every data pool Dead — it can no longer serve the fetch the
-        // acquiring node will make). A node with a DEAD data pool but
-        // an Alive node state stays in the holder set ONLY if it still
-        // has a servable data pool; otherwise it is a location that
-        // cannot serve bytes and must not count as a holder (the same
-        // semantics reconcile.rs::membership_snapshot applies).
-        let live_holders: Vec<NodeId> = request
-            .holders
-            .iter()
-            .filter(|h| {
-                let alive = matches!(
-                    self.membership.state_of(h),
-                    Some(NodeState::Alive | NodeState::Suspect)
-                );
-                alive && !self.is_data_dead(h)
-            })
-            .cloned()
-            .collect();
-
+        let live_holders = self.live_holders_of(request);
         let Some(target) = self.selector.pick_repair_target(&request.segment_id, &live_holders)
         else {
             debug!(
@@ -454,19 +505,118 @@ impl RepairDispatcher {
             return false;
         };
 
-        let addr = match self.membership.address_of(&target) {
-            Some(a) => a,
-            None => {
-                warn!(target = %target, "re-replication: target has no address; parked");
-                return false;
+        match self.dispatch_rpc(request, &target, &live_holders, REPAIR_DISPATCH_TIMEOUT_MS).await {
+            DispatchOutcome::Accepted => true,
+            DispatchOutcome::NotAccepted => {
+                warn!(
+                    segment_id = %request.segment_id,
+                    target = %target,
+                    "re-replication request not accepted; parked"
+                );
+                false
             }
+            DispatchOutcome::NoAddress
+            | DispatchOutcome::Channel
+            | DispatchOutcome::Rpc
+            | DispatchOutcome::TimedOut => {
+                // The helper logged the specific reason (and recorded the
+                // failure metric where the original path did); the caller
+                // parks so the sweep retries.
+                false
+            }
+        }
+    }
+
+    /// Dispatches one segment for the **d4 cluster drain** (ADR-0036
+    /// D4): synchronously re-replicates to a non-holder target and
+    /// returns only after the target confirms a **durable** copy.
+    ///
+    /// Reuses the repair target selection and RPC machinery: `holders`
+    /// (the segment's current `storage_locations`) filters out nodes that
+    /// already hold the segment, and the request rides `RepairReason::
+    /// Drain` so the target's handler waits for its stamp before acking.
+    /// On success the target is converged into THIS node's registry entry
+    /// (ADR-0030 Decision 3), so a subsequent source-release refreshes to
+    /// `holders − self` and drops this node cleanly.
+    ///
+    /// The drain controller paces calls to this method; failures do NOT
+    /// park — the controller classifies them (blocked on no target,
+    /// retry next cycle on a not-durable target).
+    ///
+    /// # Errors
+    ///
+    /// [`DrainDispatchError`]: no eligible target; an unroutable target;
+    /// a channel/RPC failure; or a target that did not confirm a durable
+    /// copy within the drain timeout.
+    pub async fn dispatch_drain(
+        &self,
+        request: &ReRepRequest,
+    ) -> Result<NodeId, DrainDispatchError> {
+        let live_holders = self.live_holders_of(request);
+        let target = self
+            .selector
+            .pick_repair_target(&request.segment_id, &live_holders)
+            .ok_or(DrainDispatchError::NoEligibleTarget)?;
+
+        match self.dispatch_rpc(request, &target, &live_holders, DRAIN_DISPATCH_TIMEOUT_MS).await {
+            DispatchOutcome::Accepted => Ok(target),
+            DispatchOutcome::NotAccepted => Err(DrainDispatchError::NotDurable(target)),
+            DispatchOutcome::NoAddress => Err(DrainDispatchError::NoAddress(target)),
+            DispatchOutcome::Channel => Err(DrainDispatchError::Channel {
+                target,
+                detail: "channel could not be established".into(),
+            }),
+            DispatchOutcome::Rpc => {
+                Err(DrainDispatchError::Rpc(target, "re-replication RPC failed".into()))
+            }
+            DispatchOutcome::TimedOut => Err(DrainDispatchError::TimedOut(target)),
+        }
+    }
+
+    /// The request's holder set filtered to LIVE holders (node
+    /// Alive/Suspect AND not data-dead). A dead-or-unavailable node in a
+    /// stale full set cannot serve the fetch the acquiring node will
+    /// make and must not count as a holder.
+    fn live_holders_of(&self, request: &ReRepRequest) -> Vec<NodeId> {
+        request
+            .holders
+            .iter()
+            .filter(|h| {
+                let alive = matches!(
+                    self.membership.state_of(h),
+                    Some(NodeState::Alive | NodeState::Suspect)
+                );
+                alive && !self.is_data_dead(h)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Sends one `RequestReReplication` RPC to `target` and classifies
+    /// the outcome. On `Accepted` the target has enqueued the repair
+    /// (and, for a drain request, confirmed a durable copy) and THIS
+    /// holder converges its own registry entry (ADR-0030 Decision 3).
+    ///
+    /// Metric recording mirrors the original inline path: `Accepted`
+    /// counts a dispatch; channel/RPC/timeout failures count a failure;
+    /// a missing address or a not-accepted ack count nothing.
+    async fn dispatch_rpc(
+        &self,
+        request: &ReRepRequest,
+        target: &NodeId,
+        live_holders: &[NodeId],
+        timeout_ms: u64,
+    ) -> DispatchOutcome {
+        let Some(addr) = self.membership.address_of(target) else {
+            warn!(target = %target, "re-replication: target has no address; parked");
+            return DispatchOutcome::NoAddress;
         };
         let pooled = match self.pool.get_channel(addr).await {
             Ok(p) => p,
             Err(e) => {
                 warn!(target = %target, error = %e, "re-replication: channel to target failed; parked");
                 self.metrics.record_failure();
-                return false;
+                return DispatchOutcome::Channel;
             }
         };
         let channel = pooled.channel().clone();
@@ -481,6 +631,9 @@ impl RepairDispatcher {
             }
             oceanfs_durability::healing_service::RepairReason::Reconciliation => {
                 ProtoRepairReason::Reconciliation as i32
+            }
+            oceanfs_durability::healing_service::RepairReason::Drain => {
+                ProtoRepairReason::Drain as i32
             }
             // `#[non_exhaustive]` — future reasons degrade to the
             // reconciliation priority (a safety-net repair).
@@ -507,15 +660,14 @@ impl RepairDispatcher {
 
         let mut client = HealingRpcClient::new(channel);
         let result = tokio::time::timeout(
-            Duration::from_millis(REPAIR_DISPATCH_TIMEOUT_MS),
+            Duration::from_millis(timeout_ms),
             client.request_re_replication(rpc_request),
         )
         .await;
 
         match result {
             Ok(Ok(response)) => {
-                let accepted = response.into_inner().accepted;
-                if accepted {
+                if response.into_inner().accepted {
                     info!(
                         segment_id = %request.segment_id,
                         target = %target,
@@ -529,26 +681,26 @@ impl RepairDispatcher {
                     // path so the g4 reconciler stops re-dispatching the
                     // same segment (its live-count now includes the new
                     // copy).
-                    self.converge_holder_registry(request, &target).await;
-                    true
+                    self.converge_holder_registry(request, target).await;
+                    DispatchOutcome::Accepted
                 } else {
                     warn!(
                         segment_id = %request.segment_id,
                         target = %target,
                         "re-replication request not accepted; parked"
                     );
-                    false
+                    DispatchOutcome::NotAccepted
                 }
             }
             Ok(Err(e)) => {
                 warn!(segment_id = %request.segment_id, target = %target, error = %e, "re-replication dispatch failed; parked");
                 self.metrics.record_failure();
-                false
+                DispatchOutcome::Rpc
             }
             Err(_elapsed) => {
                 warn!(segment_id = %request.segment_id, target = %target, "re-replication dispatch timed out; parked");
                 self.metrics.record_failure();
-                false
+                DispatchOutcome::TimedOut
             }
         }
     }

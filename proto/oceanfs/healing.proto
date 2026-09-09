@@ -169,6 +169,10 @@ enum RepairReason {
   REPAIR_REASON_ANNOUNCEMENT = 1;
   // The g4 periodic reconciliation safety net.
   REPAIR_REASON_RECONCILIATION = 2;
+  // The d4 cluster drain (ADR-0036 C1b): an off-node re-replication that
+  // precedes a source-release; the target acks only after its copy is
+  // durable (the drain dispatcher waits for the stamp before releasing).
+  REPAIR_REASON_DRAIN = 3;
 }
 
 // A re-replication request from a holder-side dispatcher to an
