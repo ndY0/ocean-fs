@@ -613,6 +613,7 @@ mod tests {
     struct TestEnv {
         _tmp: tempfile::TempDir,
         store: DiskSegmentStore,
+        registry: Arc<PoolRegistry>,
         lifecycle: Arc<SegmentLifecycleCoordinator>,
         data_root: std::path::PathBuf,
     }
@@ -691,7 +692,7 @@ mod tests {
             Arc::new(IoBackend::default()),
             observer,
         );
-        TestEnv { _tmp: tmp, store, lifecycle, data_root }
+        TestEnv { _tmp: tmp, store, registry: pool_registry, lifecycle, data_root }
     }
 
     /// Seeds a registered (reserved + sealed) segment.
@@ -768,6 +769,33 @@ mod tests {
             .await
             .expect_err("write-before-register must be rejected (ADR-0032 D3)");
         assert!(err.to_string().contains("not registered"), "{err}");
+    }
+
+    /// d5 re-materialization rule (ADR-0036 D8, Deviations f.ii): a copy
+    /// whose recorded `pool_id` was **detached** can never silently land
+    /// elsewhere — the store's writes are registry-resolved, so the write
+    /// fails loudly against the removed pool and the holder set is never
+    /// stamped (no stale re-add, no data loss). This is the post-detach
+    /// guard that makes an injected "remap the landed pool" unnecessary.
+    #[tokio::test]
+    async fn write_to_a_segment_whose_pool_was_detached_fails() {
+        let env = make_env().await;
+        // Drain + detach the only data pool (id 0) — the d5 workflow.
+        env.registry.begin_drain(0).unwrap();
+        env.registry.set_pool_empty(0).unwrap();
+        env.registry.detach(0).unwrap();
+        assert!(env.registry.pool_by_id(0).is_none());
+
+        // The re-materialization path (ReRepWorker / push Existing arm)
+        // reserves first (recording pool 0) then writes.
+        let id = SegmentId::new();
+        env.lifecycle.request_reserve(id, oceanfs_core::SizeTier::Standard, 4, 2).await.unwrap();
+        let err = env
+            .store
+            .write_segment_data(&id, &[1u8; 64])
+            .await
+            .expect_err("write to a removed pool must fail loudly");
+        assert!(err.to_string().contains("unknown pool 0"), "{err}");
     }
 
     /// The multi-writer regression test: N tasks write distinct payloads
