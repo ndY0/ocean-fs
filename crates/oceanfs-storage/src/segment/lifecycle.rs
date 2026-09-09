@@ -1102,7 +1102,11 @@ impl SegmentLifecycleRegistry {
     /// The d2 (ADR-0036 D2) `pool_id` section uses the `storage_locations`
     /// convention: `Some` durably replaces `SegmentMetadata.pool_id`
     /// (the relocation commit — this fold is the only writer), `None`
-    /// leaves it unchanged.
+    /// leaves it unchanged. The `merkle_root` parameter is a **value
+    /// replacement**: `Some` replaces the anchor, `None` clears it (the
+    /// heal worker clears a repaired segment's stale root so scrub/AE
+    /// re-verifies — a caller that wants to preserve the anchor must pass
+    /// the live root explicitly).
     pub(crate) fn fold_refresh(
         &self,
         id: SegmentId,
@@ -1233,7 +1237,7 @@ pub struct SegmentLifecycleCoordinator {
     /// Optional storage-locations notifier (g4 `reconciliation`).
     ///
     /// Fired with `(segment_id, locations)` after
-    /// [`set_storage_locations`](Self::set_storage_locations) commits —
+    /// [`persist_storage_locations`](Self::persist_storage_locations) commits —
     /// the SINGLE choke point where a segment's holder set is written
     /// (the replicator's stamp after full ack, the push receiver's
     /// registration). The reconciliation loop consumes this to maintain
@@ -1340,7 +1344,7 @@ impl SegmentLifecycleCoordinator {
 
     /// Wires the storage-locations notifier (composition root; g4
     /// `reconciliation`). Fired with `(segment_id, locations)` after
-    /// every [`set_storage_locations`](Self::set_storage_locations)
+    /// every [`persist_storage_locations`](Self::persist_storage_locations)
     /// commit — the reconciliation loop's HolderIndex update source.
     ///
     /// # Examples
@@ -2238,71 +2242,40 @@ impl SegmentLifecycleCoordinator {
         Ok(())
     }
 
-    /// Stamps the segment's `storage_locations` on the live registry
-    /// entry (sealed-segment-replication).
+    /// Durably stamps a sealed segment's `storage_locations` holder set
+    /// and fires the storage-locations notifier.
     ///
-    /// Called by the segment replicator once every intended holder has
-    /// acked its push, so a non-empty set means "every listed holder was
-    /// confirmed". The update is **in-memory only**: the next checkpoint
-    /// persists it (the checkpoint serializes the full `SegmentMetadata`
-    /// via bincode), but the event WAL is untouched — the `SealEvent`
-    /// binary format is fixed-size and byte-exact, and the holder set is
-    /// re-derivable from the ring at startup for any entry whose
-    /// locations were never stamped (the seal→stamp crash window).
-    ///
-    /// `Sealed`-only; a missing / Reserved / Deleted entry is left
-    /// untouched (the replicator never stamps an entry it did not seal).
+    /// The holder-set stamp that rides the event-WAL (a `MetadataRefresh`):
+    /// the holder set is written through the event-WAL (`MetadataRefresh`)
+    /// so a restart folds it back — a node's knowledge that it holds a
+    /// segment must survive a reboot (d4 cluster drain re-issue, g4
+    /// live-count, and the read path all depend on it). `Sealed`-only;
+    /// a missing / Reserved / Deleted entry is left untouched.
     ///
     /// # Errors
     ///
-    /// Returns [`TransitionError::Missing`] when no live entry exists.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use oceanfs_core::{NodeId, SegmentId};
-    /// use oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator;
-    ///
-    /// let lifecycle = SegmentLifecycleCoordinator::new(
-    ///     &oceanfs_core::LifecycleConfig::default(),
-    /// );
-    /// // Stamp a holder set on a segment (Sealed-only; a missing entry
-    /// // returns Missing — the caller ignores the error for deleted
-    /// // segments).
-    /// let mut locations = smallvec::SmallVec::new();
-    /// locations.push(NodeId::new("n1"));
-    /// locations.push(NodeId::new("n2"));
-    /// let _ = lifecycle.set_storage_locations(SegmentId::new(), locations);
-    /// ```
-    pub fn set_storage_locations(
+    /// Same as [`request_refresh_metadata`](Self::request_refresh_metadata):
+    /// `Missing` / `NotReserved` / `AlreadyDeleted` when the entry is not
+    /// `Sealed`, or `DurableWriteFailed` when the event append fails.
+    pub async fn persist_storage_locations(
         &self,
         id: SegmentId,
         locations: smallvec::SmallVec<[oceanfs_core::NodeId; 16]>,
     ) -> Result<(), TransitionError> {
-        let shard = &self.registry.shards[self.registry.shard_for(id)];
-        let mut guard = shard.write();
-        let now = Instant::now();
-        SegmentLifecycleRegistry::evict_expired_locked(&mut guard, now);
-        let committed = match guard.get_mut(&id) {
-            Some(entry) if entry.state == SegmentState::Sealed => {
-                entry.metadata.storage_locations = locations.clone();
-                true
-            }
-            Some(_) | None => false,
-        };
-        drop(guard);
-        if committed {
-            // Fire AFTER the commit AND after the shard write lock is
-            // dropped (the notifier takes the HolderIndex's own lock —
-            // never hold the shard lock across notifier work; lock order
-            // is always shard → index, never index → shard).
-            if let Some(notifier) = self.storage_locations_notifier.read().as_ref() {
-                notifier(id, &locations);
-            }
-            Ok(())
-        } else {
-            Err(TransitionError::Missing)
+        // Carry the current merkle anchor explicitly: the refresh's
+        // merkle parameter is a value replacement (None CLEARS it — the
+        // heal worker's invalidation path), so a location-only stamp must
+        // re-pass the live root or the fetch-verification anchor is lost.
+        let merkle_root = self.registry.get(id).and_then(|entry| entry.metadata.merkle_root);
+        // The durable append + fold is the single writer (ADR-0025); the
+        // notifier fires AFTER the commit and its shard lock is released
+        // (never hold the shard lock across notifier work — lock order is
+        // always shard → index).
+        self.request_refresh_metadata(id, merkle_root, Some(locations.clone()), None).await?;
+        if let Some(notifier) = self.storage_locations_notifier.read().as_ref() {
+            notifier(id, &locations);
         }
+        Ok(())
     }
 
     /// Seals a batch of segments whose `.dat` files are already

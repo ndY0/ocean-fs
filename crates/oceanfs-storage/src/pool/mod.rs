@@ -862,6 +862,11 @@ pub struct PoolRegistry {
     /// (without this lock held) and only then takes this write lock. The
     /// reverse order would deadlock against a concurrent attach.
     drain: RwLock<HashMap<u32, drain::DrainState>>,
+    /// The drain mover mode per pool (d3 `IntraNode` vs d4 `Cluster`) —
+    /// routes a `Draining` pool to exactly one mover. Short lock, never
+    /// held together with `drain` or `pools`. Pools that never drained
+    /// (or began through the plain d1 seam) read as `IntraNode`.
+    drain_mode: RwLock<HashMap<u32, drain::DrainMode>>,
 }
 
 impl PoolRegistry {
@@ -966,6 +971,7 @@ impl PoolRegistry {
             data_dir: data_dir.to_path_buf(),
             // Every configured pool starts its drain lifecycle Idle.
             drain: RwLock::new(HashMap::new()),
+            drain_mode: RwLock::new(HashMap::new()),
         })
     }
 

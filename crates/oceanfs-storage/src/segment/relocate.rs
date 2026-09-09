@@ -208,9 +208,17 @@ impl SegmentRelocator {
 
         // 2. commit: durable MetadataRefresh { pool_id = Some(target) }
         // (event-WAL append + fold — the only durable writer). The
-        // registry switch is atomic for all readers from here on.
+        // registry switch is atomic for all readers from here on. The
+        // seal-time merkle anchor is carried explicitly — the refresh's
+        // merkle parameter is a value replacement (None clears it), and a
+        // relocation must never lose the anchor fetch verification trusts.
         self.coordinator
-            .request_refresh_metadata(segment_id, None, None, Some(target_pool_id))
+            .request_refresh_metadata(
+                segment_id,
+                entry.metadata.merkle_root,
+                None,
+                Some(target_pool_id),
+            )
             .await
             .map_err(|e| RelocateError::Commit { segment_id, detail: e.to_string() })?;
 
@@ -485,6 +493,9 @@ mod tests {
         // The registry's pool_id flipped (registry-driven resolution).
         let entry = env.store.lifecycle_registry().get(id).expect("entry");
         assert_eq!(entry.metadata.pool_id, 1);
+        // A pool_id-only refresh must not clear the seal-time merkle root
+        // (fetch verification on the re-replication path trusts it).
+        assert!(entry.metadata.merkle_root.is_some());
 
         // The read path resolves the new root and returns identical bytes.
         let file = env.store.read_segment_data(&id).await.unwrap().expect("readable");
@@ -598,6 +609,39 @@ mod tests {
             (0..4u8).any(|round| data_section == vec![round; 1024].as_slice())
                 || data_section == data.as_slice(),
             "the settled .dat must equal exactly one complete payload"
+        );
+    }
+
+    /// The durable holder-set stamp (persist_storage_locations) must
+    /// survive a cold restart: a node's knowledge that it holds a segment
+    /// is folded back from the event WAL (d4 re-issue / g4 live-count).
+    #[tokio::test]
+    async fn storage_locations_stamp_survives_cold_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let locations_set = {
+            let env = build_env(&tmp).await;
+            let data = vec![21u8; 256];
+            let id = seed_on(&env, 0, &data).await;
+            let mut locations = smallvec::SmallVec::<[oceanfs_core::NodeId; 16]>::new();
+            locations.push(oceanfs_core::NodeId::new("node-b"));
+            locations.push(oceanfs_core::NodeId::new("node-c"));
+            env.lifecycle.persist_storage_locations(id, locations.clone()).await.unwrap();
+            // Give the fsync batch a beat before the simulated crash.
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            (id, locations)
+        };
+        let (id, locations) = locations_set;
+
+        let env = cold_restart(&tmp).await;
+        let entry = env.store.lifecycle_registry().get(id).expect("entry restored");
+        assert_eq!(
+            entry.metadata.storage_locations.to_vec(),
+            locations.to_vec(),
+            "the durable holder stamp is folded back after a cold restart"
+        );
+        assert!(
+            entry.metadata.merkle_root.is_some(),
+            "a location-only refresh must never clear the seal-time merkle anchor"
         );
     }
 

@@ -293,13 +293,16 @@ impl IntraNodeDrain {
     }
 
     /// Data-pool ids whose drain is currently active: status `Draining`,
-    /// record `Draining`, and not operator-paused.
+    /// record `Draining`, not operator-paused, and owned by the intra-node
+    /// mover (a pool begun in [`crate::DrainMode::Cluster`] is the d4
+    /// controller's, never this worker's).
     fn draining_source_ids(&self) -> Vec<u32> {
         self.registry
             .data_pools()
             .iter()
             .filter(|pool| {
                 pool.status() == PoolStatus::Draining
+                    && self.registry.drain_mode(pool.id()) != crate::DrainMode::Cluster
                     && matches!(
                         self.registry.drain_state(pool.id()),
                         DrainState::Draining { paused: false, .. }
@@ -677,5 +680,25 @@ mod tests {
         assert_eq!(stats.segments_moved, 0, "a dead pool is never a drain source");
         assert!(stats.emptied.is_empty());
         assert!(dat_on(&env, 0, id), "a dead pool's data is untouched");
+    }
+
+    #[tokio::test]
+    async fn cluster_mode_pool_is_not_this_workers_source() {
+        let tmp = TempDir::new().unwrap();
+        let env = build_env(&tmp).await;
+        let id = seed_on(&env, 0, 4 * KIB).await;
+        // The d4 cluster drain owns this pool (DrainMode::Cluster); the d3
+        // intra-node worker must not chase it.
+        env.registry.begin_drain_with_mode(0, crate::DrainMode::Cluster).unwrap();
+
+        let stats = worker(&env, 1 << 30).run_cycle().await;
+        assert_eq!(stats.segments_moved, 0, "cluster-owned pools are never intra-node sources");
+        assert!(stats.emptied.is_empty());
+        assert!(stats.blocked.is_empty(), "skipped, not blocked");
+        assert!(dat_on(&env, 0, id));
+        assert_eq!(
+            env.registry.drain_state(0),
+            DrainState::Draining { blocked_reason: None, paused: false }
+        );
     }
 }

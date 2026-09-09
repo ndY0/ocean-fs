@@ -196,6 +196,51 @@ impl DrainState {
     }
 }
 
+/// Which drain mover owns a `Draining` pool (d3/d4 ownership
+/// discriminator).
+///
+/// d3's `IntraNodeDrain` and d4's cluster controller both consume the
+/// registry drain state, so a pool's mode routes it to exactly one mover:
+/// `IntraNode` pools are emptied to sibling data pools (d3), `Cluster`
+/// pools are emptied off-node through the ADR-0030 target-pull + source-
+/// release path (d4). Pools begun through the d1 `begin_drain` seam (and
+/// the d3 intra-node route) default to [`DrainMode::IntraNode`].
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_storage::DrainMode;
+///
+/// assert_eq!(DrainMode::IntraNode.as_str(), "intra-node");
+/// assert_eq!(DrainMode::Cluster.as_str(), "cluster");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DrainMode {
+    /// d3's sibling-pool mover owns the pool.
+    IntraNode,
+    /// d4's cluster (off-node) controller owns the pool.
+    Cluster,
+}
+
+impl DrainMode {
+    /// Stable mode string for admin surfaces (`"intra-node" |
+    /// "cluster"`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_storage::DrainMode;
+    ///
+    /// assert_eq!(DrainMode::Cluster.as_str(), "cluster");
+    /// ```
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DrainMode::IntraNode => "intra-node",
+            DrainMode::Cluster => "cluster",
+        }
+    }
+}
+
 /// Errors from the drain-lifecycle transitions on [`PoolRegistry`].
 ///
 /// # Examples
@@ -239,28 +284,22 @@ fn update_drain_gauges(metric: &PoolMetrics, state: &DrainState) {
 }
 
 impl PoolRegistry {
-    /// Marks a `data`-role pool as `Draining`: flips its status and records
-    /// the drain lifecycle (ADR-0036 D6).
-    ///
-    /// Placement excludes the pool from new segment targets immediately
-    /// (only `Healthy` pools are eligible), reads keep serving, and the
-    /// health monitor stops transitioning it on degrading signals. The
-    /// actual mover workers (d3/d4) pick the pool up from this state.
+    /// Marks a `data`-role pool as `Draining` and records the drain
+    /// lifecycle (ADR-0036 D6) with the **intra-node** mover owning it
+    /// (d3). Equivalent to
+    /// [`begin_drain_with_mode`](Self::begin_drain_with_mode) with
+    /// [`DrainMode::IntraNode`] — see that method for the full contract.
     ///
     /// # Errors
     ///
-    /// - [`DrainStateError::UnknownPool`] — no pool with this id.
-    /// - [`DrainStateError::NotDataPool`] — only `data`-role pools drain.
-    /// - [`DrainStateError::DeadPool`] — confirmed loss beats the operator
-    ///   flag; recover/heal first.
-    /// - [`DrainStateError::AlreadyDraining`] — the pool is already draining
-    ///   (double drain is a no-op request error).
+    /// [`DrainStateError::UnknownPool`], [`DrainStateError::NotDataPool`],
+    /// [`DrainStateError::DeadPool`], [`DrainStateError::AlreadyDraining`].
     ///
     /// # Examples
     ///
     /// ```
     /// use oceanfs_core::PoolRole;
-    /// use oceanfs_storage::{DrainState, PoolRegistry, PoolStatus};
+    /// use oceanfs_storage::{DrainState, DrainMode, PoolRegistry, PoolStatus};
     ///
     /// # let tmp = tempfile::tempdir().expect("tempdir");
     /// # let data_dir = tmp.path().join("data");
@@ -283,9 +322,60 @@ impl PoolRegistry {
     ///     registry.drain_state(data.id()),
     ///     DrainState::Draining { blocked_reason: None, paused: false }
     /// );
+    /// assert_eq!(registry.drain_mode(data.id()), DrainMode::IntraNode);
     /// assert!(registry.is_draining(data.id()));
     /// ```
     pub fn begin_drain(&self, pool_id: u32) -> Result<(), DrainStateError> {
+        self.begin_drain_with_mode(pool_id, DrainMode::IntraNode)
+    }
+
+    /// Marks a `data`-role pool as `Draining` and records the drain
+    /// lifecycle (ADR-0036 D6), declaring which mover owns the pool.
+    ///
+    /// Placement excludes the pool from new segment targets immediately
+    /// (only `Healthy` pools are eligible), reads keep serving, and the
+    /// health monitor stops transitioning it on degrading signals. The
+    /// mover workers (d3 `IntraNodeDrain` for [`DrainMode::IntraNode`],
+    /// d4 cluster controller for [`DrainMode::Cluster`]) pick the pool up
+    /// from this state; [`PoolRegistry::drain_mode`] routes a draining
+    /// pool to exactly one of them.
+    ///
+    /// # Errors
+    ///
+    /// - [`DrainStateError::UnknownPool`] — no pool with this id.
+    /// - [`DrainStateError::NotDataPool`] — only `data`-role pools drain.
+    /// - [`DrainStateError::DeadPool`] — confirmed loss beats the operator
+    ///   flag; recover/heal first.
+    /// - [`DrainStateError::AlreadyDraining`] — the pool is already draining
+    ///   (double drain is a no-op request error).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::PoolRole;
+    /// use oceanfs_storage::{DrainMode, PoolRegistry};
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
+    /// let data = registry.pool_by_role(PoolRole::Data).expect("data pool");
+    /// registry.begin_drain_with_mode(data.id(), DrainMode::Cluster).expect("begin");
+    /// assert_eq!(registry.drain_mode(data.id()), DrainMode::Cluster);
+    /// ```
+    pub fn begin_drain_with_mode(
+        &self,
+        pool_id: u32,
+        mode: DrainMode,
+    ) -> Result<(), DrainStateError> {
         // Validate against the live pool (short `pools` read lock, released
         // on return — never held while the drain lock is taken).
         let pool = self.pool_by_id(pool_id).ok_or(DrainStateError::UnknownPool(pool_id))?;
@@ -308,11 +398,41 @@ impl PoolRegistry {
                 update_drain_gauges(&metric, &state);
             }
         }
+        // The mode routes the pool to one mover; a separate short lock from
+        // the drain record (never both held).
+        self.drain_mode.write().insert(pool_id, mode);
         // Placement/health/peers read the status atomic — flip it after the
         // record so the two writes never disagree for a concurrent reader
         // beyond one transition.
         self.set_status(pool_id, PoolStatus::Draining);
         Ok(())
+    }
+
+    /// The drain mover mode of a pool (d3 vs d4 ownership), defaulting to
+    /// [`DrainMode::IntraNode`] for pools that never drained (or were
+    /// begun through the plain d1 seam).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_storage::{DrainMode, PoolRegistry};
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
+    /// assert_eq!(registry.drain_mode(0), DrainMode::IntraNode);
+    /// ```
+    pub fn drain_mode(&self, pool_id: u32) -> DrainMode {
+        self.drain_mode.read().get(&pool_id).copied().unwrap_or(DrainMode::IntraNode)
     }
 
     /// Records or clears the blocked reason on a `Draining` pool
@@ -735,6 +855,31 @@ mod tests {
             "draining"
         );
         assert_eq!(DrainState::Detachable.as_str(), "detachable");
+    }
+
+    // -- drain mode (d3 vs d4 mover ownership) --
+
+    #[test]
+    fn drain_mode_defaults_to_intra_node_and_round_trips() {
+        let (registry, _tmp) = registry_with_two_data_pools();
+        // A never-drained pool reads IntraNode (d3 owns it by default).
+        assert_eq!(registry.drain_mode(0), DrainMode::IntraNode);
+        assert_eq!(registry.drain_mode(1), DrainMode::IntraNode);
+        assert_eq!(registry.drain_mode(99), DrainMode::IntraNode);
+
+        registry.begin_drain(0).unwrap();
+        assert_eq!(registry.drain_mode(0), DrainMode::IntraNode);
+        assert_eq!(registry.drain_mode(0).as_str(), "intra-node");
+
+        registry.begin_drain_with_mode(1, DrainMode::Cluster).unwrap();
+        assert_eq!(registry.drain_mode(1), DrainMode::Cluster);
+        assert_eq!(registry.drain_mode(1).as_str(), "cluster");
+        // The lifecycle record is unchanged by the mode discriminator.
+        assert!(registry.is_draining(1));
+        assert_eq!(
+            registry.drain_state(1),
+            DrainState::Draining { blocked_reason: None, paused: false }
+        );
     }
 
     // -- set_drain_paused (d3 pause/resume controls) --
