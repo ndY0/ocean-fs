@@ -177,6 +177,9 @@ impl IntraNodeDrain {
 
         'sources: for source in sources {
             let live = self.collect_live_entries(source);
+            // Drain-progress gauge (d4's `oceanfs_drain_*` close): the
+            // number of live entries still carrying the source pool_id.
+            self.registry.set_drain_remaining(source, live.len() as u64);
 
             // Empty (no Sealed and no Reserved entry still carries the
             // source pool_id) → Detachable, d5's precondition.
@@ -228,6 +231,11 @@ impl IntraNodeDrain {
                     Ok(()) => {
                         stats.segments_moved += 1;
                         stats.bytes_moved = stats.bytes_moved.saturating_add(total_bytes);
+                        // Drain-throughput counters (d4's `oceanfs_drain_*`
+                        // close): the copy left the source pool (dispatched)
+                        // and the source copy was unlinked (released).
+                        self.registry.note_drain_dispatched(source);
+                        self.registry.note_drain_released(source);
                         // Fresh statvfs so the next selection sees the space
                         // this copy consumed (cheap relative to the copy).
                         self.registry.refresh_capacity();

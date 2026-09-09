@@ -743,6 +743,20 @@ pub(crate) struct PoolMetrics {
     /// `oceanfs_pool_io_errors_total{pool_id}` — g1's `DiskIo` observer
     /// increments it via the bound handle (see `observe_into`).
     io_errors: Counter,
+    /// `oceanfs_drain_dispatched_total{pool_id}` — sealed segments whose
+    /// copy the drain mover dispatched OFF this pool this run
+    /// (intra-node relocation to a sibling / cluster re-replication to
+    /// another node; the d3/d4 mover workers report it, closing d4's
+    /// recorded `oceanfs_drain_*` gap).
+    drain_dispatched: Counter,
+    /// `oceanfs_drain_released_total{pool_id}` — sealed segments whose
+    /// source copy was released/unlinked from this pool (relocation
+    /// unlink, cluster source-release, or a direct release that keeps RF
+    /// satisfied without a new copy).
+    drain_released: Counter,
+    /// `oceanfs_drain_remaining{pool_id}` — sealed segments the node
+    /// still holds on this pool (drain progress; 0 when `Detachable`).
+    drain_remaining: Gauge,
 }
 
 impl PoolMetrics {
@@ -780,12 +794,29 @@ impl PoolMetrics {
             drain_blocked: Gauge::new(
                 "oceanfs_pool_drain_blocked_reason".into(),
                 "1 while the pool's drain is blocked (no eligible target); 0 otherwise".into(),
-                id_label,
+                id_label.clone(),
             ),
             io_errors: Counter::new(
                 "oceanfs_pool_io_errors_total".into(),
                 "I/O errors observed on the pool (g1 DiskIo observer increments it)".into(),
                 LabelSet::new(&[("pool_id", &pool_id)]),
+            ),
+            drain_dispatched: Counter::new(
+                "oceanfs_drain_dispatched_total".into(),
+                "Segments whose copy the drain mover dispatched off this pool \
+                 (intra-node relocation / cluster re-replication)".into(),
+                id_label.clone(),
+            ),
+            drain_released: Counter::new(
+                "oceanfs_drain_released_total".into(),
+                "Segments whose source copy was released/unlinked from this pool".into(),
+                id_label.clone(),
+            ),
+            drain_remaining: Gauge::new(
+                "oceanfs_drain_remaining".into(),
+                "Sealed segments the node still holds on this pool (drain progress; 0 = Detachable)"
+                    .into(),
+                id_label,
             ),
         }
     }
@@ -1690,6 +1721,9 @@ impl PoolRegistry {
             registrar.register_gauge(metric.drain_state.clone());
             registrar.register_gauge(metric.drain_blocked.clone());
             registrar.register_counter(metric.io_errors.clone());
+            registrar.register_counter(metric.drain_dispatched.clone());
+            registrar.register_counter(metric.drain_released.clone());
+            registrar.register_gauge(metric.drain_remaining.clone());
         }
     }
 
@@ -2187,11 +2221,12 @@ mod tests {
         let gauges = registrar.gauges.lock();
         let counters = registrar.counters.lock();
         // 5 pools × (status + bytes_free + bytes_total + write_degraded +
-        // drain_state + drain_blocked) gauges (d1 added the two drain
-        // series).
-        assert_eq!(gauges.len(), 30);
-        // 5 pools × io_errors counter.
-        assert_eq!(counters.len(), 5);
+        // drain_state + drain_blocked + drain_remaining) gauges (d1 added
+        // the two drain series; the d4 `oceanfs_drain_*` close added
+        // drain_remaining).
+        assert_eq!(gauges.len(), 35);
+        // 5 pools × (io_errors + drain_dispatched + drain_released).
+        assert_eq!(counters.len(), 15);
 
         let status_names: Vec<&str> =
             gauges.iter().filter(|g| g.name() == "oceanfs_pool_status").map(|g| g.name()).collect();
@@ -2264,6 +2299,41 @@ mod tests {
         registry.set_pool_empty(0).expect("pool drained empty");
         assert_eq!(drain_state.get(), 2, "Detachable gauge value");
         assert_eq!(drain_blocked.get(), 0, "blocked metric cleared on Detachable");
+
+        // The d4 `oceanfs_drain_*` throughput series (gap close): the
+        // registry-level reporters update the per-pool series the movers
+        // drive.
+        let dispatched = counters
+            .iter()
+            .find(|c| {
+                c.name() == "oceanfs_drain_dispatched_total"
+                    && c.labels().render().contains("pool_id=\"0\"")
+            })
+            .expect("pool 0 drain_dispatched counter");
+        let released = counters
+            .iter()
+            .find(|c| {
+                c.name() == "oceanfs_drain_released_total"
+                    && c.labels().render().contains("pool_id=\"0\"")
+            })
+            .expect("pool 0 drain_released counter");
+        let remaining = gauges
+            .iter()
+            .find(|g| {
+                g.name() == "oceanfs_drain_remaining"
+                    && g.labels().render().contains("pool_id=\"0\"")
+            })
+            .expect("pool 0 drain_remaining gauge");
+        assert_eq!(dispatched.get(), 0);
+        assert_eq!(released.get(), 0);
+        assert_eq!(remaining.get(), 0);
+        registry.note_drain_dispatched(0);
+        registry.note_drain_dispatched(0);
+        registry.note_drain_released(0);
+        registry.set_drain_remaining(0, 7);
+        assert_eq!(dispatched.get(), 2);
+        assert_eq!(released.get(), 1);
+        assert_eq!(remaining.get(), 7);
         drop(tmp);
     }
 

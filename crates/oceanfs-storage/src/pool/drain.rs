@@ -650,6 +650,110 @@ impl PoolRegistry {
         Ok(())
     }
 
+    /// Records that the drain mover dispatched one sealed segment's copy
+    /// OFF this pool (d4's `oceanfs_drain_dispatched_total` close — the
+    /// intra-node mover reports a relocation; the cluster mover reports an
+    /// off-node re-replication).
+    ///
+    /// Fire-and-forget over the pool's metric series; unknown pools (or
+    /// pools whose series were detached in d5) are ignored.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::PoolRole;
+    /// use oceanfs_storage::PoolRegistry;
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
+    /// let data = registry.pool_by_role(PoolRole::Data).expect("data pool");
+    /// registry.note_drain_dispatched(data.id());
+    /// ```
+    pub fn note_drain_dispatched(&self, pool_id: u32) {
+        if let Some(metric) = self.metrics_for(pool_id) {
+            metric.drain_dispatched.inc();
+        }
+    }
+
+    /// Records that the drain mover released one sealed segment's source
+    /// copy from this pool (relocation unlink / cluster source-release /
+    /// RF-satisfied direct release).
+    ///
+    /// Fire-and-forget over the pool's metric series; unknown pools are
+    /// ignored.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::PoolRole;
+    /// use oceanfs_storage::PoolRegistry;
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
+    /// let data = registry.pool_by_role(PoolRole::Data).expect("data pool");
+    /// registry.note_drain_released(data.id());
+    /// ```
+    pub fn note_drain_released(&self, pool_id: u32) {
+        if let Some(metric) = self.metrics_for(pool_id) {
+            metric.drain_released.inc();
+        }
+    }
+
+    /// Publishes the number of sealed segments the node still holds on a
+    /// pool (`oceanfs_drain_remaining{pool_id}`; the movers report it each
+    /// cycle and 0 once the pool is `Detachable`).
+    ///
+    /// Fire-and-forget over the pool's metric series; unknown pools are
+    /// ignored.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::PoolRole;
+    /// use oceanfs_storage::PoolRegistry;
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
+    /// let data = registry.pool_by_role(PoolRole::Data).expect("data pool");
+    /// registry.set_drain_remaining(data.id(), 3);
+    /// registry.set_drain_remaining(data.id(), 0);
+    /// ```
+    pub fn set_drain_remaining(&self, pool_id: u32, remaining: u64) {
+        if let Some(metric) = self.metrics_for(pool_id) {
+            metric.drain_remaining.set(remaining);
+        }
+    }
+
     /// Returns the drain record of a pool (`Idle` when no drain was
     /// requested or the pool is unknown).
     ///
@@ -675,7 +779,10 @@ impl PoolRegistry {
     ///
     /// assert_eq!(registry.drain_state(data.id()), DrainState::Idle);
     /// registry.begin_drain(data.id()).expect("begin drain");
-    /// assert_eq!(registry.drain_state(data.id()), DrainState::Draining { blocked_reason: None, paused: false });
+    /// assert_eq!(
+    ///     registry.drain_state(data.id()),
+    ///     DrainState::Draining { blocked_reason: None, paused: false }
+    /// );
     /// ```
     pub fn drain_state(&self, pool_id: u32) -> DrainState {
         self.drain.read().get(&pool_id).cloned().unwrap_or(DrainState::Idle)

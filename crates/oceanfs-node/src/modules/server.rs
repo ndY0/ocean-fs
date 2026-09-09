@@ -628,6 +628,9 @@ impl ServerModule {
                 detach_metrics.remove_gauge("oceanfs_pool_drain_state", &id_label);
                 detach_metrics.remove_gauge("oceanfs_pool_drain_blocked_reason", &id_label);
                 detach_metrics.remove_counter("oceanfs_pool_io_errors_total", &id_label);
+                detach_metrics.remove_counter("oceanfs_drain_dispatched_total", &id_label);
+                detach_metrics.remove_counter("oceanfs_drain_released_total", &id_label);
+                detach_metrics.remove_gauge("oceanfs_drain_remaining", &id_label);
                 Ok(())
             });
 

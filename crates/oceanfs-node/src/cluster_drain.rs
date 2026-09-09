@@ -178,6 +178,9 @@ impl DrainClusterController {
                     return stats;
                 }
                 let (held, has_reserved) = self.held_segments(source);
+                // Drain-progress gauge (d4's `oceanfs_drain_*` close): the
+                // number of held segments left on the source pool.
+                self.registry.set_drain_remaining(source, held.len() as u64);
                 if held.is_empty() && !has_reserved {
                     // No segment we still hold on this pool (released
                     // entries keep a pool_id but drop self) → Detachable.
@@ -203,6 +206,7 @@ impl DrainClusterController {
                     stats.released += 1;
                     stats.bytes_released =
                         stats.bytes_released.saturating_add(candidate.total_bytes);
+                    self.registry.note_drain_released(source);
                     self.clear_blocked_if_any(source);
                 } else {
                     // Need a new off-node copy first; the synchronous
@@ -214,6 +218,10 @@ impl DrainClusterController {
                             stats.released += 1;
                             stats.bytes_released =
                                 stats.bytes_released.saturating_add(candidate.total_bytes);
+                            // Drain-throughput counters (d4's
+                            // `oceanfs_drain_*` close).
+                            self.registry.note_drain_dispatched(source);
+                            self.registry.note_drain_released(source);
                             self.clear_blocked_if_any(source);
                         }
                         Err(DrainDispatchError::NoEligibleTarget) => {
