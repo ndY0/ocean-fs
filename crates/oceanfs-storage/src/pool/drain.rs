@@ -72,12 +72,12 @@ use super::{PoolMetrics, PoolRegistry, PoolStatus};
 ///
 /// assert_eq!(DrainState::Idle.as_u8(), 0);
 /// assert_eq!(
-///     DrainState::Draining { blocked_reason: None }.as_u8(),
+///     DrainState::Draining { blocked_reason: None, paused: false }.as_u8(),
 ///     1
 /// );
 /// assert_eq!(DrainState::Detachable.as_u8(), 2);
 /// assert_eq!(
-///     DrainState::Draining { blocked_reason: Some("no headroom".into()) }
+///     DrainState::Draining { blocked_reason: Some("no headroom".into()), paused: false }
 ///         .blocked_reason(),
 ///     Some("no headroom")
 /// );
@@ -88,10 +88,16 @@ pub enum DrainState {
     Idle,
     /// The pool is being drained. `blocked_reason` is `Some` when no
     /// eligible target exists — the drain is parked, nothing is deleted,
-    /// and the reason is surfaced (no-destructive-failure rule).
+    /// and the reason is surfaced (no-destructive-failure rule). `paused`
+    /// is set by the operator pause/resume controls (d3): a paused drain
+    /// makes the worker's next cycles a no-op for this pool without
+    /// aborting a relocation that already holds the per-segment lock.
     Draining {
         /// Why the drain cannot proceed (`None` = actively draining).
         blocked_reason: Option<String>,
+        /// Operator pause flag — `true` stops new relocations between
+        /// worker ticks (the pool stays `Draining`).
+        paused: bool,
     },
     /// The drain worker emptied the pool (no registered segment carries its
     /// `pool_id`); d5's detach is the only valid next step. The pool's
@@ -108,7 +114,7 @@ impl DrainState {
     /// ```
     /// use oceanfs_storage::DrainState;
     ///
-    /// assert_eq!(DrainState::Draining { blocked_reason: None }.as_u8(), 1);
+    ///     assert_eq!(DrainState::Draining { blocked_reason: None, paused: false }.as_u8(), 1);
     /// ```
     pub fn as_u8(&self) -> u8 {
         match self {
@@ -144,8 +150,7 @@ impl DrainState {
     /// ```
     /// use oceanfs_storage::DrainState;
     ///
-    /// assert_eq!(
-    ///     DrainState::Draining { blocked_reason: Some("no headroom".into()) }
+    ///     assert_eq!(DrainState::Draining { blocked_reason: Some("no headroom".into()), paused: false }
     ///         .blocked_reason(),
     ///     Some("no headroom")
     /// );
@@ -153,7 +158,7 @@ impl DrainState {
     /// ```
     pub fn blocked_reason(&self) -> Option<&str> {
         match self {
-            DrainState::Draining { blocked_reason: Some(reason) } => Some(reason),
+            DrainState::Draining { blocked_reason: Some(reason), .. } => Some(reason),
             _ => None,
         }
     }
@@ -165,11 +170,29 @@ impl DrainState {
     /// ```
     /// use oceanfs_storage::DrainState;
     ///
-    /// assert!(DrainState::Draining { blocked_reason: Some("none".into()) }.is_blocked());
-    /// assert!(!DrainState::Draining { blocked_reason: None }.is_blocked());
+    /// assert!(DrainState::Draining { blocked_reason: Some("none".into()), paused: false }.is_blocked());
+    /// assert!(!DrainState::Draining { blocked_reason: None, paused: false }.is_blocked());
     /// ```
     pub fn is_blocked(&self) -> bool {
         self.blocked_reason().is_some()
+    }
+
+    /// Whether the drain is paused by the operator (d3 pause/resume
+    /// controls). A paused drain stays `Draining`; the worker skips it
+    /// until [`PoolRegistry::set_drain_paused`] clears the flag.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_storage::DrainState;
+    ///
+    /// assert!(DrainState::Draining { blocked_reason: None, paused: true }.is_paused());
+    /// assert!(!DrainState::Draining { blocked_reason: None, paused: false }.is_paused());
+    /// assert!(!DrainState::Idle.is_paused());
+    /// assert!(!DrainState::Detachable.is_paused());
+    /// ```
+    pub fn is_paused(&self) -> bool {
+        matches!(self, DrainState::Draining { paused: true, .. })
     }
 }
 
@@ -256,7 +279,10 @@ impl PoolRegistry {
     ///
     /// registry.begin_drain(data.id()).expect("begin drain");
     /// assert_eq!(registry.pool_by_id(data.id()).expect("pool").status(), PoolStatus::Draining);
-    /// assert_eq!(registry.drain_state(data.id()), DrainState::Draining { blocked_reason: None });
+    /// assert_eq!(
+    ///     registry.drain_state(data.id()),
+    ///     DrainState::Draining { blocked_reason: None, paused: false }
+    /// );
     /// assert!(registry.is_draining(data.id()));
     /// ```
     pub fn begin_drain(&self, pool_id: u32) -> Result<(), DrainStateError> {
@@ -276,7 +302,7 @@ impl PoolRegistry {
 
         {
             let mut drain = self.drain.write();
-            let state = DrainState::Draining { blocked_reason: None };
+            let state = DrainState::Draining { blocked_reason: None, paused: false };
             drain.insert(pool_id, state.clone());
             if let Some(metric) = self.metrics_for(pool_id) {
                 update_drain_gauges(&metric, &state);
@@ -332,7 +358,7 @@ impl PoolRegistry {
     /// registry.set_drain_blocked(data.id(), None).expect("clear");
     /// assert_eq!(
     ///     registry.drain_state(data.id()),
-    ///     DrainState::Draining { blocked_reason: None }
+    ///     DrainState::Draining { blocked_reason: None, paused: false }
     /// );
     /// ```
     pub fn set_drain_blocked(
@@ -344,10 +370,71 @@ impl PoolRegistry {
             return Err(DrainStateError::UnknownPool(pool_id));
         }
         let mut drain = self.drain.write();
-        if !matches!(drain.get(&pool_id), Some(DrainState::Draining { .. })) {
-            return Err(DrainStateError::NotDraining(pool_id));
+        let paused = match drain.get(&pool_id) {
+            Some(DrainState::Draining { paused, .. }) => *paused,
+            _ => return Err(DrainStateError::NotDraining(pool_id)),
+        };
+        let state = DrainState::Draining { blocked_reason: reason.map(str::to_string), paused };
+        drain.insert(pool_id, state.clone());
+        if let Some(metric) = self.metrics_for(pool_id) {
+            update_drain_gauges(&metric, &state);
         }
-        let state = DrainState::Draining { blocked_reason: reason.map(str::to_string) };
+        Ok(())
+    }
+
+    /// Sets or clears the operator pause flag on a `Draining` pool
+    /// (d3 pause/resume controls).
+    ///
+    /// A paused drain stays `Draining` and keeps its blocked reason (if
+    /// any); the drain worker skips the pool until the flag is cleared.
+    /// Pausing never aborts a relocation that already holds the per-segment
+    /// lock — it only stops *new* relocations between worker ticks.
+    ///
+    /// # Errors
+    ///
+    /// [`DrainStateError::UnknownPool`] when no pool carries the id;
+    /// [`DrainStateError::NotDraining`] when the pool is not actively
+    /// `Draining` (an idle or already-`Detachable` pool cannot be paused).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::PoolRole;
+    /// use oceanfs_storage::{DrainState, PoolRegistry};
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
+    /// let data = registry.pool_by_role(PoolRole::Data).expect("data pool");
+    /// registry.begin_drain(data.id()).expect("begin drain");
+    ///
+    /// registry.set_drain_paused(data.id(), true).expect("pause");
+    /// let state = registry.drain_state(data.id());
+    /// assert!(state.is_paused());
+    /// assert_eq!(state.as_str(), "draining", "paused drains stay Draining");
+    ///
+    /// registry.set_drain_paused(data.id(), false).expect("resume");
+    /// assert!(!registry.drain_state(data.id()).is_paused());
+    /// ```
+    pub fn set_drain_paused(&self, pool_id: u32, paused: bool) -> Result<(), DrainStateError> {
+        if self.pool_by_id(pool_id).is_none() {
+            return Err(DrainStateError::UnknownPool(pool_id));
+        }
+        let mut drain = self.drain.write();
+        let blocked_reason = match drain.get(&pool_id) {
+            Some(DrainState::Draining { blocked_reason, .. }) => blocked_reason.clone(),
+            _ => return Err(DrainStateError::NotDraining(pool_id)),
+        };
+        let state = DrainState::Draining { blocked_reason, paused };
         drain.insert(pool_id, state.clone());
         if let Some(metric) = self.metrics_for(pool_id) {
             update_drain_gauges(&metric, &state);
@@ -440,7 +527,7 @@ impl PoolRegistry {
     ///
     /// assert_eq!(registry.drain_state(data.id()), DrainState::Idle);
     /// registry.begin_drain(data.id()).expect("begin drain");
-    /// assert_eq!(registry.drain_state(data.id()), DrainState::Draining { blocked_reason: None });
+    /// assert_eq!(registry.drain_state(data.id()), DrainState::Draining { blocked_reason: None, paused: false });
     /// ```
     pub fn drain_state(&self, pool_id: u32) -> DrainState {
         self.drain.read().get(&pool_id).cloned().unwrap_or(DrainState::Idle)
@@ -553,7 +640,10 @@ mod tests {
         let (registry, _tmp) = registry_with_two_data_pools();
         registry.begin_drain(0).unwrap();
         assert_eq!(registry.pool_by_id(0).unwrap().status(), PoolStatus::Draining);
-        assert_eq!(registry.drain_state(0), DrainState::Draining { blocked_reason: None });
+        assert_eq!(
+            registry.drain_state(0),
+            DrainState::Draining { blocked_reason: None, paused: false }
+        );
         assert!(registry.is_draining(0));
         // The sibling data pool is untouched.
         assert_eq!(registry.drain_state(1), DrainState::Idle);
@@ -590,7 +680,10 @@ mod tests {
         assert_eq!(registry.pool_by_id(0).unwrap().status(), PoolStatus::Draining);
 
         registry.set_drain_blocked(0, None).unwrap();
-        assert_eq!(registry.drain_state(0), DrainState::Draining { blocked_reason: None });
+        assert_eq!(
+            registry.drain_state(0),
+            DrainState::Draining { blocked_reason: None, paused: false }
+        );
     }
 
     // -- set_pool_empty --
@@ -634,10 +727,63 @@ mod tests {
     #[test]
     fn drain_state_round_trips_as_str_and_as_u8() {
         assert_eq!(DrainState::Idle.as_u8(), 0);
-        assert_eq!(DrainState::Draining { blocked_reason: None }.as_u8(), 1);
+        assert_eq!(DrainState::Draining { blocked_reason: None, paused: false }.as_u8(), 1);
         assert_eq!(DrainState::Detachable.as_u8(), 2);
         assert_eq!(DrainState::Idle.as_str(), "idle");
-        assert_eq!(DrainState::Draining { blocked_reason: None }.as_str(), "draining");
+        assert_eq!(
+            DrainState::Draining { blocked_reason: None, paused: false }.as_str(),
+            "draining"
+        );
         assert_eq!(DrainState::Detachable.as_str(), "detachable");
+    }
+
+    // -- set_drain_paused (d3 pause/resume controls) --
+
+    #[test]
+    fn set_drain_paused_on_non_draining_pool_errors() {
+        let (registry, _tmp) = registry_with_two_data_pools();
+        // Idle pool (never began draining).
+        assert_eq!(registry.set_drain_paused(0, true), Err(DrainStateError::NotDraining(0)));
+        registry.begin_drain(0).unwrap();
+        registry.set_pool_empty(0).unwrap();
+        // Detachable pool is no longer draining.
+        assert_eq!(registry.set_drain_paused(0, true), Err(DrainStateError::NotDraining(0)));
+    }
+
+    #[test]
+    fn set_drain_paused_on_unknown_pool_errors() {
+        let (registry, _tmp) = registry_with_two_data_pools();
+        assert_eq!(registry.set_drain_paused(99, true), Err(DrainStateError::UnknownPool(99)));
+    }
+
+    #[test]
+    fn pause_round_trips_and_preserves_blocked_reason() {
+        let (registry, _tmp) = registry_with_two_data_pools();
+        registry.begin_drain(0).unwrap();
+        registry.set_drain_blocked(0, Some("no sibling headroom")).unwrap();
+
+        registry.set_drain_paused(0, true).unwrap();
+        let state = registry.drain_state(0);
+        assert!(state.is_paused());
+        // Pausing preserves the blocked reason and the Draining status.
+        assert_eq!(state.blocked_reason(), Some("no sibling headroom"));
+        assert_eq!(registry.pool_by_id(0).unwrap().status(), PoolStatus::Draining);
+
+        registry.set_drain_paused(0, false).unwrap();
+        let state = registry.drain_state(0);
+        assert!(!state.is_paused());
+        assert_eq!(state.blocked_reason(), Some("no sibling headroom"));
+    }
+
+    #[test]
+    fn paused_state_still_counts_as_draining_for_gauges_and_status() {
+        let (registry, _tmp) = registry_with_two_data_pools();
+        registry.begin_drain(0).unwrap();
+        registry.set_drain_paused(0, true).unwrap();
+        // The drain-state gauge keeps its Draining value (1) — pause is a
+        // sub-state, not a transition.
+        assert_eq!(registry.drain_state(0).as_u8(), 1);
+        assert_eq!(registry.drain_state(0).as_str(), "draining");
+        assert!(registry.is_draining(0), "paused pools stay excluded from placement");
     }
 }

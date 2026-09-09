@@ -29,6 +29,7 @@
 #![allow(clippy::double_must_use)]
 
 mod buffer_pool;
+pub mod drain;
 mod error;
 pub mod io;
 pub mod metadata;
@@ -38,6 +39,7 @@ mod traits;
 pub mod wal;
 
 pub use buffer_pool::BufferPool;
+pub use drain::{DrainCycleStats, IntraNodeDrain, IntraNodeDrainConfig};
 pub use error::{Error, Result};
 pub use io::{
     DiskIo, FaultyIo, IoBackend, IoErrorKind, IoObserver, IoOp, IoReadMode, NoopIoObserver,

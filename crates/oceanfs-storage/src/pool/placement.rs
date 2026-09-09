@@ -184,22 +184,85 @@ impl PlacementPolicy {
             }
         }
 
-        // Weighted least-free: max `free / weight`, ties by smaller pool id
-        // (perf 9.3: integer math only).
-        let mut best: Option<(u64, Arc<StoragePool>)> = None;
-        for pool in eligible {
-            let score = pool.free_bytes() / u64::from(pool.weight().max(1));
-            let replace = match &best {
-                None => true,
-                Some((best_score, best_pool)) => {
-                    score > *best_score || (score == *best_score && pool.id() < best_pool.id())
-                }
-            };
-            if replace {
-                best = Some((score, pool));
+        best_weighted_least_free(&eligible)
+    }
+
+    /// Selects the data pool a sealed segment is relocated onto during an
+    /// intra-node drain (d3, ADR-0036 D5) — the sibling-pool mover's target
+    /// pick.
+    ///
+    /// Same weighted-least-free rule and tie-break as
+    /// [`PlacementPolicy::select_from_pools`], over the registry's *data*
+    /// pools, with two differences:
+    /// - pools whose id appears in `exclude` are skipped (the caller passes
+    ///   the source pool and any other pool it must not write to); a
+    ///   `Draining` pool is additionally excluded by the `Healthy`-only
+    ///   filter, so the exclude list is belt-and-braces on top of the
+    ///   status rule (ADR-0036 D6);
+    /// - the free-space bound is `free_bytes >= required_free +
+    ///   MIN_FREE_HEADROOM_BYTES`, i.e. the segment being moved must fit and
+    ///   leave the usual headroom behind. `required_free` is the registry
+    ///   entry's `total_bytes` (the relocation copy is whole-file).
+    ///
+    /// Returns `None` when no data pool has room — the drain worker parks
+    /// the source pool with a blocked reason (no-destructive-failure rule);
+    /// nothing is deleted and a later capacity change makes the pool
+    /// eligible again.
+    ///
+    /// Perf notes: one registry snapshot read (cloned `Arc`s), a
+    /// pre-sized candidate vec, and pure integer score math (guidelines
+    /// 1.3, 7.1, 9.3).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_storage::{PlacementPolicy, PoolRegistry};
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data-0"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-1".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data-1"), weight: Some(1), tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
+    /// let policy = PlacementPolicy::new();
+    ///
+    /// // Exclude data pool 0 (the draining source); data pool 1 is picked.
+    /// let target = policy
+    ///     .select_data_pool_with_headroom(&registry, &[0], 4 * 1024 * 1024)
+    ///     .expect("a sibling data pool");
+    /// assert_eq!(target.role(), oceanfs_core::PoolRole::Data);
+    /// ```
+    pub fn select_data_pool_with_headroom(
+        &self,
+        registry: &PoolRegistry,
+        exclude: &[u32],
+        required_free: u64,
+    ) -> Option<Arc<StoragePool>> {
+        // One snapshot read of the registry (perf 7.1): `data_pools`
+        // clones the Arcs under one short read lock; scoring runs outside
+        // any lock.
+        let pools = registry.data_pools();
+        let required = required_free.saturating_add(MIN_FREE_HEADROOM_BYTES);
+        let mut eligible: Vec<Arc<StoragePool>> = Vec::with_capacity(pools.len());
+        for pool in pools {
+            if exclude.contains(&pool.id()) {
+                continue;
+            }
+            if pool.status() == PoolStatus::Healthy
+                && !pool.write_degraded()
+                && pool.free_bytes() >= required
+            {
+                eligible.push(pool);
             }
         }
-        best.map(|(_, pool)| pool)
+        best_weighted_least_free(&eligible)
     }
 
     /// Returns the cardinality-1 pool of a pinned role (`wal`, `metadata`,
@@ -240,6 +303,27 @@ impl PlacementPolicy {
     ) -> Option<Arc<StoragePool>> {
         registry.pool_by_role(role).filter(|pool| pool.status() == PoolStatus::Healthy)
     }
+}
+
+/// Weighted least-free pick shared by every selection method: maximum
+/// `free / weight` wins (weight min 1), ties break by smaller pool id.
+/// Operates on a caller-filtered candidate list (perf 9.3: integer math
+/// only, no strings).
+fn best_weighted_least_free(pools: &[Arc<StoragePool>]) -> Option<Arc<StoragePool>> {
+    let mut best: Option<(u64, Arc<StoragePool>)> = None;
+    for pool in pools {
+        let score = pool.free_bytes() / u64::from(pool.weight().max(1));
+        let replace = match &best {
+            None => true,
+            Some((best_score, best_pool)) => {
+                score > *best_score || (score == *best_score && pool.id() < best_pool.id())
+            }
+        };
+        if replace {
+            best = Some((score, Arc::clone(pool)));
+        }
+    }
+    best.map(|(_, pool)| pool)
 }
 
 impl Default for PlacementPolicy {
@@ -441,6 +525,109 @@ mod tests {
         );
         let policy = PlacementPolicy::new();
         assert!(policy.select_data_pool(&registry).is_none());
+    }
+
+    // ---- d3 headroom-aware sibling selection (ADR-0036 C1a/D5) ----
+
+    #[test]
+    fn headroom_selection_skips_excluded_source_and_picks_a_sibling() {
+        let (_tmp, registry) = registry_with_capacities(
+            &[("data-a", PoolRole::Data, 1), ("data-b", PoolRole::Data, 1)],
+            &[(100 * GIB, 20 * GIB), (100 * GIB, 20 * GIB)],
+        );
+        let policy = PlacementPolicy::new();
+
+        // The drain worker excludes the source pool (data-a); the sibling
+        // must be picked regardless of the tie-break.
+        let target = policy
+            .select_data_pool_with_headroom(&registry, &[0], 1 * GIB)
+            .expect("a sibling data pool");
+        assert_eq!(target.id(), 1);
+
+        // Excluding the other sibling leaves only the source — and it is
+        // excluded, so nothing is eligible.
+        assert!(policy.select_data_pool_with_headroom(&registry, &[0, 1], 1 * GIB).is_none());
+    }
+
+    #[test]
+    fn headroom_selection_requires_required_free_plus_min_headroom() {
+        let (_tmp, registry) = registry_with_capacities(
+            &[("data-a", PoolRole::Data, 1)],
+            &[(100 * GIB, 64 * 1024 * 1024 + 1 * 1024 * 1024)],
+        );
+        let policy = PlacementPolicy::new();
+
+        // Free = 65 MiB. A 1 MiB segment needs 1 + 64 = 65 MiB → eligible.
+        let target = policy
+            .select_data_pool_with_headroom(&registry, &[], 1 * 1024 * 1024)
+            .expect("1 MiB segment fits with headroom");
+        assert_eq!(target.id(), 0);
+
+        // A 2 MiB segment needs 66 MiB → not eligible any more.
+        assert!(policy.select_data_pool_with_headroom(&registry, &[], 2 * 1024 * 1024).is_none());
+    }
+
+    #[test]
+    fn headroom_selection_excludes_a_draining_pool_even_when_not_listed() {
+        // Three data pools; data-b drains. Excluding only the source
+        // (data-a) must still route around the draining sibling.
+        let (_tmp, registry) = registry_with_capacities(
+            &[
+                ("data-a", PoolRole::Data, 1),
+                ("data-b", PoolRole::Data, 1),
+                ("data-c", PoolRole::Data, 1),
+            ],
+            &[(100 * GIB, 20 * GIB), (100 * GIB, 20 * GIB), (100 * GIB, 20 * GIB)],
+        );
+        let policy = PlacementPolicy::new();
+        registry.begin_drain(1).unwrap();
+
+        let target = policy
+            .select_data_pool_with_headroom(&registry, &[0], 1 * GIB)
+            .expect("a non-draining sibling");
+        assert_eq!(target.id(), 2, "the draining sibling is excluded by status");
+    }
+
+    #[test]
+    fn headroom_selection_returns_none_without_enough_capacity_anywhere() {
+        // One sibling that cannot fit the segment (below the combined
+        // required + headroom bound) → None, so the worker parks blocked.
+        let (_tmp, registry) = registry_with_capacities(
+            &[("data-a", PoolRole::Data, 1), ("data-b", PoolRole::Data, 1)],
+            &[(100 * GIB, 20 * GIB), (100 * GIB, 8 * GIB)],
+        );
+        let policy = PlacementPolicy::new();
+
+        // data-a is excluded (source); data-b has only 8 GiB free while the
+        // segment needs 9 GiB + headroom → no eligible target.
+        assert!(policy.select_data_pool_with_headroom(&registry, &[0], 9 * GIB).is_none());
+    }
+
+    #[test]
+    fn headroom_selection_uses_the_same_weighted_free_rule() {
+        // Mirrors weighted_selection_prefers_pool_with_more_free_per_weight
+        // under the headroom bound: max free/weight wins.
+        let (_tmp, registry) = registry_with_capacities(
+            &[
+                ("data-a", PoolRole::Data, 1),
+                ("data-b", PoolRole::Data, 2),
+                ("data-c", PoolRole::Data, 1),
+            ],
+            &[
+                (100 * GIB, 10 * GIB),
+                (100 * GIB, 10 * GIB),
+                (100 * GIB, 1 * GIB), // data-c: below the bound → excluded
+            ],
+        );
+        let policy = PlacementPolicy::new();
+
+        let target = policy
+            .select_data_pool_with_headroom(&registry, &[0], 1 * GIB)
+            .expect("data-b is eligible");
+        assert_eq!(target.id(), 1, "score_b = 10GiB/2 = 5GiB > score_c's floor");
+
+        // Exclude the only eligible winner → None (data-c is too full).
+        assert!(policy.select_data_pool_with_headroom(&registry, &[0, 1], 1 * GIB).is_none());
     }
 
     #[test]
