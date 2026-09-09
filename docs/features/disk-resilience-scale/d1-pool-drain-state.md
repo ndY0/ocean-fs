@@ -111,7 +111,8 @@ this state.
   methods) carrying the operator-visible drain record:
   - `begin_drain(pool_id)` — validates (data role, current status not
     Dead/not already draining), flips the pool's status to `Draining`,
-    records `DrainState::Draining { blocked_reason: None }`;
+    records `DrainState::Draining { blocked_reason: None }` (d3 later
+    added `paused: false` to the variant);
   - `set_drain_blocked(pool_id, Option<&str>)` / `clear_drain_blocked` —
     written by the workers (d3/d4) when no eligible target exists;
   - `set_pool_empty(pool_id)` — the Draining→Detachable transition,
@@ -189,13 +190,19 @@ this state.
 
 - `PoolStatus::Draining` — new enum variant (`pub enum PoolStatus`, currently
   `#[non_exhaustive]`).
-- `pub enum DrainState { Idle, Draining { blocked_reason: Option<String> },
-  Detachable }` — the operator-visible drain record (ADR-0036 D6 machine:
-  Idle → Draining → Detachable, BLOCKED = Draining + reason).
+- `pub enum DrainState { Idle, Draining { blocked_reason: Option<String>,
+  paused: bool }, Detachable }` — the operator-visible drain record
+  (ADR-0036 D6 machine: Idle → Draining → Detachable, BLOCKED = Draining +
+  reason). **d3 added the `paused` field** to the `Draining` variant for
+  the operator pause/resume controls (see the d3 feature doc); d1 shipped
+  the variant without it.
 - `PoolRegistry::begin_drain(&self, pool_id: u32) -> Result<(), DrainStateError>`
   — validates + flips status to `Draining` + records state.
 - `PoolRegistry::set_drain_blocked(&self, pool_id: u32, reason: Option<&str>)`
   — no-destructive-failure surfacing.
+- `PoolRegistry::set_drain_paused(&self, pool_id: u32, paused: bool) ->
+  Result<(), DrainStateError>` — **d3 addition**: operator pause/resume
+  toggle; preserves the blocked reason, keeps the pool `Draining`.
 - `PoolRegistry::set_pool_empty(&self, pool_id: u32)` — Draining → Detachable
   (called by d3/d4 workers when the registry holds no segment with this
   `pool_id`).
@@ -203,7 +210,8 @@ this state.
 - `PoolRegistry::is_draining(&self, pool_id: u32) -> bool` (or a
   `StoragePool::status()` read — a Draining pool reports the new variant).
 - `GET /admin/pools` status payload gains per-pool `drain_state` +
-  `blocked_reason` (read-only; mutation verbs land in d4/d5).
+  `blocked_reason` (read-only in d1) and, **from d3**, `drain_paused`;
+  mutation verbs land in d3/d4/d5.
 - Metrics: `oceanfs_pool_draining{pool_id}`,
   `oceanfs_pool_drain_blocked_reason{pool_id}`,
   `oceanfs_pool_drain_state{pool_id}`.

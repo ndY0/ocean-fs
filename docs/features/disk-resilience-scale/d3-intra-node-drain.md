@@ -1,14 +1,14 @@
 ---
 feature: "Intra-Node Drain (C1a — Sibling-Pool Mover)"
 epic: "disk-resilience-scale"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies: ["d2-segment-relocation"]
 adr: [0036, 0017, 0032, 0034]
 perf: []
 created: 2026-09-07
-updated: 2026-09-07
+updated: 2026-09-09
 ---
 
 # Intra-Node Drain (C1a — Sibling-Pool Mover)
@@ -53,9 +53,11 @@ start/pause/resume admin surface land in the composition root.
   - reports blocked when no eligible sibling exists (see the placement
     filter below): `PoolRegistry::set_drain_blocked(pool_id, reason)`
     (d1), nothing deleted, pool stays `Draining`;
-  - on empty (registry holds no sealed/unsealed entry with the source
-    `pool_id`), calls `PoolRegistry::set_pool_empty(pool_id)` → the pool
-    becomes `Detachable`.
+  - on empty (no live **Reserved-or-Sealed** entry carries the source
+    `pool_id` — re-enumerated immediately before the transition, closing
+    the reserve→seal race; see Resolved Decisions 7), calls
+    `PoolRegistry::set_pool_empty(pool_id)` → the pool becomes
+    `Detachable`.
 - **Sibling selection: reuse `PlacementPolicy`, don't invent a selector.**
   The sketch's key decision is settled: reuse the policy with a filter.
   - The worker lists the node's data pools, excludes the source (and any
@@ -69,10 +71,11 @@ start/pause/resume admin surface land in the composition root.
     MIN_FREE_HEADROOM_BYTES` (segment `total_bytes` comes from the
     registry entry, `SegmentMetadata.total_bytes`). No eligible candidate
     with enough headroom ⇒ **blocked** (reason: no sibling capacity).
-  - `<!-- TODO(spec): verify anchor -->` confirm whether the sealer's
-    pool snapshot needs the same Draining filter or whether per-seal
-    registry reads already exclude (d1's open question; if a snapshot is
-    used, the drain candidate set and the write path must agree).
+  - Sealer agreement: **resolved by d1's Deviation 3** — the f5 sealer
+    refreshes its data-pool snapshot from the live registry per seal, so a
+    pool that turns `Draining` never receives a new segment while a healthy
+    sibling exists; the drain candidate set and the write path agree with
+    no d3 change.
 - **`DurabilityTask` integration (ADR-0017).**
   - The drain runs as a Tier-1 (housekeeping) task under the durability
     scheduler: it implements/adapts `DurabilityTask`
@@ -83,15 +86,12 @@ start/pause/resume admin surface land in the composition root.
     cycle — `scheduler/budget.rs:72`; Tier-0 repair/heal is never blocked
     by a drain, ADR-0036 D4/D5). A task whose source pool is not draining,
     or whose drain is paused, is a no-op cycle.
-  - Adaptor/wiring: the four existing Tier-1 adaptors live in
+  - Adaptor/wiring: the Tier-1 adaptors live in
     `oceanfs-durability/src/scheduler/adaptors.rs` wrapping durability
-    crate workers; a drain adaptor either joins them (worker object
-    exposed through the durability crate facade, like `GarbageCollector`)
-    or node implements `DurabilityTask` directly (node already depends on
-    durability for `RepairTargetSelector`). **Implementer decision** on
-    the seam — record in Deviations. Registered in the durability module
-    builder (`crates/oceanfs-node/src/modules/durability.rs`) alongside
-    the other tasks.
+    crate workers; the drain worker is storage-side and the node's
+    composition root builds it (see Deviation b). Registered in the
+    durability module builder (`crates/oceanfs-node/src/modules/durability.rs`)
+    alongside the other tasks.
 - **Config (ADR-0036 D5 — per-task knob, no shared byte-budget
   abstraction).** New config fields in the scheduler/drain config family:
   - `drain_max_bytes_per_tick` (default e.g. 256 MiB — a bounded tick so a
@@ -112,9 +112,10 @@ start/pause/resume admin surface land in the composition root.
   Nothing is deleted and nothing is half-removed.
 - **Admin start surface.** `POST /admin/pools/{id}/drain` with target mode
   `intra-node` begins the drain (marks `Draining`, d1, and enables the
-  task's source set); `pause`/`resume` set the pause flag. Exact verbs are
-  finalized across d3/d4 (the epic leaves route wording to d4/d5 — d3 adds
-  the intra-node mode and the pause/resume controls).
+  task's source set); `pause`/`resume` set the pause flag. The route verbs
+  shipped in d3 are `POST /admin/pools/{id}/drain[/pause|/resume]` (see
+  the Interface section and Deviation e); d4 later adds the `cluster`
+  mode.
 - **Workflow the feature documents end-to-end:** attach a sibling via f8
   (`POST /admin/pools`, `runtime-attach.md`) → `POST /admin/pools/{id}/drain`
   (mode intra-node) → observe progress → pool `Detachable` → d5 detach.
@@ -154,32 +155,65 @@ start/pause/resume admin surface land in the composition root.
 
 | Crate | Change |
 |---|---|
-| `oceanfs-storage` | Drain worker object (registry enumeration + tick budget + blocked/empty logic); `PlacementPolicy::select_data_pool_with_headroom` (or equivalent) |
-| `oceanfs-durability` | Drain Tier-1 adaptor implementing `DurabilityTask` (if the adaptor seam is chosen — otherwise node implements the trait) |
-| `oceanfs-node` | Scheduler registration + worker wiring (`modules/durability.rs`); admin start/pause/resume routes (intra-node mode); config knobs (`drain_max_bytes_per_tick`) |
-| `oceanfs-server` | Admin HTTP surface additions for the intra-node drain verbs (with the node's composition root) |
+| `oceanfs-storage` | Drain worker object `drain/intra_node.rs` (`IntraNodeDrain`, `IntraNodeDrainConfig`, `DrainCycleStats`, re-exported from the facade); `PlacementPolicy::select_data_pool_with_headroom` (`pool/placement.rs:242`); per-relocate `refresh_capacity()` in the worker; d1 `pool/drain.rs` gains `paused: bool` + `PoolRegistry::set_drain_paused`/`DrainState::is_paused` |
+| `oceanfs-durability` | Drain Tier-1 adaptor `DrainIntraTask` in `scheduler/adaptors.rs` (name `"drain_intra"`, `keyspace_fraction() == 1.0`), exported through the scheduler facade; registered alongside the GC/orphan/scrub/AE tasks |
+| `oceanfs-node` | Scheduler registration + worker wiring in `modules/durability.rs` (one `IntraNodeDrain` + one `DrainIntraTask`); `StorageModule` retains `Arc<oceanfs_storage::SegmentRelocator>` (built pre-trait-erasure at `modules/storage.rs:494`); `Node::drain_worker()` accessor (`node.rs:680`); admin begin-hook wiring `with_pool_drain_begin` (`modules/server.rs`) |
+| `oceanfs-server` | Admin HTTP verbs `POST /admin/pools/{id}/drain[/pause|/resume]` (`admin.rs:777-779`, `#[cfg(feature="storage")]`) + `drain_paused` in `GET /admin/pools`; `AdminHandler::with_pool_drain_begin` builder |
+| `oceanfs-core` | `[durability]` config fields `drain_max_bytes_per_tick` (256 MiB) + `drain_interval_sec` (1) in `config/durability.rs` |
+| tests | New `crates/oceanfs-node/tests/intra_node_drain.rs` (3 scenarios); d1's `crates/oceanfs-node/tests/pool_drain_state.rs` boots with `drain_interval_sec = 3600` so the live d3 worker cannot race the d1 state assertions |
 
 ## Interface (Public API)
 
 - `PlacementPolicy::select_data_pool_with_headroom(&self, registry:
   &PoolRegistry, exclude: &[u32], required_free: u64) ->
-  Option<Arc<StoragePool>>` — sibling target pick for relocation.
-- `pub struct IntraNodeDrainConfig { pub max_bytes_per_tick: u64, pub
-  interval: Duration, … }` — per-task knob (ADR-0036 D5).
-- Drain worker: `run_cycle(registry…) -> DrainCycleStats { segments_moved,
-  bytes_moved, blocked_reason: Option<String>, remaining: usize,
-  pool_empty: bool }` (the storage-side object the Tier-1 adaptor wraps).
-- `DurabilityTask` impl (name `"drain_intra"`): `run_cycle` delegates to
-  the worker and returns `segments_moved`.
+  Option<Arc<StoragePool>>` — sibling target pick for relocation
+  (`oceanfs-storage/src/pool/placement.rs:242`): excludes the source +
+  other `Draining` pools, requires `free_bytes >= required_free +
+  MIN_FREE_HEADROOM_BYTES`, scores with the same weighted-least-free rule
+  as `select_from_pools`.
+- `pub struct IntraNodeDrainConfig { pub max_bytes_per_tick: u64 }`
+  (`oceanfs-storage`, `Default = 256 MiB`) — the per-tick byte knob
+  (ADR-0036 D5). The cadence knob (`drain_interval_sec`) is a separate
+  `[durability]` config field passed to the adaptor, not a field on the
+  worker config struct.
+- `pub struct IntraNodeDrain` (`oceanfs-storage`, re-exported):
+  `new(config, registry, lifecycle_registry, relocator)` and async
+  `run_cycle(&self) -> DrainCycleStats`. Storage-side pure orchestration:
+  registry enumeration + placement pick + d2 relocation. A no-draining /
+  all-paused cycle is a no-op.
+- `pub struct DrainCycleStats { pub segments_moved: u64, pub
+  bytes_moved: u64, pub emptied: Vec<u32>, pub blocked: Vec<(u32,
+  String)> }` — one cycle's outcome **aggregated over every draining
+  pool** (see Deviation f; supersedes the single-pool sketch shape).
+- `DrainIntraTask` (`oceanfs-durability`, exported via the scheduler
+  facade): `DurabilityTask` impl with `name() == "drain_intra"`,
+  `keyspace_fraction() == 1.0`; `new(Arc<IntraNodeDrain>, interval)`.
 - `PoolRegistry::begin_drain` / `set_drain_blocked` / `set_pool_empty` /
   `drain_state` — consumed from d1 (no new registry surface unless the
-  pause flag lives on the registry rather than the worker).
-- Admin: `POST /admin/pools/{id}/drain` (mode `intra-node`),
-  `POST /admin/pools/{id}/drain/pause`, `POST /admin/pools/{id}/drain/resume`.
-  `<!-- TODO(spec): verify anchor -->` exact route verbs are for d4/d5 to
-  finalize against the existing admin router
-  (`crates/oceanfs-server/src/admin.rs`, attach at `:899`); d3 implements
-  the intra-node mode + pause/resume semantics.
+  pause flag lives on the registry rather than the worker). **d3 pause
+  addition (registry-level, on d1's record):** `paused: bool` on
+  `DrainState::Draining`, `PoolRegistry::set_drain_paused(pool_id,
+  paused) -> Result<(), DrainStateError>`, `DrainState::is_paused()`.
+- `Node::begin_pool_drain` — d1 seam reused verbatim by the admin
+  begin-hook (Deviation e); `Node::drain_worker() ->
+  Arc<oceanfs_storage::IntraNodeDrain>` accessor (`node.rs:680`) for
+  node-level tests and future admin progress surfaces.
+- Config: `[durability] drain_max_bytes_per_tick` (default 256 MiB) +
+  `drain_interval_sec` (default 1) in `oceanfs-core`
+  (`config/durability.rs`); the byte budget lands in the storage worker's
+  `IntraNodeDrainConfig`, the interval on the adaptor.
+- Admin (`#[cfg(feature = "storage")]`):
+  - `POST /admin/pools/{id}/drain` — begin intra-node drain; body `{}`
+    or `{"mode": "intra-node"}` (empty body defaults intra-node);
+    `"cluster"` mode → `501` (d4). Wired via
+    `AdminHandler::with_pool_drain_begin`; the injected closure does
+    registry `begin_drain` + manifest rebuild + `set_self_manifest`
+    (mirrors `Node::begin_pool_drain`), so errors stringify textually.
+  - `POST /admin/pools/{id}/drain/pause` ·
+    `POST /admin/pools/{id}/drain/resume` — set/clear the registry pause
+    flag; responses carry `{"pool_id", "drain_paused": bool}`.
+  - `GET /admin/pools` per-pool entry gains `drain_paused` alongside
+    `drain_state`, `drain_blocked`, `blocked_reason` (`admin.rs:1074`).
 
 ## Data Flow
 
@@ -199,10 +233,11 @@ progress: bytes/segments remaining per pool; blocked reason surfaced; reads serv
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds in `oceanfs-storage`,
+- [x] **Code:** `cargo build --all-targets` succeeds in `oceanfs-storage`,
       `oceanfs-node`, `oceanfs-durability` (+ `oceanfs-server` for the
       admin routes).
-- [ ] **Tests:** `cargo test -p oceanfs-storage -p oceanfs-node -p
+<!-- REVIEW: verified 2026-09-09 — `cargo build --all-targets` green for core/storage/durability/node/server AND the whole workspace (`cargo build --workspace --all-targets`); the relocator is built at the single DiskSegmentStore construction site (crates/oceanfs-node/src/modules/storage.rs:480-497, before trait erasure); DurabilityModule builds one IntraNodeDrain + one DrainIntraTask (modules/durability.rs:523-531); `Node::drain_worker()` accessor present (node.rs:618+). The d3 admin verbs are `#[cfg(feature="storage")]`; server builds with no-default-features fail at 3b01447 too (53-54 pre-existing errors, not a d3 regression). -->
+- [x] **Tests:** `cargo test -p oceanfs-storage -p oceanfs-node -p
       oceanfs-durability --lib -- --test-threads=1` passes; the Scope
       scenario list is green — including the **no-destructive-failure**
       blocked test (no eligible sibling ⇒ pool stays `Draining`, reason
@@ -210,24 +245,29 @@ progress: bytes/segments remaining per pool; blocked reason surfaced; reads serv
       pause/resume no-op cycles, Detachable transition on empty, and the
       integration scenario (live read load through a pool-0 drain; all
       `.dat` moved; `storage_locations` untouched; no restart).
-- [ ] **Docs:** Every `pub` item has `# Examples`; `#![deny(missing_docs)]`
+<!-- REVIEW: verified 2026-09-09 — lib suites green single-threaded: storage 514, durability 280, node 100, server 245, core 232; storage doctests 111; node doctests 46; durability 30; server 14; core 65. Scope scenario list pinned by crates/oceanfs-storage/src/drain/intra_node.rs tests (8: sibling-drain+empty, byte-budget tick stop/resume, no-headroom park+no-delete, pause no-op+resume, two-draining-pools serialize under one global budget, Reserved-keeps-non-empty, ghost-sealed parks with reason, dead-source skipped) + placement.rs headroom tests (5) + drain.rs pause tests (4). Integration: crates/oceanfs-node/tests/intra_node_drain.rs 3/3 (scheduler-driven drain to Detachable under live reads; admin pause/resume; f8-attach→drain) and pool_drain_state.rs 3/3 (incl. blocked-drain no-delete + last-data-pool). No load/e2e suite run locally (PIPELINE §6). Residual LOW (non-blocking): d1's pool_drain_state.rs scenarios 1+2 now run with the live d3 worker ticking at 1s — there is a small latent window between `begin_pool_drain` and the sibling-drain/assertions where the worker could relocate pool-0 segments (observed stable 12/12 consecutive runs; recommend pausing the drain in those d1 scenarios if flakiness ever appears). -->
+- [x] **Docs:** Every `pub` item has `# Examples`; `#![deny(missing_docs)]`
       passes.
-- [ ] **ADR:** ADR-0036 C1a (intra-node drain to siblings), D4 (Tier-1
+<!-- REVIEW: verified 2026-09-09 — `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` clean on core/storage/durability/node/server; `#![deny(missing_docs)]` present in oceanfs-storage lib.rs:17-25. New pub items carry examples/doctests (IntraNodeDrainConfig, DrainCycleStats, PlacementPolicy::select_data_pool_with_headroom, PoolRegistry::set_drain_paused, DrainState::is_paused); the IntraNodeDrain::new/run_cycle examples are `ignore`-tagged (non-gating per the Lint note). Doc-staleness LOW (non-blocking): task.rs:3 / modules/durability.rs:46,89,488 / node.rs:42 still say "four Tier-1" housekeeping tasks (now five with drain_intra). -->
+- [x] **ADR:** ADR-0036 C1a (intra-node drain to siblings), D4 (Tier-1
       task; Tier-0 never blocked by drain), D5 (configurable per-task
       `max_bytes_per_tick`, no shared budget framework), D6 (blocked ⇒
       pool stays Draining + reason surfaced; empty ⇒ Detachable) satisfied;
       ADR-0017 (scheduled background task), ADR-0032 (relocation via the
       unified store lock — through d2), ADR-0034 (registry enumeration,
       never a disk scan) satisfied.
-- [ ] **Perf:** frontmatter `perf: []`; prose constraints: enumeration is
+<!-- REVIEW: verified 2026-09-09 — ADR-0036 D4: drain registered as a Tier-1 DurabilityTask; every scheduled cycle acquires a housekeeping (Tier-1) permit in scheduler/engine.rs run_one_cycle:240, so Tier-0 repair is never gated behind the drain. ADR-0036 D5: own knob `durability.drain_max_bytes_per_tick` (default 256 MiB, oceanfs-core config/durability.rs:48) + `drain_interval_sec` (default 1); no shared byte-budget framework. ADR-0036 D6/ADR-0034: enumeration via `SegmentLifecycleRegistry::for_each` only (intra_node.rs:317); blocked ⇒ set_drain_blocked + pool stays Draining + nothing deleted (parks_when_no_sibling_headroom_and_deletes_nothing); empty ⇒ set_pool_empty→Detachable only when NO Reserved-or-Sealed entry carries the source pool_id (collect_live_entries includes Reserved; re-enumeration at intra_node.rs:272 closes the reserve→seal race before the empty transition); a Dead pool is never a source/target (drain.rs begin_drain DeadPool + draining_source_ids status check). ADR-0017 (scheduled task + keyspace_fraction 1.0 + assert_full) and ADR-0032 (relocation under the unified-store per-segment lock via d2 SegmentRelocator) satisfied. One worker instance serializes all draining pools under one global budget (DurabilityModule builds exactly one IntraNodeDrain + one DrainIntraTask; concurrent_cycles defaults false → per-task serial cycles). -->
+- [x] **Perf:** frontmatter `perf: []`; prose constraints: enumeration is
       a registry `for_each` (in-memory, no disk scan); the byte budget
       bounds per-tick I/O; relocation batches share the per-segment lock
       discipline (d2); no per-segment allocation churn beyond the d2 copy
       path (pre-sized candidate vecs — perf rule 1.3).
-- [ ] **Integration:** integration test at the node boundary exercises the
+<!-- REVIEW: verified 2026-09-09 — enumeration is registry-only (lifecycle.rs:793 `for_each`, in-memory shard walk); byte budget caps each tick's relocations; relocation I/O is bounded by d2's copy path under the per-segment lock; placement helper pre-sizes its candidate vec (`Vec::with_capacity(pools.len())`, placement.rs:253); the per-cycle candidate Vecs in run_cycle are once-per-cycle allocations, not per-segment churn; `refresh_capacity()` is invoked once per successful relocate (statvfs, cheap relative to the copy). -->
+- [x] **Integration:** integration test at the node boundary exercises the
       complete attach → drain → `Detachable` workflow under live reads
       with no restart, and asserts no `.dat` is lost or left behind on the
       drained root. **No load suite is run locally** (PIPELINE §6).
+<!-- REVIEW: verified 2026-09-09 — crates/oceanfs-node/tests/intra_node_drain.rs scenarios 1-3 exercise: (1) admin begin over HTTP + real scheduler-driven drain under a live GET reader, pool 0 root emptied, every `.dat` on the sibling, `storage_locations`/topology untouched (manifest still 5 pools), status stays Draining after Detachable, no restart; (2) pause = no-op cycles (manual + scheduler), resume completes to Detachable; (3) boot 1 pool → f8 attach → drain to Detachable. All 3 pass; the storage-side no-destructive-failure blocked test parks with `blocked_reason` surfaced and zero `.dat` deleted (intra_node.rs:530-555). No load suite invoked (PIPELINE §6). -->
 
 > **Lint & Doc Examples (non-gating):** `cargo clippy --lib -- -D warnings`
 > should pass on production code. Test-code clippy warnings (`.unwrap()`,
@@ -236,36 +276,102 @@ progress: bytes/segments remaining per pool; blocked reason surfaced; reads serv
 > hygiene tracked separately (see `guidelines/coding.md` §9.2.1). Do NOT
 > include Lint or Manual items in the Definition of Done checklist.
 
-## Open Questions for the Implementer
+## Resolved Decisions
 
-- **Drain order.** The sketch asks: largest-segments-first vs.
-  oldest-first for bounded-tick usefulness. Largest-first makes progress
-  visible fastest and unblocks headroom sooner on the source; oldest-first
-  is fairer to long-lived segments. Recommend largest-first per tick
-  (fewer ticks, faster empty), but measure against the byte budget — 
-  record the choice.
-- **In-flight active segments on the newly-Draining pool.** d1 guarantees
-  new reservations never target a Draining pool; a segment that was
-  already appending when the pool flipped cannot be re-homed mid-life.
-  Recommended (from d1): let it finish and seal; the sealed entry then has
-  `pool_id == source` and the worker relocates it. Confirm and record.
-- **Task-adaptor seam.** Durability's Tier-1 adaptors wrap
-  durability-crate workers; the drain worker needs placement + relocator
-  (storage) and the registry. Decide whether the drain worker object is
-  exposed through the durability facade (adaptor joins
-  `scheduler/adaptors.rs`) or node implements `DurabilityTask` directly
-  (node depends on durability already). Record in Deviations.
-- **Pause-flag ownership.** Registry-level (visible to admin status, d1)
-  vs. worker-level (simplest). If admin status must reflect pause state,
-  the flag belongs where `drain_state` lives.
-- **Concurrent drains on the same node.** Two data pools draining at once
-  (pool-only retirement of two disks) — the shared Tier-1 budget + per-pool
-  byte knobs must not double-oversubscribe the node's I/O. Default:
-  serialize intra-node drains on one worker task (a task per source pool
-  would multiply; the epic does not require parallel pool drains).
+Recorded 2026-09-09 at final spec close. Every question posed under "Open
+Questions for the Implementer" is resolved; where the outcome is also
+recorded under [Deviations (accepted)](#deviations-accepted), the
+cross-reference is given.
+
+1. **Drain order & blocked semantics.** Largest-first per source pool
+   (unblocks source headroom fastest against the byte budget). When the
+   largest remaining candidate fits **no** eligible sibling the pool is
+   parked blocked — smaller segments are never moved first, because they
+   cannot make the largest fit. Deterministic per-segment relocation
+   failures (missing file, commit/store error) also park the pool with a
+   surfaced reason; the reason clears on the next successful relocate.
+   (Deviation c.)
+2. **In-flight active segments on a newly-Draining pool.** Resolved by d1's
+   Deviation 4 (documented, no code) plus the d3 emptiness rule: a segment
+   that was already reserving/appending when the pool flipped finishes and
+   seals on the source (its registry entry keeps `pool_id == source`) and
+   the worker relocates it like any other sealed segment; a live Reserved
+   entry keeps the pool non-empty until it seals and moves (see decision 7).
+3. **Task-adaptor seam.** The drain worker object is storage-side
+   (`oceanfs-storage/src/drain/intra_node.rs`, `IntraNodeDrain`) and the
+   Tier-1 task is a thin `DrainIntraTask` adaptor in
+   `oceanfs-durability/src/scheduler/adaptors.rs` (name `"drain_intra"`),
+   registered in `modules/durability.rs`. The node retains an
+   `Arc<oceanfs_storage::SegmentRelocator>` on `StorageModule`, built at
+   the single `DiskSegmentStore` construction site **before** trait
+   erasure — no raw concrete-store leak, no `SegmentDataStore` trait
+   extension (d2's D3-2 resolution). (Deviation b.)
+4. **Pause-flag ownership.** Registry-level, on the d1 drain record: d3
+   added `paused: bool` to `DrainState::Draining`, plus
+   `PoolRegistry::set_drain_paused` and `DrainState::is_paused()`;
+   `GET /admin/pools` exposes `drain_paused`. This is an additive
+   evolution of the d1 enum — d1 shipped the variant without the field and
+   its doc records the addition. (Deviation a.)
+5. **Concurrent drains on the same node.** One serialized worker per node
+   drains **all** draining pools in pool-id order under a single global
+   `max_bytes_per_tick` (a task per source pool would multiply I/O; the
+   scheduler's `concurrent_cycles` default is false → per-task serial
+   cycles). `DrainCycleStats` therefore aggregates every pool touched in
+   the cycle. (Deviation f.)
+6. **Config.** `[durability] drain_max_bytes_per_tick` (default 256 MiB)
+   and `drain_interval_sec` (default 1) in `oceanfs-core`
+   (`config/durability.rs`). The interval knob lives on the adaptor
+   (`DrainIntraTask`), the byte budget in the storage worker's
+   `IntraNodeDrainConfig`.
+7. **Emptiness / reserve→seal race.** `PoolRegistry::set_pool_empty` fires
+   only when **no** live Reserved-or-Sealed entry carries the source
+   `pool_id`, with a re-enumeration immediately before the transition —
+   closing the reserve→seal race where a just-reserved segment would seal
+   onto a pool the worker already declared empty. (Deviation c's
+   deterministic-failure surfacing covers the ghost-sealed entry case: it
+   parks with a reason rather than silently detaching.)
 
 ## Deviations (accepted)
 
-None yet — this document is proposed. Expected-deviation candidates: the
-worker/adaptor seam, the drain-order rule, and the in-flight-segment rule
-(see Open Questions). Record each with its resolution at implementation.
+Recorded 2026-09-09 after implementation review (PASS, iteration 1) —
+each validated by the stakeholder before/at implementation.
+
+- **a. DrainState pause field (registry-level `paused: bool` on the
+  `Draining` variant + `PoolRegistry::set_drain_paused`), extending d1's
+  public enum.** Operator-visible pause belongs with the drain record the
+  admin status surface already reads, so the worker and the operator see
+  one source of truth; the field is an additive evolution of d1's variant
+  (d1 doc updated to match).
+- **b. Worker home + adaptor seam (storage-side worker; durability-crate
+  adaptor; node retains `Arc<SegmentRelocator>` rather than the raw
+  concrete store).** The worker stays pure storage orchestration beside the
+  registry/placement/relocator primitives it consumes, the durability crate
+  gets only a thin ADR-0017 adaptor, and the composition root builds the
+  relocator at the single store-construction site before trait erasure — no
+  `SegmentDataStore` trait extension and no concrete-store `Arc` through
+  the scheduler facade.
+- **c. Largest-first park semantics incl. deterministic per-segment
+  failure parking.** Moving smaller segments first cannot make the largest
+  remaining segment fit, so when the largest candidate fits no eligible
+  sibling the pool parks blocked; deterministic per-segment failures
+  (missing file / commit-store) surface through the same `blocked_reason`,
+  a broader no-destructive-failure surface than "no eligible target", and
+  the reason clears on the next successful relocate.
+- **d. Per-cycle statvfs `refresh_capacity()` after each successful
+  relocate.** Headroom picks need fresh free-space after each move because
+  a cycle relocates bytes between pools; statvfs is cheap relative to the
+  copy it follows.
+- **e. HTTP begin seam mirrors `Node::begin_pool_drain` (registry
+  `begin_drain` + manifest rebuild + `set_self_manifest`).** The begin
+  route must re-gossip the `"draining"` manifest exactly like the d1 node
+  seam; the local `ManifestCache` self-entry update remains deferred from
+  d1's LOW note (d5). The begin route maps `DrainStateError` to HTTP
+  status **textually** because the injected closure stringifies the error.
+- **f. `DrainCycleStats` aggregate multi-pool shape (`emptied: Vec<u32>`,
+  `blocked: Vec<(u32, String)>`).** One task serializes every draining pool
+  per cycle, so the returned stats must aggregate pools — superseding the
+  Interface sketch's single-pool `pool_empty`/`blocked_reason` fields.
+- **g. d1 integration test interval override.** d1's
+  `pool_drain_state.rs` boots with `drain_interval_sec = 3600` so the now
+  live d3 worker cannot race the d1 state assertions between
+  `begin_pool_drain` and scenario completion.

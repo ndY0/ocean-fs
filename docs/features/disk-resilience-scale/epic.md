@@ -3,7 +3,7 @@ epic: "disk-resilience-scale"
 status: proposed
 priority: high
 created: 2026-09-07
-updated: 2026-09-07
+updated: 2026-09-09
 ---
 
 # Disk Resilience — Phase C: Cluster Capacity Operations — Epic Plan
@@ -81,10 +81,10 @@ Implementation order: **d0 → d1 → d2 → d3 → d4 → d5**, then evaluate d
 
 | # | Feature | Status | Doc | Touches | Depends on | Notes |
 |---|---|---|---|---|---|---|
-| d0 | `regression-gate` | proposed | [d0-regression-gate.md](d0-regression-gate.md) | workspace | — | **Pre-epic baseline fix + gate**: fix the seven documented pre-existing failures to zero (decision 2026-09-07), then full green gate (crates lib + node integration + quick e2e allowlist, `--test-threads=1`, PIPELINE §4.6/§6); clippy/fmt/rustdoc clean; green baseline recorded |
-| d1 | `pool-drain-state` | proposed | [d1-pool-drain-state.md](d1-pool-drain-state.md) | storage, core | d0 | Registry `Draining` state; placement exclusion; read-while-draining; health monitor ignores Draining; admin status + `oceanfs_pool_drain_blocked_reason` |
-| d2 | `segment-relocation` | proposed | [d2-segment-relocation.md](d2-segment-relocation.md) | storage | d1 | Durable `pool_id` mutation (MetadataRefreshEvent optional section, ADR-0030-style decode); copy→commit→unlink under per-segment write lock; reader-cache purge; GC/reaper/crash-window interplay |
-| d3 | `intra-node-drain` | proposed | [d3-intra-node-drain.md](d3-intra-node-drain.md) | storage, node | d2 | C1a worker (DurabilityTask Tier-1): registry-enumerated relocation to placement-chosen sibling pools; configurable `max_bytes_per_tick`; blocked-state logic |
+| d0 | `regression-gate` | done | [d0-regression-gate.md](d0-regression-gate.md) | workspace | — | **Pre-epic baseline fix + gate**: fix the seven documented pre-existing failures to zero (decision 2026-09-07), then full green gate (crates lib + node integration + quick e2e allowlist, `--test-threads=1`, PIPELINE §4.6/§6); clippy/fmt/rustdoc clean; green baseline recorded |
+| d1 | `pool-drain-state` | done | [d1-pool-drain-state.md](d1-pool-drain-state.md) | storage, core | d0 | Registry `Draining` state; placement exclusion; read-while-draining; health monitor ignores Draining; admin status + `oceanfs_pool_drain_blocked_reason` |
+| d2 | `segment-relocation` | done | [d2-segment-relocation.md](d2-segment-relocation.md) | storage | d1 | Durable `pool_id` mutation (MetadataRefreshEvent optional section, ADR-0030-style decode); copy→commit→unlink under per-segment write lock; reader-cache purge; GC/reaper/crash-window interplay |
+| d3 | `intra-node-drain` | done | [d3-intra-node-drain.md](d3-intra-node-drain.md) | storage, node | d2 | C1a worker (DurabilityTask Tier-1): registry-enumerated relocation to placement-chosen sibling pools; configurable `max_bytes_per_tick`; blocked-state logic |
 | d4 | `cluster-drain` | proposed | [d4-cluster-drain.md](d4-cluster-drain.md) | node, durability, storage | d2, d3 (mover reuse) | C1b controller: drain pool-only and node-level; target via existing selector/RPC; **source-release** (holder-set refresh minus self + local unlink); admin drain API; paced/pausable/terminal; reconciliation interaction |
 | d5 | `detach-and-drop` | proposed | [d5-detach-and-drop.md](d5-detach-and-drop.md) | storage, node | d3 (empty precondition) | `PoolRegistry::detach` on empty pool; config/topology drop; manifest rebuild + re-gossip; no restart |
 | d6 | `capacity-weighted-ownership` (C2a) | proposed | [d6-capacity-weighted-ownership.md](d6-capacity-weighted-ownership.md) | membership, routing, node | d4 (measure difficulty) | **Optional/late**: ring share tracks data-pool capacity; hysteresis; deterministic convergence. May defer to backlog `disk-resilience-capacity` |
