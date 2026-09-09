@@ -506,6 +506,31 @@ impl ServerModule {
                 Ok(())
             });
 
+        // Intra-node drain begin (d3, ADR-0036 C1a): `POST
+        // /admin/pools/{id}/drain` marks the pool `Draining` through the
+        // exact d1 `Node::begin_pool_drain` seam — registry `begin_drain`
+        // + the manifest rebuild/re-gossip so peers stop using the pool as
+        // a placement/repair target. Pause/resume need no hook: they
+        // toggle the registry's per-pool pause flag directly. (d1 LOW note:
+        // like `Node::begin_pool_drain`, the local `ManifestCache`
+        // self-entry is not updated here — peers and local placement read
+        // the registry/status; revisit when d5's worker-driven transitions
+        // land.)
+        let drain_membership = membership.clone();
+        let drain_registry = storage.registry.clone();
+        let drain_self_id = self_id.clone();
+        let on_pool_drain_begin: Arc<dyn Fn(u32) -> Result<(), String> + Send + Sync> =
+            Arc::new(move |pool_id| {
+                drain_registry.begin_drain(pool_id).map_err(|e| e.to_string())?;
+                let incarnation = drain_membership
+                    .incarnation_of(&drain_self_id)
+                    .map(|inc| inc.value())
+                    .unwrap_or(0);
+                let manifest = pool_manifest::build_node_manifest(incarnation, &drain_registry);
+                drain_membership.set_self_manifest(manifest);
+                Ok(())
+            });
+
         let admin_handler = oceanfs_server::AdminHandler::new_with_cluster(
             bucket_store,
             metrics.clone(),
@@ -525,6 +550,7 @@ impl ServerModule {
         )
         .with_accel(storage.accel.clone())
         .with_pool_attach(storage.registry.clone(), on_pool_attached)
+        .with_pool_drain_begin(on_pool_drain_begin)
         // Live wal-pool remount (g7, ADR-0035): the coordinator owns the
         // replaced-wal drain + write-resume gate (built into the
         // durability module, which holds the ReRepWorker + AE handles).
