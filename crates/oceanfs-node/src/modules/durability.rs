@@ -18,13 +18,14 @@ use std::{net::SocketAddr, sync::Arc};
 
 use oceanfs_core::{CodecConfig, MetricRegistrar, NodeConfig, NodeId, OperationTimeouts};
 use oceanfs_durability::{
-    AeTask, AntiEntropy, DurabilityBudget, DurabilityScheduler, GarbageCollector, GcTask,
-    GrpcHintDeliveryClient, HealConfig, HealQueue, HealWorker, HintedHandoff, HintedHandoffConfig,
-    HintedHandoffManager, OrphanReaper, OrphanTask, ReRepWorker, ScrubConfig, ScrubCoordinator,
-    ScrubTask,
+    AeTask, AntiEntropy, DrainIntraTask, DurabilityBudget, DurabilityScheduler, GarbageCollector,
+    GcTask, GrpcHintDeliveryClient, HealConfig, HealQueue, HealWorker, HintedHandoff,
+    HintedHandoffConfig, HintedHandoffManager, OrphanReaper, OrphanTask, ReRepWorker, ScrubConfig,
+    ScrubCoordinator, ScrubTask,
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
+use oceanfs_storage::{IntraNodeDrain, IntraNodeDrainConfig};
 
 use crate::{
     announce::AnnounceMetrics,
@@ -42,7 +43,7 @@ use crate::{
 /// consume. Metrics registration is centralized in
 /// [`register_metrics`](Self::register_metrics). ADR-0017 is built in:
 /// `budget` is the two-tier admission budget and `scheduler` drives the
-/// four Tier-1 housekeeping cycles.
+/// five Tier-1 housekeeping cycles (GC/orphan/scrub/AE/intra-node drain).
 pub(crate) struct DurabilityModule {
     /// Garbage collector (compaction + reaping orchestration).
     pub(crate) gc: Arc<GarbageCollector>,
@@ -85,9 +86,13 @@ pub(crate) struct DurabilityModule {
     /// scheduler (Tier-1) and heal/re-rep/hint-apply (Tier-0). Handed to
     /// the server builder for the healing gRPC service.
     pub(crate) budget: Arc<DurabilityBudget>,
-    /// ADR-0017 scheduler: drives the four Tier-1 housekeeping cycles
+    /// ADR-0017 scheduler: drives the five Tier-1 housekeeping cycles
     /// under Tier-1 permits from the shared budget.
     pub(crate) scheduler: Arc<DurabilityScheduler>,
+    /// The d3 intra-node drain worker (ADR-0036 C1a) — retained so the
+    /// composition root and node-level tests can run cycles directly; the
+    /// scheduler drives it as the `"drain_intra"` Tier-1 task.
+    pub(crate) drain: Arc<IntraNodeDrain>,
     /// Replaced-wal recovery coordinator (g7, ADR-0035) — owns the
     /// registry-rebuild + catch-up drain and the write-resume gate. Lives
     /// here (not on `Node`/`ServerModule`) because it needs the
@@ -480,7 +485,7 @@ impl DurabilityModule {
             .await
             .map_err(|e| format!("hinted handoff WAL replay: {e}"))?;
 
-        // ADR-0017: construct the scheduler over the four Tier-1
+        // ADR-0017: construct the scheduler over the five Tier-1
         // adaptors (f1) with their existing cadence fields. Each cycle
         // acquires a Tier-1 permit from the shared budget.
         let task_timeout = if config.durability.task_timeout_sec == 0 {
@@ -508,6 +513,22 @@ impl DurabilityModule {
         scheduler.register(std::sync::Arc::new(AeTask::new(
             ae_worker.clone(),
             std::time::Duration::from_secs(config.ae_interval_sec),
+        )));
+        // d3 (ADR-0036 C1a): the intra-node drain Tier-1 task. One worker
+        // serializes every draining pool on the node under a global
+        // max_bytes_per_tick (ADR-0036 D5 — its own knob, no shared byte
+        // budget). The worker is pure storage orchestration: registry +
+        // lifecycle registry + the d2 relocator (built in StorageModule
+        // over the concrete store).
+        let drain = Arc::new(IntraNodeDrain::new(
+            IntraNodeDrainConfig { max_bytes_per_tick: config.durability.drain_max_bytes_per_tick },
+            Arc::clone(&storage.registry),
+            Arc::clone(&storage.lifecycle_registry),
+            storage.relocator.as_ref().clone(),
+        ));
+        scheduler.register(std::sync::Arc::new(DrainIntraTask::new(
+            Arc::clone(&drain),
+            std::time::Duration::from_secs(config.durability.drain_interval_sec),
         )));
 
         // g8 metadata-loss recovery coordinator (ADR-0029 §D7). Owned here
@@ -557,6 +578,7 @@ impl DurabilityModule {
             hinted_handoff_manager,
             budget,
             scheduler: Arc::new(scheduler),
+            drain,
             wal_recovery,
             metadata_recovery,
         })

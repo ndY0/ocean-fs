@@ -77,6 +77,10 @@ pub(crate) struct StorageModule {
     /// startup recovery (reviews #57/#59/#60/#425). Both the data and
     /// delete/list roles run through it.
     pub(crate) data_store: Arc<dyn oceanfs_storage_api::SegmentDataStore>,
+    /// The d2 durable segment-relocation mover (ADR-0036 D2/D3) — built at
+    /// the one construction site over the concrete store, before the
+    /// trait erasure, and retained for the d3 intra-node drain worker.
+    pub(crate) relocator: Arc<oceanfs_storage::SegmentRelocator>,
     /// The seal-time segment replicator (sealed-segment-replication) —
     /// pushes sealed segments to their ring replicas off the seal path.
     pub(crate) segment_replicator: Arc<SegmentReplicator>,
@@ -483,6 +487,14 @@ impl StorageModule {
         ));
         // The ONE instance (ADR-0032 D4): `StorageModule.data_store` is
         // the only construction site in the node crate.
+        // d3 (ADR-0036 D2/D3): the d2 `SegmentRelocator` needs the
+        // concrete store (its guarded-write + purge seams are
+        // crate-private), so the relocator is built right here — the same
+        // construction site — before the store is erased to the trait.
+        let relocator = Arc::new(oceanfs_storage::SegmentRelocator::new(
+            Arc::clone(&lifecycle),
+            Arc::clone(&unified_store),
+        ));
         let data_store: Arc<dyn oceanfs_storage_api::SegmentDataStore> = unified_store;
 
         // [review][architecture][critical][resolved]
@@ -542,6 +554,7 @@ impl StorageModule {
             lifecycle,
             sealer,
             data_store,
+            relocator,
             segment_replicator,
             segment_reader,
             remap_alias,

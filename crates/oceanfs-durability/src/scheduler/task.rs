@@ -1,7 +1,8 @@
 //! `DurabilityTask` trait + keyspace window (ADR-0017, f1).
 //!
-//! The trait is implemented by the four Tier-1 (housekeeping) interval tasks
-//! (GC, orphan reaper, scrub, AE) and driven by the
+//! The trait is implemented by the five Tier-1 (housekeeping) interval
+//! tasks (GC, orphan reaper, scrub, AE, intra-node drain) and driven by
+//! the
 //! [`DurabilityScheduler`](crate::scheduler::DurabilityScheduler). Heal,
 //! re-replication, reconciliation, and hint delivery do NOT implement this
 //! trait — they are queue/event-driven and participate in the two-tier

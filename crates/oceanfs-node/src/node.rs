@@ -39,8 +39,9 @@ use crate::modules::server::PrefetchStoreAdapter;
 // [end]
 /// Aggregated join handles and cancellation tokens for background loops.
 pub struct BackgroundTasks {
-    /// Durability scheduler (ADR-0017) — drives the four Tier-1
-    /// housekeeping cycles (GC/orphan/scrub/AE) under the shared budget.
+    /// Durability scheduler (ADR-0017) — drives the five Tier-1
+    /// housekeeping cycles (GC/orphan/scrub/AE/intra-node drain) under the
+    /// shared budget.
     pub(crate) durability_scheduler: Option<JoinHandle<()>>,
     /// Durability scheduler cancellation token.
     pub(crate) scheduler_cancel: CancellationToken,
@@ -627,6 +628,57 @@ impl Node {
             crate::pool_manifest::build_node_manifest(incarnation, &self.storage.registry);
         self.membership.set_self_manifest(manifest);
         Ok(())
+    }
+
+    /// Returns the d3 intra-node drain worker (ADR-0036 C1a) — the paced
+    /// Tier-1 mover that relocates a `Draining` pool's sealed segments to
+    /// sibling data pools. Retained for node-level tests and future admin
+    /// progress surfaces; the durability scheduler drives it as the
+    /// `"drain_intra"` task.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn example() {
+    /// use oceanfs_core::NodeConfig;
+    /// use oceanfs_node::Node;
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # fn storage_pools(tmp: &std::path::Path) -> oceanfs_core::StorageConfig {
+    /// #     fn pool(name: &str, role: oceanfs_core::PoolRole, root: std::path::PathBuf) -> oceanfs_core::StoragePoolConfig {
+    /// #         oceanfs_core::StoragePoolConfig {
+    /// #             name: name.into(),
+    /// #             role,
+    /// #             root,
+    /// #             weight: None,
+    /// #             tech: Default::default(),
+    /// #             health: Default::default(),
+    /// #         }
+    /// #     }
+    /// #     oceanfs_core::StorageConfig {
+    /// #         pools: vec![
+    /// #             pool("data-0", oceanfs_core::PoolRole::Data, tmp.join("pool-data")),
+    /// #             pool("data-1", oceanfs_core::PoolRole::Data, tmp.join("pool-data-1")),
+    /// #             pool("wal-0", oceanfs_core::PoolRole::Wal, tmp.join("pool-wal")),
+    /// #             pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.join("pool-meta")),
+    /// #             pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.join("pool-hints")),
+    /// #         ],
+    /// #         missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+    /// #     }
+    /// # }
+    /// # let config = NodeConfig {
+    /// #     data_dir: tmp.path().join("data"),
+    /// #     listen_addr: "127.0.0.1:0".into(),
+    /// #     grpc_listen_addr: "127.0.0.1:0".into(),
+    /// #     membership_listen_addr: "127.0.0.1:0".into(),
+    /// #     storage: storage_pools(&tmp.path()),
+    /// #     ..NodeConfig::default()
+    /// # };
+    /// let node = Node::start(config).await.expect("node");
+    /// node.shutdown().await.expect("shutdown");
+    /// # }
+    /// ```
+    pub fn drain_worker(&self) -> Arc<oceanfs_storage::IntraNodeDrain> {
+        self.durability.drain.clone()
     }
 
     /// Returns the g1 per-pool I/O signal observer (ADR-0029 §D3) the

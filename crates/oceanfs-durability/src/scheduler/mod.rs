@@ -14,7 +14,7 @@
 //!
 //! ## Tier membership and scan shape
 //!
-//! The four registered tasks run full-space passes (`keyspace_fraction() ==
+//! The five registered tasks run full-space passes (`keyspace_fraction() ==
 //! 1.0`); their cycle cost (ADR-0034 accounting substrate) is:
 //!
 //! | Task | Cycle pass today | Why not sharded |
@@ -23,6 +23,7 @@
 //! | Orphan reaper | byte-accounting fully-dead detection over the registry | same — a fraction would multiply full passes per unit time |
 //! | Scrub | verify every Sealed segment against its stored Merkle root | partitions by alive nodes (H5), not keyspace fraction |
 //! | AE | continuous root exchange / full cycle reads + divergence repair | ADR-0015 incremental-tree model; not keyspace-sharded |
+//! | Drain (d3) | relocate `Draining` pools' sealed segments to siblings, paced by `max_bytes_per_tick` | registry-enumerated no-op when nothing drains; a fraction is meaningless |
 //!
 //! Sharding GC/orphan would multiply whole passes per unit time because the
 //! `MetadataStore` API has no range-scan method; the `keyspace_fraction`
@@ -37,7 +38,7 @@ pub mod budget;
 pub mod engine;
 pub mod task;
 
-pub use adaptors::{AeTask, GcTask, OrphanTask, ScrubTask};
+pub use adaptors::{AeTask, DrainIntraTask, GcTask, OrphanTask, ScrubTask};
 pub use budget::{DurabilityBudget, DurabilityPermit, DurabilityTier};
 pub use engine::DurabilityScheduler;
 pub use task::{DurabilityTask, KeyspaceWindow};

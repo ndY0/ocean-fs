@@ -67,8 +67,8 @@ pub use reconcile::{
 };
 pub use repair::{ReRepConfig, ReRepWorker, RepairTargetSelector};
 pub use scheduler::{
-    AeTask, DurabilityBudget, DurabilityPermit, DurabilityScheduler, DurabilityTask,
-    DurabilityTier, GcTask, KeyspaceWindow, OrphanTask, ScrubTask,
+    AeTask, DrainIntraTask, DurabilityBudget, DurabilityPermit, DurabilityScheduler,
+    DurabilityTask, DurabilityTier, GcTask, KeyspaceWindow, OrphanTask, ScrubTask,
 };
 pub use scrub::{ScrubConfig, ScrubCoordinator, ScrubReport, ScrubReportBuilder, SegmentPartition};
 

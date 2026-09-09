@@ -2,13 +2,14 @@
 //!
 //! Each adaptor wraps a real durability worker and implements
 //! [`DurabilityTask`] by delegating to the worker's `run_cycle`, mapping its
-//! stats to the trait's "items processed" count. The four adaptors here are
+//! stats to the trait's "items processed" count. The five adaptors here are
 //! the Tier-1 (housekeeping) members of the two-tier budget (ADR-0017
-//! amendment): GC, orphan reaper, scrub, and AE.
+//! amendment): GC, orphan reaper, scrub, AE, and the intra-node drain
+//! (d3).
 //!
 //! ## Scan shape and `keyspace_fraction == 1.0` (f3)
 //!
-//! All four adaptors run **full-space passes** (`KeyspaceWindow::Full`).
+//! All adaptors run **full-space passes** (`KeyspaceWindow::Full`).
 //! GC/orphan liveness is attributeable only at full-registry granularity
 //! (ADR-0034 accounting — no `MetadataStore` range-scan API exists yet), so a
 //! per-cycle fraction would multiply whole passes per unit time. Naive
@@ -16,11 +17,13 @@
 //! ships inert (see the f3 feature doc). Each adaptor therefore asserts the
 //! `Full` window and rejects any `Shard` window with a loud internal error so
 //! a wiring bug cannot silently run an unsharded scan labeled as sharded.
+//! The drain task is a no-op cycle when no data pool is draining, so a
+//! fraction would be meaningless.
 
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry;
+use oceanfs_storage::{segment::lifecycle::SegmentLifecycleRegistry, IntraNodeDrain};
 use oceanfs_storage_api::{MetadataStore, SegmentDataStore};
 
 use crate::{
@@ -221,6 +224,48 @@ impl DurabilityTask for AeTask {
             self.ae.run_cycle().await?
         };
         Ok(stats.segments_compared)
+    }
+}
+
+/// Tier-1 adaptor for the intra-node drain worker (d3, ADR-0036 C1a).
+///
+/// Delegates to [`IntraNodeDrain::run_cycle`] (registry-enumerated
+/// relocation of `Draining` pools to sibling data pools). Registered with
+/// `keyspace_fraction() == 1.0`; the worker itself is the no-op guard —
+/// a cycle with no draining pool does nothing.
+pub struct DrainIntraTask {
+    /// The intra-node drain worker (storage side).
+    drain: Arc<IntraNodeDrain>,
+    /// Cadence (`durability.drain_interval_sec`, captured at
+    /// construction); the worker's `max_bytes_per_tick` is the pace-setter.
+    interval: Duration,
+}
+
+impl DrainIntraTask {
+    /// Creates an intra-node drain Tier-1 task.
+    pub fn new(drain: Arc<IntraNodeDrain>, interval: Duration) -> Self {
+        Self { drain, interval }
+    }
+}
+
+#[async_trait]
+impl DurabilityTask for DrainIntraTask {
+    fn name(&self) -> &'static str {
+        "drain_intra"
+    }
+
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    fn keyspace_fraction(&self) -> f64 {
+        1.0
+    }
+
+    async fn run_cycle(&self, window: KeyspaceWindow) -> Result<u64> {
+        assert_full(self.name(), window)?;
+        let stats = self.drain.run_cycle().await;
+        Ok(stats.segments_moved)
     }
 }
 
