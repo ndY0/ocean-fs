@@ -170,6 +170,10 @@ deploy_node() {
 set -euo pipefail
 PORT="$1"; DATA_DIR="$2"; CONFIG_DIR="$3"; SERVICE="$4"; NODE_NAME="$5"; NODE_IP="$6"; SEED="$7"
 [ "$SEED" = "NONE" ] && SEED=""
+# Pool roots live on a SIBLING base of data_dir (ADR-0031/ADR-0029: a pool
+# root must stay disjoint from data_dir — the validate rule rejects a root
+# nested inside or equal to it).
+POOL_BASE="${DATA_DIR}-pools"
 
 mkdir -p "$DATA_DIR" "$CONFIG_DIR"
 
@@ -240,6 +244,37 @@ failure_timeout_ms = 15000
 indirect_ping_count = 3
 seed_nodes = [${SEED:+$(printf '"%s"' "$SEED")}]
 CONFIG
+
+# ADR-0031 (f1): storage pools are mandatory at boot — a node without a
+# role-complete [storage.pools] block refuses to start. One pool per role,
+# roots disjoint from data_dir (the e2e harness injects the same layout
+# for local spawns). The pool base is created by the startup probe.
+cat >> "${CONFIG_DIR}/oceanfs.toml" <<POOLS
+
+# ── Storage pools (ADR-0031: mandatory at boot) ─────────────────────────
+[storage]
+missing_root_policy = "fatal"
+
+[[storage.pools]]
+name = "data-0"
+role = "data"
+root = "${POOL_BASE}/pool-data"
+
+[[storage.pools]]
+name = "wal-0"
+role = "wal"
+root = "${POOL_BASE}/pool-wal"
+
+[[storage.pools]]
+name = "meta-0"
+role = "metadata"
+root = "${POOL_BASE}/pool-meta"
+
+[[storage.pools]]
+name = "hints-0"
+role = "hints"
+root = "${POOL_BASE}/pool-hints"
+POOLS
 
 cat > "/etc/systemd/system/${SERVICE}.service" <<UNIT
 [Unit]
