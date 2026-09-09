@@ -8,7 +8,7 @@ dependencies: ["d1-pool-drain-state"]
 adr: [0036, 0025, 0030, 0032, 0034]
 perf: []
 created: 2026-09-07
-updated: 2026-09-08
+updated: 2026-09-09
 ---
 
 # Segment Relocation (Durable pool_id Mutation)
@@ -321,6 +321,15 @@ cross-reference is given.
    the store's atomic temp+rename write (`write_dat_atomic`,
    data_store.rs:535), which idempotently overwrites a leftover target
    residue — re-running the drain after a pre-commit crash is safe.
+
+> **Cross-note (d4 close, 2026-09-09):** the relocate commit now passes
+> the **source merkle root explicitly** (`request_refresh_metadata` with
+> `entry.metadata.merkle_root`, relocate.rs:215-223) because the refresh's
+> merkle parameter is a **value replacement** (`None` clears the anchor) —
+> a pool_id-only commit previously cleared the seal-time anchor, a latent
+> anchor-clear fixed during d4's Option-A work (see
+> [d4-cluster-drain.md](d4-cluster-drain.md) Resolved Decisions 6 /
+> Deviations a).
 
 ## Deviations (accepted)
 
