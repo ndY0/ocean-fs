@@ -24,12 +24,12 @@
 use std::sync::Arc;
 
 use oceanfs_core::{
-    BucketId, Hlc, HlcClock, NodeConfig, NodeId, ObjectKey, ObjectMetadata, SegmentSizeConfig,
-    Tombstone,
+    BucketId, Hlc, HlcClock, LabelSet, NodeConfig, NodeId, ObjectKey, ObjectMetadata,
+    SegmentSizeConfig, StoragePoolConfig, Tombstone,
 };
 
 use crate::{
-    metadata_adapter::MetadataStoreAdapter, node::RepairRequest, pool_manifest,
+    metadata_adapter::MetadataStoreAdapter, node::RepairRequest, pool_detach, pool_manifest,
     routing_cache::ManifestCache,
 };
 
@@ -222,7 +222,9 @@ impl ServerModule {
     /// quorum mode; `announce_incarnation` is the boot incarnation the
     /// pool-attach manifest re-declaration falls back to; `metrics` is
     /// the node's central registry — module-owned series (caches, S3
-    /// handler, healing service) register here during build.
+    /// handler, healing service) register here during build;
+    /// `removed_pools` is the d5 removed-pool store (ADR-0036 D8) the
+    /// detach hook writes and the attach hook clears tombstones with.
     ///
     /// # Errors
     ///
@@ -244,6 +246,7 @@ impl ServerModule {
         is_cluster_node: bool,
         announce_incarnation: u64,
         metrics: Arc<oceanfs_server::admin::MetricsRegistry>,
+        removed_pools: Arc<crate::removed_pools::RemovedPoolStore>,
     ) -> Result<Self, String> {
         let self_id = NodeId::new(&config.node_id);
 
@@ -480,31 +483,45 @@ impl ServerModule {
         negative_cache.register_metrics(&*metrics);
         s3_handler.register_metrics(&*metrics);
 
-        // Runtime pool attach (ADR-0029 §D8, f8): after `POST
+        // Runtime pool attach (ADR-0029 §D8, f8 + d5): after `POST
         // /admin/pools` registers a pool, re-declare the NodeManifest
         // (f6) so peers see the new capacity and re-seed the routing
-        // cache's self entry (f7). The incarnation tracks the CURRENT
-        // one (a rejoin bumps it) with the boot value as the fallback.
+        // cache's self entry (f7). d5 (ADR-0036 D8): re-attaching a pool
+        // whose name+root was recorded as removed clears the tombstone, so
+        // a later restart honours the re-attach (hot-swap round-trip).
+        // The incarnation tracks the CURRENT one (a rejoin bumps it) with
+        // the boot value as the fallback.
         let attach_membership = membership.clone();
         let attach_registry = storage.registry.clone();
         let attach_cache = manifest_cache.clone();
         let attach_self_id = self_id.clone();
         let attach_boot_incarnation = announce_incarnation;
         let attach_metrics = metrics.clone();
-        let on_pool_attached: Arc<dyn Fn() -> Result<(), String> + Send + Sync> =
-            Arc::new(move || {
-                let incarnation = attach_membership
-                    .incarnation_of(&attach_self_id)
-                    .map(|inc| inc.value())
-                    .unwrap_or(attach_boot_incarnation);
-                let manifest = pool_manifest::build_node_manifest(incarnation, &attach_registry);
-                attach_membership.set_self_manifest(manifest.clone());
-                attach_cache.update(attach_self_id.clone(), Arc::new(manifest));
-                // Register the attached pool's metric series with the
-                // global registry (idempotent — existing series are kept).
-                attach_registry.register_metrics(&*attach_metrics);
-                Ok(())
-            });
+        let attach_store = removed_pools.clone();
+        // The closure signature mirrors the server crate's PoolAttachCallback.
+        #[allow(clippy::type_complexity)]
+        let on_pool_attached: Arc<
+            dyn Fn(&StoragePoolConfig) -> Result<(), String> + Send + Sync,
+        > = Arc::new(move |pool_config: &StoragePoolConfig| {
+            // d5: a re-attached pool is no longer removed — drop any
+            // tombstone matching its name+root so the next restart keeps
+            // it (ADR-0036 D8 reconciliation rule). A failure here is
+            // logged by the attach handler; the pool stays attached.
+            attach_store.clear(&pool_config.name, &pool_config.root).map_err(|e| {
+                format!("clearing removed-pool record for '{}': {e}", pool_config.name)
+            })?;
+            let incarnation = attach_membership
+                .incarnation_of(&attach_self_id)
+                .map(|inc| inc.value())
+                .unwrap_or(attach_boot_incarnation);
+            let manifest = pool_manifest::build_node_manifest(incarnation, &attach_registry);
+            attach_membership.set_self_manifest(manifest.clone());
+            attach_cache.update(attach_self_id.clone(), Arc::new(manifest));
+            // Register the attached pool's metric series with the
+            // global registry (idempotent — existing series are kept).
+            attach_registry.register_metrics(&*attach_metrics);
+            Ok(())
+        });
 
         // Pool drain begin (d3/d4, ADR-0036 C1a/C1b): `POST
         // /admin/pools/{id}/drain` marks the pool `Draining` (mode
@@ -555,6 +572,65 @@ impl ServerModule {
                 Ok(())
             });
 
+        // Pool detach (d5, ADR-0036 D1/D6/D8): `POST /admin/pools/{id}/detach`
+        // removes an empty (`Detachable`) data pool. The composition root
+        // does the whole operation in one place: node-side emptiness proof
+        // (d4 definition), registry removal, the removed-pool record write
+        // (`config − removed` at next boot), the manifest rebuild +
+        // re-gossip (peers stop treating the node as having that capacity),
+        // the local routing-cache self-entry refresh, and unregistering the
+        // pool's six Prometheus series. The removed pool disappears from
+        // `/admin/pools` automatically (it reads the live registry).
+        let detach_registry = storage.registry.clone();
+        let detach_lifecycle = Arc::clone(&storage.lifecycle_registry);
+        let detach_self_id = self_id.clone();
+        let detach_membership = membership.clone();
+        let detach_cache = manifest_cache.clone();
+        let detach_metrics = metrics.clone();
+        let detach_store = removed_pools.clone();
+        let on_pool_detach: Arc<dyn Fn(u32) -> Result<(), String> + Send + Sync> =
+            Arc::new(move |pool_id: u32| {
+                let pool = detach_registry
+                    .pool_by_id(pool_id)
+                    .ok_or_else(|| format!("pool {pool_id} is not registered"))?;
+                let role = pool.role().as_str().to_string();
+                let detached = pool_detach::try_detach_pool(
+                    &detach_registry,
+                    &detach_lifecycle,
+                    &detach_self_id,
+                    pool_id,
+                )
+                .map_err(|e| e.to_string())?;
+                // Persist the removal (ADR-0036 D8) — a restart must not
+                // resurrect the pool. Idempotent under the record store.
+                detach_store
+                    .record(&detached.name, &detached.root)
+                    .map_err(|e| format!("recording removed pool '{}': {e}", detached.name))?;
+                // Re-declare the manifest once (perf rule 2.4) so peers
+                // stop routing writes/repair to a node without this pool,
+                // and refresh the local routing-cache self entry.
+                let incarnation = detach_membership
+                    .incarnation_of(&detach_self_id)
+                    .map(|inc| inc.value())
+                    .unwrap_or(0);
+                let manifest = pool_manifest::build_node_manifest(incarnation, &detach_registry);
+                detach_membership.set_self_manifest(manifest.clone());
+                detach_cache.update(detach_self_id.clone(), Arc::new(manifest));
+                // Unregister the detached pool's metric series (d5 — a
+                // removed pool must stop rendering stale series).
+                let pool_id = pool_id.to_string();
+                let id_label = LabelSet::new(&[("pool_id", &pool_id)]);
+                let status_label = LabelSet::new(&[("pool_id", &pool_id), ("role", &role)]);
+                detach_metrics.remove_gauge("oceanfs_pool_status", &status_label);
+                detach_metrics.remove_gauge("oceanfs_pool_bytes_free", &id_label);
+                detach_metrics.remove_gauge("oceanfs_pool_bytes_total", &id_label);
+                detach_metrics.remove_gauge("oceanfs_pool_write_degraded", &id_label);
+                detach_metrics.remove_gauge("oceanfs_pool_drain_state", &id_label);
+                detach_metrics.remove_gauge("oceanfs_pool_drain_blocked_reason", &id_label);
+                detach_metrics.remove_counter("oceanfs_pool_io_errors_total", &id_label);
+                Ok(())
+            });
+
         let admin_handler = oceanfs_server::AdminHandler::new_with_cluster(
             bucket_store,
             metrics.clone(),
@@ -574,6 +650,7 @@ impl ServerModule {
         )
         .with_accel(storage.accel.clone())
         .with_pool_attach(storage.registry.clone(), on_pool_attached)
+        .with_pool_detach(on_pool_detach)
         .with_pool_drain_begin(on_pool_drain_begin)
         .with_node_drain_begin(on_node_drain_begin)
         // Live wal-pool remount (g7, ADR-0035): the coordinator owns the

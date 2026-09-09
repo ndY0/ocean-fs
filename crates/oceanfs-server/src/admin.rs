@@ -173,6 +173,53 @@ impl MetricsRegistry {
         output
     }
 
+    /// Removes a labeled gauge series (d5 detach — a detached pool's
+    /// series stop rendering).
+    ///
+    /// Exact name+labels match (the same composite key the registrar
+    /// builds), so only the targeted series is dropped. No-op when the
+    /// series is absent.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::LabelSet;
+    /// use oceanfs_server::admin::MetricsRegistry;
+    ///
+    /// let reg = MetricsRegistry::new();
+    /// let labels = LabelSet::new(&[("pool_id", "3"), ("role", "data")]);
+    /// reg.gauge_with_labels("oceanfs_pool_status", &[("pool_id", "3"), ("role", "data")], "h");
+    /// reg.remove_gauge("oceanfs_pool_status", &labels);
+    /// // A second removal is a no-op (the series is already gone).
+    /// reg.remove_gauge("oceanfs_pool_status", &labels);
+    /// ```
+    pub fn remove_gauge(&self, name: &str, labels: &LabelSet) {
+        let key = Self::make_key(name, labels);
+        self.gauges.remove(&key);
+    }
+
+    /// Removes a labeled counter series (d5 detach).
+    ///
+    /// Exact name+labels match; no-op when absent.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::LabelSet;
+    /// use oceanfs_server::admin::MetricsRegistry;
+    ///
+    /// let reg = MetricsRegistry::new();
+    /// let labels = LabelSet::new(&[("pool_id", "3")]);
+    /// reg.counter_with_labels("oceanfs_pool_io_errors_total", &[("pool_id", "3")], "h");
+    /// reg.remove_counter("oceanfs_pool_io_errors_total", &labels);
+    /// // A second removal is a no-op (the series is already gone).
+    /// reg.remove_counter("oceanfs_pool_io_errors_total", &labels);
+    /// ```
+    pub fn remove_counter(&self, name: &str, labels: &LabelSet) {
+        let key = Self::make_key(name, labels);
+        self.counters.remove(&key);
+    }
+
     /// Creates a composite key from metric name and label set.
     fn make_key(name: &str, labels: &LabelSet) -> String {
         if labels.is_empty() {
@@ -450,6 +497,21 @@ type PoolDrainBeginCallback =
 #[cfg(feature = "storage")]
 type NodeDrainBeginCallback = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
+/// A pool detach callback (d5, ADR-0036 D6/D8): the composition root's
+/// `detach` hook — node-side emptiness proof (d4 definition) +
+/// `PoolRegistry::detach` + the removed-pool record write + manifest
+/// rebuild/re-gossip + routing-cache refresh + metric unregister.
+#[cfg(feature = "storage")]
+type PoolDetachCallback = Arc<dyn Fn(u32) -> Result<(), String> + Send + Sync>;
+
+/// A pool attach callback (f8, ADR-0029 §D8 + d5): the composition root's
+/// post-attach hook — clear any removed-pool tombstone matching the
+/// attached pool's name+root, then rebuild + re-gossip the `NodeManifest`
+/// and update the routing cache.
+#[cfg(feature = "storage")]
+type PoolAttachCallback =
+    Arc<dyn Fn(&oceanfs_core::StoragePoolConfig) -> Result<(), String> + Send + Sync>;
+
 /// Shared state for admin handlers.
 #[derive(Clone)]
 pub(crate) struct AdminState {
@@ -481,11 +543,20 @@ pub(crate) struct AdminState {
     /// pool surface is not wired.
     #[cfg(feature = "storage")]
     pub pool_registry: Option<Arc<oceanfs_storage::PoolRegistry>>,
-    /// Post-attach hook the composition root wires: rebuild + re-gossip
-    /// the `NodeManifest` (f6) and update the routing cache (f7) after a
-    /// pool is registered. Errors are logged — the pool IS attached.
+    /// Post-attach hook the composition root wires: d5 — clear any
+    /// removed-pool tombstone matching the attached pool's name+root —
+    /// then rebuild + re-gossip the `NodeManifest` (f6) and update the
+    /// routing cache (f7) after a pool is registered. Receives the
+    /// attached pool so the tombstone clear is precise. Errors are
+    /// logged — the pool IS attached.
     #[cfg(feature = "storage")]
-    pub on_pool_attached: Option<Arc<dyn Fn() -> Result<(), String> + Send + Sync>>,
+    pub on_pool_attached: Option<PoolAttachCallback>,
+    /// Pool detach hook (d5): the composition root's full detach
+    /// operation (emptiness proof + removal + record + manifest +
+    /// routing-cache + metrics). `None` when the surface is not wired
+    /// (`POST /admin/pools/{id}/detach` → 501).
+    #[cfg(feature = "storage")]
+    pub on_pool_detach: Option<PoolDetachCallback>,
     /// Live wal-pool remount handler (g7, ADR-0035): runs the
     /// replaced-wal registry-rebuild + catch-up drain against the
     /// running ReRepWorker and clears the write gate. `None` when the
@@ -551,6 +622,8 @@ impl AdminHandler {
                 pool_registry: None,
                 #[cfg(feature = "storage")]
                 on_pool_attached: None,
+                #[cfg(feature = "storage")]
+                on_pool_detach: None,
                 on_wal_remount: None,
                 #[cfg(feature = "storage")]
                 on_pool_drain_begin: None,
@@ -593,6 +666,8 @@ impl AdminHandler {
                 pool_registry: None,
                 #[cfg(feature = "storage")]
                 on_pool_attached: None,
+                #[cfg(feature = "storage")]
+                on_pool_detach: None,
                 on_wal_remount: None,
                 #[cfg(feature = "storage")]
                 on_pool_drain_begin: None,
@@ -699,17 +774,44 @@ impl AdminHandler {
     ///     Arc::new(BucketConfigStore::new()),
     ///     Arc::new(MetricsRegistry::new()),
     /// )
-    /// .with_pool_attach(Arc::new(registry), Arc::new(|| Ok(())));
+    /// .with_pool_attach(Arc::new(registry), Arc::new(|_pool| Ok(())));
     /// # let _ = handler;
     /// ```
     #[cfg(feature = "storage")]
     pub fn with_pool_attach(
         mut self,
         registry: Arc<oceanfs_storage::PoolRegistry>,
-        on_attached: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+        on_attached: PoolAttachCallback,
     ) -> Self {
         self.state.pool_registry = Some(registry);
         self.state.on_pool_attached = Some(on_attached);
+        self
+    }
+
+    /// Wires the pool detach surface (d5, ADR-0036 D6/D8).
+    ///
+    /// `on_detach(pool_id)` is the composition root's full detach hook:
+    /// the node-side emptiness proof, then
+    /// [`oceanfs_storage::PoolRegistry::detach`], the removed-pool record
+    /// write (`config − removed`), the manifest rebuild/re-gossip, the
+    /// routing-cache refresh, and the metric unregister. Without it,
+    /// `POST /admin/pools/{id}/detach` answers `501 Not Implemented`.
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// use oceanfs_server::admin::{AdminHandler, MetricsRegistry};
+    /// use oceanfs_server::BucketConfigStore;
+    /// let handler = AdminHandler::new(
+    ///     Arc::new(BucketConfigStore::new()),
+    ///     Arc::new(MetricsRegistry::new()),
+    /// )
+    /// .with_pool_detach(Arc::new(|_pool_id| Ok(())));
+    /// # let _ = handler;
+    /// ```
+    #[cfg(feature = "storage")]
+    pub fn with_pool_detach(mut self, on_detach: PoolDetachCallback) -> Self {
+        self.state.on_pool_detach = Some(on_detach);
         self
     }
 
@@ -819,12 +921,15 @@ impl AdminHandler {
         let router = router.route("/admin/pools", get(pool_status_view).post(attach_pool));
 
         // Intra-node + cluster drain mutation verbs (d3/d4, ADR-0036
-        // C1a/C1b): pool begin (mode intra-node|cluster), pause, resume.
+        // C1a/C1b): pool begin (mode intra-node|cluster), pause, resume;
+        // plus d5's detach verb (the inverse of f8 attach) on an
+        // empty/`Detachable` pool.
         #[cfg(feature = "storage")]
         let router = router
             .route("/admin/pools/{id}/drain", post(begin_pool_drain))
             .route("/admin/pools/{id}/drain/pause", post(pause_pool_drain))
             .route("/admin/pools/{id}/drain/resume", post(resume_pool_drain))
+            .route("/admin/pools/{id}/detach", post(detach_pool))
             .route("/admin/nodes/{node}/drain", post(begin_node_drain))
             .route("/admin/nodes/{node}/drain/pause", post(pause_node_drain))
             .route("/admin/nodes/{node}/drain/resume", post(resume_node_drain));
@@ -1160,18 +1265,19 @@ async fn attach_pool(
             }
         };
 
-    match registry.attach(pool) {
+    match registry.attach(pool.clone()) {
         Ok(pool_id) => {
-            // The pool IS registered — re-gossip the manifest so peers
-            // see the new capacity. A hook failure is logged loudly but
-            // must not fail the attach (the operator can re-trigger via
-            // a subsequent call or a restart).
-            if let Err(e) = on_attached() {
+            // The pool IS registered — clear any removed-pool tombstone
+            // (d5) and re-gossip the manifest so peers see the new
+            // capacity. A hook failure is logged loudly but must not fail
+            // the attach (the operator can re-trigger via a subsequent
+            // call or a restart).
+            if let Err(e) = on_attached(&pool) {
                 tracing::error!(
                     error = %e,
                     pool_id,
-                    "pool attached but manifest re-gossip failed; \
-                     peers may not see the new pool until the next change"
+                    "pool attached but the post-attach hook (tombstone clear / manifest \
+                     re-gossip) failed; peers may not see the new pool until the next change"
                 );
             }
             (StatusCode::CREATED, Json(serde_json::json!({ "pool_id": pool_id }))).into_response()
@@ -1187,6 +1293,69 @@ async fn attach_pool(
                 StatusCode::INTERNAL_SERVER_ERROR
             } else {
                 StatusCode::BAD_REQUEST
+            };
+            (status, Json(serde_json::json!({ "error": message }))).into_response()
+        }
+    }
+}
+
+/// `POST /admin/pools/{id}/detach` — remove an empty (`Detachable`) data
+/// pool from the live registry (d5, ADR-0036 D6/D8).
+///
+/// The inverse of f8 `POST /admin/pools` (attach): after a drain worker
+/// (d3/d4) empties the pool, this verb removes it — the composition root's
+/// hook proves emptiness (d4 definition), calls
+/// [`oceanfs_storage::PoolRegistry::detach`], writes the removed-pool
+/// record (`config − removed`, so a restart does not resurrect the pool),
+/// re-gossips the manifest (peers stop treating the node as having that
+/// capacity), refreshes the routing cache, and unregisters the pool's
+/// metric series. The pool disappears from `GET /admin/pools`.
+///
+/// Response codes: `200` detached (`{"pool_id", "name", "root",
+/// "data_pools"}`); `400` non-`data` pool (wal/metadata/hints replacement
+/// is the g7/g8 path); `404` unknown pool; `409` the pool is not
+/// `Detachable` (not drained to empty / not drained at all) or still holds
+/// segments (a stale copy re-materialized — no-destructive-failure);
+/// `501` detach surface not wired (no storage feature or no
+/// `with_pool_detach`).
+#[cfg(feature = "storage")]
+#[instrument(skip(state))]
+async fn detach_pool(
+    State(state): State<AdminState>,
+    Path(pool_id): Path<u32>,
+) -> impl IntoResponse {
+    let Some(on_detach) = state.on_pool_detach.as_ref() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": "pool detach is not configured on this node",
+            })),
+        )
+            .into_response();
+    };
+    match on_detach(pool_id) {
+        Ok(()) => {
+            let remaining = state
+                .pool_registry
+                .as_ref()
+                .map(|registry| registry.data_pools().len())
+                .unwrap_or(0);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "pool_id": pool_id, "detached": true, "data_pools": remaining })),
+            )
+                .into_response()
+        }
+        Err(message) => {
+            let status = if message.contains("is not registered") {
+                StatusCode::NOT_FOUND
+            } else if message.contains("not a data pool") {
+                StatusCode::BAD_REQUEST
+            } else if message.contains("not Detachable") || message.contains("still holds segments")
+            {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
             };
             (status, Json(serde_json::json!({ "error": message }))).into_response()
         }

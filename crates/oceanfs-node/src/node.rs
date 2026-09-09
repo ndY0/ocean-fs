@@ -279,7 +279,10 @@ type Infra = (
 /// the metadata store, the probed acceleration dispatcher and the
 /// routing ring cache. Every module builder consumes these; no module
 /// owns them (c5 keeps them in the composition root as plain inputs).
-fn build_infrastructure(config: &NodeConfig) -> Result<Infra, String> {
+fn build_infrastructure(
+    config: &NodeConfig,
+    removed: &[oceanfs_storage::PoolRemovedRecord],
+) -> Result<Infra, String> {
     // ---- 0. Storage pool registry (ADR-0029) + role-pinned paths ----
     // The registry probes every configured pool root at boot: the
     // `Fatal` policy refuses to start on an unprobeable root, the
@@ -288,9 +291,20 @@ fn build_infrastructure(config: &NodeConfig) -> Result<Infra, String> {
     // here with the role-listing error. The role-pinned dirs resolve
     // ONCE here — the write path never re-resolves them (perf
     // guidelines 3.4/7.1: boot-time only, no locks in the hot path).
+    //
+    // d5 (ADR-0036 D8): the removed-pool overlay (`config − removed`) is
+    // applied here. Detach is persistent — a pool drained + detached and
+    // recorded under `{data_dir}/removed_pools.toml` is not resurrected by
+    // a restart; the config file itself is never rewritten. A node whose
+    // every data pool is removed refuses boot (from_config_skipping), the
+    // documented detach → leave retirement sequence.
     let pool_registry = Arc::new(
-        oceanfs_storage::PoolRegistry::from_config(&config.storage, &config.data_dir)
-            .map_err(|e| format!("storage pool registry: {e}"))?,
+        oceanfs_storage::PoolRegistry::from_config_skipping(
+            &config.storage,
+            &config.data_dir,
+            removed,
+        )
+        .map_err(|e| format!("storage pool registry: {e}"))?,
     );
     let paths = crate::pool_paths::pool_paths(&pool_registry);
 
@@ -343,8 +357,14 @@ impl Node {
         );
 
         // ---- 1. Shared infrastructure (registry, paths, metadata store, accel, ring) ----
+        // d5 (ADR-0036 D8): the removed-pool store is opened before the
+        // registry is built so a restart honours every recorded detach
+        // (`config − removed`). A corrupt record file refuses boot here.
+        let removed_pools = Arc::new(crate::removed_pools::RemovedPoolStore::at(&config.data_dir));
+        let removed_records =
+            removed_pools.load().map_err(|e| format!("removed-pool record: {e}"))?;
         let (pool_registry, paths, metadata_store, accel, ring_cache) =
-            build_infrastructure(&config)?;
+            build_infrastructure(&config, &removed_records)?;
 
         // ---- 2. Membership + data-plane modules (c4 - planes split) ----
         let membership_module =
@@ -425,6 +445,7 @@ impl Node {
             membership_module.is_cluster_node,
             membership_module.announce_incarnation,
             metrics.clone(),
+            removed_pools,
         )?;
         storage.register_metrics(&metrics);
         durability.register_metrics(&*metrics);
