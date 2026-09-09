@@ -400,21 +400,34 @@ impl Histogram {
             help = self.help,
         );
 
+        // Prometheus histogram samples carry ONE label set — the histogram's
+        // own labels merged with the bucket bound (`le`), e.g.
+        // `name_bucket{le="1",tier="gc"}`. `LabelSet::render` already wraps
+        // its labels in braces, so when non-empty we splice the `le` pair in
+        // front of that set instead of appending a second `{...}` group (the
+        // double-brace form is invalid exposition and makes Prometheus drop
+        // the whole scrape).
+        let le_prefix = if labels.is_empty() {
+            String::new()
+        } else {
+            format!(",{}", &labels[1..labels.len() - 1])
+        };
+
         let mut cumulative = 0u64;
         for (i, bound) in self.bucket_bounds.iter().enumerate() {
             cumulative = cumulative.wrapping_add(self.buckets[i].load(Ordering::Relaxed));
             out.push_str(&format!(
-                "{name}_bucket{{le=\"{bound}\"}}{labels} {cumulative}\n",
+                "{name}_bucket{{le=\"{bound}\"{le_prefix}}} {cumulative}\n",
                 name = self.name,
                 bound = bound,
-                labels = labels,
+                le_prefix = le_prefix,
                 cumulative = cumulative,
             ));
         }
         out.push_str(&format!(
-            "{name}_bucket{{le=\"+Inf\"}}{labels} {count}\n",
+            "{name}_bucket{{le=\"+Inf\"{le_prefix}}} {count}\n",
             name = self.name,
-            labels = labels,
+            le_prefix = le_prefix,
             count = count,
         ));
         out.push_str(&format!(
@@ -560,5 +573,54 @@ mod tests {
         assert_eq!(name, "requests_total");
         let name = validate_counter_name("already_total");
         assert_eq!(name, "already_total");
+    }
+
+    #[test]
+    fn unlabeled_histogram_renders_bucket_lines() {
+        let h = Histogram::new(
+            "cycle_ms".into(),
+            "help".into(),
+            &HistogramConfig::default(),
+            LabelSet::empty(),
+        );
+        h.observe(1);
+        let rendered = h.render();
+        assert!(rendered.contains("# TYPE cycle_ms histogram"));
+        assert!(rendered.contains(r#"cycle_ms_bucket{le="+Inf"} 1"#));
+        assert!(rendered.contains("cycle_ms_count 1\n"));
+    }
+
+    #[test]
+    fn labeled_histogram_renders_one_brace_group_per_line() {
+        // The regression that made Prometheus drop the whole /admin/metrics
+        // scrape: a labeled histogram rendered TWO adjacent brace groups
+        // (`bucket{le="1"}{tier="..."}`), which is invalid exposition.
+        let h = Histogram::new(
+            "durability_cycle_duration_millis".into(),
+            "help".into(),
+            &HistogramConfig::default(),
+            LabelSet::new(&[("tier", "gc")]),
+        );
+        h.observe(1);
+        let rendered = h.render();
+
+        // No adjacent brace groups anywhere (the parse-error signature).
+        assert!(!rendered.contains("}{"), "double brace group in output:\n{rendered}");
+        // Every bucket/sum/count sample line carries exactly one label set.
+        for line in rendered.lines() {
+            if line.starts_with("durability_cycle_duration_millis") {
+                assert_eq!(
+                    line.matches('{').count(),
+                    1,
+                    "exactly one brace group per sample line: {line}"
+                );
+                assert_eq!(
+                    line.matches('}').count(),
+                    1,
+                    "exactly one brace group per sample line: {line}"
+                );
+                assert!(line.contains("tier=\"gc\""), "histogram labels preserved: {line}");
+            }
+        }
     }
 }
