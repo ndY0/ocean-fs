@@ -1,6 +1,6 @@
 ---
 epic: "disk-resilience-scale"
-status: proposed
+status: in_progress
 priority: high
 created: 2026-09-07
 updated: 2026-09-09
@@ -78,6 +78,9 @@ d0 regression-gate
 ```
 
 Implementation order: **d0 → d1 → d2 → d3 → d4 → d5**, then evaluate d6.
+d6's evaluation (its only deliverable in this epic) completed 2026-09-09 →
+**deferred**; see the [Status & disposition](#status--disposition-2026-09-09)
+note below.
 
 | # | Feature | Status | Doc | Touches | Depends on | Notes |
 |---|---|---|---|---|---|---|
@@ -87,7 +90,7 @@ Implementation order: **d0 → d1 → d2 → d3 → d4 → d5**, then evaluate d
 | d3 | `intra-node-drain` | done | [d3-intra-node-drain.md](d3-intra-node-drain.md) | storage, node | d2 | C1a worker (DurabilityTask Tier-1): registry-enumerated relocation to placement-chosen sibling pools; configurable `max_bytes_per_tick`; blocked-state logic |
 | d4 | `cluster-drain` | done | [d4-cluster-drain.md](d4-cluster-drain.md) | node, durability, storage | d2, d3 (mover reuse) | C1b controller: drain pool-only and node-level; target via existing selector/RPC; **source-release** (holder-set refresh minus self + local unlink); admin drain API; paced/pausable/terminal; reconciliation interaction |
 | d5 | `detach-and-drop` | done | [d5-detach-and-drop.md](d5-detach-and-drop.md) | storage, node | d3 (empty precondition) | `PoolRegistry::detach` on empty pool; config/topology drop; manifest rebuild + re-gossip; no restart |
-| d6 | `capacity-weighted-ownership` (C2a) | proposed | [d6-capacity-weighted-ownership.md](d6-capacity-weighted-ownership.md) | membership, routing, node | d4 (measure difficulty) | **Optional/late**: ring share tracks data-pool capacity; hysteresis; deterministic convergence. May defer to backlog `disk-resilience-capacity` |
+| d6 | `capacity-weighted-ownership` (C2a) | deferred | [d6-capacity-weighted-ownership.md](d6-capacity-weighted-ownership.md) | membership, routing, node | d4 (measure difficulty) | **Optional/late — DEFERRED 2026-09-09 (not done)**: difficulty measurement complete; C2a judged same redistribution as C2b at another granularity → backlog `disk-resilience-capacity`; C2b-only decision gated on fleet/load-test data |
 
 Feature-spec documents exist for every DAG row (d0–d6) under this directory;
 each carries its own Definition of Done. The **epic DoD below is the
@@ -96,7 +99,11 @@ does not close the epic until the epic DoD holds.
 
 ### Explicit non-goals (recorded, not code)
 
-- **C2b proactive rebalance** → backlog (`disk-resilience-capacity`).
+- **C2b proactive rebalance** → backlog (`disk-resilience-capacity`); now
+  joined by deferred C2a (d6, 2026-09-09) — C2a and C2b are the same
+  redistribution functionality at two granularities, so only one of the two
+  will ever be built; decision gated on fleet/load-test data (see [Status &
+  disposition](#status--disposition-2026-09-09)).
 - **C3 segment self-description** → dropped (logically wrong after g8; ADR-0036 §D1).
 - **Graceful-leave redesign / shutdown streaming** → dropped (leave stays `leave(None)`).
 - **Migration-plane isolation** (ADR-0030 D4) → remains a recorded future consequence; not in this epic.
@@ -114,6 +121,54 @@ does not close the epic until the epic DoD holds.
 - Status: pool `Draining`/`Detachable`/`Draining(blocked: reason)`; per-pool progress.
 
 Exact verbs/routes are for the spec-writer to finalize in d4/d5.
+
+## Status & disposition (2026-09-09)
+
+**The DAG is code-complete — d0–d5 done, d6 deferred-with-findings.** The
+epic frontmatter `status` is therefore `in_progress` (code-complete with
+recorded residuals), **not `done`**: the remaining recorded residuals below
+are genuinely open or carried, so the epic-level DoD does not yet hold.
+
+### What closed
+
+- d0–d5 are `done` (regression gate green; pool drain state; segment
+  relocation; intra-node drain; cluster drain; detach-and-drop). Each feature
+  doc records its review PASS + accepted deviations.
+
+### Recorded residuals (carried / recorded, not silently dropped)
+
+- **d6 (C2a) — deferred.** The difficulty measurement completed and the
+  stakeholder deferred the feature to the backlog epic
+  `disk-resilience-capacity`. Grounded finding: making ring share track
+  capacity is ownership redistribution (C2b-class machinery — metadata row
+  migration/chase) or a data-plane redesign, precisely the ADR-0028
+  disruption ADR-0036 D1's deferral clause anticipates; the ring is the only
+  metadata-discovery index and ring membership is quasi-static by design. The
+  C2a-vs-C2b decision (only one of the two will ever be built) is gated on
+  the pending fleet/load-test data; the deferred feature doc retains the full
+  record for if/when the C2b attempt is made. **Carried** — the feature doc's
+  `status` is `deferred`, its DoD items remain the record for the backlog
+  attempt, not closed.
+- **d4 `oceanfs_drain_*` throughput counters — recorded, not closed.** d4
+  Deviation (e) accepted that `oceanfs_drain_dispatched_total` /
+  `oceanfs_drain_released_total` / `oceanfs_drain_remaining{source}` were not
+  registered (`DrainCycleStats` is the observable); its wording — "close or
+  document before the epic DoD" — means the counter registration remains a
+  recorded, unclosed residual carried to the backlog, not silently dropped.
+- **Epic-DoD wording residuals.** Two epic-DoD acceptance items are not fully
+  exercised as worded and are recorded, not dropped: (1) the "no-op
+  `leave(None)`" ending of the cluster-drain DoD bullet was not exercised by
+  the integration tests (node shutdown used instead — recorded in d4's
+  Integration REVIEW, non-blocking); (2) any DoD language that still reads as
+  if d6/C2a would land in this epic is superseded by the deferral record in
+  the d6 feature doc and this disposition note.
+
+### Backlog ownership
+
+The C2b/C2a decision and the deferred d6 attempt belong to the
+`disk-resilience-capacity` backlog epic, together with the d4 counter-close
+residual. This epic is **not** marked `done`; it is left as code-complete
+with recorded residuals so the carry-over is explicit.
 
 ## Acceptance bar (epic DoD)
 

@@ -1,14 +1,14 @@
 ---
 feature: "Capacity-Weighted Ring Ownership (C2a) — OPTIONAL / LATE-STAGE"
 epic: "disk-resilience-scale"
-status: proposed
+status: deferred
 priority: medium
 owner: ""
 dependencies: ["d4-cluster-drain"]
 adr: [0036, 0028, 0029]
 perf: []
 created: 2026-09-07
-updated: 2026-09-07
+updated: 2026-09-09
 ---
 
 # Capacity-Weighted Ring Ownership (C2a) — OPTIONAL / LATE-STAGE
@@ -22,6 +22,12 @@ updated: 2026-09-07
 > territory). It is written at full feature depth so it is ready if
 > attempted; the first act of the feature is the difficulty measurement,
 > not code.
+>
+> **DEFERRED (2026-09-09):** the difficulty measurement is complete and the
+> stakeholder decided to defer this feature (and C2a) to the backlog epic
+> `disk-resilience-capacity`; only C2b will be considered later, gated on
+> fleet/load-test data. See [Deferred (difficulty measurement,
+> 2026-09-09)](#deferred-difficulty-measurement-2026-09-09) below.
 
 ## Summary
 
@@ -235,11 +241,69 @@ no C2b: existing healthy data is NOT moved; new writes + repair reclaim freed ca
   membership-view skew window during convergence (the existing stale-cache
   failover path covers it — ADR-0029 §D5).
 
+## Deferred (difficulty measurement, 2026-09-09)
+
+The difficulty measurement — this feature's first deliverable — is complete,
+and the stakeholder has decided to **DEFER** d6. Per ADR-0036 D1, deferral is
+a **successful outcome** of the measurement step, not a failure: the
+assessment of the ADR-0028 membership/ring path and its routing consumers
+found disruption beyond a bounded change (findings below), so C2a moves to
+the backlog epic `disk-resilience-capacity` (which already carries C2b).
+
+### C2a-vs-C2b framing (decision deferred)
+
+C2a and C2b are judged to be **the same redistribution functionality at two
+different granularities**, so **only one of the two will ever be built**:
+C2a re-weights the ring so future ownership lands by capacity; C2b
+additionally moves existing healthy segments to chase the ideal. The
+stakeholder chose to consider **C2b only, LATER** — and that C2b/C2a decision
+is **gated on the pending fleet/load-test data**. Today's interim behavior
+(placement and repair-target selection are already capacity-aware via
+gossiped manifests, ADR-0033; attach → drain → detach steers future writes by
+free-space) stands until that decision is made from test data. The scope
+content above is retained intact as the record for when/if the C2b attempt is
+made.
+
+### Measurement findings (grounded at HEAD)
+
+1. **The ring is the metadata-discovery mechanism for EVERY existing key —
+   there is no second index.** Writes place object-metadata rows on the
+   `ring.lookup(hash(bucket/key))` successors
+   (`crates/oceanfs-server/src/write/coordinator.rs:474`); reads find rows on
+   the same ring set (`read/coordinator.rs:738`, `read/coordinator.rs:1054`;
+   "ring replicas hold the object's metadata by construction",
+   `read/coordinator.rs:716-718`).
+2. **Ring membership is deliberately quasi-static.** Nodes are added only at
+   admission (empty) and removed only on graceful `Left` after drain; **DEAD
+   nodes STAY in the ring** (`membership/manager.rs:1214-1222`, the
+   churn-divergence comment). Ring changes are lossless only at empty
+   boundaries.
+3. **There is NO ownership/row-migration machinery.** Capacity re-weighting a
+   live ring moves arcs; keys whose old RF holder set leaves the new
+   successor window become undiscoverable — their metadata rows are on nodes
+   the new ring no longer queries. Drain-to-zero + detach → weight 0 orphans
+   the node's whole owned arc while its rows are still on it. Making ring
+   share track capacity is therefore **ownership redistribution = C2b-class
+   machinery** (metadata row migration/chase) or a data-plane redesign —
+   precisely the ADR-0028 disruption the ADR-0036 D1 deferral clause
+   anticipates.
+4. **Placement and repair-target selection are ALREADY capacity-aware** via
+   gossiped manifests (ADR-0033). Today's attach → drain → detach steers
+   future writes by free-space; that interim behavior stands until a C2b
+   decision is made from test data.
+
+**Verdict: DEFER.** No C2a code in this epic. The feature doc above remains
+the record for the future C2b attempt (backlog `disk-resilience-capacity`).
+
 ## Deviations (accepted)
 
-None yet — this document is proposed. Expected-deviation candidates: the
-weight-source choice, the hysteresis rule, the go/defer verdict of the
-difficulty measurement, and a manifest/proto `total_bytes` addition if
-that option is chosen. **Deferral to the backlog `disk-resilience-capacity`
-epic is an accepted outcome of this feature's measurement step**, not a
-failure — record it here with the difficulty findings.
+The accepted outcome of the measurement step is the **deferral recorded in
+[Deferred (difficulty measurement, 2026-09-09)](#deferred-difficulty-measurement-2026-09-09)
+above** — the go/defer verdict of the difficulty measurement is resolved as
+DEFER, with the difficulty findings documented there. **Deferral to the
+backlog `disk-resilience-capacity` epic is an accepted outcome of this
+feature's measurement step**, not a failure. No code deviations exist (no
+code was written). Remaining expected-deviation candidates apply only to the
+future C2b attempt, should it happen: the weight-source choice, the
+hysteresis rule, and a manifest/proto `total_bytes` addition if that option
+is chosen.
