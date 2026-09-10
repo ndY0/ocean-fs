@@ -204,6 +204,11 @@ pub struct WriteCoordinator {
     /// replica targets for replication. `None` (default) disables the
     /// hint — the write path behaves exactly as before.
     routing_hint: Option<Arc<dyn RoutingHint>>,
+    /// Optional L3 negative cache. The hinted-handoff apply path writes a
+    /// row through a NON-S3 path, so a "definitely absent" entry left by
+    /// an earlier local DELETE must be cleared or the node serves a stale
+    /// 404 for a key it now holds (the churn read-quorum class).
+    negative_cache: Option<Arc<oceanfs_cache::NegativeCache>>,
 }
 
 /// Per-PUT compression context: backend + bucket config + semaphore +
@@ -342,6 +347,7 @@ impl WriteCoordinator {
             )),
             timeouts: Arc::new(OperationTimeouts::default()),
             routing_hint: None,
+            negative_cache: None,
         }
     }
 
@@ -375,6 +381,16 @@ impl WriteCoordinator {
     #[must_use]
     pub fn with_routing_hint(mut self, hint: Arc<dyn RoutingHint>) -> Self {
         self.routing_hint = Some(hint);
+        self
+    }
+
+    /// Installs the L3 negative cache (composition root). The hint-apply
+    /// path clears a stale "definitely absent" entry whenever it writes a
+    /// row, so a key delivered by hinted handoff cannot be shadowed by an
+    /// earlier local DELETE's negative-cache entry.
+    #[must_use]
+    pub fn with_negative_cache(mut self, cache: Arc<oceanfs_cache::NegativeCache>) -> Self {
+        self.negative_cache = Some(cache);
         self
     }
 
@@ -974,6 +990,24 @@ impl WriteCoordinator {
             return Err(Error::QuorumNotMet { required: quorum, received: acks_received });
         }
 
+        // Triage (2026-09-10 churn single-copy class): a write acked with
+        // only one durable copy — or with a sub-quorum bucket policy —
+        // logs its routing decision, so the run report pins why the other
+        // members never received the row/hint.
+        if acks_received < 2 || quorum < 2 {
+            warn!(
+                bucket = %req.bucket,
+                key = %req.key,
+                write_quorum = req.write_quorum,
+                quorum = quorum,
+                acks = acks_received,
+                replica_set = replica_set.len(),
+                remote_targets = remote_targets.len(),
+                failed_targets = failed_targets.len(),
+                "write acked with a single durable copy"
+            );
+        }
+
         // Step 6b: Quorum met — hint the replicas that missed the write.
         for target in failed_targets {
             self.enqueue_write_hint(&target, &req, &chunks, hlc).await;
@@ -1219,6 +1253,13 @@ impl WriteCoordinator {
                 .put_object(bucket, meta.clone())
                 .await
                 .map_err(|e| Error::Storage(format!("object metadata write: {e}")))?;
+        }
+        // Clear any stale L3 "definitely absent" entry: the hint apply
+        // writes the row through a NON-S3 path, so a negative-cache entry
+        // from an earlier local DELETE would otherwise shadow it with a
+        // stale 404.
+        if let Some(cache) = &self.negative_cache {
+            cache.invalidate(bucket, key);
         }
         Ok(meta)
     }
@@ -2472,6 +2513,42 @@ mod tests {
         assert_eq!(stored.chunks.len(), meta.chunks.len());
         assert_eq!(stored.size, data.len() as u64);
         assert_eq!(stored.hlc, hlc);
+    }
+
+    /// Fix 1 regression (churn read-quorum): the hint-apply path writes a
+    /// row through a NON-S3 path, so a stale L3 "definitely absent" entry
+    /// from an earlier local DELETE must be cleared — otherwise the node
+    /// serves a stale 404 for a key it now holds.
+    #[tokio::test]
+    async fn apply_hinted_object_clears_stale_negative_cache() {
+        let cache =
+            Arc::new(oceanfs_cache::NegativeCache::new(oceanfs_cache::NegativeCacheConfig {
+                enabled: true,
+                ..Default::default()
+            }));
+        let (coord, _dir, _store) = {
+            use oceanfs_durability::GrpcHintDeliveryClient;
+            let dir = tempfile::tempdir().unwrap();
+            let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
+            let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
+                Arc::new(GrpcHintDeliveryClient::new(pool.clone()));
+            make_write_coordinator_with_delivery("n1", &["n1"], dir, pool, delivery_client).await
+        };
+        let coord = coord.with_negative_cache(Arc::clone(&cache));
+        let bucket = BucketId::new("test");
+        let key = ObjectKey::new("hinted-negative");
+
+        // A stale "definitely absent" entry (as a local DELETE leaves).
+        cache.insert(&bucket, &key);
+        assert!(cache.contains(&bucket, &key), "stale L3 entry present before the apply");
+
+        let data = Bytes::from(vec![0xABu8; 8192]); // segment tier
+        coord
+            .apply_hinted_object(&bucket, &key, data, Hlc::new(1_700_000_000_000, 1), 0)
+            .await
+            .expect("apply must succeed");
+
+        assert!(!cache.contains(&bucket, &key), "hint apply must clear the stale L3 entry");
     }
 
     /// D6 "Hint-apply that supersedes an existing key": a hinted-handoff

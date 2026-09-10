@@ -70,6 +70,12 @@ pub struct SegmentGrpcService {
     /// exists nowhere and every read 500s (GAP-1). `None` (tests /
     /// minimal embeddings) skips the translation.
     remap_alias: Option<Arc<oceanfs_core::SegmentRemapAlias>>,
+    /// Optional L3 negative cache. A replicated metadata append writes a
+    /// row through a NON-S3 path; the local node's own DELETE handler may
+    /// have inserted a "definitely absent" L3 entry for the same key, so
+    /// the append must clear it — otherwise the node keeps serving a
+    /// stale 404 for a key it now holds (the churn read-quorum class).
+    negative_cache: Option<Arc<oceanfs_cache::NegativeCache>>,
 }
 
 impl SegmentGrpcService {
@@ -98,6 +104,7 @@ impl SegmentGrpcService {
             hlc_clock,
             lifecycle: None,
             remap_alias: None,
+            negative_cache: None,
         }
     }
 
@@ -119,6 +126,15 @@ impl SegmentGrpcService {
     #[must_use]
     pub fn with_remap_alias(mut self, alias: Arc<oceanfs_core::SegmentRemapAlias>) -> Self {
         self.remap_alias = Some(alias);
+        self
+    }
+
+    /// Wires the L3 negative cache (composition root). Cleared whenever a
+    /// replicated metadata append persists a row, so a stale "definitely
+    /// absent" entry from an earlier local DELETE cannot shadow it.
+    #[must_use]
+    pub fn with_negative_cache(mut self, cache: Arc<oceanfs_cache::NegativeCache>) -> Self {
+        self.negative_cache = Some(cache);
         self
     }
 
@@ -369,6 +385,18 @@ impl SegmentRpc for SegmentGrpcService {
                     "failed to persist replicated metadata: {e}"
                 )));
             }
+        }
+
+        // Clear any stale L3 "definitely absent" entry for this key: the
+        // row was written through the replication path, not the S3 PUT
+        // handler, so a negative-cache entry left by an earlier local
+        // DELETE would otherwise keep serving a stale 404 (the churn
+        // read-quorum class).
+        if let Some(cache) = &self.negative_cache {
+            cache.invalidate(
+                &oceanfs_core::BucketId::new(&bucket),
+                &oceanfs_core::ObjectKey::new(&key),
+            );
         }
 
         tracing::debug!(

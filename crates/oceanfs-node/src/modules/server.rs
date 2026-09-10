@@ -403,7 +403,10 @@ impl ServerModule {
             .with_routing_hint(manifest_cache.clone())
             // g2 (ADR-0029 §D3): the hint enqueue path rejects new debt
             // while the hints pool is Dead.
-            .with_pool_registry(storage.registry.clone()),
+            .with_pool_registry(storage.registry.clone())
+            // L3 negative cache: the hint-apply path clears a stale
+            // "definitely absent" entry so a delivered key is not shadowed.
+            .with_negative_cache(negative_cache.clone()),
         );
 
         // Clone for the hint-applier adapter (the coordinator is moved
@@ -747,7 +750,11 @@ impl ServerModule {
         // Late metadata appends referencing a locally compacted-away
         // segment are translated through the remap alias (g3 Option A —
         // GAP-1 closure).
-        .with_remap_alias(Arc::clone(&storage.remap_alias));
+        .with_remap_alias(Arc::clone(&storage.remap_alias))
+        // L3 negative cache: a replicated append that writes a row clears
+        // a stale "definitely absent" entry left by an earlier local
+        // DELETE (the churn read-quorum class).
+        .with_negative_cache(negative_cache.clone());
 
         let mut healing_service = oceanfs_durability::healing_service::HealingGrpcService::new(
             hinted_handoff.clone(),
