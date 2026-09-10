@@ -384,17 +384,57 @@ impl Default for GcConfig {
 /// A separate `RwLock<HashSet>` tracks which buckets *exist*
 /// (for bucket lifecycle operations) so we can distinguish
 /// "created with default policy" from "never created."
-#[derive(Default)]
 pub struct BucketConfigStore {
     /// Bucket name → policy. When a bucket exists, its entry is
     /// an `ArcSwap`. When deleted, the entry is removed entirely.
     policies: RwLock<HashMap<String, Arc<ArcSwap<BucketPolicy>>>>,
+    /// Node-level default policy for buckets that have no explicit
+    /// policy. Seeds the write/read quorum and replica count from the
+    /// node config; without it the write path fell back to W=1 (the
+    /// churn single-copy root cause).
+    default_policy: ArcSwap<BucketPolicy>,
+}
+
+impl Default for BucketConfigStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BucketConfigStore {
-    /// Creates a new empty config store.
+    /// Creates a new config store with the built-in default policy
+    /// (`ConsistencyConfig::default`: W=2, R=1, N=3).
     pub fn new() -> Self {
-        Self { policies: RwLock::new(HashMap::new()) }
+        Self {
+            policies: RwLock::new(HashMap::new()),
+            default_policy: ArcSwap::from_pointee(BucketPolicy::default()),
+        }
+    }
+
+    /// Sets the node-level default policy applied to buckets without an
+    /// explicit policy (composition root, from the node config's
+    /// `write_quorum` / `read_quorum` / `replication_factor`).
+    #[must_use]
+    pub fn with_default_consistency(
+        self,
+        write_quorum: u8,
+        read_quorum: u8,
+        total_replicas: u8,
+    ) -> Self {
+        let policy = BucketPolicy {
+            consistency: ConsistencyConfig { write_quorum, read_quorum, total_replicas },
+            ..BucketPolicy::default()
+        };
+        Self { default_policy: ArcSwap::from_pointee(policy), ..self }
+    }
+
+    /// Retrieves a bucket policy, falling back to the store's default
+    /// policy when the bucket has no explicit one.
+    ///
+    /// This is the hot-path accessor: the write/read handlers use it so
+    /// an unconfigured bucket still gets the node's configured quorum.
+    pub fn get_or_default(&self, bucket: &str) -> Arc<BucketPolicy> {
+        self.get(bucket).unwrap_or_else(|| self.default_policy.load_full())
     }
 
     /// Creates or updates a bucket policy, storing it in an
@@ -622,6 +662,32 @@ mod tests {
     fn store_get_missing_returns_none() {
         let store = BucketConfigStore::new();
         assert!(store.get("ghost").is_none());
+    }
+
+    #[test]
+    fn store_get_or_default_uses_node_consistency() {
+        // Regression (churn single-copy root cause): an unconfigured
+        // bucket must resolve to the node's configured quorum, not the
+        // write path's old `unwrap_or(1)`.
+        let store = BucketConfigStore::new().with_default_consistency(2, 2, 3);
+        let policy = store.get_or_default("never-created");
+        assert_eq!(policy.consistency.write_quorum, 2);
+        assert_eq!(policy.consistency.read_quorum, 2);
+        assert_eq!(policy.consistency.total_replicas, 3);
+
+        // An explicit per-bucket policy still wins.
+        store.put(
+            "explicit".into(),
+            BucketPolicy {
+                consistency: ConsistencyConfig {
+                    write_quorum: 3,
+                    read_quorum: 3,
+                    total_replicas: 3,
+                },
+                ..BucketPolicy::default()
+            },
+        );
+        assert_eq!(store.get_or_default("explicit").consistency.write_quorum, 3);
     }
 
     #[test]

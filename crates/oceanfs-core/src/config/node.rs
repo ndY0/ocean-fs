@@ -175,6 +175,16 @@ pub struct NodeConfig {
     /// Number of replicas for each data item (default 3).
     #[serde(default = "default_replication_factor")]
     pub replication_factor: u32,
+    /// Write quorum (W) applied to buckets without an explicit policy
+    /// (default 2). Without this the write path fell back to W=1, acked
+    /// local-only writes with no replication/hints (the churn
+    /// single-copy root cause).
+    #[serde(default = "default_write_quorum")]
+    pub write_quorum: u8,
+    /// Read quorum (R) applied to buckets without an explicit policy
+    /// (default 2).
+    #[serde(default = "default_read_quorum")]
+    pub read_quorum: u8,
     /// Number of gRPC channels per peer (default 4).
     #[serde(default = "default_pool_size_per_peer")]
     pub pool_size_per_peer: usize,
@@ -546,6 +556,12 @@ fn default_vnodes_per_node() -> u32 {
 fn default_replication_factor() -> u32 {
     3
 }
+fn default_write_quorum() -> u8 {
+    2
+}
+fn default_read_quorum() -> u8 {
+    2
+}
 fn default_pool_size_per_peer() -> usize {
     4
 }
@@ -702,6 +718,8 @@ impl Default for NodeConfig {
             orphan_reaper_interval_sec: 3600,
             vnodes_per_node: 256,
             replication_factor: 3,
+            write_quorum: 2,
+            read_quorum: 2,
             pool_size_per_peer: 4,
             keepalive_sec: 30,
             connect_timeout_ms: 5000,
@@ -798,6 +816,17 @@ mod tests {
         // stop changing for this many gossip rounds before opening.
         let config = NodeConfig::default();
         assert_eq!(config.cluster_stability_rounds, 3);
+    }
+
+    #[test]
+    fn write_and_read_quorum_default_to_two() {
+        // Regression: `config_cluster_churn` / `sut-deploy.sh` set
+        // `write_quorum = 2` / `read_quorum = 2`, but no such fields
+        // existed — serde silently dropped them and the write path ran
+        // W=1 (the churn single-copy root cause).
+        let config = NodeConfig::default();
+        assert_eq!(config.write_quorum, 2);
+        assert_eq!(config.read_quorum, 2);
     }
 
     /// ADR-0028 D1: the membership plane defaults to its own port,

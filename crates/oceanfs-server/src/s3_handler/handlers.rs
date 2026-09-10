@@ -101,7 +101,7 @@ pub(crate) async fn put_object(
 
     let hk = HashKey::from_bytes(hash_key(object_key.as_str().as_bytes()));
 
-    let policy = state.buckets.get(&bucket);
+    let policy = Some(state.buckets.get_or_default(&bucket));
     let write_quorum = policy.as_ref().map(|p| p.consistency.write_quorum).unwrap_or(1);
 
     let req = WriteRequest {
@@ -312,7 +312,7 @@ pub(crate) async fn get_object(
     }
 
     // ---- ReadCoordinator ----
-    let policy = state.buckets.get(&bucket);
+    let policy = Some(state.buckets.get_or_default(&bucket));
     let req = ReadRequest {
         bucket: bucket_id.clone(),
         key: object_key.clone(),
@@ -461,7 +461,7 @@ pub(crate) async fn head_object(
         }
     }
 
-    let policy = state.buckets.get(&bucket);
+    let policy = Some(state.buckets.get_or_default(&bucket));
     let req = ReadRequest {
         bucket: bucket_id.clone(),
         key: object_key.clone(),
@@ -543,7 +543,7 @@ pub(crate) async fn delete_object(
     // coordinator doesn't know the other replicas exist) — the churn
     // 404/404/200 divergence where one node keeps serving the deleted
     // key. Fail before ANY local mutation: the client retries.
-    let write_quorum = state.buckets.get(&bucket).map(|p| p.consistency.write_quorum).unwrap_or(1);
+    let write_quorum = state.buckets.get_or_default(&bucket).consistency.write_quorum;
     let replica_count = state.write.replica_count(&hk);
     if state.write.quorum_requires_ring() && (replica_count as u8) < write_quorum {
         let err = Error::QuorumNotMet { required: write_quorum, received: replica_count };

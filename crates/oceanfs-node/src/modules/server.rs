@@ -453,7 +453,16 @@ impl ServerModule {
         ));
 
         // ---- handlers (§12) ----
-        let bucket_store = Arc::new(oceanfs_server::BucketConfigStore::new());
+        // The node config seeds the default bucket policy: without it an
+        // unconfigured bucket fell back to the write path's `unwrap_or(1)`
+        // — acked local-only writes with no quorum guarantee (the churn
+        // single-copy root cause).
+        let bucket_store =
+            Arc::new(oceanfs_server::BucketConfigStore::new().with_default_consistency(
+                config.write_quorum,
+                config.read_quorum,
+                u8::try_from(config.replication_factor).unwrap_or(u8::MAX),
+            ));
         // Bounded write queue: at most `max_inflight_writes` concurrent
         // PUTs; requests beyond the bound wait up to `write_queue_ms`
         // then receive 503 SlowDown (backpressure propagates to the HTTP

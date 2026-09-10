@@ -579,22 +579,28 @@ mod tests {
             ))
         };
 
-        let write = Arc::new(WriteCoordinator::new(
-            ring_cache.clone(),
-            membership.clone(),
-            pool,
-            NodeId::new("n1"),
-            hlc_clock,
-            metadata,
-            size_config,
-            shard_small,
-            shard_standard,
-            segment_pool_small,
-            segment_pool_standard,
-            sealer,
-            lifecycle,
-            hinted_handoff,
-        ));
+        let write = Arc::new(
+            WriteCoordinator::new(
+                ring_cache.clone(),
+                membership.clone(),
+                pool,
+                NodeId::new("n1"),
+                hlc_clock,
+                metadata,
+                size_config,
+                shard_small,
+                shard_standard,
+                segment_pool_small,
+                segment_pool_standard,
+                sealer,
+                lifecycle,
+                hinted_handoff,
+            )
+            // Single-node test deployment: the cluster honest-quorum gate
+            // does not apply (mirrors `is_cluster_node = false`), so the
+            // node default W=2 is capped at the 1-node replica count.
+            .with_quorum_requires_ring(false),
+        );
 
         // Create in-memory segment store shared by write and read paths.
         let segment_store = Arc::new(InMemorySegmentReader::new());
