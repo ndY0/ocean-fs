@@ -933,6 +933,11 @@ impl<C: LoadTarget> Worker<C> {
                     let mut epoch = self.manifest.delete_epoch(bucket, &key);
                     let mut recorded = false;
                     let mut first_status: u16 = 0;
+                    // Set when a PUT attempt fails at the transport
+                    // layer: the server may have committed the write
+                    // while the response was lost. After the retries,
+                    // a probe decides whether the body actually exists.
+                    let mut unknown_outcome = false;
                     for attempt in 0..=3u32 {
                         let target_idx = (node_idx + attempt as usize) % node_count;
                         match self.cluster.put(target_idx, &path, &body).await {
@@ -976,6 +981,7 @@ impl<C: LoadTarget> Worker<C> {
                                 epoch = self.manifest.delete_epoch(bucket, &key);
                             }
                             Err(e) => {
+                                unknown_outcome = true;
                                 if attempt == 0 && debug_trace {
                                     // `total_ms` keeps its original
                                     // meaning: generation + HTTP
@@ -1005,6 +1011,45 @@ impl<C: LoadTarget> Worker<C> {
                                 // recording it anyway would create
                                 // phantom versions.
                                 epoch = self.manifest.delete_epoch(bucket, &key);
+                            }
+                        }
+                    }
+                    // Probe-and-record: when every attempt ended in a
+                    // transport error the PUT's outcome is unknown — the
+                    // server may have committed this body while the
+                    // response was lost. Probe every node for the body's
+                    // ETag; if ANY node serves it, the version
+                    // legitimately exists and must enter the manifest
+                    // (otherwise post-run verification flags a valid
+                    // unrecorded body — the version-mismatch class). A
+                    // write that was rolled back is absent everywhere and
+                    // stays unrecorded (no phantom version).
+                    if !recorded && unknown_outcome {
+                        let wanted = blake3::hash(&body).to_hex().to_string();
+                        for probe in 0..node_count {
+                            let idx = (node_idx + probe) % node_count;
+                            match self.cluster.head(idx, &path).await {
+                                Ok(resp) if resp.status().is_success() => {
+                                    let etag = resp
+                                        .headers()
+                                        .get(reqwest::header::ETAG)
+                                        .and_then(|v| v.to_str().ok())
+                                        .unwrap_or_default();
+                                    if !etag.is_empty() && etag.eq_ignore_ascii_case(&wanted) {
+                                        self.manifest.record(bucket, &key, &body);
+                                        self.stats.record_blob_size_tier(size);
+                                        recorded = true;
+                                        if debug_trace {
+                                            eprintln!(
+                                                "[worker-{}] PUT {} recovered by probe on node {} \
+                                                 (status unknown, body committed)",
+                                                self.id, key, idx
+                                            );
+                                        }
+                                        break;
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }

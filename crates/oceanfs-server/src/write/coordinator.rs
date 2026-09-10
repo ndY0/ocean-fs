@@ -617,6 +617,13 @@ impl WriteCoordinator {
             counts: std::collections::HashMap::new(),
             completed: false,
         };
+        // Whether THIS request wrote the local metadata row. Only the
+        // Inline arm does; segment-tier rows are written by the S3
+        // handler after `put` returns Ok. The quorum-failure rollback
+        // must undo only this request's own write — an unconditional
+        // delete would erase a PREVIOUS committed version (the churn
+        // single-copy `(404,200,404)` divergence).
+        let mut local_metadata_row_written = false;
         let chunks = match tier {
             SizeTier::Inline => {
                 let meta = ObjectMetadata {
@@ -635,6 +642,7 @@ impl WriteCoordinator {
                     .put_object(&req.bucket, meta)
                     .await
                     .map_err(|e| Error::Storage(format!("inline metadata write: {e}")))?;
+                local_metadata_row_written = true;
                 smallvec::SmallVec::new()
             }
             SizeTier::Small => {
@@ -932,23 +940,36 @@ impl WriteCoordinator {
             // tombstone carries a FRESH HLC (strictly newer than the
             // write's) so any late hint for the failed write is
             // discarded by LWW.
+            //
+            // CRITICAL: delete only when THIS request wrote the local
+            // metadata row (the Inline arm). Segment-tier writes never
+            // wrote a row here — their row is persisted by the S3
+            // handler only after `put` returns Ok — so deleting would
+            // erase a PREVIOUS committed version and stamp a newer
+            // tombstone over it, leaving the key with fewer surviving
+            // copies (the churn `(404,200,404)` single-copy class).
+            // The segment/WAL bytes this request appended are
+            // unreferenced and reclaimed by the orphan reaper.
             let rollback_hlc = self.hlc_clock.now();
             warn!(
                 bucket = %req.bucket,
                 key = %req.key,
                 required = quorum,
                 received = acks_received,
+                local_row_written = local_metadata_row_written,
                 "write quorum not met; rolling back local write"
             );
-            if let Err(e) =
-                self.metadata_store.delete_object(&req.bucket, &req.key, rollback_hlc).await
-            {
-                warn!(
-                    bucket = %req.bucket,
-                    key = %req.key,
-                    error = %e,
-                    "write rollback failed"
-                );
+            if local_metadata_row_written {
+                if let Err(e) =
+                    self.metadata_store.delete_object(&req.bucket, &req.key, rollback_hlc).await
+                {
+                    warn!(
+                        bucket = %req.bucket,
+                        key = %req.key,
+                        error = %e,
+                        "write rollback failed"
+                    );
+                }
             }
             return Err(Error::QuorumNotMet { required: quorum, received: acks_received });
         }
@@ -2526,6 +2547,67 @@ mod tests {
             meta.is_none(),
             "the failed write must be rolled back — reads must not serve \
              a version no client ever acknowledged",
+        );
+    }
+
+    #[tokio::test]
+    async fn quorum_failed_overwrite_does_not_erase_prior_committed_version() {
+        // Regression (churn single-copy): a prior committed version must
+        // survive a later overwrite whose write quorum is not met.
+        //
+        // The quorum-failure rollback in `put` unconditionally calls
+        // `metadata_store.delete_object(key, rollback_hlc)`. For a
+        // SEGMENT-tier write the coordinator never wrote a metadata row
+        // (the S3 handler persists it only after `put` returns Ok), so
+        // the rollback can only delete a PREVIOUS committed version's
+        // row — erasing a durable local copy. `(404,200,404)`.
+        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"]).await;
+        let bucket = BucketId::new("test");
+        let key = ObjectKey::new("prior-version");
+
+        // Commit an INLINE version (quorum=1 -> local durable); the
+        // coordinator itself persists the row.
+        let ok = coord
+            .put(WriteRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                hash_key: HashKey::from_bytes(hash_key(b"prior-version")),
+                data: Bytes::from_static(b"committed-inline-version"),
+                write_quorum: 1,
+                ack_after_wal: true,
+                ec_async: false,
+                policy: None,
+            })
+            .await;
+        assert!(ok.is_ok(), "prior inline write should succeed: {ok:?}");
+        let before = coord.metadata_store_async_for_test().get_object(&bucket, &key).await.unwrap();
+        assert!(before.is_some(), "prior committed version must be present");
+
+        // Overwrite with a SEGMENT-tier body (> inline threshold) whose
+        // quorum cannot be met (n2/n3 unreachable) -> coordinator rolls
+        // back.
+        let result = coord
+            .put(WriteRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                hash_key: HashKey::from_bytes(hash_key(b"prior-version")),
+                data: Bytes::from(vec![0xAAu8; 8192]),
+                write_quorum: 2,
+                ack_after_wal: true,
+                ec_async: false,
+                policy: None,
+            })
+            .await;
+        assert!(
+            matches!(result, Err(Error::QuorumNotMet { .. })),
+            "quorum=2 unmet must fail: {result:?}"
+        );
+
+        let after = coord.metadata_store_async_for_test().get_object(&bucket, &key).await.unwrap();
+        assert!(
+            after.is_some(),
+            "quorum-failed overwrite erased the prior committed version — \
+             the rollback must not delete a row this write never created"
         );
     }
 

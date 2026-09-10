@@ -512,7 +512,7 @@ impl HealingGrpcService {
         object_key: &str,
         meta: oceanfs_core::ObjectMetadata,
         data: Bytes,
-    ) {
+    ) -> bool {
         // LWW: local metadata newer → discard.
         if let Ok(Some(local)) = self.metadata_store.get_object_metadata(bucket, &meta.object_key) {
             if local.hlc > meta.hlc {
@@ -523,7 +523,7 @@ impl HealingGrpcService {
                     hint_wall = meta.hlc.wall_time(),
                     "hint discarded: local version newer (LWW)"
                 );
-                return;
+                return true;
             }
         }
         // LWW: local tombstone newer → discard.
@@ -536,7 +536,7 @@ impl HealingGrpcService {
                     hint_wall = meta.hlc.wall_time(),
                     "hint discarded: local tombstone newer (LWW)"
                 );
-                return;
+                return true;
             }
         }
 
@@ -592,6 +592,7 @@ impl HealingGrpcService {
                     hlc_logical = meta.hlc.logical(),
                     "applied hinted handoff locally"
                 );
+                true
             }
             Err(e) => {
                 tracing::warn!(
@@ -600,6 +601,7 @@ impl HealingGrpcService {
                     error = %e,
                     "failed to apply hinted handoff locally"
                 );
+                false
             }
         }
     }
@@ -610,7 +612,7 @@ impl HealingGrpcService {
         object_key: String,
         data: Bytes,
         hlc: Hlc,
-    ) {
+    ) -> bool {
         let meta = oceanfs_core::ObjectMetadata {
             object_key: oceanfs_core::ObjectKey::new(&object_key),
             size: data.len() as u64,
@@ -625,7 +627,7 @@ impl HealingGrpcService {
                 .as_millis() as i64,
             hlc,
         };
-        self.apply_hint_object(&bucket, &object_key, meta, data).await;
+        self.apply_hint_object(&bucket, &object_key, meta, data).await
     }
 
     /// Applies a hinted DELETE (a tombstone) with HLC-LWW: the delete
@@ -638,7 +640,12 @@ impl HealingGrpcService {
     /// missed a delete keeps its stale row forever, and the sender-side
     /// obsolete pre-check then drops later write hints for keys that
     /// are still live elsewhere — the churn divergence this fixes.
-    fn apply_hint_delete(&self, bucket: &oceanfs_core::BucketId, object_key: &str, hlc: Hlc) {
+    fn apply_hint_delete(
+        &self,
+        bucket: &oceanfs_core::BucketId,
+        object_key: &str,
+        hlc: Hlc,
+    ) -> bool {
         // LWW: local metadata newer → the object was rewritten after
         // the delete → discard (erasing it would regress the newer
         // write).
@@ -652,7 +659,7 @@ impl HealingGrpcService {
                     hint_wall = hlc.wall_time(),
                     "hint delete discarded: local version newer (LWW)"
                 );
-                return;
+                return true;
             }
         }
         // LWW: local tombstone at least as new → already deleted.
@@ -665,7 +672,7 @@ impl HealingGrpcService {
                     hint_wall = hlc.wall_time(),
                     "hint delete discarded: local tombstone newer (LWW)"
                 );
-                return;
+                return true;
             }
         }
 
@@ -683,6 +690,7 @@ impl HealingGrpcService {
                     hlc_logical = hlc.logical(),
                     "applied hinted delete locally"
                 );
+                true
             }
             Err(e) => {
                 tracing::warn!(
@@ -691,6 +699,7 @@ impl HealingGrpcService {
                     error = %e,
                     "failed to apply hinted delete locally"
                 );
+                false
             }
         }
     }
@@ -917,14 +926,21 @@ impl HealingRpc for HealingGrpcService {
                             .clone()
                             .map(oceanfs_core::BucketId::from)
                             .unwrap_or_else(|| oceanfs_core::BucketId::new("default"));
-                        self.apply_inline_hint(
-                            bucket,
-                            inline.object_key.clone(),
-                            inline.data.clone(),
-                            hlc,
-                        )
-                        .await;
-                        accepted_count += 1;
+                        let applied = self
+                            .apply_inline_hint(
+                                bucket,
+                                inline.object_key.clone(),
+                                inline.data.clone(),
+                                hlc,
+                            )
+                            .await;
+                        // Only a durable apply counts as accepted: a
+                        // rejected apply leaves the batch unaccepted so
+                        // the sender re-enqueues instead of truncating
+                        // its WAL and losing the replica.
+                        if applied {
+                            accepted_count += 1;
+                        }
                         continue;
                     }
 
@@ -1066,8 +1082,9 @@ impl HealingRpc for HealingGrpcService {
                     // apply the tombstone locally with HLC-LWW (a newer
                     // local write or a newer local tombstone discards it).
                     if self.is_local_hint(&intended_for) {
-                        self.apply_hint_delete(&bucket, &object_key, hlc);
-                        accepted_count += 1;
+                        if self.apply_hint_delete(&bucket, &object_key, hlc) {
+                            accepted_count += 1;
+                        }
                         continue;
                     }
 
@@ -1140,8 +1157,12 @@ impl HealingRpc for HealingGrpcService {
             while let Some(joined) = set.join_next().await {
                 match joined {
                     Ok((bucket, key, Ok(Some((meta, data))))) => {
-                        self.apply_hint_object(&bucket, &key, meta, data).await;
-                        accepted_count += 1;
+                        // Count only on a durable apply (see the inline
+                        // arm): an apply failure must leave the hint
+                        // unaccepted so the sender retries.
+                        if self.apply_hint_object(&bucket, &key, meta, data).await {
+                            accepted_count += 1;
+                        }
                     }
                     Ok((_bucket, _key, Ok(None))) => {
                         // The object no longer exists on the origin —
@@ -2137,6 +2158,73 @@ mod tests {
             Hlc::new(555, 3),
             "applied metadata must carry the original write's HLC",
         );
+    }
+
+    /// An applier that always fails — stands in for a receiver whose
+    /// segment/metadata write is erroring (backpressure, disk fault).
+    struct FailingApplier;
+
+    #[async_trait::async_trait]
+    impl HintObjectApplier for FailingApplier {
+        async fn apply_object(
+            &self,
+            _bucket: &oceanfs_core::BucketId,
+            _key: &oceanfs_core::ObjectKey,
+            _data: Bytes,
+            _hlc: Hlc,
+            _created_at: i64,
+        ) -> Result<oceanfs_core::ObjectMetadata, String> {
+            Err("injected apply failure".to_string())
+        }
+    }
+
+    /// Fix 1 (hint honesty): an apply failure must leave the hint
+    /// UNaccepted. The sender re-enqueues on `accepted=false`; if the
+    /// receipt reported success it would truncate its WAL and the
+    /// rejected replica would silently never be materialized.
+    #[tokio::test]
+    async fn rejected_hint_apply_is_not_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_store: Arc<dyn oceanfs_storage_api::MetadataStore> = Arc::new(
+            oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
+                data_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let handoff = Arc::new(HintedHandoff::new());
+        let data_store: Arc<dyn SegmentDataStore> = Arc::new(TestHealStore::new());
+        let service = HealingGrpcService::new(
+            handoff,
+            metadata_store,
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            )),
+            data_store,
+            Arc::new(HlcClock::new()),
+        )
+        .with_local_node_id(NodeId::new("self-node"))
+        .with_hint_object_applier(Arc::new(FailingApplier));
+
+        let hint = crate::hinted_handoff_rpc::HintRecord {
+            record: Some(Record::Inline(crate::hinted_handoff_rpc::HintInline {
+                intended_for: Some(NodeId::new("self-node").into()),
+                bucket_id: Some(oceanfs_core::BucketId::new("b").into()),
+                object_key: "k".to_string(),
+                data: Bytes::from_static(b"hello"),
+                hlc: Some(oceanfs_core::proto::common::HlcTimestamp { wall_time: 555, logical: 3 }),
+            })),
+            stored_at_secs: 0,
+        };
+
+        let request = tonic::Request::new(HintedHandoffRequest { hints: vec![hint] });
+        let response = service.hinted_handoff(request).await.unwrap();
+        let resp = response.into_inner();
+        assert!(
+            !resp.accepted,
+            "a rejected apply must NOT be accepted — the sender would truncate its WAL and lose the hint"
+        );
+        assert_eq!(resp.accepted_count, 0, "no hint was durably applied");
     }
 
     #[tokio::test]

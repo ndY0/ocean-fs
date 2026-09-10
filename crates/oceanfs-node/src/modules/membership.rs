@@ -73,6 +73,11 @@ pub(crate) struct MembershipModule {
     min_quorum_nodes: u64,
     /// The ready-gate bound (`cluster_ready_timeout_sec`).
     ready_timeout_secs: u64,
+    /// The roster-stability window the readiness gate requires before it
+    /// opens (`cluster_stability_rounds * [gossip] interval_ms`). Guards
+    /// against opening on a ring that has quorum but has not yet converged
+    /// (a pending gossip join would otherwise be missed as a write target).
+    stability_window: std::time::Duration,
     /// Perf 4.3 socket options applied to accepted plane connections.
     quickack: bool,
     busy_poll: u32,
@@ -209,6 +214,12 @@ impl MembershipModule {
         if !is_cluster_node {
             ready_gate.store(true, std::sync::atomic::Ordering::Release);
         }
+        // The roster-stability window scales with the deployment's own
+        // gossip cadence (see `stability_window`), so convergence speed
+        // follows the user's `[gossip] interval_ms` and
+        // `cluster_stability_rounds`.
+        let stability_window =
+            stability_window(config.gossip.interval_ms, config.cluster_stability_rounds);
         Ok(MembershipModule {
             membership,
             manifest_cache,
@@ -223,6 +234,7 @@ impl MembershipModule {
             probe_timeout_ms,
             min_quorum_nodes: config.cluster_min_quorum_nodes,
             ready_timeout_secs: config.cluster_ready_timeout_sec,
+            stability_window,
             quickack: plane_cfg.quickack,
             busy_poll: plane_cfg.busy_poll_us,
             fallback_seeds: durable_state.fallback_seeds,
@@ -450,7 +462,11 @@ impl MembershipModule {
                         _ = interval.tick() => {}
                     }
                     let ring_nodes = retry_membership.ring().snapshot().node_count();
-                    if cluster_ready_gate_opens(ring_nodes, min_quorum_nodes, false) {
+                    // Stop retrying once the ring has quorum: gossip keeps
+                    // merging the remaining members, and the readiness gate
+                    // separately waits for the roster to stabilize before
+                    // opening writes.
+                    if ring_nodes as u64 >= min_quorum_nodes {
                         return;
                     }
                     if let Err(e) = retry_membership.join(retry_incarnation, &retry_fallback).await
@@ -518,33 +534,51 @@ pub(crate) struct MembershipPlane {
     pub(crate) rejoin_handle: Option<JoinHandle<()>>,
 }
 
-/// Whether the cluster-readiness gate opens for the given ring view
-/// (B6, review #66/#69).
+/// The roster-stability window the readiness gate requires: the ring's
+/// member set must be unchanged for this long before the gate opens.
 ///
-/// The gate opens when the ring holds at least the configured minimum
-/// quorum node count (`cluster_min_quorum_nodes`) or when the
-/// configured deadline has elapsed (the bound keeps a node whose seeds
-/// are unreachable from stalling writes forever). Single-node
-/// deployments never consult this — they skip the gate entirely.
+/// Derived from the deployment's own gossip cadence — `interval_ms *
+/// cluster_stability_rounds` — so it follows the user's configured
+/// convergence speed rather than a hard-coded wall clock. Floors at 1ms
+/// so a misconfigured zero interval/rounds cannot open the gate on the
+/// first tick.
+pub(crate) fn stability_window(
+    gossip_interval_ms: u64,
+    cluster_stability_rounds: u64,
+) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        gossip_interval_ms.max(1).saturating_mul(cluster_stability_rounds.max(1)),
+    )
+}
+
+/// Whether the cluster-readiness gate should open.
 ///
-/// Shared with `Node::start()`'s §11 ready-gate task and the module's
-/// background rejoin loop (moved here by c4).
+/// The gate opens when the ring holds at least `min_quorum_nodes`
+/// members AND the roster has been stable for the configured window
+/// (`roster_stable`). The stability condition is the pending-gossip-join
+/// guard: ring >= quorum does NOT mean membership has converged — a
+/// rejoined node can see 2 of 3 members while a join pull is in flight,
+/// and a write then targets an incomplete replica set and never hints
+/// the missing member. `deadline_elapsed` is the availability escape (a
+/// node whose peers are unreachable must not refuse writes forever).
+/// Single-node deployments never consult this — they skip the gate.
 pub(crate) fn cluster_ready_gate_opens(
     ring_nodes: usize,
     min_quorum_nodes: u64,
+    roster_stable: bool,
     deadline_elapsed: bool,
 ) -> bool {
-    ring_nodes as u64 >= min_quorum_nodes || deadline_elapsed
+    deadline_elapsed || (ring_nodes as u64 >= min_quorum_nodes && roster_stable)
 }
 
 impl MembershipModule {
     /// Spawns the cluster-readiness gate loop (c5 — the gate is a
-    /// membership-plane concern: it opens when the RING reaches the
-    /// configured minimum quorum node count or the configured bound
-    /// elapses). No-op for single-node deployments — their gate is
-    /// already open (see [`ready_gate`](Self::ready_gate)). Returns the
-    /// loop handle so shutdown can await it (the loop also exits on the
-    /// membership shutdown token).
+    /// membership-plane concern). It opens when the ring has quorum AND
+    /// its member set has been stable for the configured window, or when
+    /// the configured bound elapses. No-op for single-node deployments —
+    /// their gate is already open (see [`ready_gate`](Self::ready_gate)).
+    /// Returns the loop handle so shutdown can await it (the loop also
+    /// exits on the membership shutdown token).
     pub(crate) fn spawn_ready_gate(&self) -> Option<JoinHandle<()>> {
         if !self.is_cluster_node {
             return None;
@@ -554,28 +588,39 @@ impl MembershipModule {
         let gate = Arc::clone(&self.ready_gate);
         let gate_timeout_secs = self.ready_timeout_secs.max(1);
         let min_quorum_nodes = self.min_quorum_nodes;
+        let stability_window = self.stability_window;
         let gate_shutdown = self.membership.shutdown_token();
         Some(tokio::spawn(async move {
-            // Open the gate when the ring reaches the configured
-            // minimum quorum node count or after the configured
-            // bound — the rejoin pull takes seconds; the bound
-            // keeps a node whose seeds are unreachable from
-            // stalling writes forever (it would serve stale data
-            // anyway — the 503s it emits while gated are the safer
-            // failure mode). The timeout is config
-            // (`cluster_ready_timeout_sec`) because convergence
-            // scales with the gossip profile.
+            // Open when the ring reaches the configured minimum quorum
+            // node count AND its member set has been unchanged for the
+            // stability window, or after the configured bound.
+            //
+            // The stability requirement is the completeness guard: a
+            // freshly (re)joined node's ring can hold quorum while a
+            // pending gossip join has not yet delivered a member. Waiting
+            // for the roster to stop changing follows the real gossip
+            // cadence; the bound keeps a node whose seeds are
+            // unreachable from stalling writes forever (it would serve
+            // stale data anyway — the 503s are the safer failure mode).
             let deadline =
                 tokio::time::Instant::now() + std::time::Duration::from_secs(gate_timeout_secs);
+            let mut last_roster: Vec<NodeId> = Vec::new();
+            let mut last_change = tokio::time::Instant::now();
             loop {
                 tokio::select! {
                     _ = gate_shutdown.cancelled() => return,
                     _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
                 }
-                let ring_nodes = gate_membership.ring().snapshot().node_count();
+                let mut roster: Vec<NodeId> = gate_membership.ring().snapshot().nodes().to_vec();
+                roster.sort();
+                if roster != last_roster {
+                    last_roster = roster;
+                    last_change = tokio::time::Instant::now();
+                }
                 if cluster_ready_gate_opens(
-                    ring_nodes,
+                    last_roster.len(),
                     min_quorum_nodes,
+                    last_change.elapsed() >= stability_window,
                     tokio::time::Instant::now() >= deadline,
                 ) {
                     gate.store(true, std::sync::atomic::Ordering::Release);
@@ -593,5 +638,29 @@ impl MembershipModule {
     /// follow `membership.start()`).
     pub(crate) fn register_metrics(&self, registrar: &dyn oceanfs_core::MetricRegistrar) {
         self.manifest_cache.register_metrics(registrar);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stability_window_scales_with_gossip_cadence() {
+        // 3 rounds × 500ms gossip = 1.5s (the churn profile).
+        assert_eq!(stability_window(500, 3), std::time::Duration::from_millis(1_500));
+        // Production 1s gossip, 3 rounds = 3s.
+        assert_eq!(stability_window(1_000, 3), std::time::Duration::from_millis(3_000));
+        // Floor: a zeroed config still yields a non-zero window so the
+        // gate cannot open on its very first tick.
+        assert_eq!(stability_window(0, 0), std::time::Duration::from_millis(1));
+    }
+
+    #[test]
+    fn gate_requires_quorum_and_stability_or_deadline() {
+        assert!(cluster_ready_gate_opens(3, 2, true, false), "quorum + stable");
+        assert!(!cluster_ready_gate_opens(3, 2, false, false), "roster still changing");
+        assert!(!cluster_ready_gate_opens(1, 2, true, false), "below quorum");
+        assert!(cluster_ready_gate_opens(1, 2, false, true), "deadline escape");
     }
 }

@@ -1992,7 +1992,10 @@ mod tests {
         );
         h.observe(50);
         let rendered = h.render();
-        assert!(rendered.contains(r#"accel_encode_duration_bucket{le="50"}{tier="cpu_simd"} 1"#));
+        assert!(
+            rendered.contains(r#"accel_encode_duration_bucket{le="50",tier="cpu_simd"} 1"#),
+            "labeled histogram buckets splice le into the label set:\n{rendered}"
+        );
     }
 
     // --- DashMap registry tests ---

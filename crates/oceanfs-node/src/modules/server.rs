@@ -814,6 +814,7 @@ impl ServerModule {
         let cache_service = oceanfs_server::grpc::cache_service::CacheGrpcService::new(
             Some(object_cache),
             Some(metadata_cache),
+            Some(negative_cache),
         );
         let scrub_service = oceanfs_durability::scrub_service::ScrubGrpcService::new(
             Arc::clone(&storage.lifecycle_registry),

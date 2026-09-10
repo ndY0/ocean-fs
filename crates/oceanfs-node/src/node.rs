@@ -1665,21 +1665,22 @@ mod tests {
 
     #[test]
     fn cluster_ready_gate_opens_at_configured_minimum_quorum() {
-        // B6 (review #66/#69): the gate threshold derives from
-        // `cluster_min_quorum_nodes`, not the hard-coded `ring >= 2`.
-        // Default (2): a 2-node ring opens the gate, a 1-node ring
-        // does not.
-        assert!(cluster_ready_gate_opens(2, 2, false));
-        assert!(!cluster_ready_gate_opens(1, 2, false));
-        // A deployment requiring 3 nodes stays gated at 2 nodes — the
-        // historical code would have opened here.
-        assert!(!cluster_ready_gate_opens(2, 3, false));
-        assert!(cluster_ready_gate_opens(3, 3, false));
+        // The gate opens only when the ring has quorum AND the roster has
+        // been stable for the configured window — quorum alone is not
+        // enough, because a pending gossip join can still be missing a
+        // member (the churn under-replication class).
+        assert!(cluster_ready_gate_opens(2, 2, true, false)); // quorum + stable
+        assert!(!cluster_ready_gate_opens(2, 2, false, false)); // roster still changing
+        assert!(!cluster_ready_gate_opens(1, 2, true, false)); // below quorum
+                                                               // A deployment requiring 3 nodes stays gated at 2 nodes — the
+                                                               // historical code would have opened here.
+        assert!(!cluster_ready_gate_opens(2, 3, true, false));
+        assert!(cluster_ready_gate_opens(3, 3, true, false));
         // The deadline bound still opens the gate regardless of ring
-        // size (cluster_ready_timeout_sec semantics preserved).
-        assert!(cluster_ready_gate_opens(1, 3, true));
-        // A min-quorum <= 1 opens as soon as the node has a ring view.
-        assert!(cluster_ready_gate_opens(1, 1, false));
+        // size / stability (cluster_ready_timeout_sec semantics preserved).
+        assert!(cluster_ready_gate_opens(1, 3, false, true));
+        // A min-quorum <= 1 opens once the node's roster is stable.
+        assert!(cluster_ready_gate_opens(1, 1, true, false));
     }
 
     #[tokio::test]

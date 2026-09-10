@@ -436,6 +436,26 @@ pub struct NodeConfig {
     #[serde(default = "default_cluster_min_quorum_nodes")]
     pub cluster_min_quorum_nodes: u64,
 
+    /// Number of consecutive gossip rounds the ring roster must hold the
+    /// same member set before the cluster-readiness gate opens (default
+    /// 3).
+    ///
+    /// The gate's completeness guard: the ring holding
+    /// [`cluster_min_quorum_nodes`](Self::cluster_min_quorum_nodes)
+    /// members does NOT mean membership has CONVERGED — a rejoined node's
+    /// ring can hold 2 of 3 members while a pending gossip join is still
+    /// in flight. A write then targets an incomplete replica set and
+    /// never creates a hint for the missing member (the churn
+    /// under-replication class). The gate therefore opens only after the
+    /// roster is unchanged for `cluster_stability_rounds *
+    /// [gossip] interval_ms`, which tracks the deployment's real
+    /// convergence speed (gossip cadence, network). No fixed cluster
+    /// size is assumed, so dynamic membership (adding/removing nodes)
+    /// still works. `cluster_ready_timeout_sec` remains the availability
+    /// escape.
+    #[serde(default = "default_cluster_stability_rounds")]
+    pub cluster_stability_rounds: u64,
+
     /// Shutdown grace period for the main background task group, in
     /// seconds (default 10, behavior-compatible with the historical
     /// hard-coded bound — review #71).
@@ -632,6 +652,9 @@ fn default_cluster_ready_timeout_sec() -> u64 {
 fn default_cluster_min_quorum_nodes() -> u64 {
     2
 }
+fn default_cluster_stability_rounds() -> u64 {
+    3
+}
 fn default_shutdown_grace_secs() -> u64 {
     10
 }
@@ -724,6 +747,7 @@ impl Default for NodeConfig {
             hint_delivery_sweep_sec: 5,
             cluster_ready_timeout_sec: 30,
             cluster_min_quorum_nodes: 2,
+            cluster_stability_rounds: 3,
             shutdown_grace_secs: 10,
             shutdown_fast_grace_secs: 5,
         }
@@ -749,6 +773,14 @@ mod tests {
         // hard-coded constant.
         let config = NodeConfig::default();
         assert_eq!(config.cluster_min_quorum_nodes, 2);
+    }
+
+    #[test]
+    fn cluster_stability_rounds_defaults_to_three() {
+        // The readiness gate's completeness guard: wait for the roster to
+        // stop changing for this many gossip rounds before opening.
+        let config = NodeConfig::default();
+        assert_eq!(config.cluster_stability_rounds, 3);
     }
 
     /// ADR-0028 D1: the membership plane defaults to its own port,
