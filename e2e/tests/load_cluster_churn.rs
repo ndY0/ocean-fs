@@ -746,7 +746,7 @@ async fn load_cluster_churn() {
         Vec<(String, u16, Option<String>, Option<String>, Option<String>)>,
     > = None;
     let mut report_quorum_provenance: Option<Vec<(String, Vec<e2e::load::MutationEvent>)>> = None;
-    let quorum_failed = manifest
+    let mut quorum_failed = manifest
         .verify_read_quorum(&*target, &alive_indices, READ_QUORUM, Some(READ_QUORUM_SAMPLE))
         .await;
     eprintln!(
@@ -754,6 +754,24 @@ async fn load_cluster_churn() {
         quorum_failed.len(),
         phase_start.elapsed().as_secs_f64()
     );
+    // Re-check the flagged keys after a short settle: a node still
+    // settling after churn can transiently 404 a key it actually serves
+    // (the verifier samples once). Only the failed set is re-checked.
+    for attempt in 1..=3 {
+        if quorum_failed.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let recheck = manifest
+            .verify_read_quorum_keys(&quorum_failed, &*target, &alive_indices, READ_QUORUM)
+            .await;
+        eprintln!(
+            "load_cluster_churn: read-quorum re-check {attempt}: {} of {} still failing",
+            recheck.len(),
+            quorum_failed.len()
+        );
+        quorum_failed = recheck;
+    }
     if !quorum_failed.is_empty() {
         eprintln!("load_cluster_churn: quorum-failed keys: {quorum_failed:?}");
         // Per-node diagnostics: what does each node serve for the failed

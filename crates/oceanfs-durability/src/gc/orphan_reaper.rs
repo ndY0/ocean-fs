@@ -150,11 +150,24 @@ impl OrphanReaper {
         let ttl_ms = (self.config.tombstone_ttl_sec * 1000) as i64;
 
         // Step 1: the aged dead-chunk accounting feed (shared with GC).
+        //
+        // Count each PHYSICAL chunk once. The deletions CF can hold
+        // multiple capture records for the same byte range — a
+        // delete→re-put→supersede→delete cycle, or a receiver-side append
+        // superseding a row the delete path already captured — and summing
+        // them raw double-counts, driving `dead >= total` while a live
+        // object still references the segment (the 2026-09-10 churn
+        // data-loss class). Deduping by `(segment, offset, length)` is the
+        // true "bytes captured dead" accounting.
         let records = collect_aged_dead_chunk_records(self.metadata.as_ref(), now_ms, ttl_ms);
         let mut dead_bytes: HashMap<SegmentId, u64> = HashMap::with_capacity(records.len());
+        let mut dead_seen: std::collections::HashSet<(SegmentId, u64, u32)> =
+            std::collections::HashSet::new();
         for (_bucket, _key, record) in records {
             for chunk in &record.chunks {
-                *dead_bytes.entry(chunk.segment_id).or_insert(0) += chunk.length as u64;
+                if dead_seen.insert((chunk.segment_id, chunk.offset, chunk.length)) {
+                    *dead_bytes.entry(chunk.segment_id).or_insert(0) += chunk.length as u64;
+                }
             }
         }
 
@@ -564,6 +577,40 @@ mod tests {
                 .await;
         let stats = reaper.run_cycle().await.unwrap();
         assert_eq!(stats.orphans_found, 0, "a segment with a live object is never an orphan");
+    }
+
+    #[tokio::test]
+    async fn duplicate_captures_of_same_chunk_are_counted_once() {
+        // Regression (2026-09-10 accounting over-count): the deletions CF
+        // can hold two records capturing the SAME physical byte range
+        // (delete→re-put→supersede cycles). Raw summation double-counts
+        // and reaps a segment whose real dead bytes are below its total.
+        // The reaper must count each `(segment, offset, length)` once.
+        let registry = Arc::new(SegmentLifecycleRegistry::new(&LifecycleConfig::default()));
+        let metadata = Arc::new(RocksDbMetadataStore::open(&test_config()).unwrap());
+        let seg_id = SegmentId::new();
+        // No membership index (WAL-replayed shape): only the accounting
+        // is under test.
+        seed_sealed(
+            &registry,
+            make_segment_meta(seg_id, SizeTier::Standard, 1_000_000_000_000, 1500),
+        );
+        // Two records capturing the same 1000-byte chunk, for two keys.
+        plant_aged_tombstone(&metadata, "default", "dup-a.txt", one_chunk(seg_id, 0, 1000));
+        plant_aged_tombstone(&metadata, "default", "dup-b.txt", one_chunk(seg_id, 0, 1000));
+
+        let store = test_shard_store();
+        let reaper =
+            make_reaper(metadata, Arc::clone(&store), GcConfig::default(), Arc::clone(&registry))
+                .await;
+        let stats = reaper.run_cycle().await.unwrap();
+
+        assert_eq!(
+            stats.orphans_found, 0,
+            "1000 dead (< 1500 total) must not be double-counted into an orphan"
+        );
+        assert_eq!(stats.orphans_deleted, 0);
+        assert!(!store.is_deleted(seg_id));
     }
 
     #[tokio::test]

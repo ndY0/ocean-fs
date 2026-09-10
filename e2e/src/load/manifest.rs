@@ -126,6 +126,7 @@ impl Manifest {
 
     /// Records a PUT together with triage provenance (writer node,
     /// attempts, first status, unknown-outcome flag).
+    #[allow(clippy::too_many_arguments)]
     pub fn record_put_with_provenance(
         &self,
         bucket: &str,
@@ -477,6 +478,42 @@ impl Manifest {
             }
         }
 
+        failed
+    }
+
+    /// Re-verifies a specific set of composite keys against `read_quorum`.
+    ///
+    /// Used to re-check the keys a first pass flagged: a node that is
+    /// still settling after churn can transiently 404 a key it does
+    /// serve, producing a false quorum miss. Re-checking only the
+    /// initially-failed keys (after a short settle) avoids re-scanning
+    /// the whole manifest.
+    pub async fn verify_read_quorum_keys<C: LoadTarget>(
+        &self,
+        keys: &[String],
+        target: &C,
+        node_indices: &[usize],
+        read_quorum: usize,
+    ) -> Vec<String> {
+        let mut failed = Vec::new();
+        for key in keys {
+            let Some(entry) = self.entries.get(key) else {
+                continue;
+            };
+            let (versions, deleted, _epoch) = entry.value();
+            if deleted.load(Ordering::Relaxed) {
+                continue;
+            }
+            let mut correct_nodes = 0usize;
+            for &node_idx in node_indices {
+                if verify_one_from_node(target, node_idx, key, versions).await.is_none() {
+                    correct_nodes += 1;
+                }
+            }
+            if correct_nodes < read_quorum {
+                failed.push(key.clone());
+            }
+        }
         failed
     }
 }
