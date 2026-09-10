@@ -77,15 +77,28 @@ reached all N replicas". Its hint queue is the **durable debt ledger**
 - Complete: guaranteed by Decision 1 — every N-member is either acked
   or owed, and every failed replication attempt records debt (writes
   and deletes alike).
-- Never cancelled at the sender (amended 2026-08-20): the obsolete-key
-  pre-check was removed. A sender-side opinion about distributed state
-  (the key is "absent" locally, therefore the hint is dead) can diverge
-  from the truth and silently drop a mutation the remote still needs —
-  the churn residual class. Delivery now ships **everything** and the
-  receiver's HLC-LWW apply is the single gate: a hint for a key the
-  sender later deleted is delivered and rejected by LWW on the
+- Never cancelled at the sender by a *distributed-state opinion*
+  (amended 2026-08-20): the obsolete-key pre-check was removed. The
+  receiver's HLC-LWW apply is the single acceptance gate: a hint for a
+  key the sender later deleted is delivered and rejected by LWW on the
   receiver (wasted work bounded by the mutation rate, never a lost
   mutation).
+- Per-hint partial acceptance + bounded give-up (amended 2026-09-10):
+  the receiver reports the exact hint indices it could not confirm
+  applied or resolved (`HintedHandoffResponse.retry_indices`); the
+  sender re-enqueues **only** those and drops the accepted ones. The
+  2026-08-20 "deliver everything" rule was all-or-nothing, so a single
+  permanently-unappliable hint — a Multi-tier object before that apply
+  arm existed, or a hint whose origin no longer holds the referenced
+  segment — forced a wholesale re-enqueue and wedged its entire
+  per-target queue forever (the 2026-09-10 churn `stored=44
+  delivered=7` livelock). The give-up is still **not** a sender-side
+  state opinion: the receiver classifies terminal vs retry, and a retry
+  hint is dropped only after `hint_max_delivery_attempts` (durable
+  `HintRecord.attempts`) and is counted in
+  `hinted_handoff_hints_dropped_total` — bounded, never silent. The TTL
+  prune remains the durable backstop (`stored_at_secs` now survives
+  retries instead of being re-stamped on every enqueue).
 - Bounded: hints are enqueued **only after quorum is met** — a failed
   (rolled-back) write must not leave debt for a version that never
   existed.

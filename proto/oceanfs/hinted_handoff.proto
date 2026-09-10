@@ -72,6 +72,14 @@ message HintRecord {
   // Unix timestamp (seconds) when this hint was written.
   // Used for TTL-based pruning of stale entries.
   uint64 stored_at_secs = 10;
+
+  // Delivery attempts already made for this hint. Durable so a restart
+  // cannot reset the give-up budget: a hint the receiver keeps rejecting
+  // for a non-terminal reason is retried at most
+  // `hint_max_delivery_attempts` times, then dropped (and counted in
+  // `hinted_handoff_hints_dropped_total`) — otherwise it would occupy
+  // the per-target queue forever.
+  uint32 attempts = 11;
 }
 
 // Batched hinted handoff delivery request.
@@ -86,4 +94,11 @@ message HintedHandoffResponse {
   bool accepted = 1;
   // Number of hints accepted.
   uint32 accepted_count = 2;
+
+  // Indices into the request's `hints` that were NOT confirmed applied or
+  // resolved and must be retried. Empty means the whole batch is terminal
+  // (applied, or resolved-as-obsolete). Per-hint so a single
+  // unappliable hint cannot wedge the rest of the batch (head-of-line
+  // blocking) — the sender re-enqueues only these.
+  repeated uint32 retry_indices = 3;
 }

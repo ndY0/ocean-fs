@@ -3607,6 +3607,15 @@
           "expr": "rate(hinted_handoff_hints_expired_total{job=\"oceanfs\"}[1m])",
           "legendFormat": "expired",
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(hinted_handoff_hints_dropped_total{job=\"oceanfs\"}[1m])",
+          "legendFormat": "dropped",
+          "refId": "D"
         }
       ],
       "options": {
@@ -4072,6 +4081,15 @@
           "expr": "rate(hinted_handoff_hints_expired_total{job=\"oceanfs\"}[1m])",
           "legendFormat": "expired {{instance}}",
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(hinted_handoff_hints_dropped_total{job=\"oceanfs\"}[1m])",
+          "legendFormat": "dropped {{instance}}",
+          "refId": "D"
         }
       ],
       "title": "Per-Node Hinted Handoff (hints/s)",

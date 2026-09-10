@@ -400,6 +400,19 @@ pub struct NodeConfig {
     #[serde(default = "default_hint_delivery_sweep_sec")]
     pub hint_delivery_sweep_sec: u64,
 
+    /// Maximum hinted-handoff delivery attempts per hint before it is
+    /// dropped (default 10).
+    ///
+    /// The receiver reports per-hint retry indices; a hint it keeps
+    /// rejecting for a non-terminal reason is retried at most this many
+    /// times, then dropped and counted in
+    /// `hinted_handoff_hints_dropped_total`. Bounds the otherwise-infinite
+    /// retry loop (without a cap one unappliable hint occupies its
+    /// per-target queue forever). Tune with
+    /// [`hint_delivery_sweep_sec`](Self::hint_delivery_sweep_sec).
+    #[serde(default = "default_hint_max_delivery_attempts")]
+    pub hint_max_delivery_attempts: u32,
+
     /// Cluster-readiness gate timeout in seconds (default 30).
     ///
     /// After (re)joining a cluster, a node's ring starts as a singleton
@@ -646,6 +659,9 @@ fn default_hint_prune_interval() -> u64 {
 fn default_hint_delivery_sweep_sec() -> u64 {
     5
 }
+fn default_hint_max_delivery_attempts() -> u32 {
+    10
+}
 fn default_cluster_ready_timeout_sec() -> u64 {
     30
 }
@@ -745,6 +761,7 @@ impl Default for NodeConfig {
             hint_ttl_sec: 604800,
             hint_prune_interval_sec: 3600,
             hint_delivery_sweep_sec: 5,
+            hint_max_delivery_attempts: 10,
             cluster_ready_timeout_sec: 30,
             cluster_min_quorum_nodes: 2,
             cluster_stability_rounds: 3,

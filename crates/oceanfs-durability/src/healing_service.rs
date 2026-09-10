@@ -891,12 +891,18 @@ impl HealingRpc for HealingGrpcService {
 
         let hint_count = req.hints.len() as u32;
         let mut accepted_count = 0u32;
+        // Indices into `req.hints` the receiver could NOT confirm applied
+        // or resolved. The sender re-enqueues only these (per-hint partial
+        // acceptance), so one unappliable hint cannot wedge the batch.
+        let mut retry_indices: Vec<u32> = Vec::new();
         // Local segment-ref hints deferred to the parallel fetch pass
         // (see below): serial fetches of a full batch exceed the
         // sender's delivery timeout and make it re-enqueue — thrash.
-        let mut pending_fetches: Vec<(oceanfs_core::BucketId, String)> = Vec::new();
+        // Each carries its request index so a failed apply is reported.
+        let mut pending_fetches: Vec<(u32, oceanfs_core::BucketId, String)> = Vec::new();
 
-        for proto_hint in &req.hints {
+        for (idx, proto_hint) in req.hints.iter().enumerate() {
+            let idx = idx as u32;
             // Convert proto-based HintRecord to the legacy HintRecord for storage.
             // The existing HintedHandoff uses the legacy struct.
             match &proto_hint.record {
@@ -935,11 +941,13 @@ impl HealingRpc for HealingGrpcService {
                             )
                             .await;
                         // Only a durable apply counts as accepted: a
-                        // rejected apply leaves the batch unaccepted so
-                        // the sender re-enqueues instead of truncating
-                        // its WAL and losing the replica.
+                        // rejected apply is reported for retry so the
+                        // sender does not truncate its WAL and lose the
+                        // replica.
                         if applied {
                             accepted_count += 1;
+                        } else {
+                            retry_indices.push(idx);
                         }
                         continue;
                     }
@@ -964,6 +972,7 @@ impl HealingRpc for HealingGrpcService {
                                 error = %e,
                                 "failed to store batched hint (inline)"
                             );
+                            retry_indices.push(idx);
                         }
                     }
                 }
@@ -1014,13 +1023,14 @@ impl HealingRpc for HealingGrpcService {
                     // re-enqueues and redelivers — the batch thrashes).
                     if self.is_local_hint(&intended_for) {
                         if sender_grpc_addr.is_some() && self.hint_object_fetcher.is_some() {
-                            pending_fetches.push((bucket, object_key));
+                            pending_fetches.push((idx, bucket, object_key));
                         } else {
                             tracing::warn!(
                                 intended_for = %intended_for,
                                 "hint intended for self but no origin/fetcher \
-                                 available; NOT accepted — the sender will retry"
+                                 available; reported for retry"
                             );
+                            retry_indices.push(idx);
                         }
                         // Do NOT fall through to the legacy relay buffer
                         // (which nothing drains — accepting would make
@@ -1052,6 +1062,7 @@ impl HealingRpc for HealingGrpcService {
                                 error = %e,
                                 "failed to store batched hint (segment ref)"
                             );
+                            retry_indices.push(idx);
                         }
                     }
                 }
@@ -1084,25 +1095,27 @@ impl HealingRpc for HealingGrpcService {
                     if self.is_local_hint(&intended_for) {
                         if self.apply_hint_delete(&bucket, &object_key, hlc) {
                             accepted_count += 1;
+                        } else {
+                            retry_indices.push(idx);
                         }
                         continue;
                     }
 
                     // Misrouted delete hint: the legacy relay cannot
-                    // carry a delete, so do NOT accept it — the sender
-                    // re-enqueues and retries until the hint reaches
-                    // its intended node (never ack what you can't
-                    // materialize).
+                    // carry a delete, so report it for retry — the sender
+                    // re-enqueues until the hint reaches its intended node
+                    // (never ack what you can't materialize).
                     tracing::warn!(
                         intended_for = %intended_for,
                         bucket = %bucket,
                         key = %object_key,
-                        "delete hint arrived at the wrong node; \
-                         NOT accepted — the sender will retry"
+                        "delete hint arrived at the wrong node; reported for retry"
                     );
+                    retry_indices.push(idx);
                 }
                 None => {
-                    tracing::warn!("batched hint with no record variant; skipping");
+                    tracing::warn!("batched hint with no record variant; reported for retry");
+                    retry_indices.push(idx);
                 }
             }
         }
@@ -1118,14 +1131,14 @@ impl HealingRpc for HealingGrpcService {
             else {
                 tracing::warn!(
                     count = pending_fetches.len(),
-                    "deferred segment-ref hints have no origin/fetcher; \
-                     NOT accepted — the sender will retry"
+                    "deferred segment-ref hints have no origin/fetcher; reported for retry"
                 );
-                // Leave them unaccepted: the batch returns
-                // accepted=false and the sender re-enqueues.
+                // Report every deferred hint for retry.
+                retry_indices.extend(pending_fetches.iter().map(|(idx, _, _)| *idx));
                 return Ok(Response::new(HintedHandoffResponse {
-                    accepted: accepted_count == hint_count,
+                    accepted: retry_indices.is_empty(),
                     accepted_count,
+                    retry_indices,
                 }));
             };
 
@@ -1141,30 +1154,37 @@ impl HealingRpc for HealingGrpcService {
             // [end]
             const FETCH_CONCURRENCY: usize = 16;
             let semaphore = Arc::new(tokio::sync::Semaphore::new(FETCH_CONCURRENCY));
+            // Every deferred index — conservatively retried if a fetch
+            // task panics (a panic loses the per-task index).
+            let deferred_indices: Vec<u32> =
+                pending_fetches.iter().map(|(idx, _, _)| *idx).collect();
             let mut set = tokio::task::JoinSet::new();
-            for (bucket, key) in pending_fetches {
+            for (idx, bucket, key) in pending_fetches {
                 let fetcher = Arc::clone(&fetcher);
                 let semaphore = Arc::clone(&semaphore);
                 set.spawn(async move {
                     let _permit = match semaphore.acquire_owned().await {
                         Ok(p) => p,
-                        Err(_) => return (bucket, key, Err("fetch semaphore closed".to_string())),
+                        Err(_) => {
+                            return (idx, bucket, key, Err("fetch semaphore closed".to_string()))
+                        }
                     };
                     let result = fetcher.fetch_object(origin, &bucket, &key).await;
-                    (bucket, key, result)
+                    (idx, bucket, key, result)
                 });
             }
             while let Some(joined) = set.join_next().await {
                 match joined {
-                    Ok((bucket, key, Ok(Some((meta, data))))) => {
+                    Ok((idx, bucket, key, Ok(Some((meta, data))))) => {
                         // Count only on a durable apply (see the inline
-                        // arm): an apply failure must leave the hint
-                        // unaccepted so the sender retries.
+                        // arm): an apply failure is reported for retry.
                         if self.apply_hint_object(&bucket, &key, meta, data).await {
                             accepted_count += 1;
+                        } else {
+                            retry_indices.push(idx);
                         }
                     }
-                    Ok((_bucket, _key, Ok(None))) => {
+                    Ok((_idx, _bucket, _key, Ok(None))) => {
                         // The object no longer exists on the origin —
                         // the hint resolved (the delete/supersede won).
                         // Accept it: the recipient must not receive the
@@ -1176,28 +1196,36 @@ impl HealingRpc for HealingGrpcService {
                         );
                         accepted_count += 1;
                     }
-                    Ok((bucket, key, Err(e))) => {
+                    Ok((idx, bucket, key, Err(e))) => {
                         tracing::warn!(
                             bucket = %bucket,
                             key = %key,
                             error = %e,
-                            "failed to fetch hint object state from origin; \
-                             NOT accepted — the sender will retry"
+                            "failed to fetch hint object state from origin; reported for retry"
                         );
+                        retry_indices.push(idx);
                     }
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
-                            "hint fetch task failed; NOT accepted — the sender will retry"
+                            "hint fetch task failed; retrying the deferred set"
                         );
+                        retry_indices.extend(deferred_indices.iter().copied());
                     }
                 }
             }
         }
 
+        tracing::debug!(
+            hint_count,
+            accepted = accepted_count,
+            retry = retry_indices.len(),
+            "hinted handoff batch processed"
+        );
         Ok(Response::new(HintedHandoffResponse {
-            accepted: accepted_count == hint_count,
+            accepted: retry_indices.is_empty(),
             accepted_count,
+            retry_indices,
         }))
     }
 
@@ -2140,6 +2168,7 @@ mod tests {
                 hlc: Some(oceanfs_core::proto::common::HlcTimestamp { wall_time: 555, logical: 3 }),
             })),
             stored_at_secs: 0,
+            attempts: 0,
         };
 
         let request = tonic::Request::new(HintedHandoffRequest { hints: vec![hint] });
@@ -2215,6 +2244,7 @@ mod tests {
                 hlc: Some(oceanfs_core::proto::common::HlcTimestamp { wall_time: 555, logical: 3 }),
             })),
             stored_at_secs: 0,
+            attempts: 0,
         };
 
         let request = tonic::Request::new(HintedHandoffRequest { hints: vec![hint] });
@@ -2299,6 +2329,7 @@ mod tests {
                 hlc: Some(oceanfs_core::proto::common::HlcTimestamp { wall_time: 200, logical: 0 }),
             })),
             stored_at_secs: 0,
+            attempts: 0,
         };
 
         let request = tonic::Request::new(HintedHandoffRequest { hints: vec![hint] });
@@ -2378,6 +2409,7 @@ mod tests {
                 hlc: Some(oceanfs_core::proto::common::HlcTimestamp { wall_time: 200, logical: 0 }),
             })),
             stored_at_secs: 0,
+            attempts: 0,
         };
 
         let request = tonic::Request::new(HintedHandoffRequest { hints: vec![hint] });

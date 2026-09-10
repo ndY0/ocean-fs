@@ -625,7 +625,8 @@ async fn load_cluster_churn() {
                 Ok(snap) => {
                     pending += snap.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0)
                         - snap.counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0)
-                        - snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0);
+                        - snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0)
+                        - snap.counter("hinted_handoff_hints_dropped_total").unwrap_or(0.0);
                 }
                 Err(_) => unreachable.push(i),
             }
@@ -661,14 +662,13 @@ async fn load_cluster_churn() {
             // Per-node progress heartbeat (which node is stuck, if any).
             for i in 0..target.len() {
                 if let Ok(snap) = MetricsSnapshot::scrape(&*target, i).await {
+                    let s = snap.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0);
+                    let d = snap.counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0);
+                    let x = snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0);
+                    let dr = snap.counter("hinted_handoff_hints_dropped_total").unwrap_or(0.0);
                     eprintln!(
-                        "  node {i}: pending={:.0} stored={:.0} delivered={:.0} expired={:.0}",
-                        snap.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0)
-                            - snap.counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0)
-                            - snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0),
-                        snap.counter("hinted_handoff_hints_stored_total").unwrap_or(0.0),
-                        snap.counter("hinted_handoff_hints_delivered_total").unwrap_or(0.0),
-                        snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0),
+                        "  node {i}: pending={:.0} stored={s:.0} delivered={d:.0} expired={x:.0} dropped={dr:.0}",
+                        s - d - x - dr,
                     );
                     // Ring-view probe (1a): the ring's member set per
                     // node + the probe-0 successors — catches transient
@@ -805,6 +805,7 @@ async fn load_cluster_churn() {
     let mut stored = 0.0;
     let mut delivered = 0.0;
     let mut expired = 0.0;
+    let mut dropped = 0.0;
     for (i, initial) in initial_snaps.iter().enumerate() {
         if let Ok(final_snap) = MetricsSnapshot::scrape(&*target, i).await {
             stored += delta(
@@ -819,15 +820,22 @@ async fn load_cluster_churn() {
                 final_snap.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0),
                 initial.counter("hinted_handoff_hints_expired_total").unwrap_or(0.0),
             );
+            dropped += delta(
+                final_snap.counter("hinted_handoff_hints_dropped_total").unwrap_or(0.0),
+                initial.counter("hinted_handoff_hints_dropped_total").unwrap_or(0.0),
+            );
         }
     }
     // Delivered may legitimately exceed stored (hints replayed from a
-    // restarted node's WAL were stored by the pre-restart process). The
-    // DoD invariant is that no more than `HANDOFF_TOLERANCE` of stored
-    // hints remain undelivered.
-    let handoff_delta_ok = stored == 0.0 || delivered >= stored * (1.0 - HANDOFF_TOLERANCE);
+    // restarted node's WAL were stored by the pre-restart process).
+    // Dropped hints are terminal (the receiver kept rejecting past the
+    // give-up cap) — counted as progress, not "still pending". The DoD
+    // invariant is that no more than `HANDOFF_TOLERANCE` of stored hints
+    // remain in flight.
+    let pending = (stored - delivered - expired - dropped).max(0.0);
+    let handoff_delta_ok = stored == 0.0 || pending <= stored * HANDOFF_TOLERANCE;
     eprintln!(
-        "load_cluster_churn: handoff stored={stored:.0} delivered={delivered:.0} expired={expired:.0}"
+        "load_cluster_churn: handoff stored={stored:.0} delivered={delivered:.0} expired={expired:.0} dropped={dropped:.0} pending={pending:.0}"
     );
 
     // ── Assertion 6: incarnation monotonicity ──────────────────
@@ -991,10 +999,9 @@ async fn load_cluster_churn() {
     report.assert(assert_that(
         "hinted_handoff_delivery",
         handoff_delta_ok,
-        format!("stored ~= delivered (within {:.0}%)", HANDOFF_TOLERANCE * 100.0),
+        format!("stored ~= delivered (pending within {:.0}%)", HANDOFF_TOLERANCE * 100.0),
         format!(
-            "stored={stored:.0} delivered={delivered:.0} delta={:.0}",
-            (stored - delivered).max(0.0)
+            "stored={stored:.0} delivered={delivered:.0} dropped={dropped:.0} pending={pending:.0}"
         ),
     ));
 
@@ -1102,7 +1109,7 @@ async fn load_cluster_churn() {
          convergence: {converged} (per-cycle {converged_after:?})\n\
          manifest integrity: {} keys absent from every node (of {} keys)\n\
          read quorum: {} failures\n\
-         handoff: stored={stored:.0} delivered={delivered:.0} expired={expired:.0}\n\
+         handoff: stored={stored:.0} delivered={delivered:.0} expired={expired:.0} dropped={dropped:.0} pending={pending:.0}\n\
          hlc monotonic: {:?}\n\
          ring consistency: {:?}\n\
          split brain: {:?}\n\

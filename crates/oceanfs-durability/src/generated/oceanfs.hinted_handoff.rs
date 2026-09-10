@@ -74,6 +74,14 @@ pub struct HintRecord {
     /// Used for TTL-based pruning of stale entries.
     #[prost(uint64, tag = "10")]
     pub stored_at_secs: u64,
+    /// Delivery attempts already made for this hint. Durable so a restart
+    /// cannot reset the give-up budget: a hint the receiver keeps rejecting
+    /// for a non-terminal reason is retried at most
+    /// `hint_max_delivery_attempts` times, then dropped (and counted in
+    /// `hinted_handoff_hints_dropped_total`) — otherwise it would occupy
+    /// the per-target queue forever.
+    #[prost(uint32, tag = "11")]
+    pub attempts: u32,
     #[prost(oneof = "hint_record::Record", tags = "1, 2, 3")]
     pub record: ::core::option::Option<hint_record::Record>,
 }
@@ -97,7 +105,7 @@ pub struct HintedHandoffRequest {
     pub hints: ::prost::alloc::vec::Vec<HintRecord>,
 }
 /// Response to a batched hinted handoff delivery.
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct HintedHandoffResponse {
     /// Whether all hints were accepted and persisted.
     #[prost(bool, tag = "1")]
@@ -105,4 +113,11 @@ pub struct HintedHandoffResponse {
     /// Number of hints accepted.
     #[prost(uint32, tag = "2")]
     pub accepted_count: u32,
+    /// Indices into the request's `hints` that were NOT confirmed applied or
+    /// resolved and must be retried. Empty means the whole batch is terminal
+    /// (applied, or resolved-as-obsolete). Per-hint so a single
+    /// unappliable hint cannot wedge the rest of the batch (head-of-line
+    /// blocking) — the sender re-enqueues only these.
+    #[prost(uint32, repeated, tag = "3")]
+    pub retry_indices: ::prost::alloc::vec::Vec<u32>,
 }

@@ -1136,10 +1136,60 @@ impl WriteCoordinator {
                 });
                 chunks
             }
+            SizeTier::Multi => {
+                // Multi-chunk objects (> 4 MiB): split exactly as the
+                // `put()` Multi arm does and append each chunk to the
+                // standard pool. Before this, a hinted Multi-tier object
+                // was rejected ("hinted objects are single-chunk; Multi
+                // tier unsupported") — so any large object that missed a
+                // replica during churn could never be re-materialized by
+                // hinted handoff (the churn read-quorum single-copy class).
+                let splitter = SegmentSplitter::new(self.size_config.default_target_size);
+                let split_chunks = splitter.split(&wal_data[..]);
+                let mut chunks = smallvec::SmallVec::new();
+                for (_, chunk_data) in &split_chunks {
+                    let (stored, logical_len, compressed) =
+                        compress_chunk(&compression_ctx, &Bytes::copy_from_slice(chunk_data))
+                            .await?;
+                    let write_deadline = std::time::Instant::now()
+                        + std::time::Duration::from_millis(self.timeouts.write_queue_ms);
+                    let seal_pool = self.segment_pool_standard.clone();
+                    let (seg_id, seg_offset, length, sealed) = seal_pool
+                        .append_with_hook_async(
+                            &stored[..],
+                            |seg_id, off, len| {
+                                seal_pool.record_blob_entry(seg_id, off, len, blake3_hash);
+                                // The object identity rides the seal-time
+                                // membership (ADR-0034 D5).
+                                seal_pool.record_object_key(seg_id, bucket, key);
+                            },
+                            std::time::Duration::from_millis(self.timeouts.write_queue_ms),
+                        )
+                        .await
+                        .map_err(map_append_error("multi".into()))?;
+                    // Reserve the segment BEFORE the WAL entry (ADR-0024).
+                    self.request_reserve_before_wal(seg_id, SizeTier::Standard, &mut registered)
+                        .await?;
+                    self.lifecycle.writer_join(seg_id);
+                    *leases.counts.entry(seg_id).or_insert(0) += 1;
+                    self.write_wal_entry(seg_id, seg_offset, stored, length, logical_len, 1, hlc)
+                        .await?;
+                    self.segment_pool_standard
+                        .enqueue_seal_handoff(sealed, write_deadline)
+                        .await
+                        .map_err(map_append_error("multi".into()))?;
+                    chunks.push(ChunkRef {
+                        segment_id: seg_id,
+                        offset: seg_offset,
+                        length,
+                        compressed,
+                        logical_length: logical_len,
+                    });
+                }
+                chunks
+            }
             _ => {
-                return Err(Error::InvalidRequest(
-                    "hinted objects are single-chunk; Multi tier unsupported".into(),
-                ));
+                return Err(Error::InvalidRequest(format!("unsupported storage tier: {tier:?}")));
             }
         };
 
@@ -1969,6 +2019,7 @@ mod tests {
             Ok(oceanfs_durability::hinted_handoff_rpc::HintedHandoffResponse {
                 accepted: true,
                 accepted_count: 1,
+                retry_indices: vec![],
             })
         }
     }
@@ -2361,6 +2412,66 @@ mod tests {
         assert!(meta.chunks.is_empty());
         assert!(meta.inline_data.is_some());
         assert_eq!(meta.hlc, hlc);
+    }
+
+    /// Multi-tier (> 4 MiB) hinted objects must split and apply with REAL
+    /// chunk refs. Before this, `apply_hinted_object` rejected them
+    /// ("hinted objects are single-chunk; Multi tier unsupported"), so a
+    /// large object that missed a replica during churn could never be
+    /// re-materialized by hinted handoff — the churn read-quorum
+    /// single-copy class.
+    #[tokio::test]
+    async fn apply_hinted_object_multi_tier_splits_into_chunk_refs() {
+        let (coord, _dir, _store) = {
+            use oceanfs_durability::GrpcHintDeliveryClient;
+            let dir = tempfile::tempdir().unwrap();
+            let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
+            let delivery_client: Arc<dyn oceanfs_durability::HintDeliveryClient> =
+                Arc::new(GrpcHintDeliveryClient::new(pool.clone()));
+            make_write_coordinator_with_delivery("n1", &["n1"], dir, pool, delivery_client).await
+        };
+        let hlc = Hlc::new(1_700_000_000_000, 9);
+        // 9 MiB > default_target_size (4 MiB) => multiple chunks.
+        let data = Bytes::from(vec![0x5Au8; 9 * 1024 * 1024]);
+
+        let meta = coord
+            .apply_hinted_object(
+                &BucketId::new("test"),
+                &ObjectKey::new("big-hinted"),
+                data.clone(),
+                hlc,
+                7,
+            )
+            .await
+            .expect("multi-tier hinted apply must succeed");
+
+        assert_eq!(meta.size, data.len() as u64);
+        assert!(
+            meta.chunks.len() >= 2,
+            "multi-tier must split into multiple chunks, got {}",
+            meta.chunks.len()
+        );
+        assert!(meta.inline_data.is_none());
+        assert_eq!(meta.hlc, hlc);
+
+        // Every chunk references a registered segment (real lifecycle).
+        for chunk in &meta.chunks {
+            assert!(
+                coord.lifecycle.registry().get(chunk.segment_id).is_some(),
+                "chunk segment must be registered in the lifecycle registry"
+            );
+        }
+
+        // The row round-trips with the chunk refs intact.
+        let stored = coord
+            .metadata_store
+            .get_object(&BucketId::new("test"), &ObjectKey::new("big-hinted"))
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(stored.chunks.len(), meta.chunks.len());
+        assert_eq!(stored.size, data.len() as u64);
+        assert_eq!(stored.hlc, hlc);
     }
 
     /// D6 "Hint-apply that supersedes an existing key": a hinted-handoff

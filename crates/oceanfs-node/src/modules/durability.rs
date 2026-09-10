@@ -474,6 +474,7 @@ impl DurabilityModule {
             inline_threshold_bytes: config.hint_inline_threshold_bytes,
             max_batch_size: config.hint_max_batch_size,
             max_batch_bytes: 32 * 1024 * 1024,
+            max_delivery_attempts: config.hint_max_delivery_attempts,
         };
         let hinted_handoff_manager = Arc::new(
             HintedHandoffManager::new(hints_dir.clone(), hint_delivery_client, hint_config.clone())

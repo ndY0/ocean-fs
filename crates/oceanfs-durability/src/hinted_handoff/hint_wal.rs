@@ -448,6 +448,7 @@ impl HintRecord {
                 hlc: Some(proto_hlc),
             })),
             stored_at_secs: 0,
+            attempts: 0,
         }
     }
 
@@ -480,6 +481,7 @@ impl HintRecord {
                 hlc: Some(proto_hlc),
             })),
             stored_at_secs: 0,
+            attempts: 0,
         }
     }
 
@@ -508,6 +510,7 @@ impl HintRecord {
                 hlc: Some(proto_hlc),
             })),
             stored_at_secs: 0,
+            attempts: 0,
         }
     }
 
@@ -649,6 +652,7 @@ mod tests {
                 hlc: None,
             })),
             stored_at_secs: 0,
+            attempts: 0,
         };
         wal.write_hint(&legacy).await.unwrap();
         drop(wal);

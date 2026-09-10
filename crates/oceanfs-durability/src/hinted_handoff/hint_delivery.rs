@@ -66,6 +66,15 @@ pub struct HintedHandoffConfig {
     /// 256 hints of multi-MiB blobs would build a multi-GiB RPC and be
     /// rejected (or OOM the decoder).
     pub max_batch_bytes: usize,
+    /// Maximum delivery attempts per hint before it is dropped.
+    ///
+    /// The receiver reports per-hint retry indices; a hint the receiver
+    /// keeps rejecting for a non-terminal reason is retried at most this
+    /// many times, then dropped and counted in
+    /// `hinted_handoff_hints_dropped_total`. Without a cap, one
+    /// unappliable hint would occupy its per-target queue forever (the
+    /// retry loop never ages the hint). Default: 10.
+    pub max_delivery_attempts: u32,
 }
 
 impl Default for HintedHandoffConfig {
@@ -75,6 +84,7 @@ impl Default for HintedHandoffConfig {
             inline_threshold_bytes: 4096,
             max_batch_size: 256,
             max_batch_bytes: 32 * 1024 * 1024,
+            max_delivery_attempts: 10,
         }
     }
 }
@@ -238,17 +248,23 @@ pub struct HintedHandoffManager {
     /// gone — so it must be visible (the churn residual class: the
     /// newest mutation's hint silently missing from every queue).
     hints_enqueue_failed_total: Counter,
+    /// Hints dropped after exceeding `max_delivery_attempts`. Visible so
+    /// "gave up" is never silent (the retry loop is bounded, not
+    /// infinite).
+    hints_dropped_total: Counter,
 }
 
 /// Human-readable (bucket, key, type) for a hint record (tracing).
-/// The hint delivery contract (ADR-0027 Decision 2 as amended):
-/// hints are NEVER dropped at the sender. The coordinator records
-/// every failed replication attempt as durable debt; delivery delivers
-/// EVERYTHING; the receiver's HLC-LWW apply is the single gate. A hint
-/// for a key the sender later deleted is delivered and rejected by LWW
-/// on the receiver (the tombstone is newer) — wasted work bounded by
-/// the mutation rate, but no sender-side opinion about distributed
-/// state can ever drop a mutation the remote still needs.
+/// The hint delivery contract (ADR-0027 Decision 2 as amended 2026-09-10):
+/// the sender does not invent an opinion about distributed state and never
+/// silently drops a hint the receiver might still need — but it re-enqueues
+/// ONLY the per-hint retry set the receiver reports (the receiver's
+/// HLC-LWW apply is the single gate). A hint the receiver keeps rejecting
+/// is retried at most `HintedHandoffConfig::max_delivery_attempts` times,
+/// then dropped and counted in `hints_dropped_total` — a bounded give-up,
+/// never a silent one. This replaces the old all-or-nothing batch
+/// re-enqueue, where one unappliable hint wedged its whole per-target
+/// queue forever.
 ///
 /// Fetches an object's CURRENT state from an origin node over gRPC.
 ///
@@ -404,6 +420,11 @@ impl HintedHandoffManager {
                 "Hint debt that failed to record (WAL write error)".into(),
                 LabelSet::empty(),
             ),
+            hints_dropped_total: Counter::new(
+                "hinted_handoff_hints_dropped_total".into(),
+                "Hints dropped after exceeding the delivery attempt cap".into(),
+                LabelSet::empty(),
+            ),
         }
     }
 
@@ -418,6 +439,7 @@ impl HintedHandoffManager {
         registrar.register_counter(self.hints_delivered_total.clone());
         registrar.register_counter(self.hints_expired_total.clone());
         registrar.register_counter(self.hints_enqueue_failed_total.clone());
+        registrar.register_counter(self.hints_dropped_total.clone());
     }
 
     /// Sets the membership reference for address resolution.
@@ -528,8 +550,13 @@ impl HintedHandoffManager {
         })?;
 
         // Write to WAL first for durability.
-        record.stored_at_secs =
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        // Stamp the store time ONCE: retries preserve it so the TTL prune
+        // remains a durable backstop (a retry must not reset the hint's
+        // age, which would make it immortal).
+        if record.stored_at_secs == 0 {
+            record.stored_at_secs =
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        }
         let (position, end_position) = wal.write_hint(&record).await.inspect_err(|_| {
             self.hints_enqueue_failed_total.add(1);
         })?;
@@ -648,62 +675,71 @@ impl HintedHandoffManager {
 
         match result {
             Ok(resp) => {
-                if !resp.accepted {
-                    // Re-enqueue: delivery was attempted but remote node rejected.
+                // Per-hint partial acceptance: the receiver reports the
+                // indices it could not confirm applied/resolved. Empty
+                // means the whole batch is terminal. Only the rejected
+                // hints are retried, so one unappliable hint cannot wedge
+                // the rest (head-of-line blocking).
+                let retry: std::collections::HashSet<u32> =
+                    resp.retry_indices.iter().copied().collect();
+                let drained_end = drained.last().map(|(_, end, _)| *end).unwrap_or(0);
+                let total = drained.len();
+                if !retry.is_empty() {
                     warn!(
                         target = %target,
-                        accepted = resp.accepted_count,
-                        count = drained.len(),
-                        "hint batch not fully accepted; re-enqueuing wholesale"
+                        retry = retry.len(),
+                        count = total,
+                        "hint batch partially accepted; retrying only the rejected hints"
                     );
-                    self.reenqueue_front(&target, drained);
-                    return Err(Error::ForwardFailed {
-                        target: target.to_string(),
-                        reason: "remote node rejected batched hint delivery".into(),
-                    });
                 }
 
-                // Success — truncate the per-node WAL under the same
-                // per-target queue lock the enqueue holds: the truncate
-                // can never wipe an entry being written concurrently.
-                // When the queue is fully drained, wipe the file (all
-                // delivered); otherwise truncate to the drained tail
-                // (preserving concurrently-enqueued entries). The old
-                // code always truncated to ZERO and unlinked the file
-                // outside any lock — racing a concurrent enqueue and
-                // losing its entry on crash.
-                let drained_end = drained.last().map(|(_, end, _)| *end).unwrap_or(0);
-                {
-                    let queue = self.queues.entry(target.clone()).or_default();
-                    if queue.is_empty() {
-                        if let Some(wal) = self.node_wals.get(&target) {
-                            let _ = wal.truncate_after(0).await;
+                // Split the drained batch: terminal records are done;
+                // retry records get an attempt bump and are kept until the
+                // give-up cap.
+                let mut requeue: Vec<(u64, u64, HintRecord)> = Vec::new();
+                let mut dropped = 0usize;
+                for (i, (start, end, mut record)) in drained.into_iter().enumerate() {
+                    if retry.contains(&(i as u32)) {
+                        let attempts = record.attempts.saturating_add(1);
+                        if attempts > self.config.max_delivery_attempts {
+                            dropped += 1;
+                            warn!(
+                                target = %target,
+                                attempts,
+                                max = self.config.max_delivery_attempts,
+                                "hint dropped after exceeding max delivery attempts"
+                            );
+                        } else {
+                            record.attempts = attempts;
+                            requeue.push((start, end, record));
                         }
-                        let file_path = self.wal_dir.join(format!("{}.wal", target));
-                        let _ = std::fs::remove_file(&file_path);
-                        self.node_wals.remove(&target);
-                        self.last_access.remove(&target);
-                    } else {
-                        if let Some(wal) = self.node_wals.get(&target) {
-                            let _ = wal.truncate_after(drained_end).await;
-                        }
-                        self.last_access.insert(target.clone(), std::time::Instant::now());
                     }
                 }
+                let delivered = total - retry.len();
 
-                let delivered = drained.len();
+                // Rewrite the WAL/queue to keep only the un-drained
+                // remainder plus the retry records (with their durable
+                // attempt counts). Drops everything delivered.
+                self.rewrite_after_partial(&target, drained_end, requeue).await;
+
                 self.hints_delivered_total.add(delivered as u64);
+                if dropped > 0 {
+                    self.hints_dropped_total.add(dropped as u64);
+                }
                 info!(
                     target = %target,
                     delivered,
-                    accepted = resp.accepted_count,
-                    "batched hint delivery succeeded"
+                    dropped,
+                    "batched hint delivery processed"
                 );
 
                 Ok(delivered)
             }
             Err(e) => {
-                // Delivery failed — re-enqueue hints for retry.
+                // Delivery failed (target unreachable/timeout) — re-enqueue
+                // the whole batch WITHOUT bumping attempts: a target that
+                // is merely down during churn must not consume the give-up
+                // budget.
                 warn!(
                     target = %target,
                     error = %e,
@@ -716,9 +752,93 @@ impl HintedHandoffManager {
         }
     }
 
+    /// Rewrites the per-target WAL and in-memory queue after a delivery:
+    /// keeps the un-drained remainder (WAL records whose end position is
+    /// after `drained_end`) plus `requeue` (the hints to retry), dropping
+    /// everything delivered. When nothing remains the WAL file is removed.
+    ///
+    /// Holds the per-target queue lock across the rewrite so a concurrent
+    /// `enqueue` (which also takes this lock before writing the WAL)
+    /// cannot interleave and lose an entry.
+    async fn rewrite_after_partial(
+        &self,
+        target: &NodeId,
+        drained_end: u64,
+        requeue: Vec<(u64, u64, HintRecord)>,
+    ) {
+        let mut queue = self.queues.entry(target.clone()).or_default();
+        let wal = match self.get_or_open_node_wal(target).await {
+            Ok(wal) => wal,
+            Err(e) => {
+                warn!(
+                    target = %target,
+                    error = %e,
+                    "hint WAL unavailable; keeping retries in memory only"
+                );
+                for (start, end, record) in requeue.into_iter().rev() {
+                    queue.push_front((start, end, record));
+                }
+                return;
+            }
+        };
+
+        // The un-drained remainder still present in the WAL.
+        let survivors: Vec<HintRecord> = match wal.replay().await {
+            Ok(records) => records
+                .into_iter()
+                .filter(|(_, end, _)| *end > drained_end)
+                .map(|(_, _, record)| record)
+                .collect(),
+            Err(e) => {
+                warn!(
+                    target = %target,
+                    error = %e,
+                    "hint WAL replay failed during rewrite; retry set kept in memory"
+                );
+                Vec::new()
+            }
+        };
+
+        // Clear and rewrite: remainder first, then the retry records.
+        if let Err(e) = wal.truncate_after(0).await {
+            warn!(target = %target, error = %e, "hint WAL clear failed during rewrite");
+        }
+        let mut rebuilt: VecDeque<(u64, u64, HintRecord)> = VecDeque::new();
+        for record in survivors.into_iter().chain(requeue.into_iter().map(|(_, _, r)| r)) {
+            match wal.write_hint(&record).await {
+                Ok((start, end)) => rebuilt.push_back((start, end, record)),
+                Err(e) => {
+                    warn!(target = %target, error = %e, "hint WAL rewrite failed")
+                }
+            }
+        }
+
+        queue.clear();
+        if rebuilt.is_empty() {
+            // Nothing left for this target — reclaim the WAL file.
+            drop(queue);
+            self.node_wals.remove(target);
+            self.last_access.remove(target);
+            let file_path = self.wal_dir.join(format!("{}.wal", target));
+            let _ = std::fs::remove_file(&file_path);
+            return;
+        }
+        for item in rebuilt {
+            queue.push_back(item);
+        }
+        self.last_access.insert(target.clone(), std::time::Instant::now());
+    }
+
     /// Returns the number of pending hints for a given node.
     pub fn pending_count(&self, target: &NodeId) -> usize {
         self.queues.get(target).map(|q| q.len()).unwrap_or(0)
+    }
+
+    /// Returns the number of hints dropped after exceeding the delivery
+    /// attempt cap (for tests).
+    #[doc(hidden)]
+    pub fn hints_dropped_total_for_test(&self) -> u64 {
+        self.hints_dropped_total.get()
     }
 
     /// Returns the node ids with at least one pending hint, sorted for a
@@ -968,15 +1088,103 @@ mod tests {
             _timeout_ms: u64,
         ) -> std::result::Result<HintedHandoffResponse, Error> {
             self.requests.lock().push((target_addr, request.clone()));
-            self.responses
-                .lock()
-                .pop_front()
-                .unwrap_or_else(|| Ok(HintedHandoffResponse { accepted: true, accepted_count: 0 }))
+            self.responses.lock().pop_front().unwrap_or_else(|| {
+                Ok(HintedHandoffResponse {
+                    accepted: true,
+                    accepted_count: 0,
+                    retry_indices: vec![],
+                })
+            })
         }
     }
 
     fn make_test_config(wal_dir: std::path::PathBuf) -> HintedHandoffConfig {
         HintedHandoffConfig { wal_dir, ..HintedHandoffConfig::default() }
+    }
+
+    /// Partial acceptance: only the receiver-reported retry indices are
+    /// re-enqueued; accepted hints are dropped. Regression for the
+    /// head-of-line wedge (the whole batch used to be re-enqueued, so one
+    /// unappliable hint blocked every other hint forever).
+    #[tokio::test]
+    async fn partial_acceptance_reenqueues_only_retry_indices() {
+        let dir = tempdir().unwrap();
+        let wal_dir = dir.path().to_path_buf();
+
+        let mock = Arc::new(MockDeliveryClient::new());
+        mock.add_response(Ok(HintedHandoffResponse {
+            accepted: false,
+            accepted_count: 2,
+            retry_indices: vec![1],
+        }));
+        let manager = HintedHandoffManager::new(
+            wal_dir.clone(),
+            mock.clone(),
+            make_test_config(wal_dir.clone()),
+        );
+        let node = NodeId::new("node-a");
+        for i in 0..3u8 {
+            manager
+                .enqueue(HintRecord::new_inline(
+                    node.clone(),
+                    BucketId::new("b"),
+                    format!("key-{i}"),
+                    vec![i].into(),
+                    oceanfs_core::Hlc::zero(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let delivered = manager.drain_and_deliver(node.clone()).await.unwrap();
+        assert_eq!(delivered, 2, "only the two accepted hints count as delivered");
+        assert_eq!(manager.pending_count(&node), 1, "the rejected hint is retried");
+
+        // The retry must survive a restart: the rewrite re-persisted it.
+        let manager2 = HintedHandoffManager::new(
+            wal_dir.clone(),
+            Arc::new(MockDeliveryClient::new()),
+            make_test_config(wal_dir.clone()),
+        );
+        let replayed = manager2.replay_and_enqueue().await.unwrap();
+        assert_eq!(replayed, 1, "exactly the rejected hint was re-persisted");
+        assert_eq!(manager2.pending_count(&node), 1);
+    }
+
+    /// Give-up cap: a hint the receiver keeps rejecting is dropped after
+    /// `max_delivery_attempts`, so it cannot occupy the queue forever.
+    #[tokio::test]
+    async fn retry_cap_drops_permanently_rejected_hint() {
+        let dir = tempdir().unwrap();
+        let wal_dir = dir.path().to_path_buf();
+        let mock = Arc::new(MockDeliveryClient::new());
+        let mut config = make_test_config(wal_dir.clone());
+        config.max_delivery_attempts = 2;
+        let manager = HintedHandoffManager::new(wal_dir.clone(), mock.clone(), config);
+        let node = NodeId::new("node-a");
+        manager
+            .enqueue(HintRecord::new_inline(
+                node.clone(),
+                BucketId::new("b"),
+                "key".into(),
+                vec![1].into(),
+                oceanfs_core::Hlc::zero(),
+            ))
+            .await
+            .unwrap();
+
+        // attempts 1, 2 are kept (<= cap); attempt 3 exceeds the cap and
+        // drops the hint.
+        for expected_pending in [1usize, 1, 0] {
+            mock.add_response(Ok(HintedHandoffResponse {
+                accepted: false,
+                accepted_count: 0,
+                retry_indices: vec![0],
+            }));
+            manager.drain_and_deliver(node.clone()).await.unwrap();
+            assert_eq!(manager.pending_count(&node), expected_pending);
+        }
+        assert_eq!(manager.hints_dropped_total_for_test(), 1, "the drop is counted");
     }
 
     // ── T1.5: Batched delivery ────────────────────────────────────────
@@ -988,8 +1196,16 @@ mod tests {
 
         let mock = Arc::new(MockDeliveryClient::new());
         // Add two success responses (one per node drain).
-        mock.add_response(Ok(HintedHandoffResponse { accepted: true, accepted_count: 5 }));
-        mock.add_response(Ok(HintedHandoffResponse { accepted: true, accepted_count: 3 }));
+        mock.add_response(Ok(HintedHandoffResponse {
+            accepted: true,
+            accepted_count: 5,
+            retry_indices: vec![],
+        }));
+        mock.add_response(Ok(HintedHandoffResponse {
+            accepted: true,
+            accepted_count: 3,
+            retry_indices: vec![],
+        }));
 
         let manager =
             HintedHandoffManager::new(wal_dir.clone(), mock.clone(), make_test_config(wal_dir));
@@ -1056,7 +1272,11 @@ mod tests {
             reason: "connection refused".into(),
         }));
         // Second attempt succeeds.
-        mock.add_response(Ok(HintedHandoffResponse { accepted: true, accepted_count: 3 }));
+        mock.add_response(Ok(HintedHandoffResponse {
+            accepted: true,
+            accepted_count: 3,
+            retry_indices: vec![],
+        }));
 
         let manager =
             HintedHandoffManager::new(wal_dir.clone(), mock.clone(), make_test_config(wal_dir));
@@ -1143,8 +1363,16 @@ mod tests {
         let mock = Arc::new(MockDeliveryClient::new());
         // Responses for drain (won't be used in this test, but needed for
         // drain_and_deliver if called).
-        mock.add_response(Ok(HintedHandoffResponse { accepted: true, accepted_count: 1 }));
-        mock.add_response(Ok(HintedHandoffResponse { accepted: true, accepted_count: 1 }));
+        mock.add_response(Ok(HintedHandoffResponse {
+            accepted: true,
+            accepted_count: 1,
+            retry_indices: vec![],
+        }));
+        mock.add_response(Ok(HintedHandoffResponse {
+            accepted: true,
+            accepted_count: 1,
+            retry_indices: vec![],
+        }));
 
         let manager =
             HintedHandoffManager::new(wal_dir.clone(), mock, make_test_config(wal_dir.clone()));
@@ -1197,7 +1425,11 @@ mod tests {
         let wal_dir = dir.path().to_path_buf();
 
         let mock = Arc::new(MockDeliveryClient::new());
-        mock.add_response(Ok(HintedHandoffResponse { accepted: true, accepted_count: 2 }));
+        mock.add_response(Ok(HintedHandoffResponse {
+            accepted: true,
+            accepted_count: 2,
+            retry_indices: vec![],
+        }));
 
         let manager = HintedHandoffManager::new(
             wal_dir.clone(),
@@ -1246,7 +1478,11 @@ mod tests {
         assert_eq!(manager.pending_count(&node_b), 1);
 
         // Deliver node-b — its file should also be removed.
-        mock.add_response(Ok(HintedHandoffResponse { accepted: true, accepted_count: 1 }));
+        mock.add_response(Ok(HintedHandoffResponse {
+            accepted: true,
+            accepted_count: 1,
+            retry_indices: vec![],
+        }));
         let delivered_b = manager.drain_and_deliver(node_b.clone()).await.unwrap();
         assert_eq!(delivered_b, 1);
         assert!(
