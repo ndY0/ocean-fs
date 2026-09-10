@@ -742,7 +742,10 @@ async fn load_cluster_churn() {
     // this guard keeps the quorum semantics honest).
     // Per-key diagnostics for failed keys are recorded here and
     // surfaced in the report details (fleet stdout is not captured).
-    let mut report_quorum_diag: Option<Vec<(String, u16, Option<String>)>> = None;
+    let mut report_quorum_diag: Option<
+        Vec<(String, u16, Option<String>, Option<String>, Option<String>)>,
+    > = None;
+    let mut report_quorum_provenance: Option<Vec<(String, Vec<e2e::load::MutationEvent>)>> = None;
     let quorum_failed = manifest
         .verify_read_quorum(&*target, &alive_indices, READ_QUORUM, Some(READ_QUORUM_SAMPLE))
         .await;
@@ -756,12 +759,34 @@ async fn load_cluster_churn() {
         // Per-node diagnostics: what does each node serve for the failed
         // keys (status + body hash prefix)? Recorded in the report too —
         // the fleet harness stdout is not always captured.
-        let mut per_node: Vec<(String, u16, Option<String>)> = Vec::new();
+        let mut per_node: Vec<(String, u16, Option<String>, Option<String>, Option<String>)> =
+            Vec::new();
+        let mut provenance: Vec<(String, Vec<e2e::load::MutationEvent>)> = Vec::new();
         for key in quorum_failed.iter().take(5) {
+            // The manifest's mutation history for this key (writer node,
+            // attempts, first status, unknown-outcome, when) — pins which
+            // mutation left it on a single node.
+            let events = manifest.provenance_for(key);
+            eprintln!("  {key}: provenance = {events:?}");
+            provenance.push((key.clone(), events));
             for i in 0..target.len() {
                 match target.get(i, &format!("/{key}")).await {
                     Ok(resp) => {
                         let status = resp.status().as_u16();
+                        // Per-node version HLC (200) and tombstone HLC (404)
+                        // — distinguishes "absent but deleted, at T" from
+                        // "never present", and orders it against the served
+                        // version.
+                        let hlc = resp
+                            .headers()
+                            .get("x-oceanfs-hlc")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        let tombstone = resp
+                            .headers()
+                            .get("x-oceanfs-tombstone-hlc")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
                         let hash = resp.bytes().await.ok().map(|b| {
                             let h = blake3::hash(&b);
                             format!(
@@ -774,17 +799,20 @@ async fn load_cluster_churn() {
                                 h.as_bytes()[5]
                             )
                         });
-                        eprintln!("  {key}: node {i} -> HTTP {status} hash={hash:?}");
-                        per_node.push((key.clone(), status, hash));
+                        eprintln!(
+                            "  {key}: node {i} -> HTTP {status} hash={hash:?} hlc={hlc:?} tombstone_hlc={tombstone:?}"
+                        );
+                        per_node.push((key.clone(), status, hash, hlc, tombstone));
                     }
                     Err(e) => {
                         eprintln!("  {key}: node {i} -> ERR {e}");
-                        per_node.push((key.clone(), 0, Some(e.to_string())));
+                        per_node.push((key.clone(), 0, Some(e.to_string()), None, None));
                     }
                 }
             }
         }
         report_quorum_diag = Some(per_node);
+        report_quorum_provenance = Some(provenance);
     }
 
     // ── Assertions 4-5: hinted handoff ─────────────────────────
@@ -989,10 +1017,11 @@ async fn load_cluster_churn() {
         quorum_failed.is_empty(),
         format!("every sampled key served from >= {READ_QUORUM} nodes"),
         format!(
-            "{} of {} sampled keys failed quorum{}",
+            "{} of {} sampled keys failed quorum{}; provenance: {:?}",
             quorum_failed.len(),
             READ_QUORUM_SAMPLE.min(manifest.len()),
-            report_quorum_diag.as_ref().map(|d| format!("; per-node: {d:?}")).unwrap_or_default()
+            report_quorum_diag.as_ref().map(|d| format!("; per-node: {d:?}")).unwrap_or_default(),
+            report_quorum_provenance.as_ref().map(|p| format!("{p:?}")).unwrap_or_default()
         ),
     ));
 

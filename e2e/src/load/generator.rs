@@ -938,7 +938,9 @@ impl<C: LoadTarget> Worker<C> {
                     // while the response was lost. After the retries,
                     // a probe decides whether the body actually exists.
                     let mut unknown_outcome = false;
+                    let mut attempts_made = 0u32;
                     for attempt in 0..=3u32 {
+                        attempts_made += 1;
                         let target_idx = (node_idx + attempt as usize) % node_count;
                         match self.cluster.put(target_idx, &path, &body).await {
                             Ok(resp) => {
@@ -968,7 +970,15 @@ impl<C: LoadTarget> Worker<C> {
                                     // superseding delete records: a
                                     // rolled-back write must not leave a
                                     // phantom version in the manifest.
-                                    self.manifest.record(bucket, &key, &body);
+                                    self.manifest.record_put_with_provenance(
+                                        bucket,
+                                        &key,
+                                        &body,
+                                        node_idx,
+                                        attempts_made,
+                                        first_status,
+                                        unknown_outcome,
+                                    );
                                     // Tier counters count successes, not
                                     // attempts: a 413-rejected PUT never
                                     // exercised that tier's storage path.
@@ -1036,7 +1046,15 @@ impl<C: LoadTarget> Worker<C> {
                                         .and_then(|v| v.to_str().ok())
                                         .unwrap_or_default();
                                     if !etag.is_empty() && etag.eq_ignore_ascii_case(&wanted) {
-                                        self.manifest.record(bucket, &key, &body);
+                                        self.manifest.record_put_with_provenance(
+                                            bucket,
+                                            &key,
+                                            &body,
+                                            node_idx,
+                                            attempts_made,
+                                            first_status,
+                                            unknown_outcome,
+                                        );
                                         self.stats.record_blob_size_tier(size);
                                         recorded = true;
                                         if debug_trace {
@@ -1118,7 +1136,9 @@ impl<C: LoadTarget> Worker<C> {
                             // definitive client-error rejection (400/403)
                             // leaves the key untouched.
                             if status == 204 || status == 404 || status >= 500 {
-                                self.manifest.record_delete(bucket, &key);
+                                self.manifest.record_delete_with_provenance(
+                                    bucket, &key, node_idx, status, false,
+                                );
                             }
                             self.stats.record_delete(status, latency);
                         }
@@ -1133,7 +1153,8 @@ impl<C: LoadTarget> Worker<C> {
                                 );
                             }
                             // Unknown outcome: mark deleted (see above).
-                            self.manifest.record_delete(bucket, &key);
+                            self.manifest
+                                .record_delete_with_provenance(bucket, &key, node_idx, 0, true);
                             self.stats.record_delete(0, start.elapsed());
                             self.stats.record_error();
                         }

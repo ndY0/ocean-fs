@@ -43,6 +43,21 @@ pub trait MetadataOps: Send + Sync + 'static {
     /// the underlying storage operation fails.
     fn get_object(&self, bucket: &BucketId, key: &ObjectKey) -> Result<Option<ObjectMetadata>>;
 
+    /// Returns the tombstone's HLC for a key, if a tombstone exists.
+    ///
+    /// Diagnostics only: it lets a 404 carry `x-oceanfs-tombstone-hlc`,
+    /// distinguishing "absent because deleted (and when)" from "never
+    /// present". The default returns `None` so minimal test doubles need
+    /// not implement it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata store is unavailable.
+    fn get_tombstone_hlc(&self, bucket: &BucketId, key: &ObjectKey) -> Result<Option<Hlc>> {
+        let _ = (bucket, key);
+        Ok(None)
+    }
+
     /// Soft-deletes an object by writing a tombstone entry.
     ///
     /// `hlc` is the delete's timestamp, minted by the caller's clock:

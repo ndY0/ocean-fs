@@ -358,6 +358,16 @@ pub(crate) async fn get_object(
             headers.insert(header::CONTENT_TYPE, header_val(&content_type));
             headers.insert(header::ETAG, header_val(&etag));
             headers.insert(header::CONTENT_LENGTH, header_val(&result.data.len().to_string()));
+            // Diagnostic (churn triage): the served version's HLC, so a
+            // reader can compare it against a tombstone HLC elsewhere.
+            headers.insert(
+                "x-oceanfs-hlc",
+                header_val(&format!(
+                    "{}.{}",
+                    result.metadata.hlc.wall_time(),
+                    result.metadata.hlc.logical()
+                )),
+            );
 
             // Response body: when data is file-backed (mmap or O_DIRECT),
             // wrap in SegmentFileBody for sendfile path via reverse proxy.
@@ -389,7 +399,32 @@ pub(crate) async fn get_object(
 
             (StatusCode::OK, headers, body).into_response()
         }
-        Err(e) => s3_error_response(&e, &bucket, &key),
+        Err(e) => {
+            let mut resp = s3_error_response(&e, &bucket, &key);
+            attach_tombstone_hlc(&mut resp, &state, &bucket_id, &object_key, &e).await;
+            resp
+        }
+    }
+}
+
+/// Diagnostic 404 header: the tombstone's HLC when one exists, so a reader
+/// can distinguish "absent because deleted (and when)" from "never
+/// present". Best-effort — lookup errors are ignored.
+async fn attach_tombstone_hlc(
+    resp: &mut Response,
+    state: &AppState,
+    bucket_id: &BucketId,
+    object_key: &ObjectKey,
+    err: &Error,
+) {
+    if !matches!(err, Error::NotFound(_)) {
+        return;
+    }
+    if let Ok(Some(tomb)) = state.metadata.get_tombstone_hlc(bucket_id, object_key).await {
+        resp.headers_mut().insert(
+            "x-oceanfs-tombstone-hlc",
+            header_val(&format!("{}.{}", tomb.wall_time(), tomb.logical())),
+        );
     }
 }
 
@@ -428,8 +463,8 @@ pub(crate) async fn head_object(
 
     let policy = state.buckets.get(&bucket);
     let req = ReadRequest {
-        bucket: bucket_id,
-        key: object_key,
+        bucket: bucket_id.clone(),
+        key: object_key.clone(),
         hash_key: hk,
         metadata_only: true,
         local_only: false,
@@ -451,10 +486,23 @@ pub(crate) async fn head_object(
             headers.insert(header::ETAG, header_val(&etag));
             headers.insert(header::CONTENT_LENGTH, header_val(&size.to_string()));
             headers.insert(header::ACCEPT_RANGES, header_val("bytes"));
+            // Diagnostic (churn triage): the served version's HLC.
+            headers.insert(
+                "x-oceanfs-hlc",
+                header_val(&format!(
+                    "{}.{}",
+                    result.metadata.hlc.wall_time(),
+                    result.metadata.hlc.logical()
+                )),
+            );
 
             (StatusCode::OK, headers).into_response()
         }
-        Err(e) => s3_error_response(&e, &bucket, &key),
+        Err(e) => {
+            let mut resp = s3_error_response(&e, &bucket, &key);
+            attach_tombstone_hlc(&mut resp, &state, &bucket_id, &object_key, &e).await;
+            resp
+        }
     }
 }
 

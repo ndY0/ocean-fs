@@ -67,12 +67,43 @@ pub struct Manifest {
     entries: DashMap<String, (HashSet<[u8; 32]>, AtomicBool, AtomicU64)>,
     /// Total number of keys ever inserted (including deleted ones).
     total_count: AtomicUsize,
+    /// Diagnostic provenance: per composite key, the ordered mutation
+    /// events (puts/deletes) with writer node + outcome. Used to triage
+    /// post-run verification failures (which mutation left the key on
+    /// only one node).
+    provenance: DashMap<String, parking_lot::Mutex<Vec<MutationEvent>>>,
+    /// Monotonic origin for [`MutationEvent::at_secs`].
+    started: std::time::Instant,
+}
+
+/// A single recorded mutation, for post-run triage of failing keys.
+#[derive(Debug, Clone, Serialize)]
+pub struct MutationEvent {
+    /// `"put"` or `"delete"`.
+    pub kind: &'static str,
+    /// The node the operation was first routed to.
+    pub writer_node: usize,
+    /// For puts: the BLAKE3 (hex) of the body; empty for deletes.
+    pub version: String,
+    /// Attempts made (puts retry up to 4 times).
+    pub attempts: u32,
+    /// First HTTP status observed (0 = transport error).
+    pub first_status: u16,
+    /// A transport error left the outcome unknown (retried / probed).
+    pub outcome_unknown: bool,
+    /// Seconds since the manifest was created.
+    pub at_secs: f64,
 }
 
 impl Manifest {
     /// Creates a new, empty Manifest.
     pub fn new() -> Self {
-        Self { entries: DashMap::new(), total_count: AtomicUsize::new(0) }
+        Self {
+            entries: DashMap::new(),
+            total_count: AtomicUsize::new(0),
+            provenance: DashMap::new(),
+            started: std::time::Instant::now(),
+        }
     }
 
     /// Records a successful PUT operation.
@@ -91,6 +122,75 @@ impl Manifest {
         entry.0.insert(hash);
         entry.1.store(false, Ordering::Relaxed);
         entry.2.store(0, Ordering::Relaxed);
+    }
+
+    /// Records a PUT together with triage provenance (writer node,
+    /// attempts, first status, unknown-outcome flag).
+    pub fn record_put_with_provenance(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: &[u8],
+        writer_node: usize,
+        attempts: u32,
+        first_status: u16,
+        outcome_unknown: bool,
+    ) {
+        self.record(bucket, key, body);
+        let version = hex::encode(blake3::hash(body).as_bytes());
+        self.push_event(
+            bucket,
+            key,
+            MutationEvent {
+                kind: "put",
+                writer_node,
+                version,
+                attempts,
+                first_status,
+                outcome_unknown,
+                at_secs: self.started.elapsed().as_secs_f64(),
+            },
+        );
+    }
+
+    /// Records a DELETE together with triage provenance.
+    pub fn record_delete_with_provenance(
+        &self,
+        bucket: &str,
+        key: &str,
+        writer_node: usize,
+        first_status: u16,
+        outcome_unknown: bool,
+    ) {
+        self.record_delete(bucket, key);
+        self.push_event(
+            bucket,
+            key,
+            MutationEvent {
+                kind: "delete",
+                writer_node,
+                version: String::new(),
+                attempts: 1,
+                first_status,
+                outcome_unknown,
+                at_secs: self.started.elapsed().as_secs_f64(),
+            },
+        );
+    }
+
+    fn push_event(&self, bucket: &str, key: &str, event: MutationEvent) {
+        let composite = format!("{bucket}/{key}");
+        self.provenance
+            .entry(composite)
+            .or_insert_with(|| parking_lot::Mutex::new(Vec::new()))
+            .lock()
+            .push(event);
+    }
+
+    /// Returns the recorded mutation events for a composite key
+    /// (`"{bucket}/{key}"`).
+    pub fn provenance_for(&self, composite_key: &str) -> Vec<MutationEvent> {
+        self.provenance.get(composite_key).map(|e| e.lock().clone()).unwrap_or_default()
     }
 
     /// Marks a key as deleted so that [`verify`](Self::verify) skips it.

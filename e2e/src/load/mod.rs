@@ -26,7 +26,7 @@ pub use generator::{
     AggregateStats, BlobSizeDist, KeySpace, LoadScenario, OpWeight, Operation, Orchestrator,
     Worker, WorkerStats,
 };
-pub use manifest::{Manifest, ManifestSummary, Mismatch};
+pub use manifest::{Manifest, ManifestSummary, Mismatch, MutationEvent};
 pub use metrics::{parse_prometheus_text, MetricsSnapshot};
 pub use report::{
     assert_that, AssertionResult, ClusterViewSnapshot, FailureDetail, HarnessSelfMetrics,

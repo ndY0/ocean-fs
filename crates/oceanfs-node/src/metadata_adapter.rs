@@ -48,6 +48,17 @@ impl MetadataOps for MetadataStoreAdapter {
         self.store.get_object(bucket, key).map_err(|e| MetadataError::Internal(format!("{e}")))
     }
 
+    fn get_tombstone_hlc(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+    ) -> Result<Option<Hlc>, MetadataError> {
+        self.store
+            .get_tombstone(bucket, key)
+            .map(|t| t.map(|tombstone| tombstone.hlc))
+            .map_err(|e| MetadataError::Internal(format!("{e}")))
+    }
+
     fn put_object(&self, bucket: &BucketId, meta: ObjectMetadata) -> Result<(), MetadataError> {
         self.store
             .put_object_in_bucket(bucket, meta)

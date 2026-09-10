@@ -106,6 +106,33 @@ impl AsyncMetadataOps {
         .map_err(|e| MetadataError::Internal(format!("metadata task failed: {e}")))?
     }
 
+    /// Returns the tombstone's HLC for a key, if any (diagnostics).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata store is unavailable.
+    pub async fn get_tombstone_hlc(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+    ) -> Result<Option<Hlc>> {
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| MetadataError::Internal("metadata semaphore closed".into()))?;
+        let inner = Arc::clone(&self.inner);
+        let bucket = bucket.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            inner.get_tombstone_hlc(&bucket, &key)
+        })
+        .await
+        .map_err(|e| MetadataError::Internal(format!("metadata task failed: {e}")))?
+    }
+
     /// Soft-deletes an object by writing a tombstone entry.
     ///
     /// # Errors
