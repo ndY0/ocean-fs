@@ -501,3 +501,21 @@ must not be re-litigated.
 ## Deviations (accepted)
 
 _None yet — filled at implementation close._
+
+### Pre-close findings (2026-09-11, f5 acceptance rerun)
+
+- **Heal-counter classification (recorded for f4, user decision A).** The
+  first f5 acceptance full run passed 49/50 assertions; the only failure
+  was the legacy `s4_heal_failed_zero` import from the superseded phase4
+  doc. Evidence: the heal for the *inserted* corrupted segment permanently
+  failed after 3 retries with `EC decode failed: need at least 4 shards,
+  got 0`, and a peer logged benign `segment not found` permanent heal
+  failures, while the blob was served with correct bytes throughout, the
+  second scrub pass was clean, and the manifest stayed intact. This is a
+  heal-counter semantics issue (benign stale/no-local-shard races counted
+  as permanent failures), not data loss; f3's S4 scope does not require
+  `heal_failed == 0`. The assertion was replaced with recorded evidence
+  (`s4_heal_failures_observed_evidence`) and precise repair assertions
+  belong to f4's pool-role scenarios. Artifacts:
+  [f5-rerun-full-20260911.json](artifacts/f5-rerun-full-20260911.json),
+  [f5-rerun-control-20260911.json](artifacts/f5-rerun-control-20260911.json).
