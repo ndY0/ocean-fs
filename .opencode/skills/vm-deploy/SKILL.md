@@ -69,6 +69,39 @@ Harness; the binary crosses to the SUT over the internal network.
 3. **Report the outcome** as JSON (see below). If any step failed, the
    script exits non-zero with the failing step in stderr — relay it.
 
+## Volume-backed deploys (`--pools-on-mounts`)
+
+When the topology was provisioned with `vm-up --volume-pools`
+(fleet-degradation f1), the four pool roles must root on the volume
+mounts. `setup-harness.sh` does not pass `--pools-on-mounts` (its remote
+`sut-deploy.sh` runs the harness clone's script), so deploy directly from
+the laptop with a binary copied off the harness:
+
+```bash
+scp "root@${HARNESS_PUB}:/root/ocean-fs/target/release/oceanfs" /tmp/oceanfs
+./scripts/sut-deploy.sh --sut "root@${SUT_PUB}" --pools-on-mounts --binary /tmp/oceanfs
+```
+
+The pre-flight assertion runs before the binary is copied: every role
+mount must be a **writable block-device mount** of the expected size class,
+disjoint from `data_dir`, and not the root filesystem. A plain directory,
+a root-fs path, or a tiny wrong device aborts the deploy — that guard is
+what prevents a silent local-disk fallback. After the restart,
+`GET /admin/pools` must show the four roots as exactly
+`/mnt/oceanfs-{data,wal,meta,hints}`.
+
+**Record schema + billing guarantee (f1):** each node's provisioning record
+carries `volumes[] = { role, name, id, device, device_id, mount, size_gb }`
+(`id` is the mandatory teardown handle; `device_id` is the stable
+`/dev/disk/by-id/scsi-0HC_Volume_<id>` path — letters change across
+attach/rescan). Volumes bill per GB-hour **while they exist, detached
+included**, so `vm-down` deletes every recorded volume first (name-prefix
+fallback when the record is missing) and a volume surviving destroy is an
+incident, not a warning.
+
+**Correctness only:** volume-backed runs cross network block storage. Never
+compare their throughput/latency to local-disk runs.
+
 ## Returns
 
 ```json

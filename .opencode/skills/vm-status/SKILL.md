@@ -44,7 +44,22 @@ The source of truth is the provisioning record written by `vm-provision.sh`:
    jq -r '.sut_nodes[]? | "\(.name) \(.public_ip) \(.internal_ip) \(.type)"' "$PROVISION_FILE"
    ```
 
-3. **Live checks over SSH** (BatchMode so a dead VM fails fast instead of
+3. **Volume inventory + drift** (fleet-degradation f1): when the record
+   carries `volumes[]` (provisioned with `--volume-pools`), the
+   authoritative check is the script itself — it merges the recorded
+   volumes with `hcloud volume list`:
+
+   ```bash
+   ./scripts/vm-provision.sh --status "$PREFIX" | jq '.sut_nodes[]? // .sut | {name, volumes, drift}'
+   ```
+
+   Each volume reports `present`/`attached` (live account state) and
+   `live_size_gb`; `drift: true` means a **recorded volume is
+   absent from the account** (deleted outside the tooling) — flag it
+   loudly. Volumes bill per GB-hour while they exist, so unattached
+   volumes are still active cost.
+
+4. **Live checks over SSH** (BatchMode so a dead VM fails fast instead of
    hanging on a password prompt). Every SUT node (fleet mode: each entry of
    `sut_nodes[]`):
 
@@ -66,7 +81,7 @@ The source of truth is the provisioning record written by `vm-provision.sh`:
    A failed SSH (exit != 0) means the VM is unreachable — mark it
    `"unreachable"` with the ssh error, do not guess.
 
-4. **Tunnel status** (feeds the persistent laptop Prometheus): check whether
+5. **Tunnel status** (feeds the persistent laptop Prometheus): check whether
    the observe.sh tunnel to the SUT Prometheus is up:
 
    ```bash
@@ -93,7 +108,14 @@ node VM with the same per-node fields:
       "oceanfs": "active",
       "prometheus": "active",
       "ttl_timer": "active",
-      "booted": "2026-08-19T08:00:00Z"
+      "booted": "2026-08-19T08:00:00Z",
+      "drift": false,
+      "volumes": [
+        { "role": "data", "name": "oceanfs-loadtest-3-sut-0-vol-data", "id": 12345,
+          "device": "/dev/sdb", "device_id": "/dev/disk/by-id/scsi-0HC_Volume_12345",
+          "mount": "/mnt/oceanfs-data", "size_gb": 120,
+          "present": true, "attached": true, "live_size_gb": 120 }
+      ]
     },
     { "name": "oceanfs-loadtest-3-sut-1", "status": "running", "prometheus": "n/a", "...": "..." }
   ],

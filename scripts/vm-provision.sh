@@ -10,6 +10,16 @@
 # Usage:
 #   ./scripts/vm-provision.sh --phase N [OPTIONS]
 #
+# Volume pools (fleet-degradation f1, opt-in):
+#   ./scripts/vm-provision.sh --phase 4 --nodes 3 --volume-pools
+# creates one Hetzner Cloud Volume per pool role per node (data/wal/meta/
+# hints + a spare 5th data volume), attaches it, formats ext4, mounts it at
+# /mnt/oceanfs-<role>, and records every volume id in the provisioning
+# record. `--destroy` deletes servers AND every recorded volume — volumes
+# bill per GB-hour while they exist, detached included. Volume-backed runs
+# are correctness/degradation tests only; their numbers are NOT comparable
+# to local-disk runs.
+#
 # VM Size Mapping (per phase):
 #   Phase 1: N/A (runs in CI, no cloud VMs needed)
 #   Phase 2: SUT=CX33 (4 vCPU, 8 GB, 80 GB), Harness=CX23 (2 vCPU, 4 GB, 40 GB)
@@ -35,6 +45,10 @@
 #             no-op (see check_confirmation_gate).
 #   Layer 3 — Auto-shutdown TTL: systemd timer on each VM (default 4h)
 #   Layer 4 — Budget gate: scaffolding (deferrable/v2)
+#   Layer 5 — Volume quota: total requested volume GB <=
+#             LOAD_TEST_VOLUME_QUOTA_GB (default 1024) when --volume-pools
+#             is used; teardown/cleanup delete every created volume
+#             (volumes bill while they exist, even detached)
 # Security: Hetzner VMs ship with NO firewall — managed firewalls are
 #   created and applied by default (SUT nodes: SSH + internal-net 9000/9001/9002;
 #   Harness: SSH only). Disable with --no-firewall (not recommended).
@@ -52,9 +66,17 @@
 #   LOAD_TEST_CLUSTER_NODES   Override default cluster size for phase 3-4
 #                             (default: 3)
 #   LOAD_TEST_MAX_MONTHLY_EUR Optional monthly budget cap (deferrable, v2)
+#   LOAD_TEST_VOLUME_QUOTA_GB Total volume GB cap for --volume-pools
+#                             (default: 1024)
+#   LOAD_TEST_VOLUME_DATA_GB  Per-role volume sizes in GB for --volume-pools
+#   LOAD_TEST_VOLUME_WAL_GB   (defaults: data 120, wal 20, meta 20,
+#   LOAD_TEST_VOLUME_META_GB  hints 10, spare 60)
+#   LOAD_TEST_VOLUME_HINTS_GB
+#   LOAD_TEST_VOLUME_SPARE_GB
 #
 # Author: OceanFS
-# Date: 2026-08-11 (phase 3+ fleet topology per ADR-0026: 2026-08-19)
+# Date: 2026-08-11 (phase 3+ fleet topology per ADR-0026: 2026-08-19;
+#       volume pools per fleet-degradation f1: 2026-09-11)
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -64,8 +86,19 @@ set -euo pipefail
 # .hetzner/ (e.g. on the Harness VM).
 # shellcheck source=lib/env-hetzner.sh
 _ENV_HETZNER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/env-hetzner.sh"
+# shellcheck disable=SC1090
 [ -f "$_ENV_HETZNER" ] && . "$_ENV_HETZNER"
 unset _ENV_HETZNER
+
+# Shared volume helpers (device discovery by serial, idempotent
+# format+mount, mountpoint assertions) — sourced locally; the remote-capable
+# functions are re-emitted over SSH by volume_run_remote, so no copy is
+# needed on the node.
+# shellcheck source=lib/volume-helpers.sh
+_ENV_VOLUME_HELPERS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/volume-helpers.sh"
+# shellcheck disable=SC1090
+[ -f "$_ENV_VOLUME_HELPERS" ] && . "$_ENV_VOLUME_HELPERS"
+unset _ENV_VOLUME_HELPERS
 
 # ---------------------------------------------------------------------------
 # Constants & defaults
@@ -95,6 +128,12 @@ VM_HOURLY_COST[cx43]="0.06"
 VM_HOURLY_COST[cx53]="0.12"
 VM_HOURLY_COST[cpx62]="0.24"
 
+# Approximate Hetzner volume price (~€0.044/GB-month → ~€0.00006/GB-hour,
+# verify with the Hetzner pricing page). Volumes bill per GB-hour while they
+# exist, DETACHED INCLUDED — the estimate and the quota guard both account
+# for the full requested GB, not just attached ones.
+VOLUME_HOURLY_COST_PER_GB="0.00006"
+
 # VM type ordering for comparison (lower index = smaller)
 declare -A VM_TYPE_RANK
 VM_TYPE_RANK[cx23]=1
@@ -104,6 +143,26 @@ VM_TYPE_RANK[cpx32]=2
 VM_TYPE_RANK[cx43]=3
 VM_TYPE_RANK[cx53]=4
 VM_TYPE_RANK[cpx62]=5
+
+# ---------------------------------------------------------------------------
+# Volume pools (fleet-degradation f1, opt-in via --volume-pools)
+#
+# One Hetzner Cloud Volume per pool role per node, mounted at a stable path
+# (/mnt/oceanfs-<role>). Volume-backed runs are correctness/degradation
+# tests, NOT performance tests: every I/O crosses network block storage and
+# is not comparable to local-disk Phase 2/3 runs (epic rule). The opt-in
+# flag keeps Phases 2/3 local-disk behavior unchanged.
+#
+# Billing rule (ADR-0019 guardrails retained; volume billing is the new
+# guard): volumes bill per GB-hour WHILE THEY EXIST, including detached.
+# `--destroy` and the failure cleanup path delete every recorded volume id;
+# the provisioning record carries them because nothing else can enumerate
+# them safely later.
+# ---------------------------------------------------------------------------
+readonly DEFAULT_VOLUME_QUOTA_GB="${LOAD_TEST_VOLUME_QUOTA_GB:-1024}"
+readonly VOLUME_FS="ext4"
+# Role order is stable: it drives create order, record order, and output.
+readonly VOLUME_ROLES=(data wal meta hints spare)
 
 # ---------------------------------------------------------------------------
 # Script state
@@ -127,6 +186,7 @@ CONFIRM=""
 TTL_HOURS="${DEFAULT_TTL_HOURS}"
 DESTROY_NAME=""
 STATUS_NAME=""
+VOLUME_POOLS=false
 
 SUT_TYPE=""
 SUT_IP=""
@@ -144,9 +204,27 @@ CLUSTER_NODES="${LOAD_TEST_CLUSTER_NODES:-3}"
 SUT_NODE_NAMES=()
 SUT_NODE_IPS=()
 SUT_NODE_PUBLIC_IPS=()
+# Per-node volume record JSON arrays (phase 3+ fleet), parallel to
+# SUT_NODE_NAMES; phase 2 uses SUT_VOLUME_JSON for the singular `sut` object.
+SUT_NODE_VOLUME_JSON=()
+SUT_VOLUME_JSON="[]"
+# Volume sizing (GB) — generous defaults, CLI/env-overridable.
+VOLUME_DATA_GB="${LOAD_TEST_VOLUME_DATA_GB:-120}"
+VOLUME_WAL_GB="${LOAD_TEST_VOLUME_WAL_GB:-20}"
+VOLUME_META_GB="${LOAD_TEST_VOLUME_META_GB:-20}"
+VOLUME_HINTS_GB="${LOAD_TEST_VOLUME_HINTS_GB:-10}"
+VOLUME_SPARE_GB="${LOAD_TEST_VOLUME_SPARE_GB:-60}"
+VOLUME_QUOTA_GB="${DEFAULT_VOLUME_QUOTA_GB}"
 
-# Track created VMs for cleanup on failure
-CREATED_VM_NAMES=()
+# VM cleanup tracking also goes through a temp file: create_vm runs inside
+# command substitutions (subshells), so array mutations are lost there too
+# (pre-existing bug: a failed provisioning run left its VMs behind).
+VM_TRACK_FILE=""
+# Volume cleanup tracking goes through a temp file, NOT an array: the
+# create/record helpers run inside command substitutions (subshells), where
+# array mutations are lost — a failure after attach would leak a billed
+# volume. The file is created in main(); cleanup() deletes every id in it.
+VOLUME_TRACK_FILE=""
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -320,6 +398,16 @@ check_budget_gate() {
             h_cost=$(vm_hourly_cost "$HARNESS_TYPE")
         fi
         total_hourly=$(echo "$s_cost + $h_cost" | bc -l 2>/dev/null || echo "0")
+    fi
+
+    # Volume GB-hours (when --volume-pools is requested) bill independently
+    # of VM power state — include them in the same estimate.
+    if [ "$VOLUME_POOLS" = true ]; then
+        local vol_nodes vol_total vol_hourly
+        read -r vol_nodes _vol_per_node vol_total <<< "$(volume_plan_totals)"
+        vol_hourly=$(echo "$vol_total * $VOLUME_HOURLY_COST_PER_GB" | bc -l 2>/dev/null || echo "0")
+        total_hourly=$(echo "$total_hourly + $vol_hourly" | bc -l 2>/dev/null || echo "$total_hourly")
+        log_info "Budget gate: volume plan ${vol_total} GB across ${vol_nodes} node(s) adds ~€${vol_hourly}/h (billed while detached)."
     fi
 
     local estimated_total
@@ -565,7 +653,12 @@ create_vm() {
         die "Failed to create VM '${name}': ${create_output}"
     fi
 
-    CREATED_VM_NAMES+=("$name")
+    # Register for failure cleanup immediately after the API accepted the
+    # create — before wait_for_vm/config, so a later failure still cleans
+    # up this VM (the registry file survives subshells).
+    if [ -n "$VM_TRACK_FILE" ]; then
+        printf '%s\n' "$name" >> "$VM_TRACK_FILE"
+    fi
     log_info "VM '${name}' creation initiated."
 
     wait_for_vm "$name"
@@ -610,6 +703,291 @@ wait_for_ssh() {
 # Directory this script lives in (for locating sibling scripts like
 # setup-observability.sh regardless of the invocation cwd).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---------------------------------------------------------------------------
+# Volume pools: sizing, quota, create/attach/format/mount, teardown
+# ---------------------------------------------------------------------------
+
+# Echo the configured size (GB) for a pool role.
+volume_size_for_role() {
+    case "${1:-}" in
+        data) echo "$VOLUME_DATA_GB" ;;
+        wal) echo "$VOLUME_WAL_GB" ;;
+        meta) echo "$VOLUME_META_GB" ;;
+        hints) echo "$VOLUME_HINTS_GB" ;;
+        spare) echo "$VOLUME_SPARE_GB" ;;
+        *) die "Unknown volume role: '${1:-}'" ;;
+    esac
+}
+
+# Path of the provisioning record for a name prefix (mirrors main()).
+volume_record_path() {
+    printf '%s/.hetzner/provision-%s.json' "$(cd "${SCRIPT_DIR}/.." && pwd)" "${1:-}"
+}
+
+# Echo "<nodes> <per_node_gb> <total_gb>" for the requested volume plan.
+# Used by the quota guard and the cost estimate so both agree.
+volume_plan_totals() {
+    local nodes=1
+    if [ "$PHASE" = "3" ] || [ "$PHASE" = "4" ]; then
+        nodes="$CLUSTER_NODES"
+    fi
+    local per_node=0
+    local role gb
+    for role in "${VOLUME_ROLES[@]}"; do
+        gb="$(volume_size_for_role "$role")"
+        per_node=$((per_node + gb))
+    done
+    echo "${nodes} ${per_node} $((nodes * per_node))"
+}
+
+# Layer 5 (volume quota): refuse to provision more volume GB than the
+# project quota allows. Volumes bill per GB-hour while they exist,
+# detached included — this runs BEFORE any create call.
+volume_quota_preflight() {
+    if ! [[ "$VOLUME_QUOTA_GB" =~ ^[0-9]+$ ]] || [ "$VOLUME_QUOTA_GB" -le 0 ]; then
+        die "Invalid volume quota: '${VOLUME_QUOTA_GB}' (must be a positive integer GB)."
+    fi
+
+    local nodes per_node total
+    read -r nodes per_node total <<< "$(volume_plan_totals)"
+
+    local role gb
+    for role in "${VOLUME_ROLES[@]}"; do
+        gb="$(volume_size_for_role "$role")"
+        if ! [[ "$gb" =~ ^[0-9]+$ ]] || [ "$gb" -le 0 ]; then
+            die "Invalid volume size for role '${role}': '${gb}' (must be a positive integer GB)."
+        fi
+    done
+
+    if [ "$total" -gt "$VOLUME_QUOTA_GB" ]; then
+        die "Volume quota guard: ${nodes} node(s) x ${per_node} GB = ${total} GB exceeds the cap of ${VOLUME_QUOTA_GB} GB." \
+            "Lower the per-role sizes (--volume-data-gb/--volume-wal-gb/--volume-meta-gb/--volume-hints-gb/--volume-spare-gb)" \
+            "or raise --volume-quota-gb / LOAD_TEST_VOLUME_QUOTA_GB only if the Hetzner project quota allows it."
+    fi
+
+    # Cost estimate includes volume GB (billed regardless of power state).
+    local volume_hourly volume_ttl_cost
+    volume_hourly=$(echo "$total * $VOLUME_HOURLY_COST_PER_GB" | bc -l 2>/dev/null || echo "0")
+    volume_ttl_cost=$(echo "$volume_hourly * $TTL_HOURS" | bc -l 2>/dev/null || echo "0")
+    log_info "Volume quota: ${nodes} node(s) x ${per_node} GB = ${total} GB (cap ${VOLUME_QUOTA_GB} GB); volume cost ~€${volume_hourly}/h (~€${volume_ttl_cost} over the ${TTL_HOURS}h TTL, billed even when detached)."
+}
+
+# Create (or reuse an already-attached) volume for one node+role and echo
+# its id. Reuse is only allowed when the existing volume is attached to the
+# SAME node; any other collision is a hard error (a leftover volume attached
+# elsewhere must never be silently adopted).
+create_volume() {
+    local node_name="$1" role="$2" size_gb="$3"
+    local name="${node_name}-vol-${role}"
+
+    if [ "$DRY_RUN" = true ]; then
+        # The dry-run record is built by planned_volumes_json(); no side
+        # effects here.
+        echo "0"
+        return 0
+    fi
+
+    log_info "Creating volume '${name}' (${size_gb} GB) attached to '${node_name}'..."
+
+    if hcloud volume describe "$name" >/dev/null 2>&1; then
+        local existing_json existing_id existing_server
+        existing_json=$(hcloud volume describe "$name" --output json)
+        existing_id=$(echo "$existing_json" | jq -r '.id')
+        existing_server=$(echo "$existing_json" | jq -r '.server // ""')
+        if [ "$existing_server" = "$node_name" ]; then
+            log_warn "Volume '${name}' already exists on '${node_name}' — reusing (id=${existing_id})."
+            echo "$existing_id"
+            return 0
+        fi
+        die "Volume '${name}' already exists but is attached to '${existing_server:-nothing}' (id=${existing_id})." \
+            "Refusing to reuse it. Delete it first: hcloud volume delete ${existing_id}"
+    fi
+
+    local create_output
+    if ! create_output=$(hcloud volume create \
+        --name "$name" \
+        --size "$size_gb" \
+        --server "$node_name" \
+        2>&1); then
+        die "Failed to create volume '${name}' (${size_gb} GB) on '${node_name}': ${create_output}"
+    fi
+
+    local id
+    id=$(hcloud volume describe "$name" --output json 2>/dev/null | jq -r '.id // empty')
+    # Register even when id resolution failed: cleanup can delete by name,
+    # and an unregistered volume would be a silent billing leak.
+    if [ -n "$VOLUME_TRACK_FILE" ]; then
+        printf '%s:%s\n' "$name" "$id" >> "$VOLUME_TRACK_FILE"
+    fi
+    if [ -z "$id" ]; then
+        log_warn "Volume '${name}' was created but its id could not be resolved; cleanup will delete it by name."
+    fi
+    log_info "Volume '${name}' created (id=${id:-unknown}) and attached to '${node_name}'."
+    echo "$id"
+}
+
+# Detach (if attached) and delete one volume id. Idempotent: an absent
+# volume is reported, not an error. Returns non-zero only when the volume
+# demonstrably still exists after the delete attempt (billing hazard).
+volume_delete() {
+    local id="$1" name="${2:-}"
+
+    if [ "$DRY_RUN" = true ]; then
+        log_info "[DRY-RUN] hcloud volume detach ${id} (if attached) && hcloud volume delete ${id}"
+        return 0
+    fi
+
+    local server
+    server=$(hcloud volume describe "$id" --output json 2>/dev/null | jq -r '.server // ""' 2>/dev/null || true)
+    if [ -n "$server" ]; then
+        hcloud volume detach "$id" >/dev/null 2>&1 \
+            || log_warn "Could not detach volume ${name:-} (id=${id}) — attempting delete anyway."
+    fi
+
+    if hcloud volume delete "$id" >/dev/null 2>&1; then
+        log_info "Deleted volume ${name:-}(id=${id})."
+        return 0
+    fi
+
+    # Delete failed. Never conclude "already absent" from a failed lookup:
+    # absence requires POSITIVE evidence — a successful inventory that does
+    # not contain the reference. An unavailable inventory is inconclusive
+    # and must be reported as a leaked (billed) volume.
+    local inventory="" rc=255
+    if inventory=$(hcloud volume list --output json 2>/dev/null); then
+        rc=0
+        printf '%s' "$inventory" | jq -e --arg ref "$id" \
+            'any(.[]; ((.id | tostring) == $ref) or (.name == $ref))' >/dev/null 2>&1 || rc=$?
+    fi
+    if [ "$rc" -eq 1 ]; then
+        log_info "Volume ${name:-} (id=${id}) already absent."
+        return 0
+    fi
+    if [ "$rc" -eq 0 ]; then
+        log_error "Failed to delete volume ${name:-} (id=${id}) — still present. MANUAL CLEANUP REQUIRED (volumes bill while they exist)."
+    else
+        log_error "Failed to delete volume ${name:-} (id=${id}) and absence could not be confirmed (inventory unavailable). MANUAL CLEANUP REQUIRED."
+    fi
+    return 1
+}
+
+# Record-shaped volume plan for a node: no cloud calls, placeholder
+# id/device. Used by --dry-run (so the record schema is testable) and as
+# the single source of truth for the per-role name/mount layout.
+planned_volumes_json() {
+    local node_name="$1"
+    # Without --volume-pools the record carries an empty array (additive
+    # schema: consumers tolerate its absence/emptiness).
+    if [ "$VOLUME_POOLS" != true ]; then
+        echo '[]'
+        return 0
+    fi
+    local records="[]" role
+    for role in "${VOLUME_ROLES[@]}"; do
+        local size_gb name mount
+        size_gb="$(volume_size_for_role "$role")"
+        name="${node_name}-vol-${role}"
+        mount="${VOLUME_MOUNT_BASE}/oceanfs-${role}"
+        records=$(jq -n --argjson acc "$records" \
+            --arg role "$role" --arg name "$name" \
+            --arg device_id "$(volume_by_id_path 0)" --arg mount "$mount" \
+            --argjson size_gb "$size_gb" \
+            '$acc + [{role: $role, name: $name, id: 0, device: "/dev/sdX", device_id: $device_id, mount: $mount, size_gb: $size_gb}]')
+    done
+    printf '%s' "$records"
+}
+
+# Provision all role volumes for one node: create+attach, discover the
+# device by stable serial (volume id), format (fresh only) + mount at
+# /mnt/oceanfs-<role> + fstab entry. Echo the node's `volumes[]` record
+# array. Idempotent on re-run for an intact topology.
+setup_node_volumes() {
+    local node_name="$1" public_ip="$2"
+    local records="[]"
+    local role
+
+    for role in "${VOLUME_ROLES[@]}"; do
+        local size_gb name mount id device device_id
+        size_gb="$(volume_size_for_role "$role")"
+        name="${node_name}-vol-${role}"
+        mount="${VOLUME_MOUNT_BASE}/oceanfs-${role}"
+
+        if [ "$DRY_RUN" = true ]; then
+            id="0"
+            device_id="$(volume_by_id_path 0)"
+            device="/dev/sdX"
+        else
+            id="$(create_volume "$node_name" "$role" "$size_gb")" \
+                || die "Failed to create volume '${name}' on '${node_name}'."
+            [ -n "$id" ] || die "Volume '${name}' was created but its id never resolved."
+            # Stable identity is the volume id (virtio-scsi serial); device
+            # letters are never trusted as identity.
+            device_id="$(volume_by_id_path "$id")"
+            device="$(volume_run_remote "root@${public_ip}" volume_device_by_serial "$id" 60)" \
+                || die "Volume '${name}' (id=${id}) did not surface as a block device on '${node_name}'."
+            volume_run_remote "root@${public_ip}" ensure_mount "$device_id" "$mount" "$VOLUME_FS" \
+                || die "Failed to format/mount volume '${name}' at '${mount}' on '${node_name}'."
+            log_info "Node ${node_name}: ${role} mounted at ${mount} (device=${device}, id=${id})."
+        fi
+
+        records=$(jq -n --argjson acc "$records" \
+            --arg role "$role" --arg name "$name" --argjson id "${id:-0}" \
+            --arg device "$device" --arg device_id "$device_id" \
+            --arg mount "$mount" --argjson size_gb "$size_gb" \
+            '$acc + [{role: $role, name: $name, id: $id, device: $device, device_id: $device_id, mount: $mount, size_gb: $size_gb}]')
+    done
+
+    printf '%s' "$records"
+}
+
+# Recorded volume ids ("name:id") for a prefix, from the provisioning
+# record. Empty when the record is missing (caller falls back to scan).
+volume_record_ids() {
+    local record
+    record="$(volume_record_path "${1:-}")"
+    [ -f "$record" ] || return 0
+    jq -r '[.sut.volumes[]?, (.sut_nodes[]? | .volumes[]?)] | .[] | "\(.name):\(.id)"' \
+        "$record" 2>/dev/null || true
+}
+
+# Live volume inventory keyed by node name, for --status and drift
+# detection. Shape: { nodes: { "<node>": [ per-volume, ... ] }, drift: bool }
+# where each volume carries present/attached/live_size_gb alongside the
+# recorded fields. `{}` when no record exists.
+volume_status_json() {
+    local prefix="$1" record
+    record="$(volume_record_path "$prefix")"
+    if [ ! -f "$record" ]; then
+        echo '{}'
+        return 0
+    fi
+    local live
+    live="$(hcloud volume list --output json 2>/dev/null || echo '[]')"
+    jq -n --slurpfile rec "$record" --argjson live "$live" '
+        def annotate:
+            . as $v
+            | ($live | map(select(.id == $v.id))) as $l
+            | {
+                role: $v.role, name: $v.name, id: $v.id,
+                device: $v.device, device_id: $v.device_id,
+                mount: $v.mount, size_gb: $v.size_gb,
+                present: (($l | length) > 0),
+                attached: (($l | length) > 0 and $l[0].server != null),
+                live_size_gb: (if ($l | length) > 0 then $l[0].size else null end)
+              };
+        ($rec[0]) as $r
+        | ({}
+            + (if (($r.sut.volumes // []) | length) > 0
+               then {($r.sut.name): ($r.sut.volumes | map(annotate))}
+               else {} end)
+            + (if (($r.sut_nodes // []) | length) > 0
+               then ($r.sut_nodes | map({key: .name, value: (.volumes | map(annotate))}) | from_entries)
+               else {} end)
+          ) as $nodes
+        | { nodes: $nodes, drift: ([$nodes[][] | select(.present | not)] | length > 0) }
+    '
+}
 
 # Installs the Prometheus observability stack on the SUT (scrape job for
 # :9000/admin/metrics + node exporter + textfile collector). Idempotent;
@@ -753,6 +1131,9 @@ setup_ttl_timer() {
         return 0
     fi
 
+    # Client-side expansion is intended here: TTL_SETUP contains ${TTL_HOURS}
+    # which must be substituted before the script is sent to the VM.
+    # shellcheck disable=SC2087
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${public_ip}" <<TTL_SETUP
 set -euo pipefail
 
@@ -818,20 +1199,52 @@ TTL_SETUP
 # ---------------------------------------------------------------------------
 
 cleanup() {
-    if [ "$KEEP_ON_FAILURE" = true ]; then
-        log_warn "KEEP_ON_FAILURE set — leaving created VMs in place for inspection:"
-        for vm_name in "${CREATED_VM_NAMES[@]:-}"; do
-            log_warn "  ${vm_name}"
-        done
-        return 0
+    # Volumes bill while they exist (detached included) — delete them
+    # BEFORE the VMs they are attached to, and never let one survive a
+    # failed provisioning run. Both registries are files because the
+    # create helpers run in subshells (see VOLUME_TRACK_FILE /
+    # VM_TRACK_FILE).
+    if [ -n "$VOLUME_TRACK_FILE" ] && [ -s "$VOLUME_TRACK_FILE" ]; then
+        log_warn "Cleanup: deleting volumes created during this run..."
+        local entry e_name e_id
+        while IFS= read -r entry; do
+            [ -n "$entry" ] || continue
+            e_name="${entry%%:*}"
+            e_id="${entry#*:}"
+            if [ -n "$e_id" ]; then
+                volume_delete "$e_id" "$e_name" || true
+            else
+                # id never resolved — hcloud accepts the name as handle.
+                volume_delete "$e_name" "$e_name" || true
+            fi
+        done < "$VOLUME_TRACK_FILE"
     fi
-    if [ ${#CREATED_VM_NAMES[@]} -gt 0 ]; then
-        log_warn "Cleanup: attempting to delete VMs created during this run..."
-        for vm_name in "${CREATED_VM_NAMES[@]}"; do
-            log_info "Deleting VM '${vm_name}'..."
-            hcloud server delete "$vm_name" >/dev/null 2>&1 || log_warn "Failed to delete VM '${vm_name}'. Manual cleanup may be needed."
-        done
-        CREATED_VM_NAMES=()
+
+    if [ -n "$VM_TRACK_FILE" ] && [ -s "$VM_TRACK_FILE" ]; then
+        if [ "$KEEP_ON_FAILURE" = true ]; then
+            log_warn "KEEP_ON_FAILURE set — leaving created VMs in place for inspection:"
+            local kept
+            while IFS= read -r kept; do
+                [ -n "$kept" ] && log_warn "  ${kept}"
+            done < "$VM_TRACK_FILE"
+        else
+            log_warn "Cleanup: attempting to delete VMs created during this run..."
+            local vm_name
+            while IFS= read -r vm_name; do
+                [ -n "$vm_name" ] || continue
+                log_info "Deleting VM '${vm_name}'..."
+                hcloud server delete "$vm_name" >/dev/null 2>&1 || log_warn "Failed to delete VM '${vm_name}'. Manual cleanup may be needed."
+            done < "$VM_TRACK_FILE"
+        fi
+    fi
+
+    # Always drop the registries (also when quota/preflight failed before
+    # anything was created) so no empty temp files accumulate.
+    if [ -n "$VOLUME_TRACK_FILE" ]; then
+        rm -f "$VOLUME_TRACK_FILE"
+    fi
+    if [ -n "$VM_TRACK_FILE" ]; then
+        rm -f "$VM_TRACK_FILE"
     fi
 }
 
@@ -841,6 +1254,44 @@ cleanup() {
 
 destroy_vms() {
     local prefix="$1"
+
+    # Volumes FIRST: they bill while they exist (detached included), and
+    # the VMs they are attached to are about to disappear. Prefer the
+    # provisioning record; fall back to a name-prefix scan when the record
+    # is missing/corrupt, logging loudly. Never leave a volume silently.
+    log_info "Looking for volumes recorded for '${prefix}' (and name matches)..."
+    local recorded_ids scanned_ids all_ids entry
+    local inventory="" list_ok=true
+    recorded_ids="$(volume_record_ids "$prefix")"
+    if ! inventory=$(hcloud volume list --output json 2>/dev/null); then
+        list_ok=false
+    fi
+    scanned_ids=""
+    if [ "$list_ok" = true ]; then
+        scanned_ids="$(printf '%s' "$inventory" \
+            | jq -r --arg p "${prefix}-" '.[] | select(.name | startswith($p)) | "\(.name):\(.id)"' 2>/dev/null || true)"
+    fi
+    if [ "$list_ok" = false ] && [ -z "$recorded_ids" ]; then
+        log_error "Cannot enumerate volumes for '${prefix}': no provisioning record and 'hcloud volume list' failed."
+        log_error "Refusing to report a clean destroy — volumes bill while they exist. Retry once the API is reachable."
+        return 1
+    fi
+    if [ -z "$recorded_ids" ] && [ -n "$scanned_ids" ]; then
+        log_warn "No recorded volumes for '${prefix}' — deleting by name-prefix scan (record missing or corrupt)."
+    fi
+    all_ids="$(printf '%s\n%s\n' "$recorded_ids" "$scanned_ids" | awk 'NF' | sort -u)"
+    local volume_failures=0
+    if [ -n "$all_ids" ]; then
+        while IFS= read -r entry; do
+            [ -n "$entry" ] || continue
+            volume_delete "${entry##*:}" "${entry%%:*}" || volume_failures=$((volume_failures + 1))
+        done <<< "$all_ids"
+    else
+        log_info "No volumes matching '${prefix}' found."
+    fi
+    if [ "$volume_failures" -gt 0 ]; then
+        log_error "${volume_failures} volume(s) could not be deleted — MANUAL CLEANUP REQUIRED."
+    fi
 
     log_info "Looking for VMs matching '${prefix}-sut*' and '${prefix}-harness'..."
 
@@ -874,9 +1325,16 @@ destroy_vms() {
 
     if [ "$sut_exists" = false ] && [ "$harness_exists" = false ]; then
         log_warn "No VMs matching '${prefix}' found."
-    else
-        log_info "Destroy complete for prefix '${prefix}'."
     fi
+
+    # A volume that survives destroy keeps billing. This is an incident,
+    # not a warning — exit non-zero so callers (vm-down) cannot report
+    # success while the account still holds volumes.
+    if [ "$volume_failures" -gt 0 ]; then
+        log_error "Destroy INCOMPLETE for prefix '${prefix}': ${volume_failures} volume(s) could not be deleted — MANUAL CLEANUP REQUIRED."
+        return 1
+    fi
+    log_info "Destroy complete for prefix '${prefix}' (volumes + VMs)."
 }
 
 # ---------------------------------------------------------------------------
@@ -889,6 +1347,10 @@ check_status() {
     local sut_json sut_status sut_ip sut_public_ip sut_type
     local harness_json harness_status harness_ip harness_public_ip harness_type
 
+    # Recorded + live volume inventory (empty when no record exists).
+    local vols
+    vols="$(volume_status_json "$prefix")"
+
     sut_json=$(hcloud server describe "${prefix}-sut" --output json 2>/dev/null || true)
     harness_json=$(hcloud server describe "${prefix}-harness" --output json 2>/dev/null || true)
 
@@ -897,7 +1359,7 @@ check_status() {
         sut_status=$(echo "$sut_json" | jq -r '.status // "unknown"')
         sut_ip=$(echo "$sut_json" | jq -r '.private_net[0].ip // ""')
         sut_public_ip=$(echo "$sut_json" | jq -r '.public_net.ipv4.ip // ""')
-        sut_type=$(echo "$sut_json" | jq -r '.server_type // ""')
+        sut_type=$(echo "$sut_json" | jq -r 'if (.server_type | type) == "object" then .server_type.name else (.server_type // "") end')
     else
         sut_status="not_found"
         sut_ip=""
@@ -910,7 +1372,7 @@ check_status() {
         harness_status=$(echo "$harness_json" | jq -r '.status // "unknown"')
         harness_ip=$(echo "$harness_json" | jq -r '.private_net[0].ip // ""')
         harness_public_ip=$(echo "$harness_json" | jq -r '.public_net.ipv4.ip // ""')
-        harness_type=$(echo "$harness_json" | jq -r '.server_type // ""')
+        harness_type=$(echo "$harness_json" | jq -r 'if (.server_type | type) == "object" then .server_type.name else (.server_type // "") end')
     else
         harness_status="not_found"
         harness_ip=""
@@ -928,27 +1390,32 @@ check_status() {
         # Fleet (or legacy single SUT): one object per VM, sorted.
         sut_json_part=$(hcloud server list --output json 2>/dev/null | jq \
             --arg p "${prefix}-sut" \
-            '[.[] | select(.name | startswith($p)) | sort_by(.name)[] | {
+            '[.[] | select(.name | startswith($p)) | {
                 name: .name,
                 status: .status,
                 internal_ip: (.private_net[0].ip // ""),
                 public_ip: .public_net.ipv4.ip,
-                type: .server_type
-            }]' || echo "[]")
+                type: (if (.server_type | type) == "object" then .server_type.name else (.server_type // "") end)
+            }] | sort_by(.name)' || echo "[]")
         if [ "$(echo "$sut_json_part" | jq 'length')" = "1" ]; then
             # Phase 2 shape: single `sut` object (backward compatible).
             sut_json_part=$(echo "$sut_json_part" | jq '.[0]')
             jq -n \
                 --argjson sut "$sut_json_part" \
+                --argjson vols "$vols" \
                 --arg harness_status "$harness_status" \
                 --arg harness_ip "$harness_ip" \
                 --arg harness_public_ip "$harness_public_ip" \
                 --arg harness_name "${prefix}-harness" \
                 --arg harness_type "$harness_type" \
                 --arg name "$prefix" \
-                '{
+                '($vols.nodes // {}) as $vn
+                 | {
                     name: $name,
-                    sut: $sut,
+                    sut: ($sut + {
+                        volumes: ($vn[$sut.name] // []),
+                        drift: ([$vn[$sut.name][]? | select(.present | not)] | length > 0)
+                    }),
                     harness: {
                         name: $harness_name,
                         status: $harness_status,
@@ -958,6 +1425,12 @@ check_status() {
                     }
                 }'
         else
+            sut_json_part=$(echo "$sut_json_part" | jq --argjson vols "$vols" \
+                '($vols.nodes // {}) as $vn
+                 | map(. + {
+                    volumes: ($vn[.name] // []),
+                    drift: ([$vn[.name][]? | select(.present | not)] | length > 0)
+                 })')
             jq -n \
                 --argjson sut_nodes "$sut_json_part" \
                 --arg harness_status "$harness_status" \
@@ -985,20 +1458,24 @@ check_status() {
             --arg sut_public_ip "$sut_public_ip" \
             --arg sut_name "${prefix}-sut" \
             --arg sut_type "$sut_type" \
+            --argjson vols "$vols" \
             --arg harness_status "$harness_status" \
             --arg harness_ip "$harness_ip" \
             --arg harness_public_ip "$harness_public_ip" \
             --arg harness_name "${prefix}-harness" \
             --arg harness_type "$harness_type" \
             --arg name "$prefix" \
-            '{
+            '($vols.nodes // {}) as $vn
+             | {
                 name: $name,
                 sut: {
                     name: $sut_name,
                     status: $sut_status,
                     internal_ip: $sut_ip,
                     public_ip: $sut_public_ip,
-                    type: $sut_type
+                    type: $sut_type,
+                    volumes: ($vn[$sut_name] // []),
+                    drift: ([$vn[$sut_name][]? | select(.present | not)] | length > 0)
                 },
                 harness: {
                     name: $harness_name,
@@ -1065,6 +1542,15 @@ provision_vms() {
                         log_info "[DRY-RUN] Create/update firewall '${NAME_PREFIX}-sut-fw' and apply to '${node_name}'"
                     fi
                 fi
+
+                # Volume pools (opt-in): create/attach/format/mount before the
+                # node is configured, so the deploy pre-flight always finds
+                # them. Volumes are tracked for cleanup-on-failure.
+                if [ "$VOLUME_POOLS" = true ]; then
+                    SUT_NODE_VOLUME_JSON+=("$(setup_node_volumes "$node_name" "${SUT_NODE_PUBLIC_IPS[$i]}")")
+                else
+                    SUT_NODE_VOLUME_JSON+=("[]")
+                fi
             done
 
             # 2. Configure each node. Node 0's Prometheus scrapes the whole
@@ -1116,11 +1602,21 @@ provision_vms() {
             else
                 log_warn "Firewalls DISABLED (--no-firewall) — ${sut_name} is exposed to the internet."
             fi
+
+            # Volume pools (opt-in): create/attach/format/mount before the
+            # node is configured, so the deploy pre-flight always finds them.
+            if [ "$VOLUME_POOLS" = true ]; then
+                SUT_VOLUME_JSON="$(setup_node_volumes "$sut_name" "$SUT_PUBLIC_IP")"
+            fi
+
             configure_sut_vm "$sut_name" "$SUT_PUBLIC_IP" || die "SUT VM configuration failed."
             setup_ttl_timer "$sut_name" "$SUT_PUBLIC_IP" || log_warn "TTL timer setup failed on SUT VM. Manual TTL enforcement may be needed."
         else
             if [ "$FIREWALLS" = true ]; then
                 log_info "[DRY-RUN] Create/update firewall '${NAME_PREFIX}-sut-fw' and apply to '${sut_name}'"
+            fi
+            if [ "$VOLUME_POOLS" = true ]; then
+                SUT_VOLUME_JSON="$(setup_node_volumes "$sut_name" "")"
             fi
         fi
     fi
@@ -1162,12 +1658,52 @@ provision_vms() {
 # Output JSON with VM details
 # ---------------------------------------------------------------------------
 
+# Full provisioning-record JSON for --dry-run, including the volume plan,
+# so the record schema and quota plan are testable without calling hcloud.
+dry_run_record_json() {
+    local n vols nodes_json="[]" i
+    if [ "$PHASE" = "3" ] || [ "$PHASE" = "4" ]; then
+        for ((i = 0; i < CLUSTER_NODES; i++)); do
+            n="${NAME_PREFIX}-sut-${i}"
+            vols=$(planned_volumes_json "$n")
+            nodes_json=$(jq -n --argjson acc "$nodes_json" \
+                --arg name "$n" --arg type "${SUT_TYPE:-}" --argjson volumes "$vols" \
+                '$acc + [{ name: $name, ip: "", public_ip: "", internal_ip: "", type: $type, volumes: $volumes }]')
+        done
+        jq -n --argjson sut_nodes "$nodes_json" \
+            --arg harness_name "${NAME_PREFIX}-harness" --arg harness_type "${HARNESS_TYPE:-}" \
+            --argjson phase "$PHASE" --argjson ttl_hours "$TTL_HOURS" \
+            --argjson cluster_nodes "$CLUSTER_NODES" \
+            '{
+                sut_nodes: $sut_nodes,
+                harness: { name: $harness_name, ip: "", public_ip: "", internal_ip: "", type: $harness_type },
+                phase: $phase,
+                ttl_hours: $ttl_hours,
+                cluster_nodes: $cluster_nodes
+            }'
+    else
+        n="${NAME_PREFIX}-sut"
+        vols=$(planned_volumes_json "$n")
+        jq -n --arg name "$n" --arg type "${SUT_TYPE:-}" \
+            --arg harness_name "${NAME_PREFIX}-harness" --arg harness_type "${HARNESS_TYPE:-}" \
+            --argjson volumes "$vols" \
+            --argjson phase "$PHASE" --argjson ttl_hours "$TTL_HOURS" \
+            '{
+                sut: { name: $name, ip: "", public_ip: "", internal_ip: "", type: $type, volumes: $volumes },
+                harness: { name: $harness_name, ip: "", public_ip: "", internal_ip: "", type: $harness_type },
+                phase: $phase,
+                ttl_hours: $ttl_hours
+            }'
+    fi
+}
+
 output_json() {
     if [ "$DRY_RUN" = true ]; then
-        log_info "[DRY-RUN] Would output JSON with VM details. Simulated VMs:"
-        for vm_info in "${DRY_RUN_VMS[@]}"; do
+        log_info "[DRY-RUN] Simulated VMs:"
+        for vm_info in "${DRY_RUN_VMS[@]:-}"; do
             log_info "  ${vm_info}"
         done
+        dry_run_record_json
         return 0
     fi
 
@@ -1180,6 +1716,7 @@ output_json() {
             --arg sut_public_ip "${SUT_PUBLIC_IP:-}" \
             --arg sut_name "${SUT_NAME:-}" \
             --arg sut_type "${SUT_TYPE:-}" \
+            --argjson volumes "${SUT_VOLUME_JSON:-[]}" \
             --arg harness_ip "${SUT_IP:-}" \
             --arg harness_public_ip "${SUT_PUBLIC_IP:-}" \
             --arg harness_name "${SUT_NAME:-}-harness" \
@@ -1190,7 +1727,7 @@ output_json() {
             --argjson ttl_hours "$TTL_HOURS" \
             --argjson single_vm true \
             '{
-                sut: { ip: $sut_ip, public_ip: $sut_public_ip, name: $sut_name, type: $sut_type, internal_ip: $sut_ip },
+                sut: { ip: $sut_ip, public_ip: $sut_public_ip, name: $sut_name, type: $sut_type, internal_ip: $sut_ip, volumes: $volumes },
                 harness: { ip: $harness_ip, public_ip: $harness_public_ip, name: $harness_name, type: $harness_type, internal_ip: $harness_ip },
                 phase: $phase,
                 provider: $provider,
@@ -1210,7 +1747,8 @@ output_json() {
                     --arg ip "${SUT_NODE_IPS[$i]:-}" \
                     --arg public_ip "${SUT_NODE_PUBLIC_IPS[$i]:-}" \
                     --arg type "${SUT_TYPE:-}" \
-                    '$acc + [{ name: $name, ip: $ip, public_ip: $public_ip, internal_ip: $ip, type: $type }]')
+                    --argjson volumes "${SUT_NODE_VOLUME_JSON[$i]:-[]}" \
+                    '$acc + [{ name: $name, ip: $ip, public_ip: $public_ip, internal_ip: $ip, type: $type, volumes: $volumes }]')
             done
             jq -n \
                 --argjson sut_nodes "$nodes_json" \
@@ -1240,6 +1778,7 @@ output_json() {
                 --arg sut_name "${SUT_NAME:-}" \
                 --arg sut_type "${SUT_TYPE:-}" \
                 --arg sut_internal_ip "${SUT_IP:-}" \
+                --argjson volumes "${SUT_VOLUME_JSON:-[]}" \
                 --arg harness_ip "${HARNESS_IP:-}" \
                 --arg harness_public_ip "${HARNESS_PUBLIC_IP:-}" \
                 --arg harness_name "${HARNESS_NAME:-}" \
@@ -1250,7 +1789,7 @@ output_json() {
                 --arg network "$NETWORK_CIDR" \
                 --argjson ttl_hours "$TTL_HOURS" \
                 '{
-                    sut: { ip: $sut_ip, public_ip: $sut_public_ip, name: $sut_name, type: $sut_type, internal_ip: $sut_internal_ip },
+                    sut: { ip: $sut_ip, public_ip: $sut_public_ip, name: $sut_name, type: $sut_type, internal_ip: $sut_internal_ip, volumes: $volumes },
                     harness: { ip: $harness_ip, public_ip: $harness_public_ip, name: $harness_name, type: $harness_type, internal_ip: $harness_internal_ip },
                     phase: $phase,
                     provider: $provider,
@@ -1291,12 +1830,28 @@ OPTIONS:
   --image IMAGE        OS image (default: ubuntu-24.04)
   --single-vm          Co-locate SUT+Harness on single VM
                        (Phase 2 only; Phase 3-4 prints warning per ADR-0019)
+  --volume-pools       Provision real Hetzner volumes per node (data, wal,
+                       meta, hints + spare), attach them, format ext4,
+                       mount at /mnt/oceanfs-<role>, and record every
+                       volume id in the provisioning record. Phases 2-4;
+                       opt-in — without it Phases 2/3 stay on local disk.
+                       Volume-backed runs are correctness/degradation
+                       tests, NOT performance measurements (no run on
+                       volumes is comparable to local-disk runs).
+  --volume-data-gb N   Per-role volume sizes in GB. Defaults: data 120,
+  --volume-wal-gb N    wal 20, meta 20, hints 10, spare 60 (spare = the
+  --volume-meta-gb N   5th data volume used by runtime attach/detach
+  --volume-hints-gb N  scenarios). Env: LOAD_TEST_VOLUME_<ROLE>_GB.
+  --volume-spare-gb N
+  --volume-quota-gb N  Total volume GB cap (default: 1024). Provisioning
+                       refuses to exceed it. Env: LOAD_TEST_VOLUME_QUOTA_GB.
   --confirm yes        Accepted for compatibility; no-op (confirmation gate removed)
   --ttl HOURS          Auto-shutdown TTL (default: 4, or LOAD_TEST_TTL_HOURS)
   --dry-run            Print actions without executing
   --debug              Enable shell tracing (set -x) for full visibility
   --keep-on-failure    Keep already-created VMs when a later step fails
-                       (default: cleanup deletes them)
+                       (default: cleanup deletes them; created volumes are
+                       ALWAYS deleted — they bill while they exist)
   --no-firewall        Do NOT create/apply Hetzner managed firewalls
   --no-observability   Do NOT install Prometheus on the SUT (default:
                        installed; scrape :9000 + node exporter, :9090
@@ -1304,11 +1859,15 @@ OPTIONS:
                        (default: applied — SUT: SSH + internal-net
                        9000/9001 only; Harness: SSH only)
   --ssh-source-ip IP   CIDR allowed to SSH into the VMs (default:
-                       0.0.0.0/0). The SUT additionally allows the
-                       internal test network for harness crash control.
-  --destroy NAME       Tear down all VMs with given name prefix
-                       ({prefix}-sut, {prefix}-sut-0..N-1, {prefix}-harness)
-  --status NAME        Check status of all VMs with given name prefix
+                        0.0.0.0/0). The SUT additionally allows the
+                        internal test network for harness crash control.
+  --destroy NAME       Tear down all VMs AND every recorded (or
+                       name-matched) volume with the given name prefix.
+                       Volumes are billed while they exist even when
+                       detached, so teardown is mandatory and idempotent.
+  --status NAME        Check status of all VMs with the given name prefix,
+                       including the recorded volume inventory and a drift
+                       flag for volumes missing from the cloud account.
   -h, --help           Show this help
 
 Environment Variables:
@@ -1318,6 +1877,12 @@ Environment Variables:
   LOAD_TEST_TTL_HOURS       Override default TTL (default: 4)
   LOAD_TEST_CLUSTER_NODES   Override cluster fleet size for phase 3-4
                             (default: 3)
+  LOAD_TEST_VOLUME_QUOTA_GB Volume quota cap (default: 1024)
+  LOAD_TEST_VOLUME_DATA_GB  Per-role volume sizes, GB (defaults 120/20/
+  LOAD_TEST_VOLUME_WAL_GB   20/10/60 for data/wal/meta/hints/spare)
+  LOAD_TEST_VOLUME_META_GB
+  LOAD_TEST_VOLUME_HINTS_GB
+  LOAD_TEST_VOLUME_SPARE_GB
   LOAD_TEST_MAX_MONTHLY_EUR Optional monthly budget cap (deferrable, v2)
 
 Guardrails:
@@ -1325,10 +1890,15 @@ Guardrails:
     to CX43 per ADR-0026; SUT nodes capped at cx33)
   - Confirmation gate: removed (CX33 is the standard sizing for phases 2-4)
   - Auto-shutdown TTL: systemd timer powers off VMs after TTL expires
+  - Volume quota: total requested volume GB must stay <=
+    LOAD_TEST_VOLUME_QUOTA_GB (default 1024); volumes are deleted by
+    --destroy and by the failure cleanup path because they bill per
+    GB-hour while they exist, detached included
   - Budget gate: optional LOAD_TEST_MAX_MONTHLY_EUR scaffolding
 
 Output: JSON with sut (phase 2) or sut_nodes array (phase 3-4) + harness
-VM objects on stdout.
+VM objects on stdout. With --volume-pools every node object carries a
+volumes[] array: { role, name, id, device, device_id, mount, size_gb }.
 
 Examples:
   vm-provision.sh --phase 2 --branch feature/test
@@ -1339,6 +1909,9 @@ Examples:
   vm-provision.sh --status oceanfs-loadtest-2
   vm-provision.sh --phase 2 --dry-run
   vm-provision.sh --phase 2 --ttl 2 --single-vm
+  vm-provision.sh --phase 2 --volume-pools
+  vm-provision.sh --phase 4 --nodes 3 --volume-pools --volume-data-gb 80
+  vm-provision.sh --phase 3 --volume-pools --dry-run
 HELP
 }
 
@@ -1434,6 +2007,34 @@ parse_args() {
             --single-vm)
                 SINGLE_VM=true
                 shift
+                ;;
+            --volume-pools)
+                VOLUME_POOLS=true
+                shift
+                ;;
+            --volume-data-gb)
+                VOLUME_DATA_GB="${2:-}"
+                shift 2
+                ;;
+            --volume-wal-gb)
+                VOLUME_WAL_GB="${2:-}"
+                shift 2
+                ;;
+            --volume-meta-gb)
+                VOLUME_META_GB="${2:-}"
+                shift 2
+                ;;
+            --volume-hints-gb)
+                VOLUME_HINTS_GB="${2:-}"
+                shift 2
+                ;;
+            --volume-spare-gb)
+                VOLUME_SPARE_GB="${2:-}"
+                shift 2
+                ;;
+            --volume-quota-gb)
+                VOLUME_QUOTA_GB="${2:-}"
+                shift 2
                 ;;
             --confirm)
                 CONFIRM="${2:-}"
@@ -1535,6 +2136,19 @@ main() {
         NAME_PREFIX="oceanfs-loadtest-${PHASE}"
     fi
 
+    # Failure-cleanup registries: created before any cloud call so die() ->
+    # cleanup() always has the authoritative lists of what to delete.
+    VOLUME_TRACK_FILE="${TMPDIR:-/tmp}/oceanfs-volumes-$$.txt"
+    VM_TRACK_FILE="${TMPDIR:-/tmp}/oceanfs-vms-$$.txt"
+    : > "$VOLUME_TRACK_FILE"
+    : > "$VM_TRACK_FILE"
+
+    # Volume pools (opt-in): quota preflight runs before ANY create call,
+    # including dry-run (so the guard is testable without cloud calls).
+    if [ "$VOLUME_POOLS" = true ]; then
+        volume_quota_preflight
+    fi
+
     # Provider check (only hetzner supported initially)
     if [ "$PROVIDER" != "hetzner" ]; then
         die "Provider '${PROVIDER}' is not yet supported. Only 'hetzner' is currently available." \
@@ -1580,18 +2194,31 @@ main() {
     if [ "$DRY_RUN" = false ]; then
         log_info "Provisioning complete. Outputting JSON..."
         # Persist the record so follow-up tooling (setup-harness.sh) can
-        # derive IPs, repo/branch, and the SSH key without re-querying.
-        local record
-        record=$(output_json)
+        # derive IPs, repo/branch, and the SSH key without re-querying. The
+        # path resolves off the script location (volume_record_path), not
+        # the cwd, so --status/--destroy find it from anywhere.
+        local record record_path
+        record=$(output_json) || die "Failed to build the provisioning record JSON."
         printf '%s\n' "$record"
-        mkdir -p .hetzner
+        record_path="$(volume_record_path "$NAME_PREFIX")"
+        mkdir -p "$(dirname "$record_path")"
         printf '%s\n' "$record" | jq --arg repo "$REPO_URL" --arg branch "$BRANCH" \
             --arg commit "$COMMIT" --arg ssh_key "$SSH_KEY_PATH" \
             '. + {repo: $repo, branch: $branch, commit: $commit, ssh_key: $ssh_key}' \
-            > ".hetzner/provision-${NAME_PREFIX}.json"
-        log_info "Provisioning record written to .hetzner/provision-${NAME_PREFIX}.json"
+            > "$record_path" \
+            || die "Failed to write the provisioning record to ${record_path}."
+        log_info "Provisioning record written to ${record_path}"
     else
         output_json
+    fi
+
+    # Nothing failed: every volume/VM is in the record — drop the failure
+    # registries (cleanup() uses them only until provisioning succeeds).
+    if [ -n "$VOLUME_TRACK_FILE" ]; then
+        rm -f "$VOLUME_TRACK_FILE"
+    fi
+    if [ -n "$VM_TRACK_FILE" ]; then
+        rm -f "$VM_TRACK_FILE"
     fi
 }
 

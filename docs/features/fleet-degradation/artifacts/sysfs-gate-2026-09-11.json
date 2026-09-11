@@ -1,0 +1,71 @@
+{
+  "gate": "sysfs-yank-replug",
+  "timestamp": "2026-09-11T16:48:33Z",
+  "sut": "root@<sut-public-ip>",
+  "volume_id": 106850104,
+  "by_id": "/dev/disk/by-id/scsi-0HC_Volume_106850104",
+  "mount": "/mnt/oceanfs-data",
+  "server_before": "165538848",
+  "server_after": "165538848",
+  "result": "pass",
+  "pass_count": 10,
+  "fail_count": 0,
+  "steps": [
+    {
+      "step": "resolve",
+      "status": "PASS",
+      "detail": "/dev/sdb (by-id=scsi-0HC_Volume_106850104)"
+    },
+    {
+      "step": "delete_attribute",
+      "status": "PASS",
+      "detail": "/sys/block/sdb/device/delete"
+    },
+    {
+      "step": "mount_before",
+      "status": "PASS",
+      "detail": "/mnt/oceanfs-data <- /dev/sdb"
+    },
+    {
+      "step": "marker_write",
+      "status": "PASS",
+      "detail": "sysfs-gate-20260911T164829Z"
+    },
+    {
+      "step": "yank",
+      "status": "PASS",
+      "detail": "deleted sdb"
+    },
+    {
+      "step": "yank_confirm",
+      "status": "PASS",
+      "detail": "sdb and /dev/disk/by-id/scsi-0HC_Volume_106850104 gone"
+    },
+    {
+      "step": "rescan",
+      "status": "PASS",
+      "detail": "/dev/sdc"
+    },
+    {
+      "step": "serial",
+      "status": "PASS",
+      "detail": "ID_SERIAL=0HC_Volume_106850104"
+    },
+    {
+      "step": "remount",
+      "status": "PASS",
+      "detail": "/mnt/oceanfs-data remounted from /dev/disk/by-id/scsi-0HC_Volume_106850104"
+    },
+    {
+      "step": "marker_read",
+      "status": "PASS",
+      "detail": "sysfs-gate-20260911T164829Z"
+    },
+    {
+      "step": "api_attached",
+      "status": "PASS",
+      "detail": "volume 106850104 attached to server 165538848"
+    }
+  ],
+  "note": "Generated before the 2026-09-11 count fix: pass_count excluded the api_attached step. All 11 listed steps are PASS; regenerated artifacts include the API step in pass_count."
+}

@@ -22,6 +22,9 @@ them.
 |---|---|---|
 | `phase` | Load-test phase: 2 (SUT=CX33, Harness=CX23), 3-4 (fleet: `nodes`×CX33 SUT VMs + Harness=CX43) | required |
 | `nodes` | Fleet size for phase 3-4 (range 3-5) | 3 (`LOAD_TEST_CLUSTER_NODES`) |
+| `volume-pools` | Provision real Hetzner volumes per node (data/wal/meta/hints + spare), attach, format ext4, mount at `/mnt/oceanfs-<role>`, record ids | off |
+| `volume-data-gb` etc. | Per-role volume sizes in GB (`--volume-data-gb`, `--volume-wal-gb`, `--volume-meta-gb`, `--volume-hints-gb`, `--volume-spare-gb`) | 120/20/20/10/60 |
+| `volume-quota-gb` | Total volume GB cap; provisioning refuses over it | 1024 (`LOAD_TEST_VOLUME_QUOTA_GB`) |
 | `branch` | Git branch cloned on the Harness | `main` |
 | `commit` | Optional exact commit to check out | none |
 | `name` | VM name prefix | `oceanfs-loadtest-{phase}` |
@@ -80,6 +83,9 @@ provisions the correct sizes. No confirmation gate applies (removed
      ${COMMIT:+--commit "$COMMIT"} \
      ${NAME:+--name "$NAME"} \
      ${SSH_KEY:+--ssh-key "$SSH_KEY"} \
+     ${VOLUME_POOLS:+--volume-pools} \
+     ${VOLUME_DATA_GB:+--volume-data-gb "$VOLUME_DATA_GB"} \
+     ${VOLUME_QUOTA_GB:+--volume-quota-gb "$VOLUME_QUOTA_GB"} \
      ${SINGLE_VM:+--single-vm} \
      ${TTL:+--ttl "$TTL"}
    ```
@@ -95,6 +101,19 @@ provisions the correct sizes. No confirmation gate applies (removed
    - It does NOT deploy the oceanfs binary/systemd unit to the SUT —
      that is **vm-deploy** (setup-harness.sh also re-syncs the repo so
      the deployed code is the pinned branch/commit).
+   - With `--volume-pools` (fleet-degradation f1): creates 5 Hetzner
+     volumes per node — data 120 / wal 20 / meta 20 / hints 10 / spare 60
+     GB defaults — attaches them, discovers each device by the volume-id
+     serial (`/dev/disk/by-id/scsi-0HC_Volume_<id>`; **device letters
+     change across attach/rescan/reboot** — never use `/dev/sdX` as
+     identity), formats ext4 (fresh volumes only, never an already-marked
+     one), mounts at `/mnt/oceanfs-<role>` with a `nofail` fstab entry,
+     and writes `volumes[]` into each node's provisioning record. Quota
+     guard: `nodes × 230 GB` must fit `LOAD_TEST_VOLUME_QUOTA_GB`
+     (default 1024). **Volume-backed runs are correctness/degradation
+     tests only — their numbers are NOT comparable to local-disk runs.**
+     Volumes bill per GB-hour while they exist, **detached included**:
+     every destroy path deletes them (see vm-down).
    - Provisioning takes several minutes (VMs boot, apt, rustup, release
      build on the Harness). Report progress, not a hang.
 
@@ -115,7 +134,12 @@ provisions the correct sizes. No confirmation gate applies (removed
   "phase": 2,
   "prefix": "oceanfs-loadtest-2",
   "record": ".hetzner/provision-oceanfs-loadtest-2.json",
-  "sut":     { "name": "oceanfs-loadtest-2-sut",     "public_ip": "1.2.3.4", "internal_ip": "10.0.0.5", "type": "cx23" },
+  "sut":     { "name": "oceanfs-loadtest-2-sut",     "public_ip": "1.2.3.4", "internal_ip": "10.0.0.5", "type": "cx33",
+               "volumes": [
+                 { "role": "data",  "name": "...-vol-data",  "id": 12345, "device": "/dev/sdb",
+                   "device_id": "/dev/disk/by-id/scsi-0HC_Volume_12345", "mount": "/mnt/oceanfs-data",  "size_gb": 120 },
+                 { "role": "wal", "name": "...-vol-wal", "id": 12346, "...": "..." }
+               ] },
   "harness": { "name": "oceanfs-loadtest-2-harness", "public_ip": "1.2.3.5", "internal_ip": "10.0.0.6", "type": "cx23" },
   "ttl_hours": 4,
   "ssh_config": { "oceanfs-sut": "1.2.3.4", "oceanfs-harness": "1.2.3.5" }

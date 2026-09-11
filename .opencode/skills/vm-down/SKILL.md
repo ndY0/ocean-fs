@@ -47,10 +47,22 @@ reports and Prometheus data **before** destruction.
    (`.sut.public_ip`, `.harness.public_ip`).
 
 3. **Destroy both VMs** (idempotent — missing VMs are reported as such,
-   not errors):
+   not errors). **Volumes are deleted FIRST** (fleet-degradation f1):
+   `--destroy` reads the provisioning record's `volumes[]` (all of
+   `.sut.volumes[]` + `.sut_nodes[].volumes[]`), detaches (when attached)
+   and deletes every recorded id; if the record is missing/corrupt it
+   falls back to a name-prefix scan and logs loudly. Volumes bill per
+   GB-hour while they exist — **including when detached** — so a volume
+   surviving destroy is a billing incident, not a warning.
 
    ```bash
    ./scripts/vm-provision.sh --destroy "$PREFIX"
+   ```
+
+   Verify nothing survived (should print no matching names):
+
+   ```bash
+   hcloud volume list -o columns=name,size,server | grep "${PREFIX}" || echo "no volumes left"
    ```
 
 4. **Clean local state:**
@@ -69,6 +81,10 @@ reports and Prometheus data **before** destruction.
   "prefix": "oceanfs-loadtest-2",
   "sut":     { "name": "oceanfs-loadtest-2-sut",     "destroyed": true },
   "harness": { "name": "oceanfs-loadtest-2-harness", "destroyed": true },
+  "volumes_deleted": [
+    { "name": "oceanfs-loadtest-2-sut-vol-data", "id": 12345, "outcome": "deleted" },
+    { "name": "oceanfs-loadtest-2-sut-vol-wal",  "id": 12346, "outcome": "deleted" }
+  ],
   "preserved_data": true,
   "preserved_paths": ["local-results/2_load_sustained_20260816T100000.json", "local-results/prometheus-oceanfs-loadtest-2-20260816T100500.tar.gz"],
   "record_deleted": ".hetzner/provision-oceanfs-loadtest-2.json"
@@ -87,3 +103,10 @@ reports and Prometheus data **before** destruction.
   `preserve-data` step for anything that matters.
 - If `hcloud` reports the VMs already gone, still clean the local state
   and return `destroyed: true`.
+- **Volume guarantee (fleet-degradation f1):** a destroy that cannot delete
+  a recorded volume logs `MANUAL CLEANUP REQUIRED` and reports it — treat
+  that as an incident (the volume bills until deleted). After any destroy
+  of a `--volume-pools` environment, `hcloud volume list` must show none of
+  the record's ids; the `--status` output's `drift` flag reports a
+  recorded volume that is missing from the account, and each recorded
+  volume's `present`/`attached` fields report drift in the other direction.
