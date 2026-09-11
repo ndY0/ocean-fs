@@ -32,8 +32,10 @@ use dashmap::DashMap;
 use oceanfs_core::{Counter, LabelSet, MetricRegistrar, NodeId, OperationTimeouts};
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
+use oceanfs_storage::io::IoOp;
 use tracing::{debug, info, warn};
 
+use super::hint_io::HintIoRecorder;
 use crate::{
     error::{Error, Result},
     healing_rpc::{self, healing_rpc_client::HealingRpcClient},
@@ -252,6 +254,20 @@ pub struct HintedHandoffManager {
     /// "gave up" is never silent (the retry loop is bounded, not
     /// infinite).
     hints_dropped_total: Counter,
+    /// Needed hint debt REFUSED by the coordinator's admission gate before
+    /// any WAL attempt (hints pool Dead). Disjoint from
+    /// `hints_enqueue_failed_total`, which counts attempts that failed
+    /// inside this manager: every refused-or-failed debt path is counted
+    /// exactly once.
+    hints_rejected_write_total: Counter,
+    /// Same as [`Self::hints_rejected_write_total`] for the delete path.
+    hints_rejected_delete_total: Counter,
+    /// Optional I/O observability seam. When wired, hint-WAL `open` /
+    /// `write_hint` outcomes are recorded into the shared storage observer
+    /// under the hints pool id, giving the idle hints pool a health
+    /// producer (f0 D1). `None` keeps the previous invisible-I/O behavior
+    /// (unit tests / managers without a pool registry).
+    hint_io: Option<HintIoRecorder>,
 }
 
 /// Human-readable (bucket, key, type) for a hint record (tracing).
@@ -425,6 +441,19 @@ impl HintedHandoffManager {
                 "Hints dropped after exceeding the delivery attempt cap".into(),
                 LabelSet::empty(),
             ),
+            hints_rejected_write_total: Counter::new(
+                "hinted_handoff_hints_rejected_total".into(),
+                "Needed hint debt refused by the admission gate (disjoint from enqueue_failed)"
+                    .into(),
+                LabelSet::new(&[("reason", "pool_dead"), ("path", "write")]),
+            ),
+            hints_rejected_delete_total: Counter::new(
+                "hinted_handoff_hints_rejected_total".into(),
+                "Needed hint debt refused by the admission gate (disjoint from enqueue_failed)"
+                    .into(),
+                LabelSet::new(&[("reason", "pool_dead"), ("path", "delete")]),
+            ),
+            hint_io: None,
         }
     }
 
@@ -440,6 +469,70 @@ impl HintedHandoffManager {
         registrar.register_counter(self.hints_expired_total.clone());
         registrar.register_counter(self.hints_enqueue_failed_total.clone());
         registrar.register_counter(self.hints_dropped_total.clone());
+        registrar.register_counter(self.hints_rejected_write_total.clone());
+        registrar.register_counter(self.hints_rejected_delete_total.clone());
+    }
+
+    /// Wires the hint-WAL I/O observability seam (f0 D1).
+    ///
+    /// After this, every `HintWal::open` / `write_hint` outcome is recorded
+    /// into the shared storage observer under the recorder's pool id.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Requires a node-style IoObserver registered for the hints pool:
+    /// let manager = HintedHandoffManager::new(wal_dir, client, config)
+    ///     .with_io_recorder(HintIoRecorder::new(observer, hints_pool_id));
+    /// ```
+    #[must_use]
+    pub fn with_io_recorder(mut self, recorder: HintIoRecorder) -> Self {
+        self.hint_io = Some(recorder);
+        self
+    }
+
+    /// Counts an admission-gate refusal of needed write debt
+    /// (`reason=pool_dead`).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Requires a constructed manager (the counter is registered with it):
+    /// manager.record_rejected_write_hint();
+    /// ```
+    pub fn record_rejected_write_hint(&self) {
+        self.hints_rejected_write_total.inc();
+    }
+
+    /// Counts an admission-gate refusal of needed delete debt
+    /// (`reason=pool_dead`).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Requires a constructed manager (the counter is registered with it):
+    /// manager.record_rejected_delete_hint();
+    /// ```
+    pub fn record_rejected_delete_hint(&self) {
+        self.hints_rejected_delete_total.inc();
+    }
+
+    /// Returns the count of refused write-hint debt (for tests).
+    #[doc(hidden)]
+    pub fn hints_rejected_write_total_for_test(&self) -> u64 {
+        self.hints_rejected_write_total.get()
+    }
+
+    /// Returns the count of refused delete-hint debt (for tests).
+    #[doc(hidden)]
+    pub fn hints_rejected_delete_total_for_test(&self) -> u64 {
+        self.hints_rejected_delete_total.get()
+    }
+
+    /// Returns the count of manager WAL attempts that failed (for tests).
+    #[doc(hidden)]
+    pub fn hints_enqueue_failed_total_for_test(&self) -> u64 {
+        self.hints_enqueue_failed_total.get()
     }
 
     /// Sets the membership reference for address resolution.
@@ -472,23 +565,42 @@ impl HintedHandoffManager {
     ///
     /// Returns an error if WAL replay fails for any file.
     pub async fn replay_and_enqueue(&self) -> Result<usize> {
-        // If the WAL directory does not exist yet (first run), create it
-        // and return zero — there are no WAL files to replay.
+        // A hint WAL directory that cannot be created or read — missing
+        // mountpoint, detached/read-only device, broken parent path — must
+        // NOT refuse node startup (f0): the hints pool registers Degraded
+        // under the role-aware missing-root policy, the admission gate
+        // refuses exactly the writes that need debt, and the periodic
+        // probe keeps reporting the root's health. Boot with zero replayed
+        // hints and a warning.
         if !self.wal_dir.exists() {
-            std::fs::create_dir_all(&self.wal_dir).map_err(|e| {
-                Error::Internal(format!(
-                    "failed to create hint WAL directory {:?}: {e}",
-                    self.wal_dir
-                ))
-            })?;
-            return Ok(0);
+            match std::fs::create_dir_all(&self.wal_dir) {
+                Ok(()) => return Ok(0),
+                Err(e) => {
+                    warn!(
+                        dir = %self.wal_dir.display(),
+                        error = %e,
+                        "hint WAL directory unavailable; booting with zero replayed hints \
+                         (the honest-debt gate enforces admission)"
+                    );
+                    return Ok(0);
+                }
+            }
         }
 
         let mut total = 0usize;
 
-        let dir = std::fs::read_dir(&self.wal_dir).map_err(|e| {
-            Error::Internal(format!("failed to read WAL directory {:?}: {e}", self.wal_dir))
-        })?;
+        let dir = match std::fs::read_dir(&self.wal_dir) {
+            Ok(dir) => dir,
+            Err(e) => {
+                warn!(
+                    dir = %self.wal_dir.display(),
+                    error = %e,
+                    "hint WAL directory unreadable; booting with zero replayed hints \
+                     (the honest-debt gate enforces admission)"
+                );
+                return Ok(0);
+            }
+        };
 
         for entry in dir {
             let entry = entry
@@ -544,10 +656,15 @@ impl HintedHandoffManager {
         // in-memory queue and vanished on crash).
         let mut queue = self.queues.entry(target.clone()).or_default();
 
-        // Resolve or lazily open the per-node WAL file.
-        let wal = self.get_or_open_node_wal(&target).await.inspect_err(|_| {
+        // Resolve or lazily open the per-node WAL file. The I/O outcome is
+        // recorded into the storage observer when the seam is wired (f0
+        // D1) — latency always, error kind on failure.
+        let open_started = Instant::now();
+        let wal = self.get_or_open_node_wal(&target).await.inspect_err(|e| {
             self.hints_enqueue_failed_total.add(1);
+            self.record_hint_io(IoOp::Open, open_started, Some(e));
         })?;
+        self.record_hint_io(IoOp::Open, open_started, None);
 
         // Write to WAL first for durability.
         // Stamp the store time ONCE: retries preserve it so the TTL prune
@@ -557,9 +674,12 @@ impl HintedHandoffManager {
             record.stored_at_secs =
                 SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         }
-        let (position, end_position) = wal.write_hint(&record).await.inspect_err(|_| {
+        let write_started = Instant::now();
+        let (position, end_position) = wal.write_hint(&record).await.inspect_err(|e| {
             self.hints_enqueue_failed_total.add(1);
+            self.record_hint_io(IoOp::Write, write_started, Some(e));
         })?;
+        self.record_hint_io(IoOp::Write, write_started, None);
 
         // Then add to in-memory queue.
         queue.push_back((position, end_position, record.clone()));
@@ -573,6 +693,15 @@ impl HintedHandoffManager {
         );
 
         Ok(())
+    }
+
+    /// Records a hint-WAL operation outcome into the observer seam (f0 D1).
+    ///
+    /// No-op when the seam is not wired.
+    fn record_hint_io(&self, op: IoOp, started: Instant, error: Option<&Error>) {
+        if let Some(recorder) = &self.hint_io {
+            recorder.record(op, started.elapsed(), error);
+        }
     }
 
     /// Drains all pending hints for a target node and delivers them in a batch.
@@ -1708,5 +1837,98 @@ mod tests {
         manager.deliver_pending(NodeId::new("node-a")).await.unwrap();
         let nodes = manager.nodes_with_pending();
         assert_eq!(nodes, vec![NodeId::new("node-b")], "delivered node drops out");
+    }
+
+    // ── I/O observability seam (f0 D1) ───────────────────────────────
+
+    /// f0 boot semantics: an uncreatable hint WAL directory must not make
+    /// replay fatal — the node boots with zero hints and the gate enforces
+    /// admission.
+    #[tokio::test]
+    async fn replay_with_uncreatable_wal_dir_boots_empty() {
+        let dir = tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let wal_dir = blocked.join("hints");
+
+        let manager = HintedHandoffManager::new(
+            wal_dir.clone(),
+            Arc::new(MockDeliveryClient::new()),
+            make_test_config(wal_dir),
+        );
+        let replayed = manager.replay_and_enqueue().await.expect("replay must tolerate this");
+        assert_eq!(replayed, 0, "no hints can be replayed from an unusable directory");
+    }
+
+    #[tokio::test]
+    async fn enqueue_with_io_recorder_records_open_and_write() {
+        let dir = tempdir().unwrap();
+        let wal_dir = dir.path().to_path_buf();
+        let observer = Arc::new(oceanfs_storage::IoObserver::new());
+        observer.register_pool(5, None);
+        let recorder = crate::hinted_handoff::HintIoRecorder::new(observer.clone(), 5);
+        let manager = HintedHandoffManager::new(
+            wal_dir.clone(),
+            Arc::new(MockDeliveryClient::new()),
+            make_test_config(wal_dir),
+        )
+        .with_io_recorder(recorder);
+
+        manager
+            .enqueue(HintRecord::new_inline(
+                NodeId::new("node-io"),
+                BucketId::new("b"),
+                "key".into(),
+                vec![1].into(),
+                oceanfs_core::Hlc::zero(),
+            ))
+            .await
+            .unwrap();
+
+        let signal = observer.snapshot(5).unwrap();
+        assert_eq!(signal.errors, 0, "a healthy WAL records no errors");
+        assert!(signal.ops >= 2, "open + write_hint are observed: {}", signal.ops);
+    }
+
+    #[tokio::test]
+    async fn enqueue_wal_failure_records_error_kind_and_counter() {
+        let dir = tempdir().unwrap();
+        let wal_dir = dir.path().join("hints");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        // A DIRECTORY named `{node}.wal` makes HintWal::open fail with
+        // IsADirectory — a genuine `Error::Io` whose kind must reach the
+        // observer (unlike the Internal-wrapped create_dir_all failure).
+        let target = NodeId::new("node-broken");
+        std::fs::create_dir_all(wal_dir.join(format!("{target}.wal"))).unwrap();
+
+        let observer = Arc::new(oceanfs_storage::IoObserver::new());
+        observer.register_pool(9, None);
+        let recorder = crate::hinted_handoff::HintIoRecorder::new(observer.clone(), 9);
+        let manager = HintedHandoffManager::new(
+            wal_dir.clone(),
+            Arc::new(MockDeliveryClient::new()),
+            make_test_config(wal_dir),
+        )
+        .with_io_recorder(recorder);
+
+        let result = manager
+            .enqueue(HintRecord::new_inline(
+                target,
+                BucketId::new("b"),
+                "key".into(),
+                vec![1].into(),
+                oceanfs_core::Hlc::zero(),
+            ))
+            .await;
+        assert!(result.is_err(), "the WAL open must fail");
+
+        assert_eq!(manager.hints_enqueue_failed_total_for_test(), 1, "failure counted once");
+        assert_eq!(observer.io_error_count(9), 1, "the observer sees the failure");
+        let signal = observer.snapshot(9).unwrap();
+        assert_eq!(
+            signal.error_kinds[oceanfs_storage::IoErrorKind::IsADirectory as usize],
+            1,
+            "the io kind reaches the health signal"
+        );
     }
 }

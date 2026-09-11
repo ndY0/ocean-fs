@@ -551,6 +551,22 @@ impl WriteCoordinator {
             return self.forward_write(&forward_target, &req).await;
         }
 
+        // Step 2b: Honest-debt pre-check (f0 D2). Targets that are known
+        // to need debt NOW — not Alive / no membership address, or
+        // excluded by the write-path routing hint (write_degraded
+        // manifest) — will certainly become hint debt. If the hints pool
+        // cannot record that debt, fail fast with 503 before any local
+        // append/rollback churn: a write must never be accepted while a
+        // missing replica's debt is unrecordable. A fully-healthy replica
+        // set never consults the hints pool.
+        let debt_targets_known_now = self.known_down_debt_targets(&replica_set)
+            || replica_set
+                .iter()
+                .any(|target| *target != self.node_id && self.excluded_write_target(target));
+        if debt_targets_known_now {
+            self.hint_debt_gate(true)?;
+        }
+
         // Step 3: Local write + timestamp. Handle empty blobs early.
         // Local-write gate (g6, ADR-0029 §D3): THIS node is the ring
         // owner and must journal — a `write_degraded` wal pool (Dead)
@@ -895,6 +911,19 @@ impl WriteCoordinator {
             .take(MAX_REPLICA_FANOUT)
             .collect();
 
+        // f0 (D2, invariant completion): replica members NOT attempted by
+        // this write — routing-hint excluded, or beyond the fan-out cap —
+        // are missing copies exactly like an attempted-but-failed target.
+        // Exclusion is a placement preference, not a licence to ack an
+        // unreplicated version: their debt goes to the hint ledger too
+        // (ADR-0027 D2). Without this, RF=3/W=2 with one write_degraded
+        // member acks 200 while that member's copy is silently abandoned.
+        let unattempted: Vec<NodeId> = replica_set
+            .iter()
+            .filter(|n| **n != self.node_id && !remote_targets.contains(n))
+            .cloned()
+            .collect();
+
         if !remote_targets.is_empty() {
             let write_timeout_ms = self.timeouts.wal_write_ms;
             let results = replicate_write(
@@ -966,7 +995,6 @@ impl WriteCoordinator {
             // copies (the churn `(404,200,404)` single-copy class).
             // The segment/WAL bytes this request appended are
             // unreferenced and reclaimed by the orphan reaper.
-            let rollback_hlc = self.hlc_clock.now();
             warn!(
                 bucket = %req.bucket,
                 key = %req.key,
@@ -975,18 +1003,7 @@ impl WriteCoordinator {
                 local_row_written = local_metadata_row_written,
                 "write quorum not met; rolling back local write"
             );
-            if local_metadata_row_written {
-                if let Err(e) =
-                    self.metadata_store.delete_object(&req.bucket, &req.key, rollback_hlc).await
-                {
-                    warn!(
-                        bucket = %req.bucket,
-                        key = %req.key,
-                        error = %e,
-                        "write rollback failed"
-                    );
-                }
-            }
+            self.rollback_failed_write(&req, local_metadata_row_written).await;
             return Err(Error::QuorumNotMet { required: quorum, received: acks_received });
         }
 
@@ -1008,9 +1025,38 @@ impl WriteCoordinator {
             );
         }
 
-        // Step 6b: Quorum met — hint the replicas that missed the write.
-        for target in failed_targets {
-            self.enqueue_write_hint(&target, &req, &chunks, hlc).await;
+        // Step 6b: Quorum met — hint EVERY replica that missed the write:
+        // attempted-and-failed targets plus members never attempted
+        // (routing-hint excluded / fan-out cap). An unrecordable debt fails
+        // the write BEFORE the ack (f0): the client retries, and no version
+        // is ever acknowledged while a missing replica's debt is silently
+        // gone.
+        //
+        // If a later hint fails after earlier ones were persisted, the
+        // persisted hints are cancelled with a fresh-HLC tombstone hint per
+        // already-hinted target before the local rollback (best effort — a
+        // broken pool may refuse the cancel too; ADR-0027 D2: a rolled-back
+        // write must not leave debt for a version that never existed).
+        let mut hinted_targets: Vec<NodeId> =
+            Vec::with_capacity(failed_targets.len() + unattempted.len());
+        for target in failed_targets.iter().chain(unattempted.iter()) {
+            match self.enqueue_write_hint(target, &req, &chunks, hlc).await {
+                Ok(()) => hinted_targets.push(target.clone()),
+                Err(error) => {
+                    warn!(
+                        target = %target,
+                        bucket = %req.bucket,
+                        key = %req.key,
+                        required = quorum,
+                        received = acks_received,
+                        "write rejected after quorum: hint debt unrecordable; \
+                         cancelling partial hints and rolling back local write"
+                    );
+                    self.cancel_partial_hints(&hinted_targets, &req.bucket, &req.key).await;
+                    self.rollback_failed_write(&req, local_metadata_row_written).await;
+                    return Err(error);
+                }
+            }
         }
 
         // Step 7: Build result.
@@ -1264,15 +1310,6 @@ impl WriteCoordinator {
         Ok(meta)
     }
 
-    /// Enqueues a hinted write for a replica that missed one.
-    ///
-    /// Small blobs (≤ inline_threshold_bytes) embed the data inline.
-    /// Larger blobs reference the segment (segment_id + offset +
-    /// length) WITHOUT the data: the receiver pulls the range from
-    /// this node over gRPC (FetchHintObject) and applies it. Refs keep
-    /// hints small — embedding data would break the moment multipart
-    /// uploads make blobs reach GB sizes (the hint WAL and the gRPC
-    /// batch would balloon to the blob size).
     /// `true` when the hinted-handoff path may accept new debt: the
     /// **hints** pool (ADR-0029 §D3) is not Dead. No registry wired or no
     /// hints pool configured → always accepts (legacy behavior).
@@ -1286,26 +1323,122 @@ impl WriteCoordinator {
         }
     }
 
+    /// Admission gate for needed hint debt (f0, conditional shape).
+    ///
+    /// Refusal — and the `hinted_handoff_hints_rejected_total` counter —
+    /// happens ONLY when debt is actually required and the hints pool cannot
+    /// record it (`Dead`). A `Degraded` pool is **not** a blanket reject:
+    /// the enqueue path is the authoritative mid-flight check, so a
+    /// still-writable device keeps accepting debt (ADR-0029 §D3 matrix).
+    /// Returns the mapped 503 error on refusal.
+    fn hint_debt_gate(&self, write_path: bool) -> Result<()> {
+        if self.hints_pool_accepts() {
+            return Ok(());
+        }
+        if write_path {
+            self.hinted_handoff.record_rejected_write_hint();
+        } else {
+            self.hinted_handoff.record_rejected_delete_hint();
+        }
+        Err(Error::ServiceUnavailable("hints pool dead — cannot record hinted-handoff debt"))
+    }
+
+    /// `true` when the replica set contains a target that is known to be
+    /// unreachable BEFORE dispatch (not `Alive`, or no address in
+    /// membership) — i.e. a target whose mutation will certainly become
+    /// hint debt. Used to fail fast with 503 when the hints pool cannot
+    /// record that debt, instead of appending/discarding locally first.
+    fn known_down_debt_targets(&self, replica_set: &[NodeId]) -> bool {
+        replica_set.iter().any(|target| {
+            *target != self.node_id
+                && (self.membership.state_of(target) != Some(oceanfs_core::NodeState::Alive)
+                    || self.membership.address_of(target).is_none())
+        })
+    }
+
+    /// Rolls back a local write that will not be acked: deletes only the
+    /// Inline metadata row THIS request wrote, with a fresh-HLC tombstone so
+    /// late hints for the unacknowledged version are discarded by LWW.
+    /// Segment-tier bytes were never row-referenced here and are reclaimed
+    /// by the orphan reaper. Callers log the triggering reason.
+    async fn rollback_failed_write(&self, req: &WriteRequest, local_metadata_row_written: bool) {
+        if !local_metadata_row_written {
+            return;
+        }
+        let rollback_hlc = self.hlc_clock.now();
+        if let Err(e) = self.metadata_store.delete_object(&req.bucket, &req.key, rollback_hlc).await
+        {
+            warn!(
+                bucket = %req.bucket,
+                key = %req.key,
+                error = %e,
+                "write rollback failed"
+            );
+        }
+    }
+
+    /// Best-effort LWW cancellation of write hints already persisted for a
+    /// write that is about to be rejected.
+    ///
+    /// Each cancel is a DELETE hint carrying a fresh tombstone HLC, so the
+    /// receiver's HLC-LWW apply discards the unacknowledged version instead
+    /// of resurrecting it (ADR-0027 D2: a rolled-back write must not leave
+    /// debt for a version that never existed). Cancels bypass the admission
+    /// gate on purpose — the pool was writable moments earlier, and a
+    /// cancel is strictly corrective; if it fails anyway, the client's
+    /// retry (newer HLC) is the final LWW guard.
+    async fn cancel_partial_hints(&self, targets: &[NodeId], bucket: &BucketId, key: &ObjectKey) {
+        if targets.is_empty() {
+            return;
+        }
+        let rollback_hlc = self.hlc_clock.now();
+        for target in targets {
+            let hint = oceanfs_durability::hinted_handoff_rpc::HintRecord::new_delete(
+                target.clone(),
+                bucket.clone(),
+                key.to_string(),
+                rollback_hlc,
+            );
+            if let Err(e) = self.hinted_handoff.enqueue(hint).await {
+                warn!(
+                    target = %target,
+                    bucket = %bucket,
+                    key = %key,
+                    error = %e,
+                    "failed to cancel a partially enqueued write hint"
+                );
+            }
+        }
+    }
+
+    /// Enqueues a hinted write for a replica that missed one.
+    ///
+    /// Small blobs (≤ `inline_threshold_bytes`) embed the data inline.
+    /// Larger blobs reference the segment (segment_id + offset + length)
+    /// WITHOUT the data: the receiver pulls the range from this node over
+    /// gRPC (FetchHintObject) and applies it. Refs keep hints small —
+    /// embedding data would break the moment multipart uploads make blobs
+    /// reach GB sizes (the hint WAL and the gRPC batch would balloon to the
+    /// blob size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ServiceUnavailable`] when the hints pool is Dead
+    /// (admission refusal, counted in `hinted_handoff_hints_rejected_total`)
+    /// or when the WAL write fails (counted by the manager in
+    /// `hinted_handoff_hints_enqueue_failed_total`) — the caller must fail
+    /// the not-yet-acked write in either case.
     async fn enqueue_write_hint(
         &self,
         target: &NodeId,
         req: &WriteRequest,
         chunks: &[ChunkRef],
         hlc: Hlc,
-    ) {
-        // g2 (ADR-0029 §D3): a Dead hints pool cannot persist new debt.
-        // The hint is delivery intent, not data — reconciliation rebuilds
-        // any debt lost with the device, so skipping is the correct
-        // consequence (same "debt lost" warn the failed enqueue emits).
-        if !self.hints_pool_accepts() {
-            warn!(
-                target = %target,
-                bucket = %req.bucket,
-                key = %req.key,
-                "hinted handoff enqueue REJECTED — hints pool Dead (ADR-0029 D3); debt lost, reconciliation rebuilds"
-            );
-            return;
-        }
+    ) -> Result<()> {
+        // f0 (D2): honest admission. A hints pool that cannot record this
+        // target's debt fails the not-yet-acked write — never a silent
+        // skip (the rejection counter records the refusal exactly once).
+        self.hint_debt_gate(true)?;
         let hint = if req.data.len() as u64 <= self.hint_inline_threshold_bytes {
             oceanfs_durability::hinted_handoff_rpc::HintRecord::new_inline(
                 target.clone(),
@@ -1352,18 +1485,22 @@ impl WriteCoordinator {
             "enqueue write hint"
         );
         if let Err(e) = self.hinted_handoff.enqueue(hint).await {
-            // A failed enqueue means the debt was NOT recorded anywhere
-            // (no WAL entry, no queue entry) — the mutation is lost for
-            // this replica. Never silent: the counter + this warn are
-            // the only trace (the churn residual class).
+            // The manager counted `hints_enqueue_failed_total` (attempt
+            // failed inside the WAL); the coordinator's `rejected` counter
+            // stays reserved for gate refusals, so the two counters are
+            // disjoint and every lost-debt path is counted exactly once.
             warn!(
                 target = %target,
                 bucket = %req.bucket,
                 key = %req.key,
                 error = %e,
-                "hinted handoff enqueue FAILED — write debt lost"
+                "hinted handoff enqueue FAILED — write rejected (debt unrecordable)"
             );
+            return Err(Error::ServiceUnavailable(
+                "hinted handoff enqueue failed — debt unrecordable",
+            ));
         }
+        Ok(())
     }
 
     /// Writes a WAL entry for crash-recovery durability.
@@ -1601,6 +1738,9 @@ impl WriteCoordinator {
     /// # Errors
     ///
     /// Returns [`Error::Routing`] if the ring returns an empty replica set.
+    /// Returns [`Error::ServiceUnavailable`] when a target's tombstone debt
+    /// cannot be recorded (hints pool Dead / enqueue failed): the delete
+    /// must not be quorum-acked with the debt nowhere (f0 D2).
     pub async fn delete(
         &self,
         bucket: &BucketId,
@@ -1611,6 +1751,13 @@ impl WriteCoordinator {
         let replica_set = self.ring.lookup(hash_key.as_bytes());
         if replica_set.is_empty() {
             return Err(Error::Routing("ring returned empty replica set".into()));
+        }
+
+        // f0 D2: delete debt has the same honesty contract as write debt —
+        // known-down targets will surely need a delete hint; if the hints
+        // pool cannot record it, fail fast before touching the replicas.
+        if self.known_down_debt_targets(&replica_set) {
+            self.hint_debt_gate(false)?;
         }
 
         let mut deleted: usize = 0;
@@ -1632,6 +1779,10 @@ impl WriteCoordinator {
                         key = %key,
                         "delete replication skipped: no address in membership"
                     );
+                    // No address = unreachable = the tombstone is debt.
+                    // Recording it must succeed before the delete can be
+                    // acked (f0 D2); the old silent skip was the hole.
+                    self.enqueue_delete_hint(target, bucket, key, hlc).await?;
                     continue;
                 }
             };
@@ -1651,8 +1802,9 @@ impl WriteCoordinator {
                     // The pool pre-connects eagerly, so an unreachable
                     // replica fails HERE (connection refused at channel
                     // acquisition), not at the RPC call below. Hint it —
-                    // see the RPC failure branch.
-                    self.enqueue_delete_hint(target, bucket, key, hlc).await;
+                    // and propagate a refusal: the tombstone debt must be
+                    // recorded before the delete is acked (f0 D2).
+                    self.enqueue_delete_hint(target, bucket, key, hlc).await?;
                     continue;
                 }
             };
@@ -1706,7 +1858,7 @@ impl WriteCoordinator {
                         key = %key,
                         "delete replication failed; storing hinted handoff"
                     );
-                    self.enqueue_delete_hint(target, bucket, key, hlc).await;
+                    self.enqueue_delete_hint(target, bucket, key, hlc).await?;
                 }
             }
         }
@@ -1727,18 +1879,11 @@ impl WriteCoordinator {
         bucket: &BucketId,
         key: &ObjectKey,
         hlc: Hlc,
-    ) {
-        // g2 (ADR-0029 §D3): a Dead hints pool cannot persist new debt —
-        // skip (reconciliation rebuilds lost delete debt).
-        if !self.hints_pool_accepts() {
-            warn!(
-                target = %target,
-                bucket = %bucket,
-                key = %key,
-                "hinted handoff delete enqueue REJECTED — hints pool Dead (ADR-0029 D3)"
-            );
-            return;
-        }
+    ) -> Result<()> {
+        // f0 (D2): the delete path has the same honesty contract as the
+        // write path — a tombstone debt that cannot be recorded must not
+        // be quorum-acked.
+        self.hint_debt_gate(false)?;
         let hint = oceanfs_durability::hinted_handoff_rpc::HintRecord::new_delete(
             target.clone(),
             bucket.clone(),
@@ -1754,16 +1899,21 @@ impl WriteCoordinator {
             "enqueue delete hint"
         );
         if let Err(e) = self.hinted_handoff.enqueue(hint).await {
-            // See enqueue_write_hint: a failed enqueue is a LOST delete
-            // — the tombstone will never reach the dead replica.
+            // See enqueue_write_hint: the manager counted the failed
+            // attempt; the delete must not be acked with the tombstone
+            // debt nowhere.
             warn!(
                 target = %target,
                 bucket = %bucket,
                 key = %key,
                 error = %e,
-                "hinted handoff enqueue FAILED — delete debt lost"
+                "hinted handoff enqueue FAILED — delete rejected (debt unrecordable)"
             );
+            return Err(Error::ServiceUnavailable(
+                "hinted handoff enqueue failed — delete debt unrecordable",
+            ));
         }
+        Ok(())
     }
 }
 
@@ -2202,6 +2352,245 @@ mod tests {
         assert!(plain.hints_pool_accepts());
     }
 
+    /// Builds a real pool registry (four roles) whose hints pool is `Dead`.
+    /// Returns the registry and the hints pool id.
+    fn registry_with_dead_hints() -> (Arc<oceanfs_storage::PoolRegistry>, u32) {
+        use oceanfs_core::{
+            MissingRootPolicy, PoolRole, PoolTech, StorageConfig, StoragePoolConfig,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = StorageConfig {
+            pools: vec![
+                StoragePoolConfig {
+                    name: "data-a".into(),
+                    role: PoolRole::Data,
+                    root: dir.path().join("nvme0"),
+                    weight: None,
+                    tech: PoolTech::Auto,
+                    health: Default::default(),
+                },
+                StoragePoolConfig {
+                    name: "hints-dev".into(),
+                    role: PoolRole::Hints,
+                    root: dir.path().join("hints-dev"),
+                    weight: None,
+                    tech: PoolTech::Auto,
+                    health: Default::default(),
+                },
+                StoragePoolConfig {
+                    name: "journal".into(),
+                    role: PoolRole::Wal,
+                    root: dir.path().join("optane0"),
+                    weight: None,
+                    tech: PoolTech::Auto,
+                    health: Default::default(),
+                },
+                StoragePoolConfig {
+                    name: "meta".into(),
+                    role: PoolRole::Metadata,
+                    root: dir.path().join("optane1"),
+                    weight: None,
+                    tech: PoolTech::Auto,
+                    health: Default::default(),
+                },
+            ],
+            missing_root_policy: MissingRootPolicy::Fatal,
+        };
+        let registry = Arc::new(
+            oceanfs_storage::PoolRegistry::from_config(&storage, &dir.path().join("data"))
+                .expect("registry"),
+        );
+        let hints_id = registry.pool_by_role(PoolRole::Hints).expect("hints pool").id();
+        registry.set_status(hints_id, oceanfs_storage::PoolStatus::Dead);
+        (registry, hints_id)
+    }
+
+    /// f0 (D2): an Inline write whose remote replicas fail and whose hints
+    /// pool is Dead must be rejected 503 BEFORE the ack and leave no local
+    /// row (fresh-HLC rollback). The refusal is counted in `rejected`, not
+    /// in `enqueue_failed` — the two counters are disjoint: nothing was
+    /// attempted inside the WAL.
+    #[tokio::test]
+    async fn put_with_unrecordable_debt_rejects_503_and_rolls_back_local_row() {
+        use oceanfs_core::BucketId;
+        use oceanfs_storage_api::MetadataStore as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (coord, _pool_dir, metadata) = make_write_coordinator_with_delivery(
+            "n1",
+            &["n1", "n2", "n3"],
+            dir,
+            Arc::new(ConnectionPool::new(RpcConfig::default())),
+            Arc::new(CaptureDeliveryClient::default()),
+        )
+        .await;
+        let (registry, _) = registry_with_dead_hints();
+        let coord = coord.with_pool_registry(registry);
+
+        let bucket = BucketId::new("f0-gate");
+        let key = ObjectKey::new("inline-obj");
+        let req = WriteRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            hash_key: HashKey::from_bytes(hash_key(b"inline-obj")),
+            data: Bytes::from(vec![0xABu8; 100]), // Inline tier → local row
+            write_quorum: 1,
+            ack_after_wal: true,
+            ec_async: false,
+            policy: None,
+        };
+
+        let error = coord.put(req).await.expect_err("dead hints pool must reject needed debt");
+        assert!(
+            matches!(error, Error::ServiceUnavailable(_)),
+            "the rejection maps to a retryable 503: {error:?}"
+        );
+
+        // The local Inline row was rolled back with a fresh-HLC tombstone.
+        assert!(
+            metadata.get_object_metadata(&bucket, &key).unwrap().is_none(),
+            "no unacknowledged row may linger locally"
+        );
+        assert_eq!(
+            coord.hinted_handoff_for_test().hints_rejected_write_total_for_test(),
+            1,
+            "the gate refusal is counted exactly once"
+        );
+        assert_eq!(
+            coord.hinted_handoff_for_test().hints_enqueue_failed_total_for_test(),
+            0,
+            "disjoint counters: no WAL attempt was made"
+        );
+    }
+
+    /// f0: a write with no failed targets needs no debt — a Dead hints pool
+    /// must not reject it (conditional gate, not a blanket node flag).
+    #[tokio::test]
+    async fn put_with_no_failed_targets_succeeds_with_dead_hints_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let (coord, _pool_dir, _metadata) = make_write_coordinator_with_delivery(
+            "n1",
+            &["n1"],
+            dir,
+            Arc::new(ConnectionPool::new(RpcConfig::default())),
+            Arc::new(CaptureDeliveryClient::default()),
+        )
+        .await;
+        let (registry, _) = registry_with_dead_hints();
+        let coord = coord.with_pool_registry(registry);
+
+        let result = local_write(&coord).await;
+        assert!(result.is_ok(), "no replication failures + dead hints pool must write: {result:?}");
+        assert_eq!(
+            coord.hinted_handoff_for_test().hints_rejected_write_total_for_test(),
+            0,
+            "no debt was needed, so nothing was refused"
+        );
+    }
+
+    /// f0 D2: a known-down target (membership not Alive) is pre-checked
+    /// BEFORE any local work — with a Dead hints pool the write fails 503
+    /// and no local row is created or rolled back.
+    #[tokio::test]
+    async fn put_with_known_down_target_and_dead_hints_rejects_before_local_write() {
+        use oceanfs_core::BucketId;
+        use oceanfs_storage_api::MetadataStore as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (coord, _pool_dir, metadata) = make_write_coordinator_with_delivery(
+            "n1",
+            &["n1", "n2", "n3"],
+            dir,
+            Arc::new(ConnectionPool::new(RpcConfig::default())),
+            Arc::new(CaptureDeliveryClient::default()),
+        )
+        .await;
+        let (registry, _) = registry_with_dead_hints();
+        let coord = coord.with_pool_registry(registry);
+
+        // n3 is retained-Dead per ADR-0027 — it will surely need a hint.
+        let n3 = NodeId::new("n3");
+        coord.membership.upsert_node(
+            n3.clone(),
+            NodeState::Dead,
+            Incarnation::new(2),
+            Some("127.0.0.1:9003".parse().unwrap()),
+        );
+
+        let bucket = BucketId::new("f0-precheck");
+        let key = ObjectKey::new("k");
+        let req = WriteRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            hash_key: HashKey::from_bytes(hash_key(b"k")),
+            data: Bytes::from(vec![0xABu8; 100]),
+            write_quorum: 1,
+            ack_after_wal: true,
+            ec_async: false,
+            policy: None,
+        };
+
+        let error = coord.put(req).await.expect_err("known-down target + dead hints must reject");
+        assert!(matches!(error, Error::ServiceUnavailable(_)));
+        assert!(
+            metadata.get_object_metadata(&bucket, &key).unwrap().is_none(),
+            "the pre-check rejects before any local append/row"
+        );
+        assert_eq!(
+            coord.hinted_handoff_for_test().hints_rejected_write_total_for_test(),
+            1,
+            "the pre-check refusal is counted"
+        );
+        assert_eq!(
+            coord.hinted_handoff.pending_count(&n3),
+            0,
+            "no hint was attempted for the known-down target"
+        );
+    }
+
+    /// f0 D2 (delete path): a tombstone that cannot be recorded must fail
+    /// the delete instead of returning a partial count the caller could
+    /// mistake for quorum.
+    #[tokio::test]
+    async fn delete_with_unrecordable_debt_rejects_503_and_counts() {
+        use oceanfs_core::BucketId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (coord, _pool_dir, _metadata) = make_write_coordinator_with_delivery(
+            "n1",
+            &["n1", "n2", "n3"],
+            dir,
+            Arc::new(ConnectionPool::new(RpcConfig::default())),
+            Arc::new(CaptureDeliveryClient::default()),
+        )
+        .await;
+        let (registry, _) = registry_with_dead_hints();
+        let coord = coord.with_pool_registry(registry);
+
+        let hlc = coord.hlc_clock.now();
+        let error = coord
+            .delete(
+                &BucketId::new("f0-del"),
+                &ObjectKey::new("obj"),
+                &HashKey::from_bytes(hash_key(b"obj")),
+                hlc,
+            )
+            .await
+            .expect_err("unrecordable delete debt must fail the delete");
+        assert!(matches!(error, Error::ServiceUnavailable(_)));
+        assert_eq!(
+            coord.hinted_handoff_for_test().hints_rejected_delete_total_for_test(),
+            1,
+            "the delete refusal is counted on the delete series"
+        );
+        assert_eq!(
+            coord.hinted_handoff_for_test().hints_enqueue_failed_total_for_test(),
+            0,
+            "disjoint counters: gate refusal, not a WAL attempt"
+        );
+    }
+
     /// g6 (ADR-0029 §D3): the write coordinator's LOCAL availability
     /// gate — a Dead metadata pool rejects every write with 503, and a
     /// `write_degraded` wal pool rejects LOCAL writes with 503 (the node
@@ -2351,6 +2740,240 @@ mod tests {
             }
         }
         assert!(landed, "at least one attempted key must be n1-owned");
+    }
+
+    /// f0 D2 (invariant completion): a peer excluded by the write-path
+    /// routing hint is still a MISSING replica — the acked write must leave
+    /// its debt in the hint ledger. The pre-f0 behavior silently abandoned
+    /// it (RF=3/W=2 + one `write_degraded` member acked 200 with that copy
+    /// missing and no hint).
+    #[tokio::test]
+    async fn excluded_peer_receives_hint_debt_on_acked_write() {
+        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"])
+            .await
+            .with_routing_hint(Arc::new(ExcludePeersHint));
+
+        let mut landed = false;
+        for i in 0..50 {
+            let key = format!("excl-debt-{i}");
+            let req = WriteRequest {
+                bucket: BucketId::new("test"),
+                key: ObjectKey::new(&key),
+                hash_key: HashKey::from_bytes(hash_key(key.as_bytes())),
+                data: Bytes::from(vec![0xABu8; 8192]),
+                write_quorum: 1,
+                ack_after_wal: true,
+                ec_async: false,
+                policy: None,
+            };
+            match coord.put(req).await {
+                Ok(_) => {
+                    landed = true;
+                    assert_eq!(
+                        coord.hinted_handoff.pending_count(&NodeId::new("n2")),
+                        1,
+                        "the excluded n2 must be owed the mutation"
+                    );
+                    assert_eq!(
+                        coord.hinted_handoff.pending_count(&NodeId::new("n3")),
+                        1,
+                        "the excluded n3 must be owed the mutation"
+                    );
+                    break;
+                }
+                Err(Error::Routing(_)) => continue, // not an n1-owned key
+                Err(e) => panic!("excluded-peer write must not error: {e:?}"),
+            }
+        }
+        assert!(landed, "at least one attempted key must be n1-owned");
+    }
+
+    /// f0 D2: excluded peers need debt, so a Dead hints pool makes the write
+    /// fail fast 503 at the pre-check (before local work), counted on the
+    /// write series.
+    #[tokio::test]
+    async fn excluded_peer_with_dead_hints_pool_rejects_before_local_write() {
+        use oceanfs_core::BucketId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (coord, _pool_dir, _metadata) = make_write_coordinator_with_delivery(
+            "n1",
+            &["n1", "n2", "n3"],
+            dir,
+            Arc::new(ConnectionPool::new(RpcConfig::default())),
+            Arc::new(CaptureDeliveryClient::default()),
+        )
+        .await;
+        let (registry, _) = registry_with_dead_hints();
+        let coord =
+            coord.with_pool_registry(registry).with_routing_hint(Arc::new(ExcludePeersHint));
+
+        let mut rejected = false;
+        for i in 0..50 {
+            let key = format!("excl-dead-{i}");
+            let req = WriteRequest {
+                bucket: BucketId::new("test"),
+                key: ObjectKey::new(&key),
+                hash_key: HashKey::from_bytes(hash_key(key.as_bytes())),
+                data: Bytes::from(vec![0xABu8; 8192]),
+                write_quorum: 1,
+                ack_after_wal: true,
+                ec_async: false,
+                policy: None,
+            };
+            match coord.put(req).await {
+                Err(Error::ServiceUnavailable(_)) => {
+                    rejected = true;
+                    break;
+                }
+                // Non-n1-owned keys take the forward path in this stub
+                // cluster (no live servers); keep looking for a local key.
+                _ => continue,
+            }
+        }
+        assert!(rejected, "at least one attempted key must be n1-owned");
+        assert_eq!(
+            coord.hinted_handoff_for_test().hints_rejected_write_total_for_test(),
+            1,
+            "the pre-check refusal is counted exactly once"
+        );
+    }
+
+    /// f0 D2 (Gap 5): when the hint WAL itself cannot record debt, the write
+    /// is rejected before the ack, the local Inline row is rolled back, and
+    /// the failure is counted by the manager (`enqueue_failed`) — never on
+    /// the gate-refusal series.
+    #[tokio::test]
+    async fn hint_wal_failure_rejects_write_before_ack() {
+        use oceanfs_core::BucketId;
+        use oceanfs_storage_api::MetadataStore as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        // The manager's per-node WAL dir is `{dir}/hints`; a FILE at that
+        // path makes `create_dir_all` fail, so every hint enqueue errors.
+        std::fs::write(dir.path().join("hints"), b"not a directory").unwrap();
+        let (coord, _pool_dir, metadata) = make_write_coordinator_with_delivery(
+            "n1",
+            &["n1", "n2", "n3"],
+            dir,
+            Arc::new(ConnectionPool::new(RpcConfig::default())),
+            Arc::new(CaptureDeliveryClient::default()),
+        )
+        .await;
+
+        let bucket = BucketId::new("f0-wal-fail");
+        let key = ObjectKey::new("inline");
+        let req = WriteRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            hash_key: HashKey::from_bytes(hash_key(b"inline")),
+            data: Bytes::from(vec![0xABu8; 100]), // Inline → local row rollback
+            write_quorum: 1,
+            ack_after_wal: true,
+            ec_async: false,
+            policy: None,
+        };
+
+        let error = coord.put(req).await.expect_err("unrecordable debt must reject");
+        assert!(
+            matches!(error, Error::ServiceUnavailable(_)),
+            "the rejection maps to a retryable 503: {error:?}"
+        );
+        assert!(
+            metadata.get_object_metadata(&bucket, &key).unwrap().is_none(),
+            "the local row is rolled back"
+        );
+        assert_eq!(
+            coord.hinted_handoff_for_test().hints_enqueue_failed_total_for_test(),
+            1,
+            "the manager counts the failed WAL attempt"
+        );
+        assert_eq!(
+            coord.hinted_handoff_for_test().hints_rejected_write_total_for_test(),
+            0,
+            "disjoint: an attempted WAL failure is not a gate refusal"
+        );
+    }
+
+    /// f0 D2 (partial-debt cancellation): when a later target's hint cannot
+    /// be recorded, the hints already persisted for earlier targets are
+    /// cancelled with a fresh-HLC DELETE hint before the local rollback —
+    /// a rejected write must not leave debt for a version that never
+    /// existed (ADR-0027 D2).
+    #[tokio::test]
+    async fn partial_hint_failure_cancels_already_enqueued_hints() {
+        use oceanfs_core::BucketId;
+        use oceanfs_storage_api::MetadataStore as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (coord, pool_dir, metadata) = make_write_coordinator_with_delivery(
+            "n1",
+            &["n1", "n2", "n3"],
+            dir,
+            Arc::new(ConnectionPool::new(RpcConfig::default())),
+            Arc::new(CaptureDeliveryClient::default()),
+        )
+        .await;
+
+        let bucket = BucketId::new("f0-partial");
+        let hints_dir = pool_dir.path().join("hints");
+        let mut exercised = false;
+        for i in 0..50 {
+            let key = format!("partial-{i}");
+            let hash = HashKey::from_bytes(hash_key(key.as_bytes()));
+            let replica_set = coord.ring.lookup(hash.as_bytes());
+            if !replica_set.contains(&coord.node_id) {
+                continue; // only the owner path enqueues hints
+            }
+            let remotes: Vec<NodeId> =
+                replica_set.iter().filter(|node| **node != coord.node_id).cloned().collect();
+            if remotes.len() < 2 {
+                continue;
+            }
+            // Break the SECOND remote's per-node WAL: a DIRECTORY named
+            // `{node}.wal` makes its `HintWal::open` fail while the first
+            // remote's WAL opens normally — the deterministic partial case.
+            std::fs::create_dir_all(&hints_dir).unwrap();
+            std::fs::create_dir_all(hints_dir.join(format!("{}.wal", remotes[1]))).unwrap();
+
+            let req = WriteRequest {
+                bucket: bucket.clone(),
+                key: ObjectKey::new(&key),
+                hash_key: hash,
+                data: Bytes::from(vec![0xABu8; 100]), // Inline → local row rollback
+                write_quorum: 1,
+                ack_after_wal: true,
+                ec_async: false,
+                policy: None,
+            };
+            let object_key = req.key.clone();
+            let error = coord.put(req).await.expect_err("the second hint must fail");
+            assert!(
+                matches!(error, Error::ServiceUnavailable(_)),
+                "the rejection maps to a retryable 503: {error:?}"
+            );
+
+            // The first target has the write hint AND its fresh-HLC DELETE
+            // cancel; the second target recorded nothing.
+            assert_eq!(
+                coord.hinted_handoff.pending_count(&remotes[0]),
+                2,
+                "the persisted write hint must be followed by its cancel"
+            );
+            assert_eq!(coord.hinted_handoff.pending_count(&remotes[1]), 0);
+            assert_eq!(
+                coord.hinted_handoff_for_test().hints_enqueue_failed_total_for_test(),
+                1,
+                "only the second target's WAL attempt failed"
+            );
+            assert!(
+                metadata.get_object_metadata(&bucket, &object_key).unwrap().is_none(),
+                "the local inline row is rolled back"
+            );
+            exercised = true;
+            break;
+        }
+        assert!(exercised, "a local n1-owned key with two remotes must be exercised");
     }
 
     #[tokio::test]
@@ -3271,7 +3894,16 @@ mod tests {
     /// replicas stay tombstoned.
     #[tokio::test]
     async fn failed_replica_hinted_even_when_quorum_met_by_others() {
-        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(ConnectionPool::new(RpcConfig::default()));
+        let (coord, pool_dir, _store) = make_write_coordinator_with_delivery(
+            "n1",
+            &["n1", "n2", "n3"],
+            dir,
+            pool,
+            Arc::new(CaptureDeliveryClient::default()),
+        )
+        .await;
 
         // n2 gets a live server (its write acks → quorum met); n3 keeps
         // the helper's default address (127.0.0.1:9001, nothing
@@ -3306,6 +3938,12 @@ mod tests {
             1,
             "the failed replica must be hinted even though quorum was met without it",
         );
+        // The invariant at the DURABLE boundary: the debt is in the
+        // sender's per-node hint WAL, not merely in the in-memory queue
+        // (f0 DoD: no acked write whose missing target's debt is not in
+        // the hint WAL).
+        let n3_wal = pool_dir.path().join("hints").join(format!("{n3}.wal"));
+        assert!(n3_wal.exists(), "the hint must be durable on disk: {n3_wal:?}");
     }
 
     #[tokio::test]

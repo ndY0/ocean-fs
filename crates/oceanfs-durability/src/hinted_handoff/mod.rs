@@ -23,6 +23,7 @@
 //! per-operation timeouts).
 
 pub mod hint_delivery;
+pub mod hint_io;
 pub mod hint_wal;
 
 use std::{collections::HashMap, sync::Arc};
@@ -32,6 +33,7 @@ pub use hint_delivery::{
     GrpcHintDeliveryClient, GrpcHintObjectFetcher, HintDeliveryClient, HintedHandoffConfig,
     HintedHandoffManager,
 };
+pub use hint_io::HintIoRecorder;
 pub use hint_wal::HintWal;
 use oceanfs_core::{Counter, Hlc, LabelSet, MetricRegistrar, NodeId, OperationTimeouts, SegmentId};
 use oceanfs_membership::Membership;

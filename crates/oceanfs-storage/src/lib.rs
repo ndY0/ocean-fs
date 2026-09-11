@@ -52,6 +52,7 @@ pub use pool::{
         decide_transition, evaluate_trend, ConfirmedLoss, HealthEvent, HealthMonitor,
         HealthMonitorConfig, Latency, PoolSignal, SmartCounters, TrendVerdict,
     },
+    probe::PoolRootProbe,
     removed::PoolRemovedRecord,
     resolve_pool_root, PlacementPolicy, PoolIdResolver, PoolRegistry, PoolStatus, StoragePool,
 };

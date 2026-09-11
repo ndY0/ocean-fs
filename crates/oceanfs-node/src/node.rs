@@ -66,6 +66,13 @@ pub struct BackgroundTasks {
     /// Hinted handoff WAL prune cancellation token.
     pub(crate) hint_prune_cancel: CancellationToken,
 
+    /// Hints-root write probe (f0 D1): periodic create+write+fsync whose
+    /// outcomes are recorded into the pool health observer, so an idle
+    /// hints device still has a health producer. `None` before spawned.
+    pub(crate) hints_probe: Option<JoinHandle<()>>,
+    /// Hints-root probe cancellation token.
+    pub(crate) hints_probe_cancel: CancellationToken,
+
     /// gRPC server task handle for graceful shutdown.
     pub(crate) grpc_server: Option<JoinHandle<()>>,
     /// gRPC server cancellation token.
@@ -146,6 +153,8 @@ impl BackgroundTasks {
             delivery_cancel: CancellationToken::new(),
             hinted_handoff_prune: None,
             hint_prune_cancel: CancellationToken::new(),
+            hints_probe: None,
+            hints_probe_cancel: CancellationToken::new(),
             grpc_server: None,
             grpc_shutdown: CancellationToken::new(),
             http_server: None,
@@ -1247,6 +1256,7 @@ impl Node {
         bg.heal_cancel.cancel();
         bg.delivery_cancel.cancel();
         bg.hint_prune_cancel.cancel();
+        bg.hints_probe_cancel.cancel();
         bg.health_check_cancel.cancel();
         bg.health_cancel.cancel();
         bg.segment_replicator_cancel.cancel();
@@ -1291,6 +1301,9 @@ impl Node {
             // their tokens (drained before the stores close).
             bg.health_monitor.take(),
             bg.health_consequences.take(),
+            // f0 D1: the hints-root probe (blocking fs I/O on the blocking
+            // pool; the grace bounds a hung-device cycle).
+            bg.hints_probe.take(),
             bg.metric_poller.take(),
         ];
         Self::drain_tasks(housekeeping, grace, "housekeeping").await;

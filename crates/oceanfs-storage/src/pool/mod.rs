@@ -43,6 +43,7 @@
 pub mod drain;
 pub mod health;
 pub mod placement;
+pub mod probe;
 pub mod removed;
 
 use std::{
@@ -60,6 +61,7 @@ use oceanfs_core::{
 };
 use parking_lot::RwLock;
 pub use placement::PlacementPolicy;
+pub use probe::PoolRootProbe;
 pub use removed::PoolRemovedRecord;
 
 /// One GiB — the unit auto-derived placement weights are scaled to
@@ -1036,14 +1038,32 @@ impl PoolRegistry {
                 continue;
             }
             let id = index as u32;
+            // Role-aware missing-root policy: the hints role is
+            // degraded-by-design. Hints are delivery intent (debt), not
+            // data (ADR-0029 §D3) — a missing hints root must not refuse
+            // node startup, because the honest-admission gate (f0) is the
+            // enforcement point, not the boot. Every other role follows
+            // the configured global policy.
+            //
+            // Note: the boot probe still `create_dir_all`s a creatable
+            // missing root (unchanged for all roles), so Degraded applies
+            // when creation/probe FAILS — uncreatable parent, read-only or
+            // detached/unreadable mount, device errors — not when the
+            // directory is merely absent but creatable.
+            let effective_policy = if config.role == PoolRole::Hints {
+                MissingRootPolicy::Degraded
+            } else {
+                storage.missing_root_policy
+            };
             let (status, capacity) = match probe_root(&config.root) {
                 Ok(()) => (PoolStatus::Healthy, statvfs_capacity(&config.root).unwrap_or_default()),
-                Err(e) if storage.missing_root_policy == MissingRootPolicy::Degraded => {
+                Err(e) if effective_policy == MissingRootPolicy::Degraded => {
                     tracing::warn!(
                         pool = %config.name,
+                        role = config.role.as_str(),
                         error = %e,
                         "pool root probe failed; registering pool as Degraded \
-                         (Phase A: treated as Healthy by consumers until Phase B)"
+                         (missing-root policy)"
                     );
                     (PoolStatus::Degraded, PoolCapacity::default())
                 }
@@ -1981,6 +2001,32 @@ mod tests {
         assert_eq!(pool.weight(), 1);
         assert_eq!(pool.total_bytes(), 0);
         assert_eq!(pool.free_bytes(), 0);
+        drop(tmp);
+    }
+
+    #[test]
+    fn missing_hints_root_boots_degraded_even_under_fatal_policy() {
+        // f0: hints are debt, not data — the gate enforces honesty, not
+        // the boot. A missing hints root must degrade, never refuse.
+        let (tmp, data_dir) = layout();
+        let hints_root = uncreatable_root(tmp.path());
+        let storage = StorageConfig {
+            pools: vec![
+                pool("data-0", PoolRole::Data, &tmp.path().join("nvme0"), None),
+                pool("journal", PoolRole::Wal, &tmp.path().join("optane0"), None),
+                pool("meta", PoolRole::Metadata, &tmp.path().join("optane1"), None),
+                pool("hints-0", PoolRole::Hints, &hints_root, None),
+            ],
+            missing_root_policy: MissingRootPolicy::Fatal,
+        };
+        let registry = PoolRegistry::from_config(&storage, &data_dir)
+            .expect("the hints role degrades instead of refusing boot");
+
+        let hints = registry.pool_by_role(PoolRole::Hints).expect("hints pool");
+        assert_eq!(hints.status(), PoolStatus::Degraded);
+        // The fatal policy still applies to every other role.
+        let data = registry.data_pools()[0].clone();
+        assert_eq!(data.status(), PoolStatus::Healthy);
         drop(tmp);
     }
 

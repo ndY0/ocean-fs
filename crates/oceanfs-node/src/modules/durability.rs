@@ -476,16 +476,29 @@ impl DurabilityModule {
             max_batch_bytes: 32 * 1024 * 1024,
             max_delivery_attempts: config.hint_max_delivery_attempts,
         };
-        let hinted_handoff_manager = Arc::new(
+        // f0 D1: hint-WAL I/O becomes observable. The recorder binds the
+        // node's shared observer to the hints pool id, so `open`/`write`
+        // outcomes feed the same health signals as the data path. No hints
+        // pool registered → the manager keeps its raw (unobserved) mode.
+        let hint_io_recorder =
+            storage.registry.pool_by_role(oceanfs_core::PoolRole::Hints).map(|pool| {
+                let observer: Arc<dyn oceanfs_storage::io::IoObserving> =
+                    storage.io_observer.clone();
+                oceanfs_durability::HintIoRecorder::new(observer, pool.id())
+            });
+        let mut hinted_handoff_manager =
             HintedHandoffManager::new(hints_dir.clone(), hint_delivery_client, hint_config.clone())
                 .with_membership(membership.clone())
-                .with_timeouts(op_timeouts.clone()), // Delivery contract (ADR-0027 as amended): hints are
+                .with_timeouts(op_timeouts.clone()); // Delivery contract (ADR-0027 as amended): hints are
                                                      // NEVER dropped at the sender — deliver everything, the
                                                      // receiver's HLC-LWW apply is the single gate. The old
                                                      // obsolete pre-check dropped hints based on the sender's
                                                      // view of distributed state, which could diverge from
                                                      // the truth (the churn residual class).
-        );
+        if let Some(recorder) = hint_io_recorder {
+            hinted_handoff_manager = hinted_handoff_manager.with_io_recorder(recorder);
+        }
+        let hinted_handoff_manager = Arc::new(hinted_handoff_manager);
 
         // Replay existing hints from the WAL into in-memory queues.
         hinted_handoff_manager
@@ -706,7 +719,7 @@ impl DurabilityModule {
     pub(crate) fn spawn_loops(
         &self,
         config: &NodeConfig,
-        _storage: &StorageModule,
+        storage: &StorageModule,
         membership: Arc<Membership>,
         membership_state_store: MembershipStateStore,
         bg: &mut BackgroundTasks,
@@ -776,6 +789,51 @@ impl DurabilityModule {
             }
         }));
         bg.hint_prune_cancel = hint_prune_cancel;
+
+        // f0 D1: the hints-root write probe. The hints pool is idle by
+        // nature (no data-path traffic), so a dead or full device would
+        // never produce an observed signal — the health monitor would stay
+        // Healthy forever. A create+write+fsync cycle every
+        // `detection_window / 6` (≥ 1s, so ≥ 3 observed errors per default
+        // 30s window) records into the same IoObserver the monitor
+        // consumes, making Degraded/Dead arrive through the existing state
+        // machine. Each cycle is Tier-1 housekeeping work under the shared
+        // budget (ADR-0017 amendment); the blocking fs probe runs on the
+        // blocking pool so a hung device cannot stall a runtime worker.
+        if let Some(pool) = storage.registry.pool_by_role(oceanfs_core::PoolRole::Hints) {
+            let probe_interval =
+                Duration::from_secs((pool.health_config().detection_window_secs / 6).max(1));
+            let probe = oceanfs_storage::PoolRootProbe::new(
+                pool.id(),
+                pool.root().to_path_buf(),
+                Arc::clone(&storage.io_observer),
+            );
+            let probe_budget = Arc::clone(&self.budget);
+            let probe_cancel = CancellationToken::new();
+            let probe_token = probe_cancel.clone();
+            bg.hints_probe = Some(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = probe_token.cancelled() => break,
+                        _ = tokio::time::sleep(probe_interval) => {}
+                    }
+                    // One permit = one probe cycle (Tier-1 housekeeping).
+                    let _permit = probe_budget.acquire_housekeeping().await;
+                    let probe = probe.clone();
+                    match tokio::task::spawn_blocking(move || probe.run_once()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            warn!(error = %error, "hints-root probe failed");
+                        }
+                        Err(join_error) => {
+                            warn!(error = %join_error, "hints-root probe task failed");
+                        }
+                    }
+                }
+                info!("Hints root probe stopped");
+            }));
+            bg.hints_probe_cancel = probe_cancel;
+        }
 
         // Periodic reconciliation loop (g4 — ADR-0029 §D4 pull safety
         // net). Event-driven wake + bounded risk-prioritized queue +

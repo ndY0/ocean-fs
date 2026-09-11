@@ -38,8 +38,27 @@ fn free_ports(n: usize) -> Vec<u16> {
 }
 
 struct NodeAddrs {
+    http: String,
     grpc: String,
     membership: String,
+}
+
+/// Reserves the three explicit ports (HTTP, gRPC, membership) for one
+/// node out of a `free_ports(node_count * 3)` block.
+///
+/// Every listener a node opens must be explicit: if the HTTP listener
+/// binds `127.0.0.1:0`, the kernel can hand it a port that `free_ports`
+/// just released but another node's gRPC listener has not bound yet —
+/// that node then boots with a dead data plane (and its gRPC port is
+/// answered by the other node's S3 server). Explicit ports remove the
+/// race entirely.
+fn node_addrs(ports: &[u16], node: usize) -> NodeAddrs {
+    let base = node * 3;
+    NodeAddrs {
+        http: format!("127.0.0.1:{}", ports[base]),
+        grpc: format!("127.0.0.1:{}", ports[base + 1]),
+        membership: format!("127.0.0.1:{}", ports[base + 2]),
+    }
 }
 
 struct Booted {
@@ -110,7 +129,7 @@ fn node_config(
     NodeConfig {
         node_id: id.to_string(),
         data_dir: tmp.join("data"),
-        listen_addr: "127.0.0.1:0".into(),
+        listen_addr: addrs.http.clone(),
         grpc_listen_addr: addrs.grpc.clone(),
         membership_listen_addr: addrs.membership.clone(),
         storage,
@@ -269,19 +288,10 @@ async fn node_level_cluster_drain_serves_reads_to_detachable() {
         .with_test_writer()
         .try_init();
 
-    let ports = free_ports(6);
-    let a_addrs = NodeAddrs {
-        grpc: format!("127.0.0.1:{}", ports[0]),
-        membership: format!("127.0.0.1:{}", ports[1]),
-    };
-    let b_addrs = NodeAddrs {
-        grpc: format!("127.0.0.1:{}", ports[2]),
-        membership: format!("127.0.0.1:{}", ports[3]),
-    };
-    let c_addrs = NodeAddrs {
-        grpc: format!("127.0.0.1:{}", ports[4]),
-        membership: format!("127.0.0.1:{}", ports[5]),
-    };
+    let ports = free_ports(9);
+    let a_addrs = node_addrs(&ports, 0);
+    let b_addrs = node_addrs(&ports, 1);
+    let c_addrs = node_addrs(&ports, 2);
     let booted_a = boot_node("node-a", None, &a_addrs).await;
     let booted_b = boot_node("node-b", Some(&a_addrs.membership), &b_addrs).await;
     let booted_c = boot_node("node-c", Some(&a_addrs.membership), &c_addrs).await;
@@ -380,15 +390,9 @@ async fn blocked_cluster_drain_deletes_nothing() {
         .with_test_writer()
         .try_init();
 
-    let ports = free_ports(4);
-    let a_addrs = NodeAddrs {
-        grpc: format!("127.0.0.1:{}", ports[0]),
-        membership: format!("127.0.0.1:{}", ports[1]),
-    };
-    let b_addrs = NodeAddrs {
-        grpc: format!("127.0.0.1:{}", ports[2]),
-        membership: format!("127.0.0.1:{}", ports[3]),
-    };
+    let ports = free_ports(6);
+    let a_addrs = node_addrs(&ports, 0);
+    let b_addrs = node_addrs(&ports, 1);
     let booted_a = boot_node("node-a", None, &a_addrs).await;
     let booted_b = boot_node("node-b", Some(&a_addrs.membership), &b_addrs).await;
 
@@ -460,19 +464,10 @@ async fn cluster_drain_survives_a_restart_mid_drain() {
         .with_test_writer()
         .try_init();
 
-    let ports = free_ports(6);
-    let a_addrs = NodeAddrs {
-        grpc: format!("127.0.0.1:{}", ports[0]),
-        membership: format!("127.0.0.1:{}", ports[1]),
-    };
-    let b_addrs = NodeAddrs {
-        grpc: format!("127.0.0.1:{}", ports[2]),
-        membership: format!("127.0.0.1:{}", ports[3]),
-    };
-    let c_addrs = NodeAddrs {
-        grpc: format!("127.0.0.1:{}", ports[4]),
-        membership: format!("127.0.0.1:{}", ports[5]),
-    };
+    let ports = free_ports(9);
+    let a_addrs = node_addrs(&ports, 0);
+    let b_addrs = node_addrs(&ports, 1);
+    let c_addrs = node_addrs(&ports, 2);
     let booted_a = boot_node("node-a", None, &a_addrs).await;
     let booted_b = boot_node("node-b", Some(&a_addrs.membership), &b_addrs).await;
     let booted_c = boot_node("node-c", Some(&a_addrs.membership), &c_addrs).await;
