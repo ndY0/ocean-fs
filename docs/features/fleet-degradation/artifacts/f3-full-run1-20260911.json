@@ -1,0 +1,3141 @@
+{
+  "phase": 4,
+  "test": "load_degraded",
+  "seed": 42,
+  "duration_secs": 339.094466848,
+  "result": "fail",
+  "worker_stats": {
+    "puts_total": 9830,
+    "puts_200": 1677,
+    "puts_4xx": 0,
+    "puts_5xx": 8127,
+    "gets_total": 12767,
+    "gets_200": 1660,
+    "gets_404": 10325,
+    "deletes_total": 2436,
+    "deletes_204": 2429,
+    "heads_total": 0,
+    "heads_200": 0,
+    "errors_total": 7800,
+    "ops_total": 25033,
+    "puts_inline": 292,
+    "puts_small": 723,
+    "puts_standard": 750,
+    "puts_multi": 305,
+    "active_workers": 16,
+    "put_p50_us": 223942,
+    "put_p99_us": 3751243,
+    "get_p50_us": 1629,
+    "get_p99_us": 361897,
+    "delete_p50_us": 183122,
+    "delete_p99_us": 460737,
+    "head_p50_us": 0,
+    "head_p99_us": 0,
+    "elapsed_secs": 300.87973972
+  },
+  "manifest": {
+    "objects_written": 101,
+    "objects_verified": 100,
+    "mismatches": 1,
+    "mismatch_details": [
+      {
+        "key": "load-test/hot-90",
+        "expected_hash": "one of recorded versions",
+        "actual_hash": "absent from every alive node",
+        "node": "(all nodes)"
+      }
+    ]
+  },
+  "metric_snapshots": [
+    {
+      "metrics": {
+        "cache_rebuilds_total": 0.0,
+        "segment_active_count": 8.0,
+        "durability_cycle_duration_millis_bucket{le=\"1000\",task=\"anti_entropy\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"5000\",task=\"orphan_reaper\"}": 10.0,
+        "cache_misses_total{tier=\"l2\"}": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"100\"}": 247.0,
+        "heal_completed_total": 0.0,
+        "cache_hits_total{tier=\"l2\"}": 0.0,
+        "cache_hits_total{tier=\"l1\"}": 0.0,
+        "oceanfs_drain_dispatched_total{pool_id=\"3\"}": 0.0,
+        "hinted_handoff_hints_expired_total": 0.0,
+        "durability_cycle_skipped_total{task=\"scrub\",reason=\"overrun\"}": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"100\"}": 0.0,
+        "accel_encode_duration_us_bucket{le=\"50\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"1000\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"10000000\"}": 0.0,
+        "durability_cycle_total{task=\"drain_cluster\",status=\"ok\"}": 98.0,
+        "accel_decompress_duration_seconds_bucket{le=\"+Inf\"}": 0.0,
+        "durability_cycle_duration_millis_sum{task=\"drain_cluster\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"1\"}": 0.0,
+        "durability_cycle_total{task=\"drain_intra\",status=\"ok\"}": 98.0,
+        "accel_compress_duration_seconds_bucket{le=\"500\"}": 0.0,
+        "oceanfs_pool_status{pool_id=\"1\",role=\"wal\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"10000000\"}": 181.0,
+        "durability_cycle_duration_millis_count{task=\"gc\"}": 10.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"2500\"}": 247.0,
+        "gossip_round_duration_microseconds_bucket{le=\"50000\"}": 93.0,
+        "accel_hash_duration_seconds_bucket{le=\"10\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"25\",task=\"gc\"}": 10.0,
+        "oceanfs_ranges_under_replicated": 0.0,
+        "oceanfs_pool_drain_blocked_reason{pool_id=\"3\"}": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"10000\"}": 0.0,
+        "oceanfs_pool_drain_state{pool_id=\"0\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"500\"}": 0.0,
+        "accel_encode_ops_total": 0.0,
+        "accel_ec_fallback_total": 0.0,
+        "rocksdb_num_running_compactions": 0.0,
+        "gc_dead_bytes_total": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"1000000\"}": 181.0,
+        "accel_decode_duration_us_bucket{le=\"100000\"}": 0.0,
+        "gossip_round_duration_microseconds_sum": 3109.0,
+        "oceanfs_metadata_unavailable_seconds": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"1000\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"100\"}": 0.0,
+        "accel_encode_duration_us_bucket{le=\"5\"}": 0.0,
+        "durability_items_processed_total{task=\"orphan_reaper\"}": 0.0,
+        "oceanfs_repair_failures_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5\",task=\"orphan_reaper\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"500\",task=\"orphan_reaper\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"1\",task=\"drain_intra\"}": 98.0,
+        "gossip_round_duration_microseconds_bucket{le=\"5000\"}": 93.0,
+        "segment_flush_batches_total": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"+Inf\"}": 247.0,
+        "ring_version": 3.0,
+        "accel_encode_duration_us_bucket{le=\"500000\"}": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"1000\"}": 0.0,
+        "oceanfs_pool_drain_state{pool_id=\"1\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"2500\",task=\"scrub\"}": 2.0,
+        "oceanfs_wal_recovery_seconds": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"25\",task=\"scrub\"}": 2.0,
+        "cache_false_positives_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10000\",task=\"scrub\"}": 2.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"500\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1000\",task=\"drain_intra\"}": 98.0,
+        "durability_items_processed_total{task=\"drain_cluster\"}": 0.0,
+        "durability_cycle_skipped_total{task=\"drain_intra\",reason=\"overrun\"}": 0.0,
+        "accel_encode_duration_us_bucket{le=\"5000000\"}": 0.0,
+        "durability_cycle_duration_millis_count{task=\"anti_entropy\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"100\",task=\"drain_intra\"}": 98.0,
+        "accel_compression_fallback_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"250\",task=\"drain_cluster\"}": 98.0,
+        "heal_bytes_repaired_total": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"500\"}": 0.0,
+        "accel_decode_ops_total": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"10000000\"}": 0.0,
+        "oceanfs_metadata_rebuild_objects_total": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"10\"}": 0.0,
+        "oceanfs_drain_released_total{pool_id=\"2\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"+Inf\"}": 0.0,
+        "segment_metadata_batches_total": 0.0,
+        "orphan_segments_reaped_total": 0.0,
+        "process_open_fds": 31.0,
+        "oceanfs_pool_write_degraded{pool_id=\"0\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"50000\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"50000\"}": 179.0,
+        "accel_decode_duration_us_bucket{le=\"50\"}": 0.0,
+        "oceanfs_wal_recovery_registry_rebuilt_segments": 0.0,
+        "oceanfs_segment_replication_retries_total": 0.0,
+        "oceanfs_drain_remaining{pool_id=\"1\"}": 0.0,
+        "cache_evictions_total{tier=\"l2\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"500000\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"5000000\"}": 181.0,
+        "accel_encode_duration_us_bucket{le=\"10000\"}": 0.0,
+        "durability_housekeeping_wait_duration_millis_sum": 0.0,
+        "ae_mismatches_found_total": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"100000\"}": 93.0,
+        "wal_file_count": 1.0,
+        "accel_hash_duration_seconds_bucket{le=\"5000\"}": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"250\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"25\",task=\"drain_cluster\"}": 98.0,
+        "durability_cycle_duration_millis_bucket{le=\"2500\",task=\"drain_cluster\"}": 98.0,
+        "accel_encode_duration_us_bucket{le=\"1\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"+Inf\"}": 181.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"2500\"}": 0.0,
+        "oceanfs_metadata_rebuild_deletions_total": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"100\"}": 92.0,
+        "accel_compress_duration_seconds_bucket{le=\"1000000\"}": 0.0,
+        "gossip_messages_sent_total": 181.0,
+        "durability_housekeeping_waiters": 0.0,
+        "probe_duration_microseconds_bucket{le=\"5000000\"}": 92.0,
+        "accel_hash_duration_seconds_sum": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"+Inf\"}": 0.0,
+        "gossip_delta_entries_sum": 184.0,
+        "accel_compress_duration_seconds_bucket{le=\"5000\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"5000\"}": 0.0,
+        "oceanfs_routing_manifest_skips_total{path=\"write\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"10000\"}": 1.0,
+        "gossip_round_duration_microseconds_bucket{le=\"10000\"}": 93.0,
+        "oceanfs_pool_status{pool_id=\"2\",role=\"metadata\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10000\",task=\"drain_cluster\"}": 98.0,
+        "oceanfs_announcements_tx_total": 0.0,
+        "probe_duration_microseconds_count": 92.0,
+        "durability_cycle_duration_millis_count{task=\"drain_cluster\"}": 98.0,
+        "probe_duration_microseconds_bucket{le=\"5000\"}": 1.0,
+        "gossip_round_duration_microseconds_count": 93.0,
+        "durability_cycle_duration_millis_bucket{le=\"5000\",task=\"anti_entropy\"}": 10.0,
+        "hinted_handoff_hints_delivered_total": 0.0,
+        "gossip_delta_entries_bucket{le=\"5000\"}": 181.0,
+        "rocksdb_memtable_size_bytes": 4096.0,
+        "durability_cycle_duration_millis_bucket{le=\"+Inf\",task=\"drain_intra\"}": 98.0,
+        "durability_cycle_total{task=\"orphan_reaper\",status=\"ok\"}": 10.0,
+        "gossip_push_duration_microseconds_bucket{le=\"500\"}": 0.0,
+        "oceanfs_drain_dispatched_total{pool_id=\"2\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"100\"}": 0.0,
+        "gc_compaction_bytes_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"50\",task=\"gc\"}": 10.0,
+        "oceanfs_pool_drain_blocked_reason{pool_id=\"2\"}": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"10\"}": 0.0,
+        "oceanfs_pool_io_errors_total{pool_id=\"0\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"100000\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"5\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10\",task=\"anti_entropy\"}": 10.0,
+        "accel_encode_errors_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"25\",task=\"anti_entropy\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"60000\",task=\"scrub\"}": 2.0,
+        "durability_cycle_duration_millis_bucket{le=\"60000\",task=\"gc\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"500\",task=\"drain_intra\"}": 98.0,
+        "durability_cycle_duration_millis_bucket{le=\"5000\",task=\"drain_cluster\"}": 98.0,
+        "probe_duration_microseconds_bucket{le=\"50\"}": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"1000\"}": 93.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"25\"}": 247.0,
+        "oceanfs_reconcile_scan_ms": 0.0,
+        "oceanfs_segment_replication_failures_total": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"1000\"}": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"1000000\"}": 93.0,
+        "oceanfs_lifecycle_registry_entries": 0.0,
+        "durability_cycle_skipped_total{task=\"orphan_reaper\",reason=\"overrun\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"10000\"}": 0.0,
+        "process_resident_memory_bytes": 1194725376.0,
+        "durability_cycle_duration_millis_bucket{le=\"50\",task=\"orphan_reaper\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"1\",task=\"orphan_reaper\"}": 10.0,
+        "wal_bytes_written_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"60000\",task=\"anti_entropy\"}": 10.0,
+        "accel_compress_duration_seconds_bucket{le=\"100\"}": 0.0,
+        "oceanfs_event_wal_truncated_bytes": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10000\",task=\"orphan_reaper\"}": 10.0,
+        "durability_cycle_total{task=\"orphan_reaper\",status=\"error\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5\",task=\"drain_cluster\"}": 98.0,
+        "durability_cycle_duration_millis_bucket{le=\"1\",task=\"scrub\"}": 2.0,
+        "accel_decode_duration_us_bucket{le=\"1000000\"}": 0.0,
+        "cache_misses_total{tier=\"l1\"}": 0.0,
+        "gc_segments_compacted_total": 0.0,
+        "hinted_handoff_hints_stored_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1\",task=\"drain_cluster\"}": 98.0,
+        "oceanfs_pool_io_errors_total{pool_id=\"1\"}": 0.0,
+        "oceanfs_repair_queue_depth{priority=\"announcement\"}": 0.0,
+        "accel_decode_duration_us_sum": 0.0,
+        "accel_encode_duration_us_count": 0.0,
+        "gossip_delta_entries_bucket{le=\"50\"}": 181.0,
+        "oceanfs_pool_bytes_total{pool_id=\"2\"}": 20957446144.0,
+        "accel_hash_duration_seconds_count": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"+Inf\"}": 93.0,
+        "accel_encode_duration_us_bucket{le=\"10000000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10000\",task=\"anti_entropy\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"50\",task=\"drain_intra\"}": 98.0,
+        "durability_cycle_duration_millis_bucket{le=\"2500\",task=\"gc\"}": 10.0,
+        "durability_items_processed_total{task=\"gc\"}": 0.0,
+        "gossip_delta_entries_bucket{le=\"5\"}": 181.0,
+        "oceanfs_pool_bytes_free{pool_id=\"1\"}": 19866902528.0,
+        "accel_decompress_duration_seconds_bucket{le=\"100\"}": 0.0,
+        "oceanfs_pool_status{pool_id=\"3\",role=\"hints\"}": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"1\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"500000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1000\",task=\"orphan_reaper\"}": 10.0,
+        "probe_duration_microseconds_bucket{le=\"500\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"+Inf\",task=\"anti_entropy\"}": 10.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"5\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"60000\",task=\"drain_cluster\"}": 98.0,
+        "durability_cycle_duration_millis_bucket{le=\"250\",task=\"gc\"}": 10.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"500\"}": 247.0,
+        "hinted_handoff_hints_enqueue_failed_total": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"5\"}": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"1\"}": 247.0,
+        "accel_decompress_duration_seconds_sum": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"5\"}": 0.0,
+        "oceanfs_wal_recovery_caught_up_total": 0.0,
+        "oceanfs_segment_replication_pushed_total": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"5000\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"1\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"1\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"100\",task=\"orphan_reaper\"}": 10.0,
+        "gossip_delta_entries_bucket{le=\"10\"}": 181.0,
+        "accel_decompress_duration_seconds_bucket{le=\"10000000\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"1\"}": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"5000000\"}": 93.0,
+        "oceanfs_pool_write_degraded{pool_id=\"1\"}": 0.0,
+        "accel_compress_duration_seconds_count": 0.0,
+        "oceanfs_pool_bytes_free{pool_id=\"2\"}": 19866902528.0,
+        "oceanfs_pool_bytes_total{pool_id=\"3\"}": 10464022528.0,
+        "durability_repair_wait_duration_millis_count": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"100\",task=\"drain_cluster\"}": 98.0,
+        "durability_cycle_total{task=\"drain_intra\",status=\"error\"}": 0.0,
+        "grpc_connection_errors_total": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"50\"}": 0.0,
+        "oceanfs_event_wal_checkpoint_bytes": 0.0,
+        "oceanfs_pool_drain_blocked_reason{pool_id=\"0\"}": 0.0,
+        "durability_cycle_duration_millis_count{task=\"scrub\"}": 2.0,
+        "durability_cycle_duration_millis_bucket{le=\"+Inf\",task=\"orphan_reaper\"}": 10.0,
+        "durability_repair_wait_duration_millis_sum": 0.0,
+        "cache_entry_count{tier=\"l1\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10\",task=\"drain_cluster\"}": 98.0,
+        "scrub_segments_corrupt_total": 0.0,
+        "oceanfs_event_wal_bytes": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"500\",task=\"anti_entropy\"}": 10.0,
+        "s3_requests_total{method=\"GET\"}": 0.0,
+        "gossip_delta_entries_count": 181.0,
+        "s3_requests_total{method=\"PUT\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"25\",task=\"orphan_reaper\"}": 10.0,
+        "accel_encode_duration_us_bucket{le=\"1000000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"60000\",task=\"drain_intra\"}": 98.0,
+        "durability_cycle_duration_millis_bucket{le=\"10\",task=\"scrub\"}": 2.0,
+        "oceanfs_drain_dispatched_total{pool_id=\"1\"}": 0.0,
+        "oceanfs_pool_write_degraded{pool_id=\"2\"}": 0.0,
+        "accel_encode_duration_us_bucket{le=\"5000\"}": 0.0,
+        "segment_fsyncs_total": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"500\"}": 93.0,
+        "oceanfs_pool_bytes_total{pool_id=\"1\"}": 20957446144.0,
+        "rocksdb_live_sst_files_size_bytes": 0.0,
+        "durability_repair_waiters": 0.0,
+        "accel_decode_duration_us_bucket{le=\"5000000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5\",task=\"anti_entropy\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"1\",task=\"anti_entropy\"}": 10.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"50\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"100000\"}": 0.0,
+        "durability_items_processed_total{task=\"scrub\"}": 0.0,
+        "durability_items_processed_total{task=\"drain_intra\"}": 0.0,
+        "durability_cycle_skipped_total{task=\"drain_cluster\",reason=\"overrun\"}": 0.0,
+        "oceanfs_pool_bytes_free{pool_id=\"0\"}": 119767867392.0,
+        "accel_hash_duration_seconds_bucket{le=\"50000\"}": 0.0,
+        "gossip_delta_entries_bucket{le=\"10000000\"}": 181.0,
+        "probe_duration_microseconds_bucket{le=\"5\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"+Inf\"}": 92.0,
+        "accel_decode_duration_us_bucket{le=\"5000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"100\",task=\"anti_entropy\"}": 10.0,
+        "probe_duration_microseconds_sum": 3808992.0,
+        "oceanfs_pool_io_errors_total{pool_id=\"3\"}": 0.0,
+        "orphan_bytes_reclaimed_total": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"500000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10000\",task=\"gc\"}": 10.0,
+        "gossip_push_duration_microseconds_bucket{le=\"10000\"}": 0.0,
+        "oceanfs_drain_remaining{pool_id=\"2\"}": 0.0,
+        "gossip_delta_entries_bucket{le=\"1\"}": 179.0,
+        "accel_decode_duration_us_bucket{le=\"10\"}": 0.0,
+        "oceanfs_event_wal_append_count": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"100\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"10000\"}": 0.0,
+        "oceanfs_routing_cache_misses_total": 0.0,
+        "durability_cycle_duration_millis_count{task=\"drain_intra\"}": 98.0,
+        "accel_decode_duration_us_bucket{le=\"+Inf\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"10\"}": 0.0,
+        "oceanfs_drain_released_total{pool_id=\"0\"}": 0.0,
+        "metadata_supersede_captured_total": 0.0,
+        "probe_duration_microseconds_bucket{le=\"1\"}": 0.0,
+        "durability_cycle_duration_millis_count{task=\"orphan_reaper\"}": 10.0,
+        "cache_evictions_total{tier=\"l1\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"100000\"}": 181.0,
+        "indirect_probes_total": 0.0,
+        "oceanfs_pool_bytes_free{pool_id=\"3\"}": 9910349824.0,
+        "probe_duration_microseconds_bucket{le=\"50000\"}": 92.0,
+        "accel_decompress_duration_seconds_bucket{le=\"1000000\"}": 0.0,
+        "oceanfs_pool_drain_state{pool_id=\"3\"}": 0.0,
+        "oceanfs_event_wal_files": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10\",task=\"drain_intra\"}": 98.0,
+        "durability_cycle_duration_millis_bucket{le=\"100\",task=\"gc\"}": 10.0,
+        "oceanfs_routing_manifest_skips_total{path=\"read\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"5\"}": 0.0,
+        "oceanfs_startup_rebuild_ms": 0.0,
+        "gossip_delta_entries_bucket{le=\"100\"}": 181.0,
+        "gossip_push_duration_microseconds_sum": 7660527.0,
+        "durability_cycle_total{task=\"gc\",status=\"error\"}": 0.0,
+        "rocksdb_estimate_num_keys": 0.0,
+        "gossip_delta_entries_bucket{le=\"+Inf\"}": 181.0,
+        "accel_decode_duration_us_bucket{le=\"10000\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"5000000\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"1000\"}": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"10000\"}": 247.0,
+        "accel_encode_duration_us_bucket{le=\"100000\"}": 0.0,
+        "buffer_pool_buffers_available": 4088.0,
+        "durability_cycle_duration_millis_bucket{le=\"250\",task=\"orphan_reaper\"}": 10.0,
+        "gossip_messages_dropped_total": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"10000000\"}": 93.0,
+        "durability_cycle_duration_millis_bucket{le=\"5000\",task=\"gc\"}": 10.0,
+        "accel_compress_duration_seconds_sum": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1\",task=\"gc\"}": 10.0,
+        "durability_cycle_total{task=\"anti_entropy\",status=\"error\"}": 0.0,
+        "oceanfs_metadata_rebuild_range_errors_total": 0.0,
+        "oceanfs_routing_failover_total": 0.0,
+        "rocksdb_block_cache_hit": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"50\",task=\"drain_cluster\"}": 98.0,
+        "durability_cycle_total{task=\"gc\",status=\"ok\"}": 10.0,
+        "accel_compress_duration_seconds_bucket{le=\"5\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"1000000\"}": 92.0,
+        "gossip_delta_entries_bucket{le=\"1000\"}": 181.0,
+        "durability_cycle_duration_millis_sum{task=\"drain_intra\"}": 0.0,
+        "heal_requests_total": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"50\"}": 0.0,
+        "accel_encode_duration_us_bucket{le=\"500\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"2500\",task=\"anti_entropy\"}": 10.0,
+        "durability_cycle_duration_millis_sum{task=\"gc\"}": 0.0,
+        "gossip_delta_entries_bucket{le=\"500000\"}": 181.0,
+        "probe_duration_microseconds_bucket{le=\"100000\"}": 92.0,
+        "durability_cycle_duration_millis_bucket{le=\"25\",task=\"drain_intra\"}": 98.0,
+        "oceanfs_drain_released_total{pool_id=\"3\"}": 0.0,
+        "accel_decode_duration_us_count": 0.0,
+        "scrub_segments_checked_total": 0.0,
+        "heal_failed_total": 0.0,
+        "accel_encode_duration_us_bucket{le=\"1000\"}": 0.0,
+        "oceanfs_drain_remaining{pool_id=\"0\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"250\",task=\"drain_intra\"}": 98.0,
+        "oceanfs_repair_queue_depth{priority=\"reconciliation\"}": 0.0,
+        "cache_entry_count": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5\",task=\"drain_intra\"}": 98.0,
+        "gossip_push_duration_microseconds_bucket{le=\"500000\"}": 181.0,
+        "gossip_round_duration_microseconds_bucket{le=\"5\"}": 2.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"50\"}": 247.0,
+        "durability_cycle_duration_millis_sum{task=\"scrub\"}": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"1000\"}": 247.0,
+        "s3_requests_total{method=\"DELETE\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5\",task=\"gc\"}": 10.0,
+        "probe_duration_microseconds_bucket{le=\"100\"}": 0.0,
+        "durability_repair_active": 0.0,
+        "grpc_connections_active": 0.0,
+        "accel_decompress_duration_seconds_count": 0.0,
+        "oceanfs_wal_replaced_total": 0.0,
+        "durability_cycle_total{task=\"drain_cluster\",status=\"error\"}": 0.0,
+        "grpc_health_check_failures_total": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"50\"}": 87.0,
+        "oceanfs_pool_io_errors_total{pool_id=\"2\"}": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"10\"}": 247.0,
+        "oceanfs_lifecycle_registry_bytes_estimate": 0.0,
+        "durability_items_processed_total{task=\"anti_entropy\"}": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"5\"}": 247.0,
+        "gossip_round_duration_microseconds_bucket{le=\"10\"}": 2.0,
+        "accel_encode_duration_us_bucket{le=\"50000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5\",task=\"scrub\"}": 2.0,
+        "gossip_delta_entries_bucket{le=\"100000\"}": 181.0,
+        "accel_encode_duration_us_bucket{le=\"100\"}": 0.0,
+        "metadata_supersede_dead_bytes_total": 0.0,
+        "probe_duration_microseconds_bucket{le=\"10000000\"}": 92.0,
+        "accel_decompress_duration_seconds_bucket{le=\"50\"}": 0.0,
+        "segment_seal_errors_total": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"250\"}": 247.0,
+        "gossip_delta_entries_bucket{le=\"5000000\"}": 181.0,
+        "rocksdb_estimate_table_readers_mem_bytes": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10000\",task=\"drain_intra\"}": 98.0,
+        "oceanfs_drain_released_total{pool_id=\"1\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1000\",task=\"drain_cluster\"}": 98.0,
+        "oceanfs_drain_dispatched_total{pool_id=\"0\"}": 0.0,
+        "accel_encode_duration_us_bucket{le=\"+Inf\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"50\",task=\"scrub\"}": 2.0,
+        "probe_duration_microseconds_bucket{le=\"1000\"}": 1.0,
+        "oceanfs_segment_replication_bytes_total": 0.0,
+        "hinted_handoff_hints_rejected_total{reason=\"pool_dead\",path=\"write\"}": 0.0,
+        "oceanfs_announcements_rx_total": 0.0,
+        "durability_housekeeping_wait_duration_millis_count": 247.0,
+        "oceanfs_ranges_re_replicated_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"100\",task=\"scrub\"}": 2.0,
+        "gossip_round_duration_microseconds_bucket{le=\"1\"}": 0.0,
+        "gossip_delta_entries_bucket{le=\"50000\"}": 181.0,
+        "rocksdb_num_running_flushes": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"1000000\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"1\"}": 0.0,
+        "durability_cycle_total{task=\"scrub\",status=\"error\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"5000000\"}": 0.0,
+        "cache_size_bytes{tier=\"l1\"}": 0.0,
+        "durability_cycle_total{task=\"scrub\",status=\"ok\"}": 2.0,
+        "durability_housekeeping_active": 0.0,
+        "accel_encode_duration_us_sum": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"+Inf\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"10\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"250\",task=\"anti_entropy\"}": 10.0,
+        "accel_compress_duration_seconds_bucket{le=\"5000000\"}": 0.0,
+        "buffer_pool_bytes_allocated": 268435456.0,
+        "durability_cycle_duration_millis_bucket{le=\"500\",task=\"gc\"}": 10.0,
+        "oceanfs_pool_bytes_total{pool_id=\"0\"}": 126227120128.0,
+        "accel_hash_duration_seconds_bucket{le=\"50\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1000\",task=\"gc\"}": 10.0,
+        "accel_decode_duration_us_bucket{le=\"10000000\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"500000\"}": 92.0,
+        "gossip_delta_entries_bucket{le=\"500\"}": 181.0,
+        "oceanfs_announcements_accepted": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"10\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10\",task=\"orphan_reaper\"}": 10.0,
+        "accel_compress_duration_seconds_bucket{le=\"500000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"60000\",task=\"orphan_reaper\"}": 10.0,
+        "oceanfs_pool_drain_blocked_reason{pool_id=\"1\"}": 0.0,
+        "wal_truncations_total": 1.0,
+        "gossip_round_duration_microseconds_bucket{le=\"500000\"}": 93.0,
+        "durability_cycle_duration_millis_bucket{le=\"+Inf\",task=\"scrub\"}": 2.0,
+        "accel_bytes_decoded_total": 0.0,
+        "accel_bytes_encoded_total": 0.0,
+        "accel_decode_errors_total": 0.0,
+        "gossip_push_duration_microseconds_count": 181.0,
+        "durability_cycle_duration_millis_bucket{le=\"2500\",task=\"orphan_reaper\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"250\",task=\"scrub\"}": 2.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"5000\"}": 247.0,
+        "durability_cycle_total{task=\"anti_entropy\",status=\"ok\"}": 10.0,
+        "oceanfs_drain_remaining{pool_id=\"3\"}": 0.0,
+        "gc_cycles_total": 10.0,
+        "accel_decompress_duration_seconds_bucket{le=\"500\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"500\",task=\"scrub\"}": 2.0,
+        "durability_cycle_duration_millis_bucket{le=\"+Inf\",task=\"gc\"}": 10.0,
+        "durability_cycle_skipped_total{task=\"gc\",reason=\"overrun\"}": 0.0,
+        "oceanfs_wal_recovery_pending": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10\",task=\"gc\"}": 10.0,
+        "accel_decompress_duration_seconds_bucket{le=\"50000\"}": 0.0,
+        "rocksdb_num_files_at_level_0": 0.0,
+        "oceanfs_pool_drain_state{pool_id=\"2\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"500\",task=\"drain_cluster\"}": 98.0,
+        "gc_bytes_reclaimed_total": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"5000\"}": 0.0,
+        "s3_requests_total{method=\"HEAD\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5000\",task=\"drain_intra\"}": 98.0,
+        "ae_segments_compared_total": 0.0,
+        "oceanfs_segment_replication_needs_gauge": 0.0,
+        "durability_cycle_duration_millis_sum{task=\"orphan_reaper\"}": 0.0,
+        "cache_hits_total{tier=\"l3\"}": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"25\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"10000\"}": 0.0,
+        "s3_requests_total{method=\"LIST\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"1000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"+Inf\",task=\"drain_cluster\"}": 98.0,
+        "accel_tier_active{tier=\"cpusimd\",operation=\"encode\"}": 1.0,
+        "oceanfs_pool_status{pool_id=\"0\",role=\"data\"}": 0.0,
+        "accel_runtime_fallback_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"2500\",task=\"drain_intra\"}": 98.0,
+        "probe_failures_total": 0.0,
+        "oceanfs_repair_enqueued_total": 0.0,
+        "gossip_messages_received_total": 364.0,
+        "s3_request_errors_total": 0.0,
+        "rocksdb_block_cache_miss": 0.0,
+        "durability_cycle_duration_millis_sum{task=\"anti_entropy\"}": 0.0,
+        "hinted_handoff_hints_rejected_total{reason=\"pool_dead\",path=\"delete\"}": 0.0,
+        "cache_inline_hits_total": 0.0,
+        "durability_cycle_skipped_total{task=\"anti_entropy\",reason=\"overrun\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"100000\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"50000\"}": 0.0,
+        "accel_encode_duration_us_bucket{le=\"10\"}": 0.0,
+        "gossip_delta_entries_bucket{le=\"1000000\"}": 181.0,
+        "durability_cycle_duration_millis_bucket{le=\"1000\",task=\"scrub\"}": 2.0,
+        "oceanfs_pool_write_degraded{pool_id=\"3\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5000\",task=\"scrub\"}": 2.0,
+        "hinted_handoff_hints_dropped_total": 0.0,
+        "gossip_delta_entries_bucket{le=\"10000\"}": 181.0,
+        "durability_cycle_duration_millis_bucket{le=\"50\",task=\"anti_entropy\"}": 10.0
+      }
+    },
+    {
+      "metrics": {
+        "accel_compress_duration_seconds_bucket{le=\"1\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"250\",task=\"scrub\"}": 2.0,
+        "accel_compress_duration_seconds_bucket{le=\"+Inf\"}": 0.0,
+        "oceanfs_ranges_re_replicated_total": 0.0,
+        "s3_requests_total{method=\"HEAD\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"2500\",task=\"scrub\"}": 2.0,
+        "durability_cycle_duration_millis_bucket{le=\"25\",task=\"anti_entropy\"}": 10.0,
+        "durability_items_processed_total{task=\"scrub\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"10000000\"}": 0.0,
+        "oceanfs_wal_recovery_seconds": 0.0,
+        "gossip_delta_entries_bucket{le=\"100\"}": 181.0,
+        "durability_cycle_duration_millis_sum{task=\"orphan_reaper\"}": 0.0,
+        "oceanfs_drain_remaining{pool_id=\"1\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"500\"}": 0.0,
+        "oceanfs_repair_queue_depth{priority=\"reconciliation\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"10000\"}": 0.0,
+        "oceanfs_reconcile_scan_ms": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"25\"}": 0.0,
+        "durability_cycle_total{task=\"orphan_reaper\",status=\"ok\"}": 10.0,
+        "gossip_push_duration_microseconds_bucket{le=\"500\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10000\",task=\"scrub\"}": 2.0,
+        "durability_cycle_duration_millis_count{task=\"anti_entropy\"}": 10.0,
+        "rocksdb_estimate_num_keys": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"10\"}": 0.0,
+        "accel_decode_duration_us_count": 0.0,
+        "wal_truncations_total": 1.0,
+        "gossip_round_duration_microseconds_bucket{le=\"+Inf\"}": 93.0,
+        "grpc_connection_errors_total": 0.0,
+        "accel_decode_duration_us_bucket{le=\"5000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"50\",task=\"gc\"}": 10.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"1\"}": 0.0,
+        "hinted_handoff_hints_dropped_total": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"500\"}": 238.0,
+        "oceanfs_segment_replication_retries_total": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"5\"}": 238.0,
+        "durability_cycle_duration_millis_count{task=\"orphan_reaper\"}": 10.0,
+        "accel_encode_duration_us_bucket{le=\"10000000\"}": 0.0,
+        "rocksdb_estimate_table_readers_mem_bytes": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"10\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"5000\"}": 1.0,
+        "cache_entry_count{tier=\"l1\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"100\",task=\"anti_entropy\"}": 10.0,
+        "durability_cycle_total{task=\"anti_entropy\",status=\"error\"}": 0.0,
+        "hinted_handoff_hints_stored_total": 0.0,
+        "durability_cycle_skipped_total{task=\"drain_cluster\",reason=\"overrun\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"500000\"}": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"10\"}": 238.0,
+        "gossip_push_duration_microseconds_bucket{le=\"5000000\"}": 181.0,
+        "hinted_handoff_hints_rejected_total{reason=\"pool_dead\",path=\"write\"}": 0.0,
+        "oceanfs_drain_released_total{pool_id=\"2\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"5000\"}": 0.0,
+        "gc_dead_bytes_total": 0.0,
+        "accel_compress_duration_seconds_sum": 0.0,
+        "durability_items_processed_total{task=\"anti_entropy\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5\",task=\"anti_entropy\"}": 10.0,
+        "accel_bytes_decoded_total": 0.0,
+        "orphan_bytes_reclaimed_total": 0.0,
+        "probe_duration_microseconds_bucket{le=\"1000000\"}": 93.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"50\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"+Inf\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"250\",task=\"drain_cluster\"}": 94.0,
+        "accel_compress_duration_seconds_count": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"100000\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"500\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"50\"}": 0.0,
+        "durability_cycle_skipped_total{task=\"gc\",reason=\"overrun\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"5000000\"}": 0.0,
+        "gossip_delta_entries_sum": 273.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"1000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"2500\",task=\"drain_cluster\"}": 94.0,
+        "accel_hash_duration_seconds_count": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"2500\",task=\"anti_entropy\"}": 10.0,
+        "accel_decode_duration_us_bucket{le=\"100000\"}": 0.0,
+        "oceanfs_drain_dispatched_total{pool_id=\"0\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"50\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"1000\"}": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"100000\"}": 93.0,
+        "accel_decompress_duration_seconds_sum": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1000\",task=\"orphan_reaper\"}": 10.0,
+        "gossip_delta_entries_bucket{le=\"10000000\"}": 181.0,
+        "durability_cycle_duration_millis_sum{task=\"drain_cluster\"}": 0.0,
+        "durability_cycle_total{task=\"drain_cluster\",status=\"error\"}": 0.0,
+        "rocksdb_live_sst_files_size_bytes": 0.0,
+        "oceanfs_pool_bytes_total{pool_id=\"1\"}": 20957446144.0,
+        "cache_evictions_total{tier=\"l2\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"5000\"}": 0.0,
+        "oceanfs_wal_recovery_caught_up_total": 0.0,
+        "accel_encode_duration_us_bucket{le=\"500000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"+Inf\",task=\"drain_cluster\"}": 94.0,
+        "gossip_push_duration_microseconds_bucket{le=\"1000\"}": 1.0,
+        "accel_hash_duration_seconds_bucket{le=\"5\"}": 0.0,
+        "oceanfs_drain_remaining{pool_id=\"0\"}": 0.0,
+        "oceanfs_announcements_tx_total": 0.0,
+        "hinted_handoff_hints_delivered_total": 0.0,
+        "gossip_delta_entries_bucket{le=\"1000\"}": 181.0,
+        "accel_encode_duration_us_bucket{le=\"5000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10000\",task=\"anti_entropy\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"60000\",task=\"gc\"}": 10.0,
+        "durability_repair_wait_duration_millis_sum": 0.0,
+        "scrub_segments_corrupt_total": 0.0,
+        "metadata_supersede_captured_total": 0.0,
+        "gc_segments_compacted_total": 0.0,
+        "probe_duration_microseconds_bucket{le=\"10000000\"}": 93.0,
+        "oceanfs_drain_released_total{pool_id=\"1\"}": 0.0,
+        "oceanfs_pool_bytes_total{pool_id=\"3\"}": 10464022528.0,
+        "gossip_round_duration_microseconds_bucket{le=\"10000000\"}": 93.0,
+        "accel_decompress_duration_seconds_bucket{le=\"10000000\"}": 0.0,
+        "gossip_messages_received_total": 273.0,
+        "durability_cycle_duration_millis_bucket{le=\"100\",task=\"gc\"}": 10.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"25\"}": 238.0,
+        "oceanfs_pool_write_degraded{pool_id=\"2\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"500\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"500000\"}": 93.0,
+        "accel_hash_duration_seconds_bucket{le=\"50\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"500\",task=\"gc\"}": 10.0,
+        "s3_requests_total{method=\"PUT\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"25\",task=\"drain_intra\"}": 94.0,
+        "wal_file_count": 1.0,
+        "accel_decompress_duration_seconds_bucket{le=\"5\"}": 0.0,
+        "gossip_messages_sent_total": 181.0,
+        "gossip_round_duration_microseconds_bucket{le=\"50000\"}": 93.0,
+        "durability_cycle_duration_millis_bucket{le=\"500\",task=\"orphan_reaper\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"1000\",task=\"drain_cluster\"}": 94.0,
+        "oceanfs_event_wal_checkpoint_bytes": 0.0,
+        "durability_cycle_total{task=\"drain_intra\",status=\"ok\"}": 94.0,
+        "s3_requests_total{method=\"DELETE\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1\",task=\"drain_intra\"}": 94.0,
+        "oceanfs_ranges_under_replicated": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10\",task=\"anti_entropy\"}": 10.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"50\"}": 238.0,
+        "gossip_delta_entries_bucket{le=\"10\"}": 181.0,
+        "durability_cycle_duration_millis_bucket{le=\"1\",task=\"gc\"}": 10.0,
+        "heal_bytes_repaired_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10000\",task=\"drain_cluster\"}": 94.0,
+        "gossip_round_duration_microseconds_bucket{le=\"10000\"}": 93.0,
+        "probe_duration_microseconds_bucket{le=\"50000\"}": 93.0,
+        "oceanfs_routing_manifest_skips_total{path=\"write\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"25\",task=\"drain_cluster\"}": 94.0,
+        "durability_cycle_duration_millis_bucket{le=\"10000\",task=\"drain_intra\"}": 94.0,
+        "gossip_round_duration_microseconds_bucket{le=\"100\"}": 93.0,
+        "durability_cycle_total{task=\"drain_intra\",status=\"error\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"10\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"10000000\"}": 0.0,
+        "grpc_health_check_failures_total": 0.0,
+        "durability_cycle_duration_millis_sum{task=\"gc\"}": 0.0,
+        "gossip_delta_entries_bucket{le=\"50000\"}": 181.0,
+        "durability_cycle_skipped_total{task=\"drain_intra\",reason=\"overrun\"}": 0.0,
+        "accel_hash_duration_seconds_sum": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1\",task=\"drain_cluster\"}": 94.0,
+        "durability_cycle_duration_millis_sum{task=\"scrub\"}": 0.0,
+        "accel_encode_duration_us_bucket{le=\"1\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5000\",task=\"gc\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"25\",task=\"scrub\"}": 2.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"5000\"}": 238.0,
+        "accel_encode_duration_us_bucket{le=\"50\"}": 0.0,
+        "accel_runtime_fallback_total": 0.0,
+        "gc_compaction_bytes_total": 0.0,
+        "s3_request_errors_total": 0.0,
+        "oceanfs_announcements_accepted": 0.0,
+        "accel_encode_duration_us_bucket{le=\"1000\"}": 0.0,
+        "cache_misses_total{tier=\"l1\"}": 0.0,
+        "accel_encode_duration_us_bucket{le=\"100000\"}": 0.0,
+        "oceanfs_metadata_rebuild_range_errors_total": 0.0,
+        "accel_decode_duration_us_bucket{le=\"5000000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"25\",task=\"orphan_reaper\"}": 10.0,
+        "durability_cycle_duration_millis_count{task=\"gc\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"50\",task=\"drain_intra\"}": 94.0,
+        "accel_compress_duration_seconds_bucket{le=\"10000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1\",task=\"anti_entropy\"}": 10.0,
+        "gossip_delta_entries_bucket{le=\"500\"}": 181.0,
+        "oceanfs_startup_rebuild_ms": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"60000\",task=\"drain_intra\"}": 94.0,
+        "gossip_delta_entries_bucket{le=\"+Inf\"}": 181.0,
+        "accel_encode_duration_us_bucket{le=\"5000000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5\",task=\"drain_cluster\"}": 94.0,
+        "accel_compress_duration_seconds_bucket{le=\"50000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"2500\",task=\"orphan_reaper\"}": 10.0,
+        "accel_encode_duration_us_bucket{le=\"5\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"50\"}": 0.0,
+        "rocksdb_num_running_flushes": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"100\",task=\"scrub\"}": 2.0,
+        "durability_cycle_duration_millis_count{task=\"scrub\"}": 2.0,
+        "durability_housekeeping_wait_duration_millis_sum": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"1000000\"}": 0.0,
+        "durability_cycle_total{task=\"scrub\",status=\"error\"}": 0.0,
+        "oceanfs_drain_remaining{pool_id=\"3\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"1\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"500000\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"1000\"}": 0.0,
+        "oceanfs_pool_bytes_free{pool_id=\"1\"}": 19866902528.0,
+        "oceanfs_segment_replication_bytes_total": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"100\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"10000\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"50000\"}": 0.0,
+        "accel_decode_duration_us_sum": 0.0,
+        "oceanfs_pool_io_errors_total{pool_id=\"3\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10\",task=\"scrub\"}": 2.0,
+        "durability_cycle_duration_millis_bucket{le=\"5\",task=\"orphan_reaper\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"60000\",task=\"anti_entropy\"}": 10.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"+Inf\"}": 0.0,
+        "cache_hits_total{tier=\"l1\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"50000\"}": 180.0,
+        "s3_requests_total{method=\"LIST\"}": 0.0,
+        "cache_entry_count": 0.0,
+        "accel_tier_active{tier=\"cpusimd\",operation=\"encode\"}": 1.0,
+        "grpc_connections_active": 0.0,
+        "oceanfs_drain_released_total{pool_id=\"0\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5000\",task=\"drain_intra\"}": 94.0,
+        "gossip_push_duration_microseconds_bucket{le=\"+Inf\"}": 181.0,
+        "accel_compress_duration_seconds_bucket{le=\"100000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"500\",task=\"drain_cluster\"}": 94.0,
+        "gossip_delta_entries_bucket{le=\"5000000\"}": 181.0,
+        "gc_cycles_total": 10.0,
+        "accel_hash_duration_seconds_bucket{le=\"100000\"}": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"5000\"}": 0.0,
+        "cache_rebuilds_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"2500\",task=\"drain_intra\"}": 94.0,
+        "durability_cycle_duration_millis_bucket{le=\"50\",task=\"orphan_reaper\"}": 10.0,
+        "cache_hits_total{tier=\"l3\"}": 0.0,
+        "durability_cycle_skipped_total{task=\"anti_entropy\",reason=\"overrun\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"50000\"}": 0.0,
+        "durability_cycle_duration_millis_sum{task=\"anti_entropy\"}": 0.0,
+        "accel_encode_duration_us_count": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"1000\"}": 238.0,
+        "gossip_round_duration_microseconds_bucket{le=\"1000\"}": 93.0,
+        "rocksdb_num_files_at_level_0": 0.0,
+        "wal_bytes_written_total": 0.0,
+        "oceanfs_lifecycle_registry_bytes_estimate": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"10000\"}": 238.0,
+        "gossip_round_duration_microseconds_bucket{le=\"500\"}": 93.0,
+        "oceanfs_pool_bytes_free{pool_id=\"2\"}": 19866902528.0,
+        "durability_repair_waiters": 0.0,
+        "cache_hits_total{tier=\"l2\"}": 0.0,
+        "oceanfs_event_wal_files": 0.0,
+        "accel_decode_duration_us_bucket{le=\"1\"}": 0.0,
+        "oceanfs_pool_bytes_free{pool_id=\"3\"}": 9910349824.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"100\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"25\",task=\"gc\"}": 10.0,
+        "buffer_pool_bytes_allocated": 268435456.0,
+        "oceanfs_wal_replaced_total": 0.0,
+        "indirect_probes_total": 0.0,
+        "probe_failures_total": 0.0,
+        "oceanfs_drain_dispatched_total{pool_id=\"2\"}": 0.0,
+        "oceanfs_pool_bytes_total{pool_id=\"0\"}": 126227120128.0,
+        "oceanfs_pool_status{pool_id=\"3\",role=\"hints\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10\",task=\"orphan_reaper\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"250\",task=\"drain_intra\"}": 94.0,
+        "accel_decompress_duration_seconds_bucket{le=\"50000\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"1\"}": 0.0,
+        "gossip_delta_entries_bucket{le=\"500000\"}": 181.0,
+        "oceanfs_wal_recovery_pending": 0.0,
+        "durability_cycle_skipped_total{task=\"scrub\",reason=\"overrun\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"50\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10000\",task=\"gc\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"250\",task=\"anti_entropy\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"60000\",task=\"drain_cluster\"}": 94.0,
+        "gossip_round_duration_microseconds_bucket{le=\"5000000\"}": 93.0,
+        "ae_mismatches_found_total": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"1\"}": 0.0,
+        "durability_housekeeping_waiters": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"10000000\"}": 181.0,
+        "cache_evictions_total{tier=\"l1\"}": 0.0,
+        "oceanfs_pool_write_degraded{pool_id=\"3\"}": 0.0,
+        "durability_items_processed_total{task=\"orphan_reaper\"}": 0.0,
+        "cache_false_positives_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5\",task=\"gc\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"+Inf\",task=\"gc\"}": 10.0,
+        "oceanfs_routing_failover_total": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"5000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5\",task=\"drain_intra\"}": 94.0,
+        "gossip_delta_entries_bucket{le=\"1\"}": 90.0,
+        "hinted_handoff_hints_enqueue_failed_total": 0.0,
+        "oceanfs_wal_recovery_registry_rebuilt_segments": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"10\"}": 2.0,
+        "durability_items_processed_total{task=\"gc\"}": 0.0,
+        "gossip_push_duration_microseconds_sum": 7553148.0,
+        "accel_decompress_duration_seconds_bucket{le=\"500000\"}": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"100\"}": 238.0,
+        "segment_active_count": 8.0,
+        "durability_cycle_duration_millis_bucket{le=\"2500\",task=\"gc\"}": 10.0,
+        "oceanfs_pool_status{pool_id=\"1\",role=\"wal\"}": 0.0,
+        "oceanfs_pool_status{pool_id=\"0\",role=\"data\"}": 0.0,
+        "oceanfs_pool_write_degraded{pool_id=\"1\"}": 0.0,
+        "accel_encode_duration_us_bucket{le=\"1000000\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"10\"}": 0.0,
+        "accel_encode_duration_us_bucket{le=\"100\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"50\",task=\"anti_entropy\"}": 10.0,
+        "probe_duration_microseconds_bucket{le=\"5000000\"}": 93.0,
+        "accel_hash_duration_seconds_bucket{le=\"1000000\"}": 0.0,
+        "segment_flush_batches_total": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"10000\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"1000000\"}": 181.0,
+        "probe_duration_microseconds_sum": 3885700.0,
+        "durability_cycle_duration_millis_bucket{le=\"5\",task=\"scrub\"}": 2.0,
+        "durability_cycle_duration_millis_bucket{le=\"500\",task=\"anti_entropy\"}": 10.0,
+        "probe_duration_microseconds_bucket{le=\"100\"}": 0.0,
+        "oceanfs_segment_replication_failures_total": 0.0,
+        "cache_inline_hits_total": 0.0,
+        "accel_compression_fallback_total": 0.0,
+        "oceanfs_metadata_unavailable_seconds": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"1000000\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"5\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"5\"}": 0.0,
+        "cache_size_bytes{tier=\"l1\"}": 0.0,
+        "gossip_delta_entries_bucket{le=\"1000000\"}": 181.0,
+        "accel_decode_duration_us_bucket{le=\"5\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"500\",task=\"scrub\"}": 2.0,
+        "oceanfs_metadata_rebuild_objects_total": 0.0,
+        "oceanfs_drain_dispatched_total{pool_id=\"1\"}": 0.0,
+        "oceanfs_pool_write_degraded{pool_id=\"0\"}": 0.0,
+        "oceanfs_pool_drain_blocked_reason{pool_id=\"3\"}": 0.0,
+        "accel_bytes_encoded_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"+Inf\",task=\"drain_intra\"}": 94.0,
+        "gossip_delta_entries_bucket{le=\"5\"}": 181.0,
+        "accel_decode_ops_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1000\",task=\"drain_intra\"}": 94.0,
+        "gossip_push_duration_microseconds_count": 181.0,
+        "accel_hash_duration_seconds_bucket{le=\"5000\"}": 0.0,
+        "oceanfs_pool_drain_state{pool_id=\"1\"}": 0.0,
+        "durability_housekeeping_active": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"100000\"}": 181.0,
+        "segment_seal_errors_total": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"10000\"}": 0.0,
+        "accel_decompress_duration_seconds_count": 0.0,
+        "durability_cycle_duration_millis_count{task=\"drain_intra\"}": 94.0,
+        "accel_encode_duration_us_bucket{le=\"10\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"50\",task=\"drain_cluster\"}": 94.0,
+        "oceanfs_event_wal_truncated_bytes": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1000\",task=\"scrub\"}": 2.0,
+        "gossip_delta_entries_bucket{le=\"5000\"}": 181.0,
+        "segment_metadata_batches_total": 0.0,
+        "accel_encode_duration_us_sum": 0.0,
+        "oceanfs_routing_cache_misses_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1\",task=\"orphan_reaper\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"100\",task=\"orphan_reaper\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"+Inf\",task=\"anti_entropy\"}": 10.0,
+        "rocksdb_num_running_compactions": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"250\"}": 238.0,
+        "gossip_delta_entries_bucket{le=\"10000\"}": 181.0,
+        "gossip_push_duration_microseconds_bucket{le=\"100\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"10000\"}": 1.0,
+        "durability_cycle_duration_millis_bucket{le=\"1\",task=\"scrub\"}": 2.0,
+        "accel_encode_duration_us_bucket{le=\"10000\"}": 0.0,
+        "heal_completed_total": 0.0,
+        "oceanfs_lifecycle_registry_entries": 0.0,
+        "oceanfs_routing_manifest_skips_total{path=\"read\"}": 0.0,
+        "process_resident_memory_bytes": 1194590208.0,
+        "hinted_handoff_hints_rejected_total{reason=\"pool_dead\",path=\"delete\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"+Inf\",task=\"scrub\"}": 2.0,
+        "probe_duration_microseconds_bucket{le=\"10\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"10\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5000\",task=\"scrub\"}": 2.0,
+        "probe_duration_microseconds_count": 93.0,
+        "gossip_round_duration_microseconds_bucket{le=\"5\"}": 2.0,
+        "durability_cycle_total{task=\"anti_entropy\",status=\"ok\"}": 10.0,
+        "accel_ec_fallback_total": 0.0,
+        "oceanfs_metadata_rebuild_deletions_total": 0.0,
+        "oceanfs_drain_released_total{pool_id=\"3\"}": 0.0,
+        "gossip_round_duration_microseconds_count": 93.0,
+        "gc_bytes_reclaimed_total": 0.0,
+        "oceanfs_pool_drain_blocked_reason{pool_id=\"1\"}": 0.0,
+        "oceanfs_event_wal_append_count": 0.0,
+        "durability_cycle_total{task=\"scrub\",status=\"ok\"}": 2.0,
+        "durability_cycle_duration_millis_bucket{le=\"5000\",task=\"orphan_reaper\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"10\",task=\"drain_cluster\"}": 94.0,
+        "gossip_push_duration_microseconds_bucket{le=\"500000\"}": 181.0,
+        "oceanfs_pool_bytes_total{pool_id=\"2\"}": 20957446144.0,
+        "oceanfs_segment_replication_needs_gauge": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"500000\"}": 93.0,
+        "accel_encode_duration_us_bucket{le=\"50000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10\",task=\"gc\"}": 10.0,
+        "accel_compress_duration_seconds_bucket{le=\"500\"}": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"2500\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"+Inf\",task=\"orphan_reaper\"}": 10.0,
+        "probe_duration_microseconds_bucket{le=\"50\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"10000000\"}": 0.0,
+        "accel_decode_errors_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"250\",task=\"gc\"}": 10.0,
+        "accel_encode_duration_us_bucket{le=\"+Inf\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"1000\"}": 0.0,
+        "oceanfs_repair_failures_total": 0.0,
+        "ring_version": 3.0,
+        "durability_repair_active": 0.0,
+        "accel_encode_duration_us_bucket{le=\"500\"}": 0.0,
+        "oceanfs_pool_drain_state{pool_id=\"2\"}": 0.0,
+        "gossip_round_duration_microseconds_sum": 2614.0,
+        "oceanfs_segment_replication_pushed_total": 0.0,
+        "oceanfs_pool_io_errors_total{pool_id=\"1\"}": 0.0,
+        "durability_repair_wait_duration_millis_count": 0.0,
+        "oceanfs_pool_drain_blocked_reason{pool_id=\"2\"}": 0.0,
+        "process_open_fds": 31.0,
+        "hinted_handoff_hints_expired_total": 0.0,
+        "durability_items_processed_total{task=\"drain_intra\"}": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"2500\"}": 238.0,
+        "heal_failed_total": 0.0,
+        "oceanfs_pool_drain_state{pool_id=\"3\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5000\",task=\"anti_entropy\"}": 10.0,
+        "accel_decode_duration_us_bucket{le=\"100\"}": 0.0,
+        "durability_cycle_total{task=\"gc\",status=\"error\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"1000\"}": 0.0,
+        "accel_encode_errors_total": 0.0,
+        "oceanfs_pool_drain_state{pool_id=\"0\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10000\",task=\"orphan_reaper\"}": 10.0,
+        "durability_cycle_duration_millis_sum{task=\"drain_intra\"}": 0.0,
+        "oceanfs_announcements_rx_total": 0.0,
+        "gossip_delta_entries_bucket{le=\"50\"}": 181.0,
+        "durability_cycle_duration_millis_bucket{le=\"100\",task=\"drain_intra\"}": 94.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"1\"}": 238.0,
+        "rocksdb_memtable_size_bytes": 4096.0,
+        "oceanfs_pool_drain_blocked_reason{pool_id=\"0\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"+Inf\"}": 93.0,
+        "gossip_messages_dropped_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"60000\",task=\"orphan_reaper\"}": 10.0,
+        "s3_requests_total{method=\"GET\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"1000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10\",task=\"drain_intra\"}": 94.0,
+        "accel_hash_duration_seconds_bucket{le=\"100\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"500000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5000\",task=\"drain_cluster\"}": 94.0,
+        "durability_items_processed_total{task=\"drain_cluster\"}": 0.0,
+        "gossip_delta_entries_count": 181.0,
+        "cache_misses_total{tier=\"l2\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"1\"}": 0.0,
+        "durability_cycle_skipped_total{task=\"orphan_reaper\",reason=\"overrun\"}": 0.0,
+        "durability_cycle_total{task=\"drain_cluster\",status=\"ok\"}": 94.0,
+        "metadata_supersede_dead_bytes_total": 0.0,
+        "gossip_delta_entries_bucket{le=\"100000\"}": 181.0,
+        "accel_decode_duration_us_bucket{le=\"1000000\"}": 0.0,
+        "durability_cycle_duration_millis_count{task=\"drain_cluster\"}": 94.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"500\"}": 0.0,
+        "ae_segments_compared_total": 0.0,
+        "buffer_pool_buffers_available": 4088.0,
+        "durability_cycle_duration_millis_bucket{le=\"500\",task=\"drain_intra\"}": 94.0,
+        "gossip_round_duration_microseconds_bucket{le=\"5000\"}": 93.0,
+        "durability_cycle_total{task=\"gc\",status=\"ok\"}": 10.0,
+        "oceanfs_repair_queue_depth{priority=\"announcement\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"60000\",task=\"scrub\"}": 2.0,
+        "oceanfs_event_wal_bytes": 0.0,
+        "probe_duration_microseconds_bucket{le=\"100000\"}": 93.0,
+        "orphan_segments_reaped_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1000\",task=\"anti_entropy\"}": 10.0,
+        "oceanfs_pool_io_errors_total{pool_id=\"2\"}": 0.0,
+        "heal_requests_total": 0.0,
+        "oceanfs_pool_status{pool_id=\"2\",role=\"metadata\"}": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"50\"}": 90.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"+Inf\"}": 238.0,
+        "rocksdb_block_cache_hit": 0.0,
+        "oceanfs_drain_remaining{pool_id=\"2\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"5000000\"}": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"1\"}": 0.0,
+        "scrub_segments_checked_total": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"10\"}": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"250\"}": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"10000\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"5\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"100\",task=\"drain_cluster\"}": 94.0,
+        "accel_decode_duration_us_bucket{le=\"+Inf\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1000\",task=\"gc\"}": 10.0,
+        "accel_hash_duration_seconds_bucket{le=\"+Inf\"}": 0.0,
+        "durability_cycle_total{task=\"orphan_reaper\",status=\"error\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"5000000\"}": 0.0,
+        "oceanfs_repair_enqueued_total": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"100\"}": 0.0,
+        "rocksdb_block_cache_miss": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"50\",task=\"scrub\"}": 2.0,
+        "oceanfs_pool_io_errors_total{pool_id=\"0\"}": 0.0,
+        "oceanfs_drain_dispatched_total{pool_id=\"3\"}": 0.0,
+        "durability_housekeeping_wait_duration_millis_count": 238.0,
+        "accel_encode_ops_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"250\",task=\"orphan_reaper\"}": 10.0,
+        "segment_fsyncs_total": 0.0,
+        "oceanfs_pool_bytes_free{pool_id=\"0\"}": 119767867392.0,
+        "gossip_round_duration_microseconds_bucket{le=\"1000000\"}": 93.0,
+        "accel_decode_duration_us_bucket{le=\"500\"}": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"5\"}": 0.0
+      }
+    },
+    {
+      "metrics": {
+        "durability_cycle_duration_millis_bucket{le=\"250\",task=\"orphan_reaper\"}": 10.0,
+        "durability_items_processed_total{task=\"drain_intra\"}": 0.0,
+        "durability_cycle_total{task=\"drain_intra\",status=\"ok\"}": 91.0,
+        "durability_cycle_total{task=\"drain_intra\",status=\"error\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"10000\"}": 0.0,
+        "accel_encode_duration_us_bucket{le=\"500000\"}": 0.0,
+        "heal_failed_total": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"10000000\"}": 91.0,
+        "s3_requests_total{method=\"DELETE\"}": 0.0,
+        "accel_encode_duration_us_bucket{le=\"1000000\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"5\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"1\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"10000000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"+Inf\",task=\"gc\"}": 10.0,
+        "accel_hash_duration_seconds_bucket{le=\"5000000\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"5\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"5\"}": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"1000\"}": 90.0,
+        "oceanfs_metadata_unavailable_seconds": 0.0,
+        "oceanfs_repair_queue_depth{priority=\"reconciliation\"}": 0.0,
+        "oceanfs_drain_dispatched_total{pool_id=\"3\"}": 0.0,
+        "oceanfs_drain_released_total{pool_id=\"2\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"+Inf\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5000\",task=\"anti_entropy\"}": 10.0,
+        "cache_evictions_total{tier=\"l2\"}": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"1\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"250\",task=\"drain_intra\"}": 91.0,
+        "oceanfs_pool_write_degraded{pool_id=\"2\"}": 0.0,
+        "gc_dead_bytes_total": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"5000\"}": 0.0,
+        "metadata_supersede_captured_total": 0.0,
+        "oceanfs_event_wal_append_count": 0.0,
+        "oceanfs_pool_drain_state{pool_id=\"0\"}": 0.0,
+        "hinted_handoff_hints_dropped_total": 0.0,
+        "probe_duration_microseconds_bucket{le=\"50000\"}": 90.0,
+        "oceanfs_drain_remaining{pool_id=\"1\"}": 0.0,
+        "gossip_delta_entries_bucket{le=\"10\"}": 91.0,
+        "accel_decode_duration_us_bucket{le=\"5000\"}": 0.0,
+        "hinted_handoff_hints_expired_total": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"+Inf\"}": 0.0,
+        "gc_segments_compacted_total": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"1\"}": 0.0,
+        "oceanfs_metadata_rebuild_objects_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"250\",task=\"anti_entropy\"}": 10.0,
+        "accel_encode_duration_us_sum": 0.0,
+        "probe_duration_microseconds_bucket{le=\"100000\"}": 90.0,
+        "oceanfs_pool_bytes_free{pool_id=\"3\"}": 9910349824.0,
+        "gossip_delta_entries_sum": 95.0,
+        "durability_items_processed_total{task=\"drain_cluster\"}": 0.0,
+        "indirect_probes_total": 0.0,
+        "oceanfs_pool_status{pool_id=\"1\",role=\"wal\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"5\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"1\"}": 0.0,
+        "durability_cycle_duration_millis_count{task=\"scrub\"}": 2.0,
+        "durability_cycle_duration_millis_bucket{le=\"50\",task=\"drain_cluster\"}": 91.0,
+        "durability_cycle_duration_millis_sum{task=\"gc\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1\",task=\"scrub\"}": 2.0,
+        "durability_cycle_duration_millis_bucket{le=\"5000\",task=\"drain_intra\"}": 91.0,
+        "accel_decompress_duration_seconds_bucket{le=\"1000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1\",task=\"orphan_reaper\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"10\",task=\"anti_entropy\"}": 10.0,
+        "accel_encode_ops_total": 0.0,
+        "gossip_messages_received_total": 271.0,
+        "durability_cycle_duration_millis_sum{task=\"drain_intra\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"50000\"}": 0.0,
+        "segment_flush_batches_total": 0.0,
+        "oceanfs_lifecycle_registry_entries": 0.0,
+        "probe_duration_microseconds_bucket{le=\"5000000\"}": 90.0,
+        "accel_encode_duration_us_bucket{le=\"100000\"}": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"5\"}": 0.0,
+        "rocksdb_memtable_size_bytes": 4096.0,
+        "grpc_health_check_failures_total": 0.0,
+        "oceanfs_drain_remaining{pool_id=\"3\"}": 0.0,
+        "gc_bytes_reclaimed_total": 0.0,
+        "gossip_delta_entries_bucket{le=\"5000000\"}": 91.0,
+        "gossip_messages_sent_total": 91.0,
+        "accel_ec_fallback_total": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"50000\"}": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"500\"}": 231.0,
+        "accel_encode_duration_us_bucket{le=\"50\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"500000\"}": 0.0,
+        "oceanfs_pool_status{pool_id=\"3\",role=\"hints\"}": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"50000\"}": 90.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"25\"}": 231.0,
+        "gossip_round_duration_microseconds_bucket{le=\"500\"}": 90.0,
+        "grpc_connection_errors_total": 0.0,
+        "accel_bytes_encoded_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1\",task=\"anti_entropy\"}": 10.0,
+        "oceanfs_segment_replication_retries_total": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"1000\"}": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"1000\"}": 231.0,
+        "durability_cycle_duration_millis_bucket{le=\"5000\",task=\"orphan_reaper\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"10000\",task=\"drain_intra\"}": 91.0,
+        "hinted_handoff_hints_rejected_total{reason=\"pool_dead\",path=\"write\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"1000000\"}": 0.0,
+        "cache_entry_count{tier=\"l1\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1000\",task=\"drain_intra\"}": 91.0,
+        "durability_cycle_duration_millis_bucket{le=\"5000\",task=\"gc\"}": 10.0,
+        "cache_rebuilds_total": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"10\"}": 0.0,
+        "durability_items_processed_total{task=\"gc\"}": 0.0,
+        "s3_requests_total{method=\"PUT\"}": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"2500\"}": 0.0,
+        "durability_cycle_skipped_total{task=\"drain_intra\",reason=\"overrun\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"10\"}": 0.0,
+        "segment_fsyncs_total": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"500000\"}": 0.0,
+        "oceanfs_pool_drain_state{pool_id=\"2\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1000\",task=\"scrub\"}": 2.0,
+        "ring_version": 3.0,
+        "accel_bytes_decoded_total": 0.0,
+        "accel_decode_duration_us_bucket{le=\"10\"}": 0.0,
+        "scrub_segments_corrupt_total": 0.0,
+        "durability_cycle_duration_millis_count{task=\"anti_entropy\"}": 10.0,
+        "oceanfs_repair_failures_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10\",task=\"scrub\"}": 2.0,
+        "durability_cycle_duration_millis_bucket{le=\"10\",task=\"orphan_reaper\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"2500\",task=\"drain_cluster\"}": 91.0,
+        "gossip_push_duration_microseconds_sum": 3817133.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"2500\"}": 231.0,
+        "accel_decompress_duration_seconds_bucket{le=\"10000000\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"1000\"}": 0.0,
+        "durability_cycle_skipped_total{task=\"scrub\",reason=\"overrun\"}": 0.0,
+        "gossip_delta_entries_bucket{le=\"100000\"}": 91.0,
+        "accel_encode_duration_us_bucket{le=\"10000\"}": 0.0,
+        "durability_cycle_duration_millis_sum{task=\"anti_entropy\"}": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"500000\"}": 90.0,
+        "oceanfs_drain_remaining{pool_id=\"0\"}": 0.0,
+        "gossip_delta_entries_bucket{le=\"1000\"}": 91.0,
+        "oceanfs_drain_released_total{pool_id=\"0\"}": 0.0,
+        "gossip_delta_entries_bucket{le=\"5000\"}": 91.0,
+        "durability_cycle_duration_millis_bucket{le=\"10000\",task=\"gc\"}": 10.0,
+        "gossip_delta_entries_bucket{le=\"50000\"}": 91.0,
+        "cache_inline_hits_total": 0.0,
+        "accel_encode_duration_us_bucket{le=\"500\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10000\",task=\"drain_cluster\"}": 91.0,
+        "probe_duration_microseconds_bucket{le=\"100\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"50\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"2500\",task=\"drain_intra\"}": 91.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"50\"}": 0.0,
+        "oceanfs_segment_replication_bytes_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"25\",task=\"orphan_reaper\"}": 10.0,
+        "accel_hash_duration_seconds_bucket{le=\"100\"}": 0.0,
+        "accel_encode_duration_us_count": 0.0,
+        "gossip_messages_dropped_total": 0.0,
+        "durability_cycle_total{task=\"drain_cluster\",status=\"ok\"}": 91.0,
+        "oceanfs_pool_status{pool_id=\"2\",role=\"metadata\"}": 0.0,
+        "oceanfs_wal_recovery_pending": 0.0,
+        "accel_decode_duration_us_bucket{le=\"50\"}": 0.0,
+        "cache_evictions_total{tier=\"l1\"}": 0.0,
+        "oceanfs_pool_status{pool_id=\"0\",role=\"data\"}": 0.0,
+        "gossip_round_duration_microseconds_sum": 1798.0,
+        "accel_decompress_duration_seconds_count": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"+Inf\",task=\"drain_intra\"}": 91.0,
+        "accel_compress_duration_seconds_bucket{le=\"5000\"}": 0.0,
+        "wal_truncations_total": 1.0,
+        "durability_cycle_duration_millis_bucket{le=\"60000\",task=\"orphan_reaper\"}": 10.0,
+        "oceanfs_reconcile_scan_ms": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"500\",task=\"scrub\"}": 2.0,
+        "oceanfs_pool_bytes_total{pool_id=\"3\"}": 10464022528.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"10\"}": 231.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"100\"}": 0.0,
+        "oceanfs_drain_released_total{pool_id=\"1\"}": 0.0,
+        "oceanfs_pool_bytes_free{pool_id=\"1\"}": 19866902528.0,
+        "oceanfs_drain_dispatched_total{pool_id=\"1\"}": 0.0,
+        "accel_tier_active{tier=\"cpusimd\",operation=\"encode\"}": 1.0,
+        "accel_encode_duration_us_bucket{le=\"50000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"25\",task=\"drain_intra\"}": 91.0,
+        "oceanfs_pool_bytes_free{pool_id=\"2\"}": 19866902528.0,
+        "accel_compress_duration_seconds_count": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"+Inf\",task=\"drain_cluster\"}": 91.0,
+        "oceanfs_pool_io_errors_total{pool_id=\"1\"}": 0.0,
+        "oceanfs_wal_replaced_total": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"1000000\"}": 90.0,
+        "s3_requests_total{method=\"HEAD\"}": 0.0,
+        "accel_encode_duration_us_bucket{le=\"100\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"5000\"}": 1.0,
+        "durability_repair_wait_duration_millis_sum": 0.0,
+        "accel_runtime_fallback_total": 0.0,
+        "wal_bytes_written_total": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"10000\"}": 90.0,
+        "accel_decode_duration_us_bucket{le=\"100000\"}": 0.0,
+        "oceanfs_ranges_under_replicated": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"500\"}": 0.0,
+        "oceanfs_startup_rebuild_ms": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"500\",task=\"drain_cluster\"}": 91.0,
+        "durability_cycle_duration_millis_bucket{le=\"25\",task=\"gc\"}": 10.0,
+        "durability_cycle_duration_millis_sum{task=\"orphan_reaper\"}": 0.0,
+        "oceanfs_wal_recovery_seconds": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"500\",task=\"orphan_reaper\"}": 10.0,
+        "oceanfs_segment_replication_pushed_total": 0.0,
+        "hinted_handoff_hints_rejected_total{reason=\"pool_dead\",path=\"delete\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"5000000\"}": 0.0,
+        "wal_file_count": 1.0,
+        "oceanfs_segment_replication_failures_total": 0.0,
+        "metadata_supersede_dead_bytes_total": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"10000\"}": 0.0,
+        "process_resident_memory_bytes": 1194729472.0,
+        "accel_decode_duration_us_bucket{le=\"+Inf\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"5\"}": 0.0,
+        "durability_items_processed_total{task=\"scrub\"}": 0.0,
+        "scrub_segments_checked_total": 0.0,
+        "cache_misses_total{tier=\"l2\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"10000\"}": 0.0,
+        "rocksdb_num_files_at_level_0": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"+Inf\"}": 231.0,
+        "durability_cycle_duration_millis_bucket{le=\"+Inf\",task=\"anti_entropy\"}": 10.0,
+        "heal_requests_total": 0.0,
+        "hinted_handoff_hints_delivered_total": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"50\"}": 231.0,
+        "cache_false_positives_total": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"10\"}": 0.0,
+        "s3_request_errors_total": 0.0,
+        "durability_cycle_skipped_total{task=\"gc\",reason=\"overrun\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"100000\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"10\"}": 0.0,
+        "rocksdb_estimate_num_keys": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5\",task=\"orphan_reaper\"}": 10.0,
+        "cache_hits_total{tier=\"l1\"}": 0.0,
+        "durability_cycle_total{task=\"scrub\",status=\"ok\"}": 2.0,
+        "rocksdb_num_running_flushes": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"5\"}": 231.0,
+        "process_open_fds": 31.0,
+        "durability_cycle_duration_millis_bucket{le=\"5000\",task=\"drain_cluster\"}": 91.0,
+        "durability_cycle_duration_millis_bucket{le=\"250\",task=\"drain_cluster\"}": 91.0,
+        "accel_hash_duration_seconds_bucket{le=\"1000000\"}": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"10000000\"}": 90.0,
+        "accel_compress_duration_seconds_bucket{le=\"100\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"10000000\"}": 90.0,
+        "oceanfs_pool_write_degraded{pool_id=\"3\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5\",task=\"anti_entropy\"}": 10.0,
+        "orphan_segments_reaped_total": 0.0,
+        "oceanfs_drain_dispatched_total{pool_id=\"2\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"1000\"}": 1.0,
+        "durability_housekeeping_wait_duration_millis_sum": 0.0,
+        "oceanfs_repair_queue_depth{priority=\"announcement\"}": 0.0,
+        "durability_cycle_total{task=\"gc\",status=\"ok\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"100\",task=\"orphan_reaper\"}": 10.0,
+        "accel_compression_fallback_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"60000\",task=\"drain_intra\"}": 91.0,
+        "gc_cycles_total": 10.0,
+        "accel_encode_duration_us_bucket{le=\"5000\"}": 0.0,
+        "accel_hash_duration_seconds_count": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"500\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"100000\"}": 91.0,
+        "durability_cycle_duration_millis_bucket{le=\"10000\",task=\"orphan_reaper\"}": 10.0,
+        "durability_cycle_total{task=\"anti_entropy\",status=\"ok\"}": 10.0,
+        "oceanfs_pool_io_errors_total{pool_id=\"0\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"+Inf\"}": 91.0,
+        "probe_duration_microseconds_bucket{le=\"1000000\"}": 90.0,
+        "cache_size_bytes{tier=\"l1\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1\",task=\"drain_intra\"}": 91.0,
+        "hinted_handoff_hints_stored_total": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"10000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5\",task=\"scrub\"}": 2.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"25\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"500\",task=\"anti_entropy\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"25\",task=\"anti_entropy\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"10\",task=\"gc\"}": 10.0,
+        "gossip_delta_entries_bucket{le=\"100\"}": 91.0,
+        "oceanfs_pool_io_errors_total{pool_id=\"3\"}": 0.0,
+        "ae_segments_compared_total": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"1\"}": 0.0,
+        "accel_encode_duration_us_bucket{le=\"1000\"}": 0.0,
+        "grpc_connections_active": 0.0,
+        "durability_cycle_total{task=\"orphan_reaper\",status=\"ok\"}": 10.0,
+        "gossip_round_duration_microseconds_bucket{le=\"10\"}": 0.0,
+        "oceanfs_pool_drain_blocked_reason{pool_id=\"1\"}": 0.0,
+        "oceanfs_pool_bytes_total{pool_id=\"1\"}": 20957446144.0,
+        "accel_decode_duration_us_sum": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"2500\",task=\"anti_entropy\"}": 10.0,
+        "accel_decompress_duration_seconds_bucket{le=\"+Inf\"}": 0.0,
+        "gossip_delta_entries_bucket{le=\"1\"}": 89.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"250\"}": 231.0,
+        "oceanfs_pool_bytes_total{pool_id=\"2\"}": 20957446144.0,
+        "accel_decode_duration_us_bucket{le=\"500000\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"500\"}": 0.0,
+        "accel_encode_duration_us_bucket{le=\"5\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10\",task=\"drain_intra\"}": 91.0,
+        "accel_compress_duration_seconds_bucket{le=\"5000000\"}": 0.0,
+        "oceanfs_metadata_rebuild_range_errors_total": 0.0,
+        "oceanfs_drain_dispatched_total{pool_id=\"0\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"25\",task=\"scrub\"}": 2.0,
+        "durability_cycle_duration_millis_bucket{le=\"10000\",task=\"anti_entropy\"}": 10.0,
+        "oceanfs_pool_drain_blocked_reason{pool_id=\"3\"}": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"1\"}": 231.0,
+        "probe_duration_microseconds_bucket{le=\"500\"}": 0.0,
+        "gossip_delta_entries_bucket{le=\"5\"}": 91.0,
+        "probe_failures_total": 0.0,
+        "oceanfs_routing_manifest_skips_total{path=\"write\"}": 0.0,
+        "accel_compress_duration_seconds_bucket{le=\"500\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"50\",task=\"anti_entropy\"}": 10.0,
+        "probe_duration_microseconds_bucket{le=\"500000\"}": 90.0,
+        "durability_cycle_duration_millis_bucket{le=\"100\",task=\"scrub\"}": 2.0,
+        "durability_cycle_total{task=\"drain_cluster\",status=\"error\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"10000\",task=\"scrub\"}": 2.0,
+        "oceanfs_pool_write_degraded{pool_id=\"0\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"100\",task=\"drain_intra\"}": 91.0,
+        "accel_hash_duration_seconds_bucket{le=\"1000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"250\",task=\"gc\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"2500\",task=\"gc\"}": 10.0,
+        "oceanfs_wal_recovery_caught_up_total": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"50\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"5000\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"1000000\"}": 91.0,
+        "durability_cycle_duration_millis_bucket{le=\"100\",task=\"gc\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"1000\",task=\"drain_cluster\"}": 91.0,
+        "durability_cycle_skipped_total{task=\"anti_entropy\",reason=\"overrun\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"50\",task=\"orphan_reaper\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"500\",task=\"drain_intra\"}": 91.0,
+        "s3_requests_total{method=\"LIST\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"5000000\"}": 91.0,
+        "accel_encode_duration_us_bucket{le=\"+Inf\"}": 0.0,
+        "gossip_delta_entries_bucket{le=\"10000000\"}": 91.0,
+        "accel_decode_duration_us_bucket{le=\"10000\"}": 0.0,
+        "oceanfs_pool_drain_state{pool_id=\"1\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"+Inf\",task=\"orphan_reaper\"}": 10.0,
+        "s3_requests_total{method=\"GET\"}": 0.0,
+        "cache_misses_total{tier=\"l1\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"100\",task=\"anti_entropy\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"50\",task=\"gc\"}": 10.0,
+        "durability_cycle_duration_millis_count{task=\"drain_cluster\"}": 91.0,
+        "accel_hash_duration_seconds_bucket{le=\"5000\"}": 0.0,
+        "accel_decode_ops_total": 0.0,
+        "accel_decode_duration_us_count": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"1000\"}": 0.0,
+        "durability_cycle_total{task=\"anti_entropy\",status=\"error\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"25\",task=\"drain_cluster\"}": 91.0,
+        "gossip_round_duration_microseconds_bucket{le=\"5\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"2500\",task=\"orphan_reaper\"}": 10.0,
+        "gc_compaction_bytes_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5\",task=\"gc\"}": 10.0,
+        "oceanfs_announcements_tx_total": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"50\"}": 0.0,
+        "rocksdb_num_running_compactions": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"10\"}": 0.0,
+        "durability_items_processed_total{task=\"anti_entropy\"}": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"100\"}": 90.0,
+        "accel_decompress_duration_seconds_bucket{le=\"500000\"}": 0.0,
+        "accel_encode_duration_us_bucket{le=\"1\"}": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"1\"}": 0.0,
+        "durability_cycle_duration_millis_sum{task=\"scrub\"}": 0.0,
+        "oceanfs_pool_bytes_total{pool_id=\"0\"}": 126227120128.0,
+        "accel_encode_duration_us_bucket{le=\"10000000\"}": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"100000\"}": 90.0,
+        "durability_cycle_duration_millis_bucket{le=\"1\",task=\"gc\"}": 10.0,
+        "durability_cycle_duration_millis_bucket{le=\"50\",task=\"drain_intra\"}": 91.0,
+        "probe_duration_microseconds_bucket{le=\"+Inf\"}": 90.0,
+        "durability_cycle_duration_millis_bucket{le=\"60000\",task=\"drain_cluster\"}": 91.0,
+        "accel_hash_duration_seconds_sum": 0.0,
+        "oceanfs_announcements_accepted": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"100\"}": 0.0,
+        "segment_active_count": 8.0,
+        "gossip_round_duration_microseconds_bucket{le=\"5000\"}": 90.0,
+        "accel_decode_duration_us_bucket{le=\"100\"}": 0.0,
+        "oceanfs_pool_write_degraded{pool_id=\"1\"}": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"50000\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"50\"}": 0.0,
+        "accel_compress_duration_seconds_sum": 0.0,
+        "ae_mismatches_found_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1000\",task=\"orphan_reaper\"}": 10.0,
+        "segment_metadata_batches_total": 0.0,
+        "gossip_round_duration_microseconds_count": 90.0,
+        "hinted_handoff_hints_enqueue_failed_total": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"5000000\"}": 90.0,
+        "accel_hash_duration_seconds_bucket{le=\"10000000\"}": 0.0,
+        "gossip_delta_entries_bucket{le=\"1000000\"}": 91.0,
+        "oceanfs_pool_drain_state{pool_id=\"3\"}": 0.0,
+        "oceanfs_lifecycle_registry_bytes_estimate": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"60000\",task=\"anti_entropy\"}": 10.0,
+        "accel_decompress_duration_seconds_bucket{le=\"5000000\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"100\"}": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"10000\"}": 231.0,
+        "durability_cycle_skipped_total{task=\"orphan_reaper\",reason=\"overrun\"}": 0.0,
+        "buffer_pool_bytes_allocated": 268435456.0,
+        "gossip_delta_entries_count": 91.0,
+        "accel_decompress_duration_seconds_bucket{le=\"1000000\"}": 0.0,
+        "durability_repair_waiters": 0.0,
+        "probe_duration_microseconds_bucket{le=\"10000\"}": 1.0,
+        "oceanfs_segment_replication_needs_gauge": 0.0,
+        "durability_housekeeping_wait_duration_millis_count": 231.0,
+        "oceanfs_pool_drain_blocked_reason{pool_id=\"0\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"+Inf\",task=\"scrub\"}": 2.0,
+        "cache_entry_count": 0.0,
+        "accel_encode_duration_us_bucket{le=\"5000000\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"5000\"}": 0.0,
+        "oceanfs_drain_released_total{pool_id=\"3\"}": 0.0,
+        "probe_duration_microseconds_sum": 3721489.0,
+        "gossip_push_duration_microseconds_bucket{le=\"1\"}": 0.0,
+        "oceanfs_announcements_rx_total": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"500\"}": 0.0,
+        "buffer_pool_buffers_available": 4088.0,
+        "gossip_delta_entries_bucket{le=\"10000\"}": 91.0,
+        "rocksdb_block_cache_hit": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"1000\"}": 0.0,
+        "oceanfs_metadata_rebuild_deletions_total": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"500000\"}": 91.0,
+        "durability_cycle_duration_millis_bucket{le=\"1000\",task=\"anti_entropy\"}": 10.0,
+        "oceanfs_pool_drain_blocked_reason{pool_id=\"2\"}": 0.0,
+        "durability_cycle_skipped_total{task=\"drain_cluster\",reason=\"overrun\"}": 0.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"5000\"}": 231.0,
+        "heal_bytes_repaired_total": 0.0,
+        "segment_seal_errors_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"60000\",task=\"scrub\"}": 2.0,
+        "accel_compress_duration_seconds_bucket{le=\"10000000\"}": 0.0,
+        "rocksdb_block_cache_miss": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"60000\",task=\"gc\"}": 10.0,
+        "oceanfs_drain_remaining{pool_id=\"2\"}": 0.0,
+        "durability_repair_wait_duration_millis_count": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"500\",task=\"gc\"}": 10.0,
+        "cache_hits_total{tier=\"l3\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"250\",task=\"scrub\"}": 2.0,
+        "accel_decode_duration_us_bucket{le=\"500\"}": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"50000\"}": 91.0,
+        "oceanfs_pool_io_errors_total{pool_id=\"2\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1\",task=\"drain_cluster\"}": 91.0,
+        "durability_housekeeping_wait_duration_millis_bucket{le=\"100\"}": 231.0,
+        "oceanfs_routing_manifest_skips_total{path=\"read\"}": 0.0,
+        "oceanfs_pool_bytes_free{pool_id=\"0\"}": 119767867392.0,
+        "durability_cycle_duration_millis_sum{task=\"drain_cluster\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"50\",task=\"scrub\"}": 2.0,
+        "accel_decode_duration_us_bucket{le=\"1000000\"}": 0.0,
+        "accel_decode_duration_us_bucket{le=\"1\"}": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"+Inf\"}": 90.0,
+        "gossip_delta_entries_bucket{le=\"500\"}": 91.0,
+        "durability_cycle_duration_millis_bucket{le=\"100\",task=\"drain_cluster\"}": 91.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"10\"}": 0.0,
+        "durability_cycle_total{task=\"scrub\",status=\"error\"}": 0.0,
+        "heal_completed_total": 0.0,
+        "oceanfs_ranges_re_replicated_total": 0.0,
+        "oceanfs_event_wal_bytes": 0.0,
+        "oceanfs_routing_cache_misses_total": 0.0,
+        "durability_items_processed_total{task=\"orphan_reaper\"}": 0.0,
+        "oceanfs_wal_recovery_registry_rebuilt_segments": 0.0,
+        "durability_housekeeping_active": 0.0,
+        "gossip_delta_entries_bucket{le=\"500000\"}": 91.0,
+        "durability_cycle_duration_millis_bucket{le=\"10\",task=\"drain_cluster\"}": 91.0,
+        "durability_repair_active": 0.0,
+        "gossip_round_duration_microseconds_bucket{le=\"50\"}": 90.0,
+        "accel_compress_duration_seconds_bucket{le=\"50000\"}": 0.0,
+        "cache_hits_total{tier=\"l2\"}": 0.0,
+        "accel_decode_errors_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5\",task=\"drain_cluster\"}": 91.0,
+        "accel_hash_duration_seconds_bucket{le=\"100000\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"5\"}": 0.0,
+        "durability_cycle_total{task=\"gc\",status=\"error\"}": 0.0,
+        "orphan_bytes_reclaimed_total": 0.0,
+        "gossip_delta_entries_bucket{le=\"50\"}": 91.0,
+        "oceanfs_event_wal_checkpoint_bytes": 0.0,
+        "rocksdb_live_sst_files_size_bytes": 0.0,
+        "oceanfs_repair_enqueued_total": 0.0,
+        "durability_cycle_duration_millis_count{task=\"drain_intra\"}": 91.0,
+        "durability_cycle_total{task=\"orphan_reaper\",status=\"error\"}": 0.0,
+        "accel_decompress_duration_seconds_bucket{le=\"100000\"}": 0.0,
+        "gossip_delta_entries_bucket{le=\"+Inf\"}": 91.0,
+        "durability_cycle_duration_millis_count{task=\"gc\"}": 10.0,
+        "accel_decompress_duration_seconds_sum": 0.0,
+        "oceanfs_event_wal_truncated_bytes": 0.0,
+        "accel_hash_duration_seconds_bucket{le=\"+Inf\"}": 0.0,
+        "accel_encode_duration_us_bucket{le=\"10\"}": 0.0,
+        "probe_duration_microseconds_bucket{le=\"50\"}": 0.0,
+        "probe_duration_microseconds_count": 90.0,
+        "durability_cycle_duration_millis_count{task=\"orphan_reaper\"}": 10.0,
+        "gossip_push_duration_microseconds_count": 91.0,
+        "oceanfs_event_wal_files": 0.0,
+        "durability_housekeeping_waiters": 0.0,
+        "gossip_push_duration_microseconds_bucket{le=\"10000\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"2500\",task=\"scrub\"}": 2.0,
+        "rocksdb_estimate_table_readers_mem_bytes": 0.0,
+        "durability_repair_wait_duration_millis_bucket{le=\"250\"}": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5000\",task=\"scrub\"}": 2.0,
+        "accel_encode_errors_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"5\",task=\"drain_intra\"}": 91.0,
+        "oceanfs_routing_failover_total": 0.0,
+        "durability_cycle_duration_millis_bucket{le=\"1000\",task=\"gc\"}": 10.0
+      }
+    }
+  ],
+  "injection_records": [
+    {
+      "timestamp": 1789157136.732077,
+      "injection_type": "vm_kill",
+      "node_index": 1,
+      "success": true,
+      "detail": "node 1: SIGKILL + restart via ssh (oceanfs)"
+    },
+    {
+      "timestamp": 1789157153.772296,
+      "injection_type": "latency",
+      "node_index": 1,
+      "success": true,
+      "detail": "enp7s0: enp7s0 +500ms"
+    },
+    {
+      "timestamp": 1789157199.44098,
+      "injection_type": "latency_remove",
+      "node_index": 1,
+      "success": true,
+      "detail": "enp7s0: enp7s0 qdisc removed"
+    },
+    {
+      "timestamp": 1789157216.5621228,
+      "injection_type": "disk_fill",
+      "node_index": 1,
+      "success": true,
+      "detail": "data: /mnt/oceanfs-data at 96% (target 95%)"
+    },
+    {
+      "timestamp": 1789157244.3629596,
+      "injection_type": "disk_fill_remove",
+      "node_index": 1,
+      "success": true,
+      "detail": "data: removed /mnt/oceanfs-data/.fill.bin"
+    }
+  ],
+  "cluster_views": [
+    {
+      "t_secs": 0.017711661,
+      "node_index": 0,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 0.018268759,
+      "node_index": 1,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 0.019081998,
+      "node_index": 2,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 4.322375747,
+      "node_index": 0,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 4.323513686,
+      "node_index": 1,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 4.323963082,
+      "node_index": 2,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 17.054672436,
+      "node_index": 0,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 17.055197904,
+      "node_index": 1,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 17.055657669,
+      "node_index": 2,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 34.986618409,
+      "node_index": 0,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 35.487945409,
+      "node_index": 1,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 35.488767425,
+      "node_index": 2,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 38.01140011,
+      "node_index": 0,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 38.902427336,
+      "node_index": 1,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 38.903065717,
+      "node_index": 2,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 39.913183755,
+      "node_index": 0,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 40.413952248,
+      "node_index": 1,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 40.414727756,
+      "node_index": 2,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 41.426211435,
+      "node_index": 0,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 41.927061336,
+      "node_index": 1,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 41.927770861,
+      "node_index": 2,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 42.937595675,
+      "node_index": 0,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 43.438526024,
+      "node_index": 1,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 43.439162791,
+      "node_index": 2,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 44.449341884,
+      "node_index": 0,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 44.95020287,
+      "node_index": 1,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 44.951016421,
+      "node_index": 2,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 45.962703032,
+      "node_index": 0,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 46.464587468,
+      "node_index": 1,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 46.465256677,
+      "node_index": 2,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 47.474260479,
+      "node_index": 0,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 47.975253999,
+      "node_index": 1,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 47.976024167,
+      "node_index": 2,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 48.990227524,
+      "node_index": 0,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 49.491173289,
+      "node_index": 1,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 49.491885709,
+      "node_index": 2,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 50.503935024,
+      "node_index": 0,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 51.00584016,
+      "node_index": 1,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 51.006725205,
+      "node_index": 2,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 52.018172908,
+      "node_index": 0,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 52.519004662,
+      "node_index": 1,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 52.519727144,
+      "node_index": 2,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 53.954071331,
+      "node_index": 0,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 54.45481936,
+      "node_index": 1,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 54.455478393,
+      "node_index": 2,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 56.505573535,
+      "node_index": 0,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 57.006362379,
+      "node_index": 1,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 57.006916384,
+      "node_index": 2,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 58.016724068,
+      "node_index": 0,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 58.528823232,
+      "node_index": 1,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 58.52951179,
+      "node_index": 2,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 59.544001953,
+      "node_index": 0,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 60.044824152,
+      "node_index": 1,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 60.045463818,
+      "node_index": 2,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 68.632618581,
+      "node_index": 0,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 68.633931887,
+      "node_index": 1,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ]
+      ],
+      "probe_successors": []
+    },
+    {
+      "t_secs": 68.634735631,
+      "node_index": 2,
+      "members": 3,
+      "alive": 3,
+      "members_detail": [
+        [
+          "oceanfs-node-0",
+          "Alive",
+          1
+        ],
+        [
+          "oceanfs-node-1",
+          "Alive",
+          2
+        ],
+        [
+          "oceanfs-node-2",
+          "Alive",
+          1
+        ]
+      ],
+      "probe_successors": []
+    }
+  ],
+  "assertions": [
+    {
+      "name": "fleet_prerequisites",
+      "passed": true,
+      "expected": "SSH for every node + a data volume for the injection target",
+      "actual": "[]"
+    },
+    {
+      "name": "s1_kill_succeeded",
+      "passed": true,
+      "expected": "node 1 SIGKILLed and restarted",
+      "actual": "Ok(())"
+    },
+    {
+      "name": "s1_write_completed_with_node_down",
+      "passed": true,
+      "expected": "PUT acked 2xx while the victim is down (quorum from survivors)",
+      "actual": "Ok(200)"
+    },
+    {
+      "name": "s1_membership_converged_after_restart",
+      "passed": true,
+      "expected": "all 3 nodes Alive after the victim rejoins",
+      "actual": "converged=true"
+    },
+    {
+      "name": "s1_object_readable_from_restarted_node",
+      "passed": true,
+      "expected": "the blob is served with correct bytes from the restarted node",
+      "actual": "correct bytes after 0.6s"
+    },
+    {
+      "name": "s1_object_readable_from_survivor",
+      "passed": true,
+      "expected": "the blob is served with correct bytes from a survivor",
+      "actual": "correct bytes after 0.1s"
+    },
+    {
+      "name": "s1_hints_reconverged",
+      "passed": true,
+      "expected": "hint debt is fully delivered after the victim rejoins",
+      "actual": "pending=0 unreachable=[] (3 quiet checks)"
+    },
+    {
+      "name": "s2_latency_injected",
+      "passed": true,
+      "expected": "+500ms netem on enp7s0 (node 1)",
+      "actual": "injected=true rtt_before=Some(0.95)ms rtt_during=Some(500.5)ms"
+    },
+    {
+      "name": "s2_injection_observable_on_wire",
+      "passed": true,
+      "expected": "RTT increases while netem is applied (functional injection check, not a latency bound)",
+      "actual": "before=Some(0.95)ms during=Some(500.5)ms"
+    },
+    {
+      "name": "s2_cluster_served_correct_bytes_during_latency",
+      "passed": false,
+      "expected": "every node serves >= 1 correct read and zero wrong bytes are observed",
+      "actual": "ok_reads=1 wrong_bytes=0 per_node=[1, 0, 0] writes=15 membership_views=45"
+    },
+    {
+      "name": "s2_membership_timeline_recorded",
+      "passed": true,
+      "expected": "the membership timeline is recorded as evidence (suspicion is not a failure)",
+      "actual": "45 per-node views recorded during the injection"
+    },
+    {
+      "name": "s2_latency_removed",
+      "passed": true,
+      "expected": "the netem qdisc is removed",
+      "actual": "removed=true rtt_after=Some(0.654)ms"
+    },
+    {
+      "name": "s2_membership_recovers_after_removal",
+      "passed": true,
+      "expected": "all 3 nodes Alive after latency removal",
+      "actual": "converged=true"
+    },
+    {
+      "name": "s2_no_data_loss_after_removal",
+      "passed": true,
+      "expected": "a key written under latency is served correctly after removal",
+      "actual": "correct bytes after 10.1s"
+    },
+    {
+      "name": "s3_data_mount_usable",
+      "passed": true,
+      "expected": "/mnt/oceanfs-data is a usable mountpoint on node 1",
+      "actual": "usable=true"
+    },
+    {
+      "name": "s3_data_volume_filled",
+      "passed": true,
+      "expected": "/mnt/oceanfs-data filled to 95% on node 1",
+      "actual": "fill_ok=true"
+    },
+    {
+      "name": "s3_node_survived_fill",
+      "passed": true,
+      "expected": "/admin/health keeps answering during the fill",
+      "actual": "health_ok=true statuses=[503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503] transport_errors=[]"
+    },
+    {
+      "name": "s3_writes_graceful",
+      "passed": true,
+      "expected": "every write to the full node produced an HTTP status (no panic/reset)",
+      "actual": "transport_errors=[] statuses=[503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503, 503]"
+    },
+    {
+      "name": "s3_reads_served_correct_bytes_during_fill",
+      "passed": false,
+      "expected": "every baseline read is correct on every node during the fill",
+      "actual": "8/15 correct"
+    },
+    {
+      "name": "s3_rss_and_gc_observed_evidence",
+      "passed": true,
+      "expected": "RSS/GC recorded as data — no absolute threshold is asserted",
+      "actual": "rss_before=1555402752 rss_after=1499086848 gc_dead_delta=0 gc_compacted_delta=0"
+    },
+    {
+      "name": "s3_fill_removed",
+      "passed": true,
+      "expected": "the fill file is removed and synced",
+      "actual": "removed=true"
+    },
+    {
+      "name": "s3_recovery_write_after_fill_removal",
+      "passed": false,
+      "expected": "the node accepts writes again after cleanup",
+      "actual": "Ok(503)"
+    },
+    {
+      "name": "s4_blob_written",
+      "passed": false,
+      "expected": "a known blob is written with RF >= 2",
+      "actual": "written=false"
+    },
+    {
+      "name": "s4_replicated_to_target",
+      "passed": false,
+      "expected": "the victim holds a replica before corruption",
+      "actual": "timed out after 60s: HTTP 404 Not Found"
+    },
+    {
+      "name": "background_load_served",
+      "passed": true,
+      "expected": "the background workload served at least one operation",
+      "actual": "ops_total=25033 errors_total=7800"
+    },
+    {
+      "name": "hints_settled_at_end",
+      "passed": true,
+      "expected": "no hint debt remains at the end of the run",
+      "actual": "pending=0 unreachable=[] (3 quiet checks)"
+    },
+    {
+      "name": "cluster_healthy_at_end",
+      "passed": true,
+      "expected": "every node answers /admin/health at the end of the run",
+      "actual": "healthy=true"
+    },
+    {
+      "name": "no_node_panics",
+      "passed": true,
+      "expected": "zero 'panicked' lines in node journald",
+      "actual": "0"
+    },
+    {
+      "name": "manifest_integrity",
+      "passed": false,
+      "expected": "every written key is readable with a recorded version from >= 1 node",
+      "actual": "1 of 101 keys absent from every node"
+    },
+    {
+      "name": "manifest_read_quorum",
+      "passed": false,
+      "expected": "every sampled key is served from >= 2 nodes",
+      "actual": "1 quorum failures"
+    },
+    {
+      "name": "injection_type_vm_kill_recorded",
+      "passed": true,
+      "expected": "at least one 'vm_kill' record",
+      "actual": "types: [\"vm_kill\", \"latency\", \"latency_remove\", \"disk_fill\", \"disk_fill_remove\"]"
+    },
+    {
+      "name": "injection_type_latency_recorded",
+      "passed": true,
+      "expected": "at least one 'latency' record",
+      "actual": "types: [\"vm_kill\", \"latency\", \"latency_remove\", \"disk_fill\", \"disk_fill_remove\"]"
+    },
+    {
+      "name": "injection_type_latency_remove_recorded",
+      "passed": true,
+      "expected": "at least one 'latency_remove' record",
+      "actual": "types: [\"vm_kill\", \"latency\", \"latency_remove\", \"disk_fill\", \"disk_fill_remove\"]"
+    },
+    {
+      "name": "injection_type_disk_fill_recorded",
+      "passed": true,
+      "expected": "at least one 'disk_fill' record",
+      "actual": "types: [\"vm_kill\", \"latency\", \"latency_remove\", \"disk_fill\", \"disk_fill_remove\"]"
+    },
+    {
+      "name": "injection_type_disk_fill_remove_recorded",
+      "passed": true,
+      "expected": "at least one 'disk_fill_remove' record",
+      "actual": "types: [\"vm_kill\", \"latency\", \"latency_remove\", \"disk_fill\", \"disk_fill_remove\"]"
+    },
+    {
+      "name": "injection_type_segment_corrupt_recorded",
+      "passed": false,
+      "expected": "at least one 'segment_corrupt' record",
+      "actual": "types: [\"vm_kill\", \"latency\", \"latency_remove\", \"disk_fill\", \"disk_fill_remove\"]"
+    },
+    {
+      "name": "all_injections_succeeded",
+      "passed": true,
+      "expected": "every non-skipped injection attempt reports success",
+      "actual": "0 failure(s): []"
+    },
+    {
+      "name": "platform_skips_recorded",
+      "passed": true,
+      "expected": "fleet mode executes every injector (zero skips)",
+      "actual": "0 skip(s): []"
+    },
+    {
+      "name": "records_attributed_to_injection_node",
+      "passed": true,
+      "expected": "all records attributed to node 1",
+      "actual": "nodes: [1, 1, 1, 1, 1]"
+    },
+    {
+      "name": "perf_assertions_none",
+      "passed": true,
+      "expected": "no throughput/latency threshold is asserted anywhere (correctness only)",
+      "actual": "perf: [] — RTT/RSS/GC observations are recorded as data; volume-backed numbers are not comparable to local-disk runs"
+    }
+  ],
+  "harness_metrics": {
+    "process_resident_memory_bytes": 582074368,
+    "process_open_fds": 58
+  }
+}

@@ -226,6 +226,33 @@ No new library `pub` items. The filesystem surface this feature produces:
   └─ exit with the harness run's exit code
 ```
 
+## Fleet Run Evidence and DoD Overrule (2026-09-11)
+
+The 2026-09-11 fleet validation executed this suite on the f1 volume-backed
+fleet. **The suite failed — correctly: it exposed product bugs, not test
+bugs.** User decision (2026-09-11):
+
+- **The fleet-run DoD item below is formally overruled as a closure gate.**
+  It is bug evidence, not a feature gate. The overruled item is the
+  `Tests: fleet run in harness mode passes all four scenarios` checklist
+  entry.
+- **f3 remains open (`proposed`)** until
+  [f5-degraded-pool-semantics](f5-degraded-pool-semantics.md) lands and this
+  suite is rerun green.
+- The five run artifacts are evidence only and are **not to be modified**:
+
+| Run | Result | Artifact |
+|---|---|---|
+| Full run 1 | fail — S2 read coverage 1/3 nodes, S3 reads 8/15 + recovery 503, S4 blob write failed (404 replication timeout), manifest 1/101 absent | [f3-full-run1-20260911.json](artifacts/f3-full-run1-20260911.json) |
+| Full run 2 | fail — S3 baseline 0/0, S4 write 503, manifest 1/102 absent, quorum 1 | [f3-full-run2-20260911.json](artifacts/f3-full-run2-20260911.json) |
+| Full run 3 | fail — S1 hints still draining (`pending=13`), S2 writes/reads near-zero, S3 baseline 0/0, S4 write 500, manifest 4/103 absent | [f3-full-run3-20260911.json](artifacts/f3-full-run3-20260911.json) |
+| Control `--no-injections` (dirty) | fail — manifest 6/94 absent, quorum 6, panic scan blocked (no SSH target) | [f3-control-dirty-20260911.json](artifacts/f3-control-dirty-20260911.json) |
+| Control `--no-injections` (pass) | pass — clean baseline | [f3-control-pass-20260911.json](artifacts/f3-control-pass-20260911.json) |
+
+All injections recorded in the full runs are `success=true`; the failures
+are product-side. The failing assertions and their root causes are traced in
+[f5 Root Causes & Evidence](f5-degraded-pool-semantics.md#root-causes--evidence-verified-2026-09-11).
+
 ## Definition of Done
 
 - [ ] **Code:** `cargo build --all-targets` succeeds in `e2e`; the new test
@@ -237,6 +264,12 @@ No new library `pub` items. The filesystem surface this feature produces:
       0 manifest mismatches; each scenario's assertions and injection records
       are present in the report; a second run with `--no-injections`
       (control) also passes, confirming the load path itself is clean.
+      **OVERRULED AS A CLOSURE GATE (user decision 2026-09-11):** the
+      2026-09-11 runs correctly exposed product bugs — this item is bug
+      evidence, not a feature gate. f3 stays open until
+      [f5-degraded-pool-semantics](f5-degraded-pool-semantics.md) lands and
+      the rerun is green. See
+      [Fleet Run Evidence and DoD Overrule](#fleet-run-evidence-and-dod-overrule-2026-09-11).
 - [ ] **Tests:** local-spawn quick mode runs disk-fill + corruption and
       records the device/network injectors as skipped (no silent success).
 - [ ] **Docs:** every `pub` item in any helper has `# Examples` and

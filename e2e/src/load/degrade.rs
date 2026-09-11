@@ -14,7 +14,7 @@
 //! |---|---|---|---|
 //! | `inject_latency` | ✅ `tc netem` | ❌ skipped | requires `tc` |
 //! | `remove_latency` | ✅ `tc` | ❌ skipped | |
-//! | `fill_disk` | ✅ `dd` + `df` | ❌ skipped | requires `dd` |
+//! | `fill_disk` | ✅ `fallocate`/`dd` + `df` | ❌ skipped | requires `fallocate`/`dd`; refuses tmpfs/ramfs |
 //! | `corrupt_shard` | ✅ raw I/O | ✅ raw I/O | no platform dependency |
 //!
 //! ## Usage
@@ -271,54 +271,79 @@ fn local_role_dir(data_dir: &Path, role: &str) -> Result<PathBuf, Error> {
     }
 }
 
-/// Fills `dir` to approximately `target_pct`% usage via `dd`.
+/// Fills `dir` to approximately `target_pct`% usage.
+///
+/// Allocates `dir/fill.bin` with `fallocate` (falling back to `dd`).
+/// Refuses memory-backed filesystems (tmpfs/ramfs): filling those consumes
+/// RAM and would destabilize the host instead of exercising ENOSPC — point
+/// `TMPDIR` at a disk-backed directory for the local-spawn scenario.
 ///
 /// Synchronous: callers run it on the blocking pool (`spawn_blocking`) —
-/// `dd`/`df` are child processes, not async work (perf 8.3).
+/// `fallocate`/`dd`/`df` are child processes, not async work (perf 8.3).
 fn fill_dir(dir: &Path, target_pct: u8) -> Result<PathBuf, Error> {
     if !cfg!(target_os = "linux") {
         eprintln!("fill_disk: skipped on non-Linux platform");
-        return Err(Error::ClusterError("fill_disk requires Linux (dd + df)".into()));
+        return Err(Error::ClusterError("fill_disk requires Linux (fallocate/dd + df)".into()));
     }
 
     let fill_path = dir.join("fill.bin");
 
-    // Get available space in bytes via df.
-    let total_space = get_disk_space(dir, "size")?;
+    let fstype = filesystem_type(dir)?;
+    if is_memory_fs(&fstype) {
+        return Err(Error::ClusterError(format!(
+            "fill_disk: refusing to fill {} — it is {fstype}; set TMPDIR to a disk-backed \
+             directory for the local-spawn scenario",
+            dir.display()
+        )));
+    }
+
+    // df's own percent denominator (`used + avail`) excludes reserved
+    // blocks; `size - avail` includes them and under-fills (the f2 live
+    // run landed at 16% for a 20% target before the same fix).
+    let used_space = get_disk_space(dir, "used")?;
     let avail_space = get_disk_space(dir, "avail")?;
-    let used_space = total_space.saturating_sub(avail_space);
-    let target_used = (total_space as f64 * (target_pct as f64 / 100.0)) as u64;
-    let fill_size = target_used.saturating_sub(used_space);
+    let fill_size = fill_target_bytes(used_space, avail_space, target_pct);
 
     if fill_size == 0 {
         eprintln!(
-            "fill_disk: already at or above {target_pct}% usage (used {used_space}, total {total_space})"
+            "fill_disk: already at or above {target_pct}% usage (used {used_space}, avail {avail_space})"
         );
         return Ok(fill_path);
     }
 
-    // Use dd to create the fill file.
-    // count is in 1M blocks.
-    let count_mb = (fill_size as f64 / (1024.0 * 1024.0)).ceil() as u64;
-    let output = Command::new("dd")
-        .args([
-            "if=/dev/zero",
-            &format!("of={}", fill_path.display()),
-            "bs=1M",
-            &format!("count={count_mb}"),
-        ])
-        .output()
-        .map_err(|e| Error::ClusterError(format!("dd command failed: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::ClusterError(format!("dd fill failed: {stderr}")));
+    // fallocate allocates instantly on ext4/xfs; dd is the portable fallback.
+    let fallocate_ok = Command::new("fallocate")
+        .arg("-l")
+        .arg(fill_size.to_string())
+        .arg(&fill_path)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !fallocate_ok {
+        let count_mb = fill_size.div_ceil(1024 * 1024);
+        let output = Command::new("dd")
+            .args([
+                "if=/dev/zero",
+                &format!("of={}", fill_path.display()),
+                "bs=1M",
+                &format!("count={count_mb}"),
+            ])
+            .output()
+            .map_err(|e| Error::ClusterError(format!("dd command failed: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::ClusterError(format!("dd fill failed: {stderr}")));
+        }
     }
 
     // Verify usage is within tolerance (±5% of target).
-    let new_avail = get_disk_space(dir, "avail")?;
-    let new_used = total_space.saturating_sub(new_avail);
-    let actual_pct = (new_used as f64 / total_space as f64 * 100.0).round() as u8;
+    let new_used = get_disk_space(dir, "used")?;
+    let denominator = new_used.saturating_add(get_disk_space(dir, "avail")?);
+    let actual_pct = if denominator == 0 {
+        0
+    } else {
+        (new_used as f64 / denominator as f64 * 100.0).round() as u8
+    };
     let tolerance = 5u8;
     if actual_pct < target_pct.saturating_sub(tolerance)
         || actual_pct > target_pct.saturating_add(tolerance)
@@ -327,6 +352,35 @@ fn fill_dir(dir: &Path, target_pct: u8) -> Result<PathBuf, Error> {
     }
 
     Ok(fill_path)
+}
+
+/// Returns the bytes to write so `dir`'s usage reaches `target_pct`%.
+///
+/// Uses df's percent denominator (`used + avail`, reserved blocks excluded),
+/// matching the fleet injector's `fill_command`.
+fn fill_target_bytes(used: u64, avail: u64, target_pct: u8) -> u64 {
+    let denominator = used.saturating_add(avail);
+    let target_used = denominator.saturating_mul(target_pct as u64) / 100;
+    target_used.saturating_sub(used)
+}
+
+/// Returns `true` for memory-backed filesystems that must not be filled.
+fn is_memory_fs(fstype: &str) -> bool {
+    matches!(fstype, "tmpfs" | "ramfs")
+}
+
+/// Returns the filesystem type of `dir` (e.g. `ext4`, `tmpfs`).
+fn filesystem_type(dir: &Path) -> Result<String, Error> {
+    let output = Command::new("stat")
+        .args(["-f", "-c", "%T"])
+        .arg(dir)
+        .output()
+        .map_err(|e| Error::ClusterError(format!("stat -f failed: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::ClusterError(format!("stat -f failed: {stderr}")));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// Returns a disk space metric from `df` for the given directory.
@@ -455,7 +509,9 @@ impl Cluster {
     ///
     /// 1. Writes a known blob to a healthy node, waits for replication.
     /// 2. Corrupts the segment identified by `segment_id` on `node_i`.
-    /// 3. Triggers an anti-entropy cycle (`POST /admin/trigger-anti-entropy`).
+    /// 3. Triggers a full distributed scrub (`POST /admin/scrub`, 202; the
+    ///    cycle runs asynchronously). The old `POST /admin/trigger-anti-entropy`
+    ///    route never existed on the current admin surface.
     /// 4. Waits up to `timeout` for the corrupted node to return the
     ///    original blob content (i.e., healing reconstructed it from
     ///    surviving replicas).
@@ -518,15 +574,20 @@ impl Cluster {
         // Step 2: Corrupt.
         self.corrupt_shard(node_i, segment_id).await?;
 
-        // Step 3: Trigger anti-entropy.
+        // Step 3: Trigger a full distributed scrub (the current admin
+        // surface; 202 means the cycle is running asynchronously).
         let node = self.node(node_i);
-        match node.post("/admin/trigger-anti-entropy").await {
+        match node.post("/admin/scrub").await {
             Ok(resp) => {
+                let status = resp.status();
                 let _ = resp.bytes().await;
+                if !status.is_success() {
+                    eprintln!("corrupt_and_verify_heal: POST /admin/scrub returned {status}");
+                }
             }
             Err(e) => {
-                eprintln!("corrupt_and_verify_heal: trigger-anti-entropy not available: {e}");
-                // Proceed — the periodic AE cycle will eventually repair.
+                eprintln!("corrupt_and_verify_heal: scrub trigger unavailable: {e}");
+                // Proceed — the periodic scrub/AE cycle will eventually repair.
             }
         }
 
@@ -856,5 +917,26 @@ mod tests {
         // On non-Linux, fill_disk should not work at the platform check level.
         // On Linux, it requires a real Cluster.
         const { assert!(cfg!(target_os = "linux") || !cfg!(target_os = "linux")) };
+    }
+
+    #[test]
+    fn fill_target_bytes_uses_df_percent_denominator() {
+        // used=300, avail=500 → denominator 800 (excludes 200 reserved);
+        // 50% = 400, so 100 bytes are needed. The old `size - avail`
+        // arithmetic (used=500, target=50% of 1000) computed 0.
+        assert_eq!(fill_target_bytes(300, 500, 50), 100);
+        assert_eq!(fill_target_bytes(400, 400, 50), 0);
+        assert_eq!(fill_target_bytes(0, 1000, 95), 950);
+        // Already above the target: never shrink.
+        assert_eq!(fill_target_bytes(900, 100, 10), 0);
+    }
+
+    #[test]
+    fn is_memory_fs_flags_tmpfs_and_ramfs_only() {
+        assert!(is_memory_fs("tmpfs"));
+        assert!(is_memory_fs("ramfs"));
+        for fstype in ["ext4", "xfs", "btrfs", "overlay", "nfs"] {
+            assert!(!is_memory_fs(fstype), "{fstype} must not be refused");
+        }
     }
 }
