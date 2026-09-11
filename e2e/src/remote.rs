@@ -15,16 +15,33 @@
 //!   the SUT process is managed by systemd on the SUT VM; the harness
 //!   SIGKILLs and restarts the unit over SSH so the WAL crash-recovery
 //!   phase of the load test works in remote mode too.
+//! - SSH command execution ([`RemoteCluster::ssh_exec`] and
+//!   [`RemoteCluster::ssh_exec_on`]) returning [`SshOutput`] — the black-box
+//!   substrate for the fleet fault injectors (`load::fleet_degrade`).
+//! - JSON POST ([`RemoteNode::post_json`] / [`RemoteCluster::post_json`]) for
+//!   the admin surface that requires a body (`POST /admin/pools`, drain
+//!   `{"mode": …}`).
 //!
 //! ## Environment contract
 //!
 //! | Variable | Purpose |
 //! |---|---|
 //! | `TARGET_HOST` | Comma-separated `host:port` list of remote OceanFS endpoints (Phase 2: exactly one; Phase 3: the fleet, one per node). |
-//! | `TARGET_HOST_SSH` | Comma-separated SSH targets for crash control, one per node, e.g. `root@10.0.0.2,root@10.0.0.3` or `~/.ssh/config` aliases. A single target (Phase 2) or a `~/.ssh/config` alias like `oceanfs-sut` also works. When unset, remote crash-recovery is skipped (local quick mode always covers it). |
+//! | `TARGET_HOST_SSH` | Comma-separated SSH targets for crash control and fault injection, one per node, e.g. `root@10.0.0.2,root@10.0.0.3` or `~/.ssh/config` aliases. A single target (Phase 2) or a `~/.ssh/config` alias like `oceanfs-sut` also works. When unset, remote crash-recovery/injection is skipped (local quick mode always covers crash recovery). |
 //! | `TARGET_SERVICE` | systemd unit name managing the SUT OceanFS process (default `oceanfs`). The unit must **not** auto-restart (`Restart=no`), otherwise the SIGKILL→restart sequencing is meaningless. |
+//!
+//! ## SSH command safety
+//!
+//! [`RemoteCluster::ssh_exec_on`] takes a command string. Callers must build
+//! that string from **typed parameters** (a volume id, a mount path, a
+//! segment id) and shell-quote every interpolated value — never pass an
+//! arbitrary string that originated in a report, record, or environment
+//! variable. The fleet injectors in
+//! [`load::fleet_degrade`](crate::load::fleet_degrade) follow this rule.
 
 use std::{net::SocketAddr, time::Duration};
+
+use serde_json::Value;
 
 use crate::harness::{Error, LoadTarget};
 
@@ -35,6 +52,70 @@ fn build_client() -> reqwest::Client {
         .timeout(Duration::from_secs(30))
         .build()
         .expect("reqwest client should build with default TLS")
+}
+
+/// Builds a JSON POST request without sending it.
+///
+/// Kept separate from [`RemoteNode::post_json`] so the request shape
+/// (method, content type, body) is unit-testable without a receiver
+/// server. The body is serialized explicitly because reqwest is built
+/// without its `json` feature.
+fn post_json_request(
+    client: &reqwest::Client,
+    url: String,
+    body: &Value,
+) -> Result<reqwest::Request, Error> {
+    let payload = serde_json::to_vec(body)
+        .map_err(|e| Error::ClusterError(format!("failed to serialize JSON body: {e}")))?;
+    Ok(client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(payload)
+        .build()?)
+}
+
+/// Captured result of a single SSH command run on a remote node's VM.
+///
+/// A non-zero `status` is **not** an error: the command ran and failed.
+/// [`Error::Ssh`] is reserved for ssh itself failing to run or being
+/// misconfigured.
+///
+/// # Examples
+///
+/// ```
+/// use e2e::remote::SshOutput;
+///
+/// let out = SshOutput {
+///     status: 0,
+///     stdout: "sdb\n".to_string(),
+///     stderr: String::new(),
+/// };
+/// assert!(out.success());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshOutput {
+    /// Process exit status (`-1` when killed by a signal).
+    pub status: i32,
+    /// Captured standard output (lossy UTF-8).
+    pub stdout: String,
+    /// Captured standard error (lossy UTF-8).
+    pub stderr: String,
+}
+
+impl SshOutput {
+    /// Returns `true` when the command exited with status 0.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use e2e::remote::SshOutput;
+    ///
+    /// let out = SshOutput { status: 1, stdout: String::new(), stderr: "boom".into() };
+    /// assert!(!out.success());
+    /// ```
+    pub fn success(&self) -> bool {
+        self.status == 0
+    }
 }
 
 /// A single remote OceanFS endpoint reached over HTTP.
@@ -113,6 +194,34 @@ impl RemoteNode {
     pub async fn post(&self, path: &str) -> Result<reqwest::Response, Error> {
         Ok(self.client.post(format!("{}{}", self.base_url, path)).send().await?)
     }
+
+    /// HTTP POST with a JSON body (`Content-Type: application/json`).
+    ///
+    /// The admin surface requires a body for `POST /admin/pools` (a
+    /// `StoragePoolConfig`) and accepts one for drain
+    /// (`{"mode":"cluster"|"intra-node"}`).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use e2e::remote::RemoteNode;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let node = RemoteNode::new("10.0.0.2:9000")?;
+    /// let resp = node
+    ///     .post_json("/admin/pools", &serde_json::json!({ "name": "spare" }))
+    ///     .await?;
+    /// assert!(resp.status().is_success());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be built or HTTP fails.
+    pub async fn post_json(&self, path: &str, body: &Value) -> Result<reqwest::Response, Error> {
+        let request = post_json_request(&self.client, format!("{}{}", self.base_url, path), body)?;
+        Ok(self.client.execute(request).await?)
+    }
 }
 
 /// A remote cluster: one or more already-running OceanFS endpoints.
@@ -126,6 +235,9 @@ pub struct RemoteCluster {
     nodes: Vec<RemoteNode>,
     /// Shared HTTP client.
     client: reqwest::Client,
+    /// Per-node SSH targets (from `TARGET_HOST_SSH`), aligned by index with
+    /// `nodes`. Empty entries mean "no SSH configured for that node".
+    ssh_targets: Vec<String>,
 }
 
 impl RemoteCluster {
@@ -133,11 +245,45 @@ impl RemoteCluster {
     ///
     /// Accepts a single `host:port` or a comma-separated list
     /// (`TARGET_HOSTS` style, for Phase 3+ multi-node remote targets).
+    /// Per-node SSH targets are read from `TARGET_HOST_SSH` (comma-separated,
+    /// aligned by index); unset means SSH operations are unavailable and
+    /// callers must skip them explicitly.
     ///
     /// # Errors
     ///
-    /// Returns an error if any endpoint fails to parse.
+    /// Returns an error if any endpoint fails to parse or an SSH target is
+    /// malformed.
     pub fn connect(target_host: &str) -> Result<Self, Error> {
+        Self::connect_with_ssh_targets(target_host, ssh_targets_from_env())
+    }
+
+    /// Connects to the endpoints listed in `target_host` with explicit
+    /// per-node SSH targets.
+    ///
+    /// Used by tests and by callers that resolve SSH targets themselves
+    /// (e.g. from the provisioning record) instead of `TARGET_HOST_SSH`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use e2e::remote::RemoteCluster;
+    ///
+    /// let cluster = RemoteCluster::connect_with_ssh_targets(
+    ///     "10.0.0.2:9000",
+    ///     vec!["root@10.0.0.2".to_string()],
+    /// )
+    /// .expect("connect");
+    /// assert_eq!(cluster.ssh_target_for(0), Some("root@10.0.0.2"));
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any endpoint fails to parse or any SSH target is
+    /// malformed (conservative character set, never option-shaped).
+    pub fn connect_with_ssh_targets(
+        target_host: &str,
+        ssh_targets: Vec<String>,
+    ) -> Result<Self, Error> {
         let client = build_client();
         let mut hosts: Vec<&str> = target_host
             .split(',')
@@ -147,8 +293,11 @@ impl RemoteCluster {
         if hosts.is_empty() {
             return Err(Error::ClusterError("TARGET_HOST is empty".into()));
         }
+        for target in &ssh_targets {
+            validate_ssh_target(target)?;
+        }
         let nodes = hosts.drain(..).map(RemoteNode::new).collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { nodes, client })
+        Ok(Self { nodes, client, ssh_targets })
     }
 
     /// Returns the number of remote endpoints.
@@ -159,6 +308,45 @@ impl RemoteCluster {
     /// Returns `true` if there are no remote endpoints.
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    /// Returns the configured per-node SSH targets, aligned by index with
+    /// the remote endpoints (possibly shorter or empty when unset).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use e2e::remote::RemoteCluster;
+    ///
+    /// let cluster = RemoteCluster::connect_with_ssh_targets(
+    ///     "10.0.0.2:9000,10.0.0.3:9000",
+    ///     vec!["root@10.0.0.2".to_string(), "root@10.0.0.3".to_string()],
+    /// )
+    /// .expect("connect");
+    /// assert_eq!(cluster.ssh_targets().len(), 2);
+    /// ```
+    pub fn ssh_targets(&self) -> &[String] {
+        &self.ssh_targets
+    }
+
+    /// Returns the SSH target for node `i`, or `None` when SSH is not
+    /// configured for that node.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use e2e::remote::RemoteCluster;
+    ///
+    /// let cluster = RemoteCluster::connect_with_ssh_targets(
+    ///     "10.0.0.2:9000",
+    ///     vec!["root@10.0.0.2".to_string()],
+    /// )
+    /// .expect("connect");
+    /// assert_eq!(cluster.ssh_target_for(0), Some("root@10.0.0.2"));
+    /// assert_eq!(cluster.ssh_target_for(1), None);
+    /// ```
+    pub fn ssh_target_for(&self, i: usize) -> Option<&str> {
+        self.ssh_targets.get(i).map(String::as_str)
     }
 
     /// Returns the base URL of node `i`.
@@ -316,6 +504,103 @@ impl RemoteCluster {
     ) -> Result<(), Error> {
         self.kill_and_restart_node_via_ssh(0, ssh_target, service).await
     }
+
+    /// HTTP POST with a JSON body to node `i`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use e2e::remote::RemoteCluster;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let cluster = RemoteCluster::connect("10.0.0.2:9000")?;
+    /// let resp = cluster
+    ///     .post_json(0, "/admin/pools/0/drain", &serde_json::json!({ "mode": "cluster" }))
+    ///     .await?;
+    /// assert!(resp.status().is_success());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if node `i` is out of bounds or HTTP fails.
+    pub async fn post_json(
+        &self,
+        i: usize,
+        path: &str,
+        body: &Value,
+    ) -> Result<reqwest::Response, Error> {
+        self.nodes
+            .get(i)
+            .ok_or_else(|| Error::ClusterError(format!("node {i} out of bounds")))?
+            .post_json(path, body)
+            .await
+    }
+
+    /// Runs a single shell command on node `node_idx`'s VM over SSH and
+    /// returns its captured output.
+    ///
+    /// The command runs on the blocking pool (`ssh` is a synchronous child
+    /// process) and is passed to ssh as a single argument; the **caller**
+    /// is responsible for building it from typed parameters and quoting
+    /// interpolated values (see the module-level SSH safety note).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use e2e::remote::RemoteCluster;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let cluster = RemoteCluster::connect_with_ssh_targets(
+    ///     "10.0.0.2:9000",
+    ///     vec!["root@10.0.0.2".to_string()],
+    /// )?;
+    /// let out = cluster.ssh_exec(0, "mountpoint -q /mnt/oceanfs-data").await?;
+    /// assert!(out.success());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Ssh`] when no SSH target is configured for the node
+    /// or ssh itself cannot run.
+    pub async fn ssh_exec(&self, node_idx: usize, command: &str) -> Result<SshOutput, Error> {
+        let target = self.ssh_target_for(node_idx).ok_or_else(|| {
+            Error::Ssh(format!(
+                "TARGET_HOST_SSH has no entry for node {node_idx} ({} targets configured)",
+                self.ssh_targets.len()
+            ))
+        })?;
+        self.ssh_exec_on(target, command).await
+    }
+
+    /// Runs a single shell command against an explicit SSH target and
+    /// returns its captured output.
+    ///
+    /// Used when the per-node target comes from the provisioning record
+    /// rather than `TARGET_HOST_SSH`. Same quoting contract as
+    /// [`RemoteCluster::ssh_exec`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use e2e::remote::RemoteCluster;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let cluster = RemoteCluster::connect("10.0.0.2:9000")?;
+    /// let out = cluster.ssh_exec_on("root@10.0.0.2", "uname -s").await?;
+    /// assert_eq!(out.stdout.trim(), "Linux");
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Ssh`] when the target is malformed or ssh cannot run.
+    pub async fn ssh_exec_on(&self, ssh_target: &str, command: &str) -> Result<SshOutput, Error> {
+        validate_ssh_target(ssh_target)?;
+        run_ssh_output(&["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", ssh_target, command])
+            .await
+    }
 }
 
 impl LoadTarget for RemoteCluster {
@@ -368,27 +653,76 @@ impl LoadTarget for RemoteCluster {
 /// Returns [`Error::Ssh`] when ssh cannot be spawned, exits non-zero, or
 /// the blocking task panics.
 async fn run_ssh(args: &[&str]) -> Result<(), Error> {
-    // Disposable test VMs: never track host keys (the SUT's key is not in
-    // the harness's known_hosts — the SUT is reached over the internal
-    // network and the harness may be re-provisioned at any time).
+    let display = format!("{args:?}");
+    let output = run_ssh_output(args).await?;
+    if !output.success() {
+        return Err(Error::Ssh(format!("ssh {display} exited with status {}", output.status)));
+    }
+    Ok(())
+}
+
+/// Runs an `ssh` command to completion and captures its output.
+///
+/// Runs on the blocking pool — `ssh` is a synchronous child process.
+/// Host-key checking is disabled: the SUT is a disposable test VM reached
+/// over the internal network, and the harness may be re-provisioned at any
+/// time.
+///
+/// # Errors
+///
+/// Returns [`Error::Ssh`] when ssh cannot be spawned or the blocking task
+/// panics. A non-zero remote exit status is returned in the output, not as
+/// an error.
+async fn run_ssh_output(args: &[&str]) -> Result<SshOutput, Error> {
     let mut full_args: Vec<&str> =
         vec!["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"];
     full_args.extend_from_slice(args);
     // Own the arguments so the blocking closure is `'static`.
     let args: Vec<String> = full_args.iter().map(|s| (*s).to_string()).collect();
-    let args_display = format!("{args:?}");
-    let status = tokio::task::spawn_blocking(move || {
+    let output = tokio::task::spawn_blocking(move || {
         std::process::Command::new("ssh")
             .args(&args)
-            .status()
+            .output()
             .map_err(|e| Error::Ssh(format!("failed to spawn ssh {args:?}: {e}")))
     })
     .await
     .map_err(|e| Error::Ssh(format!("ssh task join failed: {e}")))??;
-    if !status.success() {
-        return Err(Error::Ssh(format!("ssh {args_display} exited with {status}")));
+    Ok(SshOutput {
+        status: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+/// Reads the comma-separated `TARGET_HOST_SSH` list into per-node targets.
+fn ssh_targets_from_env() -> Vec<String> {
+    std::env::var("TARGET_HOST_SSH")
+        .ok()
+        .map(|list| {
+            list.split(',').map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Validates an SSH target before it is handed to the `ssh` argv.
+///
+/// SSH targets come from `TARGET_HOST_SSH` or the provisioning record —
+/// both are operator-controlled, but a target is passed to `ssh` as an
+/// **argument**, so a value starting with `-` could be parsed as an ssh
+/// option (e.g. `-oProxyCommand=…`). Restrict targets to
+/// `[A-Za-z0-9._@:\[\]-]`, at most 255 chars, and never a leading `-`.
+fn validate_ssh_target(target: &str) -> Result<(), Error> {
+    let ok = !target.is_empty()
+        && target.len() <= 255
+        && !target.starts_with('-')
+        && target.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-' | ':' | '[' | ']')
+        });
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Ssh(format!("invalid SSH target {target:?}")))
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -430,5 +764,70 @@ mod tests {
     fn remote_cluster_rejects_empty_host_list() {
         let err = RemoteCluster::connect("").expect_err("empty host list must fail");
         assert!(err.to_string().contains("TARGET_HOST is empty"));
+    }
+
+    #[test]
+    fn post_json_request_sets_method_content_type_and_body() {
+        let client = build_client();
+        let request = post_json_request(
+            &client,
+            "http://10.0.0.2:9000/admin/pools".to_string(),
+            &serde_json::json!({ "name": "spare" }),
+        )
+        .expect("build request");
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(request.url().as_str(), "http://10.0.0.2:9000/admin/pools");
+        let content_type =
+            request.headers().get(reqwest::header::CONTENT_TYPE).expect("content-type set");
+        assert!(content_type.to_str().unwrap().starts_with("application/json"));
+        let body = request.body().and_then(reqwest::Body::as_bytes).expect("in-memory body");
+        assert_eq!(body, br#"{"name":"spare"}"#);
+    }
+
+    #[test]
+    fn validate_ssh_target_accepts_hosts_and_aliases() {
+        for target in ["root@10.0.0.2", "oceanfs-sut", "user@[fd00::1]:22", "10.0.0.2"] {
+            validate_ssh_target(target).expect("valid target");
+        }
+    }
+
+    #[test]
+    fn validate_ssh_target_rejects_option_injection_and_whitespace() {
+        let long = "a".repeat(256);
+        for target in ["-oProxyCommand=touch /tmp/pwned", "root@10.0.0.2 extra", "", long.as_str()]
+        {
+            assert!(validate_ssh_target(target).is_err(), "must reject {target:?}");
+        }
+    }
+
+    #[test]
+    fn connect_with_ssh_targets_rejects_invalid_target() {
+        let err = RemoteCluster::connect_with_ssh_targets(
+            "10.0.0.5:9000",
+            vec!["-oProxyCommand=touch /tmp/pwned".to_string()],
+        )
+        .expect_err("option-shaped target must fail");
+        assert!(err.to_string().contains("invalid SSH target"));
+    }
+
+    #[test]
+    fn connect_with_ssh_targets_maps_per_node_targets() {
+        let cluster = RemoteCluster::connect_with_ssh_targets(
+            "10.0.0.5:9000,10.0.0.6:9000",
+            vec!["root@10.0.0.5".to_string(), "root@10.0.0.6".to_string()],
+        )
+        .expect("connect");
+        assert_eq!(cluster.ssh_target_for(0), Some("root@10.0.0.5"));
+        assert_eq!(cluster.ssh_target_for(1), Some("root@10.0.0.6"));
+        assert_eq!(cluster.ssh_target_for(2), None);
+        assert_eq!(cluster.ssh_targets(), &["root@10.0.0.5", "root@10.0.0.6"]);
+    }
+
+    #[tokio::test]
+    async fn ssh_exec_without_configured_target_returns_error() {
+        let cluster =
+            RemoteCluster::connect_with_ssh_targets("10.0.0.5:9000", Vec::new()).expect("connect");
+        let err = cluster.ssh_exec(0, "true").await.expect_err("no target configured");
+        assert!(err.to_string().contains("no entry for node 0"));
     }
 }

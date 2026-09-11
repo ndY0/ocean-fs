@@ -1,7 +1,7 @@
 ---
 feature: "Remote Fault Injectors (SSH Black-Box, Real Volumes)"
 epic: "fleet-degradation"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -213,39 +213,130 @@ scenario (f3/f4)
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds in `e2e`; `post_json`
+- [x] **Code:** `cargo build --all-targets` succeeds in `e2e`; `post_json`
       and `ssh_exec` are implemented on the real client paths; `fleet_degrade`
       compiles with no `unsafe`, no test-only product hooks, and all shell
       command construction is parameter-typed and quoting-safe.
-- [ ] **Tests:** `cargo test -p e2e --lib` passes (unit: JSON body, quoting,
+      *Reviewer: verified independently — `cargo build -p e2e --all-targets`,
+      `cargo clippy -p e2e --lib -- -D warnings`, `cargo fmt -p e2e --check`
+      all clean; `post_json` serializes via `serde_json::to_vec` + explicit
+      `Content-Type: application/json` (remote.rs:63-75); `ssh_exec_on`
+      validates the target and runs `ssh` under `spawn_blocking`
+      (remote.rs:599-603, 676-695); no `unsafe`/`#[allow]`; only `e2e/`
+      changed (no product crates, no test-only hooks).*
+- [x] **Tests:** `cargo test -p e2e --lib` passes (unit: JSON body, quoting,
       `lo` rejection, skipped-injection records); the fleet-only integration
       items run on the cloud harness (PIPELINE §6 — never locally) and are
       listed in the feature's review: yank/replug, per-role fill, segment
       discovery + corruption + remote heal, latency add/remove on the internal
       interface.
-- [ ] **Tests:** every injector emits exactly one `FailureInjectionRecord`
+      *Reviewer (iteration 2, commands re-run): `cargo test -p e2e --lib` =
+      163 passed / 0 failed; `cargo test -p e2e --doc` = 57 passed / 0 failed;
+      `--test fleet_injectors` skips locally (no `TARGET_HOSTS`) and passes;
+      `cargo build -p e2e --all-targets`, `cargo clippy -p e2e --lib --
+      -D warnings`, `cargo fmt -p e2e -- --check`, and
+      `RUSTDOCFLAGS="-D warnings" cargo doc -p e2e --no-deps` all clean.
+      Judged the fleet run from `artifacts/fleet-injectors-2026-09-11.json` +
+      code (cloud destroyed, no re-run attempted): yank/replug with
+      same-serial verification, fill on the spare mount (21% for a 20%
+      target), newest data segment discovered + corrupted, netem add/remove on
+      `enp7s0`, and peer-observed RTT 1.44→100.56→0.58ms
+      (`latency_observable_on_wire`, `latency_removal_restores_rtt` PASS) —
+      the iteration-1 gaps are closed. Remaining recorded caveat (deviation
+      #22): the heal loop proves the node keeps serving correct bytes (repair
+      or replica failover), not that the corrupted segment held the blob;
+      precise repair assertions belong to f4's role scenarios.*
+- [x] **Tests:** every injector emits exactly one `FailureInjectionRecord`
       per attempt (success or failure), and a skipped injector records
       `success=false` with a reason — asserted in at least one unit test and
       one fleet run.
-- [ ] **Docs:** every new `pub` item has `# Examples`; `#![deny(missing_docs)]`
+      *Reviewer (iteration 2): `finish()` appends exactly one record for
+      success/failure (fleet_degrade.rs:491-518) and is unit-tested for both
+      (`finish_records_success_and_failure_exactly_once`); skip paths are
+      unit-tested (`injector_without_volumes_records_skipped_failure`,
+      `injector_without_ssh_records_skipped_failure`); the fleet run asserts
+      `exactly_one_record_per_attempt` (7 records / 7 attempts) **and** now
+      exercises the skip path in the same run (`skip_path_records_failure`
+      PASS); the artifact serializes 8 records = 7 successes + 1 expected
+      skip. The iteration-1 LOW gap is closed.*
+- [x] **Docs:** every new `pub` item has `# Examples`; `#![deny(missing_docs)]`
       passes in `e2e`; the module doc states the Option-A SSH-black-box rule
       and the no-performance-assertion rule.
-- [ ] **ADR:** ADR-0026 (per-node SSH mapping contract preserved), ADR-0029
+      *Reviewer (iteration 3, commands re-run): the two remaining items now
+      carry `no_run` examples — `Cluster::fill_role_root`
+      (degrade.rs:185-196) and `Cluster::local_role_root` (degrade.rs:225-236);
+      every new `pub` item carries an example — `fleet_degrade.rs` 28/28,
+      `remote.rs` 9/9, `report.rs` 2/2, and the two `degrade.rs` additions.
+      `cargo test -p e2e --doc` = 59 passed / 0 failed (57 + the 2 new
+      examples); `RUSTDOCFLAGS="-D warnings" cargo doc -p e2e --no-deps` clean;
+      `#![deny(missing_docs)]` at e2e/src/lib.rs:23; fleet_degrade.rs:17-34
+      states both the Option-A SSH-black-box rule and the
+      no-performance-assertion rule. The iteration-2 gap is closed.*
+- [x] **ADR:** ADR-0026 (per-node SSH mapping contract preserved), ADR-0029
       §D3 (injectors realize confirmed-loss/device-unplug semantics for the
       scenarios), ADR-0030/0035 (heal loop uses the real recovery machinery,
       no shortcut), ADR-0036 (drain/detach driven via the real admin API)
       satisfied.
-- [ ] **Perf:** no perf assertions in this feature; frontmatter rules honored
+      *Reviewer (iteration 2): ADR-0026 — `TARGET_HOST_SSH` remains the
+      index-aligned per-node list; `ssh_targets`/`ssh_target_for`/`ssh_exec`
+      map node index to the same target and `kill_and_restart_node_via_ssh` is
+      unchanged. ADR-0029 §D3 — yank is real sysfs `device/delete`
+      (device-unplug confirmed-loss path; f1 gate PASS 11/11, fallback not
+      adopted, f1 doc:368-375). ADR-0030/0035 — the heal loop is HTTP-only
+      (`corrupt → POST /admin/scrub → read-back poll`,
+      fleet_degrade.rs:1032-1101), no product hook or data shortcut. ADR-0036
+      — `post_json` reaches body-carrying admin APIs (`POST /admin/pools`,
+      drain mode); no admin endpoint added; actually driving drain/detach
+      belongs to f3/f4. `git status` confirms no product crate was modified
+      (no test-only product hooks).*
+- [x] **Perf:** no perf assertions in this feature; frontmatter rules honored
       — bounded worker/injector orchestration (2.6), `spawn_blocking` for SSH
       and file work (8.3), pre-sized maps for the fixed 4-role volume set
       (1.3); remote commands are one-shot per injection, never per-request.
-- [ ] **Integration:** one fleet run drives all five injector families
+      *Reviewer (iteration 2): no throughput/latency threshold asserted
+      anywhere — the latency checks are functional RTT observations
+      (`latency_observable_on_wire`, `latency_removal_restores_rtt` PASS in
+      the artifact); 2.6 N/A (no channels introduced — injectors are
+      sequential one-shot calls); `ssh` runs on `spawn_blocking` with
+      justifying comments (remote.rs:647-695); `fill_dir` now runs on
+      `spawn_blocking` from both `fill_disk` and `fill_role_root`
+      (degrade.rs:170-172, :197-199), closing the iteration-1 LOW caveat;
+      `Vec::with_capacity` used for targets and records
+      (fleet_degrade.rs:314, :385). Residual (LOW, pre-existing, non-gating):
+      the opt-in local `tc` path still spawns `tc` synchronously inside an
+      async fn — one-shot and gated behind `E2E_ALLOW_LOOPBACK_LATENCY`, no
+      remote work blocked.*
+- [x] **Integration:** one fleet run drives all five injector families
       successfully against the f1 topology and the report contains the
       injection records with correct node/role attribution. **No load suite
       runs on the dev machine** (PIPELINE §6).
-- [ ] **Deviations:** module location (OQ d), SSH byte-transfer method for
+      *Reviewer (iteration 2): judged from the artifact + code (cloud fleet
+      destroyed; no re-run attempted).
+      `artifacts/fleet-injectors-2026-09-11.json`: 8 records = 7 successful
+      injector attempts + 1 expected skip-gate exercise; all 7 attempts
+      `node_index=1` and machine-asserted
+      (`records_attributed_to_injection_node`), role prefixes
+      (`spare:`/`data:`/`enp7s0:`) machine-asserted
+      (`records_role_attribution`), 18/18 assertions, 22.2s, result `pass`.
+      `post_json` is not exercised live (drain/detach is f3/f4's job per the
+      ADR-0036 note). Locally only `--lib`, `--doc`, and the `fleet_injectors`
+      skip were run (PIPELINE §6).*
+- [x] **Deviations:** module location (OQ d), SSH byte-transfer method for
       corruption, interface-resolution rule, and the fallback-injector
       selection (sysfs vs hcloud) are recorded here.
+      *Reviewer (iteration 2): verified — `## Deviations (accepted)` records
+      all four required decisions (1 OQ d layout; 2 corruption transfer: local
+      `stat` offset + remote `dd` with `python3` fallback, no byte streaming;
+      3 interface resolution: `LOAD_TEST_LATENCY_IFACE` else `ip -o route
+      get`, `lo` always rejected; 4 sysfs-only yank per f1's gate verdict
+      "PASS (11/11) — the fallback decision is NOT needed", f1 doc:368-375),
+      matching the code (`corrupt_command` :1525-1538, `latency_iface`
+      :1132-1172 + `validate_iface` :1383-1398, `yank_command` :1405-1418;
+      record/env mapping :334-420). The implementation-shape and
+      live-run deviations (5–25) are recorded too, including the re-scoped
+      heal claim (#22), the corrected fill arithmetic (#19), the opt-in local
+      latency (#16), and the artifact-commit note (#25). The iteration-1 gap
+      is closed.*
 
 > **Lint & Doc Examples (non-gating):** `cargo clippy --lib -- -D warnings`
 > should pass on production code. Test-code clippy warnings (`.unwrap()`,
@@ -254,33 +345,188 @@ scenario (f3/f4)
 > hygiene tracked separately (see `guidelines/coding.md` §9.2). Do NOT
 > include Lint or Manual items in the Definition of Done checklist.
 
-## Open Questions for the Implementer
+## Open Questions (resolved)
 
 - **OQ d (module layout).** Recommendation: `RemoteCluster`/`RemoteNode`
   plumbing in `e2e/src/remote.rs`; scenario-grade injectors in
   `e2e/src/load/fleet_degrade.rs`. Alternative: a single new
   `e2e/src/fleet.rs` carrying both. Decide at implementation; record the
   decision.
+  **RESOLVED 2026-09-11:** implemented as recommended — plumbing in
+  `e2e/src/remote.rs`; scenario-grade injectors in
+  `e2e/src/load/fleet_degrade.rs` (re-exported from `load/mod.rs`); recorded
+  in [Deviations (accepted)](#deviations-accepted) #1.
 - **Interface resolution.** How to derive the internal interface on a node
   (`ip route get <harness-ip>` vs `ip -o addr show to 10.0.0.0/24`)? Must be
   deterministic and must reject `lo`. Decide and document; the harness can
   pass `LOAD_TEST_LATENCY_IFACE` as an override.
+  **RESOLVED 2026-09-11:** `LOAD_TEST_LATENCY_IFACE` override wins; else
+  `ip -o route get <next-node internal ip>` parsed for `dev`; `lo` rejected
+  for both; single-node fleet errors out. No default-route heuristic; no
+  `ip -o addr show` alternative. Recorded in
+  [Deviations (accepted)](#deviations-accepted) #3.
 - **Corruption transfer mechanism.** Stream bytes over SSH vs a remote
   `dd`/`python3` one-liner: choose based on what is guaranteed present on
   Ubuntu 24.04 (`dd`/`python3` are; keep the fallback order explicit) and
   record it.
+  **RESOLVED 2026-09-11:** offset computed locally from `stat -c %s`; the
+  write is a remote `dd if=/dev/urandom … seek=… conv=notrunc`, with an
+  explicit `python3` fallback branch; no SSH byte streaming. Recorded in
+  [Deviations (accepted)](#deviations-accepted) #2.
 - **Volume map source on the harness.** Does the runner copy the
   provisioning record to the Harness VM, or does the injector accept a
   `LOAD_TEST_VOLUMES_JSON` env payload? (Recommendation: runner copies the
   record; injector also accepts the env override for gate/debug runs.)
+  **RESOLVED 2026-09-11:** the runner copies the f1 provisioning record and
+  sets `LOAD_TEST_RECORD_FILE`; `LOAD_TEST_VOLUMES_JSON` inline is accepted
+  as an override; per-node SSH targets come from `TARGET_HOST_SSH` first,
+  record `internal_ip` second; missing configuration records `skipped:`
+  failures, never a silent success. Recorded in
+  [Deviations (accepted)](#deviations-accepted) #5.
 - **Segment-id selection policy.** For generic corruption scenarios: pick
   the lexicographically-first `.dat` on the target role? Prefer a segment
   the harness just wrote (if discoverable)? State the rule per scenario in
   f3/f4; the injector offers both an explicit id and a discovery helper.
+  **RESOLVED 2026-09-11:** the injector takes an explicit id parameter plus
+  two discovery helpers — `list_segment_ids` (name-sorted) and
+  `newest_segment_id` (mtime-sorted); f3/f4 own their per-scenario rule; the
+  f2 suite uses `newest_segment_id`. Recorded in
+  [Deviations (accepted)](#deviations-accepted) #6.
 - **Hints-role corruption validity.** Corrupting a `.dat` on the hints role
   may not be meaningful (hints are not segment data). **Mark any hints-file
   injector as grounding-required** until f4's OQ c is resolved.
+  **RESOLVED 2026-09-11:** documented as not meaningful in the module doc
+  (hints are a WAL, not segments; `list_segment_ids` returns empty there);
+  f4 P4 asserts the f0 gate contract for hints. Recorded in
+  [Deviations (accepted)](#deviations-accepted) #7.
 
 ## Deviations (accepted)
 
-_None yet — filled at implementation close._
+Implementation close 2026-09-11. None of these change product behavior; all
+are recorded against the f2 scope as reviewed.
+
+Review closed **PASS** on iteration 3 (2026-09-11); final fleet evidence:
+`artifacts/fleet-injectors-2026-09-11.json` — 8 records = 7 successes + 1
+expected skip, 18/18 assertions, 22.2s.
+
+### Required decisions (OQ / scope)
+
+1. **OQ d — module layout.** As recommended: `RemoteCluster`/`RemoteNode`
+   plumbing in `e2e/src/remote.rs`; scenario-grade injectors in
+   `e2e/src/load/fleet_degrade.rs` (re-exported from `load/mod.rs`).
+2. **Corruption transfer.** Offset computed locally from `stat -c %s`; the
+   write is a remote `dd if=/dev/urandom … seek=… conv=notrunc`, with an
+   explicit `python3` fallback branch when `dd` is unavailable
+   (`corrupt_command`). No bytes stream over SSH.
+3. **Interface resolution.** `LOAD_TEST_LATENCY_IFACE` override wins; else
+   `ip -o route get <next-node internal ip>` parsed for `dev`. `lo` is always
+   rejected (both override and derived) and a single-node fleet errors out
+   rather than guessing. No default-route heuristic.
+4. **Fallback injector selection (sysfs vs hcloud).** Sysfs only. The f1 gate
+   passed 11/11 and recorded the hcloud detach/attach branch as **not
+   adopted** (no Hetzner token/CLI on the Harness). A hcloud branch in the
+   Rust injector would be unreachable dead code; the injector instead fails
+   loudly and records a failed attempt when `/sys/block/<dev>/device/delete`
+   is missing or unwritable. No env override for the method.
+5. **Volume map source.** The runner copies the f1 provisioning record to the
+   harness and sets `LOAD_TEST_RECORD_FILE`; the injector also accepts
+   `LOAD_TEST_VOLUMES_JSON` inline for gate/debug runs. Missing configuration
+   is not an error: every injection records `success=false` with a
+   `skipped:` reason.
+6. **Segment-id selection.** The injector accepts an explicit id and offers
+   two discovery helpers: `list_segment_ids` (name-sorted) and
+   `newest_segment_id` (mtime-sorted). f3/f4 state their per-scenario rule;
+   the f2 suite uses `newest_segment_id`.
+7. **Hints-role corruption.** Documented as not meaningful in the module doc
+   (hints are a WAL, not segments): `list_segment_ids` returns empty on the
+   hints mount; f4 P4 resolves hints semantics per the f0 gate contract.
+
+### Interface additions / shape
+
+8. **`run_ssh_command` realized as two methods.** `RemoteCluster::ssh_exec`
+   (index-based, per-node `TARGET_HOST_SSH`) and
+   `RemoteCluster::ssh_exec_on` (explicit target, needed when SSH targets
+   come from the provisioning record rather than the env list).
+9. **`connect_with_ssh_targets`** added so tests/runner can supply the
+   per-node SSH mapping explicitly; `connect` reads `TARGET_HOST_SSH`.
+   `ssh_targets()`/`ssh_target_for()` expose it. SSH targets are validated
+   (no option-shaped/whitespace values) because they are argv elements to
+   `ssh`.
+10. **`SshOutput` (status/stdout/stderr) + `SshOutput::success`.** A non-zero
+    remote exit status is returned in `SshOutput`, not as `Error::Ssh`;
+    crash-control keeps its strict behavior through `run_ssh`.
+11. **`LoadReport` gains `injection_records` + `record_injections`/
+    `injection_records`** (skip-when-empty, additive schema) — the
+    `records() → LoadReport.injection_records` wire-up the f2 Data Flow
+    requires.
+12. **`post_json` body construction.** reqwest is compiled without its `json`
+    feature, so the body is `serde_json::to_vec` + explicit
+    `Content-Type: application/json`; the wire shape is identical.
+13. **`corrupt_and_verify_heal_remote` is a method** on `FleetInjector` (not
+    a free function) so it can reach the record buffer.
+14. **Extra record type `disk_fill_remove`** for fill cleanup (the doc lists
+    the new `injection_type` strings as backward-compatible examples, not an
+    exhaustive enum; no consumer parses them exhaustively). Probes
+    (`device_gone`, `mount_usable`) and discovery helpers
+    (`list_segment_ids`, `newest_segment_id`, `measure_rtt_ms`) are `&self`
+    reads and intentionally do not record.
+15. **`fill_volume` returns `Result<(), Error>`** and cleanup is
+    `remove_fill(node, role)` (the path is a documented constant,
+    `<mount>/.fill.bin`); the In-Scope prose "returns the fill path for
+    cleanup" is satisfied by the pair.
+16. **Local latency is explicitly opt-in.** `Cluster::inject_latency`/
+    `remove_latency` (loopback `tc`) now require
+    `E2E_ALLOW_LOOPBACK_LATENCY=1` and otherwise warn + return a `skipped:`
+    error, keeping loopback contamination out of fleet scenarios. Local runs
+    have no `FailureInjectionRecord` sink; the record-bearing skip contract is
+    the fleet injector's (exercised in the fleet run and unit tests).
+
+### Live-run findings / hardening
+
+17. **Sysfs yank waits for disappearance (bounded 10s).** Removal is
+    asynchronous (the f1 gate observed the by-id link lingering); without the
+    wait the `device_gone` probe is flaky.
+18. **`tc qdisc replace` instead of `add`** for latency (idempotent; sets the
+    requested delay instead of stacking/keeping an older one) and the
+    injector verifies the qdisc via `tc qdisc show`.
+19. **Fill arithmetic uses df's percent denominator (`used + avail`, which
+    excludes reserved blocks).** The first fleet run landed at 16% for a 20%
+    target using `size - avail`; the corrected command re-validated live at
+    21% for 20%. This matters for f3/f4 near-full scenarios.
+20. **`device_gone` probe inversion fixed.** The first fleet run exposed
+    `test -e` + the shared `0 = condition true` convention; the probe now
+    runs `test ! -e` and has a dedicated unit test.
+21. **Hard yank leaves the fs stale/unmounted; `replug_volume` does not
+    remount.** Scenario-owned recovery per the epic failure-semantics table
+    (f4 P1b formats fresh; P2a/P3 mount explicitly). The f2 suite probes
+    `mount_usable` and fails with a clear message if a prior yank was not
+    recovered.
+22. **Heal-loop claim re-scoped.** `corrupt_and_verify_heal_remote` corrupts
+    a real segment, triggers the real scrub/repair machinery, and proves the
+    node keeps serving correct bytes (local repair or replica failover). It
+    does **not** prove the corrupted bytes were local to the served copy —
+    the product exposes no key→segment map — so precise repair assertions
+    (local-copy restoration, repair counters, manifest state) are f4's role
+    scenarios. The method docstring states this explicitly.
+23. **Latency is observed on the wire in the f2 suite:** `measure_rtt_ms`
+    (ICMP `ping`; functional probe, no perf assertion) before → inject →
+    after asserts RTT increases by ≥50ms (injected +100ms) and returns below
+    the delayed value after removal.
+24. **Local role-root support (additive, no product change):**
+    `Cluster::local_role_root`/`fill_role_root`, and `find_segment_files` now
+    searches the ADR-0031 sibling `pool-data` root — without it, local
+    `corrupt_shard` could not find any `.dat` after pools became mandatory.
+    `fill_disk`/`fill_role_root` run their blocking `dd`/`df` work on
+    `spawn_blocking` (perf 8.3), matching the fleet path.
+25. **Fleet evidence.** 3-node Phase 4 fleet with `--volume-pools`,
+    `sut-deploy.sh --cluster --pools-on-mounts`; `fleet_injectors` ran on the
+    Harness (PIPELINE §6 — never locally) and passed in 22.2s: 7/7 injector
+    attempts `success=true` (fill 21% for a 20% target; yank/replug with the
+    same serial; newest-segment corruption; RTT 1.4ms → 100.6ms with +100ms
+    injected → 0.6ms after removal), **18/18 assertions**, and the report
+    serializes 8 records (7 successes + 1 expected `skipped` gate exercise).
+    Post-run health was 200 with zero non-healthy pools on all nodes. The
+    fleet was destroyed afterwards (0 servers / 0 volumes). Artifact:
+    [fleet-injectors-2026-09-11.json](artifacts/fleet-injectors-2026-09-11.json).
+    Committing the artifact with the feature is the user's call per the
+    project workflow (the file is staged in the working tree).

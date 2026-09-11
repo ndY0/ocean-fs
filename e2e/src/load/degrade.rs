@@ -56,15 +56,29 @@ impl Cluster {
     ///
     /// NOTE: This affects ALL traffic on the loopback interface, not just
     /// the target node. For a multi-node cluster on the same machine, all
-    /// inter-node communication will be delayed.
+    /// inter-node communication will be delayed. Because of that
+    /// contamination, the loopback path is **gated behind an explicit
+    /// opt-in** (`E2E_ALLOW_LOOPBACK_LATENCY=1`); fleet scenarios use the
+    /// fleet injector's internal-interface variant instead.
     ///
     /// # Errors
     ///
-    /// Returns an error on non-Linux platforms or if the `tc` command fails.
+    /// Returns an error on non-Linux platforms, without the explicit
+    /// opt-in, or if the `tc` command fails.
     pub async fn inject_latency(&self, _node_i: usize, delay_ms: u64) -> Result<(), Error> {
         if !cfg!(target_os = "linux") {
             eprintln!("inject_latency: skipped on non-Linux platform");
             return Err(Error::ClusterError("inject_latency requires Linux (tc netem)".into()));
+        }
+        if !loopback_latency_opt_in(std::env::var("E2E_ALLOW_LOOPBACK_LATENCY").ok().as_deref()) {
+            eprintln!(
+                "inject_latency: skipped — loopback netem contaminates every node on this host; \
+                 set E2E_ALLOW_LOOPBACK_LATENCY=1 to opt in (fleet scenarios use the internal \
+                 interface via FleetInjector)"
+            );
+            return Err(Error::ClusterError(
+                "skipped: loopback latency injection requires E2E_ALLOW_LOOPBACK_LATENCY=1".into(),
+            ));
         }
 
         let output = Command::new("tc")
@@ -89,15 +103,26 @@ impl Cluster {
     /// Removes artificial network latency from the loopback interface.
     ///
     /// Shells out to `tc qdisc del dev lo root`. It is not an error if
-    /// no qdisc was present.
+    /// no qdisc was present. Gated by the same explicit opt-in as
+    /// [`Cluster::inject_latency`].
     ///
     /// # Errors
     ///
-    /// Returns an error on non-Linux platforms.
+    /// Returns an error on non-Linux platforms or without the explicit
+    /// opt-in.
     pub async fn remove_latency(&self, _node_i: usize) -> Result<(), Error> {
         if !cfg!(target_os = "linux") {
             eprintln!("remove_latency: skipped on non-Linux platform");
             return Err(Error::ClusterError("remove_latency requires Linux (tc)".into()));
+        }
+        if !loopback_latency_opt_in(std::env::var("E2E_ALLOW_LOOPBACK_LATENCY").ok().as_deref()) {
+            eprintln!(
+                "remove_latency: skipped — set E2E_ALLOW_LOOPBACK_LATENCY=1 to opt in to the \
+                 loopback path"
+            );
+            return Err(Error::ClusterError(
+                "skipped: loopback latency injection requires E2E_ALLOW_LOOPBACK_LATENCY=1".into(),
+            ));
         }
 
         Command::new("tc")
@@ -108,6 +133,17 @@ impl Cluster {
         // Ignore errors — the qdisc may not have existed.
         Ok(())
     }
+}
+
+/// Returns `true` when the loopback latency injector is explicitly enabled.
+///
+/// Local-spawn nodes share `lo`, so a loopback `netem` delays every node on
+/// the host; the epic keeps that path behind an explicit opt-in
+/// (`E2E_ALLOW_LOOPBACK_LATENCY`) instead of letting a scenario contaminate
+/// unrelated nodes. Fleet scenarios use the fleet injector's internal
+/// interface.
+fn loopback_latency_opt_in(value: Option<&str>) -> bool {
+    matches!(value, Some("1") | Some("true") | Some("yes"))
 }
 
 // ---------------------------------------------------------------------------
@@ -130,60 +166,167 @@ impl Cluster {
     /// Returns an error on non-Linux platforms, if the node has been killed,
     /// or if disk commands fail.
     pub async fn fill_disk(&self, node_i: usize, target_pct: u8) -> Result<PathBuf, Error> {
-        if !cfg!(target_os = "linux") {
-            eprintln!("fill_disk: skipped on non-Linux platform");
-            return Err(Error::ClusterError("fill_disk requires Linux (dd + df)".into()));
-        }
-
-        let node = self.node(node_i);
-        let data_dir = node.data_dir();
-        let fill_path = data_dir.join("fill.bin");
-
-        // Get available space in bytes via df.
-        let total_space = get_disk_space(data_dir, "size")?;
-        let avail_space = get_disk_space(data_dir, "avail")?;
-        let used_space = total_space.saturating_sub(avail_space);
-        let target_used = (total_space as f64 * (target_pct as f64 / 100.0)) as u64;
-        let fill_size = target_used.saturating_sub(used_space);
-
-        if fill_size == 0 {
-            eprintln!(
-                "fill_disk: already at or above {target_pct}% usage (used {used_space}, total {total_space})"
-            );
-            return Ok(fill_path);
-        }
-
-        // Use dd to create the fill file.
-        // count is in 1M blocks.
-        let count_mb = (fill_size as f64 / (1024.0 * 1024.0)).ceil() as u64;
-        let output = Command::new("dd")
-            .args([
-                "if=/dev/zero",
-                &format!("of={}", fill_path.display()),
-                "bs=1M",
-                &format!("count={count_mb}"),
-            ])
-            .output()
-            .map_err(|e| Error::ClusterError(format!("dd command failed: {e}")))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::ClusterError(format!("dd fill failed: {stderr}")));
-        }
-
-        // Verify usage is within tolerance (±5% of target).
-        let new_avail = get_disk_space(data_dir, "avail")?;
-        let new_used = total_space.saturating_sub(new_avail);
-        let actual_pct = (new_used as f64 / total_space as f64 * 100.0).round() as u8;
-        let tolerance = 5u8;
-        if actual_pct < target_pct.saturating_sub(tolerance)
-            || actual_pct > target_pct.saturating_add(tolerance)
-        {
-            eprintln!("fill_disk: usage is {actual_pct}%, target was {target_pct}% ± {tolerance}%");
-        }
-
-        Ok(fill_path)
+        let data_dir = self.node(node_i).data_dir().to_path_buf();
+        // spawn_blocking: dd/df are synchronous child processes (perf 8.3).
+        tokio::task::spawn_blocking(move || fill_dir(&data_dir, target_pct))
+            .await
+            .map_err(|e| Error::ClusterError(format!("fill task join failed: {e}")))?
     }
+
+    /// Fills a local pool-role root on `node_i` to approximately
+    /// `target_pct`% usage.
+    ///
+    /// Local spawns inject sibling pool roots (`{base}/pool-data`,
+    /// `{base}/pool-wal`, `{base}/pool-meta`, `{base}/pool-hints`); this is
+    /// the local CI counterpart of the fleet injector's
+    /// `fill_volume(node, role, pct)` and targets a real pool root rather
+    /// than `data_dir`. Returns the fill file path for cleanup.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use e2e::harness::{config_standard, Cluster};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let cluster = Cluster::spawn(1, &config_standard()).await?;
+    /// let fill = cluster.fill_role_root(0, "data", 95).await?;
+    /// std::fs::remove_file(fill)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the local role root is absent (e.g. the config
+    /// declared its own `[storage]` block), on non-Linux platforms, or if
+    /// disk commands fail.
+    pub async fn fill_role_root(
+        &self,
+        node_i: usize,
+        role: &str,
+        target_pct: u8,
+    ) -> Result<PathBuf, Error> {
+        let root = self.local_role_root(node_i, role)?;
+        // spawn_blocking: dd/df are synchronous child processes (perf 8.3).
+        tokio::task::spawn_blocking(move || fill_dir(&root, target_pct))
+            .await
+            .map_err(|e| Error::ClusterError(format!("fill task join failed: {e}")))?
+    }
+
+    /// Returns the harness-injected local pool root for `role` on `node_i`.
+    ///
+    /// Local spawns without a `[storage]` block place pool roots on siblings
+    /// of the node's data directory (`{base}/pool-data`, …) because a pool
+    /// root must stay disjoint from `data_dir` (ADR-0031). Fails loudly when
+    /// the conventional root does not exist instead of falling back onto
+    /// `data_dir` — the local analogue of the fleet's no-silent-fallback
+    /// mount pre-flight.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use e2e::harness::{config_standard, Cluster};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let cluster = Cluster::spawn(1, &config_standard()).await?;
+    /// let root = cluster.local_role_root(0, "data")?;
+    /// println!("local data pool root: {}", root.display());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `node_i` has no parent directory or the role
+    /// root is not a directory.
+    pub fn local_role_root(&self, node_i: usize, role: &str) -> Result<PathBuf, Error> {
+        let data_dir = self.node(node_i).data_dir().to_path_buf();
+        local_role_dir(&data_dir, role)
+    }
+}
+
+/// Resolves `{data_dir}/../pool-{role}` and requires it to exist.
+///
+/// `metadata` is the config role; the harness names the directory `meta`.
+fn local_role_dir(data_dir: &Path, role: &str) -> Result<PathBuf, Error> {
+    let dir_role = match role {
+        "metadata" => "meta",
+        other => other,
+    };
+    let base = data_dir.parent().ok_or_else(|| {
+        Error::ClusterError(format!(
+            "local_role_root: {} has no parent directory",
+            data_dir.display()
+        ))
+    })?;
+    let root = base.join(format!("pool-{dir_role}"));
+    if root.is_dir() {
+        Ok(root)
+    } else {
+        Err(Error::ClusterError(format!(
+            "local_role_root: {} not found (local spawns without a [storage] block inject \
+             pool-* siblings of the data directory)",
+            root.display()
+        )))
+    }
+}
+
+/// Fills `dir` to approximately `target_pct`% usage via `dd`.
+///
+/// Synchronous: callers run it on the blocking pool (`spawn_blocking`) —
+/// `dd`/`df` are child processes, not async work (perf 8.3).
+fn fill_dir(dir: &Path, target_pct: u8) -> Result<PathBuf, Error> {
+    if !cfg!(target_os = "linux") {
+        eprintln!("fill_disk: skipped on non-Linux platform");
+        return Err(Error::ClusterError("fill_disk requires Linux (dd + df)".into()));
+    }
+
+    let fill_path = dir.join("fill.bin");
+
+    // Get available space in bytes via df.
+    let total_space = get_disk_space(dir, "size")?;
+    let avail_space = get_disk_space(dir, "avail")?;
+    let used_space = total_space.saturating_sub(avail_space);
+    let target_used = (total_space as f64 * (target_pct as f64 / 100.0)) as u64;
+    let fill_size = target_used.saturating_sub(used_space);
+
+    if fill_size == 0 {
+        eprintln!(
+            "fill_disk: already at or above {target_pct}% usage (used {used_space}, total {total_space})"
+        );
+        return Ok(fill_path);
+    }
+
+    // Use dd to create the fill file.
+    // count is in 1M blocks.
+    let count_mb = (fill_size as f64 / (1024.0 * 1024.0)).ceil() as u64;
+    let output = Command::new("dd")
+        .args([
+            "if=/dev/zero",
+            &format!("of={}", fill_path.display()),
+            "bs=1M",
+            &format!("count={count_mb}"),
+        ])
+        .output()
+        .map_err(|e| Error::ClusterError(format!("dd command failed: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::ClusterError(format!("dd fill failed: {stderr}")));
+    }
+
+    // Verify usage is within tolerance (±5% of target).
+    let new_avail = get_disk_space(dir, "avail")?;
+    let new_used = total_space.saturating_sub(new_avail);
+    let actual_pct = (new_used as f64 / total_space as f64 * 100.0).round() as u8;
+    let tolerance = 5u8;
+    if actual_pct < target_pct.saturating_sub(tolerance)
+        || actual_pct > target_pct.saturating_add(tolerance)
+    {
+        eprintln!("fill_disk: usage is {actual_pct}%, target was {target_pct}% ± {tolerance}%");
+    }
+
+    Ok(fill_path)
 }
 
 /// Returns a disk space metric from `df` for the given directory.
@@ -259,9 +402,11 @@ impl Cluster {
 
 /// Finds files under `data_dir` whose name contains `segment_id`.
 ///
-/// Searches both `data_dir/segments/` (priority) and the entire
-/// `data_dir` tree, returning all matches. Results from `segments/`
-/// appear first.
+/// Searches `data_dir/segments/` (priority), the entire `data_dir` tree,
+/// and the harness-injected data pool root `{data_dir}/../pool-data` —
+/// since ADR-0031 the segment `.dat` files live on a pool root that is a
+/// sibling of `data_dir`, so a data_dir-only walk finds nothing.
+/// Results from `segments/` appear first.
 fn find_segment_files(data_dir: &Path, segment_id: &str) -> Vec<PathBuf> {
     let mut results = Vec::new();
 
@@ -279,15 +424,26 @@ fn find_segment_files(data_dir: &Path, segment_id: &str) -> Vec<PathBuf> {
         }
     }
 
-    // Also search the entire data_dir recursively.
-    for path in collect_data_files(data_dir) {
-        // Skip files we already found via segments/.
-        if results.contains(&path) {
-            continue;
+    // Search the data directory, then the data pool root (pools live on
+    // sibling roots since ADR-0031; `.dat` files are at
+    // `{pool-data-root}/{segment_id}.dat`).
+    let mut roots = vec![data_dir.to_path_buf()];
+    if let Some(base) = data_dir.parent() {
+        let pool_data = base.join("pool-data");
+        if pool_data.is_dir() {
+            roots.push(pool_data);
         }
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        if name.contains(segment_id) {
-            results.push(path);
+    }
+    for root in roots {
+        for path in collect_data_files(&root) {
+            // Skip files we already found via segments/.
+            if results.contains(&path) {
+                continue;
+            }
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if name.contains(segment_id) {
+                results.push(path);
+            }
         }
     }
 
@@ -624,6 +780,45 @@ mod tests {
         assert!(matches.is_empty());
     }
 
+    #[test]
+    fn find_segment_files_finds_pool_data_sibling() {
+        // Local spawn layout (ADR-0031): data_dir = {base}/data, the data
+        // pool root is the sibling {base}/pool-data.
+        let base = tempfile::TempDir::new().expect("temp dir");
+        let data_dir = base.path().join("data");
+        let pool_data = base.path().join("pool-data");
+        fs::create_dir_all(&data_dir).expect("mkdir data");
+        fs::create_dir_all(&pool_data).expect("mkdir pool-data");
+        fs::write(pool_data.join("seg_abc.dat"), b"shard").expect("write");
+
+        let matches = find_segment_files(&data_dir, "abc");
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].to_string_lossy().contains("pool-data"));
+    }
+
+    // ── local role-root resolution tests ─────
+
+    #[test]
+    fn local_role_dir_maps_metadata_to_meta_and_requires_existing_root() {
+        let base = tempfile::TempDir::new().expect("temp dir");
+        let data_dir = base.path().join("data");
+        fs::create_dir_all(&data_dir).expect("mkdir data");
+
+        // Missing role root → loud error, never a data_dir fallback.
+        assert!(local_role_dir(&data_dir, "data").is_err());
+
+        fs::create_dir_all(base.path().join("pool-data")).expect("mkdir pool-data");
+        fs::create_dir_all(base.path().join("pool-meta")).expect("mkdir pool-meta");
+        assert_eq!(
+            local_role_dir(&data_dir, "data").expect("data root"),
+            base.path().join("pool-data")
+        );
+        assert_eq!(
+            local_role_dir(&data_dir, "metadata").expect("metadata root"),
+            base.path().join("pool-meta")
+        );
+    }
+
     // ── FailureInjectionRecord tests ─────
 
     #[test]
@@ -645,6 +840,16 @@ mod tests {
     }
 
     // ── fill_disk helper tests ─────
+
+    #[test]
+    fn loopback_latency_opt_in_requires_explicit_truthy_value() {
+        assert!(loopback_latency_opt_in(Some("1")));
+        assert!(loopback_latency_opt_in(Some("true")));
+        assert!(loopback_latency_opt_in(Some("yes")));
+        assert!(!loopback_latency_opt_in(None));
+        assert!(!loopback_latency_opt_in(Some("0")));
+        assert!(!loopback_latency_opt_in(Some("")));
+    }
 
     #[test]
     fn fill_disk_requires_linux() {

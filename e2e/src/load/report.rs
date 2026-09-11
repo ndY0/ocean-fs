@@ -41,7 +41,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::{churn::ChurnEvent, generator::AggregateStats, manifest::ManifestSummary};
+use super::{
+    churn::ChurnEvent, degrade::FailureInjectionRecord, generator::AggregateStats,
+    manifest::ManifestSummary,
+};
 use crate::load::MetricsSnapshot;
 
 // ---------------------------------------------------------------------------
@@ -76,6 +79,10 @@ pub struct LoadReport {
     /// Churn events (kill/restart) recorded during a Phase 3 churn run.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub churn_events: Vec<ChurnEvent>,
+    /// Failure-injection attempts (fleet or local) recorded during a
+    /// degraded-mode run — exactly one per attempt, including skips.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub injection_records: Vec<FailureInjectionRecord>,
     /// Periodic per-node cluster membership + ring views (Phase 3),
     /// one snapshot per node per poll round.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -145,6 +152,7 @@ impl LoadReport {
             manifest: None,
             metric_snapshots: Vec::new(),
             churn_events: Vec::new(),
+            injection_records: Vec::new(),
             cluster_views: Vec::new(),
             assertions: Vec::new(),
             failures: Vec::new(),
@@ -167,6 +175,45 @@ impl LoadReport {
             detail: detail.into(),
             timestamp: chrono_now(),
         });
+    }
+
+    /// Appends failure-injection records to the report.
+    ///
+    /// The records are carried verbatim (they already encode success,
+    /// node index, type, and detail); whether a failed injection fails the
+    /// run is the scenario's assertion decision, not the report's.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use e2e::load::{FailureInjectionRecord, LoadReport};
+    ///
+    /// let mut report = LoadReport::new(4, "load_degraded", 42);
+    /// report.record_injections([FailureInjectionRecord::new(
+    ///     "device_yank",
+    ///     1,
+    ///     true,
+    ///     "data: volume 101 yanked",
+    /// )]);
+    /// assert_eq!(report.injection_records().len(), 1);
+    /// ```
+    pub fn record_injections(&mut self, records: impl IntoIterator<Item = FailureInjectionRecord>) {
+        self.injection_records.extend(records);
+    }
+
+    /// Returns the failure-injection records carried by the report.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use e2e::load::{FailureInjectionRecord, LoadReport};
+    ///
+    /// let mut report = LoadReport::new(4, "load_degraded", 42);
+    /// report.record_injections([FailureInjectionRecord::new("disk_fill", 1, true, "spare")]);
+    /// assert_eq!(report.injection_records()[0].injection_type, "disk_fill");
+    /// ```
+    pub fn injection_records(&self) -> &[FailureInjectionRecord] {
+        &self.injection_records
     }
 
     /// Computes the final result based on assertions.
@@ -587,6 +634,23 @@ mod tests {
         // Empty vecs should not appear.
         assert!(!json.contains("metric_snapshots"));
         assert!(!json.contains("failures"));
+        assert!(!json.contains("injection_records"));
+    }
+
+    #[test]
+    fn load_report_serializes_injection_records() {
+        let mut report = LoadReport::new(4, "load_degraded", 7);
+        report.record_injections([
+            FailureInjectionRecord::new("device_yank", 1, true, "data: volume 101 yanked"),
+            FailureInjectionRecord::new("device_yank", 1, false, "data: skipped: no ssh"),
+        ]);
+        assert_eq!(report.injection_records().len(), 2);
+
+        let json = serde_json::to_string_pretty(&report).expect("serialize");
+        assert!(json.contains("\"injection_records\""));
+        assert!(json.contains("\"injection_type\": \"device_yank\""));
+        assert!(json.contains("\"node_index\": 1"));
+        assert!(json.contains("\"success\": false"));
     }
 
     // ── write_json_atomic tests ─────

@@ -1,0 +1,175 @@
+{
+  "phase": 4,
+  "test": "fleet_injectors",
+  "seed": 42,
+  "duration_secs": 22.226350356,
+  "result": "pass",
+  "injection_records": [
+    {
+      "timestamp": 1789154616.2748804,
+      "injection_type": "disk_fill",
+      "node_index": 1,
+      "success": true,
+      "detail": "spare: /mnt/oceanfs-spare at 21% (target 20%)"
+    },
+    {
+      "timestamp": 1789154616.6488874,
+      "injection_type": "disk_fill_remove",
+      "node_index": 1,
+      "success": true,
+      "detail": "spare: removed /mnt/oceanfs-spare/.fill.bin"
+    },
+    {
+      "timestamp": 1789154617.0482695,
+      "injection_type": "device_yank",
+      "node_index": 1,
+      "success": true,
+      "detail": "spare: volume 106850806 yanked via sysfs (deleted sdf)"
+    },
+    {
+      "timestamp": 1789154619.5787995,
+      "injection_type": "device_replug",
+      "node_index": 1,
+      "success": true,
+      "detail": "spare: replugged /dev/sdf serial=0HC_Volume_106850806"
+    },
+    {
+      "timestamp": 1789154626.4628153,
+      "injection_type": "segment_corrupt",
+      "node_index": 1,
+      "success": true,
+      "detail": "data: /mnt/oceanfs-data/01a091eb-d57b-7020-81af-9d96f669f65c.dat offset=1043706 bytes=64"
+    },
+    {
+      "timestamp": 1789154629.624462,
+      "injection_type": "latency",
+      "node_index": 1,
+      "success": true,
+      "detail": "enp7s0: enp7s0 +100ms"
+    },
+    {
+      "timestamp": 1789154634.5381272,
+      "injection_type": "latency_remove",
+      "node_index": 1,
+      "success": true,
+      "detail": "enp7s0: enp7s0 qdisc removed"
+    },
+    {
+      "timestamp": 1789154636.9145937,
+      "injection_type": "device_yank",
+      "node_index": 0,
+      "success": false,
+      "detail": "data: cluster node error: skipped: node 0 has no 'data' volume in the provisioning record (is this a --volume-pools fleet?)"
+    }
+  ],
+  "assertions": [
+    {
+      "name": "injection_type_disk_fill_recorded",
+      "passed": true,
+      "expected": ">= 1 'disk_fill' record",
+      "actual": "types: [\"disk_fill\", \"disk_fill_remove\", \"device_yank\", \"device_replug\", \"segment_corrupt\", \"latency\", \"latency_remove\"]"
+    },
+    {
+      "name": "injection_type_disk_fill_remove_recorded",
+      "passed": true,
+      "expected": ">= 1 'disk_fill_remove' record",
+      "actual": "types: [\"disk_fill\", \"disk_fill_remove\", \"device_yank\", \"device_replug\", \"segment_corrupt\", \"latency\", \"latency_remove\"]"
+    },
+    {
+      "name": "injection_type_device_yank_recorded",
+      "passed": true,
+      "expected": ">= 1 'device_yank' record",
+      "actual": "types: [\"disk_fill\", \"disk_fill_remove\", \"device_yank\", \"device_replug\", \"segment_corrupt\", \"latency\", \"latency_remove\"]"
+    },
+    {
+      "name": "injection_type_device_replug_recorded",
+      "passed": true,
+      "expected": ">= 1 'device_replug' record",
+      "actual": "types: [\"disk_fill\", \"disk_fill_remove\", \"device_yank\", \"device_replug\", \"segment_corrupt\", \"latency\", \"latency_remove\"]"
+    },
+    {
+      "name": "injection_type_segment_corrupt_recorded",
+      "passed": true,
+      "expected": ">= 1 'segment_corrupt' record",
+      "actual": "types: [\"disk_fill\", \"disk_fill_remove\", \"device_yank\", \"device_replug\", \"segment_corrupt\", \"latency\", \"latency_remove\"]"
+    },
+    {
+      "name": "injection_type_latency_recorded",
+      "passed": true,
+      "expected": ">= 1 'latency' record",
+      "actual": "types: [\"disk_fill\", \"disk_fill_remove\", \"device_yank\", \"device_replug\", \"segment_corrupt\", \"latency\", \"latency_remove\"]"
+    },
+    {
+      "name": "injection_type_latency_remove_recorded",
+      "passed": true,
+      "expected": ">= 1 'latency_remove' record",
+      "actual": "types: [\"disk_fill\", \"disk_fill_remove\", \"device_yank\", \"device_replug\", \"segment_corrupt\", \"latency\", \"latency_remove\"]"
+    },
+    {
+      "name": "exactly_one_record_per_attempt",
+      "passed": true,
+      "expected": "7 records",
+      "actual": "7 records"
+    },
+    {
+      "name": "all_injections_succeeded",
+      "passed": true,
+      "expected": "every attempt success=true",
+      "actual": "0 failure(s): []"
+    },
+    {
+      "name": "records_attributed_to_injection_node",
+      "passed": true,
+      "expected": "all node_index=1",
+      "actual": "nodes: [1, 1, 1, 1, 1, 1, 1]"
+    },
+    {
+      "name": "records_role_attribution",
+      "passed": true,
+      "expected": "spare:/data:/<iface>: detail prefixes",
+      "actual": "details: [\"spare: /mnt/oceanfs-spare at 21% (target 20%)\", \"spare: removed /mnt/oceanfs-spare/.fill.bin\", \"spare: volume 106850806 yanked via sysfs (deleted sdf)\", \"spare: replugged /dev/sdf serial=0HC_Volume_106850806\", \"data: /mnt/oceanfs-data/01a091eb-d57b-7020-81af-9d96f669f65c.dat offset=1043706 bytes=64\", \"enp7s0: enp7s0 +100ms\", \"enp7s0: enp7s0 qdisc removed\"]"
+    },
+    {
+      "name": "skip_path_records_failure",
+      "passed": true,
+      "expected": "1 skipped record with success=false",
+      "actual": "[FailureInjectionRecord { timestamp: 1789154636.9145937, injection_type: \"device_yank\", node_index: 0, success: false, detail: \"data: cluster node error: skipped: node 0 has no 'data' volume in the provisioning record (is this a --volume-pools fleet?)\" }]"
+    },
+    {
+      "name": "device_gone_after_yank",
+      "passed": true,
+      "expected": "expected true",
+      "actual": "device_gone=true"
+    },
+    {
+      "name": "device_present_after_replug",
+      "passed": true,
+      "expected": "expected true",
+      "actual": "device_gone=false"
+    },
+    {
+      "name": "data_segments_discovered",
+      "passed": true,
+      "expected": "expected true",
+      "actual": "1 segment(s) on node 1"
+    },
+    {
+      "name": "latency_iface_not_lo",
+      "passed": true,
+      "expected": "expected true",
+      "actual": "enp7s0"
+    },
+    {
+      "name": "latency_observable_on_wire",
+      "passed": true,
+      "expected": "expected true",
+      "actual": "before=1.44ms during=100.56ms (injected +100ms)"
+    },
+    {
+      "name": "latency_removal_restores_rtt",
+      "passed": true,
+      "expected": "expected true",
+      "actual": "during=100.56ms after=0.58ms"
+    }
+  ]
+}

@@ -10,10 +10,12 @@
 //! - [`MetricsSnapshot`]: scrapes `/admin/metrics` and computes counter deltas
 //! - [`LoadReport`]: JSON output, assertions, and Prometheus textfile
 //! - [`FailureInjectionRecord`]: records of injected failures during degraded-mode tests
+//! - [`FleetInjector`]: SSH black-box fault injectors against a real-volume fleet
 //! - [`ChurnScheduler`]: periodic node kill/restart for cluster churn tests
 
 pub mod churn;
 pub mod degrade;
+pub mod fleet_degrade;
 pub mod generator;
 pub mod manifest;
 pub mod metrics;
@@ -22,6 +24,7 @@ pub mod report;
 // Re-export public types from submodules.
 pub use churn::{ChurnAction, ChurnEvent, ChurnMode, ChurnScheduler};
 pub use degrade::FailureInjectionRecord;
+pub use fleet_degrade::{FleetInjector, FleetTarget, VolumeRef};
 pub use generator::{
     AggregateStats, BlobSizeDist, KeySpace, LoadScenario, OpWeight, Operation, Orchestrator,
     Worker, WorkerStats,
