@@ -160,7 +160,7 @@ which epics must be completed first:
 | Phase 1 (concurrency + TSAN) | Epic 2: `phase1-concurrency-test` | CI runner (single process, local spawn) | Config fix + metrics wiring |
 | Phase 2 (sustained single-node) | Epic 2: `phase2-sustained-load-test` | Two-VM (SUT=CX22 + Harness=CX22) | Write path + correctness + metrics + `TARGET_HOST` remote target mode |
 | Phase 3 (cluster churn) | Epic 2: `phase3-cluster-churn-test` | Two-VM (SUT=CX32 + Harness=CX22) | Phase 1-2 passing + all gap-closure |
-| Phase 4 (degraded mode) | Epic 2: `phase4-degraded-mode-test` | Two-VM (SUT=CX32 + Harness=CX22) | Phase 3 passing + all gap-closure |
+| Phase 4 (degraded mode) | Epic 2: `phase4-degraded-mode-test` — **cancelled 2026-09-11**, see note below | Fleet (`N`×CX33 + CX43) | Phase 3 passing + all gap-closure |
 | Phase 5 (scale properties) | Epic 3: `loadgen-binary` | Dedicated loadgen binary targeting remote cluster | Phase 4 passing |
 | Phase 6 (simulation 1000+ nodes) | NOT in this plan (separate `oceanfs-sim` crate, tracked in campaign doc §7) | Simulation | Phase 3-4 passing |
 
@@ -194,6 +194,26 @@ runs on demand via agent skills.
 
 ---
 
+## Fleet Degradation Testing (Phase 4 class) — 2026-09-11
+
+> **Superseding epic:** [`docs/features/fleet-degradation/`](../fleet-degradation/epic.md).
+> The Phase 4 spec in this directory (`phase4-degraded-mode-test`) was written
+> for ADR-0019's co-located 3-process SUT topology, superseded by ADR-0026 for
+> Phases 3+. It is marked `cancelled` and replaced by the **fleet-degradation**
+> epic:
+>
+> | Feature | Deliverable |
+> |---|---|
+> | f1 | Volume-backed fleet topology — real Hetzner Cloud Volumes per pool role (opt-in `--volume-pools`), sysfs yank/replug validation gate, destroy deletes volumes |
+> | f2 | Remote fault injectors — SSH device yank/replug, per-volume disk fill, segment corruption, internal-interface `tc`, `RemoteCluster` POST-with-body |
+> | f3 | `load_degraded` fleet-ready — the four adapted scenarios + `scripts/run-phase4.sh` |
+> | f4 | Pool degradation under load — role hard-failure matrix + dynamic ops (attach/drain/detach/node-drain); produces the C2a/C2b decision data |
+>
+> Volume-backed runs are **correctness/degradation** tests: results are **not
+> comparable** to local-disk runs and no performance assertion is made.
+
+---
+
 ## Epic 1: test-harness-extensions
 
 Build the load test harness types in the `e2e/` crate. These are pure
@@ -219,7 +239,7 @@ Implement the actual load test functions. Each is a `#[tokio::test]` in `e2e/tes
 | 2.1 | [phase1-concurrency-test](test-phase-implementations/phase1-concurrency-test/feature.md) | Single-node, N concurrent workers, TSAN, 60s, manifest integrity |
 | 2.2 | [phase2-sustained-load-test](test-phase-implementations/phase2-sustained-load-test/feature.md) | Single-node, 30-60min, resource stability, post-crash WAL recovery |
 | 2.3 | [phase3-cluster-churn-test](test-phase-implementations/phase3-cluster-churn-test/feature.md) | 3-5 node, churn, gossip convergence, hinted handoff, ring consistency |
-| 2.4 | [phase4-degraded-mode-test](test-phase-implementations/phase4-degraded-mode-test/feature.md) | 3-node, failure injections, mid-write kill, slow-node, disk-full, corruption+heal |
+| 2.4 | [phase4-degraded-mode-test](test-phase-implementations/phase4-degraded-mode-test/feature.md) | 3-node, failure injections, mid-write kill, slow-node, disk-full, corruption+heal — **cancelled 2026-09-11**: written for the superseded ADR-0019 co-located topology; replaced by the [`fleet-degradation`](../fleet-degradation/epic.md) epic (F3/F4) |
 
 ---
 

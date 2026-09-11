@@ -170,6 +170,25 @@ The C2b/C2a decision and the deferred d6 attempt belong to the
 residual. This epic is **not** marked `done`; it is left as code-complete
 with recorded residuals so the carry-over is explicit.
 
+> **Fleet-data hand-off (2026-09-11):** the
+> [`fleet-degradation`](../fleet-degradation/epic.md) epic (f1–f4) produces
+> the fleet/load-test data the C2a/C2b decision is gated on and runs the
+> dynamic ops (attach → drain → pause/resume → detach → node-drain→leave)
+> under sustained load on real volumes. Its f4 carries the explicit
+> close-or-document verdict for the d4 `oceanfs_drain_*` residual and the
+> node-level drain → `leave(None)` workflow the d4 integration tests
+> substituted with node shutdown. The decision remains owned by
+> `disk-resilience-capacity`; this epic's residuals are inputs to it, not
+> closed here.
+>
+> **Related metadata-plane work (not C2b):** the churn residual "anti-entropy
+> does not backfill missing object *rows*" is addressed separately by the
+> deferred [metadata-anti-entropy design draft](../metadata-anti-entropy/design-draft.md)
+> (validated by an f4 rerun), with the admission-honesty pre-epic
+> [f0-hints-durability-gate](../fleet-degradation/f0-hints-durability-gate.md).
+> A future C2b row-migration attempt would likely reuse the AE digests; it
+> does not gate the C2a/C2b decision.
+
 ## Acceptance bar (epic DoD)
 
 - [ ] ADR-0036 D1–D7 implemented: drain-state plumbing; durable `pool_id`

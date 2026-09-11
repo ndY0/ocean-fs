@@ -454,3 +454,13 @@ implementation.
   - (iii) Node-level drain begin is non-transactional across pools
     (`modules/server.rs:541-556`): a failing pool aborts the loop leaving
     earlier pools Cluster-Draining; the operator recovers individually.
+
+> **Fleet-data hand-off (2026-09-11):** the
+> [`fleet-degradation`](../fleet-degradation/epic.md) epic exercises this
+> controller's pool-only and node-level drain (plus pause/resume and detach)
+> under sustained load on real volumes, and its
+> [`f4-pool-degradation-under-load`](../fleet-degradation/f4-pool-degradation-under-load.md)
+> carries the **close-or-document verdict for deviation (e)** and the
+> node-level drain → `leave(None)` fleet coverage that this feature's
+> integration tests substituted with node shutdown. The residual remains
+> recorded here until that verdict lands.

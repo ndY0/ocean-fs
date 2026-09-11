@@ -295,6 +295,16 @@ made.
 **Verdict: DEFER.** No C2a code in this epic. The feature doc above remains
 the record for the future C2b attempt (backlog `disk-resilience-capacity`).
 
+> **Data source (2026-09-11):** the pending fleet/load-test data this
+> deferral is gated on is produced by the
+> [`fleet-degradation`](../fleet-degradation/epic.md) epic — specifically
+> [`f4-pool-degradation-under-load`](../fleet-degradation/f4-pool-degradation-under-load.md),
+> whose report carries the per-node capacity timeline, placement/repair-target
+> distributions, and skew observations for the attach → drain → pause/resume →
+> detach → node-drain→leave workflow on real volumes. The C2a-vs-C2b decision
+> remains with `disk-resilience-capacity`; this doc's measurement findings stand
+> until that data lands.
+
 ## Deviations (accepted)
 
 The accepted outcome of the measurement step is the **deferral recorded in

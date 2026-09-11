@@ -1,7 +1,7 @@
 ---
 feature: "Phase 4 — Degraded Mode Under Load (Failure Injection) Test"
 epic: "test-phase-implementations"
-status: proposed
+status: cancelled
 priority: critical
 owner: ""
 dependencies:
@@ -31,6 +31,33 @@ updated: 2026-08-10
 ---
 
 # Phase 4 — Degraded Mode Under Load (Failure Injection) Test
+
+> **SUPERSEDED (2026-09-11).** This spec was written for the **ADR-0019**
+> two-VM topology with 3 co-located `oceanfs` processes on one SUT VM.
+> [ADR-0026](../../../../adr/0026-phase3-dedicated-node-vms.md) supersedes
+> that topology for Phases 3+ (N dedicated node VMs + CX43 harness, real
+> per-role volumes), so the co-location assumptions throughout this document
+> — `tc` on `lo`, local `data_dir` walk for corruption, "all injectors on
+> one SUT VM" — no longer describe the test environment. This feature was
+> never implemented (`e2e/tests/load_degraded.rs` does not exist).
+>
+> **Replacement:**
+> [`docs/features/fleet-degradation/f3-load-degraded-fleet.md`](../../../fleet-degradation/f3-load-degraded-fleet.md)
+> (epic [`fleet-degradation`](../../../fleet-degradation/epic.md)) carries
+> the four adapted scenarios on the fleet topology. The pool-role hard-failure
+> matrix and dynamic ops live in
+> [`f4-pool-degradation-under-load.md`](../../../fleet-degradation/f4-pool-degradation-under-load.md).
+>
+> Two findings from this spec are carried forward and corrected there: the
+> `POST /admin/trigger-anti-entropy` endpoint it cites **does not exist** in
+> the current admin surface (use `POST /admin/scrub` / the AE interval), and
+> its metric names are suffixed differently in code — the labels are
+> `hinted_handoff_hints_stored_total` / `..._delivered_total`,
+> `heal_requests_total` / `heal_completed_total` / `heal_failed_total`, and
+> `ae_mismatches_found_total` (verified 2026-09-11; f3 re-verifies the
+> observable set before freezing assertions).
+>
+> This document is retained as history only; do not implement from it.
 
 ## Summary
 
