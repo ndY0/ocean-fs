@@ -160,9 +160,10 @@ re-verifies its own subset at implementation start.
 f0 hints-durability-gate  (pre-epic, product — DONE; gates f4's P4 only)
 
 f1 volume-backed-fleet-topology  (DONE 2026-09-11, review iteration 3 PASS)
- └── f2 remote-fault-injectors
-      ├── f3 load-degraded-fleet
-      └── f4 pool-degradation-under-load   ◀── f0
+ └── f2 remote-fault-injectors  (DONE 2026-09-11)
+      ├── f3 load-degraded-fleet  (open — fleet runs exposed product bugs)
+      │     └── f5 degraded-pool-semantics  (PRE-F4 BUG-FIX GATE, critical)
+      └── f4 pool-degradation-under-load   ◀── f0, f5
 
 f4 rerun ──▶ metadata-anti-entropy (deferred, post-epic; own directory)
 ```
@@ -170,9 +171,20 @@ f4 rerun ──▶ metadata-anti-entropy (deferred, post-epic; own directory)
 Implementation order: **f0 landed first (done 2026-09-11, review iteration 3
 PASS; it had no fleet dependency and could run in parallel with f1/f2, but
 MUST land before f4's hints scenario); f1 landed second (done 2026-09-11,
-review iteration 3 PASS), so the remaining order is f2 → f3 → f4.** f3 and
-f4 both build on f2; f3 proves the injector substrate on the four adapted
-scenarios, f4 spends it on the pool-role matrix. The sysfs-yank gate and the
+review iteration 3 PASS); f2 landed third (done 2026-09-11). The remaining
+order is now `f3 → f5 → f4`.** The f3 `load_degraded` fleet validation
+(2026-09-11) ran on the real volume fleet and **exposed product defects** in
+degraded-pool semantics (hard-avoided Degraded pools, Degraded counted as a
+faithful copy, hint-cap debt destruction, hard-coded detector knobs). The
+user decision (2026-09-11) is to fix them **before f4**: **f5 is the pre-f4
+bug-fix gate**, and f3 stays open until f5 lands and the f3 suite passes —
+f3's fleet-run DoD item is overruled as a closure gate (the failing run is
+bug evidence, not a feature gate; see
+[f3 Fleet Run Evidence and DoD Overrule](f3-load-degraded-fleet.md#fleet-run-evidence-and-dod-overrule-2026-09-11)).
+f3 and f4 both build on f2; f3 proves the injector substrate on the four
+adapted scenarios, f5 corrects the product semantics the runs exposed (its
+acceptance is the existing f3 suite rerun), and f4 then spends it on the
+pool-role matrix. The sysfs-yank gate and the
 volume-record/destroy path were
 **f1-internal early gates** — both cleared (see
 [f1 Deviations](f1-volume-backed-fleet-topology.md#deviations-accepted));
@@ -185,8 +197,9 @@ workstream (own directory) whose acceptance is the f4 rerun after f0.
 | f0 | [hints-durability-gate (pre-epic)](f0-hints-durability-gate.md) | done | critical | — | **Product pre-epic**: hints-root observability (observer/probe; ENOSPC detected; `/admin/pools` truthful) + conditional admission gate (no ack without durable debt) + `hinted_handoff_hints_rejected_total` + boot/reopen verdict |
 | f1 | [volume-backed-fleet-topology](f1-volume-backed-fleet-topology.md) | done | critical | — | `vm-provision.sh` creates/attaches/records 5 volumes/node (4 pool roles + spare), `sut-deploy.sh` roots pools on their mounts, `vm-down` deletes them; sysfs yank/replug validation gate PASS (hcloud fallback not adopted) |
 | f2 | [remote-fault-injectors](f2-remote-fault-injectors.md) | done | critical | f1 | SSH device yank/replug, per-volume disk fill, segment discovery + corruption, network latency on the internal interface, `RemoteCluster` POST-with-body + SSH exec, `FailureInjectionRecord` wiring |
-| f3 | [load-degraded-fleet](f3-load-degraded-fleet.md) | proposed | critical | f1, f2 | `e2e/tests/load_degraded.rs` fleet-ready (mid-write VM kill, slow node, disk-full, corruption+heal) + `scripts/run-phase4.sh` (supersedes the old phase4 feature doc) |
-| f4 | [pool-degradation-under-load](f4-pool-degradation-under-load.md) | proposed | critical | f1, f2, **f0** | Pool-role hard-failure matrix + dynamic ops under load; produces the C2a/C2b fleet data, targets the d4 counter residual; its P4 asserts the f0 gate contract and its rerun is the AE acceptance harness |
+| f3 | [load-degraded-fleet](f3-load-degraded-fleet.md) | proposed | critical | f1, f2 | `e2e/tests/load_degraded.rs` fleet-ready (mid-write VM kill, slow node, disk-full, corruption+heal) + `scripts/run-phase4.sh` (supersedes the old phase4 feature doc); **stays open until f5 lands** |
+| f5 | [degraded-pool-semantics (pre-f4 bug-fix gate)](f5-degraded-pool-semantics.md) | proposed | critical | f1, f2, f3 | **Pre-f4 product gate**: Degraded = preferred/fallback tiers (reads + write fan-out), never hard-avoided; no Healthy data pool = non-copy for reconciliation (+ healthy-preferred/degraded-fallback repair targets); hint-cap drops → bounded per-segment repair intents + bounded reconcile queue with overflow metric; `[storage.health]` global detector knobs + per-pool overrides; f3 `load_degraded` rerun green |
+| f4 | [pool-degradation-under-load](f4-pool-degradation-under-load.md) | proposed | critical | f1, f2, **f0, f5** | Pool-role hard-failure matrix + dynamic ops under load; produces the C2a/C2b fleet data, targets the d4 counter residual; its P4 asserts the f0 gate contract and its rerun is the AE acceptance harness |
 | AE | [metadata-anti-entropy (design draft, deferred)](../metadata-anti-entropy/design-draft.md) | deferred | high | f4 rerun data + detection ADR | The index plane's eventual-repair path: hints are the only row backfill today; segment reconcile guards bytes, not key→segment rows. Detection under ADR-0034 is the ADR-gated hard question. |
 
 ## Everything is grounded in a real product surface
@@ -196,6 +209,7 @@ workstream (own directory) whose acceptance is the f4 rerun after f0.
 | f1 | Pool topology config (`[[storage.pools]]`, ADR-0031), systemd unit | `sut-deploy.sh`, `vm-provision.sh` |
 | f2 | `/admin/pools`, `/admin/segments`, `/admin/scrub`, `/admin/wal-remount`, `/admin/health` | `oceanfs-server/src/admin.rs:907-939` |
 | f3 | Crash recovery (WAL), heal/AE, `GET /admin/segments`, `/admin/scrub` | `wal_pool_recovery.rs`, `metadata_pool_recovery.rs`, `cluster_drain.rs` |
+| f5 | Routing hints, reconciliation accounting, hint delivery give-up, health monitor/config | `routing_cache.rs`, `repair.rs`, `reconcile.rs`, `hint_delivery.rs`, `pool/health.rs`, `config/storage.rs` |
 | f4 | `POST /admin/pools` attach, pool/node drain (pause/resume), detach, replicated lifecycle (g7/g8) | `crates/oceanfs-node/tests/{runtime_attach,pool_detach,cluster_drain,pool_drain_state,wal_pool_recovery,metadata_pool_recovery}.rs` |
 
 There are **no test-only product hooks** in this epic. Where a black-box
@@ -306,6 +320,22 @@ the device replacement is explicit.
 - [ ] **f3:** `load_degraded` runs on the ADR-0026 fleet in harness mode and
       passes all four adapted scenarios with zero data loss; the old
       phase4-degraded-mode spec is superseded with no conflicting doc left.
+      **Status 2026-09-11: blocked on f5.** The fleet validation ran and
+      correctly exposed product bugs; its fleet-run DoD item is overruled
+      as a closure gate (bug evidence, not a feature gate) and f3 stays
+      open until [f5-degraded-pool-semantics](f5-degraded-pool-semantics.md)
+      lands and the suite reruns green. See
+      [f3 Fleet Run Evidence and DoD Overrule](f3-load-degraded-fleet.md#fleet-run-evidence-and-dod-overrule-2026-09-11).
+- [ ] **f5 (pre-f4 bug-fix gate):** degraded pools are preferred-avoided,
+      not hard-avoided (read + write fallback tiers; `write_degraded` stays
+      a hard write exclusion); a node with no healthy data pool is non-copy
+      for reconciliation and repair targets are
+      healthy-preferred/degraded-fallback; hint-cap exhaustion converts to
+      a bounded per-segment repair intent and the reconcile queue is bounded
+      with an overflow metric; detector knobs are configurable. The f3
+      `load_degraded` full rerun passes all four scenarios with 0 manifest
+      mismatches and all injections `success=true`, plus a
+      `--no-injections` control run, with the artifacts recorded.
 - [ ] **f4:** the pool-role hard-failure matrix runs under sustained load
       with live reads throughout; WAL boot-variant and metadata
       objects+deletions rebuilds are asserted; orphan-reaper safety is

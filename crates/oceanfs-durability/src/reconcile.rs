@@ -40,7 +40,7 @@ use std::{
 use oceanfs_core::{
     Counter, Gauge, LabelSet, MetricRegistrar, NodeId, NodeState, SegmentId, SegmentMetadata,
 };
-use oceanfs_membership::Membership;
+use oceanfs_membership::{manifest::NodeManifest, Membership};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -77,11 +77,24 @@ pub struct ReconcileConfig {
     /// ticks; the queue is never processed in one unbounded burst.
     /// Default 256.
     pub max_batch_per_tick: usize,
+    /// Bound on the pending work queue (distinct segments), f5 D3. When
+    /// the queue is full, a new intent is not enqueued (drop-new) and
+    /// `oceanfs_reconcile_queue_overflow_total` increments; overflow is
+    /// safe because the drift scan and the holder's next event re-detect
+    /// the segment. Bounds memory under intent storms (e.g. mass
+    /// hint-drop conversion). Default 10_000.
+    pub max_queue_depth: usize,
 }
 
 impl Default for ReconcileConfig {
     fn default() -> Self {
-        Self { tick_secs: 5, retry_after_ticks: 3, drift_scan_secs: 3600, max_batch_per_tick: 256 }
+        Self {
+            tick_secs: 5,
+            retry_after_ticks: 3,
+            drift_scan_secs: 3600,
+            max_batch_per_tick: 256,
+            max_queue_depth: 10_000,
+        }
     }
 }
 
@@ -93,11 +106,13 @@ impl Default for ReconcileConfig {
 /// `storage_locations` holders that are alive AND not unavailable.
 ///
 /// `alive` is the membership-alive node set. `unavailable` is the set of
-/// nodes whose **data** is genuinely lost (all their data pools Dead per
-/// their manifests, or the node Left/Dead). A node whose METADATA pool is
-/// Dead is NOT in `unavailable` — it still holds the segment's data (data
-/// pools intact, g8), so it counts as a live copy for RF purposes; it is
-/// merely unservable, which is a routing concern (g6), not durability.
+/// nodes whose data is **not faithfully held**: no Healthy data pool on
+/// their manifest (every data pool Degraded or Dead — f5 D2;
+/// over-replication after a pool recovers is acceptable), or the node
+/// Left/Dead. A node whose METADATA pool is Dead is NOT in `unavailable`
+/// — it still holds the segment's data (data pools intact, g8), so it
+/// counts as a live copy for RF purposes; it is merely unservable, which
+/// is a routing concern (g6), not durability.
 ///
 /// This is a *belief* (metadata says who holds S), not disk truth —
 /// scrub/anti-entropy verify disk contents (out of scope).
@@ -130,7 +145,7 @@ impl Default for ReconcileConfig {
 /// };
 ///
 /// let alive: HashSet<NodeId> = [a.clone(), b.clone(), c.clone()].into_iter().collect();
-/// // c is unavailable (its data pools are all Dead) → only a and b count.
+/// // c is unavailable (no Healthy data pool left) → only a and b count.
 /// let unavailable: HashSet<NodeId> = [c].into_iter().collect();
 /// assert_eq!(live_copy_count(&segment, &alive, &unavailable), 2);
 /// ```
@@ -345,6 +360,12 @@ pub struct ReconciliationLoop {
     ranges_under_replicated: Gauge,
     scan_ms: Gauge,
     repair_enqueued_total: Counter,
+    /// Current pending-queue occupancy (distinct segments), f5 D3.
+    queue_depth: Gauge,
+    /// Intents dropped at `ReconcileConfig::max_queue_depth` (f5 D3).
+    /// Overflow is observable, never silent; the drift scan re-detects
+    /// the segment later.
+    queue_overflow_total: Counter,
 }
 
 /// A repair sink that does nothing (tests / minimal embeddings).
@@ -429,6 +450,16 @@ impl ReconciliationLoop {
                 "Re-replication repair requests enqueued".into(),
                 LabelSet::empty(),
             ),
+            queue_depth: Gauge::new(
+                "oceanfs_reconcile_queue_depth".into(),
+                "Pending reconciliation work items (distinct segments)".into(),
+                LabelSet::empty(),
+            ),
+            queue_overflow_total: Counter::new(
+                "oceanfs_reconcile_queue_overflow_total".into(),
+                "Repair intents dropped at the reconciliation queue bound".into(),
+                LabelSet::empty(),
+            ),
         }
     }
 
@@ -449,6 +480,8 @@ impl ReconciliationLoop {
         registrar.register_gauge(self.ranges_under_replicated.clone());
         registrar.register_gauge(self.scan_ms.clone());
         registrar.register_counter(self.repair_enqueued_total.clone());
+        registrar.register_gauge(self.queue_depth.clone());
+        registrar.register_counter(self.queue_overflow_total.clone());
     }
 
     /// The number of pending work items (tests/observability).
@@ -469,12 +502,24 @@ impl ReconciliationLoop {
     /// Enqueues a segment with a CALLER-COMPUTED live count (the drift
     /// scan uses this to avoid re-entering the registry — `for_each`
     /// already holds the shard lock).
+    ///
+    /// f5 D3: bounded by [`ReconcileConfig::max_queue_depth`]. Overflow
+    /// drops the NEW intent (the segment is not inserted), increments
+    /// `oceanfs_reconcile_queue_overflow_total`, and leaves the segment
+    /// for the drift scan / next holder event — bounded memory, never a
+    /// silent loss.
     fn enqueue_with_live(&self, segment_id: SegmentId, live: usize) -> bool {
         let mut in_queue = self.in_queue.lock();
         if !in_queue.insert(segment_id) {
             return false;
         }
+        if in_queue.len() > self.config.max_queue_depth {
+            in_queue.remove(&segment_id);
+            self.queue_overflow_total.inc();
+            return false;
+        }
         self.queue.lock().push(WorkItem { segment_id, live });
+        self.queue_depth.set(in_queue.len() as u64);
         true
     }
 
@@ -488,9 +533,23 @@ impl ReconciliationLoop {
         live_copy_count(&entry.metadata, &alive, &unavailable)
     }
 
+    /// Whether a manifest means its node is **not a faithful copy
+    /// holder** (f5 D2): every data pool is non-Healthy (Degraded or
+    /// Dead). A Degraded pool is treated as lost for RF accounting —
+    /// over-replication after recovery is acceptable, and it is the only
+    /// way repair can fire while a pool sits Degraded.
+    ///
+    /// The empty-data-pool guard is preserved: a manifest that declares
+    /// no data rows is not confirmed loss (unknown pools), so it stays
+    /// countable.
+    fn manifest_data_unavailable(manifest: &NodeManifest) -> bool {
+        let data_pools: Vec<_> = manifest.pools().iter().filter(|p| p.role() == "data").collect();
+        !data_pools.is_empty() && data_pools.iter().all(|p| p.status() != "healthy")
+    }
+
     /// Snapshots the membership view: alive nodes + unavailable nodes
-    /// (Left/Dead members, or members whose data pools are all Dead per
-    /// their manifest).
+    /// (Left/Dead members, or members with no Healthy data pool per
+    /// their manifest — f5 D2).
     fn membership_snapshot(&self) -> (HashSet<NodeId>, HashSet<NodeId>) {
         let mut alive = HashSet::new();
         let mut unavailable = HashSet::new();
@@ -499,20 +558,18 @@ impl ReconciliationLoop {
             match state {
                 NodeState::Alive | NodeState::Suspect => {
                     alive.insert(node_id.clone());
-                    // A node whose data pools are ALL Dead holds no
-                    // usable data copy (ADR-0029 D3: data Dead =
-                    // "Range copies lost"). Its segments' data is gone;
-                    // re-replication must restore RF elsewhere.
-                    let all_data_dead = manifest
+                    // f5 (D2, ADR-0029 D3): a node with no Healthy data
+                    // pool is not a faithful copy holder. A Degraded pool
+                    // counts as lost for reconciliation — over-replication
+                    // is a lesser problem than never repairing RF. The
+                    // empty-data-pool guard is preserved: a manifest with
+                    // no data rows stays countable (unknown pools are not
+                    // confirmed loss).
+                    let no_healthy_data = manifest
                         .as_ref()
-                        .map(|m| {
-                            let data_pools: Vec<_> =
-                                m.pools().iter().filter(|p| p.role() == "data").collect();
-                            !data_pools.is_empty()
-                                && data_pools.iter().all(|p| p.status() == "dead")
-                        })
+                        .map(|m| Self::manifest_data_unavailable(m.as_ref()))
                         .unwrap_or(false);
-                    if all_data_dead {
+                    if no_healthy_data {
                         unavailable.insert(node_id.clone());
                     }
                 }
@@ -751,6 +808,7 @@ impl ReconciliationLoop {
         // the last batch's transient count, so it is monotonic-ish and
         // meaningful across batches.
         self.ranges_under_replicated.set(self.pending_len() as u64);
+        self.queue_depth.set(self.pending_len() as u64);
         debug!(processed = batch_len, under_count, repaired, "reconciliation batch processed");
     }
 }
@@ -807,6 +865,74 @@ mod tests {
         // A node not in alive is not counted.
         let alive: HashSet<NodeId> = [a.clone()].into_iter().collect();
         assert_eq!(live_copy_count(&segment, &alive, &unavailable), 1);
+    }
+
+    /// f5 D2: all-Degraded data pools mean "not a faithful copy" — the
+    /// same predicate the snapshot uses to build `unavailable`.
+    #[test]
+    fn manifest_data_unavailable_flags_all_degraded_and_all_dead() {
+        use oceanfs_membership::manifest::PoolManifest;
+
+        let degraded = NodeManifest::from_pools(
+            1,
+            &[PoolManifest::new(0, "data", "degraded", false, 1 << 40, 1)],
+        );
+        assert!(ReconciliationLoop::manifest_data_unavailable(&degraded));
+
+        let dead =
+            NodeManifest::from_pools(1, &[PoolManifest::new(0, "data", "dead", false, 0, 1)]);
+        assert!(ReconciliationLoop::manifest_data_unavailable(&dead));
+
+        let mixed = NodeManifest::from_pools(
+            1,
+            &[
+                PoolManifest::new(0, "data", "degraded", false, 1 << 40, 1),
+                PoolManifest::new(1, "data", "healthy", false, 1 << 40, 1),
+            ],
+        );
+        assert!(
+            !ReconciliationLoop::manifest_data_unavailable(&mixed),
+            "one Healthy data pool is still a faithful copy"
+        );
+
+        // The empty-data-pool guard: unknown pools are not confirmed loss.
+        let no_data = NodeManifest::from_pools(
+            1,
+            &[PoolManifest::new(0, "wal", "healthy", false, 1 << 30, 1)],
+        );
+        assert!(!ReconciliationLoop::manifest_data_unavailable(&no_data));
+    }
+
+    /// f5 D3: the reconciliation queue is bounded — an intent beyond
+    /// `max_queue_depth` is not enqueued and the overflow counter moves;
+    /// the queue never grows past the bound.
+    #[test]
+    fn bounded_queue_drops_new_intents_and_counts_overflow() {
+        use oceanfs_membership::Membership;
+        use oceanfs_routing::{Ring, RingCache};
+
+        let ring = Arc::new(RingCache::new(Ring::new(oceanfs_core::RingConfig::default())));
+        let membership = Arc::new(Membership::new(
+            NodeId::new("n1"),
+            "127.0.0.1:9300".parse().unwrap(),
+            "127.0.0.1:9301".parse().unwrap(),
+            oceanfs_core::GossipConfig::default(),
+            ring,
+        ));
+        let registry =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
+        let config = ReconcileConfig { max_queue_depth: 1, ..ReconcileConfig::default() };
+        let sink: Arc<dyn RepairSink> = Arc::new(NoopRepairSink);
+        let loop_ =
+            ReconciliationLoop::new(registry, membership, sink, NodeId::new("n1"), 3, config);
+
+        assert!(loop_.enqueue(SegmentId::new()), "first intent fits");
+        assert!(!loop_.enqueue(SegmentId::new()), "second intent dropped at the bound");
+        assert_eq!(loop_.pending_len(), 1, "queue never exceeds max_queue_depth");
+        assert_eq!(loop_.queue_overflow_total.get(), 1, "overflow is observed");
+        assert_eq!(loop_.queue_depth.get(), 1, "occupancy gauge reflects the queue");
     }
 
     #[test]

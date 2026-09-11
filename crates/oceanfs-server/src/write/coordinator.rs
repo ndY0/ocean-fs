@@ -42,7 +42,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     error::{Error, Result},
-    routing_hint::RoutingHint,
+    routing_hint::{CandidateClass, FallbackPath, RoutingHint},
     write::replication::replicate_write,
 };
 
@@ -436,12 +436,30 @@ impl WriteCoordinator {
         self.quorum_requires_ring
     }
 
-    /// Whether the write-path routing hint excludes `node` as a replica
-    /// target: its cached manifest reports `write_degraded` or zero
-    /// Healthy data pools. `false` when the hint is unset or the cache
-    /// has no entry (unknown node stays eligible).
+    /// The write-path routing class of `node` (f5, ADR-0029 §D5):
+    /// `Preferred` (Healthy data pool), `Fallback` (Degraded but still
+    /// writable), or `Excluded` (unavailable / `write_degraded` / no
+    /// writable data pool). Unknown nodes are `Preferred` — the error
+    /// path decides.
+    fn write_target_class(&self, node: &NodeId) -> CandidateClass {
+        self.routing_hint
+            .as_ref()
+            .map_or(CandidateClass::Preferred, |hint| hint.write_target_class(node))
+    }
+
+    /// Whether the write-path routing hint **hard-excludes** `node` as a
+    /// replica target: unavailable, `write_degraded`, or no writable data
+    /// pool. Degraded nodes are NOT excluded (they are fallback targets).
+    /// `false` when the hint is unset or the cache has no entry.
     fn excluded_write_target(&self, node: &NodeId) -> bool {
-        self.routing_hint.as_ref().is_some_and(|hint| hint.exclude_write_target(node))
+        self.write_target_class(node) == CandidateClass::Excluded
+    }
+
+    /// Records that a Degraded fallback target was ordered (metric).
+    fn on_degraded_write_fallback(&self) {
+        if let Some(hint) = &self.routing_hint {
+            hint.on_degraded_fallback(FallbackPath::Write);
+        }
     }
 
     /// Sets the hint inline threshold (hints above it become segment
@@ -527,24 +545,40 @@ impl WriteCoordinator {
 
         let is_local = replica_set.contains(&self.node_id);
 
-        // Step 2: If not local, forward to the first available successor.
+        // Step 2: If not local, forward to the best available successor:
+        // Preferred first, then a Degraded fallback, then (last resort)
+        // any Alive node — the I/O error path decides. The hint is a
+        // preference, never a dependency (f5, ADR-0029 §D5).
         if !is_local {
-            // ADR-0029 §D5: the forwarding target must not be excluded
-            // by the write-path hint (write_degraded / zero Healthy data
-            // pools) — the hint is a preference, not a dependency: when
-            // every alive candidate is excluded or unknown, fall back to
-            // the first alive node and let the I/O error path decide.
-            let forward_target = replica_set
-                .iter()
-                .find(|n| {
-                    self.membership.state_of(n) == Some(oceanfs_core::NodeState::Alive)
-                        && !self.excluded_write_target(n)
-                })
-                .or_else(|| {
-                    replica_set.iter().find(|n| {
-                        self.membership.state_of(n) == Some(oceanfs_core::NodeState::Alive)
-                    })
-                })
+            let mut preferred: Option<&NodeId> = None;
+            let mut fallback: Option<&NodeId> = None;
+            let mut any_alive: Option<&NodeId> = None;
+            for candidate in &replica_set {
+                if self.membership.state_of(candidate) != Some(oceanfs_core::NodeState::Alive) {
+                    continue;
+                }
+                if any_alive.is_none() {
+                    any_alive = Some(candidate);
+                }
+                match self.write_target_class(candidate) {
+                    CandidateClass::Preferred => {
+                        preferred = Some(candidate);
+                        break;
+                    }
+                    CandidateClass::Fallback => {
+                        if fallback.is_none() {
+                            fallback = Some(candidate);
+                        }
+                    }
+                    CandidateClass::Excluded => {}
+                }
+            }
+            if preferred.is_none() && fallback.is_some() {
+                self.on_degraded_write_fallback();
+            }
+            let forward_target = preferred
+                .or(fallback)
+                .or(any_alive)
                 .cloned()
                 .ok_or_else(|| Error::Routing("no alive replica to forward write".into()))?;
 
@@ -552,10 +586,12 @@ impl WriteCoordinator {
         }
 
         // Step 2b: Honest-debt pre-check (f0 D2). Targets that are known
-        // to need debt NOW — not Alive / no membership address, or
-        // excluded by the write-path routing hint (write_degraded
-        // manifest) — will certainly become hint debt. If the hints pool
-        // cannot record that debt, fail fast with 503 before any local
+        // to need debt NOW — not Alive / no membership address, or HARD
+        // excluded by the write-path routing hint (node unavailable /
+        // write_degraded) — will certainly become hint debt. Degraded
+        // nodes are fallback targets and are attempted (f5), so they do
+        // not pre-emptively require debt. If the hints pool cannot
+        // record that debt, fail fast with 503 before any local
         // append/rollback churn: a write must never be accepted while a
         // missing replica's debt is unrecordable. A fully-healthy replica
         // set never consults the hints pool.
@@ -902,22 +938,39 @@ impl WriteCoordinator {
         let mut acks_received: usize = 1; // local ack counted
         let mut failed_targets: Vec<NodeId> = Vec::new();
 
-        // Build list of remote replicas. ADR-0029 §D5: exclude nodes
-        // whose manifest reports `write_degraded` or zero Healthy data
-        // pools (the write-path hint); unknown nodes stay eligible.
-        let remote_targets: Vec<&NodeId> = replica_set
-            .iter()
-            .filter(|n| *n != &self.node_id && !self.excluded_write_target(n))
+        // Build the ordered remote-target list (f5, ADR-0029 §D5):
+        // Preferred replicas first, then Degraded fallbacks; only hard
+        // exclusions are dropped. Fallback targets count toward W — a
+        // Degraded member is attempted, never silently replaced by debt.
+        let mut preferred_targets: Vec<&NodeId> = Vec::new();
+        let mut fallback_targets: Vec<&NodeId> = Vec::new();
+        for candidate in &replica_set {
+            if *candidate == self.node_id {
+                continue;
+            }
+            match self.write_target_class(candidate) {
+                CandidateClass::Preferred => preferred_targets.push(candidate),
+                CandidateClass::Fallback => fallback_targets.push(candidate),
+                CandidateClass::Excluded => {}
+            }
+        }
+        if !fallback_targets.is_empty() {
+            self.on_degraded_write_fallback();
+        }
+        let remote_targets: Vec<&NodeId> = preferred_targets
+            .into_iter()
+            .chain(fallback_targets)
             .take(MAX_REPLICA_FANOUT)
             .collect();
 
         // f0 (D2, invariant completion): replica members NOT attempted by
-        // this write — routing-hint excluded, or beyond the fan-out cap —
-        // are missing copies exactly like an attempted-but-failed target.
-        // Exclusion is a placement preference, not a licence to ack an
-        // unreplicated version: their debt goes to the hint ledger too
-        // (ADR-0027 D2). Without this, RF=3/W=2 with one write_degraded
-        // member acks 200 while that member's copy is silently abandoned.
+        // this write — hard-excluded by the routing hint, or beyond the
+        // fan-out cap — are missing copies exactly like an
+        // attempted-but-failed target. Exclusion is a placement
+        // preference, not a licence to ack an unreplicated version: their
+        // debt goes to the hint ledger too (ADR-0027 D2). Without this,
+        // RF=3/W=2 with one write_degraded member acks 200 while that
+        // member's copy is silently abandoned.
         let unattempted: Vec<NodeId> = replica_set
             .iter()
             .filter(|n| **n != self.node_id && !remote_targets.contains(n))

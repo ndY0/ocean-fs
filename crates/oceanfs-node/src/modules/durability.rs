@@ -34,7 +34,7 @@ use crate::{
     modules::storage::StorageModule,
     node::BackgroundTasks,
     pool_paths::PoolPaths,
-    repair::{ManifestRepairTargetSelector, RepairDispatcher},
+    repair::{HintDropRepairBridge, ManifestRepairTargetSelector, RepairDispatcher},
 };
 
 /// The durability subsystem bundle (c2).
@@ -498,6 +498,15 @@ impl DurabilityModule {
         if let Some(recorder) = hint_io_recorder {
             hinted_handoff_manager = hinted_handoff_manager.with_io_recorder(recorder);
         }
+        // f5 D3: exhausted hint debt becomes a bounded ADR-0030 repair
+        // intent (one per distinct dropped segment) instead of a silent
+        // divergence.
+        hinted_handoff_manager =
+            hinted_handoff_manager.with_drop_sink(Arc::new(HintDropRepairBridge::new(
+                Arc::clone(&repair_dispatcher),
+                Arc::clone(&storage.lifecycle),
+                NodeId::new(&config.node_id),
+            )));
         let hinted_handoff_manager = Arc::new(hinted_handoff_manager);
 
         // Replay existing hints from the WAL into in-memory queues.

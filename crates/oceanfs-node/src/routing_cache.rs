@@ -9,16 +9,17 @@
 //! consume.
 //!
 //! Phase A: every manifest is Healthy and `write_degraded` is always
-//! false, so the exclusion filters never exclude — the cache is
-//! observationally neutral. The structure, the error-driven fallback,
-//! and the metrics are in place for Phase B's status transitions.
+//! false, so the filters never exclude — the cache is observationally
+//! neutral. f5 (2026-09-11): Degraded data pools are a **fallback tier**,
+//! never a hard exclusion — reads and writes prefer Healthy candidates
+//! and fall back to Degraded ones before failing.
 
 use std::{collections::HashMap, sync::Arc};
 
 use arc_swap::ArcSwap;
 use oceanfs_core::{Counter, LabelSet, MetricRegistrar, NodeId};
 use oceanfs_membership::manifest::NodeManifest;
-use oceanfs_server::RoutingHint;
+use oceanfs_server::{CandidateClass, FallbackPath, RoutingHint};
 
 /// The per-peer cached routing state (ADR-0029 §D5).
 ///
@@ -69,9 +70,15 @@ pub struct ManifestCache {
     /// data pools (g6).
     read_skips: Counter,
     /// `oceanfs_routing_manifest_skips_total{path="write"}` — a write
-    /// target excluded because its manifest reported `write_degraded` or
-    /// zero Healthy data pools (g6).
+    /// target hard-excluded because its manifest reported
+    /// `write_degraded`, `node_unavailable`, or no writable data pool.
     write_skips: Counter,
+    /// `oceanfs_routing_degraded_fallbacks_total{path="read"}` — a
+    /// Degraded read candidate was ordered for an attempt (f5).
+    degraded_fallbacks_read: Counter,
+    /// `oceanfs_routing_degraded_fallbacks_total{path="write"}` — a
+    /// Degraded write target was ordered for an attempt (f5).
+    degraded_fallbacks_write: Counter,
 }
 
 impl ManifestCache {
@@ -100,13 +107,24 @@ impl ManifestCache {
             ),
             read_skips: Counter::new(
                 "oceanfs_routing_manifest_skips_total".into(),
-                "Read candidates skipped due to their manifest (zero Healthy data pools)".into(),
+                "Read candidates hard-excluded by their manifest (unavailable / no usable data pool)"
+                    .into(),
                 LabelSet::new(&[("path", "read")]),
             ),
             write_skips: Counter::new(
                 "oceanfs_routing_manifest_skips_total".into(),
-                "Write targets skipped due to their manifest (write_degraded / zero Healthy pools)"
+                "Write targets hard-excluded by their manifest (write_degraded / unavailable / no writable pool)"
                     .into(),
+                LabelSet::new(&[("path", "write")]),
+            ),
+            degraded_fallbacks_read: Counter::new(
+                "oceanfs_routing_degraded_fallbacks_total".into(),
+                "Degraded read candidates ordered for an attempt (fallback tier)".into(),
+                LabelSet::new(&[("path", "read")]),
+            ),
+            degraded_fallbacks_write: Counter::new(
+                "oceanfs_routing_degraded_fallbacks_total".into(),
+                "Degraded write targets ordered for an attempt (fallback tier)".into(),
                 LabelSet::new(&[("path", "write")]),
             ),
         }
@@ -240,6 +258,8 @@ impl ManifestCache {
         registrar.register_counter(self.failover_total.clone());
         registrar.register_counter(self.read_skips.clone());
         registrar.register_counter(self.write_skips.clone());
+        registrar.register_counter(self.degraded_fallbacks_read.clone());
+        registrar.register_counter(self.degraded_fallbacks_write.clone());
     }
 }
 
@@ -348,15 +368,133 @@ pub fn can_accept_writes(manifest: &NodeManifest) -> bool {
     !manifest.node_unavailable() && !is_write_degraded(manifest) && healthy_data_pools(manifest) > 0
 }
 
+/// Classifies a manifest for the **read** path (f5, ADR-0029 §D5).
+///
+/// - `Excluded`: `node_unavailable`, or no usable data pool at all
+///   (zero data pools / every data pool `dead`).
+/// - `Fallback`: no Healthy data pool remains, but at least one data
+///   pool is still readable (Degraded, draining, or an unknown status).
+/// - `Preferred`: at least one Healthy data pool.
+///
+/// Degraded is a preference, never an exclusion: reads still serve from
+/// a Degraded pool, so a Degraded candidate is attempted after every
+/// Preferred one instead of being dropped.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_membership::manifest::{NodeManifest, PoolManifest};
+/// use oceanfs_node::routing_cache::manifest_read_class;
+/// use oceanfs_server::CandidateClass;
+///
+/// let degraded = NodeManifest::from_pools(
+///     1,
+///     &[PoolManifest::new(0, "data", "degraded", false, 1 << 40, 2)],
+/// );
+/// assert_eq!(manifest_read_class(&degraded), CandidateClass::Fallback);
+///
+/// let all_dead = NodeManifest::from_pools(
+///     1,
+///     &[PoolManifest::new(0, "data", "dead", false, 0, 2)],
+/// );
+/// assert_eq!(manifest_read_class(&all_dead), CandidateClass::Excluded);
+/// ```
+pub fn manifest_read_class(manifest: &NodeManifest) -> CandidateClass {
+    if manifest.node_unavailable() {
+        return CandidateClass::Excluded;
+    }
+    let mut any_usable = false;
+    let mut any_healthy = false;
+    for pool in manifest.pools() {
+        if pool.role() != "data" {
+            continue;
+        }
+        match pool.status() {
+            "healthy" => {
+                any_healthy = true;
+                any_usable = true;
+            }
+            // A Dead pool holds nothing to serve; Degraded/draining/unknown
+            // statuses are still readable (ADR-0029 §D5 read preference).
+            "dead" => {}
+            _ => any_usable = true,
+        }
+    }
+    if any_healthy {
+        CandidateClass::Preferred
+    } else if any_usable {
+        CandidateClass::Fallback
+    } else {
+        CandidateClass::Excluded
+    }
+}
+
+/// Classifies a manifest for the **write** path (f5, ADR-0029 §D5).
+///
+/// - `Excluded`: `node_unavailable`, `write_degraded` (Dead WAL — role
+///   consequence), or no writable data pool (zero data pools / all
+///   `dead`/`draining`).
+/// - `Fallback`: no Healthy data pool remains, but at least one data
+///   pool is Degraded (still accepts replication; over-committing is a
+///   lesser problem than refusing to write).
+/// - `Preferred`: at least one Healthy, non-draining data pool.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_membership::manifest::{NodeManifest, PoolManifest};
+/// use oceanfs_node::routing_cache::manifest_write_class;
+/// use oceanfs_server::CandidateClass;
+///
+/// let degraded = NodeManifest::from_pools(
+///     1,
+///     &[PoolManifest::new(0, "data", "degraded", false, 1 << 40, 2)],
+/// );
+/// assert_eq!(manifest_write_class(&degraded), CandidateClass::Fallback);
+///
+/// // A Dead WAL (`write_degraded`) is a hard write exclusion.
+/// let wal_dead = NodeManifest::from_pools(
+///     1,
+///     &[
+///         PoolManifest::new(0, "data", "healthy", false, 1 << 40, 2),
+///         PoolManifest::new(1, "wal", "healthy", true, 1 << 30, 1),
+///     ],
+/// );
+/// assert_eq!(manifest_write_class(&wal_dead), CandidateClass::Excluded);
+/// ```
+pub fn manifest_write_class(manifest: &NodeManifest) -> CandidateClass {
+    if manifest.node_unavailable() || is_write_degraded(manifest) {
+        return CandidateClass::Excluded;
+    }
+    let mut any_writable = false;
+    let mut any_healthy = false;
+    for pool in manifest.pools() {
+        if pool.role() != "data" {
+            continue;
+        }
+        match pool.status() {
+            // Draining pools take no new segment placements (ADR-0036 D6).
+            "healthy" if !pool.write_degraded() => {
+                any_healthy = true;
+                any_writable = true;
+            }
+            "degraded" => any_writable = true,
+            _ => {}
+        }
+    }
+    if any_healthy {
+        CandidateClass::Preferred
+    } else if any_writable {
+        CandidateClass::Fallback
+    } else {
+        CandidateClass::Excluded
+    }
+}
+
 impl RoutingHint for ManifestCache {
     fn exclude_read_candidate(&self, node_id: &NodeId) -> bool {
         let excluded = match self.get(node_id) {
-            Some(manifest) => {
-                // g8: `node_unavailable` is a HARD exclusion — a
-                // metadata-dead node cannot serve object reads even with
-                // healthy data pools (its local index is gone).
-                manifest.node_unavailable() || healthy_data_pools(&manifest) == 0
-            }
+            Some(manifest) => manifest_read_class(&manifest) == CandidateClass::Excluded,
             // Unknown peer = no pool info: stay eligible; the
             // error-driven fallback is the guarantee (ADR-0029 §D5).
             None => false,
@@ -369,7 +507,7 @@ impl RoutingHint for ManifestCache {
 
     fn exclude_write_target(&self, node_id: &NodeId) -> bool {
         let excluded = match self.get(node_id) {
-            Some(manifest) => !can_accept_writes(&manifest),
+            Some(manifest) => manifest_write_class(&manifest) == CandidateClass::Excluded,
             // Unknown peer stays eligible; write failures become
             // hinted-handoff debt.
             None => false,
@@ -382,6 +520,32 @@ impl RoutingHint for ManifestCache {
 
     fn on_failover(&self) {
         self.failover_total.inc();
+    }
+
+    fn read_candidate_class(&self, node_id: &NodeId) -> CandidateClass {
+        match self.get(node_id) {
+            Some(manifest) => manifest_read_class(&manifest),
+            // Unknown peers are attempted as preferred; the error path
+            // decides (the manifest is only a hint).
+            None => CandidateClass::Preferred,
+        }
+    }
+
+    fn write_target_class(&self, node_id: &NodeId) -> CandidateClass {
+        match self.get(node_id) {
+            Some(manifest) => manifest_write_class(&manifest),
+            None => CandidateClass::Preferred,
+        }
+    }
+
+    fn on_degraded_fallback(&self, path: FallbackPath) {
+        match path {
+            FallbackPath::Read => self.degraded_fallbacks_read.inc(),
+            FallbackPath::Write => self.degraded_fallbacks_write.inc(),
+            // `FallbackPath` is non-exhaustive: unknown future paths are
+            // ignored rather than counted against the wrong series.
+            _ => {}
+        }
     }
 }
 
@@ -636,5 +800,74 @@ mod tests {
             ],
         );
         assert_eq!(healthy_data_pools(&mixed), 1);
+    }
+
+    /// f5: a Degraded data pool is a Fallback for BOTH paths — it is
+    /// neither Preferred nor Excluded.
+    #[test]
+    fn degraded_data_pool_is_fallback_not_excluded() {
+        let degraded = data_manifest("degraded", false, 1);
+        assert_eq!(manifest_read_class(&degraded), CandidateClass::Fallback);
+        assert_eq!(manifest_write_class(&degraded), CandidateClass::Fallback);
+
+        let cache = ManifestCache::new();
+        let id = NodeId::new("peer");
+        cache.update(id.clone(), Arc::new(degraded));
+        assert_eq!(cache.read_candidate_class(&id), CandidateClass::Fallback);
+        assert_eq!(cache.write_target_class(&id), CandidateClass::Fallback);
+        assert!(!cache.exclude_read_candidate(&id), "Degraded is not a hard read exclusion");
+        assert!(!cache.exclude_write_target(&id), "Degraded is not a hard write exclusion");
+    }
+
+    /// f5: an all-Dead data pool set stays a hard exclusion for both
+    /// paths (nothing to serve, nothing to write).
+    #[test]
+    fn all_dead_data_pools_are_excluded_for_read_and_write() {
+        let all_dead = data_manifest("dead", false, 2);
+        assert_eq!(manifest_read_class(&all_dead), CandidateClass::Excluded);
+        assert_eq!(manifest_write_class(&all_dead), CandidateClass::Excluded);
+    }
+
+    /// f5: a node with no data pools at all is a hard exclusion; a
+    /// Healthy pool makes it Preferred even if a sibling pool is Degraded.
+    #[test]
+    fn mixed_healthy_and_degraded_is_preferred() {
+        let mixed = NodeManifest::from_pools(
+            1,
+            &[
+                PoolManifest::new(0, "data", "degraded", false, 1 << 40, 2),
+                PoolManifest::new(1, "data", "healthy", false, 1 << 40, 2),
+            ],
+        );
+        assert_eq!(manifest_read_class(&mixed), CandidateClass::Preferred);
+        assert_eq!(manifest_write_class(&mixed), CandidateClass::Preferred);
+
+        let no_data = NodeManifest::from_pools(
+            1,
+            &[PoolManifest::new(0, "wal", "healthy", false, 1 << 30, 1)],
+        );
+        assert_eq!(manifest_read_class(&no_data), CandidateClass::Excluded);
+        assert_eq!(manifest_write_class(&no_data), CandidateClass::Excluded);
+    }
+
+    /// f5: draining data pools still serve reads (fallback) but take no
+    /// new writes (excluded) — ADR-0036 D6.
+    #[test]
+    fn draining_is_read_fallback_but_write_excluded() {
+        let draining = data_manifest("draining", false, 1);
+        assert_eq!(manifest_read_class(&draining), CandidateClass::Fallback);
+        assert_eq!(manifest_write_class(&draining), CandidateClass::Excluded);
+    }
+
+    /// f5: the Degraded-fallback metric counts per path exactly once per
+    /// `on_degraded_fallback` call.
+    #[test]
+    fn degraded_fallback_metric_counts_per_path() {
+        let cache = ManifestCache::new();
+        cache.on_degraded_fallback(FallbackPath::Read);
+        cache.on_degraded_fallback(FallbackPath::Read);
+        cache.on_degraded_fallback(FallbackPath::Write);
+        assert_eq!(cache.degraded_fallbacks_read.get(), 2);
+        assert_eq!(cache.degraded_fallbacks_write.get(), 1);
     }
 }

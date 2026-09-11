@@ -57,9 +57,9 @@ pub use heal::{
     enqueue_heal, HealConfig, HealQueue, HealQueueSender, HealRequest, HealStats, HealWorker,
 };
 pub use hinted_handoff::{
-    GrpcHintDeliveryClient, GrpcHintObjectFetcher, HintDeliveryClient, HintIoRecorder,
-    HintObjectFetcher, HintObjectReader, HintRecord, HintWal, HintedHandoff, HintedHandoffConfig,
-    HintedHandoffManager,
+    GrpcHintDeliveryClient, GrpcHintObjectFetcher, HintDeliveryClient, HintDropRecord,
+    HintDropSink, HintIoRecorder, HintObjectFetcher, HintObjectReader, HintRecord, HintWal,
+    HintedHandoff, HintedHandoffConfig, HintedHandoffManager,
 };
 pub use peer_selection::{PartitionPlanner, PeerSelector};
 pub use reconcile::{

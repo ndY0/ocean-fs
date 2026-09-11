@@ -29,13 +29,13 @@ use std::{
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use oceanfs_core::{Counter, LabelSet, MetricRegistrar, NodeId, OperationTimeouts};
+use oceanfs_core::{Counter, LabelSet, MetricRegistrar, NodeId, OperationTimeouts, SegmentId};
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_storage::io::IoOp;
 use tracing::{debug, info, warn};
 
-use super::hint_io::HintIoRecorder;
+use super::{hint_io::HintIoRecorder, HintDropRecord, HintDropSink};
 use crate::{
     error::{Error, Result},
     healing_rpc::{self, healing_rpc_client::HealingRpcClient},
@@ -268,6 +268,10 @@ pub struct HintedHandoffManager {
     /// producer (f0 D1). `None` keeps the previous invisible-I/O behavior
     /// (unit tests / managers without a pool registry).
     hint_io: Option<HintIoRecorder>,
+    /// f5 D3: converts exhausted hint debt into bounded repair intent(s)
+    /// (one per distinct segment, fanned out via the ADR-0030 dispatch).
+    /// `None` keeps the legacy give-up behavior (counted, not repaired).
+    drop_sink: Option<Arc<dyn HintDropSink>>,
 }
 
 /// Human-readable (bucket, key, type) for a hint record (tracing).
@@ -454,6 +458,7 @@ impl HintedHandoffManager {
                 LabelSet::new(&[("reason", "pool_dead"), ("path", "delete")]),
             ),
             hint_io: None,
+            drop_sink: None,
         }
     }
 
@@ -488,6 +493,26 @@ impl HintedHandoffManager {
     #[must_use]
     pub fn with_io_recorder(mut self, recorder: HintIoRecorder) -> Self {
         self.hint_io = Some(recorder);
+        self
+    }
+
+    /// Wires the sink that converts exhausted hint debt into repair
+    /// intent(s) (f5 D3).
+    ///
+    /// When unset, a dropped hint is only counted (the legacy give-up
+    /// behavior). The node composition root wires a sink that fans one
+    /// ADR-0030 repair intent per distinct segment out to the segment's
+    /// RF holders.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let manager = HintedHandoffManager::new(wal_dir, client, config)
+    ///     .with_drop_sink(Arc::new(node_bridge));
+    /// ```
+    #[must_use]
+    pub fn with_drop_sink(mut self, sink: Arc<dyn HintDropSink>) -> Self {
+        self.drop_sink = Some(sink);
         self
     }
 
@@ -827,6 +852,13 @@ impl HintedHandoffManager {
                 // give-up cap.
                 let mut requeue: Vec<(u64, u64, HintRecord)> = Vec::new();
                 let mut dropped = 0usize;
+                // f5 D3: dedupe exhausted debt by segment before emitting
+                // repair intent(s) — one intent per distinct segment per
+                // delivery cycle (inline/delete records carry no segment
+                // and cannot be segment-repaired).
+                let mut drop_records: Vec<HintDropRecord> = Vec::new();
+                let mut dropped_segments: std::collections::HashSet<SegmentId> =
+                    std::collections::HashSet::new();
                 for (i, (start, end, mut record)) in drained.into_iter().enumerate() {
                     if retry.contains(&(i as u32)) {
                         let attempts = record.attempts.saturating_add(1);
@@ -838,6 +870,11 @@ impl HintedHandoffManager {
                                 max = self.config.max_delivery_attempts,
                                 "hint dropped after exceeding max delivery attempts"
                             );
+                            if let Some(drop) = hint_drop_record(&record) {
+                                if dropped_segments.insert(drop.segment_id) {
+                                    drop_records.push(drop);
+                                }
+                            }
                         } else {
                             record.attempts = attempts;
                             requeue.push((start, end, record));
@@ -854,6 +891,11 @@ impl HintedHandoffManager {
                 self.hints_delivered_total.add(delivered as u64);
                 if dropped > 0 {
                     self.hints_dropped_total.add(dropped as u64);
+                    if let Some(sink) = &self.drop_sink {
+                        if !drop_records.is_empty() {
+                            sink.on_hints_dropped(&drop_records);
+                        }
+                    }
                 }
                 info!(
                     target = %target,
@@ -1166,6 +1208,22 @@ impl HintedHandoffManager {
     }
 }
 
+/// Extracts the repair identity from a dropped hint (f5 D3).
+///
+/// Only segment-reference records carry a `segment_id`: the mutation's
+/// data lives in a segment, so a re-replication intent can restore the
+/// missing copy. Inline records are self-contained and deletes are
+/// tombstones — neither has a segment copy to repair, so they return
+/// `None` (they remain counted in `hints_dropped_total`).
+fn hint_drop_record(record: &HintRecord) -> Option<HintDropRecord> {
+    let hinted_handoff_rpc::hint_record::Record::SegmentRef(seg) = record.record.as_ref()? else {
+        return None;
+    };
+    let segment_id = SegmentId::try_from(seg.segment_id.clone()?).ok()?;
+    let intended_for = NodeId::from(seg.intended_for.as_ref()?.id.clone());
+    Some(HintDropRecord { segment_id, intended_for })
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -1314,6 +1372,107 @@ mod tests {
             assert_eq!(manager.pending_count(&node), expected_pending);
         }
         assert_eq!(manager.hints_dropped_total_for_test(), 1, "the drop is counted");
+    }
+
+    /// f5 D3: an exhausted segment-reference hint emits exactly ONE
+    /// repair record per distinct segment (two hints in the same segment
+    /// collapse), with the intended node attached; the drop counter still
+    /// increments for every dropped hint.
+    #[tokio::test]
+    async fn retry_cap_emits_one_deduped_repair_record_per_segment() {
+        #[derive(Default)]
+        struct RecordingSink(std::sync::Mutex<Vec<HintDropRecord>>);
+        impl HintDropSink for RecordingSink {
+            fn on_hints_dropped(&self, dropped: &[HintDropRecord]) {
+                self.0.lock().unwrap().extend_from_slice(dropped);
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let wal_dir = dir.path().to_path_buf();
+        let mock = Arc::new(MockDeliveryClient::new());
+        let mut config = make_test_config(wal_dir.clone());
+        config.max_delivery_attempts = 1;
+        let sink = Arc::new(RecordingSink::default());
+        let manager = HintedHandoffManager::new(wal_dir.clone(), mock.clone(), config)
+            .with_drop_sink(sink.clone());
+        let node = NodeId::new("node-a");
+        let segment_a = SegmentId::new();
+        let segment_b = SegmentId::new();
+        // Two hints in the SAME segment (dedup) + one in another segment.
+        for (key, segment) in [("k1", &segment_a), ("k2", &segment_a), ("k3", &segment_b)] {
+            manager
+                .enqueue(HintRecord::new_segment_ref(
+                    node.clone(),
+                    BucketId::new("b"),
+                    key.to_string(),
+                    *segment,
+                    0,
+                    1024,
+                    oceanfs_core::Hlc::zero(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        // cap = 1: the first attempt is kept, the second exceeds and drops.
+        for _ in 0..2 {
+            mock.add_response(Ok(HintedHandoffResponse {
+                accepted: false,
+                accepted_count: 0,
+                retry_indices: vec![0, 1, 2],
+            }));
+            manager.drain_and_deliver(node.clone()).await.unwrap();
+        }
+        assert_eq!(manager.hints_dropped_total_for_test(), 3, "every hint drop is counted");
+        let records = sink.0.lock().unwrap().clone();
+        assert_eq!(records.len(), 2, "one repair record per DISTINCT segment");
+        let segments: std::collections::HashSet<_> =
+            records.iter().map(|r| r.segment_id.clone()).collect();
+        assert!(segments.contains(&segment_a) && segments.contains(&segment_b));
+        assert!(records.iter().all(|r| r.intended_for == node));
+    }
+
+    /// f5 D3: inline hints carry no segment and emit no repair record
+    /// (nothing to re-replicate) — they remain counted only.
+    #[tokio::test]
+    async fn inline_hint_drop_emits_no_repair_record() {
+        #[derive(Default)]
+        struct RecordingSink(std::sync::Mutex<Vec<HintDropRecord>>);
+        impl HintDropSink for RecordingSink {
+            fn on_hints_dropped(&self, dropped: &[HintDropRecord]) {
+                self.0.lock().unwrap().extend_from_slice(dropped);
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let wal_dir = dir.path().to_path_buf();
+        let mock = Arc::new(MockDeliveryClient::new());
+        let mut config = make_test_config(wal_dir.clone());
+        config.max_delivery_attempts = 0;
+        let sink = Arc::new(RecordingSink::default());
+        let manager = HintedHandoffManager::new(wal_dir.clone(), mock.clone(), config)
+            .with_drop_sink(sink.clone());
+        let node = NodeId::new("node-a");
+        manager
+            .enqueue(HintRecord::new_inline(
+                node.clone(),
+                BucketId::new("b"),
+                "key".into(),
+                vec![1].into(),
+                oceanfs_core::Hlc::zero(),
+            ))
+            .await
+            .unwrap();
+
+        mock.add_response(Ok(HintedHandoffResponse {
+            accepted: false,
+            accepted_count: 0,
+            retry_indices: vec![0],
+        }));
+        manager.drain_and_deliver(node.clone()).await.unwrap();
+        assert_eq!(manager.hints_dropped_total_for_test(), 1);
+        assert!(sink.0.lock().unwrap().is_empty(), "inline hints are not segment-repairable");
     }
 
     // ── T1.5: Batched delivery ────────────────────────────────────────

@@ -11,6 +11,8 @@ dependencies:
     reason: Role mounts/devices and the record's volume map; sysfs/hcloud yank verdict
   - feature: f2-remote-fault-injectors
     reason: SSH yank/replug, per-role fill, segment corruption, POST-with-body admin driving
+  - feature: f5-degraded-pool-semantics
+    reason: Pre-f4 bug-fix gate — f4's scenarios assume corrected degraded-pool semantics (preferred/fallback tiers, faithful-copy accounting, hint-drop repair intents)
   - feature: test-harness-load-report
     reason: Injection records + assertion blocks in the report (existing Epic 1 types)
   - feature: disk-resilience-scale/d4-cluster-drain
@@ -63,6 +65,12 @@ on the fleet, and it closes two recorded Phase C residuals:
 network block storage and are **not comparable** to local-disk runs. No
 scenario asserts throughput or latency; the sustained load exists to keep
 the system busy while storage fails, not to measure it.
+
+**Sequencing (2026-09-11):** f4 is gated on
+[f5-degraded-pool-semantics](f5-degraded-pool-semantics.md). The f3 fleet
+validation exposed product defects in degraded-pool semantics that f4's
+scenarios would otherwise re-test on a broken substrate; f5 must land (and
+the f3 suite rerun green) before f4 starts.
 
 ## Scope
 

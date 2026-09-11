@@ -25,7 +25,7 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use futures::{stream::FuturesUnordered, StreamExt};
 use oceanfs_core::{
-    proto::segment::FetchShardRequest as GprcFetchShardRequest, ChunkRef, NodeId, ObjectMetadata,
+    proto::segment::FetchShardRequest as GprcFetchShardRequest, ChunkRef, ObjectMetadata,
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
@@ -37,7 +37,7 @@ use tracing::{debug, warn};
 use crate::{
     error::{Error, Result},
     read::coordinator::SegmentReader,
-    routing_hint::RoutingHint,
+    routing_hint::{order_read_candidates, RoutingHint},
 };
 
 /// Parameters for EC recovery during chunk fetch.
@@ -542,15 +542,11 @@ async fn fetch_single_chunk_raw(
     // that actually hold the data (sealed-segment-replication).
     let replica_set = segment_replica_set(ring, &chunk.segment_id);
 
-    // ADR-0029 §D5: exclude candidates whose manifest reports zero
-    // Healthy data pools (the node cannot serve segment reads). The
+    // f5 (ADR-0029 §D5): order the candidate replicas Preferred-first,
+    // then Degraded fallbacks; only hard exclusions are dropped. The
     // manifest is a HINT — an unknown node stays eligible and the
     // error-driven fallback below is the guarantee.
-    let replica_set: Vec<NodeId> = if let Some(hint) = routing_hint {
-        replica_set.iter().filter(|n| !hint.exclude_read_candidate(n)).cloned().collect()
-    } else {
-        replica_set
-    };
+    let replica_set = order_read_candidates(replica_set, routing_hint.map(|hint| hint.as_ref()));
 
     if replica_set.is_empty() {
         // If no replicas but EC recovery is available, try it before giving up.
@@ -779,13 +775,10 @@ async fn fetch_parity_shard_via_grpc(
     // target set — see fetch_single_chunk_raw).
     let replica_set = segment_replica_set(ring, &chunk.segment_id);
 
-    // ADR-0029 §D5: same read-candidate exclusion as the data-shard
-    // path — a node with zero Healthy data pools cannot serve reads.
-    let replica_set: Vec<NodeId> = if let Some(hint) = routing_hint {
-        replica_set.iter().filter(|n| !hint.exclude_read_candidate(n)).cloned().collect()
-    } else {
-        replica_set
-    };
+    // f5 (ADR-0029 §D5): same read-candidate ordering as the data-shard
+    // path — Preferred first, then Degraded fallbacks, hard exclusions
+    // dropped.
+    let replica_set = order_read_candidates(replica_set, routing_hint.map(|hint| hint.as_ref()));
 
     for replica in &replica_set {
         let addr = match membership.address_of(replica) {

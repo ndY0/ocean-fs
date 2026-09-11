@@ -58,6 +58,50 @@ const MAX_HINTS_PER_NODE: usize = 1_000;
 /// Set to a positive value to enable automatic expiry of stale hints.
 const DEFAULT_HINT_TTL_SECS: u64 = 0;
 
+/// A hint whose delivery budget is exhausted (f5 D3).
+///
+/// The hint WAL no longer holds the debt, but the mutation's data still
+/// exists on the write's other replicas — the segment copy has not been
+/// replicated to the intended target. A [`HintDropSink`] converts this
+/// record into a repair intent so the copy can be restored by
+/// re-replication instead of silently diverging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HintDropRecord {
+    /// The segment that holds the mutation's data.
+    pub segment_id: SegmentId,
+    /// The node the hint was intended for (the node that missed the copy).
+    pub intended_for: NodeId,
+}
+
+/// Receives hints whose delivery budget is exhausted (f5 D3).
+///
+/// The manager calls this at most once per dropped record (deduped by
+/// segment within a delivery cycle, and never for delete/inline records
+/// that carry no segment). Implementations must be cheap and must not
+/// block: the node-side bridge spawns the bounded ADR-0030 repair
+/// dispatch rather than awaiting it inline.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_durability::hinted_handoff::{HintDropRecord, HintDropSink};
+///
+/// struct Counting(std::sync::atomic::AtomicUsize);
+/// impl HintDropSink for Counting {
+///     fn on_hints_dropped(&self, dropped: &[HintDropRecord]) {
+///         self.0.fetch_add(dropped.len(), std::sync::atomic::Ordering::Relaxed);
+///     }
+/// }
+///
+/// let sink = Counting(Default::default());
+/// sink.on_hints_dropped(&[]);
+/// assert_eq!(sink.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+/// ```
+pub trait HintDropSink: Send + Sync {
+    /// Converts exhausted hint debt into bounded repair intent(s).
+    fn on_hints_dropped(&self, dropped: &[HintDropRecord]);
+}
+
 /// A buffered write intended for a specific node.
 ///
 /// Each hint is keyed by the intended node. When the node returns,

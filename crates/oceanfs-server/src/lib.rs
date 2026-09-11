@@ -50,6 +50,6 @@ pub use read::coordinator::{
     ReadResult, SegmentReader,
 };
 pub use router::{RouteRequest, RouteResponse, Router};
-pub use routing_hint::RoutingHint;
+pub use routing_hint::{CandidateClass, FallbackPath, RoutingHint};
 pub use s3_handler::S3Handler;
 pub use write::coordinator::{WriteCoordinator, WriteCoordinatorHintObjectApplier, WriteRequest};

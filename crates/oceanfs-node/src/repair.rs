@@ -26,11 +26,13 @@ use oceanfs_durability::{
         healing_rpc_client::HealingRpcClient, RepairReason as ProtoRepairReason,
         RequestReReplicationRequest,
     },
-    healing_service::{ReRepRequest, RepairSink},
+    healing_service::{ReRepRequest, RepairReason, RepairSink},
+    hinted_handoff::{HintDropRecord, HintDropSink},
     RepairTargetSelector,
 };
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
+use oceanfs_server::CandidateClass;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -113,12 +115,16 @@ pub enum DrainDispatchError {
 // ManifestRepairTargetSelector
 // ---------------------------------------------------------------------------
 
-/// `RepairTargetSelector` over the membership manifest cache (f7).
+/// `RepairTargetSelector` over the membership manifest cache (f7, f5).
 ///
-/// Filters candidates by manifest health — excludes the source holder
-/// itself, nodes with `write_degraded` or no Healthy data pool — and
-/// prefers the node with the most free data-pool capacity
-/// (`capacity_free_bytes`). Ties break by node id (deterministic).
+/// Filters candidates by manifest class — excludes the source holder
+/// itself, hard-excluded nodes (`write_degraded`, `node_unavailable`, no
+/// writable data pool) — and prefers **Healthy** destinations over
+/// Degraded fallbacks. Within a tier it prefers the node with the most
+/// free data-pool capacity (`capacity_free_bytes`); ties break by node id
+/// (deterministic). Degraded-fallback targets let repair land while the
+/// fleet is degraded (f5 D2): over-replication is a lesser problem than
+/// under-replication.
 ///
 /// # Examples
 ///
@@ -161,11 +167,13 @@ impl RepairTargetSelector for ManifestRepairTargetSelector {
         // - not self, not an existing holder;
         // - NOT node_unavailable (g8: a metadata-dead node cannot
         //   persist the new copy's object row);
-        // - its manifest has at least one Healthy, non-write_degraded
-        //   data pool (f7 — a node with no healthy data pool cannot
-        //   hold a new copy).
+        // - written-class Preferred (≥1 Healthy, non-write_degraded data
+        //   pool) or Fallback (Degraded data pool; f5 D2 — repair must be
+        //   able to land while the fleet is degraded).
+        // Preferred destinations always win over fallbacks; capacity breaks
+        // ties inside a tier.
         let holder_set: std::collections::HashSet<&NodeId> = holders.iter().collect();
-        let mut best: Option<(u64, NodeId)> = None;
+        let mut best: Option<(CandidateClass, u64, NodeId)> = None;
 
         for (node_id, state, _inc, _addr, _maddr, _v, _o, manifest) in self.membership.nodes_full()
         {
@@ -176,14 +184,8 @@ impl RepairTargetSelector for ManifestRepairTargetSelector {
                 continue;
             }
             let Some(manifest) = manifest else { continue };
-            if manifest.node_unavailable() {
-                continue;
-            }
-            let has_healthy_data_pool = manifest
-                .pools()
-                .iter()
-                .any(|p| p.role() == "data" && p.status() == "healthy" && !p.write_degraded());
-            if !has_healthy_data_pool {
+            let class = crate::routing_cache::manifest_write_class(&manifest);
+            if class == CandidateClass::Excluded {
                 continue;
             }
             let capacity = manifest
@@ -194,16 +196,29 @@ impl RepairTargetSelector for ManifestRepairTargetSelector {
                 .sum::<u64>();
             let replace = match &best {
                 None => true,
-                Some((best_capacity, best_id)) => {
-                    capacity > *best_capacity || (capacity == *best_capacity && node_id < *best_id)
+                Some((best_class, best_capacity, best_id)) => {
+                    class_rank(class) < class_rank(*best_class)
+                        || (class == *best_class
+                            && (capacity > *best_capacity
+                                || (capacity == *best_capacity && node_id < *best_id)))
                 }
             };
             if replace {
-                best = Some((capacity, node_id));
+                best = Some((class, capacity, node_id));
             }
         }
 
-        best.map(|(_, id)| id)
+        best.map(|(_, _, id)| id)
+    }
+}
+
+/// Orders the manifest classes for repair-target preference (lower wins).
+fn class_rank(class: CandidateClass) -> u8 {
+    match class {
+        CandidateClass::Preferred => 0,
+        CandidateClass::Fallback => 1,
+        // Non-exhaustive: unknown classes rank last.
+        _ => 2,
     }
 }
 
@@ -762,6 +777,70 @@ impl RepairSink for RepairDispatcher {
     }
 }
 
+/// f5 D3 bridge: converts exhausted hint debt into bounded ADR-0030
+/// repair intent.
+///
+/// The hint manager calls this once per distinct dropped segment (within
+/// a delivery cycle). The bridge resolves the segment's current holders
+/// from the local lifecycle registry and spawns one
+/// [`RepairDispatcher::enqueue`] per record — the dispatcher picks a
+/// target (Healthy-preferred, Degraded-fallback) and the acquiring node
+/// pulls the bytes. Segments this node does not hold are skipped: a
+/// holder's own reconciliation owns them, and inventing a holder set
+/// would violate the target-pull contract.
+pub struct HintDropRepairBridge {
+    dispatcher: Arc<RepairDispatcher>,
+    lifecycle: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
+    self_id: NodeId,
+}
+
+impl HintDropRepairBridge {
+    /// Creates the bridge over the node's repair dispatcher + lifecycle
+    /// registry.
+    pub fn new(
+        dispatcher: Arc<RepairDispatcher>,
+        lifecycle: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
+        self_id: NodeId,
+    ) -> Self {
+        Self { dispatcher, lifecycle, self_id }
+    }
+}
+
+impl HintDropSink for HintDropRepairBridge {
+    fn on_hints_dropped(&self, dropped: &[HintDropRecord]) {
+        for record in dropped {
+            let Some(entry) = self.lifecycle.registry().get(record.segment_id) else {
+                debug!(
+                    segment_id = %record.segment_id,
+                    intended_for = %record.intended_for,
+                    "hint-drop repair skipped: segment not held locally"
+                );
+                continue;
+            };
+            let holders: Vec<NodeId> = entry.metadata.storage_locations.iter().cloned().collect();
+            let request = ReRepRequest {
+                origin: self.self_id.clone(),
+                segment_id: record.segment_id,
+                holders,
+                reason: RepairReason::Reconciliation,
+                retry_count: 0,
+                merkle_root: entry.metadata.merkle_root,
+                tier: entry.metadata.size_tier,
+                ec_k: entry.metadata.ec_k,
+                ec_m: entry.metadata.ec_m,
+            };
+            let dispatcher = Arc::clone(&self.dispatcher);
+            // Fire-and-forget: the dispatcher's bounded queue owns pacing;
+            // a dispatch failure parks the request for the next sweep.
+            tokio::spawn(async move {
+                if let Err(error) = dispatcher.enqueue(request).await {
+                    warn!(error = %error, "hint-drop repair intent rejected");
+                }
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1081,5 +1160,62 @@ mod tests {
             ),
         );
         assert!(!dispatcher.is_data_dead(&n2), "wal-only node is not data-dead");
+    }
+
+    /// f5 D2: repair target selection prefers Healthy destinations over
+    /// Degraded fallbacks (regardless of capacity) and never picks a
+    /// hard-excluded candidate; when only Degraded candidates remain, a
+    /// Degraded target is chosen (over-replication is a lesser problem
+    /// than under-replication).
+    #[test]
+    fn repair_target_prefers_healthy_over_degraded_and_never_hard_excluded() {
+        use oceanfs_membership::manifest::{NodeManifest, PoolManifest};
+
+        let membership = make_membership("n1");
+        upsert(&membership, "n2");
+        upsert(&membership, "n3");
+        upsert(&membership, "n4");
+
+        // n2: Degraded with the most capacity; n3: Healthy with less.
+        membership.set_peer_manifest(
+            NodeId::new("n2"),
+            NodeManifest::from_pools(
+                1,
+                &[PoolManifest::new(0, "data", "degraded", false, 500 << 30, 1)],
+            ),
+        );
+        membership.set_peer_manifest(
+            NodeId::new("n3"),
+            NodeManifest::from_pools(
+                1,
+                &[PoolManifest::new(0, "data", "healthy", false, 100 << 30, 1)],
+            ),
+        );
+        // n4: write_degraded (Dead WAL) → hard-excluded, despite the most
+        // capacity.
+        membership.set_peer_manifest(
+            NodeId::new("n4"),
+            NodeManifest::from_pools(
+                1,
+                &[
+                    PoolManifest::new(0, "data", "healthy", false, 900 << 30, 1),
+                    PoolManifest::new(1, "wal", "healthy", true, 1 << 30, 1),
+                ],
+            ),
+        );
+
+        let selector = ManifestRepairTargetSelector::new(membership.clone(), NodeId::new("n1"));
+        assert_eq!(
+            selector.pick_repair_target(&SegmentId::new(), &[]),
+            Some(NodeId::new("n3")),
+            "Healthy wins over the larger Degraded candidate; write_degraded never wins"
+        );
+
+        // With n3 already a holder, the Degraded n2 is the fallback.
+        assert_eq!(
+            selector.pick_repair_target(&SegmentId::new(), &[NodeId::new("n3")]),
+            Some(NodeId::new("n2")),
+            "a Degraded data pool is a valid repair fallback target"
+        );
     }
 }
