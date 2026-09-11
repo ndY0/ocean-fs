@@ -39,6 +39,7 @@ use oceanfs_storage::{PoolRegistry, PoolStatus, StoragePool};
 /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
 /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
 /// #     ],
+/// #     health: Default::default(),
 /// #     missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
 /// # };
 /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -134,6 +135,7 @@ mod tests {
                 pool("meta", PoolRole::Metadata, &roots[3]),
                 pool("hints", PoolRole::Hints, &roots[4]),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -207,6 +209,7 @@ mod tests {
                 pool("meta", PoolRole::Metadata, &roots[3]),
                 pool("hints", PoolRole::Hints, &roots[4]),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -248,6 +251,7 @@ mod tests {
                 pool("meta", PoolRole::Metadata, &roots[2]),
                 pool("hints", PoolRole::Hints, &roots[3]),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");

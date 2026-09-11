@@ -55,6 +55,7 @@ async fn make_store() -> (
             pool_config("meta-0", PoolRole::Metadata, &tmp.path().join("pool-meta")),
             pool_config("hints-0", PoolRole::Hints, &tmp.path().join("pool-hints")),
         ],
+        health: Default::default(),
         missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
     };
     let pool_registry =

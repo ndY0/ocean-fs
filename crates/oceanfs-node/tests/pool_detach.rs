@@ -65,7 +65,11 @@ fn config_with_two_data_pools(tmp: &tempfile::TempDir) -> (NodeConfig, Vec<PathB
         listen_addr: "127.0.0.1:0".into(),
         grpc_listen_addr: "127.0.0.1:0".into(),
         membership_listen_addr: "127.0.0.1:0".into(),
-        storage: StorageConfig { pools, missing_root_policy: MissingRootPolicy::Fatal },
+        storage: StorageConfig {
+            pools,
+            health: Default::default(),
+            missing_root_policy: MissingRootPolicy::Fatal,
+        },
         ..NodeConfig::default()
     };
     (config, data_roots)

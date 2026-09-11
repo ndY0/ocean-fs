@@ -41,6 +41,7 @@ fn four_pool_config(tmp: &tempfile::TempDir) -> (NodeConfig, PathBuf, PathBuf, P
             pool("meta", PoolRole::Metadata, &metadata_root),
             pool("hints", PoolRole::Hints, &hints_root),
         ],
+        health: Default::default(),
         missing_root_policy: MissingRootPolicy::Fatal,
     };
     let config = NodeConfig {

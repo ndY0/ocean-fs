@@ -14,8 +14,7 @@
 use std::time::Duration;
 
 use oceanfs_core::{
-    MissingRootPolicy, NodeConfig, PoolHealthConfig, PoolRole, PoolTech, StorageConfig,
-    StoragePoolConfig,
+    MissingRootPolicy, NodeConfig, PoolRole, PoolTech, StorageConfig, StoragePoolConfig,
 };
 use oceanfs_node::Node;
 use oceanfs_storage::{
@@ -32,11 +31,11 @@ fn pool(name: &str, role: PoolRole, root: &std::path::Path) -> StoragePoolConfig
         tech: PoolTech::Auto,
         // Fast detection/recovery so the test runs in seconds: any
         // error spikes (min_errors 1), one clean tick recovers.
-        health: PoolHealthConfig {
-            min_errors: 1,
-            detection_window_secs: 1,
-            recovery_window_secs: 1,
-            ..PoolHealthConfig::default()
+        health: oceanfs_core::PoolHealthOverride {
+            min_errors: Some(1),
+            detection_window_secs: Some(1),
+            recovery_window_secs: Some(1),
+            ..Default::default()
         },
     }
 }
@@ -50,6 +49,7 @@ fn fast_config(tmp: &tempfile::TempDir) -> NodeConfig {
             pool("meta", PoolRole::Metadata, &tmp.path().join("optane1")),
             pool("hints", PoolRole::Hints, &tmp.path().join("hints-dev")),
         ],
+        health: Default::default(),
         missing_root_policy: MissingRootPolicy::Fatal,
     };
     NodeConfig {

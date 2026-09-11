@@ -539,7 +539,13 @@ impl StorageModule {
         let (health_monitor, health_events_rx) = oceanfs_storage::pool::health::HealthMonitor::new(
             Arc::clone(&registry),
             io_observer.clone(),
-            oceanfs_storage::pool::health::HealthMonitorConfig::default(),
+            oceanfs_storage::pool::health::HealthMonitorConfig {
+                tick_interval: config
+                    .storage
+                    .monitor_tick_interval_secs()
+                    .map(std::time::Duration::from_secs),
+                event_capacity: config.storage.event_capacity(),
+            },
         );
 
         Ok(Self {
@@ -1080,6 +1086,7 @@ pub(crate) mod test_support {
                     pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.path().join("pool-meta")),
                     pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.path().join("pool-hints")),
                 ],
+                health: Default::default(),
                 missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
             },
             // The event WAL lives under the temp data dir (the default

@@ -80,6 +80,7 @@ fn two_data_pool_registry(tmp: &tempfile::TempDir) -> (PoolRegistry, PathBuf, Pa
                 health: Default::default(),
             },
         ],
+        health: Default::default(),
         missing_root_policy: MissingRootPolicy::Fatal,
     };
     let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");

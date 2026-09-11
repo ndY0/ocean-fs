@@ -1880,6 +1880,7 @@ mod tests {
                     health: Default::default(),
                 },
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let registry = Arc::new(

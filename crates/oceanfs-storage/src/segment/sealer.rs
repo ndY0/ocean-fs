@@ -1284,6 +1284,7 @@ mod tests {
                     health: Default::default(),
                 },
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let registry = crate::pool::PoolRegistry::from_config(&storage, &data_dir).unwrap();
@@ -1433,6 +1434,7 @@ mod tests {
                     health: Default::default(),
                 },
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let registry = crate::pool::PoolRegistry::from_config(&storage, &data_dir).unwrap();

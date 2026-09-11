@@ -40,8 +40,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use oceanfs_core::{
-    MissingRootPolicy, NodeConfig, PoolHealthConfig, PoolRole, PoolTech, StorageConfig,
-    StoragePoolConfig,
+    MissingRootPolicy, NodeConfig, PoolRole, PoolTech, StorageConfig, StoragePoolConfig,
 };
 use oceanfs_node::Node;
 use oceanfs_storage::io::IoErrorKind;
@@ -77,11 +76,11 @@ fn pool(
         weight: None,
         tech: PoolTech::Auto,
         health: if fast_health {
-            PoolHealthConfig {
-                min_errors: 1,
-                detection_window_secs: 1,
-                recovery_window_secs: 1,
-                ..PoolHealthConfig::default()
+            oceanfs_core::PoolHealthOverride {
+                min_errors: Some(1),
+                detection_window_secs: Some(1),
+                recovery_window_secs: Some(1),
+                ..Default::default()
             }
         } else {
             Default::default()
@@ -99,6 +98,7 @@ fn storage_pools(tmp: &tempfile::TempDir, fast_health: bool) -> StorageConfig {
             pool("meta-0", PoolRole::Metadata, tmp.path().join("pool-meta"), false),
             pool("hints-0", PoolRole::Hints, tmp.path().join("pool-hints"), false),
         ],
+        health: Default::default(),
         missing_root_policy: MissingRootPolicy::Fatal,
     }
 }

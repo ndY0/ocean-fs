@@ -656,6 +656,7 @@ mod tests {
                     health: Default::default(),
                 },
             ],
+            health: Default::default(),
             missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
         };
         let pool_registry =

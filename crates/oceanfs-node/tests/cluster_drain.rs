@@ -23,8 +23,7 @@
 use std::{collections::HashSet, path::PathBuf, time::Duration};
 
 use oceanfs_core::{
-    MissingRootPolicy, NodeConfig, PoolHealthConfig, PoolRole, PoolTech, StorageConfig,
-    StoragePoolConfig,
+    MissingRootPolicy, NodeConfig, PoolRole, PoolTech, StorageConfig, StoragePoolConfig,
 };
 use oceanfs_node::Node;
 use oceanfs_storage::{DrainState, PoolStatus};
@@ -92,11 +91,11 @@ fn node_config(
                 root: tmp.join("nvme0"),
                 weight: None,
                 tech: PoolTech::Auto,
-                health: PoolHealthConfig {
-                    min_errors: 1,
-                    detection_window_secs: 1,
-                    recovery_window_secs: 1,
-                    ..PoolHealthConfig::default()
+                health: oceanfs_core::PoolHealthOverride {
+                    min_errors: Some(1),
+                    detection_window_secs: Some(1),
+                    recovery_window_secs: Some(1),
+                    ..Default::default()
                 },
             },
             StoragePoolConfig {
@@ -105,7 +104,7 @@ fn node_config(
                 root: tmp.join("optane0"),
                 weight: None,
                 tech: PoolTech::Auto,
-                health: PoolHealthConfig::default(),
+                health: Default::default(),
             },
             StoragePoolConfig {
                 name: "meta".to_string(),
@@ -113,7 +112,7 @@ fn node_config(
                 root: tmp.join("optane1"),
                 weight: None,
                 tech: PoolTech::Auto,
-                health: PoolHealthConfig::default(),
+                health: Default::default(),
             },
             StoragePoolConfig {
                 name: "hints".to_string(),
@@ -121,9 +120,10 @@ fn node_config(
                 root: tmp.join("hints0"),
                 weight: None,
                 tech: PoolTech::Auto,
-                health: PoolHealthConfig::default(),
+                health: Default::default(),
             },
         ],
+        health: Default::default(),
         missing_root_policy: MissingRootPolicy::Fatal,
     };
     NodeConfig {

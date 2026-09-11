@@ -158,8 +158,8 @@ mod tests {
     use std::path::Path;
 
     use oceanfs_core::{
-        LifecycleConfig, MissingRootPolicy, PoolHealthConfig, PoolTech, SegmentId, SegmentMetadata,
-        SizeTier, StorageConfig, StoragePoolConfig,
+        LifecycleConfig, MissingRootPolicy, PoolTech, SegmentId, SegmentMetadata, SizeTier,
+        StorageConfig, StoragePoolConfig,
     };
     use oceanfs_storage::SegmentLifecycleRegistry;
 
@@ -174,7 +174,7 @@ mod tests {
             root: root.to_path_buf(),
             weight: Some(1),
             tech: PoolTech::Auto,
-            health: PoolHealthConfig::default(),
+            health: Default::default(),
         };
         let storage = StorageConfig {
             pools: vec![
@@ -184,6 +184,7 @@ mod tests {
                 pool("meta", PoolRole::Metadata, &tmp.join("optane1")),
                 pool("hints", PoolRole::Hints, &tmp.join("hints0")),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");

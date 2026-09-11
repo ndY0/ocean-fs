@@ -104,6 +104,7 @@ pub(crate) fn replacement_marker_path(paths: &PoolPaths) -> std::path::PathBuf {
 /// #         pool("meta-0", PoolRole::Metadata, tmp.path().join("pool-meta")),
 /// #         pool("hints-0", PoolRole::Hints, tmp.path().join("pool-hints")),
 /// #     ],
+/// #     health: Default::default(),
 /// #     missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
 /// # };
 /// # let registry = Arc::new(PoolRegistry::from_config(&storage, &data_dir).expect("registry"));
@@ -1482,6 +1483,7 @@ mod tests {
                 pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.path().join("pool-meta")),
                 pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.path().join("pool-hints")),
             ],
+            health: Default::default(),
             missing_root_policy: oceanfs_core::MissingRootPolicy::Degraded,
         };
         let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");

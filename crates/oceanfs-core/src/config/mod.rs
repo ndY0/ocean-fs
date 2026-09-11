@@ -31,5 +31,8 @@ pub use ring::RingConfig;
 // segment pool). The storage one is re-exported as `StoragePoolConfig` to
 // keep both reachable without ambiguity.
 pub use storage::PoolConfig as StoragePoolConfig;
-pub use storage::{MissingRootPolicy, PoolHealthConfig, PoolRole, PoolTech, StorageConfig};
+pub use storage::{
+    MissingRootPolicy, PoolHealthConfig, PoolHealthOverride, PoolRole, PoolTech, SmartCounter,
+    SmartGrowthConfig, StorageConfig, TrendPercentile,
+};
 pub use wal::WalConfig;

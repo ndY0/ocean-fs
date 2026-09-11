@@ -23,8 +23,7 @@
 use std::time::Duration;
 
 use oceanfs_core::{
-    MissingRootPolicy, NodeConfig, PoolHealthConfig, PoolRole, PoolTech, StorageConfig,
-    StoragePoolConfig,
+    MissingRootPolicy, NodeConfig, PoolRole, PoolTech, StorageConfig, StoragePoolConfig,
 };
 use oceanfs_node::Node;
 use oceanfs_storage::{io::IoErrorKind, PoolStatus};
@@ -54,11 +53,11 @@ async fn boot_node(id: &str, seed: Option<&str>, addrs: &NodeAddrs) -> (Node, te
                 root: tmp.path().join("nvme0"),
                 weight: None,
                 tech: PoolTech::Auto,
-                health: PoolHealthConfig {
-                    min_errors: 1,
-                    detection_window_secs: 1,
-                    recovery_window_secs: 1,
-                    ..PoolHealthConfig::default()
+                health: oceanfs_core::PoolHealthOverride {
+                    min_errors: Some(1),
+                    detection_window_secs: Some(1),
+                    recovery_window_secs: Some(1),
+                    ..Default::default()
                 },
             },
             StoragePoolConfig {
@@ -67,7 +66,7 @@ async fn boot_node(id: &str, seed: Option<&str>, addrs: &NodeAddrs) -> (Node, te
                 root: tmp.path().join("optane0"),
                 weight: None,
                 tech: PoolTech::Auto,
-                health: PoolHealthConfig::default(),
+                health: Default::default(),
             },
             StoragePoolConfig {
                 name: "meta".to_string(),
@@ -75,7 +74,7 @@ async fn boot_node(id: &str, seed: Option<&str>, addrs: &NodeAddrs) -> (Node, te
                 root: tmp.path().join("optane1"),
                 weight: None,
                 tech: PoolTech::Auto,
-                health: PoolHealthConfig::default(),
+                health: Default::default(),
             },
             StoragePoolConfig {
                 name: "hints".to_string(),
@@ -83,9 +82,10 @@ async fn boot_node(id: &str, seed: Option<&str>, addrs: &NodeAddrs) -> (Node, te
                 root: tmp.path().join("hints0"),
                 weight: None,
                 tech: PoolTech::Auto,
-                health: PoolHealthConfig::default(),
+                health: Default::default(),
             },
         ],
+        health: Default::default(),
         missing_root_policy: MissingRootPolicy::Fatal,
     };
     let config = NodeConfig {

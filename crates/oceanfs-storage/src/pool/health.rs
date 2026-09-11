@@ -32,7 +32,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use oceanfs_core::{PoolHealthConfig, PoolRole, PoolTech};
+use oceanfs_core::{
+    PoolHealthConfig, PoolRole, PoolTech, SmartCounter, SmartGrowthConfig, TrendPercentile,
+};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -122,11 +124,26 @@ impl PoolSignal {
         self.latency[op.as_usize()]
     }
 
-    /// Returns the worst p99 latency across all ops (the "latency
-    /// series" value for this window): any op's degradation trips the
-    /// trend detector, so the detector sees the maximum.
-    fn worst_p99_nanos(&self) -> u64 {
-        self.latency.iter().filter_map(|l| l.p99.map(|d| d.as_nanos() as u64)).max().unwrap_or(0)
+    /// Returns the worst latency at the configured percentile across all
+    /// ops (the "latency series" value for this window): any op's
+    /// degradation trips the trend detector, so the detector sees the
+    /// maximum.
+    fn worst_latency_nanos(&self, percentile: TrendPercentile) -> u64 {
+        self.latency
+            .iter()
+            .filter_map(|latency| {
+                let value = match percentile {
+                    TrendPercentile::P50 => latency.p50,
+                    TrendPercentile::P99 => latency.p99,
+                    TrendPercentile::P999 => latency.p999,
+                    // `TrendPercentile` is non-exhaustive: unknown future
+                    // percentiles fall back to p99 (the pre-f5 behavior).
+                    _ => latency.p99,
+                };
+                value.map(|d| d.as_nanos() as u64)
+            })
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -187,67 +204,117 @@ pub enum TrendVerdict {
 /// assert_eq!(evaluate_trend(&history, PoolTech::Nvme), TrendVerdict::Degrading);
 /// ```
 pub fn evaluate_trend(history: &[PoolSignal], tech: PoolTech) -> TrendVerdict {
-    // I/O-signal series: error rate + worst-per-op p99 latency.
-    let error_rates: Vec<f64> = history.iter().map(|signal| signal.error_rate).collect();
-    let p99_latencies: Vec<f64> =
-        history.iter().map(|signal| signal.worst_p99_nanos() as f64).collect();
+    evaluate_trend_with(history, tech, &PoolHealthConfig::default())
+}
 
-    if doubling(&error_rates) || doubling(&p99_latencies) {
+/// Configurable variant of [`evaluate_trend`] (f5 D4): the doubling factor,
+/// minimum series length, latency percentile, and per-tech SMART counter
+/// selection all come from the resolved [`PoolHealthConfig`].
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::{PoolHealthConfig, PoolTech};
+/// use oceanfs_storage::pool::health::{evaluate_trend_with, PoolSignal, TrendVerdict};
+///
+/// // A 1.5×/window slope does not trip the default 2× factor...
+/// let history: Vec<PoolSignal> = [1.0, 1.5, 2.25]
+///     .into_iter()
+///     .map(|error_rate| PoolSignal { error_rate, ops: 100, ..PoolSignal::default() })
+///     .collect();
+/// assert_eq!(
+///     evaluate_trend_with(&history, PoolTech::Nvme, &PoolHealthConfig::default()),
+///     TrendVerdict::Stable
+/// );
+///
+/// // ...but a configured 1.4× factor catches it.
+/// let config = PoolHealthConfig { trend_doubling_factor: 1.4, ..PoolHealthConfig::default() };
+/// assert_eq!(
+///     evaluate_trend_with(&history, PoolTech::Nvme, &config),
+///     TrendVerdict::Degrading
+/// );
+/// ```
+pub fn evaluate_trend_with(
+    history: &[PoolSignal],
+    tech: PoolTech,
+    config: &PoolHealthConfig,
+) -> TrendVerdict {
+    // I/O-signal series: error rate + worst-per-op latency at the
+    // configured percentile.
+    let error_rates: Vec<f64> = history.iter().map(|signal| signal.error_rate).collect();
+    let latencies: Vec<f64> = history
+        .iter()
+        .map(|signal| signal.worst_latency_nanos(config.trend_latency_percentile) as f64)
+        .collect();
+
+    if doubling(&error_rates, config.trend_doubling_factor, config.trend_min_windows)
+        || doubling(&latencies, config.trend_doubling_factor, config.trend_min_windows)
+    {
         return TrendVerdict::Degrading;
     }
 
-    // Tech-specific SMART baselines. Auto is resolved by the pool runtime
-    // before this layer; cloud-ephemeral has no SMART (I/O only).
-    let smart_degrading = match tech {
-        PoolTech::Hdd => {
-            let series: Vec<u64> = history
-                .iter()
-                .map(|s| {
-                    s.smart
-                        .reallocated_sectors
-                        .unwrap_or(0)
-                        .saturating_add(s.smart.pending_sectors.unwrap_or(0))
-                })
-                .collect();
-            smart_growth(&series)
+    // Tech-specific SMART baselines (configurable selection; empty list =
+    // I/O-only, e.g. cloud-ephemeral).
+    let counters = smart_counters_for(&config.smart_growth, tech);
+    if !counters.is_empty() {
+        let series: Vec<u64> = history
+            .iter()
+            .map(|signal| {
+                counters
+                    .iter()
+                    .map(|counter| smart_counter_value(&signal.smart, *counter))
+                    .fold(0u64, u64::saturating_add)
+            })
+            .collect();
+        if smart_growth(&series) {
+            return TrendVerdict::Degrading;
         }
-        PoolTech::Ssd | PoolTech::Nvme => {
-            let series: Vec<u64> = history
-                .iter()
-                .map(|s| {
-                    s.smart
-                        .uncorrectable_ecc
-                        .unwrap_or(0)
-                        .saturating_add(s.smart.wear_level.unwrap_or(0))
-                })
-                .collect();
-            smart_growth(&series)
-        }
-        // Auto is resolved by the pool runtime before this layer;
-        // cloud-ephemeral has no SMART (I/O only); unknown future techs
-        // are I/O-only too.
-        _ => false,
-    };
-    if smart_degrading {
-        TrendVerdict::Degrading
-    } else {
-        TrendVerdict::Stable
+    }
+
+    TrendVerdict::Stable
+}
+
+/// The SMART counters configured for `tech` (empty = no SMART signal).
+fn smart_counters_for(config: &SmartGrowthConfig, tech: PoolTech) -> &[SmartCounter] {
+    match tech {
+        PoolTech::Hdd => &config.hdd,
+        PoolTech::Ssd => &config.ssd,
+        PoolTech::Nvme => &config.nvme,
+        // `Auto` is resolved by the pool runtime before this layer;
+        // cloud-ephemeral and unknown future techs are I/O-only by default.
+        _ => &config.cloud_ephemeral,
     }
 }
 
-/// `true` when a series shows a monotonic-worsening slope: `x[i] >= 2 *
-/// x[i-1]` for the LAST TWO consecutive window pairs (both the final and
-/// the penultimate pair double). A zero baseline never counts as the
+/// Reads one SMART counter, `0` when absent.
+fn smart_counter_value(smart: &SmartCounters, counter: SmartCounter) -> u64 {
+    match counter {
+        SmartCounter::ReallocatedSectors => smart.reallocated_sectors,
+        SmartCounter::PendingSectors => smart.pending_sectors,
+        SmartCounter::UncorrectableEcc => smart.uncorrectable_ecc,
+        SmartCounter::WearLevel => smart.wear_level,
+        // `SmartCounter` is non-exhaustive: unknown future counters
+        // contribute nothing.
+        _ => None,
+    }
+    .unwrap_or(0)
+}
+
+/// `true` when a series shows a monotonic-worsening slope: `x[i] >=
+/// factor * x[i-1]` for the LAST TWO consecutive window pairs (both the
+/// final and the penultimate pair). A zero baseline never counts as the
 /// doubling base — an abrupt 0→N spike is the absolute-threshold fast
 /// path's signal, not the trend's.
-fn doubling(series: &[f64]) -> bool {
+fn doubling(series: &[f64], factor: f64, min_windows: usize) -> bool {
     let n = series.len();
-    if n < 3 {
+    // Two window pairs need at least 3 points; the configurable minimum
+    // raises that floor.
+    if n < min_windows.max(3) {
         return false;
     }
     let pair_doubles = |i: usize| -> bool {
         let previous = series[i - 1];
-        previous > 0.0 && series[i] >= 2.0 * previous
+        previous > 0.0 && series[i] >= factor * previous
     };
     pair_doubles(n - 1) && pair_doubles(n - 2)
 }
@@ -437,6 +504,7 @@ impl Default for HealthMonitorConfig {
 /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
 /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
 /// #     ],
+/// #     health: Default::default(),
 /// #     missing_root_policy: Default::default(),
 /// # };
 /// let registry = Arc::new(
@@ -513,6 +581,7 @@ impl HealthMonitor {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = Arc::new(
@@ -561,6 +630,7 @@ impl HealthMonitor {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = Arc::new(
@@ -600,6 +670,7 @@ impl HealthMonitor {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = Arc::new(
@@ -663,6 +734,7 @@ impl HealthMonitor {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = Arc::new(
@@ -748,14 +820,17 @@ impl HealthMonitor {
             entry.next_tick = now + Duration::from_secs(tick_secs);
             let signal = self.observer.snapshot(pool_id).unwrap_or_default();
             // Bounded history (perf 1.3): trend_window / tick, clamped so
-            // a fast test tick does not grow it unboundedly.
-            let history_len = (config.trend_window_secs / tick_secs).clamp(4, 64) as usize;
+            // a fast test tick does not grow it unboundedly. The upper
+            // bound is configurable (f5 D4).
+            let history_len = (config.trend_window_secs / tick_secs)
+                .clamp(4, config.history_max_windows.max(4) as u64)
+                as usize;
             entry.history.push_back(signal);
             while entry.history.len() > history_len {
                 entry.history.pop_front();
             }
             let history: Vec<PoolSignal> = entry.history.iter().copied().collect();
-            let verdict = evaluate_trend(&history, pool.tech());
+            let verdict = evaluate_trend_with(&history, pool.tech(), &config);
             let (new_status, clean_windows) = decide_transition(
                 entry.status,
                 &signal,
@@ -1027,7 +1102,82 @@ mod tests {
         assert_eq!(evaluate_trend(&history, PoolTech::CloudEphemeral), TrendVerdict::Degrading);
     }
 
-    // -- Tech-specific SMART baselines --
+    // -- f5 D4: configurable detector knobs --
+
+    #[test]
+    fn configured_min_windows_raises_the_series_floor() {
+        // 100 → 200 → 400 doubles, but a configured minimum of 4 windows
+        // refuses to evaluate a 3-point series.
+        let history = vec![
+            signal_with_p99(IoOp::Write, 100),
+            signal_with_p99(IoOp::Write, 200),
+            signal_with_p99(IoOp::Write, 400),
+        ];
+        let config = PoolHealthConfig { trend_min_windows: 4, ..PoolHealthConfig::default() };
+        assert_eq!(
+            evaluate_trend_with(&history, PoolTech::CloudEphemeral, &config),
+            TrendVerdict::Stable
+        );
+    }
+
+    #[test]
+    fn configured_latency_percentile_selects_the_series() {
+        // p50 doubles while p99 stays flat: P50 catches it, P99 does not.
+        let history: Vec<PoolSignal> = (0..3)
+            .map(|i| {
+                let mut window = [Latency::default(); IO_OP_COUNT];
+                window[IoOp::Write.as_usize()].p50 =
+                    Some(Duration::from_nanos(100 * 2_u64.pow(i as u32)));
+                window[IoOp::Write.as_usize()].p99 = Some(Duration::from_nanos(1_000));
+                PoolSignal { latency: window, ..PoolSignal::default() }
+            })
+            .collect();
+        assert_eq!(
+            evaluate_trend_with(&history, PoolTech::CloudEphemeral, &PoolHealthConfig::default()),
+            TrendVerdict::Stable,
+            "the default p99 series is flat"
+        );
+        let p50 = PoolHealthConfig {
+            trend_latency_percentile: oceanfs_core::TrendPercentile::P50,
+            ..PoolHealthConfig::default()
+        };
+        assert_eq!(
+            evaluate_trend_with(&history, PoolTech::CloudEphemeral, &p50),
+            TrendVerdict::Degrading,
+            "the configured p50 series doubles"
+        );
+    }
+
+    #[test]
+    fn configured_smart_selection_can_deselect_counters() {
+        // Wear-level growth on an ssd trips only while wear_level is
+        // selected for that tech.
+        let history: Vec<PoolSignal> = [0u64, 2, 5]
+            .into_iter()
+            .map(|wear| PoolSignal {
+                smart: SmartCounters { wear_level: Some(wear), ..SmartCounters::default() },
+                ..PoolSignal::default()
+            })
+            .collect();
+        assert_eq!(
+            evaluate_trend_with(&history, PoolTech::Ssd, &PoolHealthConfig::default()),
+            TrendVerdict::Degrading,
+            "wear_level is selected by default for ssd"
+        );
+
+        let without_wear = PoolHealthConfig {
+            smart_growth: oceanfs_core::SmartGrowthConfig {
+                ssd: vec![oceanfs_core::SmartCounter::UncorrectableEcc],
+                ..oceanfs_core::SmartGrowthConfig::default()
+            },
+            ..PoolHealthConfig::default()
+        };
+        assert_eq!(
+            evaluate_trend_with(&history, PoolTech::Ssd, &without_wear),
+            TrendVerdict::Stable,
+            "deselecting wear_level disables the signal"
+        );
+    }
 
     #[test]
     fn hdd_reallocated_sector_growth_is_degrading() {
@@ -1404,7 +1554,17 @@ mod tests {
             root: root.to_path_buf(),
             weight: None,
             tech: PoolTech::Auto,
-            health: fast_config(),
+            health: fast_override(),
+        }
+    }
+
+    /// The per-pool override form of [`fast_config`] for registry tests.
+    fn fast_override() -> oceanfs_core::PoolHealthOverride {
+        oceanfs_core::PoolHealthOverride {
+            min_errors: Some(1),
+            detection_window_secs: Some(1),
+            recovery_window_secs: Some(1),
+            ..Default::default()
         }
     }
 
@@ -1426,6 +1586,7 @@ mod tests {
                 pool_config("meta", PoolRole::Metadata, &tmp.path().join("optane1")),
                 pool_config("hints", PoolRole::Hints, &tmp.path().join("hints0")),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let registry = Arc::new(PoolRegistry::from_config(&storage, &data_dir).unwrap());

@@ -414,8 +414,11 @@ mod tests {
         pools.push(pool_config("wal-0", PoolRole::Wal, &tmp.path().join("pool-wal")));
         pools.push(pool_config("meta-0", PoolRole::Metadata, &tmp.path().join("pool-meta")));
         pools.push(pool_config("hints-0", PoolRole::Hints, &tmp.path().join("pool-hints")));
-        let storage =
-            StorageConfig { pools, missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal };
+        let storage = StorageConfig {
+            pools,
+            health: Default::default(),
+            missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
+        };
         let registry =
             Arc::new(PoolRegistry::from_config(&storage, &tmp.path().join("meta")).unwrap());
         let lifecycle_registry =

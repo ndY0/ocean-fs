@@ -41,6 +41,7 @@ fn node_config(tmp: &tempfile::TempDir) -> NodeConfig {
                 pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.path().join("pool-meta")),
                 pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.path().join("pool-hints")),
             ],
+            health: Default::default(),
             missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
         },
         ..NodeConfig::default()

@@ -45,6 +45,7 @@ fn four_pool_config(tmp: &tempfile::TempDir) -> (NodeConfig, PathBuf, PathBuf) {
             pool("meta", PoolRole::Metadata, &tmp.path().join("optane1")),
             pool("hints", PoolRole::Hints, &tmp.path().join("hints-dev")),
         ],
+        health: Default::default(),
         missing_root_policy: MissingRootPolicy::Fatal,
     };
     let config = NodeConfig {

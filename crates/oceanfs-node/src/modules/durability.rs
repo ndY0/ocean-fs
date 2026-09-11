@@ -810,8 +810,10 @@ impl DurabilityModule {
         // budget (ADR-0017 amendment); the blocking fs probe runs on the
         // blocking pool so a hung device cannot stall a runtime worker.
         if let Some(pool) = storage.registry.pool_by_role(oceanfs_core::PoolRole::Hints) {
-            let probe_interval =
-                Duration::from_secs((pool.health_config().detection_window_secs / 6).max(1));
+            let probe_interval = Duration::from_secs(
+                (pool.health_config().detection_window_secs / config.storage.hints_probe_divisor())
+                    .max(1),
+            );
             let probe = oceanfs_storage::PoolRootProbe::new(
                 pool.id(),
                 pool.root().to_path_buf(),

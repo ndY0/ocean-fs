@@ -48,6 +48,7 @@ async fn seal_pipeline_feeds_the_io_observer() {
                 pool("meta-0", oceanfs_core::PoolRole::Metadata, tmp.path().join("pool-meta")),
                 pool("hints-0", oceanfs_core::PoolRole::Hints, tmp.path().join("pool-hints")),
             ],
+            health: Default::default(),
             missing_root_policy: oceanfs_core::MissingRootPolicy::Fatal,
         }
     }

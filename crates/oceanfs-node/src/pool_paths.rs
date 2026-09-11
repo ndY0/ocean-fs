@@ -126,6 +126,7 @@ mod tests {
                     pool(name, *role, &root)
                 })
                 .collect(),
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Degraded,
         };
         let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();

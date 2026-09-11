@@ -179,15 +179,118 @@ pub enum MissingRootPolicy {
 }
 
 // ---------------------------------------------------------------------------
+// Health detector configuration
+// ---------------------------------------------------------------------------
+
+/// Latency percentile that feeds the health monitor's trend detector.
+///
+/// The observer records p50, p99, and p999 per op; the detector compares
+/// the configured percentile across windows. Default: `P99` (the
+/// pre-f5 hard-coded behavior).
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::TrendPercentile;
+///
+/// assert_eq!(TrendPercentile::default(), TrendPercentile::P99);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TrendPercentile {
+    /// Median latency.
+    P50,
+    /// 99th percentile (default).
+    #[default]
+    P99,
+    /// 99.9th percentile.
+    P999,
+}
+
+/// A SMART counter selectable for the trend detector.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::{SmartCounter};
+///
+/// #[derive(serde::Deserialize)]
+/// struct Wrapper {
+///     counter: SmartCounter,
+/// }
+///
+/// let wrapper: Wrapper = toml::from_str("counter = \"wear_level\"").unwrap();
+/// assert_eq!(wrapper.counter, SmartCounter::WearLevel);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SmartCounter {
+    /// Reallocated sector count (HDD tell).
+    ReallocatedSectors,
+    /// Pending sector count (HDD tell).
+    PendingSectors,
+    /// Uncorrectable ECC errors (SSD/NVMe tell).
+    UncorrectableEcc,
+    /// Wear-level indicator, 0-100 (SSD/NVMe tell).
+    WearLevel,
+}
+
+/// Per-tech SMART counter selection for the trend detector.
+///
+/// The selected counters are summed per window; any growth across the
+/// last two window pairs trips `Degrading`. An empty list disables the
+/// SMART signal for that tech (e.g. cloud volumes). Defaults preserve the
+/// pre-f5 hard-coded mapping.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::{SmartCounter, SmartGrowthConfig};
+///
+/// let config = SmartGrowthConfig::default();
+/// assert_eq!(
+///     config.hdd,
+///     vec![SmartCounter::ReallocatedSectors, SmartCounter::PendingSectors]
+/// );
+/// assert!(config.cloud_ephemeral.is_empty());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SmartGrowthConfig {
+    /// Counters for `tech = "hdd"`.
+    pub hdd: Vec<SmartCounter>,
+    /// Counters for `tech = "ssd"`.
+    pub ssd: Vec<SmartCounter>,
+    /// Counters for `tech = "nvme"`.
+    pub nvme: Vec<SmartCounter>,
+    /// Counters for `tech = "cloud-ephemeral"` (default: none — I/O only).
+    pub cloud_ephemeral: Vec<SmartCounter>,
+}
+
+impl Default for SmartGrowthConfig {
+    fn default() -> Self {
+        Self {
+            hdd: vec![SmartCounter::ReallocatedSectors, SmartCounter::PendingSectors],
+            ssd: vec![SmartCounter::UncorrectableEcc, SmartCounter::WearLevel],
+            nvme: vec![SmartCounter::UncorrectableEcc, SmartCounter::WearLevel],
+            cloud_ephemeral: Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PoolHealthConfig
 // ---------------------------------------------------------------------------
 
-/// Per-pool health-monitor tuning knobs (ADR-0029 §D3).
+/// Resolved per-pool health-monitor tuning knobs (ADR-0029 §D3).
 ///
-/// Carried in config and validated now; consumed by Phase B's health
-/// monitor, which detects trend-based, tech-aware disk failure. All fields
-/// have built-in defaults, so a minimal pool entry only needs `name`, `role`,
-/// and `root`.
+/// This is the fully-resolved form (hard-coded defaults ← global
+/// `[storage.health]` ← per-pool `health = { ... }`) consumed by the
+/// health monitor. Configuration files use [`PoolHealthOverride`] for the
+/// partial tables; every field here has a built-in default, so a minimal
+/// pool entry only needs `name`, `role`, and `root`.
 ///
 /// # Examples
 ///
@@ -197,9 +300,11 @@ pub enum MissingRootPolicy {
 /// let health = PoolHealthConfig::default();
 /// assert_eq!(health.error_rate_threshold, 0.001);
 /// assert_eq!(health.trend_window_secs, 300);
-/// assert_eq!(health.detection_window_secs, 30);
+/// assert_eq!(health.trend_doubling_factor, 2.0);
+/// assert_eq!(health.trend_min_windows, 3);
+/// assert_eq!(health.history_max_windows, 64);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PoolHealthConfig {
     /// I/O error rate (errors per operation) above which the trend fast-path
@@ -219,6 +324,20 @@ pub struct PoolHealthConfig {
     /// Clean window (seconds) that moves a pool back to `Healthy`.
     /// Must be `> 0`. Default: `300`.
     pub recovery_window_secs: u64,
+    /// Trend doubling factor: `x[i] >= factor * x[i-1]` for the last two
+    /// window pairs counts as worsening. Must be `> 1.0`. Default: `2.0`.
+    pub trend_doubling_factor: f64,
+    /// Minimum number of windows in a series before the trend detector
+    /// evaluates a slope. Must be `>= 2`. Default: `3` (last two pairs).
+    pub trend_min_windows: usize,
+    /// Which latency percentile feeds the latency trend. Default: `P99`.
+    pub trend_latency_percentile: TrendPercentile,
+    /// Upper bound of the per-pool signal history (windows). Must be
+    /// `>= 4` (the hard lower clamp). Default: `64`.
+    pub history_max_windows: usize,
+    /// Per-tech SMART counters whose growth trips the trend. Defaults
+    /// mirror the pre-f5 hard-coded mapping.
+    pub smart_growth: SmartGrowthConfig,
 }
 
 impl Default for PoolHealthConfig {
@@ -230,6 +349,108 @@ impl Default for PoolHealthConfig {
             trend_window_secs: 300,
             detection_window_secs: 30,
             recovery_window_secs: 300,
+            trend_doubling_factor: 2.0,
+            trend_min_windows: 3,
+            trend_latency_percentile: TrendPercentile::P99,
+            history_max_windows: 64,
+            smart_growth: SmartGrowthConfig::default(),
+        }
+    }
+}
+
+/// Partial health overrides — the config-file surface (f5 D4).
+///
+/// Used for both `[storage.health]` (node-global defaults) and a pool's
+/// inline `health = { ... }` table. Resolution is field-by-field:
+/// hard-coded defaults ← global table ← per-pool table (per-pool wins).
+///
+/// The three monitor-level fields (`monitor_tick_interval_secs`,
+/// `event_capacity`, `hints_probe_divisor`) are **global-only**; setting
+/// them on a pool's inline table is rejected by
+/// [`StorageConfig::validate`].
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::{PoolHealthConfig, PoolHealthOverride};
+///
+/// let global: PoolHealthOverride = toml::from_str(
+///     "latency_factor = 2.0\ntrend_doubling_factor = 1.5",
+/// )
+/// .unwrap();
+/// let pool: PoolHealthOverride = toml::from_str("latency_factor = 1.25").unwrap();
+///
+/// let resolved = pool.resolve(&global.resolve(&PoolHealthConfig::default()));
+/// assert_eq!(resolved.latency_factor, 1.25); // per-pool wins
+/// assert_eq!(resolved.trend_doubling_factor, 1.5); // global applies
+/// assert_eq!(resolved.min_errors, 3); // hard-coded default
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PoolHealthOverride {
+    /// See [`PoolHealthConfig::error_rate_threshold`].
+    pub error_rate_threshold: Option<f64>,
+    /// See [`PoolHealthConfig::min_errors`].
+    pub min_errors: Option<u64>,
+    /// See [`PoolHealthConfig::latency_factor`].
+    pub latency_factor: Option<f64>,
+    /// See [`PoolHealthConfig::trend_window_secs`].
+    pub trend_window_secs: Option<u64>,
+    /// See [`PoolHealthConfig::detection_window_secs`].
+    pub detection_window_secs: Option<u64>,
+    /// See [`PoolHealthConfig::recovery_window_secs`].
+    pub recovery_window_secs: Option<u64>,
+    /// See [`PoolHealthConfig::trend_doubling_factor`].
+    pub trend_doubling_factor: Option<f64>,
+    /// See [`PoolHealthConfig::trend_min_windows`].
+    pub trend_min_windows: Option<usize>,
+    /// See [`PoolHealthConfig::trend_latency_percentile`].
+    pub trend_latency_percentile: Option<TrendPercentile>,
+    /// See [`PoolHealthConfig::history_max_windows`].
+    pub history_max_windows: Option<usize>,
+    /// See [`PoolHealthConfig::smart_growth`].
+    pub smart_growth: Option<SmartGrowthConfig>,
+    /// Global monitor ticker override in seconds (`[storage.health]` only;
+    /// `None` = per-pool `detection_window_secs` cadence).
+    pub monitor_tick_interval_secs: Option<u64>,
+    /// Global status-event channel capacity (`[storage.health]` only;
+    /// default `64`).
+    pub event_capacity: Option<usize>,
+    /// Hints-root probe cadence divisor (`[storage.health]` only): the
+    /// probe runs every `detection_window_secs / divisor` (min 1s).
+    /// Default `6`.
+    pub hints_probe_divisor: Option<u64>,
+}
+
+impl PoolHealthOverride {
+    /// Resolves this partial override over `base` (per-pool fields only;
+    /// monitor-level fields are ignored here).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::{PoolHealthConfig, PoolHealthOverride};
+    ///
+    /// let base = PoolHealthConfig::default();
+    /// let override_config: PoolHealthOverride = toml::from_str("min_errors = 7").unwrap();
+    /// assert_eq!(override_config.resolve(&base).min_errors, 7);
+    /// assert_eq!(override_config.resolve(&base).detection_window_secs, 30);
+    /// ```
+    pub fn resolve(&self, base: &PoolHealthConfig) -> PoolHealthConfig {
+        PoolHealthConfig {
+            error_rate_threshold: self.error_rate_threshold.unwrap_or(base.error_rate_threshold),
+            min_errors: self.min_errors.unwrap_or(base.min_errors),
+            latency_factor: self.latency_factor.unwrap_or(base.latency_factor),
+            trend_window_secs: self.trend_window_secs.unwrap_or(base.trend_window_secs),
+            detection_window_secs: self.detection_window_secs.unwrap_or(base.detection_window_secs),
+            recovery_window_secs: self.recovery_window_secs.unwrap_or(base.recovery_window_secs),
+            trend_doubling_factor: self.trend_doubling_factor.unwrap_or(base.trend_doubling_factor),
+            trend_min_windows: self.trend_min_windows.unwrap_or(base.trend_min_windows),
+            trend_latency_percentile: self
+                .trend_latency_percentile
+                .unwrap_or(base.trend_latency_percentile),
+            history_max_windows: self.history_max_windows.unwrap_or(base.history_max_windows),
+            smart_growth: self.smart_growth.clone().unwrap_or_else(|| base.smart_growth.clone()),
         }
     }
 }
@@ -284,9 +505,11 @@ pub struct PoolConfig {
     /// Device technology class. Default: `Auto` (resolved in f2).
     #[serde(default)]
     pub tech: PoolTech,
-    /// Per-pool health knobs. Default: [`PoolHealthConfig::default`].
+    /// Per-pool health overrides, merged field-by-field over the global
+    /// `[storage.health]` table and the hard-coded defaults (f5 D4).
+    /// Default: no overrides.
     #[serde(default)]
-    pub health: PoolHealthConfig,
+    pub health: PoolHealthOverride,
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +564,7 @@ pub struct PoolConfig {
 ///         },
 ///     ],
 ///     missing_root_policy: MissingRootPolicy::Fatal,
+///     health: Default::default(),
 /// };
 /// assert!(config.validate(Path::new("/var/lib/oceanfs")).is_ok());
 /// ```
@@ -350,9 +574,52 @@ pub struct StorageConfig {
     /// Configured storage pools. Must declare at least one `data` pool and
     /// exactly one `wal`, `metadata`, and `hints` pool each (ADR-0031).
     pub pools: Vec<PoolConfig>,
+    /// Node-global health-detector defaults (f5 D4). Per-pool
+    /// `health = { ... }` tables override these field-by-field. The
+    /// monitor-level keys (`monitor_tick_interval_secs`,
+    /// `event_capacity`, `hints_probe_divisor`) live **only** here.
+    pub health: PoolHealthOverride,
     /// Startup policy for a pool whose root is missing or unprobeable.
     /// Default: `Fatal`.
     pub missing_root_policy: MissingRootPolicy,
+}
+
+impl StorageConfig {
+    /// Resolves a pool's effective health config: hard-coded defaults ←
+    /// `[storage.health]` ← the pool's inline `health` table.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::{PoolHealthConfig, StorageConfig};
+    ///
+    /// let config = StorageConfig::default();
+    /// assert_eq!(config.health.error_rate_threshold, None);
+    /// // No pools to resolve against; the helper is exercised in config tests.
+    /// let base: PoolHealthConfig = PoolHealthConfig::default();
+    /// assert_eq!(base.min_errors, 3);
+    /// ```
+    pub fn resolved_pool_health(&self, pool: &PoolConfig) -> PoolHealthConfig {
+        let global = self.health.resolve(&PoolHealthConfig::default());
+        pool.health.resolve(&global)
+    }
+
+    /// Global monitor tick override in seconds (`None` = per-pool
+    /// `detection_window_secs` cadence).
+    pub fn monitor_tick_interval_secs(&self) -> Option<u64> {
+        self.health.monitor_tick_interval_secs
+    }
+
+    /// Global status-event channel capacity (default `64`, perf 2.6).
+    pub fn event_capacity(&self) -> usize {
+        self.health.event_capacity.unwrap_or(64)
+    }
+
+    /// Hints-root probe cadence divisor (default `6`, minimum `1`): the
+    /// probe runs every `detection_window_secs / divisor` seconds.
+    pub fn hints_probe_divisor(&self) -> u64 {
+        self.health.hints_probe_divisor.unwrap_or(6).max(1)
+    }
 }
 
 impl StorageConfig {
@@ -404,6 +671,7 @@ impl StorageConfig {
     ///         pool("hints", PoolRole::Hints, "/mnt/hints0"),
     ///     ],
     ///     missing_root_policy: MissingRootPolicy::Fatal,
+    ///     health: Default::default(),
     /// };
     /// assert!(config.validate(Path::new("/var/lib/oceanfs")).is_ok());
     ///
@@ -418,6 +686,20 @@ impl StorageConfig {
             return Err("at least one 'data', 'wal', 'metadata', and 'hints' pool is required; \
                  storage pools are mandatory (ADR-0031)"
                 .to_string());
+        }
+
+        // Global monitor knobs (f5 D4) are `[storage.health]`-only and
+        // must be usable when set.
+        if let Some(tick) = self.health.monitor_tick_interval_secs {
+            if tick == 0 {
+                return Err("[storage.health].monitor_tick_interval_secs must be > 0".to_string());
+            }
+        }
+        if self.health.event_capacity == Some(0) {
+            return Err("[storage.health].event_capacity must be > 0".to_string());
+        }
+        if self.health.hints_probe_divisor == Some(0) {
+            return Err("[storage.health].hints_probe_divisor must be > 0".to_string());
         }
 
         // At least one data pool must exist so placement has somewhere to
@@ -472,8 +754,21 @@ impl StorageConfig {
                 }
             }
 
-            // Health knobs: error-rate threshold in (0, 1), windows > 0.
-            let health = &pool.health;
+            // Health knobs (resolved: defaults ← [storage.health] ← pool):
+            // error-rate threshold in (0, 1), windows > 0, detector knobs
+            // sane. Monitor-level fields are rejected on the pool table.
+            if pool.health.monitor_tick_interval_secs.is_some()
+                || pool.health.event_capacity.is_some()
+                || pool.health.hints_probe_divisor.is_some()
+            {
+                return Err(format!(
+                    "pool '{}' health must not set monitor-level fields \
+                     (monitor_tick_interval_secs / event_capacity / hints_probe_divisor); \
+                     set them under [storage.health]",
+                    pool.name
+                ));
+            }
+            let health = self.resolved_pool_health(pool);
             if !(health.error_rate_threshold > 0.0 && health.error_rate_threshold < 1.0) {
                 return Err(format!(
                     "pool '{}' health.error_rate_threshold must be in (0, 1), got {}",
@@ -487,6 +782,24 @@ impl StorageConfig {
                 return Err(format!(
                     "pool '{}' health windows (trend/detection/recovery) must all be > 0",
                     pool.name
+                ));
+            }
+            if !health.trend_doubling_factor.is_finite() || health.trend_doubling_factor <= 1.0 {
+                return Err(format!(
+                    "pool '{}' health.trend_doubling_factor must be > 1.0, got {}",
+                    pool.name, health.trend_doubling_factor
+                ));
+            }
+            if health.trend_min_windows < 3 {
+                return Err(format!(
+                    "pool '{}' health.trend_min_windows must be >= 3 (two window pairs), got {}",
+                    pool.name, health.trend_min_windows
+                ));
+            }
+            if health.history_max_windows < 4 {
+                return Err(format!(
+                    "pool '{}' health.history_max_windows must be >= 4, got {}",
+                    pool.name, health.history_max_windows
                 ));
             }
 
@@ -560,7 +873,7 @@ mod tests {
             root: PathBuf::from(root),
             weight,
             tech: PoolTech::Auto,
-            health: PoolHealthConfig::default(),
+            health: Default::default(),
         }
     }
 
@@ -571,7 +884,7 @@ mod tests {
             root: PathBuf::from(root),
             weight: None,
             tech: PoolTech::Auto,
-            health: PoolHealthConfig::default(),
+            health: Default::default(),
         }
     }
 
@@ -582,7 +895,7 @@ mod tests {
             root: PathBuf::from(root),
             weight: None,
             tech: PoolTech::Auto,
-            health: PoolHealthConfig::default(),
+            health: Default::default(),
         }
     }
 
@@ -593,7 +906,7 @@ mod tests {
             root: PathBuf::from(root),
             weight: None,
             tech: PoolTech::Auto,
-            health: PoolHealthConfig::default(),
+            health: Default::default(),
         }
     }
 
@@ -677,7 +990,7 @@ mod tests {
         let pool = &config.pools[0];
         assert_eq!(pool.tech, PoolTech::Auto);
         assert_eq!(pool.weight, None);
-        assert_eq!(pool.health, PoolHealthConfig::default());
+        assert_eq!(pool.health, PoolHealthOverride::default());
         assert_eq!(config.missing_root_policy, MissingRootPolicy::Fatal);
     }
 
@@ -693,13 +1006,14 @@ mod tests {
                     root: PathBuf::from("/mnt/a"),
                     weight: Some(2),
                     tech: PoolTech::Nvme,
-                    health: PoolHealthConfig {
-                        error_rate_threshold: 0.01,
-                        ..PoolHealthConfig::default()
+                    health: PoolHealthOverride {
+                        error_rate_threshold: Some(0.01),
+                        ..Default::default()
                     },
                 },
                 data_pool("pool-b", "/mnt/b", None),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Degraded,
         };
 
@@ -862,6 +1176,7 @@ mod tests {
                 data_pool("same-name", "/mnt/a", None),
                 data_pool("same-name", "/mnt/b", None),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let err = config.validate(Path::new("/var/lib/oceanfs")).unwrap_err();
@@ -872,6 +1187,7 @@ mod tests {
     fn validate_empty_pool_name_rejected() {
         let config = StorageConfig {
             pools: vec![data_pool("  ", "/mnt/a", None)],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let err = config.validate(Path::new("/var/lib/oceanfs")).unwrap_err();
@@ -882,6 +1198,7 @@ mod tests {
     fn validate_duplicate_pool_root_rejected() {
         let config = StorageConfig {
             pools: vec![data_pool("pool-a", "/mnt/a", None), data_pool("pool-b", "/mnt/a", None)],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let err = config.validate(Path::new("/var/lib/oceanfs")).unwrap_err();
@@ -892,6 +1209,7 @@ mod tests {
     fn validate_non_absolute_root_rejected() {
         let config = StorageConfig {
             pools: vec![data_pool("pool-a", "mnt/a", None)],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let err = config.validate(Path::new("/var/lib/oceanfs")).unwrap_err();
@@ -902,6 +1220,7 @@ mod tests {
     fn validate_missing_data_pool_rejected() {
         let config = StorageConfig {
             pools: vec![wal_pool("journal", "/mnt/wal"), metadata_pool("meta", "/mnt/meta")],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let err = config.validate(Path::new("/var/lib/oceanfs")).unwrap_err();
@@ -913,6 +1232,7 @@ mod tests {
         // ADR-0031: wal/metadata/hints are mandatory (role pinning).
         let config = StorageConfig {
             pools: vec![data_pool("pool-a", "/mnt/a", None)],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let err = config.validate(Path::new("/var/lib/oceanfs")).unwrap_err();
@@ -927,6 +1247,7 @@ mod tests {
                 wal_pool("journal", "/mnt/wal"),
                 metadata_pool("meta", "/mnt/meta"),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let err = config.validate(Path::new("/var/lib/oceanfs")).unwrap_err();
@@ -941,6 +1262,7 @@ mod tests {
                 wal_pool("journal-b", "/mnt/wal-b"),
                 data_pool("pool-a", "/mnt/a", None),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let err = config.validate(Path::new("/var/lib/oceanfs")).unwrap_err();
@@ -955,6 +1277,7 @@ mod tests {
                 metadata_pool("meta-b", "/mnt/meta-b"),
                 data_pool("pool-a", "/mnt/a", None),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let err = config.validate(Path::new("/var/lib/oceanfs")).unwrap_err();
@@ -969,6 +1292,7 @@ mod tests {
                 hints_pool("hints-b", "/mnt/hints-b"),
                 data_pool("pool-a", "/mnt/a", None),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let err = config.validate(Path::new("/var/lib/oceanfs")).unwrap_err();
@@ -979,6 +1303,7 @@ mod tests {
     fn validate_zero_weight_rejected() {
         let config = StorageConfig {
             pools: vec![data_pool("pool-a", "/mnt/a", Some(0))],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let err = config.validate(Path::new("/var/lib/oceanfs")).unwrap_err();
@@ -995,11 +1320,12 @@ mod tests {
                     root: PathBuf::from("/mnt/a"),
                     weight: None,
                     tech: PoolTech::Auto,
-                    health: PoolHealthConfig {
-                        error_rate_threshold: bad_threshold,
-                        ..PoolHealthConfig::default()
+                    health: PoolHealthOverride {
+                        error_rate_threshold: Some(bad_threshold),
+                        ..Default::default()
                     },
                 }],
+                health: Default::default(),
                 missing_root_policy: MissingRootPolicy::Fatal,
             };
             let err = config.validate(Path::new("/var/lib/oceanfs")).unwrap_err();
@@ -1009,8 +1335,7 @@ mod tests {
 
     #[test]
     fn validate_zero_health_windows_rejected() {
-        let mut health = PoolHealthConfig::default();
-        health.trend_window_secs = 0;
+        let health = PoolHealthOverride { trend_window_secs: Some(0), ..Default::default() };
         let config = StorageConfig {
             pools: vec![PoolConfig {
                 name: "pool-a".into(),
@@ -1020,13 +1345,13 @@ mod tests {
                 tech: PoolTech::Auto,
                 health,
             }],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let err = config.validate(Path::new("/var/lib/oceanfs")).unwrap_err();
         assert!(err.contains("health windows"), "message: {err}");
 
-        let mut health = PoolHealthConfig::default();
-        health.detection_window_secs = 0;
+        let health = PoolHealthOverride { detection_window_secs: Some(0), ..Default::default() };
         let config = StorageConfig {
             pools: vec![PoolConfig {
                 name: "pool-a".into(),
@@ -1036,12 +1361,12 @@ mod tests {
                 tech: PoolTech::Auto,
                 health,
             }],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         assert!(config.validate(Path::new("/var/lib/oceanfs")).is_err());
 
-        let mut health = PoolHealthConfig::default();
-        health.recovery_window_secs = 0;
+        let health = PoolHealthOverride { recovery_window_secs: Some(0), ..Default::default() };
         let config = StorageConfig {
             pools: vec![PoolConfig {
                 name: "pool-a".into(),
@@ -1051,6 +1376,7 @@ mod tests {
                 tech: PoolTech::Auto,
                 health,
             }],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         assert!(config.validate(Path::new("/var/lib/oceanfs")).is_err());
@@ -1060,6 +1386,7 @@ mod tests {
     fn validate_root_equal_to_data_dir_rejected() {
         let config = StorageConfig {
             pools: vec![data_pool("pool-a", "/var/lib/oceanfs", None)],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let err = config.validate(Path::new("/var/lib/oceanfs")).unwrap_err();
@@ -1070,6 +1397,7 @@ mod tests {
     fn validate_root_nested_inside_data_dir_rejected() {
         let config = StorageConfig {
             pools: vec![data_pool("pool-a", "/var/lib/oceanfs/segments", None)],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let err = config.validate(Path::new("/var/lib/oceanfs")).unwrap_err();
@@ -1086,6 +1414,7 @@ mod tests {
                 metadata_pool("meta", "/mnt/meta"),
                 hints_pool("hints", "/mnt/hints"),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Degraded,
         };
         assert!(config.validate(Path::new("/var/lib/oceanfs")).is_ok());
@@ -1147,16 +1476,155 @@ mod tests {
         );
     }
 
-    /// A stray top-level key under `[storage]` (e.g. a global `health` block)
-    /// is rejected rather than silently ignored.
+    /// A stray top-level key under `[storage]` (e.g. a typo) is rejected
+    /// rather than silently ignored.
     #[test]
     fn unknown_storage_key_rejected() {
         let toml_str = r#"
+            node_id = "node-1"
+
             [storage]
-            health = { error_rate_threshold = 0.5 }
+            not_a_real_key = 1
         "#;
         let err = toml::from_str::<NodeConfig>(toml_str).unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("health"), "message: {message}");
+        assert!(message.contains("not_a_real_key"), "message: {message}");
+    }
+
+    /// f5 D4: `[storage.health]` global defaults merge field-by-field with
+    /// per-pool inline overrides (per-pool wins); monitor-level keys work
+    /// at the global level only.
+    #[test]
+    fn storage_health_global_defaults_merge_with_pool_overrides() {
+        let toml_str = r#"
+            node_id = "node-1"
+
+            [storage.health]
+            latency_factor = 2.0
+            trend_doubling_factor = 1.5
+            monitor_tick_interval_secs = 5
+            event_capacity = 32
+            hints_probe_divisor = 3
+
+            [[storage.pools]]
+            name = "data-0"
+            role = "data"
+            root = "/mnt/a"
+            health = { latency_factor = 1.25, min_errors = 9 }
+
+            [[storage.pools]]
+            name = "journal"
+            role = "wal"
+            root = "/mnt/journal"
+
+            [[storage.pools]]
+            name = "meta"
+            role = "metadata"
+            root = "/mnt/meta"
+
+            [[storage.pools]]
+            name = "hints"
+            role = "hints"
+            root = "/mnt/hints"
+        "#;
+        let node: NodeConfig = toml::from_str(toml_str).unwrap();
+        let data = node.storage.pools.iter().find(|p| p.name == "data-0").unwrap();
+        let resolved = node.storage.resolved_pool_health(data);
+        assert_eq!(resolved.latency_factor, 1.25, "per-pool override wins");
+        assert_eq!(resolved.min_errors, 9, "per-pool override wins");
+        assert_eq!(resolved.trend_doubling_factor, 1.5, "global default applies");
+        assert_eq!(resolved.detection_window_secs, 30, "hard-coded default stays");
+        assert_eq!(resolved.trend_min_windows, 3, "hard-coded default stays");
+
+        let journal = node.storage.pools.iter().find(|p| p.name == "journal").unwrap();
+        assert_eq!(
+            node.storage.resolved_pool_health(journal).latency_factor,
+            2.0,
+            "global default applies to pools without overrides"
+        );
+
+        assert_eq!(node.storage.monitor_tick_interval_secs(), Some(5));
+        assert_eq!(node.storage.event_capacity(), 32);
+        assert_eq!(node.storage.hints_probe_divisor(), 3);
+        assert!(node.storage.validate(&node.data_dir).is_ok());
+    }
+
+    /// f5 D4: monitor-level keys are rejected on a pool's inline table.
+    #[test]
+    fn storage_health_monitor_keys_rejected_on_pool_table() {
+        let toml_str = r#"
+            node_id = "node-1"
+
+            [[storage.pools]]
+            name = "data-0"
+            role = "data"
+            root = "/mnt/a"
+            health = { monitor_tick_interval_secs = 5 }
+
+            [[storage.pools]]
+            name = "journal"
+            role = "wal"
+            root = "/mnt/journal"
+
+            [[storage.pools]]
+            name = "meta"
+            role = "metadata"
+            root = "/mnt/meta"
+
+            [[storage.pools]]
+            name = "hints"
+            role = "hints"
+            root = "/mnt/hints"
+        "#;
+        let node: NodeConfig = toml::from_str(toml_str).unwrap();
+        let err = node.storage.validate(&node.data_dir).unwrap_err();
+        assert!(err.contains("monitor-level"), "message: {err}");
+    }
+
+    /// f5 D4: invalid detector knobs are rejected with clear messages.
+    #[test]
+    fn storage_health_invalid_detector_knobs_rejected() {
+        let health_toml = |health: &str| {
+            format!(
+                r#"
+                node_id = "node-1"
+
+                [storage.health]
+                {health}
+
+                [[storage.pools]]
+                name = "data-0"
+                role = "data"
+                root = "/mnt/a"
+
+                [[storage.pools]]
+                name = "journal"
+                role = "wal"
+                root = "/mnt/journal"
+
+                [[storage.pools]]
+                name = "meta"
+                role = "metadata"
+                root = "/mnt/meta"
+
+                [[storage.pools]]
+                name = "hints"
+                role = "hints"
+                root = "/mnt/hints"
+            "#
+            )
+        };
+        for (health, needle) in [
+            ("trend_doubling_factor = 1.0", "trend_doubling_factor"),
+            ("trend_min_windows = 2", "trend_min_windows"),
+            ("history_max_windows = 3", "history_max_windows"),
+            ("monitor_tick_interval_secs = 0", "monitor_tick_interval_secs"),
+            ("event_capacity = 0", "event_capacity"),
+            ("hints_probe_divisor = 0", "hints_probe_divisor"),
+        ] {
+            let node: NodeConfig = toml::from_str(&health_toml(health)).unwrap();
+            let err = node.storage.validate(&node.data_dir).unwrap_err();
+            assert!(err.contains(needle), "health {health:?}: expected {needle}, got {err}");
+        }
     }
 }

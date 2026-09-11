@@ -41,6 +41,7 @@ fn pool_registry_builds_from_four_pool_config_and_probes_all_roots() {
             pool("meta", PoolRole::Metadata, &roots[3]),
             pool("hints", PoolRole::Hints, &roots[4]),
         ],
+        health: Default::default(),
         missing_root_policy: MissingRootPolicy::Fatal,
     };
 

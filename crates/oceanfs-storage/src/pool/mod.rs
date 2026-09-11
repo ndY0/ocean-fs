@@ -98,6 +98,7 @@ pub type PoolIdResolver = Arc<dyn Fn(&oceanfs_core::SegmentId) -> Option<u32> + 
 /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
 /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
 /// #     ],
+/// #     health: Default::default(),
 /// #     missing_root_policy: Default::default(),
 /// # };
 /// # let registry = oceanfs_storage::PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -236,6 +237,7 @@ struct PoolCapacity {
 /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
 /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
 /// #     ],
+/// #     health: Default::default(),
 /// #     missing_root_policy: Default::default(),
 /// # };
 /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -322,6 +324,7 @@ impl StoragePool {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -347,6 +350,7 @@ impl StoragePool {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -373,6 +377,7 @@ impl StoragePool {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -398,6 +403,7 @@ impl StoragePool {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -423,6 +429,7 @@ impl StoragePool {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -450,6 +457,7 @@ impl StoragePool {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -477,13 +485,14 @@ impl StoragePool {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
     /// assert_eq!(registry.pools()[0].health_config().detection_window_secs, 30);
     /// ```
     pub fn health_config(&self) -> PoolHealthConfig {
-        self.health
+        self.health.clone()
     }
 
     /// Returns the pool's health status.
@@ -502,6 +511,7 @@ impl StoragePool {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -528,6 +538,7 @@ impl StoragePool {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -553,6 +564,7 @@ impl StoragePool {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -578,6 +590,7 @@ impl StoragePool {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -854,6 +867,7 @@ impl PoolMetrics {
 /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
 /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
 /// #     ],
+/// #     health: Default::default(),
 /// #     missing_root_policy: Default::default(),
 /// # };
 /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -897,6 +911,10 @@ pub struct PoolRegistry {
     /// (without this lock held) and only then takes this write lock. The
     /// reverse order would deadlock against a concurrent attach.
     drain: RwLock<HashMap<u32, drain::DrainState>>,
+    /// The node's resolved global `[storage.health]` defaults (f5 D4):
+    /// runtime-attached pools resolve their own inline overrides over
+    /// this, matching boot-time resolution.
+    global_health: oceanfs_core::PoolHealthConfig,
     /// The drain mover mode per pool (d3 `IntraNode` vs d4 `Cluster`) —
     /// routes a `Draining` pool to exactly one mover. Short lock, never
     /// held together with `drain` or `pools`. Pools that never drained
@@ -941,6 +959,7 @@ impl PoolRegistry {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir);
@@ -994,6 +1013,7 @@ impl PoolRegistry {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: root("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: root("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let removed = vec![PoolRemovedRecord::new(
@@ -1088,7 +1108,7 @@ impl PoolRegistry {
                 resolve_tech(config.tech),
                 status,
                 capacity,
-                config.health,
+                storage.resolved_pool_health(config),
             ));
             metrics.push(PoolMetrics::new(&pool));
             pools.push(pool);
@@ -1120,6 +1140,9 @@ impl PoolRegistry {
             pools: RwLock::new(pools),
             metrics: RwLock::new(metrics),
             missing_root_policy: storage.missing_root_policy,
+            // f5 D4: resolve the global defaults once; runtime attach
+            // resolves a pool's inline overrides over this.
+            global_health: storage.health.resolve(&oceanfs_core::PoolHealthConfig::default()),
             data_dir: data_dir.to_path_buf(),
             // Every registered pool starts its drain lifecycle Idle.
             drain: RwLock::new(HashMap::new()),
@@ -1146,6 +1169,7 @@ impl PoolRegistry {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -1171,6 +1195,7 @@ impl PoolRegistry {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -1202,6 +1227,7 @@ impl PoolRegistry {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -1229,6 +1255,7 @@ impl PoolRegistry {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -1263,6 +1290,7 @@ impl PoolRegistry {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -1301,6 +1329,7 @@ impl PoolRegistry {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -1335,6 +1364,7 @@ impl PoolRegistry {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -1377,6 +1407,7 @@ impl PoolRegistry {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -1408,6 +1439,7 @@ impl PoolRegistry {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -1443,6 +1475,7 @@ impl PoolRegistry {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -1498,6 +1531,7 @@ impl PoolRegistry {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -1561,7 +1595,9 @@ impl PoolRegistry {
         let name = pool.name.clone();
         let role = pool.role;
         let root = pool.root.clone();
-        let health = pool.health;
+        // f5 D4: runtime attach resolves the pool's inline overrides over
+        // the node's global `[storage.health]` defaults.
+        let health = pool.health.resolve(&self.global_health);
         let id = {
             let mut pools = self.pools.write();
             // Re-validate under the write lock (TOCTOU: a concurrent
@@ -1643,7 +1679,18 @@ impl PoolRegistry {
                 return Err(format!("pool '{}' weight must be > 0, got 0", pool.name));
             }
         }
-        let health = &pool.health;
+        if pool.health.monitor_tick_interval_secs.is_some()
+            || pool.health.event_capacity.is_some()
+            || pool.health.hints_probe_divisor.is_some()
+        {
+            return Err(format!(
+                "pool '{}' health must not set monitor-level fields \
+                 (monitor_tick_interval_secs / event_capacity / hints_probe_divisor); \
+                 set them under [storage.health]",
+                pool.name
+            ));
+        }
+        let health = pool.health.resolve(&self.global_health);
         if !(health.error_rate_threshold > 0.0 && health.error_rate_threshold < 1.0) {
             return Err(format!(
                 "pool '{}' health.error_rate_threshold must be in (0, 1), got {}",
@@ -1657,6 +1704,24 @@ impl PoolRegistry {
             return Err(format!(
                 "pool '{}' health windows (trend/detection/recovery) must all be > 0",
                 pool.name
+            ));
+        }
+        if !health.trend_doubling_factor.is_finite() || health.trend_doubling_factor <= 1.0 {
+            return Err(format!(
+                "pool '{}' health.trend_doubling_factor must be > 1.0, got {}",
+                pool.name, health.trend_doubling_factor
+            ));
+        }
+        if health.trend_min_windows < 3 {
+            return Err(format!(
+                "pool '{}' health.trend_min_windows must be >= 3, got {}",
+                pool.name, health.trend_min_windows
+            ));
+        }
+        if health.history_max_windows < 4 {
+            return Err(format!(
+                "pool '{}' health.history_max_windows must be >= 4, got {}",
+                pool.name, health.history_max_windows
             ));
         }
         // The pool root must stay disjoint from the node's data_dir.
@@ -1691,6 +1756,7 @@ impl PoolRegistry {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -1720,6 +1786,7 @@ impl PoolRegistry {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -1773,6 +1840,7 @@ impl PoolRegistry {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -1808,6 +1876,7 @@ impl PoolRegistry {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
@@ -1881,6 +1950,7 @@ mod tests {
                 pool("meta", PoolRole::Metadata, &roots[3], None),
                 pool("hints", PoolRole::Hints, &roots[4], None),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         (storage, roots)
@@ -1937,6 +2007,7 @@ mod tests {
                 pool("journal-b", PoolRole::Wal, &tmp.path().join("wal-b"), None),
                 pool("data-a", PoolRole::Data, &tmp.path().join("data-a"), None),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let err = PoolRegistry::from_config(&storage, &data_dir).unwrap_err();
@@ -1973,6 +2044,7 @@ mod tests {
                 pool("meta", PoolRole::Metadata, &tmp.path().join("optane1"), None),
                 pool("hints", PoolRole::Hints, &tmp.path().join("hints0"), None),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let err = PoolRegistry::from_config(&storage, &data_dir).unwrap_err();
@@ -1991,6 +2063,7 @@ mod tests {
                 pool("meta", PoolRole::Metadata, &tmp.path().join("optane1"), None),
                 pool("hints", PoolRole::Hints, &tmp.path().join("hints0"), None),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Degraded,
         };
         let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
@@ -2017,6 +2090,7 @@ mod tests {
                 pool("meta", PoolRole::Metadata, &tmp.path().join("optane1"), None),
                 pool("hints-0", PoolRole::Hints, &hints_root, None),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let registry = PoolRegistry::from_config(&storage, &data_dir)
@@ -2073,6 +2147,7 @@ mod tests {
                 pool("meta", PoolRole::Metadata, &tmp.path().join("optane1"), None),
                 pool("hints", PoolRole::Hints, &tmp.path().join("hints0"), None),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         };
         let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
@@ -2210,6 +2285,7 @@ mod tests {
                 pool("meta", PoolRole::Metadata, &tmp.path().join("optane1"), None),
                 pool("hints", PoolRole::Hints, &tmp.path().join("hints0"), None),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Degraded,
         };
         let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
@@ -2483,6 +2559,7 @@ mod tests {
     fn attach_probe_failure_under_degraded_policy_registers_degraded() {
         let (tmp, data_dir) = layout();
         let mut storage_config = StorageConfig {
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Degraded,
             ..StorageConfig::default()
         };

@@ -30,8 +30,7 @@
 use std::{collections::HashSet, path::Path, time::Duration};
 
 use oceanfs_core::{
-    MissingRootPolicy, NodeConfig, PoolHealthConfig, PoolRole, PoolTech, StorageConfig,
-    StoragePoolConfig,
+    MissingRootPolicy, NodeConfig, PoolRole, PoolTech, StorageConfig, StoragePoolConfig,
 };
 use oceanfs_node::Node;
 use oceanfs_storage::{
@@ -54,11 +53,11 @@ fn pool(name: &str, role: PoolRole, root: &Path) -> StoragePoolConfig {
         root: root.to_path_buf(),
         weight: None,
         tech: PoolTech::Auto,
-        health: PoolHealthConfig {
-            min_errors: 1,
-            detection_window_secs: 1,
-            recovery_window_secs: 1,
-            ..PoolHealthConfig::default()
+        health: oceanfs_core::PoolHealthOverride {
+            min_errors: Some(1),
+            detection_window_secs: Some(1),
+            recovery_window_secs: Some(1),
+            ..Default::default()
         },
     }
 }
@@ -81,6 +80,7 @@ async fn boot_node(
             pool("meta", PoolRole::Metadata, &tmp.path().join("optane1")),
             pool("hints", PoolRole::Hints, &tmp.path().join("hints-dev")),
         ],
+        health: Default::default(),
         missing_root_policy: MissingRootPolicy::Fatal,
     };
     let config = NodeConfig {

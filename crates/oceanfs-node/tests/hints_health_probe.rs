@@ -26,8 +26,7 @@
 use std::time::{Duration, Instant};
 
 use oceanfs_core::{
-    MissingRootPolicy, NodeConfig, PoolHealthConfig, PoolRole, PoolTech, StorageConfig,
-    StoragePoolConfig,
+    MissingRootPolicy, NodeConfig, PoolRole, PoolTech, StorageConfig, StoragePoolConfig,
 };
 use oceanfs_node::Node;
 
@@ -52,12 +51,12 @@ async fn hints_probe_drives_healthy_degraded_dead_without_gating_needless_writes
 
     // Fast windows so the test observes a real Degraded transition without
     // waiting the production 30s detection window.
-    let fast_health = PoolHealthConfig {
-        min_errors: 1,
-        detection_window_secs: 1,
-        trend_window_secs: 1,
-        recovery_window_secs: 1,
-        ..PoolHealthConfig::default()
+    let fast_health = oceanfs_core::PoolHealthOverride {
+        min_errors: Some(1),
+        detection_window_secs: Some(1),
+        trend_window_secs: Some(1),
+        recovery_window_secs: Some(1),
+        ..Default::default()
     };
     let mut hints = pool("hints-0", PoolRole::Hints, &hints_root);
     hints.health = fast_health;
@@ -74,6 +73,7 @@ async fn hints_probe_drives_healthy_degraded_dead_without_gating_needless_writes
                 pool("meta-0", PoolRole::Metadata, &tmp.path().join("pool-meta")),
                 hints,
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         },
         ..NodeConfig::default()
@@ -220,6 +220,7 @@ async fn uncreatable_hints_root_still_boots_degraded() {
                 pool("meta-0", PoolRole::Metadata, &tmp.path().join("pool-meta")),
                 pool("hints-0", PoolRole::Hints, &hints_root),
             ],
+            health: Default::default(),
             missing_root_policy: MissingRootPolicy::Fatal,
         },
         ..NodeConfig::default()

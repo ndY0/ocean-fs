@@ -256,6 +256,7 @@ impl DiskSegmentReader {
     /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
     /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
     /// #     ],
+    /// #     health: Default::default(),
     /// #     missing_root_policy: Default::default(),
     /// # };
     /// let registry = PoolRegistry::from_config(&storage, &data_dir).expect("registry");
