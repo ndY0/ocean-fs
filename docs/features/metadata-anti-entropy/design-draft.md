@@ -17,7 +17,7 @@ adr:
   - 0030-re-replication-target-pull
 perf: []
 created: 2026-09-11
-updated: 2026-09-11
+updated: 2026-09-12
 ---
 
 # Metadata Anti-Entropy — Design Draft (Deferred)
@@ -93,7 +93,18 @@ over *sealed segments* (a small, append-oriented, registry-bounded set).
 The metadata plane is different: **rows are O(all objects)**, churn on
 every PUT/DELETE, and the existing range lister is a scan-and-filter. Any
 detection mechanism must state its bound on CPU, memory, I/O, and rebuild
-cost. Options, each with honest trade-offs:
+cost.
+
+> **Status: ADR decided pending acceptance; feature spec rewrite pending.**
+> [ADR-0038](../../adr/0038-metadata-change-journal.md) replaces the rejected
+> [ADR-0037](../../adr/0037-metadata-anti-entropy-detection.md) rotating
+> scan: a co-durable metadata **change journal** + **pull-based catch-up**
+> (detection cost ∝ changes, never ∝ rows; triggered range-bounded bootstrap
+> as the only recovery read). The feature spec
+> ([pr3](pr3-metadata-anti-entropy.md)) still encodes the old O3 scan design
+> and is rewritten by the spec-writer after ADR-0038 is accepted.
+
+Options, each with honest trade-offs:
 
 1. **New hash-ordered metadata index CF maintained on write/delete.**
    A compact derived CF keyed by `hash(bucket/key) → row fingerprint`
