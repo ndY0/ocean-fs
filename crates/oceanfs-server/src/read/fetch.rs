@@ -1049,8 +1049,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        grpc::segment_service::SegmentGrpcService, read::coordinator::InMemorySegmentReader,
-        routing_hint::RoutingHint,
+        grpc::segment_service::SegmentGrpcService,
+        read::coordinator::InMemorySegmentReader,
+        routing_hint::{CandidateClass, RoutingHint},
     };
 
     /// An in-memory segment store for the failover test's gRPC servers.
@@ -1263,6 +1264,173 @@ mod tests {
             1,
             "the failed first replica must count one failover"
         );
+    }
+
+    /// A tiered hint for two replicas: n1 is Preferred, n2 is a Degraded
+    /// Fallback; counts failovers (f5 D1 read ordering).
+    struct TieredHint(std::sync::atomic::AtomicU64);
+
+    impl RoutingHint for TieredHint {
+        fn exclude_read_candidate(&self, _: &NodeId) -> bool {
+            false
+        }
+        fn exclude_write_target(&self, _: &NodeId) -> bool {
+            false
+        }
+        fn on_failover(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn read_candidate_class(&self, node: &NodeId) -> CandidateClass {
+            match node.as_str() {
+                "n2" => CandidateClass::Fallback,
+                _ => CandidateClass::Preferred,
+            }
+        }
+    }
+
+    /// f5 D1: the read ordering tries every Preferred replica before a
+    /// Degraded Fallback. The ring order here puts the FALLBACK (n2)
+    /// first, so only the tier ordering can move the Preferred n1 ahead
+    /// of it: the fetch fails on n1, falls through to the fallback n2,
+    /// and serves — proving the fallback is consulted after preferred,
+    /// neither skipped nor tried first.
+    #[tokio::test]
+    async fn fetch_serves_from_degraded_fallback_after_preferred_fails() {
+        let test_data = Bytes::from_static(b"tiered fallback data");
+        let failing_store = Arc::new(TestSegmentStore::new()) as Arc<dyn SegmentDataStore>;
+        let serving_store = Arc::new(TestSegmentStore::new()) as Arc<dyn SegmentDataStore>;
+
+        let mut ring = Ring::new(RingConfig { replication_factor: 2, ..RingConfig::default() });
+        ring.add_node(NodeId::new("n1"));
+        ring.add_node(NodeId::new("n2"));
+
+        let seg_id = loop {
+            let candidate = SegmentId::new();
+            let hash = blake3::hash(candidate.to_string().as_bytes());
+            if ring.lookup(hash.as_bytes()).first() == Some(&NodeId::new("n2")) {
+                break candidate;
+            }
+        };
+        serving_store.write_segment_data(&seg_id, &test_data).await.unwrap();
+
+        let ring_cache = Arc::new(RingCache::new(ring));
+        let (failing_addr, _failing_lifecycle) = serve_segment(failing_store).await;
+        let (serving_addr, serving_lifecycle) = serve_segment(serving_store).await;
+
+        let root = oceanfs_durability::MerkleTree::build(&test_data, 0).unwrap().root().hash();
+        let mut meta = oceanfs_core::SegmentMetadata {
+            pool_id: 0,
+            total_bytes: 0,
+            segment_id: seg_id,
+            ec_k: 4,
+            ec_m: 2,
+            size_tier: oceanfs_core::SizeTier::Standard,
+            merkle_root: None,
+            storage_locations: smallvec::SmallVec::new(),
+            sealed_at: Some(0),
+        };
+        serving_lifecycle.registry().reserve(seg_id, meta.clone()).expect("reserve succeeds");
+        meta.merkle_root = Some(root);
+        serving_lifecycle.registry().seal(seg_id, meta).expect("seal succeeds");
+
+        let membership = Arc::new(Membership::new(
+            NodeId::new("reader"),
+            "127.0.0.1:9300".parse().unwrap(),
+            "127.0.0.1:9300".parse().unwrap(),
+            GossipConfig::default(),
+            ring_cache.clone(),
+        ));
+        membership.upsert_node(
+            NodeId::new("n1"),
+            oceanfs_core::NodeState::Alive,
+            oceanfs_core::Incarnation::new(1),
+            Some(failing_addr),
+        );
+        membership.upsert_node(
+            NodeId::new("n2"),
+            oceanfs_core::NodeState::Alive,
+            oceanfs_core::Incarnation::new(1),
+            Some(serving_addr),
+        );
+
+        let pool = Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default()));
+        let hint = Arc::new(TieredHint(AtomicU64::new(0)));
+        let hint_dyn: Arc<dyn RoutingHint> = hint.clone();
+
+        let chunk = ChunkRef {
+            segment_id: seg_id,
+            offset: 0,
+            length: test_data.len() as u32,
+            compressed: false,
+            logical_length: test_data.len() as u32,
+        };
+
+        let data = fetch_single_chunk_raw(
+            &ring_cache,
+            &chunk,
+            5000,
+            None,
+            Some(&pool),
+            Some(&membership),
+            Some(&hint_dyn),
+            None,
+            None,
+        )
+        .await
+        .expect("the fallback replica must serve the chunk after the preferred one fails");
+
+        assert_eq!(&data[..], &test_data[..], "data must come from the Degraded fallback");
+        assert_eq!(
+            hint.0.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the preferred replica failure counts exactly one failover"
+        );
+    }
+
+    /// f5 D1: when every candidate is a hard exclusion the ordering drops
+    /// them all and the fetch fails instead of dialing a Dead replica.
+    #[tokio::test]
+    async fn fetch_fails_when_all_candidates_are_excluded() {
+        struct AllExcluded;
+        impl RoutingHint for AllExcluded {
+            fn exclude_read_candidate(&self, _: &NodeId) -> bool {
+                true
+            }
+            fn exclude_write_target(&self, _: &NodeId) -> bool {
+                false
+            }
+            fn on_failover(&self) {}
+            fn read_candidate_class(&self, _: &NodeId) -> CandidateClass {
+                CandidateClass::Excluded
+            }
+        }
+
+        let mut ring = Ring::new(RingConfig { replication_factor: 2, ..RingConfig::default() });
+        ring.add_node(NodeId::new("n1"));
+        ring.add_node(NodeId::new("n2"));
+        let ring_cache = Arc::new(RingCache::new(ring));
+
+        let chunk = ChunkRef {
+            segment_id: SegmentId::new(),
+            offset: 0,
+            length: 64,
+            compressed: false,
+            logical_length: 64,
+        };
+        let hint: Arc<dyn RoutingHint> = Arc::new(AllExcluded);
+        let result = fetch_single_chunk_raw(
+            &ring_cache,
+            &chunk,
+            5000,
+            None,
+            None,
+            None,
+            Some(&hint),
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "all-excluded candidates must fail the fetch");
     }
 
     #[tokio::test]

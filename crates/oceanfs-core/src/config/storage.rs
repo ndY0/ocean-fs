@@ -17,19 +17,30 @@
 //! [storage]
 //! missing_root_policy = "fatal"   # or "degraded"
 //!
+//! # Node-global health defaults (f5 D4): every PoolHealthConfig field
+//! # plus the detector knobs. Monitor-level keys
+//! # (monitor_tick_interval_secs, event_capacity, hints_probe_divisor)
+//! # are global-only.
+//! [storage.health]
+//! error_rate_threshold = 0.001
+//! trend_latency_percentile = "p99"
+//! hints_probe_divisor = 6
+//!
 //! [[storage.pools]]
 //! name = "fast-nvme-0"
 //! role = "data"
 //! root = "/mnt/nvme0"
 //! weight = 2
 //! tech = "nvme"
-//! health = { error_rate_threshold = 0.001, min_errors = 3,
-//!            latency_factor = 5.0, trend_window_secs = 300,
-//!            detection_window_secs = 30, recovery_window_secs = 300 }
+//! # Per-pool overrides merge field-by-field over [storage.health]
+//! # (per-pool wins); monitor-level keys are rejected here.
+//! health = { latency_factor = 2.0, trend_min_windows = 4 }
 //! ```
 //!
-//! `health` is an inline table on each pool — per-pool, never a global
-//! `[storage.pools.health]` block.
+//! `health` is an inline table on each pool; its fields override the
+//! `[storage.health]` global defaults field-by-field (f5 D4). The
+//! monitor-level keys (`monitor_tick_interval_secs`, `event_capacity`,
+//! `hints_probe_divisor`) are global-only and rejected on a pool table.
 
 use std::{
     collections::HashSet,
@@ -606,17 +617,41 @@ impl StorageConfig {
 
     /// Global monitor tick override in seconds (`None` = per-pool
     /// `detection_window_secs` cadence).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::StorageConfig;
+    ///
+    /// assert_eq!(StorageConfig::default().monitor_tick_interval_secs(), None);
+    /// ```
     pub fn monitor_tick_interval_secs(&self) -> Option<u64> {
         self.health.monitor_tick_interval_secs
     }
 
     /// Global status-event channel capacity (default `64`, perf 2.6).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::StorageConfig;
+    ///
+    /// assert_eq!(StorageConfig::default().event_capacity(), 64);
+    /// ```
     pub fn event_capacity(&self) -> usize {
         self.health.event_capacity.unwrap_or(64)
     }
 
     /// Hints-root probe cadence divisor (default `6`, minimum `1`): the
     /// probe runs every `detection_window_secs / divisor` seconds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::StorageConfig;
+    ///
+    /// assert_eq!(StorageConfig::default().hints_probe_divisor(), 6);
+    /// ```
     pub fn hints_probe_divisor(&self) -> u64 {
         self.health.hints_probe_divisor.unwrap_or(6).max(1)
     }

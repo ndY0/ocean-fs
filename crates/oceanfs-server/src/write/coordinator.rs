@@ -2844,6 +2844,98 @@ mod tests {
         assert!(landed, "at least one attempted key must be n1-owned");
     }
 
+    /// A routing hint with one Degraded write FALLBACK peer (n2) and one
+    /// hard-excluded peer (n3); counts write-fallback notifications — the
+    /// f5 D1 mixed-tier replica set.
+    struct TieredPeersHint {
+        fallbacks: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RoutingHint for TieredPeersHint {
+        fn exclude_read_candidate(&self, _: &NodeId) -> bool {
+            false
+        }
+        fn exclude_write_target(&self, _: &NodeId) -> bool {
+            false
+        }
+        fn on_failover(&self) {}
+        fn write_target_class(&self, node: &NodeId) -> CandidateClass {
+            match node.as_str() {
+                "n2" => CandidateClass::Fallback,
+                "n3" => CandidateClass::Excluded,
+                _ => CandidateClass::Preferred,
+            }
+        }
+        fn on_degraded_fallback(&self, path: FallbackPath) {
+            if path == FallbackPath::Write {
+                self.fallbacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// f5 D1: a Degraded peer is attempted as a WRITE fallback — it counts
+    /// toward W, its acked replication leaves NO hint debt, and the
+    /// hard-excluded member is still owed the copy (f0 D2). The fan-out
+    /// consults the fallback tier exactly once.
+    #[tokio::test]
+    async fn degraded_peer_is_attempted_as_write_fallback_without_debt() {
+        let coord = make_write_coordinator("n1", &["n1", "n2", "n3"]).await;
+
+        // n2 (Degraded fallback) gets a live server so its replication
+        // ACKs; n3 (hard-excluded) keeps the helper's dead address and
+        // must never be attempted.
+        let addr_n2 = spawn_segment_server(false).await;
+        coord.membership.upsert_node(
+            NodeId::new("n2"),
+            NodeState::Alive,
+            Incarnation::new(2),
+            Some(addr_n2),
+        );
+
+        let hint = Arc::new(TieredPeersHint { fallbacks: Default::default() });
+        let hint_dyn: Arc<dyn RoutingHint> = hint.clone();
+        let coord = coord.with_routing_hint(hint_dyn);
+
+        let mut landed = false;
+        for i in 0..50 {
+            let key = format!("tiered-{i}");
+            let req = WriteRequest {
+                bucket: BucketId::new("test"),
+                key: ObjectKey::new(&key),
+                hash_key: HashKey::from_bytes(hash_key(key.as_bytes())),
+                data: Bytes::from(vec![0xABu8; 8192]),
+                write_quorum: 1,
+                ack_after_wal: true,
+                ec_async: false,
+                policy: None,
+            };
+            match coord.put(req).await {
+                Ok(_) => {
+                    landed = true;
+                    break;
+                }
+                Err(Error::Routing(_)) => continue, // not an n1-owned key
+                Err(e) => panic!("tiered write must not error: {e:?}"),
+            }
+        }
+        assert!(landed, "at least one attempted key must be n1-owned");
+        assert_eq!(
+            coord.hinted_handoff.pending_count(&NodeId::new("n2")),
+            0,
+            "an attempted-and-acked Degraded fallback is not owed a hint"
+        );
+        assert_eq!(
+            coord.hinted_handoff.pending_count(&NodeId::new("n3")),
+            1,
+            "the hard-excluded member is still owed the copy (f0 D2)"
+        );
+        assert_eq!(
+            hint.fallbacks.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the write fallback tier was consulted exactly once"
+        );
+    }
+
     /// f0 D2: excluded peers need debt, so a Dead hints pool makes the write
     /// fail fast 503 at the pre-check (before local work), counted on the
     /// write series.

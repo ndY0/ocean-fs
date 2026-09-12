@@ -65,6 +65,19 @@ const DEFAULT_HINT_TTL_SECS: u64 = 0;
 /// replicated to the intended target. A [`HintDropSink`] converts this
 /// record into a repair intent so the copy can be restored by
 /// re-replication instead of silently diverging.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_core::{NodeId, SegmentId};
+/// use oceanfs_durability::hinted_handoff::HintDropRecord;
+///
+/// let record = HintDropRecord {
+///     segment_id: SegmentId::new(),
+///     intended_for: NodeId::new("n2"),
+/// };
+/// assert_eq!(record.intended_for.as_str(), "n2");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HintDropRecord {
     /// The segment that holds the mutation's data.

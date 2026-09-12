@@ -788,10 +788,51 @@ impl RepairSink for RepairDispatcher {
 /// pulls the bytes. Segments this node does not hold are skipped: a
 /// holder's own reconciliation owns them, and inventing a holder set
 /// would violate the target-pull contract.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use oceanfs_core::{GossipConfig, NodeId, RingConfig};
+/// use oceanfs_durability::hinted_handoff::HintDropSink;
+/// use oceanfs_membership::Membership;
+/// use oceanfs_network::ConnectionPool;
+/// use oceanfs_node::repair::{HintDropRepairBridge, RepairDispatcher};
+/// use oceanfs_routing::{Ring, RingCache};
+///
+/// let ring = Arc::new(RingCache::new(Ring::new(RingConfig::default())));
+/// let membership = Arc::new(Membership::new(
+///     NodeId::new("n1"),
+///     "127.0.0.1:9100".parse().unwrap(),
+///     "127.0.0.1:9101".parse().unwrap(),
+///     GossipConfig::default(),
+///     ring,
+/// ));
+/// let lifecycle =
+///     Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+///         &oceanfs_core::LifecycleConfig::default(),
+///     ));
+/// let dispatcher = Arc::new(RepairDispatcher::new(
+///     Arc::new(oceanfs_node::repair::ManifestRepairTargetSelector::new(
+///         membership.clone(),
+///         NodeId::new("n1"),
+///     )),
+///     Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default())),
+///     membership,
+///     Arc::clone(&lifecycle),
+///     NodeId::new("n1"),
+/// ));
+/// let bridge = HintDropRepairBridge::new(dispatcher, lifecycle, NodeId::new("n1"));
+/// // No dropped hints: the sink is inert for an empty batch.
+/// bridge.on_hints_dropped(&[]);
+/// ```
 pub struct HintDropRepairBridge {
     dispatcher: Arc<RepairDispatcher>,
     lifecycle: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
     self_id: NodeId,
+    /// Shared `oceanfs_repair_enqueued_total` series (f5 D3): emitted
+    /// hint-drop intents are counted next to the drift-scan repairs.
+    repair_enqueued: Option<Counter>,
 }
 
 impl HintDropRepairBridge {
@@ -802,7 +843,57 @@ impl HintDropRepairBridge {
         lifecycle: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
         self_id: NodeId,
     ) -> Self {
-        Self { dispatcher, lifecycle, self_id }
+        Self { dispatcher, lifecycle, self_id, repair_enqueued: None }
+    }
+
+    /// Counts every emitted hint-drop intent on the supplied
+    /// `oceanfs_repair_enqueued_total` handle, so the series covers the
+    /// reconciliation drift scan AND the hint-drop bridge (f5 D3).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use oceanfs_core::{Counter, GossipConfig, LabelSet, NodeId, RingConfig};
+    /// use oceanfs_membership::Membership;
+    /// use oceanfs_network::ConnectionPool;
+    /// use oceanfs_node::repair::{HintDropRepairBridge, RepairDispatcher};
+    /// use oceanfs_routing::{Ring, RingCache};
+    ///
+    /// let ring = Arc::new(RingCache::new(Ring::new(RingConfig::default())));
+    /// let membership = Arc::new(Membership::new(
+    ///     NodeId::new("n1"),
+    ///     "127.0.0.1:9100".parse().unwrap(),
+    ///     "127.0.0.1:9101".parse().unwrap(),
+    ///     GossipConfig::default(),
+    ///     ring,
+    /// ));
+    /// let lifecycle =
+    ///     Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+    ///         &oceanfs_core::LifecycleConfig::default(),
+    ///     ));
+    /// let dispatcher = Arc::new(RepairDispatcher::new(
+    ///     Arc::new(oceanfs_node::repair::ManifestRepairTargetSelector::new(
+    ///         membership.clone(),
+    ///         NodeId::new("n1"),
+    ///     )),
+    ///     Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default())),
+    ///     membership,
+    ///     Arc::clone(&lifecycle),
+    ///     NodeId::new("n1"),
+    /// ));
+    /// let counter = Counter::new(
+    ///     "oceanfs_repair_enqueued_total".into(),
+    ///     "repair intents enqueued".into(),
+    ///     LabelSet::empty(),
+    /// );
+    /// let _bridge = HintDropRepairBridge::new(dispatcher, lifecycle, NodeId::new("n1"))
+    ///     .with_repair_enqueued_counter(counter.clone());
+    /// assert_eq!(counter.get(), 0);
+    /// ```
+    pub fn with_repair_enqueued_counter(mut self, counter: Counter) -> Self {
+        self.repair_enqueued = Some(counter);
+        self
     }
 }
 
@@ -829,6 +920,9 @@ impl HintDropSink for HintDropRepairBridge {
                 ec_k: entry.metadata.ec_k,
                 ec_m: entry.metadata.ec_m,
             };
+            if let Some(counter) = &self.repair_enqueued {
+                counter.inc();
+            }
             let dispatcher = Arc::clone(&self.dispatcher);
             // Fire-and-forget: the dispatcher's bounded queue owns pacing;
             // a dispatch failure parks the request for the next sweep.
@@ -1065,6 +1159,79 @@ mod tests {
         assert_eq!(
             selector.pick_repair_target(&SegmentId::new(), &[NodeId::new("n2"), NodeId::new("n3")]),
             None
+        );
+    }
+
+    /// f5 D3: the hint-drop bridge emits exactly ONE ADR-0030 intent per
+    /// dropped segment the node holds — carrying the segment's recorded
+    /// holder set — and counts each emitted intent on the shared
+    /// `oceanfs_repair_enqueued_total` handle. A dropped segment this
+    /// node does not hold is skipped (its holders' own reconciliation
+    /// owns it).
+    #[tokio::test]
+    async fn hint_drop_bridge_dispatches_one_intent_per_held_segment() {
+        use oceanfs_durability::hinted_handoff::{HintDropRecord, HintDropSink};
+
+        let membership = make_membership("n1");
+        upsert(&membership, "n2");
+        upsert(&membership, "n3");
+
+        let lifecycle =
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            ));
+        let held = SegmentId::new();
+        let holders = vec![NodeId::new("n2"), NodeId::new("n3")];
+        let meta = oceanfs_core::SegmentMetadata {
+            pool_id: 0,
+            total_bytes: 0,
+            segment_id: held,
+            ec_k: 4,
+            ec_m: 2,
+            size_tier: oceanfs_core::SizeTier::Standard,
+            merkle_root: None,
+            storage_locations: holders.iter().cloned().collect(),
+            sealed_at: Some(0),
+        };
+        lifecycle.registry().reserve(held, meta.clone()).unwrap();
+        lifecycle.registry().seal(held, meta).unwrap();
+
+        let dispatcher = Arc::new(RepairDispatcher::new(
+            Arc::new(SmallestId),
+            Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default())),
+            membership,
+            Arc::clone(&lifecycle),
+            NodeId::new("n1"),
+        ));
+        let enqueued = Counter::new(
+            "test_repair_enqueued_total".into(),
+            "test repair intents".into(),
+            LabelSet::empty(),
+        );
+        let bridge = HintDropRepairBridge::new(
+            Arc::clone(&dispatcher),
+            Arc::clone(&lifecycle),
+            NodeId::new("n1"),
+        )
+        .with_repair_enqueued_counter(enqueued.clone());
+
+        let not_held = SegmentId::new();
+        bridge.on_hints_dropped(&[
+            HintDropRecord { segment_id: held, intended_for: NodeId::new("n2") },
+            HintDropRecord { segment_id: not_held, intended_for: NodeId::new("n3") },
+        ]);
+        // The bridge spawns the bounded dispatch tasks; let them park.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            dispatcher.pending_len(),
+            1,
+            "one intent for the HELD segment; the unheld drop is skipped"
+        );
+        assert_eq!(
+            enqueued.get(),
+            1,
+            "the emitted intent is counted on the shared repair-enqueued series"
         );
     }
 

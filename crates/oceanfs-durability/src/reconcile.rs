@@ -468,6 +468,41 @@ impl ReconciliationLoop {
         Arc::clone(&self.index)
     }
 
+    /// A handle to the `oceanfs_repair_enqueued_total` counter (f5 D3).
+    ///
+    /// Other repair producers increment the same series through this
+    /// handle — the node's hint-drop bridge counts its exhausted-hint
+    /// repair intents next to the reconciliation drift-scan enqueues.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use oceanfs_core::{GossipConfig, NodeId, RingConfig};
+    /// use oceanfs_durability::reconcile::{ReconcileConfig, ReconciliationLoop};
+    /// use oceanfs_membership::Membership;
+    /// use oceanfs_routing::{Ring, RingCache};
+    ///
+    /// # let ring = Arc::new(RingCache::new(Ring::new(RingConfig::default())));
+    /// # let membership = Arc::new(Membership::new(
+    /// #     NodeId::new("n1"), "127.0.0.1:9200".parse().unwrap(),
+    /// #     "127.0.0.1:9201".parse().unwrap(), GossipConfig::default(), ring,
+    /// # ));
+    /// # let registry = Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleRegistry::new(
+    /// #     &oceanfs_core::LifecycleConfig::default(),
+    /// # ));
+    /// # let sink: Arc<dyn oceanfs_durability::healing_service::RepairSink> =
+    /// #     Arc::new(oceanfs_durability::reconcile::NoopRepairSink);
+    /// let loop_ = ReconciliationLoop::new(
+    ///     registry, membership, sink, NodeId::new("n1"), 3, ReconcileConfig::default(),
+    /// );
+    /// // The handle the node's hint-drop bridge increments (f5 D3).
+    /// assert_eq!(loop_.repair_enqueued_counter().get(), 0);
+    /// ```
+    pub fn repair_enqueued_counter(&self) -> Counter {
+        self.repair_enqueued_total.clone()
+    }
+
     /// Records a segment's holder set into the index (the composition
     /// root wires this to the lifecycle coordinator's
     /// `persist_storage_locations` notifier).

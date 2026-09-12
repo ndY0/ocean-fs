@@ -493,29 +493,13 @@ pub fn manifest_write_class(manifest: &NodeManifest) -> CandidateClass {
 
 impl RoutingHint for ManifestCache {
     fn exclude_read_candidate(&self, node_id: &NodeId) -> bool {
-        let excluded = match self.get(node_id) {
-            Some(manifest) => manifest_read_class(&manifest) == CandidateClass::Excluded,
-            // Unknown peer = no pool info: stay eligible; the
-            // error-driven fallback is the guarantee (ADR-0029 §D5).
-            None => false,
-        };
-        if excluded {
-            self.read_skips.inc();
-        }
-        excluded
+        // Delegates to the tier classifier so the skip counter is
+        // maintained in exactly one place (f5 D1).
+        self.read_candidate_class(node_id) == CandidateClass::Excluded
     }
 
     fn exclude_write_target(&self, node_id: &NodeId) -> bool {
-        let excluded = match self.get(node_id) {
-            Some(manifest) => manifest_write_class(&manifest) == CandidateClass::Excluded,
-            // Unknown peer stays eligible; write failures become
-            // hinted-handoff debt.
-            None => false,
-        };
-        if excluded {
-            self.write_skips.inc();
-        }
-        excluded
+        self.write_target_class(node_id) == CandidateClass::Excluded
     }
 
     fn on_failover(&self) {
@@ -523,19 +507,29 @@ impl RoutingHint for ManifestCache {
     }
 
     fn read_candidate_class(&self, node_id: &NodeId) -> CandidateClass {
-        match self.get(node_id) {
+        let class = match self.get(node_id) {
             Some(manifest) => manifest_read_class(&manifest),
             // Unknown peers are attempted as preferred; the error path
             // decides (the manifest is only a hint).
             None => CandidateClass::Preferred,
+        };
+        // The skip metric counts hard exclusions only — a Degraded
+        // fallback is consulted, not skipped (f5 D1).
+        if class == CandidateClass::Excluded {
+            self.read_skips.inc();
         }
+        class
     }
 
     fn write_target_class(&self, node_id: &NodeId) -> CandidateClass {
-        match self.get(node_id) {
+        let class = match self.get(node_id) {
             Some(manifest) => manifest_write_class(&manifest),
             None => CandidateClass::Preferred,
+        };
+        if class == CandidateClass::Excluded {
+            self.write_skips.inc();
         }
+        class
     }
 
     fn on_degraded_fallback(&self, path: FallbackPath) {
@@ -817,6 +811,8 @@ mod tests {
         assert_eq!(cache.write_target_class(&id), CandidateClass::Fallback);
         assert!(!cache.exclude_read_candidate(&id), "Degraded is not a hard read exclusion");
         assert!(!cache.exclude_write_target(&id), "Degraded is not a hard write exclusion");
+        assert_eq!(cache.read_skips.get(), 0, "a consulted read fallback is not a skip");
+        assert_eq!(cache.write_skips.get(), 0, "a consulted write fallback is not a skip");
     }
 
     /// f5: an all-Dead data pool set stays a hard exclusion for both
@@ -826,6 +822,16 @@ mod tests {
         let all_dead = data_manifest("dead", false, 2);
         assert_eq!(manifest_read_class(&all_dead), CandidateClass::Excluded);
         assert_eq!(manifest_write_class(&all_dead), CandidateClass::Excluded);
+
+        // f5 D1: hard exclusions — and only those — drive the skip
+        // counters the coordinators' tier classification maintains.
+        let cache = ManifestCache::new();
+        let id = NodeId::new("peer");
+        cache.update(id.clone(), Arc::new(all_dead));
+        assert_eq!(cache.read_candidate_class(&id), CandidateClass::Excluded);
+        assert_eq!(cache.write_target_class(&id), CandidateClass::Excluded);
+        assert_eq!(cache.read_skips.get(), 1, "the hard read exclusion is counted");
+        assert_eq!(cache.write_skips.get(), 1, "the hard write exclusion is counted");
     }
 
     /// f5: a node with no data pools at all is a hard exclusion; a

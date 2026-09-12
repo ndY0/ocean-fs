@@ -501,12 +501,16 @@ impl DurabilityModule {
         // f5 D3: exhausted hint debt becomes a bounded ADR-0030 repair
         // intent (one per distinct dropped segment) instead of a silent
         // divergence.
-        hinted_handoff_manager =
-            hinted_handoff_manager.with_drop_sink(Arc::new(HintDropRepairBridge::new(
+        hinted_handoff_manager = hinted_handoff_manager.with_drop_sink(Arc::new(
+            HintDropRepairBridge::new(
                 Arc::clone(&repair_dispatcher),
                 Arc::clone(&storage.lifecycle),
                 NodeId::new(&config.node_id),
-            )));
+            )
+            // f5 D3: emitted intents count on the same series as the
+            // reconciliation drift-scan enqueues.
+            .with_repair_enqueued_counter(reconciliation.repair_enqueued_counter()),
+        ));
         let hinted_handoff_manager = Arc::new(hinted_handoff_manager);
 
         // Replay existing hints from the WAL into in-memory queues.

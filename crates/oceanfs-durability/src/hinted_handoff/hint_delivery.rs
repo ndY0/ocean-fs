@@ -1381,10 +1381,10 @@ mod tests {
     #[tokio::test]
     async fn retry_cap_emits_one_deduped_repair_record_per_segment() {
         #[derive(Default)]
-        struct RecordingSink(std::sync::Mutex<Vec<HintDropRecord>>);
+        struct RecordingSink(StdMutex<Vec<HintDropRecord>>);
         impl HintDropSink for RecordingSink {
             fn on_hints_dropped(&self, dropped: &[HintDropRecord]) {
-                self.0.lock().unwrap().extend_from_slice(dropped);
+                self.0.lock().extend_from_slice(dropped);
             }
         }
 
@@ -1425,10 +1425,9 @@ mod tests {
             manager.drain_and_deliver(node.clone()).await.unwrap();
         }
         assert_eq!(manager.hints_dropped_total_for_test(), 3, "every hint drop is counted");
-        let records = sink.0.lock().unwrap().clone();
+        let records = sink.0.lock().clone();
         assert_eq!(records.len(), 2, "one repair record per DISTINCT segment");
-        let segments: std::collections::HashSet<_> =
-            records.iter().map(|r| r.segment_id.clone()).collect();
+        let segments: std::collections::HashSet<_> = records.iter().map(|r| r.segment_id).collect();
         assert!(segments.contains(&segment_a) && segments.contains(&segment_b));
         assert!(records.iter().all(|r| r.intended_for == node));
     }
@@ -1438,10 +1437,10 @@ mod tests {
     #[tokio::test]
     async fn inline_hint_drop_emits_no_repair_record() {
         #[derive(Default)]
-        struct RecordingSink(std::sync::Mutex<Vec<HintDropRecord>>);
+        struct RecordingSink(StdMutex<Vec<HintDropRecord>>);
         impl HintDropSink for RecordingSink {
             fn on_hints_dropped(&self, dropped: &[HintDropRecord]) {
-                self.0.lock().unwrap().extend_from_slice(dropped);
+                self.0.lock().extend_from_slice(dropped);
             }
         }
 
@@ -1472,7 +1471,7 @@ mod tests {
         }));
         manager.drain_and_deliver(node.clone()).await.unwrap();
         assert_eq!(manager.hints_dropped_total_for_test(), 1);
-        assert!(sink.0.lock().unwrap().is_empty(), "inline hints are not segment-repairable");
+        assert!(sink.0.lock().is_empty(), "inline hints are not segment-repairable");
     }
 
     // ── T1.5: Batched delivery ────────────────────────────────────────
