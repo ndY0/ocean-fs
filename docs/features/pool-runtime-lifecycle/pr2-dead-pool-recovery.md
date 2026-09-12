@@ -1,7 +1,7 @@
 ---
 feature: "Dead-Pool Runtime Recovery"
 epic: "pool-runtime-lifecycle"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -292,12 +292,12 @@ boot/restart: unchanged (still a supported path)
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds in the affected crates
+- [x] **Code:** `cargo build --all-targets` succeeds in the affected crates
       (`oceanfs-server`, `oceanfs-node`, and `oceanfs-storage` if the probe
       entry point is added); the route is registered and answers 501 when the
       hook is unwired; a probe failure keeps the pool Dead and returns the
       reason (no silent `Healthy`); no test-only hooks.
-- [ ] **Tests:** route + error taxonomy (unknown 404; non-Dead 409;
+- [x] **Tests:** route + error taxonomy (unknown 404; non-Dead 409;
       probe-failure keeps Dead with the documented status + reason; success
       200 and pool observable Healthy); health-reset effect (the monitor's
       Dead latch clears and a subsequent health tick cannot re-Dead from the
@@ -309,10 +309,10 @@ boot/restart: unchanged (still a supported path)
       Dead → reset → corrected accounting → repaired scenario; no regression
       in the existing suites (RocksDB-affected crates with
       `--test-threads=1`, PIPELINE §4.6).
-- [ ] **Docs:** every new/changed `pub` item has `# Examples`;
+- [x] **Docs:** every new/changed `pub` item has `# Examples`;
       `#![deny(missing_docs)]` passes; the endpoint and the reset contract
       (probe-gated, operator-confirmed, residue-corrected) are documented.
-- [ ] **ADR:** ADR-0029 §D3's data-pool return row is implemented at runtime;
+- [x] **ADR:** ADR-0029 §D3's data-pool return row is implemented at runtime;
       the amendment/new-ADR disposition is recorded with what it must state
       (operator-triggered + probe-gated; residue/`storage_locations`
       correction before trust; reconciliation hand-off) — see
@@ -321,11 +321,12 @@ boot/restart: unchanged (still a supported path)
       ADR-0035 (durable lifecycle state/`storage_locations`), and ADR-0036
       (detach/drain semantics not weakened; no destructive failure)
       constraints are addressed; no ADR is written here.
-- [ ] **Perf:** `perf: []` — the reset is operator-triggered, single-flight,
-      and bounded by the recovered pool's registry entries (no full-disk
-      scans in the normal path; ADR-0034 discipline); no hot-path change and
-      no performance assertion.
-- [ ] **Integration:** a node-level integration test exercises a Dead data
+- [x] **Perf:** `perf: []` — the reset is operator-triggered and serialized
+      by the lifecycle state (a concurrent call sees not-Dead → 409; no
+      lock), bounded by the recovered pool's registry entries plus one root
+      directory listing (no full-disk scans in the normal path; ADR-0034
+      discipline); no hot-path change and no performance assertion.
+- [x] **Integration:** a node-level integration test exercises a Dead data
       pool returning at runtime with the residue-corrected accounting
       observed by reconciliation and a new seal landing on the returned pool;
       restart remains a documented, supported alternative.
@@ -372,4 +373,50 @@ the recorded recommendation (the user may veto at review).
 
 ## Deviations (accepted)
 
-_None yet — filled at implementation close._
+- **Route + scope.** `POST /admin/pools/{id}/reset`, **data pools only**
+  (WAL/metadata keep g7/g8; hints keeps f0 semantics). Error taxonomy:
+  `404` unknown pool; `400` non-data role; `409` not Dead or root probe
+  failed (both operator-precondition conflicts — the probe-failure case
+  keeps the pool `Dead`); `501` unwired; `200` with
+  `{pool_id, status:"healthy", segments_released, sweep_failures}`.
+- **Probe/activate entry point.** New public
+  `PoolRegistry::reset_dead_pool(id) -> Result<(), PoolResetError>`
+  (probe → `Healthy` → `write_degraded(false)` → capacity refresh);
+  `probe_root` stays private. The node hook pairs it with
+  `HealthMonitor::reset_pool(id, Healthy)` exactly like the g7/g8 reset
+  pairing, then re-declares the self manifest.
+- **Residue-sweep mechanics.** Local presence comes from one bounded root
+  listing via the store's `list_segment_files` (the same layout source as
+  the boot residue sweep, never path guessing); only `Sealed` entries naming the recovered pool
+  with `self` still in `storage_locations` are candidates; the stale set
+  is snapshotted before the async durable writes (no registry lock across
+  I/O). Per-entry `persist_storage_locations` failures increment
+  `sweep_failures` and are logged — the route still answers `200` because
+  the pool did return; the drift scan re-detects the leftovers. A listing
+  failure changes nothing (logged). On-disk `.dat` files without a
+  registry entry are left to the next boot sweep (out of scope).
+- **Ordering/visibility.** The pool is set `Healthy` before the sweep and
+  the sweep runs synchronously inside the request; new seals racing the
+  sweep have their files present by construction, so they are kept.
+  Placement may target the returned pool immediately — intended.
+- **Concurrency.** No new single-flight lock: a concurrent reset sees the
+  pool not-Dead on the second call (`409`); a drain on a Dead pool is
+  already rejected by the registry (`409`). The operation is
+  operator-triggered and bounded by the pool's registry entries plus one
+  root directory listing.
+- **Observability.** Logs + the response counters only; no new metric
+  series (minimal per the spec OQ).
+- **ADR hand-off (recorded for the ADR owner).** Recommendation: a short
+  **ADR-0029 §D3 amendment** stating (a) the data-pool return is
+  operator-triggered and probe-gated — never an automatic `Dead→Healthy`;
+  (b) the return-residue/`storage_locations` correction runs before the
+  pool is trusted as a live copy; (c) the reconciliation hand-off is the
+  repair trigger for the lost copies. No ADR is written by this feature;
+  f4's P1b/P2/P3 use this path where it replaces a restart, and restart
+  remains supported.
+- **Review note (non-blocking).** The per-entry
+  `persist_storage_locations` failure branch is untested — exercising it
+  needs a failing event-WAL.
+- **Review note (non-blocking).** `#[non_exhaustive]` is intentionally
+  omitted on the two new error enums, consistent with the existing
+  `oceanfs_storage::Error` / `TransitionError` precedent.

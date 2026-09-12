@@ -666,6 +666,43 @@ impl ServerModule {
         .with_accel(storage.accel.clone())
         .with_pool_attach(storage.registry.clone(), on_pool_attached)
         .with_pool_detach(on_pool_detach)
+        // pr2 (pool-runtime-lifecycle): probe-gated runtime return of a
+        // Dead data pool + return-residue sweep, then a manifest
+        // re-declare so peers see the Healthy status + refreshed capacity.
+        .with_pool_reset({
+            let reset_registry = Arc::clone(&storage.registry);
+            let reset_monitor = Arc::clone(&storage.health_monitor);
+            let reset_lifecycle = Arc::clone(&storage.lifecycle);
+            let reset_store = Arc::clone(&storage.data_store);
+            let reset_membership = membership.clone();
+            let reset_cache = manifest_cache.clone();
+            let reset_self = oceanfs_core::NodeId::new(&config.node_id);
+            let reset_boot_incarnation = announce_incarnation;
+            Arc::new(move |pool_id: u32| {
+                let registry = Arc::clone(&reset_registry);
+                let monitor = Arc::clone(&reset_monitor);
+                let lifecycle = Arc::clone(&reset_lifecycle);
+                let store = Arc::clone(&reset_store);
+                let membership = reset_membership.clone();
+                let cache = reset_cache.clone();
+                let self_id = reset_self.clone();
+                Box::pin(async move {
+                    let outcome = crate::pool_reset::reset_dead_pool(
+                        &registry, &monitor, &lifecycle, &store, &self_id, pool_id,
+                    )
+                    .await?;
+                    let incarnation = membership
+                        .incarnation_of(&self_id)
+                        .map(|inc| inc.value())
+                        .unwrap_or(reset_boot_incarnation);
+                    let manifest =
+                        Arc::new(crate::pool_manifest::build_node_manifest(incarnation, &registry));
+                    membership.set_self_manifest((*manifest).clone());
+                    cache.update(self_id.clone(), manifest);
+                    Ok(outcome)
+                })
+            })
+        })
         .with_pool_drain_begin(on_pool_drain_begin)
         .with_node_drain_begin(on_node_drain_begin)
         // Live wal-pool remount (g7, ADR-0035): the coordinator owns the

@@ -82,10 +82,12 @@ provisioned while this epic is paused.
 
 The fixes are scoped in the new **`pool-runtime-lifecycle`** epic
 ([epic](../pool-runtime-lifecycle/epic.md)); the ordering is
-`pr1 capacity-refresh → pr2 dead-pool-recovery → f4`. This epic resumes
-when both land with review PASS; f4 then re-provisions the fleet and keeps
-its original scope (P1b/P2/P3 assertions use the new recovery path where it
-replaces a restart).
+`pr1 capacity-refresh → pr2 dead-pool-recovery → f4`. **Update 2026-09-12:
+both blockers are cleared** — pr1 and pr2 are `done` with review iteration 2
+PASS. f4 may resume on the user's go-ahead and then re-provisions the fleet
+with its original scope (P1b/P2/P3 assertions use the new recovery path where
+it replaces a restart); no run is scheduled until the user approves, and this
+epic stays `paused` with the fleet at 0 servers / 0 volumes until then.
 
 ## Code-grounding facts (verified 2026-09-11)
 

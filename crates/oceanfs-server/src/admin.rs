@@ -512,6 +512,114 @@ type PoolDetachCallback = Arc<dyn Fn(u32) -> Result<(), String> + Send + Sync>;
 type PoolAttachCallback =
     Arc<dyn Fn(&oceanfs_core::StoragePoolConfig) -> Result<(), String> + Send + Sync>;
 
+/// Outcome of a successful `POST /admin/pools/{id}/reset` (pr2,
+/// pool-runtime-lifecycle).
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_server::admin::PoolResetOutcome;
+///
+/// let outcome = PoolResetOutcome {
+///     pool_id: 0,
+///     status: "healthy",
+///     segments_released: 2,
+///     sweep_failures: 0,
+/// };
+/// assert_eq!(outcome.status, "healthy");
+/// ```
+#[cfg(feature = "storage")]
+#[derive(Debug, Clone, Serialize)]
+pub struct PoolResetOutcome {
+    /// The reset pool's id.
+    pub pool_id: u32,
+    /// The pool's status after the reset (`"healthy"`).
+    pub status: &'static str,
+    /// Registry entries whose local segment file was absent and whose
+    /// `storage_locations` therefore no longer name this node; the f5
+    /// reconciliation accounting sees the lost copies and re-replicates
+    /// them.
+    pub segments_released: usize,
+    /// Residue-sweep durable writes that failed (logged; the drift scan
+    /// re-detects them). The reset itself already succeeded.
+    pub sweep_failures: usize,
+}
+
+/// Error returned by the composition root's pool-reset hook (pr2): the
+/// reset is valid only for a registered **data** pool currently `Dead`
+/// whose root probes healthy.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_server::admin::PoolResetError;
+///
+/// assert_eq!(PoolResetError::UnknownPool(7).to_string(), "unknown pool id 7");
+/// ```
+#[cfg(feature = "storage")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PoolResetError {
+    /// No registered pool carries this id.
+    UnknownPool(u32),
+    /// Only `data` pools have a runtime reset (WAL/metadata use g7/g8,
+    /// hints has its own admission semantics).
+    NotDataPool(u32),
+    /// The pool is not `Dead`.
+    NotDead(u32),
+    /// The root does not probe healthy; the pool stays `Dead`.
+    ProbeFailed(String),
+}
+
+#[cfg(feature = "storage")]
+impl std::fmt::Display for PoolResetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownPool(id) => write!(f, "unknown pool id {id}"),
+            Self::NotDataPool(id) => {
+                write!(f, "pool {id} is not a data pool (role-specific recovery paths apply)")
+            }
+            Self::NotDead(id) => write!(f, "pool {id} is not Dead; reset is only for a Dead pool"),
+            Self::ProbeFailed(reason) => write!(f, "root probe failed: {reason}"),
+        }
+    }
+}
+
+#[cfg(feature = "storage")]
+impl std::error::Error for PoolResetError {}
+
+/// A pool reset callback (pr2): the composition root's probe-gated
+/// Dead-data-pool recovery — `PoolRegistry::reset_dead_pool` +
+/// `HealthMonitor::reset_pool` + the return-residue sweep. Async because
+/// the residue sweep writes durable `storage_locations` refreshes.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use oceanfs_server::admin::{PoolResetCallback, PoolResetOutcome};
+///
+/// let callback: PoolResetCallback = Arc::new(|pool_id| {
+///     Box::pin(async move {
+///         Ok(PoolResetOutcome {
+///             pool_id,
+///             status: "healthy",
+///             segments_released: 0,
+///             sweep_failures: 0,
+///         })
+///     })
+/// });
+/// let _ = callback;
+/// ```
+#[cfg(feature = "storage")]
+pub type PoolResetCallback = Arc<
+    dyn Fn(
+            u32,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<PoolResetOutcome, PoolResetError>> + Send>,
+        > + Send
+        + Sync,
+>;
+
 /// Shared state for admin handlers.
 #[derive(Clone)]
 pub(crate) struct AdminState {
@@ -557,6 +665,11 @@ pub(crate) struct AdminState {
     /// (`POST /admin/pools/{id}/detach` → 501).
     #[cfg(feature = "storage")]
     pub on_pool_detach: Option<PoolDetachCallback>,
+    /// Pool reset hook (pr2): probe-gated runtime return of a Dead data
+    /// pool + return-residue accounting. `None` when the surface is not
+    /// wired (`POST /admin/pools/{id}/reset` → 501).
+    #[cfg(feature = "storage")]
+    pub on_pool_reset: Option<PoolResetCallback>,
     /// Live wal-pool remount handler (g7, ADR-0035): runs the
     /// replaced-wal registry-rebuild + catch-up drain against the
     /// running ReRepWorker and clears the write gate. `None` when the
@@ -624,6 +737,8 @@ impl AdminHandler {
                 on_pool_attached: None,
                 #[cfg(feature = "storage")]
                 on_pool_detach: None,
+                #[cfg(feature = "storage")]
+                on_pool_reset: None,
                 on_wal_remount: None,
                 #[cfg(feature = "storage")]
                 on_pool_drain_begin: None,
@@ -668,6 +783,8 @@ impl AdminHandler {
                 on_pool_attached: None,
                 #[cfg(feature = "storage")]
                 on_pool_detach: None,
+                #[cfg(feature = "storage")]
+                on_pool_reset: None,
                 on_wal_remount: None,
                 #[cfg(feature = "storage")]
                 on_pool_drain_begin: None,
@@ -816,6 +933,45 @@ impl AdminHandler {
         self
     }
 
+    /// Wires the pool-reset surface (pr2, pool-runtime-lifecycle).
+    ///
+    /// `on_reset(pool_id)` is the composition root's probe-gated recovery
+    /// hook: `PoolRegistry::reset_dead_pool` (re-probe + `Healthy` +
+    /// capacity), `HealthMonitor::reset_pool` (clear the Dead latch), and
+    /// the return-residue sweep that removes this node from the
+    /// `storage_locations` of entries whose local `.dat` is absent, so f5
+    /// reconciliation repairs the lost copies. Without it,
+    /// `POST /admin/pools/{id}/reset` answers `501 Not Implemented`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// use oceanfs_server::admin::{AdminHandler, MetricsRegistry, PoolResetOutcome};
+    /// use oceanfs_server::BucketConfigStore;
+    ///
+    /// let handler = AdminHandler::new(
+    ///     Arc::new(BucketConfigStore::new()),
+    ///     Arc::new(MetricsRegistry::new()),
+    /// )
+    /// .with_pool_reset(Arc::new(|pool_id| {
+    ///     Box::pin(async move {
+    ///         Ok(PoolResetOutcome {
+    ///             pool_id,
+    ///             status: "healthy",
+    ///             segments_released: 0,
+    ///             sweep_failures: 0,
+    ///         })
+    ///     })
+    /// }));
+    /// # let _ = handler;
+    /// ```
+    #[cfg(feature = "storage")]
+    pub fn with_pool_reset(mut self, on_reset: PoolResetCallback) -> Self {
+        self.state.on_pool_reset = Some(on_reset);
+        self
+    }
+
     /// Wires the pool drain-mutation surface (d3/d4, ADR-0036 C1a/C1b).
     ///
     /// `on_begin_drain` is the composition root's mark-`Draining` hook —
@@ -931,6 +1087,8 @@ impl AdminHandler {
             .route("/admin/pools/{id}/drain/pause", post(pause_pool_drain))
             .route("/admin/pools/{id}/drain/resume", post(resume_pool_drain))
             .route("/admin/pools/{id}/detach", post(detach_pool))
+            // pr2: probe-gated runtime return of a Dead data pool.
+            .route("/admin/pools/{id}/reset", post(reset_pool))
             .route("/admin/nodes/{node}/drain", post(begin_node_drain))
             .route("/admin/nodes/{node}/drain/pause", post(pause_node_drain))
             .route("/admin/nodes/{node}/drain/resume", post(resume_node_drain));
@@ -1363,6 +1521,59 @@ async fn detach_pool(
     }
 }
 
+/// `POST /admin/pools/{id}/reset` — probe-gated runtime return of a Dead
+/// data pool (pr2, pool-runtime-lifecycle).
+///
+/// The composition root's hook re-probes the pool root, clears the Dead
+/// latch (`PoolRegistry::reset_dead_pool` + `HealthMonitor::reset_pool`),
+/// refreshes capacity, re-gossips the manifest, and runs the return-residue
+/// sweep (`storage_locations` corrected for entries whose local `.dat` is
+/// gone, so f5 reconciliation repairs them).
+///
+/// Response codes: `200` with the outcome; `404` unknown pool; `400` the
+/// pool is not a `data` pool (role-specific recovery paths apply); `409`
+/// the pool is not Dead or its root does not probe healthy yet (the pool
+/// stays Dead and the body carries the reason); `501` the reset surface is
+/// not wired.
+#[cfg(feature = "storage")]
+#[instrument(skip(state))]
+async fn reset_pool(
+    State(state): State<AdminState>,
+    Path(pool_id): Path<u32>,
+) -> impl IntoResponse {
+    let Some(on_reset) = state.on_pool_reset.as_ref() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": "pool reset is not configured on this node",
+            })),
+        )
+            .into_response();
+    };
+
+    match on_reset(pool_id).await {
+        Ok(outcome) => (StatusCode::OK, Json(outcome)).into_response(),
+        Err(error) => {
+            let status = pool_reset_error_status(&error);
+            (status, Json(serde_json::json!({ "error": error.to_string() }))).into_response()
+        }
+    }
+}
+
+/// Maps a [`PoolResetError`] to its HTTP status (pr2).
+///
+/// `NotDead` (operator action conflicts with the lifecycle state) and
+/// `ProbeFailed` (the device is not ready yet) are both operator-precondition
+/// conflicts; the pool stays `Dead` in the probe-failure case.
+#[cfg(feature = "storage")]
+fn pool_reset_error_status(error: &PoolResetError) -> StatusCode {
+    match error {
+        PoolResetError::UnknownPool(_) => StatusCode::NOT_FOUND,
+        PoolResetError::NotDataPool(_) => StatusCode::BAD_REQUEST,
+        PoolResetError::NotDead(_) | PoolResetError::ProbeFailed(_) => StatusCode::CONFLICT,
+    }
+}
+
 /// Maps a drain-lifecycle error to its HTTP status.
 ///
 /// d3's mutation verbs (`POST /admin/pools/{id}/drain[/pause|/resume]`)
@@ -1777,6 +1988,85 @@ mod tests {
         let router = handler.into_router();
         // Verify router can be constructed
         let _ = router;
+    }
+
+    // --- Pool reset route (pr2) ---
+
+    #[cfg(feature = "storage")]
+    async fn post_pool_reset(handler: AdminHandler, pool_id: u32) -> (StatusCode, String) {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let response = handler
+            .into_router()
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/pools/{pool_id}/reset"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[cfg(feature = "storage")]
+    fn reset_test_handler(callback: Option<PoolResetCallback>) -> AdminHandler {
+        let handler =
+            AdminHandler::new(Arc::new(BucketConfigStore::new()), Arc::new(MetricsRegistry::new()));
+        match callback {
+            Some(callback) => handler.with_pool_reset(callback),
+            None => handler,
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "storage")]
+    async fn pool_reset_route_answers_501_when_unwired() {
+        let (status, body) = post_pool_reset(reset_test_handler(None), 7).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(body.contains("not configured"), "{body}");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "storage")]
+    async fn pool_reset_route_maps_error_taxonomy_and_success() {
+        let callback: PoolResetCallback = Arc::new(|pool_id| {
+            Box::pin(async move {
+                match pool_id {
+                    1 => Err(PoolResetError::UnknownPool(1)),
+                    2 => Err(PoolResetError::NotDataPool(2)),
+                    3 => Err(PoolResetError::NotDead(3)),
+                    4 => Err(PoolResetError::ProbeFailed("stale mount".into())),
+                    _ => Ok(PoolResetOutcome {
+                        pool_id,
+                        status: "healthy",
+                        segments_released: 2,
+                        sweep_failures: 0,
+                    }),
+                }
+            })
+        });
+
+        for (id, expected) in [
+            (1, StatusCode::NOT_FOUND),
+            (2, StatusCode::BAD_REQUEST),
+            (3, StatusCode::CONFLICT),
+            (4, StatusCode::CONFLICT),
+        ] {
+            let (status, body) =
+                post_pool_reset(reset_test_handler(Some(callback.clone())), id).await;
+            assert_eq!(status, expected, "pool {id}: {body}");
+        }
+
+        let (status, body) = post_pool_reset(reset_test_handler(Some(callback)), 9).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"segments_released\":2"), "{body}");
+        assert!(body.contains("\"status\":\"healthy\""), "{body}");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 ---
 epic: "pool-runtime-lifecycle"
-status: proposed
+status: done
 priority: critical
 created: 2026-09-12
 updated: 2026-09-12
@@ -62,17 +62,20 @@ blocking the paused fleet-degradation epic.
 pr1-capacity-refresh  (priority 1 of 2) — done 2026-09-12 (review iteration 2 PASS)
         │
         ▼
-pr2-dead-pool-recovery  (priority 2 of 2) — next
+pr2-dead-pool-recovery  (priority 2 of 2) — done 2026-09-12 (review iteration 2 PASS)
         │
         ▼
-resume fleet-degradation f4   (paused; resumes after both land with review PASS)
+resume fleet-degradation f4   (paused; blockers cleared — resumes on user go-ahead)
 ```
 
 `pr1 → pr2` reflects the approved order: pr1 landed 2026-09-12 (review
-iteration 2 PASS) and keeps capacity fresh on the periodic tick; pr2 is next
-and its reset path re-probes + refreshes capacity on top of that. f4 then
-re-provisions the fleet and keeps its original scope; its P1b/P2/P3 recovery
-assertions use the new runtime path where it replaces a restart.
+iteration 2 PASS) and keeps capacity fresh on the periodic tick; pr2 landed
+2026-09-12 (review iteration 2 PASS) and its reset path re-probes + refreshes
+capacity on top of that. The two blockers on the paused
+`fleet-degradation` epic are therefore cleared: f4 keeps its original scope
+(P1b/P2/P3 recovery assertions use the new runtime path where it replaces a
+restart) and is ready to resume on the user's go-ahead; no fleet run is
+scheduled until then.
 
 ## Grounded defects (verified 2026-09-12 at HEAD b3eba7f)
 
@@ -129,28 +132,32 @@ assertions use the new runtime path where it replaces a restart.
 | # | Feature | Status | Priority | Depends on | Deliverable in one line |
 |---|---|---|---|---|---|
 | pr1 | [capacity-refresh](pr1-capacity-refresh.md) | done (2026-09-12, review iteration 2 PASS) | critical | — | Periodic background task calling `refresh_capacity` for all registered pools + `[durability] capacity_refresh_interval_sec` (default 10, `0` disables) + validation; refreshed gauges/manifest reach placement; f4's C2a/C2b dataset consumes the metrics instead of SSH `df` |
-| pr2 | [dead-pool-recovery](pr2-dead-pool-recovery.md) | proposed | critical | pr1; f5 (done) | Operator-triggered, probe-gated runtime return of a Dead data pool (`POST /admin/pools/{id}/reset`, name OQ) + return-residue sweep correcting `storage_locations` + reconciliation observes the corrected state; restart stays supported |
+| pr2 | [dead-pool-recovery](pr2-dead-pool-recovery.md) | done (2026-09-12, review iteration 2 PASS) | critical | pr1; f5 (done) | Operator-triggered, probe-gated runtime return of a Dead data pool (`POST /admin/pools/{id}/reset`, name OQ) + return-residue sweep correcting `storage_locations` + reconciliation observes the corrected state; restart stays supported |
 
 ## Acceptance bar (epic DoD)
 
-- [ ] **pr1:** lands with review PASS — a periodic background refresh exists
+- [x] **pr1:** lands with review PASS — a periodic background refresh exists
       (no hot-path syscall), the new config knob is parsed/validated and
       documented, the refresh-effect and disabled-interval tests pass, and the
       existing suites show no regression.
-- [ ] **pr2:** lands with review PASS — a Dead data pool returns at runtime
+- [x] **pr2:** lands with review PASS — a Dead data pool returns at runtime
       operator-triggered and probe-gated (probe failure keeps it Dead, never a
       silent Healthy), the return-residue sweep corrects `storage_locations`
       (stale entries removed, present files kept), reconciliation observes the
       corrected state, and node-integration coverage passes.
-- [ ] **Both:** no test-only hooks; ADR-0029 §D3's data-pool return semantics
+- [x] **Both:** no test-only hooks; ADR-0029 §D3's data-pool return semantics
       are satisfied (pr2 records the amendment/new-ADR hand-off); no
       performance assertion is added anywhere.
-- [ ] **Resume:** `fleet-degradation` f4 re-provisions the fleet only after
+- [x] **Resume:** `fleet-degradation` f4 re-provisions the fleet only after
       both features are `done` with review PASS, and keeps its original scope
       (P1b/P2/P3 use the new recovery path where it replaces a restart). The
       paused epic's [pause section](../fleet-degradation/epic.md#paused-product-gaps-before-further-testing-2026-09-12-user-decision)
       and [f4's banner](../fleet-degradation/f4-pool-degradation-under-load.md)
-      are the resume anchors.
+      are the resume anchors. **Status 2026-09-12:** the blocker condition is
+      cleared — pr1 and pr2 are `done` with review iteration 2 PASS — and f4
+      is ready to resume **pending the user's go-ahead**; no fleet run is
+      scheduled until the user approves re-provisioning (the epic stays paused
+      meanwhile).
 
 ## Cost & process guardrails (while paused)
 

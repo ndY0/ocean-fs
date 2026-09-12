@@ -756,6 +756,50 @@ impl HealthMonitor {
         entry.next_tick = Instant::now();
     }
 
+    /// Returns the monitor's internal status for `pool_id`, or `None` when
+    /// the pool has never been observed.
+    ///
+    /// The monitor's mirror is the latch that makes `Dead` absorbing; a
+    /// successful [`reset_pool`](Self::reset_pool) (g7/g8 recovery, pr2
+    /// dead-pool reset) is observable here.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use oceanfs_storage::io::IoObserver;
+    /// use oceanfs_storage::pool::health::{HealthMonitor, HealthMonitorConfig};
+    /// use oceanfs_storage::{PoolRegistry, PoolStatus};
+    ///
+    /// # let tmp = tempfile::tempdir().expect("tempdir");
+    /// # let data_dir = tmp.path().join("data");
+    /// # let storage = oceanfs_core::StorageConfig {
+    /// #     pools: vec![
+    /// #         oceanfs_core::StoragePoolConfig { name: "data-0".into(), role: oceanfs_core::PoolRole::Data, root: tmp.path().join("pool-data"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "wal-0".into(), role: oceanfs_core::PoolRole::Wal, root: tmp.path().join("pool-wal"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "meta-0".into(), role: oceanfs_core::PoolRole::Metadata, root: tmp.path().join("pool-meta"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #         oceanfs_core::StoragePoolConfig { name: "hints-0".into(), role: oceanfs_core::PoolRole::Hints, root: tmp.path().join("pool-hints"), weight: None, tech: Default::default(), health: Default::default() },
+    /// #     ],
+    /// #     health: Default::default(),
+    /// #     missing_root_policy: Default::default(),
+    /// # };
+    /// let registry = Arc::new(
+    ///     PoolRegistry::from_config(&storage, &data_dir).expect("registry"),
+    /// );
+    /// let observer = Arc::new(IoObserver::new());
+    /// registry.observe_into(&observer);
+    /// let (monitor, _events) =
+    ///     HealthMonitor::new(registry.clone(), observer.clone(), HealthMonitorConfig::default());
+    /// assert_eq!(monitor.status(0), None, "never observed");
+    /// monitor.reset_pool(0, PoolStatus::Dead);
+    /// assert_eq!(monitor.status(0), Some(PoolStatus::Dead));
+    /// monitor.reset_pool(0, PoolStatus::Healthy);
+    /// assert_eq!(monitor.status(0), Some(PoolStatus::Healthy), "latch cleared");
+    /// ```
+    pub fn status(&self, pool_id: u32) -> Option<PoolStatus> {
+        self.state.lock().get(&pool_id).map(|entry| entry.status)
+    }
+
     // [review][configuration][high]
     // the tick rate should be configurable by the end user.
     // also, one second is  a very fast tick rate, disk health doesnt merely move that fast,

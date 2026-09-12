@@ -32,6 +32,7 @@ pub mod peer_selection;
 mod pool_detach;
 pub mod pool_manifest;
 pub mod pool_paths;
+mod pool_reset;
 mod removed_pools;
 pub mod repair;
 pub mod routing_cache;

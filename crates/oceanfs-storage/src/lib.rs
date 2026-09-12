@@ -54,7 +54,8 @@ pub use pool::{
     },
     probe::PoolRootProbe,
     removed::PoolRemovedRecord,
-    resolve_pool_root, PlacementPolicy, PoolIdResolver, PoolRegistry, PoolStatus, StoragePool,
+    resolve_pool_root, PlacementPolicy, PoolIdResolver, PoolRegistry, PoolResetError, PoolStatus,
+    StoragePool,
 };
 pub use segment::{
     entry_is_garbage, is_startup_residue, ActiveSegment, CheckpointInfo, DataWalPos, DeleteEvent,

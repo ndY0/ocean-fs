@@ -1868,6 +1868,167 @@ mod tests {
         node.shutdown().await.expect("shutdown");
     }
 
+    /// pr2: a Dead data pool returns at runtime through the admin route;
+    /// the return-residue sweep drops this node from `storage_locations`
+    /// for entries whose `.dat` is gone (present files kept), and the f5
+    /// reconciliation holder index observes the corrected set.
+    #[tokio::test]
+    async fn dead_data_pool_reset_corrects_residue_and_reconciliation() {
+        use oceanfs_core::{SegmentId, SegmentMetadata, SizeTier};
+
+        let tmp = TempDir::new().expect("tempdir");
+        let config = test_config(&tmp);
+        let node = Node::start(config).await.expect("start");
+        let self_id = oceanfs_core::NodeId::new(&node.config.node_id);
+
+        // Repair-intent baseline: no segment exists yet, so the dispatcher
+        // has nothing parked (the keys below are created after this point;
+        // the dispatcher parks by segment id, so a re-park does not grow the
+        // count — the baseline must predate the segment).
+        let parked_before = node.durability.repair_dispatcher.pending_len();
+
+        let data_pool_id = node.storage.registry.pool_by_id(0).expect("data pool").id();
+        let root =
+            node.storage.registry.pool_by_id(data_pool_id).expect("data pool").root().to_path_buf();
+
+        // Two sealed entries naming the data pool: one file present, one
+        // gone (the fresh-device recovery shape).
+        let present_seg = SegmentId::new();
+        let missing_seg = SegmentId::new();
+        let holders: smallvec::SmallVec<[oceanfs_core::NodeId; 16]> =
+            [self_id.clone(), oceanfs_core::NodeId::new("peer-1")].into_iter().collect();
+        for seg in [present_seg, missing_seg] {
+            let meta = SegmentMetadata {
+                pool_id: data_pool_id,
+                total_bytes: 0,
+                segment_id: seg,
+                ec_k: 4,
+                ec_m: 2,
+                size_tier: SizeTier::Standard,
+                merkle_root: None,
+                storage_locations: holders.clone(),
+                sealed_at: Some(0),
+            };
+            node.storage.lifecycle.registry().reserve(seg, meta.clone()).expect("reserve");
+            node.storage.lifecycle.registry().seal(seg, meta).expect("seal");
+        }
+        std::fs::write(root.join(format!("{present_seg}.dat")), b"shard").expect("write .dat");
+
+        // The fault: the data pool is Dead — both the registry status and
+        // the monitor's absorbing latch (the state a real unplug leaves).
+        node.storage.registry.set_status(data_pool_id, oceanfs_storage::PoolStatus::Dead);
+        node.storage.health_monitor.reset_pool(data_pool_id, oceanfs_storage::PoolStatus::Dead);
+        assert_eq!(
+            oceanfs_storage::PlacementPolicy::new()
+                .select_data_pool(&node.storage.registry)
+                .map(|pool| pool.id()),
+            None,
+            "a Dead pool is not a placement target"
+        );
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{}/admin/pools/{data_pool_id}/reset", node.server_addr()))
+            .send()
+            .await
+            .expect("POST reset");
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "reset answers 200");
+        let outcome: serde_json::Value = response.json().await.expect("outcome json");
+        assert_eq!(outcome["segments_released"], 1, "only the absent file is released: {outcome}");
+        assert_eq!(outcome["sweep_failures"], 0, "{outcome}");
+
+        assert_eq!(
+            node.storage.registry.pool_by_id(data_pool_id).unwrap().status(),
+            oceanfs_storage::PoolStatus::Healthy,
+            "the pool returned at runtime"
+        );
+        assert_eq!(
+            node.storage.health_monitor.status(data_pool_id),
+            Some(oceanfs_storage::PoolStatus::Healthy),
+            "the monitor's Dead latch is cleared (no stale re-Dead)"
+        );
+        let present_locations = node
+            .storage
+            .lifecycle
+            .registry()
+            .get(present_seg)
+            .expect("present entry")
+            .metadata
+            .storage_locations;
+        assert!(present_locations.contains(&self_id), "a present file keeps its holder");
+        let missing_locations = node
+            .storage
+            .lifecycle
+            .registry()
+            .get(missing_seg)
+            .expect("missing entry")
+            .metadata
+            .storage_locations;
+        assert!(!missing_locations.contains(&self_id), "the absent copy is released");
+
+        // f5 reconciliation observes the corrected holder set (the notifier
+        // fired by the durable refresh).
+        let held = node.durability.reconciliation.holder_index().segments_held_by(&self_id);
+        assert!(held.contains(&present_seg), "present segment stays indexed");
+        assert!(!held.contains(&missing_seg), "released segment leaves the holder index");
+
+        // The returned pool accepts new placements: a multi-MiB PUT seals a
+        // fresh segment on it (placement has only this data pool).
+        assert_eq!(
+            oceanfs_storage::PlacementPolicy::new()
+                .select_data_pool(&node.storage.registry)
+                .map(|pool| pool.id()),
+            Some(data_pool_id),
+            "the returned pool is a placement target"
+        );
+        let dat_count = |dir: &std::path::Path| {
+            std::fs::read_dir(dir)
+                .expect("read pool root")
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .map(|ext| ext == std::ffi::OsStr::new("dat"))
+                        .unwrap_or(false)
+                })
+                .count()
+        };
+        let before_seal = dat_count(&root);
+        let put = client
+            .put(format!("http://{}/bucket/post-reset-seal", node.server_addr()))
+            .body(vec![0xCDu8; 1024 * 1024])
+            .send()
+            .await
+            .expect("post-reset PUT returns");
+        assert!(put.status().is_success(), "post-reset PUT status: {}", put.status());
+        let seal_deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while dat_count(&root) <= before_seal && std::time::Instant::now() < seal_deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(dat_count(&root) > before_seal, "a new segment sealed on the returned pool");
+
+        // The released segment now feeds f5's under-replication path: with
+        // the corrected holder set its live count is below RF. The drift
+        // scan is hourly, so wake the segment explicitly (the same
+        // `enqueue` the drift scan / holder events use) and observe the
+        // ADR-0030 repair intent on the next reconciliation tick (parked
+        // here — the test cluster has no other holder to pull from).
+        let _ = node.durability.reconciliation.enqueue(missing_seg);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while node.durability.repair_dispatcher.pending_len() == parked_before
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            node.durability.repair_dispatcher.pending_len() > parked_before,
+            "an ADR-0030 repair intent follows the residue release"
+        );
+
+        node.shutdown().await.expect("shutdown");
+    }
+
     #[test]
     fn prefetch_store_adapter_get_object_metadata_nonexistent() {
         let tmp = TempDir::new().expect("tempdir");

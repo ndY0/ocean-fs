@@ -922,6 +922,50 @@ pub struct PoolRegistry {
     drain_mode: RwLock<HashMap<u32, drain::DrainMode>>,
 }
 
+/// Error reasons for [`PoolRegistry::reset_dead_pool`] (pr2,
+/// pool-runtime-lifecycle).
+///
+/// The reset is valid only for a registered **data** pool currently in
+/// [`PoolStatus::Dead`] whose root probes healthy; every other state is an
+/// operator error, not a server fault.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_storage::PoolResetError;
+///
+/// let error = PoolResetError::ProbeFailed("stale mount".into());
+/// assert!(matches!(error, PoolResetError::ProbeFailed(reason) if reason == "stale mount"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PoolResetError {
+    /// No registered pool carries this id.
+    UnknownPool(u32),
+    /// Only `data` pools have a runtime reset; WAL/metadata use the g7/g8
+    /// recovery paths and hints has its own admission semantics (f0).
+    NotDataPool(u32),
+    /// The pool is not `Dead` — reset is meaningful only for a Dead pool.
+    NotDead(u32),
+    /// The root does not probe healthy (unwritable, stale mount, probe
+    /// read-back mismatch). The pool stays `Dead`.
+    ProbeFailed(String),
+}
+
+impl std::fmt::Display for PoolResetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownPool(id) => write!(f, "unknown pool id {id}"),
+            Self::NotDataPool(id) => {
+                write!(f, "pool {id} is not a data pool (role-specific recovery paths apply)")
+            }
+            Self::NotDead(id) => write!(f, "pool {id} is not Dead; reset is only for a Dead pool"),
+            Self::ProbeFailed(reason) => write!(f, "root probe failed: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for PoolResetError {}
+
 impl PoolRegistry {
     /// Builds the registry from the topology config, probing every root.
     ///
@@ -1307,6 +1351,85 @@ impl PoolRegistry {
                 }
             }
         }
+    }
+
+    /// Probe-gated runtime return of a **Dead data pool** (pr2,
+    /// operator-triggered after the device was replaced and mounted).
+    ///
+    /// Valid only for a registered `data` pool in [`PoolStatus::Dead`]. The
+    /// root is re-probed with the same write+fsync check boot uses; on
+    /// success the pool is set `Healthy`, `write_degraded` is cleared, and
+    /// the capacity is refreshed (callers read the new free/total from
+    /// [`PoolRegistry::pool_by_id`]). A probe failure leaves the pool `Dead`
+    /// and returns
+    /// [`PoolResetError::ProbeFailed`] — never a silent `Healthy`.
+    ///
+    /// The composition root pairs this with
+    /// `HealthMonitor::reset_pool` (to clear the monitor's Dead latch) and
+    /// runs the return-residue sweep before the pool is trusted as a live
+    /// copy for data whose local `.dat` is gone.
+    ///
+    /// # Errors
+    ///
+    /// [`PoolResetError::UnknownPool`] / [`PoolResetError::NotDataPool`] /
+    /// [`PoolResetError::NotDead`] before any I/O; [`PoolResetError::ProbeFailed`]
+    /// when the root does not probe healthy (the pool stays `Dead`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use oceanfs_core::{MissingRootPolicy, PoolRole, PoolTech, StorageConfig, StoragePoolConfig};
+    /// use oceanfs_storage::{PoolRegistry, PoolResetError, PoolStatus};
+    ///
+    /// let tmp = tempfile::tempdir().expect("tempdir");
+    /// fn pool(name: &str, role: PoolRole, root: std::path::PathBuf) -> StoragePoolConfig {
+    ///     StoragePoolConfig {
+    ///         name: name.into(), role, root, weight: None, tech: PoolTech::Auto,
+    ///         health: Default::default(),
+    ///     }
+    /// }
+    /// let storage = StorageConfig {
+    ///     pools: vec![
+    ///         pool("data-0", PoolRole::Data, tmp.path().join("pool-data")),
+    ///         pool("wal-0", PoolRole::Wal, tmp.path().join("pool-wal")),
+    ///         pool("meta-0", PoolRole::Metadata, tmp.path().join("pool-meta")),
+    ///         pool("hints-0", PoolRole::Hints, tmp.path().join("pool-hints")),
+    ///     ],
+    ///     health: Default::default(),
+    ///     missing_root_policy: MissingRootPolicy::Fatal,
+    /// };
+    /// let registry = Arc::new(
+    ///     PoolRegistry::from_config(&storage, &tmp.path().join("data")).expect("registry"),
+    /// );
+    /// // A Healthy pool is not resettable.
+    /// assert!(matches!(registry.reset_dead_pool(0), Err(PoolResetError::NotDead(0))));
+    /// registry.set_status(0, PoolStatus::Dead);
+    /// registry.reset_dead_pool(0).expect("the root still probes");
+    /// let pool = registry.pool_by_id(0).expect("pool");
+    /// assert_eq!(pool.status(), PoolStatus::Healthy);
+    /// assert!(pool.total_bytes() > 0, "capacity refreshed");
+    /// ```
+    pub fn reset_dead_pool(&self, id: u32) -> Result<(), PoolResetError> {
+        let pool = self.pool_by_id(id).ok_or(PoolResetError::UnknownPool(id))?;
+        if pool.role() != PoolRole::Data {
+            return Err(PoolResetError::NotDataPool(id));
+        }
+        if pool.status() != PoolStatus::Dead {
+            return Err(PoolResetError::NotDead(id));
+        }
+        let capacity = match probe_root(pool.root()) {
+            Ok(()) => statvfs_capacity(pool.root()).unwrap_or_default(),
+            Err(e) => return Err(PoolResetError::ProbeFailed(e.to_string())),
+        };
+        pool.set_capacity(capacity);
+        if let Some(metric) = self.metrics_for(id) {
+            metric.bytes_free.set(capacity.free_bytes);
+            metric.bytes_total.set(capacity.total_bytes);
+        }
+        self.set_status(id, PoolStatus::Healthy);
+        self.set_write_degraded(id, false);
+        Ok(())
     }
 
     /// Sets a pool's health status and its `oceanfs_pool_status` gauge.
@@ -2174,6 +2297,74 @@ mod tests {
 
         assert!(pool.free_bytes() < before_free, "free must shrink after a write");
         assert_eq!(pool.total_bytes(), before_total, "total must not change");
+        drop(tmp);
+    }
+
+    // -- Dead-pool runtime reset (pr2) --
+
+    /// The reset refuses unknown ids, non-data roles, and pools that are
+    /// not Dead — before any probe I/O.
+    #[test]
+    fn reset_dead_pool_rejects_unknown_non_data_and_not_dead() {
+        let (tmp, data_dir) = layout();
+        let (storage, _roots) = full_pool_config(tmp.path());
+        let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
+
+        assert_eq!(registry.reset_dead_pool(99), Err(PoolResetError::UnknownPool(99)));
+
+        // `full_pool_config` orders data(0), data(1), wal(2), meta(3), hints(4).
+        let wal_id = registry.pool_by_role(PoolRole::Wal).unwrap().id();
+        assert_eq!(registry.reset_dead_pool(wal_id), Err(PoolResetError::NotDataPool(wal_id)));
+
+        // A Healthy data pool is not resettable (operator action conflicts
+        // with the lifecycle state).
+        assert_eq!(registry.reset_dead_pool(0), Err(PoolResetError::NotDead(0)));
+        drop(tmp);
+    }
+
+    /// A probe failure leaves the pool Dead (never a silent Healthy).
+    #[test]
+    fn reset_dead_pool_probe_failure_keeps_dead() {
+        let (tmp, data_dir) = layout();
+        let (storage, roots) = full_pool_config(tmp.path());
+        let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
+        registry.set_status(0, PoolStatus::Dead);
+
+        // Replace the data root directory with a FILE so `probe_root`'s
+        // create_dir_all fails (the "device not ready" analogue).
+        std::fs::remove_dir_all(&roots[0]).unwrap();
+        std::fs::write(&roots[0], b"not a directory").unwrap();
+
+        match registry.reset_dead_pool(0) {
+            Err(PoolResetError::ProbeFailed(reason)) => {
+                assert!(!reason.is_empty(), "the probe failure carries a reason");
+            }
+            other => panic!("expected ProbeFailed, got {other:?}"),
+        }
+        assert_eq!(
+            registry.pool_by_id(0).unwrap().status(),
+            PoolStatus::Dead,
+            "a failed probe must not clear the Dead latch"
+        );
+        drop(tmp);
+    }
+
+    /// A successful reset clears Dead, clears `write_degraded`, and
+    /// returns the refreshed capacity.
+    #[test]
+    fn reset_dead_pool_returns_healthy_with_refreshed_capacity() {
+        let (tmp, data_dir) = layout();
+        let (storage, _roots) = full_pool_config(tmp.path());
+        let registry = PoolRegistry::from_config(&storage, &data_dir).unwrap();
+
+        registry.set_status(0, PoolStatus::Dead);
+        registry.set_write_degraded(0, true);
+
+        registry.reset_dead_pool(0).expect("root probes healthy");
+        let pool = registry.pool_by_id(0).unwrap();
+        assert_eq!(pool.status(), PoolStatus::Healthy);
+        assert!(!pool.write_degraded(), "the write gate is cleared");
+        assert!(pool.total_bytes() > 0, "capacity is refreshed from statvfs");
         drop(tmp);
     }
 
