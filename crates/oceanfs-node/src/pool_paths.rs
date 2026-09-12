@@ -25,6 +25,8 @@ use oceanfs_storage::PoolRegistry;
 ///
 /// let paths = PoolPaths {
 ///     metadata: "/mnt/meta".into(),
+///     metadata_journal: "/mnt/meta/metadata-journal".into(),
+///     metadata_watermarks: "/mnt/meta/metadata_sync/watermarks".into(),
 ///     wal: "/mnt/journal".into(),
 ///     event_wal: "/mnt/journal/event-wal".into(),
 ///     hints: "/mnt/hints".into(),
@@ -35,6 +37,12 @@ use oceanfs_storage::PoolRegistry;
 pub struct PoolPaths {
     /// Directory for the metadata store (RocksDB).
     pub metadata: PathBuf,
+    /// Directory for the metadata change journal
+    /// (`<metadata pool root>/metadata-journal`, ADR-0038; ae2 / S2).
+    pub metadata_journal: PathBuf,
+    /// Directory for the metadata-sync watermarks
+    /// (`<metadata pool root>/metadata_sync/watermarks`).
+    pub metadata_watermarks: PathBuf,
     /// Directory for the data WAL.
     pub wal: PathBuf,
     /// Directory for the segment event WAL (rides the wal pool root).
@@ -53,6 +61,9 @@ pub struct PoolPaths {
 /// D2).
 ///
 /// - `metadata` → metadata pool root;
+/// - `metadata-journal` → metadata pool root + `metadata-journal`
+///   (ADR-0038: the journal shares the metadata store's pool/device);
+/// - `metadata/watermarks` → metadata pool root + `metadata_sync/watermarks`;
 /// - `wal` → wal pool root;
 /// - `event-wal` → wal pool root + `event-wal` (the event log rides the
 ///   journal device, ADR-0024);
@@ -76,6 +87,8 @@ pub(crate) fn pool_paths(registry: &PoolRegistry) -> PoolPaths {
     let metadata = role_root(registry, PoolRole::Metadata);
     let wal = role_root(registry, PoolRole::Wal);
     PoolPaths {
+        metadata_journal: metadata.join("metadata-journal"),
+        metadata_watermarks: metadata.join("metadata_sync").join("watermarks"),
         metadata,
         wal: wal.clone(),
         // The event log rides the journal device (ADR-0024): the pinned
@@ -162,6 +175,15 @@ mod tests {
         // The event log rides the journal device, under the wal pool root.
         assert_eq!(paths.event_wal, root_for(&roots, PoolRole::Wal).join("event-wal"));
         assert_eq!(paths.hints, root_for(&roots, PoolRole::Hints));
+        // ae2: the journal + watermarks ride the metadata pool root.
+        assert_eq!(
+            paths.metadata_journal,
+            root_for(&roots, PoolRole::Metadata).join("metadata-journal")
+        );
+        assert_eq!(
+            paths.metadata_watermarks,
+            root_for(&roots, PoolRole::Metadata).join("metadata_sync").join("watermarks")
+        );
         // No role dir resolves under a `data_dir` anymore.
         let data_dir = tmp.path().join("data");
         assert!(!paths.metadata.starts_with(&data_dir));

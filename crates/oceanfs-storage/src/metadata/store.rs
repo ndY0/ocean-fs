@@ -30,14 +30,17 @@ use std::{
 };
 
 use oceanfs_core::{
-    BucketId, ChunkRef, Counter, DeadChunkKind, DeadChunkRecord, Gauge, Hlc, LabelSet,
+    BucketId, ChunkRef, Counter, DeadChunkKind, DeadChunkRecord, Gauge, HashOutput, Hlc, LabelSet,
     MetadataConfig, MetricRegistrar, ObjectKey, ObjectMetadata, Tombstone,
 };
 use rocksdb::{ColumnFamilyDescriptor, Options, DB};
 
 use crate::{
     error::{Error, Result},
-    metadata::cf,
+    metadata::{
+        cf,
+        journal::{JournalOp, MetadataJournal},
+    },
 };
 
 /// Assumed worst-case number of metadata writers concurrently inside
@@ -250,6 +253,162 @@ pub struct RocksDbMetadataStore {
     /// Per-store random hash seed so client-chosen object keys cannot be
     /// deliberately aligned onto a single stripe (SipHash via `RandomState`).
     key_lock_hasher: RandomState,
+    /// Optional metadata change journal (ADR-0038, ae2 / S2). `None` when
+    /// `[metadata_sync] enabled = false`: every capture site is a branch
+    /// on this `Option` and performs no I/O.
+    journal: Option<Arc<MetadataJournal>>,
+}
+
+/// Outcome of applying a pulled metadata state through the sync worker
+/// (ADR-0038 D5).
+///
+/// # Examples
+///
+/// ```ignore
+/// match store.sync_apply_object(&bucket, meta)? {
+///     SyncApplyOutcome::Applied => counters.applied.inc(),
+///     SyncApplyOutcome::AlreadyCurrent => counters.skipped.inc(),
+///     SyncApplyOutcome::LocalWins => counters.rejected.inc(),
+///     _ => {}
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SyncApplyOutcome {
+    /// The pulled state won the LWW comparison and was written.
+    Applied,
+    /// The local state is already the same logical version (no write).
+    AlreadyCurrent,
+    /// The local state won the LWW comparison (no write).
+    LocalWins,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LwwDecision {
+    Apply,
+    AlreadyCurrent,
+    LocalWins,
+}
+
+/// Logical identity hash of a live row: `(size, blake3_hash, inline_data,
+/// hlc)` — physical chunk refs are deliberately excluded (ADR-0038 D5).
+fn object_identity_hash(meta: &ObjectMetadata) -> HashOutput {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"oceanfs-meta-object-row-v1");
+    hasher.update(&meta.size.to_le_bytes());
+    match &meta.blake3_hash {
+        Some(hash) => {
+            hasher.update(&[1u8]);
+            hasher.update(hash.as_bytes());
+        }
+        None => {
+            hasher.update(&[0u8]);
+        }
+    }
+    match &meta.inline_data {
+        Some(data) => {
+            hasher.update(&[1u8]);
+            hasher.update(&(data.len() as u64).to_le_bytes());
+            hasher.update(data);
+        }
+        None => {
+            hasher.update(&[0u8]);
+        }
+    }
+    hasher.update(&meta.hlc.wall_time().to_le_bytes());
+    hasher.update(&meta.hlc.logical().to_le_bytes());
+    HashOutput::from_bytes(*hasher.finalize().as_bytes())
+}
+
+/// Logical identity hash of a tombstone: its delete version only —
+/// `deletion_time` and chunk refs are local accounting, not identity.
+fn tombstone_identity_hash(tombstone: &Tombstone) -> HashOutput {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"oceanfs-meta-tombstone-v1");
+    hasher.update(&tombstone.hlc.wall_time().to_le_bytes());
+    hasher.update(&tombstone.hlc.logical().to_le_bytes());
+    HashOutput::from_bytes(*hasher.finalize().as_bytes())
+}
+
+fn object_logically_equal(a: &ObjectMetadata, b: &ObjectMetadata) -> bool {
+    a.size == b.size
+        && a.blake3_hash == b.blake3_hash
+        && a.inline_data == b.inline_data
+        && a.hlc == b.hlc
+}
+
+/// Decides whether a pulled OBJECT row wins against the local state.
+///
+/// Order: a local plain tombstone is compared first (delete wins ties
+/// unless the object's identity hash is greater), then a local live row.
+/// Equal HLC with equal logical identity is `AlreadyCurrent`; equal HLC
+/// with different identity is broken by the greater identity hash
+/// (symmetric on both sides).
+fn decide_object(
+    pulled: &ObjectMetadata,
+    local_row: Option<&ObjectMetadata>,
+    local_tombstone: Option<&Tombstone>,
+) -> LwwDecision {
+    if let Some(tombstone) = local_tombstone {
+        match pulled.hlc.cmp(&tombstone.hlc) {
+            std::cmp::Ordering::Less => return LwwDecision::LocalWins,
+            std::cmp::Ordering::Equal => {
+                if object_identity_hash(pulled) <= tombstone_identity_hash(tombstone) {
+                    return LwwDecision::LocalWins;
+                }
+            }
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+    if let Some(row) = local_row {
+        match pulled.hlc.cmp(&row.hlc) {
+            std::cmp::Ordering::Less => return LwwDecision::LocalWins,
+            std::cmp::Ordering::Equal => {
+                if object_logically_equal(pulled, row) {
+                    return LwwDecision::AlreadyCurrent;
+                }
+                if object_identity_hash(pulled) <= object_identity_hash(row) {
+                    return LwwDecision::LocalWins;
+                }
+            }
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+    LwwDecision::Apply
+}
+
+/// Decides whether a pulled TOMBSTONE wins against the local state. A
+/// local tombstone at the same HLC is identical (its identity is its
+/// version); a live row at the same HLC loses to the tombstone iff the
+/// tombstone's identity hash is greater.
+fn decide_tombstone(
+    pulled: &Tombstone,
+    local_row: Option<&ObjectMetadata>,
+    local_tombstone: Option<&Tombstone>,
+) -> LwwDecision {
+    if let Some(tombstone) = local_tombstone {
+        return match pulled.hlc.cmp(&tombstone.hlc) {
+            std::cmp::Ordering::Less => LwwDecision::LocalWins,
+            std::cmp::Ordering::Equal => LwwDecision::AlreadyCurrent,
+            std::cmp::Ordering::Greater => apply_after_row_check(pulled, local_row),
+        };
+    }
+    apply_after_row_check(pulled, local_row)
+}
+
+fn apply_after_row_check(pulled: &Tombstone, local_row: Option<&ObjectMetadata>) -> LwwDecision {
+    if let Some(row) = local_row {
+        match pulled.hlc.cmp(&row.hlc) {
+            std::cmp::Ordering::Less => return LwwDecision::LocalWins,
+            std::cmp::Ordering::Equal => {
+                if tombstone_identity_hash(pulled) <= object_identity_hash(row) {
+                    return LwwDecision::LocalWins;
+                }
+            }
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+    LwwDecision::Apply
 }
 
 fn io_err(e: impl std::error::Error) -> std::io::Error {
@@ -271,6 +430,35 @@ impl RocksDbMetadataStore {
     /// Returns an error if RocksDB cannot open the database or create
     /// the required column families.
     pub fn open(config: &MetadataConfig) -> Result<Self> {
+        Self::open_with_journal(config, None)
+    }
+
+    /// Opens or creates a metadata store with an optional change journal
+    /// (ADR-0038, ae2 / S2).
+    ///
+    /// Passing `None` is byte-for-byte equivalent to [`Self::open`]: every
+    /// capture site branches on the `Option` and performs no journal I/O.
+    /// When `Some`, every logical mutation appends its `{seq, op, key,
+    /// hlc}` record **before** the row commit becomes visible (J1) and a
+    /// journal failure fails the mutation closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if RocksDB cannot open the database or create the
+    /// required column families.
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let store = RocksDbMetadataStore::open_with_journal(&config, Some(journal))?;
+    /// ```
+    pub fn open_with_journal(
+        config: &MetadataConfig,
+        journal: Option<Arc<MetadataJournal>>,
+    ) -> Result<Self> {
+        Self::open_impl(config, journal)
+    }
+
+    fn open_impl(config: &MetadataConfig, journal: Option<Arc<MetadataJournal>>) -> Result<Self> {
         std::fs::create_dir_all(&config.data_dir)?;
 
         // --- DB-level options ---
@@ -441,7 +629,7 @@ impl RocksDbMetadataStore {
             }
         }
 
-        Ok(Self { db, metrics, key_locks, key_lock_hasher })
+        Ok(Self { db, metrics, key_locks, key_lock_hasher, journal })
     }
 
     /// Runs `f` with the per-key overwrite lock for `(bucket, key)` held.
@@ -473,17 +661,10 @@ impl RocksDbMetadataStore {
     /// Returns an error if the objects column family is not found, serialization
     /// fails, or the underlying RocksDB write fails.
     pub fn put_object(&self, meta: ObjectMetadata) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle(cf::CF_OBJECTS)
-            .ok_or_else(|| Error::InvalidConfig("objects CF not found".into()))?;
-
-        let key = cf::encode_object_key("default", meta.object_key.as_str());
-        let value = bincode::serialize(&meta).map_err(|e| Error::Io(io_err(e)))?;
-
-        self.db.put_cf(&cf, key, value).map_err(|e| Error::Io(io_err(e)))?;
-
-        Ok(())
+        // Default-bucket overlay of the journaled choke point: capture,
+        // stale-tombstone clearing, and the J1 append all stay in one
+        // place.
+        self.put_object_in_bucket(&BucketId::new("default"), meta)
     }
 
     /// Stores object metadata with an explicit bucket.
@@ -596,6 +777,11 @@ impl RocksDbMetadataStore {
         let value = bincode::serialize(&meta).map_err(|e| Error::Io(io_err(e)))?;
         batch.put_cf(&objects_cf, &row_key, value);
 
+        // J1 (ADR-0038 D1): the change record is made durable BEFORE the
+        // row commit becomes visible. An append failure fails the write
+        // closed — the batch is never written.
+        self.journal_append(JournalOp::Put, &row_key, meta.hlc)?;
+
         self.db.write(batch).map_err(|e| Error::Io(io_err(e)))?;
 
         Ok(())
@@ -686,8 +872,146 @@ impl RocksDbMetadataStore {
         let value = bincode::serialize(&tombstone).map_err(|e| Error::Io(io_err(e)))?;
         batch.put_cf(&deletions_cf, &db_key, value);
 
+        // J1: journal the delete before the row removal is visible.
+        self.journal_append(JournalOp::Delete, &db_key, hlc)?;
+
         self.db.write(batch).map_err(|e| Error::Io(io_err(e)))?;
 
+        Ok(())
+    }
+
+    /// Applies a point-fetched OBJECT row through the mandatory HLC-LWW
+    /// guards (ADR-0038 D5).
+    ///
+    /// Logical identity is `(size, blake3_hash, inline_data, hlc)`; chunk
+    /// refs are **not** identity, so two replicas holding the same logical
+    /// object with different physical refs are already in sync and are not
+    /// repaired. Equal HLC with different identity is broken
+    /// deterministically by the greater identity hash, symmetrically on
+    /// both sides. There is **no local-segment-presence precondition**: a
+    /// row referencing segments this node does not hold is applied
+    /// normally (rows and bytes live on independent rings; bytes are the
+    /// segment plane's).
+    ///
+    /// The apply reuses the same choke point as a client PUT
+    /// ([`Self::put_object_in_bucket`]): superseded chunk capture, stale
+    /// tombstone clearing, and the J1 journal append all happen exactly
+    /// once.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// match store.sync_apply_object(&bucket, fetched)? {
+    ///     SyncApplyOutcome::Applied => { /* written */ }
+    ///     _ => { /* already current or local wins */ }
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a read, the row write, or the journal append
+    /// fails (the journal failure fails the apply closed).
+    pub fn sync_apply_object(
+        &self,
+        bucket: &BucketId,
+        meta: ObjectMetadata,
+    ) -> Result<SyncApplyOutcome> {
+        let key = meta.object_key.clone();
+        self.with_key_lock(bucket, &key, || {
+            let local_row = self.get_object(bucket, &key).ok().flatten();
+            let local_tombstone = self.get_tombstone(bucket, &key).ok().flatten();
+            match decide_object(&meta, local_row.as_ref(), local_tombstone.as_ref()) {
+                LwwDecision::Apply => {
+                    self.put_object_in_bucket_locked(bucket, meta)?;
+                    Ok(SyncApplyOutcome::Applied)
+                }
+                LwwDecision::AlreadyCurrent => Ok(SyncApplyOutcome::AlreadyCurrent),
+                LwwDecision::LocalWins => Ok(SyncApplyOutcome::LocalWins),
+            }
+        })
+    }
+
+    /// Applies a point-fetched plain TOMBSTONE through the mandatory
+    /// HLC-LWW guards (ADR-0038 D5): a newer delete removes the local live
+    /// row and writes the pulled tombstone verbatim (preserving its
+    /// deletion version); a newer local state wins and nothing is
+    /// written. The local live row's chunk refs (if any) are captured as
+    /// a supersede record so byte accounting survives the delete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a read, the row write, or the journal append
+    /// fails (the journal failure fails the apply closed).
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let outcome = store.sync_apply_tombstone(&bucket, &key, tombstone)?;
+    /// ```
+    pub fn sync_apply_tombstone(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+        tombstone: Tombstone,
+    ) -> Result<SyncApplyOutcome> {
+        self.with_key_lock(bucket, key, || {
+            let local_row = self.get_object(bucket, key).ok().flatten();
+            let local_tombstone = self.get_tombstone(bucket, key).ok().flatten();
+            match decide_tombstone(&tombstone, local_row.as_ref(), local_tombstone.as_ref()) {
+                LwwDecision::Apply => {
+                    self.apply_tombstone_row_locked(bucket, key, tombstone, local_row.as_ref())?;
+                    Ok(SyncApplyOutcome::Applied)
+                }
+                LwwDecision::AlreadyCurrent => Ok(SyncApplyOutcome::AlreadyCurrent),
+                LwwDecision::LocalWins => Ok(SyncApplyOutcome::LocalWins),
+            }
+        })
+    }
+
+    /// Row-delete + pulled-tombstone write body of
+    /// [`Self::sync_apply_tombstone`], invoked with the per-key lock held.
+    fn apply_tombstone_row_locked(
+        &self,
+        bucket: &BucketId,
+        key: &ObjectKey,
+        tombstone: Tombstone,
+        local_row: Option<&ObjectMetadata>,
+    ) -> Result<()> {
+        let objects_cf = self
+            .db
+            .cf_handle(cf::CF_OBJECTS)
+            .ok_or_else(|| Error::InvalidConfig("objects CF not found".into()))?;
+        let deletions_cf = self
+            .db
+            .cf_handle(cf::CF_DELETIONS)
+            .ok_or_else(|| Error::InvalidConfig("deletions CF not found".into()))?;
+        let row_key = cf::encode_object_key(bucket.as_str(), key.as_str());
+
+        let mut batch = rocksdb::WriteBatch::default();
+        // Capture the local row's chunks as a supersede record (ADR-0034
+        // D2): they stop being referenced here and remain attributable.
+        if let Some(local) = local_row {
+            if local.is_segment_stored() {
+                let dead_bytes: u64 = local.chunks.iter().map(|c| u64::from(c.length)).sum();
+                let supersede_key =
+                    cf::encode_supersede_key(bucket.as_str(), key.as_str(), local.hlc);
+                let value = bincode::serialize(&Tombstone {
+                    deletion_time: now_ms(),
+                    hlc: local.hlc,
+                    chunks: local.chunks.clone(),
+                })
+                .map_err(|e| Error::Io(io_err(e)))?;
+                batch.put_cf(&deletions_cf, supersede_key, value);
+                self.metrics.supersede_captured_total.inc();
+                self.metrics.supersede_dead_bytes_total.add(dead_bytes);
+            }
+        }
+        batch.delete_cf(&objects_cf, &row_key);
+        let value = bincode::serialize(&tombstone).map_err(|e| Error::Io(io_err(e)))?;
+        batch.put_cf(&deletions_cf, &row_key, value);
+        // J1: the delete's change record is durable before the tombstone
+        // becomes visible.
+        self.journal_append(JournalOp::Delete, &row_key, tombstone.hlc)?;
+        self.db.write(batch).map_err(|e| Error::Io(io_err(e)))?;
         Ok(())
     }
 
@@ -783,12 +1107,25 @@ impl RocksDbMetadataStore {
     // Tombstone operations
     // ------------------------------------------------------------------
 
-    /// Records a deletion tombstone.
+    /// Records a deletion tombstone directly.
+    ///
+    /// **Accounting/fixture primitive, never a logical delete.** It does
+    /// not remove the live row and is therefore **not journaled**
+    /// (ADR-0038 D1 capture matrix): journaling it would make consumers
+    /// infer a delete that never happened. Logical deletes go through
+    /// [`Self::delete_object`] (which journals).
     ///
     /// # Errors
     ///
     /// Returns an error if the deletions column family is not found, serialization
     /// fails, or the RocksDB write fails.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Accounting/fixture primitive; logical deletes use delete_object().
+    /// store.put_tombstone(&bucket, &key, tombstone)?;
+    /// ```
     pub fn put_tombstone(
         &self,
         bucket: &BucketId,
@@ -1055,12 +1392,18 @@ impl RocksDbMetadataStore {
     /// family is not found, serialization fails, or the RocksDB write fails.
     pub async fn put_object_async(&self, meta: ObjectMetadata) -> Result<()> {
         let db = self.db.clone();
+        let journal = self.journal.clone();
         tokio::task::spawn_blocking(move || {
             let cf = db
                 .cf_handle(cf::CF_OBJECTS)
                 .ok_or_else(|| Error::InvalidConfig("objects CF not found".into()))?;
             let key = cf::encode_object_key("default", meta.object_key.as_str());
             let value = bincode::serialize(&meta).map_err(|e| Error::Io(io_err(e)))?;
+            // J1: the change record is durable before the row becomes
+            // visible.
+            if let Some(journal) = journal {
+                journal.append(JournalOp::Put, &key, meta.hlc)?;
+            }
             db.put_cf(&cf, key, value).map_err(|e| Error::Io(io_err(e)))?;
             Ok(())
         })
@@ -1100,20 +1443,43 @@ impl RocksDbMetadataStore {
         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?
     }
 
-    /// Async version of [`Self::delete_object`].
+    /// Async row removal (no tombstone).
+    ///
+    /// This is a raw row delete: it does not write a deletion tombstone
+    /// (use [`Self::delete_object`] for a logical delete). It still
+    /// journals the state change — when a live row existed, its version
+    /// is appended as a `delete` record before the removal becomes
+    /// visible (J1), so a replica cannot silently miss the removal.
     ///
     /// # Errors
     ///
-    /// Returns an error if the blocking task fails to spawn, the objects column
-    /// family is not found, or the RocksDB delete fails.
+    /// Returns an error if the blocking task fails to spawn, the objects
+    /// column family is not found, the journal append fails (fail-closed),
+    /// or the RocksDB delete fails.
+    /// # Examples
+    ///
+    /// ```ignore
+    /// store.delete_object_async(bucket, key).await?; // journals the removal
+    /// ```
     pub async fn delete_object_async(&self, bucket: BucketId, key: ObjectKey) -> Result<()> {
         let db = self.db.clone();
+        let journal = self.journal.clone();
         tokio::task::spawn_blocking(move || {
-            let cf = db
+            let objects_cf = db
                 .cf_handle(cf::CF_OBJECTS)
                 .ok_or_else(|| Error::InvalidConfig("objects CF not found".into()))?;
             let db_key = cf::encode_object_key(bucket.as_str(), key.as_str());
-            db.delete_cf(&cf, db_key).map_err(|e| Error::Io(io_err(e)))?;
+            // J1: read the removed row's version and journal the change
+            // before the row disappears; an unreadable row is treated as
+            // absent (no record), mirroring the write path's tolerance.
+            if let Some(journal) = journal {
+                if let Ok(Some(value)) = db.get_cf(&objects_cf, &db_key) {
+                    if let Some(meta) = decode_metadata(&value) {
+                        journal.append(JournalOp::Delete, &db_key, meta.hlc)?;
+                    }
+                }
+            }
+            db.delete_cf(&objects_cf, db_key).map_err(|e| Error::Io(io_err(e)))?;
             Ok(())
         })
         .await
@@ -1132,6 +1498,12 @@ impl RocksDbMetadataStore {
     /// fails for any operation, or the RocksDB batch write fails.
     pub fn batch_write(&self, ops: Vec<BatchOp>) -> Result<()> {
         let mut batch = rocksdb::WriteBatch::default();
+        // Change records for operations that actually change logical
+        // state (ADR-0038 D1 capture matrix). `batch_write` is used by
+        // compaction/healing remaps that preserve HLC and re-point
+        // physical refs only: those must NOT journal. The defensive
+        // read-before-write below is what distinguishes the two.
+        let mut journal_entries: Vec<(JournalOp, Vec<u8>, Hlc)> = Vec::new();
 
         for op in &ops {
             match op {
@@ -1142,6 +1514,15 @@ impl RocksDbMetadataStore {
                         .ok_or_else(|| Error::InvalidConfig("objects CF not found".into()))?;
                     let k = cf::encode_object_key(bucket.as_str(), key.as_str());
                     let v = bincode::serialize(value).map_err(|e| Error::Io(io_err(e)))?;
+                    let logical_change = self
+                        .get_object(bucket, key)
+                        .ok()
+                        .flatten()
+                        .map(|previous| !object_logically_equal(&previous, value))
+                        .unwrap_or(true);
+                    if logical_change {
+                        journal_entries.push((JournalOp::Put, k.clone(), value.hlc));
+                    }
                     batch.put_cf(&cf, k, v);
                 }
                 BatchOp::DeleteObject(bucket, key) => {
@@ -1150,6 +1531,9 @@ impl RocksDbMetadataStore {
                         .cf_handle(cf::CF_OBJECTS)
                         .ok_or_else(|| Error::InvalidConfig("objects CF not found".into()))?;
                     let k = cf::encode_object_key(bucket.as_str(), key.as_str());
+                    if let Some(previous) = self.get_object(bucket, key).ok().flatten() {
+                        journal_entries.push((JournalOp::Delete, k.clone(), previous.hlc));
+                    }
                     batch.delete_cf(&cf, k);
                 }
                 BatchOp::PutTombstone(bucket, key, tombstone) => {
@@ -1159,9 +1543,20 @@ impl RocksDbMetadataStore {
                         .ok_or_else(|| Error::InvalidConfig("deletions CF not found".into()))?;
                     let k = cf::encode_object_key(bucket.as_str(), key.as_str());
                     let v = bincode::serialize(tombstone).map_err(|e| Error::Io(io_err(e)))?;
+                    let changed = self
+                        .get_tombstone(bucket, key)
+                        .ok()
+                        .flatten()
+                        .map(|previous| previous.hlc != tombstone.hlc)
+                        .unwrap_or(true);
+                    if changed {
+                        journal_entries.push((JournalOp::Delete, k.clone(), tombstone.hlc));
+                    }
                     batch.put_cf(&cf, k, v);
                 }
                 BatchOp::DeleteTombstone(bucket, key) => {
+                    // GC accounting cleanup (post-compaction tombstone
+                    // removal) — never journaled.
                     let cf = self
                         .db
                         .cf_handle(cf::CF_DELETIONS)
@@ -1170,6 +1565,12 @@ impl RocksDbMetadataStore {
                     batch.delete_cf(&cf, encoded);
                 }
             }
+        }
+
+        if !journal_entries.is_empty() {
+            let refs: Vec<(JournalOp, &[u8], Hlc)> =
+                journal_entries.iter().map(|(op, key, hlc)| (*op, key.as_slice(), *hlc)).collect();
+            self.journal_append_batch(&refs)?;
         }
 
         self.db.write(batch).map_err(|e| Error::Io(io_err(e)))?;
@@ -1185,6 +1586,35 @@ impl RocksDbMetadataStore {
     /// Returns a reference to the metrics gauges.
     pub fn metrics(&self) -> &Arc<RocksDbMetrics> {
         &self.metrics
+    }
+
+    /// Returns the change journal when `[metadata_sync]` is enabled.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let journal = store.metadata_journal().cloned();
+    /// ```
+    pub fn metadata_journal(&self) -> Option<&Arc<MetadataJournal>> {
+        self.journal.as_ref()
+    }
+
+    /// Appends one change record before a row commit (J1). A no-op when
+    /// the journal is disabled; an append failure propagates so the
+    /// caller fails its metadata write closed.
+    fn journal_append(&self, op: JournalOp, key: &[u8], hlc: Hlc) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            journal.append(op, key, hlc)?;
+        }
+        Ok(())
+    }
+
+    /// Appends a batch of change records with one group commit (J1).
+    fn journal_append_batch(&self, items: &[(JournalOp, &[u8], Hlc)]) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            journal.append_batch(items)?;
+        }
+        Ok(())
     }
 
     /// Flushes all column families to disk.
@@ -1611,6 +2041,9 @@ impl RocksDbMetadataStore {
         let mut batch = rocksdb::WriteBatch::default();
         batch.delete_cf(&objects_cf, row_key);
         batch.put_cf(&deletions_cf, row_key, value);
+        // A plain tombstone is a logical delete: journal it. Supersede
+        // records returned above are GC accounting and never journal.
+        self.journal_append(JournalOp::Delete, row_key, deleted.hlc)?;
         self.db.write(batch).map_err(|e| Error::Io(io_err(e)))?;
         Ok(true)
     }
@@ -1655,6 +2088,9 @@ impl RocksDbMetadataStore {
         let mut batch = rocksdb::WriteBatch::default();
         batch.delete_cf(&deletions_cf, row_key);
         batch.put_cf(&objects_cf, row_key, value);
+        // The rebuilt node's journal covers the state it restores
+        // (ADR-0038 D1 capture matrix: g8 / bootstrap row apply).
+        self.journal_append(JournalOp::Put, row_key, meta.hlc)?;
         self.db.write(batch).map_err(|e| Error::Io(io_err(e)))?;
         Ok(true)
     }
@@ -1800,9 +2236,10 @@ impl oceanfs_storage_api::MetadataStore for RocksDbMetadataStore {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_types)]
 mod tests {
-    use oceanfs_core::{ChunkRef, HashOutput, Hlc, SegmentId};
+    use oceanfs_core::{ChunkRef, HashOutput, Hlc, NodeId, SegmentId};
 
     use super::*;
+    use crate::metadata::journal::{JournalEntry, JournalRead};
 
     fn test_config() -> MetadataConfig {
         let dir = tempfile::tempdir().unwrap();
@@ -2985,5 +3422,387 @@ mod tests {
 
         // Idempotent re-apply of the same row changes nothing.
         assert!(!store.rebuild_apply_object_row(&row_key("b", "k"), &recreated_value).unwrap());
+    }
+
+    // ── ADR-0038 capture + sync apply (ae2 / S2) ──
+
+    /// Opens a store with an enabled journal; returns the store, the
+    /// journal, and the tempdirs that keep both alive.
+    fn open_with_journal(
+    ) -> (RocksDbMetadataStore, Arc<MetadataJournal>, (tempfile::TempDir, tempfile::TempDir)) {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let journal_dir = tempfile::tempdir().unwrap();
+        let config = MetadataConfig {
+            data_dir: meta_dir.path().to_path_buf(),
+            block_cache_size: 8 * 1024 * 1024,
+            memtable_size: 8 * 1024 * 1024,
+            objects_write_buffer_mb: 4,
+            segments_write_buffer_mb: 8,
+            deletions_write_buffer_mb: 1,
+            max_open_files: 1024,
+            ..Default::default()
+        };
+        let journal =
+            Arc::new(MetadataJournal::open(journal_dir.path(), &NodeId::new("test-node")).unwrap());
+        let store =
+            RocksDbMetadataStore::open_with_journal(&config, Some(Arc::clone(&journal))).unwrap();
+        (store, journal, (meta_dir, journal_dir))
+    }
+
+    fn journal_entries(journal: &MetadataJournal) -> Vec<JournalEntry> {
+        match journal.read_range(0, 10_000, u64::MAX).unwrap() {
+            JournalRead::Entries { entries, .. } => entries,
+            JournalRead::Gap { .. } => panic!("unexpected journal gap"),
+        }
+    }
+
+    fn object_row_key(bucket: &str, key: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(bucket.as_bytes());
+        out.push(0);
+        out.extend_from_slice(key.as_bytes());
+        out
+    }
+
+    #[test]
+    fn disabled_store_exposes_no_journal_and_performs_no_journal_io() {
+        let store = RocksDbMetadataStore::open(&test_config()).unwrap();
+        assert!(store.metadata_journal().is_none());
+        let bucket = BucketId::new("default");
+        store.put_object(make_object_meta("off.txt", 3, Some(b"abc"))).unwrap();
+        store.delete_object(&bucket, &ObjectKey::new("off.txt"), Hlc::new(9, 0)).unwrap();
+    }
+
+    #[test]
+    fn put_object_journals_the_put_and_fails_closed_on_append_failure() {
+        let (store, journal, _dirs) = open_with_journal();
+        let bucket = BucketId::new("default");
+        let mut meta = make_object_meta("a.txt", 10, Some(b"payload"));
+        meta.hlc = Hlc::new(5, 0);
+        store.put_object_in_bucket(&bucket, meta).unwrap();
+
+        let entries = journal_entries(&journal);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op, JournalOp::Put);
+        assert_eq!(entries[0].key.as_ref(), object_row_key("default", "a.txt"));
+        assert_eq!(entries[0].hlc, Hlc::new(5, 0));
+
+        // J1: a poisoned journal fails the write closed — the row is not
+        // committed and no record is appended.
+        journal.poison_for_test("injected fsync failure");
+        let mut next = make_object_meta("b.txt", 10, None);
+        next.hlc = Hlc::new(6, 0);
+        store
+            .put_object_in_bucket(&bucket, next)
+            .expect_err("journal failure must fail the write closed");
+        assert!(
+            store.get_object(&bucket, &ObjectKey::new("b.txt")).unwrap().is_none(),
+            "the row was never committed"
+        );
+        assert_eq!(journal_entries(&journal).len(), 1);
+    }
+
+    #[test]
+    fn delete_object_journals_the_delete_and_gc_cleanup_never_journals() {
+        let (store, journal, _dirs) = open_with_journal();
+        let bucket = BucketId::new("default");
+        let key = ObjectKey::new("d.txt");
+        let meta = make_segment_stored_meta(
+            "d.txt",
+            Hlc::new(10, 0),
+            vec![make_chunk(SegmentId::new(), 0, 64)],
+        );
+        store.put_object_in_bucket(&bucket, meta).unwrap();
+        store.delete_object(&bucket, &key, Hlc::new(11, 0)).unwrap();
+
+        let entries = journal_entries(&journal);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].op, JournalOp::Delete);
+        assert_eq!(entries[1].hlc, Hlc::new(11, 0));
+        assert_eq!(entries[1].key.as_ref(), object_row_key("default", "d.txt"));
+
+        // GC accounting cleanup never journals.
+        store.delete_dead_chunk_record(&bucket, &key, Hlc::new(10, 0)).unwrap();
+        store.delete_tombstone(&bucket, &key).unwrap();
+        assert_eq!(journal_entries(&journal).len(), 2);
+    }
+
+    #[test]
+    fn batch_write_journals_only_when_logical_identity_changes() {
+        let (store, journal, _dirs) = open_with_journal();
+        let bucket = BucketId::new("default");
+        let key = ObjectKey::new("remap.txt");
+        let meta = make_segment_stored_meta(
+            "remap.txt",
+            Hlc::new(20, 0),
+            vec![make_chunk(SegmentId::new(), 0, 100)],
+        );
+        store.put_object_in_bucket(&bucket, meta.clone()).unwrap();
+        assert_eq!(journal_entries(&journal).len(), 1);
+
+        // Compaction/healing remap: same logical identity, different
+        // physical chunk refs → NOT journaled.
+        let mut remapped = meta.clone();
+        remapped.chunks = vec![make_chunk(SegmentId::new(), 500, 100)].into_iter().collect();
+        store
+            .batch_write(vec![BatchOp::PutObject(bucket.clone(), key.clone(), remapped.clone())])
+            .unwrap();
+        assert_eq!(journal_entries(&journal).len(), 1, "physical re-point does not journal");
+
+        // A defensive future caller that changes the HLC must journal.
+        let mut changed = remapped.clone();
+        changed.hlc = Hlc::new(21, 0);
+        store.batch_write(vec![BatchOp::PutObject(bucket.clone(), key.clone(), changed)]).unwrap();
+        assert_eq!(journal_entries(&journal).len(), 2, "logical change journals");
+    }
+
+    #[test]
+    fn rebuild_apply_object_row_journals_only_when_applied() {
+        let (store, journal, _dirs) = open_with_journal();
+        let row = object_row_key("default", "rebuild.txt");
+        let meta = make_object_meta("rebuild.txt", 3, Some(b"abc"));
+        let value = bincode::serialize(&meta).unwrap();
+
+        assert!(store.rebuild_apply_object_row(&row, &value).unwrap());
+        let entries = journal_entries(&journal);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op, JournalOp::Put);
+        assert_eq!(entries[0].key.as_ref(), row.as_slice());
+
+        // An equal-HLC re-apply is shadowed and appends nothing.
+        assert!(!store.rebuild_apply_object_row(&row, &value).unwrap());
+        assert_eq!(journal_entries(&journal).len(), 1);
+    }
+
+    #[test]
+    fn sync_apply_object_applies_newer_and_skips_current_state() {
+        let (store, journal, _dirs) = open_with_journal();
+        let bucket = BucketId::new("default");
+        let mut meta = make_object_meta("s.txt", 5, Some(b"hello"));
+        meta.hlc = Hlc::new(30, 0);
+
+        assert_eq!(
+            store.sync_apply_object(&bucket, meta.clone()).unwrap(),
+            SyncApplyOutcome::Applied
+        );
+        assert_eq!(journal_entries(&journal).len(), 1);
+
+        // Identical logical identity → already current, no new record.
+        assert_eq!(
+            store.sync_apply_object(&bucket, meta.clone()).unwrap(),
+            SyncApplyOutcome::AlreadyCurrent
+        );
+        assert_eq!(journal_entries(&journal).len(), 1);
+
+        // Older HLC loses.
+        let mut older = meta.clone();
+        older.hlc = Hlc::new(29, 0);
+        assert_eq!(store.sync_apply_object(&bucket, older).unwrap(), SyncApplyOutcome::LocalWins);
+
+        // Newer HLC wins and journals.
+        let mut newer = meta.clone();
+        newer.hlc = Hlc::new(31, 0);
+        newer.size = 6;
+        newer.inline_data = Some(bytes::Bytes::from_static(b"hello!"));
+        assert_eq!(store.sync_apply_object(&bucket, newer).unwrap(), SyncApplyOutcome::Applied);
+        assert_eq!(journal_entries(&journal).len(), 2);
+    }
+
+    #[test]
+    fn sync_apply_object_ignores_physical_chunk_differences() {
+        let (store, journal, _dirs) = open_with_journal();
+        let bucket = BucketId::new("default");
+        let meta = make_segment_stored_meta(
+            "same.txt",
+            Hlc::new(35, 0),
+            vec![make_chunk(SegmentId::new(), 0, 100)],
+        );
+        assert_eq!(
+            store.sync_apply_object(&bucket, meta.clone()).unwrap(),
+            SyncApplyOutcome::Applied
+        );
+
+        // Same logical identity, different physical refs → in sync.
+        let mut replica = meta;
+        replica.chunks = vec![make_chunk(SegmentId::new(), 999, 100)].into_iter().collect();
+        assert_eq!(
+            store.sync_apply_object(&bucket, replica).unwrap(),
+            SyncApplyOutcome::AlreadyCurrent
+        );
+        assert_eq!(journal_entries(&journal).len(), 1, "no repair for ref-only differences");
+    }
+
+    #[test]
+    fn sync_apply_object_equal_hlc_tie_break_is_symmetric() {
+        let bucket = BucketId::new("default");
+        let mut a = make_object_meta("tie.txt", 1, Some(b"a"));
+        a.hlc = Hlc::new(40, 0);
+        let mut b = a.clone();
+        b.size = 2;
+        b.inline_data = Some(bytes::Bytes::from_static(b"bb"));
+        let (winner, loser) =
+            if object_identity_hash(&a) > object_identity_hash(&b) { (a, b) } else { (b, a) };
+
+        let (left, left_journal, _l) = open_with_journal();
+        assert_eq!(
+            left.sync_apply_object(&bucket, loser.clone()).unwrap(),
+            SyncApplyOutcome::Applied
+        );
+        assert_eq!(
+            left.sync_apply_object(&bucket, winner.clone()).unwrap(),
+            SyncApplyOutcome::Applied
+        );
+
+        let (right, right_journal, _r) = open_with_journal();
+        assert_eq!(
+            right.sync_apply_object(&bucket, winner.clone()).unwrap(),
+            SyncApplyOutcome::Applied
+        );
+        assert_eq!(
+            right.sync_apply_object(&bucket, loser.clone()).unwrap(),
+            SyncApplyOutcome::LocalWins
+        );
+
+        for (store, journal) in [(&left, &left_journal), (&right, &right_journal)] {
+            let stored = store.get_object(&bucket, &ObjectKey::new("tie.txt")).unwrap().unwrap();
+            assert_eq!(object_identity_hash(&stored), object_identity_hash(&winner));
+            assert!(!journal_entries(journal).is_empty(), "the winning apply journaled");
+        }
+        assert_eq!(journal_entries(&left_journal).len(), 2, "both applies changed state here");
+        assert_eq!(journal_entries(&right_journal).len(), 1, "the loser apply was a no-op here");
+    }
+
+    #[test]
+    fn sync_apply_equal_hlc_object_vs_tombstone_is_symmetric() {
+        let bucket = BucketId::new("default");
+        let key = ObjectKey::new("cross.txt");
+        let hlc = Hlc::new(80, 0);
+        let mut meta = make_object_meta("cross.txt", 5, Some(b"hello"));
+        meta.hlc = hlc;
+        let tombstone = Tombstone { deletion_time: 1, hlc, chunks: smallvec::SmallVec::new() };
+        let object_wins = object_identity_hash(&meta) > tombstone_identity_hash(&tombstone);
+
+        // Direction 1: the object is the local state, the tombstone arrives.
+        let (object_first, _j1, _d1) = open_with_journal();
+        assert_eq!(
+            object_first.sync_apply_object(&bucket, meta.clone()).unwrap(),
+            SyncApplyOutcome::Applied
+        );
+        let tombstone_decision =
+            object_first.sync_apply_tombstone(&bucket, &key, tombstone.clone()).unwrap();
+
+        // Direction 2: the tombstone is local, the object arrives.
+        let (tombstone_first, _j2, _d2) = open_with_journal();
+        assert_eq!(
+            tombstone_first.sync_apply_tombstone(&bucket, &key, tombstone.clone()).unwrap(),
+            SyncApplyOutcome::Applied
+        );
+        let object_decision = tombstone_first.sync_apply_object(&bucket, meta.clone()).unwrap();
+
+        if object_wins {
+            // The object's identity hash wins: the arriving tombstone
+            // loses; the arriving object overwrites the local tombstone.
+            assert_eq!(tombstone_decision, SyncApplyOutcome::LocalWins);
+            assert_eq!(object_decision, SyncApplyOutcome::Applied);
+        } else {
+            assert_eq!(tombstone_decision, SyncApplyOutcome::Applied);
+            assert_eq!(object_decision, SyncApplyOutcome::LocalWins);
+        }
+        // Both sides converge to the same winner regardless of order.
+        for store in [&object_first, &tombstone_first] {
+            let row = store.get_object(&bucket, &key).unwrap();
+            let ts = store.get_tombstone(&bucket, &key).unwrap();
+            assert_eq!(row.is_some(), object_wins);
+            assert_eq!(ts.is_some(), !object_wins);
+        }
+    }
+
+    #[test]
+    fn sync_apply_object_applies_foreign_chunk_refs_without_local_segments() {
+        let (store, _journal, _dirs) = open_with_journal();
+        let bucket = BucketId::new("default");
+        // A segment id this node has never heard of.
+        let mut meta = make_segment_stored_meta(
+            "foreign.bin",
+            Hlc::new(45, 0),
+            vec![make_chunk(SegmentId::new(), 0, 128)],
+        );
+        meta.chunks = vec![make_chunk(SegmentId::new(), 0, 128)].into_iter().collect();
+        assert_eq!(store.sync_apply_object(&bucket, meta).unwrap(), SyncApplyOutcome::Applied);
+        assert!(store.get_object(&bucket, &ObjectKey::new("foreign.bin")).unwrap().is_some());
+    }
+
+    #[test]
+    fn sync_apply_tombstone_deletes_and_never_resurrects() {
+        let (store, journal, _dirs) = open_with_journal();
+        let bucket = BucketId::new("default");
+        let key = ObjectKey::new("gone.txt");
+        let mut live = make_object_meta("gone.txt", 5, Some(b"hello"));
+        live.hlc = Hlc::new(50, 0);
+        assert_eq!(
+            store.sync_apply_object(&bucket, live.clone()).unwrap(),
+            SyncApplyOutcome::Applied
+        );
+
+        let tombstone =
+            Tombstone { deletion_time: 1, hlc: Hlc::new(51, 0), chunks: smallvec::SmallVec::new() };
+        assert_eq!(
+            store.sync_apply_tombstone(&bucket, &key, tombstone.clone()).unwrap(),
+            SyncApplyOutcome::Applied
+        );
+        assert!(store.get_object(&bucket, &key).unwrap().is_none());
+        assert_eq!(store.get_tombstone(&bucket, &key).unwrap().unwrap().hlc, Hlc::new(51, 0));
+        let entries = journal_entries(&journal);
+        assert_eq!(entries.last().unwrap().op, JournalOp::Delete);
+
+        // A stale re-PUT must not resurrect the deleted object.
+        let mut stale = live;
+        stale.hlc = Hlc::new(50, 0);
+        assert_eq!(store.sync_apply_object(&bucket, stale).unwrap(), SyncApplyOutcome::LocalWins);
+        assert!(store.get_object(&bucket, &key).unwrap().is_none());
+    }
+
+    #[test]
+    fn sync_apply_object_re_put_clears_a_local_tombstone() {
+        let (store, _journal, _dirs) = open_with_journal();
+        let bucket = BucketId::new("default");
+        let key = ObjectKey::new("reborn.txt");
+        let tombstone =
+            Tombstone { deletion_time: 1, hlc: Hlc::new(60, 0), chunks: smallvec::SmallVec::new() };
+        assert_eq!(
+            store.sync_apply_tombstone(&bucket, &key, tombstone).unwrap(),
+            SyncApplyOutcome::Applied
+        );
+        assert!(store.get_tombstone(&bucket, &key).unwrap().is_some());
+
+        let mut reborn = make_object_meta("reborn.txt", 3, Some(b"new"));
+        reborn.hlc = Hlc::new(61, 0);
+        assert_eq!(store.sync_apply_object(&bucket, reborn).unwrap(), SyncApplyOutcome::Applied);
+        assert!(store.get_object(&bucket, &key).unwrap().is_some());
+        assert!(store.get_tombstone(&bucket, &key).unwrap().is_none());
+    }
+
+    #[test]
+    fn sync_apply_tombstone_captures_the_local_rows_chunks() {
+        let (store, _journal, _dirs) = open_with_journal();
+        let bucket = BucketId::new("default");
+        let key = ObjectKey::new("dead.bin");
+        let live = make_segment_stored_meta(
+            "dead.bin",
+            Hlc::new(70, 0),
+            vec![make_chunk(SegmentId::new(), 0, 256)],
+        );
+        assert_eq!(store.sync_apply_object(&bucket, live).unwrap(), SyncApplyOutcome::Applied);
+        let tombstone =
+            Tombstone { deletion_time: 2, hlc: Hlc::new(71, 0), chunks: smallvec::SmallVec::new() };
+        assert_eq!(
+            store.sync_apply_tombstone(&bucket, &key, tombstone).unwrap(),
+            SyncApplyOutcome::Applied
+        );
+
+        let captured = supersedes(&store);
+        assert_eq!(captured.len(), 1, "the local row's chunks were captured");
+        assert_eq!(captured[0].2.hlc, Hlc::new(70, 0));
+        assert_eq!(captured[0].2.chunks.len(), 1);
     }
 }

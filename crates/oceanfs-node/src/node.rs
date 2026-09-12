@@ -81,6 +81,12 @@ pub struct BackgroundTasks {
     /// Capacity-refresh cancellation token.
     pub(crate) capacity_refresh_cancel: CancellationToken,
 
+    /// Metadata-sync peer-Alive event watcher (ae2 / S2; ADR-0038 D4).
+    /// `None` when `[metadata_sync] enabled = false`.
+    pub(crate) metadata_sync_watcher: Option<JoinHandle<()>>,
+    /// Metadata-sync watcher cancellation token.
+    pub(crate) metadata_sync_watcher_cancel: CancellationToken,
+
     /// gRPC server task handle for graceful shutdown.
     pub(crate) grpc_server: Option<JoinHandle<()>>,
     /// gRPC server cancellation token.
@@ -165,6 +171,8 @@ impl BackgroundTasks {
             hints_probe_cancel: CancellationToken::new(),
             capacity_refresh: None,
             capacity_refresh_cancel: CancellationToken::new(),
+            metadata_sync_watcher: None,
+            metadata_sync_watcher_cancel: CancellationToken::new(),
             grpc_server: None,
             grpc_shutdown: CancellationToken::new(),
             http_server: None,
@@ -333,9 +341,26 @@ fn build_infrastructure(
     // the metadata store must be configurable, a part of the configuration is dedicated to it.
     // [end]
     let metadata_config = MetadataConfig { data_dir: paths.metadata.clone(), ..Default::default() };
+    // ae2 (ADR-0038): open the metadata change journal on the same
+    // pool/device when enabled. When disabled the handle is `None` and no
+    // journal directory is created, read, or written (structurally inert).
+    let metadata_journal = if config.metadata_sync.enabled {
+        Some(Arc::new(
+            oceanfs_storage::MetadataJournal::open(
+                &paths.metadata_journal,
+                &NodeId::new(&config.node_id),
+            )
+            .map_err(|e| format!("failed to open metadata journal: {e}"))?,
+        ))
+    } else {
+        None
+    };
     let metadata_store = Arc::new(
-        oceanfs_storage::RocksDbMetadataStore::open(&metadata_config)
-            .map_err(|e| format!("failed to open metadata store: {e}"))?,
+        oceanfs_storage::RocksDbMetadataStore::open_with_journal(
+            &metadata_config,
+            metadata_journal,
+        )
+        .map_err(|e| format!("failed to open metadata store: {e}"))?,
     );
     // [review][config][high]
     // acceleration config : same comment that of the metadata store. what is the point of config if static
@@ -1250,6 +1275,11 @@ impl Node {
     pub async fn shutdown(self) -> Result<(), Box<dyn std::error::Error>> {
         info!(node_id = %self.config.node_id, "Shutting down OceanFS node");
 
+        // ae2: persist the metadata-sync watermarks before anything
+        // closes (lazy flush otherwise; a lost advance only re-consumes
+        // entries — the apply path is idempotent).
+        self.durability.flush_metadata_sync();
+
         // ---- 1. Graceful leave ----
         // The NodeLeaveHandler (whole-datadir WAL+shard handoff to the ring
         // successor) was deleted in c1 (reviews #34/#35, B1): data is
@@ -1284,6 +1314,7 @@ impl Node {
         bg.hint_prune_cancel.cancel();
         bg.hints_probe_cancel.cancel();
         bg.capacity_refresh_cancel.cancel();
+        bg.metadata_sync_watcher_cancel.cancel();
         bg.health_check_cancel.cancel();
         bg.health_cancel.cancel();
         bg.segment_replicator_cancel.cancel();
@@ -1334,6 +1365,8 @@ impl Node {
             // pr1: the pool-capacity refresh (statvfs per pool; bounded by
             // the grace like the other housekeeping loops).
             bg.capacity_refresh.take(),
+            // ae2: the metadata-sync peer-Alive watcher.
+            bg.metadata_sync_watcher.take(),
             bg.metric_poller.take(),
         ];
         Self::drain_tasks(housekeeping, grace, "housekeeping").await;
@@ -1487,6 +1520,8 @@ impl Node {
 
         // pr1: reject unusable capacity-refresh cadences before startup.
         cfg.durability.validate().map_err(|e| format!("invalid durability config: {e}"))?;
+        // ae2: reject invalid metadata-sync settings before startup.
+        cfg.metadata_sync.validate().map_err(|e| format!("invalid metadata_sync config: {e}"))?;
 
         Ok(cfg)
     }

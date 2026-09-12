@@ -228,6 +228,11 @@ pub struct NodeConfig {
     /// timeout.
     #[serde(default)]
     pub durability: crate::DurabilityConfig,
+    /// Metadata change-journal & pull-based catch-up configuration
+    /// (ADR-0038, ae2 / S2). Off by default; when `enabled = false` the
+    /// journal, sync worker, and gRPC handlers are all absent.
+    #[serde(default)]
+    pub metadata_sync: crate::MetadataSyncConfig,
 
     // ── Item 1: Garbage collection tuning ──
     /// GC compaction liveness-ratio threshold (0.0–1.0, default 0.5).
@@ -732,6 +737,8 @@ impl Default for NodeConfig {
             anti_entropy: AntiEntropyConfig::default(),
             // Durability budget + scheduler (ADR-0017 amendment)
             durability: crate::DurabilityConfig::default(),
+            // Metadata change journal + sync (ADR-0038, ae2; off by default)
+            metadata_sync: crate::MetadataSyncConfig::default(),
             // Item 1: GC
             gc_compact_threshold: 0.5,
             gc_max_concurrent_compactions: 4,
@@ -935,6 +942,35 @@ mod tests {
         assert_eq!(defaults.durability.repair_max_active, 16);
         assert_eq!(defaults.durability.housekeeping_max_active, 2);
         assert_eq!(defaults.durability.task_timeout_sec, 3600);
+    }
+
+    #[test]
+    fn metadata_sync_config_defaults_to_disabled() {
+        let config = NodeConfig::default();
+        assert!(!config.metadata_sync.enabled);
+        assert_eq!(config.metadata_sync.interval_sec, 10);
+        assert_eq!(config.metadata_sync.journal_max_bytes, 268_435_456);
+    }
+
+    #[test]
+    fn metadata_sync_config_toml_parse() {
+        let toml_str = r#"
+            node_id = "n1"
+            [metadata_sync]
+            enabled = true
+            interval_sec = 3
+            max_entries_per_cycle = 128
+        "#;
+        let config: NodeConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.metadata_sync.enabled);
+        assert_eq!(config.metadata_sync.interval_sec, 3);
+        assert_eq!(config.metadata_sync.max_entries_per_cycle, 128);
+        assert_eq!(config.metadata_sync.max_bytes_per_cycle, 4_194_304);
+
+        // An absent section defaults to inert/off.
+        let defaults: NodeConfig = toml::from_str("node_id = \"n2\"").unwrap();
+        assert!(!defaults.metadata_sync.enabled);
+        assert_eq!(defaults.metadata_sync.interval_sec, 10);
     }
 
     // ── Item 1: GC config tests ──

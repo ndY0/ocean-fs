@@ -16,7 +16,9 @@
 
 use std::{net::SocketAddr, sync::Arc};
 
-use oceanfs_core::{CodecConfig, MetricRegistrar, NodeConfig, NodeId, OperationTimeouts};
+use oceanfs_core::{
+    CodecConfig, MetricRegistrar, NodeConfig, NodeId, NodeState, OperationTimeouts,
+};
 use oceanfs_durability::{
     AeTask, AntiEntropy, DrainIntraTask, DurabilityBudget, DurabilityScheduler, GarbageCollector,
     GcTask, GrpcHintDeliveryClient, HealConfig, HealQueue, HealWorker, HintedHandoff,
@@ -110,6 +112,14 @@ pub(crate) struct DurabilityModule {
     /// ranges.
     pub(crate) metadata_recovery:
         Arc<crate::modules::metadata_recovery::MetadataRecoveryCoordinator>,
+    /// ae2 (ADR-0038): the Tier-1 metadata-sync worker. `Some` only when
+    /// `[metadata_sync] enabled = true`.
+    pub(crate) metadata_sync: Option<Arc<oceanfs_durability::MetadataSync>>,
+    /// ae2: enabled-only server-side metadata-sync handles (journal +
+    /// watermarks) for the healing gRPC service.
+    pub(crate) metadata_sync_service: Option<Arc<oceanfs_durability::MetadataSyncService>>,
+    /// ae2: durable per-peer watermarks (retained for shutdown flush).
+    pub(crate) metadata_watermarks: Option<Arc<oceanfs_durability::WatermarkStore>>,
 }
 
 impl DurabilityModule {
@@ -517,7 +527,7 @@ impl DurabilityModule {
         ));
         // ae1 S1: per-target pending-debt gauges need a registrar handle
         // retained past construction (dynamic `{target}` labels).
-        if let Some(registrar) = metrics {
+        if let Some(registrar) = metrics.clone() {
             hinted_handoff_manager = hinted_handoff_manager.with_metric_registrar(registrar);
         }
         let hinted_handoff_manager = Arc::new(hinted_handoff_manager);
@@ -595,6 +605,49 @@ impl DurabilityModule {
         scheduler
             .register(Arc::clone(&drain_cluster) as Arc<dyn oceanfs_durability::DurabilityTask>);
 
+        // ---- ae2 (ADR-0038 D4/D8): metadata change journal + sync ----
+        // Enabled only: a disabled node builds no worker, opens no
+        // journal/watermark files, and serves `unavailable`. The journal
+        // itself was opened (or not) by the composition root; its handle
+        // rides the metadata store.
+        let mut metadata_sync = None;
+        let mut metadata_sync_service = None;
+        let mut metadata_watermarks = None;
+        if config.metadata_sync.enabled {
+            let journal = storage.metadata_store.metadata_journal().cloned().ok_or_else(|| {
+                "metadata_sync is enabled but the metadata journal was not opened".to_string()
+            })?;
+            let watermarks = Arc::new(
+                oceanfs_durability::WatermarkStore::open(&paths.metadata_watermarks)
+                    .map_err(|e| format!("metadata watermark store: {e}"))?,
+            );
+            let worker = oceanfs_durability::MetadataSync::new(
+                NodeId::new(&config.node_id),
+                &config.metadata_sync,
+                membership.clone(),
+                Arc::clone(&pool),
+                std::time::Duration::from_millis(op_timeouts.shard_fetch_ms),
+                Arc::clone(&storage.metadata_store),
+                Arc::clone(&journal),
+                Arc::clone(&watermarks),
+            )
+            .map_err(|e| format!("metadata sync worker: {e}"))?;
+            let worker = match &metrics {
+                Some(registrar) => worker.with_metric_registrar(Arc::clone(registrar)),
+                None => worker,
+            };
+            let worker = Arc::new(worker);
+            scheduler.register(Arc::clone(&worker) as Arc<dyn oceanfs_durability::DurabilityTask>);
+            let service = oceanfs_durability::MetadataSyncService::new(
+                journal,
+                Arc::clone(&watermarks),
+                Arc::clone(&storage.metadata_store) as Arc<dyn oceanfs_storage_api::MetadataStore>,
+            );
+            metadata_sync = Some(worker);
+            metadata_sync_service = Some(service);
+            metadata_watermarks = Some(watermarks);
+        }
+
         // g8 metadata-loss recovery coordinator (ADR-0029 §D7). Owned here
         // next to the wal coordinator; the membership + pool handles the
         // peer pulls need are cloned BEFORE the wal coordinator consumes
@@ -646,6 +699,9 @@ impl DurabilityModule {
             drain_cluster,
             wal_recovery,
             metadata_recovery,
+            metadata_sync,
+            metadata_sync_service,
+            metadata_watermarks,
         })
     }
 
@@ -695,6 +751,25 @@ impl DurabilityModule {
         self.metadata_recovery.run_deferred_boot_drain().await
     }
 
+    /// Flushes the metadata-sync watermarks (no-op when disabled).
+    /// Called on graceful shutdown so the last cycle's advances survive;
+    /// a lost advance only re-consumes entries (idempotent apply).
+    pub(crate) fn flush_metadata_sync(&self) {
+        if let Some(watermarks) = &self.metadata_watermarks {
+            if let Err(error) = watermarks.flush() {
+                tracing::warn!(%error, "metadata-sync watermark flush on shutdown failed");
+            }
+        }
+    }
+
+    /// Returns the enabled-only metadata-sync service for the healing
+    /// gRPC builder (ADR-0038; ae2 / S2).
+    pub(crate) fn metadata_sync_service(
+        &self,
+    ) -> Option<Arc<oceanfs_durability::MetadataSyncService>> {
+        self.metadata_sync_service.clone()
+    }
+
     /// Registers the durability workers' metrics with the node's central
     /// registry (one call replaces the §12 per-worker register lines the
     /// inline code carried).
@@ -723,6 +798,10 @@ impl DurabilityModule {
         self.wal_recovery.register_metrics(registrar);
         // g8 metadata-loss recovery metrics (audit M4).
         self.metadata_recovery.register_metrics(registrar);
+        // ae2 metadata-sync metrics (only when enabled).
+        if let Some(sync) = &self.metadata_sync {
+            sync.register_metrics(registrar);
+        }
     }
 
     /// Spawns every durability-owned background loop (c5 — each worker
@@ -1039,6 +1118,40 @@ impl DurabilityModule {
         });
         bg.delivery_cancel = delivery_cancel;
         bg.hinted_handoff_delivery = Some(delivery_handle);
+
+        // ae2 (ADR-0038 D4): the metadata-sync peer-Alive trigger. The
+        // periodic cadence rides the scheduler; this watcher runs an extra
+        // serialized cycle (with its own Tier-1 permit) when a peer
+        // becomes Alive, so a returning node is caught up promptly.
+        if let Some(sync) = &self.metadata_sync {
+            let mut events = membership.subscribe();
+            let worker = Arc::clone(sync);
+            let budget = Arc::clone(&self.budget);
+            let watcher_cancel = CancellationToken::new();
+            let watcher_token = watcher_cancel.clone();
+            let watcher_handle = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = watcher_token.cancelled() => break,
+                        event = events.recv() => {
+                            match event {
+                                Ok(event) if event.new_state == NodeState::Alive => {
+                                    if let Err(error) = worker.run_event_cycle(&budget).await {
+                                        warn!(%error, "metadata_sync: event cycle failed");
+                                    }
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                    warn!(skipped, "metadata_sync: membership events lagged");
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            });
+            bg.metadata_sync_watcher = Some(watcher_handle);
+            bg.metadata_sync_watcher_cancel = watcher_cancel;
+        }
     }
 }
 
@@ -1050,7 +1163,30 @@ mod tests {
     use oceanfs_core::NodeConfig;
 
     use super::DurabilityModule;
-    use crate::modules::storage::test_support::build_storage_prelude;
+    use crate::modules::storage::test_support::{
+        build_storage_prelude, build_storage_prelude_with,
+    };
+
+    async fn build_durability_with(
+        tmp: &tempfile::TempDir,
+        mutate: impl FnOnce(&mut NodeConfig),
+    ) -> (NodeConfig, Arc<crate::modules::durability::DurabilityModule>) {
+        let prelude = build_storage_prelude_with(tmp, mutate).await;
+        let module = Arc::new(
+            DurabilityModule::build(
+                &prelude.config,
+                &prelude.module,
+                prelude.membership.clone(),
+                prelude.pool.clone(),
+                &prelude.module.paths,
+                "127.0.0.1:0".parse().expect("grpc addr"),
+                None,
+            )
+            .await
+            .expect("durability module build"),
+        );
+        (prelude.config, module)
+    }
 
     async fn build_durability(
         tmp: &tempfile::TempDir,
@@ -1070,6 +1206,52 @@ mod tests {
             .expect("durability module build"),
         );
         (prelude.config, module)
+    }
+
+    /// ae2 / S2 kill-switch: `[metadata_sync] enabled = false` is
+    /// structurally inert — no worker, no service, no journal/watermark
+    /// directories (and therefore no journal I/O).
+    #[tokio::test]
+    async fn metadata_sync_disabled_is_structurally_inert() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (config, module) = build_durability(&tmp).await;
+        assert!(!config.metadata_sync.enabled, "the default is off");
+        assert!(module.metadata_sync.is_none());
+        assert!(module.metadata_sync_service().is_none());
+        assert!(module.metadata_watermarks.is_none());
+        let metadata_root = tmp.path().join("pool-meta");
+        assert!(
+            !metadata_root.join("metadata-journal").exists(),
+            "no journal directory may be created while disabled"
+        );
+        assert!(
+            !metadata_root.join("metadata_sync").exists(),
+            "no watermark directory may be created while disabled"
+        );
+    }
+
+    /// ae2 / S2 enablement: the journal opens on the metadata pool root,
+    /// the watermark directory is created, and the worker + service are
+    /// built and registered with the scheduler.
+    #[tokio::test]
+    async fn metadata_sync_enabled_builds_worker_service_and_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (config, module) = build_durability_with(&tmp, |config| {
+            config.metadata_sync.enabled = true;
+        })
+        .await;
+        assert!(config.metadata_sync.enabled);
+        assert!(module.metadata_sync.is_some(), "the worker is built");
+        assert!(module.metadata_sync_service().is_some(), "the service is built");
+        let metadata_root = tmp.path().join("pool-meta");
+        assert!(
+            metadata_root.join("metadata-journal").is_dir(),
+            "the journal opened on the metadata pool root"
+        );
+        assert!(
+            metadata_root.join("metadata_sync").join("watermarks").is_dir(),
+            "the watermark directory was created"
+        );
     }
 
     /// c2 DoD: the builder returns a live bundle whose workers are wired

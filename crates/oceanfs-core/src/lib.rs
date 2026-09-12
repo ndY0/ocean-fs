@@ -58,8 +58,8 @@ pub mod proto_convert;
 
 pub use config::{
     shard, AccelConfig, AntiEntropyConfig, AuthConfig, CompressionConfig, DurabilityConfig,
-    EventWalConfig, LifecycleConfig, MetadataConfig, MissingRootPolicy, NodeConfig,
-    PoolHealthConfig, PoolHealthOverride, PoolRole, PoolTech, RingConfig, SmartCounter,
+    EventWalConfig, LifecycleConfig, MetadataConfig, MetadataSyncConfig, MissingRootPolicy,
+    NodeConfig, PoolHealthConfig, PoolHealthOverride, PoolRole, PoolTech, RingConfig, SmartCounter,
     SmartGrowthConfig, StorageConfig, StoragePoolConfig, TrendPercentile, WalConfig,
 };
 pub use conflict::{ConflictResolver, LwwResolver, Resolution};

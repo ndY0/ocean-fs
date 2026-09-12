@@ -102,7 +102,7 @@ bootstrap; no scheduled phase anywhere re-reads the keyspace.
 | Stage | Feature | Status | Priority | Depends on | Scope |
 |---|---|---|---|---|---|
 | S1 | [ae1 — Hint-Debt Hardening & Segment Unrecoverable Signal](ae1-debt-hardening-loss-signal.md) | done (2026-09-12, review PASS) | high | — (independent; f5 is the escalation substrate) | Membership-driven hint retention (not blind TTL); TTL expiry escalates through the f5 D3 repair-intent sink; `hinted_handoff_pending_debt{target}` gauge; hint mirroring stays rejected. Segment plane: a repair with no live recorded holder becomes terminal after N sweeps — bounded dedupe marker + `oceanfs_repair_unrecoverable_total{reason}` + stop re-enqueue; a returning holder clears and resumes. No journal dependency. |
-| S2 | [ae2 — Metadata Change Journal & Pull-Based Catch-Up](ae2-metadata-change-journal.md) | proposed (next; unblocked) | critical | ae1 (soft, ordering only — done 2026-09-12); f0 (complement) | The change edge: co-durable journal at the store mutation choke point (pinned location, format, capture points, epoch, trim), per-peer durable watermarks + exchange, Tier-1 `metadata_sync` worker, ownership filter, point fetch of current row state, HLC-LWW idempotent apply, J1 fail-closed, exact `[metadata_sync]` kill-switch, metrics, ADR-0034 accounting statement. Bootstrap/read-trigger/spot-check are S3/S4 follow-ups, not S2 DoD. |
+| S2 | [ae2 — Metadata Change Journal & Pull-Based Catch-Up](ae2-metadata-change-journal.md) | done (2026-09-12, review PASS after 3 iterations + post-cap docs close-out) | critical | ae1 (soft, ordering only — done 2026-09-12); f0 (complement) | The change edge: co-durable journal at the store mutation choke point (pinned location, format, capture points, epoch, trim), per-peer durable watermarks + exchange, Tier-1 `metadata_sync` worker, ownership filter, point fetch of current row state, HLC-LWW idempotent apply, J1 fail-closed, exact `[metadata_sync]` kill-switch, metrics, ADR-0034 accounting statement. Bootstrap/read-trigger/spot-check are S3/S4 follow-ups, not S2 DoD. |
 | S3 | ae3 — Range Iterator + Bootstrap + Read-Trigger (slug indicative; spec not written) | not specified | high | S2 (epoch/watermarks/gap); f0 | Backend-neutral `visit_rows_range` on the metadata store; triggered range-bounded, key-ordered bootstrap with persisted cursors (new-owner / gap / pool-loss / **enable-time** triggers); g8 lister replacement with golden equivalence; owner-only read-miss point fetch with single-flight + short negative cache. **Acceptance gate: the mandatory N>RF matrix below + the f4 P3 re-run.** |
 | S4 | ae4 — Spot-Check + Hardening (slug indicative; spec not written) | not specified | medium | S2/S3 | Bounded HMAC spot-check verifier (recent-touch reservoir, tag exchange, mismatch escalates to point fetch + apply) for probabilistic capture-gap detection; mixed-mesh/epoch/fault-injection hardening; spot-check key provisioning decided here (ratified deferral); O1 remains the unwired fallback. |
 
@@ -110,11 +110,12 @@ bootstrap; no scheduled phase anywhere re-reads the keyspace.
 
 **S1 quick wins → S2 core → S3 removes the last full scan → S4 polish.**
 S1 [ae1](ae1-debt-hardening-loss-signal.md) landed 2026-09-12 with review
-PASS. **S2 is next and unblocked** — the ae1 dependency was soft ordering
-only; S2 carries the dominant risk (co-durability/capture/trim) and the
-"minimum viable convergence"; S3 supplies completeness (bootstrap) and the
-user edge, and is the point where the g8 full-CF scan disappears; S4 adds
-probabilistic detection and hardening.
+PASS. [S2 ae2](ae2-metadata-change-journal.md) landed 2026-09-12 with review
+PASS after 3 iterations plus a post-cap Docs close-out. **S3 is next and
+unblocked** — it supplies completeness (bootstrap) and the user edge, and is
+the point where the g8 full-CF scan disappears; S4 adds probabilistic
+detection and hardening. S2's cloud Pass B remains gated on the user's
+f4-resume go-ahead.
 
 **f4 mapping (f4 is paused; fleet at 0 resources; resume only on the user's
 go-ahead — PIPELINE §7):**
@@ -143,15 +144,15 @@ f0 hints-durability-gate   done 2026-09-11 ── ack boundary (complement)
 S1 ae1 debt-hardening + unrecoverable signal   done 2026-09-12 (review PASS)
         │  (soft ordering only)
         ▼
-S2 ae2 journal + sync (change edge)  ◄── ADR-0038 ratified 2026-09-12   (next; unblocked)
+S2 ae2 journal + sync (change edge)   done 2026-09-12 (review PASS after 3 iterations + post-cap docs close-out)
         │
         ▼
-S3 ae3 bootstrap + range iterator + read-trigger (ownership/user edge)
+S3 ae3 bootstrap + range iterator + read-trigger (ownership/user edge)   (next; unblocked)
         │
         ▼
 S4 ae4 spot-check + hardening
 
-f4 (paused): Pass A baseline ──► Pass B validates S2 ──► P3 re-run validates S3
+f4 (paused): Pass A baseline ──► Pass B validates S2 (gated on user go-ahead) ──► P3 re-run validates S3
 ```
 
 ## Mandatory N>RF test matrix (S3 acceptance gate)
@@ -185,10 +186,14 @@ weighted-ring harness:
       no hint mirroring; terminal no-live-holder signal with bounded dedupe,
       metric, and resume-on-return; existing suites show no regression (the
       one remaining failure is pre-existing and baseline-reproducing).
-- [ ] **S2:** ae2 lands with review PASS under the kill-switch default
-      (`enabled = false`), structurally inert (no journal I/O, no worker, no
-      RPC, no metrics), J1 fail-closed with group commit, and passes f4
-      Pass B once the fleet resumes (post-enable divergence assertions).
+- [x] **S2:** ae2 landed 2026-09-12 with review PASS after 3 iterations
+      (both HIGH defects fixed and independently re-verified; the post-cap
+      Docs close-out was approved by the user). Evidence: change edge green
+      (journal capture + durable watermarks + Tier-1 pull + HLC-LWW apply),
+      J1 fail-closed with group commit, kill-switch structurally inert
+      (no journal I/O / worker / RPC / metrics), in-process e2e 9/9. The
+      cloud f4 P4 Pass B item is gated on the user's f4-resume go-ahead
+      (fleet at 0 resources; PIPELINE §7) — a recorded deferral.
 - [ ] **S3:** ae3 spec + implementation land with review PASS — g8 golden
       equivalence, enable-time bootstrap, gap/new-owner/pool-loss triggers,
       read-trigger single-flight; the **N>RF matrix is green** and the f4 P3

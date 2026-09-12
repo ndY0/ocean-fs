@@ -125,6 +125,21 @@ service HealingRpc {
   // blind the reaper's byte accounting). Server-streaming; the
   // responder never buffers the whole range in memory.
   rpc ListObjectsInRange(ObjectRangeRequest) returns (stream MetadataRow);
+
+  // Pull a peer's metadata change journal past the caller's durable
+  // watermark (ADR-0038 D3; ae2 / S2). Unary, bounded by the caller's
+  // per-cycle budgets. `from_seq < oldest_seq` or a foreign epoch with
+  // prior progress returns a gap (empty entries) — the requester must
+  // bootstrap (S3), never skip sequence numbers. A disabled node answers
+  // `unavailable`.
+  rpc FetchJournal(FetchJournalRequest) returns (FetchJournalResponse);
+
+  // Point-fetch the CURRENT stored state of a bounded key set
+  // (ADR-0038 D5). Generalizes the FetchHintObject current-state pattern
+  // and reuses MetadataRow; keys are full store keys (`{bucket}\0{key}`),
+  // absent rows are simply not streamed, and supersede records never
+  // travel. Server-streaming. A disabled node answers `unavailable`.
+  rpc FetchMetadataRows(MetadataRowsRequest) returns (stream MetadataRow);
 }
 
 // Request for the replicated-lifecycle metadata pull (ADR-0035 D2).
@@ -403,4 +418,62 @@ message DeletionRow {
   bytes key = 1;
   // Serialized Tombstone (the deletions-CF value).
   bytes value = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Metadata change journal (ADR-0038; ae2 / S2)
+// ---------------------------------------------------------------------------
+
+// One metadata change record: `{seq, op, key, hlc}`, no row body. The
+// entry is a TRIGGER, not a value: the consumer point-fetches the key's
+// current state (FetchMetadataRows) and applies it with HLC-LWW, so a
+// stale entry self-corrects.
+message JournalEntry {
+  // Per-node monotonic sequence number, assigned at append.
+  uint64 seq = 1;
+  // 1 = put (live state), 2 = delete (plain tombstone).
+  uint32 op = 2;
+  // Full store key `{bucket}\0{key}`.
+  bytes key = 3;
+  // The logical version the apply carried.
+  oceanfs.common.HlcTimestamp hlc = 4;
+}
+
+// Request to pull a peer's journal past the caller's watermark.
+message FetchJournalRequest {
+  // The requester's view of the responder's epoch (empty when unknown).
+  bytes epoch = 1;
+  // Exclusive resume point (the requester's `consumed(responder)`).
+  uint64 from_seq = 2;
+  uint32 max_entries = 3;
+  uint64 max_bytes = 4;
+  // UTF-8 requester node id; the responder records `acked(requester)`.
+  bytes requester_id = 5;
+}
+
+message FetchJournalResponse {
+  // The responder's current epoch.
+  bytes epoch = 1;
+  // The replayable floor; `from_seq < oldest_seq` means the requested
+  // range is gone and the requester must bootstrap.
+  uint64 oldest_seq = 2;
+  // The entries in ascending sequence order (empty on a gap or when the
+  // requester is already current).
+  repeated JournalEntry entries = 3;
+  // Exclusive resume point for the next pull.
+  uint64 next_seq = 4;
+  // The responder's own `consumed(requester)` — lets the requester
+  // advance `acked(responder)` without a third RPC (ADR-0038 D3,
+  // bidirectional watermarks).
+  uint64 acknowledged_seq = 5;
+  // The epoch of the REQUESTER's journal that `acknowledged_seq` refers
+  // to (empty when unknown). The requester accepts the ack only when it
+  // matches its own current journal epoch — an ack from a previous epoch
+  // is meaningless.
+  bytes acknowledged_epoch = 6;
+}
+
+// A bounded set of full store keys to point-fetch.
+message MetadataRowsRequest {
+  repeated bytes keys = 1;
 }

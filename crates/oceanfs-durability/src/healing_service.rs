@@ -10,7 +10,10 @@ use oceanfs_core::{Hlc, HlcClock, NodeId, RemappedChunk, SegmentId, SegmentRemap
 use oceanfs_storage_api::SegmentDataStore;
 use tonic::{Request, Response, Status};
 
-use crate::scheduler::DurabilityBudget;
+use crate::{
+    healing_rpc::{FetchJournalRequest, FetchJournalResponse, MetadataRowsRequest},
+    scheduler::DurabilityBudget,
+};
 
 /// How long a `reason == Drain` re-replication request waits for the
 /// target's durable stamp (entry `Sealed` + `storage_locations`
@@ -340,6 +343,11 @@ pub struct HealingGrpcService {
     /// composition root over the concrete store). `None` (tests) makes
     /// the RPC return `Unavailable`.
     range_lister: Option<Arc<dyn MetadataRangeLister>>,
+    /// Enabled-only metadata-sync service (ADR-0038; ae2 / S2): the
+    /// journal `FetchJournal` serves and the watermark store it records
+    /// acks into. `None` (disabled node, tests) makes both metadata-sync
+    /// RPCs answer `Unavailable`.
+    metadata_sync: Option<Arc<crate::metadata_sync::MetadataSyncService>>,
 }
 
 impl HealingGrpcService {
@@ -377,6 +385,7 @@ impl HealingGrpcService {
                 oceanfs_core::LabelSet::empty(),
             ),
             range_lister: None,
+            metadata_sync: None,
         }
     }
 
@@ -399,6 +408,18 @@ impl HealingGrpcService {
     #[must_use]
     pub fn with_range_lister(mut self, lister: Arc<dyn MetadataRangeLister>) -> Self {
         self.range_lister = Some(lister);
+        self
+    }
+
+    /// Wires the enabled-only metadata-sync service (ADR-0038; ae2 / S2).
+    /// Without it `FetchJournal` and `FetchMetadataRows` answer
+    /// `Unavailable` — the mixed-kill-switch behavior.
+    #[must_use]
+    pub fn with_metadata_sync(
+        mut self,
+        service: Arc<crate::metadata_sync::MetadataSyncService>,
+    ) -> Self {
+        self.metadata_sync = Some(service);
         self
     }
 
@@ -803,6 +824,8 @@ impl HealingRpc for HealingGrpcService {
     type FetchSegmentLifecycleMetadataStream =
         tokio_stream::wrappers::ReceiverStream<Result<SegmentLifecycleEntry, Status>>;
     type ListObjectsInRangeStream =
+        tokio_stream::wrappers::ReceiverStream<Result<MetadataRow, Status>>;
+    type FetchMetadataRowsStream =
         tokio_stream::wrappers::ReceiverStream<Result<MetadataRow, Status>>;
 
     async fn hinted_handoff_single(
@@ -2033,6 +2056,36 @@ impl HealingRpc for HealingGrpcService {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         Arc::clone(lister).stream_range(start, end, tx);
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+
+    async fn fetch_journal(
+        &self,
+        request: Request<FetchJournalRequest>,
+    ) -> Result<Response<FetchJournalResponse>, Status> {
+        let Some(service) = self.metadata_sync.clone() else {
+            return Err(Status::unavailable(
+                "FetchJournal is not configured on this node (metadata_sync disabled)",
+            ));
+        };
+        let request = request.into_inner();
+        let response = tokio::task::spawn_blocking(move || service.fetch_journal(request))
+            .await
+            .map_err(|error| Status::internal(format!("journal read task failed: {error}")))?
+            .map_err(Status::internal)?;
+        Ok(Response::new(response))
+    }
+
+    async fn fetch_metadata_rows(
+        &self,
+        request: Request<MetadataRowsRequest>,
+    ) -> Result<Response<Self::FetchMetadataRowsStream>, Status> {
+        let Some(service) = self.metadata_sync.clone() else {
+            return Err(Status::unavailable(
+                "FetchMetadataRows is not configured on this node (metadata_sync disabled)",
+            ));
+        };
+        let keys = request.into_inner().keys;
+        Ok(Response::new(service.metadata_rows(keys)))
     }
 }
 

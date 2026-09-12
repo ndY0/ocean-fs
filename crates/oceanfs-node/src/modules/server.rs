@@ -863,6 +863,11 @@ impl ServerModule {
                 storage.metadata_store.clone(),
             ),
         ));
+        // ae2 (ADR-0038): the enabled-only metadata journal pull + point
+        // fetch handlers. A disabled node leaves both RPCs `Unavailable`.
+        if let Some(metadata_sync) = durability.metadata_sync_service() {
+            healing_service = healing_service.with_metadata_sync(metadata_sync);
+        }
         healing_service.register_metrics(&*metrics);
         let cache_service = oceanfs_server::grpc::cache_service::CacheGrpcService::new(
             Some(object_cache),

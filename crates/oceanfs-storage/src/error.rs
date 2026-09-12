@@ -64,6 +64,12 @@ pub enum Error {
     #[error("invalid config: {0}")]
     InvalidConfig(String),
 
+    /// A metadata change-journal (ADR-0038) format, limit, or state
+    /// violation: oversized keys, non-monotonic sequences, a failed
+    /// journal, or structurally invalid framing.
+    #[error("metadata journal: {0}")]
+    Journal(String),
+
     /// The async append path waited for a slot re-activation past its
     /// deadline (bounded backpressure). The caller propagates this as a
     /// retryable overload response (`503 SlowDown`) — the write was not

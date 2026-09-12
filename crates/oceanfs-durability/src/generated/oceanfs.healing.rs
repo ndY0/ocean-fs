@@ -394,6 +394,76 @@ pub struct DeletionRow {
     #[prost(bytes = "bytes", tag = "2")]
     pub value: ::prost::bytes::Bytes,
 }
+/// One metadata change record: `{seq, op, key, hlc}`, no row body. The
+/// entry is a TRIGGER, not a value: the consumer point-fetches the key's
+/// current state (FetchMetadataRows) and applies it with HLC-LWW, so a
+/// stale entry self-corrects.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct JournalEntry {
+    /// Per-node monotonic sequence number, assigned at append.
+    #[prost(uint64, tag = "1")]
+    pub seq: u64,
+    /// 1 = put (live state), 2 = delete (plain tombstone).
+    #[prost(uint32, tag = "2")]
+    pub op: u32,
+    /// Full store key `{bucket}\0{key}`.
+    #[prost(bytes = "bytes", tag = "3")]
+    pub key: ::prost::bytes::Bytes,
+    /// The logical version the apply carried.
+    #[prost(message, optional, tag = "4")]
+    pub hlc: ::core::option::Option<::oceanfs_core::proto::common::HlcTimestamp>,
+}
+/// Request to pull a peer's journal past the caller's watermark.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FetchJournalRequest {
+    /// The requester's view of the responder's epoch (empty when unknown).
+    #[prost(bytes = "bytes", tag = "1")]
+    pub epoch: ::prost::bytes::Bytes,
+    /// Exclusive resume point (the requester's `consumed(responder)`).
+    #[prost(uint64, tag = "2")]
+    pub from_seq: u64,
+    #[prost(uint32, tag = "3")]
+    pub max_entries: u32,
+    #[prost(uint64, tag = "4")]
+    pub max_bytes: u64,
+    /// UTF-8 requester node id; the responder records `acked(requester)`.
+    #[prost(bytes = "bytes", tag = "5")]
+    pub requester_id: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FetchJournalResponse {
+    /// The responder's current epoch.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub epoch: ::prost::bytes::Bytes,
+    /// The replayable floor; `from_seq < oldest_seq` means the requested
+    /// range is gone and the requester must bootstrap.
+    #[prost(uint64, tag = "2")]
+    pub oldest_seq: u64,
+    /// The entries in ascending sequence order (empty on a gap or when the
+    /// requester is already current).
+    #[prost(message, repeated, tag = "3")]
+    pub entries: ::prost::alloc::vec::Vec<JournalEntry>,
+    /// Exclusive resume point for the next pull.
+    #[prost(uint64, tag = "4")]
+    pub next_seq: u64,
+    /// The responder's own `consumed(requester)` — lets the requester
+    /// advance `acked(responder)` without a third RPC (ADR-0038 D3,
+    /// bidirectional watermarks).
+    #[prost(uint64, tag = "5")]
+    pub acknowledged_seq: u64,
+    /// The epoch of the REQUESTER's journal that `acknowledged_seq` refers
+    /// to (empty when unknown). The requester accepts the ack only when it
+    /// matches its own current journal epoch — an ack from a previous epoch
+    /// is meaningless.
+    #[prost(bytes = "bytes", tag = "6")]
+    pub acknowledged_epoch: ::prost::bytes::Bytes,
+}
+/// A bounded set of full store keys to point-fetch.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MetadataRowsRequest {
+    #[prost(bytes = "bytes", repeated, tag = "1")]
+    pub keys: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
+}
 /// Why a re-replication repair was requested (ADR-0029 §D6 urgency; the
 /// worker reports it as `oceanfs_repair_queue_depth{priority}`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -830,6 +900,67 @@ pub mod healing_rpc_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Pull a peer's metadata change journal past the caller's durable
+        /// watermark (ADR-0038 D3; ae2 / S2). Unary, bounded by the caller's
+        /// per-cycle budgets. `from_seq < oldest_seq` or a foreign epoch with
+        /// prior progress returns a gap (empty entries) — the requester must
+        /// bootstrap (S3), never skip sequence numbers. A disabled node answers
+        /// `unavailable`.
+        pub async fn fetch_journal(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FetchJournalRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FetchJournalResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/oceanfs.healing.HealingRpc/FetchJournal",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("oceanfs.healing.HealingRpc", "FetchJournal"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Point-fetch the CURRENT stored state of a bounded key set
+        /// (ADR-0038 D5). Generalizes the FetchHintObject current-state pattern
+        /// and reuses MetadataRow; keys are full store keys (`{bucket}\0{key}`),
+        /// absent rows are simply not streamed, and supersede records never
+        /// travel. Server-streaming. A disabled node answers `unavailable`.
+        pub async fn fetch_metadata_rows(
+            &mut self,
+            request: impl tonic::IntoRequest<super::MetadataRowsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::MetadataRow>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/oceanfs.healing.HealingRpc/FetchMetadataRows",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("oceanfs.healing.HealingRpc", "FetchMetadataRows"),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -965,6 +1096,37 @@ pub mod healing_rpc_server {
             request: tonic::Request<super::ObjectRangeRequest>,
         ) -> std::result::Result<
             tonic::Response<Self::ListObjectsInRangeStream>,
+            tonic::Status,
+        >;
+        /// Pull a peer's metadata change journal past the caller's durable
+        /// watermark (ADR-0038 D3; ae2 / S2). Unary, bounded by the caller's
+        /// per-cycle budgets. `from_seq < oldest_seq` or a foreign epoch with
+        /// prior progress returns a gap (empty entries) — the requester must
+        /// bootstrap (S3), never skip sequence numbers. A disabled node answers
+        /// `unavailable`.
+        async fn fetch_journal(
+            &self,
+            request: tonic::Request<super::FetchJournalRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FetchJournalResponse>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the FetchMetadataRows method.
+        type FetchMetadataRowsStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::MetadataRow, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Point-fetch the CURRENT stored state of a bounded key set
+        /// (ADR-0038 D5). Generalizes the FetchHintObject current-state pattern
+        /// and reuses MetadataRow; keys are full store keys (`{bucket}\0{key}`),
+        /// absent rows are simply not streamed, and supersede records never
+        /// travel. Server-streaming. A disabled node answers `unavailable`.
+        async fn fetch_metadata_rows(
+            &self,
+            request: tonic::Request<super::MetadataRowsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::FetchMetadataRowsStream>,
             tonic::Status,
         >;
     }
@@ -1535,6 +1697,98 @@ pub mod healing_rpc_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ListObjectsInRangeSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/oceanfs.healing.HealingRpc/FetchJournal" => {
+                    #[allow(non_camel_case_types)]
+                    struct FetchJournalSvc<T: HealingRpc>(pub Arc<T>);
+                    impl<
+                        T: HealingRpc,
+                    > tonic::server::UnaryService<super::FetchJournalRequest>
+                    for FetchJournalSvc<T> {
+                        type Response = super::FetchJournalResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::FetchJournalRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as HealingRpc>::fetch_journal(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = FetchJournalSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/oceanfs.healing.HealingRpc/FetchMetadataRows" => {
+                    #[allow(non_camel_case_types)]
+                    struct FetchMetadataRowsSvc<T: HealingRpc>(pub Arc<T>);
+                    impl<
+                        T: HealingRpc,
+                    > tonic::server::ServerStreamingService<super::MetadataRowsRequest>
+                    for FetchMetadataRowsSvc<T> {
+                        type Response = super::MetadataRow;
+                        type ResponseStream = T::FetchMetadataRowsStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::MetadataRowsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as HealingRpc>::fetch_metadata_rows(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = FetchMetadataRowsSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

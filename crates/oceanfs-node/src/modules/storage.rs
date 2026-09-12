@@ -953,6 +953,12 @@ impl StorageModule {
         self.segment_replicator.register_metrics(metrics);
         // Register RocksDB property gauges into the central registry.
         self.metadata_store.metrics().register(metrics);
+        // ae2 (ADR-0038): the metadata change-journal series. Registered
+        // only when the journal is enabled (the handle is absent on a
+        // disabled node, so no series appears).
+        if let Some(journal) = self.metadata_store.metadata_journal() {
+            journal.metrics().register(metrics);
+        }
         // Start the background RocksDB metrics polling task (every 30s).
         // The task is cancellable — the node cancels its token during
         // shutdown and awaits the handle so the DB handle is released
@@ -1058,6 +1064,15 @@ pub(crate) mod test_support {
     /// pool) and runs `StorageModule::build`. ADR-0031 (f1): the config
     /// declares the mandatory four-role topology.
     pub(crate) async fn build_storage_prelude(tmp: &TempDir) -> StoragePrelude {
+        build_storage_prelude_with(tmp, |_| {}).await
+    }
+
+    /// [`build_storage_prelude`] with a config-mutation hook (tests that
+    /// need `[metadata_sync] enabled = true` before the journal opens).
+    pub(crate) async fn build_storage_prelude_with(
+        tmp: &TempDir,
+        mutate: impl FnOnce(&mut NodeConfig),
+    ) -> StoragePrelude {
         // Pool roots are siblings under the tempdir, so `data_dir` is a
         // subdir (disjointness rule).
         let data_dir = tmp.path().join("data");
@@ -1076,7 +1091,7 @@ pub(crate) mod test_support {
                 health: Default::default(),
             }
         }
-        let config = NodeConfig {
+        let mut config = NodeConfig {
             data_dir: data_dir.clone(),
             // ADR-0031: pools are mandatory (data first = pool id 0).
             storage: oceanfs_core::StorageConfig {
@@ -1097,16 +1112,32 @@ pub(crate) mod test_support {
             },
             ..NodeConfig::default()
         };
+        mutate(&mut config);
         let registry = Arc::new(
             oceanfs_storage::PoolRegistry::from_config(&config.storage, &data_dir)
                 .expect("pool registry"),
         );
         let paths = crate::pool_paths::pool_paths(&registry);
+        // Mirror `Node::start()` §1: the journal opens only when enabled.
+        let metadata_journal = if config.metadata_sync.enabled {
+            Some(Arc::new(
+                oceanfs_storage::MetadataJournal::open(
+                    &paths.metadata_journal,
+                    &oceanfs_core::NodeId::new(&config.node_id),
+                )
+                .expect("metadata journal"),
+            ))
+        } else {
+            None
+        };
         let metadata_store = Arc::new(
-            oceanfs_storage::RocksDbMetadataStore::open(&oceanfs_core::MetadataConfig {
-                data_dir: paths.metadata.clone(),
-                ..Default::default()
-            })
+            oceanfs_storage::RocksDbMetadataStore::open_with_journal(
+                &oceanfs_core::MetadataConfig {
+                    data_dir: paths.metadata.clone(),
+                    ..Default::default()
+                },
+                metadata_journal,
+            )
             .expect("metadata store"),
         );
         let accel =

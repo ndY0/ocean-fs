@@ -45,7 +45,10 @@ pub use io::{
     DiskIo, FaultyIo, IoBackend, IoErrorKind, IoObserver, IoOp, IoReadMode, NoopIoObserver,
     ObservedIo, SegmentWriteMode,
 };
-pub use metadata::{BatchOp, RocksDbMetadataStore, RocksDbMetrics};
+pub use metadata::{
+    BatchOp, JournalEntry, JournalEpoch, JournalMetrics, JournalOp, JournalRead, MetadataJournal,
+    RocksDbMetadataStore, RocksDbMetrics, SyncApplyOutcome,
+};
 pub use pool::{
     drain::{DetachError, DrainMode, DrainState, DrainStateError},
     health::{

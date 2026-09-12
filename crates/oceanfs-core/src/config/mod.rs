@@ -11,6 +11,7 @@ mod durability;
 mod event_wal;
 mod lifecycle;
 mod metadata;
+mod metadata_sync;
 mod node;
 mod ring;
 pub mod shard;
@@ -24,6 +25,7 @@ pub use durability::DurabilityConfig;
 pub use event_wal::EventWalConfig;
 pub use lifecycle::LifecycleConfig;
 pub use metadata::MetadataConfig;
+pub use metadata_sync::MetadataSyncConfig;
 pub use node::{AntiEntropyConfig, NodeConfig};
 pub use ring::RingConfig;
 // The storage-pool definition type is named `PoolConfig` in this module, but

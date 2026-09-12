@@ -31,3 +31,27 @@ pub fn object_key_bytes(row_key: &[u8]) -> Option<Vec<u8>> {
         None => None,
     }
 }
+
+/// Splits a full object store key `{bucket}\0{key}` into its parts.
+///
+/// Unlike [`object_key_bytes`] this preserves the bucket, which the
+/// metadata-sync point fetch needs to address the store. Supersede-shaped
+/// deletions keys are rejected: they are GC accounting, never row
+/// identities.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_storage::metadata::split_object_row_key;
+///
+/// let row = b"photos\0cat.jpg";
+/// assert_eq!(split_object_row_key(row), Some(("photos", "cat.jpg")));
+/// assert_eq!(split_object_row_key(b"no-nul"), None);
+/// ```
+pub fn split_object_row_key(row_key: &[u8]) -> Option<(&str, &str)> {
+    match cf::decode_deletions_key(row_key)? {
+        cf::DeletionsKey::Plain { .. } => {}
+        cf::DeletionsKey::Supersede { .. } => return None,
+    }
+    cf::decode_object_key(row_key)
+}

@@ -33,6 +33,7 @@ pub mod gc;
 pub mod heal;
 pub mod hinted_handoff;
 pub mod merkle;
+pub mod metadata_sync;
 pub mod peer_selection;
 pub mod reconcile;
 pub mod repair;
@@ -60,6 +61,10 @@ pub use hinted_handoff::{
     GrpcHintDeliveryClient, GrpcHintObjectFetcher, HintDeliveryClient, HintDropRecord,
     HintDropSink, HintIoRecorder, HintObjectFetcher, HintObjectReader, HintRecord, HintWal,
     HintedHandoff, HintedHandoffConfig, HintedHandoffManager,
+};
+pub use metadata_sync::{
+    BootstrapEnqueuer, BootstrapReason, MetadataSync, MetadataSyncMetrics, MetadataSyncService,
+    PeerWatermark, WatermarkStore,
 };
 pub use peer_selection::{PartitionPlanner, PeerSelector};
 pub use reconcile::{

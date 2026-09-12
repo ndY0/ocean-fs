@@ -110,6 +110,8 @@ pub(crate) fn replacement_marker_path(paths: &PoolPaths) -> std::path::PathBuf {
 /// # let registry = Arc::new(PoolRegistry::from_config(&storage, &data_dir).expect("registry"));
 /// # let paths = PoolPaths {
 /// #     metadata: tmp.path().join("pool-meta"),
+/// #     metadata_journal: tmp.path().join("pool-meta").join("metadata-journal"),
+/// #     metadata_watermarks: tmp.path().join("pool-meta").join("metadata_sync").join("watermarks"),
 /// #     wal: tmp.path().join("pool-wal"),
 /// #     event_wal: tmp.path().join("pool-wal").join("event-wal"),
 /// #     hints: tmp.path().join("pool-hints"),
