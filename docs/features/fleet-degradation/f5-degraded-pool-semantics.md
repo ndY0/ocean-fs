@@ -1,7 +1,7 @@
 ---
 feature: "Degraded-Pool Semantics & Detector Configuration (pre-f4 Bug-Fix Gate)"
 epic: "fleet-degradation"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -18,7 +18,7 @@ adr:
   - 0033-manifest-aware-peer-selection
 perf: []
 created: 2026-09-11
-updated: 2026-09-11
+updated: 2026-09-12
 ---
 
 # Degraded-Pool Semantics & Detector Configuration (pre-f4 Bug-Fix Gate)
@@ -319,13 +319,13 @@ health = { latency_factor = 2.0, trend_min_windows = 4 }   # per-pool override
 
 | Metric | Kind | Change |
 |---|---|---|
-| `oceanfs_routing_read_skips_total` | counter | Semantics: counts only hard exclusions; Degraded no longer increments |
-| `oceanfs_routing_write_skips_total` | counter | Same |
+| `oceanfs_routing_manifest_skips_total{path="read"}` | counter | Semantics: counts only hard exclusions; Degraded no longer increments |
+| `oceanfs_routing_manifest_skips_total{path="write"}` | counter | Same |
 | `oceanfs_routing_degraded_fallbacks_total{path}` | counter (new) | Fallback tier was consulted (`read`/`write`) — proposed name |
-| `oceanfs_reconcile_queue_depth{priority}` | gauge (new) | Bounded queue occupancy (the requested overflow gauge) |
+| `oceanfs_reconcile_queue_depth` | gauge (new) | Bounded queue occupancy (single urgency class; the proposed `{priority}` label was dropped — see Deviations) |
 | `oceanfs_reconcile_queue_overflow_total` | counter (new) | Intents dropped at the bound — overflow is observable, never silent |
 | `hinted_handoff_hints_dropped_total` | counter (existing) | Unchanged; remains the trigger counter for intent conversion |
-| `oceanfs_repair_enqueued_total` | counter (existing) | Now also counts hint-drop-derived repair intents (reason label if added) |
+| `oceanfs_repair_enqueued_total` | counter (existing) | Counts the reconciliation drift-scan enqueues AND the hint-drop bridge intents (shared counter handle) |
 | `oceanfs_ranges_under_replicated` | gauge (existing) | Must move with the D2 accounting |
 
 ### Module-boundary signatures (sketch — names finalized in implementation)
@@ -407,10 +407,10 @@ hint batch delivery → receiver retry_indices → attempts > max_delivery_attem
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds in every affected crate
+- [x] **Code:** `cargo build --all-targets` succeeds in every affected crate
       (`oceanfs-core`, `oceanfs-storage`, `oceanfs-node`, `oceanfs-server`,
       `oceanfs-durability`); no `unsafe`, no test-only product hooks.
-- [ ] **Tests (unit — each changed gate):**
+- [x] **Tests (unit — each changed gate):**
       - Degraded read fallback: a Degraded candidate is consulted after the
         Preferred ones and serves the read; both-exhausted still fails;
       - Degraded replication fallback: a write reaches W with a Degraded
@@ -428,25 +428,25 @@ hint batch delivery → receiver retry_indices → attempts > max_delivery_attem
         observable and does not grow the heap unboundedly;
       - config parsing/validation: `[storage.health]` + per-pool override
         merge, invalid values rejected, existing defaults unchanged.
-- [ ] **Tests (no regression):** existing suites pass —
+- [x] **Tests (no regression):** existing suites pass —
       `cargo test -p oceanfs-node --lib -- --test-threads=1`,
       `-p oceanfs-durability`, `-p oceanfs-server`, `-p oceanfs-storage`,
       `-p oceanfs-core` (RocksDB-affected crates serialized per PIPELINE
       §4.6). No `load_*` suite on the dev machine (PIPELINE §6).
-- [ ] **Docs:** every new/changed `pub` item has `# Examples`;
+- [x] **Docs:** every new/changed `pub` item has `# Examples`;
       `#![deny(missing_docs)]` passes in the affected crates; the config
       reference documents `[storage.health]`, the merge/validation rules,
       and each new knob.
-- [ ] **ADR:** ADR-0029 §D3/D5 (Degraded = suspicion; the cache optimizes,
+- [x] **ADR:** ADR-0029 §D3/D5 (Degraded = suspicion; the cache optimizes,
       the error path guarantees; `write_degraded` role consequence),
       ADR-0027 D2 (debt is bounded, never silent; the coordinator owns
       convergence), ADR-0030 (repair intents flow through the target-pull
       dispatcher), and ADR-0033 (manifest-aware selection) are satisfied;
       no new test-only hook.
-- [ ] **Perf:** `perf: []`; the reconciliation queue is bounded (perf 2.6),
+- [x] **Perf:** `perf: []`; the reconciliation queue is bounded (perf 2.6),
       candidate tiering stays allocation-light on hot paths (perf 1.3/2.4
       lock-free manifest reads), and no fleet run asserts a perf bound.
-- [ ] **Integration (fleet acceptance):** on the cloud fleet via
+- [x] **Integration (fleet acceptance):** on the cloud fleet via
       `run-phase4.sh` (PIPELINE §6), the **existing f3 `load_degraded` full
       run passes all four scenarios with 0 manifest mismatches and all
       injections `success=true`**, and a `--no-injections` control run
@@ -455,13 +455,14 @@ hint batch delivery → receiver retry_indices → attempts > max_delivery_attem
       `f5-rerun-control-…`) and linked from this doc. Any assertion change
       needed to observe a fixed gate is a recorded deviation (no new
       scenario).
-- [ ] **Integration (docs):** the epic DAG/table shows f5 as the pre-f4
+- [x] **Integration (docs):** the epic DAG/table shows f5 as the pre-f4
       bug-fix gate; f3's fleet-run DoD item is annotated as overruled as a
       closure gate and f3 stays open until this feature's rerun passes; no
       artifact file is modified.
-- [ ] **Deviations:** implementation-shape choices (OQ answers), the
+- [x] **Deviations:** implementation-shape choices (OQ answers), the
       queue-bound value, the intent message shape, the final config schema,
       and any rerun finding are recorded in this doc.
+<!-- REVIEW (iteration 2, 2026-09-12): all ten review-1 gaps independently re-verified — (1) write-fallback test `degraded_peer_is_attempted_as_write_fallback_without_debt` (Fallback attempted+acked, no debt; Excluded still owed; fallback tier consulted exactly once); (2) live skip counters — `read_candidate_class`/`write_target_class` increment on `Excluded` only, are registered, and are reached from the production coordinator/fetch paths; (3) bridge test `hint_drop_bridge_dispatches_one_intent_per_held_segment`; (4) shared `oceanfs_repair_enqueued_total` handle (`ReconciliationLoop::repair_enqueued_counter` + `with_repair_enqueued_counter`, wired at `modules/durability.rs:504-513`); (5) Deviations section populated; (6) `{priority}` drop recorded (final gauge unlabeled); (7) the two read-tier fetch tests; (8) `# Examples` added for `HintDropRecord`, `HintDropRepairBridge`+`new`/`with_repair_enqueued_counter`, `StorageConfig` accessors, and the module doc now carries `[storage.health]`+merge; (9) `hint_delivery` test lints fixed (`StdMutex`, Copy clone); (10) frontmatter `updated: 2026-09-12`. Commands reproduced: `cargo build --all-targets` clean; `cargo fmt --all -- --check` clean; lib suites core 239 / storage 538 / server 264 / node 123 / durability 294 (0 failed, `--test-threads=1`); doctests pass; `RUSTDOCFLAGS="-D warnings" cargo doc` clean; `cargo clippy --lib -- -D warnings` clean in all five crates. Fleet artifact `f5-rerun-full-20260912.json`: 50/50 assertions, 0 manifest mismatches, 6/6 injections `success=true`; control 8/8. Non-blocking notes: `ReconciliationLoop::repair_enqueued_counter` (reconcile.rs:476) has no `# Examples` (trivial accessor, same as sibling `holder_index`; doc examples are explicitly non-gating per the note below); the integration red `routing_manifests::write_degraded_peer_is_routed_around` is pre-existing (reproduced at the f5 base `3081da5`; recorded in f0's review notes), not an f5 regression. -->
 
 > **Lint & Doc Examples (non-gating):** `cargo clippy --lib -- -D warnings`
 > should pass on production code. Test-code clippy warnings (`.unwrap()`,
@@ -500,7 +501,62 @@ must not be re-litigated.
 
 ## Deviations (accepted)
 
-_None yet — filled at implementation close._
+Implementation-shape choices (the OQ answers) and the rerun findings:
+
+- **D1 ordering representation.** Two explicit tier lists, built once per
+  operation on the calling coordinator (`order_read_candidates` for reads;
+  `preferred_targets`/`fallback_targets` in the write fan-out, Preferred
+  first, input order preserved inside a tier, unknown-manifest peers =
+  Preferred, hard exclusions dropped). The write tiering lives at the
+  coordinator call site, not inside `RoutingHint`, because it must run on
+  the same pass that collects failures for the hint ledger.
+- **D1 skip counters.** `oceanfs_routing_manifest_skips_total{path="read"}`
+  / `{path="write"}` are incremented from the tier
+  classification itself (`read_candidate_class`/`write_target_class` in
+  `ManifestCache`), so hard exclusions are counted exactly once per
+  consulted candidate and Degraded fallbacks never increment them. The
+  binary `exclude_*` trait methods delegate to the tier methods.
+- **D2 storage placement.** No `oceanfs-storage` change was needed: the
+  repair write path resolves the segment's recorded `pool_id` without a
+  status gate, so a dispatched repair can already land on a Degraded pool.
+  The `ManifestRepairTargetSelector` change supplies the
+  healthy-preferred/degraded-fallback *node* choice.
+- **D3 repair-intent shape.** `HintDropRecord { segment_id, intended_for }`
+  plus a node-side `HintDropRepairBridge` emitting one `ReRepRequest`
+  (`RepairReason::Reconciliation`) per held segment through the existing
+  ADR-0030 dispatcher; segments the node does not hold are skipped. Dedup
+  is per delivery cycle (upstream, by segment); the bridge fans out to the
+  recorded holder set (≤ RF). `oceanfs_repair_enqueued_total` counts the
+  emitted intents through a counter handle shared with the reconciliation
+  loop.
+- **D3 queue bound.** `ReconcileConfig::max_queue_depth = 10 000`,
+  drop-new: the overflowing intent is not enqueued,
+  `oceanfs_reconcile_queue_overflow_total` increments, and the segment
+  stays discoverable by the drift scan / next holder event. Dedup is
+  unchanged (a segment already in flight is not re-enqueued).
+- **D3 queue-depth metric.** Final name `oceanfs_reconcile_queue_depth`, a
+  single unlabeled gauge: the queue has one urgency class (live count), so
+  the proposed `{priority}` label would be constant. The dispatcher's
+  parked-repair gauges (`announcement`/`reconciliation`) remain the
+  per-priority observability.
+- **D4 config schema (OQ).** `[storage.health]` holds `PoolHealthOverride`
+  (all fields optional) merged field-by-field over the hard-coded
+  `PoolHealthConfig::default()`; a pool's inline `health` table merges over
+  that resolved global (per-pool wins). Final new knobs:
+  `trend_doubling_factor` (2.0), `trend_min_windows` (3),
+  `trend_latency_percentile` (`p50|p99|p999`, default `p99`),
+  `history_max_windows` (64), `smart_growth` (per-tech counter lists:
+  hdd/ssd/nvme/cloud_ephemeral), `hints_probe_divisor` (6). Monitor-level
+  keys (`monitor_tick_interval_secs`, `event_capacity`,
+  `hints_probe_divisor`) are global-only and rejected on a pool table.
+  Existing defaults reproduce the pre-f5 hard-coded behavior exactly.
+- **Acceptance assertion A-change.** `s4_heal_failed_zero` →
+  `s4_heal_failures_observed_evidence` (user decision A, 2026-09-11):
+  recorded evidence of the heal-counter classification finding (benign
+  stale-segment / no-local-shard races counted as permanent failures) is
+  the correct S4 contract; exact repair-failure assertions belong to f4's
+  pool-role scenarios. The green rerun is
+  [f5-rerun-full-20260912.json](artifacts/f5-rerun-full-20260912.json).
 
 ### Pre-close findings (2026-09-11, f5 acceptance rerun)
 
@@ -519,3 +575,20 @@ _None yet — filled at implementation close._
   belong to f4's pool-role scenarios. Artifacts:
   [f5-rerun-full-20260911.json](artifacts/f5-rerun-full-20260911.json),
   [f5-rerun-control-20260911.json](artifacts/f5-rerun-control-20260911.json).
+- **Fleet acceptance rerun green (2026-09-12, post-A).** The full
+  `load_degraded` run on the freshly provisioned volume-backed fleet passed
+  all four scenarios: **50/50 assertions, 0 manifest mismatches, 0 failed
+  injections** (6 records: `vm_kill`, `latency`, `latency_remove`,
+  `disk_fill`, `disk_fill_remove`, `segment_corrupt`), including
+  `s4_heal_failures_observed_evidence` — the A-change replacement for
+  `s4_heal_failed_zero` — and `cluster_healthy_at_end`. No perf assertion is
+  present. Artifact:
+  [f5-rerun-full-20260912.json](artifacts/f5-rerun-full-20260912.json)
+  (seed 42, duration 341s). The `--no-injections` control from 2026-09-11
+  (8/8 pass) remains valid: the A-change only touched a full-run assertion.
+  The 2026-09-12 fleet was re-provisioned from scratch (the f3 fleet had
+  been destroyed) via `vm-provision.sh --volume-pools`; the provisioning
+  script was interrupted mid-run and completed manually, with the
+  provisioning record reconstructed from the live account before the
+  deploy — the acceptance run itself used the standard
+  `run-phase4.sh --full` path.

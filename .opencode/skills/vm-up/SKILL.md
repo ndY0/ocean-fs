@@ -46,6 +46,15 @@ Prometheus scraping **all** nodes (`instance=oceanfs-node-0..N-1`), so
 Grafana can follow each VM individually. Cost: ~€0.09/h for 3 nodes +
 CX43 harness — a 5-min smoke run costs about a cent.
 
+**Billing is time-based, not usage-based (HARD).** Servers bill while they
+exist even when powered off (the TTL timer only powers them off), and every
+created resource bills a **minimum 1-hour frame** even if deleted minutes
+later. Only destroy stops the meter; a provision → run → destroy cycle
+inside one hour costs the full hour per resource. Never provision
+speculatively, never create/destroy in a loop to test scripts
+(`--dry-run` is free), and hand teardown to **vm-down** at the end of the
+session — see PIPELINE §7.
+
 **Phase 2 sizing — SUT is CX33 (8 GB), not CX23.** The load-test deploy
 profile (`scripts/sut-deploy.sh`) targets the 8 GB CX33 (generous caches,
 16 MiB bodies — restored in commit `5e7aa70`) so CPU (hashing, EC encode)

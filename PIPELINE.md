@@ -248,3 +248,30 @@ machine (memory pressure, disk churn, CPU saturation).
 Violating this rule risks the host machine (the 2026-09-04 incident:
 `load_cluster_churn` was started on the dev laptop by a reviewer agent).
 
+## 7. Hetzner Billing Discipline (HARD — never surprise the user with cost)
+
+Facts (user-stipulated 2026-09-12; verified against the account):
+
+1. **Servers bill while they exist, powered ON or OFF.** The TTL timer
+   (`oceanfs-ttl.timer`) only powers a VM off — it does **not** stop
+   billing. Only deletion (`vm-provision.sh --destroy`) stops it.
+2. **Every created resource bills a minimum 1-hour frame**, even if it is
+   deleted minutes later. A provision → run → destroy cycle inside one hour
+   costs the full hour **per resource** (a 3-node fleet with volumes = 4
+   servers + 15 volumes = 19 resource-hours per cycle).
+3. Volumes bill per GB-hour while they exist, detached included (ADR-0019 /
+   fleet-degradation f1 guardrail).
+
+**Rules for every agent:**
+
+- Provision only when the user asked for a cloud run, and only the fleet
+  that run needs. Never provision "to check something quickly".
+- **Destroy at the end of every session** — or leave the fleet up only if
+  the user explicitly said to keep it. Then verify: `hcloud server list`
+  and `hcloud volume list` show **0** entries for the prefix. A surviving
+  resource is a billing incident, not a warning.
+- Do not create/destroy repeatedly to "test" scripts — each cycle bills the
+  1-hour minimum per resource. Use `--dry-run` for script checks.
+- `--status` / `vm-status` is free; powering VMs back on within an existing
+  billing frame is fine, but the session must still end with a destroy.
+

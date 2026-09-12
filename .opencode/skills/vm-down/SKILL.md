@@ -100,7 +100,11 @@ reports and Prometheus data **before** destruction.
   (SUT TSDB snapshot) plus the structured LoadReport JSONs.
 - The TTL timer normally poweroffs the VMs first; vm-down is the full
   cleanup (delete). Destroyed VMs cannot be recovered — hence the
-  `preserve-data` step for anything that matters.
+  `preserve-data` step for anything that matters. **Poweroff does NOT stop
+  billing:** Hetzner bills servers while they exist (on or off) and bills a
+  minimum **1-hour frame per created resource** even after early deletion.
+  A session that ends with VMs merely powered off is a billing incident —
+  destroy is mandatory (PIPELINE §7).
 - If `hcloud` reports the VMs already gone, still clean the local state
   and return `destroyed: true`.
 - **Volume guarantee (fleet-degradation f1):** a destroy that cannot delete

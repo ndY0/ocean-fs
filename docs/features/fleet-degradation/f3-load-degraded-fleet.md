@@ -1,7 +1,7 @@
 ---
 feature: "load_degraded — Fleet-Ready Phase 4 Degraded Mode Under Load"
 epic: "fleet-degradation"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies:
@@ -20,7 +20,7 @@ adr:
   - 0019-test-harness-topology-cost-guardrails
 perf: []
 created: 2026-09-11
-updated: 2026-09-11
+updated: 2026-09-12
 ---
 
 # load_degraded — Fleet-Ready Phase 4 Degraded Mode Under Load
@@ -255,12 +255,12 @@ are product-side. The failing assertions and their root causes are traced in
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds in `e2e`; the new test
+- [x] **Code:** `cargo build --all-targets` succeeds in `e2e`; the new test
       compiles for both target modes; `scripts/run-phase4.sh` passes
       `shellcheck` and `--help`.
-- [ ] **Tests:** `cargo test -p e2e --lib` passes (any helper units). The
+- [x] **Tests:** `cargo test -p e2e --lib` passes (any helper units). The
       load suite itself runs only on the cloud harness (PIPELINE §6).
-- [ ] **Tests:** fleet run in harness mode passes all four scenarios with
+- [x] **Tests:** fleet run in harness mode passes all four scenarios with
       0 manifest mismatches; each scenario's assertions and injection records
       are present in the report; a second run with `--no-injections`
       (control) also passes, confirming the load path itself is clean.
@@ -270,26 +270,46 @@ are product-side. The failing assertions and their root causes are traced in
       [f5-degraded-pool-semantics](f5-degraded-pool-semantics.md) lands and
       the rerun is green. See
       [Fleet Run Evidence and DoD Overrule](#fleet-run-evidence-and-dod-overrule-2026-09-11).
-- [ ] **Tests:** local-spawn quick mode runs disk-fill + corruption and
+      **SATISFIED BY RERUN (2026-09-12, condition met):** f5 landed (done,
+      review iteration 2 PASS) and the suite reran green —
+      [f5-rerun-full-20260912.json](artifacts/f5-rerun-full-20260912.json):
+      50/50 assertions, all four scenarios, 0/110 manifest mismatches, 6/6
+      injections `success=true` (incl. `segment_corrupt`),
+      `cluster_healthy_at_end`, `perf_assertions_none`; control
+      [f5-rerun-control-20260911.json](artifacts/f5-rerun-control-20260911.json):
+      8/8. The overrule record above is retained.
+- [x] **Tests:** local-spawn quick mode runs disk-fill + corruption and
       records the device/network injectors as skipped (no silent success).
-- [ ] **Docs:** every `pub` item in any helper has `# Examples` and
+      **Verified 2026-09-12** on the Harness VM (cloud infrastructure, not
+      the dev machine, per PIPELINE §6): `run-phase4.sh --quick` → 43/43
+      assertions; injections `vm_kill:true`, `disk_fill:true`,
+      `disk_fill_remove:true`, `segment_corrupt:true`, with
+      `latency`/`latency_remove` recorded as `skipped:` platform skips.
+      Evidence:
+      [f3-local-quick-20260912.json](artifacts/f3-local-quick-20260912.json).
+      Executing the item exposed two local-helper defects, both fixed:
+      `Cluster::local_role_root` resolved `{base}/../pool-*` instead of
+      `{base}/pool-*` (`e2e/src/load/degrade.rs`), and the local `df` probe
+      passed `--output used` (a FILE operand on GNU coreutils; must be
+      `--output=used`).
+- [x] **Docs:** every `pub` item in any helper has `# Examples` and
       `#![deny(missing_docs)]` holds in `e2e`; the test's module doc states
       the fleet topology, the hard-yank-vs-graceful classification per
       scenario, and the **no-performance-assertion / non-comparability**
       rule.
-- [ ] **ADR:** ADR-0026 (fleet topology; no co-located-process assumptions
+- [x] **ADR:** ADR-0026 (fleet topology; no co-located-process assumptions
       remain), ADR-0029/0031 (real volumes, pools mandatory and role-pinned),
       ADR-0030/0035 (heal path is the real target-pull/rebuild machinery),
       ADR-0036 (no drain/detach mutation in this feature), ADR-0019
       (report on tmpfs; guardrails retained) satisfied.
-- [ ] **Perf:** `perf: []`; no threshold assertion exists in the test or the
+- [x] **Perf:** `perf: []`; no threshold assertion exists in the test or the
       runner; any latency observation is recorded as data only. The runner
       does not add harness-side load beyond the existing Phase 3 pattern.
-- [ ] **Integration:** `run-phase4.sh` full chain — harness SSH execution,
+- [x] **Integration:** `run-phase4.sh` full chain — harness SSH execution,
       injectors over SSH, report fetch, observe/backup — exercised on the
       cloud fleet; the old phase4-degraded-mode doc is marked superseded
       with a pointer to this feature (no conflicting spec left).
-- [ ] **Deviations:** the metric-name findings (hinted-handoff, heal/AE),
+- [x] **Deviations:** the metric-name findings (hinted-handoff, heal/AE),
       the SWIM behavior observed in Scenario 2, the corruption targeting
       rule, and any scenario re-scoped by volume reality are recorded here.
 
@@ -299,6 +319,34 @@ are product-side. The failing assertions and their root causes are traced in
 > are non-blocking for feature completeness — they are structural codebase
 > hygiene tracked separately (see `guidelines/coding.md` §9.2). Do NOT
 > include Lint or Manual items in the Definition of Done checklist.
+
+### Closure Review (2026-09-12)
+
+**Fleet gate condition met.** f5 landed (done, review iteration 2 PASS,
+2026-09-12) and the f3 suite reran green on the cloud fleet —
+[f5-rerun-full-20260912.json](artifacts/f5-rerun-full-20260912.json): 50/50
+assertions across all four scenarios, 0/110 manifest mismatches, 6/6
+injections `success=true`, `cluster_healthy_at_end`, `perf_assertions_none`;
+control [f5-rerun-control-20260911.json](artifacts/f5-rerun-control-20260911.json):
+8/8. Independently re-verified in this closure review: `cargo build
+--all-targets -p e2e` clean, `cargo test -p e2e --lib` (165 passed),
+`shellcheck scripts/run-phase4.sh` clean, `--help` exits 0 (the `.hetzner`
+source-block leak at lines 77-84 found here was fixed in iteration 2 by
+narrowing the usage `sed` range to `2,76p` — `scripts/run-phase4.sh:108` —
+and re-verified clean: the output ends at the usage separator; the metric
+query now uses `oceanfs_repair_enqueued_total`
+(`e2e/tests/load_degraded.rs:1894`), matching the registered series
+`crates/oceanfs-durability/src/reconcile.rs:449`).
+
+Both items left open by the first closure review were closed the same day:
+the **Deviations** section is now filled, and the **local-spawn quick mode**
+was executed on the Harness VM (cloud infrastructure, PIPELINE §6) —
+[f3-local-quick-20260912.json](artifacts/f3-local-quick-20260912.json):
+43/43 assertions with disk-fill and corruption executed and the network
+injectors recorded as `skipped:`. Running it exposed and fixed two
+`e2e`-helper defects (local pool-root resolution and a malformed GNU
+`df --output` argument; see Deviations). The five 2026-09-11 fleet
+artifacts are evidence only and were not modified.
 
 ## Open Questions for the Implementer
 
@@ -327,4 +375,49 @@ are product-side. The failing assertions and their root causes are traced in
 
 ## Deviations (accepted)
 
-_None yet — filled at implementation close._
+- **Metric-name findings (confirmed on the deployed `/admin/metrics`).**
+  The deployed build registers the `_total` suffixes the suite queries:
+  `hinted_handoff_hints_{stored,delivered,expired,dropped}_total`,
+  `heal_{requests,completed,failed}_total`, `ae_mismatches_found_total`,
+  `scrub_segments_corrupt_total`. `POST /admin/trigger-anti-entropy` does
+  not exist; the suite uses `POST /admin/scrub` (202) plus the AE interval.
+  Two findings: (a) the recorded `repair_enqueued=0` in the
+  2026-09-11/12 artifacts is a **false zero** — the suite queried
+  `repair_enqueued_total` while the registered series is
+  `oceanfs_repair_enqueued_total` (query fixed in the suite after the
+  green rerun; the run's pass/fail assertions are unaffected); (b) S4
+  detection on the green rerun fired from `heal_requests_total` while
+  `scrub_segments_corrupt_total` / `ae_mismatches_found_total` were still
+  0 within the polling window — the detection assertion accepts either.
+- **Heal-counter classification (A-change).** Benign stale-segment /
+  no-local-shard races are counted as permanent `heal_failed`; the legacy
+  `s4_heal_failed_zero` assertion was replaced with
+  `s4_heal_failures_observed_evidence` (user decision A, 2026-09-11). The
+  full finding and rationale are recorded in
+  [f5 Pre-close findings](f5-degraded-pool-semantics.md#pre-close-findings-2026-09-11-f5-acceptance-rerun).
+- **SWIM behavior under injected latency (Scenario 2).** Every recorded
+  `/admin/cluster` view in every full run (f3 runs 1–3 and the f5 reruns)
+  shows all members `Alive`: the +500 ms internal-interface `netem` window
+  never produced a Suspect/Dead transition, so the scenario's
+  suspicion-fallback path was never exercised. The scenario asserts only
+  the no-data-loss/no-cascade properties, as scoped.
+- **Corruption targeting rule (Scenario 4).** The injector corrupts the
+  newest live `.dat` on the victim's data volume (there is no key→segment
+  map on the black-box surface) and read-back proves the heal path served
+  correct bytes. Precise repair-target assertions belong to f4.
+- **Volume-reality re-scoping.** S2 reads during the injection come from
+  the writer and first-key all-node replication is checked after the
+  settle; the fleet-wide scrub plus a bounded (360 s) no-Dead-pool /
+  two-clean-checks settle runs before manifest verification; S3 waits for
+  baseline replication before filling. These deltas are the volume-backed
+  run shape and are recorded as such.
+- **Local-mode helper defects (found by executing the local-spawn DoD item
+  on the Harness VM, 2026-09-12).** Two `e2e` helper bugs prevented the
+  local quick mode from running the fill/corruption scenarios:
+  `Cluster::local_role_root` resolved `{base}/../pool-*` while the local
+  harness injects `{base}/pool-*`, and the local `df` probe passed
+  `--output used` (GNU coreutils treats `used` as a FILE operand; the
+  value must be `--output=used`). Both fixed; the recorded quick run is
+  [f3-local-quick-20260912.json](artifacts/f3-local-quick-20260912.json)
+  (43/43 assertions; disk-fill and corruption executed; the latency
+  injectors recorded as `skipped:`).
