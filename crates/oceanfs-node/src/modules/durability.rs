@@ -146,6 +146,7 @@ impl DurabilityModule {
         pool: Arc<ConnectionPool>,
         paths: &PoolPaths,
         grpc_addr: SocketAddr,
+        metrics: Option<oceanfs_core::SharedMetricRegistrar>,
     ) -> Result<Self, String> {
         // ---- 7. Construct durability workers ----
         let gc_config = oceanfs_durability::GcConfig::new(
@@ -176,13 +177,16 @@ impl DurabilityModule {
         let repair_selector: Arc<dyn oceanfs_durability::RepairTargetSelector> = Arc::new(
             ManifestRepairTargetSelector::new(membership.clone(), NodeId::new(&config.node_id)),
         );
-        let repair_dispatcher = Arc::new(RepairDispatcher::new(
-            repair_selector,
-            pool.clone(),
-            membership.clone(),
-            storage.lifecycle.clone(),
-            NodeId::new(&config.node_id),
-        ));
+        let repair_dispatcher = Arc::new(
+            RepairDispatcher::new(
+                repair_selector,
+                pool.clone(),
+                membership.clone(),
+                storage.lifecycle.clone(),
+                NodeId::new(&config.node_id),
+            )
+            .with_unrecoverable_sweeps(config.durability.repair_unrecoverable_sweeps),
+        );
         // The acquiring-side worker (bound to THIS node's pool-aware
         // store + lifecycle; the migration pool/membership are injected
         // plane-agnostically, ADR-0030 Decision 4).
@@ -511,6 +515,11 @@ impl DurabilityModule {
             // reconciliation drift-scan enqueues.
             .with_repair_enqueued_counter(reconciliation.repair_enqueued_counter()),
         ));
+        // ae1 S1: per-target pending-debt gauges need a registrar handle
+        // retained past construction (dynamic `{target}` labels).
+        if let Some(registrar) = metrics {
+            hinted_handoff_manager = hinted_handoff_manager.with_metric_registrar(registrar);
+        }
         let hinted_handoff_manager = Arc::new(hinted_handoff_manager);
 
         // Replay existing hints from the WAL into in-memory queues.
@@ -1055,6 +1064,7 @@ mod tests {
                 prelude.pool.clone(),
                 &prelude.module.paths,
                 "127.0.0.1:0".parse().expect("grpc addr"),
+                None,
             )
             .await
             .expect("durability module build"),

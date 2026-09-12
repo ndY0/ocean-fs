@@ -412,6 +412,10 @@ impl Node {
         .await?;
 
         // ---- 4. Durability workers (c2: modules/durability.rs) ----
+        // The metrics registry is created BEFORE the workers: subsystems
+        // that register metrics after startup (dynamic per-label gauges,
+        // ae1) hold a shared registrar handle.
+        let metrics = Arc::new(oceanfs_server::admin::MetricsRegistry::new());
         let durability = crate::modules::durability::DurabilityModule::build(
             &config,
             &storage,
@@ -419,6 +423,7 @@ impl Node {
             pool.clone(),
             &paths,
             grpc_addr,
+            Some(metrics.clone()),
         )
         .await?;
 
@@ -449,7 +454,6 @@ impl Node {
         }
 
         // ---- 6. Server subsystem (c3: modules/server.rs) ----
-        let metrics = Arc::new(oceanfs_server::admin::MetricsRegistry::new());
         let server = crate::modules::server::ServerModule::build(
             &config,
             &storage,

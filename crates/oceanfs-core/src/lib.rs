@@ -67,7 +67,7 @@ pub use error::{Error, Result};
 pub use hlc::{Hlc, HlcClock};
 pub use metrics::{
     sub_millisecond_histogram_config, validate_counter_name, Counter, Gauge, Histogram,
-    HistogramConfig, LabelSet, MetricRegistrar,
+    HistogramConfig, LabelSet, MetricRegistrar, SharedMetricRegistrar,
 };
 pub use proto_convert::ConversionError;
 pub use timeouts::OperationTimeouts;

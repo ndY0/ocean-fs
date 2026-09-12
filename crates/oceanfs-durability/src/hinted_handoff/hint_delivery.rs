@@ -20,7 +20,7 @@
 //! ```
 
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
@@ -29,7 +29,10 @@ use std::{
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use oceanfs_core::{Counter, LabelSet, MetricRegistrar, NodeId, OperationTimeouts, SegmentId};
+use oceanfs_core::{
+    Counter, Gauge, LabelSet, MetricRegistrar, NodeId, OperationTimeouts, SegmentId,
+    SharedMetricRegistrar,
+};
 use oceanfs_membership::Membership;
 use oceanfs_network::ConnectionPool;
 use oceanfs_storage::io::IoOp;
@@ -272,6 +275,19 @@ pub struct HintedHandoffManager {
     /// (one per distinct segment, fanned out via the ADR-0030 dispatch).
     /// `None` keeps the legacy give-up behavior (counted, not repaired).
     drop_sink: Option<Arc<dyn HintDropSink>>,
+    /// ae1 S1: registrar handle for per-target debt gauges registered
+    /// after startup (dynamic `{target}` labels cannot be pre-registered
+    /// at construction). `None` keeps the legacy no-gauge behavior
+    /// (unit tests / managers without a registry).
+    metric_registrar: Option<SharedMetricRegistrar>,
+    /// ae1 S1: per-target pending-debt gauges (record count), created
+    /// lazily on first debt and kept for the process lifetime.
+    pending_debt_gauges: DashMap<NodeId, Gauge>,
+    /// ae1 S1: per-target pending-debt gauges (payload bytes).
+    pending_debt_bytes_gauges: DashMap<NodeId, Gauge>,
+    /// ae1 S1: outstanding debt payload bytes per target, maintained
+    /// alongside `queues` under the per-target queue lock.
+    pending_bytes: DashMap<NodeId, u64>,
 }
 
 /// Human-readable (bucket, key, type) for a hint record (tracing).
@@ -459,6 +475,10 @@ impl HintedHandoffManager {
             ),
             hint_io: None,
             drop_sink: None,
+            metric_registrar: None,
+            pending_debt_gauges: DashMap::new(),
+            pending_debt_bytes_gauges: DashMap::new(),
+            pending_bytes: DashMap::new(),
         }
     }
 
@@ -513,6 +533,27 @@ impl HintedHandoffManager {
     #[must_use]
     pub fn with_drop_sink(mut self, sink: Arc<dyn HintDropSink>) -> Self {
         self.drop_sink = Some(sink);
+        self
+    }
+
+    /// ae1 S1: wires the shared metrics registrar so the per-target
+    /// pending-debt gauges can be registered lazily.
+    ///
+    /// Dynamic `{target}` labels cannot be pre-registered at
+    /// construction; the manager creates and registers one gauge pair
+    /// per target on first debt and updates it through the stored
+    /// clone. When unset, debt bookkeeping still runs — only the gauge
+    /// series are absent (unit tests / managers without a registry).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let manager = HintedHandoffManager::new(wal_dir, client, config)
+    ///     .with_metric_registrar(metrics.clone());
+    /// ```
+    #[must_use]
+    pub fn with_metric_registrar(mut self, registrar: SharedMetricRegistrar) -> Self {
+        self.metric_registrar = Some(registrar);
         self
     }
 
@@ -639,10 +680,12 @@ impl HintedHandoffManager {
                 let records = wal.replay().await?;
                 let count = records.len();
 
+                let mut queue = self.queues.entry(node_id.clone()).or_default();
                 for (start, end, record) in records {
-                    let mut queue = self.queues.entry(node_id.clone()).or_default();
                     queue.push_back((start, end, record));
                 }
+                self.refresh_target_debt(&node_id, &queue);
+                drop(queue);
 
                 info!(
                     node = %node_id,
@@ -710,10 +753,23 @@ impl HintedHandoffManager {
         queue.push_back((position, end_position, record.clone()));
         self.hints_stored_total.add(1);
 
+        // ae1 S1: keep the pending-debt gauge pair (count/bytes) in
+        // lockstep with the queue — incrementally on the enqueue path
+        // (the delivery/prune paths rebuild from the queue).
+        let bytes = self.pending_bytes.get(&target).map(|v| *v).unwrap_or(0)
+            + record_payload_bytes(&record);
+        self.pending_bytes.insert(target.clone(), bytes);
+        let count = queue.len() as u64;
+        // Update the gauges while still holding the queue lock so a
+        // concurrent enqueue cannot interleave a newer snapshot with an
+        // older one (observability-only; refreshed on the next write).
+        self.update_debt_gauge(&target, count, bytes);
+        drop(queue);
+
         debug!(
             target = %target,
             position,
-            queue_len = queue.len(),
+            queue_len = count,
             "enqueued hint record"
         );
 
@@ -760,14 +816,7 @@ impl HintedHandoffManager {
                 // Payload estimate for the proto record: the inline blob
                 // (or the fixed-size segment ref), plus proto overhead
                 // slack.
-                let payload = match &item.2.record {
-                    Some(hinted_handoff_rpc::hint_record::Record::Inline(inline)) => {
-                        inline.data.len() + 128
-                    }
-                    Some(hinted_handoff_rpc::hint_record::Record::SegmentRef(_)) => 256,
-                    Some(hinted_handoff_rpc::hint_record::Record::Delete(_)) => 128,
-                    None => 128,
-                };
+                let payload = record_payload_bytes(&item.2) as usize;
                 if batch_bytes + payload > self.config.max_batch_bytes {
                     break;
                 }
@@ -949,6 +998,7 @@ impl HintedHandoffManager {
                 for (start, end, record) in requeue.into_iter().rev() {
                     queue.push_front((start, end, record));
                 }
+                self.refresh_target_debt(target, &queue);
                 return;
             }
         };
@@ -990,6 +1040,8 @@ impl HintedHandoffManager {
             drop(queue);
             self.node_wals.remove(target);
             self.last_access.remove(target);
+            self.pending_bytes.remove(target);
+            self.update_debt_gauge(target, 0, 0);
             let file_path = self.wal_dir.join(format!("{}.wal", target));
             let _ = std::fs::remove_file(&file_path);
             return;
@@ -997,6 +1049,7 @@ impl HintedHandoffManager {
         for item in rebuilt {
             queue.push_back(item);
         }
+        self.refresh_target_debt(target, &queue);
         self.last_access.insert(target.clone(), std::time::Instant::now());
     }
 
@@ -1035,6 +1088,153 @@ impl HintedHandoffManager {
         self.queues.iter().map(|entry| entry.value().len()).sum()
     }
 
+    /// ae1 S1: updates the per-target pending-debt gauges (record count
+    /// and payload bytes), creating and registering the gauge pair on
+    /// first use.
+    ///
+    /// No-op when no registrar is wired. The gauges are kept for the
+    /// process lifetime (one series per target), so a drained target
+    /// reads 0 rather than disappearing.
+    fn update_debt_gauge(&self, target: &NodeId, count: u64, bytes: u64) {
+        let Some(registrar) = &self.metric_registrar else {
+            return;
+        };
+        let count_gauge = self
+            .pending_debt_gauges
+            .entry(target.clone())
+            .or_insert_with(|| {
+                let gauge = Gauge::new(
+                    "hinted_handoff_pending_debt".into(),
+                    "Outstanding hint debt (records) per target".into(),
+                    LabelSet::new(&[("target", target.as_str())]),
+                );
+                registrar.register_gauge(gauge.clone());
+                gauge
+            })
+            .clone();
+        count_gauge.set(count);
+
+        let bytes_gauge = self
+            .pending_debt_bytes_gauges
+            .entry(target.clone())
+            .or_insert_with(|| {
+                let gauge = Gauge::new(
+                    "hinted_handoff_pending_debt_bytes".into(),
+                    "Outstanding hint debt (payload bytes) per target".into(),
+                    LabelSet::new(&[("target", target.as_str())]),
+                );
+                registrar.register_gauge(gauge.clone());
+                gauge
+            })
+            .clone();
+        bytes_gauge.set(bytes);
+    }
+
+    /// ae1 S1: recomputes the pending count/bytes of `target` from its
+    /// in-memory queue. Callers hold the per-target queue lock.
+    fn refresh_target_debt(&self, target: &NodeId, queue: &VecDeque<(u64, u64, HintRecord)>) {
+        let count = queue.len() as u64;
+        let bytes: u64 = queue.iter().map(|(_, _, record)| record_payload_bytes(record)).sum();
+        self.pending_bytes.insert(target.clone(), bytes);
+        self.update_debt_gauge(target, count, bytes);
+    }
+
+    /// ae1 S1: whether a target should keep its debt because it is still
+    /// in the topology (`Alive`/`Suspect`/retained `Dead` — ADR-0027 D1).
+    /// A membership-less manager treats every target as retained
+    /// (TTL-only behavior).
+    fn target_is_retained(&self, target: &NodeId) -> bool {
+        match &self.membership {
+            None => true,
+            Some(membership) => membership.state_of(target).is_some(),
+        }
+    }
+
+    /// ae1 S1: prunes one target's WAL and escalates debt per the
+    /// retention rule.
+    ///
+    /// Returns `(ttl_expired_count, reclaimed)`. A departed target
+    /// (absent from membership) has all remaining debt escalated through
+    /// the f5 D3 sink and its WAL reclaimed; a retained target only
+    /// loses TTL-expired records, which are escalated the same way
+    /// (never a silent delete).
+    async fn prune_target_wal(
+        &self,
+        target: &NodeId,
+        wal: &Arc<HintWal>,
+        ttl_secs: u64,
+        drop_records: &mut Vec<HintDropRecord>,
+        dropped_segments: &mut HashSet<SegmentId>,
+    ) -> (usize, bool) {
+        if !self.target_is_retained(target) {
+            match wal.replay().await {
+                Ok(records) => {
+                    let count = records.len();
+                    for (_, _, record) in &records {
+                        collect_drop_record(record, drop_records, dropped_segments);
+                    }
+                    if count > 0 {
+                        self.hints_dropped_total.add(count as u64);
+                        info!(
+                            node = %target,
+                            count,
+                            "escalated and reclaimed hint debt of a departed target"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        node = %target,
+                        error = %e,
+                        "failed to replay the hint WAL of a departed target; kept on disk"
+                    );
+                    return (0, false);
+                }
+            }
+            self.node_wals.remove(target);
+            self.last_access.remove(target);
+            self.pending_bytes.remove(target);
+            self.update_debt_gauge(target, 0, 0);
+            self.queues.remove(target);
+            let file_path = self.wal_dir.join(format!("{}.wal", target));
+            let _ = std::fs::remove_file(&file_path);
+            return (0, true);
+        }
+
+        match wal.prune_expired(ttl_secs).await {
+            Ok((0, _)) => (0, false),
+            Ok((n, expired)) => {
+                for record in &expired {
+                    collect_drop_record(record, drop_records, dropped_segments);
+                }
+                // The prune re-wrote the surviving frames at new offsets:
+                // rebuild the in-memory queue so positions stay valid.
+                match wal.replay().await {
+                    Ok(records) => {
+                        let mut queue = self.queues.entry(target.clone()).or_default();
+                        queue.clear();
+                        for item in records {
+                            queue.push_back(item);
+                        }
+                        self.refresh_target_debt(target, &queue);
+                    }
+                    Err(e) => {
+                        warn!(
+                            node = %target,
+                            error = %e,
+                            "hint WAL replay failed after prune; in-memory queue may be stale"
+                        );
+                    }
+                }
+                (n, false)
+            }
+            Err(e) => {
+                warn!(node = %target, error = %e, "failed to prune per-node hint WAL");
+                (0, false)
+            }
+        }
+    }
+
     /// Delivers all pending hints for a returned node (convenience wrapper).
     ///
     /// This is an alias for `drain_and_deliver` for backward compatibility
@@ -1043,40 +1243,50 @@ impl HintedHandoffManager {
         self.drain_and_deliver(target).await
     }
 
-    /// Prunes expired entries from all open per-node WAL files.
+    /// Prunes expired or departed-target debt from all per-node WALs
+    /// (ae1 S1).
     ///
-    /// Iterates all open per-node WALs and calls `prune_expired()` on each,
-    /// delegating the TTL check to the persistent WAL layer.
+    /// Retention follows the membership topology:
+    ///
+    /// - a target still in the ring (`Alive`/`Suspect`/retained `Dead` —
+    ///   ADR-0027 D1 / ADR-0028) keeps its debt; only the TTL cap prunes
+    ///   it, and the expired records are **escalated** through the f5 D3
+    ///   [`HintDropSink`] (one repair intent per distinct segment) before
+    ///   removal — never a silent delete;
+    /// - a target no longer in the topology escalates its remaining debt
+    ///   the same way and its WAL is reclaimed.
+    ///
+    /// When the manager has no membership handle (unit tests / legacy
+    /// embeddings) every target is treated as retained and the TTL cap
+    /// applies.
     ///
     /// # Returns
     ///
-    /// The total number of entries pruned across all node WALs.
+    /// The total number of TTL-expired entries pruned across all node
+    /// WALs. Departed-target removals are counted in
+    /// `hinted_handoff_hints_dropped_total` instead.
     ///
     /// # Errors
     ///
-    /// Returns an error if pruning fails for any WAL.
+    /// Per-WAL failures are logged and skipped; the directory scan never
+    /// fails the call.
     pub async fn prune_all_expired(&self, ttl_secs: u64) -> Result<usize> {
         let mut total_pruned = 0usize;
+        let mut drop_records: Vec<HintDropRecord> = Vec::new();
+        let mut dropped_segments: HashSet<SegmentId> = HashSet::new();
 
-        for entry in self.node_wals.iter() {
-            match entry.value().prune_expired(ttl_secs).await {
-                Ok(0) => {}
-                Ok(n) => {
-                    total_pruned += n;
-                    info!(
-                        node = %entry.key(),
-                        pruned = n,
-                        "pruned expired entries from per-node hint WAL"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        node = %entry.key(),
-                        error = %e,
-                        "failed to prune per-node hint WAL"
-                    );
-                }
-            }
+        // Open WALs first. Collect the handles BEFORE awaiting: never hold
+        // a DashMap ref across an await point.
+        let open: Vec<(NodeId, Arc<HintWal>)> = self
+            .node_wals
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        for (target, wal) in open {
+            total_pruned += self
+                .prune_target_wal(&target, &wal, ttl_secs, &mut drop_records, &mut dropped_segments)
+                .await
+                .0;
         }
 
         // Also scan the directory for WAL files that aren't currently open
@@ -1093,24 +1303,18 @@ impl HintedHandoffManager {
                         continue;
                     }
                     match HintWal::open(&path).await {
-                        Ok(wal) => match wal.prune_expired(ttl_secs).await {
-                            Ok(0) => {}
-                            Ok(n) => {
-                                total_pruned += n;
-                                info!(
-                                    node = %node_id,
-                                    pruned = n,
-                                    "pruned expired entries from unopened per-node hint WAL"
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    node = %node_id,
-                                    error = %e,
-                                    "failed to prune unopened per-node hint WAL"
-                                );
-                            }
-                        },
+                        Ok(wal) => {
+                            let (pruned, _reclaimed) = self
+                                .prune_target_wal(
+                                    &node_id,
+                                    &std::sync::Arc::new(wal),
+                                    ttl_secs,
+                                    &mut drop_records,
+                                    &mut dropped_segments,
+                                )
+                                .await;
+                            total_pruned += pruned;
+                        }
                         Err(e) => {
                             warn!(
                                 path = %path.display(),
@@ -1125,6 +1329,11 @@ impl HintedHandoffManager {
 
         if total_pruned > 0 {
             self.hints_expired_total.add(total_pruned as u64);
+        }
+        if !drop_records.is_empty() {
+            if let Some(sink) = &self.drop_sink {
+                sink.on_hints_dropped(&drop_records);
+            }
         }
 
         Ok(total_pruned)
@@ -1222,6 +1431,34 @@ fn hint_drop_record(record: &HintRecord) -> Option<HintDropRecord> {
     let segment_id = SegmentId::try_from(seg.segment_id.clone()?).ok()?;
     let intended_for = NodeId::from(seg.intended_for.as_ref()?.id.clone());
     Some(HintDropRecord { segment_id, intended_for })
+}
+
+/// ae1 S1: appends `record`'s repair identity to `out` unless its segment
+/// was already collected in this prune/delivery cycle.
+fn collect_drop_record(
+    record: &HintRecord,
+    out: &mut Vec<HintDropRecord>,
+    seen: &mut HashSet<SegmentId>,
+) {
+    if let Some(drop) = hint_drop_record(record) {
+        if seen.insert(drop.segment_id) {
+            out.push(drop);
+        }
+    }
+}
+
+/// ae1 S1: the payload size estimate used for debt-byte accounting —
+/// the same shape the delivery batching uses: the inline blob (or the
+/// fixed-size segment ref / delete), plus proto overhead slack.
+fn record_payload_bytes(record: &HintRecord) -> u64 {
+    match &record.record {
+        Some(hinted_handoff_rpc::hint_record::Record::Inline(inline)) => {
+            (inline.data.len() + 128) as u64
+        }
+        Some(hinted_handoff_rpc::hint_record::Record::SegmentRef(_)) => 256,
+        Some(hinted_handoff_rpc::hint_record::Record::Delete(_)) => 128,
+        None => 128,
+    }
 }
 
 #[cfg(test)]
@@ -2088,5 +2325,264 @@ mod tests {
             1,
             "the io kind reaches the health signal"
         );
+    }
+
+    // ── ae1 S1: retention, escalation, debt gauges ────────────────────
+
+    /// ae1 S1: TTL expiry escalates debt through the f5 D3 sink instead
+    /// of deleting it silently — one deduped repair record per segment;
+    /// inline records are counted but not segment-repairable.
+    #[tokio::test]
+    async fn ttl_expiry_escalates_segment_debt_through_the_sink() {
+        #[derive(Default)]
+        struct RecordingSink(StdMutex<Vec<HintDropRecord>>);
+        impl HintDropSink for RecordingSink {
+            fn on_hints_dropped(&self, dropped: &[HintDropRecord]) {
+                self.0.lock().extend_from_slice(dropped);
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let wal_dir = dir.path().to_path_buf();
+        let mock = Arc::new(MockDeliveryClient::new());
+        let sink = Arc::new(RecordingSink::default());
+        let manager = HintedHandoffManager::new(wal_dir.clone(), mock, make_test_config(wal_dir))
+            .with_drop_sink(sink.clone());
+        let node = NodeId::new("node-a");
+        let segment = SegmentId::new();
+        for key in ["k1", "k2"] {
+            let mut record = HintRecord::new_segment_ref(
+                node.clone(),
+                BucketId::new("b"),
+                key.to_string(),
+                segment,
+                0,
+                1024,
+                oceanfs_core::Hlc::zero(),
+            );
+            record.stored_at_secs = 1; // long expired
+            manager.enqueue(record).await.unwrap();
+        }
+        let mut inline = HintRecord::new_inline(
+            node.clone(),
+            BucketId::new("b"),
+            "inline".into(),
+            vec![1, 2, 3, 4].into(),
+            oceanfs_core::Hlc::zero(),
+        );
+        inline.stored_at_secs = 1;
+        manager.enqueue(inline).await.unwrap();
+
+        let pruned = manager.prune_all_expired(1).await.unwrap();
+        assert_eq!(pruned, 3, "every expired record is pruned");
+        let records = sink.0.lock().clone();
+        assert_eq!(records.len(), 1, "one deduped repair record per distinct segment");
+        assert_eq!(records[0].segment_id, segment);
+        assert_eq!(records[0].intended_for, node);
+        assert_eq!(manager.pending_count(&node), 0, "queue drained");
+    }
+
+    /// ae1 S1: retention follows the membership topology — a retained
+    /// (Dead) target keeps its debt under the TTL cap; a departed target
+    /// escalates through the sink and reclaims its WAL.
+    #[tokio::test]
+    async fn debt_retention_follows_membership_topology() {
+        #[derive(Default)]
+        struct RecordingSink(StdMutex<Vec<HintDropRecord>>);
+        impl HintDropSink for RecordingSink {
+            fn on_hints_dropped(&self, dropped: &[HintDropRecord]) {
+                self.0.lock().extend_from_slice(dropped);
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let wal_dir = dir.path().to_path_buf();
+        let mock = Arc::new(MockDeliveryClient::new());
+        let sink = Arc::new(RecordingSink::default());
+
+        let ring = oceanfs_routing::Ring::new(oceanfs_core::RingConfig::default());
+        let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
+        let membership = Arc::new(Membership::new(
+            NodeId::new("self"),
+            "127.0.0.1:9100".parse().unwrap(),
+            "127.0.0.1:9101".parse().unwrap(),
+            oceanfs_core::GossipConfig::default(),
+            ring_cache,
+        ));
+
+        let manager =
+            HintedHandoffManager::new(wal_dir.clone(), mock, make_test_config(wal_dir.clone()))
+                .with_membership(membership.clone())
+                .with_drop_sink(sink.clone());
+
+        // Retained-Dead target: debt is held (long-TTL pass prunes nothing).
+        let retained = NodeId::new("retained");
+        membership.upsert_node(
+            retained.clone(),
+            oceanfs_core::NodeState::Dead,
+            oceanfs_core::Incarnation::new(1),
+            None,
+        );
+        manager
+            .enqueue(HintRecord::new_segment_ref(
+                retained.clone(),
+                BucketId::new("b"),
+                "kept".into(),
+                SegmentId::new(),
+                0,
+                1024,
+                oceanfs_core::Hlc::zero(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.prune_all_expired(86_400 * 365).await.unwrap(),
+            0,
+            "retained debt survives a long-TTL pass"
+        );
+        assert_eq!(manager.pending_count(&retained), 1, "retained debt is held");
+
+        // Departed target (absent from membership): escalate + reclaim.
+        let departed = NodeId::new("departed");
+        let segment_b = SegmentId::new();
+        manager
+            .enqueue(HintRecord::new_segment_ref(
+                departed.clone(),
+                BucketId::new("b"),
+                "gone".into(),
+                segment_b,
+                0,
+                1024,
+                oceanfs_core::Hlc::zero(),
+            ))
+            .await
+            .unwrap();
+        let wal_path = dir.path().join("departed.wal");
+        assert!(wal_path.exists(), "departed WAL written before the prune");
+
+        assert_eq!(
+            manager.prune_all_expired(86_400 * 365).await.unwrap(),
+            0,
+            "departure is not a TTL prune"
+        );
+        assert_eq!(manager.pending_count(&departed), 0, "departed queue reclaimed");
+        assert!(!wal_path.exists(), "departed WAL file reclaimed");
+        let records = sink.0.lock().clone();
+        assert!(
+            records.iter().any(|r| r.segment_id == segment_b && r.intended_for == departed),
+            "departed debt escalates through the f5 D3 sink"
+        );
+    }
+
+    /// ae1 S1: retained-Dead debt replays when the target returns (the
+    /// membership-driven retention keeps it deliverable).
+    #[tokio::test]
+    async fn retained_dead_debt_replays_when_the_target_returns() {
+        let dir = tempdir().unwrap();
+        let wal_dir = dir.path().to_path_buf();
+        let mock = Arc::new(MockDeliveryClient::new());
+        let ring = oceanfs_routing::Ring::new(oceanfs_core::RingConfig::default());
+        let ring_cache = Arc::new(oceanfs_routing::RingCache::new(ring));
+        let membership = Arc::new(Membership::new(
+            NodeId::new("self"),
+            "127.0.0.1:9100".parse().unwrap(),
+            "127.0.0.1:9101".parse().unwrap(),
+            oceanfs_core::GossipConfig::default(),
+            ring_cache,
+        ));
+        let manager =
+            HintedHandoffManager::new(wal_dir.clone(), mock.clone(), make_test_config(wal_dir))
+                .with_membership(membership.clone());
+        let target = NodeId::new("node-a");
+        membership.upsert_node(
+            target.clone(),
+            oceanfs_core::NodeState::Dead,
+            oceanfs_core::Incarnation::new(1),
+            None,
+        );
+        manager
+            .enqueue(HintRecord::new_inline(
+                target.clone(),
+                BucketId::new("b"),
+                "k".into(),
+                vec![7].into(),
+                oceanfs_core::Hlc::zero(),
+            ))
+            .await
+            .unwrap();
+
+        // Retained (Dead still in the topology): a long-TTL pass holds it.
+        assert_eq!(manager.prune_all_expired(86_400 * 365).await.unwrap(), 0);
+        assert_eq!(manager.pending_count(&target), 1, "retained debt is held");
+
+        // The target returns: the retained debt replays on delivery.
+        let addr: SocketAddr = "127.0.0.1:9200".parse().unwrap();
+        membership.upsert_node(
+            target.clone(),
+            oceanfs_core::NodeState::Alive,
+            oceanfs_core::Incarnation::new(2),
+            Some(addr),
+        );
+        mock.add_response(Ok(HintedHandoffResponse {
+            accepted: true,
+            accepted_count: 1,
+            retry_indices: vec![],
+        }));
+        let delivered = manager.deliver_pending(target.clone()).await.unwrap();
+        assert_eq!(delivered, 1, "retained debt replays when the target returns");
+        assert_eq!(manager.pending_count(&target), 0);
+    }
+
+    /// ae1 S1: the pending-debt gauge pair tracks count and bytes and
+    /// returns to zero after the debt is pruned (the series stays).
+    #[tokio::test]
+    async fn pending_debt_gauges_track_count_and_bytes() {
+        #[derive(Default)]
+        struct RecordingRegistrar(StdMutex<Vec<Gauge>>);
+        impl MetricRegistrar for RecordingRegistrar {
+            fn register_counter(&self, _counter: Counter) {}
+            fn register_gauge(&self, gauge: Gauge) {
+                self.0.lock().push(gauge);
+            }
+            fn register_histogram(&self, _histogram: std::sync::Arc<oceanfs_core::Histogram>) {}
+        }
+
+        let dir = tempdir().unwrap();
+        let wal_dir = dir.path().to_path_buf();
+        let mock = Arc::new(MockDeliveryClient::new());
+        let registrar = Arc::new(RecordingRegistrar::default());
+        let manager = HintedHandoffManager::new(wal_dir.clone(), mock, make_test_config(wal_dir))
+            .with_metric_registrar(registrar.clone());
+        let node = NodeId::new("node-a");
+
+        fn gauge_value(registrar: &RecordingRegistrar, name: &str) -> u64 {
+            registrar
+                .0
+                .lock()
+                .iter()
+                .find(|gauge| gauge.name() == name)
+                .expect("gauge registered")
+                .get()
+        }
+
+        let mut record = HintRecord::new_inline(
+            node.clone(),
+            BucketId::new("b"),
+            "key".into(),
+            vec![0u8; 100].into(),
+            oceanfs_core::Hlc::zero(),
+        );
+        record.stored_at_secs = 1; // long expired
+        manager.enqueue(record).await.unwrap();
+        assert_eq!(gauge_value(&registrar, "hinted_handoff_pending_debt"), 1);
+        assert_eq!(
+            gauge_value(&registrar, "hinted_handoff_pending_debt_bytes"),
+            100 + 128,
+            "inline payload + proto slack"
+        );
+
+        manager.prune_all_expired(1).await.unwrap();
+        assert_eq!(gauge_value(&registrar, "hinted_handoff_pending_debt"), 0);
+        assert_eq!(gauge_value(&registrar, "hinted_handoff_pending_debt_bytes"), 0);
     }
 }

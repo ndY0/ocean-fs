@@ -301,12 +301,25 @@ impl HintWal {
     /// Entries without a `stored_at_secs` timestamp (from before this field was added)
     /// are preserved — they survive the filter.
     ///
-    /// Returns the number of entries pruned.
+    /// Returns `(pruned_count, expired_records)`. The expired records are
+    /// handed back so the caller can **escalate** the debt (ae1: TTL
+    /// expiry must route through the f5 D3 `HintDropSink` like give-up —
+    /// never a silent delete).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Requires tokio; the caller owns the escalation policy.
+    /// let (pruned, expired) = wal.prune_expired(86_400).await?;
+    /// for record in &expired {
+    ///     // Route SegmentRef records through the injected HintDropSink.
+    /// }
+    /// ```
     ///
     /// # Errors
     ///
     /// Returns an error if WAL replay, truncation, or re-write fails.
-    pub async fn prune_expired(&self, ttl_secs: u64) -> Result<usize> {
+    pub async fn prune_expired(&self, ttl_secs: u64) -> Result<(usize, Vec<HintRecord>)> {
         let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
         let records = self.replay().await?;
@@ -318,10 +331,12 @@ impl HintWal {
             });
 
         if expired.is_empty() {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
 
         let pruned = expired.len();
+        let expired_records: Vec<HintRecord> =
+            expired.into_iter().map(|(_, _, record)| record).collect();
 
         // Clear the WAL.
         self.truncate_after(0).await?;
@@ -331,7 +346,7 @@ impl HintWal {
             self.write_hint(record).await?;
         }
 
-        Ok(pruned)
+        Ok((pruned, expired_records))
     }
 
     /// Returns the current WAL position (bytes written).
@@ -937,8 +952,14 @@ mod tests {
         wal.write_hint(&r2).await.unwrap();
         wal.write_hint(&r3).await.unwrap();
 
-        let pruned = wal.prune_expired(ttl).await.unwrap();
+        let (pruned, expired) = wal.prune_expired(ttl).await.unwrap();
         assert_eq!(pruned, 1, "exactly 1 entry should be pruned");
+        assert_eq!(expired.len(), 1, "the expired record is returned for escalation");
+        let expired_key = match expired[0].record.as_ref().unwrap() {
+            Record::Inline(i) => i.object_key.as_str(),
+            _ => panic!("expected an inline record"),
+        };
+        assert_eq!(expired_key, "obj1", "the expired record is the old one");
 
         let survivors = wal.replay().await.unwrap();
         assert_eq!(survivors.len(), 2, "2 entries should survive");

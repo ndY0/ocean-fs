@@ -1451,6 +1451,7 @@ mod tests {
                 prelude.pool.clone(),
                 &prelude.module.paths,
                 "127.0.0.1:0".parse().expect("grpc addr"),
+                None,
             )
             .await
             .expect("durability module build"),

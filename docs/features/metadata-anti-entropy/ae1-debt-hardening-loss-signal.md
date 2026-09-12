@@ -1,7 +1,7 @@
 ---
 feature: "Hint-Debt Hardening & Segment Unrecoverable Signal"
 epic: "metadata-anti-entropy"
-status: proposed
+status: done
 priority: high
 owner: ""
 dependencies:
@@ -190,45 +190,45 @@ repair request (segment S)
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds in the affected crates
+- [x] **Code:** `cargo build --all-targets` succeeds in the affected crates
       (`oceanfs-durability`, `oceanfs-core`, and `oceanfs-server` only if an
       admin surface is touched); no test-only hooks.
-- [ ] **Code (retention/escalation):** hint debt for a retained-Dead target
+- [x] **Code (retention/escalation):** hint debt for a retained-Dead target
       is held while the target remains in the topology; `Left`/removed debt
       and TTL-expired debt route through the existing f5 D3 `HintDropSink`
       (repair-intent conversion) before removal; delivered hints and the
       delivery contract are unchanged.
-- [ ] **Code (gauge):** `hinted_handoff_pending_debt{target}` reflects
+- [x] **Code (gauge):** `hinted_handoff_pending_debt{target}` reflects
       outstanding debt (count and bytes), decreases on delivery/escalation,
       and is registered independently of the journal kill-switch.
-- [ ] **Code (terminal signal):** a repair whose `storage_locations ∩ live =
+- [x] **Code (terminal signal):** a repair whose `storage_locations ∩ live =
       ∅` becomes terminal after N consecutive sweeps; the bounded dedupe set
       prevents re-enqueue; the counter increments once per classification;
       the log fires once; a returning recorded holder clears the marker and
       normal repair resumes.
-- [ ] **Tests (unit):** retention vs `Dead`(retained)/`Left`; TTL expiry
+- [x] **Tests (unit):** retention vs `Dead`(retained)/`Left`; TTL expiry
       routes through the sink and not through a bare delete; gauge
       count/bytes transitions; terminal after N sweeps and not before;
       dedupe set stays bounded under repeated sweeps; clear/resume on holder
       return; no panic on a missing/empty holder set.
-- [ ] **Tests (integration):** an in-process scenario with a target that
+- [x] **Tests (integration):** an in-process scenario with a target that
       leaves (debt escalates) and one that goes retained-Dead then returns
       (debt replays); a repair whose holders are all dead reaches terminal
       and resumes when a holder is restored; existing hint/repair suites show
       no regression (RocksDB-affected crates with `--test-threads=1`,
       PIPELINE §4.6).
-- [ ] **Docs:** new metrics documented; the retention/escalation policy and
+- [x] **Docs:** new metrics documented; the retention/escalation policy and
       the terminal classification rules are documented; every new/changed
       `pub` item has `# Examples`; `#![deny(missing_docs)]` passes.
-- [ ] **ADR:** ADR-0038 D7 complements are implemented; ADR-0027's contract
+- [x] **ADR:** ADR-0038 D7 complements are implemented; ADR-0027's contract
       (no delivery-contract change) and ADR-0028's retained-Dead topology
       drive the retention rule; ADR-0030/ADR-0035 define the holder-set
       source; ADR-0034's bounded discipline is preserved (no new persisted
       surface, bounded dedupe set).
-- [ ] **Perf:** the cited rules are followed — atomic gauges/counters (11.1),
+- [x] **Perf:** the cited rules are followed — atomic gauges/counters (11.1),
       pre-sized bounded bookkeeping (1.3); no hot-path fsync is added; the
       terminal dedupe set is bounded and O(1) lookup.
-- [ ] **Integration:** a node-level scenario exercises debt-escalation and
+- [x] **Integration:** a node-level scenario exercises debt-escalation and
       terminal-no-live-holder classification end to end (both directions:
       classified and resumed).
 
@@ -280,4 +280,84 @@ repair request (segment S)
 
 ## Deviations (accepted)
 
-_None yet — filled at implementation close._
+Reviewed 2026-09-12. All deviations below were independently verified
+against the working tree and are accepted; the DoD checklist above is
+checked on that basis.
+
+- **Terminal-classification home: `oceanfs-node/src/repair.rs`, not
+  `oceanfs-durability/src/repair.rs`.** The holder-side `RepairDispatcher`
+  (the component that already computes `holders ∩ live` at dispatch time)
+  lives in `oceanfs-node`; `oceanfs-durability/src/repair.rs` is the
+  acquiring-side `ReRepWorker`. Consequence (contrary to the Crate Impact
+  "oceanfs-node: None expected" row): the dispatcher gained the
+  `with_unrecoverable_sweeps` builder
+  (`crates/oceanfs-node/src/repair.rs:457`), `DurabilityConfig` gained the
+  sweep knob (`crates/oceanfs-core/src/config/durability.rs:69`, serde
+  default 3, `validate()` rejects 0), and `DurabilityModule::build` gained a
+  `metrics: Option<SharedMetricRegistrar>` parameter
+  (`crates/oceanfs-node/src/modules/durability.rs:149`). The behavior is as
+  specified; only the file/table rows were stale.
+- **Metrics registry created earlier in `node.rs`.** The gauges need a
+  registrar handle retained past construction (dynamic `{target}` labels),
+  so `MetricsRegistry::new()` moved before the durability module
+  (`crates/oceanfs-node/src/node.rs:418`) and is passed through
+  (`durability.rs:520-522`). No behavior change to other metric
+  registration; `register_metrics` is still called once from
+  `Node::start`.
+- **Gauge series shape (spec OQ): two series, not one.** Count is
+  `hinted_handoff_pending_debt{target}` (records) and bytes is
+  `hinted_handoff_pending_debt_bytes{target}` (payload bytes), both
+  registered lazily on first debt through `with_metric_registrar`
+  (`hinted_handoff/hint_delivery.rs:555,1095`). A target never seen with
+  debt exposes no series; once seen, the pair stays at 0 after drain (the
+  series is not deleted). Count is sourced from the queue length, bytes
+  from the new `pending_bytes` bookkeeping maintained under the per-target
+  queue lock. Not gated by any kill-switch.
+- **TTL semantics pinned.** Retained targets (`Alive`/`Suspect`/retained
+  `Dead`) keep debt until the TTL cap; TTL-expired records escalate through
+  the f5 D3 `HintDropSink` before removal
+  (`hinted_handoff/hint_delivery.rs:1158-1233`). Departed targets (absent
+  from membership — `Left` removes the entry, ADR-0027 D1) escalate all
+  remaining debt immediately on the prune sweep. A manager without a
+  membership handle is TTL-only (`target_is_retained`,
+  `hint_delivery.rs:1143`). This is the reading that satisfies both "held
+  while retained" and "TTL remains a cap".
+- **`HintWal::prune_expired` return type changed** from `Result<usize>` to
+  `Result<(usize, Vec<HintRecord>)>` (`hinted_handoff/hint_wal.rs:312`) so
+  the caller can escalate the expired records; only the caller and the
+  colocated test were updated.
+- **Sweep definition and miss-counter persistence (spec OQ).** One sweep =
+  one `RepairDispatcher::run` retry tick (fixed 5 s interval,
+  `repair.rs:701`). The no-live-holder streak (`unrecoverable_misses`) and
+  the terminal set are in-memory: a restart re-derives classification
+  within N sweeps (no persisted surface, ADR-0034 preserved). The dedupe
+  set is capped at `UNRECOVERABLE_SET_CAPACITY = 10_000` with FIFO eviction
+  of the oldest marker (`repair.rs:641-655`); the counter and log fire
+  once per new classification (a resumed-and-re-classified segment counts
+  again).
+- **Hint-half scenarios are colocated tests, not a `tests/` file.** The
+  retained-Dead/return replay and departed-escalation scenarios run as
+  `#[cfg(test)]` tests in `hinted_handoff/hint_delivery.rs` against the real
+  `Membership`, `HintWal`, and manager in-process; the repair half has the
+  `crates/oceanfs-node/tests/repair_unrecoverable.rs` integration test
+  driving the real `run` loop.
+
+### Review close-out (2026-09-12)
+
+Independent review returned **PASS** (all 10 DoD items checked; the accepted
+deviations above were verified against the working tree). Four LOW review
+notes were closed post-review before this sync:
+
+1. The pending-debt gauge update now happens while holding the per-target
+   queue lock, so a concurrent enqueue cannot expose an interleaved stale
+   snapshot.
+2. The `unrecoverable` / `unrecoverable_order` collections are pre-sized to
+   capacity (perf 1.3).
+3. `# Examples` added to `HintWal::prune_expired` and the internal
+   `default_repair_unrecoverable_sweeps`.
+4. `unrecoverable_set_evicts_oldest_beyond_capacity` — a new
+   10,001-classification unit test drives the FIFO eviction path.
+
+One remaining environment failure is pre-existing and out of scope:
+`routing_manifests::write_degraded_peer_is_routed_around` reproduces on the
+baseline. Accepted design is unchanged.

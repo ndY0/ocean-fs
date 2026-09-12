@@ -18,7 +18,7 @@
 //! write + stamp happens on the acquiring target's `ReRepWorker`
 //! (oceanfs-durability::repair).
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use oceanfs_core::{Counter, Gauge, LabelSet, MetricRegistrar, NodeId, NodeState, SegmentId};
 use oceanfs_durability::{
@@ -251,6 +251,9 @@ pub struct RepairMetrics {
     failures_total: Counter,
     queue_depth_announcement: Gauge,
     queue_depth_reconciliation: Gauge,
+    /// ae1 S1: terminal no-live-holder classifications (once per
+    /// segment; a resumed + re-classified segment counts again).
+    unrecoverable_total: Counter,
 }
 
 impl RepairMetrics {
@@ -281,6 +284,11 @@ impl RepairMetrics {
                 "Re-replication repairs awaiting a target (reconciliation)".into(),
                 LabelSet::new(&[("priority", "reconciliation")]),
             ),
+            unrecoverable_total: Counter::new(
+                "oceanfs_repair_unrecoverable_total".into(),
+                "Repairs classified terminal: no live recorded holder".into(),
+                LabelSet::new(&[("reason", "no_live_holder")]),
+            ),
         }
     }
 
@@ -290,6 +298,28 @@ impl RepairMetrics {
         registrar.register_counter(self.failures_total.clone());
         registrar.register_gauge(self.queue_depth_announcement.clone());
         registrar.register_gauge(self.queue_depth_reconciliation.clone());
+        registrar.register_counter(self.unrecoverable_total.clone());
+    }
+
+    /// Records one terminal no-live-holder classification (ae1).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_node::repair::RepairMetrics;
+    ///
+    /// let metrics = RepairMetrics::new();
+    /// metrics.record_unrecoverable();
+    /// assert_eq!(metrics.unrecoverable_total_for_test(), 1);
+    /// ```
+    pub fn record_unrecoverable(&self) {
+        self.unrecoverable_total.inc();
+    }
+
+    /// Returns the terminal-classification count (for tests).
+    #[doc(hidden)]
+    pub fn unrecoverable_total_for_test(&self) -> u64 {
+        self.unrecoverable_total.get()
     }
 
     /// Records one successful dispatch (the target accepted).
@@ -327,6 +357,18 @@ impl Default for RepairMetrics {
     }
 }
 
+/// ae1 S1: hard cap on the terminal no-live-holder set (ADR-0034
+/// bounded discipline). Oldest classifications are evicted first.
+///
+/// # Examples
+///
+/// ```
+/// use oceanfs_node::repair::UNRECOVERABLE_SET_CAPACITY;
+///
+/// assert_eq!(UNRECOVERABLE_SET_CAPACITY, 10_000);
+/// ```
+pub const UNRECOVERABLE_SET_CAPACITY: usize = 10_000;
+
 /// The holder-side re-replication dispatcher (ADR-0030 target-pull).
 ///
 /// Implements [`RepairSink`] — the same trait g3's `announce_loss`
@@ -342,6 +384,13 @@ impl Default for RepairMetrics {
 /// retried by the sweep. This keeps the g3/g4 tests meaningful (the
 /// holder has accepted the repair) while the actual copy lands on the
 /// acquiring node.
+///
+/// ae1 S1: a request whose recorded holder set has **no live member at
+/// all** cannot ever be served. After `unrecoverable_sweeps` consecutive
+/// sweeps it is classified terminal (see [`Self::unrecoverable_len`]),
+/// counted once in `oceanfs_repair_unrecoverable_total`, and kept in a
+/// bounded set so it is not re-enqueued; a recorded holder returning
+/// clears the marker and resumes normal repair.
 pub struct RepairDispatcher {
     selector: Arc<dyn RepairTargetSelector>,
     pool: Arc<ConnectionPool>,
@@ -353,6 +402,17 @@ pub struct RepairDispatcher {
     lifecycle: Arc<oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator>,
     /// Parked segments awaiting an eligible target.
     parked: dashmap::DashMap<SegmentId, ReRepRequest>,
+    /// ae1 S1: consecutive-sweep no-live-holder streaks per parked
+    /// segment (reset by a live-holder dispatch).
+    unrecoverable_misses: dashmap::DashMap<SegmentId, u32>,
+    /// ae1 S1: terminal no-live-holder classifications. The request is
+    /// retained so the clear/resume re-check can re-park it.
+    unrecoverable: dashmap::DashMap<SegmentId, ReRepRequest>,
+    /// ae1 S1: FIFO insertion order for bounded eviction of
+    /// `unrecoverable` (ADR-0034 bounded discipline).
+    unrecoverable_order: parking_lot::Mutex<VecDeque<SegmentId>>,
+    /// ae1 S1: consecutive no-live-holder sweeps before terminal.
+    unrecoverable_sweeps: u32,
     metrics: RepairMetrics,
 }
 
@@ -371,8 +431,81 @@ impl RepairDispatcher {
             membership,
             lifecycle,
             parked: dashmap::DashMap::new(),
+            unrecoverable_misses: dashmap::DashMap::new(),
+            unrecoverable: dashmap::DashMap::with_capacity(UNRECOVERABLE_SET_CAPACITY),
+            unrecoverable_order: parking_lot::Mutex::new(VecDeque::with_capacity(
+                UNRECOVERABLE_SET_CAPACITY,
+            )),
+            // Overridden by `with_unrecoverable_sweeps` at wiring time
+            // (the config default is 3; see `DurabilityConfig`).
+            unrecoverable_sweeps: 3,
             metrics: RepairMetrics::new(),
         }
+    }
+
+    /// ae1 S1: sets the consecutive-sweep bound before a parked repair
+    /// with no live recorded holder becomes terminal. Clamped to at
+    /// least 1 (a terminal classification must never be immediate).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Requires a constructed dispatcher; see the integration test
+    /// // `tests/repair_unrecoverable.rs`.
+    /// let dispatcher = RepairDispatcher::new(selector, pool, membership, lifecycle, self_id)
+    ///     .with_unrecoverable_sweeps(3);
+    /// ```
+    #[must_use]
+    pub fn with_unrecoverable_sweeps(mut self, sweeps: u32) -> Self {
+        self.unrecoverable_sweeps = sweeps.max(1);
+        self
+    }
+
+    /// ae1 S1: the number of segments currently classified unrecoverable
+    /// (terminal: no live recorded holder).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use oceanfs_core::{GossipConfig, LifecycleConfig, NodeId, RingConfig};
+    /// use oceanfs_membership::Membership;
+    /// use oceanfs_network::ConnectionPool;
+    /// use oceanfs_node::repair::RepairDispatcher;
+    /// use oceanfs_routing::{Ring, RingCache};
+    /// use oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator;
+    ///
+    /// let ring = Arc::new(RingCache::new(Ring::new(RingConfig::default())));
+    /// let membership = Arc::new(Membership::new(
+    ///     NodeId::new("n1"), "127.0.0.1:9100".parse().unwrap(),
+    ///     "127.0.0.1:9101".parse().unwrap(), GossipConfig::default(), ring,
+    /// ));
+    /// let dispatcher = RepairDispatcher::new(
+    ///     Arc::new(oceanfs_node::repair::ManifestRepairTargetSelector::new(
+    ///         membership.clone(), NodeId::new("n1"),
+    ///     )),
+    ///     Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default())),
+    ///     membership,
+    ///     Arc::new(SegmentLifecycleCoordinator::new(&LifecycleConfig::default())),
+    ///     NodeId::new("n1"),
+    /// );
+    /// assert_eq!(dispatcher.unrecoverable_len(), 0);
+    /// ```
+    pub fn unrecoverable_len(&self) -> usize {
+        self.unrecoverable.len()
+    }
+
+    /// ae1 S1: whether `segment_id` is currently classified unrecoverable.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Requires a constructed dispatcher (see the integration test
+    /// // `tests/repair_unrecoverable.rs`).
+    /// assert!(!dispatcher.is_unrecoverable(&segment_id));
+    /// ```
+    pub fn is_unrecoverable(&self, segment_id: &SegmentId) -> bool {
+        self.unrecoverable.contains_key(segment_id)
     }
 
     /// Returns the number of parked repairs (awaiting a target).
@@ -436,22 +569,101 @@ impl RepairDispatcher {
         self.metrics.register_metrics(registrar);
     }
 
-    /// Retries the parked repairs in a bounded batch (the sweep). Each
-    /// parked request is re-dispatched; a still-untargetable request
-    /// stays parked for the next sweep.
+    /// Retries the parked repairs in a bounded batch (the sweep) and
+    /// applies the ae1 S1 unrecoverable rule.
+    ///
+    /// A parked request whose recorded holder set has **no live member**
+    /// increments its consecutive-miss streak; after
+    /// `unrecoverable_sweeps` sweeps it becomes terminal (not
+    /// re-enqueued, counted once). A request with live holders but no
+    /// eligible target is the benign cannot-reach-RF state and stays
+    /// parked indefinitely.
     async fn sweep(&self) {
-        if self.parked.is_empty() {
-            return;
-        }
-        let requests: Vec<ReRepRequest> = self.parked.iter().map(|e| e.value().clone()).collect();
-        for req in requests {
-            let dispatched = self.try_dispatch(&req).await;
-            if dispatched {
-                self.parked.remove(&req.segment_id);
+        // ae1 S1: resume terminal repairs whose recorded holder set has a
+        // live member again, BEFORE processing the parked set, so a
+        // resumed request can dispatch on this same sweep.
+        self.resume_recoverable();
+
+        if !self.parked.is_empty() {
+            let requests: Vec<ReRepRequest> =
+                self.parked.iter().map(|e| e.value().clone()).collect();
+            for req in requests {
+                if self.live_holders_of(&req).is_empty() {
+                    let misses = {
+                        let mut entry =
+                            self.unrecoverable_misses.entry(req.segment_id).or_insert(0);
+                        *entry = entry.saturating_add(1);
+                        *entry
+                    };
+                    if misses >= self.unrecoverable_sweeps {
+                        self.classify_unrecoverable(req);
+                    }
+                    continue;
+                }
+                // A live holder exists: not an unrecoverable candidate;
+                // reset the streak and dispatch normally.
+                self.unrecoverable_misses.remove(&req.segment_id);
+                if self.try_dispatch(&req).await {
+                    self.parked.remove(&req.segment_id);
+                }
+                // Not dispatched → stays parked; the next sweep retries.
             }
-            // Not dispatched → stays parked; the next sweep retries.
         }
         self.metrics.set_queue_depth(&self.parked);
+    }
+
+    /// ae1 S1: clears terminal markers whose recorded holder set has a
+    /// live member again and re-parks the request for normal dispatch.
+    fn resume_recoverable(&self) {
+        if self.unrecoverable.is_empty() {
+            return;
+        }
+        let candidates: Vec<(SegmentId, ReRepRequest)> =
+            self.unrecoverable.iter().map(|entry| (*entry.key(), entry.value().clone())).collect();
+        for (segment_id, request) in candidates {
+            if self.live_holders_of(&request).is_empty() {
+                continue;
+            }
+            self.unrecoverable.remove(&segment_id);
+            self.unrecoverable_order.lock().retain(|id| *id != segment_id);
+            info!(
+                segment_id = %segment_id,
+                "unrecoverable repair resumed: a recorded holder is live again"
+            );
+            self.parked.insert(segment_id, request);
+        }
+    }
+
+    /// ae1 S1: classifies a parked repair as terminal (no live recorded
+    /// holder after N consecutive sweeps): stops re-enqueueing, counts it
+    /// once, and keeps the request for the clear/resume re-check. The set
+    /// is bounded (oldest evicted first) per ADR-0034.
+    fn classify_unrecoverable(&self, request: ReRepRequest) {
+        let segment_id = request.segment_id;
+        self.parked.remove(&segment_id);
+        self.unrecoverable_misses.remove(&segment_id);
+        let newly = self.unrecoverable.insert(segment_id, request).is_none();
+        if newly {
+            let mut order = self.unrecoverable_order.lock();
+            order.push_back(segment_id);
+            while order.len() > UNRECOVERABLE_SET_CAPACITY {
+                if let Some(evicted) = order.pop_front() {
+                    self.unrecoverable.remove(&evicted);
+                    debug!(
+                        segment_id = %evicted,
+                        "evicted oldest unrecoverable marker (bounded set)"
+                    );
+                }
+            }
+            drop(order);
+            self.metrics.record_unrecoverable();
+            warn!(
+                segment_id = %segment_id,
+                sweeps = self.unrecoverable_sweeps,
+                "re-replication: no live recorded holder after consecutive sweeps; \
+                 classified unrecoverable"
+            );
+        }
     }
 
     /// Runs the dispatcher's retry sweep until shutdown.
@@ -521,7 +733,12 @@ impl RepairDispatcher {
         };
 
         match self.dispatch_rpc(request, &target, &live_holders, REPAIR_DISPATCH_TIMEOUT_MS).await {
-            DispatchOutcome::Accepted => true,
+            DispatchOutcome::Accepted => {
+                // ae1 S1: a live-holder dispatch ends any no-live-holder
+                // streak for this segment.
+                self.unrecoverable_misses.remove(&request.segment_id);
+                true
+            }
             DispatchOutcome::NotAccepted => {
                 warn!(
                     segment_id = %request.segment_id,
@@ -765,6 +982,16 @@ impl RepairDispatcher {
 #[async_trait::async_trait]
 impl RepairSink for RepairDispatcher {
     async fn enqueue(&self, request: ReRepRequest) -> Result<(), String> {
+        // ae1 S1: a segment already classified unrecoverable is not
+        // re-enqueued; the sweep's clear/resume re-check is the only way
+        // out of the terminal state.
+        if self.unrecoverable.contains_key(&request.segment_id) {
+            debug!(
+                segment_id = %request.segment_id,
+                "re-replication: request for an unrecoverable segment ignored (terminal)"
+            );
+            return Ok(());
+        }
         // Try to dispatch immediately; park on failure. The enqueue
         // ALWAYS returns Ok — a parked request is a held obligation
         // (the g3/g4 tests observe it via `pending_repairs`), not a
@@ -1384,5 +1611,134 @@ mod tests {
             Some(NodeId::new("n2")),
             "a Degraded data pool is a valid repair fallback target"
         );
+    }
+
+    // ── ae1 S1: terminal no-live-holder classification ────────────────
+
+    fn test_dispatcher(membership: Arc<Membership>, sweeps: u32) -> RepairDispatcher {
+        RepairDispatcher::new(
+            Arc::new(SmallestId),
+            Arc::new(ConnectionPool::new(oceanfs_core::RpcConfig::default())),
+            membership,
+            Arc::new(oceanfs_storage::segment::lifecycle::SegmentLifecycleCoordinator::new(
+                &oceanfs_core::LifecycleConfig::default(),
+            )),
+            NodeId::new("n1"),
+        )
+        .with_unrecoverable_sweeps(sweeps)
+    }
+
+    /// ae1 S1: a parked repair whose recorded holders are all absent from
+    /// membership becomes terminal after N sweeps — not before — stops
+    /// being re-enqueued, and counts exactly once.
+    #[tokio::test]
+    async fn terminal_classification_after_n_sweeps_and_not_before() {
+        let membership = make_membership("n1");
+        // No peers at all: the recorded holder "n2" is absent from membership.
+        let dispatcher = test_dispatcher(membership, 3);
+        let segment_id = SegmentId::new();
+        dispatcher.enqueue(request(segment_id, vec![NodeId::new("n2")])).await.unwrap();
+        assert_eq!(dispatcher.pending_len(), 1);
+
+        for _ in 0..2 {
+            dispatcher.sweep().await;
+            assert!(!dispatcher.is_unrecoverable(&segment_id), "not terminal before N sweeps");
+            assert_eq!(dispatcher.pending_len(), 1, "still parked before N sweeps");
+        }
+        dispatcher.sweep().await;
+        assert!(dispatcher.is_unrecoverable(&segment_id), "terminal at N sweeps");
+        assert_eq!(dispatcher.pending_len(), 0, "terminal requests are not parked");
+        assert_eq!(dispatcher.metrics.unrecoverable_total_for_test(), 1, "counted once");
+
+        // Repeated sweeps do not reclassify; re-enqueue is ignored.
+        dispatcher.sweep().await;
+        assert_eq!(dispatcher.metrics.unrecoverable_total_for_test(), 1, "no double count");
+        assert_eq!(dispatcher.unrecoverable_len(), 1, "the dedupe set does not grow");
+        dispatcher.enqueue(request(segment_id, vec![NodeId::new("n2")])).await.unwrap();
+        assert_eq!(dispatcher.pending_len(), 0, "terminal requests are not re-enqueued");
+    }
+
+    /// ae1 S1: a recorded holder returning clears the terminal marker and
+    /// resumes normal repair (re-parked, not terminal).
+    #[tokio::test]
+    async fn terminal_repair_resumes_when_a_recorded_holder_returns() {
+        let membership = make_membership("n1");
+        let dispatcher = test_dispatcher(membership.clone(), 2);
+        let segment_id = SegmentId::new();
+        dispatcher.enqueue(request(segment_id, vec![NodeId::new("n2")])).await.unwrap();
+        dispatcher.sweep().await;
+        dispatcher.sweep().await;
+        assert!(dispatcher.is_unrecoverable(&segment_id), "terminal after two absent sweeps");
+
+        // The recorded holder returns → the marker clears and the request
+        // re-enters the parked set for normal dispatch.
+        upsert(&membership, "n2");
+        dispatcher.sweep().await;
+        assert!(!dispatcher.is_unrecoverable(&segment_id), "marker cleared on holder return");
+        assert_eq!(dispatcher.pending_len(), 1, "request resumes normal parking");
+        assert_eq!(
+            dispatcher.metrics.unrecoverable_total_for_test(),
+            1,
+            "resume does not decrement or recount"
+        );
+    }
+
+    /// ae1 S1: the terminal set is bounded — more than `UNRECOVERABLE_SET_CAPACITY`
+    /// classifications evict the oldest markers instead of growing
+    /// without bound.
+    #[tokio::test]
+    async fn unrecoverable_set_evicts_oldest_beyond_capacity() {
+        let membership = make_membership("n1");
+        let dispatcher = test_dispatcher(membership, 1);
+        let total = UNRECOVERABLE_SET_CAPACITY + 1;
+        let mut segments = Vec::with_capacity(total);
+        for _ in 0..total {
+            let segment = SegmentId::new();
+            segments.push(segment);
+            dispatcher.enqueue(request(segment, vec![NodeId::new("ghost")])).await.unwrap();
+        }
+        assert_eq!(dispatcher.pending_len(), total);
+
+        dispatcher.sweep().await;
+        assert_eq!(dispatcher.metrics.unrecoverable_total_for_test(), total as u64);
+        assert_eq!(
+            dispatcher.unrecoverable_len(),
+            UNRECOVERABLE_SET_CAPACITY,
+            "the terminal set stays bounded"
+        );
+        let remaining = segments.iter().filter(|s| dispatcher.is_unrecoverable(s)).count();
+        assert_eq!(
+            remaining, UNRECOVERABLE_SET_CAPACITY,
+            "exactly the excess classifications were evicted (classification order)"
+        );
+    }
+
+    /// ae1 S1: an empty holder set is parked and classified terminal — no
+    /// panic, and a live holder but no eligible target stays parked
+    /// forever (the benign cannot-reach-RF state is NOT unrecoverable).
+    #[tokio::test]
+    async fn empty_holder_set_terminates_but_live_holders_do_not() {
+        let membership = make_membership("n1");
+        let dispatcher = test_dispatcher(membership.clone(), 2);
+        let empty_segment = SegmentId::new();
+        dispatcher.enqueue(request(empty_segment, vec![])).await.unwrap();
+        for _ in 0..2 {
+            dispatcher.sweep().await;
+        }
+        assert!(dispatcher.is_unrecoverable(&empty_segment), "no holders at all → terminal");
+
+        // A live holder with no eligible target (no free peer) stays
+        // parked — it is repairable, just not now.
+        upsert(&membership, "n2");
+        let live_segment = SegmentId::new();
+        dispatcher.enqueue(request(live_segment, vec![NodeId::new("n2")])).await.unwrap();
+        for _ in 0..5 {
+            dispatcher.sweep().await;
+        }
+        assert!(
+            !dispatcher.is_unrecoverable(&live_segment),
+            "live holder + no target is the honest cannot-reach-RF state"
+        );
+        assert_eq!(dispatcher.pending_len(), 1);
     }
 }

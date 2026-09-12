@@ -269,6 +269,39 @@ pub trait MetricRegistrar {
     fn register_histogram(&self, histogram: Arc<Histogram>);
 }
 
+/// A shared, thread-safe handle to a [`MetricRegistrar`].
+///
+/// Subsystems that register metrics **after startup** (dynamic
+/// per-label gauges, e.g. `hinted_handoff_pending_debt{target}`) hold
+/// one of these instead of only receiving `&dyn MetricRegistrar` during
+/// construction. Registration is idempotent per `(name, labels)`, so a
+/// lazily-created gauge is registered once and updated through the
+/// clone the subsystem keeps.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use oceanfs_core::{
+///     Counter, Gauge, Histogram, LabelSet, MetricRegistrar, SharedMetricRegistrar,
+/// };
+///
+/// struct Noop;
+/// impl MetricRegistrar for Noop {
+///     fn register_counter(&self, _counter: Counter) {}
+///     fn register_gauge(&self, _gauge: Gauge) {}
+///     fn register_histogram(&self, _histogram: Arc<Histogram>) {}
+/// }
+///
+/// let shared: SharedMetricRegistrar = Arc::new(Noop);
+/// let gauge = Gauge::new("example_gauge".into(), "help".into(), LabelSet::empty());
+/// shared.register_gauge(gauge.clone());
+/// gauge.set(1);
+/// assert_eq!(gauge.get(), 1);
+/// ```
+pub type SharedMetricRegistrar = Arc<dyn MetricRegistrar + Send + Sync>;
+
 // ---------------------------------------------------------------------------
 // HistogramConfig
 // ---------------------------------------------------------------------------
