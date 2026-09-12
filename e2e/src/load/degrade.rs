@@ -215,12 +215,12 @@ impl Cluster {
 
     /// Returns the harness-injected local pool root for `role` on `node_i`.
     ///
-    /// Local spawns without a `[storage]` block place pool roots on siblings
-    /// of the node's data directory (`{base}/pool-data`, …) because a pool
-    /// root must stay disjoint from `data_dir` (ADR-0031). Fails loudly when
-    /// the conventional root does not exist instead of falling back onto
-    /// `data_dir` — the local analogue of the fleet's no-silent-fallback
-    /// mount pre-flight.
+    /// Local spawns without a `[storage]` block place pool roots next to the
+    /// node's own data directory (`{base}/pool-data`, …; the node's data
+    /// directory is `{base}/data`) because a pool root must stay disjoint
+    /// from `data_dir` (ADR-0031). Fails loudly when the conventional root
+    /// does not exist instead of falling back onto `data_dir` — the local
+    /// analogue of the fleet's no-silent-fallback mount pre-flight.
     ///
     /// # Examples
     ///
@@ -237,35 +237,32 @@ impl Cluster {
     ///
     /// # Errors
     ///
-    /// Returns an error when `node_i` has no parent directory or the role
-    /// root is not a directory.
+    /// Returns an error when the role root is not a directory.
     pub fn local_role_root(&self, node_i: usize, role: &str) -> Result<PathBuf, Error> {
         let data_dir = self.node(node_i).data_dir().to_path_buf();
         local_role_dir(&data_dir, role)
     }
 }
 
-/// Resolves `{data_dir}/../pool-{role}` and requires it to exist.
+/// Resolves `{base}/pool-{role}` and requires it to exist.
 ///
-/// `metadata` is the config role; the harness names the directory `meta`.
+/// The local harness treats the spawn path as the node **BASE**: the node's
+/// own data directory is `{base}/data` and the injected pool roots are
+/// `{base}/pool-{role}` (`NodeProcess::spawn_with_data_dir_and_options`,
+/// ADR-0031). `metadata` is the config role; the harness names the
+/// directory `meta`.
 fn local_role_dir(data_dir: &Path, role: &str) -> Result<PathBuf, Error> {
     let dir_role = match role {
         "metadata" => "meta",
         other => other,
     };
-    let base = data_dir.parent().ok_or_else(|| {
-        Error::ClusterError(format!(
-            "local_role_root: {} has no parent directory",
-            data_dir.display()
-        ))
-    })?;
-    let root = base.join(format!("pool-{dir_role}"));
+    let root = data_dir.join(format!("pool-{dir_role}"));
     if root.is_dir() {
         Ok(root)
     } else {
         Err(Error::ClusterError(format!(
             "local_role_root: {} not found (local spawns without a [storage] block inject \
-             pool-* siblings of the data directory)",
+             pool-* next to the node's data directory)",
             root.display()
         )))
     }
@@ -390,7 +387,10 @@ fn filesystem_type(dir: &Path) -> Result<String, Error> {
 fn get_disk_space(dir: &Path, field: &str) -> Result<u64, Error> {
     let output = Command::new("df")
         .env("LC_ALL", "C")
-        .args(["--output", field, "--block-size=1"])
+        // `--output` takes its field list with `=`; a space-separated value
+        // becomes a FILE operand (`df: used: No such file or directory`).
+        .arg(format!("--output={field}"))
+        .arg("--block-size=1")
         .arg(dir)
         .output()
         .map_err(|e| Error::ClusterError(format!("df command failed: {e}")))?;
@@ -862,20 +862,22 @@ mod tests {
     #[test]
     fn local_role_dir_maps_metadata_to_meta_and_requires_existing_root() {
         let base = tempfile::TempDir::new().expect("temp dir");
-        let data_dir = base.path().join("data");
-        fs::create_dir_all(&data_dir).expect("mkdir data");
+        // The spawn path is the node BASE: `{base}/data` is the node's own
+        // data directory and `{base}/pool-*` are the injected role roots
+        // (`NodeProcess::spawn_with_data_dir_and_options`).
+        fs::create_dir_all(base.path().join("data")).expect("mkdir data");
 
         // Missing role root → loud error, never a data_dir fallback.
-        assert!(local_role_dir(&data_dir, "data").is_err());
+        assert!(local_role_dir(base.path(), "data").is_err());
 
         fs::create_dir_all(base.path().join("pool-data")).expect("mkdir pool-data");
         fs::create_dir_all(base.path().join("pool-meta")).expect("mkdir pool-meta");
         assert_eq!(
-            local_role_dir(&data_dir, "data").expect("data root"),
+            local_role_dir(base.path(), "data").expect("data root"),
             base.path().join("pool-data")
         );
         assert_eq!(
-            local_role_dir(&data_dir, "metadata").expect("metadata root"),
+            local_role_dir(base.path(), "metadata").expect("metadata root"),
             base.path().join("pool-meta")
         );
     }

@@ -1891,7 +1891,7 @@ async fn load_degraded() {
     let dropped_hints =
         total_counter_delta(&initial_snaps, &final_snaps, "hinted_handoff_hints_dropped_total");
     let repair_enqueued =
-        total_counter_delta(&initial_snaps, &final_snaps, "repair_enqueued_total");
+        total_counter_delta(&initial_snaps, &final_snaps, "oceanfs_repair_enqueued_total");
     let scrub_corrupt =
         total_counter_delta(&initial_snaps, &final_snaps, "scrub_segments_corrupt_total");
     log.check(

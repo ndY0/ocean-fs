@@ -105,7 +105,7 @@ log_info() { echo "[INFO]  $(date '+%H:%M:%S') $*" >&2; }
 log_error() { echo "[ERROR] $(date '+%H:%M:%S') $*" >&2; }
 
 usage() {
-    sed -n '2,84p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,76p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 }
 
