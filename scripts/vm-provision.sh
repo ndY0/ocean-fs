@@ -116,6 +116,12 @@ readonly NETWORK_NAME="oceanfs-testnet"
 readonly NETWORK_CIDR="10.0.0.0/24"
 
 # VM type pricing (approximate, for cost estimates)
+#
+# WARNING (2026-09-12): these figures UNDERSTATE real invoices. The user
+# observed the phase-4 fleet (3x cx33 + cx43 + 690 GB volumes) at close to
+# EUR 1/h -- roughly 10x the estimate this table produces. Treat every
+# estimate below as a LOWER BOUND; verify against the Hetzner console and
+# never provision based on this table alone (PIPELINE section 7).
 declare -A VM_HOURLY_COST
 # Approximate hourly prices (2026-08 Hetzner table; verify with
 # `hcloud server-type list --output json`). cx23/cx33 replaced the
@@ -422,6 +428,7 @@ check_budget_gate() {
     fi
 
     log_info "Budget gate: OK. Current spend: €${current_total}, estimated: €${estimated_total}, budget: €${max_budget}."
+    log_warn "Cost estimate is a LOWER BOUND (stale price table). User-observed 2026-09-12: the 3-node + volumes fleet runs close to €1/h. Verify the Hetzner console; PIPELINE §7."
 }
 
 # Run all guardrails

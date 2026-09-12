@@ -1,9 +1,9 @@
 ---
 epic: "fleet-degradation"
-status: proposed
+status: paused
 priority: high
 created: 2026-09-11
-updated: 2026-09-11
+updated: 2026-09-12
 ---
 
 # Fleet Degradation Testing (Phase 4 class) — Epic Plan
@@ -59,6 +59,33 @@ path. Every result in this epic is a **correctness / degradation** result.
 Throughput and latency numbers from these runs are **not comparable** to
 local-disk or Phase 2/3 runs and are never asserted on. The `dm-delay` /
 `dm-flakey` soft-degradation follow-up, if built, inherits the same rule.
+
+## PAUSED: product gaps before further testing (2026-09-12, user decision)
+
+**This epic is paused.** The f3/f5 fleet runs and the f4 grounding exposed
+two product defects in the pool model; per the user decision (2026-09-12:
+*"it is pointless to test a faulty behaviour"*) they are fixed **before**
+any further fleet testing, so f4 does not test semantics that are about to
+change and its assertions do not need reworking afterwards. The cloud fleet
+has been destroyed (0 servers, 0 volumes) and no test resource may be
+provisioned while this epic is paused.
+
+1. **A Dead data pool cannot return at runtime.** `Dead` is absorbing; the
+   only re-probe is boot, `POST /admin/pools` attach works only for a new
+   root, and detach refuses a Dead pool. Replacing a data device therefore
+   requires a node restart, and there is no pool-return residue handling
+   for the lost local copies.
+2. **Pool capacity is stale.** `refresh_capacity` has no periodic caller:
+   placement decisions, `oceanfs_pool_bytes_*` and the gossiped
+   `capacity_free_bytes` drift under load (the f4 C2a/C2b dataset would be
+   built on stale numbers).
+
+The fixes are scoped in the new **`pool-runtime-lifecycle`** epic
+([epic](../pool-runtime-lifecycle/epic.md)); the ordering is
+`pr1 capacity-refresh → pr2 dead-pool-recovery → f4`. This epic resumes
+when both land with review PASS; f4 then re-provisions the fleet and keeps
+its original scope (P1b/P2/P3 assertions use the new recovery path where it
+replaces a restart).
 
 ## Code-grounding facts (verified 2026-09-11)
 
@@ -262,6 +289,10 @@ the device replacement is explicit.
   **minimum 1-hour frame** even if deleted minutes later. Only destroy
   (delete) stops the meter. Teardown at the end of every session is
   mandatory; see PIPELINE §7.
+- **Observed cost (user, 2026-09-12): the 3-node + volumes fleet runs close
+  to €1/h** — roughly 10× the `vm-provision.sh` estimator table, which is a
+  stale lower bound. Never reason from the script estimate; verify the
+  Hetzner console.
 - **Billing rule (HARD):** Hetzner volumes are billed while they exist,
   **including when detached**. `vm-down` (and `--destroy`) MUST delete every
   recorded volume id, and the provisioning record MUST carry them

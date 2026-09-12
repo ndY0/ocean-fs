@@ -43,8 +43,11 @@ a replica of every write. Node 0 is the bootstrap (no `seed_nodes`);
 nodes 1..N-1 seed to node 0's gRPC address (`[gossip] seed_nodes`),
 wired at deploy time by `sut-deploy.sh --cluster`. Node 0 also hosts
 Prometheus scraping **all** nodes (`instance=oceanfs-node-0..N-1`), so
-Grafana can follow each VM individually. Cost: ~€0.09/h for 3 nodes +
-CX43 harness — a 5-min smoke run costs about a cent.
+Grafana can follow each VM individually. **Cost (user-observed
+2026-09-12): the 3-node + volumes fleet runs close to €1/h — roughly 10×
+the `vm-provision.sh` estimator table, which understates real invoices.
+Treat any provisioned topology as a ~€1/h meter, verify against the
+Hetzner console, and never reason from the script estimate (PIPELINE §7).**
 
 **Billing is time-based, not usage-based (HARD).** Servers bill while they
 exist even when powered off (the TTL timer only powers them off), and every

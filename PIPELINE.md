@@ -261,6 +261,10 @@ Facts (user-stipulated 2026-09-12; verified against the account):
    servers + 15 volumes = 19 resource-hours per cycle).
 3. Volumes bill per GB-hour while they exist, detached included (ADR-0019 /
    fleet-degradation f1 guardrail).
+4. **Observed fleet cost (user, 2026-09-12).** The 3-node + volumes fleet
+   lands **close to €1/h** — roughly 10× the `vm-provision.sh` estimator
+   table, which is a stale lower bound. Never reason from that table; treat
+   a provisioned fleet as a ~€1/h meter and verify the account.
 
 **Rules for every agent:**
 

@@ -1,7 +1,7 @@
 ---
 feature: "Pool Degradation Under Load (Role Matrix + Dynamic Ops)"
 epic: "fleet-degradation"
-status: proposed
+status: paused
 priority: critical
 owner: ""
 dependencies:
@@ -37,6 +37,14 @@ updated: 2026-09-11
 ---
 
 # Pool Degradation Under Load (Role Matrix + Dynamic Ops)
+
+> **PAUSED (2026-09-12, user decision).** This feature does not run while the
+> two pool-model product defects exposed by f3/f5 are fixed — see the
+> [fleet-degradation Pause](epic.md#paused-product-gaps-before-further-testing-2026-09-12-user-decision)
+> and the [pool-runtime-lifecycle epic](../pool-runtime-lifecycle/epic.md):
+> a Dead data pool cannot return at runtime (P1b/P2/P3 recovery semantics)
+> and pool capacity is stale (C2a/C2b dataset). The cloud fleet is destroyed;
+> f4 resumes after those features land with review PASS.
 
 ## Summary
 
