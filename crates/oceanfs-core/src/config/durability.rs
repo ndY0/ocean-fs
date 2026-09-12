@@ -54,6 +54,12 @@ pub struct DurabilityConfig {
     /// Cadence of the `"drain_intra"` Tier-1 task in seconds (default 1);
     /// the byte budget above is the real pace-setter.
     pub drain_interval_sec: u64,
+    /// Cadence of the periodic pool-capacity refresh in seconds (default
+    /// 10); `0` disables the periodic refresh (boot/attach probes still
+    /// run). One `statvfs` per registered pool per tick; the refreshed
+    /// free/total values feed placement, the `oceanfs_pool_bytes_*`
+    /// gauges and the re-declared manifest (pr1).
+    pub capacity_refresh_interval_sec: u64,
 }
 
 impl Default for DurabilityConfig {
@@ -65,7 +71,42 @@ impl Default for DurabilityConfig {
             drain_max_bytes_per_tick: default_drain_max_bytes_per_tick(),
             drain_cluster_max_bytes_per_tick: default_drain_cluster_max_bytes_per_tick(),
             drain_interval_sec: default_drain_interval_sec(),
+            capacity_refresh_interval_sec: default_capacity_refresh_interval_sec(),
         }
+    }
+}
+
+impl DurabilityConfig {
+    /// Validates the durability settings.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a `capacity_refresh_interval_sec` outside `0` (disabled)
+    /// or `1..=86400` (one day) seconds, naming the field and the accepted
+    /// range.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oceanfs_core::DurabilityConfig;
+    ///
+    /// assert!(DurabilityConfig::default().validate().is_ok());
+    /// let mut disabled = DurabilityConfig::default();
+    /// disabled.capacity_refresh_interval_sec = 0;
+    /// assert!(disabled.validate().is_ok());
+    ///
+    /// disabled.capacity_refresh_interval_sec = 86_401;
+    /// assert!(disabled.validate().is_err());
+    /// ```
+    pub fn validate(&self) -> Result<(), String> {
+        let secs = self.capacity_refresh_interval_sec;
+        if secs != 0 && !(1..=CAPACITY_REFRESH_MAX_INTERVAL_SEC).contains(&secs) {
+            return Err(format!(
+                "durability.capacity_refresh_interval_sec: expected 0 (disabled) or \
+                 1..={CAPACITY_REFRESH_MAX_INTERVAL_SEC} seconds, got {secs}"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -97,4 +138,56 @@ pub fn default_drain_cluster_max_bytes_per_tick() -> u64 {
 /// Default intra-node drain task cadence: one cycle per second.
 pub fn default_drain_interval_sec() -> u64 {
     1
+}
+
+/// Upper bound accepted for `capacity_refresh_interval_sec` (one day):
+/// longer cadences are configuration mistakes, not disablement — `0` is
+/// the documented disable value.
+pub const CAPACITY_REFRESH_MAX_INTERVAL_SEC: u64 = 86_400;
+
+/// Default pool-capacity refresh cadence: every 10 seconds.
+pub fn default_capacity_refresh_interval_sec() -> u64 {
+    10
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_capacity_refresh_interval_is_ten_seconds() {
+        assert_eq!(DurabilityConfig::default().capacity_refresh_interval_sec, 10);
+    }
+
+    #[test]
+    fn toml_defaults_and_explicit_values_parse() {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            durability: DurabilityConfig,
+        }
+
+        let absent: Wrapper = toml::from_str("").expect("empty table parses");
+        assert_eq!(absent.durability.capacity_refresh_interval_sec, 10, "serde default is 10");
+
+        let explicit: Wrapper = toml::from_str("[durability]\ncapacity_refresh_interval_sec = 3\n")
+            .expect("explicit value parses");
+        assert_eq!(explicit.durability.capacity_refresh_interval_sec, 3);
+    }
+
+    #[test]
+    fn validate_accepts_disabled_bounds_and_rejects_beyond_one_day() {
+        assert!(DurabilityConfig::default().validate().is_ok());
+        for secs in [0u64, 1, 86_400] {
+            let mut config = DurabilityConfig::default();
+            config.capacity_refresh_interval_sec = secs;
+            assert!(config.validate().is_ok(), "{secs} must be accepted");
+        }
+
+        let mut config = DurabilityConfig::default();
+        config.capacity_refresh_interval_sec = 86_401;
+        let error = config.validate().expect_err("86_401 must be rejected");
+        assert!(error.contains("capacity_refresh_interval_sec"), "{error}");
+        assert!(error.contains("86400"), "{error}");
+    }
 }

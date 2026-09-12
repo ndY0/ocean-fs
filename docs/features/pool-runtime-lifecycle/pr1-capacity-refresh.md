@@ -1,7 +1,7 @@
 ---
 feature: "Pool Capacity Refresh"
 epic: "pool-runtime-lifecycle"
-status: proposed
+status: done
 priority: critical
 owner: ""
 dependencies: []
@@ -252,12 +252,13 @@ background ticker: every `[storage] capacity_refresh_interval_secs` (0 = disable
 
 ## Definition of Done
 
-- [ ] **Code:** `cargo build --all-targets` succeeds in the affected
+- [x] **Code:** `cargo build --all-targets` succeeds in the affected
       crate(s) (`oceanfs-core`, `oceanfs-node`); the refresh task is
       registered at the composition root and cancelled with the node's
       shutdown; no `statvfs`/I/O is added to the read/write/placement hot
       paths; no test-only hooks.
-- [ ] **Tests:** config parse/validate tests for
+<!-- REVIEW: verified 2026-09-12 (iter 2, verdict PASS) — `bg.capacity_refresh_cancel.cancel()` at node.rs:1282 plus `bg.capacity_refresh.take()` in the housekeeping drain vec at node.rs:1332 (between `hints_probe` and `metric_poller`); `drain_tasks` (node.rs:1401-1438) awaits under the grace and aborts survivors, so the loop no longer outlives `membership.shutdown()`. `background_tasks_spawns_all_handles` asserts the live handle (node.rs:1779); `cargo build --all-targets -p oceanfs-core -p oceanfs-node` clean; no storage/server source touched (diff scope: core config + background.rs + node.rs). -->
+- [x] **Tests:** config parse/validate tests for
       `capacity_refresh_interval_secs` (default 10, an explicit value, `0`
       accepted as disabled, invalid values rejected with a clear error); a
       refresh-effect test on a temp-backed pool (write into a pool root,
@@ -268,19 +269,19 @@ background ticker: every `[storage] capacity_refresh_interval_secs` (0 = disable
       the existing suites (`oceanfs-core`, `oceanfs-storage`,
       `oceanfs-node`, `oceanfs-server`; RocksDB-affected crates serialized
       with `--test-threads=1` per PIPELINE §4.6).
-- [ ] **Docs:** every new/changed `pub` item has `# Examples`;
+- [x] **Docs:** every new/changed `pub` item has `# Examples`;
       `#![deny(missing_docs)]` passes; the config reference documents the new
       knob, its default, and the `0` disable semantics.
-- [ ] **ADR:** ADR-0017 (scheduled background work; slow cycles skip rather
+- [x] **ADR:** ADR-0017 (scheduled background work; slow cycles skip rather
       than backlog), ADR-0029 §D2/D5 (capacity in the manifest; capacity-aware
       placement), and ADR-0033 (manifest-aware selection) constraints are
       addressed; the rejected hot-path/probabilistic alternative is recorded
       in this doc.
-- [ ] **Perf:** `perf: []` — the refresh is one `statvfs` per registered pool
+- [x] **Perf:** `perf: []` — the refresh is one `statvfs` per registered pool
       per interval with no lock held across the I/O (the existing
       `refresh_capacity` shape), there is no hot-path change, and no
       throughput/latency claim is made.
-- [ ] **Integration:** a node-level integration test exercises the complete
+- [x] **Integration:** a node-level integration test exercises the complete
       path (registry → ticker → refreshed gauge + manifest on a temp-backed
       pool); f4's C2a/C2b dataset consumes the refreshed
       `oceanfs_pool_bytes_*`/manifest values instead of an SSH `df` probe
@@ -325,4 +326,33 @@ alternative above are settled.
 
 ## Deviations (accepted)
 
-_None yet — filled at implementation close._
+- **Config section moved: `[durability]`, not `[storage]`.** The knob is
+  `[durability] capacity_refresh_interval_sec` (default 10, `0` disables).
+  Rationale: the refresher is scheduled background work (ADR-0017's
+  `DurabilityConfig` already owns every interval knob), and the
+  `[storage]` placement would have required adding a field to
+  `StorageConfig` — breaking ~168 explicit struct literals across the
+  workspace for a schedule setting. Recorded as an implementation-shape
+  choice; the semantics (default 10, 0 disables, one `statvfs` per pool
+  per interval) are unchanged. Validation bound: `0` or `1..=86_400`
+  seconds, enforced in `Node::validate_config`.
+- **Schedule seam: a dedicated background loop in
+  `modules/background.rs`, not a `DurabilityTask`.** A statvfs-only cycle
+  performs no `.dat`/metadata I/O, so it takes no Tier-1 permit (the
+  ADR-0017 amendment meters heavy I/O only). The loop has its own
+  cancellation token stored in `BackgroundTasks` (cancelled on shutdown
+  beside the other loops). Seam chosen for clarity; the scheduler's
+  skip/overrun semantics are unnecessary for a microsecond-scale cycle.
+- **Manifest re-declare policy: any observed change, exact comparison.**
+  The ticker rebuilds and re-declares the self manifest whenever any
+  pool's `(free, total)` differs from the pre-refresh snapshot, or a pool
+  was registered since it (runtime attach). No materiality threshold and
+  no change → no re-declare (zero gossip churn on an unchanged pool set).
+- **Ticker skips the immediate first tick.** `tokio::time::interval`
+  fires immediately; the loop consumes that tick so the first refresh
+  happens one full interval after start — boot/attach already probed.
+- **No new metrics.** The existing `oceanfs_pool_bytes_free/_total`
+  gauges carry the refreshed values; a failure of `statvfs` leaves the
+  previous values in place (existing `refresh_capacity` behavior) and is
+  not separately counted (would need a new series; not required by the
+  DoD).

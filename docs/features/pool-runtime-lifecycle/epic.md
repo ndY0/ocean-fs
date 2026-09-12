@@ -59,20 +59,20 @@ blocking the paused fleet-degradation epic.
 ## Dependency graph
 
 ```
-pr1-capacity-refresh  (priority 1 of 2)
+pr1-capacity-refresh  (priority 1 of 2) — done 2026-09-12 (review iteration 2 PASS)
         │
         ▼
-pr2-dead-pool-recovery  (priority 2 of 2)
+pr2-dead-pool-recovery  (priority 2 of 2) — next
         │
         ▼
 resume fleet-degradation f4   (paused; resumes after both land with review PASS)
 ```
 
-`pr1 → pr2` reflects the approved order: pr1 lays the periodic refresh down
-first, and pr2's reset path re-probes + refreshes capacity with pr1 keeping it
-fresh afterwards. f4 then re-provisions the fleet and keeps its original
-scope; its P1b/P2/P3 recovery assertions use the new runtime path where it
-replaces a restart.
+`pr1 → pr2` reflects the approved order: pr1 landed 2026-09-12 (review
+iteration 2 PASS) and keeps capacity fresh on the periodic tick; pr2 is next
+and its reset path re-probes + refreshes capacity on top of that. f4 then
+re-provisions the fleet and keeps its original scope; its P1b/P2/P3 recovery
+assertions use the new runtime path where it replaces a restart.
 
 ## Grounded defects (verified 2026-09-12 at HEAD b3eba7f)
 
@@ -128,7 +128,7 @@ replaces a restart.
 
 | # | Feature | Status | Priority | Depends on | Deliverable in one line |
 |---|---|---|---|---|---|
-| pr1 | [capacity-refresh](pr1-capacity-refresh.md) | proposed | critical | — | Periodic background task calling `refresh_capacity` for all registered pools + `[storage] capacity_refresh_interval_secs` (default 10, `0` disables) + validation; refreshed gauges/manifest reach placement; f4's C2a/C2b dataset consumes the metrics instead of SSH `df` |
+| pr1 | [capacity-refresh](pr1-capacity-refresh.md) | done (2026-09-12, review iteration 2 PASS) | critical | — | Periodic background task calling `refresh_capacity` for all registered pools + `[durability] capacity_refresh_interval_sec` (default 10, `0` disables) + validation; refreshed gauges/manifest reach placement; f4's C2a/C2b dataset consumes the metrics instead of SSH `df` |
 | pr2 | [dead-pool-recovery](pr2-dead-pool-recovery.md) | proposed | critical | pr1; f5 (done) | Operator-triggered, probe-gated runtime return of a Dead data pool (`POST /admin/pools/{id}/reset`, name OQ) + return-residue sweep correcting `storage_locations` + reconciliation observes the corrected state; restart stays supported |
 
 ## Acceptance bar (epic DoD)

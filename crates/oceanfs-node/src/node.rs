@@ -73,6 +73,14 @@ pub struct BackgroundTasks {
     /// Hints-root probe cancellation token.
     pub(crate) hints_probe_cancel: CancellationToken,
 
+    /// Periodic pool-capacity refresh (pr1): one `statvfs` per registered
+    /// pool per `[durability] capacity_refresh_interval_sec`, with a
+    /// manifest re-declare when capacity changed. `None` when disabled
+    /// (interval `0`).
+    pub(crate) capacity_refresh: Option<JoinHandle<()>>,
+    /// Capacity-refresh cancellation token.
+    pub(crate) capacity_refresh_cancel: CancellationToken,
+
     /// gRPC server task handle for graceful shutdown.
     pub(crate) grpc_server: Option<JoinHandle<()>>,
     /// gRPC server cancellation token.
@@ -155,6 +163,8 @@ impl BackgroundTasks {
             hint_prune_cancel: CancellationToken::new(),
             hints_probe: None,
             hints_probe_cancel: CancellationToken::new(),
+            capacity_refresh: None,
+            capacity_refresh_cancel: CancellationToken::new(),
             grpc_server: None,
             grpc_shutdown: CancellationToken::new(),
             http_server: None,
@@ -1269,6 +1279,7 @@ impl Node {
         bg.delivery_cancel.cancel();
         bg.hint_prune_cancel.cancel();
         bg.hints_probe_cancel.cancel();
+        bg.capacity_refresh_cancel.cancel();
         bg.health_check_cancel.cancel();
         bg.health_cancel.cancel();
         bg.segment_replicator_cancel.cancel();
@@ -1316,6 +1327,9 @@ impl Node {
             // f0 D1: the hints-root probe (blocking fs I/O on the blocking
             // pool; the grace bounds a hung-device cycle).
             bg.hints_probe.take(),
+            // pr1: the pool-capacity refresh (statvfs per pool; bounded by
+            // the grace like the other housekeeping loops).
+            bg.capacity_refresh.take(),
             bg.metric_poller.take(),
         ];
         Self::drain_tasks(housekeeping, grace, "housekeeping").await;
@@ -1466,6 +1480,9 @@ impl Node {
                 warn!("s3_auth_enabled but no access_keys.toml found at {}", keys_path.display());
             }
         }
+
+        // pr1: reject unusable capacity-refresh cadences before startup.
+        cfg.durability.validate().map_err(|e| format!("invalid durability config: {e}"))?;
 
         Ok(cfg)
     }
@@ -1759,6 +1776,7 @@ mod tests {
         let handles = [
             node.background.durability_scheduler.as_ref(),
             node.background.heal.as_ref(),
+            node.background.capacity_refresh.as_ref(),
             node.background.hinted_handoff_prune.as_ref(),
             node.background.hinted_handoff_delivery.as_ref(),
             node.background.health_monitor.as_ref(),
@@ -1774,6 +1792,79 @@ mod tests {
             let h = h.expect("loop handle present after start");
             assert!(!h.is_finished(), "loop must be running before shutdown");
         }
+        node.shutdown().await.expect("shutdown");
+    }
+
+    /// pr1: the periodic capacity-refresh task observes consumed space on
+    /// the next interval, updates the pool atomics, and re-declares the
+    /// manifest so peers see the same `capacity_free_bytes`.
+    #[tokio::test]
+    async fn capacity_refresh_updates_pool_atomics_and_manifest() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut config = test_config(&tmp);
+        config.durability.capacity_refresh_interval_sec = 1;
+        let node = Node::start(config).await.expect("start");
+
+        let self_id = oceanfs_core::NodeId::new(&node.config.node_id);
+        let data_pool = node
+            .storage
+            .registry
+            .pools()
+            .into_iter()
+            .find(|pool| pool.role() == oceanfs_core::PoolRole::Data)
+            .expect("data pool");
+        let free_before = data_pool.free_bytes();
+
+        // Consume space in the data pool root so statvfs must see it.
+        std::fs::write(data_pool.root().join("capacity-refresh.bin"), vec![0u8; 32 * 1024 * 1024])
+            .expect("write filler");
+
+        // Interval 1s; two intervals leave margin for the ticker.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        assert!(
+            data_pool.free_bytes() < free_before,
+            "the refresh must observe the consumed space (before {free_before}, after {})",
+            data_pool.free_bytes()
+        );
+        let manifest = node.membership.manifest_of(&self_id).expect("self manifest is declared");
+        let manifest_data =
+            manifest.pools().iter().find(|pool| pool.role() == "data").expect("data pool manifest");
+        assert_eq!(
+            manifest_data.capacity_free_bytes(),
+            data_pool.free_bytes(),
+            "the re-declared manifest carries the refreshed capacity"
+        );
+        node.shutdown().await.expect("shutdown");
+    }
+
+    /// pr1: `capacity_refresh_interval_sec = 0` disables the periodic
+    /// refresh — the pool atomics stay pinned to the last probe.
+    #[tokio::test]
+    async fn capacity_refresh_disabled_keeps_the_last_probe() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut config = test_config(&tmp);
+        config.durability.capacity_refresh_interval_sec = 0;
+        let node = Node::start(config).await.expect("start");
+
+        let data_pool = node
+            .storage
+            .registry
+            .pools()
+            .into_iter()
+            .find(|pool| pool.role() == oceanfs_core::PoolRole::Data)
+            .expect("data pool");
+        let free_before = data_pool.free_bytes();
+
+        std::fs::write(data_pool.root().join("capacity-refresh.bin"), vec![0u8; 32 * 1024 * 1024])
+            .expect("write filler");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        assert_eq!(
+            data_pool.free_bytes(),
+            free_before,
+            "disabled refresh leaves the last probe untouched"
+        );
         node.shutdown().await.expect("shutdown");
     }
 

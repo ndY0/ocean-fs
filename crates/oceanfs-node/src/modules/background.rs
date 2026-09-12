@@ -164,6 +164,22 @@ pub(crate) fn spawn_all(
         bg.health_consequences_cancel.clone(),
     ));
 
+    // pr1 (pool-runtime-lifecycle): periodic pool-capacity refresh. The
+    // user-approved background task — one `statvfs` per registered pool
+    // per interval, then a manifest re-declare only when a capacity value
+    // actually changed (no gossip churn on an unchanged pool set).
+    if config.durability.capacity_refresh_interval_sec > 0 {
+        let (handle, cancel) = spawn_capacity_refresh(
+            std::time::Duration::from_secs(config.durability.capacity_refresh_interval_sec),
+            Arc::clone(&storage.registry),
+            Arc::clone(&membership_module.membership),
+            Arc::clone(&membership_module.manifest_cache),
+            oceanfs_core::NodeId::new(&config.node_id),
+        );
+        bg.capacity_refresh = Some(handle);
+        bg.capacity_refresh_cancel = cancel;
+    }
+
     // Server-owned loop: the prefetch pre-warmer keep-alive.
     server::spawn_prefetch_loop(prefetch_engine, &mut bg);
 
@@ -219,4 +235,80 @@ pub(crate) fn spawn_all(
     }));
 
     bg
+}
+
+/// Spawns the periodic pool-capacity refresh (pr1, user-approved
+/// 2026-09-12).
+///
+/// Every `interval`, one `statvfs` per registered pool
+/// ([`oceanfs_storage::PoolRegistry::refresh_capacity`]) updates the pool
+/// atomics and the `oceanfs_pool_bytes_*` gauges. When any pool's
+/// free/total capacity changed (or a pool was registered since the last
+/// probe), the node manifest is rebuilt and re-declared so peers see the
+/// fresh `capacity_free_bytes` that placement, repair-target selection
+/// and the f4 C2a/C2b dataset consume.
+///
+/// No I/O touches the read/write/placement hot paths: the refresh runs
+/// entirely on this background task. Returns the join handle and its
+/// cancellation token; the caller stores both in the node's
+/// `BackgroundTasks`.
+fn spawn_capacity_refresh(
+    interval: std::time::Duration,
+    registry: Arc<oceanfs_storage::PoolRegistry>,
+    membership: Arc<oceanfs_membership::Membership>,
+    manifest_cache: Arc<crate::routing_cache::ManifestCache>,
+    self_id: oceanfs_core::NodeId,
+) -> (tokio::task::JoinHandle<()>, tokio_util::sync::CancellationToken) {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let token = cancel.clone();
+    let handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The first tick completes immediately; boot/attach already
+        // probed capacity, so wait one full interval before refreshing.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    info!("Capacity refresh cancelled");
+                    break;
+                }
+                _ = ticker.tick() => {
+                    let before: Vec<(u32, u64, u64)> = registry
+                        .pools()
+                        .iter()
+                        .map(|pool| (pool.id(), pool.free_bytes(), pool.total_bytes()))
+                        .collect();
+                    registry.refresh_capacity();
+                    let changed = registry.pools().iter().any(|pool| {
+                        match before.iter().find(|(id, _, _)| *id == pool.id()) {
+                            Some((_, free, total)) => {
+                                *free != pool.free_bytes() || *total != pool.total_bytes()
+                            }
+                            // Registered after the snapshot (runtime attach):
+                            // peers must see the new capacity.
+                            None => true,
+                        }
+                    });
+                    if !changed {
+                        continue;
+                    }
+                    // The same incarnation the health-consequence re-declare
+                    // uses; the cache fallback guards a not-yet-joined node.
+                    let incarnation = membership
+                        .incarnation_of(&self_id)
+                        .map(|inc| inc.value())
+                        .or_else(|| manifest_cache.get(&self_id).map(|m| m.incarnation()))
+                        .unwrap_or(1);
+                    let manifest = Arc::new(crate::pool_manifest::build_node_manifest(
+                        incarnation,
+                        &registry,
+                    ));
+                    membership.set_self_manifest((*manifest).clone());
+                    manifest_cache.update(self_id.clone(), manifest);
+                }
+            }
+        }
+    });
+    (handle, cancel)
 }
